@@ -12,6 +12,21 @@ export interface RoomInfo {
   path: string;
   fileCount: number;
   messageCount: number;
+  /** True when the room file lives in a cloud-sync folder (HLT-6). */
+  synced: boolean;
+}
+
+/** A prior saved state of a file (ADD-2). */
+export interface FileVersion {
+  id: string;
+  savedAt: string;
+  cause: string;
+}
+
+/** A recently opened room, listed on the start screen (ADD-5). */
+export interface RecentRoom {
+  name: string;
+  path: string;
 }
 
 export interface FileMeta {
@@ -151,6 +166,22 @@ export const api = {
   setCell: (id: string, sheet: string | null, cell: string, value: string) =>
     invoke<void>("set_cell", { id, sheet, cell, value }),
   deleteFile: (id: string) => invoke<void>("delete_file", { id }),
+  // ---- Wave 2: data safety ----
+  listFileVersions: (id: string) =>
+    invoke<FileVersion[]>("list_file_versions", { id }),
+  restoreFileVersion: (versionId: string) =>
+    invoke<void>("restore_file_version", { versionId }),
+  exportFile: (id: string, destPath: string) =>
+    invoke<void>("export_file", { id, destPath }),
+  exportAll: (destDir: string) => invoke<number>("export_all", { destDir }),
+  changePassword: (current: string, newPassword: string) =>
+    invoke<void>("change_password", { current, newPassword }),
+  duplicateRoom: (destPath: string, newPassword: string | null) =>
+    invoke<void>("duplicate_room", { destPath, newPassword }),
+  compactRoom: () => invoke<string>("compact_room"),
+  listRecent: () => invoke<RecentRoom[]>("list_recent"),
+  removeRecent: (path: string) => invoke<void>("remove_recent", { path }),
+  clearRecent: () => invoke<void>("clear_recent"),
   saveGeneratedFile: (name: string, content: string) =>
     invoke<FileMeta>("save_generated_file", { name, content }),
   addMemory: (content: string) => invoke<Memory>("add_memory", { content }),
