@@ -202,6 +202,16 @@ export default function Workspace({ info, onLock }: Props) {
   const [saveDraft, setSaveDraft] = useState<{ id: string; name: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [mcpTools, setMcpTools] = useState<string[]>([]);
+  // SEC-1: MCP approval prompt, driven by info.pendingMcp; dismissed once chosen.
+  const [mcpDialogDismissed, setMcpDialogDismissed] = useState(false);
+  const [approvingMcp, setApprovingMcp] = useState(false);
+  // ADD-17: room summary generation.
+  const [summarizing, setSummarizing] = useState(false);
+  const [summarizeProgress, setSummarizeProgress] = useState("");
+  // ADD-12: add-link dialog.
+  const [showAddLink, setShowAddLink] = useState(false);
+  const [linkUrl, setLinkUrl] = useState("");
+  const [importingLink, setImportingLink] = useState(false);
   const [webOn, setWebOn] = useState(false);
   // ADD-2 version history panel.
   const [showHistory, setShowHistory] = useState(false);
@@ -421,6 +431,74 @@ export default function Workspace({ info, onLock }: Props) {
       .flatMap((s) => s.tools.map((t) => `${s.name}: ${t}`));
   }
 
+  // ---- SEC-1: approve (or decline) the room's pending MCP servers ----
+  async function approveMcp() {
+    const pending = info.pendingMcp;
+    if (!pending || approvingMcp) return;
+    setApprovingMcp(true);
+    try {
+      const statuses = await api.approveMcp(pending.fingerprint);
+      setMcpTools(connectedTools(statuses));
+      setMcpDialogDismissed(true);
+      pushToast("success", "This room's tools are now allowed on this Mac.");
+    } catch (e) {
+      pushToast("error", String(e));
+    } finally {
+      setApprovingMcp(false);
+    }
+  }
+
+  // Decline: servers stay stopped (they show as blocked in Settings).
+  function keepMcpOff() {
+    setMcpDialogDismissed(true);
+  }
+
+  // ---- ADD-17: build/refresh "Room summary.md" and open it ----
+  async function summarizeRoom() {
+    if (summarizing) return;
+    setSummarizing(true);
+    setSummarizeProgress("");
+    try {
+      const result = await api.summarizeRoom();
+      setFiles(await api.listFiles());
+      viewFile(result.id);
+      pushToast("success", "Room summary is ready.");
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("OLLAMA_DOWN")) {
+        pushToast(
+          "error",
+          "Ollama is not running. Start the Ollama app, then try again.",
+        );
+      } else {
+        pushToast("error", msg);
+      }
+    } finally {
+      // Never leave the button stuck disabled on error.
+      setSummarizing(false);
+      setSummarizeProgress("");
+    }
+  }
+
+  // ---- ADD-12: fetch one web page and save it as a readable room file ----
+  async function submitLink() {
+    const url = linkUrl.trim();
+    if (!url || importingLink) return;
+    setImportingLink(true);
+    try {
+      const meta = await api.importLink(url);
+      setFiles(await api.listFiles());
+      setShowAddLink(false);
+      setLinkUrl("");
+      pushToast("success", `Saved "${meta.name}" into the room.`);
+      viewFile(meta.id);
+    } catch (e) {
+      pushToast("error", String(e));
+    } finally {
+      setImportingLink(false);
+    }
+  }
+
   async function refreshAi() {
     const status = await api.aiStatus();
     setAi(status);
@@ -465,6 +543,10 @@ export default function Workspace({ info, onLock }: Props) {
     });
     const unlistenNotice = api.onAskNotice((text) => {
       pushToast("info", text);
+    });
+    // ADD-17: live "Summarizing file N of M…" progress.
+    const unlistenSummarize = api.onSummarizeProgress((text) => {
+      setSummarizeProgress(text);
     });
     // CHG-1/ADD-10: live progress for the in-banner model download.
     const unlistenPull = listen<{ status: string; percent: number | null }>(
@@ -551,6 +633,7 @@ export default function Workspace({ info, onLock }: Props) {
       unlistenStep.then((fn) => fn());
       unlistenRound.then((fn) => fn());
       unlistenNotice.then((fn) => fn());
+      unlistenSummarize.then((fn) => fn());
       unlistenPull.then((fn) => fn());
       unlistenDrop.then((fn) => fn());
       unlistenOpen.then((fn) => fn());
@@ -1461,6 +1544,108 @@ export default function Workspace({ info, onLock }: Props) {
         />
       )}
 
+      {/* SEC-1: ask before any of the room's saved plug-ins start. Driven
+          purely by info.pendingMcp — the backend only sets it when nothing
+          has run yet, so this appears before anything can start. */}
+      {info.pendingMcp && !mcpDialogDismissed && (
+        <div className="settings-backdrop mcp-approve-backdrop">
+          <div className="settings mcp-approve">
+            <div className="settings-head">
+              <span>🔒 This room wants to start programs</span>
+            </div>
+            <div className="settings-body">
+              <p className="mcp-approve-lead">
+                Opening <strong>{info.name}</strong> wants to run these programs
+                on this Mac to give the AI extra tools. Only allow this if you
+                trust whoever made the room.
+              </p>
+              <div className="mcp-approve-list">
+                {info.pendingMcp.servers.map((s) => (
+                  <div key={s.name} className="mcp-approve-server">
+                    <div className="mcp-approve-name">{s.name}</div>
+                    <code className="mcp-approve-cmd">{s.command}</code>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="settings-actions mcp-approve-actions">
+              <button
+                className="subtle"
+                onClick={keepMcpOff}
+                disabled={approvingMcp}
+              >
+                Keep off
+              </button>
+              <button
+                className="primary"
+                onClick={approveMcp}
+                disabled={approvingMcp}
+              >
+                {approvingMcp ? "Starting…" : "Allow"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ADD-12: paste a URL to save one page as a readable room file. */}
+      {showAddLink && (
+        <div
+          className="settings-backdrop"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget && !importingLink)
+              setShowAddLink(false);
+          }}
+        >
+          <div className="settings add-link-modal">
+            <div className="settings-head">
+              <span>🔗 Add a web link</span>
+              <button
+                className="subtle btn-ic"
+                title="Close"
+                onClick={() => setShowAddLink(false)}
+                disabled={importingLink}
+              >
+                <CloseIcon size={12} />
+              </button>
+            </div>
+            <div className="settings-body">
+              <p className="settings-hint">
+                This fetches one page from the internet.
+              </p>
+              <input
+                className="add-link-input"
+                autoFocus
+                dir="auto"
+                placeholder="https://example.com/article"
+                value={linkUrl}
+                onChange={(e) => setLinkUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") submitLink();
+                  if (e.key === "Escape" && !importingLink) setShowAddLink(false);
+                }}
+              />
+              <div className="settings-actions">
+                <button
+                  className="subtle"
+                  onClick={() => setShowAddLink(false)}
+                  disabled={importingLink}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="primary"
+                  onClick={submitLink}
+                  disabled={importingLink || !linkUrl.trim()}
+                >
+                  {importingLink ? "Fetching…" : "Save page"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="body">
         {/* ------- pane 1: file explorer ------- */}
         <aside className="sidebar">
@@ -1483,11 +1668,31 @@ export default function Workspace({ info, onLock }: Props) {
               >
                 + Folder
               </button>
+              <button
+                className="subtle"
+                title="Save a readable copy of a web page into this room"
+                onClick={() => {
+                  setLinkUrl("");
+                  setShowAddLink(true);
+                }}
+              >
+                🔗 Link
+              </button>
               <button className="subtle" onClick={importFiles}>
                 + Add
               </button>
             </span>
           </div>
+          <button
+            className="summarize-btn"
+            title="Write a short overview of this room and what's inside"
+            disabled={summarizing}
+            onClick={summarizeRoom}
+          >
+            {summarizing
+              ? summarizeProgress || "Summarizing…"
+              : "✨ Summarize room"}
+          </button>
           <div className="file-list">
             {files.length === 0 && (
               <div className="empty-hint">
