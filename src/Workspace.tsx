@@ -169,7 +169,7 @@ export default function Workspace({ info, onLock }: Props) {
   function refreshWebAccess() {
     api
       .getSetting("web_provider")
-      .then((v) => setWebOn(v === "duckduckgo" || v === "searxng"))
+      .then((v) => setWebOn(v === "duckduckgo" || v === "searxng" || v === "brave"))
       .catch(() => {});
   }
 

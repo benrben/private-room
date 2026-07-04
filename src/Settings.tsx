@@ -60,8 +60,9 @@ export default function Settings({
     api.mcpGetConfig().then(setMcpConfig).catch(() => {});
     api.mcpStatus().then(setMcpStatuses).catch(() => {});
     api.getSetting("web_provider").then((v) => {
-      // "brave" was removed (needed an API key); treat it as off.
-      setWebProvider(v === "brave" || !v ? "off" : v);
+      // "brave" was removed (needed an API key); those rooms now run on the
+      // free DuckDuckGo provider.
+      setWebProvider(v === "brave" ? "duckduckgo" : v || "off");
     });
     api.getSetting("web_endpoint").then((v) => setWebEndpoint(v || ""));
     const unlisten = listen<PullProgress>("pull-progress", (e) => {

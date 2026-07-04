@@ -1373,9 +1373,11 @@ pub async fn ask(
         if !connected_mcp.is_empty() {
             system.push_str(&format!(
                 "\n\nThe user has also connected external tool servers to this room: {}. \
-                 Their tools appear alongside the built-in ones. Unlike the room itself, \
-                 calling them can reach the internet or other apps — use them when a question \
-                 needs current or outside information, and mention when you did.",
+                 Their tools appear alongside the built-in ones and can reach the internet \
+                 or other apps. IMPORTANT: when a question needs current or outside \
+                 information (weather, news, prices, events) and no built-in tool covers \
+                 it, you MUST use one of these tools instead of answering that you lack \
+                 real-time data. Mention when you did.",
                 connected_mcp.join(", ")
             ));
         }
@@ -1989,7 +1991,7 @@ async fn exec_tool(
                 format!("🌐 Searching the web for \"{query}\" (leaves this Mac)…\n"),
             );
             let hits = match provider.as_str() {
-                "duckduckgo" => web::search_duckduckgo(query).await?,
+                "duckduckgo" | "brave" => web::search_duckduckgo(query).await?,
                 "searxng" => web::search_searxng(&endpoint, query).await?,
                 _ => return Ok("Web access is turned off in Settings → Online features.".into()),
             };
