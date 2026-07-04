@@ -37,6 +37,8 @@ export default function Settings({
   const [webProvider, setWebProvider] = useState("off");
   const [webEndpoint, setWebEndpoint] = useState("");
   const [webSaved, setWebSaved] = useState(false);
+  const [webTesting, setWebTesting] = useState(false);
+  const [webTestResult, setWebTestResult] = useState("");
 
   // ---- Privacy section (Wave 2) ----
   // SEC-3: per-room auto-lock choice (Workspace enforces it; here we only persist).
@@ -118,6 +120,21 @@ export default function Settings({
     await api.setSetting("web_endpoint", webEndpoint.trim());
     setWebSaved(true);
     window.setTimeout(() => setWebSaved(false), 1600);
+  }
+
+  /** Saves first (so what's tested is what's active), then runs one real
+   * search through the backend — the model is not involved. */
+  async function testWebSearch() {
+    setWebTesting(true);
+    setWebTestResult("");
+    try {
+      await saveWebAccess();
+      setWebTestResult(await api.webSearchTest());
+    } catch (e) {
+      setWebTestResult(`✗ ${String(e)}`);
+    } finally {
+      setWebTesting(false);
+    }
   }
 
   async function saveTuning() {
@@ -564,10 +581,20 @@ export default function Settings({
               </>
             )}
             <div className="settings-actions">
+              <button
+                className="subtle"
+                disabled={webTesting}
+                onClick={testWebSearch}
+              >
+                {webTesting ? "Testing…" : "Test search"}
+              </button>
               <button className="primary" onClick={saveWebAccess}>
                 {webSaved ? "Saved ✓" : "Save"}
               </button>
             </div>
+            {webTestResult && (
+              <p className="settings-hint">{webTestResult}</p>
+            )}
           </section>
 
           <section>

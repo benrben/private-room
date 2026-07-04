@@ -43,6 +43,7 @@ pub fn run() {
             commands::delete_memory,
             commands::get_setting,
             commands::set_setting,
+            commands::web_search_test,
             commands::mcp_get_config,
             commands::mcp_apply_config,
             commands::mcp_status,

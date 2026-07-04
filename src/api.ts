@@ -188,6 +188,7 @@ export const api = {
   listMemories: () => invoke<Memory[]>("list_memories"),
   deleteMemory: (id: string) => invoke<void>("delete_memory", { id }),
   getSetting: (key: string) => invoke<string | null>("get_setting", { key }),
+  webSearchTest: () => invoke<string>("web_search_test"),
   setSetting: (key: string, value: string) =>
     invoke<void>("set_setting", { key, value }),
   mcpGetConfig: () => invoke<string>("mcp_get_config"),

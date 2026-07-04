@@ -249,6 +249,39 @@ async fn run_external(engine: &str, messages: &[ollama::ChatMessage]) -> Result<
     result
 }
 
+/// Settings → Online features "Test search": exercise the real provider
+/// path without the model, so a broken pipeline is visible immediately.
+#[tauri::command]
+pub async fn web_search_test(state: State<'_, AppState>) -> Result<String, String> {
+    let (provider, endpoint) = {
+        let guard = state.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        (
+            db::get_setting(&room.conn, "web_provider").unwrap_or_default(),
+            db::get_setting(&room.conn, "web_endpoint").unwrap_or_default(),
+        )
+    };
+    let hits = match provider.as_str() {
+        "duckduckgo" | "brave" => web::search_duckduckgo("duckduckgo").await?,
+        "searxng" => web::search_searxng(&endpoint, "searxng").await?,
+        _ => {
+            return Err(
+                "Web access is off in this room — pick a provider above and press Save first. \
+                 (Each room has its own setting.)"
+                    .into(),
+            )
+        }
+    };
+    match hits.first() {
+        Some(hit) => Ok(format!(
+            "Working ✓ — {} results. Top hit: {}",
+            hits.len(),
+            hit.title
+        )),
+        None => Err("The provider responded but returned no results — try again.".into()),
+    }
+}
+
 fn room_name_from_path(path: &str) -> String {
     std::path::Path::new(path)
         .file_stem()
@@ -284,11 +317,12 @@ fn is_synced_path(path: &str) -> bool {
 }
 
 /// The web tools exist for the model only when the user picked a provider
-/// in Settings → Online features.
+/// in Settings → Online features. "brave" is a legacy value from before the
+/// key-less provider existed; those rooms run on DuckDuckGo.
 fn web_access_enabled(conn: &Connection) -> bool {
     matches!(
         db::get_setting(conn, "web_provider").as_deref(),
-        Some("brave") | Some("searxng")
+        Some("duckduckgo") | Some("searxng") | Some("brave")
     )
 }
 
