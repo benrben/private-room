@@ -1,6 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 import {
   AiStatus,
   AnnotationPayload,
@@ -173,16 +171,13 @@ export default function Workspace({ info, onLock }: Props) {
         setActiveChatId(cs[0].id);
       }
     });
-    const unlisten = listen<string>("ask-delta", (e) => {
-      setStreamText((t) => t + e.payload);
+    const unlisten = api.onAskDelta((delta) => {
+      setStreamText((t) => t + delta);
     });
     refreshWebAccess();
     // The AI can drive the app: open files in the viewer, create/edit files,
     // and highlight spots in documents.
-    const unlistenOpen = listen<
-      string | { id: string; page?: number; cell?: string; find?: string }
-    >("agent-open-file", (e) => {
-      const p = e.payload;
+    const unlistenOpen = api.onAgentOpenFile((p) => {
       if (typeof p === "string") {
         viewFile(p);
       } else {
@@ -195,23 +190,23 @@ export default function Workspace({ info, onLock }: Props) {
         });
       }
     });
-    const unlistenAnnotate = listen<AnnotationPayload>("agent-annotate", (e) => {
-      viewFile(e.payload.fileId, annotationTarget(e.payload));
+    const unlistenAnnotate = api.onAgentAnnotate((payload) => {
+      viewFile(payload.fileId, annotationTarget(payload));
     });
-    const unlistenUpdated = listen<string>("file-updated", async (e) => {
+    const unlistenUpdated = api.onFileUpdated(async (fileId) => {
       const current = openFileRef.current;
-      if (current && current.id === e.payload) {
+      if (current && current.id === fileId) {
         // Refresh in place — keep the edit/preview mode and target.
         const content = await api.getFileContent(current.id);
         setOpenFile({ ...current, content });
       }
     });
-    const unlistenFiles = listen("room-files-changed", () => {
+    const unlistenFiles = api.onRoomFilesChanged(() => {
       api.listFiles().then(setFiles);
     });
     api.mcpStatus().then((s) => setMcpTools(connectedTools(s))).catch(() => {});
-    const unlistenMcp = listen<McpServerStatus[]>("mcp-status", (e) => {
-      setMcpTools(connectedTools(e.payload));
+    const unlistenMcp = api.onMcpStatus((statuses) => {
+      setMcpTools(connectedTools(statuses));
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -243,7 +238,7 @@ export default function Workspace({ info, onLock }: Props) {
     ai?.external.includes(model);
 
   async function importFiles() {
-    const picked = await open({ title: "Add files to this room", multiple: true });
+    const picked = await api.chooseOpenPath({ title: "Add files to this room", multiple: true });
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
     const report = await api.importFiles(paths);

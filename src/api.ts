@@ -1,4 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  open,
+  save,
+  type OpenDialogOptions,
+  type SaveDialogOptions,
+} from "@tauri-apps/plugin-dialog";
 
 export interface RoomInfo {
   name: string;
@@ -109,6 +116,12 @@ export interface McpServerStatus {
   tools: string[];
 }
 
+/** Payload of the agent-open-file event: a bare file id, or an id with a
+ * navigation hint (page/cell/find). */
+export type AgentOpenFilePayload =
+  | string
+  | { id: string; page?: number; cell?: string; find?: string };
+
 export const api = {
   createRoom: (path: string, password: string) =>
     invoke<RoomInfo>("create_room", { path, password }),
@@ -154,6 +167,32 @@ export const api = {
     imgHeight: number,
   ) =>
     invoke<ImageBox[]>("locate_in_image", { fileId, query, imgWidth, imgHeight }),
+
+  // ---- events (@tauri-apps/api/event) ----
+  onOpenRoomFile: (cb: (path: string) => void): Promise<UnlistenFn> =>
+    listen<string>("open-room-file", (e) => cb(e.payload)),
+  onAskDelta: (cb: (delta: string) => void): Promise<UnlistenFn> =>
+    listen<string>("ask-delta", (e) => cb(e.payload)),
+  onAgentOpenFile: (
+    cb: (payload: AgentOpenFilePayload) => void,
+  ): Promise<UnlistenFn> =>
+    listen<AgentOpenFilePayload>("agent-open-file", (e) => cb(e.payload)),
+  onAgentAnnotate: (
+    cb: (payload: AnnotationPayload) => void,
+  ): Promise<UnlistenFn> =>
+    listen<AnnotationPayload>("agent-annotate", (e) => cb(e.payload)),
+  onFileUpdated: (cb: (fileId: string) => void): Promise<UnlistenFn> =>
+    listen<string>("file-updated", (e) => cb(e.payload)),
+  onRoomFilesChanged: (cb: () => void): Promise<UnlistenFn> =>
+    listen("room-files-changed", () => cb()),
+  onMcpStatus: (
+    cb: (statuses: McpServerStatus[]) => void,
+  ): Promise<UnlistenFn> =>
+    listen<McpServerStatus[]>("mcp-status", (e) => cb(e.payload)),
+
+  // ---- dialogs (@tauri-apps/plugin-dialog) ----
+  chooseOpenPath: (options?: OpenDialogOptions) => open(options),
+  chooseSavePath: (options?: SaveDialogOptions) => save(options),
 };
 
 export function formatSize(bytes: number): string {

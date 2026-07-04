@@ -1,6 +1,4 @@
 import { useCallback, useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { open, save } from "@tauri-apps/plugin-dialog";
 import { api, RoomInfo } from "./api";
 import Workspace from "./Workspace";
 import { Logomark } from "./icons";
@@ -39,8 +37,8 @@ export default function App() {
     api.takePendingOpen().then((path) => {
       if (path) goTo({ kind: "unlock", path });
     });
-    const unlisten = listen<string>("open-room-file", (e) => {
-      goTo({ kind: "unlock", path: e.payload });
+    const unlisten = api.onOpenRoomFile((path) => {
+      goTo({ kind: "unlock", path });
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -48,7 +46,7 @@ export default function App() {
   }, [goTo]);
 
   async function chooseCreate() {
-    const path = await save({
+    const path = await api.chooseSavePath({
       title: "Create a new Private Room",
       defaultPath: "My Room.roomai",
       filters: ROOM_FILTER,
@@ -57,7 +55,7 @@ export default function App() {
   }
 
   async function chooseOpen() {
-    const path = await open({
+    const path = await api.chooseOpenPath({
       title: "Open a Private Room",
       multiple: false,
       filters: ROOM_FILTER,

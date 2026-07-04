@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, FileContent, ImageBox } from "../api";
-import { BOX_COLORS } from "./ImageView";
+import { BOX_COLORS } from "./util";
 
 interface Props {
   fileId: string;

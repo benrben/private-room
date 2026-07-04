@@ -2,17 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { normalizeForMatch } from "./highlight";
+import { base64ToBytes } from "./util";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
 const MAX_PAGES = 100;
-
-export function base64ToBytes(b64: string): Uint8Array {
-  const raw = atob(b64);
-  const bytes = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-  return bytes;
-}
 
 export interface PdfTarget {
   page?: number;

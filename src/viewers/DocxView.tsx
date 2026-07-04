@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { renderAsync } from "docx-preview";
-import { base64ToBytes } from "./PdfView";
+import { base64ToBytes } from "./util";
 import { applyQuoteHighlight, clearQuoteHighlight } from "./highlight";
 
 interface Props {

@@ -1,13 +1,12 @@
 use crate::{db, extraction, mcp, ollama, web};
 use base64::Engine;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tauri::State;
 use uuid::Uuid;
 
 const DEFAULT_MODEL: &str = "qwen3.5:4b";
-const CHUNK_TARGET_CHARS: usize = 1200;
 const MAX_CONTEXT_CHUNKS: usize = 6;
 const MAX_IMPORT_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_ATTACHED_IMAGES: usize = 4;
@@ -239,14 +238,7 @@ fn room_name_from_path(path: &str) -> String {
 }
 
 fn info_of(room: &Room) -> Result<RoomInfo, String> {
-    let file_count: i64 = room
-        .conn
-        .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    let message_count: i64 = room
-        .conn
-        .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
+    let (file_count, message_count) = db::room_counts(&room.conn)?;
     Ok(RoomInfo {
         name: room.name.clone(),
         path: room.path.clone(),
@@ -255,140 +247,13 @@ fn info_of(room: &Room) -> Result<RoomInfo, String> {
     })
 }
 
-fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
-    Ok(FileMeta {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        mime_type: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-        size_bytes: row.get(3)?,
-        source: row.get(4)?,
-        has_text: row.get::<_, Option<String>>(5)?.is_some(),
-        created_at: row.get(6)?,
-    })
-}
-
-fn insert_file(
-    conn: &Connection,
-    name: &str,
-    mime: &str,
-    bytes: &[u8],
-    text: Option<&str>,
-    source: &str,
-) -> Result<FileMeta, String> {
-    let id = Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id, name, mime, bytes.len() as i64, source, bytes, text],
-    )
-    .map_err(|e| e.to_string())?;
-    if let Some(text) = text {
-        for (seq, chunk) in extraction::chunk_text(text, CHUNK_TARGET_CHARS)
-            .into_iter()
-            .take(2000)
-            .enumerate()
-        {
-            conn.execute(
-                "INSERT INTO chunks(id, file_id, seq, text) VALUES (?1, ?2, ?3, ?4)",
-                params![Uuid::new_v4().to_string(), id, seq as i64, chunk],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-    }
-    conn.query_row(
-        "SELECT id, name, mime_type, size_bytes, source, extracted_text, created_at
-         FROM files WHERE id = ?1",
-        [&id],
-        file_meta_row,
-    )
-    .map_err(|e| e.to_string())
-}
-
-fn insert_message(
-    conn: &Connection,
-    chat_id: &str,
-    role: &str,
-    content: &str,
-    sources: &[String],
-) -> Result<Message, String> {
-    let id = Uuid::new_v4().to_string();
-    let sources_json = serde_json::to_string(sources).map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO messages(id, chat_id, role, content, sources) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, chat_id, role, content, sources_json],
-    )
-    .map_err(|e| e.to_string())?;
-    let created_at: String = conn
-        .query_row("SELECT created_at FROM messages WHERE id = ?1", [&id], |r| {
-            r.get(0)
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(Message {
-        id,
-        role: role.into(),
-        content: content.into(),
-        sources: sources.to_vec(),
-        created_at,
-    })
-}
-
-fn setting_of(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
-        r.get(0)
-    })
-    .ok()
-}
-
 /// The web tools exist for the model only when the user picked a provider
 /// in Settings → Online features.
 fn web_access_enabled(conn: &Connection) -> bool {
     matches!(
-        setting_of(conn, "web_provider").as_deref(),
+        db::get_setting(conn, "web_provider").as_deref(),
         Some("brave") | Some("searxng")
     )
-}
-
-/// Resolve a model-supplied file name (or fragment) to the newest match.
-fn find_file_like(conn: &Connection, fragment: &str) -> Result<(String, String), String> {
-    let needle = fragment.to_lowercase();
-    conn.query_row(
-        "SELECT id, name FROM files WHERE lower(name) LIKE '%' || ?1 || '%'
-         ORDER BY created_at DESC LIMIT 1",
-        [&needle],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .map_err(|_| format!("No file matching \"{fragment}\" in this room."))
-}
-
-/// Overwrite a file's bytes and rebuild its search index.
-fn store_file_bytes(
-    conn: &Connection,
-    id: &str,
-    bytes: &[u8],
-    text: Option<&str>,
-) -> Result<(), String> {
-    conn.execute(
-        "UPDATE files SET original_bytes = ?2, extracted_text = ?3, size_bytes = ?4
-         WHERE id = ?1",
-        params![id, bytes, text, bytes.len() as i64],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM chunks WHERE file_id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-    if let Some(text) = text {
-        for (seq, chunk) in extraction::chunk_text(text, CHUNK_TARGET_CHARS)
-            .into_iter()
-            .take(2000)
-            .enumerate()
-        {
-            conn.execute(
-                "INSERT INTO chunks(id, file_id, seq, text) VALUES (?1, ?2, ?3, ?4)",
-                params![Uuid::new_v4().to_string(), id, seq as i64, chunk],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
 }
 
 /// "B7" → zero-based (row, col). None when it isn't A1 notation.
@@ -574,9 +439,7 @@ pub fn open_room(
     password: String,
 ) -> Result<RoomInfo, String> {
     let conn = db::open_room(&path, &password)?;
-    let name: String = conn
-        .query_row("SELECT value FROM meta WHERE key = 'name'", [], |r| r.get(0))
-        .unwrap_or_else(|_| room_name_from_path(&path));
+    let name = db::get_meta(&conn, "name").unwrap_or_else(|| room_name_from_path(&path));
     let room = Room { conn, path, name };
     let info = info_of(&room)?;
     *state.room.lock().unwrap() = Some(room);
@@ -653,7 +516,7 @@ pub fn import_files(
                 {
                     text = extraction::markitdown_extract(&path);
                 }
-                match insert_file(&room.conn, &file_name, &mime, &bytes, text.as_deref(), "upload")
+                match db::insert_file(&room.conn, &file_name, &mime, &bytes, text.as_deref(), "upload")
                 {
                     Ok(meta) => imported.push(meta),
                     Err(e) => errors.push(format!("{file_name}: {e}")),
@@ -669,19 +532,7 @@ pub fn import_files(
 pub fn list_files(state: State<'_, AppState>) -> Result<Vec<FileMeta>, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let mut stmt = room
-        .conn
-        .prepare(
-            "SELECT id, name, mime_type, size_bytes, source, extracted_text, created_at
-             FROM files ORDER BY created_at DESC, rowid DESC",
-        )
-        .map_err(|e| e.to_string())?;
-    let files = stmt
-        .query_map([], file_meta_row)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(files)
+    db::list_files(&room.conn)
 }
 
 const MAX_VIEWER_BYTES: usize = 50 * 1024 * 1024;
@@ -690,14 +541,7 @@ const MAX_VIEWER_BYTES: usize = 50 * 1024 * 1024;
 pub fn get_file_content(state: State<'_, AppState>, id: String) -> Result<FileContent, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let (name, mime, bytes, extracted): (String, Option<String>, Option<Vec<u8>>, Option<String>) =
-        room.conn
-            .query_row(
-                "SELECT name, mime_type, original_bytes, extracted_text FROM files WHERE id = ?1",
-                [&id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .map_err(|e| e.to_string())?;
+    let (name, mime, bytes, extracted) = db::get_file_full(&room.conn, &id)?;
     let mime = mime.unwrap_or_default();
     let bytes = bytes.unwrap_or_default();
     let ext = extraction::extension_of(&name);
@@ -775,21 +619,11 @@ pub fn update_file_content(
 ) -> Result<FileMeta, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let name: String = room
-        .conn
-        .query_row("SELECT name FROM files WHERE id = ?1", [&id], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
+    let name = db::get_file_name(&room.conn, &id)?;
     let bytes = content.as_bytes();
     let text = extraction::extract_text(&name, bytes).unwrap_or_else(|| content.clone());
-    store_file_bytes(&room.conn, &id, bytes, Some(&text))?;
-    room.conn
-        .query_row(
-            "SELECT id, name, mime_type, size_bytes, source, extracted_text, created_at
-             FROM files WHERE id = ?1",
-            [&id],
-            file_meta_row,
-        )
-        .map_err(|e| e.to_string())
+    db::update_file_content(&room.conn, &id, bytes, Some(&text))?;
+    db::get_file_meta(&room.conn, &id)
 }
 
 /// Grid editing from the viewer: set one spreadsheet cell and re-index.
@@ -805,17 +639,10 @@ pub fn set_cell(
     use tauri::Emitter;
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let (name, bytes): (String, Option<Vec<u8>>) = room
-        .conn
-        .query_row(
-            "SELECT name, original_bytes FROM files WHERE id = ?1",
-            [&id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|e| e.to_string())?;
+    let (name, bytes) = db::get_file_bytes_named(&room.conn, &id)?;
     let bytes = bytes.ok_or("File has no stored content.")?;
     let (new_bytes, text) = set_cell_in_bytes(&name, &bytes, sheet.as_deref(), &cell, &value)?;
-    store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref())?;
+    db::update_file_content(&room.conn, &id, &new_bytes, text.as_deref())?;
     let _ = window.emit("room-files-changed", ());
     let _ = window.emit("file-updated", &id);
     Ok(())
@@ -825,10 +652,7 @@ pub fn set_cell(
 pub fn delete_file(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    room.conn
-        .execute("DELETE FROM files WHERE id = ?1", [&id])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    db::delete_file(&room.conn, &id)
 }
 
 #[tauri::command]
@@ -848,7 +672,7 @@ pub fn save_generated_file(
         .first_or(mime_guess::mime::TEXT_PLAIN)
         .essence_str()
         .to_string();
-    insert_file(
+    db::insert_file(
         &room.conn,
         &name,
         &mime,
@@ -864,56 +688,21 @@ pub fn save_generated_file(
 pub fn add_memory(state: State<'_, AppState>, content: String) -> Result<Memory, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let id = Uuid::new_v4().to_string();
-    room.conn
-        .execute(
-            "INSERT INTO memories(id, content) VALUES (?1, ?2)",
-            params![id, content],
-        )
-        .map_err(|e| e.to_string())?;
-    let created_at: String = room
-        .conn
-        .query_row("SELECT created_at FROM memories WHERE id = ?1", [&id], |r| {
-            r.get(0)
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(Memory {
-        id,
-        content,
-        created_at,
-    })
+    db::add_memory(&room.conn, &content)
 }
 
 #[tauri::command]
 pub fn list_memories(state: State<'_, AppState>) -> Result<Vec<Memory>, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let mut stmt = room
-        .conn
-        .prepare("SELECT id, content, created_at FROM memories ORDER BY created_at ASC")
-        .map_err(|e| e.to_string())?;
-    let memories = stmt
-        .query_map([], |r| {
-            Ok(Memory {
-                id: r.get(0)?,
-                content: r.get(1)?,
-                created_at: r.get(2)?,
-            })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(memories)
+    db::list_memories(&room.conn)
 }
 
 #[tauri::command]
 pub fn delete_memory(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    room.conn
-        .execute("DELETE FROM memories WHERE id = ?1", [&id])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    db::delete_memory(&room.conn, &id)
 }
 
 // ---------------------------------------------------------------- settings
@@ -922,26 +711,14 @@ pub fn delete_memory(state: State<'_, AppState>, id: String) -> Result<(), Strin
 pub fn get_setting(state: State<'_, AppState>, key: String) -> Result<Option<String>, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    Ok(room
-        .conn
-        .query_row("SELECT value FROM settings WHERE key = ?1", [&key], |r| {
-            r.get(0)
-        })
-        .ok())
+    Ok(db::get_setting(&room.conn, &key))
 }
 
 #[tauri::command]
 pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    room.conn
-        .execute(
-            "INSERT INTO settings(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    db::set_setting(&room.conn, &key, &value)
 }
 
 // ---------------------------------------------------------------- mcp
@@ -950,14 +727,7 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
 pub fn mcp_get_config(state: State<'_, AppState>) -> Result<String, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    Ok(room
-        .conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            [MCP_CONFIG_KEY],
-            |r| r.get(0),
-        )
-        .unwrap_or_else(|_| DEFAULT_MCP_CONFIG.to_string()))
+    Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string()))
 }
 
 #[tauri::command]
@@ -970,13 +740,7 @@ pub fn mcp_apply_config(
     {
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
-        room.conn
-            .execute(
-                "INSERT INTO settings(key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![MCP_CONFIG_KEY, json],
-            )
-            .map_err(|e| e.to_string())?;
+        db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
     }
     start_mcp_connections(app, servers);
     Ok(state.mcp.lock().unwrap().statuses())
@@ -994,15 +758,9 @@ fn refresh_mcp(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
     let config_json: Option<String> = {
         let guard = state.room.lock().unwrap();
-        guard.as_ref().and_then(|room| {
-            room.conn
-                .query_row(
-                    "SELECT value FROM settings WHERE key = ?1",
-                    [MCP_CONFIG_KEY],
-                    |r| r.get(0),
-                )
-                .ok()
-        })
+        guard
+            .as_ref()
+            .and_then(|room| db::get_setting(&room.conn, MCP_CONFIG_KEY))
     };
     let servers = config_json
         .as_deref()
@@ -1133,7 +891,7 @@ fn grounding_prompt(query: &str, w: f64, h: f64) -> String {
 }
 
 fn model_setting(conn: &Connection) -> Option<String> {
-    setting_of(conn, "model")
+    db::get_setting(conn, "model")
 }
 
 #[tauri::command]
@@ -1189,88 +947,28 @@ pub async fn warm_model(state: State<'_, AppState>) -> Result<(), String> {
 pub fn list_chats(state: State<'_, AppState>) -> Result<Vec<Chat>, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let mut stmt = room
-        .conn
-        .prepare("SELECT id, title, created_at FROM chats ORDER BY created_at DESC, rowid DESC")
-        .map_err(|e| e.to_string())?;
-    let chats = stmt
-        .query_map([], |r| {
-            Ok(Chat {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                created_at: r.get(2)?,
-            })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(chats)
+    db::list_chats(&room.conn)
 }
 
 #[tauri::command]
 pub fn create_chat(state: State<'_, AppState>) -> Result<Chat, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let id = Uuid::new_v4().to_string();
-    room.conn
-        .execute("INSERT INTO chats(id, title) VALUES (?1, 'New chat')", [&id])
-        .map_err(|e| e.to_string())?;
-    room.conn
-        .query_row(
-            "SELECT id, title, created_at FROM chats WHERE id = ?1",
-            [&id],
-            |r| {
-                Ok(Chat {
-                    id: r.get(0)?,
-                    title: r.get(1)?,
-                    created_at: r.get(2)?,
-                })
-            },
-        )
-        .map_err(|e| e.to_string())
+    db::create_chat(&room.conn)
 }
 
 #[tauri::command]
 pub fn delete_chat(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    room.conn
-        .execute("DELETE FROM messages WHERE chat_id = ?1", [&id])
-        .map_err(|e| e.to_string())?;
-    room.conn
-        .execute("DELETE FROM chats WHERE id = ?1", [&id])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    db::delete_chat(&room.conn, &id)
 }
 
 #[tauri::command]
 pub fn get_messages(state: State<'_, AppState>, chat_id: String) -> Result<Vec<Message>, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let mut stmt = room
-        .conn
-        .prepare(
-            "SELECT id, role, content, sources, created_at FROM messages
-             WHERE chat_id = ?1 ORDER BY rowid ASC",
-        )
-        .map_err(|e| e.to_string())?;
-    let messages = stmt
-        .query_map([&chat_id], |r| {
-            let sources_json: Option<String> = r.get(3)?;
-            Ok(Message {
-                id: r.get(0)?,
-                role: r.get(1)?,
-                content: r.get(2)?,
-                sources: sources_json
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default(),
-                created_at: r.get(4)?,
-            })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(messages)
+    db::list_messages(&room.conn, &chat_id)
 }
 
 #[derive(Serialize, Clone)]
@@ -1378,14 +1076,7 @@ pub async fn locate_in_image(
     let (explicit, prepared, w, h) = {
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
-        let bytes: Option<Vec<u8>> = room
-            .conn
-            .query_row(
-                "SELECT original_bytes FROM files WHERE id = ?1",
-                [&file_id],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+        let bytes = db::get_file_bytes(&room.conn, &file_id)?;
         let bytes = bytes.ok_or("File has no stored content.")?;
         let (prepared, w, h) = prepare_image(&bytes);
         (model_setting(&room.conn), prepared, w, h)
@@ -1503,17 +1194,7 @@ struct ScoredChunk {
 
 fn retrieve_context(conn: &Connection, question: &str) -> Result<Vec<ScoredChunk>, String> {
     let terms = question_terms(question);
-    let mut stmt = conn
-        .prepare(
-            "SELECT f.name, c.text FROM chunks c JOIN files f ON f.id = c.file_id
-             ORDER BY f.created_at DESC, c.seq ASC",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+    let rows = db::list_chunks_with_file_names(conn)?;
 
     let mut scored: Vec<ScoredChunk> = rows
         .iter()
@@ -1573,48 +1254,17 @@ pub async fn ask(
         let conn = &room.conn;
 
         let explicit_model = model_setting(conn);
-        let temperature: Option<f64> = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'temperature'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
+        let temperature: Option<f64> = db::get_setting(conn, "temperature")
             .and_then(|s| s.parse().ok());
-        let custom_instructions: Option<String> = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'custom_instructions'",
-                [],
-                |r| r.get(0),
-            )
-            .ok();
+        let custom_instructions: Option<String> = db::get_setting(conn, "custom_instructions");
 
-        let memories: Vec<String> = {
-            let mut stmt = conn
-                .prepare("SELECT content FROM memories ORDER BY created_at ASC")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            rows
-        };
+        let memories: Vec<String> = db::list_memories(conn)?
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
 
         let history: Vec<(String, String)> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT role, content FROM messages WHERE chat_id = ?1
-                     ORDER BY rowid DESC LIMIT ?2",
-                )
-                .map_err(|e| e.to_string())?;
-            let mut rows = stmt
-                .query_map(params![chat_id, MAX_HISTORY_MESSAGES as i64], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
+            let mut rows = db::recent_messages(conn, &chat_id, MAX_HISTORY_MESSAGES as i64)?;
             rows.reverse();
             rows
         };
@@ -1628,14 +1278,7 @@ pub async fn ask(
         let mut sources: Vec<String> = Vec::new();
         let mut first_image: Option<(String, String, Vec<u8>, f64, f64)> = None;
         for file_id in &attachments {
-            let row: Result<(String, Option<String>, Option<Vec<u8>>, Option<String>), _> =
-                conn.query_row(
-                    "SELECT name, mime_type, original_bytes, extracted_text
-                     FROM files WHERE id = ?1",
-                    [file_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                );
-            let (name, mime, bytes, text) = match row {
+            let (name, mime, bytes, text) = match db::get_file_full(conn, file_id) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -1718,20 +1361,7 @@ pub async fn ask(
 
         // Give the model an inventory so it can answer questions like
         // "what images do we have here?" without excerpts being retrieved.
-        let inventory: Vec<(String, String)> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT name, coalesce(mime_type, '') FROM files
-                     ORDER BY created_at ASC LIMIT 100",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            rows
-        };
+        let inventory: Vec<(String, String)> = db::list_file_inventory(conn)?;
         if !inventory.is_empty() {
             system.push_str("\n\nFiles currently stored in this room:\n");
             for (name, mime) in &inventory {
@@ -1791,18 +1421,14 @@ pub async fn ask(
             ..Default::default()
         });
 
-        insert_message(conn, &chat_id, "user", &question, &[])?;
+        db::insert_message(conn, &chat_id, "user", &question, &[])?;
 
         // First question names the session.
         let mut title: String = question.chars().take(48).collect();
         if question.chars().count() > 48 {
             title.push('…');
         }
-        conn.execute(
-            "UPDATE chats SET title = ?2 WHERE id = ?1 AND title = 'New chat'",
-            params![chat_id, title],
-        )
-        .map_err(|e| e.to_string())?;
+        db::set_chat_title_if_new(conn, &chat_id, &title)?;
 
         (explicit_model, chat_messages, sources, first_image, temperature, web_enabled)
     };
@@ -1880,7 +1506,7 @@ pub async fn ask(
     // Phase 3 (locked): save the assistant reply.
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    insert_message(&room.conn, &chat_id, "assistant", &content, &sources)
+    db::insert_message(&room.conn, &chat_id, "assistant", &content, &sources)
 }
 
 /// Every built-in agent tool name — also the reserved set MCP tools may not
@@ -2118,22 +1744,10 @@ async fn exec_tool(
         "list_room_files" => {
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            let mut stmt = room
-                .conn
-                .prepare("SELECT name, coalesce(mime_type,''), size_bytes FROM files ORDER BY created_at")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok(format!(
-                        "- {} ({}, {} bytes)",
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?
-                    ))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
+            let rows: Vec<String> = db::list_files_brief(&room.conn)?
+                .into_iter()
+                .map(|(name, mime, size)| format!("- {name} ({mime}, {size} bytes)"))
+                .collect();
             Ok(if rows.is_empty() {
                 "The room has no files.".into()
             } else {
@@ -2160,18 +1774,10 @@ async fn exec_tool(
             let page = args["page"].as_u64();
             let cell = args["cell"].as_str().filter(|c| parse_a1(c).is_some());
             let find = args["find"].as_str().filter(|f| !f.trim().is_empty());
-            let (id, real_name, text): (String, String, Option<String>) = {
+            let (id, real_name, text) = {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
-                room.conn
-                    .query_row(
-                        "SELECT id, name, extracted_text FROM files
-                         WHERE lower(name) LIKE '%' || ?1 || '%'
-                         ORDER BY created_at DESC LIMIT 1",
-                        [&name],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                    )
-                    .map_err(|_| format!("No file matching \"{name}\" in this room."))?
+                db::find_file_like_full(&room.conn, &name)?
             };
             let _ = window.emit(
                 "agent-open-file",
@@ -2198,16 +1804,8 @@ async fn exec_tool(
             let (id, real_name, extracted): (String, String, Option<String>) = {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
-                let (id, real_name) = find_file_like(&room.conn, name)?;
-                let extracted = room
-                    .conn
-                    .query_row(
-                        "SELECT extracted_text FROM files WHERE id = ?1",
-                        [&id],
-                        |r| r.get(0),
-                    )
-                    .ok()
-                    .flatten();
+                let (id, real_name) = db::find_file_like(&room.conn, name)?;
+                let extracted = db::get_file_extracted_text(&room.conn, &id);
                 (id, real_name, extracted)
             };
             let payload;
@@ -2258,16 +1856,8 @@ async fn exec_tool(
             }
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = find_file_like(&room.conn, name)?;
-            let bytes: Vec<u8> = room
-                .conn
-                .query_row(
-                    "SELECT original_bytes FROM files WHERE id = ?1",
-                    [&id],
-                    |r| r.get::<_, Option<Vec<u8>>>(0),
-                )
-                .map_err(|e| e.to_string())?
-                .ok_or("File has no stored content.")?;
+            let (id, real_name) = db::find_file_like(&room.conn, name)?;
+            let bytes = db::get_file_bytes(&room.conn, &id)?.ok_or("File has no stored content.")?;
             let ext = extraction::extension_of(&real_name);
             let (new_bytes, count) = match ext.as_str() {
                 "docx" => extraction::docx_replace_text(&bytes, old_text, new_text)?,
@@ -2305,7 +1895,7 @@ async fn exec_tool(
             };
             let text = extraction::extract_text(&real_name, &new_bytes)
                 .or_else(|| String::from_utf8(new_bytes.clone()).ok());
-            store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref())?;
+            db::update_file_content(&room.conn, &id, &new_bytes, text.as_deref())?;
             let _ = window.emit("room-files-changed", ());
             let _ = window.emit("file-updated", &id);
             Ok(format!(
@@ -2317,7 +1907,7 @@ async fn exec_tool(
             let content = args["content"].as_str().unwrap_or_default();
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = find_file_like(&room.conn, name)?;
+            let (id, real_name) = db::find_file_like(&room.conn, name)?;
             let ext = extraction::extension_of(&real_name);
             if !extraction::is_text_extension(&ext) {
                 return Err(format!(
@@ -2327,7 +1917,7 @@ async fn exec_tool(
             }
             let text = extraction::extract_text(&real_name, content.as_bytes())
                 .unwrap_or_else(|| content.to_string());
-            store_file_bytes(&room.conn, &id, content.as_bytes(), Some(&text))?;
+            db::update_file_content(&room.conn, &id, content.as_bytes(), Some(&text))?;
             let _ = window.emit("room-files-changed", ());
             let _ = window.emit("file-updated", &id);
             Ok(format!(
@@ -2345,18 +1935,10 @@ async fn exec_tool(
             let sheet = args["sheet"].as_str();
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = find_file_like(&room.conn, name)?;
-            let bytes: Vec<u8> = room
-                .conn
-                .query_row(
-                    "SELECT original_bytes FROM files WHERE id = ?1",
-                    [&id],
-                    |r| r.get::<_, Option<Vec<u8>>>(0),
-                )
-                .map_err(|e| e.to_string())?
-                .ok_or("File has no stored content.")?;
+            let (id, real_name) = db::find_file_like(&room.conn, name)?;
+            let bytes = db::get_file_bytes(&room.conn, &id)?.ok_or("File has no stored content.")?;
             let (new_bytes, text) = set_cell_in_bytes(&real_name, &bytes, sheet, &cell, &value)?;
-            store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref())?;
+            db::update_file_content(&room.conn, &id, &new_bytes, text.as_deref())?;
             let _ = window.emit("room-files-changed", ());
             let _ = window.emit("file-updated", &id);
             Ok(format!("Set {cell} = \"{value}\" in \"{real_name}\"."))
@@ -2367,9 +1949,9 @@ async fn exec_tool(
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
                 (
-                    setting_of(&room.conn, "web_provider").unwrap_or_default(),
-                    setting_of(&room.conn, "web_api_key").unwrap_or_default(),
-                    setting_of(&room.conn, "web_endpoint").unwrap_or_default(),
+                    db::get_setting(&room.conn, "web_provider").unwrap_or_default(),
+                    db::get_setting(&room.conn, "web_api_key").unwrap_or_default(),
+                    db::get_setting(&room.conn, "web_endpoint").unwrap_or_default(),
                 )
             };
             let _ = window.emit(
@@ -2409,29 +1991,17 @@ async fn exec_tool(
             {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
-                let _ = room.conn.execute(
-                    "INSERT INTO web_pages(id, url, title, readable_text) VALUES (?1, ?2, ?3, ?4)",
-                    params![Uuid::new_v4().to_string(), url, title, text],
-                );
+                let _ = db::save_web_page(&room.conn, url, &title, &text);
             }
             Ok(clamp_tool_result(format!("[{title}] {url}\n\n{text}")))
         }
         "mark_image" => {
             let image_name = args["image_name"].as_str().unwrap_or_default().to_lowercase();
             let find = args["find"].as_str().unwrap_or_default();
-            let (id, real_name, bytes): (String, String, Vec<u8>) = {
+            let (id, real_name, bytes) = {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
-                room.conn
-                    .query_row(
-                        "SELECT id, name, original_bytes FROM files
-                         WHERE lower(name) LIKE '%' || ?1 || '%'
-                           AND mime_type LIKE 'image/%'
-                         ORDER BY created_at DESC LIMIT 1",
-                        [&image_name],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default())),
-                    )
-                    .map_err(|_| format!("No image matching \"{image_name}\" in this room."))?
+                db::find_image_like(&room.conn, &image_name)?
             };
             let (prepared, w, h) = prepare_image(&bytes);
             let models = ollama::list_models().await.unwrap_or_default();
@@ -2473,7 +2043,7 @@ async fn exec_tool(
                 .first_or(mime_guess::mime::TEXT_PLAIN)
                 .essence_str()
                 .to_string();
-            let meta = insert_file(&room.conn, &name, &mime, content.as_bytes(), Some(&content), "generated")?;
+            let meta = db::insert_file(&room.conn, &name, &mime, content.as_bytes(), Some(&content), "generated")?;
             let _ = window.emit("room-files-changed", ());
             Ok(format!("Created \"{}\" in the room.", meta.name))
         }
@@ -2481,12 +2051,7 @@ async fn exec_tool(
             let content = args["content"].as_str().unwrap_or_default();
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            room.conn
-                .execute(
-                    "INSERT INTO memories(id, content) VALUES (?1, ?2)",
-                    params![Uuid::new_v4().to_string(), content],
-                )
-                .map_err(|e| e.to_string())?;
+            db::add_memory(&room.conn, content)?;
             Ok("Memory saved.".into())
         }
         other => match routes.iter().find(|r| r.catalog_name == other) {

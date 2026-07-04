@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { api, ImageBox } from "../api";
+import { BOX_COLORS } from "./util";
 
 interface Props {
   fileId: string;
@@ -7,8 +8,6 @@ interface Props {
   mime: string;
   dataB64: string;
 }
-
-export const BOX_COLORS = ["#8b7cf6", "#4cc38a", "#e3b341", "#e5646c", "#5ab8d4"];
 
 export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
   const imgRef = useRef<HTMLImageElement>(null);
