@@ -819,6 +819,40 @@ code {
   height: 100%;
 }
 
+/* CHG-3 sheet labels: sticky column-letter row + row-number column.
+   The label cells read as chrome (dim bg + muted text), distinct from
+   data cells. Structural thead/tbody selectors out-specify the generic
+   `.sheet-scroll th` sticky-top rule so row labels pin left, not top. */
+.sheet-scroll thead th,
+.sheet-scroll tbody th {
+  background: var(--panel-2);
+  color: var(--text-dim);
+  font-weight: 500;
+  text-align: center;
+  user-select: none;
+}
+
+/* Column letters: pinned to the top edge. */
+.sheet-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+/* Row numbers: pinned to the left edge (override the generic top:0). */
+.sheet-scroll tbody th {
+  position: sticky;
+  left: 0;
+  top: auto;
+  z-index: 1;
+}
+
+/* Blank top-left corner: pinned on both axes, above both label bands. */
+.sheet-scroll thead th.sheet-corner {
+  left: 0;
+  z-index: 3;
+}
+
 .sheet-tabs {
   display: flex;
   gap: 4px;

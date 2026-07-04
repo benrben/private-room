@@ -76,6 +76,11 @@ export default function SheetView({ dataB64, text, target, editable, onEditCell 
     blankrows: false,
   });
   const visible = rows.slice(0, MAX_ROWS);
+  // Rectangular grid width so column letters line up over every row.
+  const numCols = Math.min(
+    MAX_COLS,
+    visible.reduce((m, r) => Math.max(m, (r as unknown[]).length), 0),
+  );
   // Only decorate when we're on the sheet the highlight refers to.
   const hlActive =
     hl && (targetSheetIdx == null || targetSheetIdx === activeIdx) ? hl : null;
@@ -115,10 +120,24 @@ export default function SheetView({ dataB64, text, target, editable, onEditCell 
       )}
       <div className="sheet-scroll">
         <table>
+          <thead>
+            <tr>
+              {/* Blank corner, then spreadsheet column letters A, B, C … */}
+              <th className="sheet-corner" aria-hidden />
+              {Array.from({ length: numCols }, (_, j) => (
+                <th key={j} className="sheet-colhead">
+                  {colLetters(j)}
+                </th>
+              ))}
+            </tr>
+          </thead>
           <tbody>
             {visible.map((row, i) => (
               <tr key={i}>
-                {(row as unknown[]).slice(0, MAX_COLS).map((cell, j) => {
+                {/* Sticky 1-based row number; label "1" == data row 0. */}
+                <th className="sheet-rowhead">{i + 1}</th>
+                {Array.from({ length: numCols }, (_, j) => {
+                  const cell = (row as unknown[])[j];
                   const cellRef =
                     hlActive && i === hlActive.r1 && j === hlActive.c1 ? hlRef : undefined;
                   const cls =
@@ -146,11 +165,7 @@ export default function SheetView({ dataB64, text, target, editable, onEditCell 
                     editable && !isEditing
                       ? () => setEditing({ r: i, c: j, value: String(cell ?? "") })
                       : undefined;
-                  return i === 0 ? (
-                    <th key={j} ref={cellRef} className={cls} onClick={onClick}>
-                      {body}
-                    </th>
-                  ) : (
+                  return (
                     <td key={j} ref={cellRef} className={cls} onClick={onClick}>
                       {body}
                     </td>
