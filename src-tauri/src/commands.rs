@@ -1825,10 +1825,6 @@ fn read_mcp_approvals(app: &tauri::AppHandle) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn is_mcp_approved(app: &tauri::AppHandle, fingerprint: &str) -> bool {
-    read_mcp_approvals(app).iter().any(|f| f == fingerprint)
-}
-
 fn add_mcp_approval(app: &tauri::AppHandle, fingerprint: &str) {
     let mut list = read_mcp_approvals(app);
     if list.iter().any(|f| f == fingerprint) {
@@ -1842,32 +1838,67 @@ fn add_mcp_approval(app: &tauri::AppHandle, fingerprint: &str) {
     }
 }
 
+/// SEC-1: the spawn/approval decision for a room's MCP config, decided PURELY
+/// from the config text and the set of already-approved fingerprints — no I/O,
+/// so it is unit-testable. `refresh_mcp` (the spawner) and `pending_mcp_for`
+/// (the dialog) both route through this, so they can never disagree about
+/// whether a config is allowed to run.
+#[cfg_attr(not(test), allow(dead_code))]
+enum McpGate {
+    /// No enabled servers — spawn nothing, show no dialog.
+    Nothing,
+    /// Enabled servers whose exact config is already approved — start them.
+    Start(Vec<(String, mcp::ServerConfig)>),
+    /// Enabled servers whose fingerprint is NOT approved — spawn nothing and
+    /// ask the user first. `servers` are the enabled ones, for the dialog.
+    NeedsApproval {
+        fingerprint: String,
+        servers: Vec<(String, mcp::ServerConfig)>,
+    },
+}
+
+fn mcp_gate(config_json: &str, approved: &std::collections::HashSet<String>) -> McpGate {
+    let servers = match mcp::parse_config(config_json) {
+        Ok(s) => s,
+        Err(_) => return McpGate::Nothing,
+    };
+    if !servers.iter().any(|(_, c)| !c.disabled) {
+        return McpGate::Nothing;
+    }
+    let fingerprint = mcp_fingerprint(config_json);
+    if approved.contains(&fingerprint) {
+        return McpGate::Start(servers);
+    }
+    let enabled = servers.into_iter().filter(|(_, c)| !c.disabled).collect();
+    McpGate::NeedsApproval {
+        fingerprint,
+        servers: enabled,
+    }
+}
+
 /// SEC-1: if the open room's config has ENABLED servers whose fingerprint isn't
 /// approved on this Mac, describe them for the approval dialog. None otherwise
 /// (no enabled servers, or already approved).
 fn pending_mcp_for(app: &tauri::AppHandle, conn: &Connection) -> Option<McpApproval> {
     let config = db::get_setting(conn, MCP_CONFIG_KEY)?;
-    let servers = mcp::parse_config(&config).ok()?;
-    let enabled: Vec<&(String, mcp::ServerConfig)> =
-        servers.iter().filter(|(_, c)| !c.disabled).collect();
-    if enabled.is_empty() {
-        return None;
+    let approved: std::collections::HashSet<String> =
+        read_mcp_approvals(app).into_iter().collect();
+    match mcp_gate(&config, &approved) {
+        McpGate::NeedsApproval {
+            fingerprint,
+            servers,
+        } => Some(McpApproval {
+            fingerprint,
+            servers: servers
+                .iter()
+                .map(|(name, cfg)| McpServerBrief {
+                    name: name.clone(),
+                    command: render_command_line(cfg),
+                })
+                .collect(),
+        }),
+        McpGate::Start(_) | McpGate::Nothing => None,
     }
-    let fingerprint = mcp_fingerprint(&config);
-    if is_mcp_approved(app, &fingerprint) {
-        return None;
-    }
-    let briefs = enabled
-        .iter()
-        .map(|(name, cfg)| McpServerBrief {
-            name: name.clone(),
-            command: render_command_line(cfg),
-        })
-        .collect();
-    Some(McpApproval {
-        fingerprint,
-        servers: briefs,
-    })
 }
 
 /// SEC-1: approve the currently open room's plug-in config on this Mac, then
@@ -1900,21 +1931,23 @@ fn refresh_mcp(app: &tauri::AppHandle) {
             .as_ref()
             .and_then(|room| db::get_setting(&room.conn, MCP_CONFIG_KEY))
     };
+    // SEC-1: never auto-spawn a room's plug-ins without a per-Mac approval of
+    // this exact config. If the gate says NeedsApproval, start NOTHING — the UI
+    // surfaces the approval dialog via RoomInfo.pendingMcp and calls approve_mcp
+    // on "Allow". This is the SAME decision pending_mcp_for shows the user.
+    let approved: std::collections::HashSet<String> =
+        read_mcp_approvals(app).into_iter().collect();
+    if let Some(McpGate::NeedsApproval { .. }) =
+        config_json.as_deref().map(|j| mcp_gate(j, &approved))
+    {
+        return;
+    }
+    // Approved, or only-disabled/no config: register the parsed servers (disabled
+    // ones simply show as Disabled; enabled+approved ones connect).
     let servers = config_json
         .as_deref()
         .and_then(|j| mcp::parse_config(j).ok())
         .unwrap_or_default();
-    // SEC-1: never auto-spawn a room's plug-ins without a per-Mac approval of
-    // this exact config. If any server is enabled and the config's fingerprint
-    // is not approved, start NOTHING — the UI surfaces the approval dialog via
-    // RoomInfo.pendingMcp and calls approve_mcp on "Allow".
-    if servers.iter().any(|(_, c)| !c.disabled) {
-        if let Some(json) = &config_json {
-            if !is_mcp_approved(app, &mcp_fingerprint(json)) {
-                return;
-            }
-        }
-    }
     start_mcp_connections(app.clone(), servers);
 }
 
@@ -2801,7 +2834,20 @@ pub async fn ask(
              A1 reference like B7), add_memory (remember something permanently). Use them \
              whenever the user asks you to open, show, mark, find, create, change or remember \
              something — then give your answer in plain text. Before editing or annotating, \
-             copy text exactly as it appears in the file (search_room shows it verbatim).",
+             copy text exactly as it appears in the file (search_room shows it verbatim).\n\n\
+             CRITICAL — never fabricate an action:\n\
+             - To change a file you MUST call edit_file, write_file, or set_cells. NEVER say a \
+             file was changed, edited, updated, saved, or fixed unless that tool call returned \
+             success in THIS turn. Do not print a diff, a new version, or \"File updated\" from \
+             memory — only a real tool result proves a change happened.\n\
+             - To highlight or mark a passage you MUST call annotate_file with text copied \
+             EXACTLY from the file. If you have not already seen the file's exact text this \
+             turn, call open_file or search_room FIRST to read it, then annotate_file with the \
+             verbatim quote. Never claim you highlighted, marked, or boxed anything unless \
+             annotate_file (or mark_image) returned success this turn — a guessed quote that \
+             fails to match is NOT a highlight.\n\
+             - If a tool call fails or you cannot find the exact text, say so plainly and stop; \
+             do not narrate success you did not achieve.",
         );
         if web_enabled {
             system.push_str(
@@ -3842,6 +3888,74 @@ mod tests {
         assert_ne!(mcp_fingerprint(a), mcp_fingerprint(b));
         // Hex SHA-256 is 64 chars.
         assert_eq!(mcp_fingerprint(a).len(), 64);
+    }
+
+    #[test]
+    fn mcp_gate_blocks_unapproved_enabled_server() {
+        // SEC-1 core invariant: an enabled server whose exact config has NOT been
+        // approved on this Mac must NOT start — the gate asks first.
+        let cfg = r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"]}}}"#;
+        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+        match mcp_gate(cfg, &none) {
+            McpGate::NeedsApproval {
+                fingerprint,
+                servers,
+            } => {
+                // The dialog is asked about exactly the enabled server, and the
+                // fingerprint it will approve is this config's SHA-256.
+                assert_eq!(fingerprint, mcp_fingerprint(cfg));
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0].0, "web");
+            }
+            _ => panic!("unapproved enabled server must gate (NeedsApproval), never Start"),
+        }
+    }
+
+    #[test]
+    fn mcp_gate_starts_when_fingerprint_approved() {
+        // SEC-1 (b): once this exact config is in the approved set, the same
+        // server is allowed to Start.
+        let cfg = r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"]}}}"#;
+        let approved: std::collections::HashSet<String> =
+            [mcp_fingerprint(cfg)].into_iter().collect();
+        match mcp_gate(cfg, &approved) {
+            McpGate::Start(servers) => {
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0].0, "web");
+            }
+            _ => panic!("approved config must Start"),
+        }
+    }
+
+    #[test]
+    fn mcp_gate_nothing_when_only_disabled_servers() {
+        // SEC-1 (c): a config with only disabled servers is Nothing — no dialog,
+        // no spawn — even though its fingerprint is not approved.
+        let cfg = r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"],"disabled":true}}}"#;
+        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(matches!(mcp_gate(cfg, &none), McpGate::Nothing));
+        // An empty server map is likewise Nothing.
+        assert!(matches!(
+            mcp_gate(r#"{"mcpServers":{}}"#, &none),
+            McpGate::Nothing
+        ));
+    }
+
+    #[test]
+    fn mcp_gate_edited_config_needs_reapproval() {
+        // SEC-1 (d): approve one config, then edit it — the fingerprint changes,
+        // so the OLD approval no longer covers it and the gate asks again.
+        let original = r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"]}}}"#;
+        let approved: std::collections::HashSet<String> =
+            [mcp_fingerprint(original)].into_iter().collect();
+        // Same text still starts.
+        assert!(matches!(mcp_gate(original, &approved), McpGate::Start(_)));
+        // One-character edit → different fingerprint → NeedsApproval again.
+        let edited = r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg2"]}}}"#;
+        assert!(matches!(
+            mcp_gate(edited, &approved),
+            McpGate::NeedsApproval { .. }
+        ));
     }
 
     #[test]
