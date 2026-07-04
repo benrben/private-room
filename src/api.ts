@@ -1,0 +1,187 @@
+import { invoke } from "@tauri-apps/api/core";
+
+export interface RoomInfo {
+  name: string;
+  path: string;
+  fileCount: number;
+  messageCount: number;
+}
+
+export interface FileMeta {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  source: string;
+  hasText: boolean;
+  createdAt: string;
+}
+
+export interface ImportReport {
+  imported: FileMeta[];
+  errors: string[];
+}
+
+export interface Chat {
+  id: string;
+  title: string;
+  createdAt: string;
+}
+
+export interface Message {
+  id: string;
+  role: string;
+  content: string;
+  sources: string[];
+  createdAt: string;
+}
+
+export interface Memory {
+  id: string;
+  content: string;
+  createdAt: string;
+}
+
+export interface FileContent {
+  kind:
+    | "image"
+    | "pdf"
+    | "docx"
+    | "sheet"
+    | "csv"
+    | "markdown"
+    | "code"
+    | "text"
+    | "binary";
+  name: string;
+  mime: string;
+  editable: boolean;
+  text: string | null;
+  dataB64: string | null;
+}
+
+export interface AiStatus {
+  running: boolean;
+  models: string[];
+  defaultModel: string;
+  /** Cloud CLIs detected on this Mac ("claude-cli", "codex-cli"). */
+  external: string[];
+}
+
+export const ENGINE_LABELS: Record<string, string> = {
+  "claude-cli": "Claude Code (cloud)",
+  "codex-cli": "Codex (cloud)",
+};
+
+export interface ImageBox {
+  label: string;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+/** Where a viewer should navigate/highlight when a file opens. */
+export interface FileTarget {
+  page?: number;
+  cell?: string;
+  find?: string;
+  sheet?: string;
+  range?: string;
+  quote?: string;
+}
+
+/** Payload of an ```annotation block / agent-annotate event. */
+export interface AnnotationPayload {
+  fileId: string;
+  name?: string;
+  quote?: string;
+  page?: number;
+  sheet?: string;
+  range?: string;
+  note?: string;
+}
+
+export interface McpServerStatus {
+  name: string;
+  status: "connecting" | "connected" | "failed" | "disabled";
+  error: string | null;
+  tools: string[];
+}
+
+export const api = {
+  createRoom: (path: string, password: string) =>
+    invoke<RoomInfo>("create_room", { path, password }),
+  openRoom: (path: string, password: string) =>
+    invoke<RoomInfo>("open_room", { path, password }),
+  closeRoom: () => invoke<void>("close_room"),
+  roomInfo: () => invoke<RoomInfo | null>("room_info"),
+  takePendingOpen: () => invoke<string | null>("take_pending_open"),
+  importFiles: (paths: string[]) => invoke<ImportReport>("import_files", { paths }),
+  listFiles: () => invoke<FileMeta[]>("list_files"),
+  getFileContent: (id: string) => invoke<FileContent>("get_file_content", { id }),
+  updateFileContent: (id: string, content: string) =>
+    invoke<FileMeta>("update_file_content", { id, content }),
+  setCell: (id: string, sheet: string | null, cell: string, value: string) =>
+    invoke<void>("set_cell", { id, sheet, cell, value }),
+  deleteFile: (id: string) => invoke<void>("delete_file", { id }),
+  saveGeneratedFile: (name: string, content: string) =>
+    invoke<FileMeta>("save_generated_file", { name, content }),
+  addMemory: (content: string) => invoke<Memory>("add_memory", { content }),
+  listMemories: () => invoke<Memory[]>("list_memories"),
+  deleteMemory: (id: string) => invoke<void>("delete_memory", { id }),
+  getSetting: (key: string) => invoke<string | null>("get_setting", { key }),
+  setSetting: (key: string, value: string) =>
+    invoke<void>("set_setting", { key, value }),
+  mcpGetConfig: () => invoke<string>("mcp_get_config"),
+  mcpApplyConfig: (json: string) =>
+    invoke<McpServerStatus[]>("mcp_apply_config", { json }),
+  mcpStatus: () => invoke<McpServerStatus[]>("mcp_status"),
+  aiStatus: () => invoke<AiStatus>("ai_status"),
+  warmModel: () => invoke<void>("warm_model"),
+  pullModel: (name: string) => invoke<void>("pull_model", { name }),
+  deleteModel: (name: string) => invoke<void>("delete_model", { name }),
+  listChats: () => invoke<Chat[]>("list_chats"),
+  createChat: () => invoke<Chat>("create_chat"),
+  deleteChat: (id: string) => invoke<void>("delete_chat", { id }),
+  getMessages: (chatId: string) => invoke<Message[]>("get_messages", { chatId }),
+  ask: (chatId: string, question: string, attachments: string[]) =>
+    invoke<Message>("ask", { chatId, question, attachments }),
+  locateInImage: (
+    fileId: string,
+    query: string,
+    imgWidth: number,
+    imgHeight: number,
+  ) =>
+    invoke<ImageBox[]>("locate_in_image", { fileId, query, imgWidth, imgHeight }),
+};
+
+export function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export type FileKind =
+  | "image"
+  | "generated"
+  | "pdf"
+  | "docx"
+  | "sheet"
+  | "markdown"
+  | "web"
+  | "text"
+  | "file";
+
+export function fileKind(f: FileMeta): FileKind {
+  if (f.mimeType.startsWith("image/")) return "image";
+  if (f.source === "generated") return "generated";
+  const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
+  if (ext === "pdf") return "pdf";
+  if (["doc", "docx"].includes(ext)) return "docx";
+  if (["xls", "xlsx", "csv", "tsv"].includes(ext)) return "sheet";
+  if (["md", "markdown"].includes(ext)) return "markdown";
+  if (["txt", "log"].includes(ext)) return "text";
+  if (["html", "htm"].includes(ext)) return "web";
+  return "file";
+}

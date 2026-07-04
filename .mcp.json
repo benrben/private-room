@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "arch-map": {
+      "type": "http",
+      "url": "http://127.0.0.1:8800/mcp"
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"]
+    }
+  }
+}

@@ -1,0 +1,5 @@
+<svg width="164" height="28" viewBox="0 0 164 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0.5" y="0.5" width="163" height="27" rx="13.5" fill="#161a22" stroke="#262d3b"/>
+  <circle cx="18" cy="14" r="4" fill="#8b7cf6"/>
+  <text x="30" y="18" font-family="-apple-system, 'Segoe UI', Helvetica, sans-serif" font-size="12" fill="#8b93a7">Local AI via Ollama</text>
+</svg>

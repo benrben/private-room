@@ -1,0 +1,43 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="sheet" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c212c"/>
+      <stop offset="100%" stop-color="#10131a"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#323b4d"/>
+      <stop offset="100%" stop-color="#1c212c"/>
+    </linearGradient>
+    <radialGradient id="dochalo" cx="50%" cy="45%" r="60%">
+      <stop offset="0%" stop-color="#8b7cf6" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#8b7cf6" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="docglow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="20"/>
+    </filter>
+    <clipPath id="sheetclip">
+      <path d="M232 128a48 48 0 0 1 48-48h380l172 172v596a48 48 0 0 1-48 48H280a48 48 0 0 1-48-48V128z"/>
+    </clipPath>
+  </defs>
+
+  <!-- sheet with folded corner -->
+  <path d="M232 128a48 48 0 0 1 48-48h380l172 172v596a48 48 0 0 1-48 48H280a48 48 0 0 1-48-48V128z" fill="url(#sheet)"/>
+  <g clip-path="url(#sheetclip)">
+    <rect x="232" y="80" width="600" height="768" fill="url(#dochalo)"/>
+  </g>
+  <path d="M232 128a48 48 0 0 1 48-48h380l172 172v596a48 48 0 0 1-48 48H280a48 48 0 0 1-48-48V128z" stroke="#3a4356" stroke-width="8"/>
+  <path d="M660 80l172 172H708a48 48 0 0 1-48-48V80z" fill="url(#fold)" stroke="#3a4356" stroke-width="8" stroke-linejoin="round"/>
+
+  <!-- keyhole doorway mark -->
+  <g filter="url(#docglow)" opacity="0.8">
+    <path d="M406 682V520a106 106 0 0 1 212 0v162" stroke="#8b7cf6" stroke-width="27" stroke-linecap="round"/>
+    <path d="M370 682h284" stroke="#8b7cf6" stroke-width="27" stroke-linecap="round"/>
+    <circle cx="512" cy="520" r="39" fill="#8b7cf6"/>
+    <path d="M512 550l-26 92h52l-26-92z" fill="#8b7cf6"/>
+  </g>
+  <path d="M406 682V520a106 106 0 0 1 212 0v162" stroke="#8b7cf6" stroke-width="25" stroke-linecap="round"/>
+  <path d="M370 682h284" stroke="#8b7cf6" stroke-width="25" stroke-linecap="round"/>
+  <circle cx="512" cy="520" r="38" fill="#8b7cf6"/>
+  <path d="M512 548l-25 90h50l-25-90z" fill="#8b7cf6"/>
+  <circle cx="512" cy="512" r="12" fill="#c9c1fb" opacity="0.9"/>
+</svg>

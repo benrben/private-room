@@ -1,0 +1,101 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg1" cx="30%" cy="18%" r="75%">
+      <stop offset="0%" stop-color="#8b7cf6" stop-opacity="0.24"/>
+      <stop offset="55%" stop-color="#8b7cf6" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#8b7cf6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bg2" cx="88%" cy="90%" r="55%">
+      <stop offset="0%" stop-color="#8b7cf6" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#8b7cf6" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="bglow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="640" fill="#0e1014"/>
+  <rect width="1280" height="640" fill="url(#bg1)"/>
+  <rect width="1280" height="640" fill="url(#bg2)"/>
+
+  <!-- left: mark + wordmark -->
+  <g transform="translate(96 140)">
+    <g filter="url(#bglow)" opacity="0.8">
+      <path d="M18 128V66a46 46 0 0 1 92 0v62" stroke="#8b7cf6" stroke-width="11" stroke-linecap="round"/>
+      <path d="M2 128h124" stroke="#8b7cf6" stroke-width="11" stroke-linecap="round"/>
+      <circle cx="64" cy="66" r="16" fill="#8b7cf6"/>
+      <path d="M64 78l-10.5 39h21L64 78z" fill="#8b7cf6"/>
+    </g>
+    <path d="M18 128V66a46 46 0 0 1 92 0v62" stroke="#8b7cf6" stroke-width="10" stroke-linecap="round"/>
+    <path d="M2 128h124" stroke="#8b7cf6" stroke-width="10" stroke-linecap="round"/>
+    <circle cx="64" cy="66" r="15.5" fill="#8b7cf6"/>
+    <path d="M64 77l-10 38h20l-10-38z" fill="#8b7cf6"/>
+    <circle cx="64" cy="62" r="4.8" fill="#c9c1fb"/>
+  </g>
+
+  <text x="96" y="360" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif" font-size="64" font-weight="700" letter-spacing="-1" fill="#e8eaf0">Private Room</text>
+  <text x="96" y="410" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="27" fill="#8b93a7">A private AI workspace sealed inside a single file.</text>
+
+  <!-- feature chips -->
+  <g font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="16" fill="#8b93a7">
+    <rect x="96" y="452" width="212" height="40" rx="20" fill="#161a22" stroke="#262d3b"/>
+    <circle cx="122" cy="472" r="4" fill="#8b7cf6"/>
+    <text x="138" y="478">End-to-end encrypted</text>
+
+    <rect x="322" y="452" width="150" height="40" rx="20" fill="#161a22" stroke="#262d3b"/>
+    <circle cx="348" cy="472" r="4" fill="#4cc38a"/>
+    <text x="364" y="478">Offline-first</text>
+
+    <rect x="486" y="452" width="212" height="40" rx="20" fill="#161a22" stroke="#262d3b"/>
+    <circle cx="512" cy="472" r="4" fill="#8b7cf6"/>
+    <text x="528" y="478">Local AI via Ollama</text>
+  </g>
+
+  <!-- right: simplified app window -->
+  <g transform="translate(756 120)">
+    <rect width="440" height="400" rx="16" fill="#161a22" stroke="#262d3b" stroke-width="2"/>
+    <circle cx="26" cy="24" r="6" fill="#e5646c"/>
+    <circle cx="46" cy="24" r="6" fill="#e3b341"/>
+    <circle cx="66" cy="24" r="6" fill="#4cc38a"/>
+    <line x1="0" y1="44" x2="440" y2="44" stroke="#262d3b" stroke-width="2"/>
+
+    <!-- sidebar -->
+    <line x1="140" y1="44" x2="140" y2="400" stroke="#262d3b" stroke-width="2"/>
+    <g fill="#1c212c">
+      <rect x="16" y="64" width="108" height="22" rx="6"/>
+      <rect x="16" y="94" width="108" height="22" rx="6"/>
+      <rect x="16" y="124" width="108" height="22" rx="6"/>
+      <rect x="16" y="154" width="108" height="22" rx="6"/>
+    </g>
+    <g fill="#8b93a7" opacity="0.65">
+      <rect x="24" y="70" width="10" height="10" rx="2"/>
+      <rect x="24" y="100" width="10" height="10" rx="2"/>
+      <rect x="24" y="130" width="10" height="10" rx="2"/>
+      <rect x="24" y="160" width="10" height="10" rx="2"/>
+    </g>
+    <g fill="#2a3140">
+      <rect x="42" y="72" width="70" height="6" rx="3"/>
+      <rect x="42" y="102" width="60" height="6" rx="3"/>
+      <rect x="42" y="132" width="74" height="6" rx="3"/>
+      <rect x="42" y="162" width="52" height="6" rx="3"/>
+    </g>
+
+    <!-- chat -->
+    <rect x="206" y="70" width="212" height="54" rx="12" fill="#8b7cf6"/>
+    <rect x="222" y="88" width="150" height="7" rx="3.5" fill="#c9c1fb"/>
+    <rect x="222" y="102" width="110" height="7" rx="3.5" fill="#c9c1fb"/>
+
+    <rect x="160" y="146" width="240" height="118" rx="12" fill="#1c212c" stroke="#262d3b"/>
+    <rect x="176" y="164" width="196" height="7" rx="3.5" fill="#3a4356"/>
+    <rect x="176" y="180" width="180" height="7" rx="3.5" fill="#3a4356"/>
+    <rect x="176" y="196" width="200" height="7" rx="3.5" fill="#3a4356"/>
+    <rect x="176" y="212" width="140" height="7" rx="3.5" fill="#3a4356"/>
+    <rect x="176" y="238" width="84" height="14" rx="7" fill="#262d3b"/>
+    <rect x="268" y="238" width="64" height="14" rx="7" fill="#262d3b"/>
+
+    <!-- composer -->
+    <rect x="160" y="340" width="200" height="36" rx="10" fill="#1c212c" stroke="#262d3b"/>
+    <rect x="368" y="340" width="52" height="36" rx="10" fill="#8b7cf6"/>
+    <path d="M390 352l10 6-10 6 2-6-2-6z" fill="#fff"/>
+  </g>
+</svg>

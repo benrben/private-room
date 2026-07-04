@@ -1,0 +1,49 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a1f2a"/>
+      <stop offset="55%" stop-color="#10131a"/>
+      <stop offset="100%" stop-color="#0a0c10"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="50%" cy="38%" r="55%">
+      <stop offset="0%" stop-color="#8b7cf6" stop-opacity="0.32"/>
+      <stop offset="60%" stop-color="#8b7cf6" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#8b7cf6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="doorlight" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b7cf6" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#8b7cf6" stop-opacity="0.02"/>
+    </linearGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+    <clipPath id="squircle">
+      <rect x="100" y="100" width="824" height="824" rx="185"/>
+    </clipPath>
+  </defs>
+
+  <!-- tile -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)"/>
+  <g clip-path="url(#squircle)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#halo)"/>
+  </g>
+  <rect x="106" y="106" width="812" height="812" rx="179" stroke="#8b7cf6" stroke-opacity="0.22" stroke-width="6"/>
+
+  <!-- light inside the doorway -->
+  <path d="M362 700V470a150 150 0 0 1 300 0v230H362z" fill="url(#doorlight)"/>
+
+  <!-- glow pass of the mark -->
+  <g filter="url(#glow)" opacity="0.85">
+    <path d="M362 700V470a150 150 0 0 1 300 0v230" stroke="#8b7cf6" stroke-width="36" stroke-linecap="round"/>
+    <path d="M312 700h400" stroke="#8b7cf6" stroke-width="36" stroke-linecap="round"/>
+    <circle cx="512" cy="470" r="54" fill="#8b7cf6"/>
+    <path d="M512 512l-36 128h72l-36-128z" fill="#8b7cf6"/>
+  </g>
+
+  <!-- crisp mark -->
+  <path d="M362 700V470a150 150 0 0 1 300 0v230" stroke="#8b7cf6" stroke-width="34" stroke-linecap="round"/>
+  <path d="M312 700h400" stroke="#8b7cf6" stroke-width="34" stroke-linecap="round"/>
+  <circle cx="512" cy="470" r="52" fill="#8b7cf6"/>
+  <path d="M512 510l-34 126h68l-34-126z" fill="#8b7cf6"/>
+  <circle cx="512" cy="458" r="16" fill="#c9c1fb" opacity="0.9"/>
+</svg>
