@@ -176,11 +176,20 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     }
 
     // RM-2: the web_pages cache must be keyed by URL so save_web_page can upsert.
-    // Older rooms may already hold duplicate-URL rows, which would make the
-    // unique index fail — collapse them first (keep the newest row per URL),
-    // then enforce uniqueness. Both steps are idempotent on already-migrated rooms.
+    // Old rooms opened via open_room never ran SCHEMA, so the table may not exist
+    // yet — create it first. Older rooms may also hold duplicate-URL rows, which
+    // would make the unique index fail — collapse them (keep the newest row per
+    // URL), then enforce uniqueness. Every step is idempotent on migrated rooms.
     conn.execute_batch(
-        "DELETE FROM web_pages
+        "CREATE TABLE IF NOT EXISTS web_pages (
+           id TEXT PRIMARY KEY,
+           url TEXT NOT NULL,
+           title TEXT,
+           raw_html BLOB,
+           readable_text TEXT,
+           saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );
+         DELETE FROM web_pages
            WHERE rowid NOT IN (SELECT MAX(rowid) FROM web_pages GROUP BY url);
          CREATE UNIQUE INDEX IF NOT EXISTS idx_web_pages_url ON web_pages(url);",
     )
