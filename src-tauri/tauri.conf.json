@@ -38,6 +38,7 @@
       "icons/document.icns": "document.icns"
     },
     "macOS": {
+      "signingIdentity": "-",
       "dmg": {
         "background": "./dmg-background.tiff",
         "windowSize": { "width": 660, "height": 400 },
@@ -52,5 +53,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/benreich/private-room/releases/latest/download/latest.json"
+      ],
+      "pubkey": "REPLACE_WITH_UPDATER_PUBLIC_KEY"
+    }
   }
 }

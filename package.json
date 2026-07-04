@@ -13,6 +13,8 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "docx-preview": "^0.3.7",
     "monaco-editor": "^0.55.1",
     "pdfjs-dist": "^6.1.200",
