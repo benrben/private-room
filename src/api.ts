@@ -186,6 +186,11 @@ export const api = {
   openRoom: (path: string, password: string) =>
     invoke<RoomInfo>("open_room", { path, password }),
   closeRoom: () => invoke<void>("close_room"),
+  // ---- Wave 6: Touch ID unlock (ADD-11) ----
+  touchIdHas: (path: string) => invoke<boolean>("touchid_has", { path }),
+  touchIdEnable: () => invoke<void>("touchid_enable"),
+  touchIdDisable: (path: string) => invoke<void>("touchid_disable", { path }),
+  touchIdOpen: (path: string) => invoke<RoomInfo>("touchid_open", { path }),
   roomInfo: () => invoke<RoomInfo | null>("room_info"),
   takePendingOpen: () => invoke<string | null>("take_pending_open"),
   importFiles: (paths: string[]) => invoke<ImportReport>("import_files", { paths }),
