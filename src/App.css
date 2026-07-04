@@ -613,6 +613,15 @@ code {
   padding: 0 8px 8px;
 }
 
+/* BUG 1: inline "+ Folder" create input at the top of the file list. */
+.folder-create-input {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 4px 0 6px;
+  font-size: 13px;
+  padding: 6px 8px;
+}
+
 /* ---------- ADD-16 folders ---------- */
 
 .folder-group {
