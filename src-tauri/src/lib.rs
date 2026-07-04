@@ -2,6 +2,7 @@ mod commands;
 pub mod db;
 pub mod extraction;
 pub mod mcp;
+mod ocr;
 mod ollama;
 pub mod web;
 
