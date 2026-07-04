@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { foldChar, normalizeForMatch } from "./highlight";
+import { locateQuote } from "./highlight";
 import { base64ToBytes } from "./util";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -50,6 +50,28 @@ function pageTextFromItems(items: TextItem[]): string {
   return out.replace(/[ \t]+\n/g, "\n").trim();
 }
 
+/** Concatenate a page's text items into one source string, plus a
+ * per-character map back to the originating item index. A `\n` is inserted
+ * at each `hasEOL` boundary so line-end hyphenation and whitespace
+ * collapsing (see locateQuote) see the line breaks. The map lets a match
+ * that spans several items resolve back to every item it touched. */
+function pageSource(items: TextItem[]): { text: string; map: number[] } {
+  let text = "";
+  const map: number[] = [];
+  items.forEach((it, idx) => {
+    const s = it.str ?? "";
+    for (let i = 0; i < s.length; i++) {
+      text += s[i];
+      map.push(idx);
+    }
+    if (it.hasEOL) {
+      text += "\n";
+      map.push(idx);
+    }
+  });
+  return { text, map };
+}
+
 /** A per-page "Copy text" button (UX-2). Built imperatively because the
  * pages themselves are rendered imperatively into the container. */
 function makeCopyButton(text: string): HTMLButtonElement {
@@ -91,32 +113,21 @@ async function highlightQuoteOnPage(
   quote: string,
   scroll = true,
 ): Promise<boolean> {
-  // Space-free matching: pdf.js and the backend's text extractor split
-  // words and spaces differently, so spacing can't be trusted at all.
-  const needle = normalizeForMatch(quote).replace(/ /g, "");
-  if (!needle) return false;
+  // Normalization-tolerant match: locateQuote folds case, whitespace,
+  // newlines, soft hyphens, line-end hyphenation and typographic
+  // look-alikes, and can span the many items pdf.js splits a line into.
   const items = await readTextItems(page);
-  let hay = "";
-  const itemOf: number[] = [];
-  items.forEach((it, idx) => {
-    for (const ch of it.str ?? "") {
-      if (!/\s/.test(ch)) {
-        for (const fc of foldChar(ch.toLowerCase().charAt(0))) {
-          hay += fc;
-          itemOf.push(idx);
-        }
-      }
-    }
-  });
-  const at = hay.indexOf(needle);
-  if (at < 0) return false;
+  const { text, map } = pageSource(items);
+  const hit = locateQuote(text, quote);
+  if (!hit) return false;
 
   const canvas = wrap.querySelector("canvas");
   if (!canvas) return false;
   const cssWidth = parseFloat(canvas.style.width) || canvas.clientWidth;
   const base = page.getViewport({ scale: 1 });
   const viewport = page.getViewport({ scale: cssWidth / base.width });
-  const matched = [...new Set(itemOf.slice(at, at + needle.length))];
+  // Every item the (inclusive) matched source range touches gets a box.
+  const matched = [...new Set(map.slice(hit.start, hit.end + 1))];
   let first: HTMLDivElement | null = null;
   for (const idx of matched) {
     const it = items[idx];
@@ -221,27 +232,33 @@ export default function PdfView({
         );
 
         if (tgt?.quote) {
-          // Try the hinted page first, then the rest.
-          const order = [...Array(pages).keys()].map((i) => i + 1);
-          if (tgt.page && tgt.page >= 1 && tgt.page <= pages) {
-            order.splice(order.indexOf(tgt.page), 1);
-            order.unshift(tgt.page);
-          }
-          let found = false;
-          for (const p of order) {
-            if (token !== renderTokenRef.current) return;
-            const page = await pdf.getPage(p);
-            if (
-              await highlightQuoteOnPage(
-                page,
-                pageWraps[p - 1],
-                tgt.quote,
-                !restoring,
-              )
-            ) {
-              found = true;
-              break;
+          const quote = tgt.quote;
+          // Search the hinted page first, then the rest; the match may live
+          // on a different page than the hint.
+          const runHighlight = async (): Promise<boolean> => {
+            const order = [...Array(pages).keys()].map((i) => i + 1);
+            if (tgt.page && tgt.page >= 1 && tgt.page <= pages) {
+              order.splice(order.indexOf(tgt.page), 1);
+              order.unshift(tgt.page);
             }
+            for (const p of order) {
+              if (token !== renderTokenRef.current) return false;
+              const page = await pdf.getPage(p);
+              if (
+                await highlightQuoteOnPage(page, pageWraps[p - 1], quote, !restoring)
+              ) {
+                return true;
+              }
+            }
+            return false;
+          };
+          let found = await runHighlight();
+          if (!found && token === renderTokenRef.current) {
+            // A freshly-opened page's text layer may not be parsed on the
+            // first pass; wait one frame and retry once before giving up.
+            await new Promise<void>((r) => requestAnimationFrame(() => r()));
+            if (token !== renderTokenRef.current) return;
+            found = await runHighlight();
           }
           if (!found && token === renderTokenRef.current && !restoring) {
             setStatus(
@@ -261,6 +278,14 @@ export default function PdfView({
             block: "start",
             behavior: "smooth",
           });
+        }
+
+        // UX-3: with every page now rendered at final height, put the page
+        // the reader was on before the zoom back at the top of the viewport.
+        // (Done here, not only mid-stream, so there is enough scroll room to
+        // actually reach it — the mid-loop scroll can fall short.)
+        if (restoreIdx != null && token === renderTokenRef.current) {
+          pageWraps[restoreIdx]?.scrollIntoView({ block: "start" });
         }
       } catch (e) {
         if (token === renderTokenRef.current) {
