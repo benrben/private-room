@@ -408,9 +408,22 @@ fn xlsx_set_cell(
 }
 
 /// Case- and whitespace-insensitive form used to verify quotes the model
-/// wants to highlight or edit actually exist in a file.
+/// wants to highlight or edit actually exist in a file. Typographic
+/// look-alikes (curly quotes, dashes, ligatures) are folded so extracted
+/// text and model quotes can meet in the middle.
 fn normalize_for_match(s: &str) -> String {
-    s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut folded = String::with_capacity(s.len());
+    for c in s.to_lowercase().chars() {
+        match c {
+            '\u{2018}' | '\u{2019}' | '\u{02BC}' => folded.push('\''),
+            '\u{201C}' | '\u{201D}' => folded.push('"'),
+            '\u{2013}' | '\u{2014}' => folded.push('-'),
+            '\u{FB01}' => folded.push_str("fi"),
+            '\u{FB02}' => folded.push_str("fl"),
+            _ => folded.push(c),
+        }
+    }
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 // ---------------------------------------------------------------- room lifecycle
@@ -1823,7 +1836,12 @@ async fn exec_tool(
                 });
             } else if !quote.is_empty() {
                 let haystack = normalize_for_match(&extracted.unwrap_or_default());
-                if !haystack.contains(&normalize_for_match(&quote)) {
+                let needle = normalize_for_match(&quote);
+                // PDF extraction breaks words unpredictably; fall back to a
+                // space-free comparison before rejecting the quote.
+                let found = haystack.contains(&needle)
+                    || haystack.replace(' ', "").contains(&needle.replace(' ', ""));
+                if !found {
                     return Err(format!(
                         "Could not find that text in \"{real_name}\". Copy a short snippet \
                          exactly as it appears in the file (use search_room or open_file to \
@@ -1959,7 +1977,7 @@ async fn exec_tool(
                 format!("🌐 Searching the web for \"{query}\" (leaves this Mac)…\n"),
             );
             let hits = match provider.as_str() {
-                "brave" => web::search_brave(&key, query).await?,
+                "duckduckgo" => web::search_duckduckgo(query).await?,
                 "searxng" => web::search_searxng(&endpoint, query).await?,
                 _ => return Ok("Web access is turned off in Settings → Online features.".into()),
             };
@@ -2134,8 +2152,8 @@ mod tests {
             umya_spreadsheet::reader::xlsx::read_reader(std::io::Cursor::new(&edited), true)
                 .unwrap();
         let sheet = reread.sheet(0).unwrap();
-        assert_eq!(sheet.cell_value("B7").get_value(), "42");
-        assert_eq!(sheet.cell_value("A1").get_value(), "hello");
+        assert_eq!(sheet.cell_value("B7").value(), "42");
+        assert_eq!(sheet.cell_value("A1").value(), "hello");
         assert!(xlsx_set_cell(&bytes, Some("NoSuchSheet"), "B7", "x").is_err());
     }
 

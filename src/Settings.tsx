@@ -35,7 +35,6 @@ export default function Settings({
   const [mcpStatuses, setMcpStatuses] = useState<McpServerStatus[]>([]);
   const [mcpError, setMcpError] = useState("");
   const [webProvider, setWebProvider] = useState("off");
-  const [webKey, setWebKey] = useState("");
   const [webEndpoint, setWebEndpoint] = useState("");
   const [webSaved, setWebSaved] = useState(false);
 
@@ -51,8 +50,10 @@ export default function Settings({
     });
     api.mcpGetConfig().then(setMcpConfig).catch(() => {});
     api.mcpStatus().then(setMcpStatuses).catch(() => {});
-    api.getSetting("web_provider").then((v) => setWebProvider(v || "off"));
-    api.getSetting("web_api_key").then((v) => setWebKey(v || ""));
+    api.getSetting("web_provider").then((v) => {
+      // "brave" was removed (needed an API key); treat it as off.
+      setWebProvider(v === "brave" || !v ? "off" : v);
+    });
     api.getSetting("web_endpoint").then((v) => setWebEndpoint(v || ""));
     const unlisten = listen<PullProgress>("pull-progress", (e) => {
       setPullStatus(e.payload.status);
@@ -78,7 +79,6 @@ export default function Settings({
 
   async function saveWebAccess() {
     await api.setSetting("web_provider", webProvider);
-    await api.setSetting("web_api_key", webKey.trim());
     await api.setSetting("web_endpoint", webEndpoint.trim());
     setWebSaved(true);
     window.setTimeout(() => setWebSaved(false), 1600);
@@ -276,24 +276,15 @@ export default function Settings({
               onChange={(e) => setWebProvider(e.target.value)}
             >
               <option value="off">Off — room stays offline</option>
-              <option value="brave">Brave Search API (bring your key)</option>
+              <option value="duckduckgo">DuckDuckGo — free, no key or account</option>
               <option value="searxng">SearXNG (your own instance)</option>
             </select>
-            {webProvider === "brave" && (
-              <>
-                <label className="settings-label">Brave Search API key</label>
-                <input
-                  type="password"
-                  placeholder="BSA…"
-                  value={webKey}
-                  onChange={(e) => setWebKey(e.target.value)}
-                />
-                <p className="settings-hint">
-                  Free keys (~1,000 searches/month) at
-                  api-dashboard.search.brave.com. The key is stored encrypted
-                  inside this room.
-                </p>
-              </>
+            {webProvider === "duckduckgo" && (
+              <p className="settings-hint">
+                Uses the public duckduckgo.com results page directly — nothing
+                to sign up for. Heavy use can hit a temporary rate limit; the
+                AI will say so and you can just retry.
+              </p>
             )}
             {webProvider === "searxng" && (
               <>
@@ -319,11 +310,13 @@ export default function Settings({
           <section>
             <h3>Connections (MCP)</h3>
             <p className="settings-hint">
-              Connect external tools with the Model Context Protocol — paste
-              the same <code>mcpServers</code> config used by Claude Desktop or
-              Cursor. The example gives the AI free DuckDuckGo web search
-              (needs <code>uv</code>: <code>brew install uv</code>): remove the{" "}
-              <code>"disabled": true</code> line and connect.
+              Advanced: connect external tools with the Model Context Protocol
+              — paste the same <code>mcpServers</code> config used by Claude
+              Desktop or Cursor. For web search you don't need MCP — use{" "}
+              <strong>Online features</strong> above instead. Keep{" "}
+              <code>"disabled": true</code> on servers you don't use; a
+              "Could not start …" error means that server's program isn't
+              installed on this Mac.
             </p>
             <p className="settings-hint">
               ⚠️ Connected tools are separate programs and can reach the

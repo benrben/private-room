@@ -47,9 +47,10 @@ computer — the AI runs locally through Ollama.
   and each reply carries a 📍 chip that re-opens the highlight.
 - **Optional web access.** Off by default; the search tools are not even
   offered to the model until you pick a provider in Settings → Online
-  features (Brave Search with your own key, or a SearXNG instance you
-  trust). Fetches run in Rust with a private-network guard, results are
-  clamped to fit a small context, and pages are cached in the room.
+  features. DuckDuckGo works free with no key or account; a SearXNG
+  instance you trust is the self-hosted option. Fetches run in Rust with a
+  private-network guard, results are clamped to fit a small context, and
+  pages are cached in the room.
 - **It can see.** Attach an image with the paperclip and ask about it.
   "Where is X?" questions draw labeled boxes on the image; grounding
   auto-routes to a Qwen-VL model when one is installed (measured: far more

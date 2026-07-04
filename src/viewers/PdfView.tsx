@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { normalizeForMatch } from "./highlight";
+import { foldChar, normalizeForMatch } from "./highlight";
 import { base64ToBytes } from "./util";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -29,25 +29,21 @@ async function highlightQuoteOnPage(
   wrap: HTMLDivElement,
   quote: string,
 ): Promise<boolean> {
-  const needle = normalizeForMatch(quote);
+  // Space-free matching: pdf.js and the backend's text extractor split
+  // words and spaces differently, so spacing can't be trusted at all.
+  const needle = normalizeForMatch(quote).replace(/ /g, "");
   if (!needle) return false;
   const content = await page.getTextContent();
   const items = content.items as TextItem[];
   let hay = "";
   const itemOf: number[] = [];
-  let lastWasSpace = true;
   items.forEach((it, idx) => {
-    for (const ch of `${it.str ?? ""} `) {
-      if (/\s/.test(ch)) {
-        if (!lastWasSpace) {
-          hay += " ";
+    for (const ch of it.str ?? "") {
+      if (!/\s/.test(ch)) {
+        for (const fc of foldChar(ch.toLowerCase().charAt(0))) {
+          hay += fc;
           itemOf.push(idx);
-          lastWasSpace = true;
         }
-      } else {
-        hay += ch.toLowerCase().charAt(0);
-        itemOf.push(idx);
-        lastWasSpace = false;
       }
     }
   });
@@ -142,11 +138,18 @@ export default function PdfView({
               break;
             }
           }
-          if (!found && target.page) {
-            pageWraps[Math.min(target.page, pages) - 1]?.scrollIntoView({
-              block: "start",
-              behavior: "smooth",
-            });
+          if (!found && !cancelled) {
+            setStatus(
+              target.page
+                ? `Couldn't locate the highlighted text — showing page ${target.page} instead.`
+                : "Couldn't locate the highlighted text in this PDF.",
+            );
+            if (target.page) {
+              pageWraps[Math.min(target.page, pages) - 1]?.scrollIntoView({
+                block: "start",
+                behavior: "smooth",
+              });
+            }
           }
         } else if (target?.page) {
           pageWraps[Math.min(Math.max(target.page, 1), pages) - 1]?.scrollIntoView({

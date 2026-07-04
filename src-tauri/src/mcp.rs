@@ -165,7 +165,13 @@ fn login_shell_path() -> &'static str {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
         let inherited = std::env::var("PATH").unwrap_or_default();
-        format!("{from_shell}:{inherited}:/opt/homebrew/bin:/usr/local/bin")
+        // Well-known tool homes login shells often miss: uv installs to
+        // ~/.local/bin (via .zshrc only, which -lc doesn't source).
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!(
+            "{from_shell}:{inherited}:/opt/homebrew/bin:/usr/local/bin:\
+             {home}/.local/bin:{home}/.cargo/bin"
+        )
     })
 }
 

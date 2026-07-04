@@ -137,7 +137,7 @@ export default function Workspace({ info, onLock }: Props) {
   function refreshWebAccess() {
     api
       .getSetting("web_provider")
-      .then((v) => setWebOn(v === "brave" || v === "searxng"))
+      .then((v) => setWebOn(v === "duckduckgo" || v === "searxng"))
       .catch(() => {});
   }
 
@@ -178,8 +178,15 @@ export default function Workspace({ info, onLock }: Props) {
     // The AI can drive the app: open files in the viewer, create/edit files,
     // and highlight spots in documents.
     const unlistenOpen = api.onAgentOpenFile((p) => {
-      if (typeof p === "string") {
-        viewFile(p);
+      const id = typeof p === "string" ? p : p.id;
+      const hint =
+        typeof p === "string" ? undefined : (p.page ?? p.cell ?? p.find ?? undefined);
+      // Models often call open_file alongside annotate_file; a plain open
+      // must not wipe a highlight already applied to the same file.
+      const current = openFileRef.current;
+      if (hint == null && current?.id === id && current.target) return;
+      if (typeof p === "string" || hint == null) {
+        viewFile(id);
       } else {
         viewFile(p.id, {
           page: p.page ?? undefined,

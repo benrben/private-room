@@ -19,7 +19,7 @@ function name if the line moved.
 | File | What is inside | Items |
 |---|---|---|
 | [part-1-security.md](part-1-security.md) | Trust & safety fixes. For this product, trust IS the product. | SEC-1 … SEC-7 |
-| [part-2-features-to-add.md](part-2-features-to-add.md) | Missing features, from "must have" to roadmap. | ADD-1 … ADD-15 |
+| [part-2-features-to-add.md](part-2-features-to-add.md) | Missing features, from "must have" to roadmap. | ADD-1 … ADD-17 |
 | [part-3-things-to-change.md](part-3-things-to-change.md) | Existing things that should work differently. | CHG-1 … CHG-10 |
 | [part-4-ux-polish.md](part-4-ux-polish.md) | Smaller annoyances that create real friction. | UX-1 … UX-7 |
 | [part-5-project-health.md](part-5-project-health.md) | Behind-the-scenes: code safety, performance, shipping. | HLT-1 … HLT-8 |

@@ -57,7 +57,8 @@ future link-import feature, ADD-12).
 2. Keep the table definition (dropping columns needs a migration and old
    rooms may hold rows) with a comment explaining it is reserved.
 
-**How to check it (path A)**
+**How to check it**
+(For the recommended path A.)
 1. Turn web on, ask the AI to fetch the same URL twice.
 2. Second fetch returns instantly and the "leaves this Mac" notice is not
    needed (log or breakpoint shows no network call).

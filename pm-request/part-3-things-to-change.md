@@ -28,7 +28,7 @@ Replace the "Run `ollama pull …` in a terminal" banner with a
 
 **How to check it**
 1. Select a model that is not downloaded → banner shows the button.
-2. Click → progress percreally moves → chat works when done, banner gone.
+2. Click → the progress bar really moves → chat works when done, banner gone.
 3. Kill the network mid-pull → readable error, retry possible.
 
 **Acceptance criteria**

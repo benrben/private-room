@@ -554,3 +554,130 @@ Journal) that pre-fill instructions, starter memories, and a welcome note.
 - [ ] At least 4 templates plus Blank (the default).
 - [ ] Template content is ordinary editable data.
 - [ ] Blank rooms contain nothing extra.
+
+---
+
+## ADD-16 — Folders inside the room
+
+**Goal**
+Rooms with many files stay organized. Today the file list is one flat
+pile sorted by date — fine with 10 files, painful with 30.
+
+**Task**
+Add one level of folders to the Files pane: create a folder, move files
+in and out, collapse and expand groups. No folders inside folders in v1 —
+keep it simple.
+
+**How to do it**
+1. Schema (in `migrate()` in `src-tauri/src/db.rs`): new table
+   `folders(id TEXT PRIMARY KEY, name TEXT UNIQUE)` and a new nullable
+   column `files.folder_id`. NULL means the file sits at the top level.
+   (A separate table lets a folder exist while empty and makes rename
+   one UPDATE.)
+2. Backend commands in `src-tauri/src/commands.rs`:
+   - `create_folder(name)`, `rename_folder(id, name)`,
+     `delete_folder(id)` — deleting a folder sets its files'
+     `folder_id` back to NULL. **Deleting a folder must never delete
+     files.**
+   - `move_file_to_folder(file_id, folder_id | null)`.
+   - Extend `list_files` to return `folderId`, and add `list_folders`.
+3. Frontend (`src/Workspace.tsx` sidebar):
+   - Group the file list under collapsible folder headers with a count,
+     e.g. "▸ Contracts (4)". Files without a folder show above/below the
+     groups.
+   - "New folder" button next to "+ Add".
+   - On each file row, a small "Move to…" menu listing folders +
+     "No folder". (Drag-and-drop onto a folder header is a nice bonus,
+     not required.)
+4. Let the AI see the organization: include folder names in the file
+   inventory in the system prompt and in the `list_room_files` tool
+   output ("Contracts/lease.pdf"). Optional: let `create_file` accept a
+   folder name.
+5. Old rooms: migration adds the empty structures; everything keeps
+   working with no folders.
+
+**How to check it**
+1. Create a folder "Contracts", move two files into it → they appear
+   grouped under a collapsible header showing (2).
+2. Collapse and expand the group; open a file from inside it — viewing,
+   attaching, and deleting files behave exactly as before.
+3. Delete the folder → the two files return to the top level, nothing is
+   lost.
+4. Rename a folder → the header updates everywhere.
+5. Ask the AI "what is in the Contracts folder?" → it answers from the
+   file list.
+6. Open a room created before this change → opens fine, flat list as
+   before.
+
+**Acceptance criteria**
+- [ ] One level of folders: create, rename, delete, move files in/out.
+- [ ] Deleting a folder never deletes or hides files.
+- [ ] Attach/view/delete on a file work the same inside a folder.
+- [ ] The AI's file listing shows the folder structure.
+- [ ] Old rooms migrate automatically and safely.
+
+---
+
+## ADD-17 — "Summarize this room" button
+
+**Goal**
+One click answers "what is this room for, and what is inside it?" —
+exactly what a returning user needs when reopening a room after weeks.
+
+**Task**
+A "Summarize room" button that generates (or refreshes) a single
+"Room summary.md" file: a short paragraph on what the room is for, one
+line per file, and three suggested questions — then opens it in the
+viewer.
+
+**How to do it**
+1. New async command `summarize_room` in `src-tauri/src/commands.rs`.
+2. The local model has a small memory (8K context), so it cannot read the
+   whole room at once. Build the summary in two steps (map, then reduce):
+   - **Per-file step:** for each file, one short model call — "In one
+     sentence, what is this file?" — using the file name, type, and the
+     first ~1,500 characters of its extracted text. Files with no text
+     (images without OCR) are listed by name and type only, without
+     invented content.
+   - **Combine step:** one final call with all the one-line summaries,
+     the room name, and the memory notes → ask for: a "What this room is
+     for" paragraph, the file list with the one-liners (grouped by
+     folder once ADD-16 exists), and three suggested questions to ask.
+3. Cache the per-file one-liners in a new nullable column
+   `files.ai_summary` (clear it inside `store_file_bytes` whenever a
+   file's content changes). Re-running the button then only summarizes
+   new or changed files — fast and cheap.
+4. Save the result as ONE canonical file, "Room summary.md" (source
+   "generated"): create it the first time, overwrite it on refresh
+   (ADD-2's version history keeps the old ones). Put the generation date
+   in the first line. Exclude this file from its own summary.
+5. UI: a "✨ Summarize room" button at the top of the Files pane.
+   While running, show progress ("Summarizing file 3 of 12…" via an
+   event) and disable the button. When done, emit `room-files-changed`
+   and open the summary in the viewer (reuse the `agent-open-file` path).
+6. Guard rails: cap at ~50 files per run (list the rest by name with a
+   note); if Ollama is down, show the normal friendly error and write
+   nothing half-finished.
+
+**How to check it**
+1. In a room with a few PDFs and notes, click the button → progress
+   counts up → "Room summary.md" opens with a purpose paragraph, one
+   line per file, and three suggested questions, dated today.
+2. Add one new file and click again → only the new file is summarized
+   (fast), and the summary now includes it.
+3. A room with an image and no OCR → the image is listed by name and
+   type, with no made-up description.
+4. Quit Ollama and click → friendly error, no broken half-summary file.
+5. Lock and reopen the room → the summary is right there in the file
+   list, so "what is this room?" is answered before asking anything.
+
+**Acceptance criteria**
+- [ ] One click produces or refreshes a single "Room summary.md" and
+      opens it.
+- [ ] It contains: purpose paragraph, one line per file, suggested
+      questions, and the generation date.
+- [ ] Re-runs are incremental thanks to cached per-file summaries.
+- [ ] Works on any room size within the 8K context (two-step build,
+      capped with an honest note).
+- [ ] Files without text are listed honestly, never invented.
+- [ ] The summary file never summarizes itself; offline failure is clean.

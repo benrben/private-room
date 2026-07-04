@@ -5,16 +5,46 @@
  * (no DOM mutation — safe over docx-preview / react-markdown output).
  */
 
+/** Fold typographic look-alikes so quotes from extracted text match the
+ * rendered document: curly quotes, dashes, ligatures, exotic spaces. */
+export function foldChar(ch: string): string {
+  switch (ch) {
+    case "‘":
+    case "’":
+    case "ʼ":
+      return "'";
+    case "“":
+    case "”":
+      return '"';
+    case "–":
+    case "—":
+      return "-";
+    case "ﬁ":
+      return "fi";
+    case "ﬂ":
+      return "fl";
+    case " ":
+      return " ";
+    default:
+      return ch;
+  }
+}
+
 export function normalizeForMatch(s: string): string {
-  return s.toLowerCase().split(/\s+/).filter(Boolean).join(" ");
+  return [...s.toLowerCase()]
+    .map(foldChar)
+    .join("")
+    .split(/\s+/)
+    .filter(Boolean)
+    .join(" ");
 }
 
 const HIGHLIGHT_NAME = "pr-annotation";
 
-/** Find `quote` across the text nodes under `root` as a DOM Range. */
-export function findQuoteRange(root: HTMLElement, quote: string): Range | null {
-  const needle = normalizeForMatch(quote);
-  if (!needle) return null;
+function buildTextIndex(
+  root: HTMLElement,
+  withSpaces: boolean,
+): { hay: string; map: { node: Text; offset: number }[] } {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   let hay = "";
   const map: { node: Text; offset: number }[] = [];
@@ -27,26 +57,43 @@ export function findQuoteRange(root: HTMLElement, quote: string): Range | null {
     const s = node.data;
     for (let i = 0; i < s.length; i++) {
       if (/\s/.test(s[i])) {
-        if (!lastWasSpace) {
+        if (withSpaces && !lastWasSpace) {
           hay += " ";
           map.push({ node, offset: i });
           lastWasSpace = true;
         }
       } else {
-        hay += s[i].toLowerCase().charAt(0);
-        map.push({ node, offset: i });
+        for (const fc of foldChar(s[i].toLowerCase().charAt(0))) {
+          hay += fc;
+          map.push({ node, offset: i });
+        }
         lastWasSpace = false;
       }
     }
   }
-  const idx = hay.indexOf(needle);
-  if (idx < 0) return null;
-  const start = map[idx];
-  const end = map[idx + needle.length - 1];
-  const range = document.createRange();
-  range.setStart(start.node, start.offset);
-  range.setEnd(end.node, end.offset + 1);
-  return range;
+  return { hay, map };
+}
+
+/** Find `quote` across the text nodes under `root` as a DOM Range.
+ * Tries whitespace-collapsed matching first, then whitespace-free —
+ * extracted text and rendered text rarely agree on spacing. */
+export function findQuoteRange(root: HTMLElement, quote: string): Range | null {
+  for (const withSpaces of [true, false]) {
+    const needle = withSpaces
+      ? normalizeForMatch(quote)
+      : normalizeForMatch(quote).replace(/ /g, "");
+    if (!needle) return null;
+    const { hay, map } = buildTextIndex(root, withSpaces);
+    const idx = hay.indexOf(needle);
+    if (idx < 0) continue;
+    const start = map[idx];
+    const end = map[idx + needle.length - 1];
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset + 1);
+    return range;
+  }
+  return null;
 }
 
 /** Highlight `quote` under `root` and scroll it into view. */
