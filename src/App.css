@@ -204,6 +204,51 @@ code {
   margin: 14px 0 0;
 }
 
+/* password strength meter (create form only) */
+.pw-meter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: -2px;
+}
+
+.pw-meter-track {
+  flex: 1;
+  height: 4px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.pw-meter-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  transition: width 0.25s ease, background-color 0.25s ease;
+}
+
+.pw-meter-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 42px;
+  text-align: right;
+}
+
+.pw-meter.weak .pw-meter-fill {
+  width: 33%;
+  background: var(--danger);
+}
+
+.pw-meter.okay .pw-meter-fill {
+  width: 66%;
+  background: var(--warn);
+}
+
+.pw-meter.strong .pw-meter-fill {
+  width: 100%;
+  background: var(--ok);
+}
+
 /* ---------- workspace ---------- */
 
 .workspace {

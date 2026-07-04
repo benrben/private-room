@@ -12,8 +12,37 @@ type Screen =
 
 const ROOM_FILTER = [{ name: "Private Room Project", extensions: ["roomai"] }];
 
+const MIN_PASSWORD = 8;
+
 function fileNameOf(path: string): string {
   return path.split("/").pop() ?? path;
+}
+
+type Strength = { score: 0 | 1 | 2 | 3; label: string; level: "weak" | "okay" | "strong" };
+
+// Simple, library-free estimate: length plus the mix of character kinds
+// (lowercase, uppercase, digit, symbol). Empty input scores nothing.
+function passwordStrength(pw: string): Strength {
+  if (!pw) return { score: 0, label: "", level: "weak" };
+  let kinds = 0;
+  if (/[a-z]/.test(pw)) kinds++;
+  if (/[A-Z]/.test(pw)) kinds++;
+  if (/[0-9]/.test(pw)) kinds++;
+  if (/[^A-Za-z0-9]/.test(pw)) kinds++;
+
+  let points = 0;
+  if (pw.length >= 8) points++;
+  if (pw.length >= 12) points++;
+  if (kinds >= 2) points++;
+  if (kinds >= 3) points++;
+
+  if (pw.length < 8 || points <= 1) {
+    return { score: 1, label: "Weak", level: "weak" };
+  }
+  if (points === 2 || points === 3) {
+    return { score: 2, label: "Okay", level: "okay" };
+  }
+  return { score: 3, label: "Strong", level: "strong" };
 }
 
 export default function App() {
@@ -74,8 +103,8 @@ export default function App() {
   }
 
   async function handleCreate(path: string) {
-    if (password.length < 4) {
-      setError("Password must be at least 4 characters.");
+    if (password.length < MIN_PASSWORD) {
+      setError(`Please use at least ${MIN_PASSWORD} characters.`);
       return;
     }
     if (password !== confirm) {
@@ -116,6 +145,8 @@ export default function App() {
   if (screen.kind === "workspace") {
     return <Workspace info={screen.info} onLock={handleLock} />;
   }
+
+  const strength = passwordStrength(password);
 
   return (
     <div className={`gate${entering ? " entering" : ""}`}>
@@ -158,6 +189,14 @@ export default function App() {
               autoFocus
               onChange={(e) => setPassword(e.target.value)}
             />
+            {password && (
+              <div className={`pw-meter ${strength.level}`}>
+                <div className="pw-meter-track">
+                  <div className="pw-meter-fill" />
+                </div>
+                <span className="pw-meter-label">{strength.label}</span>
+              </div>
+            )}
             <input
               type="password"
               placeholder="Repeat password"
@@ -174,8 +213,7 @@ export default function App() {
               </button>
             </div>
             <p className="gate-note">
-              The password encrypts the whole file. There is no recovery if you
-              forget it.
+              Longer is stronger. There is no recovery if you forget it.
             </p>
           </form>
         )}
