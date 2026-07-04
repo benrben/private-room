@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::State;
 use uuid::Uuid;
 
@@ -72,6 +72,28 @@ pub struct RoomInfo {
     pub message_count: i64,
     /// True when the room file lives in a cloud-sync folder (HLT-6).
     pub synced: bool,
+    /// SEC-1: set when the room has enabled MCP plug-ins whose config has not
+    /// been approved on this Mac. The UI shows an approval dialog and, on
+    /// "Allow", calls `approve_mcp` with the fingerprint. None = nothing to ask
+    /// (no enabled servers, or this config is already approved).
+    pub pending_mcp: Option<McpApproval>,
+}
+
+/// SEC-1: what the approval dialog needs — the config fingerprint to approve and
+/// the enabled servers that would run, each with its real command line.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct McpApproval {
+    pub fingerprint: String,
+    pub servers: Vec<McpServerBrief>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerBrief {
+    pub name: String,
+    /// The full command line the server would run, e.g. "uvx duckduckgo-mcp-server".
+    pub command: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -399,7 +421,7 @@ fn room_name_from_path(path: &str) -> String {
         .unwrap_or_else(|| "Room".into())
 }
 
-fn info_of(room: &Room) -> Result<RoomInfo, String> {
+fn info_of(app: &tauri::AppHandle, room: &Room) -> Result<RoomInfo, String> {
     let (file_count, message_count) = db::room_counts(&room.conn)?;
     Ok(RoomInfo {
         name: room.name.clone(),
@@ -407,6 +429,7 @@ fn info_of(room: &Room) -> Result<RoomInfo, String> {
         file_count,
         message_count,
         synced: is_synced_path(&room.path),
+        pending_mcp: pending_mcp_for(app, &room.conn),
     })
 }
 
@@ -623,7 +646,7 @@ pub fn create_room(
         name,
         password,
     };
-    let info = info_of(&room)?;
+    let info = info_of(&app, &room)?;
     push_recent(&app, &room.name, &room.path);
     *state.room.lock().unwrap() = Some(room);
     refresh_mcp(&app);
@@ -645,7 +668,7 @@ pub fn open_room(
         name,
         password,
     };
-    let info = info_of(&room)?;
+    let info = info_of(&app, &room)?;
     push_recent(&app, &room.name, &room.path);
     *state.room.lock().unwrap() = Some(room);
     refresh_mcp(&app);
@@ -695,10 +718,13 @@ pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
 }
 
 #[tauri::command]
-pub fn room_info(state: State<'_, AppState>) -> Result<Option<RoomInfo>, String> {
+pub fn room_info(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<RoomInfo>, String> {
     let guard = state.room.lock().unwrap();
     match guard.as_ref() {
-        Some(room) => Ok(Some(info_of(room)?)),
+        Some(room) => Ok(Some(info_of(&app, room)?)),
         None => Ok(None),
     }
 }
@@ -928,6 +954,295 @@ pub fn save_generated_file(
         Some(&content),
         "generated",
     )
+}
+
+// ---------------------------------------------------------------- import link (ADD-12)
+
+/// A safe, readable Markdown filename derived from a page title (or its URL when
+/// the title is empty). Pure so it can be unit-tested.
+fn link_file_name(title: &str, url: &str) -> String {
+    let base = title.trim();
+    let base = if base.is_empty() { url } else { base };
+    // Fold path/reserved characters and collapse whitespace to keep one clean
+    // line that is valid as a file name on macOS.
+    let folded: String = base
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t' => ' ',
+            _ => c,
+        })
+        .collect();
+    let cleaned = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut name: String = cleaned.chars().take(80).collect();
+    name = name.trim().to_string();
+    if name.is_empty() {
+        name = "Web page".into();
+    }
+    format!("{name}.md")
+}
+
+/// ADD-12: fetch a web page and save a readable offline copy as a Markdown file.
+/// Uses `web::fetch_page` WITH the SEC-5 guard, so private/loopback addresses
+/// are refused. An explicit user action, so it works even when the AI's web
+/// tools are off. The saved file (source "web") is indexed and searchable.
+#[tauri::command]
+pub async fn import_link(state: State<'_, AppState>, url: String) -> Result<FileMeta, String> {
+    let (title, text) = web::fetch_page(&url).await?;
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    let saved = db::current_date(&room.conn);
+    let name = link_file_name(&title, &url);
+    let content = format!("# {title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
+    db::insert_file(
+        &room.conn,
+        &name,
+        "text/markdown",
+        content.as_bytes(),
+        Some(&content),
+        "web",
+    )
+}
+
+// ---------------------------------------------------------------- summarize room (ADD-17)
+
+/// The one canonical, overwrite-in-place summary file (ADD-17).
+const SUMMARY_FILE_NAME: &str = "Room summary.md";
+/// Cap per run so a huge room stays within the small local context; the rest are
+/// listed by name with a note.
+const MAX_SUMMARY_FILES: usize = 50;
+
+/// True for the app's own generated "Room summary.md" — excluded from its own
+/// summary. A user-uploaded file that happens to share the name is NOT excluded.
+fn is_summary_file(name: &str, source: &str) -> bool {
+    name == SUMMARY_FILE_NAME && source == "generated"
+}
+
+/// Trim a model reply down to a single clean sentence for a file one-liner.
+fn clean_one_liner(raw: &str) -> String {
+    let line = strip_markup_blocks(raw)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim_start_matches(['-', '*', '#', '>', ' '])
+        .to_string();
+    line.chars().take(200).collect::<String>().trim().to_string()
+}
+
+/// ADD-17 map step: one short call describing a single file in a sentence.
+async fn summarize_one_file(
+    model: &str,
+    name: &str,
+    mime: &str,
+    text: &str,
+) -> Result<String, String> {
+    let messages = vec![
+        ollama::ChatMessage::new(
+            "system",
+            "You describe a single file in ONE short, factual sentence based only on what is \
+             given. No preamble, no quotes, just the sentence.",
+        ),
+        ollama::ChatMessage::new(
+            "user",
+            format!(
+                "File name: {name}\nType: {mime}\n\nBeginning of its text:\n{text}\n\n\
+                 In one sentence, what is this file about?"
+            ),
+        ),
+    ];
+    let (out, _) =
+        ollama::chat_stream_tools(model, messages, None, Some(0.2), None, KEEP_ALIVE_WARM, |_| {})
+            .await?;
+    Ok(clean_one_liner(&out))
+}
+
+/// ADD-17 reduce step: one call producing the "What this room is for" paragraph
+/// and three suggested questions, given the per-file one-liners for context. The
+/// deterministic file list is assembled by the caller (never invented here).
+async fn combine_summary(
+    model: &str,
+    room_name: &str,
+    memories: &[String],
+    file_lines: &str,
+) -> Result<String, String> {
+    let mut context = format!("Room name: {room_name}\n\nFiles and what each is:\n{file_lines}\n");
+    if !memories.is_empty() {
+        context.push_str("\nMemory notes the user saved for this room:\n");
+        for m in memories {
+            context.push_str(&format!("- {m}\n"));
+        }
+    }
+    let messages = vec![
+        ollama::ChatMessage::new(
+            "system",
+            "You summarize a personal document room. Output Markdown with EXACTLY these two \
+             sections and nothing else:\n\
+             ## What this room is for\n\
+             <one short paragraph, 2-4 sentences>\n\n\
+             ## Try asking\n\
+             1. <a question the files could answer>\n\
+             2. <another>\n\
+             3. <another>\n\
+             Base everything only on the information given. Do not list the files.",
+        ),
+        ollama::ChatMessage::new("user", context),
+    ];
+    let (out, _) =
+        ollama::chat_stream_tools(model, messages, None, Some(0.4), None, KEEP_ALIVE_WARM, |_| {})
+            .await?;
+    Ok(out.trim().to_string())
+}
+
+/// ADD-17: generate (or refresh) the room's single "Room summary.md" via a
+/// two-step map-reduce, caching each file's one-liner so re-runs only summarize
+/// new or changed files. Emits `summarize-progress` while running. Writes
+/// nothing if the model is unreachable (returns the normal friendly error).
+#[tauri::command]
+pub async fn summarize_room(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+) -> Result<FileMeta, String> {
+    use tauri::Emitter;
+
+    // Phase 1 (locked): pull the room name, memories and the file rows.
+    let (room_name, explicit_model, memories, files, existing_id) = {
+        let guard = state.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        let conn = &room.conn;
+        let all = db::list_files_for_summary(conn)?;
+        let existing_id = all
+            .iter()
+            .find(|f| is_summary_file(&f.name, &f.source))
+            .map(|f| f.id.clone());
+        let files: Vec<db::SummaryFile> = all
+            .into_iter()
+            .filter(|f| !is_summary_file(&f.name, &f.source))
+            .collect();
+        let memories: Vec<String> =
+            db::list_memories(conn)?.into_iter().map(|m| m.content).collect();
+        (room.name.clone(), model_setting(conn), memories, files, existing_id)
+    };
+
+    if files.is_empty() {
+        return Err("This room has no files to summarize yet.".into());
+    }
+
+    // Summarization always runs on a LOCAL model (map-reduce needs many small
+    // calls); if a cloud engine is selected, fall back to the default local one.
+    let models = ollama::list_models()
+        .await
+        .map_err(|_| "The local AI (Ollama) isn't running — start it and try again.".to_string())?;
+    if models.is_empty() {
+        return Err("No local AI model is installed yet — download one first.".into());
+    }
+    let mut model = explicit_model.unwrap_or_else(|| best_default(&models));
+    if is_external_engine(&model) {
+        model = best_default(&models);
+    }
+
+    let capped = files.len() > MAX_SUMMARY_FILES;
+    let to_do = files.len().min(MAX_SUMMARY_FILES);
+
+    // Map: a one-liner per file, reusing the cache and filling any gaps.
+    let mut file_lines = String::new();
+    for (i, f) in files.iter().take(MAX_SUMMARY_FILES).enumerate() {
+        let _ = window.emit(
+            "summarize-progress",
+            format!("Summarizing file {} of {}…", i + 1, to_do),
+        );
+        let display = match &f.folder {
+            Some(folder) => format!("{folder}/{}", f.name),
+            None => f.name.clone(),
+        };
+        let one_liner = if let Some(cached) = &f.ai_summary {
+            cached.clone()
+        } else if f.text.as_deref().map_or(true, |t| t.trim().is_empty()) {
+            // No extractable text (e.g. an image without OCR): list by name and
+            // type only, never invent content.
+            String::new()
+        } else {
+            let snippet = f.text.as_deref().unwrap_or("");
+            let liner = summarize_one_file(&model, &f.name, &f.mime, snippet).await?;
+            if !liner.is_empty() {
+                if let Some(room) = state.room.lock().unwrap().as_ref() {
+                    let _ = db::set_file_ai_summary(&room.conn, &f.id, &liner);
+                }
+            }
+            liner
+        };
+        if one_liner.is_empty() {
+            file_lines.push_str(&format!("- {display} ({})\n", f.mime));
+        } else {
+            file_lines.push_str(&format!("- {display} — {one_liner}\n"));
+        }
+    }
+    if capped {
+        for f in files.iter().skip(MAX_SUMMARY_FILES) {
+            let display = match &f.folder {
+                Some(folder) => format!("{folder}/{}", f.name),
+                None => f.name.clone(),
+            };
+            file_lines.push_str(&format!("- {display}\n"));
+        }
+    }
+
+    // Reduce: purpose paragraph + suggested questions.
+    let _ = window.emit("summarize-progress", "Writing the summary…");
+    let combined = combine_summary(&model, &room_name, &memories, &file_lines).await?;
+
+    // Assemble the final Markdown. The file list is placed deterministically
+    // between the model's purpose paragraph and its suggested questions.
+    let (purpose_part, questions_part) = match combined.find("## Try asking") {
+        Some(i) => (combined[..i].trim().to_string(), combined[i..].trim().to_string()),
+        None => (combined.trim().to_string(), String::new()),
+    };
+    let saved_date = {
+        let guard = state.room.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|room| db::current_date(&room.conn))
+            .unwrap_or_default()
+    };
+    let mut content = format!("_Generated on {saved_date}_\n\n");
+    if purpose_part.is_empty() {
+        content.push_str("## What this room is for\n\n");
+    } else {
+        content.push_str(&purpose_part);
+        content.push_str("\n\n");
+    }
+    content.push_str("## Files\n\n");
+    content.push_str(file_lines.trim_end());
+    if capped {
+        content.push_str(&format!(
+            "\n\n_Only the first {MAX_SUMMARY_FILES} files were summarized; the rest are listed by name._"
+        ));
+    }
+    if !questions_part.is_empty() {
+        content.push_str("\n\n");
+        content.push_str(&questions_part);
+    }
+    content.push('\n');
+
+    // Phase 3 (locked): write the ONE canonical summary file — overwrite in
+    // place (ADD-2 keeps the previous versions) or create it the first time.
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    let meta = match existing_id {
+        Some(id) => {
+            store_file_bytes(&room.conn, &id, content.as_bytes(), Some(&content), "Summarized")?;
+            db::get_file_meta(&room.conn, &id)?
+        }
+        None => db::insert_file(
+            &room.conn,
+            SUMMARY_FILE_NAME,
+            "text/markdown",
+            content.as_bytes(),
+            Some(&content),
+            "generated",
+        )?,
+    };
+    let _ = window.emit("room-files-changed", ());
+    Ok(meta)
 }
 
 // ---------------------------------------------------------------- data safety
@@ -1340,7 +1655,105 @@ pub fn mcp_apply_config(
         let room = guard.as_ref().ok_or("No room is open.")?;
         db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
     }
+    // SEC-1: the user just typed and saved this config, which counts as
+    // approval — remember its fingerprint so reopening the room won't re-ask.
+    add_mcp_approval(&app, &mcp_fingerprint(&json));
     start_mcp_connections(app, servers);
+    Ok(state.mcp.lock().unwrap().statuses())
+}
+
+/// SEC-1: SHA-256 of the room's mcp_config JSON, hex-encoded. Any change to the
+/// config text changes the fingerprint, so an old approval no longer counts.
+fn mcp_fingerprint(config_json: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(config_json.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// SEC-1: the full command line a server would run, e.g. "uvx duckduckgo-mcp-server".
+/// Shown in the approval dialog so the user sees exactly what would execute.
+fn render_command_line(cfg: &mcp::ServerConfig) -> String {
+    let mut parts = Vec::with_capacity(1 + cfg.args.len());
+    parts.push(cfg.command.clone());
+    parts.extend(cfg.args.iter().cloned());
+    parts.join(" ")
+}
+
+/// Approved MCP fingerprints live OUTSIDE any room, in the app's own data
+/// folder — the room's author is the attacker, so approvals are per-Mac and
+/// never travel inside the `.roomai` file (SEC-1).
+fn mcp_approvals_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager as _;
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("mcp_approvals.json"))
+}
+
+fn read_mcp_approvals(app: &tauri::AppHandle) -> Vec<String> {
+    mcp_approvals_file(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn is_mcp_approved(app: &tauri::AppHandle, fingerprint: &str) -> bool {
+    read_mcp_approvals(app).iter().any(|f| f == fingerprint)
+}
+
+fn add_mcp_approval(app: &tauri::AppHandle, fingerprint: &str) {
+    let mut list = read_mcp_approvals(app);
+    if list.iter().any(|f| f == fingerprint) {
+        return;
+    }
+    list.push(fingerprint.to_string());
+    if let Ok(path) = mcp_approvals_file(app) {
+        if let Ok(json) = serde_json::to_string_pretty(&list) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+/// SEC-1: if the open room's config has ENABLED servers whose fingerprint isn't
+/// approved on this Mac, describe them for the approval dialog. None otherwise
+/// (no enabled servers, or already approved).
+fn pending_mcp_for(app: &tauri::AppHandle, conn: &Connection) -> Option<McpApproval> {
+    let config = db::get_setting(conn, MCP_CONFIG_KEY)?;
+    let servers = mcp::parse_config(&config).ok()?;
+    let enabled: Vec<&(String, mcp::ServerConfig)> =
+        servers.iter().filter(|(_, c)| !c.disabled).collect();
+    if enabled.is_empty() {
+        return None;
+    }
+    let fingerprint = mcp_fingerprint(&config);
+    if is_mcp_approved(app, &fingerprint) {
+        return None;
+    }
+    let briefs = enabled
+        .iter()
+        .map(|(name, cfg)| McpServerBrief {
+            name: name.clone(),
+            command: render_command_line(cfg),
+        })
+        .collect();
+    Some(McpApproval {
+        fingerprint,
+        servers: briefs,
+    })
+}
+
+/// SEC-1: approve the currently open room's plug-in config on this Mac, then
+/// start its servers and return their statuses. Declining is simply never
+/// calling this — the servers stay stopped.
+#[tauri::command]
+pub fn approve_mcp(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    fingerprint: String,
+) -> Result<Vec<mcp::ServerStatus>, String> {
+    add_mcp_approval(&app, &fingerprint);
+    refresh_mcp(&app);
     Ok(state.mcp.lock().unwrap().statuses())
 }
 
@@ -1364,6 +1777,17 @@ fn refresh_mcp(app: &tauri::AppHandle) {
         .as_deref()
         .and_then(|j| mcp::parse_config(j).ok())
         .unwrap_or_default();
+    // SEC-1: never auto-spawn a room's plug-ins without a per-Mac approval of
+    // this exact config. If any server is enabled and the config's fingerprint
+    // is not approved, start NOTHING — the UI surfaces the approval dialog via
+    // RoomInfo.pendingMcp and calls approve_mcp on "Allow".
+    if servers.iter().any(|(_, c)| !c.disabled) {
+        if let Some(json) = &config_json {
+            if !is_mcp_approved(app, &mcp_fingerprint(json)) {
+                return;
+            }
+        }
+    }
     start_mcp_connections(app.clone(), servers);
 }
 
@@ -1442,6 +1866,42 @@ fn vision_model(models: &[String], chat_model: &str) -> String {
         .or_else(|| models.iter().find(|m| m.contains("qwen3-vl")))
         .cloned()
         .unwrap_or_else(|| chat_model.to_string())
+}
+
+/// HLT-5: keep the chat model resident this long so follow-up questions are
+/// snappy. Vision/grounding calls may override this (see `vision_keep_alive`).
+const KEEP_ALIVE_WARM: &str = "30m";
+/// HLT-5: release a distinct vision model quickly on low-RAM machines.
+const KEEP_ALIVE_SHORT: &str = "2m";
+/// HLT-5: machines at or above this stay warm even for a second model.
+const HIGH_RAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+/// Total physical RAM in bytes, read once (sysinfo). Cached — the value doesn't
+/// change while the app runs, and refreshing memory info is not free.
+fn total_ram_bytes() -> u64 {
+    static RAM: OnceLock<u64> = OnceLock::new();
+    *RAM.get_or_init(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.total_memory()
+    })
+}
+
+/// HLT-5: how long a vision/grounding call should keep its model resident.
+///
+/// When the vision model IS the chat model, only one model is ever loaded, so
+/// keeping it warm costs nothing — use the warm value. When they differ, holding
+/// BOTH resident for 30 minutes has overwhelmed and crashed Ollama on 16 GB
+/// Macs. So on machines under 32 GB we release the vision model right after the
+/// grounding call (a short keep_alive): repeated marking pays a reload, which is
+/// the right tradeoff for stability. Machines with >= 32 GB have the headroom to
+/// keep it warm for snappier repeated marking. The chat model always stays warm.
+fn vision_keep_alive(total_ram: u64, vision_model: &str, chat_model: &str) -> &'static str {
+    if vision_model == chat_model || total_ram >= HIGH_RAM_THRESHOLD_BYTES {
+        KEEP_ALIVE_WARM
+    } else {
+        KEEP_ALIVE_SHORT
+    }
 }
 
 const MAX_VISION_DIM: u32 = 1024;
@@ -1753,8 +2213,10 @@ pub async fn locate_in_image(
         ]),
         ..Default::default()
     }];
+    // HLT-5: release the vision model quickly on low-RAM machines.
+    let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &chat_model);
     let (raw, _) =
-        ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), None, |_| {}).await?;
+        ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), None, keep, |_| {}).await?;
     Ok(parse_boxes(&raw, w, h))
 }
 
@@ -2191,8 +2653,11 @@ pub async fn ask(
                     ]),
                     ..Default::default()
                 }];
+                // HLT-5: short keep_alive for this vision pass on low-RAM Macs.
+                let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &model);
                 if let Ok((raw, _)) =
-                    ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), None, |_| {}).await
+                    ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), None, keep, |_| {})
+                        .await
                 {
                     let boxes = parse_boxes(&raw, *w, *h);
                     if !boxes.is_empty() {
@@ -2497,6 +2962,8 @@ async fn agent_loop(
             Some(&tools),
             temperature,
             Some(cancel.clone()),
+            // HLT-5: the chat model stays warm throughout the conversation.
+            KEEP_ALIVE_WARM,
             |d| {
                 let _ = window.emit("ask-delta", d);
             },
@@ -2827,9 +3294,10 @@ async fn exec_tool(
             };
             let (prepared, w, h) = prepare_image(&bytes);
             let models = ollama::list_models().await.unwrap_or_default();
+            let chat_model = best_default(&models);
             let vmodel = {
-                let v = vision_model(&models, &best_default(&models));
-                if is_external_engine(&v) { best_default(&models) } else { v }
+                let v = vision_model(&models, &chat_model);
+                if is_external_engine(&v) { chat_model.clone() } else { v }
             };
             let messages = vec![ollama::ChatMessage {
                 role: "user".into(),
@@ -2837,8 +3305,11 @@ async fn exec_tool(
                 images: Some(vec![base64::engine::general_purpose::STANDARD.encode(&prepared)]),
                 ..Default::default()
             }];
+            // HLT-5: short keep_alive on low-RAM machines when vision != chat.
+            let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &chat_model);
             let (raw, _) =
-                ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), None, |_| {}).await?;
+                ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), None, keep, |_| {})
+                    .await?;
             let boxes = parse_boxes(&raw, w, h);
             if boxes.is_empty() {
                 return Ok(format!("Could not locate \"{find}\" in {real_name}."));
@@ -3072,6 +3543,72 @@ mod tests {
         assert_eq!(list.len(), 5);
         assert_eq!(list[0].path, "c");
         assert_eq!(list.iter().filter(|r| r.path == "c").count(), 1);
+    }
+
+    #[test]
+    fn mcp_fingerprint_is_stable_and_config_sensitive() {
+        // SEC-1: same text → same fingerprint (approval survives reopening).
+        let a = r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"]}}}"#;
+        assert_eq!(mcp_fingerprint(a), mcp_fingerprint(a));
+        // A one-character change invalidates the old approval.
+        let b = r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg2"]}}}"#;
+        assert_ne!(mcp_fingerprint(a), mcp_fingerprint(b));
+        // Hex SHA-256 is 64 chars.
+        assert_eq!(mcp_fingerprint(a).len(), 64);
+    }
+
+    #[test]
+    fn renders_full_command_line() {
+        let cfg = mcp::ServerConfig {
+            command: "uvx".into(),
+            args: vec!["duckduckgo-mcp-server".into(), "--verbose".into()],
+            env: std::collections::HashMap::new(),
+            disabled: false,
+        };
+        assert_eq!(render_command_line(&cfg), "uvx duckduckgo-mcp-server --verbose");
+        let bare = mcp::ServerConfig {
+            command: "node".into(),
+            args: vec![],
+            env: std::collections::HashMap::new(),
+            disabled: false,
+        };
+        assert_eq!(render_command_line(&bare), "node");
+    }
+
+    #[test]
+    fn vision_keep_alive_by_ram_and_model() {
+        let gb = 1024 * 1024 * 1024;
+        // Distinct vision model on a 16 GB Mac → released quickly.
+        assert_eq!(vision_keep_alive(16 * gb, "qwen2.5vl", "qwen3.5:4b"), "2m");
+        // Same 16 GB Mac, but vision == chat model → only one model loaded, warm.
+        assert_eq!(vision_keep_alive(16 * gb, "qwen3.5:4b", "qwen3.5:4b"), "30m");
+        // 32 GB Mac keeps a distinct vision model warm too.
+        assert_eq!(vision_keep_alive(32 * gb, "qwen2.5vl", "qwen3.5:4b"), "30m");
+        assert_eq!(vision_keep_alive(64 * gb, "qwen2.5vl", "qwen3.5:4b"), "30m");
+    }
+
+    #[test]
+    fn summary_file_excludes_only_the_generated_one() {
+        // ADD-17: the app's own generated summary is excluded from itself.
+        assert!(is_summary_file("Room summary.md", "generated"));
+        // A user upload with the same name is NOT the canonical summary.
+        assert!(!is_summary_file("Room summary.md", "upload"));
+        assert!(!is_summary_file("notes.md", "generated"));
+    }
+
+    #[test]
+    fn cleans_model_one_liner() {
+        assert_eq!(clean_one_liner("- A lease agreement.\nExtra"), "A lease agreement.");
+        assert_eq!(clean_one_liner("\n\n  The résumé.  "), "The résumé.");
+    }
+
+    #[test]
+    fn link_file_name_is_safe_and_falls_back() {
+        assert_eq!(link_file_name("Hello World", "https://x.com"), "Hello World.md");
+        // Path/reserved characters are folded, whitespace collapsed.
+        assert_eq!(link_file_name("A/B: c\td", "https://x.com"), "A B c d.md");
+        // Empty title falls back to the URL (reserved chars folded), never empty.
+        assert_eq!(link_file_name("   ", "https://ex.com/p"), "https ex.com p.md");
     }
 
     #[test]

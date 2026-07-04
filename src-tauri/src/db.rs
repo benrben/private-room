@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS files (
   original_bytes BLOB,
   extracted_text TEXT,
   folder_id TEXT,
+  -- ADD-17: cached one-line "what is this file" summary, cleared whenever the
+  -- file's content changes so re-summarizing only touches new/changed files.
+  ai_summary TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -255,6 +258,14 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
+    // ADD-17: cached per-file one-liner for "Summarize room". Nullable; a fresh
+    // NULL means the file still needs summarizing (also how content changes
+    // invalidate a stale summary). Guarded ALTER, like folder_id above.
+    if table_exists(conn, "files")? && !column_exists(conn, "files", "ai_summary")? {
+        conn.execute("ALTER TABLE files ADD COLUMN ai_summary TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
     // HLT-3: FTS5 index over chunk text. Create the virtual table and its sync
     // triggers if absent, then backfill from existing chunks — but only when the
     // table was just created, so re-opening a migrated room stays cheap. The
@@ -450,6 +461,64 @@ pub fn list_file_inventory(conn: &Connection) -> Result<Vec<(String, String)>, S
     Ok(rows)
 }
 
+/// ADD-17: one file's fields needed to build the room summary. `text` is only
+/// the first ~1500 chars (clipped in SQL). `ai_summary` is the cached one-liner
+/// (None → still needs summarizing). `folder` is the owning folder's name.
+pub struct SummaryFile {
+    pub id: String,
+    pub name: String,
+    pub mime: String,
+    pub source: String,
+    pub folder: Option<String>,
+    pub text: Option<String>,
+    pub ai_summary: Option<String>,
+}
+
+/// ADD-17: every file with the fields the summarizer needs, grouped by folder
+/// (top-level files last) then creation order, so the file list reads sensibly.
+pub fn list_files_for_summary(conn: &Connection) -> Result<Vec<SummaryFile>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.id, f.name, coalesce(f.mime_type,''), f.source, fo.name,
+                    substr(f.extracted_text, 1, 1500), f.ai_summary
+             FROM files f LEFT JOIN folders fo ON fo.id = f.folder_id
+             ORDER BY (fo.name IS NULL), fo.name COLLATE NOCASE, f.created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(SummaryFile {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                mime: r.get(2)?,
+                source: r.get(3)?,
+                folder: r.get(4)?,
+                text: r.get(5)?,
+                ai_summary: r.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// ADD-17: cache a file's generated one-liner so re-runs skip it.
+pub fn set_file_ai_summary(conn: &Connection, id: &str, summary: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE files SET ai_summary = ?2 WHERE id = ?1",
+        params![id, summary],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Today's date as YYYY-MM-DD, from SQLite so it matches stored timestamps.
+pub fn current_date(conn: &Connection) -> String {
+    conn.query_row("SELECT strftime('%Y-%m-%d','now')", [], |r| r.get(0))
+        .unwrap_or_default()
+}
+
 /// Full metadata row for one file by id.
 pub fn get_file_meta(conn: &Connection, id: &str) -> Result<FileMeta, String> {
     conn.query_row(
@@ -522,8 +591,11 @@ pub fn update_file_content(
     bytes: &[u8],
     text: Option<&str>,
 ) -> Result<(), String> {
+    // ADD-17: content changed, so the cached one-liner is stale — clear it so
+    // the next "Summarize room" run re-summarizes this file.
     conn.execute(
-        "UPDATE files SET original_bytes = ?2, extracted_text = ?3, size_bytes = ?4
+        "UPDATE files SET original_bytes = ?2, extracted_text = ?3, size_bytes = ?4,
+             ai_summary = NULL
          WHERE id = ?1",
         params![id, bytes, text, bytes.len() as i64],
     )

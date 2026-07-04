@@ -54,12 +54,17 @@ fn map_send_err(e: reqwest::Error) -> String {
 ///
 /// `cancel`, when set true mid-stream (ADD-7), breaks out of the token loop
 /// promptly and returns whatever text streamed so far.
+///
+/// `keep_alive` (HLT-5) is how long Ollama holds the model resident after this
+/// call (e.g. "30m" to stay warm, "2m"/"0" to release a vision model on
+/// low-RAM machines). The caller decides per model — see `vision_keep_alive`.
 pub async fn chat_stream_tools(
     model: &str,
     messages: Vec<ChatMessage>,
     tools: Option<&serde_json::Value>,
     temperature: Option<f64>,
     cancel: Option<Arc<AtomicBool>>,
+    keep_alive: &str,
     mut on_delta: impl FnMut(&str),
 ) -> Result<(String, Vec<ToolCall>), String> {
     use futures_util::StreamExt;
@@ -72,9 +77,10 @@ pub async fn chat_stream_tools(
         "model": model,
         "messages": messages,
         "stream": true,
-        // Keep the model resident so follow-up questions don't pay the
-        // multi-second load cost again.
-        "keep_alive": "30m",
+        // HLT-5: how long Ollama keeps this model resident after the call.
+        // Chat passes "30m" to stay warm; vision/grounding calls pass a short
+        // value on low-RAM machines so both models never sit resident at once.
+        "keep_alive": keep_alive,
         // CRITICAL: some models (qwen3-vl) declare a 256K context window and
         // Ollama will allocate ~30 GB of KV cache for it, OOM-killing the
         // server on a 16 GB machine. Our prompts fit comfortably in 8K.
