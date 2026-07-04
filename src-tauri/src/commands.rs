@@ -10,6 +10,13 @@ use uuid::Uuid;
 
 const DEFAULT_MODEL: &str = "qwen3.5:4b";
 const MAX_CONTEXT_CHUNKS: usize = 6;
+/// ADD-13: retrieval blend weights (simple weighted sum of a per-chunk keyword
+/// score and vector cosine, both normalized to ~[0,1]).
+const KEYWORD_WEIGHT: f32 = 0.5;
+const VECTOR_WEIGHT: f32 = 0.5;
+/// ADD-13: widen the per-signal candidate pool before blending, so a strong
+/// vector-only (synonym) chunk can surface above weak keyword hits.
+const RETRIEVE_CANDIDATES: usize = MAX_CONTEXT_CHUNKS * 4;
 const MAX_IMPORT_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_ATTACHED_IMAGES: usize = 4;
 const MAX_HISTORY_MESSAGES: usize = 12;
@@ -38,6 +45,11 @@ pub struct AppState {
     /// The entry is inserted when an ask starts and removed when it returns
     /// (success, error, or cancel). `cancel_ask` and `close_room` flip flags.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// ADD-13: generation stamp for the lazy background embed pass. Each room
+    /// unlock bumps it and spawns one loop carrying that stamp; a loop exits
+    /// once the stamp moves on (a newer room opened) or the room closes, so at
+    /// most one embed pass is ever live.
+    pub embed_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Removes an ask's cancel flag from the registry when the ask returns, on
@@ -650,6 +662,7 @@ pub fn create_room(
     push_recent(&app, &room.name, &room.path);
     *state.room.lock().unwrap() = Some(room);
     refresh_mcp(&app);
+    spawn_embedding_backfill(&app);
     Ok(info)
 }
 
@@ -672,6 +685,7 @@ pub fn open_room(
     push_recent(&app, &room.name, &room.path);
     *state.room.lock().unwrap() = Some(room);
     refresh_mcp(&app);
+    spawn_embedding_backfill(&app);
     Ok(info)
 }
 
@@ -2304,8 +2318,96 @@ fn question_terms(question: &str) -> Vec<String> {
 struct ScoredChunk {
     file_name: String,
     text: String,
-    #[allow(dead_code)]
     score: f32,
+}
+
+/// ADD-13: embed the question so retrieval can blend meaning with keywords.
+/// Returns None on ANY failure (model missing, Ollama down, empty result) so the
+/// caller silently falls back to the pure keyword path — the chat never blocks.
+/// Keeps the small embed model briefly warm so back-to-back questions are fast.
+async fn embed_question(question: &str) -> Option<Vec<f32>> {
+    match ollama::embed(ollama::EMBED_MODEL, std::slice::from_ref(&question.to_string()), "5m").await {
+        Ok(mut v) if !v.is_empty() && !v[0].is_empty() => Some(v.remove(0)),
+        _ => None,
+    }
+}
+
+/// ADD-13: kick off the lazy background embed pass for the currently open room.
+/// Bumps the embed generation (so any older pass exits) and spawns exactly one
+/// loop carrying the new stamp. Cheap to call on every unlock; no-op work once
+/// every chunk already has a vector.
+fn spawn_embedding_backfill(app: &tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    use tauri::Manager as _;
+    let generation = {
+        let state = app.state::<AppState>();
+        state.embed_generation.fetch_add(1, Ordering::SeqCst) + 1
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        backfill_embeddings(app, generation).await;
+    });
+}
+
+/// ADD-13: background pass that fills `chunks.embedding` for the open room. It
+/// drains NULL-embedding chunks in batches, then idles — picking up chunks that
+/// later imports/edits add — until the room closes or a newer room opens (the
+/// generation stamp moves). Never holds the room lock across the Ollama call.
+/// Any embed error (model missing / server down) just backs off and retries; the
+/// keyword path keeps working meanwhile. The short `keep_alive` lets Ollama
+/// release the small embed model on its own once indexing goes idle (HLT-5).
+async fn backfill_embeddings(app: tauri::AppHandle, generation: u64) {
+    use std::sync::atomic::Ordering;
+    use tauri::Manager as _;
+    const BATCH: usize = 32;
+    loop {
+        // Collect a batch under the lock; bail if this pass is stale or closed.
+        let (path, batch) = {
+            let state = app.state::<AppState>();
+            if state.embed_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let guard = state.room.lock().unwrap();
+            let Some(room) = guard.as_ref() else { return };
+            let batch = db::chunks_missing_embedding(&room.conn, BATCH).unwrap_or_default();
+            (room.path.clone(), batch)
+        };
+
+        if batch.is_empty() {
+            // Fully indexed for now; poll for chunks future imports/edits add.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            continue;
+        }
+
+        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+        let vectors = match ollama::embed(ollama::EMBED_MODEL, &texts, "30s").await {
+            Ok(v) if v.len() == texts.len() => v,
+            _ => {
+                // Model missing or Ollama down — back off, then retry. Keyword
+                // retrieval stays fully functional in the meantime.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+        };
+
+        // Write the vectors back, only if this is still the same open room.
+        let state = app.state::<AppState>();
+        if state.embed_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let guard = state.room.lock().unwrap();
+        let Some(room) = guard.as_ref() else { return };
+        if room.path != path {
+            return;
+        }
+        for ((id, _), vec) in batch.iter().zip(vectors.iter()) {
+            if vec.is_empty() {
+                continue;
+            }
+            let blob = db::embedding_to_blob(vec);
+            let _ = db::set_chunk_embedding(&room.conn, id, &blob);
+        }
+    }
 }
 
 /// Build an FTS5 MATCH expression from search terms: each term is double-quoted
@@ -2325,24 +2427,87 @@ fn fts_match_expr<'a>(terms: impl IntoIterator<Item = &'a str>) -> Option<String
     }
 }
 
-/// HLT-3: retrieve context via the FTS5 index instead of scanning every chunk.
-/// Ranks by bm25() and takes the top MAX_CONTEXT_CHUNKS. Returns the chunks plus
-/// a `fallback` flag: true when nothing matched and we padded with recent
-/// content instead (CHG-10 — such filler must not be credited as a "source").
-/// The `(chunks, fallback)` tuple shape is preserved for callers.
-fn retrieve_context(conn: &Connection, question: &str) -> Result<(Vec<ScoredChunk>, bool), String> {
+/// HLT-3 + ADD-13: retrieve context by blending the FTS5 keyword score with
+/// vector (cosine) similarity over stored chunk embeddings, then taking the top
+/// MAX_CONTEXT_CHUNKS. `question_embedding` is the question's vector (from
+/// `embed_question`); pass None to run the pure keyword path unchanged — when
+/// the embed model is absent or no chunks are embedded yet, retrieval degrades
+/// cleanly to keywords.
+///
+/// Returns the chunks plus a `fallback` flag: true when nothing matched and we
+/// padded with recent content instead (CHG-10 — such filler must not be credited
+/// as a "source"). The `(chunks, fallback)` tuple shape is preserved for callers.
+fn retrieve_context(
+    conn: &Connection,
+    question: &str,
+    question_embedding: Option<&[f32]>,
+) -> Result<(Vec<ScoredChunk>, bool), String> {
+    // One candidate per chunk rowid, so keyword and vector scores line up.
+    struct Cand {
+        file_name: String,
+        text: String,
+        kw: f32,
+        vec: f32,
+    }
+    let mut pool: HashMap<i64, Cand> = HashMap::new();
+
+    // Keyword signal: bm25 (lower-is-better) → higher-is-better, min-max
+    // normalized across the hit set to ~[0,1] so it blends with cosine.
     if let Some(expr) = fts_match_expr(question_terms(question).iter().map(String::as_str)) {
-        let hits = db::search_chunks_fts(conn, &expr, MAX_CONTEXT_CHUNKS)?;
+        let hits = db::search_chunks_fts_ranked(conn, &expr, RETRIEVE_CANDIDATES)?;
         if !hits.is_empty() {
-            let scored = hits
-                .into_iter()
-                // bm25 is lower-is-better; negate so higher score = better match.
-                .map(|(file_name, text, bm25)| ScoredChunk {
-                    file_name,
+            let raws: Vec<f32> = hits.iter().map(|(_, _, _, bm25)| -*bm25 as f32).collect();
+            let max = raws.iter().cloned().fold(f32::MIN, f32::max);
+            let min = raws.iter().cloned().fold(f32::MAX, f32::min);
+            let span = max - min;
+            for ((rowid, name, text, _), raw) in hits.into_iter().zip(raws) {
+                let kw = if span > 0.0 { (raw - min) / span } else { 1.0 };
+                let e = pool.entry(rowid).or_insert_with(|| Cand {
+                    file_name: name,
                     text,
-                    score: -bm25 as f32,
-                })
-                .collect();
+                    kw: 0.0,
+                    vec: 0.0,
+                });
+                e.kw = kw;
+            }
+        }
+    }
+
+    // Vector signal: cosine of the question against every stored chunk vector
+    // (brute force), clamped to [0,1]; keep the strongest as candidates.
+    if let Some(q) = question_embedding {
+        let mut scored: Vec<(i64, String, String, f32)> = db::chunk_embeddings(conn)?
+            .into_iter()
+            .filter_map(|(rowid, name, text, blob)| {
+                db::blob_to_embedding(&blob)
+                    .map(|emb| (rowid, name, text, db::cosine_similarity(q, &emb).max(0.0)))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        for (rowid, name, text, cos) in scored.into_iter().take(RETRIEVE_CANDIDATES) {
+            let e = pool.entry(rowid).or_insert_with(|| Cand {
+                file_name: name,
+                text,
+                kw: 0.0,
+                vec: 0.0,
+            });
+            e.vec = cos;
+        }
+    }
+
+    if !pool.is_empty() {
+        let mut scored: Vec<ScoredChunk> = pool
+            .into_values()
+            .map(|c| ScoredChunk {
+                file_name: c.file_name,
+                text: c.text,
+                score: KEYWORD_WEIGHT * c.kw + VECTOR_WEIGHT * c.vec,
+            })
+            .collect();
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(MAX_CONTEXT_CHUNKS);
+        // A real match means at least one chunk scored above zero.
+        if scored.iter().any(|s| s.score > 0.0) {
             return Ok((scored, false));
         }
     }
@@ -2422,6 +2587,10 @@ pub async fn ask(
         ask_id: ask_id.clone(),
     };
 
+    // ADD-13: embed the question BEFORE taking the room lock (the Ollama call is
+    // async; the lock is not held across it). None on any failure → keyword-only.
+    let question_embedding = embed_question(&question).await;
+
     // Phase 1 (locked): gather context, save the user message.
     let (explicit_model, chat_messages, sources, first_image, temperature, web_enabled) = {
         let guard = state.room.lock().unwrap();
@@ -2444,7 +2613,8 @@ pub async fn ask(
             rows
         };
 
-        let (context_chunks, context_fallback) = retrieve_context(conn, &question)?;
+        let (context_chunks, context_fallback) =
+            retrieve_context(conn, &question, question_embedding.as_deref())?;
 
         // Attachments: images go to the model as vision input, text files as
         // guaranteed context.
@@ -3031,9 +3201,13 @@ async fn exec_tool(
         }
         "search_room" => {
             let query = args["query"].as_str().unwrap_or_default();
+            // ADD-13: embed the query before locking (async Ollama call); None
+            // → keyword-only retrieval.
+            let query_embedding = embed_question(query).await;
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            let (chunks, fallback) = retrieve_context(&room.conn, query)?;
+            let (chunks, fallback) =
+                retrieve_context(&room.conn, query, query_embedding.as_deref())?;
             if chunks.is_empty() || fallback {
                 return Ok("No matching content found.".into());
             }
@@ -3609,6 +3783,63 @@ mod tests {
         assert_eq!(link_file_name("A/B: c\td", "https://x.com"), "A B c d.md");
         // Empty title falls back to the URL (reserved chars folded), never empty.
         assert_eq!(link_file_name("   ", "https://ex.com/p"), "https ex.com p.md");
+    }
+
+    /// ADD-13: give every chunk a toy 2-D embedding chosen by its text so the
+    /// blend is deterministic — "vacation" chunks point one way, others the
+    /// orthogonal way.
+    fn embed_chunks_by_keyword(conn: &Connection, keyword: &str) {
+        for (id, text) in db::chunks_missing_embedding(conn, 1000).unwrap() {
+            let v = if text.to_lowercase().contains(keyword) {
+                [1.0f32, 0.0]
+            } else {
+                [0.0f32, 1.0]
+            };
+            db::set_chunk_embedding(conn, &id, &db::embedding_to_blob(&v)).unwrap();
+        }
+    }
+
+    #[test]
+    fn blend_retrieves_synonym_by_vector() {
+        // ADD-13: keyword search cannot connect "time off" to "vacation
+        // schedule", but a vector pointing at the vacation chunk can.
+        let conn = db::open_in_memory_schema();
+        db::insert_file(
+            &conn,
+            "handbook.txt",
+            "text/plain",
+            b"x",
+            Some("The office holiday party is on Friday."),
+            "upload",
+        )
+        .unwrap();
+        db::insert_file(
+            &conn,
+            "hr.txt",
+            "text/plain",
+            b"x",
+            Some("Our vacation schedule lists everyone's paid time away."),
+            "upload",
+        )
+        .unwrap();
+        embed_chunks_by_keyword(&conn, "vacation");
+
+        // Question shares no keyword with either file; its vector points at the
+        // vacation chunk ([1,0]).
+        let q = [1.0f32, 0.0];
+        let (chunks, fallback) =
+            retrieve_context(&conn, "how much unpaid absence", Some(&q)).unwrap();
+        assert!(!fallback, "vector match must count as a real match");
+        assert_eq!(chunks[0].file_name, "hr.txt");
+
+        // Pure keyword path (no embedding) still works for a literal term.
+        let (kw_chunks, kw_fallback) = retrieve_context(&conn, "holiday", None).unwrap();
+        assert!(!kw_fallback);
+        assert_eq!(kw_chunks[0].file_name, "handbook.txt");
+
+        // No keyword hit and no embedding → clean fallback to recent content.
+        let (_, generic_fallback) = retrieve_context(&conn, "xyzzy nothing", None).unwrap();
+        assert!(generic_fallback);
     }
 
     #[test]
