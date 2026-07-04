@@ -15,6 +15,135 @@ const ROOM_FILTER = [{ name: "Private Room Project", extensions: ["roomai"] }];
 
 const MIN_PASSWORD = 8;
 
+// ADD-15 — Room templates.
+// Plain frontend data: each template pre-fills the room's custom
+// instructions, a couple of starter memories, and a Welcome.md note.
+// Applied AFTER create_room succeeds using ordinary APIs, so everything
+// a template makes is normal, editable content — no special machinery.
+// "Blank" is the default and seeds nothing (a room exactly like today).
+type RoomTemplate = {
+  key: string;
+  label: string;
+  customInstructions: string;
+  memories: string[];
+  welcome: string;
+};
+
+const ROOM_TEMPLATES: RoomTemplate[] = [
+  {
+    key: "blank",
+    label: "Blank",
+    customInstructions: "",
+    memories: [],
+    welcome: "",
+  },
+  {
+    key: "legal",
+    label: "Legal",
+    customInstructions:
+      "This room holds legal documents and correspondence. Answer plainly " +
+      "and cite the exact file and clause you are drawing from. Flag " +
+      "deadlines, obligations, and anything that looks unusual. You are " +
+      "not a lawyer and do not give legal advice — when something has real " +
+      "consequences, say so and suggest checking with a professional.",
+    memories: [
+      "This room is for keeping and understanding legal paperwork.",
+      "Prefer quoting the document over paraphrasing when wording matters.",
+      "Always note dates, deadlines, and who is responsible for what.",
+    ],
+    welcome:
+      "# Welcome to your Legal room\n\n" +
+      "A quiet, private place for contracts, letters, and anything with " +
+      "fine print. Nothing here leaves your computer.\n\n" +
+      "## What to add here\n\n" +
+      "- Contracts and agreements (leases, employment, services)\n" +
+      "- Letters and notices you have sent or received\n" +
+      "- Terms, policies, and any document you want to actually understand\n\n" +
+      "## Three questions to try\n\n" +
+      "1. What are my main obligations and deadlines in this contract?\n" +
+      "2. Summarize this letter in plain language.\n" +
+      "3. Are there any unusual or one-sided clauses I should notice?\n",
+  },
+  {
+    key: "medical",
+    label: "Medical",
+    customInstructions:
+      "This room holds personal medical records and notes. Explain terms " +
+      "in plain, calm language and always point to the file a fact comes " +
+      "from. Help track dates, results, and medications. You are not a " +
+      "doctor and do not diagnose — for anything worrying, encourage the " +
+      "person to speak with a clinician.",
+    memories: [
+      "This room is for personal health records and understanding them.",
+      "Explain medical terms simply, without alarm.",
+      "Keep track of test dates, results, and medications when they appear.",
+    ],
+    welcome:
+      "# Welcome to your Medical room\n\n" +
+      "A private place to keep and make sense of your health records. " +
+      "Everything stays on this computer.\n\n" +
+      "## What to add here\n\n" +
+      "- Test and lab results, scans, and doctor's letters\n" +
+      "- Medication lists and prescriptions\n" +
+      "- Notes from appointments and questions for next time\n\n" +
+      "## Three questions to try\n\n" +
+      "1. What do the results in this report mean, in plain words?\n" +
+      "2. List every medication mentioned across my files.\n" +
+      "3. What questions should I bring to my next appointment?\n",
+  },
+  {
+    key: "research",
+    label: "Research",
+    customInstructions:
+      "This room is for research and reading. Help gather, compare, and " +
+      "summarize sources, and always cite the file behind each claim. When " +
+      "sources disagree, say so rather than smoothing it over. Keep a clear " +
+      "line between what a source states and your own reasoning.",
+    memories: [
+      "This room is for collecting and thinking through research material.",
+      "Cite the source file for every claim.",
+      "When sources conflict, surface the disagreement plainly.",
+    ],
+    welcome:
+      "# Welcome to your Research room\n\n" +
+      "A calm workspace for papers, articles, and notes on a topic you " +
+      "care about. Read, compare, and connect — all offline.\n\n" +
+      "## What to add here\n\n" +
+      "- Papers, PDFs, and saved web pages\n" +
+      "- Your own notes, outlines, and questions\n" +
+      "- Anything you want to compare, summarize, or cite later\n\n" +
+      "## Three questions to try\n\n" +
+      "1. Summarize the key findings across these documents.\n" +
+      "2. Where do these sources agree, and where do they disagree?\n" +
+      "3. What questions are still open based on what I have here?\n",
+  },
+  {
+    key: "journal",
+    label: "Journal",
+    customInstructions:
+      "This room is a personal journal. Be a warm, unhurried listener. " +
+      "Help reflect, notice patterns over time, and find past entries when " +
+      "asked. Never judge. Keep everything private and gentle in tone.",
+    memories: [
+      "This room is a private personal journal.",
+      "Respond with warmth and without judgement.",
+      "Help notice themes and patterns across entries over time.",
+    ],
+    welcome:
+      "# Welcome to your Journal\n\n" +
+      "A private space to write, reflect, and look back. No one else can " +
+      "read this — it lives only on your computer.\n\n" +
+      "## What to add here\n\n" +
+      "- Daily or occasional entries, however long or short\n" +
+      "- Thoughts, plans, gratitude, or things weighing on you\n" +
+      "- Photos or notes you want to remember\n\n" +
+      "## Three questions to try\n\n" +
+      "1. What themes come up most often in my entries?\n" +
+      "2. How was I feeling around last month?\n" +
+      "3. Find the entry where I wrote about a particular day or event.\n",
+  },
+];
+
 function fileNameOf(path: string): string {
   return path.split("/").pop() ?? path;
 }
@@ -54,6 +183,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [entering, setEntering] = useState(false);
   const [recent, setRecent] = useState<RecentRoom[]>([]);
+  const [templateKey, setTemplateKey] = useState("blank");
 
   const loadRecent = useCallback(() => {
     api
@@ -66,6 +196,7 @@ export default function App() {
     setPassword("");
     setConfirm("");
     setError("");
+    setTemplateKey("blank");
     setScreen(next);
   }, []);
 
@@ -139,6 +270,24 @@ export default function App() {
     setBusy(true);
     try {
       const info = await api.createRoom(path, password);
+      // The room is now open. Seed the chosen template through ordinary
+      // APIs before entering. Blank seeds nothing (empty content array),
+      // so this loop is skipped and the room stays exactly like today.
+      const tpl = ROOM_TEMPLATES.find((t) => t.key === templateKey);
+      if (tpl && tpl.key !== "blank") {
+        // Best-effort: a failed template must never trap the user outside
+        // their freshly created room. Surface a gentle note, still enter.
+        try {
+          await api.setSetting("custom_instructions", tpl.customInstructions);
+          for (const memory of tpl.memories) {
+            await api.addMemory(memory);
+          }
+          await api.saveGeneratedFile("Welcome.md", tpl.welcome);
+        } catch (e) {
+          console.error("Failed to apply room template", e);
+          setError("Room created, but its starter content could not be added.");
+        }
+      }
       enterRoom(info);
     } catch (e) {
       setError(String(e));
@@ -240,6 +389,24 @@ export default function App() {
             <p className="gate-sub">
               New room: <strong>{fileNameOf(screen.path)}</strong>
             </p>
+            <div className="tpl-picker">
+              <div className="tpl-label">Start from a template</div>
+              <div className="tpl-chips">
+                {ROOM_TEMPLATES.map((tpl) => (
+                  <button
+                    key={tpl.key}
+                    type="button"
+                    className={`tpl-chip${
+                      templateKey === tpl.key ? " active" : ""
+                    }`}
+                    aria-pressed={templateKey === tpl.key}
+                    onClick={() => setTemplateKey(tpl.key)}
+                  >
+                    {tpl.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <input
               type="password"
               placeholder="Choose a password"
