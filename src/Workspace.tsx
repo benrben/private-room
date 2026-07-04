@@ -229,6 +229,8 @@ export default function Workspace({ info, onLock }: Props) {
   const [folders, setFolders] = useState<Folder[]>([]);
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
   const [moveMenuFor, setMoveMenuFor] = useState<string | null>(null);
+  // ADD-16: which folder header (or "root") a dragged file is hovering over.
+  const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
   const [renamingFolder, setRenamingFolder] = useState<{ id: string; name: string } | null>(null);
   // BUG 1: inline "+ Folder" create input (window.prompt is a no-op in
   // WKWebView). null = not creating; a string is the in-progress name.
@@ -1251,7 +1253,15 @@ export default function Workspace({ info, onLock }: Props) {
   /** One file row — identical behaviour whether loose or inside a folder. */
   function renderFileRow(f: FileMeta) {
     return (
-      <div key={f.id} className="file-row">
+      <div
+        key={f.id}
+        className="file-row"
+        draggable
+        onDragStart={(e) => {
+          e.dataTransfer.setData("text/plain", f.id);
+          e.dataTransfer.effectAllowed = "move";
+        }}
+      >
         <button className="file-main" onClick={() => viewFile(f.id)}>
           <span className="file-icon">
             <FileTypeIcon file={f} />
@@ -1680,7 +1690,21 @@ export default function Workspace({ info, onLock }: Props) {
       <div className="body">
         {/* ------- pane 1: file explorer ------- */}
         <aside className="sidebar">
-          <div className="side-head">
+          <div
+            className={`side-head${dragOverFolder === "__root__" ? " drag-over" : ""}`}
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+              if (dragOverFolder !== "__root__") setDragOverFolder("__root__");
+            }}
+            onDragLeave={() => setDragOverFolder(null)}
+            onDrop={(e) => {
+              e.preventDefault();
+              const id = e.dataTransfer.getData("text/plain");
+              setDragOverFolder(null);
+              if (id) moveFile(id, null);
+            }}
+          >
             <span>Files</span>
             <span className="side-head-actions">
               {files.length > 0 && (
@@ -1753,7 +1777,21 @@ export default function Workspace({ info, onLock }: Props) {
               const collapsed = collapsedFolders.has(folder.id);
               return (
                 <div key={folder.id} className="folder-group">
-                  <div className="folder-head">
+                  <div
+                    className={`folder-head${dragOverFolder === folder.id ? " drag-over" : ""}`}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = "move";
+                      if (dragOverFolder !== folder.id) setDragOverFolder(folder.id);
+                    }}
+                    onDragLeave={() => setDragOverFolder(null)}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const id = e.dataTransfer.getData("text/plain");
+                      setDragOverFolder(null);
+                      if (id) moveFile(id, folder.id);
+                    }}
+                  >
                     <button
                       className="folder-caret-btn"
                       title={collapsed ? "Expand" : "Collapse"}
@@ -1808,7 +1846,9 @@ export default function Workspace({ info, onLock }: Props) {
                   {!collapsed && (
                     <div className="folder-files">
                       {inFolder.length === 0 ? (
-                        <div className="folder-empty">Empty — use “Move to…”.</div>
+                        <div className="folder-empty">
+                          Empty — drag a file here, or use the 🗂 button on a file.
+                        </div>
                       ) : (
                         inFolder.map(renderFileRow)
                       )}

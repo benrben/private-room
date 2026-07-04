@@ -640,6 +640,18 @@ code {
   background: var(--panel-2);
 }
 
+/* ADD-16: drag-a-file-onto-a-folder (and onto the Files header to un-group). */
+.file-row[draggable="true"] {
+  cursor: grab;
+}
+.folder-head.drag-over,
+.side-head.drag-over {
+  background: var(--accent-soft);
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+  border-radius: 8px;
+}
+
 .folder-caret-btn {
   background: none;
   border: none;
