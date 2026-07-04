@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { ReactNode, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AiStatus,
@@ -9,6 +9,7 @@ import {
   FileContent,
   FileMeta,
   FileTarget,
+  FileVersion,
   formatSize,
   McpServerStatus,
   Memory,
@@ -18,6 +19,7 @@ import {
 } from "./api";
 import {
   CloseIcon,
+  DownloadIcon,
   EmptyChatArt,
   EmptyViewerArt,
   EyeIcon,
@@ -107,6 +109,12 @@ function annotationTarget(a: AnnotationPayload): FileTarget {
   };
 }
 
+/** Human-friendly timestamp for a saved version (ADD-2). */
+function formatWhen(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
 /** Read-only extracted-text preview that can highlight a quoted snippet. */
 function TextView({ text, quote }: { text: string; quote?: string }) {
   const ref = useRef<HTMLPreElement>(null);
@@ -144,11 +152,28 @@ export default function Workspace({ info, onLock }: Props) {
   const [showSettings, setShowSettings] = useState(false);
   const [mcpTools, setMcpTools] = useState<string[]>([]);
   const [webOn, setWebOn] = useState(false);
+  // ADD-2 version history panel.
+  const [showHistory, setShowHistory] = useState(false);
+  const [versions, setVersions] = useState<FileVersion[]>([]);
+  // ADD-3 two-step delete: which item is awaiting confirmation, keyed "kind:id".
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // HLT-6 cloud-sync banner.
+  const [showSyncWarn, setShowSyncWarn] = useState(false);
   const chatRef = useRef<HTMLDivElement>(null);
   const initRef = useRef(false);
   const toastSeq = useRef(0);
   const openFileRef = useRef<OpenFile | null>(null);
   openFileRef.current = openFile;
+  // ADD-1: show the "not encrypted" notice only once per session.
+  const exportWarnedRef = useRef(false);
+  // ADD-3: revert the confirm affordance after a few seconds.
+  const confirmTimer = useRef<number | undefined>(undefined);
+  // SEC-3 auto-lock bookkeeping (refs so the interval reads live values).
+  const autolockRef = useRef<string>("15");
+  const lastActivityRef = useRef<number>(Date.now());
+  const askingRef = useRef(false);
+  const prevAskingRef = useRef(false);
+  askingRef.current = asking;
 
   function pushToast(kind: Toast["kind"], text: string) {
     const id = ++toastSeq.current;
@@ -171,6 +196,150 @@ export default function Workspace({ info, onLock }: Props) {
       .getSetting("web_provider")
       .then((v) => setWebOn(v === "duckduckgo" || v === "searxng"))
       .catch(() => {});
+  }
+
+  // SEC-3: (re)load the per-room auto-lock choice into the ref the timer reads.
+  function refreshAutolock() {
+    api
+      .getSetting("autolock_minutes")
+      .then((v) => {
+        autolockRef.current = v ?? "15";
+      })
+      .catch(() => {});
+  }
+
+  // ---- ADD-1: export copies out of the room ----
+  /** The room's contents leave encrypted; exported copies are plain files. */
+  function noteExportOnce() {
+    if (exportWarnedRef.current) return;
+    exportWarnedRef.current = true;
+    pushToast("info", "Exported copies are normal, NOT encrypted files.");
+  }
+
+  async function exportOne(id: string, name: string) {
+    const dest = await api.chooseSavePath({ defaultPath: name });
+    if (!dest) return;
+    try {
+      await api.exportFile(id, dest);
+      noteExportOnce();
+      pushToast("success", `Exported "${name}".`);
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  async function exportAllFiles() {
+    const dir = await api.chooseOpenPath({ directory: true });
+    if (!dir || Array.isArray(dir)) return;
+    try {
+      const count = await api.exportAll(dir);
+      noteExportOnce();
+      pushToast(
+        "success",
+        `Exported ${count} file${count === 1 ? "" : "s"} out of the room.`,
+      );
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  // ---- ADD-2: file version history ----
+  async function openHistory() {
+    if (!openFile) return;
+    if (showHistory) {
+      setShowHistory(false);
+      return;
+    }
+    try {
+      const vs = await api.listFileVersions(openFile.id);
+      // Newest first, defensively (backend order not relied upon).
+      setVersions([...vs].sort((a, b) => b.savedAt.localeCompare(a.savedAt)));
+      setShowHistory(true);
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  async function restoreVersion(versionId: string) {
+    const current = openFile;
+    if (!current) return;
+    try {
+      await api.restoreFileVersion(versionId);
+      const content = await api.getFileContent(current.id);
+      setOpenFile({ ...current, content });
+      setFiles(await api.listFiles());
+      setVersions(
+        [...(await api.listFileVersions(current.id))].sort((a, b) =>
+          b.savedAt.localeCompare(a.savedAt),
+        ),
+      );
+      pushToast("success", "Restored an earlier version.");
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  // ---- ADD-3: two-step delete ----
+  function askConfirm(key: string) {
+    window.clearTimeout(confirmTimer.current);
+    setConfirmDelete(key);
+    confirmTimer.current = window.setTimeout(
+      () => setConfirmDelete((k) => (k === key ? null : k)),
+      3000,
+    );
+  }
+
+  function cancelConfirm() {
+    window.clearTimeout(confirmTimer.current);
+    setConfirmDelete(null);
+  }
+
+  /** A trash/× button that first asks "Delete? ✓ ✕" before firing. */
+  function deleteControl(
+    key: string,
+    trigger: ReactNode,
+    onConfirm: () => void,
+    title: string,
+  ): ReactNode {
+    if (confirmDelete === key) {
+      return (
+        <span className="confirm-del">
+          <span className="confirm-q">Delete?</span>
+          <button
+            className="chip-btn confirm-yes"
+            title="Confirm delete"
+            onClick={() => {
+              cancelConfirm();
+              onConfirm();
+            }}
+          >
+            ✓
+          </button>
+          <button className="chip-btn confirm-no" title="Keep" onClick={cancelConfirm}>
+            ✕
+          </button>
+        </span>
+      );
+    }
+    return (
+      <button
+        className="chip-btn danger"
+        title={title}
+        onClick={() => askConfirm(key)}
+      >
+        {trigger}
+      </button>
+    );
+  }
+
+  // ---- HLT-6: dismiss the cloud-sync warning for this room ----
+  async function dismissSyncWarn() {
+    setShowSyncWarn(false);
+    try {
+      await api.setSetting("hlt6_sync_dismissed", "1");
+    } catch {
+      /* best-effort; banner is already hidden for this session */
+    }
   }
 
   function connectedTools(statuses: McpServerStatus[]): string[] {
@@ -212,6 +381,16 @@ export default function Workspace({ info, onLock }: Props) {
       setStreamText((t) => t + delta);
     });
     refreshWebAccess();
+    refreshAutolock();
+    // HLT-6: warn once per room when it lives in a cloud-sync folder.
+    if (info.synced) {
+      api
+        .getSetting("hlt6_sync_dismissed")
+        .then((v) => {
+          if (v !== "1") setShowSyncWarn(true);
+        })
+        .catch(() => {});
+    }
     // The AI can drive the app: open files in the viewer, create/edit files,
     // and highlight spots in documents.
     const unlistenOpen = api.onAgentOpenFile((p) => {
@@ -274,6 +453,58 @@ export default function Workspace({ info, onLock }: Props) {
     const el = chatRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, asking, streamText]);
+
+  // SEC-3: treat "an answer just finished" as fresh activity, so an idle user
+  // who kicked off a long answer gets the full timeout after it lands (and we
+  // never lock mid-stream — the timer skips while asking is true).
+  useEffect(() => {
+    if (prevAskingRef.current && !asking) {
+      lastActivityRef.current = Date.now();
+    }
+    prevAskingRef.current = asking;
+  }, [asking]);
+
+  // SEC-3: auto-lock on idle or after sleep. One timer + activity listeners.
+  useEffect(() => {
+    const bump = () => {
+      lastActivityRef.current = Date.now();
+    };
+    window.addEventListener("mousemove", bump);
+    window.addEventListener("keydown", bump);
+    let lastTick = Date.now();
+    const interval = window.setInterval(() => {
+      const now = Date.now();
+      const gap = now - lastTick;
+      lastTick = now;
+      const setting = autolockRef.current;
+      if (setting === "off") return;
+      const limitMs = Number(setting) * 60_000;
+      if (!Number.isFinite(limitMs) || limitMs <= 0) return;
+      // Never lock while an answer is streaming — wait for it to finish.
+      if (askingRef.current) return;
+      const idle = now - lastActivityRef.current;
+      // A gap far larger than the 30s interval means the Mac slept; if that
+      // sleep exceeded the limit, lock on this first tick after waking even if
+      // a stray mousemove already refreshed the activity clock.
+      const slept = gap > 45_000;
+      if (idle >= limitMs || (slept && gap >= limitMs)) {
+        onLock();
+      }
+    }, 30_000);
+    return () => {
+      window.removeEventListener("mousemove", bump);
+      window.removeEventListener("keydown", bump);
+      window.clearInterval(interval);
+    };
+  }, [onLock]);
+
+  // ADD-3: cancel any pending confirm timer on unmount.
+  useEffect(() => () => window.clearTimeout(confirmTimer.current), []);
+
+  // ADD-2: a fresh file starts with the history panel closed.
+  useEffect(() => {
+    setShowHistory(false);
+  }, [openFile?.id]);
 
   const modelReady =
     (ai?.running &&
@@ -520,6 +751,7 @@ export default function Workspace({ info, onLock }: Props) {
           onClose={() => {
             setShowSettings(false);
             refreshWebAccess();
+            refreshAutolock();
           }}
         />
       )}
@@ -529,9 +761,20 @@ export default function Workspace({ info, onLock }: Props) {
         <aside className="sidebar">
           <div className="side-head">
             <span>Files</span>
-            <button className="subtle" onClick={importFiles}>
-              + Add
-            </button>
+            <span className="side-head-actions">
+              {files.length > 0 && (
+                <button
+                  className="subtle"
+                  title="Save normal copies of every file to a folder"
+                  onClick={exportAllFiles}
+                >
+                  Export all…
+                </button>
+              )}
+              <button className="subtle" onClick={importFiles}>
+                + Add
+              </button>
+            </span>
           </div>
           <div className="file-list">
             {files.length === 0 && (
@@ -563,12 +806,18 @@ export default function Workspace({ info, onLock }: Props) {
                   <PaperclipIcon size={14} />
                 </button>
                 <button
-                  className="chip-btn danger"
-                  title="Remove from room"
-                  onClick={() => removeFile(f.id)}
+                  className="chip-btn"
+                  title="Export a normal copy out of the room"
+                  onClick={() => exportOne(f.id, f.name)}
                 >
-                  <TrashIcon size={14} />
+                  <DownloadIcon size={14} />
                 </button>
+                {deleteControl(
+                  `file:${f.id}`,
+                  <TrashIcon size={14} />,
+                  () => removeFile(f.id),
+                  "Remove from room",
+                )}
               </div>
             ))}
           </div>
@@ -584,15 +833,15 @@ export default function Workspace({ info, onLock }: Props) {
               {memories.map((m) => (
                 <div key={m.id} className="memory-row">
                   <span dir="auto">{m.content}</span>
-                  <button
-                    className="chip-btn danger"
-                    onClick={async () => {
+                  {deleteControl(
+                    `mem:${m.id}`,
+                    "×",
+                    async () => {
                       await api.deleteMemory(m.id);
                       setMemories(await api.listMemories());
-                    }}
-                  >
-                    ×
-                  </button>
+                    },
+                    "Forget this",
+                  )}
                 </div>
               ))}
               <div className="memory-add">
@@ -636,6 +885,48 @@ export default function Workspace({ info, onLock }: Props) {
                           : "Edit"}
                     </button>
                   )}
+                  <span className="history-wrap">
+                    <button
+                      className={`subtle ${showHistory ? "active" : ""}`}
+                      title="Earlier saved versions of this file"
+                      onClick={openHistory}
+                    >
+                      History
+                    </button>
+                    {showHistory && (
+                      <div className="history-pop">
+                        {versions.length === 0 ? (
+                          <div className="history-empty">
+                            No earlier versions yet.
+                          </div>
+                        ) : (
+                          versions.map((v) => (
+                            <div key={v.id} className="history-row">
+                              <span className="history-meta">
+                                <span className="history-cause">{v.cause}</span>
+                                <span className="history-time">
+                                  {formatWhen(v.savedAt)}
+                                </span>
+                              </span>
+                              <button
+                                className="subtle"
+                                onClick={() => restoreVersion(v.id)}
+                              >
+                                Restore
+                              </button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
+                  </span>
+                  <button
+                    className="subtle btn-ic"
+                    title="Export a normal copy out of the room"
+                    onClick={() => exportOne(openFile.id, openFile.content.name)}
+                  >
+                    <DownloadIcon size={13} /> Export
+                  </button>
                   <button
                     className="subtle btn-ic"
                     onClick={() => setOpenFile(null)}
@@ -803,17 +1094,25 @@ export default function Workspace({ info, onLock }: Props) {
             <button className="subtle" title="New chat session" onClick={newChat}>
               ＋ New
             </button>
-            {activeChatId && (
-              <button
-                className="chip-btn danger"
-                title="Delete this chat session"
-                onClick={() => removeChat(activeChatId)}
-              >
-                <TrashIcon size={14} />
-              </button>
-            )}
+            {activeChatId &&
+              deleteControl(
+                `chat:${activeChatId}`,
+                <TrashIcon size={14} />,
+                () => removeChat(activeChatId),
+                "Delete this chat session",
+              )}
           </div>
 
+          {showSyncWarn && (
+            <div className="banner">
+              This room lives in a synced folder. Never open it on two computers
+              at the same time — the file can be damaged. Lock it before
+              switching machines.{" "}
+              <button className="subtle" onClick={dismissSyncWarn}>
+                Dismiss
+              </button>
+            </div>
+          )}
           {ai && !ai.running && (
             <div className="banner">
               Local AI engine is offline. Start <strong>Ollama</strong> to chat
