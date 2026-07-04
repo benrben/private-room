@@ -49,6 +49,11 @@ export default function Settings({
   const [pwRepeat, setPwRepeat] = useState("");
   const [pwError, setPwError] = useState("");
   const [pwSaved, setPwSaved] = useState(false);
+
+  // ADD-11: Touch ID unlock. Needs the open room's path (from room_info).
+  const [roomPath, setRoomPath] = useState("");
+  const [touchIdOn, setTouchIdOn] = useState(false);
+  const [touchIdErr, setTouchIdErr] = useState("");
   // ADD-4: duplicate room.
   const [dupDest, setDupDest] = useState("");
   const [dupPassword, setDupPassword] = useState("");
@@ -93,6 +98,15 @@ export default function Settings({
     api.getSetting("autolock_minutes").then((v) => {
       if (v) setAutolock(v);
     });
+    // ADD-11: learn the open room's path, then whether Touch ID is enabled.
+    api
+      .roomInfo()
+      .then((info) => {
+        if (!info) return;
+        setRoomPath(info.path);
+        api.touchIdHas(info.path).then(setTouchIdOn).catch(() => {});
+      })
+      .catch(() => {});
     const unlisten = listen<PullProgress>("pull-progress", (e) => {
       setPullStatus(e.payload.status);
       setPullPercent(e.payload.percent);
@@ -220,6 +234,23 @@ export default function Settings({
       window.setTimeout(() => setPwSaved(false), 2400);
     } catch (e) {
       setPwError(String(e));
+    }
+  }
+
+  // ADD-11: flip Touch ID unlock for this room. On = store the open room's
+  // password in the Keychain behind biometrics; off = delete the entry.
+  async function toggleTouchId() {
+    setTouchIdErr("");
+    try {
+      if (touchIdOn) {
+        await api.touchIdDisable(roomPath);
+        setTouchIdOn(false);
+      } else {
+        await api.touchIdEnable();
+        setTouchIdOn(true);
+      }
+    } catch (e) {
+      setTouchIdErr(String(e));
     }
   }
 
@@ -487,6 +518,32 @@ export default function Settings({
                 {pwSaved ? "Password changed ✓" : "Change password"}
               </button>
             </div>
+
+            {/* ADD-11 — Touch ID unlock */}
+            <label className="settings-label">Touch ID unlock</label>
+            <div className="settings-toggle-row">
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  checked={touchIdOn}
+                  onChange={toggleTouchId}
+                />
+                <span className="switch-track" aria-hidden="true">
+                  <span className="switch-thumb" />
+                </span>
+              </label>
+              <span>
+                {touchIdOn
+                  ? "This room can be unlocked with Touch ID."
+                  : "Unlock this room with a fingerprint."}
+              </span>
+            </div>
+            <p className="settings-hint">
+              Your password is stored in the macOS Keychain, guarded by
+              biometrics — never in the room file. Changing your password
+              updates it automatically.
+            </p>
+            {touchIdErr && <div className="gate-error">{touchIdErr}</div>}
 
             {/* ADD-4 — duplicate room */}
             <label className="settings-label">Duplicate room</label>

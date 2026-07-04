@@ -1,3 +1,4 @@
+mod biometrics;
 mod commands;
 pub mod db;
 pub mod extraction;
@@ -18,6 +19,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::create_room,
             commands::open_room,
+            commands::touchid_has,
+            commands::touchid_enable,
+            commands::touchid_disable,
+            commands::touchid_open,
             commands::close_room,
             commands::room_info,
             commands::take_pending_open,

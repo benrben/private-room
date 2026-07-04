@@ -675,6 +675,43 @@ pub fn open_room(
     Ok(info)
 }
 
+// ---------------------------------------------------------------- Touch ID (ADD-11)
+
+/// True if a biometric Keychain entry exists for this room path. Never prompts.
+#[tauri::command]
+pub fn touchid_has(path: String) -> Result<bool, String> {
+    Ok(crate::biometrics::has(&path))
+}
+
+/// Store the CURRENTLY-OPEN room's password in the Keychain, guarded by
+/// biometrics. The secret is read from the in-memory Room — it is never taken
+/// from a file and never written anywhere but the Keychain.
+#[tauri::command]
+pub fn touchid_enable(state: State<'_, AppState>) -> Result<(), String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    crate::biometrics::store(&room.path, &room.password)
+}
+
+/// Turn Touch ID off for a room: delete its Keychain entry (idempotent).
+#[tauri::command]
+pub fn touchid_disable(path: String) -> Result<(), String> {
+    crate::biometrics::delete(&path)
+}
+
+/// Fingerprint-unlock: trigger the system biometric prompt to read the stored
+/// password, then take the normal `open_room` path. On cancel/failure this
+/// returns a clear error and the UI falls back to the password field.
+#[tauri::command]
+pub fn touchid_open(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<RoomInfo, String> {
+    let password = crate::biometrics::read(&path)?;
+    open_room(app, state, path, password)
+}
+
 #[tauri::command]
 pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     use tauri::Emitter;
@@ -1355,6 +1392,16 @@ pub fn change_password(
     db::verify_password(&room.path, &current)?;
     db::rekey(&room.conn, &new_password)?;
     room.password = new_password;
+    // ADD-11: keep Touch ID working after a password change. Chosen behavior:
+    // UPDATE the Keychain entry with the new password (re-store overwrites it).
+    // Storing creates a fresh biometric item and needs no prompt. If it somehow
+    // fails, delete the stale entry so Touch ID can never hand back the old
+    // password — the room then falls back to typing until re-enabled.
+    if crate::biometrics::has(&room.path)
+        && crate::biometrics::store(&room.path, &room.password).is_err()
+    {
+        let _ = crate::biometrics::delete(&room.path);
+    }
     Ok(())
 }
 
