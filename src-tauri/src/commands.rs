@@ -2004,6 +2004,15 @@ async fn exec_tool(
             if !enabled {
                 return Ok("Web access is turned off in Settings → Online features.".into());
             }
+            // RM-2: serve a fresh (<24h) cached copy without touching the network.
+            let cached = {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                db::get_fresh_web_page(&room.conn, url)
+            };
+            if let Some((title, text)) = cached {
+                return Ok(clamp_tool_result(format!("[{title}] {url}\n\n{text}")));
+            }
             let _ = window.emit("ask-delta", format!("🌐 Fetching {url} (leaves this Mac)…\n"));
             let (title, text) = web::fetch_page(url).await?;
             {
