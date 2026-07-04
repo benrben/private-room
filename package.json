@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "e2e": "wdio run e2e/wdio.conf.mjs",
+    "e2e:mock": "node e2e/mock-ollama.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -29,6 +31,10 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "@wdio/cli": "^9.9.1",
+    "@wdio/local-runner": "^9.9.1",
+    "@wdio/mocha-framework": "^9.9.1",
+    "@wdio/spec-reporter": "^9.9.1",
     "typescript": "~5.8.3",
     "vite": "^7.0.4"
   }

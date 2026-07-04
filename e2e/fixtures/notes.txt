@@ -1,0 +1,6 @@
+Project Apollo — quick notes
+
+The Apollo program landed twelve people on the Moon between 1969 and 1972.
+Apollo 11 was the first crewed mission to land, in July 1969.
+The Saturn V rocket remains the most powerful launch vehicle ever flown.
+Budget notes and crew rosters are tracked in the accompanying spreadsheet.
