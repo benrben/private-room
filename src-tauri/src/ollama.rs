@@ -1,9 +1,22 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-const BASE_URL: &str = "http://127.0.0.1:11434";
+/// Ollama's HTTP base URL. Normally the local daemon, but overridable via the
+/// `PRIVATE_ROOM_OLLAMA_URL` env var so end-to-end tests (HLT-8) can point the
+/// app at a mock server with no real model. Cached on first read; behaviour is
+/// identical to the old hardcoded constant when the env var is unset.
+fn base_url() -> &'static str {
+    static BASE_URL: OnceLock<String> = OnceLock::new();
+    BASE_URL.get_or_init(|| {
+        std::env::var("PRIVATE_ROOM_OLLAMA_URL")
+            .ok()
+            .map(|s| s.trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:11434".to_string())
+    })
+}
 
 #[derive(Serialize, Clone, Default)]
 pub struct ChatMessage {
@@ -99,7 +112,7 @@ pub async fn chat_stream_tools(
         body["think"] = serde_json::Value::Bool(false);
     }
     let resp = client()?
-        .post(format!("{BASE_URL}/api/chat"))
+        .post(format!("{}/api/chat", base_url()))
         .json(&body)
         .send()
         .await
@@ -172,7 +185,7 @@ pub async fn warm(model: &str) -> Result<(), String> {
         "options": { "num_ctx": 8192 },
     });
     client()?
-        .post(format!("{BASE_URL}/api/generate"))
+        .post(format!("{}/api/generate", base_url()))
         .json(&body)
         .send()
         .await
@@ -192,7 +205,7 @@ pub async fn pull(
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
-        .post(format!("{BASE_URL}/api/pull"))
+        .post(format!("{}/api/pull", base_url()))
         .json(&serde_json::json!({ "model": model, "stream": true }))
         .send()
         .await
@@ -235,7 +248,7 @@ pub async fn pull(
 
 pub async fn delete_model(model: &str) -> Result<(), String> {
     let resp = client()?
-        .delete(format!("{BASE_URL}/api/delete"))
+        .delete(format!("{}/api/delete", base_url()))
         .json(&serde_json::json!({ "model": model }))
         .send()
         .await
@@ -252,7 +265,7 @@ pub async fn delete_model(model: &str) -> Result<(), String> {
 
 pub async fn list_models() -> Result<Vec<String>, String> {
     let resp = client()?
-        .get(format!("{BASE_URL}/api/tags"))
+        .get(format!("{}/api/tags", base_url()))
         .send()
         .await
         .map_err(map_send_err)?;
