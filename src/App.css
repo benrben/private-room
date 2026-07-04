@@ -543,6 +543,97 @@ code {
   flex-shrink: 0;
 }
 
+/* ---- Wave 2: data safety (ADD-1/2/3, HLT-6) ---- */
+
+/* Files-pane header actions (Export all… + Add). */
+.side-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ADD-2 — version history popover, anchored under the History button. */
+.history-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.history-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  width: 280px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+}
+
+.history-empty {
+  padding: 12px 10px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.history-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 8px;
+}
+
+.history-row:hover {
+  background: var(--panel);
+}
+
+.history-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.history-cause {
+  font-size: 13px;
+}
+
+.history-time {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* ADD-3 — inline "Delete? ✓ ✕" confirm affordance. */
+.confirm-del {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.confirm-q {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 0 4px;
+}
+
+.chip-btn.confirm-yes {
+  color: var(--ok);
+  opacity: 1;
+}
+
+.chip-btn.confirm-yes:hover {
+  background: rgba(90, 190, 130, 0.15);
+}
+
+.chip-btn.confirm-no {
+  opacity: 1;
+}
+
 .viewer-empty {
   margin: auto;
   text-align: center;
