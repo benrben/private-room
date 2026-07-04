@@ -84,6 +84,9 @@ export interface FileContent {
 
 export interface AiStatus {
   running: boolean;
+  /** True when Ollama is installed on this Mac even if not currently running
+   * — lets onboarding tell "not installed" from "not started" (ADD-10). */
+  installed: boolean;
   models: string[];
   defaultModel: string;
   /** Cloud CLIs detected on this Mac ("claude-cli", "codex-cli"). */
@@ -199,12 +202,21 @@ export const api = {
   warmModel: () => invoke<void>("warm_model"),
   pullModel: (name: string) => invoke<void>("pull_model", { name }),
   deleteModel: (name: string) => invoke<void>("delete_model", { name }),
+  openOllama: () => invoke<void>("open_ollama"),
   listChats: () => invoke<Chat[]>("list_chats"),
   createChat: () => invoke<Chat>("create_chat"),
   deleteChat: (id: string) => invoke<void>("delete_chat", { id }),
+  renameChat: (id: string, title: string) =>
+    invoke<void>("rename_chat", { id, title }),
   getMessages: (chatId: string) => invoke<Message[]>("get_messages", { chatId }),
-  ask: (chatId: string, question: string, attachments: string[]) =>
-    invoke<Message>("ask", { chatId, question, attachments }),
+  deleteMessage: (id: string) => invoke<void>("delete_message", { id }),
+  // ADD-7: each ask carries an id so it can be cancelled mid-stream.
+  ask: (chatId: string, question: string, attachments: string[], askId: string) =>
+    invoke<Message>("ask", { chatId, question, attachments, askId }),
+  cancelAsk: (askId: string) => invoke<void>("cancel_ask", { askId }),
+  // ADD-8: import a pasted image (base64) as a room file.
+  importImageBytes: (name: string, b64: string) =>
+    invoke<FileMeta>("import_image_bytes", { name, b64 }),
   locateInImage: (
     fileId: string,
     query: string,
@@ -218,6 +230,15 @@ export const api = {
     listen<string>("open-room-file", (e) => cb(e.payload)),
   onAskDelta: (cb: (delta: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-delta", (e) => cb(e.payload)),
+  // CHG-5: structured turn events. `ask-step` fires when a tool runs;
+  // `ask-round` fires when a new model round starts (clear the live text);
+  // `ask-notice` carries a user-facing warning (e.g. UX-4 truncation).
+  onAskStep: (cb: (label: string) => void): Promise<UnlistenFn> =>
+    listen<string>("ask-step", (e) => cb(e.payload)),
+  onAskRound: (cb: () => void): Promise<UnlistenFn> =>
+    listen("ask-round", () => cb()),
+  onAskNotice: (cb: (text: string) => void): Promise<UnlistenFn> =>
+    listen<string>("ask-notice", (e) => cb(e.payload)),
   onAgentOpenFile: (
     cb: (payload: AgentOpenFilePayload) => void,
   ): Promise<UnlistenFn> =>

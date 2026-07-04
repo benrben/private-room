@@ -628,8 +628,9 @@ export default function Workspace({ info, onLock }: Props) {
       createdAt: "",
     };
     setMessages((m) => [...m, optimistic]);
+    const askId = crypto.randomUUID();
     try {
-      await api.ask(activeChatId, q, attachments.map((f) => f.id));
+      await api.ask(activeChatId, q, attachments.map((f) => f.id), askId);
       setMessages(await api.getMessages(activeChatId));
       setChats(await api.listChats());
       setAttachments([]);
