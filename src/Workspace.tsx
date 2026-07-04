@@ -1,4 +1,11 @@
-import { ClipboardEvent, ReactNode, useEffect, useRef, useState } from "react";
+import {
+  ClipboardEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
@@ -13,12 +20,14 @@ import {
   FileMeta,
   FileTarget,
   FileVersion,
+  Folder,
   formatSize,
   McpServerStatus,
   Memory,
   Message,
   modelLabel,
   RoomInfo,
+  SearchResults,
 } from "./api";
 import {
   CloseIcon,
@@ -51,6 +60,12 @@ interface OpenFile {
   content: FileContent;
   target?: FileTarget;
 }
+
+/** One flattened search hit (ADD-6) — the arrow-key navigable unit. */
+type FlatResult =
+  | { kind: "file"; id: string; name: string; snippet: string }
+  | { kind: "message"; chatId: string; messageId: string; snippet: string }
+  | { kind: "memory"; id: string; snippet: string };
 
 /** A transient message to the user. Successes/info self-dismiss; errors stay
  * until closed (UX-7). */
@@ -195,11 +210,29 @@ export default function Workspace({ info, onLock }: Props) {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   // HLT-6 cloud-sync banner.
   const [showSyncWarn, setShowSyncWarn] = useState(false);
+  // ADD-16 folders: the room's one-level folders, which groups are collapsed,
+  // which file row's "Move to…" menu is open, and the inline folder rename.
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
+  const [moveMenuFor, setMoveMenuFor] = useState<string | null>(null);
+  const [renamingFolder, setRenamingFolder] = useState<{ id: string; name: string } | null>(null);
+  // UX-5 memory inline edit.
+  const [editingMemory, setEditingMemory] = useState<{ id: string; content: string } | null>(null);
+  // ADD-6 search overlay.
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResults | null>(null);
+  const [searchSel, setSearchSel] = useState(0);
   const chatRef = useRef<HTMLDivElement>(null);
   const initRef = useRef(false);
   const toastSeq = useRef(0);
   const openFileRef = useRef<OpenFile | null>(null);
   openFileRef.current = openFile;
+  // UX-6: live values for the single window keydown listener (added once).
+  const showSearchRef = useRef(false);
+  showSearchRef.current = showSearch;
+  const showSettingsRef = useRef(false);
+  showSettingsRef.current = showSettings;
   // ADD-1: show the "not encrypted" notice only once per session.
   const exportWarnedRef = useRef(false);
   // ADD-3: revert the confirm affordance after a few seconds.
@@ -403,6 +436,7 @@ export default function Workspace({ info, onLock }: Props) {
       .setTitle(`${info.name} — Private Room`)
       .catch(() => {});
     api.listFiles().then(setFiles);
+    api.listFolders().then(setFolders).catch(() => {});
     api.listMemories().then(setMemories);
     refreshAi();
     // Pre-load the model so the first question doesn't pay the cold start.
@@ -506,6 +540,7 @@ export default function Workspace({ info, onLock }: Props) {
     });
     const unlistenFiles = api.onRoomFilesChanged(() => {
       api.listFiles().then(setFiles);
+      api.listFolders().then(setFolders).catch(() => {});
     });
     api.mcpStatus().then((s) => setMcpTools(connectedTools(s))).catch(() => {});
     const unlistenMcp = api.onMcpStatus((statuses) => {
@@ -586,6 +621,71 @@ export default function Workspace({ info, onLock }: Props) {
 
   // ADD-3: cancel any pending confirm timer on unmount.
   useEffect(() => () => window.clearTimeout(confirmTimer.current), []);
+
+  // UX-6: one window keydown listener for Mac shortcuts. Only ⌘-combos are
+  // intercepted (never plain typing); Esc has a priority order. Added once —
+  // it reads live state through refs.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        if (showSearchRef.current) {
+          e.preventDefault();
+          setShowSearch(false);
+          return;
+        }
+        // Let Settings handle its own Esc (it renders its own close).
+        if (showSettingsRef.current) return;
+        // Don't steal Esc from an inline input (memory/rename/composer) that
+        // uses it to cancel — only close the viewer when not typing.
+        const t = e.target as HTMLElement | null;
+        const typing =
+          t != null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+        if (!typing && openFileRef.current) {
+          e.preventDefault();
+          setOpenFile(null);
+        }
+        return;
+      }
+      if (!e.metaKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "n") {
+        e.preventDefault();
+        newChat();
+      } else if (k === "l") {
+        e.preventDefault();
+        handleLock();
+      } else if (k === "f" || k === "k") {
+        e.preventDefault();
+        setSearchSel(0);
+        setShowSearch(true);
+      } else if (k === ",") {
+        e.preventDefault();
+        setShowSettings(true);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // ADD-6: debounced room-wide search while the overlay is open.
+  useEffect(() => {
+    if (!showSearch) return;
+    const q = searchQuery.trim();
+    if (!q) {
+      setSearchResults(null);
+      return;
+    }
+    const t = window.setTimeout(() => {
+      api
+        .searchAll(q)
+        .then((r) => {
+          setSearchResults(r);
+          setSearchSel(0);
+        })
+        .catch(() => {});
+    }, 200);
+    return () => window.clearTimeout(t);
+  }, [searchQuery, showSearch]);
 
   // ADD-2: a fresh file starts with the history panel closed.
   useEffect(() => {
@@ -932,6 +1032,96 @@ export default function Workspace({ info, onLock }: Props) {
     setMemoryDraft("");
   }
 
+  // ---- UX-5: edit a memory in place ----
+  async function saveMemoryEdit() {
+    if (!editingMemory) return;
+    const { id, content } = editingMemory;
+    const trimmed = content.trim();
+    setEditingMemory(null);
+    if (!trimmed) return;
+    try {
+      await api.updateMemory(id, trimmed);
+      setMemories(await api.listMemories());
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  // ---- ADD-16: folders ----
+  async function createFolderPrompt() {
+    const name = window.prompt("New folder name")?.trim();
+    if (!name) return;
+    try {
+      await api.createFolder(name);
+      setFolders(await api.listFolders());
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  async function commitFolderRename() {
+    if (!renamingFolder) return;
+    const { id, name } = renamingFolder;
+    const trimmed = name.trim();
+    setRenamingFolder(null);
+    if (!trimmed) return;
+    try {
+      await api.renameFolder(id, trimmed);
+      setFolders(await api.listFolders());
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  // Deleting a folder only ungroups its files — it never deletes them.
+  async function deleteFolder(id: string) {
+    try {
+      await api.deleteFolder(id);
+      setFolders(await api.listFolders());
+      setFiles(await api.listFiles());
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  async function moveFile(fileId: string, folderId: string | null) {
+    setMoveMenuFor(null);
+    try {
+      await api.moveFileToFolder(fileId, folderId);
+      setFiles(await api.listFiles());
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  function toggleFolderCollapse(id: string) {
+    setCollapsedFolders((s) => {
+      const next = new Set(s);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  // ---- ADD-6: act on a search hit ----
+  function activateResult(r: FlatResult) {
+    if (r.kind === "file") {
+      viewFile(r.id, { find: r.snippet });
+    } else if (r.kind === "message") {
+      setActiveChatId(r.chatId);
+      // Best-effort: jump to the message once the chat's rendered.
+      const mid = r.messageId;
+      window.setTimeout(() => {
+        document
+          .getElementById(`msg-${mid}`)
+          ?.scrollIntoView({ block: "center" });
+      }, 120);
+    } else {
+      setShowMemory(true);
+    }
+    setShowSearch(false);
+  }
+
   async function changeModel(value: string) {
     setModel(value);
     await api.setSetting("model", value);
@@ -941,6 +1131,129 @@ export default function Workspace({ info, onLock }: Props) {
     .reverse()
     .find((m) => m.role === "assistant")?.id;
 
+  // ADD-16: files without a folder sit at the top level; the rest group.
+  const looseFiles = files.filter((f) => f.folderId === null);
+
+  /** One file row — identical behaviour whether loose or inside a folder. */
+  function renderFileRow(f: FileMeta) {
+    return (
+      <div key={f.id} className="file-row">
+        <button className="file-main" onClick={() => viewFile(f.id)}>
+          <span className="file-icon">
+            <FileTypeIcon file={f} />
+          </span>
+          <span className="file-name" title={f.name}>
+            {f.name}
+          </span>
+          {f.partiallyIndexed && (
+            <span
+              className="partial-badge"
+              title="Partially indexed — only the first part of this large file is searchable."
+            >
+              ◐
+            </span>
+          )}
+          <span className="file-size">{formatSize(f.sizeBytes)}</span>
+        </button>
+        <span className="move-wrap">
+          <button
+            className={`chip-btn ${moveMenuFor === f.id ? "active" : ""}`}
+            title="Move to a folder"
+            onClick={() => setMoveMenuFor(moveMenuFor === f.id ? null : f.id)}
+          >
+            🗂
+          </button>
+          {moveMenuFor === f.id && (
+            <div className="move-pop">
+              <button
+                className="move-opt"
+                disabled={f.folderId === null}
+                onClick={() => moveFile(f.id, null)}
+              >
+                No folder
+              </button>
+              {folders.map((fo) => (
+                <button
+                  key={fo.id}
+                  className="move-opt"
+                  disabled={f.folderId === fo.id}
+                  onClick={() => moveFile(f.id, fo.id)}
+                >
+                  {fo.name}
+                </button>
+              ))}
+              {folders.length === 0 && (
+                <div className="move-empty">No folders yet</div>
+              )}
+            </div>
+          )}
+        </span>
+        <button
+          className={`chip-btn ${attachments.some((a) => a.id === f.id) ? "active" : ""}`}
+          title={
+            f.mimeType.startsWith("image/")
+              ? "Attach image to your next question (vision)"
+              : "Pin this file into your next question"
+          }
+          onClick={() => toggleAttach(f)}
+        >
+          <PaperclipIcon size={14} />
+        </button>
+        <button
+          className="chip-btn"
+          title="Export a normal copy out of the room"
+          onClick={() => exportOne(f.id, f.name)}
+        >
+          <DownloadIcon size={14} />
+        </button>
+        {deleteControl(
+          `file:${f.id}`,
+          <TrashIcon size={14} />,
+          () => removeFile(f.id),
+          "Remove from room",
+        )}
+      </div>
+    );
+  }
+
+  // ADD-6: flatten the grouped results for arrow-key navigation.
+  const searchFlat: FlatResult[] = [];
+  if (searchResults) {
+    searchResults.files.forEach((f) =>
+      searchFlat.push({ kind: "file", id: f.id, name: f.name, snippet: f.snippet }),
+    );
+    searchResults.messages.forEach((m) =>
+      searchFlat.push({
+        kind: "message",
+        chatId: m.chatId,
+        messageId: m.messageId,
+        snippet: m.snippet,
+      }),
+    );
+    searchResults.memories.forEach((m) =>
+      searchFlat.push({ kind: "memory", id: m.id, snippet: m.snippet }),
+    );
+  }
+  const msgOffset = searchResults ? searchResults.files.length : 0;
+  const memOffset = searchResults
+    ? searchResults.files.length + searchResults.messages.length
+    : 0;
+
+  function onSearchKey(e: ReactKeyboardEvent<HTMLInputElement>) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSearchSel((s) => Math.min(s + 1, Math.max(searchFlat.length - 1, 0)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSearchSel((s) => Math.max(s - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const r = searchFlat[searchSel];
+      if (r) activateResult(r);
+    }
+    // Esc is handled by the global keydown listener.
+  }
+
   return (
     <div className="workspace">
       {dragOver && (
@@ -948,6 +1261,114 @@ export default function Workspace({ info, onLock }: Props) {
           <div className="drop-overlay-inner">
             <DownloadIcon size={28} />
             <span>Drop to add to this room</span>
+          </div>
+        </div>
+      )}
+      {showSearch && (
+        <div
+          className="search-overlay"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setShowSearch(false);
+          }}
+        >
+          <div className="search-panel">
+            <input
+              className="search-input"
+              autoFocus
+              dir="auto"
+              placeholder="Search files, messages and memories…"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={onSearchKey}
+            />
+            <div className="search-results">
+              {searchQuery.trim() &&
+                searchResults &&
+                searchFlat.length === 0 && (
+                  <div className="search-empty">No matches.</div>
+                )}
+              {searchResults && searchResults.files.length > 0 && (
+                <div className="search-group">
+                  <div className="search-group-head">Files</div>
+                  {searchResults.files.map((f, i) => (
+                    <button
+                      key={f.id}
+                      className={`search-result ${searchSel === i ? "sel" : ""}`}
+                      onMouseEnter={() => setSearchSel(i)}
+                      onClick={() =>
+                        activateResult({
+                          kind: "file",
+                          id: f.id,
+                          name: f.name,
+                          snippet: f.snippet,
+                        })
+                      }
+                    >
+                      <span className="search-result-title">{f.name}</span>
+                      <span className="search-result-snippet" dir="auto">
+                        {f.snippet}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {searchResults && searchResults.messages.length > 0 && (
+                <div className="search-group">
+                  <div className="search-group-head">Messages</div>
+                  {searchResults.messages.map((m, i) => {
+                    const idx = msgOffset + i;
+                    return (
+                      <button
+                        key={m.messageId}
+                        className={`search-result ${searchSel === idx ? "sel" : ""}`}
+                        onMouseEnter={() => setSearchSel(idx)}
+                        onClick={() =>
+                          activateResult({
+                            kind: "message",
+                            chatId: m.chatId,
+                            messageId: m.messageId,
+                            snippet: m.snippet,
+                          })
+                        }
+                      >
+                        <span className="search-result-snippet" dir="auto">
+                          {m.snippet}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {searchResults && searchResults.memories.length > 0 && (
+                <div className="search-group">
+                  <div className="search-group-head">Memories</div>
+                  {searchResults.memories.map((m, i) => {
+                    const idx = memOffset + i;
+                    return (
+                      <button
+                        key={m.id}
+                        className={`search-result ${searchSel === idx ? "sel" : ""}`}
+                        onMouseEnter={() => setSearchSel(idx)}
+                        onClick={() =>
+                          activateResult({
+                            kind: "memory",
+                            id: m.id,
+                            snippet: m.snippet,
+                          })
+                        }
+                      >
+                        <span className="search-result-snippet" dir="auto">
+                          {m.snippet}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+            <div className="search-hint">
+              ↑↓ to move · Enter to open · Esc to close
+            </div>
           </div>
         </div>
       )}
@@ -1005,12 +1426,22 @@ export default function Workspace({ info, onLock }: Props) {
           )}
           <button
             className="subtle btn-ic"
-            title="Settings"
+            title="Search ⌘F"
+            onClick={() => {
+              setSearchSel(0);
+              setShowSearch(true);
+            }}
+          >
+            <span className="search-glyph">⌕</span>
+          </button>
+          <button
+            className="subtle btn-ic"
+            title="Settings ⌘,"
             onClick={() => setShowSettings(true)}
           >
             <GearIcon size={15} />
           </button>
-          <button className="btn-ic" onClick={handleLock}>
+          <button className="btn-ic" title="Lock ⌘L" onClick={handleLock}>
             <LockIcon size={14} /> Lock
           </button>
         </div>
@@ -1045,6 +1476,13 @@ export default function Workspace({ info, onLock }: Props) {
                   Export all…
                 </button>
               )}
+              <button
+                className="subtle"
+                title="Create a folder to group files"
+                onClick={createFolderPrompt}
+              >
+                + Folder
+              </button>
               <button className="subtle" onClick={importFiles}>
                 + Add
               </button>
@@ -1057,43 +1495,77 @@ export default function Workspace({ info, onLock }: Props) {
                 encrypted inside this room.
               </div>
             )}
-            {files.map((f) => (
-              <div key={f.id} className="file-row">
-                <button className="file-main" onClick={() => viewFile(f.id)}>
-                  <span className="file-icon">
-                    <FileTypeIcon file={f} />
-                  </span>
-                  <span className="file-name" title={f.name}>
-                    {f.name}
-                  </span>
-                  <span className="file-size">{formatSize(f.sizeBytes)}</span>
-                </button>
-                <button
-                  className={`chip-btn ${attachments.some((a) => a.id === f.id) ? "active" : ""}`}
-                  title={
-                    f.mimeType.startsWith("image/")
-                      ? "Attach image to your next question (vision)"
-                      : "Pin this file into your next question"
-                  }
-                  onClick={() => toggleAttach(f)}
-                >
-                  <PaperclipIcon size={14} />
-                </button>
-                <button
-                  className="chip-btn"
-                  title="Export a normal copy out of the room"
-                  onClick={() => exportOne(f.id, f.name)}
-                >
-                  <DownloadIcon size={14} />
-                </button>
-                {deleteControl(
-                  `file:${f.id}`,
-                  <TrashIcon size={14} />,
-                  () => removeFile(f.id),
-                  "Remove from room",
-                )}
-              </div>
-            ))}
+            {/* ADD-16: top-level (unfoldered) files first, then folder groups. */}
+            {looseFiles.map(renderFileRow)}
+            {folders.map((folder) => {
+              const inFolder = files.filter((f) => f.folderId === folder.id);
+              const collapsed = collapsedFolders.has(folder.id);
+              return (
+                <div key={folder.id} className="folder-group">
+                  <div className="folder-head">
+                    <button
+                      className="folder-caret-btn"
+                      title={collapsed ? "Expand" : "Collapse"}
+                      onClick={() => toggleFolderCollapse(folder.id)}
+                    >
+                      {collapsed ? "▸" : "▾"}
+                    </button>
+                    {renamingFolder?.id === folder.id ? (
+                      <input
+                        className="folder-rename"
+                        autoFocus
+                        dir="auto"
+                        value={renamingFolder.name}
+                        onChange={(e) =>
+                          setRenamingFolder({ id: folder.id, name: e.target.value })
+                        }
+                        onBlur={commitFolderRename}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitFolderRename();
+                          if (e.key === "Escape") setRenamingFolder(null);
+                        }}
+                      />
+                    ) : (
+                      <button
+                        className="folder-label"
+                        onClick={() => toggleFolderCollapse(folder.id)}
+                      >
+                        <span className="folder-name" title={folder.name}>
+                          {folder.name}
+                        </span>
+                        <span className="count">{inFolder.length}</span>
+                      </button>
+                    )}
+                    <span className="folder-actions">
+                      <button
+                        className="chip-btn"
+                        title="Rename folder"
+                        onClick={() =>
+                          setRenamingFolder({ id: folder.id, name: folder.name })
+                        }
+                      >
+                        <PencilIcon size={13} />
+                      </button>
+                      {deleteControl(
+                        `folder:${folder.id}`,
+                        <TrashIcon size={14} />,
+                        () => deleteFolder(folder.id),
+                        "Delete folder (its files are kept, just ungrouped)",
+                      )}
+                    </span>
+                  </div>
+                  {!collapsed && (
+                    <div className="folder-files">
+                      {inFolder.length === 0 ? (
+                        <div className="folder-empty">Empty — use “Move to…”.</div>
+                      ) : (
+                        inFolder.map(renderFileRow)
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
 
           <div className="side-head clickable" onClick={() => setShowMemory(!showMemory)}>
@@ -1104,20 +1576,63 @@ export default function Workspace({ info, onLock }: Props) {
           </div>
           {showMemory && (
             <div className="memory-panel">
-              {memories.map((m) => (
-                <div key={m.id} className="memory-row">
-                  <span dir="auto">{m.content}</span>
-                  {deleteControl(
-                    `mem:${m.id}`,
-                    "×",
-                    async () => {
-                      await api.deleteMemory(m.id);
-                      setMemories(await api.listMemories());
-                    },
-                    "Forget this",
-                  )}
-                </div>
-              ))}
+              {memories.map((m) =>
+                editingMemory?.id === m.id ? (
+                  <div key={m.id} className="memory-row editing">
+                    <input
+                      className="memory-edit-input"
+                      autoFocus
+                      dir="auto"
+                      value={editingMemory.content}
+                      onChange={(e) =>
+                        setEditingMemory({ id: m.id, content: e.target.value })
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") saveMemoryEdit();
+                        if (e.key === "Escape") setEditingMemory(null);
+                      }}
+                    />
+                    <button
+                      className="chip-btn"
+                      title="Save"
+                      onClick={saveMemoryEdit}
+                    >
+                      ✓
+                    </button>
+                    <button
+                      className="chip-btn"
+                      title="Cancel"
+                      onClick={() => setEditingMemory(null)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ) : (
+                  <div key={m.id} className="memory-row">
+                    <span dir="auto">{m.content}</span>
+                    <span className="memory-actions">
+                      <button
+                        className="chip-btn"
+                        title="Edit this memory"
+                        onClick={() =>
+                          setEditingMemory({ id: m.id, content: m.content })
+                        }
+                      >
+                        <PencilIcon size={13} />
+                      </button>
+                      {deleteControl(
+                        `mem:${m.id}`,
+                        "×",
+                        async () => {
+                          await api.deleteMemory(m.id);
+                          setMemories(await api.listMemories());
+                        },
+                        "Forget this",
+                      )}
+                    </span>
+                  </div>
+                ),
+              )}
               <div className="memory-add">
                 <input
                   placeholder="Something the AI should always remember…"
@@ -1388,7 +1903,7 @@ export default function Workspace({ info, onLock }: Props) {
             >
               <PencilIcon size={13} />
             </button>
-            <button className="subtle" title="New chat session" onClick={newChat}>
+            <button className="subtle" title="New chat ⌘N" onClick={newChat}>
               ＋ New
             </button>
             {activeChatId &&
@@ -1494,7 +2009,7 @@ export default function Workspace({ info, onLock }: Props) {
                   ? splitMarkupBlocks(m.content)
                   : { text: m.content, boxes: undefined, annotation: undefined };
               return (
-              <div key={m.id} className={`msg ${m.role}`}>
+              <div key={m.id} id={`msg-${m.id}`} className={`msg ${m.role}`}>
                 <div className="msg-content" dir="auto">
                   {m.role === "assistant" ? (
                     <>

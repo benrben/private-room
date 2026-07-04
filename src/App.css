@@ -477,6 +477,258 @@ code {
   padding: 0 8px 8px;
 }
 
+/* ---------- ADD-16 folders ---------- */
+
+.folder-group {
+  margin-top: 2px;
+}
+
+.folder-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 8px;
+  padding: 2px 2px 2px 0;
+}
+
+.folder-head:hover {
+  background: var(--panel-2);
+}
+
+.folder-caret-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  padding: 4px 4px 4px 6px;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.folder-label {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 6px 2px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.folder-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-rename {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  padding: 5px 7px;
+}
+
+.folder-actions {
+  display: inline-flex;
+  align-items: center;
+  opacity: 0;
+}
+
+.folder-head:hover .folder-actions {
+  opacity: 1;
+}
+
+.folder-files {
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
+  margin-left: 10px;
+}
+
+.folder-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+/* File-row "Move to…" menu */
+
+.move-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.move-pop {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 20;
+  min-width: 150px;
+  margin-top: 2px;
+  padding: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.move-opt {
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.move-opt:hover:not(:disabled) {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.move-opt:disabled {
+  color: var(--text-dim);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.move-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 7px 9px;
+}
+
+/* HLT-4 partial-index badge */
+
+.partial-badge {
+  flex-shrink: 0;
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1;
+  cursor: default;
+}
+
+/* ---------- ADD-6 search overlay ---------- */
+
+.search-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.search-panel {
+  width: min(640px, 92vw);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.search-input {
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  padding: 16px 18px;
+  font-size: 16px;
+  background: transparent;
+}
+
+.search-input:focus {
+  border-color: var(--border);
+  outline: none;
+}
+
+.search-results {
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.search-group {
+  padding: 4px 0;
+}
+
+.search-group-head {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--text-dim);
+  padding: 6px 10px 4px;
+}
+
+.search-result {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.search-result.sel {
+  background: var(--accent-soft);
+}
+
+.search-result-title {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-result-snippet {
+  color: var(--text-dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-empty {
+  color: var(--text-dim);
+  font-size: 13px;
+  padding: 16px;
+  text-align: center;
+}
+
+.search-hint {
+  border-top: 1px solid var(--border);
+  padding: 8px 14px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.search-glyph {
+  font-size: 16px;
+  line-height: 0;
+}
+
 .empty-hint {
   color: var(--text-dim);
   font-size: 13px;
@@ -571,6 +823,23 @@ code {
   color: var(--text-dim);
   padding: 5px 0;
   border-bottom: 1px solid var(--border);
+}
+
+.memory-row.editing {
+  align-items: center;
+}
+
+.memory-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.memory-edit-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  padding: 5px 7px;
 }
 
 .memory-add {
