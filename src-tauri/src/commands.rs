@@ -1,7 +1,7 @@
 use crate::{db, extraction, mcp, ollama, web};
 use base64::Engine;
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tauri::State;
 use uuid::Uuid;
@@ -38,6 +38,9 @@ pub struct Room {
     pub conn: Connection,
     pub path: String,
     pub name: String,
+    /// The room's current password. Held in memory (the key already lives in
+    /// SQLCipher's memory anyway) so ADD-4 can re-key a freshly made copy.
+    pub password: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -47,6 +50,25 @@ pub struct RoomInfo {
     pub path: String,
     pub file_count: i64,
     pub message_count: i64,
+    /// True when the room file lives in a cloud-sync folder (HLT-6).
+    pub synced: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileVersion {
+    pub id: String,
+    pub saved_at: String,
+    pub cause: String,
+}
+
+/// Recent rooms live OUTSIDE any room, in the app's own data folder. Rooms are
+/// encrypted; this list holds only their names and paths, never their contents.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentRoom {
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -241,7 +263,24 @@ fn info_of(room: &Room) -> Result<RoomInfo, String> {
         path: room.path.clone(),
         file_count,
         message_count,
+        synced: is_synced_path(&room.path),
     })
+}
+
+/// True when the room file lives under a known cloud-sync root — databases and
+/// file sync are a dangerous mix, so the UI warns once (HLT-6). Covers iCloud
+/// (`Library/Mobile Documents`), modern `Library/CloudStorage/` (Dropbox,
+/// Google Drive, OneDrive), and legacy `~/Dropbox`.
+fn is_synced_path(path: &str) -> bool {
+    if path.contains("Library/Mobile Documents") || path.contains("Library/CloudStorage/") {
+        return true;
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && path.starts_with(&format!("{home}/Dropbox")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The web tools exist for the model only when the user picked a provider
@@ -434,8 +473,14 @@ pub fn create_room(
 ) -> Result<RoomInfo, String> {
     let name = room_name_from_path(&path);
     let conn = db::create_room(&path, &password, &name)?;
-    let room = Room { conn, path, name };
+    let room = Room {
+        conn,
+        path,
+        name,
+        password,
+    };
     let info = info_of(&room)?;
+    push_recent(&app, &room.name, &room.path);
     *state.room.lock().unwrap() = Some(room);
     refresh_mcp(&app);
     Ok(info)
@@ -450,8 +495,14 @@ pub fn open_room(
 ) -> Result<RoomInfo, String> {
     let conn = db::open_room(&path, &password)?;
     let name = db::get_meta(&conn, "name").unwrap_or_else(|| room_name_from_path(&path));
-    let room = Room { conn, path, name };
+    let room = Room {
+        conn,
+        path,
+        name,
+        password,
+    };
     let info = info_of(&room)?;
+    push_recent(&app, &room.name, &room.path);
     *state.room.lock().unwrap() = Some(room);
     refresh_mcp(&app);
     Ok(info)
@@ -460,6 +511,16 @@ pub fn open_room(
 #[tauri::command]
 pub fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     use tauri::Emitter;
+    // SEC-7: reclaim space before closing when a large amount was freed (e.g.
+    // the user deleted big files). Small deletions skip the slow vacuum.
+    {
+        let guard = state.room.lock().unwrap();
+        if let Some(room) = guard.as_ref() {
+            if db::reclaimable_bytes(&room.conn).unwrap_or(0) > 10 * 1024 * 1024 {
+                let _ = db::vacuum(&room.conn);
+            }
+        }
+    }
     *state.room.lock().unwrap() = None;
     // Dropping the clients kills the server processes (kill_on_drop).
     {
@@ -621,6 +682,21 @@ pub fn get_file_content(state: State<'_, AppState>, id: String) -> Result<FileCo
     Ok(content("binary", false, None, false))
 }
 
+/// The single write path for changing an existing file's bytes. Snapshots the
+/// CURRENT bytes into version history (ADD-2) tagged with `cause`, then
+/// overwrites and rebuilds the search index. Every caller that mutates a file's
+/// content goes through here so nothing is ever irreversibly overwritten.
+fn store_file_bytes(
+    conn: &Connection,
+    id: &str,
+    bytes: &[u8],
+    text: Option<&str>,
+    cause: &str,
+) -> Result<(), String> {
+    db::snapshot_file_version(conn, id, cause)?;
+    db::update_file_content(conn, id, bytes, text)
+}
+
 #[tauri::command]
 pub fn update_file_content(
     state: State<'_, AppState>,
@@ -632,7 +708,7 @@ pub fn update_file_content(
     let name = db::get_file_name(&room.conn, &id)?;
     let bytes = content.as_bytes();
     let text = extraction::extract_text(&name, bytes).unwrap_or_else(|| content.clone());
-    db::update_file_content(&room.conn, &id, bytes, Some(&text))?;
+    store_file_bytes(&room.conn, &id, bytes, Some(&text), "You saved")?;
     db::get_file_meta(&room.conn, &id)
 }
 
@@ -652,7 +728,7 @@ pub fn set_cell(
     let (name, bytes) = db::get_file_bytes_named(&room.conn, &id)?;
     let bytes = bytes.ok_or("File has no stored content.")?;
     let (new_bytes, text) = set_cell_in_bytes(&name, &bytes, sheet.as_deref(), &cell, &value)?;
-    db::update_file_content(&room.conn, &id, &new_bytes, text.as_deref())?;
+    store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref(), "You edited")?;
     let _ = window.emit("room-files-changed", ());
     let _ = window.emit("file-updated", &id);
     Ok(())
@@ -690,6 +766,223 @@ pub fn save_generated_file(
         Some(&content),
         "generated",
     )
+}
+
+// ---------------------------------------------------------------- data safety
+
+/// ADD-2: a file's saved versions (newest first).
+#[tauri::command]
+pub fn list_file_versions(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<FileVersion>, String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::list_file_versions(&room.conn, &id)
+}
+
+/// ADD-2: restore a saved version's bytes. Goes back through `store_file_bytes`,
+/// so the CURRENT state is snapshotted first — restoring is itself undoable.
+#[tauri::command]
+pub fn restore_file_version(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    version_id: String,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    let (file_id, bytes) = db::get_version(&room.conn, &version_id)?;
+    let name = db::get_file_name(&room.conn, &file_id)?;
+    let text = extraction::extract_text(&name, &bytes)
+        .or_else(|| String::from_utf8(bytes.clone()).ok());
+    store_file_bytes(&room.conn, &file_id, &bytes, text.as_deref(), "Restored")?;
+    let _ = window.emit("room-files-changed", ());
+    let _ = window.emit("file-updated", &file_id);
+    Ok(())
+}
+
+/// ADD-1: write one file's original bytes out as a normal (unencrypted) file.
+#[tauri::command]
+pub fn export_file(
+    state: State<'_, AppState>,
+    id: String,
+    dest_path: String,
+) -> Result<(), String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    let bytes = db::get_file_bytes(&room.conn, &id)?
+        .ok_or("This file has no stored content to export.")?;
+    std::fs::write(&dest_path, &bytes).map_err(|e| format!("Could not save the file: {e}"))?;
+    Ok(())
+}
+
+/// Choose a destination name inside a folder that will not overwrite anything:
+/// on a clash, insert " (2)", " (3)", … before the extension. `is_taken`
+/// reports whether a candidate name already exists.
+fn unique_export_name(name: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    if !is_taken(name) {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
+        _ => (name.to_string(), String::new()),
+    };
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{stem} ({n}){ext}");
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// ADD-1: export every file into `dest_dir`, never overwriting. Returns the
+/// number written.
+#[tauri::command]
+pub fn export_all(state: State<'_, AppState>, dest_dir: String) -> Result<u32, String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    let dir = std::path::Path::new(&dest_dir);
+    if !dir.is_dir() {
+        return Err("Choose a folder to export into.".into());
+    }
+    let files = db::list_files(&room.conn)?;
+    let mut written = 0u32;
+    for f in files {
+        let bytes = db::get_file_bytes(&room.conn, &f.id)?.unwrap_or_default();
+        // Files written earlier this run land on disk, so the existence check
+        // also dedups same-named files against each other.
+        let name = unique_export_name(&f.name, |candidate| dir.join(candidate).exists());
+        std::fs::write(dir.join(&name), &bytes)
+            .map_err(|e| format!("Could not write \"{name}\": {e}"))?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// SEC-4: rotate the room's password. Verifies `current` on a second throwaway
+/// connection, then re-keys the live connection.
+#[tauri::command]
+pub fn change_password(
+    state: State<'_, AppState>,
+    current: String,
+    new_password: String,
+) -> Result<(), String> {
+    if new_password.chars().count() < 8 {
+        return Err("Password must be at least 8 characters.".into());
+    }
+    let mut guard = state.room.lock().unwrap();
+    let room = guard.as_mut().ok_or("No room is open.")?;
+    db::verify_password(&room.path, &current)?;
+    db::rekey(&room.conn, &new_password)?;
+    room.password = new_password;
+    Ok(())
+}
+
+/// ADD-4: a full copy of the open room as it is now, optionally with its own
+/// new password. The original is never touched.
+#[tauri::command]
+pub fn duplicate_room(
+    state: State<'_, AppState>,
+    dest_path: String,
+    new_password: Option<String>,
+) -> Result<(), String> {
+    if let Some(pw) = &new_password {
+        if pw.chars().count() < 8 {
+            return Err("Password must be at least 8 characters.".into());
+        }
+    }
+    if std::path::Path::new(&dest_path).exists() {
+        return Err("A file already exists at that location.".into());
+    }
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::vacuum_into(&room.conn, &dest_path)?;
+    if let Some(pw) = new_password {
+        if let Err(e) = db::rekey_copy(&dest_path, &room.password, &pw) {
+            let _ = std::fs::remove_file(&dest_path);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// SEC-7: compact the open room on demand, reporting how much was reclaimed.
+#[tauri::command]
+pub fn compact_room(state: State<'_, AppState>) -> Result<String, String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    let reclaimable = db::reclaimable_bytes(&room.conn)?;
+    let mb = reclaimable as f64 / (1024.0 * 1024.0);
+    if mb < 0.05 {
+        return Ok("Nothing to recover.".into());
+    }
+    db::vacuum(&room.conn)?;
+    Ok(format!("Recovered {mb:.1} MB."))
+}
+
+// ---------------------------------------------------------------- recent rooms (ADD-5)
+
+/// Path to the recent-rooms list in the app's own data folder (outside any
+/// room). Rooms are encrypted; this file holds only names and paths.
+fn recent_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager as _;
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("recent.json"))
+}
+
+fn read_recent(app: &tauri::AppHandle) -> Vec<RecentRoom> {
+    recent_file(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_recent(app: &tauri::AppHandle, list: &[RecentRoom]) -> Result<(), String> {
+    let path = recent_file(app)?;
+    let json = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+/// Push a room to the front of the recents: most-recent-first, deduped by path,
+/// capped at 5.
+fn merge_recent(mut list: Vec<RecentRoom>, entry: RecentRoom) -> Vec<RecentRoom> {
+    list.retain(|r| r.path != entry.path);
+    list.insert(0, entry);
+    list.truncate(5);
+    list
+}
+
+fn push_recent(app: &tauri::AppHandle, name: &str, path: &str) {
+    let list = merge_recent(
+        read_recent(app),
+        RecentRoom {
+            name: name.to_string(),
+            path: path.to_string(),
+        },
+    );
+    let _ = write_recent(app, &list);
+}
+
+#[tauri::command]
+pub fn list_recent(app: tauri::AppHandle) -> Result<Vec<RecentRoom>, String> {
+    Ok(read_recent(&app))
+}
+
+#[tauri::command]
+pub fn remove_recent(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let mut list = read_recent(&app);
+    list.retain(|r| r.path != path);
+    write_recent(&app, &list)
+}
+
+#[tauri::command]
+pub fn clear_recent(app: tauri::AppHandle) -> Result<(), String> {
+    write_recent(&app, &[])
 }
 
 // ---------------------------------------------------------------- memory
@@ -1925,7 +2218,7 @@ async fn exec_tool(
             };
             let text = extraction::extract_text(&real_name, &new_bytes)
                 .or_else(|| String::from_utf8(new_bytes.clone()).ok());
-            db::update_file_content(&room.conn, &id, &new_bytes, text.as_deref())?;
+            store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref(), "AI edit")?;
             let _ = window.emit("room-files-changed", ());
             let _ = window.emit("file-updated", &id);
             Ok(format!(
@@ -1947,7 +2240,7 @@ async fn exec_tool(
             }
             let text = extraction::extract_text(&real_name, content.as_bytes())
                 .unwrap_or_else(|| content.to_string());
-            db::update_file_content(&room.conn, &id, content.as_bytes(), Some(&text))?;
+            store_file_bytes(&room.conn, &id, content.as_bytes(), Some(&text), "AI rewrite")?;
             let _ = window.emit("room-files-changed", ());
             let _ = window.emit("file-updated", &id);
             Ok(format!(
@@ -1968,7 +2261,7 @@ async fn exec_tool(
             let (id, real_name) = db::find_file_like(&room.conn, name)?;
             let bytes = db::get_file_bytes(&room.conn, &id)?.ok_or("File has no stored content.")?;
             let (new_bytes, text) = set_cell_in_bytes(&real_name, &bytes, sheet, &cell, &value)?;
-            db::update_file_content(&room.conn, &id, &new_bytes, text.as_deref())?;
+            store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref(), "AI cell change")?;
             let _ = window.emit("room-files-changed", ());
             let _ = window.emit("file-updated", &id);
             Ok(format!("Set {cell} = \"{value}\" in \"{real_name}\"."))
@@ -2200,5 +2493,54 @@ mod tests {
         let content = "Answer.\n\n```boxes\n{\"a\":1}\n```\n\n```annotation\n{\"b\":2}\n```";
         assert_eq!(strip_markup_blocks(content), "Answer.");
         assert_eq!(strip_markup_blocks("plain"), "plain");
+    }
+
+    #[test]
+    fn export_name_suffixes_on_clash() {
+        use std::collections::HashSet;
+        let mut taken: HashSet<String> = HashSet::new();
+        // Unclaimed name is used as-is.
+        assert_eq!(unique_export_name("fresh.txt", |c| taken.contains(c)), "fresh.txt");
+        // Clash inserts the suffix before the extension.
+        taken.insert("report.pdf".into());
+        assert_eq!(unique_export_name("report.pdf", |c| taken.contains(c)), "report (2).pdf");
+        // Keeps counting while suffixed names are also taken.
+        taken.insert("report (2).pdf".into());
+        assert_eq!(unique_export_name("report.pdf", |c| taken.contains(c)), "report (3).pdf");
+        // No extension → suffix goes at the end.
+        taken.insert("README".into());
+        assert_eq!(unique_export_name("README", |c| taken.contains(c)), "README (2)");
+        // A leading dot is not an extension separator.
+        taken.insert(".gitignore".into());
+        assert_eq!(unique_export_name(".gitignore", |c| taken.contains(c)), ".gitignore (2)");
+    }
+
+    #[test]
+    fn recent_dedup_and_cap() {
+        let mk = |p: &str| RecentRoom { name: p.into(), path: p.into() };
+        let mut list: Vec<RecentRoom> = Vec::new();
+        for p in ["a", "b", "c", "d", "e", "f"] {
+            list = merge_recent(list, mk(p));
+        }
+        // Newest first, capped at 5 (the oldest, "a", fell off).
+        assert_eq!(list.len(), 5);
+        assert_eq!(list[0].path, "f");
+        assert_eq!(list.last().unwrap().path, "b");
+        // Re-opening an existing path moves it to the front without duplicating.
+        list = merge_recent(list, mk("c"));
+        assert_eq!(list.len(), 5);
+        assert_eq!(list[0].path, "c");
+        assert_eq!(list.iter().filter(|r| r.path == "c").count(), 1);
+    }
+
+    #[test]
+    fn detects_synced_paths() {
+        assert!(is_synced_path(
+            "/Users/x/Library/Mobile Documents/com~apple~CloudDocs/room.roomai"
+        ));
+        assert!(is_synced_path(
+            "/Users/x/Library/CloudStorage/Dropbox/room.roomai"
+        ));
+        assert!(!is_synced_path("/Users/x/Documents/room.roomai"));
     }
 }

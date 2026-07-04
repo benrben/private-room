@@ -1,4 +1,4 @@
-use crate::commands::{Chat, FileMeta, Memory, Message};
+use crate::commands::{Chat, FileMeta, FileVersion, Memory, Message};
 use crate::extraction;
 use rusqlite::{params, Connection};
 use uuid::Uuid;
@@ -59,6 +59,16 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- ADD-2: previous bytes of a file, captured before each overwrite so any
+-- change can be undone. Dropped automatically when the file is deleted.
+CREATE TABLE IF NOT EXISTS file_versions (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  bytes BLOB NOT NULL,
+  saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  cause TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_versions_file ON file_versions(file_id);
 "#;
 
 fn apply_key(conn: &Connection, password: &str) -> Result<(), String> {
@@ -174,6 +184,20 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     }
+
+    // ADD-2: file version history. Old rooms opened via open_room never ran
+    // SCHEMA, so mirror the table (and its index) here with IF NOT EXISTS.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_versions (
+           id TEXT PRIMARY KEY,
+           file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+           bytes BLOB NOT NULL,
+           saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           cause TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_file_versions_file ON file_versions(file_id);",
+    )
+    .map_err(|e| e.to_string())?;
 
     // RM-2: the web_pages cache must be keyed by URL so save_web_page can upsert.
     // Old rooms opened via open_room never ran SCHEMA, so the table may not exist
@@ -725,4 +749,118 @@ pub fn get_fresh_web_page(conn: &Connection, url: &str) -> Option<(String, Strin
         },
     )
     .ok()
+}
+
+// ---------------------------------------------------------------- file versions (ADD-2)
+
+/// Copy a file's CURRENT bytes into history before it is overwritten, labelled
+/// with `cause`, then keep only the newest 10 versions for that file. A file
+/// with no stored bytes yet (nothing to preserve) is a no-op.
+pub fn snapshot_file_version(conn: &Connection, file_id: &str, cause: &str) -> Result<(), String> {
+    let current: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT original_bytes FROM files WHERE id = ?1",
+            [file_id],
+            |r| r.get::<_, Option<Vec<u8>>>(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let Some(bytes) = current else { return Ok(()) };
+    conn.execute(
+        "INSERT INTO file_versions(id, file_id, bytes, cause) VALUES (?1, ?2, ?3, ?4)",
+        params![Uuid::new_v4().to_string(), file_id, bytes, cause],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM file_versions WHERE file_id = ?1 AND id NOT IN (
+           SELECT id FROM file_versions WHERE file_id = ?1
+           ORDER BY saved_at DESC, rowid DESC LIMIT 10)",
+        [file_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A file's saved versions, newest first.
+pub fn list_file_versions(conn: &Connection, file_id: &str) -> Result<Vec<FileVersion>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, saved_at, cause FROM file_versions WHERE file_id = ?1
+             ORDER BY saved_at DESC, rowid DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([file_id], |r| {
+            Ok(FileVersion {
+                id: r.get(0)?,
+                saved_at: r.get(1)?,
+                cause: r.get(2)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// (owning file id, stored bytes) for one saved version.
+pub fn get_version(conn: &Connection, version_id: &str) -> Result<(String, Vec<u8>), String> {
+    conn.query_row(
+        "SELECT file_id, bytes FROM file_versions WHERE id = ?1",
+        [version_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(|_| "That version is no longer available.".to_string())
+}
+
+// ---------------------------------------------------------------- password / maintenance
+
+/// Verify a password against a room file on a fresh, throwaway connection —
+/// used by SEC-4 change-password so an open room can't be re-keyed by a
+/// walk-up attacker, and to open a freshly duplicated copy (ADD-4).
+pub fn verify_password(path: &str, password: &str) -> Result<(), String> {
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    apply_key(&conn, password)?;
+    verify_key(&conn).map_err(|_| "The current password is not correct.".to_string())
+}
+
+/// Change the encryption key of an OPEN connection (SQLCipher rekey).
+pub fn rekey(conn: &Connection, new_password: &str) -> Result<(), String> {
+    conn.pragma_update(None, "rekey", new_password)
+        .map_err(|e| e.to_string())
+}
+
+/// Open a room copy with its current key, then re-key it to `new_password`
+/// (ADD-4 duplicate-with-new-password).
+pub fn rekey_copy(path: &str, current_password: &str, new_password: &str) -> Result<(), String> {
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    apply_key(&conn, current_password)?;
+    verify_key(&conn).map_err(|_| "Could not open the copied room to set its password.".to_string())?;
+    conn.pragma_update(None, "rekey", new_password)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Bytes sitting in the database's free pages — space a VACUUM would reclaim.
+pub fn reclaimable_bytes(conn: &Connection) -> Result<i64, String> {
+    let freelist: i64 = conn
+        .pragma_query_value(None, "freelist_count", |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let page_size: i64 = conn
+        .pragma_query_value(None, "page_size", |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok(freelist * page_size)
+}
+
+/// Compact the database in place (SEC-7).
+pub fn vacuum(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("VACUUM").map_err(|e| e.to_string())
+}
+
+/// A consistent copy of the live, encrypted database to `dest` — keeps the
+/// current key (ADD-4). `dest` is single-quote-escaped into the statement
+/// since VACUUM INTO does not accept bound parameters.
+pub fn vacuum_into(conn: &Connection, dest: &str) -> Result<(), String> {
+    let escaped = dest.replace('\'', "''");
+    conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))
+        .map_err(|e| e.to_string())
 }
