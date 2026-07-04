@@ -35,6 +35,35 @@ imagesize = "0.13"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 umya-spreadsheet = { version = "3.0.0", default-features = false }
 
+# ADD-14: on-device OCR via Apple's Vision framework (macOS only).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSString",
+] }
+objc2-vision = { version = "0.3", features = [
+    "VNRequest",
+    "VNRequestHandler",
+    "VNRecognizeTextRequest",
+    "VNObservation",
+] }
+objc2-core-foundation = { version = "0.3", features = [
+    "CFData",
+    "CFCGTypes",
+] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGColorSpace",
+    "CGContext",
+    "CGBitmapContext",
+    "CGDataProvider",
+    "CGImage",
+    "CGPDFDocument",
+    "CGPDFPage",
+] }
+
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

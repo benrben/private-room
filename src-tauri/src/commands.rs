@@ -1,4 +1,4 @@
-use crate::{db, extraction, mcp, ollama, web};
+use crate::{db, extraction, mcp, ocr, ollama, web};
 use base64::Engine;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -750,15 +750,30 @@ pub fn take_pending_open(state: State<'_, AppState>) -> Result<Option<String>, S
 
 // ---------------------------------------------------------------- files
 
+/// ADD-14: a queued background OCR pass for one just-imported file.
+struct OcrJob {
+    id: String,
+    name: String,
+    mime: String,
+    ext: String,
+    bytes: Vec<u8>,
+}
+
 #[tauri::command]
 pub fn import_files(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<ImportReport, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
+    let room_path = room.path.clone();
     let mut imported = Vec::new();
     let mut errors = Vec::new();
+    // ADD-14: files that arrived with no extractable text and could be scans or
+    // photos. OCR runs in the background AFTER import returns, so a big scan
+    // never freezes the import.
+    let mut ocr_jobs: Vec<OcrJob> = Vec::new();
     for path in paths {
         let file_name = std::path::Path::new(&path)
             .file_name()
@@ -789,16 +804,67 @@ pub fn import_files(
                 {
                     text = extraction::markitdown_extract(&path);
                 }
+                let ext = extraction::extension_of(&file_name);
+                let needs_ocr = text.as_deref().map_or(true, |t| t.trim().is_empty())
+                    && ocr::is_ocr_candidate(&mime, &ext);
                 match db::insert_file(&room.conn, &file_name, &mime, &bytes, text.as_deref(), "upload")
                 {
-                    Ok(meta) => imported.push(meta),
+                    Ok(meta) => {
+                        if needs_ocr {
+                            ocr_jobs.push(OcrJob {
+                                id: meta.id.clone(),
+                                name: file_name.clone(),
+                                mime: mime.clone(),
+                                ext,
+                                bytes,
+                            });
+                        }
+                        imported.push(meta);
+                    }
                     Err(e) => errors.push(format!("{file_name}: {e}")),
                 }
             }
             Err(e) => errors.push(format!("{file_name}: {e}")),
         }
     }
+    // Release the room lock before kicking off background OCR — the workers
+    // re-acquire it once, briefly, only when they have text to store.
+    drop(guard);
+    for job in ocr_jobs {
+        spawn_ocr(app.clone(), room_path.clone(), job);
+    }
     Ok(ImportReport { imported, errors })
+}
+
+/// ADD-14: run on-device OCR for one file on a background thread. On success,
+/// store the recognized text (prefixed so the AI can flag OCR uncertainty),
+/// re-index it, and tell the UI the file list changed. Any failure is silent —
+/// the file simply keeps having no text, exactly like before this feature.
+fn spawn_ocr(app: tauri::AppHandle, room_path: String, job: OcrJob) {
+    use tauri::{Emitter, Manager};
+    std::thread::spawn(move || {
+        let _ = app.emit("ocr-progress", (&job.name, "started"));
+        let recognized = ocr::recognize(&job.mime, &job.ext, &job.bytes);
+        let Some(text) = recognized else {
+            let _ = app.emit("ocr-progress", (&job.name, "none"));
+            return;
+        };
+        let full_text = format!("(text recognized from scan)\n{text}");
+        {
+            let state = app.state::<AppState>();
+            let guard = state.room.lock().unwrap();
+            // The room may have been closed or switched while OCR ran; only
+            // write back into the same room this file was imported into.
+            match guard.as_ref() {
+                Some(room) if room.path == room_path => {
+                    let _ = db::update_file_content(&room.conn, &job.id, &job.bytes, Some(&full_text));
+                }
+                _ => return,
+            }
+        }
+        let _ = app.emit("room-files-changed", ());
+        let _ = app.emit("ocr-progress", (&job.name, "done"));
+    });
 }
 
 #[tauri::command]
