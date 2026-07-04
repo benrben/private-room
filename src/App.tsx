@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, RoomInfo } from "./api";
 import Workspace from "./Workspace";
 import { Logomark } from "./icons";
@@ -110,6 +111,8 @@ export default function App() {
 
   async function handleLock() {
     await api.closeRoom();
+    // Drop the room name from the title bar once locked (CHG-9).
+    getCurrentWindow().setTitle("Private Room").catch(() => {});
     goTo({ kind: "start" });
   }
 

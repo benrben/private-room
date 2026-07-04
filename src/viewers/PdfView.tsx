@@ -19,6 +19,22 @@ interface TextItem {
   transform: number[];
 }
 
+/** pdf.js v6's getTextContent() iterates a ReadableStream with
+ * `for await`, which WKWebView/Safari doesn't support — it throws
+ * "undefined is not a function". Read the stream manually instead. */
+async function readTextItems(page: pdfjs.PDFPageProxy): Promise<TextItem[]> {
+  const reader = (
+    page.streamTextContent() as ReadableStream<{ items: TextItem[] }>
+  ).getReader();
+  const items: TextItem[] = [];
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    items.push(...value.items);
+  }
+  return items;
+}
+
 /**
  * Find `quote` in a page's text items and paint absolutely-positioned
  * highlight divs over the canvas. Item-level granularity: every text run
@@ -33,8 +49,7 @@ async function highlightQuoteOnPage(
   // words and spaces differently, so spacing can't be trusted at all.
   const needle = normalizeForMatch(quote).replace(/ /g, "");
   if (!needle) return false;
-  const content = await page.getTextContent();
-  const items = content.items as TextItem[];
+  const items = await readTextItems(page);
   let hay = "";
   const itemOf: number[] = [];
   items.forEach((it, idx) => {

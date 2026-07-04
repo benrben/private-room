@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AiStatus,
   AnnotationPayload,
@@ -12,6 +13,7 @@ import {
   McpServerStatus,
   Memory,
   Message,
+  modelLabel,
   RoomInfo,
 } from "./api";
 import {
@@ -43,6 +45,19 @@ interface OpenFile {
   id: string;
   content: FileContent;
   target?: FileTarget;
+}
+
+/** A transient message to the user. Successes/info self-dismiss; errors stay
+ * until closed (UX-7). */
+interface Toast {
+  id: number;
+  kind: "info" | "success" | "error";
+  text: string;
+}
+
+/** Cloud CLI engines send questions off this Mac (SEC-6). */
+function isCloudEngine(model: string): boolean {
+  return model === "claude-cli" || model === "codex-cli";
 }
 
 interface BoxesPayload {
@@ -120,7 +135,7 @@ export default function Workspace({ info, onLock }: Props) {
   const [question, setQuestion] = useState("");
   const [asking, setAsking] = useState(false);
   const [streamText, setStreamText] = useState("");
-  const [notice, setNotice] = useState("");
+  const [toasts, setToasts] = useState<Toast[]>([]);
   const [openFile, setOpenFile] = useState<OpenFile | null>(null);
   const [editMode, setEditMode] = useState(false);
   const [memoryDraft, setMemoryDraft] = useState("");
@@ -131,8 +146,25 @@ export default function Workspace({ info, onLock }: Props) {
   const [webOn, setWebOn] = useState(false);
   const chatRef = useRef<HTMLDivElement>(null);
   const initRef = useRef(false);
+  const toastSeq = useRef(0);
   const openFileRef = useRef<OpenFile | null>(null);
   openFileRef.current = openFile;
+
+  function pushToast(kind: Toast["kind"], text: string) {
+    const id = ++toastSeq.current;
+    setToasts((t) => [...t, { id, kind, text }]);
+    // Successes and info clear themselves; errors stay until dismissed.
+    if (kind !== "error") {
+      window.setTimeout(
+        () => setToasts((t) => t.filter((x) => x.id !== id)),
+        5000,
+      );
+    }
+  }
+
+  function dismissToast(id: number) {
+    setToasts((t) => t.filter((x) => x.id !== id));
+  }
 
   function refreshWebAccess() {
     api
@@ -156,6 +188,11 @@ export default function Workspace({ info, onLock }: Props) {
   useEffect(() => {
     if (initRef.current) return;
     initRef.current = true;
+    // Show which room is open in the title bar / Mission Control (CHG-9).
+    // Reset to plain "Private Room" happens on lock, in App.handleLock.
+    getCurrentWindow()
+      .setTitle(`${info.name} — Private Room`)
+      .catch(() => {});
     api.listFiles().then(setFiles);
     api.listMemories().then(setMemories);
     refreshAi();
@@ -250,10 +287,20 @@ export default function Workspace({ info, onLock }: Props) {
     const paths = Array.isArray(picked) ? picked : [picked];
     const report = await api.importFiles(paths);
     setFiles(await api.listFiles());
-    if (report.errors.length > 0) {
-      setNotice(report.errors.join(" · "));
+    if (report.imported.length > 0) {
+      pushToast(
+        "success",
+        `Added ${report.imported.length} file${report.imported.length === 1 ? "" : "s"} to the room.`,
+      );
+    }
+    // One toast per failed file, grouped once there are more than three.
+    if (report.errors.length > 3) {
+      pushToast(
+        "error",
+        `${report.errors.length} files could not be added:\n${report.errors.join("\n")}`,
+      );
     } else {
-      setNotice(`Added ${report.imported.length} file${report.imported.length === 1 ? "" : "s"} to the room.`);
+      report.errors.forEach((err) => pushToast("error", err));
     }
   }
 
@@ -276,7 +323,7 @@ export default function Workspace({ info, onLock }: Props) {
       ...openFile,
       content: { ...openFile.content, text: newText },
     });
-    setNotice(`Saved "${openFile.content.name}".`);
+    pushToast("success", `Saved "${openFile.content.name}".`);
   }
 
   /** Editing a binary format (pdf/docx/pptx) can't round-trip — the edited
@@ -286,7 +333,7 @@ export default function Workspace({ info, onLock }: Props) {
     const base = openFile.content.name.replace(/\.[^.]+$/, "");
     const meta = await api.saveGeneratedFile(`${base} (edited).md`, newText);
     setFiles(await api.listFiles());
-    setNotice(`Saved "${meta.name}" into the room — the original file is unchanged.`);
+    pushToast("success", `Saved "${meta.name}" into the room — the original file is unchanged.`);
   }
 
   async function editCell(sheet: string, cell: string, value: string) {
@@ -294,7 +341,7 @@ export default function Workspace({ info, onLock }: Props) {
     try {
       await api.setCell(openFile.id, sheet || null, cell, value);
     } catch (e) {
-      setNotice(String(e));
+      pushToast("error", String(e));
     }
   }
 
@@ -340,7 +387,6 @@ export default function Workspace({ info, onLock }: Props) {
     const q = question.trim();
     if (!q || asking || !activeChatId) return;
     setAsking(true);
-    setNotice("");
     setQuestion("");
     setStreamText("");
     const optimistic: Message = {
@@ -362,11 +408,11 @@ export default function Workspace({ info, onLock }: Props) {
     } catch (e) {
       const msg = String(e);
       if (msg.includes("OLLAMA_DOWN")) {
-        setNotice("Ollama is not running. Start the Ollama app, then try again.");
+        pushToast("error", "Ollama is not running. Start the Ollama app, then try again.");
       } else if (msg.includes("MODEL_MISSING")) {
-        setNotice(`Model "${model}" is not downloaded. Run: ollama pull ${model}`);
+        pushToast("error", `Model "${model}" is not downloaded. Open Settings to download it.`);
       } else {
-        setNotice(msg);
+        pushToast("error", msg);
       }
       setMessages(await api.getMessages(activeChatId));
       refreshAi();
@@ -382,7 +428,7 @@ export default function Workspace({ info, onLock }: Props) {
     const meta = await api.saveGeneratedFile(name, message.content);
     setFiles(await api.listFiles());
     setSaveDraft(null);
-    setNotice(`Saved "${meta.name}" into the room.`);
+    pushToast("success", `Saved "${meta.name}" into the room.`);
   }
 
   async function addMemory() {
@@ -424,13 +470,17 @@ export default function Workspace({ info, onLock }: Props) {
             }
           />
           {ai && (ai.models.length > 0 || ai.external.length > 0) ? (
-            <select value={model} onChange={(e) => changeModel(e.target.value)}>
+            <select
+              className={isCloudEngine(model) ? "cloud-engine" : undefined}
+              value={model}
+              onChange={(e) => changeModel(e.target.value)}
+            >
               {!ai.models.includes(model) && !ai.external.includes(model) && (
                 <option value={model}>{model}</option>
               )}
               {ai.models.map((m) => (
-                <option key={m} value={m}>
-                  {m}
+                <option key={m} value={m} title={m}>
+                  {modelLabel(m) ? `${modelLabel(m)} — ${m}` : m}
                 </option>
               ))}
               {ai.external.length > 0 && (
@@ -533,7 +583,7 @@ export default function Workspace({ info, onLock }: Props) {
             <div className="memory-panel">
               {memories.map((m) => (
                 <div key={m.id} className="memory-row">
-                  <span>{m.content}</span>
+                  <span dir="auto">{m.content}</span>
                   <button
                     className="chip-btn danger"
                     onClick={async () => {
@@ -549,6 +599,7 @@ export default function Workspace({ info, onLock }: Props) {
                 <input
                   placeholder="Something the AI should always remember…"
                   value={memoryDraft}
+                  dir="auto"
                   onChange={(e) => setMemoryDraft(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && addMemory()}
                 />
@@ -740,6 +791,7 @@ export default function Workspace({ info, onLock }: Props) {
             <select
               className="chat-select"
               value={activeChatId ?? ""}
+              dir="auto"
               onChange={(e) => setActiveChatId(e.target.value)}
             >
               {chats.map((c) => (
@@ -775,15 +827,6 @@ export default function Workspace({ info, onLock }: Props) {
               <button className="subtle" onClick={refreshAi}>refresh</button>.
             </div>
           )}
-          {notice && (
-            <div className="banner notice">
-              {notice}{" "}
-              <button className="subtle" onClick={() => setNotice("")}>
-                <CloseIcon size={12} />
-              </button>
-            </div>
-          )}
-
           <div className="messages" ref={chatRef}>
             {messages.length === 0 && (
               <div className="chat-hero">
@@ -805,7 +848,7 @@ export default function Workspace({ info, onLock }: Props) {
                   : { text: m.content, boxes: undefined, annotation: undefined };
               return (
               <div key={m.id} className={`msg ${m.role}`}>
-                <div className="msg-content">
+                <div className="msg-content" dir="auto">
                   {m.role === "assistant" ? (
                     <>
                       <MarkdownView text={text} />
@@ -891,14 +934,30 @@ export default function Workspace({ info, onLock }: Props) {
           </div>
 
           <div className="composer">
-            {mcpTools.length > 0 && (
-              <div className="mcp-badge" title={mcpTools.join("\n")}>
-                🌐 External tools connected — answers can use the internet
+            {isCloudEngine(model) && (
+              <div className="cloud-badge">
+                <span>☁ Cloud engine active — questions leave this Mac</span>
+                <button
+                  className="subtle"
+                  onClick={() => changeModel(ai?.defaultModel ?? "")}
+                >
+                  Switch to local
+                </button>
               </div>
             )}
-            {webOn && (
-              <div className="mcp-badge">
-                🌐 Web access is on — searches and page fetches leave this Mac
+            {(webOn || mcpTools.length > 0) && (
+              <div
+                className="mcp-badge"
+                title={[
+                  webOn ? "Web search: on" : null,
+                  mcpTools.length > 0
+                    ? `Connected tools: ${mcpTools.join(", ")}`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join("\n")}
+              >
+                🌐 This room can reach the internet
               </div>
             )}
             {attachments.length > 0 && (
@@ -916,6 +975,7 @@ export default function Workspace({ info, onLock }: Props) {
                 placeholder="Ask this room anything…"
                 value={question}
                 rows={2}
+                dir="auto"
                 onChange={(e) => setQuestion(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
@@ -934,6 +994,23 @@ export default function Workspace({ info, onLock }: Props) {
               </button>
             </div>
           </div>
+
+          {toasts.length > 0 && (
+            <div className="toast-stack">
+              {toasts.map((t) => (
+                <div key={t.id} className={`toast ${t.kind}`}>
+                  <span className="toast-text">{t.text}</span>
+                  <button
+                    className="toast-close"
+                    title="Dismiss"
+                    onClick={() => dismissToast(t.id)}
+                  >
+                    <CloseIcon size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </main>
       </div>
     </div>

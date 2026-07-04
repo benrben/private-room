@@ -80,6 +80,19 @@ export const ENGINE_LABELS: Record<string, string> = {
   "codex-cli": "Codex (cloud)",
 };
 
+/** Friendly display names for models we ship guidance for. The stored setting
+ * always keeps the raw id — this is display only (CHG-4). Unknown models the
+ * user pulled themselves fall through to their raw id. */
+const MODEL_LABELS: { match: (id: string) => boolean; label: string }[] = [
+  { match: (m) => m.startsWith("qwen3.5"), label: "Standard local AI (recommended)" },
+  { match: (m) => m.includes("qwen2.5vl") || m.includes("qwen2.5-vl"), label: "Vision helper (marks images)" },
+];
+
+/** Friendly name for a model id, or `null` if we ship no label for it. */
+export function modelLabel(id: string): string | null {
+  return MODEL_LABELS.find((m) => m.match(id))?.label ?? null;
+}
+
 export interface ImageBox {
   label: string;
   x1: number;

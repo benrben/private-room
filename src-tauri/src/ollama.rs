@@ -47,18 +47,6 @@ fn map_send_err(e: reqwest::Error) -> String {
     }
 }
 
-/// Stream a chat completion, invoking `on_delta` for every token fragment.
-/// Returns the full assembled reply.
-pub async fn chat_stream(
-    model: &str,
-    messages: Vec<ChatMessage>,
-    temperature: Option<f64>,
-    on_delta: impl FnMut(&str),
-) -> Result<String, String> {
-    let (content, _) = chat_stream_tools(model, messages, None, temperature, on_delta).await?;
-    Ok(content)
-}
-
 /// Streaming chat that can also carry a tool catalog. Returns the streamed
 /// text plus any tool calls the model made this round.
 pub async fn chat_stream_tools(

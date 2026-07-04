@@ -20,14 +20,11 @@ const MAX_MCP_TOOLS: usize = 24;
 const MCP_CONFIG_KEY: &str = "mcp_config";
 /// Shown as the starting config. The web-search entry ships disabled so a
 /// room never reaches the internet without the user flipping it on.
+// Ship an empty scaffold, not a search example: web search has one clear home
+// (Settings → Online features). MCP is the advanced "connect external tool
+// programs" path — see CHG-2 / RM-5. Rooms that already saved a config keep it.
 const DEFAULT_MCP_CONFIG: &str = r#"{
-  "mcpServers": {
-    "websearch": {
-      "command": "uvx",
-      "args": ["duckduckgo-mcp-server"],
-      "disabled": true
-    }
-  }
+  "mcpServers": {}
 }"#;
 
 #[derive(Default)]
@@ -837,8 +834,9 @@ fn start_mcp_connections(app: tauri::AppHandle, servers: Vec<(String, mcp::Serve
 
 // ---------------------------------------------------------------- chat / AI
 
-/// Chat default: gemma3 — fast, no hidden "thinking" pass. Falls back to
-/// whatever is installed.
+/// Chat default: `DEFAULT_MODEL` (qwen3.5:4b) — text + vision + tool calling,
+/// no hidden "thinking" pass. Falls back to the first installed model when the
+/// default isn't present.
 fn best_default(models: &[String]) -> String {
     if models.is_empty() || models.iter().any(|m| m.starts_with(DEFAULT_MODEL)) {
         return DEFAULT_MODEL.to_string();
@@ -1146,7 +1144,6 @@ fn is_locate_intent(question: &str) -> bool {
         "circle",
         "highlight",
         "show me",
-        "sign me",
         "find the",
         "find all",
         "find where",
@@ -1205,7 +1202,10 @@ struct ScoredChunk {
     score: f32,
 }
 
-fn retrieve_context(conn: &Connection, question: &str) -> Result<Vec<ScoredChunk>, String> {
+/// Returns the scored chunks plus a `fallback` flag: true when nothing matched
+/// the question and we padded with recent content instead (CHG-10 — such
+/// filler must not be credited as a "source").
+fn retrieve_context(conn: &Connection, question: &str) -> Result<(Vec<ScoredChunk>, bool), String> {
     let terms = question_terms(question);
     let rows = db::list_chunks_with_file_names(conn)?;
 
@@ -1247,8 +1247,9 @@ fn retrieve_context(conn: &Connection, question: &str) -> Result<Vec<ScoredChunk
                 score: 0.0,
             })
             .collect();
+        return Ok((scored, true));
     }
-    Ok(scored)
+    Ok((scored, false))
 }
 
 #[tauri::command]
@@ -1282,7 +1283,7 @@ pub async fn ask(
             rows
         };
 
-        let context_chunks = retrieve_context(conn, &question)?;
+        let (context_chunks, context_fallback) = retrieve_context(conn, &question)?;
 
         // Attachments: images go to the model as vision input, text files as
         // guaranteed context.
@@ -1319,9 +1320,14 @@ pub async fn ask(
             }
         }
 
-        for chunk in &context_chunks {
-            if !sources.contains(&chunk.file_name) {
-                sources.push(chunk.file_name.clone());
+        // Only credit files that genuinely matched the question. On the
+        // zero-score fallback the chunks are just "recent content", so they
+        // must not appear as source chips (CHG-10). Attachments still count.
+        if !context_fallback {
+            for chunk in &context_chunks {
+                if !sources.contains(&chunk.file_name) {
+                    sources.push(chunk.file_name.clone());
+                }
             }
         }
 
@@ -1347,10 +1353,12 @@ pub async fn ask(
         );
         if web_enabled {
             system.push_str(
-                "\n\nThe user has turned on web access for this room: web_search finds \
-                 current information on the public internet and fetch_page reads one page. \
-                 These are the only tools that leave this Mac — use them when a question \
-                 needs up-to-date or outside information, and say when you did.",
+                "\n\nThe user has turned web access ON for this room. You have two more \
+                 tools: web_search (find pages) and fetch_page (read one page). \
+                 IMPORTANT: for any question about current or recent things — weather, \
+                 news, prices, sports, events, anything after your training data — you \
+                 MUST call web_search first. Never answer that you lack real-time data: \
+                 search instead. Mention that you searched the web in your answer.",
             );
         }
 
@@ -1415,7 +1423,11 @@ pub async fn ask(
         let mut user_content = String::new();
         let has_context = !context_chunks.is_empty() || !attached_notes.is_empty();
         if has_context {
-            user_content.push_str("Context from files stored in this room:\n\n");
+            user_content.push_str(if context_fallback && attached_notes.is_empty() {
+                "Recently added content (may be unrelated to the question):\n\n"
+            } else {
+                "Context from files stored in this room:\n\n"
+            });
             for note in &attached_notes {
                 user_content.push_str(note);
                 user_content.push_str("\n\n");
@@ -1771,8 +1783,8 @@ async fn exec_tool(
             let query = args["query"].as_str().unwrap_or_default();
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            let chunks = retrieve_context(&room.conn, query)?;
-            if chunks.is_empty() {
+            let (chunks, fallback) = retrieve_context(&room.conn, query)?;
+            if chunks.is_empty() || fallback {
                 return Ok("No matching content found.".into());
             }
             Ok(chunks
@@ -2100,6 +2112,17 @@ fn clamp_tool_result(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locate_intent_only_fires_on_real_locate_questions() {
+        assert!(is_locate_intent("show me the cat"));
+        assert!(is_locate_intent("Where is the signature?"));
+        assert!(is_locate_intent("highlight the total"));
+        // "sign me" was a typo that fired the slow grounding pass on unrelated
+        // sentences (RM-3) — it must not match anymore.
+        assert!(!is_locate_intent("please sign me up for the newsletter"));
+        assert!(!is_locate_intent("summarize this document"));
+    }
 
     #[test]
     fn parses_a1_notation() {

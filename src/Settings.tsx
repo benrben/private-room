@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AiStatus, api, ENGINE_LABELS, McpServerStatus } from "./api";
+import { AiStatus, api, ENGINE_LABELS, McpServerStatus, modelLabel } from "./api";
 import { CloseIcon, DownloadIcon, TrashIcon } from "./icons";
 
 interface Props {
@@ -42,7 +42,16 @@ export default function Settings({
     api.getSetting("temperature").then((v) => {
       if (v != null) {
         const n = parseFloat(v);
-        if (!Number.isNaN(n)) setTemperature(n);
+        if (!Number.isNaN(n)) {
+          // The slider now caps at 1.0 (higher makes a small model ramble).
+          // Clamp legacy saves above 1.0 once and persist the clamp (CHG-8).
+          if (n > 1) {
+            setTemperature(1);
+            api.setSetting("temperature", "1.00");
+          } else {
+            setTemperature(n);
+          }
+        }
       }
     });
     api.getSetting("custom_instructions").then((v) => {
@@ -150,7 +159,13 @@ export default function Settings({
                         checked={m === model}
                         onChange={() => onModelChange(m)}
                       />
-                      {m}
+                      {modelLabel(m) ? (
+                        <span className="model-label">
+                          {modelLabel(m)} <span className="model-id">{m}</span>
+                        </span>
+                      ) : (
+                        m
+                      )}
                     </label>
                     <button
                       className="subtle btn-ic"
@@ -233,20 +248,21 @@ export default function Settings({
               Creativity (temperature): <strong>{temperature.toFixed(2)}</strong>
             </label>
             <div className="temp-row">
-              <span className="settings-hint">precise</span>
+              <span className="settings-hint">focused</span>
               <input
                 type="range"
                 min={0}
-                max={1.5}
+                max={1}
                 step={0.05}
                 value={temperature}
                 onChange={(e) => setTemperature(parseFloat(e.target.value))}
               />
-              <span className="settings-hint">creative</span>
+              <span className="settings-hint">imaginative</span>
             </div>
             <label className="settings-label">Custom instructions</label>
             <textarea
               rows={4}
+              dir="auto"
               placeholder='Shape the AI&apos;s tone, e.g. "Answer briefly and formally, in Hebrew when I write Hebrew."'
               value={instructions}
               onChange={(e) => setInstructions(e.target.value)}
@@ -310,13 +326,12 @@ export default function Settings({
           <section>
             <h3>Connections (MCP)</h3>
             <p className="settings-hint">
-              Advanced: connect external tools with the Model Context Protocol
-              — paste the same <code>mcpServers</code> config used by Claude
-              Desktop or Cursor. For web search you don't need MCP — use{" "}
-              <strong>Online features</strong> above instead. Keep{" "}
-              <code>"disabled": true</code> on servers you don't use; a
-              "Could not start …" error means that server's program isn't
-              installed on this Mac.
+              Advanced: connect external tool programs with the Model Context
+              Protocol — paste the same <code>mcpServers</code> config used by
+              Claude Desktop or Cursor. For web search you don't need this — use{" "}
+              <strong>Online features</strong> above, the one built-in search
+              path. A "Could not start …" error means that server's program
+              isn't installed on this Mac.
             </p>
             <p className="settings-hint">
               ⚠️ Connected tools are separate programs and can reach the
