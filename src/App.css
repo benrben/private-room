@@ -1323,7 +1323,60 @@ code {
 .settings-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
   margin-top: 12px;
+}
+
+/* ---- Privacy section (Wave 2: SEC-3/4/7, ADD-3/4) ---- */
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.settings-form input {
+  width: 100%;
+  font-size: 13px;
+}
+
+/* saved/recovered confirmation, calm green */
+.settings-confirm {
+  color: var(--ok);
+  font-size: 13px;
+}
+
+/* duplicate-room destination row sits left, not pushed to the edge */
+.settings-actions.dup-dest-row {
+  justify-content: flex-start;
+  margin-top: 6px;
+}
+
+.dup-dest {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ADD-3: inline two-step delete confirm on a model row */
+.model-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-confirm .confirm-yes {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.model-confirm .confirm-no {
+  color: var(--danger);
+  font-weight: 600;
 }
 
 /* ---- agent annotations: highlights across viewers ---- */
