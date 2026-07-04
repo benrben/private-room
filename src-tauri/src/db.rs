@@ -694,6 +694,126 @@ pub fn search_chunks_fts(
     Ok(rows)
 }
 
+// ---------------------------------------------------------------- embeddings (ADD-13)
+
+/// ADD-13: encode an embedding as a compact little-endian f32 BLOB for storage
+/// in `chunks.embedding`. Round-trips with `blob_to_embedding`.
+pub fn embedding_to_blob(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// ADD-13: decode a little-endian f32 BLOB back into a vector. A blob whose
+/// length is not a whole number of f32s (corrupt / foreign) reads as None so the
+/// caller silently skips it rather than mis-scoring it.
+pub fn blob_to_embedding(b: &[u8]) -> Option<Vec<f32>> {
+    if b.is_empty() || b.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// ADD-13: cosine similarity of two vectors. Returns 0.0 when the lengths
+/// differ, either is empty, or either has zero magnitude — a safe "no signal"
+/// value for the blend.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0f32;
+    let mut na = 0f32;
+    let mut nb = 0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// ADD-13: a batch of chunks that still lack an embedding — (chunk id, text).
+/// The background pass drains these in batches until none remain.
+pub fn chunks_missing_embedding(conn: &Connection, limit: usize) -> Result<Vec<(String, String)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, text FROM chunks WHERE embedding IS NULL LIMIT ?1")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// ADD-13: store an embedding BLOB on one chunk (by chunk id).
+pub fn set_chunk_embedding(conn: &Connection, id: &str, blob: &[u8]) -> Result<(), String> {
+    conn.execute(
+        "UPDATE chunks SET embedding = ?2 WHERE id = ?1",
+        params![id, blob],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// ADD-13: every chunk that has a stored embedding — (chunk rowid, file name,
+/// chunk text, embedding blob). The rowid keys the keyword/vector blend so both
+/// scores line up on the same chunk. Brute-force scan; fine to a few thousand
+/// chunks (see ADD-13 latency budget).
+pub fn chunk_embeddings(conn: &Connection) -> Result<Vec<(i64, String, String, Vec<u8>)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.rowid, f.name, c.text, c.embedding
+             FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE c.embedding IS NOT NULL",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// ADD-13: like `search_chunks_fts` but also returns each hit's chunk rowid so
+/// keyword and vector scores can be blended per chunk. (rowid, file name, chunk
+/// text, bm25 — smaller is a better match).
+pub fn search_chunks_fts_ranked(
+    conn: &Connection,
+    match_expr: &str,
+    limit: usize,
+) -> Result<Vec<(i64, String, String, f64)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT chunks_fts.rowid, f.name, c.text, bm25(chunks_fts)
+             FROM chunks_fts
+             JOIN chunks c ON c.rowid = chunks_fts.rowid
+             JOIN files f ON f.id = c.file_id
+             WHERE chunks_fts MATCH ?1
+             ORDER BY bm25(chunks_fts)
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![match_expr, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
 /// (file name, chunk text) for the most recently added chunks — the fallback
 /// context when a question matches nothing in the FTS index (CHG-10).
 pub fn recent_chunks(conn: &Connection, limit: usize) -> Result<Vec<(String, String)>, String> {
@@ -1264,6 +1384,17 @@ pub fn vacuum(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("VACUUM").map_err(|e| e.to_string())
 }
 
+/// Test-only: a fresh in-memory database with the live SCHEMA applied — same
+/// tables a new room gets. Shared by unit tests in this crate (incl. the
+/// retrieval blend test in `commands`).
+#[cfg(test)]
+pub fn open_in_memory_schema() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(SCHEMA).unwrap();
+    conn
+}
+
 /// A consistent copy of the live, encrypted database to `dest` — keeps the
 /// current key (ADD-4). `dest` is single-quote-escaped into the statement
 /// since VACUUM INTO does not accept bound parameters.
@@ -1355,6 +1486,44 @@ mod tests {
         let names: Vec<String> = list_file_inventory(&conn).unwrap().into_iter().map(|(n, _)| n).collect();
         assert!(names.contains(&"Contracts/lease.pdf".to_string()));
         assert!(names.contains(&"loose.txt".to_string()));
+    }
+
+    #[test]
+    fn embedding_blob_round_trips() {
+        // ADD-13: f32 vector <-> little-endian BLOB is lossless.
+        let v = vec![0.0f32, 1.5, -2.25, 3.125, 1e-6];
+        let blob = embedding_to_blob(&v);
+        assert_eq!(blob.len(), v.len() * 4);
+        assert_eq!(blob_to_embedding(&blob), Some(v));
+        // Empty and misaligned blobs decode to None (skipped, not mis-scored).
+        assert_eq!(blob_to_embedding(&[]), None);
+        assert_eq!(blob_to_embedding(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn cosine_similarity_basics() {
+        // Identical direction → 1.0; orthogonal → 0.0; opposite → -1.0.
+        assert!((cosine_similarity(&[1.0, 0.0], &[2.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+        assert!((cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-6);
+        // Mismatched length or zero vector → safe 0.0.
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn embedding_backfill_columns_work() {
+        // ADD-13: chunks start with NULL embedding; storing a blob makes them
+        // visible to chunk_embeddings and clears them from the missing list.
+        let conn = mem();
+        add_file(&conn, "a.txt", "The office holiday party is on Friday.");
+        let missing = chunks_missing_embedding(&conn, 10).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert!(chunk_embeddings(&conn).unwrap().is_empty());
+        let blob = embedding_to_blob(&[0.1, 0.2, 0.3]);
+        set_chunk_embedding(&conn, &missing[0].0, &blob).unwrap();
+        assert!(chunks_missing_embedding(&conn, 10).unwrap().is_empty());
+        assert_eq!(chunk_embeddings(&conn).unwrap().len(), 1);
     }
 
     #[test]

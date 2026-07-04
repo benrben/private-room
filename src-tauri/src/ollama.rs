@@ -18,6 +18,11 @@ fn base_url() -> &'static str {
     })
 }
 
+/// ADD-13: default local embedding model for meaning-based retrieval. Small
+/// (~270 MB), served by Ollama's `/api/embed`. Both chunk vectors (stored in
+/// `chunks.embedding`) and the question vector are produced by this model.
+pub const EMBED_MODEL: &str = "nomic-embed-text";
+
 #[derive(Serialize, Clone, Default)]
 pub struct ChatMessage {
     pub role: String,
@@ -174,6 +179,53 @@ pub async fn chat_stream_tools(
         }
     }
     Ok((full, tool_calls))
+}
+
+/// ADD-13: embed one or more texts via Ollama's `/api/embed`. Returns one f32
+/// vector per input, in the same order. `keep_alive` (HLT-5) controls how long
+/// Ollama holds the (small) embed model resident after the call — a query pass
+/// keeps it briefly warm; a background batch pass uses a short value so the
+/// model releases itself once indexing goes idle.
+///
+/// A missing model surfaces as `MODEL_MISSING:<model>` and a stopped server as
+/// `OLLAMA_DOWN`, mirroring `chat_stream_tools`; callers treat any error as a
+/// silent signal to fall back to the keyword path.
+pub async fn embed(model: &str, texts: &[String], keep_alive: &str) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let body = serde_json::json!({
+        "model": model,
+        "input": texts,
+        "keep_alive": keep_alive,
+    });
+    let resp = client()?
+        .post(format!("{BASE_URL}/api/embed"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(map_send_err)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 404 && text.contains("not found") {
+            return Err(format!("MODEL_MISSING:{model}"));
+        }
+        return Err(format!("Local AI error ({status}): {text}"));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let embeddings = v["embeddings"]
+        .as_array()
+        .ok_or("Embed response had no embeddings")?;
+    let out = embeddings
+        .iter()
+        .map(|e| {
+            e.as_array()
+                .map(|arr| arr.iter().filter_map(|n| n.as_f64().map(|f| f as f32)).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    Ok(out)
 }
 
 /// Load a model into memory without generating anything, so the first real
