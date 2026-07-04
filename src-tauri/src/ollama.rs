@@ -1,4 +1,6 @@
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const BASE_URL: &str = "http://127.0.0.1:11434";
@@ -49,11 +51,15 @@ fn map_send_err(e: reqwest::Error) -> String {
 
 /// Streaming chat that can also carry a tool catalog. Returns the streamed
 /// text plus any tool calls the model made this round.
+///
+/// `cancel`, when set true mid-stream (ADD-7), breaks out of the token loop
+/// promptly and returns whatever text streamed so far.
 pub async fn chat_stream_tools(
     model: &str,
     messages: Vec<ChatMessage>,
     tools: Option<&serde_json::Value>,
     temperature: Option<f64>,
+    cancel: Option<Arc<AtomicBool>>,
     mut on_delta: impl FnMut(&str),
 ) -> Result<(String, Vec<ToolCall>), String> {
     use futures_util::StreamExt;
@@ -106,6 +112,12 @@ pub async fn chat_stream_tools(
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
+        // ADD-7: user pressed Stop — abandon the stream, keep partial text.
+        if let Some(flag) = &cancel {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+        }
         let chunk = chunk.map_err(|e| format!("Local AI stream failed: {e}"))?;
         buf.extend_from_slice(&chunk);
         // Ollama streams newline-delimited JSON objects.

@@ -554,6 +554,14 @@ pub fn list_messages(conn: &Connection, chat_id: &str) -> Result<Vec<Message>, S
     Ok(messages)
 }
 
+/// ADD-9: delete one message by id (used by regenerate to drop the last
+/// assistant reply before re-asking).
+pub fn delete_message(conn: &Connection, id: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM messages WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// The most recent `limit` (role, content) pairs for a chat, newest first —
 /// callers reverse this to get chronological order for a prompt.
 pub fn recent_messages(
@@ -693,6 +701,16 @@ pub fn delete_chat(conn: &Connection, id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM chats WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// ADD-9: rename a chat unconditionally (user gave it an explicit title).
+pub fn rename_chat(conn: &Connection, id: &str, title: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE chats SET title = ?2 WHERE id = ?1",
+        params![id, title],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

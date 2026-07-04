@@ -2,6 +2,8 @@ use crate::{db, extraction, mcp, ollama, web};
 use base64::Engine;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::State;
 use uuid::Uuid;
@@ -32,6 +34,24 @@ pub struct AppState {
     pub room: Mutex<Option<Room>>,
     pub pending_open: Mutex<Option<String>>,
     pub mcp: Mutex<mcp::Manager>,
+    /// ADD-7: one cancel flag per in-flight `ask`, keyed by its `ask_id`.
+    /// The entry is inserted when an ask starts and removed when it returns
+    /// (success, error, or cancel). `cancel_ask` and `close_room` flip flags.
+    pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+/// Removes an ask's cancel flag from the registry when the ask returns, on
+/// every path (`?` early-return, error, success, or cancel).
+struct CancelGuard<'a> {
+    state: &'a AppState,
+    ask_id: String,
+}
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.state.cancels.lock() {
+            m.remove(&self.ask_id);
+        }
+    }
 }
 
 pub struct Room {
@@ -132,6 +152,9 @@ pub struct FileContent {
 #[serde(rename_all = "camelCase")]
 pub struct AiStatus {
     pub running: bool,
+    /// ADD-10: Ollama is installed on this Mac (may still not be running).
+    /// Lets onboarding tell "not installed" from "installed but not started".
+    pub installed: bool,
     pub models: Vec<String>,
     pub default_model: String,
     /// Cloud CLIs detected on this Mac ("claude-cli", "codex-cli").
@@ -163,12 +186,32 @@ fn detect_external_blocking() -> Vec<String> {
     found
 }
 
+/// ADD-10: is Ollama installed on this Mac at all? Distinct from "running".
+/// Matches the login-shell PATH trick used for the cloud CLIs.
+fn ollama_installed_blocking() -> bool {
+    if std::path::Path::new("/Applications/Ollama.app").exists() {
+        return true;
+    }
+    std::process::Command::new("zsh")
+        .args(["-lc", "command -v ollama"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
 /// Run one prompt through a cloud CLI (Claude Code / Codex). The content
 /// leaves the machine via the user's own account — surfaced in the UI.
 ///
 /// These CLIs are agents with file access, so attached images are written to
 /// a private temp folder for the CLI to open itself, then deleted.
-async fn run_external(engine: &str, messages: &[ollama::ChatMessage]) -> Result<String, String> {
+///
+/// `cancel` (ADD-7): a watcher thread kills the child process if the user
+/// presses Stop, so a runaway cloud answer ends promptly.
+async fn run_external(
+    engine: &str,
+    messages: &[ollama::ChatMessage],
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<String, String> {
     use std::io::Write;
 
     let tmp_dir =
@@ -228,13 +271,35 @@ async fn run_external(engine: &str, messages: &[ollama::ChatMessage]) -> Result<
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("Could not start {engine_name}: {e}"))?;
+        let pid = child.id();
         child
             .stdin
             .take()
             .ok_or("no stdin")?
             .write_all(prompt.as_bytes())
             .map_err(|e| e.to_string())?;
+        // ADD-7: watcher kills the child on Stop. `wait_with_output` keeps
+        // draining stdout on this thread, so the pipe never deadlocks.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_w = done.clone();
+        let watcher = std::thread::spawn(move || loop {
+            if done_w.load(Ordering::SeqCst) {
+                break;
+            }
+            match &cancel {
+                Some(flag) if flag.load(Ordering::SeqCst) => {
+                    let _ = std::process::Command::new("kill")
+                        .arg(pid.to_string())
+                        .status();
+                    break;
+                }
+                Some(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                None => break,
+            }
+        });
         let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        done.store(true, Ordering::SeqCst);
+        let _ = watcher.join();
         if !out.status.success() {
             let err: String = String::from_utf8_lossy(&out.stderr).chars().take(400).collect();
             return Err(format!("{engine_name} failed: {err}"));
@@ -543,8 +608,26 @@ pub fn open_room(
 }
 
 #[tauri::command]
-pub fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     use tauri::Emitter;
+    // HLT-7: if an answer is streaming, cancel it and wait briefly for its
+    // save-partial phase to finish, so locking never races the DB shut.
+    {
+        let flags: Vec<Arc<AtomicBool>> =
+            state.cancels.lock().unwrap().values().cloned().collect();
+        if !flags.is_empty() {
+            for f in &flags {
+                f.store(true, Ordering::SeqCst);
+            }
+            // Up to ~1s; the ask removes its own entry once it has saved.
+            for _ in 0..20 {
+                if state.cancels.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
     // SEC-7: reclaim space before closing when a large amount was freed (e.g.
     // the user deleted big files). Small deletions skip the slow vacuum.
     {
@@ -1241,11 +1324,16 @@ pub async fn ai_status(state: State<'_, AppState>) -> Result<AiStatus, String> {
     let external = tauri::async_runtime::spawn_blocking(detect_external_blocking)
         .await
         .unwrap_or_default();
+    let installed = tauri::async_runtime::spawn_blocking(ollama_installed_blocking)
+        .await
+        .unwrap_or(false);
     match ollama::list_models().await {
         Ok(models) => {
             let default_model = explicit.unwrap_or_else(|| best_default(&models));
             Ok(AiStatus {
                 running: true,
+                // Reachable means installed, regardless of the app-path check.
+                installed: true,
                 models,
                 default_model,
                 external,
@@ -1253,11 +1341,22 @@ pub async fn ai_status(state: State<'_, AppState>) -> Result<AiStatus, String> {
         }
         Err(_) => Ok(AiStatus {
             running: false,
+            installed,
             models: vec![],
             default_model: explicit.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             external,
         }),
     }
+}
+
+/// ADD-10: launch the Ollama app so a first-time user never touches a terminal.
+#[tauri::command]
+pub fn open_ollama() -> Result<(), String> {
+    std::process::Command::new("open")
+        .args(["-a", "Ollama"])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open Ollama: {e}"))
 }
 
 #[tauri::command]
@@ -1307,6 +1406,44 @@ pub fn get_messages(state: State<'_, AppState>, chat_id: String) -> Result<Vec<M
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
     db::list_messages(&room.conn, &chat_id)
+}
+
+/// ADD-9: give a chat an explicit title (persists in the room file).
+#[tauri::command]
+pub fn rename_chat(state: State<'_, AppState>, id: String, title: String) -> Result<(), String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::rename_chat(&room.conn, &id, &title)
+}
+
+/// ADD-9: delete one message — regenerate drops the last assistant reply, then
+/// re-runs `ask` with the previous user question.
+#[tauri::command]
+pub fn delete_message(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::delete_message(&room.conn, &id)
+}
+
+/// ADD-8: import a pasted screenshot. Base64-decode, then go through the same
+/// insert/index path any uploaded file uses (source "upload").
+#[tauri::command]
+pub fn import_image_bytes(
+    state: State<'_, AppState>,
+    name: String,
+    b64: String,
+) -> Result<FileMeta, String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("Could not read the pasted image: {e}"))?;
+    let mime = mime_guess::from_path(&name)
+        .first_or(mime_guess::mime::IMAGE_PNG)
+        .essence_str()
+        .to_string();
+    // Images carry no extractable text; they still index by name like any file.
+    db::insert_file(&room.conn, &name, &mime, &bytes, None, "upload")
 }
 
 #[derive(Serialize, Clone)]
@@ -1438,7 +1575,8 @@ pub async fn locate_in_image(
         ]),
         ..Default::default()
     }];
-    let (raw, _) = ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), |_| {}).await?;
+    let (raw, _) =
+        ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), None, |_| {}).await?;
     Ok(parse_boxes(&raw, w, h))
 }
 
@@ -1583,11 +1721,26 @@ fn retrieve_context(conn: &Connection, question: &str) -> Result<(Vec<ScoredChun
 pub async fn ask(
     window: tauri::Window,
     state: State<'_, AppState>,
+    ask_id: String,
     chat_id: String,
     question: String,
     attachments: Vec<String>,
 ) -> Result<Message, String> {
     use tauri::Emitter;
+
+    // ADD-7: register this ask's cancel flag; the guard removes it on return
+    // (success, error, or cancel) so `close_room`'s wait can see us finish.
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .cancels
+        .lock()
+        .unwrap()
+        .insert(ask_id.clone(), cancel.clone());
+    let _cancel_guard = CancelGuard {
+        state: state.inner(),
+        ask_id: ask_id.clone(),
+    };
+
     // Phase 1 (locked): gather context, save the user message.
     let (explicit_model, chat_messages, sources, first_image, temperature, web_enabled) = {
         let guard = state.room.lock().unwrap();
@@ -1641,6 +1794,14 @@ pub async fn ask(
                 if text.len() > 6000 {
                     text.truncate(6000);
                     text.push_str("\n… (truncated)");
+                    // UX-4: the AI saw only the beginning — say so, by name.
+                    let _ = window.emit(
+                        "ask-notice",
+                        format!(
+                            "Only the beginning of \"{name}\" was included (file is large). \
+                             For full coverage, ask about it in sections."
+                        ),
+                    );
                 }
                 attached_notes.push(format!("[attached file: {name}]\n{text}"));
                 sources.push(name);
@@ -1812,7 +1973,7 @@ pub async fn ask(
                     ..Default::default()
                 }];
                 if let Ok((raw, _)) =
-                    ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), |_| {}).await
+                    ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), None, |_| {}).await
                 {
                     let boxes = parse_boxes(&raw, *w, *h);
                     if !boxes.is_empty() {
@@ -1821,7 +1982,9 @@ pub async fn ask(
                             "name": img_name,
                             "boxes": boxes,
                         }));
-                        let _ = window.emit("ask-delta", "📍 Marked on the image.\n\n");
+                        // CHG-5: a step, not fake answer text (ask-delta is
+                        // reserved for the model's own words now).
+                        let _ = window.emit("ask-step", "Marked the image");
                     }
                 }
             }
@@ -1829,13 +1992,12 @@ pub async fn ask(
     }
 
     // Phase 2 (unlocked): answer — through a cloud CLI if selected, or the
-    // local model with full app-control tools.
-    let answer = if is_external_engine(&model) {
-        let _ = window.emit(
-            "ask-delta",
-            "☁ Asking via your cloud CLI (content leaves this Mac)…\n\n",
-        );
-        run_external(&model, &chat_messages).await?
+    // local model with full app-control tools. When the user pressed Stop
+    // mid-answer, a raised error is expected — swallow it and save the partial.
+    let run = if is_external_engine(&model) {
+        // CHG-5: a step chip, not fake live text (nothing streams for cloud).
+        let _ = window.emit("ask-step", "Asking your cloud AI (content leaves this Mac)");
+        run_external(&model, &chat_messages, Some(cancel.clone())).await
     } else {
         agent_loop(
             &window,
@@ -1845,11 +2007,23 @@ pub async fn ask(
             temperature,
             &mut effects,
             web_enabled,
+            cancel.clone(),
         )
-        .await?
+        .await
+    };
+    let stopped = cancel.load(Ordering::SeqCst);
+    let answer = match run {
+        Ok(text) => text,
+        // ADD-7: the child was killed / stream cut on purpose — keep partial.
+        Err(_) if stopped => String::new(),
+        Err(e) => return Err(e),
     };
 
     let mut content = answer;
+    // ADD-7: mark the transcript so it matches what the user watched.
+    if stopped {
+        content.push_str(" *(stopped)*");
+    }
     if let Some(payload) = &effects.boxes {
         content.push_str(&format!("\n\n```boxes\n{payload}\n```"));
     }
@@ -1857,10 +2031,29 @@ pub async fn ask(
         content.push_str(&format!("\n\n```annotation\n{payload}\n```"));
     }
 
-    // Phase 3 (locked): save the assistant reply.
+    // Phase 3 (locked): save the assistant reply. HLT-7: if the room was
+    // locked mid-answer it is already closed — return quietly with the
+    // (unsaved) content instead of surfacing "No room is open" to the UI.
     let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::insert_message(&room.conn, &chat_id, "assistant", &content, &sources)
+    match guard.as_ref() {
+        Some(room) => db::insert_message(&room.conn, &chat_id, "assistant", &content, &sources),
+        None => Ok(Message {
+            id: String::new(),
+            role: "assistant".into(),
+            content,
+            sources,
+            created_at: String::new(),
+        }),
+    }
+}
+
+/// ADD-7: stop a running answer. Sets its cancel flag; a no-op for an unknown
+/// id (the ask may have already finished).
+#[tauri::command]
+pub fn cancel_ask(state: State<'_, AppState>, ask_id: String) {
+    if let Some(flag) = state.cancels.lock().unwrap().get(&ask_id) {
+        flag.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Every built-in agent tool name — also the reserved set MCP tools may not
@@ -2028,6 +2221,28 @@ struct ToolEffects {
     annotation: Option<serde_json::Value>,
 }
 
+/// CHG-5: map a tool name to a short human label shown as a step chip while
+/// the answer streams (replaces the old inline "⚙ name…" text).
+fn tool_step_label(name: &str) -> String {
+    match name {
+        "list_room_files" => "Listed the room's files",
+        "search_room" => "Searched the room",
+        "open_file" => "Opened a file",
+        "mark_image" => "Marked an image",
+        "annotate_file" => "Highlighted a passage",
+        "create_file" => "Created a file",
+        "edit_file" => "Edited a file",
+        "write_file" => "Rewrote a file",
+        "set_cells" => "Updated a spreadsheet cell",
+        "add_memory" => "Saved a memory",
+        "web_search" => "Searched the web",
+        "fetch_page" => "Fetched a page",
+        // Connected MCP tools are namespaced server_tool.
+        _ => return format!("Ran the {name} tool"),
+    }
+    .to_string()
+}
+
 async fn agent_loop(
     window: &tauri::Window,
     state: &State<'_, AppState>,
@@ -2036,6 +2251,7 @@ async fn agent_loop(
     temperature: Option<f64>,
     effects: &mut ToolEffects,
     web_enabled: bool,
+    cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
     use tauri::Emitter;
     let mut tools = tools_catalog(web_enabled);
@@ -2049,12 +2265,25 @@ async fn agent_loop(
     let max_rounds = if routes.is_empty() && !web_enabled { 4 } else { 8 };
     let mut final_text = String::new();
     for _round in 0..max_rounds {
-        let (content, calls) =
-            ollama::chat_stream_tools(model, messages.clone(), Some(&tools), temperature, |d| {
+        // ADD-7: stop between rounds too.
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        // CHG-5: a fresh model round begins — frontend clears its live text so
+        // the visible stream always equals only the current round's words.
+        let _ = window.emit("ask-round", ());
+        let (content, calls) = ollama::chat_stream_tools(
+            model,
+            messages.clone(),
+            Some(&tools),
+            temperature,
+            Some(cancel.clone()),
+            |d| {
                 let _ = window.emit("ask-delta", d);
-            })
-            .await?;
-        if calls.is_empty() {
+            },
+        )
+        .await?;
+        if calls.is_empty() || cancel.load(Ordering::SeqCst) {
             final_text = content;
             break;
         }
@@ -2066,7 +2295,12 @@ async fn agent_loop(
             ..Default::default()
         });
         for call in &calls {
-            let _ = window.emit("ask-delta", format!("\n⚙ {}…\n", call.name));
+            // ADD-7: stop between tool calls.
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            // CHG-5: human step label, not inline "⚙ name…" answer text.
+            let _ = window.emit("ask-step", tool_step_label(&call.name));
             let result = exec_tool(state, window, call, effects, &routes)
                 .await
                 .unwrap_or_else(|e| format!("Tool error: {e}"));
@@ -2079,7 +2313,8 @@ async fn agent_loop(
         }
         final_text = content;
     }
-    if final_text.trim().is_empty() {
+    // Don't invent "Done." over a partial answer the user stopped.
+    if final_text.trim().is_empty() && !cancel.load(Ordering::SeqCst) {
         final_text = "Done.".into();
     }
     Ok(final_text)
@@ -2314,8 +2549,8 @@ async fn exec_tool(
                 )
             };
             let _ = window.emit(
-                "ask-delta",
-                format!("🌐 Searching the web for \"{query}\" (leaves this Mac)…\n"),
+                "ask-step",
+                format!("Searching the web for \"{query}\" (leaves this Mac)"),
             );
             let hits = match provider.as_str() {
                 "duckduckgo" | "brave" => web::search_duckduckgo(query).await?,
@@ -2354,7 +2589,7 @@ async fn exec_tool(
             if let Some((title, text)) = cached {
                 return Ok(clamp_tool_result(format!("[{title}] {url}\n\n{text}")));
             }
-            let _ = window.emit("ask-delta", format!("🌐 Fetching {url} (leaves this Mac)…\n"));
+            let _ = window.emit("ask-step", format!("Fetching {url} (leaves this Mac)"));
             let (title, text) = web::fetch_page(url).await?;
             {
                 let guard = state.room.lock().unwrap();
@@ -2384,7 +2619,7 @@ async fn exec_tool(
                 ..Default::default()
             }];
             let (raw, _) =
-                ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), |_| {}).await?;
+                ollama::chat_stream_tools(&vmodel, messages, None, Some(0.0), None, |_| {}).await?;
             let boxes = parse_boxes(&raw, w, h);
             if boxes.is_empty() {
                 return Ok(format!("Could not locate \"{find}\" in {real_name}."));
@@ -2474,6 +2709,15 @@ mod tests {
         assert!(is_a1_range("B2"));
         assert!(!is_a1_range("B2:"));
         assert!(!is_a1_range("hello"));
+    }
+
+    #[test]
+    fn tool_step_labels_are_human_friendly() {
+        assert_eq!(tool_step_label("search_room"), "Searched the room");
+        assert_eq!(tool_step_label("fetch_page"), "Fetched a page");
+        assert_eq!(tool_step_label("open_file"), "Opened a file");
+        // Unknown / MCP tools fall back to naming the tool, never panic.
+        assert_eq!(tool_step_label("weather_lookup"), "Ran the weather_lookup tool");
     }
 
     #[test]
