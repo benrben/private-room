@@ -196,6 +196,10 @@ export default function Workspace({ info, onLock }: Props) {
   const [pullPercent, setPullPercent] = useState<number | null>(null);
   const [pullError, setPullError] = useState("");
   const [openFile, setOpenFile] = useState<OpenFile | null>(null);
+  // BUG 2: bumping this remounts the viewer/editor with fresh content. Bumped
+  // ONLY on genuinely external changes (file-updated event + Restore), never on
+  // the user's own typing — so an AI edit / restore shows without reopening.
+  const [viewerRev, setViewerRev] = useState(0);
   const [editMode, setEditMode] = useState(false);
   const [memoryDraft, setMemoryDraft] = useState("");
   const [showMemory, setShowMemory] = useState(false);
@@ -226,6 +230,9 @@ export default function Workspace({ info, onLock }: Props) {
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
   const [moveMenuFor, setMoveMenuFor] = useState<string | null>(null);
   const [renamingFolder, setRenamingFolder] = useState<{ id: string; name: string } | null>(null);
+  // BUG 1: inline "+ Folder" create input (window.prompt is a no-op in
+  // WKWebView). null = not creating; a string is the in-progress name.
+  const [creatingFolder, setCreatingFolder] = useState<string | null>(null);
   // UX-5 memory inline edit.
   const [editingMemory, setEditingMemory] = useState<{ id: string; content: string } | null>(null);
   // ADD-6 search overlay.
@@ -350,6 +357,8 @@ export default function Workspace({ info, onLock }: Props) {
       await api.restoreFileVersion(versionId);
       const content = await api.getFileContent(current.id);
       setOpenFile({ ...current, content });
+      // External change → remount the viewer/editor so restored bytes show now.
+      setViewerRev((r) => r + 1);
       setFiles(await api.listFiles());
       setVersions(
         [...(await api.listFileVersions(current.id))].sort((a, b) =>
@@ -618,6 +627,9 @@ export default function Workspace({ info, onLock }: Props) {
         // Refresh in place — keep the edit/preview mode and target.
         const content = await api.getFileContent(current.id);
         setOpenFile({ ...current, content });
+        // External write (e.g. an AI edit) → remount so the open viewer/editor
+        // shows the new bytes instead of its mount-time snapshot.
+        setViewerRev((r) => r + 1);
       }
     });
     const unlistenFiles = api.onRoomFilesChanged(() => {
@@ -998,6 +1010,17 @@ export default function Workspace({ info, onLock }: Props) {
     );
   }
 
+  // BUG 3 (UX-2): copy the open document's whole extracted text (PDFs now
+  // return their text; also fine for docx/text). Hidden when there's no text.
+  function copyAllText() {
+    const text = openFile?.content.text;
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(
+      () => pushToast("success", "Copied all text to clipboard."),
+      (e) => pushToast("error", String(e)),
+    );
+  }
+
   // CHG-7: a source chip names a file — resolve name → id (exact, newest first)
   // and open it; if it's gone, say so gently.
   function openSource(name: string) {
@@ -1131,8 +1154,16 @@ export default function Workspace({ info, onLock }: Props) {
   }
 
   // ---- ADD-16: folders ----
-  async function createFolderPrompt() {
-    const name = window.prompt("New folder name")?.trim();
+  // BUG 1: reveal the inline create input (mirrors the folder-rename input).
+  function startCreateFolder() {
+    setCreatingFolder("");
+  }
+
+  // Enter/blur commits; a guard covers the blur that fires after Esc cancels.
+  async function commitCreateFolder() {
+    if (creatingFolder === null) return;
+    const name = creatingFolder.trim();
+    setCreatingFolder(null);
     if (!name) return;
     try {
       await api.createFolder(name);
@@ -1664,7 +1695,7 @@ export default function Workspace({ info, onLock }: Props) {
               <button
                 className="subtle"
                 title="Create a folder to group files"
-                onClick={createFolderPrompt}
+                onClick={startCreateFolder}
               >
                 + Folder
               </button>
@@ -1694,6 +1725,21 @@ export default function Workspace({ info, onLock }: Props) {
               : "✨ Summarize room"}
           </button>
           <div className="file-list">
+            {creatingFolder !== null && (
+              <input
+                className="folder-create-input"
+                autoFocus
+                dir="auto"
+                placeholder="New folder name"
+                value={creatingFolder}
+                onChange={(e) => setCreatingFolder(e.target.value)}
+                onBlur={commitCreateFolder}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitCreateFolder();
+                  if (e.key === "Escape") setCreatingFolder(null);
+                }}
+              />
+            )}
             {files.length === 0 && (
               <div className="empty-hint">
                 Add PDFs, notes, images, code or spreadsheets — they are stored
@@ -1914,6 +1960,15 @@ export default function Workspace({ info, onLock }: Props) {
                       </div>
                     )}
                   </span>
+                  {openFile.content.text && (
+                    <button
+                      className="subtle"
+                      title="Copy the whole document's extracted text"
+                      onClick={copyAllText}
+                    >
+                      Copy all text
+                    </button>
+                  )}
                   <button
                     className="subtle btn-ic"
                     title="Export a normal copy out of the room"
@@ -1946,7 +2001,7 @@ export default function Workspace({ info, onLock }: Props) {
                   if (editMode && mode === "grid") {
                     return (
                       <SheetView
-                        key={openFile.id}
+                        key={`${openFile.id}-grid-${viewerRev}`}
                         dataB64={c.dataB64}
                         text={c.text}
                         target={{ sheet: t?.sheet, range: t?.range ?? t?.cell }}
@@ -1958,7 +2013,7 @@ export default function Workspace({ info, onLock }: Props) {
                   if (editMode && mode === "editor") {
                     return (
                       <CodeEditor
-                        key={`${openFile.id}-edit`}
+                        key={`${openFile.id}-edit-${viewerRev}`}
                         value={c.text ?? ""}
                         language={languageForFile(c.name)}
                         onSave={saveEdit}
@@ -1969,7 +2024,7 @@ export default function Workspace({ info, onLock }: Props) {
                   if (editMode && mode === "copy") {
                     return (
                       <CodeEditor
-                        key={`${openFile.id}-copy`}
+                        key={`${openFile.id}-copy-${viewerRev}`}
                         value={c.text ?? ""}
                         language="markdown"
                         onSave={saveEditAsCopy}
@@ -1983,7 +2038,7 @@ export default function Workspace({ info, onLock }: Props) {
                   if (c.kind === "code") {
                     return (
                       <CodeEditor
-                        key={`${openFile.id}-view`}
+                        key={`${openFile.id}-view-${viewerRev}`}
                         value={c.text ?? ""}
                         language={languageForFile(c.name)}
                         readOnly
@@ -1995,7 +2050,7 @@ export default function Workspace({ info, onLock }: Props) {
                     case "image":
                       return (
                         <ImageView
-                          key={openFile.id}
+                          key={`${openFile.id}-${viewerRev}`}
                           fileId={openFile.id}
                           name={c.name}
                           mime={c.mime}
@@ -2005,7 +2060,7 @@ export default function Workspace({ info, onLock }: Props) {
                     case "pdf":
                       return (
                         <PdfView
-                          key={openFile.id}
+                          key={`${openFile.id}-${viewerRev}`}
                           dataB64={c.dataB64 ?? ""}
                           target={{ page: t?.page, quote: t?.quote ?? t?.find }}
                         />
@@ -2013,7 +2068,7 @@ export default function Workspace({ info, onLock }: Props) {
                     case "docx":
                       return (
                         <DocxView
-                          key={openFile.id}
+                          key={`${openFile.id}-${viewerRev}`}
                           dataB64={c.dataB64 ?? ""}
                           target={{ quote: t?.quote ?? t?.find }}
                         />
@@ -2021,7 +2076,7 @@ export default function Workspace({ info, onLock }: Props) {
                     case "sheet":
                       return (
                         <SheetView
-                          key={openFile.id}
+                          key={`${openFile.id}-${viewerRev}`}
                           dataB64={c.dataB64}
                           target={{ sheet: t?.sheet, range: t?.range ?? t?.cell }}
                         />
@@ -2029,7 +2084,7 @@ export default function Workspace({ info, onLock }: Props) {
                     case "csv":
                       return (
                         <SheetView
-                          key={openFile.id}
+                          key={`${openFile.id}-${viewerRev}`}
                           text={c.text}
                           target={{ sheet: t?.sheet, range: t?.range ?? t?.cell }}
                         />
@@ -2037,6 +2092,7 @@ export default function Workspace({ info, onLock }: Props) {
                     case "markdown":
                       return (
                         <MarkdownView
+                          key={`${openFile.id}-${viewerRev}`}
                           text={c.text ?? ""}
                           target={{ quote: t?.quote ?? t?.find }}
                         />
@@ -2044,7 +2100,7 @@ export default function Workspace({ info, onLock }: Props) {
                     case "text":
                       return (
                         <TextView
-                          key={openFile.id}
+                          key={`${openFile.id}-${viewerRev}`}
                           text={c.text ?? ""}
                           quote={t?.quote ?? t?.find}
                         />
