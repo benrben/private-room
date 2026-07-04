@@ -1,5 +1,8 @@
-import { ReactNode, useEffect, useRef, useState } from "react";
+import { ClipboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   AiStatus,
   AnnotationPayload,
@@ -109,6 +112,27 @@ function annotationTarget(a: AnnotationPayload): FileTarget {
   };
 }
 
+/** Read a File (pasted image) into base64 without the data: prefix (ADD-8). */
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const res = String(r.result);
+      const comma = res.indexOf(",");
+      resolve(comma >= 0 ? res.slice(comma + 1) : res);
+    };
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+}
+
+/** CHG-6: an in-progress stream may hold a half-open ``` fence — balance it
+ * (display only) so MarkdownView never renders a broken code block. */
+function patchStreamFences(s: string): string {
+  const fences = (s.match(/```/g) ?? []).length;
+  return fences % 2 === 1 ? `${s}\n\`\`\`` : s;
+}
+
 /** Human-friendly timestamp for a saved version (ADD-2). */
 function formatWhen(iso: string): string {
   const d = new Date(iso);
@@ -143,7 +167,19 @@ export default function Workspace({ info, onLock }: Props) {
   const [question, setQuestion] = useState("");
   const [asking, setAsking] = useState(false);
   const [streamText, setStreamText] = useState("");
+  // CHG-5: per-turn tool-step chips shown above the live text (not saved).
+  const [steps, setSteps] = useState<string[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  // ADD-8: full-window highlight while files are dragged over the app.
+  const [dragOver, setDragOver] = useState(false);
+  // ADD-9: inline chat rename.
+  const [renaming, setRenaming] = useState(false);
+  const [renameDraft, setRenameDraft] = useState("");
+  // CHG-1/ADD-10: download the missing model from the onboarding banner.
+  const [pullingModel, setPullingModel] = useState(false);
+  const [pullStatus, setPullStatus] = useState("");
+  const [pullPercent, setPullPercent] = useState<number | null>(null);
+  const [pullError, setPullError] = useState("");
   const [openFile, setOpenFile] = useState<OpenFile | null>(null);
   const [editMode, setEditMode] = useState(false);
   const [memoryDraft, setMemoryDraft] = useState("");
@@ -174,6 +210,10 @@ export default function Workspace({ info, onLock }: Props) {
   const askingRef = useRef(false);
   const prevAskingRef = useRef(false);
   askingRef.current = asking;
+  // ADD-7/HLT-7: the current in-flight ask's id, so Stop/Lock can cancel it.
+  const askIdRef = useRef<string | null>(null);
+  // ADD-10: interval that re-checks AI status after "Open Ollama".
+  const recheckTimer = useRef<number | undefined>(undefined);
 
   function pushToast(kind: Toast["kind"], text: string) {
     const id = ++toastSeq.current;
@@ -377,8 +417,48 @@ export default function Workspace({ info, onLock }: Props) {
         setActiveChatId(cs[0].id);
       }
     });
+    // CHG-5: split the old single ask-delta stream into structured events.
+    // ask-delta = current round's text; ask-round = a new round starts (clear
+    // the live text); ask-step = a tool ran (append a chip). UX-4 ask-notice.
     const unlisten = api.onAskDelta((delta) => {
       setStreamText((t) => t + delta);
+    });
+    const unlistenStep = api.onAskStep((label) => {
+      setSteps((s) => [...s, label]);
+    });
+    const unlistenRound = api.onAskRound(() => {
+      setStreamText("");
+    });
+    const unlistenNotice = api.onAskNotice((text) => {
+      pushToast("info", text);
+    });
+    // CHG-1/ADD-10: live progress for the in-banner model download.
+    const unlistenPull = listen<{ status: string; percent: number | null }>(
+      "pull-progress",
+      (e) => {
+        setPullStatus(e.payload.status);
+        setPullPercent(e.payload.percent);
+      },
+    );
+    // ADD-8: drop files anywhere on the window to import them.
+    const unlistenDrop = getCurrentWebview().onDragDropEvent(async (event) => {
+      const p = event.payload;
+      if (p.type === "enter" || p.type === "over") {
+        setDragOver(true);
+      } else if (p.type === "leave") {
+        setDragOver(false);
+      } else if (p.type === "drop") {
+        setDragOver(false);
+        if (p.paths && p.paths.length > 0) {
+          try {
+            const report = await api.importFiles(p.paths);
+            setFiles(await api.listFiles());
+            reportImport(report);
+          } catch (e) {
+            pushToast("error", String(e));
+          }
+        }
+      }
     });
     refreshWebAccess();
     refreshAutolock();
@@ -433,11 +513,17 @@ export default function Workspace({ info, onLock }: Props) {
     });
     return () => {
       unlisten.then((fn) => fn());
+      unlistenStep.then((fn) => fn());
+      unlistenRound.then((fn) => fn());
+      unlistenNotice.then((fn) => fn());
+      unlistenPull.then((fn) => fn());
+      unlistenDrop.then((fn) => fn());
       unlistenOpen.then((fn) => fn());
       unlistenAnnotate.then((fn) => fn());
       unlistenUpdated.then((fn) => fn());
       unlistenFiles.then((fn) => fn());
       unlistenMcp.then((fn) => fn());
+      window.clearInterval(recheckTimer.current);
     };
   }, []);
 
@@ -512,12 +598,8 @@ export default function Workspace({ info, onLock }: Props) {
         ai.models.some((m) => m.startsWith(model + ":") || model.startsWith(m)))) ||
     ai?.external.includes(model);
 
-  async function importFiles() {
-    const picked = await api.chooseOpenPath({ title: "Add files to this room", multiple: true });
-    if (!picked) return;
-    const paths = Array.isArray(picked) ? picked : [picked];
-    const report = await api.importFiles(paths);
-    setFiles(await api.listFiles());
+  /** Turn an import report into toasts (shared by the picker and drag-drop). */
+  function reportImport(report: { imported: FileMeta[]; errors: string[] }) {
     if (report.imported.length > 0) {
       pushToast(
         "success",
@@ -533,6 +615,15 @@ export default function Workspace({ info, onLock }: Props) {
     } else {
       report.errors.forEach((err) => pushToast("error", err));
     }
+  }
+
+  async function importFiles() {
+    const picked = await api.chooseOpenPath({ title: "Add files to this room", multiple: true });
+    if (!picked) return;
+    const paths = Array.isArray(picked) ? picked : [picked];
+    const report = await api.importFiles(paths);
+    setFiles(await api.listFiles());
+    reportImport(report);
   }
 
   async function removeFile(id: string) {
@@ -614,12 +705,51 @@ export default function Workspace({ info, onLock }: Props) {
     }
   }
 
+  /** Core ask flow shared by send() and regenerate(). Owns the ask id (ADD-7),
+   * resets the live stream/steps (CHG-5), and swallows cancel-driven rejections
+   * so Stop/Lock never surface an error toast (HLT-7). */
+  async function askOnce(q: string, attachmentIds: string[]) {
+    if (!activeChatId) return;
+    const chatId = activeChatId;
+    const askId = crypto.randomUUID();
+    askIdRef.current = askId;
+    setAsking(true);
+    setStreamText("");
+    setSteps([]);
+    try {
+      await api.ask(chatId, q, attachmentIds, askId);
+    } catch (e) {
+      const msg = String(e);
+      // A cancel (Stop or Lock) rejects the in-flight promise — not an error.
+      if (!/cancel/i.test(msg)) {
+        if (msg.includes("OLLAMA_DOWN")) {
+          pushToast("error", "Ollama is not running. Start the Ollama app, then try again.");
+        } else if (msg.includes("MODEL_MISSING")) {
+          pushToast("error", `Model "${model}" is not downloaded — use the Download button above.`);
+        } else {
+          pushToast("error", msg);
+        }
+        refreshAi();
+      }
+    } finally {
+      askIdRef.current = null;
+      // The saved message (incl. any "(stopped)" partial) is the source of truth.
+      setMessages(await api.getMessages(chatId));
+      setChats(await api.listChats());
+      // Agent tools may have created files or memories.
+      api.listFiles().then(setFiles);
+      api.listMemories().then(setMemories);
+      setAsking(false);
+      setStreamText("");
+      setSteps([]);
+    }
+  }
+
   async function send() {
     const q = question.trim();
     if (!q || asking || !activeChatId) return;
-    setAsking(true);
     setQuestion("");
-    setStreamText("");
+    const attachmentIds = attachments.map((f) => f.id);
     const optimistic: Message = {
       id: `pending-${Date.now()}`,
       role: "user",
@@ -628,30 +758,161 @@ export default function Workspace({ info, onLock }: Props) {
       createdAt: "",
     };
     setMessages((m) => [...m, optimistic]);
-    const askId = crypto.randomUUID();
-    try {
-      await api.ask(activeChatId, q, attachments.map((f) => f.id), askId);
-      setMessages(await api.getMessages(activeChatId));
-      setChats(await api.listChats());
-      setAttachments([]);
-      // Agent tools may have created files or memories.
-      api.listFiles().then(setFiles);
-      api.listMemories().then(setMemories);
-    } catch (e) {
-      const msg = String(e);
-      if (msg.includes("OLLAMA_DOWN")) {
-        pushToast("error", "Ollama is not running. Start the Ollama app, then try again.");
-      } else if (msg.includes("MODEL_MISSING")) {
-        pushToast("error", `Model "${model}" is not downloaded. Open Settings to download it.`);
-      } else {
-        pushToast("error", msg);
+    setAttachments([]);
+    await askOnce(q, attachmentIds);
+  }
+
+  // ADD-7: cancel the running answer; the backend saves the partial "(stopped)".
+  function stopAsk() {
+    const id = askIdRef.current;
+    if (id) api.cancelAsk(id).catch(() => {});
+  }
+
+  // HLT-7: lock cleanly during an answer — cancel, let the partial save land,
+  // then close. Any cancel rejection is already swallowed inside askOnce().
+  async function handleLock() {
+    if (askingRef.current && askIdRef.current) {
+      try {
+        await api.cancelAsk(askIdRef.current);
+      } catch {
+        /* ignore — we're locking anyway */
       }
-      setMessages(await api.getMessages(activeChatId));
-      refreshAi();
-    } finally {
-      setAsking(false);
-      setStreamText("");
+      await new Promise((r) => window.setTimeout(r, 250));
     }
+    onLock();
+  }
+
+  // ADD-9c: delete the last answer and re-ask the previous question. Original
+  // attachments aren't stored per message, so the retry goes without them.
+  async function regenerate(assistantId: string) {
+    if (asking || !activeChatId) return;
+    const idx = messages.findIndex((m) => m.id === assistantId);
+    if (idx < 0) return;
+    let userText = "";
+    for (let i = idx - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        userText = messages[i].content;
+        break;
+      }
+    }
+    if (!userText) return;
+    try {
+      await api.deleteMessage(assistantId);
+    } catch (e) {
+      pushToast("error", String(e));
+      return;
+    }
+    setMessages(await api.getMessages(activeChatId));
+    await askOnce(userText, []);
+  }
+
+  // ADD-9b: copy an assistant answer with viewer-markup blocks stripped out.
+  function copyMessage(m: Message) {
+    const clean = splitMarkupBlocks(m.content).text;
+    navigator.clipboard.writeText(clean).then(
+      () => pushToast("success", "Copied to clipboard."),
+      (e) => pushToast("error", String(e)),
+    );
+  }
+
+  // CHG-7: a source chip names a file — resolve name → id (exact, newest first)
+  // and open it; if it's gone, say so gently.
+  function openSource(name: string) {
+    const match = files
+      .filter((f) => f.name === name)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    if (match) viewFile(match.id);
+    else pushToast("info", "That file is no longer in the room.");
+  }
+
+  // ADD-9a: inline chat rename.
+  function startRename() {
+    const c = chats.find((c) => c.id === activeChatId);
+    setRenameDraft(c?.title ?? "");
+    setRenaming(true);
+  }
+
+  async function commitRename() {
+    const title = renameDraft.trim();
+    setRenaming(false);
+    if (!title || !activeChatId) return;
+    await api.renameChat(activeChatId, title);
+    setChats(await api.listChats());
+  }
+
+  // ADD-8b: paste an image into the composer → import it and attach it.
+  async function onComposerPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const it of Array.from(items)) {
+      if (it.type.startsWith("image/")) {
+        e.preventDefault();
+        const file = it.getAsFile();
+        if (!file) continue;
+        try {
+          const b64 = await fileToBase64(file);
+          const time = new Date()
+            .toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+            .replace(/:/g, ".");
+          const meta = await api.importImageBytes(`Pasted image ${time}.png`, b64);
+          setFiles(await api.listFiles());
+          setAttachments((a) => (a.some((f) => f.id === meta.id) ? a : [...a, meta]));
+        } catch (err) {
+          pushToast("error", String(err));
+        }
+        return;
+      }
+    }
+  }
+
+  // CHG-1: download the missing model from the banner with live progress.
+  async function downloadModel(name: string) {
+    if (pullingModel) return;
+    setPullingModel(true);
+    setPullError("");
+    setPullStatus("starting…");
+    setPullPercent(null);
+    try {
+      await api.pullModel(name);
+      refreshAi();
+    } catch (e) {
+      setPullError(String(e));
+    } finally {
+      setPullingModel(false);
+      setPullPercent(null);
+    }
+  }
+
+  // ADD-10: open the download page for people who don't have Ollama yet.
+  async function getOllama() {
+    try {
+      await openUrl("https://ollama.com/download");
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  // ADD-10: start the installed-but-not-running Ollama, then auto-recheck.
+  async function openOllamaApp() {
+    try {
+      await api.openOllama();
+    } catch (e) {
+      pushToast("error", String(e));
+      return;
+    }
+    window.clearInterval(recheckTimer.current);
+    let tries = 0;
+    recheckTimer.current = window.setInterval(async () => {
+      tries++;
+      try {
+        const st = await api.aiStatus();
+        setAi(st);
+        setModel((current) => current || st.defaultModel);
+        if (st.running || tries >= 6) window.clearInterval(recheckTimer.current);
+      } catch {
+        if (tries >= 6) window.clearInterval(recheckTimer.current);
+      }
+    }, 1500);
   }
 
   async function saveToRoom(message: Message) {
@@ -676,8 +937,20 @@ export default function Workspace({ info, onLock }: Props) {
     await api.setSetting("model", value);
   }
 
+  const lastAssistantId = [...messages]
+    .reverse()
+    .find((m) => m.role === "assistant")?.id;
+
   return (
     <div className="workspace">
+      {dragOver && (
+        <div className="drop-overlay">
+          <div className="drop-overlay-inner">
+            <DownloadIcon size={28} />
+            <span>Drop to add to this room</span>
+          </div>
+        </div>
+      )}
       <header className="topbar">
         <div className="room-id">
           <span className="room-lock">
@@ -737,7 +1010,7 @@ export default function Workspace({ info, onLock }: Props) {
           >
             <GearIcon size={15} />
           </button>
-          <button className="btn-ic" onClick={onLock}>
+          <button className="btn-ic" onClick={handleLock}>
             <LockIcon size={14} /> Lock
           </button>
         </div>
@@ -1080,18 +1353,41 @@ export default function Workspace({ info, onLock }: Props) {
         {/* ------- pane 3: chat ------- */}
         <main className="chat">
           <div className="chat-head">
-            <select
-              className="chat-select"
-              value={activeChatId ?? ""}
-              dir="auto"
-              onChange={(e) => setActiveChatId(e.target.value)}
+            {renaming ? (
+              <input
+                className="chat-select chat-rename"
+                autoFocus
+                dir="auto"
+                value={renameDraft}
+                onChange={(e) => setRenameDraft(e.target.value)}
+                onBlur={commitRename}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitRename();
+                  if (e.key === "Escape") setRenaming(false);
+                }}
+              />
+            ) : (
+              <select
+                className="chat-select"
+                value={activeChatId ?? ""}
+                dir="auto"
+                onChange={(e) => setActiveChatId(e.target.value)}
+              >
+                {chats.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.title}
+                  </option>
+                ))}
+              </select>
+            )}
+            <button
+              className="subtle btn-ic"
+              title="Rename this chat"
+              disabled={asking || !activeChatId || renaming}
+              onClick={startRename}
             >
-              {chats.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.title}
-                </option>
-              ))}
-            </select>
+              <PencilIcon size={13} />
+            </button>
             <button className="subtle" title="New chat session" onClick={newChat}>
               ＋ New
             </button>
@@ -1114,17 +1410,68 @@ export default function Workspace({ info, onLock }: Props) {
               </button>
             </div>
           )}
-          {ai && !ai.running && (
-            <div className="banner">
-              Local AI engine is offline. Start <strong>Ollama</strong> to chat
-              with this room. <button className="subtle" onClick={refreshAi}>Retry</button>
+          {/* ADD-10: three distinct onboarding states, all button-driven. */}
+          {ai && !ai.running && !ai.installed && (
+            <div className="banner onboard">
+              <span>
+                This room's AI runs on <strong>Ollama</strong>, a free app.
+              </span>
+              <span className="onboard-actions">
+                <button className="subtle" onClick={getOllama}>
+                  Get Ollama
+                </button>
+                <button className="subtle" onClick={refreshAi}>
+                  I installed it — check again
+                </button>
+              </span>
+            </div>
+          )}
+          {ai && !ai.running && ai.installed && (
+            <div className="banner onboard">
+              <span>
+                <strong>Ollama</strong> is installed but not running.
+              </span>
+              <span className="onboard-actions">
+                <button className="subtle" onClick={openOllamaApp}>
+                  Open Ollama
+                </button>
+              </span>
             </div>
           )}
           {ai?.running && !modelReady && (
-            <div className="banner">
-              Model <strong>{model}</strong> is not downloaded. Run{" "}
-              <code>ollama pull {model}</code> in a terminal, then{" "}
-              <button className="subtle" onClick={refreshAi}>refresh</button>.
+            <div className="banner onboard">
+              {pullingModel ? (
+                <span className="banner-pull">
+                  <span className="banner-pull-label">
+                    Downloading <strong>{model}</strong>…
+                  </span>
+                  <span className="pull-bar">
+                    <span
+                      className="pull-bar-fill"
+                      style={{ width: `${pullPercent ?? 0}%` }}
+                    />
+                  </span>
+                  <span className="banner-pull-status">
+                    {pullStatus}
+                    {pullPercent != null && ` — ${pullPercent.toFixed(0)}%`}
+                  </span>
+                </span>
+              ) : (
+                <>
+                  <span>
+                    Model <strong>{model}</strong> isn't downloaded yet.
+                  </span>
+                  <span className="onboard-actions">
+                    <button
+                      className="subtle btn-ic"
+                      onClick={() => downloadModel(model)}
+                    >
+                      <DownloadIcon size={13} /> Download {model}
+                    </button>
+                  </span>
+                </>
+              )}
+              {pullError && <div className="banner-error">{pullError}</div>}
             </div>
           )}
           <div className="messages" ref={chatRef}>
@@ -1182,11 +1529,34 @@ export default function Workspace({ info, onLock }: Props) {
                     {m.sources.length > 0 && (
                       <span className="msg-sources">
                         {m.sources.map((s) => (
-                          <span key={s} className="source-chip">
+                          <button
+                            key={s}
+                            className="source-chip"
+                            title={`Open ${s}`}
+                            onClick={() => openSource(s)}
+                          >
                             {s}
-                          </span>
+                          </button>
                         ))}
                       </span>
+                    )}
+                    <button
+                      className="subtle"
+                      title="Copy this answer"
+                      disabled={asking}
+                      onClick={() => copyMessage(m)}
+                    >
+                      Copy
+                    </button>
+                    {m.id === lastAssistantId && (
+                      <button
+                        className="subtle"
+                        title="Delete this answer and ask again (the original attachments are not re-sent)"
+                        disabled={asking}
+                        onClick={() => regenerate(m.id)}
+                      >
+                        Regenerate
+                      </button>
                     )}
                     {saveDraft?.id === m.id ? (
                       <span className="save-form">
@@ -1218,19 +1588,29 @@ export default function Workspace({ info, onLock }: Props) {
               </div>
               );
             })}
-            {asking &&
-              (streamText ? (
-                <div className="msg assistant">
-                  <div className="msg-content">
-                    {streamText}
-                    <span className="stream-cursor">▍</span>
+            {asking && (
+              <div className={`msg assistant ${streamText ? "" : "thinking"}`}>
+                {steps.length > 0 && (
+                  <div className="step-chips">
+                    {steps.map((s, i) => (
+                      <span key={i} className="step-chip">
+                        {s}
+                      </span>
+                    ))}
                   </div>
+                )}
+                <div className="msg-content" dir="auto">
+                  {streamText ? (
+                    <>
+                      <MarkdownView text={patchStreamFences(streamText)} />
+                      <span className="stream-cursor">▍</span>
+                    </>
+                  ) : (
+                    "Thinking locally…"
+                  )}
                 </div>
-              ) : (
-                <div className="msg assistant thinking">
-                  <div className="msg-content">Thinking locally…</div>
-                </div>
-              ))}
+              </div>
+            )}
           </div>
 
           <div className="composer">
@@ -1277,6 +1657,7 @@ export default function Workspace({ info, onLock }: Props) {
                 rows={2}
                 dir="auto"
                 onChange={(e) => setQuestion(e.target.value)}
+                onPaste={onComposerPaste}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
@@ -1284,14 +1665,23 @@ export default function Workspace({ info, onLock }: Props) {
                   }
                 }}
               />
-              <button
-                className="primary btn-ic"
-                onClick={send}
-                disabled={asking || !question.trim()}
-              >
-                <SendIcon size={14} />
-                {asking ? "…" : "Send"}
-              </button>
+              {asking ? (
+                <button
+                  className="btn-ic stop-btn"
+                  title="Stop this answer"
+                  onClick={stopAsk}
+                >
+                  <span className="stop-glyph">◼</span> Stop
+                </button>
+              ) : (
+                <button
+                  className="primary btn-ic"
+                  onClick={send}
+                  disabled={!question.trim()}
+                >
+                  <SendIcon size={14} /> Send
+                </button>
+              )}
             </div>
           </div>
 

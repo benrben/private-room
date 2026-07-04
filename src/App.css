@@ -1174,6 +1174,115 @@ code {
   padding: 12px 16px;
 }
 
+/* ===== Wave 3 (Workspace) additions ===== */
+
+/* ADD-8 — full-window drop highlight while dragging files over the app. */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(139, 124, 246, 0.14);
+  backdrop-filter: blur(1px);
+  pointer-events: none;
+}
+.drop-overlay-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 26px 40px;
+  border: 2px dashed var(--accent);
+  border-radius: 16px;
+  background: var(--panel);
+  color: var(--accent);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+/* ADD-7 — Stop button while an answer streams. */
+.stop-btn {
+  color: var(--danger);
+  border-color: var(--border);
+  white-space: nowrap;
+}
+.stop-btn:hover {
+  border-color: var(--danger);
+}
+.stop-glyph {
+  font-size: 10px;
+  line-height: 1;
+}
+
+/* CHG-5 — per-turn tool-step chips above the live stream. */
+.step-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 7px;
+}
+.step-chip {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 2px 9px;
+}
+
+/* CHG-7 — source chips are now clickable buttons. */
+.source-chip {
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+.source-chip:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* ADD-9 — inline chat rename input matches the chat select. */
+.chat-rename {
+  flex: 1;
+  min-width: 0;
+}
+
+/* CHG-1/ADD-10 — onboarding banners: button rows + in-banner download bar. */
+.banner.onboard {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.onboard-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.banner-pull {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.banner-pull .pull-bar {
+  flex: 1;
+  margin-bottom: 0;
+}
+.banner-pull-status {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.banner-error {
+  width: 100%;
+  margin-top: 6px;
+  color: var(--danger);
+  font-size: 12px;
+}
+
 .attach-row {
   display: flex;
   flex-wrap: wrap;
