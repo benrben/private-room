@@ -184,6 +184,8 @@ export default function App() {
   const [entering, setEntering] = useState(false);
   const [recent, setRecent] = useState<RecentRoom[]>([]);
   const [templateKey, setTemplateKey] = useState("blank");
+  // ADD-11: whether the room on the unlock screen has a Touch ID entry.
+  const [canTouchId, setCanTouchId] = useState(false);
 
   const loadRecent = useCallback(() => {
     api
@@ -197,6 +199,7 @@ export default function App() {
     setConfirm("");
     setError("");
     setTemplateKey("blank");
+    setCanTouchId(false);
     setScreen(next);
   }, []);
 
@@ -219,6 +222,24 @@ export default function App() {
   useEffect(() => {
     if (screen.kind === "start") loadRecent();
   }, [screen.kind, loadRecent]);
+
+  // ADD-11: when the unlock screen appears, ask (without prompting) whether a
+  // Touch ID entry exists for this room, so we can offer the button.
+  useEffect(() => {
+    if (screen.kind !== "unlock") return;
+    let live = true;
+    api
+      .touchIdHas(screen.path)
+      .then((yes) => {
+        if (live) setCanTouchId(yes);
+      })
+      .catch(() => {
+        if (live) setCanTouchId(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [screen]);
 
   async function removeRecent(path: string) {
     await api.removeRecent(path);
@@ -306,6 +327,21 @@ export default function App() {
       setError(
         msg.includes("WRONG_PASSWORD") ? "Wrong password. Try again." : msg,
       );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // ADD-11: unlock with a fingerprint. Any failure (cancel, no match) just
+  // surfaces a message; the password field below stays available as fallback.
+  async function handleTouchId(path: string) {
+    setError("");
+    setBusy(true);
+    try {
+      const info = await api.touchIdOpen(path);
+      enterRoom(info);
+    } catch (e) {
+      setError(String(e));
     } finally {
       setBusy(false);
     }
@@ -454,6 +490,33 @@ export default function App() {
             <p className="gate-sub">
               Unlock <strong>{fileNameOf(screen.path)}</strong>
             </p>
+            {canTouchId && (
+              <button
+                type="button"
+                className="touchid-btn"
+                disabled={busy}
+                onClick={() => handleTouchId(screen.path)}
+              >
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.7"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M12 10a2 2 0 0 0-2 2c0 1.5.1 3 .5 4.5" />
+                  <path d="M8.5 8a5 5 0 0 1 7.5 4.3c0 1.4.1 2.8.4 4.2" />
+                  <path d="M5 12a7 7 0 0 1 13-3.6" />
+                  <path d="M6.2 16.5c-.4-1.5-.5-3-.5-4.5" />
+                  <path d="M12 12v1.5c0 2 .2 4 .8 6" />
+                </svg>
+                Use Touch ID
+              </button>
+            )}
             <input
               type="password"
               placeholder="Password"

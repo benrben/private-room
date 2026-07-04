@@ -3396,6 +3396,8 @@ name = "private-room"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
  "futures-util",
  "image",
  "imagesize 0.13.0",
@@ -3408,6 +3410,8 @@ dependencies = [
  "pdf-extract",
  "reqwest 0.12.28",
  "rusqlite",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",

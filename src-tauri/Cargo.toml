@@ -35,7 +35,7 @@ imagesize = "0.13"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 umya-spreadsheet = { version = "3.0.0", default-features = false }
 
-# ADD-14: on-device OCR via Apple's Vision framework (macOS only).
+# macOS-only native deps: ADD-14 OCR (Apple Vision) + ADD-11 Touch ID (Keychain).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
@@ -63,6 +63,10 @@ objc2-core-graphics = { version = "0.3", features = [
     "CGPDFDocument",
     "CGPDFPage",
 ] }
+security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }

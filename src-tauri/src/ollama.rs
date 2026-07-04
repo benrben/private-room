@@ -200,7 +200,7 @@ pub async fn embed(model: &str, texts: &[String], keep_alive: &str) -> Result<Ve
         "keep_alive": keep_alive,
     });
     let resp = client()?
-        .post(format!("{BASE_URL}/api/embed"))
+        .post(format!("{}/api/embed", base_url()))
         .json(&body)
         .send()
         .await
