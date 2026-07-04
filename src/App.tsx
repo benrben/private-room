@@ -448,7 +448,10 @@ export default function App() {
               placeholder="Choose a password"
               value={password}
               autoFocus
-              onChange={(e) => setPassword(e.target.value)}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                if (error) setError("");
+              }}
             />
             {password && (
               <div className={`pw-meter ${strength.level}`}>
@@ -462,7 +465,10 @@ export default function App() {
               type="password"
               placeholder="Repeat password"
               value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
+              onChange={(e) => {
+                setConfirm(e.target.value);
+                if (error) setError("");
+              }}
             />
             {error && <div className="gate-error">{error}</div>}
             <div className="gate-actions">
@@ -522,7 +528,10 @@ export default function App() {
               placeholder="Password"
               value={password}
               autoFocus
-              onChange={(e) => setPassword(e.target.value)}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                if (error) setError("");
+              }}
             />
             {error && <div className="gate-error">{error}</div>}
             <div className="gate-actions">
