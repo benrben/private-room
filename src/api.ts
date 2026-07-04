@@ -37,6 +37,23 @@ export interface FileMeta {
   source: string;
   hasText: boolean;
   createdAt: string;
+  /** Folder this file sits in, or null for the top level (ADD-16). */
+  folderId: string | null;
+  /** True when only the first N chunks were indexed (HLT-4). */
+  partiallyIndexed: boolean;
+}
+
+/** A one-level folder inside the room (ADD-16). */
+export interface Folder {
+  id: string;
+  name: string;
+}
+
+/** Grouped results of a room-wide search (ADD-6). */
+export interface SearchResults {
+  files: { id: string; name: string; snippet: string }[];
+  messages: { chatId: string; messageId: string; snippet: string }[];
+  memories: { id: string; snippet: string }[];
 }
 
 export interface ImportReport {
@@ -190,6 +207,18 @@ export const api = {
   addMemory: (content: string) => invoke<Memory>("add_memory", { content }),
   listMemories: () => invoke<Memory[]>("list_memories"),
   deleteMemory: (id: string) => invoke<void>("delete_memory", { id }),
+  updateMemory: (id: string, content: string) =>
+    invoke<void>("update_memory", { id, content }),
+  // ---- Wave 4: folders (ADD-16) ----
+  listFolders: () => invoke<Folder[]>("list_folders"),
+  createFolder: (name: string) => invoke<Folder>("create_folder", { name }),
+  renameFolder: (id: string, name: string) =>
+    invoke<void>("rename_folder", { id, name }),
+  deleteFolder: (id: string) => invoke<void>("delete_folder", { id }),
+  moveFileToFolder: (fileId: string, folderId: string | null) =>
+    invoke<void>("move_file_to_folder", { fileId, folderId }),
+  // ---- Wave 4: room-wide search (ADD-6) ----
+  searchAll: (query: string) => invoke<SearchResults>("search_all", { query }),
   getSetting: (key: string) => invoke<string | null>("get_setting", { key }),
   webSearchTest: () => invoke<string>("web_search_test"),
   setSetting: (key: string, value: string) =>
