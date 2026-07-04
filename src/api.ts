@@ -14,6 +14,16 @@ export interface RoomInfo {
   messageCount: number;
   /** True when the room file lives in a cloud-sync folder (HLT-6). */
   synced: boolean;
+  /** Set when the room has enabled MCP servers whose config fingerprint is
+   * not yet approved on this Mac — the UI must ask before anything runs
+   * (SEC-1). null when there's nothing to approve. */
+  pendingMcp: McpApproval | null;
+}
+
+/** An MCP config awaiting the user's approval before its servers start (SEC-1). */
+export interface McpApproval {
+  fingerprint: string;
+  servers: { name: string; command: string }[];
 }
 
 /** A prior saved state of a file (ADD-2). */
@@ -227,6 +237,13 @@ export const api = {
   mcpApplyConfig: (json: string) =>
     invoke<McpServerStatus[]>("mcp_apply_config", { json }),
   mcpStatus: () => invoke<McpServerStatus[]>("mcp_status"),
+  // SEC-1: approve the pending config fingerprint and start its servers.
+  approveMcp: (fingerprint: string) =>
+    invoke<McpServerStatus[]>("approve_mcp", { fingerprint }),
+  // ADD-12: fetch a web page and save it as a readable room file.
+  importLink: (url: string) => invoke<FileMeta>("import_link", { url }),
+  // ADD-17: build/refresh the "Room summary.md" file; emits summarize-progress.
+  summarizeRoom: () => invoke<FileMeta>("summarize_room"),
   aiStatus: () => invoke<AiStatus>("ai_status"),
   warmModel: () => invoke<void>("warm_model"),
   pullModel: (name: string) => invoke<void>("pull_model", { name }),
@@ -268,6 +285,9 @@ export const api = {
     listen("ask-round", () => cb()),
   onAskNotice: (cb: (text: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-notice", (e) => cb(e.payload)),
+  // ADD-17: progress while the room summary is being built.
+  onSummarizeProgress: (cb: (text: string) => void): Promise<UnlistenFn> =>
+    listen<string>("summarize-progress", (e) => cb(e.payload)),
   onAgentOpenFile: (
     cb: (payload: AgentOpenFilePayload) => void,
   ): Promise<UnlistenFn> =>
