@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api, RoomInfo } from "./api";
+import { api, RoomInfo, RecentRoom } from "./api";
 import Workspace from "./Workspace";
-import { Logomark } from "./icons";
+import { Logomark, CloseIcon } from "./icons";
 import "./App.css";
 
 type Screen =
@@ -53,6 +53,14 @@ export default function App() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [entering, setEntering] = useState(false);
+  const [recent, setRecent] = useState<RecentRoom[]>([]);
+
+  const loadRecent = useCallback(() => {
+    api
+      .listRecent()
+      .then(setRecent)
+      .catch(() => setRecent([]));
+  }, []);
 
   const goTo = useCallback((next: Screen) => {
     setPassword("");
@@ -74,6 +82,22 @@ export default function App() {
       unlisten.then((fn) => fn());
     };
   }, [goTo]);
+
+  // Refresh the recent-rooms list every time we land on the start screen,
+  // so it reflects rooms opened since the app launched.
+  useEffect(() => {
+    if (screen.kind === "start") loadRecent();
+  }, [screen.kind, loadRecent]);
+
+  async function removeRecent(path: string) {
+    await api.removeRecent(path);
+    loadRecent();
+  }
+
+  async function clearRecent() {
+    await api.clearRecent();
+    loadRecent();
+  }
 
   async function chooseCreate() {
     const path = await api.chooseSavePath({
@@ -171,6 +195,37 @@ export default function App() {
               </button>
               <button onClick={chooseOpen}>Open Room…</button>
             </div>
+            {recent.length > 0 && (
+              <div className="recent">
+                <div className="recent-label">Recent</div>
+                <ul className="recent-list">
+                  {recent.map((room) => (
+                    <li key={room.path} className="recent-row">
+                      <button
+                        className="recent-open"
+                        onClick={() =>
+                          goTo({ kind: "unlock", path: room.path })
+                        }
+                      >
+                        <span className="recent-name">{room.name}</span>
+                        <span className="recent-path">{room.path}</span>
+                      </button>
+                      <button
+                        className="recent-remove"
+                        title="Remove from list"
+                        aria-label="Remove from list"
+                        onClick={() => removeRecent(room.path)}
+                      >
+                        <CloseIcon size={14} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <button className="recent-clear" onClick={clearRecent}>
+                  Clear list
+                </button>
+              </div>
+            )}
           </>
         )}
 
