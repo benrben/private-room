@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS web_pages (
   readable_text TEXT,
   saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
+-- RM-2: one cache row per URL so repeat fetches upsert instead of piling up.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_web_pages_url ON web_pages(url);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -172,6 +174,17 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     }
+
+    // RM-2: the web_pages cache must be keyed by URL so save_web_page can upsert.
+    // Older rooms may already hold duplicate-URL rows, which would make the
+    // unique index fail — collapse them first (keep the newest row per URL),
+    // then enforce uniqueness. Both steps are idempotent on already-migrated rooms.
+    conn.execute_batch(
+        "DELETE FROM web_pages
+           WHERE rowid NOT IN (SELECT MAX(rowid) FROM web_pages GROUP BY url);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_web_pages_url ON web_pages(url);",
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -663,13 +676,44 @@ pub fn set_chat_title_if_new(conn: &Connection, chat_id: &str, title: &str) -> R
 
 // ---------------------------------------------------------------- web pages
 
-/// Cache a fetched page's readable text. Callers ignore failures here (the
-/// fetch itself already succeeded; caching it is best-effort).
+/// How long a cached page counts as fresh before we re-fetch (RM-2).
+const WEB_CACHE_TTL: &str = "-24 hours";
+
+/// Cache a fetched page's readable text, keyed by URL (RM-2). Upserts so
+/// repeat fetches refresh the same row instead of growing the table forever.
+/// `raw_html` is intentionally left NULL — it is reserved for ADD-12 (link
+/// import), the future reader that will populate and consume it.
+/// Callers ignore failures here (the fetch already succeeded; caching is
+/// best-effort).
 pub fn save_web_page(conn: &Connection, url: &str, title: &str, text: &str) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO web_pages(id, url, title, readable_text) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO web_pages(id, url, title, readable_text) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(url) DO UPDATE SET
+           title = excluded.title,
+           readable_text = excluded.readable_text,
+           saved_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
         params![Uuid::new_v4().to_string(), url, title, text],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Return a cached (title, readable_text) for this exact URL if it was fetched
+/// within the last 24h, else None (RM-2). Lets `fetch_page` skip the network on
+/// a fresh hit. `saved_at` is a sortable ISO-8601 string, so a lexical compare
+/// against the TTL cutoff is correct.
+pub fn get_fresh_web_page(conn: &Connection, url: &str) -> Option<(String, String)> {
+    conn.query_row(
+        "SELECT title, readable_text FROM web_pages
+         WHERE url = ?1
+           AND saved_at > strftime('%Y-%m-%dT%H:%M:%SZ','now',?2)",
+        params![url, WEB_CACHE_TTL],
+        |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        },
+    )
+    .ok()
 }
