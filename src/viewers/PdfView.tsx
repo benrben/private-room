@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { foldChar, normalizeForMatch } from "./highlight";
@@ -7,6 +7,9 @@ import { base64ToBytes } from "./util";
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
 const MAX_PAGES = 100;
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 3;
+const SCALE_STEP = 0.25;
 
 export interface PdfTarget {
   page?: number;
@@ -17,6 +20,7 @@ interface TextItem {
   str?: string;
   width?: number;
   transform: number[];
+  hasEOL?: boolean;
 }
 
 /** pdf.js v6's getTextContent() iterates a ReadableStream with
@@ -35,15 +39,57 @@ async function readTextItems(page: pdfjs.PDFPageProxy): Promise<TextItem[]> {
   return items;
 }
 
+/** Join a page's text items into readable text (reading order + line
+ * breaks). pdf.js emits `hasEOL` on the item that ends a line. */
+function pageTextFromItems(items: TextItem[]): string {
+  let out = "";
+  for (const it of items) {
+    out += it.str ?? "";
+    if (it.hasEOL) out += "\n";
+  }
+  return out.replace(/[ \t]+\n/g, "\n").trim();
+}
+
+/** A per-page "Copy text" button (UX-2). Built imperatively because the
+ * pages themselves are rendered imperatively into the container. */
+function makeCopyButton(text: string): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "pdf-copy-btn";
+  btn.textContent = "Copy text";
+  btn.title = "Copy this page's text";
+  const reset = () => {
+    btn.textContent = "Copy text";
+    btn.classList.remove("copied");
+  };
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        btn.textContent = "Copied";
+        btn.classList.add("copied");
+        window.setTimeout(reset, 1200);
+      })
+      .catch(() => {
+        btn.textContent = "Copy failed";
+        window.setTimeout(reset, 1200);
+      });
+  });
+  return btn;
+}
+
 /**
  * Find `quote` in a page's text items and paint absolutely-positioned
  * highlight divs over the canvas. Item-level granularity: every text run
- * the match passes through gets a box.
+ * the match passes through gets a box. `scroll` brings the first box into
+ * view (suppressed on zoom re-renders, which preserve reading position).
  */
 async function highlightQuoteOnPage(
   page: pdfjs.PDFPageProxy,
   wrap: HTMLDivElement,
   quote: string,
+  scroll = true,
 ): Promise<boolean> {
   // Space-free matching: pdf.js and the backend's text extractor split
   // words and spaces differently, so spacing can't be trusted at all.
@@ -86,7 +132,7 @@ async function highlightQuoteOnPage(
     wrap.appendChild(hl);
     first = first ?? hl;
   }
-  first?.scrollIntoView({ block: "center", behavior: "smooth" });
+  if (scroll) first?.scrollIntoView({ block: "center", behavior: "smooth" });
   return first != null;
 }
 
@@ -97,28 +143,54 @@ export default function PdfView({
   dataB64: string;
   target?: PdfTarget;
 }) {
+  const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const pdfRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
+  const pageWrapsRef = useRef<HTMLDivElement[]>([]);
+  const renderTokenRef = useRef(0);
+  const hoverRef = useRef(false);
+  const targetRef = useRef(target);
+  targetRef.current = target;
+
   const [status, setStatus] = useState("Rendering PDF…");
+  const [scale, setScale] = useState(1);
+  const scaleRef = useRef(scale);
+  scaleRef.current = scale;
+
   const targetKey = JSON.stringify(target ?? null);
 
-  useEffect(() => {
-    let cancelled = false;
-    const container = containerRef.current;
-    if (!container) return;
-    container.innerHTML = "";
-    const task = pdfjs.getDocument({ data: base64ToBytes(dataB64) });
-    (async () => {
+  /**
+   * Render every page into the container at `scale` (1 = fit width),
+   * attach per-page copy buttons, then re-run the quote highlight.
+   * `restoreIdx` (set on zoom re-renders) scrolls that page back to the
+   * top afterwards instead of auto-scrolling to the highlighted match.
+   * A monotonic token cancels a render that a newer one has superseded.
+   */
+  const doRender = useCallback(
+    async (renderScale: number, restoreIdx: number | null) => {
+      const pdf = pdfRef.current;
+      const container = containerRef.current;
+      if (!pdf || !container) return;
+      const token = ++renderTokenRef.current;
+      const tgt = targetRef.current;
+      const restoring = restoreIdx != null;
+
+      container.innerHTML = "";
+      const pageWraps: HTMLDivElement[] = [];
+      pageWrapsRef.current = pageWraps;
+      const pages = Math.min(pdf.numPages, MAX_PAGES);
+
       try {
-        const pdf = await task.promise;
-        const pages = Math.min(pdf.numPages, MAX_PAGES);
-        const pageWraps: HTMLDivElement[] = [];
         for (let p = 1; p <= pages; p++) {
-          if (cancelled) return;
+          if (token !== renderTokenRef.current) return;
           const page = await pdf.getPage(p);
-          const cssWidth = Math.max(container.clientWidth - 16, 400);
+          const fitWidth = Math.max(container.clientWidth - 16, 400);
+          const cssWidth = fitWidth * renderScale;
           const base = page.getViewport({ scale: 1 });
           const dpr = window.devicePixelRatio || 1;
-          const viewport = page.getViewport({ scale: (cssWidth / base.width) * dpr });
+          const viewport = page.getViewport({
+            scale: (cssWidth / base.width) * dpr,
+          });
           const canvas = document.createElement("canvas");
           canvas.width = viewport.width;
           canvas.height = viewport.height;
@@ -130,63 +202,194 @@ export default function PdfView({
           container.appendChild(wrap);
           pageWraps.push(wrap);
           await page.render({ canvas, viewport }).promise;
+          if (token !== renderTokenRef.current) return;
+
+          // UX-2: per-page copy button, hidden when the page has no text.
+          const pageText = pageTextFromItems(await readTextItems(page));
+          if (pageText) wrap.appendChild(makeCopyButton(pageText));
+
+          // Keep the reader's place while pages stream in below.
+          if (restoring && p - 1 === restoreIdx) {
+            wrap.scrollIntoView({ block: "start" });
+          }
         }
-        if (cancelled) return;
+        if (token !== renderTokenRef.current) return;
         setStatus(
           pdf.numPages > MAX_PAGES
             ? `Showing first ${MAX_PAGES} of ${pdf.numPages} pages`
             : "",
         );
-        if (target?.quote) {
+
+        if (tgt?.quote) {
           // Try the hinted page first, then the rest.
           const order = [...Array(pages).keys()].map((i) => i + 1);
-          if (target.page && target.page >= 1 && target.page <= pages) {
-            order.splice(order.indexOf(target.page), 1);
-            order.unshift(target.page);
+          if (tgt.page && tgt.page >= 1 && tgt.page <= pages) {
+            order.splice(order.indexOf(tgt.page), 1);
+            order.unshift(tgt.page);
           }
           let found = false;
           for (const p of order) {
-            if (cancelled) return;
+            if (token !== renderTokenRef.current) return;
             const page = await pdf.getPage(p);
-            if (await highlightQuoteOnPage(page, pageWraps[p - 1], target.quote)) {
+            if (
+              await highlightQuoteOnPage(
+                page,
+                pageWraps[p - 1],
+                tgt.quote,
+                !restoring,
+              )
+            ) {
               found = true;
               break;
             }
           }
-          if (!found && !cancelled) {
+          if (!found && token === renderTokenRef.current && !restoring) {
             setStatus(
-              target.page
-                ? `Couldn't locate the highlighted text — showing page ${target.page} instead.`
+              tgt.page
+                ? `Couldn't locate the highlighted text — showing page ${tgt.page} instead.`
                 : "Couldn't locate the highlighted text in this PDF.",
             );
-            if (target.page) {
-              pageWraps[Math.min(target.page, pages) - 1]?.scrollIntoView({
+            if (tgt.page) {
+              pageWraps[Math.min(tgt.page, pages) - 1]?.scrollIntoView({
                 block: "start",
                 behavior: "smooth",
               });
             }
           }
-        } else if (target?.page) {
-          pageWraps[Math.min(Math.max(target.page, 1), pages) - 1]?.scrollIntoView({
+        } else if (tgt?.page && !restoring) {
+          pageWraps[Math.min(Math.max(tgt.page, 1), pages) - 1]?.scrollIntoView({
             block: "start",
             behavior: "smooth",
           });
         }
+      } catch (e) {
+        if (token === renderTokenRef.current) {
+          setStatus(`Could not render PDF: ${e}`);
+        }
+      }
+    },
+    [],
+  );
+
+  // Load the document once per file/target, then render at current scale.
+  useEffect(() => {
+    let cancelled = false;
+    const container = containerRef.current;
+    if (!container) return;
+    setStatus("Rendering PDF…");
+    const task = pdfjs.getDocument({ data: base64ToBytes(dataB64) });
+    (async () => {
+      try {
+        const pdf = await task.promise;
+        if (cancelled) return;
+        pdfRef.current = pdf;
+        await doRender(scaleRef.current, null);
       } catch (e) {
         if (!cancelled) setStatus(`Could not render PDF: ${e}`);
       }
     })();
     return () => {
       cancelled = true;
+      renderTokenRef.current++; // cancel any in-flight render
       task.destroy();
+      pdfRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataB64, targetKey]);
+  }, [dataB64, targetKey, doRender]);
+
+  // UX-3: re-render on zoom, debounced, preserving reading position.
+  useEffect(() => {
+    if (!pdfRef.current) return; // document not loaded yet
+    const container = containerRef.current;
+    const wraps = pageWrapsRef.current;
+    let topIdx = 0;
+    if (container && wraps.length) {
+      const ref = container.getBoundingClientRect().top;
+      for (let i = 0; i < wraps.length; i++) {
+        if (wraps[i].getBoundingClientRect().bottom >= ref + 4) {
+          topIdx = i;
+          break;
+        }
+      }
+    }
+    const t = window.setTimeout(() => doRender(scale, topIdx), 200);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scale, doRender]);
+
+  const clamp = (s: number) =>
+    Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(s * 100) / 100));
+  const zoomIn = useCallback(() => setScale((s) => clamp(s + SCALE_STEP)), []);
+  const zoomOut = useCallback(() => setScale((s) => clamp(s - SCALE_STEP)), []);
+  const fitWidth = useCallback(() => setScale(1), []);
+
+  // ⌘+ / ⌘- / ⌘0 while the viewer is hovered or focused.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey) return;
+      const root = rootRef.current;
+      const active =
+        hoverRef.current || (root ? root.contains(document.activeElement) : false);
+      if (!active) return;
+      if (e.key === "+" || e.key === "=") {
+        e.preventDefault();
+        zoomIn();
+      } else if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        zoomOut();
+      } else if (e.key === "0") {
+        e.preventDefault();
+        fitWidth();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoomIn, zoomOut, fitWidth]);
 
   return (
-    <div className="pdf-view">
+    <div
+      className="pdf-view"
+      ref={rootRef}
+      onMouseEnter={() => {
+        hoverRef.current = true;
+      }}
+      onMouseLeave={() => {
+        hoverRef.current = false;
+      }}
+    >
+      <div className="pdf-zoombar">
+        <button
+          type="button"
+          className="pdf-zoom-btn"
+          onClick={zoomOut}
+          disabled={scale <= MIN_SCALE + 1e-9}
+          title="Zoom out (⌘−)"
+          aria-label="Zoom out"
+        >
+          −
+        </button>
+        <span className="pdf-zoom-pct">{Math.round(scale * 100)}%</span>
+        <button
+          type="button"
+          className="pdf-zoom-btn"
+          onClick={zoomIn}
+          disabled={scale >= MAX_SCALE - 1e-9}
+          title="Zoom in (⌘+)"
+          aria-label="Zoom in"
+        >
+          +
+        </button>
+        <button
+          type="button"
+          className="pdf-zoom-fit"
+          onClick={fitWidth}
+          title="Fit width (⌘0)"
+        >
+          Fit width
+        </button>
+      </div>
       {status && <div className="viewer-status">{status}</div>}
-      <div ref={containerRef} />
+      <div ref={containerRef} className="pdf-pages" />
     </div>
   );
 }
