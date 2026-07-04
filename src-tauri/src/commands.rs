@@ -101,6 +101,51 @@ pub struct FileMeta {
     pub source: String,
     pub has_text: bool,
     pub created_at: String,
+    /// ADD-16: owning folder, or None when the file sits at the top level.
+    pub folder_id: Option<String>,
+    /// HLT-4: true when indexing hit the chunk cap, so only the first part of
+    /// the file is searchable. Derived live from the chunk count, no column.
+    pub partially_indexed: bool,
+}
+
+/// ADD-16: one flat folder. Files reference it by `folder_id`.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
+}
+
+/// ADD-6: grouped results for the user's own room-wide search (⌘F).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResults {
+    pub files: Vec<FileHit>,
+    pub messages: Vec<MessageHit>,
+    pub memories: Vec<MemoryHit>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHit {
+    pub id: String,
+    pub name: String,
+    pub snippet: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageHit {
+    pub chat_id: String,
+    pub message_id: String,
+    pub snippet: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryHit {
+    pub id: String,
+    pub snippet: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -1104,10 +1149,24 @@ pub fn clear_recent(app: tauri::AppHandle) -> Result<(), String> {
 
 // ---------------------------------------------------------------- memory
 
+/// UX-5: an existing memory whose normalized text equals `content`'s, if any.
+/// Shared by the UI command and the AI tool so neither path can create an exact
+/// duplicate (ignoring case and whitespace).
+fn duplicate_memory(conn: &Connection, content: &str) -> Result<Option<Memory>, String> {
+    let norm = normalize_for_match(content);
+    Ok(db::list_memories(conn)?
+        .into_iter()
+        .find(|m| normalize_for_match(&m.content) == norm))
+}
+
 #[tauri::command]
 pub fn add_memory(state: State<'_, AppState>, content: String) -> Result<Memory, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
+    // UX-5: never store an exact duplicate; hand back the existing entry instead.
+    if let Some(existing) = duplicate_memory(&room.conn, &content)? {
+        return Ok(existing);
+    }
     db::add_memory(&room.conn, &content)
 }
 
@@ -1118,11 +1177,130 @@ pub fn list_memories(state: State<'_, AppState>) -> Result<Vec<Memory>, String> 
     db::list_memories(&room.conn)
 }
 
+/// UX-5: edit a memory's text in place.
+#[tauri::command]
+pub fn update_memory(state: State<'_, AppState>, id: String, content: String) -> Result<(), String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::update_memory(&room.conn, &id, &content)
+}
+
 #[tauri::command]
 pub fn delete_memory(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
     db::delete_memory(&room.conn, &id)
+}
+
+// ---------------------------------------------------------------- folders (ADD-16)
+
+#[tauri::command]
+pub fn list_folders(state: State<'_, AppState>) -> Result<Vec<Folder>, String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::list_folders(&room.conn)
+}
+
+#[tauri::command]
+pub fn create_folder(state: State<'_, AppState>, name: String) -> Result<Folder, String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::create_folder(&room.conn, &name)
+}
+
+#[tauri::command]
+pub fn rename_folder(state: State<'_, AppState>, id: String, name: String) -> Result<(), String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::rename_folder(&room.conn, &id, &name)
+}
+
+#[tauri::command]
+pub fn delete_folder(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::delete_folder(&room.conn, &id)
+}
+
+#[tauri::command]
+pub fn move_file_to_folder(
+    state: State<'_, AppState>,
+    file_id: String,
+    folder_id: Option<String>,
+) -> Result<(), String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::move_file_to_folder(&room.conn, &file_id, folder_id.as_deref())
+}
+
+// ---------------------------------------------------------------- search (ADD-6)
+
+/// ADD-6: search the user's own room across file names + content, chat
+/// messages, and memories. File content rides the FTS5 index (HLT-3); messages
+/// and memories use LIKE. Every hit carries a short snippet for the overlay.
+#[tauri::command]
+pub fn search_all(state: State<'_, AppState>, query: String) -> Result<SearchResults, String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    let conn = &room.conn;
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(SearchResults {
+            files: Vec::new(),
+            messages: Vec::new(),
+            memories: Vec::new(),
+        });
+    }
+    let needle = trimmed.to_lowercase();
+
+    // Files: content hits (FTS) first, then name-only matches not already shown.
+    let mut files: Vec<FileHit> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(expr) = fts_match_expr(question_terms(trimmed).iter().map(String::as_str))
+        .or_else(|| fts_match_expr(std::iter::once(needle.as_str())))
+    {
+        for (id, name, chunk) in db::files_content_fts(conn, &expr, 15)? {
+            if seen.insert(id.clone()) {
+                files.push(FileHit {
+                    id,
+                    name,
+                    snippet: make_snippet(&chunk, trimmed, 60),
+                });
+            }
+        }
+    }
+    for (id, name) in db::files_name_like(conn, &needle)? {
+        if seen.insert(id.clone()) {
+            files.push(FileHit {
+                snippet: name.clone(),
+                id,
+                name,
+            });
+        }
+    }
+
+    let messages = db::messages_like(conn, &needle)?
+        .into_iter()
+        .map(|(chat_id, message_id, content)| MessageHit {
+            chat_id,
+            message_id,
+            snippet: make_snippet(&content, trimmed, 60),
+        })
+        .collect();
+
+    let memories = db::memories_like(conn, &needle)?
+        .into_iter()
+        .map(|(id, content)| MemoryHit {
+            snippet: make_snippet(&content, trimmed, 60),
+            id,
+        })
+        .collect();
+
+    Ok(SearchResults {
+        files,
+        messages,
+        memories,
+    })
 }
 
 // ---------------------------------------------------------------- settings
@@ -1664,57 +1842,98 @@ fn question_terms(question: &str) -> Vec<String> {
 struct ScoredChunk {
     file_name: String,
     text: String,
+    #[allow(dead_code)]
     score: f32,
 }
 
-/// Returns the scored chunks plus a `fallback` flag: true when nothing matched
-/// the question and we padded with recent content instead (CHG-10 — such
-/// filler must not be credited as a "source").
-fn retrieve_context(conn: &Connection, question: &str) -> Result<(Vec<ScoredChunk>, bool), String> {
-    let terms = question_terms(question);
-    let rows = db::list_chunks_with_file_names(conn)?;
-
-    let mut scored: Vec<ScoredChunk> = rows
-        .iter()
-        .map(|(name, text)| {
-            let lower = text.to_lowercase();
-            let score: f32 = terms
-                .iter()
-                .map(|t| {
-                    let c = lower.matches(t.as_str()).count();
-                    if c > 0 {
-                        1.0 + (c as f32).ln()
-                    } else {
-                        0.0
-                    }
-                })
-                .sum();
-            ScoredChunk {
-                file_name: name.clone(),
-                text: text.clone(),
-                score,
-            }
-        })
-        .filter(|c| c.score > 0.0)
+/// Build an FTS5 MATCH expression from search terms: each term is double-quoted
+/// (so punctuation or an FTS keyword like "or"/"near" is treated as a literal)
+/// and the terms are OR-joined. Returns None when there are no usable terms.
+fn fts_match_expr<'a>(terms: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let quoted: Vec<String> = terms
+        .into_iter()
+        // A quote inside a term would break out of the FTS string literal.
+        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .filter(|t| t.len() > 2) // drop the empty `""` a stripped term leaves
         .collect();
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(MAX_CONTEXT_CHUNKS);
+    if quoted.is_empty() {
+        None
+    } else {
+        Some(quoted.join(" OR "))
+    }
+}
+
+/// HLT-3: retrieve context via the FTS5 index instead of scanning every chunk.
+/// Ranks by bm25() and takes the top MAX_CONTEXT_CHUNKS. Returns the chunks plus
+/// a `fallback` flag: true when nothing matched and we padded with recent
+/// content instead (CHG-10 — such filler must not be credited as a "source").
+/// The `(chunks, fallback)` tuple shape is preserved for callers.
+fn retrieve_context(conn: &Connection, question: &str) -> Result<(Vec<ScoredChunk>, bool), String> {
+    if let Some(expr) = fts_match_expr(question_terms(question).iter().map(String::as_str)) {
+        let hits = db::search_chunks_fts(conn, &expr, MAX_CONTEXT_CHUNKS)?;
+        if !hits.is_empty() {
+            let scored = hits
+                .into_iter()
+                // bm25 is lower-is-better; negate so higher score = better match.
+                .map(|(file_name, text, bm25)| ScoredChunk {
+                    file_name,
+                    text,
+                    score: -bm25 as f32,
+                })
+                .collect();
+            return Ok((scored, false));
+        }
+    }
 
     // Generic questions ("summarize this") match nothing; fall back to the
     // most recently added content so the model still sees the room.
-    if scored.is_empty() {
-        scored = rows
-            .into_iter()
-            .take(MAX_CONTEXT_CHUNKS)
-            .map(|(name, text)| ScoredChunk {
-                file_name: name,
-                text,
-                score: 0.0,
-            })
-            .collect();
-        return Ok((scored, true));
+    let scored = db::recent_chunks(conn, MAX_CONTEXT_CHUNKS)?
+        .into_iter()
+        .map(|(file_name, text)| ScoredChunk {
+            file_name,
+            text,
+            score: 0.0,
+        })
+        .collect();
+    Ok((scored, true))
+}
+
+/// ADD-6: extract a short snippet of `haystack` around the first occurrence of
+/// `needle` (case-insensitive), with ellipses when clipped. Falls back to the
+/// first matching word of `needle`, then to the start of the text. Whitespace
+/// is collapsed so multi-line file text reads as one line. Pure and testable.
+fn make_snippet(haystack: &str, needle: &str, radius: usize) -> String {
+    let normalized: String = haystack.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_lowercase();
+    let find = |n: &str| {
+        let n = n.trim().to_lowercase();
+        if n.is_empty() {
+            None
+        } else {
+            lower.find(&n)
+        }
+    };
+    let chars: Vec<char> = normalized.chars().collect();
+    // No match to center on: return a clipped preview from the start.
+    let Some(byte) = find(needle).or_else(|| needle.split_whitespace().find_map(find)) else {
+        let mut out: String = chars.iter().take(radius * 2).collect();
+        if chars.len() > radius * 2 {
+            out.push('…');
+        }
+        return out;
+    };
+    let char_pos = lower[..byte].chars().count();
+    let start = char_pos.saturating_sub(radius);
+    let end = (char_pos + radius).min(chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
     }
-    Ok((scored, false))
+    out.extend(&chars[start..end]);
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
 }
 
 #[tauri::command]
@@ -2654,6 +2873,10 @@ async fn exec_tool(
             let content = args["content"].as_str().unwrap_or_default();
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
+            // UX-5: don't store an exact duplicate; tell the model so it stops.
+            if duplicate_memory(&room.conn, content)?.is_some() {
+                return Ok("Already remembered.".into());
+            }
             db::add_memory(&room.conn, content)?;
             Ok("Memory saved.".into())
         }
@@ -2766,6 +2989,44 @@ mod tests {
     fn normalizes_for_quote_matching() {
         let doc = normalize_for_match("The  Fee is\n 5%  of total.");
         assert!(doc.contains(&normalize_for_match("fee is 5%")));
+    }
+
+    #[test]
+    fn memory_dedup_normalization() {
+        // UX-5: dedup keys on normalize_for_match, so case and spacing
+        // differences collapse to the same key (an exact duplicate).
+        assert_eq!(
+            normalize_for_match("The dog is named Rex"),
+            normalize_for_match("the   dog  is named rex")
+        );
+        // A genuinely different fact keeps a distinct key.
+        assert_ne!(
+            normalize_for_match("The dog is named Rex"),
+            normalize_for_match("The cat is named Rex")
+        );
+    }
+
+    #[test]
+    fn snippet_centers_on_the_match() {
+        let text = "The quarterly report shows revenue of five million dollars this year.";
+        let snip = make_snippet(text, "revenue", 20);
+        assert!(snip.to_lowercase().contains("revenue"));
+        // Clipped on both sides → ellipses front and back.
+        assert!(snip.starts_with('…') && snip.ends_with('…'));
+        // Multi-line text collapses to one line in the snippet.
+        let multi = make_snippet("alpha\n\n  beta   gamma", "beta", 40);
+        assert!(multi.contains("alpha beta gamma"));
+        // No match → a preview from the start, never a panic.
+        let none = make_snippet("just some words here", "zzzzz", 5);
+        assert!(none.starts_with("just"));
+    }
+
+    #[test]
+    fn fts_match_expr_quotes_and_or_joins() {
+        let expr = fts_match_expr(["lease", "rent"]).unwrap();
+        assert_eq!(expr, "\"lease\" OR \"rent\"");
+        // Empty input yields no query (caller falls back).
+        assert!(fts_match_expr(std::iter::empty::<&str>()).is_none());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::commands::{Chat, FileMeta, FileVersion, Memory, Message};
+use crate::commands::{Chat, FileMeta, FileVersion, Folder, Memory, Message};
 use crate::extraction;
 use rusqlite::{params, Connection};
 use uuid::Uuid;
@@ -8,6 +8,11 @@ CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- ADD-16: one flat level of folders. A file's folder_id is NULL at top level.
+CREATE TABLE IF NOT EXISTS folders (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE
+);
 CREATE TABLE IF NOT EXISTS files (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -16,6 +21,7 @@ CREATE TABLE IF NOT EXISTS files (
   source TEXT NOT NULL DEFAULT 'upload',
   original_bytes BLOB,
   extracted_text TEXT,
+  folder_id TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -26,6 +32,20 @@ CREATE TABLE IF NOT EXISTS chunks (
   embedding BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
+-- HLT-3: full-text index over chunk text, kept in sync by the triggers below.
+-- External-content table: rows live in `chunks`, the index only stores terms.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
+  USING fts5(text, content='chunks', content_rowid='rowid');
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
+  INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
+  INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE ON chunks BEGIN
+  INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+  INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
 CREATE TABLE IF NOT EXISTS chats (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL DEFAULT 'New chat',
@@ -218,7 +238,78 @@ fn migrate(conn: &Connection) -> Result<(), String> {
          CREATE UNIQUE INDEX IF NOT EXISTS idx_web_pages_url ON web_pages(url);",
     )
     .map_err(|e| e.to_string())?;
+
+    // ADD-16: folders table + a nullable files.folder_id (NULL = top level).
+    // Old rooms never ran SCHEMA, so create the table and add the column when
+    // it is missing — mirroring the chat_id migration above. The column only
+    // makes sense once a files table exists.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS folders (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL UNIQUE
+         );",
+    )
+    .map_err(|e| e.to_string())?;
+    if table_exists(conn, "files")? && !column_exists(conn, "files", "folder_id")? {
+        conn.execute("ALTER TABLE files ADD COLUMN folder_id TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    // HLT-3: FTS5 index over chunk text. Create the virtual table and its sync
+    // triggers if absent, then backfill from existing chunks — but only when the
+    // table was just created, so re-opening a migrated room stays cheap. The
+    // triggers keep it in sync on every insert/update/delete afterwards. All of
+    // this depends on the chunks table existing.
+    if table_exists(conn, "chunks")? {
+        let fts_existed = table_exists(conn, "chunks_fts")?;
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
+               USING fts5(text, content='chunks', content_rowid='rowid');
+             CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
+               INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
+               INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE ON chunks BEGIN
+               INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+               INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+             END;",
+        )
+        .map_err(|e| e.to_string())?;
+        if !fts_existed {
+            // Populate the index from whatever chunks the old room already has.
+            conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')", [])
+                .map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
+}
+
+/// True when `table` has a column named `column` (used to guard ALTER TABLE
+/// migrations so they run exactly once).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let cols = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(cols.iter().any(|c| c == column))
+}
+
+/// True when a table (or virtual table) named `name` exists.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(count > 0)
 }
 
 // ==================================================================
@@ -229,6 +320,10 @@ fn migrate(conn: &Connection) -> Result<(), String> {
 
 /// Target chunk size (chars) for the room's keyword search index.
 const CHUNK_TARGET_CHARS: usize = 1200;
+/// HLT-4: hard cap on chunks indexed per file. A file that hits it is only
+/// partially searchable; `FileMeta.partially_indexed` surfaces that live via a
+/// chunk-count check, so this cap and that flag must agree.
+pub const CHUNK_CAP: usize = 2000;
 
 // ---------------------------------------------------------------- meta
 
@@ -240,7 +335,15 @@ pub fn get_meta(conn: &Connection, key: &str) -> Option<String> {
 
 // ---------------------------------------------------------------- files
 
+/// Column list shared by every FileMeta query: the base row plus folder_id and
+/// a live chunk count for `partially_indexed` (HLT-4). Kept as one constant so
+/// the row mapper's indices always line up with the SELECT.
+const FILE_META_COLS: &str = "f.id, f.name, f.mime_type, f.size_bytes, f.source, \
+     f.extracted_text, f.created_at, f.folder_id, \
+     (SELECT count(*) FROM chunks WHERE file_id = f.id)";
+
 fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
+    let chunk_count: i64 = row.get(8)?;
     Ok(FileMeta {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -249,6 +352,9 @@ fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
         source: row.get(4)?,
         has_text: row.get::<_, Option<String>>(5)?.is_some(),
         created_at: row.get(6)?,
+        folder_id: row.get(7)?,
+        // HLT-4: hitting the cap means only the first part is searchable.
+        partially_indexed: chunk_count >= CHUNK_CAP as i64,
     })
 }
 
@@ -257,7 +363,7 @@ fn insert_chunks(conn: &Connection, file_id: &str, text: Option<&str>) -> Result
     if let Some(text) = text {
         for (seq, chunk) in extraction::chunk_text(text, CHUNK_TARGET_CHARS)
             .into_iter()
-            .take(2000)
+            .take(CHUNK_CAP)
             .enumerate()
         {
             conn.execute(
@@ -293,10 +399,9 @@ pub fn insert_file(
 /// List every file's metadata, newest first.
 pub fn list_files(conn: &Connection) -> Result<Vec<FileMeta>, String> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, name, mime_type, size_bytes, source, extracted_text, created_at
-             FROM files ORDER BY created_at DESC, rowid DESC",
-        )
+        .prepare(&format!(
+            "SELECT {FILE_META_COLS} FROM files f ORDER BY f.created_at DESC, f.rowid DESC"
+        ))
         .map_err(|e| e.to_string())?;
     let files = stmt
         .query_map([], file_meta_row)
@@ -306,10 +411,17 @@ pub fn list_files(conn: &Connection) -> Result<Vec<FileMeta>, String> {
     Ok(files)
 }
 
-/// (name, mime type, size) for every file — feeds the agent's list_room_files tool.
+/// (display name, mime type, size) for every file — feeds the agent's
+/// list_room_files tool. ADD-16: files inside a folder read as "Folder/name"
+/// so the model sees the room's organization.
 pub fn list_files_brief(conn: &Connection) -> Result<Vec<(String, String, i64)>, String> {
     let mut stmt = conn
-        .prepare("SELECT name, coalesce(mime_type,''), size_bytes FROM files ORDER BY created_at")
+        .prepare(
+            "SELECT CASE WHEN fo.name IS NOT NULL THEN fo.name || '/' || f.name ELSE f.name END,
+                    coalesce(f.mime_type,''), f.size_bytes
+             FROM files f LEFT JOIN folders fo ON fo.id = f.folder_id
+             ORDER BY f.created_at",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -319,12 +431,15 @@ pub fn list_files_brief(conn: &Connection) -> Result<Vec<(String, String, i64)>,
     Ok(rows)
 }
 
-/// (name, mime type) for the oldest 100 files — feeds the model's file inventory.
+/// (display name, mime type) for the oldest 100 files — feeds the model's file
+/// inventory in the system prompt. ADD-16: folder-prefixed like list_files_brief.
 pub fn list_file_inventory(conn: &Connection) -> Result<Vec<(String, String)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT name, coalesce(mime_type, '') FROM files
-             ORDER BY created_at ASC LIMIT 100",
+            "SELECT CASE WHEN fo.name IS NOT NULL THEN fo.name || '/' || f.name ELSE f.name END,
+                    coalesce(f.mime_type, '')
+             FROM files f LEFT JOIN folders fo ON fo.id = f.folder_id
+             ORDER BY f.created_at ASC LIMIT 100",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -338,8 +453,7 @@ pub fn list_file_inventory(conn: &Connection) -> Result<Vec<(String, String)>, S
 /// Full metadata row for one file by id.
 pub fn get_file_meta(conn: &Connection, id: &str) -> Result<FileMeta, String> {
     conn.query_row(
-        "SELECT id, name, mime_type, size_bytes, source, extracted_text, created_at
-         FROM files WHERE id = ?1",
+        &format!("SELECT {FILE_META_COLS} FROM files f WHERE f.id = ?1"),
         [id],
         file_meta_row,
     )
@@ -479,17 +593,125 @@ pub fn find_image_like(
     .map_err(|_| format!("No image matching \"{needle}\" in this room."))
 }
 
-/// (file name, chunk text) for every chunk in the room, newest file first —
-/// input to the keyword search ranking in `retrieve_context`.
-pub fn list_chunks_with_file_names(conn: &Connection) -> Result<Vec<(String, String)>, String> {
+/// HLT-3: rank chunks by an FTS5 MATCH query, best (lowest bm25) first.
+/// Returns (file name, chunk text, bm25 score) — smaller score = better match.
+/// `match_expr` is a ready-built FTS5 query (e.g. `"foo" OR "bar"`).
+pub fn search_chunks_fts(
+    conn: &Connection,
+    match_expr: &str,
+    limit: usize,
+) -> Result<Vec<(String, String, f64)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT f.name, c.text FROM chunks c JOIN files f ON f.id = c.file_id
-             ORDER BY f.created_at DESC, c.seq ASC",
+            "SELECT f.name, c.text, bm25(chunks_fts)
+             FROM chunks_fts
+             JOIN chunks c ON c.rowid = chunks_fts.rowid
+             JOIN files f ON f.id = c.file_id
+             WHERE chunks_fts MATCH ?1
+             ORDER BY bm25(chunks_fts)
+             LIMIT ?2",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map(params![match_expr, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// (file name, chunk text) for the most recently added chunks — the fallback
+/// context when a question matches nothing in the FTS index (CHG-10).
+pub fn recent_chunks(conn: &Connection, limit: usize) -> Result<Vec<(String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.name, c.text FROM chunks c JOIN files f ON f.id = c.file_id
+             ORDER BY f.created_at DESC, c.seq ASC LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// ADD-6: file rows whose name contains `needle` (already lowercased).
+pub fn files_name_like(conn: &Connection, needle: &str) -> Result<Vec<(String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name FROM files WHERE lower(name) LIKE '%' || ?1 || '%'
+             ORDER BY created_at DESC LIMIT 20",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([needle], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// ADD-6: file content hits via FTS — (file id, name, matching chunk text) for
+/// the best-ranked chunk. The caller trims a snippet out of the chunk text.
+pub fn files_content_fts(
+    conn: &Connection,
+    match_expr: &str,
+    limit: usize,
+) -> Result<Vec<(String, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.id, f.name, c.text
+             FROM chunks_fts
+             JOIN chunks c ON c.rowid = chunks_fts.rowid
+             JOIN files f ON f.id = c.file_id
+             WHERE chunks_fts MATCH ?1
+             ORDER BY bm25(chunks_fts)
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![match_expr, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// ADD-6: chat messages whose content contains `needle` (already lowercased) —
+/// (chat id, message id, content). Orphan (chat_id NULL) rows are skipped.
+pub fn messages_like(conn: &Connection, needle: &str) -> Result<Vec<(String, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT chat_id, id, content FROM messages
+             WHERE chat_id IS NOT NULL AND lower(content) LIKE '%' || ?1 || '%'
+             ORDER BY rowid DESC LIMIT 30",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([needle], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// ADD-6: memories whose content contains `needle` (already lowercased) —
+/// (memory id, content).
+pub fn memories_like(conn: &Connection, needle: &str) -> Result<Vec<(String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, content FROM memories WHERE lower(content) LIKE '%' || ?1 || '%'
+             ORDER BY created_at DESC LIMIT 30",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([needle], |r| Ok((r.get(0)?, r.get(1)?)))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -636,6 +858,102 @@ pub fn list_memories(conn: &Connection) -> Result<Vec<Memory>, String> {
 pub fn delete_memory(conn: &Connection, id: &str) -> Result<(), String> {
     conn.execute("DELETE FROM memories WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// UX-5: overwrite a memory's text in place.
+pub fn update_memory(conn: &Connection, id: &str, content: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE memories SET content = ?2 WHERE id = ?1",
+        params![id, content],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- folders (ADD-16)
+
+pub fn list_folders(conn: &Connection) -> Result<Vec<Folder>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, name FROM folders ORDER BY name COLLATE NOCASE ASC")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Folder {
+                id: r.get(0)?,
+                name: r.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// Create a folder. Names are UNIQUE, so a clash is reported in plain language.
+pub fn create_folder(conn: &Connection, name: &str) -> Result<Folder, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Folder name cannot be empty.".into());
+    }
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO folders(id, name) VALUES (?1, ?2)",
+        params![id, name],
+    )
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE") {
+            format!("A folder named \"{name}\" already exists.")
+        } else {
+            e.to_string()
+        }
+    })?;
+    Ok(Folder {
+        id,
+        name: name.to_string(),
+    })
+}
+
+pub fn rename_folder(conn: &Connection, id: &str, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Folder name cannot be empty.".into());
+    }
+    conn.execute(
+        "UPDATE folders SET name = ?2 WHERE id = ?1",
+        params![id, name],
+    )
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE") {
+            format!("A folder named \"{name}\" already exists.")
+        } else {
+            e.to_string()
+        }
+    })?;
+    Ok(())
+}
+
+/// Delete a folder. Its files are moved back to the top level (folder_id → NULL)
+/// FIRST — deleting a folder must never delete or hide files (ADD-16).
+pub fn delete_folder(conn: &Connection, id: &str) -> Result<(), String> {
+    conn.execute("UPDATE files SET folder_id = NULL WHERE folder_id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM folders WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Move a file into a folder, or to the top level when `folder_id` is None.
+pub fn move_file_to_folder(
+    conn: &Connection,
+    file_id: &str,
+    folder_id: Option<&str>,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE files SET folder_id = ?2 WHERE id = ?1",
+        params![file_id, folder_id],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -881,4 +1199,99 @@ pub fn vacuum_into(conn: &Connection, dest: &str) -> Result<(), String> {
     let escaped = dest.replace('\'', "''");
     conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fresh in-memory DB with the current SCHEMA — same statements a new room
+    /// runs, so it exercises the folders table, folder_id column, and the FTS5
+    /// virtual table + triggers.
+    fn mem() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn
+    }
+
+    fn add_file(conn: &Connection, name: &str, text: &str) -> String {
+        insert_file(conn, name, "text/plain", text.as_bytes(), Some(text), "upload")
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn fts5_is_available() {
+        // HLT-3 precondition: the bundled SQLCipher must have FTS5 compiled in.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE t USING fts5(x);")
+            .expect("FTS5 must be available in the bundled SQLCipher build");
+    }
+
+    #[test]
+    fn fts_index_finds_and_stays_in_sync() {
+        let conn = mem();
+        let id = add_file(&conn, "lease.txt", "The tenant pays rent on the first of each month.");
+        // Inserted chunks are searchable via the FTS index.
+        let hits = search_chunks_fts(&conn, "\"rent\"", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "lease.txt");
+        // Update path: old terms drop out, new terms appear (triggers fired).
+        update_file_content(&conn, &id, b"The landlord provides parking spaces.", Some("The landlord provides parking spaces.")).unwrap();
+        assert!(search_chunks_fts(&conn, "\"rent\"", 5).unwrap().is_empty());
+        assert_eq!(search_chunks_fts(&conn, "\"parking\"", 5).unwrap().len(), 1);
+        // Delete path: the file's text no longer surfaces.
+        delete_file(&conn, &id).unwrap();
+        assert!(search_chunks_fts(&conn, "\"parking\"", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_folder_keeps_its_files() {
+        let conn = mem();
+        let folder = create_folder(&conn, "Contracts").unwrap();
+        let f1 = add_file(&conn, "a.txt", "alpha");
+        let f2 = add_file(&conn, "b.txt", "beta");
+        move_file_to_folder(&conn, &f1, Some(&folder.id)).unwrap();
+        move_file_to_folder(&conn, &f2, Some(&folder.id)).unwrap();
+        assert_eq!(get_file_meta(&conn, &f1).unwrap().folder_id.as_deref(), Some(folder.id.as_str()));
+
+        delete_folder(&conn, &folder.id).unwrap();
+
+        // Folder gone, but both files survive and are back at the top level.
+        assert!(list_folders(&conn).unwrap().is_empty());
+        assert_eq!(list_files(&conn).unwrap().len(), 2);
+        assert_eq!(get_file_meta(&conn, &f1).unwrap().folder_id, None);
+        assert_eq!(get_file_meta(&conn, &f2).unwrap().folder_id, None);
+    }
+
+    #[test]
+    fn folder_names_are_unique() {
+        let conn = mem();
+        create_folder(&conn, "Legal").unwrap();
+        assert!(create_folder(&conn, "Legal").is_err());
+        assert!(create_folder(&conn, "  ").is_err());
+    }
+
+    #[test]
+    fn inventory_shows_folder_prefix() {
+        let conn = mem();
+        let folder = create_folder(&conn, "Contracts").unwrap();
+        let f = add_file(&conn, "lease.pdf", "x");
+        add_file(&conn, "loose.txt", "y");
+        move_file_to_folder(&conn, &f, Some(&folder.id)).unwrap();
+        let names: Vec<String> = list_file_inventory(&conn).unwrap().into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"Contracts/lease.pdf".to_string()));
+        assert!(names.contains(&"loose.txt".to_string()));
+    }
+
+    #[test]
+    fn memory_update_persists() {
+        let conn = mem();
+        let m = add_memory(&conn, "old text").unwrap();
+        update_memory(&conn, &m.id, "new text").unwrap();
+        let got = list_memories(&conn).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "new text");
+    }
 }
