@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { AiStatus, api, ENGINE_LABELS, McpServerStatus, modelLabel } from "./api";
 import { CloseIcon, DownloadIcon, TrashIcon } from "./icons";
@@ -38,6 +38,29 @@ export default function Settings({
   const [webEndpoint, setWebEndpoint] = useState("");
   const [webSaved, setWebSaved] = useState(false);
 
+  // ---- Privacy section (Wave 2) ----
+  // SEC-3: per-room auto-lock choice (Workspace enforces it; here we only persist).
+  const [autolock, setAutolock] = useState("15");
+  // SEC-4: change password.
+  const [pwCurrent, setPwCurrent] = useState("");
+  const [pwNew, setPwNew] = useState("");
+  const [pwRepeat, setPwRepeat] = useState("");
+  const [pwError, setPwError] = useState("");
+  const [pwSaved, setPwSaved] = useState(false);
+  // ADD-4: duplicate room.
+  const [dupDest, setDupDest] = useState("");
+  const [dupPassword, setDupPassword] = useState("");
+  const [dupRepeat, setDupRepeat] = useState("");
+  const [dupError, setDupError] = useState("");
+  const [dupDone, setDupDone] = useState(false);
+  // SEC-7: compact room.
+  const [compacting, setCompacting] = useState(false);
+  const [compactMsg, setCompactMsg] = useState("");
+  const [compactErr, setCompactErr] = useState("");
+  // ADD-3: two-step confirm for deleting a model.
+  const [confirmModel, setConfirmModel] = useState<string | null>(null);
+  const confirmTimer = useRef<number | null>(null);
+
   useEffect(() => {
     api.getSetting("temperature").then((v) => {
       if (v != null) {
@@ -65,6 +88,9 @@ export default function Settings({
       setWebProvider(v === "brave" ? "duckduckgo" : v || "off");
     });
     api.getSetting("web_endpoint").then((v) => setWebEndpoint(v || ""));
+    api.getSetting("autolock_minutes").then((v) => {
+      if (v) setAutolock(v);
+    });
     const unlisten = listen<PullProgress>("pull-progress", (e) => {
       setPullStatus(e.payload.status);
       setPullPercent(e.payload.percent);
@@ -133,6 +159,106 @@ export default function Settings({
     }
   }
 
+  // ADD-3: first click arms the confirm; ✓ deletes, ✕ or a 3s timeout reverts.
+  function askRemoveModel(name: string) {
+    if (confirmTimer.current) window.clearTimeout(confirmTimer.current);
+    setConfirmModel(name);
+    confirmTimer.current = window.setTimeout(() => setConfirmModel(null), 3000);
+  }
+
+  function cancelRemoveModel() {
+    if (confirmTimer.current) window.clearTimeout(confirmTimer.current);
+    confirmTimer.current = null;
+    setConfirmModel(null);
+  }
+
+  function confirmRemoveModel(name: string) {
+    cancelRemoveModel();
+    removeModel(name);
+  }
+
+  // SEC-3: persist the auto-lock choice; the Workspace timer reads it.
+  function changeAutolock(value: string) {
+    setAutolock(value);
+    api.setSetting("autolock_minutes", value);
+  }
+
+  // SEC-4: verify + rekey via the existing command.
+  async function changePassword() {
+    setPwError("");
+    if (pwNew !== pwRepeat) {
+      setPwError("The new passwords do not match.");
+      return;
+    }
+    if (pwNew.length < 8) {
+      setPwError("New password must be at least 8 characters.");
+      return;
+    }
+    try {
+      await api.changePassword(pwCurrent, pwNew);
+      setPwCurrent("");
+      setPwNew("");
+      setPwRepeat("");
+      setPwSaved(true);
+      window.setTimeout(() => setPwSaved(false), 2400);
+    } catch (e) {
+      setPwError(String(e));
+    }
+  }
+
+  // ADD-4: pick a destination file for the copy.
+  async function chooseDupDest() {
+    const p = await api.chooseSavePath({
+      defaultPath: "Copy of room.roomai",
+      filters: [{ name: "Private Room Project", extensions: ["roomai"] }],
+    });
+    if (p) setDupDest(p);
+  }
+
+  async function duplicate() {
+    setDupError("");
+    if (!dupDest) {
+      setDupError("Choose where to save the copy first.");
+      return;
+    }
+    let newPassword: string | null = null;
+    if (dupPassword) {
+      if (dupPassword !== dupRepeat) {
+        setDupError("The new passwords do not match.");
+        return;
+      }
+      if (dupPassword.length < 8) {
+        setDupError("New password must be at least 8 characters.");
+        return;
+      }
+      newPassword = dupPassword;
+    }
+    try {
+      await api.duplicateRoom(dupDest, newPassword);
+      setDupDest("");
+      setDupPassword("");
+      setDupRepeat("");
+      setDupDone(true);
+      window.setTimeout(() => setDupDone(false), 2400);
+    } catch (e) {
+      setDupError(String(e));
+    }
+  }
+
+  // SEC-7: reclaim space left by deleted files.
+  async function compact() {
+    setCompacting(true);
+    setCompactMsg("");
+    setCompactErr("");
+    try {
+      setCompactMsg(await api.compactRoom());
+    } catch (e) {
+      setCompactErr(String(e));
+    } finally {
+      setCompacting(false);
+    }
+  }
+
   return (
     <div className="settings-backdrop" onClick={onClose}>
       <div className="settings" onClick={(e) => e.stopPropagation()}>
@@ -168,14 +294,34 @@ export default function Settings({
                         m
                       )}
                     </label>
-                    <button
-                      className="subtle btn-ic"
-                      title={m === model ? "Can't delete the active model" : "Delete model from disk"}
-                      disabled={m === model}
-                      onClick={() => removeModel(m)}
-                    >
-                      <TrashIcon size={13} />
-                    </button>
+                    {confirmModel === m ? (
+                      <span className="model-confirm">
+                        <span className="settings-hint">Delete?</span>
+                        <button
+                          className="subtle btn-ic confirm-yes"
+                          title="Confirm delete"
+                          onClick={() => confirmRemoveModel(m)}
+                        >
+                          ✓
+                        </button>
+                        <button
+                          className="subtle btn-ic confirm-no"
+                          title="Keep model"
+                          onClick={cancelRemoveModel}
+                        >
+                          ✕
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        className="subtle btn-ic"
+                        title={m === model ? "Can't delete the active model" : "Delete model from disk"}
+                        disabled={m === model}
+                        onClick={() => askRemoveModel(m)}
+                      >
+                        <TrashIcon size={13} />
+                      </button>
+                    )}
                   </div>
                 ))}
                 {ai.models.length === 0 && (
@@ -273,6 +419,106 @@ export default function Settings({
                 {saved ? "Saved ✓" : "Save"}
               </button>
             </div>
+          </section>
+
+          <section>
+            <h3>Privacy</h3>
+
+            {/* SEC-3 — auto-lock */}
+            <label className="settings-label">Lock automatically after</label>
+            <select
+              value={autolock}
+              onChange={(e) => changeAutolock(e.target.value)}
+            >
+              <option value="off">Off — never lock by itself</option>
+              <option value="5">5 minutes</option>
+              <option value="15">15 minutes</option>
+              <option value="60">60 minutes</option>
+            </select>
+            <p className="settings-hint">
+              An idle room locks itself and returns to the password screen.
+            </p>
+
+            {/* SEC-4 — change password */}
+            <label className="settings-label">Change password</label>
+            <div className="settings-form">
+              <input
+                type="password"
+                placeholder="Current password"
+                value={pwCurrent}
+                onChange={(e) => setPwCurrent(e.target.value)}
+              />
+              <input
+                type="password"
+                placeholder="New password"
+                value={pwNew}
+                onChange={(e) => setPwNew(e.target.value)}
+              />
+              <input
+                type="password"
+                placeholder="Repeat new password"
+                value={pwRepeat}
+                onChange={(e) => setPwRepeat(e.target.value)}
+              />
+            </div>
+            <p className="settings-hint">
+              There is no recovery if you forget it.
+            </p>
+            {pwError && <div className="gate-error">{pwError}</div>}
+            <div className="settings-actions">
+              <button className="primary" onClick={changePassword}>
+                {pwSaved ? "Password changed ✓" : "Change password"}
+              </button>
+            </div>
+
+            {/* ADD-4 — duplicate room */}
+            <label className="settings-label">Duplicate room</label>
+            <p className="settings-hint">
+              A full copy of this room as it is right now.
+            </p>
+            <div className="settings-form">
+              <div className="settings-actions dup-dest-row">
+                <button className="btn-ic" onClick={chooseDupDest}>
+                  Choose destination…
+                </button>
+                {dupDest && (
+                  <span className="dup-dest">{dupDest.split("/").pop()}</span>
+                )}
+              </div>
+              <input
+                type="password"
+                placeholder="New password for the copy (optional)"
+                value={dupPassword}
+                onChange={(e) => setDupPassword(e.target.value)}
+              />
+              <input
+                type="password"
+                placeholder="Repeat new password"
+                value={dupRepeat}
+                onChange={(e) => setDupRepeat(e.target.value)}
+              />
+            </div>
+            {dupError && <div className="gate-error">{dupError}</div>}
+            <div className="settings-actions">
+              <button className="primary" onClick={duplicate}>
+                {dupDone ? "Duplicated ✓" : "Duplicate"}
+              </button>
+            </div>
+
+            {/* SEC-7 — compact room */}
+            <label className="settings-label">Compact room</label>
+            <p className="settings-hint">
+              Reclaims space left by deleted files.
+            </p>
+            <div className="settings-actions">
+              {compactMsg && (
+                <span className="settings-confirm">{compactMsg}</span>
+              )}
+              <button onClick={compact} disabled={compacting}>
+                {compacting ? "Compacting…" : "Compact room now"}
+              </button>
+            </div>
+            {compactErr && <div className="gate-error">{compactErr}</div>}
           </section>
 
           <section>
