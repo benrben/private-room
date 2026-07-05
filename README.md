@@ -3,6 +3,7 @@
 ![Private Room — a private AI workspace sealed inside a single file](docs/banner.png)
 
 <p align="center">
+  <a href="https://github.com/benrben/private-room/releases/latest"><img src="docs/badge-download.svg" alt="Download the latest DMG" height="28"></a>
   <img src="docs/badge-encrypted.svg" alt="End-to-end encrypted" height="28">
   <img src="docs/badge-offline.svg" alt="Offline-first" height="28">
   <img src="docs/badge-local-ai.svg" alt="Local AI via Ollama" height="28">
@@ -217,16 +218,18 @@ not in the model's good intentions:
 **[⬇︎ Download the latest DMG](https://github.com/benrben/private-room/releases/latest)** — macOS 12 or later, Apple Silicon.
 
 1. Open the `.dmg` and drag **Private Room** into **Applications**.
-2. The build is ad-hoc signed (not notarized), so macOS quarantines anything
-   downloaded from the web. Clear it once, then open the app normally:
+2. This build is ad-hoc signed (**not notarized**), so the first time you open
+   it macOS warns *"Apple could not verify 'Private Room' is free of malware…"*
+   That's expected for an un-notarized app — the full source is in this repo.
+   Clear the download quarantine once, then open it normally:
 
    ```sh
    xattr -cr "/Applications/Private Room.app"
    ```
 
-   Without this, Gatekeeper says *"Private Room is damaged and can't be
-   opened."* The app is fine — it just isn't notarized. (Or from the terminal:
-   `curl -L -o PrivateRoom.dmg https://github.com/benrben/private-room/releases/latest/download/Private-Room-macOS-arm64.dmg`.)
+   Rather not use Terminal? Double-click the app, click **Done** on the warning,
+   then open **System Settings → Privacy & Security**, scroll to **Security**,
+   and click **Open Anyway** next to "Private Room" (you'll confirm once more).
 3. Install the local AI engine and pull a small model — the app talks to it on
    `localhost:11434`:
 
