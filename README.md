@@ -212,6 +212,37 @@ not in the model's good intentions:
 - **Cache-stable prompts.** The system prompt is kept KV-cache-stable
   (per-question memories move into the user message) so warm replies stay fast.
 
+## Download
+
+**[⬇︎ Download the latest DMG](https://github.com/benrben/private-room/releases/latest)** — macOS 12 or later, Apple Silicon.
+
+1. Open the `.dmg` and drag **Private Room** into **Applications**.
+2. The build is ad-hoc signed (not notarized), so macOS quarantines anything
+   downloaded from the web. Clear it once, then open the app normally:
+
+   ```sh
+   xattr -cr "/Applications/Private Room.app"
+   ```
+
+   Without this, Gatekeeper says *"Private Room is damaged and can't be
+   opened."* The app is fine — it just isn't notarized. (Or from the terminal:
+   `curl -L -o PrivateRoom.dmg https://github.com/benrben/private-room/releases/latest/download/Private-Room-macOS-arm64.dmg`.)
+3. Install the local AI engine and pull a small model — the app talks to it on
+   `localhost:11434`:
+
+   ```sh
+   brew install ollama            # or get it from https://ollama.com
+   ollama serve &                 # skip if the Ollama menu-bar app is running
+   ollama pull qwen3.5:4b         # default chat model
+   ollama pull qwen2.5vl:3b       # optional: sharper image marking / OCR
+   ```
+
+   Dictation and OCR need nothing extra — the Whisper weights download on first
+   use, and you can also pull models from inside the app via **Settings → Model
+   manager**.
+
+Prefer to build it yourself? See [Development](#development).
+
 ## Development
 
 ```sh
