@@ -224,8 +224,11 @@ not in the model's good intentions:
    Clear the download quarantine once, then open it normally:
 
    ```sh
-   xattr -cr "/Applications/Private Room.app"
+   /usr/bin/xattr -cr "/Applications/Private Room.app"
    ```
+
+   (Use the full path `/usr/bin/xattr` — a Python `xattr` on your PATH, e.g. from
+   pyenv, has no `-r` flag and fails with *"option -r not recognized"*.)
 
    Rather not use Terminal? Double-click the app, click **Done** on the warning,
    then open **System Settings → Privacy & Security**, scroll to **Security**,
