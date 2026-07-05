@@ -140,8 +140,18 @@ export default function SheetView({ dataB64, text, target, editable, onEditCell 
                   const cell = (row as unknown[])[j];
                   const cellRef =
                     hlActive && i === hlActive.r1 && j === hlActive.c1 ? hlRef : undefined;
+                  // Right-align cells that read as numbers (currency/percent
+                  // symbols tolerated) so columns of figures line up.
+                  const raw = String(cell ?? "");
+                  const numeric =
+                    raw.trim() !== "" &&
+                    !Number.isNaN(Number(raw.replace(/[$£€,%\s]/g, "")));
                   const cls =
-                    [inHl(i, j) ? "cell-hl" : "", editable ? "cell-editable" : ""]
+                    [
+                      inHl(i, j) ? "cell-hl" : "",
+                      editable ? "cell-editable" : "",
+                      numeric ? "num" : "",
+                    ]
                       .filter(Boolean)
                       .join(" ") || undefined;
                   const isEditing =

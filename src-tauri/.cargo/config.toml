@@ -1,0 +1,9 @@
+# whisper.cpp (whisper-rs-sys) uses std::filesystem, which Apple's SDK marks
+# unavailable before macOS 10.15 — but tauri-cli exports
+# MACOSX_DEPLOYMENT_TARGET=10.13 into the build env, and cmake appends that
+# AFTER any injected flags, so it wins. `force = true` makes this pin beat
+# tauri's export in every build path (cargo test, npm run tauri build).
+# Matches bundle.macOS.minimumSystemVersion (the app is Apple-Silicon-only,
+# so macOS 12 is a safe floor).
+[env]
+MACOSX_DEPLOYMENT_TARGET = { value = "12.0", force = true }

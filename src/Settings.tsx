@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AiStatus, api, ENGINE_LABELS, McpServerStatus, modelLabel } from "./api";
-import { CloseIcon, DownloadIcon, TrashIcon } from "./icons";
+import {
+  AiStatus,
+  api,
+  ENGINE_LABELS,
+  McpServerStatus,
+  modelLabel,
+  ModelCaps,
+  SttStatus,
+} from "./api";
+import { AlertIcon, CloseIcon, DownloadIcon, TrashIcon } from "./icons";
 
 interface Props {
   ai: AiStatus | null;
@@ -34,11 +42,19 @@ export default function Settings({
   const [mcpConfig, setMcpConfig] = useState("");
   const [mcpStatuses, setMcpStatuses] = useState<McpServerStatus[]>([]);
   const [mcpError, setMcpError] = useState("");
+  // Guided connector form — a friendlier path than hand-editing JSON.
+  const [connName, setConnName] = useState("");
+  const [connCmd, setConnCmd] = useState("");
+  const [connArgs, setConnArgs] = useState("");
   const [webProvider, setWebProvider] = useState("off");
   const [webEndpoint, setWebEndpoint] = useState("");
   const [webSaved, setWebSaved] = useState(false);
   const [webTesting, setWebTesting] = useState(false);
   const [webTestResult, setWebTestResult] = useState("");
+  // ADD-21: "AI advisors" — let the local model delegate a hard subtask to a
+  // cloud CLI, and (sub-option) give that advisor the room's connected tools.
+  const [advisorsOn, setAdvisorsOn] = useState(false);
+  const [advisorToolsOn, setAdvisorToolsOn] = useState(false);
 
   // ---- Privacy section (Wave 2) ----
   // SEC-3: per-room auto-lock choice (Workspace enforces it; here we only persist).
@@ -64,9 +80,30 @@ export default function Settings({
   const [compacting, setCompacting] = useState(false);
   const [compactMsg, setCompactMsg] = useState("");
   const [compactErr, setCompactErr] = useState("");
+  const [compactArmed, setCompactArmed] = useState(false);
   // ADD-3: two-step confirm for deleting a model.
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
   const confirmTimer = useRef<number | null>(null);
+  // ADD-18: built-in dictation/transcription model (Whisper).
+  const [stt, setStt] = useState<SttStatus | null>(null);
+  const [sttPercent, setSttPercent] = useState<number | null>(null);
+  const [sttErr, setSttErr] = useState("");
+  // ADD-18: dictation shaping (alfred's translate/intent pipeline, run on the
+  // room's local model). Persisted per room.
+  const [dictTranslate, setDictTranslate] = useState(false);
+  const [dictMode, setDictMode] = useState("off");
+  // ADD-22: per-model tool/vision abilities (Ollama /api/show), for badges and a
+  // warning when the chosen model can't drive the app.
+  const [caps, setCaps] = useState<ModelCaps[]>([]);
+  const modelsKey = ai?.models.join(",") ?? "";
+  useEffect(() => {
+    if (ai?.running && ai.models.length > 0) {
+      api.modelCapabilities().then(setCaps).catch(() => setCaps([]));
+    } else {
+      setCaps([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ai?.running, modelsKey]);
 
   useEffect(() => {
     api.getSetting("temperature").then((v) => {
@@ -95,6 +132,10 @@ export default function Settings({
       setWebProvider(v === "brave" ? "duckduckgo" : v || "off");
     });
     api.getSetting("web_endpoint").then((v) => setWebEndpoint(v || ""));
+    api.getSetting("advisors_enabled").then((v) => setAdvisorsOn(v === "on"));
+    api
+      .getSetting("advisor_tools_enabled")
+      .then((v) => setAdvisorToolsOn(v === "on"));
     api.getSetting("autolock_minutes").then((v) => {
       if (v) setAutolock(v);
     });
@@ -114,11 +155,43 @@ export default function Settings({
     const unlistenMcp = listen<McpServerStatus[]>("mcp-status", (e) => {
       setMcpStatuses(e.payload);
     });
+    // ADD-18: dictation model presence + live download progress + shaping prefs.
+    api.sttStatus().then(setStt).catch(() => {});
+    api.getSetting("dict_translate").then((v) => setDictTranslate(v === "on"));
+    api.getSetting("dict_mode").then((v) => setDictMode(v || "off"));
+    const unlistenStt = api.onSttDownloadProgress((p) =>
+      setSttPercent(p.percent),
+    );
     return () => {
       unlisten.then((fn) => fn());
       unlistenMcp.then((fn) => fn());
+      unlistenStt.then((fn) => fn());
     };
   }, []);
+
+  // ADD-18: download / delete the built-in dictation model.
+  async function downloadStt() {
+    setSttErr("");
+    setSttPercent(0);
+    try {
+      await api.sttDownloadModel();
+      setStt(await api.sttStatus());
+    } catch (e) {
+      setSttErr(String(e));
+    } finally {
+      setSttPercent(null);
+    }
+  }
+
+  async function removeStt() {
+    setSttErr("");
+    try {
+      await api.sttDeleteModel();
+      setStt(await api.sttStatus());
+    } catch (e) {
+      setSttErr(String(e));
+    }
+  }
 
   async function applyMcp() {
     setMcpError("");
@@ -127,6 +200,38 @@ export default function Settings({
     } catch (e) {
       setMcpError(String(e));
     }
+  }
+
+  // Merge the guided form's fields into the mcpServers JSON so non-technical
+  // users never have to hand-write it. The raw editor below stays available
+  // for anyone pasting a config from elsewhere.
+  function addConnector() {
+    setMcpError("");
+    const name = connName.trim();
+    const command = connCmd.trim();
+    if (!name || !command) {
+      setMcpError("Give the connector a name and a command.");
+      return;
+    }
+    let root: { mcpServers?: Record<string, unknown> } = {};
+    if (mcpConfig.trim()) {
+      try {
+        root = JSON.parse(mcpConfig);
+      } catch {
+        setMcpError(
+          "The current config isn't valid JSON — fix or clear the box below before adding.",
+        );
+        return;
+      }
+    }
+    const servers = (root.mcpServers ?? {}) as Record<string, unknown>;
+    const args = connArgs.trim() ? connArgs.trim().split(/\s+/) : [];
+    servers[name] = args.length ? { command, args } : { command };
+    root.mcpServers = servers;
+    setMcpConfig(JSON.stringify(root, null, 2));
+    setConnName("");
+    setConnCmd("");
+    setConnArgs("");
   }
 
   async function saveWebAccess() {
@@ -316,9 +421,35 @@ export default function Settings({
             <CloseIcon size={14} />
           </button>
         </div>
-        <div className="settings-body">
-          <section>
-            <h3>Model</h3>
+        <div className="settings-main">
+          <nav className="settings-nav">
+            {(
+              [
+                ["set-model", "Model"],
+                ["set-behavior", "Behavior"],
+                ["set-privacy", "Privacy"],
+                ["set-online", "Online"],
+                ["set-advisors", "AI advisors"],
+                ["set-mcp", "Connections"],
+              ] as [string, string][]
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                className="settings-nav-item"
+                onClick={() =>
+                  document
+                    .getElementById(id)
+                    ?.scrollIntoView({ behavior: "smooth", block: "start" })
+                }
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
+          <div className="settings-body">
+            <section id="set-model">
+              <h3>Model</h3>
             <p className="settings-hint">
               The AI that lives in this room. Everything runs locally through
               Ollama.
@@ -341,6 +472,24 @@ export default function Settings({
                       ) : (
                         m
                       )}
+                      {(() => {
+                        const cap = caps.find((c) => c.name === m);
+                        if (!cap) return null;
+                        return (
+                          <span className="model-badges">
+                            {cap.tools && (
+                              <span className="model-badge" title="Can control the app: open, edit, highlight files">
+                                🔧 tools
+                              </span>
+                            )}
+                            {cap.vision && (
+                              <span className="model-badge" title="Can see and mark images">
+                                👁 vision
+                              </span>
+                            )}
+                          </span>
+                        );
+                      })()}
                     </label>
                     {confirmModel === m ? (
                       <span className="model-confirm">
@@ -375,6 +524,17 @@ export default function Settings({
                 {ai.models.length === 0 && (
                   <div className="settings-hint">No models installed yet.</div>
                 )}
+                {(() => {
+                  const sel = caps.find((c) => c.name === model);
+                  if (!sel || sel.tools) return null;
+                  return (
+                    <p className="settings-hint model-warn">
+                      <AlertIcon size={13} className="warn-ic" /> This model can chat
+                      but can't control the app (open, edit, or highlight files).
+                      Pick a model badged <strong>🔧 tools</strong> for full features.
+                    </p>
+                  );
+                })()}
               </div>
             ) : (
               <div className="settings-hint">
@@ -400,7 +560,7 @@ export default function Settings({
                   ))}
                 </div>
                 <p className="settings-hint">
-                  ⚠️ Cloud engines send your questions and room context to your
+                  <AlertIcon size={13} className="warn-ic" /> Cloud engines send your questions and room context to your
                   Claude/OpenAI account — content leaves this Mac. Images stay
                   local (vision and image marking always use the local model).
                 </p>
@@ -435,9 +595,85 @@ export default function Settings({
               Tip: on a 16 GB Mac keep one model around 4B parameters — larger
               models are smarter but slower and heavier.
             </p>
+
+            <label className="settings-label">Dictation &amp; transcription</label>
+            <p className="settings-hint">
+              Turns speech into text fully on this Mac — voice messages, and
+              imported recordings/videos become searchable transcripts. The
+              engine is built in; it needs a one-time model download
+              {stt ? ` (~${stt.sizeMb} MB)` : ""}.
+            </p>
+            {stt?.installed ? (
+              <div className="model-row active">
+                <span>Voice model installed ✓</span>
+                <button
+                  className="subtle btn-ic"
+                  title="Delete the dictation model from disk"
+                  onClick={removeStt}
+                >
+                  <TrashIcon size={13} />
+                </button>
+              </div>
+            ) : sttPercent != null || stt?.downloading ? (
+              <div className="pull-progress">
+                <div className="pull-bar">
+                  <div
+                    className="pull-bar-fill"
+                    style={{ width: `${sttPercent ?? 0}%` }}
+                  />
+                </div>
+                <span>Downloading voice model — {sttPercent ?? 0}%</span>
+              </div>
+            ) : (
+              <button className="btn-ic" onClick={downloadStt}>
+                <DownloadIcon size={14} /> Download voice model
+              </button>
+            )}
+            {sttErr && <div className="gate-error">{sttErr}</div>}
+            {stt?.installed && (
+              <>
+                <label className="settings-label" style={{ marginTop: 10 }}>
+                  <input
+                    type="checkbox"
+                    checked={dictTranslate}
+                    onChange={(e) => {
+                      setDictTranslate(e.target.checked);
+                      api.setSetting(
+                        "dict_translate",
+                        e.target.checked ? "on" : "off",
+                      );
+                    }}
+                  />{" "}
+                  Translate dictation to English (local AI)
+                </label>
+                <label className="settings-label">
+                  Shape dictation as{" "}
+                  <select
+                    value={dictMode}
+                    onChange={(e) => {
+                      setDictMode(e.target.value);
+                      api.setSetting("dict_mode", e.target.value);
+                    }}
+                  >
+                    <option value="off">Exact words (no shaping)</option>
+                    <option value="raw">Cleaned up (remove ums, fix grammar)</option>
+                    <option value="notes">Notes / bullets</option>
+                    <option value="email">Email body</option>
+                    <option value="message">Chat message</option>
+                    <option value="commit">Commit message</option>
+                    <option value="prompt">Optimized AI prompt</option>
+                  </select>
+                </label>
+                <p className="settings-hint">
+                  Shaping and translation run on this room's local AI — dictated
+                  words never reach a cloud engine. If the local AI is off, the
+                  exact transcript is used instead.
+                </p>
+              </>
+            )}
           </section>
 
-          <section>
+          <section id="set-behavior">
             <h3>Behavior</h3>
             <label className="settings-label">
               Creativity (temperature): <strong>{temperature.toFixed(2)}</strong>
@@ -469,7 +705,7 @@ export default function Settings({
             </div>
           </section>
 
-          <section>
+          <section id="set-privacy">
             <h3>Privacy</h3>
 
             {/* SEC-3 — auto-lock */}
@@ -588,14 +824,42 @@ export default function Settings({
               {compactMsg && (
                 <span className="settings-confirm">{compactMsg}</span>
               )}
-              <button onClick={compact} disabled={compacting}>
-                {compacting ? "Compacting…" : "Compact room now"}
-              </button>
+              {compactArmed ? (
+                <>
+                  <button
+                    className="danger"
+                    onClick={() => {
+                      setCompactArmed(false);
+                      compact();
+                    }}
+                    disabled={compacting}
+                  >
+                    {compacting ? "Compacting…" : "Confirm compact"}
+                  </button>
+                  <button
+                    className="subtle"
+                    onClick={() => setCompactArmed(false)}
+                    disabled={compacting}
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => {
+                    setCompactMsg("");
+                    setCompactArmed(true);
+                  }}
+                  disabled={compacting}
+                >
+                  Compact room now
+                </button>
+              )}
             </div>
             {compactErr && <div className="gate-error">{compactErr}</div>}
           </section>
 
-          <section>
+          <section id="set-online">
             <h3>Online features</h3>
             <p className="settings-hint">
               Give the AI two extra tools — <code>web_search</code> and{" "}
@@ -604,7 +868,7 @@ export default function Settings({
               not even offered to the model.
             </p>
             <p className="settings-hint">
-              ⚠️ When on, search queries and fetched pages leave this Mac (to
+              <AlertIcon size={13} className="warn-ic" /> When on, search queries and fetched pages leave this Mac (to
               the provider you pick). Your files never do.
             </p>
             <label className="settings-label">Search provider</label>
@@ -654,7 +918,80 @@ export default function Settings({
             )}
           </section>
 
-          <section>
+          <section id="set-advisors">
+            <h3>AI advisors (advanced)</h3>
+            <p className="settings-hint">
+              Let your <strong>local</strong> AI hand off one genuinely hard
+              subtask — deep research, complex reasoning, difficult code — to a
+              powerful cloud AI (<code>consult_advisor</code>), using the cloud
+              CLIs already installed on this Mac. Off by default. While off, the
+              tool is not even offered to the model, so nothing can leave this
+              Mac on the model's own initiative.
+            </p>
+            <p className="settings-hint">
+              <AlertIcon size={13} className="warn-ic" /> When on, the local AI may decide — on its own, mid-answer — to
+              send the subtask it writes to Claude or Codex through your cloud
+              account. That text leaves this Mac. Each consult is shown as a
+              step while it happens, and it's capped at one per question.
+            </p>
+            {ai && ai.external.length > 0 ? (
+              <>
+                <label className="settings-label">
+                  <input
+                    type="checkbox"
+                    checked={advisorsOn}
+                    onChange={(e) => {
+                      setAdvisorsOn(e.target.checked);
+                      api.setSetting(
+                        "advisors_enabled",
+                        e.target.checked ? "on" : "off",
+                      );
+                      // Turning the feature off also disables the sub-option.
+                      if (!e.target.checked && advisorToolsOn) {
+                        setAdvisorToolsOn(false);
+                        api.setSetting("advisor_tools_enabled", "off");
+                      }
+                    }}
+                  />{" "}
+                  Enable AI advisors ({ai.external
+                    .map((e) => ENGINE_LABELS[e] ?? e)
+                    .join(", ")})
+                </label>
+                {advisorsOn && (
+                  <>
+                    <label className="settings-label">
+                      <input
+                        type="checkbox"
+                        checked={advisorToolsOn}
+                        onChange={(e) => {
+                          setAdvisorToolsOn(e.target.checked);
+                          api.setSetting(
+                            "advisor_tools_enabled",
+                            e.target.checked ? "on" : "off",
+                          );
+                        }}
+                      />{" "}
+                      Let a Claude advisor use this room's tools
+                    </label>
+                    <p className="settings-hint">
+                      When consulted, the advisor can list, search, open and
+                      edit this room's files — and drive any Connected tools
+                      (MCP) below — through a private, one-question-long local
+                      bridge. A second, separate way for content to leave this
+                      Mac.
+                    </p>
+                  </>
+                )}
+              </>
+            ) : (
+              <p className="settings-hint">
+                No cloud AI CLIs (Claude Code, Codex) were detected on this Mac.
+                Install one and reopen Settings to enable advisors.
+              </p>
+            )}
+          </section>
+
+          <section id="set-mcp">
             <h3>Connections (MCP)</h3>
             <p className="settings-hint">
               Advanced: connect external tool programs with the Model Context
@@ -665,17 +1002,46 @@ export default function Settings({
               isn't installed on this Mac.
             </p>
             <p className="settings-hint">
-              ⚠️ Connected tools are separate programs and can reach the
+              <AlertIcon size={13} className="warn-ic" /> Connected tools are separate programs and can reach the
               internet — what the AI sends them leaves this room. They stay
               off unless you turn them on here, per room.
             </p>
-            <textarea
-              className="mcp-config"
-              rows={9}
-              spellCheck={false}
-              value={mcpConfig}
-              onChange={(e) => setMcpConfig(e.target.value)}
-            />
+            <div className="connector-form">
+              <label className="settings-label">Add a connector</label>
+              <input
+                type="text"
+                placeholder="Name (e.g. yfinance)"
+                value={connName}
+                onChange={(e) => setConnName(e.target.value)}
+              />
+              <input
+                type="text"
+                placeholder="Command (e.g. uvx)"
+                value={connCmd}
+                onChange={(e) => setConnCmd(e.target.value)}
+              />
+              <input
+                type="text"
+                placeholder="Arguments, space-separated (e.g. yfinance-mcp)"
+                value={connArgs}
+                onChange={(e) => setConnArgs(e.target.value)}
+              />
+              <div className="settings-actions">
+                <button className="btn-ic" onClick={addConnector}>
+                  Add to config
+                </button>
+              </div>
+            </div>
+            <details className="mcp-advanced">
+              <summary>Advanced: edit the raw JSON</summary>
+              <textarea
+                className="mcp-config"
+                rows={9}
+                spellCheck={false}
+                value={mcpConfig}
+                onChange={(e) => setMcpConfig(e.target.value)}
+              />
+            </details>
             <div className="settings-actions">
               <button className="primary" onClick={applyMcp}>
                 Save & Connect
@@ -702,6 +1068,7 @@ export default function Settings({
           </section>
 
           {error && <div className="gate-error">{error}</div>}
+          </div>
         </div>
       </div>
     </div>

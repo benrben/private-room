@@ -37,8 +37,10 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 -- HLT-3: full-text index over chunk text, kept in sync by the triggers below.
 -- External-content table: rows live in `chunks`, the index only stores terms.
+-- CHG-14: porter stemming so plural/inflected query words match singular
+-- document words ('invoices' → 'invoice', 'renewing' → 'renewal').
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
-  USING fts5(text, content='chunks', content_rowid='rowid');
+  USING fts5(text, content='chunks', content_rowid='rowid', tokenize='porter unicode61');
 CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
   INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
 END;
@@ -242,6 +244,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // CHG-33: short-lived web_search results cache, keyed by normalized query.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS web_searches (
+           query_key TEXT PRIMARY KEY,
+           results_text TEXT NOT NULL,
+           saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );",
+    )
+    .map_err(|e| e.to_string())?;
+
     // ADD-16: folders table + a nullable files.folder_id (NULL = top level).
     // Old rooms never ran SCHEMA, so create the table and add the column when
     // it is missing — mirroring the chat_id migration above. The column only
@@ -272,10 +284,29 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     // triggers keep it in sync on every insert/update/delete afterwards. All of
     // this depends on the chunks table existing.
     if table_exists(conn, "chunks")? {
+        // CHG-14: a pre-existing chunks_fts built without porter stemming must be
+        // dropped and rebuilt — FTS5 tokenizers cannot be altered in place. An
+        // index whose stored `sql` lacks "porter" is stale; drop it so the CREATE
+        // below rebuilds it with the current tokenizer.
+        let existing_fts_sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='chunks_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        let stale = existing_fts_sql
+            .as_deref()
+            .map(|sql| !sql.contains("porter"))
+            .unwrap_or(false);
+        if stale {
+            conn.execute("DROP TABLE chunks_fts", [])
+                .map_err(|e| e.to_string())?;
+        }
         let fts_existed = table_exists(conn, "chunks_fts")?;
         conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
-               USING fts5(text, content='chunks', content_rowid='rowid');
+               USING fts5(text, content='chunks', content_rowid='rowid', tokenize='porter unicode61');
              CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
                INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
              END;
@@ -291,6 +322,22 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         if !fts_existed {
             // Populate the index from whatever chunks the old room already has.
             conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')", [])
+                .map_err(|e| e.to_string())?;
+        }
+
+        // CHG-12: nomic-embed-text needs task-instruction prefixes
+        // (search_query:/search_document:). Older rooms stored vectors WITHOUT
+        // them; a prefixed query against unprefixed document vectors is a
+        // cross-task mismatch. One-time: null out existing embeddings so the
+        // background backfill re-embeds them prefixed. Keyword retrieval covers
+        // the gap meanwhile. Guarded by PRAGMA user_version (was unused).
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if user_version < 1 {
+            conn.execute("UPDATE chunks SET embedding = NULL", [])
+                .map_err(|e| e.to_string())?;
+            conn.execute("PRAGMA user_version = 1", [])
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -422,39 +469,49 @@ pub fn list_files(conn: &Connection) -> Result<Vec<FileMeta>, String> {
     Ok(files)
 }
 
-/// (display name, mime type, size) for every file — feeds the agent's
-/// list_room_files tool. ADD-16: files inside a folder read as "Folder/name"
-/// so the model sees the room's organization.
-pub fn list_files_brief(conn: &Connection) -> Result<Vec<(String, String, i64)>, String> {
+/// (display name, mime type, size, one-liner) for every file — feeds the
+/// agent's list_room_files tool. ADD-16: files inside a folder read as
+/// "Folder/name". CHG-23: the cached ai_summary rides along so the tool can show
+/// what each file is without a search round-trip.
+/// (display name, mime, size bytes, cached one-liner) for one file row.
+pub type FileBriefRow = (String, String, i64, Option<String>);
+
+pub fn list_files_brief(conn: &Connection) -> Result<Vec<FileBriefRow>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT CASE WHEN fo.name IS NOT NULL THEN fo.name || '/' || f.name ELSE f.name END,
-                    coalesce(f.mime_type,''), f.size_bytes
+                    coalesce(f.mime_type,''), f.size_bytes, f.ai_summary
              FROM files f LEFT JOIN folders fo ON fo.id = f.folder_id
              ORDER BY f.created_at",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     Ok(rows)
 }
 
-/// (display name, mime type) for the oldest 100 files — feeds the model's file
-/// inventory in the system prompt. ADD-16: folder-prefixed like list_files_brief.
-pub fn list_file_inventory(conn: &Connection) -> Result<Vec<(String, String)>, String> {
+/// (display name, mime type, one-liner) for the 100 NEWEST files — feeds the
+/// model's file inventory in the system prompt. CHG-9: newest-first (was oldest-
+/// first, which hid exactly the files the user just added), and one extra row
+/// (LIMIT 101) acts as an overflow sentinel so the caller can flag a partial
+/// list without a second COUNT. CHG-23: cached ai_summary rides along.
+/// ADD-16: folder-prefixed like list_files_brief.
+pub fn list_file_inventory(
+    conn: &Connection,
+) -> Result<Vec<(String, String, Option<String>)>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT CASE WHEN fo.name IS NOT NULL THEN fo.name || '/' || f.name ELSE f.name END,
-                    coalesce(f.mime_type, '')
+                    coalesce(f.mime_type, ''), f.ai_summary
              FROM files f LEFT JOIN folders fo ON fo.id = f.folder_id
-             ORDER BY f.created_at ASC LIMIT 100",
+             ORDER BY f.created_at DESC, f.rowid DESC LIMIT 101",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -511,6 +568,35 @@ pub fn set_file_ai_summary(conn: &Connection, id: &str, summary: &str) -> Result
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// CHG-22: files that still need a cached one-liner — (id, name, mime, first
+/// ~1500 chars of text). Skips images with no OCR (empty text) and the app's own
+/// generated summary file. Feeds the background one-liner filler so the work is
+/// done at ingest, not on the interactive Summarize-room path.
+pub fn files_missing_summary(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<(String, String, String, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, coalesce(mime_type,''), substr(extracted_text, 1, 1500)
+             FROM files
+             WHERE ai_summary IS NULL
+               AND extracted_text IS NOT NULL AND trim(extracted_text) <> ''
+               AND NOT (name = 'Room summary.md' AND source = 'generated')
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
 }
 
 /// Today's date as YYYY-MM-DD, from SQLite so it matches stored timestamps.
@@ -611,8 +697,69 @@ pub fn delete_file(conn: &Connection, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn rename_file(conn: &Connection, id: &str, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("File name cannot be empty.".into());
+    }
+    let n = conn
+        .execute("UPDATE files SET name = ?2 WHERE id = ?1", params![id, name])
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("That file is no longer in this room.".into());
+    }
+    Ok(())
+}
+
+/// Files that carry no extracted text yet — candidates for a re-extraction
+/// pass after an extractor is improved (e.g. the xlsx numeric-cell fix). Only
+/// files with stored bytes are returned; OCR/STT candidates are left to their
+/// own background workers. Returns (id, name, mime, original_bytes).
+pub fn files_missing_text(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String, Vec<u8>)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, coalesce(mime_type,''), original_bytes FROM files
+             WHERE (extracted_text IS NULL OR trim(extracted_text) = '')
+               AND original_bytes IS NOT NULL",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
 /// Resolve a model-supplied file name (or fragment) to the newest match.
 /// Lowercases `fragment` itself; the error message keeps the original case.
+/// ADD-22: a short "(Files in this room: …)" hint appended to file-not-found
+/// errors, so a small model can correct the name from the real list instead of
+/// guessing again. Best-effort; capped so it never bloats the tool result.
+fn file_names_hint(conn: &Connection) -> String {
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM files ORDER BY created_at DESC LIMIT 10")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        " This room has no files yet.".to_string()
+    } else {
+        format!(" Files in this room: {}.", names.join(", "))
+    }
+}
+
 pub fn find_file_like(conn: &Connection, fragment: &str) -> Result<(String, String), String> {
     let needle = fragment.to_lowercase();
     conn.query_row(
@@ -621,7 +768,7 @@ pub fn find_file_like(conn: &Connection, fragment: &str) -> Result<(String, Stri
         [&needle],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
-    .map_err(|_| format!("No file matching \"{fragment}\" in this room."))
+    .map_err(|_| format!("No file matching \"{fragment}\" in this room.{}", file_names_hint(conn)))
 }
 
 /// Same fuzzy match as `find_file_like`, also returning extracted text —
@@ -639,7 +786,7 @@ pub fn find_file_like_full(
         [needle],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )
-    .map_err(|_| format!("No file matching \"{needle}\" in this room."))
+    .map_err(|_| format!("No file matching \"{needle}\" in this room.{}", file_names_hint(conn)))
 }
 
 /// Fuzzy match restricted to images — used by the agent's mark_image tool.
@@ -741,14 +888,24 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
-/// ADD-13: a batch of chunks that still lack an embedding — (chunk id, text).
-/// The background pass drains these in batches until none remain.
-pub fn chunks_missing_embedding(conn: &Connection, limit: usize) -> Result<Vec<(String, String)>, String> {
+/// ADD-13: a batch of chunks that still lack an embedding — (chunk id, file
+/// name, text). CHG-12: the file name is prepended when embedding as a
+/// `search_document:` so a paragraph that never names its own file ("...pets
+/// allowed...") can still match a question that does ("what does the lease say
+/// about pets"). The background pass drains these in batches until none remain.
+pub fn chunks_missing_embedding(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<(String, String, String)>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, text FROM chunks WHERE embedding IS NULL LIMIT ?1")
+        .prepare(
+            "SELECT c.id, f.name, c.text
+             FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE c.embedding IS NULL LIMIT ?1",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -765,20 +922,47 @@ pub fn set_chunk_embedding(conn: &Connection, id: &str, blob: &[u8]) -> Result<(
     Ok(())
 }
 
-/// ADD-13: every chunk that has a stored embedding — (chunk rowid, file name,
-/// chunk text, embedding blob). The rowid keys the keyword/vector blend so both
-/// scores line up on the same chunk. Brute-force scan; fine to a few thousand
-/// chunks (see ADD-13 latency budget).
-pub fn chunk_embeddings(conn: &Connection) -> Result<Vec<(i64, String, String, Vec<u8>)>, String> {
+/// CHG-15: every chunk's (rowid, embedding blob) — NO text. The brute-force
+/// cosine pass scores over just these, so only the ~24 winners' text is ever
+/// copied (via `chunks_by_rowids`). Previously this JOINed `c.text` for every
+/// embedded chunk on every question — tens of MB of discarded String allocation
+/// under the room mutex on a large room. The rowid keys the keyword/vector blend.
+pub fn chunk_embedding_vectors(conn: &Connection) -> Result<Vec<(i64, Vec<u8>)>, String> {
     let mut stmt = conn
-        .prepare(
-            "SELECT c.rowid, f.name, c.text, c.embedding
-             FROM chunks c JOIN files f ON f.id = c.file_id
-             WHERE c.embedding IS NOT NULL",
-        )
+        .prepare("SELECT rowid, embedding FROM chunks WHERE embedding IS NOT NULL")
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// CHG-15: fetch (rowid, file name, chunk text) for a specific set of chunk
+/// rowids — used to hydrate only the top vector candidates after scoring.
+pub fn chunks_by_rowids(
+    conn: &Connection,
+    rowids: &[i64],
+) -> Result<Vec<(i64, String, String)>, String> {
+    if rowids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = rowids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT c.rowid, f.name, c.text
+         FROM chunks c JOIN files f ON f.id = c.file_id
+         WHERE c.rowid IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        rowids.iter().map(|r| r as &dyn rusqlite::ToSql).collect();
+    let rows = stmt
+        .query_map(params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -1239,6 +1423,54 @@ pub fn set_chat_title_if_new(conn: &Connection, chat_id: &str, title: &str) -> R
 
 /// How long a cached page counts as fresh before we re-fetch (RM-2).
 const WEB_CACHE_TTL: &str = "-24 hours";
+/// CHG-33: web_search results cache shorter than page bodies — results churn.
+const WEB_SEARCH_TTL: &str = "-15 minutes";
+
+/// CHG-33: normalize a search query for cache keying — lowercase, trim, collapse
+/// internal whitespace — so exact repeats and case/spacing variants share a row.
+fn search_key(provider: &str, endpoint: &str, query: &str) -> String {
+    let q = query.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    format!("{provider}|{endpoint}|{q}")
+}
+
+/// CHG-33: cache a web_search result list (the formatted, pre-clamp text).
+pub fn put_web_search(
+    conn: &Connection,
+    provider: &str,
+    endpoint: &str,
+    query: &str,
+    results: &str,
+) -> Result<(), String> {
+    let key = search_key(provider, endpoint, query);
+    conn.execute(
+        "INSERT INTO web_searches(query_key, results_text, saved_at)
+         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         ON CONFLICT(query_key) DO UPDATE SET
+           results_text = excluded.results_text,
+           saved_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        params![key, results],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// CHG-33: a cached web_search result list if searched within the TTL, else None.
+pub fn get_fresh_web_search(
+    conn: &Connection,
+    provider: &str,
+    endpoint: &str,
+    query: &str,
+) -> Option<String> {
+    let key = search_key(provider, endpoint, query);
+    conn.query_row(
+        "SELECT results_text FROM web_searches
+         WHERE query_key = ?1
+           AND saved_at > strftime('%Y-%m-%dT%H:%M:%SZ','now',?2)",
+        params![key, WEB_SEARCH_TTL],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
 
 /// Cache a fetched page's readable text, keyed by URL (RM-2). Upserts so
 /// repeat fetches refresh the same row instead of growing the table forever.
@@ -1483,7 +1715,7 @@ mod tests {
         let f = add_file(&conn, "lease.pdf", "x");
         add_file(&conn, "loose.txt", "y");
         move_file_to_folder(&conn, &f, Some(&folder.id)).unwrap();
-        let names: Vec<String> = list_file_inventory(&conn).unwrap().into_iter().map(|(n, _)| n).collect();
+        let names: Vec<String> = list_file_inventory(&conn).unwrap().into_iter().map(|(n, _, _)| n).collect();
         assert!(names.contains(&"Contracts/lease.pdf".to_string()));
         assert!(names.contains(&"loose.txt".to_string()));
     }
@@ -1514,16 +1746,22 @@ mod tests {
     #[test]
     fn embedding_backfill_columns_work() {
         // ADD-13: chunks start with NULL embedding; storing a blob makes them
-        // visible to chunk_embeddings and clears them from the missing list.
+        // visible to the vector pass and clears them from the missing list.
         let conn = mem();
         add_file(&conn, "a.txt", "The office holiday party is on Friday.");
         let missing = chunks_missing_embedding(&conn, 10).unwrap();
         assert_eq!(missing.len(), 1);
-        assert!(chunk_embeddings(&conn).unwrap().is_empty());
+        assert!(chunk_embedding_vectors(&conn).unwrap().is_empty());
         let blob = embedding_to_blob(&[0.1, 0.2, 0.3]);
         set_chunk_embedding(&conn, &missing[0].0, &blob).unwrap();
         assert!(chunks_missing_embedding(&conn, 10).unwrap().is_empty());
-        assert_eq!(chunk_embeddings(&conn).unwrap().len(), 1);
+        assert_eq!(chunk_embedding_vectors(&conn).unwrap().len(), 1);
+        // CHG-15: hydrating the winning rowids returns the chunk text.
+        let vecs = chunk_embedding_vectors(&conn).unwrap();
+        let rowids: Vec<i64> = vecs.iter().map(|(r, _)| *r).collect();
+        let hydrated = chunks_by_rowids(&conn, &rowids).unwrap();
+        assert_eq!(hydrated.len(), 1);
+        assert!(hydrated[0].2.contains("holiday party"));
     }
 
     #[test]

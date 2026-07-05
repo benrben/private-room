@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <!-- ADD-18: dictation records from the microphone; audio is transcribed
+       on-device and never leaves this Mac. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Private Room uses the microphone for voice messages and dictation. Audio is transcribed on this Mac and never leaves it.</string>
   <!-- Re-declares the .roomai association from tauri.conf.json so the
        document icon (bundled via resources) can be attached; user-supplied
        plist keys take precedence over the generated ones. -->

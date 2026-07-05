@@ -24,6 +24,9 @@ const MIN_PASSWORD = 8;
 type RoomTemplate = {
   key: string;
   label: string;
+  // One-line description shown under the template pills so choosing one isn't
+  // a leap of faith about what it pre-fills.
+  blurb: string;
   customInstructions: string;
   memories: string[];
   welcome: string;
@@ -33,6 +36,7 @@ const ROOM_TEMPLATES: RoomTemplate[] = [
   {
     key: "blank",
     label: "Blank",
+    blurb: "An empty room. Add anything and set it up your own way.",
     customInstructions: "",
     memories: [],
     welcome: "",
@@ -40,6 +44,7 @@ const ROOM_TEMPLATES: RoomTemplate[] = [
   {
     key: "legal",
     label: "Legal",
+    blurb: "Contracts and letters — flags deadlines, obligations, odd clauses.",
     customInstructions:
       "This room holds legal documents and correspondence. Answer plainly " +
       "and cite the exact file and clause you are drawing from. Flag " +
@@ -67,6 +72,7 @@ const ROOM_TEMPLATES: RoomTemplate[] = [
   {
     key: "medical",
     label: "Medical",
+    blurb: "Health records — plain-language explanations, tracks dates and meds.",
     customInstructions:
       "This room holds personal medical records and notes. Explain terms " +
       "in plain, calm language and always point to the file a fact comes " +
@@ -94,6 +100,7 @@ const ROOM_TEMPLATES: RoomTemplate[] = [
   {
     key: "research",
     label: "Research",
+    blurb: "Papers and sources — compares, summarizes, cites every claim.",
     customInstructions:
       "This room is for research and reading. Help gather, compare, and " +
       "summarize sources, and always cite the file behind each claim. When " +
@@ -120,6 +127,7 @@ const ROOM_TEMPLATES: RoomTemplate[] = [
   {
     key: "journal",
     label: "Journal",
+    blurb: "A private diary — a warm listener that notices patterns over time.",
     customInstructions:
       "This room is a personal journal. Be a warm, unhurried listener. " +
       "Help reflect, notice patterns over time, and find past entries when " +
@@ -175,6 +183,39 @@ function passwordStrength(pw: string): Strength {
   return { score: 3, label: "Strong", level: "strong" };
 }
 
+// Friendly "Opened 2 hours ago" for the Recent list.
+function relativeTime(ms?: number | null): string {
+  if (!ms) return "";
+  const diff = Date.now() - ms;
+  if (diff < 0) return "just now";
+  const min = Math.round(diff / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr} hour${hr === 1 ? "" : "s"} ago`;
+  const day = Math.round(hr / 24);
+  if (day < 30) return `${day} day${day === 1 ? "" : "s"} ago`;
+  const mo = Math.round(day / 30);
+  if (mo < 12) return `${mo} month${mo === 1 ? "" : "s"} ago`;
+  const yr = Math.round(mo / 12);
+  return `${yr} year${yr === 1 ? "" : "s"} ago`;
+}
+
+// The check-off chips shown under the strength meter, so "how much more?" is
+// answerable rather than a mystery between Weak and Strong.
+function passwordCriteria(pw: string): { label: string; met: boolean }[] {
+  const kinds =
+    (/[a-z]/.test(pw) ? 1 : 0) +
+    (/[A-Z]/.test(pw) ? 1 : 0) +
+    (/[0-9]/.test(pw) ? 1 : 0) +
+    (/[^A-Za-z0-9]/.test(pw) ? 1 : 0);
+  return [
+    { label: "8+ characters", met: pw.length >= 8 },
+    { label: "12+ characters", met: pw.length >= 12 },
+    { label: "Mix of letters, numbers or symbols", met: kinds >= 2 },
+  ];
+}
+
 export default function App() {
   const [screen, setScreen] = useState<Screen>({ kind: "start" });
   const [password, setPassword] = useState("");
@@ -183,6 +224,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [entering, setEntering] = useState(false);
   const [recent, setRecent] = useState<RecentRoom[]>([]);
+  const [roomName, setRoomName] = useState("");
   const [templateKey, setTemplateKey] = useState("blank");
   // ADD-11: whether the room on the unlock screen has a Touch ID entry.
   const [canTouchId, setCanTouchId] = useState(false);
@@ -198,6 +240,7 @@ export default function App() {
     setPassword("");
     setConfirm("");
     setError("");
+    setRoomName("");
     setTemplateKey("blank");
     setCanTouchId(false);
     setScreen(next);
@@ -251,13 +294,11 @@ export default function App() {
     loadRecent();
   }
 
-  async function chooseCreate() {
-    const path = await api.chooseSavePath({
-      title: "Create a new Private Room",
-      defaultPath: "My Room.roomai",
-      filters: ROOM_FILTER,
-    });
-    if (path) goTo({ kind: "create", path });
+  // Start the branded create flow immediately — the user names the room and
+  // sets a password in-app; the native file panel is deferred to the final
+  // "Create & Enter", and only to choose where the one encrypted file lands.
+  function chooseCreate() {
+    goTo({ kind: "create", path: "" });
   }
 
   async function chooseOpen() {
@@ -279,7 +320,7 @@ export default function App() {
     }, 700);
   }
 
-  async function handleCreate(path: string) {
+  async function handleCreate() {
     if (password.length < MIN_PASSWORD) {
       setError(`Please use at least ${MIN_PASSWORD} characters.`);
       return;
@@ -288,6 +329,14 @@ export default function App() {
       setError("Passwords do not match.");
       return;
     }
+    // Defer to the native panel only now, to pick where the file is saved.
+    const suggested = (roomName.trim() || "My Room").replace(/[/\\:]/g, "-");
+    const path = await api.chooseSavePath({
+      title: "Choose where to save this room",
+      defaultPath: `${suggested}.roomai`,
+      filters: ROOM_FILTER,
+    });
+    if (!path) return; // cancelled the location picker; stay in the branded flow
     setBusy(true);
     try {
       const info = await api.createRoom(path, password);
@@ -359,6 +408,8 @@ export default function App() {
   }
 
   const strength = passwordStrength(password);
+  const tooShort = password.length > 0 && password.length < MIN_PASSWORD;
+  const mismatch = confirm.length > 0 && password !== confirm;
 
   return (
     <div className={`gate${entering ? " entering" : ""}`}>
@@ -374,6 +425,11 @@ export default function App() {
               Your files, links, chats and AI — sealed inside one encrypted
               file that never leaves this computer.
             </p>
+            <ul className="gate-assurances">
+              <li>Offline by default</li>
+              <li>No account needed</li>
+              <li>One file, fully encrypted</li>
+            </ul>
             <div className="gate-actions">
               <button className="primary" onClick={chooseCreate}>
                 Create New Room
@@ -394,6 +450,11 @@ export default function App() {
                       >
                         <span className="recent-name">{room.name}</span>
                         <span className="recent-path">{room.path}</span>
+                        {relativeTime(room.openedAt) && (
+                          <span className="recent-when">
+                            Opened {relativeTime(room.openedAt)}
+                          </span>
+                        )}
                       </button>
                       <button
                         className="recent-remove"
@@ -419,12 +480,17 @@ export default function App() {
             className="gate-form"
             onSubmit={(e) => {
               e.preventDefault();
-              handleCreate(screen.path);
+              handleCreate();
             }}
           >
-            <p className="gate-sub">
-              New room: <strong>{fileNameOf(screen.path)}</strong>
-            </p>
+            <p className="gate-sub">Name your room</p>
+            <input
+              type="text"
+              placeholder="e.g. Personal, Work, Journal"
+              value={roomName}
+              autoFocus
+              onChange={(e) => setRoomName(e.target.value)}
+            />
             <div className="tpl-picker">
               <div className="tpl-label">Start from a template</div>
               <div className="tpl-chips">
@@ -442,37 +508,74 @@ export default function App() {
                   </button>
                 ))}
               </div>
+              <p className="tpl-blurb">
+                {ROOM_TEMPLATES.find((t) => t.key === templateKey)?.blurb}
+              </p>
             </div>
             <input
               type="password"
               placeholder="Choose a password"
+              className={tooShort ? "invalid" : undefined}
+              aria-invalid={tooShort}
               value={password}
-              autoFocus
               onChange={(e) => {
                 setPassword(e.target.value);
                 if (error) setError("");
               }}
             />
             {password && (
-              <div className={`pw-meter ${strength.level}`}>
-                <div className="pw-meter-track">
-                  <div className="pw-meter-fill" />
+              <>
+                <div className={`pw-meter ${strength.level}`}>
+                  <div className="pw-meter-track">
+                    <div className="pw-meter-fill" />
+                  </div>
+                  <span className="pw-meter-label">{strength.label}</span>
                 </div>
-                <span className="pw-meter-label">{strength.label}</span>
-              </div>
+                <ul className="pw-criteria">
+                  {passwordCriteria(password).map((c) => (
+                    <li
+                      key={c.label}
+                      className={c.met ? "met" : undefined}
+                    >
+                      {c.met ? "✓" : "○"} {c.label}
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
             <input
               type="password"
               placeholder="Repeat password"
+              className={mismatch ? "invalid" : undefined}
+              aria-invalid={mismatch}
               value={confirm}
               onChange={(e) => {
                 setConfirm(e.target.value);
                 if (error) setError("");
               }}
             />
-            {error && <div className="gate-error">{error}</div>}
+            {mismatch && !error && (
+              <div className="gate-error" role="alert">
+                <span className="gate-error-ic" aria-hidden="true">!</span>
+                Passwords do not match.
+              </div>
+            )}
+            {error && (
+              <div className="gate-error" role="alert">
+                <span className="gate-error-ic" aria-hidden="true">!</span>
+                {error}
+              </div>
+            )}
             <div className="gate-actions">
-              <button className="primary" type="submit" disabled={busy}>
+              <button
+                className="primary"
+                type="submit"
+                disabled={
+                  busy ||
+                  password.length < MIN_PASSWORD ||
+                  password !== confirm
+                }
+              >
                 {busy ? "Creating…" : "Create & Enter"}
               </button>
               <button type="button" onClick={() => goTo({ kind: "start" })}>
@@ -526,6 +629,8 @@ export default function App() {
             <input
               type="password"
               placeholder="Password"
+              className={error ? "invalid" : undefined}
+              aria-invalid={!!error}
               value={password}
               autoFocus
               onChange={(e) => {
@@ -533,7 +638,17 @@ export default function App() {
                 if (error) setError("");
               }}
             />
-            {error && <div className="gate-error">{error}</div>}
+            {error && (
+              <div className="gate-error" role="alert">
+                <span className="gate-error-ic" aria-hidden="true">!</span>
+                {error}
+              </div>
+            )}
+            {!canTouchId && (
+              <p className="gate-hint">
+                Tip: enable fingerprint unlock in Settings → Privacy.
+              </p>
+            )}
             <div className="gate-actions">
               <button className="primary" type="submit" disabled={busy}>
                 {busy ? "Unlocking…" : "Unlock"}

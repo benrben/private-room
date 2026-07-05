@@ -37,6 +37,8 @@ export interface FileVersion {
 export interface RecentRoom {
   name: string;
   path: string;
+  /** Unix epoch millis of the last open; absent for entries saved earlier. */
+  openedAt?: number | null;
 }
 
 export interface FileMeta {
@@ -57,6 +59,14 @@ export interface FileMeta {
 export interface Folder {
   id: string;
   name: string;
+}
+
+/** A prebuilt "#name" chat workflow, for autocomplete/help. */
+export interface ChatCommand {
+  name: string;
+  summary: string;
+  usage: string;
+  needsRefs: boolean;
 }
 
 /** Grouped results of a room-wide search (ADD-6). */
@@ -99,8 +109,11 @@ export interface FileContent {
     | "sheet"
     | "csv"
     | "markdown"
+    | "html"
     | "code"
     | "text"
+    | "audio"
+    | "video"
     | "binary";
   name: string;
   mime: string;
@@ -124,6 +137,22 @@ export const ENGINE_LABELS: Record<string, string> = {
   "claude-cli": "Claude Code (cloud)",
   "codex-cli": "Codex (cloud)",
 };
+
+/** ADD-22: a local model's declared abilities (from Ollama /api/show), so the
+ * picker can badge each model and warn when the chosen one can't drive the app. */
+export interface ModelCaps {
+  name: string;
+  tools: boolean;
+  vision: boolean;
+}
+
+/** ADD-18: state of the built-in dictation/transcription engine. The engine
+ * (Whisper) is compiled into the app; only the model file downloads on demand. */
+export interface SttStatus {
+  installed: boolean;
+  downloading: boolean;
+  sizeMb: number;
+}
 
 /** Friendly display names for models we ship guidance for. The stored setting
  * always keeps the raw id — this is display only (CHG-4). Unknown models the
@@ -165,6 +194,9 @@ export interface AnnotationPayload {
   sheet?: string;
   range?: string;
   note?: string;
+  /** ADD-22: true when the exact quote wasn't found and the closest passage was
+   * highlighted instead — the UI marks it "≈ closest match". */
+  approx?: boolean;
 }
 
 export interface McpServerStatus {
@@ -172,6 +204,14 @@ export interface McpServerStatus {
   status: "connecting" | "connected" | "failed" | "disabled";
   error: string | null;
   tools: string[];
+}
+
+/** SEC-1b: a pending per-call MCP approval prompt from the backend. */
+export interface McpApproveRequest {
+  id: string;
+  server: string;
+  tool: string;
+  args: string;
 }
 
 /** Payload of the agent-open-file event: a bare file id, or an id with a
@@ -230,6 +270,8 @@ export const api = {
   renameFolder: (id: string, name: string) =>
     invoke<void>("rename_folder", { id, name }),
   deleteFolder: (id: string) => invoke<void>("delete_folder", { id }),
+  renameFile: (id: string, name: string) =>
+    invoke<void>("rename_file", { id, name }),
   moveFileToFolder: (fileId: string, folderId: string | null) =>
     invoke<void>("move_file_to_folder", { fileId, folderId }),
   // ---- Wave 4: room-wide search (ADD-6) ----
@@ -245,11 +287,16 @@ export const api = {
   // SEC-1: approve the pending config fingerprint and start its servers.
   approveMcp: (fingerprint: string) =>
     invoke<McpServerStatus[]>("approve_mcp", { fingerprint }),
+  // SEC-1b: answer a per-call MCP approval prompt ("once" | "always" | "deny").
+  resolveMcpCall: (id: string, decision: "once" | "always" | "deny") =>
+    invoke<void>("resolve_mcp_call", { id, decision }),
   // ADD-12: fetch a web page and save it as a readable room file.
   importLink: (url: string) => invoke<FileMeta>("import_link", { url }),
   // ADD-17: build/refresh the "Room summary.md" file; emits summarize-progress.
   summarizeRoom: () => invoke<FileMeta>("summarize_room"),
   aiStatus: () => invoke<AiStatus>("ai_status"),
+  /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
+  modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
   warmModel: () => invoke<void>("warm_model"),
   pullModel: (name: string) => invoke<void>("pull_model", { name }),
   deleteModel: (name: string) => invoke<void>("delete_model", { name }),
@@ -265,9 +312,25 @@ export const api = {
   ask: (chatId: string, question: string, attachments: string[], askId: string) =>
     invoke<Message>("ask", { chatId, question, attachments, askId }),
   cancelAsk: (askId: string) => invoke<void>("cancel_ask", { askId }),
+  /** Run a prebuilt "#name" workflow. `refs` are @-pinned file ids; `raw` is
+   *  the full line the user typed (saved verbatim as the user message). Streams
+   *  the same ask-delta/ask-step/ask-notice events as `ask`. */
+  runCommand: (
+    chatId: string,
+    command: string,
+    args: string,
+    refs: string[],
+    raw: string,
+    askId: string,
+  ) => invoke<Message>("run_command", { chatId, command, args, refs, raw, askId }),
+  /** The catalog of "#name" commands (for autocomplete + help). */
+  listChatCommands: () => invoke<ChatCommand[]>("list_chat_commands"),
   // ADD-8: import a pasted image (base64) as a room file.
   importImageBytes: (name: string, b64: string) =>
     invoke<FileMeta>("import_image_bytes", { name, b64 }),
+  // ADD-18: store an in-room voice note; transcribes in the background.
+  importAudioBytes: (name: string, b64: string) =>
+    invoke<FileMeta>("import_audio_bytes", { name, b64 }),
   locateInImage: (
     fileId: string,
     query: string,
@@ -275,8 +338,32 @@ export const api = {
     imgHeight: number,
   ) =>
     invoke<ImageBox[]>("locate_in_image", { fileId, query, imgWidth, imgHeight }),
+  // ---- ADD-18: on-device dictation & transcription (Whisper built in) ----
+  sttStatus: () => invoke<SttStatus>("stt_status"),
+  sttDownloadModel: () => invoke<void>("stt_download_model"),
+  sttDeleteModel: () => invoke<void>("stt_delete_model"),
+  /** Transcribe recorded audio bytes on-device. Rejects with STT_MODEL_MISSING
+   *  when the dictation model hasn't been downloaded yet (Settings → AI). */
+  transcribeAudio: (dataB64: string, ext: string, timestamps: boolean) =>
+    invoke<string>("transcribe_audio", { dataB64, ext, timestamps }),
+  /** Post-process dictated text on the LOCAL model (alfred's pipeline):
+   *  optional translate-to-English + an intent rewrite (raw/email/message/
+   *  commit/notes/prompt). mode="off" && !translate returns text unchanged. */
+  shapeText: (text: string, translate: boolean, mode: string) =>
+    invoke<string>("shape_text", { text, translate, mode }),
 
   // ---- events (@tauri-apps/api/event) ----
+  onSttDownloadProgress: (
+    cb: (p: { got: number; total: number; percent: number }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ got: number; total: number; percent: number }>(
+      "stt-download-progress",
+      (e) => cb(e.payload),
+    ),
+  /** Background transcription of an imported recording: [fileName, phase],
+   *  phase one of started | done | none | model-missing. */
+  onSttProgress: (cb: (p: [string, string]) => void): Promise<UnlistenFn> =>
+    listen<[string, string]>("stt-progress", (e) => cb(e.payload)),
   onOpenRoomFile: (cb: (path: string) => void): Promise<UnlistenFn> =>
     listen<string>("open-room-file", (e) => cb(e.payload)),
   onAskDelta: (cb: (delta: string) => void): Promise<UnlistenFn> =>
@@ -286,6 +373,13 @@ export const api = {
   // `ask-notice` carries a user-facing warning (e.g. UX-4 truncation).
   onAskStep: (cb: (label: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-step", (e) => cb(e.payload)),
+  // ADD-22: the deterministic router's chosen lane ("Answering", "Working on
+  // your files", …), shown as a subtle label so an odd answer is explainable.
+  onAskLane: (cb: (label: string) => void): Promise<UnlistenFn> =>
+    listen<string>("ask-lane", (e) => cb(e.payload)),
+  // ADD-22: outcome of the most recent tool step, so a failed chip reads failed.
+  onAskStepStatus: (cb: (p: { ok: boolean }) => void): Promise<UnlistenFn> =>
+    listen<{ ok: boolean }>("ask-step-status", (e) => cb(e.payload)),
   onAskRound: (cb: () => void): Promise<UnlistenFn> =>
     listen("ask-round", () => cb()),
   onAskNotice: (cb: (text: string) => void): Promise<UnlistenFn> =>
@@ -305,6 +399,11 @@ export const api = {
     listen<string>("file-updated", (e) => cb(e.payload)),
   onRoomFilesChanged: (cb: () => void): Promise<UnlistenFn> =>
     listen("room-files-changed", () => cb()),
+  // SEC-1b: the AI is about to invoke a connected (MCP) tool and needs consent.
+  onMcpApproveRequest: (
+    cb: (req: McpApproveRequest) => void,
+  ): Promise<UnlistenFn> =>
+    listen<McpApproveRequest>("mcp-approve-request", (e) => cb(e.payload)),
   onMcpStatus: (
     cb: (statuses: McpServerStatus[]) => void,
   ): Promise<UnlistenFn> =>

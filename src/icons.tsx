@@ -31,6 +31,26 @@ export function DownloadIcon({ size, className }: IconProps) {
   );
 }
 
+/** ADD-18: dictation (voice input). */
+export function MicIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <rect x="9" y="2.5" width="6" height="11" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0" />
+      <path d="M12 18v3.5" />
+    </Stroke>
+  );
+}
+
+export function UndoIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M9 14 4 9l5-5" />
+      <path d="M4 9h11a5 5 0 0 1 5 5 5 5 0 0 1-5 5H8" />
+    </Stroke>
+  );
+}
+
 function Stroke({
   size = 16,
   className,
@@ -293,6 +313,102 @@ export function PencilIcon(p: IconProps) {
   return (
     <Stroke {...p}>
       <path d="M17 3.5a2.3 2.3 0 0 1 3.3 3.3L7.5 19.8l-4.2 1 1-4.2L17 3.5z" />
+    </Stroke>
+  );
+}
+
+export function FolderIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l2 2.5h7A1.5 1.5 0 0 1 19 9v8.5A1.5 1.5 0 0 1 17.5 19h-13A1.5 1.5 0 0 1 3 17.5z" />
+    </Stroke>
+  );
+}
+
+export function LinkIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M10 13.5a3.5 3.5 0 0 0 5 0l3-3a3.5 3.5 0 0 0-5-5l-1.5 1.5" />
+      <path d="M14 10.5a3.5 3.5 0 0 0-5 0l-3 3a3.5 3.5 0 0 0 5 5l1.5-1.5" />
+    </Stroke>
+  );
+}
+
+export function GlobeIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18" />
+      <path d="M12 3c2.5 2.5 3.8 5.7 3.8 9s-1.3 6.5-3.8 9c-2.5-2.5-3.8-5.7-3.8-9S9.5 5.5 12 3z" />
+    </Stroke>
+  );
+}
+
+export function CloudIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M7 18a4 4 0 0 1-.5-7.97A5.5 5.5 0 0 1 17 9.5a3.5 3.5 0 0 1-.5 8.5z" />
+    </Stroke>
+  );
+}
+
+export function MemoryIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M6.5 4.5h11a1 1 0 0 1 1 1v14l-6.5-4-6.5 4v-14a1 1 0 0 1 1-1z" />
+    </Stroke>
+  );
+}
+
+export function DotsIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="19" cy="12" r="1.4" fill="currentColor" stroke="none" />
+    </Stroke>
+  );
+}
+
+export function CheckIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M4.5 12.5l5 5 10-11" />
+    </Stroke>
+  );
+}
+
+export function PlusIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M12 5v14M5 12h14" />
+    </Stroke>
+  );
+}
+
+export function ChevronDownIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M6 9.5l6 6 6-6" />
+    </Stroke>
+  );
+}
+
+export function SearchIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <circle cx="11" cy="11" r="6.5" />
+      <path d="M20 20l-4.2-4.2" />
+    </Stroke>
+  );
+}
+
+export function AlertIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M12 4.5l8.5 15h-17z" />
+      <path d="M12 10v4" />
+      <circle cx="12" cy="16.6" r="0.4" fill="currentColor" stroke="none" />
     </Stroke>
   );
 }

@@ -5,6 +5,8 @@ pub mod extraction;
 pub mod mcp;
 mod ocr;
 mod ollama;
+mod room_mcp;
+pub mod stt;
 pub mod web;
 
 use commands::AppState;
@@ -56,6 +58,7 @@ pub fn run() {
             commands::create_folder,
             commands::rename_folder,
             commands::delete_folder,
+            commands::rename_file,
             commands::move_file_to_folder,
             commands::search_all,
             commands::get_setting,
@@ -65,7 +68,9 @@ pub fn run() {
             commands::mcp_apply_config,
             commands::mcp_status,
             commands::approve_mcp,
+            commands::resolve_mcp_call,
             commands::ai_status,
+            commands::model_capabilities,
             commands::open_ollama,
             commands::warm_model,
             commands::pull_model,
@@ -77,9 +82,17 @@ pub fn run() {
             commands::delete_message,
             commands::get_messages,
             commands::import_image_bytes,
+            commands::import_audio_bytes,
             commands::ask,
             commands::cancel_ask,
+            commands::run_command,
+            commands::list_chat_commands,
             commands::locate_in_image,
+            commands::stt_status,
+            commands::stt_download_model,
+            commands::stt_delete_model,
+            commands::transcribe_audio,
+            commands::shape_text,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

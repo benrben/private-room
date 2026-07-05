@@ -3,18 +3,20 @@ import {
   KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   AiStatus,
   AnnotationPayload,
   api,
   Chat,
+  ChatCommand,
   ENGINE_LABELS,
   FileContent,
   FileMeta,
@@ -23,6 +25,7 @@ import {
   Folder,
   formatSize,
   McpServerStatus,
+  McpApproveRequest,
   Memory,
   Message,
   modelLabel,
@@ -30,24 +33,38 @@ import {
   SearchResults,
 } from "./api";
 import {
+  CheckIcon,
+  ChevronDownIcon,
   CloseIcon,
+  CloudIcon,
+  DotsIcon,
   DownloadIcon,
   EmptyChatArt,
   EmptyViewerArt,
   EyeIcon,
   FileTypeIcon,
-  GearIcon,
+  FolderIcon,
+  GlobeIcon,
+  LinkIcon,
+  MemoryIcon,
+  MicIcon,
   LockIcon,
   Logomark,
   PaperclipIcon,
   PencilIcon,
+  PlusIcon,
+  SearchIcon,
   SendIcon,
+  SparkIcon,
   TrashIcon,
+  UndoIcon,
 } from "./icons";
 import Settings from "./Settings";
 import ChatAnnotatedImage from "./viewers/ChatAnnotatedImage";
 import CodeEditor from "./viewers/CodeEditor";
+import AudioView from "./viewers/AudioView";
 import DocxView from "./viewers/DocxView";
+import HtmlView from "./viewers/HtmlView";
 import ImageView from "./viewers/ImageView";
 import MarkdownView from "./viewers/MarkdownView";
 import PdfView from "./viewers/PdfView";
@@ -148,10 +165,126 @@ function patchStreamFences(s: string): string {
   return fences % 2 === 1 ? `${s}\n\`\`\`` : s;
 }
 
-/** Human-friendly timestamp for a saved version (ADD-2). */
+// ---- "#command" / "@reference" parsing (makes the small model deterministic) ----
+
+/** Live autocomplete popover state for the composer. */
+interface AutocompleteState {
+  kind: "cmd" | "ref";
+  /** The partial token being typed (after # or @), lowercased for matching. */
+  query: string;
+  /** Byte offset of the '#'/'@' that opened this token. */
+  start: number;
+  /** Highlighted item index. */
+  index: number;
+}
+
+/** The token immediately left of the caret, if it's a "#…" or "@…" being typed
+ *  (i.e. no whitespace since the sigil). Returns null otherwise. */
+function tokenAtCaret(
+  value: string,
+  caret: number,
+): { kind: "cmd" | "ref"; start: number; query: string } | null {
+  const before = value.slice(0, caret);
+  // A '#' command only makes sense as the first token of the message.
+  const cmd = /^#([a-z-]*)$/.exec(before);
+  if (cmd) {
+    return { kind: "cmd", start: 0, query: cmd[1].toLowerCase() };
+  }
+  // '@' references can appear anywhere; match back to the sigil (allows spaces
+  // in the query so multi-word filenames can be typed/filtered).
+  const at = /@([^@\n]*)$/.exec(before);
+  if (at) {
+    return { kind: "ref", start: caret - at[1].length - 1, query: at[1].toLowerCase() };
+  }
+  return null;
+}
+
+/** Resolve every "@name" / "@folder/" span in `text` against the room's files
+ *  and folders (longest-name-first so spaces work), returning the collected
+ *  file ids and the text with those spans removed. Unmatched "@…" is left as
+ *  literal text. */
+function resolveRefs(
+  text: string,
+  files: FileMeta[],
+  folders: Folder[],
+): { refIds: string[]; cleaned: string } {
+  // Build match candidates, longest label first (so "Room summary.md" wins over
+  // a file literally named "Room").
+  const candidates: { label: string; ids: string[] }[] = [];
+  for (const fo of folders) {
+    const ids = files.filter((f) => f.folderId === fo.id).map((f) => f.id);
+    candidates.push({ label: `${fo.name}/`, ids });
+  }
+  for (const f of files) candidates.push({ label: f.name, ids: [f.id] });
+  candidates.sort((a, b) => b.label.length - a.label.length);
+
+  const refIds: string[] = [];
+  let cleaned = "";
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === "@") {
+      const rest = text.slice(i + 1);
+      const hit = candidates.find((c) =>
+        rest.toLowerCase().startsWith(c.label.toLowerCase()),
+      );
+      if (hit) {
+        for (const id of hit.ids) if (!refIds.includes(id)) refIds.push(id);
+        i += 1 + hit.label.length;
+        continue;
+      }
+    }
+    cleaned += text[i];
+    i += 1;
+  }
+  return { refIds, cleaned: cleaned.replace(/\s+/g, " ").trim() };
+}
+
+/** Parse a composed message into a command (if any), its cleaned args, and the
+ *  resolved @-file ids. `commandError` is set when "#word" names no command. */
+function parseComposer(
+  text: string,
+  commands: ChatCommand[],
+  files: FileMeta[],
+  folders: Folder[],
+): {
+  command?: string;
+  args: string;
+  refIds: string[];
+  commandError?: string;
+} {
+  const { refIds, cleaned } = resolveRefs(text, files, folders);
+  const m = /^#([a-z-]+)\b\s*([\s\S]*)$/.exec(cleaned);
+  if (!m) return { args: cleaned, refIds };
+  const name = m[1];
+  if (!commands.some((c) => c.name === name)) {
+    return { args: cleaned, refIds, commandError: name };
+  }
+  return { command: name, args: m[2].trim(), refIds };
+}
+
+/** Friendly file name for the sidebar: drop the extension (the type icon
+ * already conveys it) and turn underscores into spaces. The full original
+ * name still rides along in a tooltip and on export. */
+function displayName(name: string): string {
+  const dot = name.lastIndexOf(".");
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const cleaned = base.replace(/_+/g, " ").trim();
+  return cleaned || name;
+}
+
+/** Human-friendly timestamp for a saved version (ADD-2). Spelled-out month so
+ * it's never ambiguous between D/M/Y and M/D/Y locales (e.g. "Jul 5, 2026,
+ * 12:47 AM"). */
 function formatWhen(iso: string): string {
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 /** Read-only extracted-text preview that can highlight a quoted snippet. */
@@ -180,11 +313,30 @@ export default function Workspace({ info, onLock }: Props) {
   const [model, setModel] = useState("");
   const [attachments, setAttachments] = useState<FileMeta[]>([]);
   const [question, setQuestion] = useState("");
+  // Prebuilt "#name" workflows + inline "#"/"@" autocomplete state.
+  const [commands, setCommands] = useState<ChatCommand[]>([]);
+  const [ac, setAc] = useState<AutocompleteState | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const [asking, setAsking] = useState(false);
   const [streamText, setStreamText] = useState("");
   // CHG-5: per-turn tool-step chips shown above the live text (not saved).
-  const [steps, setSteps] = useState<string[]>([]);
+  // ADD-22: each chip carries an ok flag so a failed tool reads as failed.
+  const [steps, setSteps] = useState<{ label: string; ok: boolean }[]>([]);
+  // ADD-22: the deterministic router's chosen lane, shown as a subtle label.
+  const [lane, setLane] = useState("");
+  // ADD-22: files edited during a turn, keyed by the resulting assistant message
+  // id, so we can offer a one-tap Undo on that message (session-only).
+  const [undoByMsg, setUndoByMsg] = useState<Record<string, string[]>>({});
+  const editedRef = useRef<Set<string>>(new Set());
   const [toasts, setToasts] = useState<Toast[]>([]);
+  // ADD-18: dictation — idle → recording (mic live) → busy (transcribing).
+  // `dictOwner` is which button holds the mic: composer/note/memory/file/journal.
+  const [dictState, setDictState] = useState<"idle" | "recording" | "busy">(
+    "idle",
+  );
+  const [dictOwner, setDictOwner] = useState<string | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const dictChunksRef = useRef<Blob[]>([]);
   // ADD-8: full-window highlight while files are dragged over the app.
   const [dragOver, setDragOver] = useState(false);
   // ADD-9: inline chat rename.
@@ -228,9 +380,35 @@ export default function Workspace({ info, onLock }: Props) {
   // which file row's "Move to…" menu is open, and the inline folder rename.
   const [folders, setFolders] = useState<Folder[]>([]);
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
-  const [moveMenuFor, setMoveMenuFor] = useState<string | null>(null);
+  const [moveMenuFor, setMoveMenuFor] = useState<{
+    id: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  // Right-click file menu + inline rename (mirrors the folder rename pattern).
+  const [ctxMenu, setCtxMenu] = useState<{ file: FileMeta; x: number; y: number } | null>(null);
+  const ctxMenuRef = useRef(false);
+  const ctxMenuElRef = useRef<HTMLDivElement>(null);
+  const moveMenuElRef = useRef<HTMLDivElement>(null);
+  const [renamingFile, setRenamingFile] = useState<{ id: string; name: string } | null>(null);
+  // Redesign: sidebar file filter + the header/sidebar popover menus.
+  const [fileFilter, setFileFilter] = useState("");
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [roomMenuOpen, setRoomMenuOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  // SEC-1b: queued MCP tool-call approval prompts (one shown at a time).
+  const [mcpApprovals, setMcpApprovals] = useState<McpApproveRequest[]>([]);
   // ADD-16: which folder header (or "root") a dragged file is hovering over.
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
+  // True while a file row is being dragged within the sidebar. Used to keep the
+  // full-canvas "Drop to add to this room" overlay (meant for Finder drops) from
+  // hijacking the window during an in-app move.
+  const internalDragRef = useRef(false);
+  // Resizable panes. Widths persist per room in localStorage so a room reopens
+  // the way the user left it. Clamped so no pane can be dragged away entirely.
+  const paneKey = `paneWidths:${info.name}`;
+  const [sidebarW, setSidebarW] = useState(300);
+  const [chatW, setChatW] = useState(400);
   const [renamingFolder, setRenamingFolder] = useState<{ id: string; name: string } | null>(null);
   // BUG 1: inline "+ Folder" create input (window.prompt is a no-op in
   // WKWebView). null = not creating; a string is the in-progress name.
@@ -266,17 +444,25 @@ export default function Workspace({ info, onLock }: Props) {
   const askIdRef = useRef<string | null>(null);
   // ADD-10: interval that re-checks AI status after "Open Ollama".
   const recheckTimer = useRef<number | undefined>(undefined);
+  // Trust: announce every engine change. `prevModelRef` tracks the last value
+  // we've already announced; `userPickedModelRef` marks a change the user made
+  // in the dropdown (no toast needed) vs. an automatic/fallback switch (toast).
+  const prevModelRef = useRef<string>("");
+  const userPickedModelRef = useRef(false);
+  const memoryHeadRef = useRef<HTMLDivElement>(null);
+  // One-time spotlight explaining what Memory is, dismissed per room.
+  const [showMemoryIntro, setShowMemoryIntro] = useState(false);
 
   function pushToast(kind: Toast["kind"], text: string) {
     const id = ++toastSeq.current;
     setToasts((t) => [...t, { id, kind, text }]);
-    // Successes and info clear themselves; errors stay until dismissed.
-    if (kind !== "error") {
-      window.setTimeout(
-        () => setToasts((t) => t.filter((x) => x.id !== id)),
-        5000,
-      );
-    }
+    // Everything auto-dismisses so nothing lingers across later actions; errors
+    // simply linger longer, and the × is always available to close early.
+    const ttl = kind === "error" ? 9000 : 5000;
+    window.setTimeout(
+      () => setToasts((t) => t.filter((x) => x.id !== id)),
+      ttl,
+    );
   }
 
   function dismissToast(id: number) {
@@ -368,6 +554,39 @@ export default function Workspace({ info, onLock }: Props) {
         ),
       );
       pushToast("success", "Restored an earlier version.");
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
+  /** ADD-22: undo the file change(s) an AI turn made, by restoring each file's
+   *  most recent version (the pre-edit snapshot store_file_bytes took). Restore
+   *  is itself undoable, so this is reversible via the file's version history. */
+  async function undoEdits(msgId: string) {
+    const fileIds = undoByMsg[msgId];
+    if (!fileIds || fileIds.length === 0) return;
+    try {
+      for (const fid of fileIds) {
+        const versions = await api.listFileVersions(fid);
+        if (versions[0]) await api.restoreFileVersion(versions[0].id);
+      }
+      setUndoByMsg((u) => {
+        const next = { ...u };
+        delete next[msgId];
+        return next;
+      });
+      setFiles(await api.listFiles());
+      // If the reverted file is open, remount so it shows the restored bytes.
+      const current = openFileRef.current;
+      if (current && fileIds.includes(current.id)) {
+        const content = await api.getFileContent(current.id);
+        setOpenFile({ ...current, content });
+        setViewerRev((r) => r + 1);
+      }
+      pushToast(
+        "success",
+        fileIds.length > 1 ? `Undid changes to ${fileIds.length} files.` : "Change undone.",
+      );
     } catch (e) {
       pushToast("error", String(e));
     }
@@ -527,6 +746,7 @@ export default function Workspace({ info, onLock }: Props) {
     api.listFiles().then(setFiles);
     api.listFolders().then(setFolders).catch(() => {});
     api.listMemories().then(setMemories);
+    api.listChatCommands().then(setCommands).catch(() => {});
     refreshAi();
     // Pre-load the model so the first question doesn't pay the cold start.
     api.warmModel().catch(() => {});
@@ -547,7 +767,17 @@ export default function Workspace({ info, onLock }: Props) {
       setStreamText((t) => t + delta);
     });
     const unlistenStep = api.onAskStep((label) => {
-      setSteps((s) => [...s, label]);
+      setSteps((s) => [...s, { label, ok: true }]);
+    });
+    // ADD-22: the router's lane label, and per-step success/failure.
+    const unlistenLane = api.onAskLane((label) => {
+      setLane(label);
+    });
+    const unlistenStepStatus = api.onAskStepStatus(({ ok }) => {
+      if (ok) return;
+      setSteps((s) =>
+        s.length ? [...s.slice(0, -1), { ...s[s.length - 1], ok: false }] : s,
+      );
     });
     const unlistenRound = api.onAskRound(() => {
       setStreamText("");
@@ -570,6 +800,8 @@ export default function Workspace({ info, onLock }: Props) {
     // ADD-8: drop files anywhere on the window to import them.
     const unlistenDrop = getCurrentWebview().onDragDropEvent(async (event) => {
       const p = event.payload;
+      // An in-app file-row drag isn't a Finder import — leave the canvas alone.
+      if (internalDragRef.current) return;
       if (p.type === "enter" || p.type === "over") {
         setDragOver(true);
       } else if (p.type === "leave") {
@@ -586,6 +818,9 @@ export default function Workspace({ info, onLock }: Props) {
           }
         }
       }
+    });
+    const unlistenMcpApprove = api.onMcpApproveRequest((req) => {
+      setMcpApprovals((q) => [...q, req]);
     });
     refreshWebAccess();
     refreshAutolock();
@@ -624,6 +859,8 @@ export default function Workspace({ info, onLock }: Props) {
       viewFile(payload.fileId, annotationTarget(payload));
     });
     const unlistenUpdated = api.onFileUpdated(async (fileId) => {
+      // ADD-22: remember which files this turn changed, to offer Undo afterward.
+      editedRef.current.add(fileId);
       const current = openFileRef.current;
       if (current && current.id === fileId) {
         // Refresh in place — keep the edit/preview mode and target.
@@ -645,6 +882,8 @@ export default function Workspace({ info, onLock }: Props) {
     return () => {
       unlisten.then((fn) => fn());
       unlistenStep.then((fn) => fn());
+      unlistenLane.then((fn) => fn());
+      unlistenStepStatus.then((fn) => fn());
       unlistenRound.then((fn) => fn());
       unlistenNotice.then((fn) => fn());
       unlistenSummarize.then((fn) => fn());
@@ -655,6 +894,7 @@ export default function Workspace({ info, onLock }: Props) {
       unlistenUpdated.then((fn) => fn());
       unlistenFiles.then((fn) => fn());
       unlistenMcp.then((fn) => fn());
+      unlistenMcpApprove.then((fn) => fn());
       window.clearInterval(recheckTimer.current);
     };
   }, []);
@@ -725,6 +965,11 @@ export default function Workspace({ info, onLock }: Props) {
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") {
+        if (ctxMenuRef.current) {
+          e.preventDefault();
+          setCtxMenu(null);
+          return;
+        }
         if (showSearchRef.current) {
           e.preventDefault();
           setShowSearch(false);
@@ -902,10 +1147,12 @@ export default function Workspace({ info, onLock }: Props) {
     }
   }
 
-  /** Core ask flow shared by send() and regenerate(). Owns the ask id (ADD-7),
-   * resets the live stream/steps (CHG-5), and swallows cancel-driven rejections
-   * so Stop/Lock never surface an error toast (HLT-7). */
-  async function askOnce(q: string, attachmentIds: string[]) {
+  /** Core turn flow shared by ask, regenerate, and "#command" runs. Owns the
+   * ask id (ADD-7), resets the live stream/steps (CHG-5), swallows cancel-driven
+   * rejections so Stop/Lock never surface an error toast (HLT-7), and reloads
+   * the saved transcript + files/memories afterward. `run` performs the actual
+   * backend call with the freshly-minted ask id. */
+  async function runTurn(run: (askId: string) => Promise<unknown>) {
     if (!activeChatId) return;
     const chatId = activeChatId;
     const askId = crypto.randomUUID();
@@ -913,8 +1160,10 @@ export default function Workspace({ info, onLock }: Props) {
     setAsking(true);
     setStreamText("");
     setSteps([]);
+    setLane("");
+    editedRef.current = new Set();
     try {
-      await api.ask(chatId, q, attachmentIds, askId);
+      await run(askId);
     } catch (e) {
       const msg = String(e);
       // A cancel (Stop or Lock) rejects the in-flight promise — not an error.
@@ -931,32 +1180,195 @@ export default function Workspace({ info, onLock }: Props) {
     } finally {
       askIdRef.current = null;
       // The saved message (incl. any "(stopped)" partial) is the source of truth.
-      setMessages(await api.getMessages(chatId));
+      const msgs = await api.getMessages(chatId);
+      setMessages(msgs);
+      // ADD-22: if this turn edited any files, offer a one-tap Undo on the
+      // resulting assistant message.
+      const edited = [...editedRef.current];
+      if (edited.length) {
+        const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+        if (lastAssistant) {
+          setUndoByMsg((u) => ({ ...u, [lastAssistant.id]: edited }));
+        }
+      }
       setChats(await api.listChats());
-      // Agent tools may have created files or memories.
+      // Agent tools / commands may have created files or memories.
       api.listFiles().then(setFiles);
       api.listMemories().then(setMemories);
       setAsking(false);
       setStreamText("");
       setSteps([]);
+      setLane("");
     }
   }
 
+  async function askOnce(q: string, attachmentIds: string[]) {
+    const chatId = activeChatId;
+    if (!chatId) return;
+    await runTurn((askId) => api.ask(chatId, q, attachmentIds, askId));
+  }
+
   async function send() {
-    const q = question.trim();
-    if (!q || asking || !activeChatId) return;
+    const raw = question.trim();
+    if (!raw || asking || !activeChatId) return;
+    // Deterministic routing done by the human: parse "#command" and "@refs"
+    // BEFORE anything reaches the model.
+    const parsed = parseComposer(raw, commands, files, folders);
+    if (parsed.commandError) {
+      const names = commands.map((c) => `#${c.name}`).join(", ");
+      pushToast(
+        "error",
+        `#${parsed.commandError} isn't a command. Try: ${names || "(none available)"}`,
+      );
+      return;
+    }
     setQuestion("");
-    const attachmentIds = attachments.map((f) => f.id);
+    setAc(null);
     const optimistic: Message = {
       id: `pending-${Date.now()}`,
       role: "user",
-      content: q,
+      content: raw,
       sources: [],
       createdAt: "",
     };
     setMessages((m) => [...m, optimistic]);
-    setAttachments([]);
-    await askOnce(q, attachmentIds);
+    const chatId = activeChatId;
+    if (parsed.command) {
+      // A prebuilt workflow: the model (if used at all) gets a tiny task prompt.
+      setAttachments([]);
+      await runTurn((askId) =>
+        api.runCommand(chatId, parsed.command!, parsed.args, parsed.refIds, raw, askId),
+      );
+    } else {
+      // Plain chat: @-pinned files join the manual attachments as guaranteed
+      // context.
+      const attachmentIds = [
+        ...new Set([...attachments.map((f) => f.id), ...parsed.refIds]),
+      ];
+      setAttachments([]);
+      await askOnce(raw, attachmentIds);
+    }
+  }
+
+  // ---- "#"/"@" autocomplete ----
+
+  /** The popover items for the current token (commands, or files/folders). */
+  function autocompleteItems(): { key: string; label: string; hint: string; insert: string }[] {
+    if (!ac) return [];
+    if (ac.kind === "cmd") {
+      return commands
+        .filter((c) => c.name.startsWith(ac.query))
+        .map((c) => ({
+          key: c.name,
+          label: `#${c.name}`,
+          hint: c.summary,
+          insert: `#${c.name} `,
+        }));
+    }
+    const q = ac.query;
+    const folderItems = folders
+      .filter((f) => f.name.toLowerCase().includes(q))
+      .map((f) => ({
+        key: `fo-${f.id}`,
+        label: `@${f.name}/`,
+        hint: "folder",
+        insert: `@${f.name}/ `,
+      }));
+    const fileItems = files
+      .filter((f) => f.name.toLowerCase().includes(q))
+      .slice(0, 8)
+      .map((f) => ({
+        key: `fi-${f.id}`,
+        label: `@${f.name}`,
+        hint: f.mimeType,
+        insert: `@${f.name} `,
+      }));
+    return [...folderItems, ...fileItems].slice(0, 10);
+  }
+
+  /** Recompute the autocomplete state from the textarea value + caret. */
+  function refreshAutocomplete(value: string, caret: number) {
+    const tok = tokenAtCaret(value, caret);
+    setAc(tok ? { kind: tok.kind, query: tok.query, start: tok.start, index: 0 } : null);
+  }
+
+  /** Composer "Attach"/"# Action" chips: drop the trigger token at the caret
+   * and open its popover, so the affordance is discoverable without knowing
+   * the @ / # shortcuts. */
+  function insertComposerToken(token: "@" | "#") {
+    const cur = question;
+    let next: string;
+    let caret: number;
+    if (token === "#") {
+      // A "#command" only parses as the FIRST token, so prepend it (never
+      // append mid-text, which the parser ignores) and drop the caret after
+      // the sigil so the command picker opens with an empty query.
+      const body = cur.replace(/^\s+/, "");
+      next = `#${body}`;
+      caret = 1;
+    } else {
+      // "@file" can sit anywhere — append at the caret/end.
+      const needsSpace = cur.length > 0 && !/\s$/.test(cur);
+      next = `${cur}${needsSpace ? " " : ""}@`;
+      caret = next.length;
+    }
+    setQuestion(next);
+    requestAnimationFrame(() => {
+      const el = composerRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(caret, caret);
+        refreshAutocomplete(next, caret);
+      }
+    });
+  }
+
+  /** Replace the in-progress token with the chosen item's text. */
+  function acceptAutocomplete(insert: string) {
+    const el = composerRef.current;
+    const caret = el ? el.selectionStart : question.length;
+    const start = ac ? ac.start : caret;
+    const next = question.slice(0, start) + insert + question.slice(caret);
+    setQuestion(next);
+    setAc(null);
+    requestAnimationFrame(() => {
+      if (el) {
+        el.focus();
+        const pos = start + insert.length;
+        el.setSelectionRange(pos, pos);
+      }
+    });
+  }
+
+  /** Textarea keydown: drive the popover when open, else Enter sends. */
+  function onComposerKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    const items = autocompleteItems();
+    if (ac && items.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setAc({ ...ac, index: (ac.index + 1) % items.length });
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setAc({ ...ac, index: (ac.index - 1 + items.length) % items.length });
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        acceptAutocomplete(items[Math.min(ac.index, items.length - 1)].insert);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setAc(null);
+        return;
+      }
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
   }
 
   // ADD-7: cancel the running answer; the backend saves the partial "(stopped)".
@@ -1071,6 +1483,182 @@ export default function Workspace({ info, onLock }: Props) {
         return;
       }
     }
+  }
+
+  // ---- ADD-18: one shared microphone, several sinks (composer / voice note /
+  // memory / talk-to-file / journal). `owner` names the button that holds the
+  // live mic so only it renders the recording state.
+  async function beginRecording(
+    owner: string,
+    onDone: (blob: Blob, ext: string) => Promise<void>,
+  ) {
+    if (dictState === "busy") return;
+    if (dictState === "recording") {
+      if (dictOwner === owner) recorderRef.current?.stop(); // finish
+      return; // another button owns the live mic
+    }
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      pushToast(
+        "error",
+        "Microphone unavailable — allow it in System Settings → Privacy & Security → Microphone.",
+      );
+      return;
+    }
+    // WKWebView records AAC in an MP4 container; the backend decodes it with
+    // the OS's own converter, so no other format is needed.
+    const mime = MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "";
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    dictChunksRef.current = [];
+    rec.ondataavailable = (e) => {
+      if (e.data.size > 0) dictChunksRef.current.push(e.data);
+    };
+    rec.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      setDictState("busy");
+      try {
+        const blob = new Blob(dictChunksRef.current, {
+          type: rec.mimeType || "audio/mp4",
+        });
+        const ext = (rec.mimeType || "").includes("webm") ? "webm" : "m4a";
+        await onDone(blob, ext);
+      } catch (e) {
+        pushToast(
+          "error",
+          String(e).includes("STT_MODEL_MISSING")
+            ? "Download the voice model first (Settings → Model → Dictation)."
+            : `Dictation failed: ${e}`,
+        );
+      } finally {
+        setDictState("idle");
+        setDictOwner(null);
+      }
+    };
+    rec.start();
+    recorderRef.current = rec;
+    setDictOwner(owner);
+    setDictState("recording");
+  }
+
+  /** Record → transcribe on this Mac → optional translate/intent shaping on
+   * the room's LOCAL model (alfred's pipeline; Settings → Dictation) → hand
+   * the words to `sink`. Shaping failures never lose the words: the raw
+   * transcript is used instead. */
+  function dictateTo(owner: string, sink: (text: string) => void | Promise<void>) {
+    void beginRecording(owner, async (blob, ext) => {
+      const b64 = await fileToBase64(new File([blob], `dictation.${ext}`));
+      let text = (await api.transcribeAudio(b64, ext, false)).trim();
+      if (!text) {
+        pushToast("info", "No speech detected.");
+        return;
+      }
+      try {
+        const [translate, mode] = await Promise.all([
+          api.getSetting("dict_translate"),
+          api.getSetting("dict_mode"),
+        ]);
+        if (translate === "on" || (mode && mode !== "off")) {
+          text = (await api.shapeText(text, translate === "on", mode || "off")).trim() || text;
+        }
+      } catch (e) {
+        pushToast("info", `Kept the exact transcript — ${e}`);
+      }
+      await sink(text);
+    });
+  }
+
+  /** Owner-aware classes/titles for a mic button. */
+  function micState(owner: string) {
+    const active = dictOwner === owner ? dictState : "idle";
+    return {
+      cls: active,
+      title:
+        active === "recording"
+          ? "Stop recording"
+          : active === "busy"
+            ? "Transcribing…"
+            : "Dictate (transcribed on this Mac)",
+      disabled: dictState !== "idle" && dictOwner !== owner,
+    };
+  }
+
+  /** ADD-18 (voice note): keep the audio itself; the transcript follows in the
+   * background, so the room ends up with both. */
+  function recordVoiceNote() {
+    void beginRecording("note", async (blob, ext) => {
+      const stamp = new Date()
+        .toLocaleString([], { dateStyle: "short", timeStyle: "short" })
+        .replace(/[/:]/g, ".");
+      const b64 = await fileToBase64(new File([blob], `note.${ext}`));
+      await api.importAudioBytes(`Voice note ${stamp}.${ext}`, b64);
+      setFiles(await api.listFiles());
+      pushToast("success", "Voice note saved — transcript is being written…");
+    });
+  }
+
+  /** ADD-18 (journal): dictate a dated entry; appends to today's journal file
+   * in a "Journal" folder (both created on first use). */
+  function dictateJournal() {
+    dictateTo("journal", async (text) => {
+      const today = new Date().toISOString().slice(0, 10);
+      const name = `Journal ${today}.md`;
+      const existing = files.find((f) => f.name === name);
+      if (existing) {
+        const c = await api.getFileContent(existing.id);
+        await api.updateFileContent(
+          existing.id,
+          `${(c.text ?? "").replace(/\s+$/, "")}\n\n${text}\n`,
+        );
+      } else {
+        const meta = await api.saveGeneratedFile(
+          name,
+          `# Journal — ${today}\n\n${text}\n`,
+        );
+        let folder = folders.find((f) => f.name === "Journal");
+        if (!folder) folder = await api.createFolder("Journal");
+        await api.moveFileToFolder(meta.id, folder.id);
+        setFolders(await api.listFolders());
+      }
+      setFiles(await api.listFiles());
+      pushToast("success", "Journal updated.");
+    });
+  }
+
+  /** ADD-18 (talk-to-file): dictate straight into the open editable file —
+   * the words are appended to its saved content (a version is snapshotted,
+   * like every edit). */
+  function dictateIntoFile() {
+    if (!openFile) return;
+    const id = openFile.id;
+    const current = openFile.content.text ?? "";
+    dictateTo("file", async (text) => {
+      await api.updateFileContent(
+        id,
+        current ? `${current.replace(/\s+$/, "")}\n\n${text}\n` : `${text}\n`,
+      );
+      await viewFile(id);
+      pushToast("success", "Added your words to the file.");
+    });
+  }
+
+  /** ADD-18 (make minutes): turn an open recording's transcript into a saved
+   * minutes file via the room's own local agent and its create_file tool. */
+  async function makeMinutes() {
+    if (!openFile || asking || !activeChatId) return;
+    const name = openFile.content.name;
+    const base = name.replace(/\.[^.]+$/, "");
+    const q = `Read the transcript in the file "${name}" and write meeting minutes from it: a 2-3 sentence summary, the key decisions, and action items (with owners if mentioned). Save the minutes as a new file named "${base} — minutes.md" using create_file, then reply with just the highlights.`;
+    const optimistic: Message = {
+      id: `pending-${Date.now()}`,
+      role: "user",
+      content: q,
+      sources: [],
+      createdAt: "",
+    };
+    setMessages((m) => [...m, optimistic]);
+    await askOnce(q, []);
   }
 
   // CHG-1: download the missing model from the banner with live progress.
@@ -1210,6 +1798,24 @@ export default function Workspace({ info, onLock }: Props) {
     }
   }
 
+  async function commitRenameFile() {
+    const pending = renamingFile;
+    setRenamingFile(null);
+    if (!pending) return;
+    const name = pending.name.trim();
+    const original = files.find((f) => f.id === pending.id);
+    if (!name || name === original?.name) return;
+    try {
+      await api.renameFile(pending.id, name);
+      setFiles(await api.listFiles());
+      if (openFileRef.current?.id === pending.id) {
+        setOpenFile((o) => (o ? { ...o, name } : o));
+      }
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
   function toggleFolderCollapse(id: string) {
     setCollapsedFolders((s) => {
       const next = new Set(s);
@@ -1238,104 +1844,228 @@ export default function Workspace({ info, onLock }: Props) {
     setShowSearch(false);
   }
 
+  useEffect(() => {
+    ctxMenuRef.current = ctxMenu !== null;
+  }, [ctxMenu]);
+
+  // Keep the fixed-position row menus inside the viewport — a bottom/right row
+  // would otherwise open partly off-screen. Runs before paint, so no flash.
+  function clampMenu(el: HTMLDivElement | null, x: number, y: number) {
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const maxLeft = window.innerWidth - r.width - 8;
+    const maxTop = window.innerHeight - r.height - 8;
+    el.style.left = `${Math.max(8, Math.min(x, maxLeft))}px`;
+    el.style.top = `${Math.max(8, Math.min(y, maxTop))}px`;
+  }
+  useLayoutEffect(() => {
+    if (ctxMenu) clampMenu(ctxMenuElRef.current, ctxMenu.x, ctxMenu.y);
+  }, [ctxMenu]);
+  useLayoutEffect(() => {
+    if (moveMenuFor) clampMenu(moveMenuElRef.current, moveMenuFor.x, moveMenuFor.y);
+  }, [moveMenuFor]);
+
+  // Restore saved pane widths once per room.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(paneKey);
+      if (raw) {
+        const w = JSON.parse(raw);
+        if (typeof w.sidebar === "number") setSidebarW(w.sidebar);
+        if (typeof w.chat === "number") setChatW(w.chat);
+      }
+    } catch {
+      /* ignore malformed saved widths */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paneKey]);
+
+  /** Start dragging a pane divider. `edge` says which pane the divider sizes. */
+  function startPaneResize(edge: "sidebar" | "chat", e: React.MouseEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = edge === "sidebar" ? sidebarW : chatW;
+    document.body.classList.add("resizing-col");
+    function onMove(ev: MouseEvent) {
+      // Sidebar grows to the right; chat grows to the left (mirror the delta).
+      const delta = edge === "sidebar" ? ev.clientX - startX : startX - ev.clientX;
+      const next = Math.max(220, Math.min(560, startW + delta));
+      if (edge === "sidebar") setSidebarW(next);
+      else setChatW(next);
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.classList.remove("resizing-col");
+      // Persist the final widths (read from the DOM-synced state on next tick).
+      setSidebarW((sw) => {
+        setChatW((cw) => {
+          try {
+            localStorage.setItem(paneKey, JSON.stringify({ sidebar: sw, chat: cw }));
+          } catch {
+            /* storage full/unavailable — non-fatal */
+          }
+          return cw;
+        });
+        return sw;
+      });
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function engineLabelOf(m: string): string {
+    return ENGINE_LABELS[m] ?? modelLabel(m) ?? m;
+  }
+
+  function resolveMcpApproval(
+    req: McpApproveRequest,
+    decision: "once" | "always" | "deny",
+  ) {
+    api.resolveMcpCall(req.id, decision).catch(() => {});
+    setMcpApprovals((q) => q.filter((r) => r.id !== req.id));
+  }
+
+  // Open the Memory panel and bring it into view — used by the top-of-sidebar
+  // chip so this trust feature is reachable without scrolling to the bottom.
+  function revealMemory() {
+    setShowMemory(true);
+    setShowMemoryIntro(false);
+    try {
+      localStorage.setItem(`memoryIntroSeen:${info.name}`, "1");
+    } catch {
+      /* non-fatal */
+    }
+    window.setTimeout(() => {
+      memoryHeadRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }, 30);
+  }
+
+  // Show the Memory intro once per room.
+  useEffect(() => {
+    try {
+      if (!localStorage.getItem(`memoryIntroSeen:${info.name}`)) {
+        setShowMemoryIntro(true);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [info.name]);
+
   async function changeModel(value: string) {
+    userPickedModelRef.current = true;
     setModel(value);
     await api.setSetting("model", value);
   }
+
+  // Surface engine changes the user didn't make (auto-fallback, cloud CLI
+  // disappearing, status re-fetch) so the header label is never the only clue.
+  useEffect(() => {
+    const prev = prevModelRef.current;
+    if (prev && model && prev !== model && !userPickedModelRef.current) {
+      pushToast("info", `Switched to ${engineLabelOf(model)}`);
+    }
+    prevModelRef.current = model;
+    userPickedModelRef.current = false;
+  }, [model]);
 
   const lastAssistantId = [...messages]
     .reverse()
     .find((m) => m.role === "assistant")?.id;
 
+  // Sidebar name filter (client-side): matches the cleaned display name too, so
+  // "EOSE Stock" finds "EOSE_Stock_Info.md".
+  const filterQ = fileFilter.trim().toLowerCase();
+  const matchesFilter = (f: FileMeta) =>
+    !filterQ ||
+    f.name.toLowerCase().includes(filterQ) ||
+    displayName(f.name).toLowerCase().includes(filterQ);
+  const shownFiles = files.filter(matchesFilter);
   // ADD-16: files without a folder sit at the top level; the rest group.
-  const looseFiles = files.filter((f) => f.folderId === null);
+  const looseFiles = shownFiles.filter((f) => f.folderId === null);
 
-  /** One file row — identical behaviour whether loose or inside a folder. */
+  /** One file row — identical behaviour whether loose or inside a folder.
+   * Normally shows just name + size; the actions (attach + a ••• menu) reveal
+   * on hover to keep the list calm. */
   function renderFileRow(f: FileMeta) {
+    const attached = attachments.some((a) => a.id === f.id);
+    const selected = openFile?.id === f.id;
     return (
       <div
         key={f.id}
-        className="file-row"
+        className={`file-row${selected ? " selected" : ""}${attached ? " attached" : ""}`}
         draggable
         onDragStart={(e) => {
           e.dataTransfer.setData("text/plain", f.id);
           e.dataTransfer.effectAllowed = "move";
+          internalDragRef.current = true;
+        }}
+        onDragEnd={() => {
+          internalDragRef.current = false;
+          setDragOverFolder(null);
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMoveMenuFor(null);
+          setCtxMenu({ file: f, x: e.clientX, y: e.clientY });
         }}
       >
-        <button className="file-main" onClick={() => viewFile(f.id)}>
-          <span className="file-icon">
-            <FileTypeIcon file={f} />
-          </span>
-          <span className="file-name" title={f.name}>
-            {f.name}
-          </span>
-          {f.partiallyIndexed && (
-            <span
-              className="partial-badge"
-              title="Partially indexed — only the first part of this large file is searchable."
-            >
-              ◐
+        {renamingFile?.id === f.id ? (
+          <input
+            className="file-rename-input"
+            autoFocus
+            dir="auto"
+            value={renamingFile.name}
+            onChange={(e) => setRenamingFile({ id: f.id, name: e.target.value })}
+            onBlur={commitRenameFile}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitRenameFile();
+              if (e.key === "Escape") setRenamingFile(null);
+            }}
+          />
+        ) : (
+          <button className="file-main" onClick={() => viewFile(f.id)}>
+            <span className="file-icon">
+              <FileTypeIcon file={f} />
             </span>
-          )}
-          <span className="file-size">{formatSize(f.sizeBytes)}</span>
-        </button>
-        <span className="move-wrap">
-          <button
-            className={`chip-btn ${moveMenuFor === f.id ? "active" : ""}`}
-            title="Move to a folder"
-            onClick={() => setMoveMenuFor(moveMenuFor === f.id ? null : f.id)}
-          >
-            🗂
-          </button>
-          {moveMenuFor === f.id && (
-            <div className="move-pop">
-              <button
-                className="move-opt"
-                disabled={f.folderId === null}
-                onClick={() => moveFile(f.id, null)}
+            <span className="file-name" title={f.name}>
+              {displayName(f.name)}
+            </span>
+            {f.partiallyIndexed && (
+              <span
+                className="partial-badge"
+                title="Partially indexed — only the first part of this large file is searchable."
               >
-                No folder
-              </button>
-              {folders.map((fo) => (
-                <button
-                  key={fo.id}
-                  className="move-opt"
-                  disabled={f.folderId === fo.id}
-                  onClick={() => moveFile(f.id, fo.id)}
-                >
-                  {fo.name}
-                </button>
-              ))}
-              {folders.length === 0 && (
-                <div className="move-empty">No folders yet</div>
-              )}
-            </div>
-          )}
-        </span>
-        <button
-          className={`chip-btn ${attachments.some((a) => a.id === f.id) ? "active" : ""}`}
-          title={
-            f.mimeType.startsWith("image/")
-              ? "Attach image to your next question (vision)"
-              : "Pin this file into your next question"
-          }
-          onClick={() => toggleAttach(f)}
-        >
-          <PaperclipIcon size={14} />
-        </button>
-        <button
-          className="chip-btn"
-          title="Export a normal copy out of the room"
-          onClick={() => exportOne(f.id, f.name)}
-        >
-          <DownloadIcon size={14} />
-        </button>
-        {deleteControl(
-          `file:${f.id}`,
-          <TrashIcon size={14} />,
-          () => removeFile(f.id),
-          "Remove from room",
+                ◐
+              </span>
+            )}
+            <span className="file-size">{formatSize(f.sizeBytes)}</span>
+          </button>
         )}
+        <span className="row-actions">
+          <button
+            className={`chip-btn ${attached ? "active" : ""}`}
+            title={
+              f.mimeType.startsWith("image/")
+                ? "Attach image to your next question (vision)"
+                : "Pin this file into your next question"
+            }
+            onClick={() => toggleAttach(f)}
+          >
+            <PaperclipIcon size={14} />
+          </button>
+          <button
+            className="chip-btn"
+            title="More actions"
+            onClick={(e) => {
+              const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+              setMoveMenuFor(null);
+              setCtxMenu({ file: f, x: r.right - 4, y: r.bottom + 4 });
+            }}
+          >
+            <DotsIcon size={14} />
+          </button>
+        </span>
       </div>
     );
   }
@@ -1378,8 +2108,109 @@ export default function Workspace({ info, onLock }: Props) {
     // Esc is handled by the global keydown listener.
   }
 
+  const pendingApproval = mcpApprovals[0];
+
   return (
     <div className="workspace">
+      {pendingApproval && (
+        <div className="approve-backdrop">
+          <div className="approve-card" role="alertdialog" aria-modal="true">
+            <div className="approve-title">
+              <GlobeIcon size={17} /> Allow a connected tool to run?
+            </div>
+            <p className="approve-body">
+              The AI wants to use{" "}
+              <strong>{pendingApproval.tool}</strong> from the{" "}
+              <strong>{pendingApproval.server}</strong> connector. This is a
+              separate program that can reach the internet — what the AI sends
+              it leaves this room.
+            </p>
+            {pendingApproval.args && pendingApproval.args !== "{}" && (
+              <pre className="approve-args">{pendingApproval.args}</pre>
+            )}
+            <div className="approve-actions">
+              <button
+                className="primary"
+                onClick={() => resolveMcpApproval(pendingApproval, "once")}
+              >
+                Allow once
+              </button>
+              <button
+                onClick={() => resolveMcpApproval(pendingApproval, "always")}
+              >
+                Always allow this connector
+              </button>
+              <button
+                className="danger"
+                onClick={() => resolveMcpApproval(pendingApproval, "deny")}
+              >
+                Don't allow
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {ctxMenu && (
+        <>
+          <div className="ctx-backdrop" onMouseDown={() => setCtxMenu(null)} onContextMenu={(e) => { e.preventDefault(); setCtxMenu(null); }} />
+          <div
+            ref={ctxMenuElRef}
+            className="ctx-menu"
+            style={{ top: ctxMenu.y, left: ctxMenu.x }}
+          >
+            <button className="ctx-item" onClick={() => { viewFile(ctxMenu.file.id); setCtxMenu(null); }}>Open</button>
+            <button className="ctx-item" onClick={() => { toggleAttach(ctxMenu.file); setCtxMenu(null); }}>{attachments.some((a) => a.id === ctxMenu.file.id) ? "Detach from chat" : "Attach to chat"}</button>
+            <button className="ctx-item" onClick={() => { setRenamingFile({ id: ctxMenu.file.id, name: ctxMenu.file.name }); setCtxMenu(null); }}>Rename…</button>
+            <button className="ctx-item" onClick={() => { setMoveMenuFor({ id: ctxMenu.file.id, x: ctxMenu.x, y: ctxMenu.y }); setCtxMenu(null); }}>Move to…</button>
+            <button className="ctx-item" onClick={() => { exportOne(ctxMenu.file.id, ctxMenu.file.name); setCtxMenu(null); }}>Export a copy…</button>
+            <div className="ctx-sep" />
+            <button className="ctx-item danger" onClick={() => { removeFile(ctxMenu.file.id); setCtxMenu(null); }}>Remove from room</button>
+          </div>
+        </>
+      )}
+      {moveMenuFor && (
+        <>
+          <div
+            className="ctx-backdrop"
+            onMouseDown={() => setMoveMenuFor(null)}
+            onContextMenu={(e) => { e.preventDefault(); setMoveMenuFor(null); }}
+          />
+          <div
+            ref={moveMenuElRef}
+            className="ctx-menu"
+            style={{ top: moveMenuFor.y, left: moveMenuFor.x }}
+          >
+            <div className="ctx-heading">Move to…</div>
+            {(() => {
+              const mf = files.find((f) => f.id === moveMenuFor.id);
+              return (
+                <>
+                  <button
+                    className="ctx-item"
+                    disabled={!mf || mf.folderId === null}
+                    onClick={() => { moveFile(moveMenuFor.id, null); setMoveMenuFor(null); }}
+                  >
+                    No folder
+                  </button>
+                  {folders.map((fo) => (
+                    <button
+                      key={fo.id}
+                      className="ctx-item"
+                      disabled={mf?.folderId === fo.id}
+                      onClick={() => { moveFile(moveMenuFor.id, fo.id); setMoveMenuFor(null); }}
+                    >
+                      {fo.name}
+                    </button>
+                  ))}
+                  {folders.length === 0 && (
+                    <div className="ctx-empty">No folders yet</div>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+        </>
+      )}
       {dragOver && (
         <div className="drop-overlay">
           <div className="drop-overlay-inner">
@@ -1411,9 +2242,23 @@ export default function Workspace({ info, onLock }: Props) {
                 searchFlat.length === 0 && (
                   <div className="search-empty">No matches.</div>
                 )}
+              {searchQuery.trim() &&
+                searchResults &&
+                searchFlat.length > 0 && (
+                  <div className="search-summary">
+                    {searchResults.files.length} file
+                    {searchResults.files.length === 1 ? "" : "s"} ·{" "}
+                    {searchResults.messages.length} message
+                    {searchResults.messages.length === 1 ? "" : "s"} ·{" "}
+                    {searchResults.memories.length} memor
+                    {searchResults.memories.length === 1 ? "y" : "ies"}
+                  </div>
+                )}
               {searchResults && searchResults.files.length > 0 && (
                 <div className="search-group">
-                  <div className="search-group-head">Files</div>
+                  <div className="search-group-head">
+                    Files <span className="search-count">{searchResults.files.length}</span>
+                  </div>
                   {searchResults.files.map((f, i) => (
                     <button
                       key={f.id}
@@ -1438,7 +2283,9 @@ export default function Workspace({ info, onLock }: Props) {
               )}
               {searchResults && searchResults.messages.length > 0 && (
                 <div className="search-group">
-                  <div className="search-group-head">Messages</div>
+                  <div className="search-group-head">
+                    Messages <span className="search-count">{searchResults.messages.length}</span>
+                  </div>
                   {searchResults.messages.map((m, i) => {
                     const idx = msgOffset + i;
                     return (
@@ -1465,7 +2312,9 @@ export default function Workspace({ info, onLock }: Props) {
               )}
               {searchResults && searchResults.memories.length > 0 && (
                 <div className="search-group">
-                  <div className="search-group-head">Memories</div>
+                  <div className="search-group-head">
+                    Memories <span className="search-count">{searchResults.memories.length}</span>
+                  </div>
                   {searchResults.memories.map((m, i) => {
                     const idx = memOffset + i;
                     return (
@@ -1497,75 +2346,155 @@ export default function Workspace({ info, onLock }: Props) {
         </div>
       )}
       <header className="topbar">
-        <div className="room-id">
+        <div className="room-id" title={info.path}>
           <span className="room-lock">
             <Logomark size={26} />
           </span>
-          <div>
+          <div className="room-id-text">
             <div className="room-name">{info.name}</div>
-            <div className="room-path" title={info.path}>
-              {info.path}
-            </div>
+            <div className="room-sub">Private Room</div>
           </div>
         </div>
         <div className="topbar-right">
-          <span
-            className={`ai-dot ${ai?.running ? (modelReady ? "ok" : "warn") : "down"}`}
-            title={
-              ai?.running
-                ? modelReady
-                  ? "Local AI ready"
-                  : "Model not downloaded"
-                : "Ollama not running"
-            }
-          />
           {ai && (ai.models.length > 0 || ai.external.length > 0) ? (
-            <select
-              className={isCloudEngine(model) ? "cloud-engine" : undefined}
-              value={model}
-              onChange={(e) => changeModel(e.target.value)}
-            >
-              {!ai.models.includes(model) && !ai.external.includes(model) && (
-                <option value={model}>{model}</option>
+            <div className="model-pill-wrap">
+              <button
+                className={`model-pill${isCloudEngine(model) ? " cloud" : ""}`}
+                onClick={() => setModelMenuOpen((o) => !o)}
+                title={
+                  ai?.running
+                    ? modelReady || isCloudEngine(model)
+                      ? "AI ready — click to switch engine"
+                      : "Model not downloaded"
+                    : "Ollama not running"
+                }
+              >
+                <span
+                  className={`model-dot ${
+                    isCloudEngine(model)
+                      ? "ok"
+                      : ai?.running
+                        ? modelReady
+                          ? "ok"
+                          : "warn"
+                        : "down"
+                  }`}
+                />
+                <span className="model-pill-name">{engineLabelOf(model)}</span>
+                <span className="model-pill-tier">
+                  {isCloudEngine(model) ? "Cloud" : "Local"}
+                </span>
+                <ChevronDownIcon size={13} className="model-pill-caret" />
+              </button>
+              {modelMenuOpen && (
+                <>
+                  <div
+                    className="menu-backdrop"
+                    onMouseDown={() => setModelMenuOpen(false)}
+                  />
+                  <div className="pop-menu model-menu">
+                    {ai.models.map((m) => (
+                      <button
+                        key={m}
+                        className={`model-menu-item${m === model ? " sel" : ""}`}
+                        onClick={() => {
+                          changeModel(m);
+                          setModelMenuOpen(false);
+                        }}
+                      >
+                        <span className="model-dot local" />
+                        <span className="model-menu-name">
+                          {modelLabel(m) ?? m}
+                        </span>
+                        <span className="model-menu-tier">Local</span>
+                        {m === model && <CheckIcon size={14} />}
+                      </button>
+                    ))}
+                    {ai.external.map((e) => (
+                      <button
+                        key={e}
+                        className={`model-menu-item${e === model ? " sel" : ""}`}
+                        onClick={() => {
+                          changeModel(e);
+                          setModelMenuOpen(false);
+                        }}
+                      >
+                        <span className="model-dot cloud" />
+                        <span className="model-menu-name">
+                          {ENGINE_LABELS[e] ?? e}
+                        </span>
+                        <span className="model-menu-tier cloud">Cloud</span>
+                        {e === model && <CheckIcon size={14} />}
+                      </button>
+                    ))}
+                  </div>
+                </>
               )}
-              {ai.models.map((m) => (
-                <option key={m} value={m} title={m}>
-                  {modelLabel(m) ? `${modelLabel(m)} — ${m}` : m}
-                </option>
-              ))}
-              {ai.external.length > 0 && (
-                <optgroup label="Cloud engines — leaves this Mac">
-                  {ai.external.map((e) => (
-                    <option key={e} value={e}>
-                      {ENGINE_LABELS[e] ?? e}
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-            </select>
+            </div>
           ) : (
             <button className="subtle" onClick={refreshAi}>
               Check AI
             </button>
           )}
           <button
-            className="subtle btn-ic"
+            className="icon-btn"
             title="Search ⌘F"
             onClick={() => {
               setSearchSel(0);
               setShowSearch(true);
             }}
           >
-            <span className="search-glyph">⌕</span>
+            <SearchIcon size={16} />
           </button>
-          <button
-            className="subtle btn-ic"
-            title="Settings ⌘,"
-            onClick={() => setShowSettings(true)}
-          >
-            <GearIcon size={15} />
-          </button>
-          <button className="btn-ic" title="Lock ⌘L" onClick={handleLock}>
+          <div className="room-menu-wrap">
+            <button
+              className="icon-btn"
+              title="Room menu"
+              onClick={() => setRoomMenuOpen((o) => !o)}
+            >
+              <DotsIcon size={16} />
+            </button>
+            {roomMenuOpen && (
+              <>
+                <div
+                  className="menu-backdrop"
+                  onMouseDown={() => setRoomMenuOpen(false)}
+                />
+                <div className="pop-menu room-menu">
+                  <button
+                    className="pop-item"
+                    onClick={() => {
+                      setShowSettings(true);
+                      setRoomMenuOpen(false);
+                    }}
+                  >
+                    Room settings
+                  </button>
+                  {files.length > 0 && (
+                    <button
+                      className="pop-item"
+                      onClick={() => {
+                        exportAllFiles();
+                        setRoomMenuOpen(false);
+                      }}
+                    >
+                      Export all files…
+                    </button>
+                  )}
+                  <button
+                    className="pop-item"
+                    onClick={() => {
+                      revealItemInDir(info.path).catch(() => {});
+                      setRoomMenuOpen(false);
+                    }}
+                  >
+                    Reveal in Finder
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+          <button className="lock-btn btn-ic" title="Lock ⌘L" onClick={handleLock}>
             <LockIcon size={14} /> Lock
           </button>
         </div>
@@ -1592,7 +2521,9 @@ export default function Workspace({ info, onLock }: Props) {
         <div className="settings-backdrop mcp-approve-backdrop">
           <div className="settings mcp-approve">
             <div className="settings-head">
-              <span>🔒 This room wants to start programs</span>
+              <span className="badge-label">
+                <LockIcon size={15} /> This room wants to start programs
+              </span>
             </div>
             <div className="settings-body">
               <p className="mcp-approve-lead">
@@ -1640,7 +2571,9 @@ export default function Workspace({ info, onLock }: Props) {
         >
           <div className="settings add-link-modal">
             <div className="settings-head">
-              <span>🔗 Add a web link</span>
+              <span className="badge-label">
+                <LinkIcon size={15} /> Add a web link
+              </span>
               <button
                 className="subtle btn-ic"
                 title="Close"
@@ -1689,7 +2622,7 @@ export default function Workspace({ info, onLock }: Props) {
 
       <div className="body">
         {/* ------- pane 1: file explorer ------- */}
-        <aside className="sidebar">
+        <aside className="sidebar" style={{ width: sidebarW }}>
           <div
             className={`side-head${dragOverFolder === "__root__" ? " drag-over" : ""}`}
             onDragOver={(e) => {
@@ -1707,36 +2640,92 @@ export default function Workspace({ info, onLock }: Props) {
           >
             <span>Files</span>
             <span className="side-head-actions">
-              {files.length > 0 && (
+              <div className="add-menu-wrap">
                 <button
-                  className="subtle"
-                  title="Save normal copies of every file to a folder"
-                  onClick={exportAllFiles}
+                  className="add-btn"
+                  title="Add something to this room"
+                  onClick={() => setAddMenuOpen((o) => !o)}
                 >
-                  Export all…
+                  <PlusIcon size={14} /> Add
                 </button>
-              )}
-              <button
-                className="subtle"
-                title="Create a folder to group files"
-                onClick={startCreateFolder}
-              >
-                + Folder
-              </button>
-              <button
-                className="subtle"
-                title="Save a readable copy of a web page into this room"
-                onClick={() => {
-                  setLinkUrl("");
-                  setShowAddLink(true);
-                }}
-              >
-                🔗 Link
-              </button>
-              <button className="subtle" onClick={importFiles}>
-                + Add
-              </button>
+                {addMenuOpen && (
+                  <>
+                    <div
+                      className="menu-backdrop"
+                      onMouseDown={() => setAddMenuOpen(false)}
+                    />
+                    <div className="pop-menu add-menu">
+                      <button
+                        className="pop-item"
+                        onClick={() => {
+                          importFiles();
+                          setAddMenuOpen(false);
+                        }}
+                      >
+                        <DownloadIcon size={14} /> File
+                      </button>
+                      <button
+                        className="pop-item"
+                        onClick={() => {
+                          startCreateFolder();
+                          setAddMenuOpen(false);
+                        }}
+                      >
+                        <FolderIcon size={14} /> Folder
+                      </button>
+                      <button
+                        className="pop-item"
+                        onClick={() => {
+                          setLinkUrl("");
+                          setShowAddLink(true);
+                          setAddMenuOpen(false);
+                        }}
+                      >
+                        <LinkIcon size={14} /> Web link
+                      </button>
+                      <button
+                        className="pop-item"
+                        disabled={micState("note").disabled}
+                        onClick={() => {
+                          recordVoiceNote();
+                          setAddMenuOpen(false);
+                        }}
+                      >
+                        <MicIcon size={14} /> Voice note
+                      </button>
+                      <button
+                        className="pop-item"
+                        disabled={micState("journal").disabled}
+                        onClick={() => {
+                          dictateJournal();
+                          setAddMenuOpen(false);
+                        }}
+                      >
+                        <MicIcon size={14} /> Journal entry
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
             </span>
+          </div>
+          <div className="side-search">
+            <SearchIcon size={14} />
+            <input
+              className="side-search-input"
+              placeholder="Search files…"
+              value={fileFilter}
+              onChange={(e) => setFileFilter(e.target.value)}
+            />
+            {fileFilter && (
+              <button
+                className="side-search-clear"
+                title="Clear"
+                onClick={() => setFileFilter("")}
+              >
+                <CloseIcon size={12} />
+              </button>
+            )}
           </div>
           <button
             className="summarize-btn"
@@ -1744,10 +2733,43 @@ export default function Workspace({ info, onLock }: Props) {
             disabled={summarizing}
             onClick={summarizeRoom}
           >
-            {summarizing
-              ? summarizeProgress || "Summarizing…"
-              : "✨ Summarize room"}
+            {summarizing ? (
+              summarizeProgress || "Summarizing…"
+            ) : (
+              <>
+                <SparkIcon size={14} /> Summarize room
+              </>
+            )}
           </button>
+          <button
+            className={`memory-chip${showMemoryIntro ? " glow" : ""}`}
+            title="What the AI remembers about you — visible and editable"
+            onClick={revealMemory}
+          >
+            <span className="memory-chip-label">
+              <MemoryIcon size={14} /> Memory
+            </span>
+            <span className="count">{memories.length}</span>
+          </button>
+          {showMemoryIntro && (
+            <div className="memory-intro">
+              This is your room's memory — everything the AI remembers about
+              you, visible and editable any time.
+              <button
+                className="memory-intro-dismiss"
+                onClick={() => {
+                  setShowMemoryIntro(false);
+                  try {
+                    localStorage.setItem(`memoryIntroSeen:${info.name}`, "1");
+                  } catch {
+                    /* non-fatal */
+                  }
+                }}
+              >
+                Got it
+              </button>
+            </div>
+          )}
           <div className="file-list">
             {creatingFolder !== null && (
               <input
@@ -1770,10 +2792,15 @@ export default function Workspace({ info, onLock }: Props) {
                 encrypted inside this room.
               </div>
             )}
+            {files.length > 0 && shownFiles.length === 0 && (
+              <div className="empty-hint">No files match “{fileFilter}”.</div>
+            )}
             {/* ADD-16: top-level (unfoldered) files first, then folder groups. */}
             {looseFiles.map(renderFileRow)}
             {folders.map((folder) => {
-              const inFolder = files.filter((f) => f.folderId === folder.id);
+              const inFolder = shownFiles.filter((f) => f.folderId === folder.id);
+              // While filtering, hide folders that have no matching file.
+              if (filterQ && inFolder.length === 0) return null;
               const collapsed = collapsedFolders.has(folder.id);
               return (
                 <div key={folder.id} className="folder-group">
@@ -1847,7 +2874,7 @@ export default function Workspace({ info, onLock }: Props) {
                     <div className="folder-files">
                       {inFolder.length === 0 ? (
                         <div className="folder-empty">
-                          Empty — drag a file here, or use the 🗂 button on a file.
+                          Empty — drag a file here, or use the folder button on a file.
                         </div>
                       ) : (
                         inFolder.map(renderFileRow)
@@ -1859,7 +2886,11 @@ export default function Workspace({ info, onLock }: Props) {
             })}
           </div>
 
-          <div className="side-head clickable" onClick={() => setShowMemory(!showMemory)}>
+          <div
+            ref={memoryHeadRef}
+            className="side-head clickable"
+            onClick={() => setShowMemory(!showMemory)}
+          >
             <span>
               Memory <span className="count">{memories.length}</span>
             </span>
@@ -1932,6 +2963,22 @@ export default function Workspace({ info, onLock }: Props) {
                   onChange={(e) => setMemoryDraft(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && addMemory()}
                 />
+                <button
+                  className={`subtle btn-ic mic-btn ${micState("memory").cls}`}
+                  title={
+                    dictOwner === "memory" && dictState === "recording"
+                      ? "Stop recording"
+                      : "Speak a memory"
+                  }
+                  disabled={micState("memory").disabled}
+                  onClick={() =>
+                    dictateTo("memory", (text) =>
+                      setMemoryDraft((d) => (d.trim() ? `${d.trimEnd()} ${text}` : text)),
+                    )
+                  }
+                >
+                  <MicIcon size={12} />
+                </button>
                 <button className="subtle" onClick={addMemory}>
                   Add
                 </button>
@@ -1939,6 +2986,12 @@ export default function Workspace({ info, onLock }: Props) {
             </div>
           )}
         </aside>
+
+        <div
+          className="pane-resizer"
+          title="Drag to resize"
+          onMouseDown={(e) => startPaneResize("sidebar", e)}
+        />
 
         {/* ------- pane 2: opened file ------- */}
         <section className="viewer">
@@ -2009,6 +3062,34 @@ export default function Workspace({ info, onLock }: Props) {
                       Copy all text
                     </button>
                   )}
+                  {/* ADD-18: talk-to-file — dictate into the open editable file. */}
+                  {openFile.content.editable && (
+                    <button
+                      className={`subtle btn-ic mic-btn ${micState("file").cls}`}
+                      title={
+                        dictOwner === "file" && dictState === "recording"
+                          ? "Stop and append the words"
+                          : "Dictate into this file — your words are appended to its saved content"
+                      }
+                      disabled={micState("file").disabled}
+                      onClick={dictateIntoFile}
+                    >
+                      <MicIcon size={12} /> Dictate
+                    </button>
+                  )}
+                  {/* ADD-18: one-click minutes from a recording's transcript. */}
+                  {(openFile.content.kind === "audio" ||
+                    openFile.content.kind === "video") &&
+                    openFile.content.text && (
+                      <button
+                        className="subtle"
+                        title="Ask the room's AI to write minutes (summary, decisions, action items) and save them as a file"
+                        disabled={asking}
+                        onClick={makeMinutes}
+                      >
+                        <SparkIcon size={13} /> Minutes
+                      </button>
+                    )}
                   <button
                     className="subtle btn-ic"
                     title="Export a normal copy out of the room"
@@ -2027,6 +3108,7 @@ export default function Workspace({ info, onLock }: Props) {
               <div
                 className={`viewer-body ${
                   openFile.content.kind === "code" ||
+                  openFile.content.kind === "html" ||
                   (editMode && editModeOf(openFile.content) !== "grid")
                     ? "fill"
                     : ""
@@ -2137,12 +3219,34 @@ export default function Workspace({ info, onLock }: Props) {
                           target={{ quote: t?.quote ?? t?.find }}
                         />
                       );
+                    // HTML renders live in a sandboxed runner; Edit drops to
+                    // Monaco for the source.
+                    case "html":
+                      return (
+                        <HtmlView
+                          key={`${openFile.id}-${viewerRev}`}
+                          source={c.text ?? ""}
+                        />
+                      );
                     case "text":
                       return (
                         <TextView
                           key={`${openFile.id}-${viewerRev}`}
                           text={c.text ?? ""}
                           quote={t?.quote ?? t?.find}
+                        />
+                      );
+                    // ADD-18: recordings/videos with a clickable transcript.
+                    case "audio":
+                    case "video":
+                      return (
+                        <AudioView
+                          key={`${openFile.id}-${viewerRev}`}
+                          kind={c.kind}
+                          mime={c.mime}
+                          dataB64={c.dataB64 ?? ""}
+                          text={c.text}
+                          target={{ quote: t?.quote ?? t?.find }}
                         />
                       );
                     default:
@@ -2161,13 +3265,49 @@ export default function Workspace({ info, onLock }: Props) {
               <div className="viewer-empty-icon">
                 <EmptyViewerArt />
               </div>
-              <p>Select a file on the left to open it here.</p>
+              <h1 className="viewer-empty-title">Your room is sealed</h1>
+              <p className="viewer-empty-sub">
+                Everything you add stays inside{" "}
+                <strong>{info.path.split("/").pop()}</strong>. Add a file, open a
+                note, or ask the room a question about everything inside.
+              </p>
+              <div className="viewer-empty-actions">
+                <button className="qa-btn primary" onClick={importFiles}>
+                  <PlusIcon size={15} /> Add a file
+                </button>
+                <button
+                  className="qa-btn"
+                  disabled={summarizing || files.length === 0}
+                  onClick={summarizeRoom}
+                >
+                  <SparkIcon size={15} /> Summarize room
+                </button>
+                <button
+                  className="qa-btn"
+                  onClick={() => composerRef.current?.focus()}
+                >
+                  <SendIcon size={14} /> Ask the room
+                </button>
+              </div>
+              <div className="viewer-empty-note">
+                <LockIcon size={16} />
+                <div>
+                  <strong>End-to-end encrypted.</strong> Your data is encrypted
+                  and never leaves this file unless you choose a cloud model.
+                </div>
+              </div>
             </div>
           )}
         </section>
 
+        <div
+          className="pane-resizer"
+          title="Drag to resize"
+          onMouseDown={(e) => startPaneResize("chat", e)}
+        />
+
         {/* ------- pane 3: chat ------- */}
-        <main className="chat">
+        <main className="chat" style={{ width: chatW, maxWidth: "none", flex: "0 0 auto" }}>
           <div className="chat-head">
             {renaming ? (
               <input
@@ -2296,12 +3436,49 @@ export default function Workspace({ info, onLock }: Props) {
                 <div className="chat-hero-icon">
                   <EmptyChatArt />
                 </div>
-                <h2>This room is yours alone.</h2>
+                <h2>Ask your room</h2>
                 <p>
-                  Ask about the files you add, attach images for the AI to look
-                  at, or ask it to write summaries and notes — everything stays
-                  inside this encrypted file.
+                  I can work across everything inside{" "}
+                  {info.path.split("/").pop()}, using only the context you attach
+                  or make available.
                 </p>
+                <div className="prompt-chips">
+                  {[
+                    "Summarize what's in this room",
+                    "What are the key points across my files?",
+                    "What did I add recently?",
+                    "Draft a short memo from these files",
+                  ].map((p) => (
+                    <button
+                      key={p}
+                      className="prompt-chip"
+                      onClick={() => {
+                        setQuestion(p);
+                        composerRef.current?.focus();
+                      }}
+                    >
+                      {p}
+                    </button>
+                  ))}
+                </div>
+                {commands.length > 0 && (
+                  <div className="cmd-hints">
+                    <span className="cmd-hints-label">Or run a command:</span>
+                    {commands.slice(0, 4).map((c) => (
+                      <button
+                        key={c.name}
+                        className="cmd-hint-chip"
+                        title={c.summary}
+                        onClick={() => {
+                          setQuestion(`#${c.name} `);
+                          composerRef.current?.focus();
+                        }}
+                      >
+                        #{c.name}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
             {messages.map((m) => {
@@ -2329,10 +3506,20 @@ export default function Workspace({ info, onLock }: Props) {
                             viewFile(annotation.fileId, annotationTarget(annotation))
                           }
                         >
-                          📍 {annotation.note ||
+                          <EyeIcon size={13} />{" "}
+                          {annotation.note ||
                             annotation.quote ||
                             annotation.range}{" "}
                           — {annotation.name}
+                          {annotation.approx && (
+                            <span
+                              className="annot-approx"
+                              title="The exact quote wasn't found — the closest passage was highlighted"
+                            >
+                              {" "}
+                              · ≈ closest match
+                            </span>
+                          )}
                         </button>
                       )}
                     </>
@@ -2364,6 +3551,17 @@ export default function Workspace({ info, onLock }: Props) {
                     >
                       Copy
                     </button>
+                    {undoByMsg[m.id] && (
+                      <button
+                        className="subtle undo-edit"
+                        title="Undo the file change this answer made (reversible via version history)"
+                        disabled={asking}
+                        onClick={() => undoEdits(m.id)}
+                      >
+                        <UndoIcon size={13} /> Undo{" "}
+                        {undoByMsg[m.id].length > 1 ? `${undoByMsg[m.id].length} edits` : "edit"}
+                      </button>
+                    )}
                     {m.id === lastAssistantId && (
                       <button
                         className="subtle"
@@ -2406,11 +3604,17 @@ export default function Workspace({ info, onLock }: Props) {
             })}
             {asking && (
               <div className={`msg assistant ${streamText ? "" : "thinking"}`}>
-                {steps.length > 0 && (
+                {(lane || steps.length > 0) && (
                   <div className="step-chips">
+                    {lane && <span className="lane-chip">{lane}</span>}
                     {steps.map((s, i) => (
-                      <span key={i} className="step-chip">
-                        {s}
+                      <span
+                        key={i}
+                        className={`step-chip${s.ok ? "" : " failed"}`}
+                        title={s.ok ? undefined : "This step didn't succeed"}
+                      >
+                        {s.ok ? "" : "⚠ "}
+                        {s.label}
                       </span>
                     ))}
                   </div>
@@ -2421,6 +3625,8 @@ export default function Workspace({ info, onLock }: Props) {
                       <MarkdownView text={patchStreamFences(streamText)} />
                       <span className="stream-cursor">▍</span>
                     </>
+                  ) : isCloudEngine(model) ? (
+                    "Asking your cloud AI — content leaves this Mac…"
                   ) : (
                     "Thinking locally…"
                   )}
@@ -2430,18 +3636,36 @@ export default function Workspace({ info, onLock }: Props) {
           </div>
 
           <div className="composer">
+            {toasts.length > 0 && (
+              <div className="toast-stack">
+                {toasts.map((t) => (
+                  <div key={t.id} className={`toast ${t.kind}`}>
+                    <span className="toast-text">{t.text}</span>
+                    <button
+                      className="toast-close"
+                      title="Dismiss"
+                      onClick={() => dismissToast(t.id)}
+                    >
+                      <CloseIcon size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             {isCloudEngine(model) && (
-              <div className="cloud-badge">
-                <span>☁ Cloud engine active — questions leave this Mac</span>
+              <div className="cloud-strip" title="This room is using a cloud model — your prompts and attached context are sent to it.">
+                <span className="cloud-strip-label">
+                  <CloudIcon size={13} /> Cloud · leaves this Mac
+                </span>
                 <button
-                  className="subtle"
+                  className="cloud-strip-action"
                   onClick={() => changeModel(ai?.defaultModel ?? "")}
                 >
-                  Switch to local
+                  Use local
                 </button>
               </div>
             )}
-            {(webOn || mcpTools.length > 0) && (
+            {!isCloudEngine(model) && (webOn || mcpTools.length > 0) && (
               <div
                 className="mcp-badge"
                 title={[
@@ -2453,70 +3677,147 @@ export default function Workspace({ info, onLock }: Props) {
                   .filter(Boolean)
                   .join("\n")}
               >
-                🌐 This room can reach the internet
+                <span className="badge-label">
+                  <GlobeIcon size={13} /> This room can reach the internet
+                </span>
               </div>
             )}
+            {(() => {
+              // ADD-22: if the question names an image file that isn't attached,
+              // nudge to attach it — the model can only SEE an image via the
+              // paperclip, a rule users won't remember.
+              const q = question.trim().toLowerCase();
+              if (!q) return null;
+              const attachedIds = new Set(attachments.map((f) => f.id));
+              const hit = files.find(
+                (f) =>
+                  f.mimeType.startsWith("image/") &&
+                  !attachedIds.has(f.id) &&
+                  f.name.length >= 3 &&
+                  q.includes(f.name.toLowerCase()),
+              );
+              if (!hit) return null;
+              return (
+                <div className="attach-nudge">
+                  <span>
+                    The AI can only see <strong>{displayName(hit.name)}</strong> if you
+                    attach it.
+                  </span>
+                  <button className="subtle" onClick={() => toggleAttach(hit)}>
+                    <PaperclipIcon size={13} /> Attach it
+                  </button>
+                </div>
+              );
+            })()}
             {attachments.length > 0 && (
               <div className="attach-row">
                 {attachments.map((f) => (
                   <span key={f.id} className="attach-chip">
-                    <FileTypeIcon file={f} size={13} /> {f.name}
+                    <FileTypeIcon file={f} size={13} /> {displayName(f.name)}
                     <button onClick={() => toggleAttach(f)}>×</button>
                   </span>
                 ))}
               </div>
             )}
-            <div className="composer-row">
-              <textarea
-                placeholder="Ask this room anything…"
-                value={question}
-                rows={2}
-                dir="auto"
-                onChange={(e) => setQuestion(e.target.value)}
-                onPaste={onComposerPaste}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    send();
-                  }
-                }}
-              />
-              {asking ? (
-                <button
-                  className="btn-ic stop-btn"
-                  title="Stop this answer"
-                  onClick={stopAsk}
-                >
-                  <span className="stop-glyph">◼</span> Stop
-                </button>
-              ) : (
-                <button
-                  className="primary btn-ic"
-                  onClick={send}
-                  disabled={!question.trim()}
-                >
-                  <SendIcon size={14} /> Send
-                </button>
+            <div className={`composer-card${asking ? " busy" : ""}`}>
+              {ac && autocompleteItems().length > 0 && (
+                <div className="ac-popover">
+                  <div className="ac-hint">
+                    {ac.kind === "cmd"
+                      ? "Commands — run a prebuilt action"
+                      : "Attach a file or folder as context"}
+                  </div>
+                  {autocompleteItems().map((it, i) => (
+                    <button
+                      key={it.key}
+                      className={`ac-item ${i === ac.index ? "active" : ""}`}
+                      // mousedown so the textarea doesn't blur first.
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        acceptAutocomplete(it.insert);
+                      }}
+                    >
+                      <span className="ac-label">{it.label}</span>
+                      <span className="ac-desc">{it.hint}</span>
+                    </button>
+                  ))}
+                </div>
               )}
-            </div>
-          </div>
-
-          {toasts.length > 0 && (
-            <div className="toast-stack">
-              {toasts.map((t) => (
-                <div key={t.id} className={`toast ${t.kind}`}>
-                  <span className="toast-text">{t.text}</span>
+              <textarea
+                ref={composerRef}
+                className="composer-input"
+                placeholder="Ask anything about this room…"
+                value={question}
+                rows={3}
+                dir="auto"
+                onChange={(e) => {
+                  setQuestion(e.target.value);
+                  refreshAutocomplete(e.target.value, e.target.selectionStart);
+                }}
+                onSelect={(e) =>
+                  refreshAutocomplete(
+                    e.currentTarget.value,
+                    e.currentTarget.selectionStart,
+                  )
+                }
+                onBlur={() => setAc(null)}
+                onPaste={onComposerPaste}
+                onKeyDown={onComposerKeyDown}
+              />
+              <div className="composer-tools">
+                <div className="composer-tools-left">
                   <button
-                    className="toast-close"
-                    title="Dismiss"
-                    onClick={() => dismissToast(t.id)}
+                    className="tool-chip"
+                    title="Attach a file as context"
+                    onClick={() => insertComposerToken("@")}
                   >
-                    <CloseIcon size={12} />
+                    <PaperclipIcon size={14} /> Attach
+                  </button>
+                  <button
+                    className="tool-chip"
+                    title="Run a prebuilt action"
+                    onClick={() => insertComposerToken("#")}
+                  >
+                    <span className="tool-hash">#</span> Action
                   </button>
                 </div>
-              ))}
+                <div className="composer-tools-right">
+                  <button
+                    className={`icon-btn mic-btn ${micState("composer").cls}`}
+                    title={micState("composer").title}
+                    disabled={micState("composer").disabled || asking}
+                    onClick={() =>
+                      dictateTo("composer", (text) =>
+                        setQuestion((q) =>
+                          q.trim() ? `${q.trimEnd()} ${text}` : text,
+                        ),
+                      )
+                    }
+                  >
+                    <MicIcon size={16} />
+                  </button>
+                  {asking ? (
+                    <button
+                      className="send-btn stop"
+                      title="Stop this answer"
+                      onClick={stopAsk}
+                    >
+                      <span className="stop-glyph">◼</span>
+                    </button>
+                  ) : (
+                    <button
+                      className="send-btn"
+                      title="Send ⏎"
+                      onClick={send}
+                      disabled={!question.trim()}
+                    >
+                      <SendIcon size={16} />
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
-          )}
+          </div>
         </main>
       </div>
     </div>

@@ -46,7 +46,15 @@ mod imp {
             ERR_SEC_USER_CANCELED => "Touch ID was cancelled.".into(),
             -25293 /* errSecAuthFailed */ => "Touch ID did not match.".into(),
             code if code == errSecItemNotFound => "No Touch ID entry for this room.".into(),
-            code => format!("Keychain error ({code})."),
+            // errSecMissingEntitlement — the Keychain is unavailable to this
+            // build (unsigned/sandboxed run, or no Secure Enclave). Speak plainly
+            // and keep the raw code out of the user's face; password still works.
+            -34018 => "Touch ID isn't available on this Mac right now. You can still unlock with your password.".into(),
+            // Any other OSStatus: a friendly line, with the raw code tucked at
+            // the end in brackets for support without leading with jargon.
+            code => format!(
+                "Touch ID isn't available right now. You can still unlock with your password. [code {code}]"
+            ),
         }
     }
 

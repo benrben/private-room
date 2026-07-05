@@ -76,6 +76,25 @@ fn map_send_err(e: reqwest::Error) -> String {
 /// `keep_alive` (HLT-5) is how long Ollama holds the model resident after this
 /// call (e.g. "30m" to stay warm, "2m"/"0" to release a vision model on
 /// low-RAM machines). The caller decides per model — see `vision_keep_alive`.
+/// ADD-22: the working-memory window (`num_ctx`) handed to Ollama. The base
+/// sizes stay small so a 16 GB Mac never OOMs on a model that declares a huge
+/// context; on high-RAM machines (>=32 GB) we allow more, so long conversations
+/// and big tool results are trimmed less often. Read once.
+fn num_ctx_for(has_tools: bool) -> u32 {
+    static HIGH_RAM: OnceLock<bool> = OnceLock::new();
+    let high = *HIGH_RAM.get_or_init(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.total_memory() >= 32 * 1024 * 1024 * 1024
+    });
+    match (has_tools, high) {
+        (true, true) => 24576,
+        (true, false) => 12288,
+        (false, true) => 16384,
+        (false, false) => 8192,
+    }
+}
+
 pub async fn chat_stream_tools(
     model: &str,
     messages: Vec<ChatMessage>,
@@ -83,6 +102,42 @@ pub async fn chat_stream_tools(
     temperature: Option<f64>,
     cancel: Option<Arc<AtomicBool>>,
     keep_alive: &str,
+    on_delta: impl FnMut(&str),
+) -> Result<(String, Vec<ToolCall>), String> {
+    chat_core(model, messages, tools, temperature, cancel, keep_alive, None, on_delta).await
+}
+
+/// ADD-22 training wheel: a one-shot call whose output is CONSTRAINED to a JSON
+/// schema via Ollama's `format` (grammar-based token masking). No tools, no
+/// streaming, no cancel — for the small side-jobs (grounding boxes, field
+/// extraction, list-making, summaries) that used to beg the model for JSON in
+/// prose and salvage-parse the result. The model literally cannot emit a
+/// structurally invalid document, and constrained decoding is markedly faster.
+pub async fn chat_structured(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    temperature: Option<f64>,
+    keep_alive: &str,
+    schema: &serde_json::Value,
+) -> Result<String, String> {
+    let (text, _) =
+        chat_core(model, messages, None, temperature, None, keep_alive, Some(schema), |_| {}).await?;
+    Ok(text)
+}
+
+/// Streaming chat that can also carry a tool catalog and/or a `format` schema.
+/// `format`, when set, constrains the response to a JSON schema; it is mutually
+/// exclusive with tool calling in practice (Ollama injects tool specs into the
+/// prompt but masks tokens for `format`), so tool callers pass None.
+#[allow(clippy::too_many_arguments)]
+async fn chat_core(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    tools: Option<&serde_json::Value>,
+    temperature: Option<f64>,
+    cancel: Option<Arc<AtomicBool>>,
+    keep_alive: &str,
+    format: Option<&serde_json::Value>,
     mut on_delta: impl FnMut(&str),
 ) -> Result<(String, Vec<ToolCall>), String> {
     use futures_util::StreamExt;
@@ -90,7 +145,7 @@ pub async fn chat_stream_tools(
     // Tool catalogs and tool results (search hits, fetched pages) need more
     // room than plain chat, but stay far below the model-declared maximums
     // that OOM 16 GB machines.
-    let num_ctx = if tools.is_some() { 12288 } else { 8192 };
+    let num_ctx = num_ctx_for(tools.is_some());
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
@@ -109,6 +164,10 @@ pub async fn chat_stream_tools(
     }
     if let Some(tools) = tools {
         body["tools"] = tools.clone();
+    }
+    // ADD-22: constrain the output to a JSON schema (grammar token masking).
+    if let Some(fmt) = format {
+        body["format"] = fmt.clone();
     }
     // Qwen3 thinking variants burn thousands of hidden reasoning tokens
     // (measured: 90s for a one-line answer). Instruct variants don't think
@@ -330,4 +389,28 @@ pub async fn list_models() -> Result<Vec<String>, String> {
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// ADD-22: a model's declared capabilities via `/api/show` (e.g. "tools",
+/// "vision", "completion"). This is a metadata call — it does NOT load the model
+/// into memory. Empty on any error, so callers treat "unknown" as "no special
+/// capability" rather than failing (the Settings badges just don't show).
+pub async fn capabilities(model: &str) -> Vec<String> {
+    let Ok(client) = client() else { return Vec::new() };
+    let resp = client
+        .post(format!("{}/api/show", base_url()))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await;
+    let Ok(resp) = resp else { return Vec::new() };
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    v["capabilities"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+        .unwrap_or_default()
 }
