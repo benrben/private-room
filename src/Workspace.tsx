@@ -1500,11 +1500,17 @@ export default function Workspace({ info, onLock }: Props) {
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch {
-      pushToast(
-        "error",
-        "Microphone unavailable — allow it in System Settings → Privacy & Security → Microphone.",
-      );
+    } catch (e) {
+      // Distinguish the real failure modes rather than always blaming Privacy
+      // settings: a denied prompt vs. no hardware vs. the device being busy.
+      const name = (e as { name?: string })?.name || "";
+      const msg =
+        name === "NotFoundError" || name === "OverconstrainedError"
+          ? "No microphone found — plug one in or check your input device."
+          : name === "NotReadableError" || name === "AbortError"
+            ? "The microphone is busy in another app — close it and try again."
+            : "Microphone blocked — allow Private Room in System Settings → Privacy & Security → Microphone, then reopen the app.";
+      pushToast("error", msg);
       return;
     }
     // WKWebView records AAC in an MP4 container; the backend decodes it with
@@ -1643,22 +1649,25 @@ export default function Workspace({ info, onLock }: Props) {
     });
   }
 
-  /** ADD-18 (make minutes): turn an open recording's transcript into a saved
-   * minutes file via the room's own local agent and its create_file tool. */
+  /** ADD-18 / ADD-22 (make minutes): run the deterministic #minutes command on
+   * the open recording's transcript. It fills a structured template and Rust
+   * renders a timeline-styled HTML minutes file — far more reliable (and prettier)
+   * than asking the small model to hand-author a document. */
   async function makeMinutes() {
     if (!openFile || asking || !activeChatId) return;
-    const name = openFile.content.name;
-    const base = name.replace(/\.[^.]+$/, "");
-    const q = `Read the transcript in the file "${name}" and write meeting minutes from it: a 2-3 sentence summary, the key decisions, and action items (with owners if mentioned). Save the minutes as a new file named "${base} — minutes.md" using create_file, then reply with just the highlights.`;
+    const raw = `#minutes @${openFile.content.name}`;
     const optimistic: Message = {
       id: `pending-${Date.now()}`,
       role: "user",
-      content: q,
+      content: raw,
       sources: [],
       createdAt: "",
     };
     setMessages((m) => [...m, optimistic]);
-    await askOnce(q, []);
+    const chatId = activeChatId;
+    await runTurn((askId) =>
+      api.runCommand(chatId, "minutes", "", [openFile.id], raw, askId),
+    );
   }
 
   // CHG-1: download the missing model from the banner with live progress.
@@ -3083,7 +3092,7 @@ export default function Workspace({ info, onLock }: Props) {
                     openFile.content.text && (
                       <button
                         className="subtle"
-                        title="Ask the room's AI to write minutes (summary, decisions, action items) and save them as a file"
+                        title="Turn this recording's transcript into timeline-style HTML minutes (summary, decisions, action items)"
                         disabled={asking}
                         onClick={makeMinutes}
                       >

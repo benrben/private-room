@@ -15,7 +15,6 @@ const MAX_CONTEXT_CHUNKS: usize = 6;
 /// ADD-13: widen the per-signal candidate pool before blending, so a strong
 /// vector-only (synonym) chunk can surface above weak keyword hits.
 const RETRIEVE_CANDIDATES: usize = MAX_CONTEXT_CHUNKS * 4;
-const MAX_IMPORT_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_ATTACHED_IMAGES: usize = 4;
 /// Shared character budget for all text attachments in one question — a
 /// first-come cap so N attached files can never blow the 8K window.
@@ -1450,16 +1449,13 @@ pub fn import_files(
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
-        match std::fs::metadata(&path) {
-            Ok(md) if md.len() > MAX_IMPORT_BYTES => {
-                errors.push(format!("{file_name}: file is larger than 200 MB"));
-                continue;
-            }
-            Err(e) => {
-                errors.push(format!("{file_name}: {e}"));
-                continue;
-            }
-            _ => {}
+        // No size cap on imports (removed by request). We still surface a clean
+        // error if the file can't be stat'd (missing / no permission); the only
+        // hard ceiling now is SQLite's ~1 GB per-blob limit, which fails at
+        // storage with its own message.
+        if let Err(e) = std::fs::metadata(&path) {
+            errors.push(format!("{file_name}: {e}"));
+            continue;
         }
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -1933,47 +1929,50 @@ async fn combine_summary(
             context.push_str(&format!("- {m}\n"));
         }
     }
-    let messages = vec![
-        ollama::ChatMessage::new(
-            "system",
-            "You summarize a personal document room. Write a 'purpose' of 2-4 sentences \
-             describing what the room is for, and exactly three example questions the files \
-             could answer. Base everything only on the information given; do not list the files.",
-        ),
-        ollama::ChatMessage::new("user", context),
-    ];
-    // ADD-22: the two sections used to be begged for in prose and salvaged by
-    // split_summary_sections. Now the model fills a guaranteed shape and returns
-    // (purpose, questions); the caller assembles the HTML page from these plus
-    // the deterministic file list.
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "purpose": {"type": "string"},
-            "questions": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 3,
-                "maxItems": 3
-            }
-        },
-        "required": ["purpose", "questions"]
-    });
-    let raw = ollama::chat_structured(model, messages, Some(0.4), KEEP_ALIVE_WARM, &schema).await?;
-    let parsed: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
-    let purpose = parsed.get("purpose").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let questions: Vec<String> = parsed
-        .get("questions")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|q| q.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+
+    // ADD-22 (fix): the old design asked one constrained call for a nested
+    // {purpose, questions[3]} object and often got empty strings back — a small
+    // model can't fill a JSON shape it never sees. Split into TWO single-purpose
+    // calls instead: free-text prose for the purpose (what a 4B model does most
+    // reliably), and a plain string array for the questions (grounded by the
+    // schema-in-prompt that chat_structured now adds).
+    let purpose = {
+        let messages = vec![
+            ollama::ChatMessage::new(
+                "system",
+                "You describe what a personal document room is for. In 2-4 sentences, say what \
+                 the room is about and the main topics it covers, based only on the file list. \
+                 Be specific and concrete. No preamble, no bullet lists, no file names.",
+            ),
+            ollama::ChatMessage::new("user", context.clone()),
+        ];
+        let (t, _) =
+            ollama::chat_stream_tools(model, messages, None, Some(0.4), None, KEEP_ALIVE_WARM, |_| {})
+                .await?;
+        strip_think_spans(&t).trim().to_string()
+    };
+
+    let questions = {
+        let messages = vec![
+            ollama::ChatMessage::new(
+                "system",
+                "You suggest example questions a user could ask about their own documents. Give \
+                 exactly three short, specific questions that these files would actually answer.",
+            ),
+            ollama::ChatMessage::new("user", context),
+        ];
+        let schema = serde_json::json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 3,
+            "maxItems": 3
+        });
+        let raw = ollama::chat_structured(model, messages, Some(0.4), KEEP_ALIVE_WARM, &schema)
+            .await
+            .unwrap_or_default();
+        parse_string_list(&raw).into_iter().take(3).collect()
+    };
+
     Ok((purpose, questions))
 }
 
@@ -1989,16 +1988,22 @@ pub async fn summarize_room(
     use tauri::Emitter;
 
     // Phase 1 (locked): pull the room name, memories and the file rows.
-    let (room_name, explicit_model, memories, files, existing_id) = {
+    let (room_name, explicit_model, memories, files, existing_id, legacy_md_id) = {
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
         let conn = &room.conn;
         let all = db::list_files_for_summary(conn)?;
-        // Overwrite only the current (HTML) summary; a legacy .md summary is left
-        // alone (and excluded from the new one via is_summary_file).
+        // Overwrite the current (HTML) summary in place.
         let existing_id = all
             .iter()
             .find(|f| f.name == SUMMARY_FILE_NAME && f.source == "generated")
+            .map(|f| f.id.clone());
+        // ADD-22: the pre-HTML "Room summary.md" (from an older app version) is
+        // removed once we regenerate, so the room isn't left with a stale
+        // duplicate summary in the other format.
+        let legacy_md_id = all
+            .iter()
+            .find(|f| f.name == "Room summary.md" && f.source == "generated")
             .map(|f| f.id.clone());
         let files: Vec<db::SummaryFile> = all
             .into_iter()
@@ -2006,7 +2011,7 @@ pub async fn summarize_room(
             .collect();
         let memories: Vec<String> =
             db::list_memories(conn)?.into_iter().map(|m| m.content).collect();
-        (room.name.clone(), model_setting(conn), memories, files, existing_id)
+        (room.name.clone(), model_setting(conn), memories, files, existing_id, legacy_md_id)
     };
 
     if files.is_empty() {
@@ -2107,35 +2112,49 @@ pub async fn summarize_room(
             .map(|room| db::current_date(&room.conn))
             .unwrap_or_default()
     };
-    let mut body = format!("<p><em>Generated on {}</em></p>\n", html_escape(&saved_date));
+    let mut body = doc_hero(
+        "Room summary",
+        &room_name,
+        &format!("Generated on {}", html_escape(&saved_date)),
+    );
     body.push_str("<h2>What this room is for</h2>\n");
     body.push_str(&format!(
-        "<p>{}</p>\n",
+        "<div class=\"lead-wrap\"><p class=\"lead\">{}</p></div>\n",
         if purpose.is_empty() {
             "A personal document room.".to_string()
         } else {
             html_escape(&purpose)
         }
     ));
-    body.push_str("<h2>Files</h2>\n<ul>\n");
+    body.push_str(&format!(
+        "<h2>Files <span class=\"count\">{}</span></h2>\n<ul class=\"files\">\n",
+        file_items.len()
+    ));
     for (display, liner) in &file_items {
+        let icon = file_glyph(display);
         match liner {
             Some(l) => body.push_str(&format!(
-                "<li><strong>{}</strong> — {}</li>\n",
+                "<li><span class=\"ic\">{}</span><div><div class=\"nm\">{}</div>\
+                 <div class=\"ds\">{}</div></div></li>\n",
+                icon,
                 html_escape(display),
                 html_escape(l)
             )),
-            None => body.push_str(&format!("<li><strong>{}</strong></li>\n", html_escape(display))),
+            None => body.push_str(&format!(
+                "<li><span class=\"ic\">{}</span><div><div class=\"nm\">{}</div></div></li>\n",
+                icon,
+                html_escape(display)
+            )),
         }
     }
     body.push_str("</ul>\n");
     if capped {
         body.push_str(&format!(
-            "<p><em>Only the first {MAX_SUMMARY_FILES} files were summarized; the rest are listed by name.</em></p>\n"
+            "<p class=\"note\">Only the first {MAX_SUMMARY_FILES} files were summarized; the rest are listed by name.</p>\n"
         ));
     }
     if !questions.is_empty() {
-        body.push_str("<h2>Try asking</h2>\n<ol>\n");
+        body.push_str("<h2>Try asking</h2>\n<ol class=\"asks\">\n");
         for q in &questions {
             body.push_str(&format!("<li>{}</li>\n", html_escape(q)));
         }
@@ -2161,6 +2180,10 @@ pub async fn summarize_room(
             "generated",
         )?,
     };
+    // ADD-22: drop the legacy Markdown summary so only the HTML one remains.
+    if let Some(md_id) = legacy_md_id {
+        let _ = db::delete_file(&room.conn, &md_id);
+    }
     let _ = window.emit("room-files-changed", ());
     Ok(meta)
 }
@@ -2882,34 +2905,49 @@ fn vision_keep_alive(total_ram: u64, vision_model: &str, chat_model: &str) -> &'
     }
 }
 
-const MAX_VISION_DIM: u32 = 1024;
+/// The square canvas every image is fitted to before grounding. Exactly 1000 so
+/// pixel coordinates and 0..1000-normalized coordinates COINCIDE (both divide to
+/// the same 0..1 value) — which is what makes box placement robust regardless of
+/// which convention the vision model answers in (see `prepare_image`).
+const VISION_SQUARE: u32 = 1000;
 
 /// Normalize an image for the model: transcode to PNG (Ollama only decodes
-/// PNG/JPEG — WebP/HEIC/mislabeled files fail with "unknown format") and
-/// downscale so vision prefill stays fast. Returns (bytes, width, height).
+/// PNG/JPEG — WebP/HEIC/mislabeled files fail with "unknown format") and fit it
+/// onto a fixed VISION_SQUARE×VISION_SQUARE canvas. Returns (bytes, width, height).
+///
+/// Marking fix: the image is STRETCHED to a square rather than kept at its own
+/// aspect ratio. This removes the two things that were pushing highlight boxes
+/// off — almost always downward: (1) the pixel-vs-0..1000 scale ambiguity
+/// disappears, because on a 1000×1000 image both conventions normalize
+/// identically; and (2) it pre-empts the vision model's OWN internal
+/// square-padding, which otherwise squeezes a non-square image's content toward
+/// the middle and drags the boxes down. Boxes are drawn back over the ORIGINAL
+/// image using NORMALIZED coordinates, so the per-axis stretch cancels out
+/// exactly — only the model's working view is distorted, never the placement.
 fn prepare_image(bytes: &[u8]) -> (Vec<u8>, f64, f64) {
+    let square = VISION_SQUARE as f64;
     match image::load_from_memory(bytes) {
         Ok(img) => {
-            let img = if img.width() > MAX_VISION_DIM || img.height() > MAX_VISION_DIM {
-                img.thumbnail(MAX_VISION_DIM, MAX_VISION_DIM)
-            } else {
-                img
-            };
-            let (w, h) = (img.width() as f64, img.height() as f64);
+            let (ow, oh) = (img.width() as f64, img.height() as f64);
+            let fitted = img.resize_exact(
+                VISION_SQUARE,
+                VISION_SQUARE,
+                image::imageops::FilterType::Triangle,
+            );
             let mut out = Vec::new();
-            if img
+            if fitted
                 .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
                 .is_ok()
             {
-                (out, w, h)
+                (out, square, square)
             } else {
-                (bytes.to_vec(), w, h)
+                (bytes.to_vec(), ow, oh)
             }
         }
         Err(_) => {
             let (w, h) = imagesize::blob_size(bytes)
                 .map(|s| (s.width as f64, s.height as f64))
-                .unwrap_or((1000.0, 1000.0));
+                .unwrap_or((square, square));
             (bytes.to_vec(), w, h)
         }
     }
@@ -3944,9 +3982,10 @@ pub async fn ask(
              user sees it), create_file (save a new note/document into the room), edit_file \
              (replace exact text inside an existing file — text, code, csv, or docx), \
              write_file (rewrite a whole text file), set_cells (change a spreadsheet cell by \
-             A1 reference like B7), add_memory (remember something permanently). Use them \
-             whenever the user asks you to open, show, mark, find, create, change or remember \
-             something — then give your answer in plain text. Before editing or annotating, \
+             A1 reference like B7), rename_file (rename a file), move_file (move a file into a \
+             folder), add_memory (remember something permanently). Use them \
+             whenever the user asks you to open, show, mark, find, create, change, rename, move \
+             or remember something — then give your answer in plain text. Before editing or annotating, \
              copy text exactly as it appears in the file (search_room shows it verbatim).\n\n\
              CRITICAL — never fabricate an action:\n\
              - To change a file you MUST call edit_file, write_file, or set_cells. NEVER say a \
@@ -4295,6 +4334,8 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "edit_file",
     "write_file",
     "set_cells",
+    "rename_file",
+    "move_file",
     "add_memory",
     "web_search",
     "fetch_page",
@@ -4310,6 +4351,8 @@ const WRITE_TOOL_NAMES: &[&str] = &[
     "edit_file",
     "write_file",
     "set_cells",
+    "rename_file",
+    "move_file",
     "add_memory",
 ];
 
@@ -4324,6 +4367,7 @@ fn wants_write_tools(question: &str) -> bool {
         "create", "make ", "new file", "save", "delete", "remove", "set ", "fill",
         "insert", "append", "rename", "correct", "remember", "note ", "jot", "record",
         "translate", "highlight", "mark ", "annotate", "draft", "generate",
+        "move ", "rename", "organize", "organise", "put ", "folder", "sort ", "tidy",
     ];
     HINTS.iter().any(|h| q.contains(h))
 }
@@ -4405,6 +4449,18 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                         "required": ["cell", "value"]}},
                 "sheet": {"type": "string", "description": "Sheet name (default: first sheet)"}},
                 "required": ["name", "updates"]}}},
+        {"type": "function", "function": {"name": "rename_file",
+            "description": "Rename a file in the room. The extension is kept if you omit it. Example: {\"name\": \"draft.md\", \"new_name\": \"Q3 plan\"}",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "Current file name or part of it"},
+                "new_name": {"type": "string", "description": "The new name"}},
+                "required": ["name", "new_name"]}}},
+        {"type": "function", "function": {"name": "move_file",
+            "description": "Move a file into a folder (created if it doesn't exist), or to the top level with an empty folder. Example: {\"name\": \"NVDA_Stock_Info.md\", \"folder\": \"stocks\"}",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "File name or part of it"},
+                "folder": {"type": "string", "description": "Destination folder name; empty string for the top level"}},
+                "required": ["name", "folder"]}}},
         {"type": "function", "function": {"name": "add_memory",
             "description": "Save a permanent memory note that the assistant will always see in this room.",
             "parameters": {"type": "object", "properties": {
@@ -4637,6 +4693,8 @@ fn tool_step_label(name: &str) -> String {
         "edit_file" => "Edited a file",
         "write_file" => "Rewrote a file",
         "set_cells" => "Updated spreadsheet cells",
+        "rename_file" => "Renamed a file",
+        "move_file" => "Moved a file",
         "add_memory" => "Saved a memory",
         "web_search" => "Searched the web",
         "fetch_page" => "Fetched a page",
@@ -5383,6 +5441,57 @@ pub(crate) async fn exec_tool(
             effects.wrote = true;
             Ok(format!("Created \"{}\" in the room.", meta.name))
         }
+        "rename_file" => {
+            let name = args["name"].as_str().unwrap_or_default();
+            let new_name = args["new_name"].as_str().unwrap_or_default().trim();
+            if new_name.is_empty() {
+                return Err("new_name is required.".into());
+            }
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let (id, real_name) = db::find_file_like(&room.conn, name)?;
+            // Keep the original extension if the model dropped it.
+            let final_name = if extraction::extension_of(new_name).is_empty() {
+                let ext = extraction::extension_of(&real_name);
+                if ext.is_empty() {
+                    new_name.to_string()
+                } else {
+                    format!("{new_name}.{ext}")
+                }
+            } else {
+                new_name.to_string()
+            };
+            db::rename_file(&room.conn, &id, &final_name)?;
+            let _ = window.emit("room-files-changed", ());
+            let _ = window.emit("file-updated", &id);
+            effects.wrote = true;
+            Ok(format!("Renamed \"{real_name}\" to \"{final_name}\"."))
+        }
+        "move_file" => {
+            let name = args["name"].as_str().unwrap_or_default();
+            let folder = args["folder"].as_str().unwrap_or_default().trim();
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let (id, real_name) = db::find_file_like(&room.conn, name)?;
+            let to_top = folder.is_empty()
+                || ["none", "top", "top level", "root", "/"]
+                    .iter()
+                    .any(|w| folder.eq_ignore_ascii_case(w));
+            let (folder_id, where_to) = if to_top {
+                (None, "the top level".to_string())
+            } else {
+                let folders = db::list_folders(&room.conn)?;
+                let fid = match folders.iter().find(|f| f.name.eq_ignore_ascii_case(folder)) {
+                    Some(f) => f.id.clone(),
+                    None => db::create_folder(&room.conn, folder)?.id,
+                };
+                (Some(fid), format!("\"{folder}\""))
+            };
+            db::move_file_to_folder(&room.conn, &id, folder_id.as_deref())?;
+            let _ = window.emit("room-files-changed", ());
+            effects.wrote = true;
+            Ok(format!("Moved \"{real_name}\" to {where_to}."))
+        }
         "add_memory" => {
             let raw = args["content"].as_str().unwrap_or_default();
             if raw.chars().count() > MAX_MEMORY_CONTENT_CHARS {
@@ -5801,6 +5910,12 @@ pub const CHAT_COMMANDS: &[ChatCommandInfo] = &[
         needs_refs: true,
     },
     ChatCommandInfo {
+        name: "minutes",
+        summary: "Turn a meeting transcript or notes into timeline-style HTML minutes",
+        usage: "#minutes @recording   ·   #minutes @notes.md",
+        needs_refs: false,
+    },
+    ChatCommandInfo {
         name: "to-sheet",
         summary: "Turn the table in the last answer into a spreadsheet",
         usage: "#to-sheet",
@@ -5943,7 +6058,9 @@ fn is_full_html_doc(s: &str) -> bool {
 
 /// Wrap body markup in a clean, self-contained HTML document with inline styling.
 /// It renders in the app's sandboxed, network-blocked HtmlView, so it is safe to
-/// store and open. If `body` is already a full page, it is returned unchanged.
+/// store and open. Everything draws from the shared `DOC_STYLE` design system, so
+/// bare model-authored markup (h2/p/ul/table…) looks as polished as the built-in
+/// templates. If `body` is already a full page, it is returned unchanged.
 fn html_document(title: &str, body: &str) -> String {
     if is_full_html_doc(body) {
         return body.to_string();
@@ -5951,19 +6068,296 @@ fn html_document(title: &str, body: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{}</title>\n<style>\n\
-         :root {{ color-scheme: light dark; }}\n\
-         body {{ font: 16px/1.6 -apple-system, system-ui, sans-serif; max-width: 46rem; \
-         margin: 2rem auto; padding: 0 1.25rem; }}\n\
-         h1,h2,h3 {{ line-height: 1.25; }}\n\
-         table {{ border-collapse: collapse; }}\n\
-         td,th {{ border: 1px solid #8884; padding: 0.35rem 0.6rem; text-align: left; }}\n\
-         code,pre {{ background: #8881; border-radius: 4px; }}\n\
-         pre {{ padding: 0.8rem; overflow-x: auto; }}\n\
-         </style>\n</head>\n<body>\n{}\n</body>\n</html>\n",
+         <title>{}</title>\n{}\n</head>\n<body>\n<main class=\"doc\">\n{}\n</main>\n\
+         <footer class=\"doc-foot\">Private Room · generated on this Mac</footer>\n\
+         </body>\n</html>\n",
         html_escape(title),
+        DOC_STYLE,
         body.trim()
     )
+}
+
+/// ADD-22 (refined): the shared design system every generated document and
+/// template draws from — an editorial, theme-aware stylesheet (serif display
+/// titles, an accent-violet echoing the app, cards, chips, a timeline, tidy
+/// tables). Light/dark are both first-class; `html` gets an explicit background
+/// so the sandboxed viewer's white iframe backdrop never shows through as
+/// white-on-white in dark mode. Everything is inline — the viewer blocks the
+/// network, so there are no external fonts, styles, or images.
+const DOC_STYLE: &str = r#"<style>
+:root{
+  color-scheme:light dark;
+  --bg:#f6f7f9; --surface:#ffffff; --surface-2:#eef0f4; --card:#eef0f4;
+  --fg:#191b1f; --muted:#63697a; --faint:#9aa0b0;
+  --accent:#6d5cf0; --accent-2:#8b7cf6; --accent-soft:rgba(109,92,240,.10);
+  --border:#e6e7ee; --line:#e3e4ec; --ok:#12a150;
+  --radius:14px;
+  --shadow:0 1px 2px rgba(24,24,60,.05),0 12px 30px rgba(24,24,60,.06);
+  --serif:ui-serif,"New York",Georgia,"Times New Roman",serif;
+  --sans:-apple-system,"SF Pro Text",system-ui,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0e1014; --surface:#161a22; --surface-2:#1c212c; --card:#1c212c;
+    --fg:#e8eaf0; --muted:#8b93a7; --faint:#626b7d;
+    --accent:#8b7cf6; --accent-2:#a99df8; --accent-soft:rgba(139,124,246,.16);
+    --border:#232a37; --line:#2a3140; --ok:#4cc38a;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 14px 36px rgba(0,0,0,.36);
+  }
+}
+*{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 var(--sans);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+.doc{max-width:52rem;margin:0 auto;padding:3.25rem 1.5rem 1rem}
+h1,h2,h3{color:var(--fg);line-height:1.2}
+h1{font-family:var(--serif);font-weight:600;font-size:2.5rem;letter-spacing:-.021em;margin:.15em 0 .35em}
+h2{font-size:1.32rem;font-weight:650;letter-spacing:-.01em;margin:2.5rem 0 .9rem;padding-bottom:.5rem;border-bottom:1px solid var(--border)}
+h2 .count{font:600 .72rem/1 var(--sans);letter-spacing:0;color:var(--muted);background:var(--surface-2);border:1px solid var(--border);border-radius:999px;padding:.2rem .5rem;vertical-align:.14em;margin-left:.55rem}
+h3{font-size:1.06rem;font-weight:650;margin:1.6rem 0 .5rem}
+p{margin:.7rem 0}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+strong{font-weight:650}
+hr{border:0;height:1px;background:linear-gradient(90deg,var(--border),transparent);margin:2rem 0}
+.note{color:var(--muted);font-size:.9rem;margin-top:.6rem}
+.hero{margin:0 0 2.2rem}
+.eyebrow{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent);margin-bottom:.55rem}
+.hero h1{margin:.05rem 0 .35rem}
+.hero .sub{color:var(--muted);font-size:1.01rem;margin:.15rem 0 0}
+.hero .rule{height:3px;width:66px;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--accent-2));margin-top:1.15rem}
+.lead-wrap{background:var(--accent-soft);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:var(--radius);padding:1.05rem 1.25rem;margin:.4rem 0 0}
+.lead{font-size:1.14rem;line-height:1.62;margin:0}
+.chips{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0 0}
+.chip{display:inline-flex;align-items:center;gap:.4rem;background:var(--surface-2);border:1px solid var(--border);border-radius:999px;padding:.22rem .72rem;font-size:.83rem}
+.chip::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--accent)}
+.files{list-style:none;margin:.4rem 0 0;padding:0;display:grid;gap:.5rem}
+.files li{display:flex;gap:.75rem;align-items:flex-start;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:.7rem .85rem;box-shadow:var(--shadow)}
+.files .ic{flex:none;width:2rem;height:2rem;border-radius:9px;background:var(--accent-soft);display:grid;place-items:center;font-size:1.05rem;line-height:1}
+.files .nm{font-weight:600}
+.files .ds{color:var(--muted);font-size:.92rem;margin-top:.12rem}
+.asks{list-style:none;counter-reset:a;display:grid;gap:.55rem;margin:.4rem 0 0;padding:0}
+.asks li{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:.78rem .95rem .78rem 3rem;box-shadow:var(--shadow)}
+.asks li::before{counter-increment:a;content:counter(a);position:absolute;left:.85rem;top:.72rem;width:1.55rem;height:1.55rem;border-radius:8px;background:var(--accent);color:#fff;font-size:.82rem;font-weight:700;display:grid;place-items:center}
+.tl{list-style:none;padding:0;margin:1rem 0 0;position:relative}
+.tl::before{content:'';position:absolute;left:8px;top:8px;bottom:14px;width:2px;background:var(--line)}
+.tl li{position:relative;padding:0 0 1.6rem 2.15rem}
+.tl li:last-child{padding-bottom:.2rem}
+.tl li::before{content:'';position:absolute;left:2px;top:5px;width:14px;height:14px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--bg),0 0 0 5px var(--border)}
+.tl .time{font-size:.71rem;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);font-weight:700}
+.tl .topic{font-weight:650;font-size:1.02rem;margin:.12rem 0 .18rem}
+.tl .summary{margin:0;color:var(--muted)}
+.checks{list-style:none;padding:0;margin:.4rem 0 0;display:grid;gap:.45rem}
+.checks li{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:.6rem .85rem .6rem 2.2rem}
+.checks li::before{content:'\2713';position:absolute;left:.8rem;top:.58rem;color:var(--ok);font-weight:800}
+table{border-collapse:separate;border-spacing:0;width:100%;margin:.6rem 0 0;border:1px solid var(--border);border-radius:12px;overflow:hidden}
+th,td{padding:.6rem .82rem;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+tr:first-child th,thead th{background:var(--surface-2);font-size:.73rem;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);font-weight:700}
+table tr:last-child td{border-bottom:0}
+table tr:nth-child(even) td{background:var(--surface-2)}
+.actions td:first-child{white-space:nowrap;color:var(--muted);font-weight:600;width:1%}
+code{background:var(--surface-2);border-radius:5px;padding:.1em .36em;font-size:.9em;font-family:var(--mono)}
+pre{background:var(--surface-2);border:1px solid var(--border);border-radius:12px;padding:1rem;overflow-x:auto}
+pre code{background:none;padding:0}
+blockquote{margin:1rem 0;padding:.4rem 0 .4rem 1.1rem;border-left:3px solid var(--accent);color:var(--muted)}
+ul,ol{padding-left:1.3rem}
+li{margin:.28rem 0}
+img{max-width:100%;border-radius:10px}
+.doc-foot{max-width:52rem;margin:2.5rem auto 0;padding:1.2rem 1.5rem 2.5rem;border-top:1px solid var(--border);color:var(--faint);font-size:.8rem;text-align:center}
+@media (max-width:640px){.doc{padding:2.2rem 1.15rem 1rem}h1{font-size:2rem}}
+</style>"#;
+
+/// A polished document header: an uppercase accent eyebrow, a large serif title,
+/// an optional muted subline, and an accent rule. `sub_html` is inserted as-is,
+/// so callers pass already-escaped content.
+fn doc_hero(eyebrow: &str, title: &str, sub_html: &str) -> String {
+    let mut h = String::from("<header class=\"hero\">\n");
+    if !eyebrow.is_empty() {
+        h.push_str(&format!("<div class=\"eyebrow\">{}</div>\n", html_escape(eyebrow)));
+    }
+    h.push_str(&format!("<h1>{}</h1>\n", html_escape(title)));
+    if !sub_html.trim().is_empty() {
+        h.push_str(&format!("<p class=\"sub\">{sub_html}</p>\n"));
+    }
+    h.push_str("<div class=\"rule\"></div>\n</header>\n");
+    h
+}
+
+/// An emoji glyph for a file, chosen by extension, so each row of the summary's
+/// file list reads at a glance.
+fn file_glyph(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "pdf" => "📕",
+        "csv" | "tsv" | "xls" | "xlsx" | "numbers" => "📊",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "heic" | "tiff" => "🖼️",
+        "mp3" | "m4a" | "wav" | "aac" | "flac" | "ogg" | "aiff" => "🎧",
+        "mp4" | "mov" | "mkv" | "webm" | "avi" => "🎬",
+        "html" | "htm" => "🌐",
+        "md" | "markdown" | "txt" | "rtf" => "📝",
+        "json" | "yaml" | "yml" | "toml" | "xml" => "🗂️",
+        "zip" | "tar" | "gz" | "7z" => "🗜️",
+        "doc" | "docx" | "pages" => "📘",
+        "ppt" | "pptx" | "key" => "📽️",
+        _ => "📄",
+    }
+}
+
+/// The display title for a generated document, derived from its file name with
+/// the extension dropped: "Q3 report.html" -> "Q3 report".
+fn title_from_name(name: &str) -> String {
+    match name.rfind('.') {
+        Some(i) if i > 0 => name[..i].to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Wrap a model-authored document body into a full page, giving it a serif title
+/// header derived from `title` — unless the model already returned a whole HTML
+/// page, in which case it passes through untouched (no double header/wrap).
+fn html_titled_doc(name: &str, title: &str, body: &str) -> String {
+    if is_full_html_doc(body) {
+        html_document(name, body)
+    } else {
+        html_document(name, &format!("{}{}", doc_hero("", title, ""), body))
+    }
+}
+
+// ---- ADD-22: document templates (model fills structured slots, Rust renders) ----
+
+/// The structured shape the model fills for meeting minutes. Constrained via
+/// `format` so a small model returns a valid object, not hand-authored HTML.
+fn minutes_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "date": {"type": "string"},
+            "attendees": {"type": "array", "items": {"type": "string"}},
+            "timeline": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "time": {"type": "string"},
+                        "topic": {"type": "string"},
+                        "summary": {"type": "string"}
+                    },
+                    "required": ["topic", "summary"]
+                }
+            },
+            "decisions": {"type": "array", "items": {"type": "string"}},
+            "actions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"owner": {"type": "string"}, "task": {"type": "string"}},
+                    "required": ["task"]
+                }
+            }
+        },
+        "required": ["title", "timeline"]
+    })
+}
+
+/// Render structured minutes into a timeline-styled HTML body using the shared
+/// `DOC_STYLE` components (hero, chips, timeline, checklist, table). Every section
+/// is omitted when empty, and all text is escaped. Pure and testable.
+fn render_minutes_html(p: &serde_json::Value, title: &str) -> String {
+    let arr_strings = |k: &str| -> Vec<String> {
+        p.get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let field = |v: &serde_json::Value, k: &str| {
+        v.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string()
+    };
+
+    let date = p.get("date").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let attendees = arr_strings("attendees");
+    let mut meta = Vec::new();
+    if !date.is_empty() {
+        meta.push(html_escape(&date));
+    }
+    if !attendees.is_empty() {
+        meta.push(format!(
+            "{} attendee{}",
+            attendees.len(),
+            if attendees.len() == 1 { "" } else { "s" }
+        ));
+    }
+    let mut body = doc_hero("Meeting minutes", title, &meta.join(" · "));
+    if !attendees.is_empty() {
+        body.push_str("<div class=\"chips\">");
+        for a in &attendees {
+            body.push_str(&format!("<span class=\"chip\">{}</span>", html_escape(a)));
+        }
+        body.push_str("</div>\n");
+    }
+
+    if let Some(items) = p.get("timeline").and_then(|v| v.as_array()) {
+        let items: Vec<&serde_json::Value> = items
+            .iter()
+            .filter(|it| !field(it, "topic").is_empty() || !field(it, "summary").is_empty())
+            .collect();
+        if !items.is_empty() {
+            body.push_str("<h2>Timeline</h2>\n<ul class=\"tl\">\n");
+            for it in items {
+                body.push_str("<li>");
+                let time = field(it, "time");
+                if !time.is_empty() {
+                    body.push_str(&format!("<div class=\"time\">{}</div>", html_escape(&time)));
+                }
+                let topic = field(it, "topic");
+                if !topic.is_empty() {
+                    body.push_str(&format!("<div class=\"topic\">{}</div>", html_escape(&topic)));
+                }
+                let summary = field(it, "summary");
+                if !summary.is_empty() {
+                    body.push_str(&format!("<p class=\"summary\">{}</p>", html_escape(&summary)));
+                }
+                body.push_str("</li>\n");
+            }
+            body.push_str("</ul>\n");
+        }
+    }
+
+    let decisions = arr_strings("decisions");
+    if !decisions.is_empty() {
+        body.push_str("<h2>Decisions</h2>\n<ul class=\"checks\">\n");
+        for d in &decisions {
+            body.push_str(&format!("<li>{}</li>\n", html_escape(d)));
+        }
+        body.push_str("</ul>\n");
+    }
+
+    if let Some(actions) = p.get("actions").and_then(|v| v.as_array()) {
+        let rows: Vec<(String, String)> = actions
+            .iter()
+            .filter_map(|a| {
+                let task = field(a, "task");
+                if task.is_empty() {
+                    return None;
+                }
+                Some((field(a, "owner"), task))
+            })
+            .collect();
+        if !rows.is_empty() {
+            body.push_str("<h2>Action items</h2>\n<table class=\"actions\">\n<tr><th>Owner</th><th>Task</th></tr>\n");
+            for (owner, task) in rows {
+                let owner = if owner.is_empty() { "—".to_string() } else { html_escape(&owner) };
+                body.push_str(&format!("<tr><td>{}</td><td>{}</td></tr>\n", owner, html_escape(&task)));
+            }
+            body.push_str("</table>\n");
+        }
+    }
+    body
 }
 
 /// Pinned-file text as context, plus the file names, under a shared char budget.
@@ -6084,8 +6478,10 @@ fn extract_md_table(text: &str) -> Option<Vec<Vec<String>>> {
 // only simple BODY markup; the app wraps it in a styled, sandboxed page.
 const DOC_SYS: &str = "You write the body of a single clear, well-structured HTML document \
 using simple tags only: <h2>, <h3>, <p>, <ul>/<li>, <ol>/<li>, <strong>, <em>, <a>, \
-<table>/<tr>/<td>. Output ONLY the inner HTML — no <html>, <head>, <body> or <style> tags, \
-no code fences, no preamble, no \"Here is\".";
+<blockquote>, <table>/<tr>/<td>. Open with ONE short <p> that sums up the document, then \
+organize the rest under <h2> section headings. Do NOT repeat the document's title as a \
+heading — it is added for you. Output ONLY the inner HTML — no <html>, <head>, <body>, <h1> \
+or <style> tags, no code fences, no preamble, no \"Here is\".";
 
 // ---- individual commands ----
 
@@ -6197,7 +6593,7 @@ async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
                 continue;
             }
             let name = html_note_name(item);
-            let doc = html_document(&name, &body);
+            let doc = html_titled_doc(&name, item, &body);
             let guard = ctx.state.room.lock().unwrap();
             let Some(room) = guard.as_ref() else { break };
             if let Ok(meta) = create_note(&room.conn, &name, &doc) {
@@ -6247,7 +6643,7 @@ async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
         Some(h) => format!("{h}.html"),
         None => html_note_name(&topic),
     };
-    let doc = html_document(&name, &body);
+    let doc = html_titled_doc(&name, &title_from_name(&name), &body);
     let meta = {
         let guard = ctx.state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
@@ -6518,21 +6914,150 @@ async fn cmd_transcribe(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     let ext = extraction::extension_of(&name);
     let is_media = stt::media_kind(&mime, &ext).is_some();
     if text.trim().is_empty() {
-        return if is_media {
-            Ok(CommandResult {
-                content: format!(
-                    "\"{name}\" is still being transcribed in the background — try again in a \
-                     moment."
-                ),
-                ..Default::default()
-            })
-        } else {
-            Err(format!("\"{name}\" isn't an audio or video file."))
+        if !is_media {
+            return Err(format!("\"{name}\" isn't an audio or video file."));
+        }
+        use tauri::{Emitter, Manager};
+        let app = ctx.window.app_handle().clone();
+        // The voice model must be downloaded before anything can transcribe.
+        let model_path = stt_model_path(&app)?;
+        if !model_path.exists() {
+            return Err(
+                "The voice model isn't downloaded yet — get it in Settings → AI (Voice model), \
+                 then run #transcribe again."
+                    .into(),
+            );
+        }
+        // The import-time background job may have failed or not finished — so do
+        // it now, on demand. Whisper is CPU-bound, so run it OFF the async runtime.
+        let _ = ctx.window.emit(
+            "ask-step",
+            format!("Transcribing {name} (long recordings take a while)…"),
+        );
+        let (bytes, room_path) = {
+            let guard = ctx.state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let bytes = db::get_file_bytes(&room.conn, file_id)?
+                .ok_or("This recording has no stored audio.")?;
+            (bytes, room.path.clone())
         };
+        let kind = stt::media_kind(&mime, &ext).unwrap_or(stt::MediaKind::Audio);
+        let ext_owned = ext.clone();
+        let model_for_job = model_path.clone();
+        let transcript = tauri::async_runtime::spawn_blocking(move || {
+            stt::decode_bytes_to_pcm(&bytes, &ext_owned, kind)
+                .and_then(|pcm| stt::transcribe(&model_for_job, &pcm, true))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let transcript = transcript.trim().to_string();
+        if transcript.is_empty() {
+            return Err(format!(
+                "Couldn't get any speech from \"{name}\" — it may be silent, music-only, or an \
+                 unreadable format."
+            ));
+        }
+        // Cache it so a re-run is instant and the one-liner filler picks it up.
+        let full_text = format!("(transcribed from recording)\n{transcript}");
+        {
+            let guard = ctx.state.room.lock().unwrap();
+            if let Some(room) = guard.as_ref() {
+                if room.path == room_path {
+                    if let Ok(Some(b)) = db::get_file_bytes(&room.conn, file_id) {
+                        let _ = db::update_file_content(&room.conn, file_id, &b, Some(&full_text));
+                    }
+                }
+            }
+        }
+        let _ = ctx.window.emit("room-files-changed", ());
+        return Ok(CommandResult {
+            content: format!("Transcript of **{name}**:\n\n{transcript}"),
+            sources: vec![name],
+            ..Default::default()
+        });
     }
     Ok(CommandResult {
         content: format!("Transcript of **{name}**:\n\n{}", text.trim()),
         sources: vec![name],
+        ..Default::default()
+    })
+}
+
+/// #minutes @<transcript/recording/notes> — turn a meeting source into a
+/// timeline-styled HTML minutes document (ADD-22). The model only fills the
+/// structured `minutes_schema`; Rust renders the template. Falls back to the
+/// recent chat when no @ files are pinned.
+async fn cmd_minutes(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
+    use tauri::Emitter;
+    let (refctx, ref_names) = {
+        let guard = ctx.state.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        refs_context(&room.conn, ctx.refs, 12000)
+    };
+    // A pinned file with no readable text is usually an un-transcribed recording.
+    if !ctx.refs.is_empty() && refctx.trim().is_empty() {
+        return Err(
+            "That file has no readable text yet — if it's a recording, run #transcribe on it \
+             first, then #minutes."
+                .into(),
+        );
+    }
+    let source = if !refctx.trim().is_empty() {
+        refctx
+    } else if !ctx.history.trim().is_empty() {
+        format!("Conversation:\n{}", ctx.history)
+    } else {
+        return Err(
+            "Give me something to turn into minutes — e.g. #minutes @meeting.m4a (a transcript \
+             or notes), or run it after a discussion in this chat."
+                .into(),
+        );
+    };
+    let _ = ctx.window.emit("ask-step", "Building the meeting minutes…");
+    let raw = ctx
+        .ask_structured(
+            "You turn a meeting transcript or notes into structured minutes. Produce a short \
+             title; the date if stated; attendees if named; a TIMELINE of the discussion as an \
+             ordered list of items, each with an optional time or phase label, a short topic, and \
+             a 1-2 sentence summary; the key decisions; and action items with an owner when known. \
+             Base everything ONLY on the source — leave a field empty rather than inventing it.",
+            format!("Source:\n{source}"),
+            Some(0.3),
+            &minutes_schema(),
+        )
+        .await?;
+    let parsed: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
+    let has_timeline = parsed
+        .get("timeline")
+        .and_then(|v| v.as_array())
+        .map_or(false, |a| !a.is_empty());
+    if !has_timeline {
+        return Err(
+            "Couldn't find a meeting to summarize in that source. Point #minutes at a transcript \
+             or notes with @, e.g. #minutes @meeting.m4a."
+                .into(),
+        );
+    }
+    let title = parsed
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Meeting minutes")
+        .to_string();
+    let body = render_minutes_html(&parsed, &title);
+    let doc = html_document(&title, &body);
+    let name = html_note_name(&title);
+    let meta = {
+        let guard = ctx.state.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        create_note(&room.conn, &name, &doc)?
+    };
+    let _ = ctx.window.emit("room-files-changed", ());
+    let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
+    Ok(CommandResult {
+        content: format!("Created **{}** — a timeline of the meeting.", meta.name),
+        sources: ref_names,
         ..Default::default()
     })
 }
@@ -6730,6 +7255,7 @@ pub async fn run_command(
         "summarize" => cmd_summarize(&ctx).await,
         "compare" => cmd_compare(&ctx).await,
         "transcribe" => cmd_transcribe(&ctx).await,
+        "minutes" => cmd_minutes(&ctx).await,
         "to-sheet" => cmd_to_sheet(&ctx).await,
         "translate" => cmd_translate(&ctx).await,
         _ => Err(format!("Unknown command #{command}.")),
@@ -6808,6 +7334,30 @@ mod tests {
         assert_eq!(parse_boxes(raw2, w, h).len(), 1);
         // A genuine empty answer stays empty.
         assert_eq!(parse_boxes("[]", w, h).len(), 0);
+    }
+
+    #[test]
+    fn prepare_image_fits_square_so_boxes_dont_drift_down() {
+        // A wide, non-square image is fitted onto the 1000×1000 grounding canvas.
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(800, 300))
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        let (_bytes, w, h) = prepare_image(&buf);
+        assert_eq!((w, h), (1000.0, 1000.0), "image is fitted to a square canvas");
+        // A box the model reports centered vertically (0..1000 space) must land
+        // centered — before the fix it was normalized by the 300px height and
+        // shot far down the page.
+        let items = vec![serde_json::json!({"bbox_2d": [100, 450, 900, 550], "label": "mid"})];
+        let boxes = boxes_from_items(items, w, h);
+        assert_eq!(boxes.len(), 1);
+        assert!(
+            (boxes[0].y1 - 0.45).abs() < 0.01 && (boxes[0].y2 - 0.55).abs() < 0.01,
+            "vertical center stays centered: got y1={}, y2={}",
+            boxes[0].y1,
+            boxes[0].y2
+        );
+        assert!((boxes[0].x1 - 0.10).abs() < 0.01, "x maps cleanly too");
     }
 
     #[test]
@@ -7312,5 +7862,54 @@ mod tests {
     fn html_note_name_defaults_to_html() {
         assert_eq!(html_note_name("Q3 report"), "Q3 report.html");
         assert_eq!(html_note_name(""), "Note.html");
+    }
+
+    #[test]
+    fn render_minutes_html_builds_timeline() {
+        let data = serde_json::json!({
+            "title": "Weekly sync",
+            "date": "2026-07-05",
+            "attendees": ["Ana", "Ben"],
+            "timeline": [
+                {"time": "09:00", "topic": "Kickoff", "summary": "Reviewed goals."},
+                {"topic": "Budget", "summary": "Agreed on Q3 numbers."}
+            ],
+            "decisions": ["Ship on Friday"],
+            "actions": [{"owner": "Ana", "task": "Send recap"}, {"task": "Book room"}]
+        });
+        let body = render_minutes_html(&data, "Weekly sync");
+        assert!(body.contains("<h1>Weekly sync</h1>"));
+        // Editorial hero: an accent eyebrow labels the document type.
+        assert!(body.contains("class=\"eyebrow\"") && body.contains("Meeting minutes"));
+        assert!(body.contains("class=\"tl\""));
+        assert!(body.contains("class=\"chip\""), "attendees render as chips");
+        assert!(body.contains("Kickoff") && body.contains("Budget"));
+        assert!(body.contains("Ship on Friday"));
+        assert!(body.contains("Send recap"));
+        assert!(body.contains("<td>—</td>"), "ownerless action falls back to —");
+        // Wraps into a full themed document (centered column + footer).
+        let doc = html_document("Weekly sync", &body);
+        assert!(doc.starts_with("<!doctype html>"));
+        assert!(doc.contains("--accent"));
+        assert!(doc.contains("class=\"doc\"") && doc.contains("doc-foot"));
+    }
+
+    #[test]
+    fn doc_helpers_render() {
+        assert_eq!(title_from_name("Q3 report.html"), "Q3 report");
+        assert_eq!(title_from_name("notes"), "notes");
+        assert_eq!(file_glyph("chart.pdf"), "📕");
+        assert_eq!(file_glyph("clip.m4a"), "🎧");
+        assert_eq!(file_glyph("mystery.zzz"), "📄");
+        // A model body gets a serif title header prepended…
+        let doc = html_titled_doc("Apple.html", "Apple", "<p>Hi</p>");
+        assert!(doc.contains("<h1>Apple</h1>") && doc.contains("<p>Hi</p>"));
+        // …but a full page the model already returned passes through untouched.
+        let full = "<!doctype html><html><body>x</body></html>";
+        assert_eq!(html_titled_doc("f.html", "F", full), full);
+        // Hero with an eyebrow and a subline.
+        let h = doc_hero("Room summary", "My Room", "Generated on 2026-07-06");
+        assert!(h.contains("class=\"eyebrow\"") && h.contains("My Room"));
+        assert!(h.contains("class=\"rule\""));
     }
 }

@@ -115,11 +115,21 @@ pub async fn chat_stream_tools(
 /// structurally invalid document, and constrained decoding is markedly faster.
 pub async fn chat_structured(
     model: &str,
-    messages: Vec<ChatMessage>,
+    mut messages: Vec<ChatMessage>,
     temperature: Option<f64>,
     keep_alive: &str,
     schema: &serde_json::Value,
 ) -> Result<String, String> {
+    // CRITICAL (Ollama's own guidance): `format` constrains the output GRAMMAR
+    // but the model NEVER SEES the schema. Without the field names in the prompt
+    // a small model tends to fill the forced JSON with empty strings, so we
+    // append the schema to the last user message to ground its content.
+    if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "user") {
+        last.content.push_str(&format!(
+            "\n\nReply with ONLY JSON matching this schema, filling every field with real content:\n{}",
+            serde_json::to_string(schema).unwrap_or_default()
+        ));
+    }
     let (text, _) =
         chat_core(model, messages, None, temperature, None, keep_alive, Some(schema), |_| {}).await?;
     Ok(text)
