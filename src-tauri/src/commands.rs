@@ -918,12 +918,41 @@ pub fn open_room(
 
 // ---------------------------------------------------------------- speech-to-text (ADD-18)
 
-/// Where the Whisper model lives: <app data dir>/models/<MODEL_FILE>. The
-/// engine is compiled in; only these weights download, like Ollama models.
+/// Where a *downloaded* Whisper model lives: <app data dir>/models/<MODEL_FILE>.
+/// The engine is compiled in; the weights are either bundled in the app (see
+/// `bundled_stt_model`) or downloaded here, like Ollama models.
 fn stt_model_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     use tauri::Manager;
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(dir.join("models").join(stt::MODEL_FILE))
+}
+
+/// The Whisper model bundled inside the app as a Tauri resource, if this build
+/// shipped with it (release DMGs do). Dev/unbundled builds just get a path that
+/// doesn't exist.
+fn bundled_stt_model(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    app.path()
+        .resolve(
+            format!("models/{}", stt::MODEL_FILE),
+            tauri::path::BaseDirectory::Resource,
+        )
+        .ok()
+        .filter(|p| p.exists())
+}
+
+/// The model to actually transcribe with: a user-downloaded copy wins (they may
+/// have swapped one in), otherwise the copy bundled in the app. whisper.cpp
+/// mmaps the file read-only, so the read-only Resources path is used directly —
+/// no copy-out needed. `None` only when neither exists (an unbundled build with
+/// nothing downloaded yet).
+fn stt_effective_model(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    if let Ok(p) = stt_model_path(app) {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    bundled_stt_model(app)
 }
 
 /// One download at a time; the UI disables the button while this is set.
@@ -940,7 +969,9 @@ pub struct SttStatus {
 #[tauri::command]
 pub fn stt_status(app: tauri::AppHandle) -> Result<SttStatus, String> {
     Ok(SttStatus {
-        installed: stt_model_path(&app)?.exists(),
+        // Bundled OR downloaded both count as installed, so a release build
+        // (which ships the model) never prompts for a download.
+        installed: stt_effective_model(&app).is_some(),
         downloading: STT_DOWNLOADING.load(Ordering::SeqCst),
         size_mb: stt::MODEL_SIZE_MB,
     })
@@ -958,7 +989,7 @@ pub async fn stt_download_model(
     use tauri::Emitter;
 
     let dest = stt_model_path(&app)?;
-    if dest.exists() {
+    if dest.exists() || bundled_stt_model(&app).is_some() {
         return Ok(());
     }
     if STT_DOWNLOADING.swap(true, Ordering::SeqCst) {
@@ -1022,10 +1053,9 @@ pub async fn transcribe_audio(
     ext: String,
     timestamps: bool,
 ) -> Result<String, String> {
-    let model = stt_model_path(&app)?;
-    if !model.exists() {
+    let Some(model) = stt_effective_model(&app) else {
         return Err("STT_MODEL_MISSING".into());
-    }
+    };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data_b64)
         .map_err(|e| e.to_string())?;
@@ -1045,11 +1075,10 @@ pub async fn transcribe_audio(
 /// having no text, exactly like before this feature.
 fn run_stt_job(app: &tauri::AppHandle, job: JobMeta) {
     use tauri::{Emitter, Manager};
-    let Ok(model) = stt_model_path(app) else { return };
-    if !model.exists() {
+    let Some(model) = stt_effective_model(app) else {
         let _ = app.emit("stt-progress", (&job.name, "model-missing"));
         return;
-    }
+    };
     let Some(kind) = stt::media_kind(&job.mime, &job.ext) else { return };
     let _ = app.emit("stt-progress", (&job.name, "started"));
     let Some(bytes) = read_job_bytes(app, &job) else { return };
@@ -6919,15 +6948,15 @@ async fn cmd_transcribe(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
         }
         use tauri::{Emitter, Manager};
         let app = ctx.window.app_handle().clone();
-        // The voice model must be downloaded before anything can transcribe.
-        let model_path = stt_model_path(&app)?;
-        if !model_path.exists() {
+        // Prefer a bundled/downloaded model; only unbundled builds with nothing
+        // downloaded yet reach the error.
+        let Some(model_path) = stt_effective_model(&app) else {
             return Err(
-                "The voice model isn't downloaded yet — get it in Settings → AI (Voice model), \
+                "The voice model isn't available yet — get it in Settings → AI (Voice model), \
                  then run #transcribe again."
                     .into(),
             );
-        }
+        };
         // The import-time background job may have failed or not finished — so do
         // it now, on demand. Whisper is CPU-bound, so run it OFF the async runtime.
         let _ = ctx.window.emit(

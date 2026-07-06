@@ -35,7 +35,8 @@
       }
     ],
     "resources": {
-      "icons/document.icns": "document.icns"
+      "icons/document.icns": "document.icns",
+      "resources/models/ggml-large-v3-turbo-q5_0.bin": "models/ggml-large-v3-turbo-q5_0.bin"
     },
     "macOS": {
       "signingIdentity": "-",

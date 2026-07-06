@@ -119,8 +119,9 @@ already there.
   bundled engine, nothing over the network. Best-effort: if it can't, import
   quietly falls back to "no text."
 - **Dictation & transcription.** A Whisper engine is *compiled into* the app
-  (whisper.cpp on Metal) — only the model weights download on first use, one
-  deletable file. Record voice messages, dictate into the composer, or drop in
+  (whisper.cpp on Metal) and the release DMG **ships the voice model**, so
+  transcription works offline the moment you open it — no download. Record voice
+  messages, dictate into the composer, or drop in
   an audio/video file and get an on-device transcript. Optionally have the
   local model clean up or translate what you said. Decoding uses tools that
   ship with macOS (`afconvert`/`avconvert`) — no ffmpeg, no Python.
@@ -243,9 +244,9 @@ not in the model's good intentions:
 
    On first launch Private Room shows a **model picker** — choose one (e.g.
    `qwen3.5:4b`, ~3.4 GB) and it downloads with a progress bar, no Terminal
-   needed. Dictation and OCR need nothing extra (the Whisper weights download on
-   first use), and you can add more models anytime in **Settings → Model
-   manager**.
+   needed. Dictation, transcription, and OCR need nothing extra — the Whisper
+   voice model is **bundled in the app**, so transcription works offline right
+   away. You can add more chat models anytime in **Settings → Model manager**.
 
 Prefer to build it yourself? See [Development](#development).
 
@@ -261,8 +262,17 @@ npm run e2e           # headless end-to-end smoke test (mock model, no network)
 
 Requires: Rust, Node, and [Ollama](https://ollama.com) with a model pulled
 (`ollama pull qwen3.5:4b`) — or pull it from inside the app via Settings →
-Model manager. Dictation and OCR need no extra install; the Whisper weights
-download on first use.
+Model manager. Dictation and OCR need no extra install; a dev build downloads
+the Whisper voice model on first use.
+
+> **Release builds bundle the voice model.** It's gitignored (~574 MB), so
+> before `npm run tauri build` fetch it into place, or the bundle step fails on
+> the missing resource:
+> ```sh
+> mkdir -p src-tauri/resources/models
+> curl -L -o src-tauri/resources/models/ggml-large-v3-turbo-q5_0.bin \
+>   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+> ```
 
 **Stack:** Tauri 2 (Rust) · React 19 + TypeScript · SQLCipher (AES-256) ·
 Ollama · whisper.cpp · Apple Vision.
