@@ -2564,6 +2564,66 @@ video.audio-view-media {
   font-size: 12px;
 }
 
+/* First-run model chooser inside the onboarding banner. */
+.model-pick {
+  width: 100%;
+}
+.model-pick-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 9px;
+}
+.model-pick-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.model-pick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+.model-pick-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 11px;
+}
+.model-pick-tag {
+  align-self: flex-start;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 1px 7px;
+  margin-bottom: 2px;
+}
+.model-pick-name {
+  font-weight: 650;
+  font-size: 13px;
+}
+.model-pick-meta {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.model-pick-blurb {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+  margin: 2px 0 9px;
+}
+.model-pick-get {
+  margin-top: auto;
+  align-self: flex-start;
+}
+
 .attach-row {
   display: flex;
   flex-wrap: wrap;

@@ -303,6 +303,41 @@ interface Props {
   onLock: () => void;
 }
 
+/**
+ * First-run model chooser. A curated set of local chat models the app can fully
+ * drive (chat + tools + image marking), so a fresh install isn't hard-wired to
+ * one download. Sizes are the Ollama download size; anything else can still be
+ * pulled by name in Settings → Model manager. Keep the first entry the default
+ * (matches the backend's DEFAULT_MODEL / best_default).
+ */
+const RECOMMENDED_MODELS: {
+  name: string;
+  label: string;
+  size: string;
+  blurb: string;
+  tag?: string;
+}[] = [
+  {
+    name: "qwen3.5:4b",
+    label: "Balanced",
+    size: "3.4 GB",
+    blurb: "Chat, tools, and image marking. A great default on 16 GB Macs.",
+    tag: "Recommended",
+  },
+  {
+    name: "qwen3.5:9b",
+    label: "Higher quality",
+    size: "6.6 GB",
+    blurb: "Sharper answers and reasoning; best with 32 GB+ of RAM.",
+  },
+  {
+    name: "gemma3:4b",
+    label: "Compact",
+    size: "3.3 GB",
+    blurb: "Google's small model — a lighter, capable all-rounder.",
+  },
+];
+
 export default function Workspace({ info, onLock }: Props) {
   const [files, setFiles] = useState<FileMeta[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
@@ -1686,6 +1721,14 @@ export default function Workspace({ info, onLock }: Props) {
       setPullingModel(false);
       setPullPercent(null);
     }
+  }
+
+  // First-run chooser: make the picked model the room's active model, then pull
+  // it — so once the download finishes the app is immediately ready to use it.
+  async function pickAndDownload(name: string) {
+    if (pullingModel) return;
+    await changeModel(name);
+    await downloadModel(name);
   }
 
   // ADD-10: open the download page for people who don't have Ollama yet.
@@ -3422,19 +3465,35 @@ export default function Workspace({ info, onLock }: Props) {
                   </span>
                 </span>
               ) : (
-                <>
-                  <span>
-                    Model <strong>{model}</strong> isn't downloaded yet.
-                  </span>
-                  <span className="onboard-actions">
-                    <button
-                      className="subtle btn-ic"
-                      onClick={() => downloadModel(model)}
-                    >
-                      <DownloadIcon size={13} /> Download {model}
-                    </button>
-                  </span>
-                </>
+                <div className="model-pick">
+                  <div className="model-pick-head">
+                    <strong>Pick a model to download</strong>
+                    <span className="model-pick-sub">
+                      It runs entirely on your Mac. You can switch or add more
+                      anytime in Settings.
+                    </span>
+                  </div>
+                  <div className="model-pick-grid">
+                    {RECOMMENDED_MODELS.map((m) => (
+                      <div className="model-pick-card" key={m.name}>
+                        {m.tag && (
+                          <span className="model-pick-tag">{m.tag}</span>
+                        )}
+                        <div className="model-pick-name">{m.name}</div>
+                        <div className="model-pick-meta">
+                          {m.label} · {m.size}
+                        </div>
+                        <div className="model-pick-blurb">{m.blurb}</div>
+                        <button
+                          className="subtle btn-ic model-pick-get"
+                          onClick={() => pickAndDownload(m.name)}
+                        >
+                          <DownloadIcon size={13} /> Download
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               )}
               {pullError && <div className="banner-error">{pullError}</div>}
             </div>

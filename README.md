@@ -233,18 +233,18 @@ not in the model's good intentions:
    Rather not use Terminal? Double-click the app, click **Done** on the warning,
    then open **System Settings → Privacy & Security**, scroll to **Security**,
    and click **Open Anyway** next to "Private Room" (you'll confirm once more).
-3. Install the local AI engine and pull a small model — the app talks to it on
-   `localhost:11434`:
+3. Install the local AI engine — **Ollama** — and start it (the app talks to it
+   on `localhost:11434`):
 
    ```sh
    brew install ollama            # or get it from https://ollama.com
    ollama serve &                 # skip if the Ollama menu-bar app is running
-   ollama pull qwen3.5:4b         # default chat model
-   ollama pull qwen2.5vl:3b       # optional: sharper image marking / OCR
    ```
 
-   Dictation and OCR need nothing extra — the Whisper weights download on first
-   use, and you can also pull models from inside the app via **Settings → Model
+   On first launch Private Room shows a **model picker** — choose one (e.g.
+   `qwen3.5:4b`, ~3.4 GB) and it downloads with a progress bar, no Terminal
+   needed. Dictation and OCR need nothing extra (the Whisper weights download on
+   first use), and you can add more models anytime in **Settings → Model
    manager**.
 
 Prefer to build it yourself? See [Development](#development).
