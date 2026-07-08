@@ -32,6 +32,19 @@ human with the developer account.
 The auto-updater verifies each update with a Tauri (minisign) keypair that is
 separate from Apple code signing.
 
+> **Current state:** a keypair has already been generated during development and
+> its **public key is already committed** in `src-tauri/tauri.conf.json` at
+> `plugins.updater.pubkey`. The matching **private key was written to
+> `/tmp/pr_updater.key`** (an ephemeral, no-password dev key — it is NOT in git
+> and must never be committed). Before the first real release you must EITHER:
+> - move that private key into a CI secret (see step 7) and keep the committed
+>   pubkey as-is, OR
+> - regenerate a password-protected keypair (step 5) and replace the pubkey.
+>
+> Since no public release has shipped with this key yet, regenerating now is
+> safe (it only breaks updates for users already on a build signed with the old
+> key — of which there are none).
+
 5. **(one-time)** Generate the keypair:
    ```sh
    npm run tauri signer generate -- -w ~/.tauri/private-room.key
@@ -39,14 +52,21 @@ separate from Apple code signing.
    - Choose a strong password when prompted; save it in your password manager.
    - This prints (and writes) a **public key** and a **private key**.
 6. **(one-time)** Put the **public key** into `src-tauri/tauri.conf.json` at
-   `plugins.updater.pubkey`, replacing `REPLACE_WITH_UPDATER_PUBLIC_KEY`.
-   Commit that change.
-7. **(one-time)** Keep the **private key** and its password OUT of git. At
-   build/sign time they are supplied via env vars (see below).
+   `plugins.updater.pubkey` (already done for the current dev key). Commit that
+   change — the public key is safe to commit.
+7. **(one-time)** Keep the **private key** and its password OUT of git. The
+   private key belongs in **CI secrets**, never in the repo:
+   - GitHub Actions: store the private key text as the secret
+     `TAURI_SIGNING_PRIVATE_KEY` and (if password-protected) the password as
+     `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The release workflow reads them as
+     env vars at sign time.
+   - For local release builds, they are supplied via env vars (see below).
+   - Delete the ephemeral `/tmp/pr_updater.key` once it is safely in the secret
+     store — a temp file is not a keystore.
 8. **(one-time)** Set the release endpoint in `tauri.conf.json` at
    `plugins.updater.endpoints`. The default points at:
    ```
-   https://github.com/benreich/private-room/releases/latest/download/latest.json
+   https://github.com/benrben/private-room/releases/latest/download/latest.json
    ```
    Adjust the `owner/repo` if the GitHub repo differs.
 
@@ -111,7 +131,7 @@ export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="the-keypair-password"
      "platforms": {
        "darwin-aarch64": {
          "signature": "<paste contents of Private Room.app.tar.gz.sig>",
-         "url": "https://github.com/benreich/private-room/releases/download/v0.2.0/Private.Room.app.tar.gz"
+         "url": "https://github.com/benrben/private-room/releases/download/v0.2.0/Private.Room.app.tar.gz"
        }
      }
    }

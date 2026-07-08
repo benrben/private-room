@@ -1,0 +1,158 @@
+/* ---------- ADD-16 folders ---------- */
+
+.folder-group {
+  margin-top: 2px;
+}
+
+.folder-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 8px;
+  padding: 2px 2px 2px 0;
+}
+
+.folder-head:hover {
+  background: var(--panel-2);
+}
+
+/* ADD-16: drag-a-file-onto-a-folder (and onto the Files header to un-group). */
+.file-row[draggable="true"] {
+  cursor: grab;
+}
+.folder-head.drag-over,
+.side-head.drag-over {
+  background: var(--accent-soft);
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+  border-radius: 8px;
+}
+
+.folder-caret-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  padding: 4px 4px 4px 6px;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.folder-label {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 6px 2px;
+  text-align: left;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.folder-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-rename {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  padding: 5px 7px;
+}
+
+.folder-actions {
+  display: inline-flex;
+  align-items: center;
+  opacity: 0;
+}
+
+.folder-head:hover .folder-actions {
+  opacity: 1;
+}
+
+.folder-files {
+  padding-left: 16px;
+  margin-left: 12px;
+  border-left: 1px solid var(--border-subtle);
+}
+
+.folder-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+/* File-row "Move to…" menu */
+
+.move-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.move-pop {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 20;
+  min-width: 150px;
+  margin-top: 2px;
+  padding: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.move-opt {
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.move-opt:hover:not(:disabled) {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.move-opt:disabled {
+  color: var(--text-dim);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.move-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 7px 9px;
+}
+
+/* HLT-4 partial-index badge */
+
+.partial-badge {
+  flex-shrink: 0;
+  color: var(--warn);
+  font-size: 11px;
+  line-height: 1;
+  cursor: default;
+}
+

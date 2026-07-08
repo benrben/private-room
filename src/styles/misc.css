@@ -1,0 +1,421 @@
+/* =====================================================================
+   UX review additions
+   ===================================================================== */
+
+/* ---- resizable panes ---- */
+.sidebar {
+  flex-shrink: 0;
+}
+.pane-resizer {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+}
+.pane-resizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 2px;
+  border-radius: 3px;
+  transition: background 0.15s ease;
+}
+.pane-resizer:hover::after {
+  background: var(--accent-soft);
+}
+body.resizing-col,
+body.resizing-col * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+/* ---- right-click context menu on file rows ---- */
+.ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+}
+.ctx-menu {
+  position: fixed;
+  z-index: 61;
+  min-width: 180px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 5px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.ctx-item {
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 13px;
+  color: var(--text);
+}
+.ctx-item:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+.ctx-item:disabled {
+  color: var(--text-faint);
+  cursor: default;
+}
+.ctx-heading {
+  padding: 5px 10px 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.ctx-empty {
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.ctx-item.danger {
+  color: var(--danger);
+}
+.ctx-item.danger:hover {
+  background: rgba(229, 100, 108, 0.15);
+}
+.ctx-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 2px;
+}
+/* Inline "Remove from room?" confirm inside the file context menu. */
+.ctx-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ctx-confirm-q {
+  padding: 5px 10px 3px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.file-rename-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* ---- Memory prominence ---- */
+.memory-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: calc(100% - 24px);
+  margin: 0 12px 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: var(--surface-3);
+  font-size: 12.5px;
+  color: var(--text);
+}
+.memory-chip:hover {
+  border-color: var(--accent);
+}
+.memory-chip .count {
+  background: var(--accent-soft);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 11px;
+}
+.memory-chip.glow {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.memory-intro {
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--accent-soft);
+  border-radius: 9px;
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  line-height: 1.45;
+}
+.memory-intro-dismiss {
+  display: inline-block;
+  margin-top: 8px;
+  font-size: 12px;
+  padding: 3px 12px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+}
+
+/* ---- search overlay counts ---- */
+.search-count {
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.search-summary {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  padding: 4px 10px 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+
+/* ---- Settings: section navigation ---- */
+.settings-main {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+}
+.settings-nav {
+  flex: 0 0 140px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 8px;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+.settings-nav-item {
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 7px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.settings-nav-item:hover {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--text);
+}
+
+/* Guided MCP connector form. */
+.connector-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.mcp-advanced {
+  margin-bottom: 10px;
+}
+.mcp-advanced summary {
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  margin-bottom: 8px;
+}
+
+/* Generic danger button (context menu, compact confirm, MCP deny). */
+button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+button.danger:hover {
+  background: rgba(229, 100, 108, 0.15);
+}
+
+/* ---- MCP per-call approval modal ---- */
+.approve-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.approve-card {
+  width: 100%;
+  max-width: 440px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 22px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+.approve-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+.approve-body {
+  font-size: 13.5px;
+  color: var(--text);
+  line-height: 1.5;
+  margin: 0 0 12px;
+}
+.approve-args {
+  max-height: 140px;
+  overflow: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+  margin: 0 0 14px;
+}
+.approve-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.approve-actions button {
+  width: 100%;
+  padding: 9px;
+}
+
+/* ---- icon + text alignment (emoji → SVG swap) ---- */
+.badge-label,
+.memory-chip-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.badge-label svg,
+.memory-chip-label svg {
+  flex-shrink: 0;
+}
+.mcp-badge {
+  display: flex;
+  align-items: center;
+}
+/* Sidebar text buttons that pair a line-icon with a label. */
+.side-head-actions .subtle,
+.viewer-actions .subtle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.side-head-actions .subtle svg,
+.viewer-actions .subtle svg {
+  flex-shrink: 0;
+}
+/* Inline warning glyph inside settings hint paragraphs. */
+.warn-ic {
+  color: var(--warn);
+  vertical-align: -2px;
+  margin-right: 3px;
+}
+
+/* ---- ADD-22: training-wheel UI (badges, lanes, undo, nudges) ---- */
+
+/* Settings: model capability badges + the can't-drive-the-app warning. */
+.model-badges {
+  display: inline-flex;
+  gap: 5px;
+  margin-left: 8px;
+}
+.model-badge {
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  background: var(--panel);
+  white-space: nowrap;
+}
+.model-warn {
+  margin-top: 8px;
+}
+
+/* Chat: the deterministic router's chosen lane, shown before the step chips. */
+.lane-chip {
+  font-size: 11px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 20px;
+  padding: 2px 9px;
+  font-weight: 500;
+}
+
+/* A tool step that didn't succeed reads as failed instead of neutral. */
+.step-chip.failed {
+  color: var(--warn, #d9534f);
+  border-color: color-mix(in srgb, var(--warn, #d9534f) 45%, transparent);
+  background: color-mix(in srgb, var(--warn, #d9534f) 10%, transparent);
+}
+
+/* Annotation chip: "≈ closest match" qualifier when the quote was approximate. */
+.annot-approx {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* Undo affordance on an assistant message that changed a file. */
+.undo-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Nudge to attach an image the question names but hasn't attached. */
+.attach-nudge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 8px;
+}
+.attach-nudge .subtle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+/* Empty-chat command discovery row. */
+.cmd-hints {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+}
+.cmd-hints-label {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.cmd-hint-chip {
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-dim);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+.cmd-hint-chip:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+

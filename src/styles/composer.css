@@ -1,0 +1,341 @@
+/* ---------- composer ---------- */
+
+.composer {
+  position: relative;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+  padding: 12px 16px 14px;
+}
+
+/* Compact, calm one-line cloud status (was a heavy amber banner). */
+.cloud-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 5px 10px;
+  font-size: 11px;
+  border-radius: 8px;
+  background: rgba(227, 179, 65, 0.06);
+  border: 1px solid rgba(227, 179, 65, 0.2);
+  color: var(--warn);
+}
+.cloud-strip-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.cloud-strip-label svg {
+  flex-shrink: 0;
+}
+.cloud-strip-action {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--warn);
+  font-size: 11px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.cloud-strip-action:hover {
+  border-color: transparent;
+  color: #f0c85a;
+}
+
+/* Floating composer card. */
+.composer-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 12px 8px;
+  transition: border-color 0.15s ease;
+}
+.composer-card:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ghost);
+}
+.composer-input {
+  width: 100%;
+  min-height: 72px;
+  max-height: 200px;
+  resize: none;
+  background: none;
+  border: none;
+  padding: 2px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--text);
+  outline: none;
+}
+.composer-input:focus {
+  border: none;
+}
+.composer-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+}
+.composer-tools-left,
+.composer-tools-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 7px;
+}
+.tool-chip:hover {
+  color: var(--text);
+  background: var(--surface-4);
+  border-color: transparent;
+}
+.tool-chip svg {
+  flex-shrink: 0;
+}
+.tool-hash {
+  font-weight: 700;
+  color: var(--text-dim);
+}
+/* Violet square send button — icon only, no label. */
+.send-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 9px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: #fff;
+}
+.send-btn:hover:not(:disabled) {
+  background: #7d6ef0;
+  border-color: #7d6ef0;
+}
+.send-btn:disabled {
+  background: var(--surface-4);
+  border-color: transparent;
+  color: var(--text-faint);
+}
+.send-btn.stop {
+  background: transparent;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.send-btn.stop:hover {
+  background: rgba(229, 100, 108, 0.12);
+}
+
+/* ===== Wave 3 (Workspace) additions ===== */
+
+/* ADD-8 — full-window drop highlight while dragging files over the app. */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(139, 124, 246, 0.14);
+  backdrop-filter: blur(1px);
+  pointer-events: none;
+}
+.drop-overlay-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 26px 40px;
+  border: 2px dashed var(--accent);
+  border-radius: 16px;
+  background: var(--panel);
+  color: var(--accent);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+/* ADD-7 — Stop button while an answer streams. */
+.stop-btn {
+  color: var(--danger);
+  border-color: var(--border);
+  white-space: nowrap;
+}
+.stop-btn:hover {
+  border-color: var(--danger);
+}
+.stop-glyph {
+  font-size: 10px;
+  line-height: 1;
+}
+
+/* ADD-18 — audio/video viewer with clickable transcript. */
+.audio-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+.audio-view-media {
+  width: 100%;
+  flex-shrink: 0;
+  border-radius: 8px;
+  outline: none;
+}
+video.audio-view-media {
+  max-height: 45%;
+  background: #000;
+}
+.audio-transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-right: 4px;
+}
+.audio-line {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: none;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.audio-line.plain {
+  color: var(--text-dim);
+  font-style: italic;
+  cursor: default;
+}
+.audio-line:not(.plain):hover {
+  background: var(--panel);
+  border-color: var(--border);
+}
+.audio-line.active {
+  background: var(--panel);
+  border-color: var(--accent);
+}
+.audio-stamp {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+/* ---- HTML runner (sandboxed live preview) ---- */
+.html-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.html-view-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  flex-shrink: 0;
+}
+.html-view-note {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.html-view-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.html-view-frame {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+
+/* ADD-18 — dictation mic in the composer. */
+.mic-btn {
+  flex-shrink: 0;
+}
+.mic-btn.recording {
+  color: var(--danger);
+  border-color: var(--danger);
+  animation: mic-pulse 1.4s ease-in-out infinite;
+}
+.mic-btn.busy {
+  opacity: 0.6;
+}
+@keyframes mic-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(224, 82, 82, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(224, 82, 82, 0);
+  }
+}
+
+/* CHG-5 — per-turn tool-step chips above the live stream. */
+.step-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 7px;
+}
+.step-chip {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 2px 9px;
+}
+
+/* CHG-7 — source chips are clickable buttons; style them to read as links. */
+.source-chip {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 2px;
+  transition: color 0.15s ease, border-color 0.15s ease,
+    background 0.15s ease, text-decoration-color 0.15s ease;
+}
+.source-chip:hover {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  text-decoration-color: var(--accent);
+}
+
+/* ADD-9 — inline chat rename input matches the chat select. */
+.chat-rename {
+  flex: 1;
+  min-width: 0;
+}
+

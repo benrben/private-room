@@ -3,10 +3,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// Ollama's HTTP base URL. Normally the local daemon, but overridable via the
-/// `PRIVATE_ROOM_OLLAMA_URL` env var so end-to-end tests (HLT-8) can point the
-/// app at a mock server with no real model. Cached on first read; behaviour is
-/// identical to the old hardcoded constant when the env var is unset.
+/// Ollama's HTTP base URL from the ENV/DEFAULT layer only. Normally the local
+/// daemon, but overridable via the `PRIVATE_ROOM_OLLAMA_URL` env var so
+/// end-to-end tests (HLT-8) can point the app at a mock server with no real
+/// model. Cached on first read; behaviour is identical to the old hardcoded
+/// constant when the env var is unset.
+///
+/// Actual requests do NOT call this directly — they call `resolved_base_url()`,
+/// which layers a runtime override (the "closet supercomputer" Settings value)
+/// on top of this. Kept as `&'static str` because the env/default is fixed for
+/// the process lifetime.
 fn base_url() -> &'static str {
     static BASE_URL: OnceLock<String> = OnceLock::new();
     BASE_URL.get_or_init(|| {
@@ -16,6 +22,43 @@ fn base_url() -> &'static str {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "http://127.0.0.1:11434".to_string())
     })
+}
+
+/// C1: the runtime base-URL override — the "closet supercomputer" Settings
+/// value that points the app at a remote Ollama box on the LAN. Unlike
+/// `PRIVATE_ROOM_OLLAMA_URL` (read once, cached), this is settable while the app
+/// runs, so flipping the Settings field takes effect on the next request with no
+/// restart. `None` (the default) means "no override — fall back to env, then the
+/// local default".
+fn base_url_override() -> &'static std::sync::RwLock<Option<String>> {
+    static BASE_URL_OVERRIDE: OnceLock<std::sync::RwLock<Option<String>>> = OnceLock::new();
+    BASE_URL_OVERRIDE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// C1: set (or clear, with `None`) the runtime base-URL override. Trailing
+/// slashes are trimmed so a pasted `http://box:11434/` is stored the same as
+/// `http://box:11434`. An empty or whitespace-only string clears the override,
+/// same as `None`.
+pub fn set_base_url_override(url: Option<String>) {
+    let normalized = url
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+    if let Ok(mut guard) = base_url_override().write() {
+        *guard = normalized;
+    }
+}
+
+/// C1: the base URL that actual requests use. Precedence:
+/// runtime override (`set_base_url_override`) > `PRIVATE_ROOM_OLLAMA_URL` env >
+/// default `http://127.0.0.1:11434`. Returns an owned `String` (not the
+/// `&'static str` of `base_url()`) because the override can change at runtime.
+pub fn resolved_base_url() -> String {
+    if let Ok(guard) = base_url_override().read() {
+        if let Some(url) = guard.as_ref() {
+            return url.clone();
+        }
+    }
+    base_url().to_string()
 }
 
 /// ADD-13: default local embedding model for meaning-based retrieval. Small
@@ -132,7 +175,35 @@ pub async fn chat_structured(
     }
     let (text, _) =
         chat_core(model, messages, None, temperature, None, keep_alive, Some(schema), |_| {}).await?;
-    Ok(text)
+    Ok(recover_json(&text))
+}
+
+/// Recover the JSON payload from a structured-output response. Models that honor
+/// Ollama's `format` return bare JSON, so this is a no-op for them; but some
+/// models — notably Ollama *cloud* models, which ignore `format` — wrap the JSON
+/// in a ```json code fence or emit a `<think>` preamble, which a strict
+/// `serde_json::from_str` then rejects (the caller reports "nothing usable").
+/// Drop any `<think>` span, then slice from the first opening bracket to the last
+/// closing one so callers can parse it regardless of the model's framing.
+fn recover_json(text: &str) -> String {
+    let mut s = text.trim().to_string();
+    while let Some(a) = s.find("<think>") {
+        match s[a..].find("</think>") {
+            Some(rel) => {
+                let b = a + rel + "</think>".len();
+                s.replace_range(a..b, "");
+            }
+            None => break,
+        }
+    }
+    let s = s.trim();
+    match (
+        s.find(|c| c == '{' || c == '['),
+        s.rfind(|c| c == '}' || c == ']'),
+    ) {
+        (Some(a), Some(b)) if b >= a => s[a..=b].to_string(),
+        _ => s.to_string(),
+    }
 }
 
 /// Streaming chat that can also carry a tool catalog and/or a `format` schema.
@@ -186,7 +257,7 @@ async fn chat_core(
         body["think"] = serde_json::Value::Bool(false);
     }
     let resp = client()?
-        .post(format!("{}/api/chat", base_url()))
+        .post(format!("{}/api/chat", resolved_base_url()))
         .json(&body)
         .send()
         .await
@@ -269,7 +340,7 @@ pub async fn embed(model: &str, texts: &[String], keep_alive: &str) -> Result<Ve
         "keep_alive": keep_alive,
     });
     let resp = client()?
-        .post(format!("{}/api/embed", base_url()))
+        .post(format!("{}/api/embed", resolved_base_url()))
         .json(&body)
         .send()
         .await
@@ -306,7 +377,7 @@ pub async fn warm(model: &str) -> Result<(), String> {
         "options": { "num_ctx": 8192 },
     });
     client()?
-        .post(format!("{}/api/generate", base_url()))
+        .post(format!("{}/api/generate", resolved_base_url()))
         .json(&body)
         .send()
         .await
@@ -326,7 +397,7 @@ pub async fn pull(
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
-        .post(format!("{}/api/pull", base_url()))
+        .post(format!("{}/api/pull", resolved_base_url()))
         .json(&serde_json::json!({ "model": model, "stream": true }))
         .send()
         .await
@@ -369,7 +440,7 @@ pub async fn pull(
 
 pub async fn delete_model(model: &str) -> Result<(), String> {
     let resp = client()?
-        .delete(format!("{}/api/delete", base_url()))
+        .delete(format!("{}/api/delete", resolved_base_url()))
         .json(&serde_json::json!({ "model": model }))
         .send()
         .await
@@ -386,7 +457,7 @@ pub async fn delete_model(model: &str) -> Result<(), String> {
 
 pub async fn list_models() -> Result<Vec<String>, String> {
     let resp = client()?
-        .get(format!("{}/api/tags", base_url()))
+        .get(format!("{}/api/tags", resolved_base_url()))
         .send()
         .await
         .map_err(map_send_err)?;
@@ -408,7 +479,7 @@ pub async fn list_models() -> Result<Vec<String>, String> {
 pub async fn capabilities(model: &str) -> Vec<String> {
     let Ok(client) = client() else { return Vec::new() };
     let resp = client
-        .post(format!("{}/api/show", base_url()))
+        .post(format!("{}/api/show", resolved_base_url()))
         .json(&serde_json::json!({ "model": model }))
         .send()
         .await;
@@ -423,4 +494,49 @@ pub async fn capabilities(model: &str) -> Vec<String> {
         .as_array()
         .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // C1: the runtime override wins over env/default, trims trailing slashes,
+    // and clearing it falls back to the env/default path. No network involved.
+    #[test]
+    fn base_url_override_precedence() {
+        // A set override wins over env/default...
+        set_base_url_override(Some("http://example:1".to_string()));
+        assert_eq!(resolved_base_url(), "http://example:1");
+
+        // ...trailing slashes (and surrounding whitespace) are trimmed...
+        set_base_url_override(Some(" http://example:2/ ".to_string()));
+        assert_eq!(resolved_base_url(), "http://example:2");
+
+        // ...clearing with None falls back to the env/default layer...
+        set_base_url_override(None);
+        assert_eq!(resolved_base_url(), base_url());
+
+        // ...and an empty/whitespace-only string clears it too (same as None).
+        set_base_url_override(Some("   ".to_string()));
+        assert_eq!(resolved_base_url(), base_url());
+    }
+
+    // A structured-output response must parse whether the model returns bare
+    // JSON (local, honors `format`) or wraps it in a ```json fence / <think>
+    // preamble (Ollama cloud models, which ignore `format`).
+    #[test]
+    fn recover_json_unwraps_fences_think_and_prose() {
+        // Bare JSON is returned unchanged.
+        assert_eq!(recover_json("{\"markdown\":\"hi\"}"), "{\"markdown\":\"hi\"}");
+        // A ```json code fence (the cloud-model failure that reported "nothing
+        // usable") is stripped down to the JSON.
+        assert_eq!(
+            recover_json("```json\n{\"markdown\":\"hi\"}\n```"),
+            "{\"markdown\":\"hi\"}"
+        );
+        // A <think> reasoning preamble is dropped.
+        assert_eq!(recover_json("<think>hmm</think>\n{\"a\":1}"), "{\"a\":1}");
+        // A top-level array survives a bare fence.
+        assert_eq!(recover_json("```\n[1,2,3]\n```"), "[1,2,3]");
+    }
 }

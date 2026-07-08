@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { locateQuote } from "./highlight";
+import { locateQuote, makeReceiptBadge } from "./highlight";
 import { base64ToBytes } from "./util";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -142,6 +142,22 @@ async function highlightQuoteOnPage(
     hl.style.height = `${fontH * 1.2}px`;
     wrap.appendChild(hl);
     first = first ?? hl;
+  }
+  // A painted highlight means locateQuote found the quote verbatim on this
+  // page — a receipt. Tag the first box with a green "verified" check.
+  if (first) {
+    const badge = makeReceiptBadge();
+    badge.classList.add("pdf-hl-badge");
+    // Position only (look comes from the .receipt-badge CSS): sit just above
+    // the first matched run.
+    badge.style.position = "absolute";
+    badge.style.left = first.style.left;
+    badge.style.top = first.style.top;
+    badge.style.transform = "translateY(-115%)";
+    badge.style.pointerEvents = "none";
+    badge.style.zIndex = "3";
+    badge.style.whiteSpace = "nowrap";
+    wrap.appendChild(badge);
   }
   if (scroll) first?.scrollIntoView({ block: "center", behavior: "smooth" });
   return first != null;

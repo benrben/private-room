@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Private Room",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.benreich.privateroom",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -20,12 +20,13 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' ipc: http://ipc.localhost; frame-src 'self' blob: data: roomdoc:"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "fileAssociations": [
       {
         "ext": ["roomai"],
@@ -60,9 +61,9 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/benreich/private-room/releases/latest/download/latest.json"
+        "https://github.com/benrben/private-room/releases/latest/download/latest.json"
       ],
-      "pubkey": "REPLACE_WITH_UPDATER_PUBLIC_KEY"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRGRENGRDQzMUM1MTlDODgKUldTSW5GRWNRLzNjVCtkdXVDWFZOZU1aTkZSajY3a1Bab0lyd3hJWFMrNUFjNFZFa29nLzZFV1gK"
     }
   }
 }

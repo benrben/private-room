@@ -1,0 +1,30 @@
+/* A4 — Settings accessibility + brand-consistency styles.
+ * Imported from Settings.tsx (owned by A4). Keep new Settings-scoped styles
+ * here rather than in App.css (owned by A2).
+ *
+ * 1) Focus trap: give the focused element inside the trapped modal a clear
+ *    violet ring so keyboard users can always see where they are.
+ * 2) Badge glyphs: the model capability badges used to render multicolor
+ *    emoji (🔧 / 👁). They now use inline monochrome SVG glyphs that inherit
+ *    the badge's neutral text color — this keeps alignment tidy. */
+
+.settings :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* The modal container itself is programmatically focusable (tabindex=-1) as a
+   fallback focus target; it should not show a ring when focused that way. */
+.settings:focus,
+.settings:focus-visible {
+  outline: none;
+}
+
+/* Inline glyph inside a capability badge: sits on the text baseline and keeps
+   a small gap before the label. currentColor => inherits the badge's dim
+   neutral text color, so no warm emoji coloring. */
+.model-badge-ic {
+  vertical-align: -1.5px;
+  margin-right: 3px;
+}

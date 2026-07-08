@@ -21,9 +21,48 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
+        .manage(commands::HtmlPreviews::default())
+        // THE SANDBOX: serve staged HTML pages from an isolated origin so their
+        // own JS/CSS runs (like a real browser) while a strict per-response CSP
+        // blocks every network request — the page can't phone home or reach the
+        // app/room. The frontend loads roomdoc://localhost/<token>.
+        .register_uri_scheme_protocol("roomdoc", |ctx, request| {
+            use tauri::http::Response;
+            use tauri::Manager;
+            const CSP: &str = "default-src 'none'; \
+                script-src 'unsafe-inline' 'unsafe-eval'; \
+                style-src 'unsafe-inline'; img-src data: blob:; \
+                media-src data: blob:; font-src data:; connect-src 'none'; \
+                form-action 'none'; base-uri 'none'; frame-src 'none'";
+            let token = request.uri().path().trim_start_matches('/').to_string();
+            let html = ctx
+                .app_handle()
+                .state::<commands::HtmlPreviews>()
+                .map
+                .lock()
+                .unwrap()
+                .get(&token)
+                .cloned();
+            match html {
+                Some(body) => Response::builder()
+                    .status(200)
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .header("Content-Security-Policy", CSP)
+                    .body(body.into_bytes())
+                    .unwrap(),
+                None => Response::builder()
+                    .status(404)
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .body(b"preview not found".to_vec())
+                    .unwrap(),
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::create_room,
             commands::open_room,
+            commands::write_recovery_key,
+            commands::has_recovery_key,
+            commands::open_room_with_recovery,
             commands::touchid_has,
             commands::touchid_enable,
             commands::touchid_disable,
@@ -93,6 +132,27 @@ pub fn run() {
             commands::stt_delete_model,
             commands::transcribe_audio,
             commands::shape_text,
+            // Moonshot (Section D)
+            commands::recommended_models,
+            commands::ensure_embed_model,
+            commands::room_graph,
+            commands::front_page,
+            commands::front_page_suggestions,
+            commands::studio_prompts,
+            commands::ai_action_prompts,
+            commands::ai_action,
+            commands::open_html_in_browser,
+            commands::stage_preview_html,
+            commands::studio_flashcards,
+            commands::studio_mindmap,
+            commands::generate_podcast_script,
+            commands::memory_suggestion,
+            commands::suggest_file_meta,
+            commands::room_server_status,
+            commands::set_room_server,
+            commands::set_ollama_url,
+            commands::get_ollama_url,
+            commands::list_roles,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

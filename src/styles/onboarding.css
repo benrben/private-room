@@ -1,0 +1,227 @@
+/* CHG-1/ADD-10 — onboarding banners: button rows + in-banner download bar. */
+.banner.onboard {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.onboard-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.banner-pull {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.banner-pull .pull-bar {
+  flex: 1;
+  margin-bottom: 0;
+}
+.banner-pull-status {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.banner-error {
+  width: 100%;
+  margin-top: 6px;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+/* First-run model chooser inside the onboarding banner. */
+.model-pick {
+  width: 100%;
+}
+.model-pick-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 9px;
+}
+.model-pick-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.model-pick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+.model-pick-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 11px;
+}
+.model-pick-tag {
+  align-self: flex-start;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 1px 7px;
+  margin-bottom: 2px;
+}
+.model-pick-name {
+  font-weight: 650;
+  font-size: 13px;
+}
+.model-pick-meta {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.model-pick-blurb {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+  margin: 2px 0 9px;
+}
+.model-pick-get {
+  margin-top: auto;
+  align-self: flex-start;
+}
+
+.attach-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 20px;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+.attach-chip svg {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.attach-chip button {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  color: var(--text-dim);
+}
+
+.composer-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  position: relative;
+}
+
+.composer-row textarea {
+  flex: 1;
+  resize: none;
+  max-height: 140px;
+}
+
+/* ---------- "#"/"@" autocomplete popover ---------- */
+.ac-popover {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  /* Wider than the composer so command descriptions get room to breathe. */
+  min-width: 320px;
+  max-width: min(520px, 94vw);
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+  z-index: 20;
+}
+
+.ac-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 4px 8px 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ac-item {
+  /* Stack label ▸ usage ▸ description so nothing is clipped. */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 9px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.ac-item:hover,
+.ac-item.active {
+  background: var(--accent-soft);
+}
+
+.ac-label {
+  font-weight: 600;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+/* The "#cmd …" usage line, shown above the description as a monospace chip. */
+.ac-usage {
+  align-self: flex-start;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  padding: 1px 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ac-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+  /* No ellipsis — full descriptions wrap onto as many lines as needed. */
+  white-space: normal;
+  overflow: visible;
+}
+
+/* The "#help" sheet lists every command; give it extra width + height. */
+.help-popover {
+  min-width: 360px;
+  max-height: 60vh;
+}
+
+/* sidebar stays compact in the 3-pane layout */
+.sidebar {
+  width: 260px;
+  flex-shrink: 0;
+}
+

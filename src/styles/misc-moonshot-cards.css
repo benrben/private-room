@@ -1,0 +1,421 @@
+/* ---- STUDIO "edit the prompt" modal ---- */
+.studio-prompt-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.55);
+}
+.studio-prompt {
+  width: min(520px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 20px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+}
+.studio-prompt-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+}
+.studio-prompt-hint {
+  margin: 6px 0 12px;
+  font-size: 12.5px;
+  color: var(--slate);
+}
+.studio-prompt-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 84px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--panel-2, #1c212c);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.studio-prompt-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+/* Anchor the @-mention popover to the prompt field. */
+.studio-prompt-field {
+  position: relative;
+}
+.studio-ac-popover {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  z-index: 5;
+}
+.studio-prompt-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* The one-line "Your question" field shown for the "research" AI action. */
+.studio-prompt-question {
+  width: 100%;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--panel-2, #1c212c);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 9px 12px;
+  margin-bottom: 10px;
+}
+.studio-prompt-question:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* A quieter subtitle for the second group of the Studio shelf (AI actions). */
+.studio-shelf-subtitle {
+  margin-top: 4px;
+}
+
+/* Whole-room AI actions rendered as a compact chip grid under the shelf. */
+.ai-action-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 6px;
+}
+.ai-action-chip {
+  padding: 7px 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: center;
+  color: var(--text);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.ai-action-chip:hover:not(:disabled) {
+  border-color: rgba(139, 124, 246, 0.4);
+  background: var(--accent-ghost);
+}
+.ai-action-chip:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* ---- RECEIPTS (verified-quote badge) ---- */
+
+/* Small green "verified" check pill. */
+.receipt-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 9px 1px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.7;
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.receipt-badge svg {
+  flex-shrink: 0;
+}
+
+/* Verified state on an annotation chip: the amber quote turns calm green
+   (the located quote was found verbatim in the source). */
+.annot-chip.receipt-verified {
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+.annot-chip.receipt-verified:hover {
+  background: color-mix(in srgb, var(--ok) 18%, transparent);
+}
+.annot-chip.receipt-verified svg {
+  color: var(--ok);
+}
+
+/* ---- MEMORY SUGGESTION CARD (dismissible, save / ignore) ---- */
+
+.memory-suggestion {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-top: 10px;
+  padding: 11px 13px;
+  background: var(--accent-ghost);
+  border: 1px solid rgba(139, 124, 246, 0.22);
+  border-radius: 11px;
+  animation: toast-in 0.2s ease-out;
+}
+.memory-suggestion-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+}
+.memory-suggestion-head svg {
+  flex-shrink: 0;
+}
+.memory-suggestion-fact {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.memory-suggestion-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ---- SMART-IMPORT SUGGESTION CHIP (undoable) ---- */
+
+.import-suggestion {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  animation: toast-in 0.2s ease-out;
+}
+.import-suggestion svg {
+  flex-shrink: 0;
+  color: var(--accent-2);
+}
+.import-suggestion-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  line-height: 1.45;
+}
+.import-suggestion-text strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.import-suggestion-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* ---- RECOVERY SHEET (one-time code reveal; Print / Save PDF) ---- */
+
+.recovery-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 20px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  text-align: center;
+}
+.recovery-sheet-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+/* The code itself: big, monospace, generously spaced so it can be read aloud
+   and copied by hand. */
+.recovery-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  line-height: 1.5;
+  color: var(--accent-2);
+  padding: 14px 16px;
+  background: var(--bg);
+  border: 1px dashed rgba(139, 124, 246, 0.4);
+  border-radius: 10px;
+  word-break: break-word;
+  user-select: all;
+}
+.recovery-sheet-note {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+.recovery-sheet-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* Print / Save-PDF: strip the app chrome and lay the sheet out as a clean,
+   single, black-on-white page with the code big and monospace. */
+@media print {
+  /* Hide everything, then re-reveal only the recovery sheet. */
+  body * {
+    visibility: hidden !important;
+  }
+  .recovery-sheet,
+  .recovery-sheet * {
+    visibility: visible !important;
+  }
+  .recovery-sheet {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 48px 40px;
+    gap: 20px;
+    background: #fff;
+    border: none;
+    border-radius: 0;
+    color: #000;
+    box-shadow: none;
+  }
+  .recovery-sheet-title {
+    font-size: 20px;
+    color: #000;
+  }
+  .recovery-code {
+    font-size: 28px;
+    letter-spacing: 0.18em;
+    color: #000;
+    background: #fff;
+    border: 1.5px dashed #555;
+    padding: 22px 20px;
+  }
+  .recovery-sheet-note {
+    color: #333;
+    font-size: 13px;
+    max-width: 520px;
+    margin: 0 auto;
+  }
+  /* On-screen-only controls never print. */
+  .recovery-sheet-actions {
+    display: none !important;
+  }
+  /* Avoid a stray second page from an unrelated backdrop. */
+  .approve-backdrop,
+  .search-overlay {
+    display: none !important;
+  }
+  /* The recovery sheet can be printed from inside the Settings modal, whose
+     backdrop is `.settings-backdrop`. `display:none` on that ancestor would
+     kill the sheet subtree (a descendant's visibility can't override an
+     ancestor's display:none), so hide the backdrop ONLY when it does not hold
+     a recovery sheet. Browsers without :has() drop both rules and fall back to
+     the visibility trick above, which still prints the sheet cleanly. */
+  .settings-backdrop:not(:has(.recovery-sheet)) {
+    display: none !important;
+  }
+  .settings-backdrop:has(.recovery-sheet) {
+    display: block !important;
+    background: #fff !important;
+  }
+}
+
+/* ---- TIME MACHINE (version timeline strip) ---- */
+
+.time-machine {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* One version row: a timeline dot, the cause label, and a timestamp. */
+.tm-version {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.tm-version:hover {
+  background: var(--surface-3);
+  border-color: transparent;
+}
+.tm-version-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  box-shadow: 0 0 0 3px var(--surface-2);
+}
+.tm-cause {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tm-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Confirm step before a restore replaces the current file bytes. */
+.tm-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.tm-confirm-q {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+}
+.tm-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* The version currently loaded reads as the live, accented point. */
+.tm-version.current {
+  background: var(--accent-ghost);
+}
+.tm-version.current .tm-version-dot {
+  background: var(--accent);
+}
+.tm-version.current .tm-cause {
+  color: var(--accent-2);
+  font-weight: 600;
+}

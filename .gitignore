@@ -18,6 +18,9 @@ dist-ssr
 .idea
 .DS_Store
 
+# MCP tool scratch output (Playwright MCP) — not source
+.playwright-mcp/
+
 # Bundled Whisper voice model — ~574 MB, shipped inside the DMG, never committed.
 # Fetch it into place before a release build (see README / RELEASING.md).
 src-tauri/resources/models/*.bin

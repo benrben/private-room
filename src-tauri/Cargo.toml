@@ -1,13 +1,22 @@
 [package]
 name = "private-room"
-version = "0.1.0"
+version = "0.2.0"
 description = "Private Room — an encrypted local AI workspace in a single file"
 authors = ["Ben Reich"]
 edition = "2021"
+# The package now ships two binaries (the Tauri app + the `roomai` CLI), so the
+# bundler needs to be told which one is the app.
+default-run = "private-room"
 
 [lib]
 name = "private_room_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# ADD-20: tiny offline CLI (roomai verify/info/export) built on the lib crate.
+# The Tauri desktop app's default binary (src/main.rs) is unaffected.
+[[bin]]
+name = "roomai"
+path = "src/bin/roomai.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -27,6 +36,11 @@ tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt",
 futures-util = "0.3"
 base64 = "0.22"
 sha2 = "0.10"
+# ADD-19: recovery-key sidecar crypto (AES-256-GCM + PBKDF2). base64/sha2
+# above are reused; these three are the only new crypto deps.
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+rand = "0.8"
 sysinfo = "0.33"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 pdf-extract = "0.7"

@@ -1,84 +1,98 @@
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
+import { api } from "../api";
 
 /**
- * Live "runner" for HTML files. The source is rendered in a sandboxed iframe so
- * an opened page can't reach the app, the Tauri IPC, or the rest of the room:
- * the frame runs at a unique opaque origin (sandbox WITHOUT allow-same-origin),
- * so its scripts have no handle on our window.
+ * In-app "browser" for self-contained HTML files. The page is staged with the
+ * backend and loaded from the `roomdoc://` custom scheme, which serves it at an
+ * isolated origin with a strict CSP header: the page's OWN inline JS/CSS and
+ * data: assets run (so interactive pages render fully, like a real browser),
+ * but every network request is blocked — it can't phone home, and its opaque,
+ * cross-origin frame can't touch the app, the room, or Tauri IPC.
  *
- * Privacy: by default we inject a strict Content-Security-Policy that blocks
- * every network request, so merely opening a file can never phone home or leak
- * that it was viewed. Self-contained pages (inline CSS/JS, data: images) run
- * fine; a page that pulls external resources shows nothing until the reader
- * explicitly clicks "Allow network" for this view.
+ * Why not a blob: URL (the previous approach)? WKWebView won't execute a
+ * sandboxed blob: document's scripts, so JS-driven pages rendered blank. A real
+ * scheme served by the backend runs them normally.
+ *
+ * For a page that needs external resources (CDN scripts, remote images), the
+ * "Open in browser" button hands it to the user's default browser instead.
  */
 
 interface Props {
   source: string;
+  name?: string;
 }
 
-const BLOCK_NETWORK_CSP =
-  "default-src 'none'; " +
-  "script-src 'unsafe-inline' 'unsafe-eval'; " +
-  "style-src 'unsafe-inline'; " +
-  "img-src data: blob:; " +
-  "media-src data: blob:; " +
-  "font-src data:; " +
-  "connect-src 'none'; " +
-  "form-action 'none'; " +
-  "base-uri 'none'";
+export default function HtmlView({ source, name }: Props) {
+  const [url, setUrl] = useState("");
+  const [failed, setFailed] = useState(false);
+  const [opening, setOpening] = useState(false);
 
-/** Prepend a network-blocking CSP <meta> into the document's <head> so the
- * policy is in force before any resource can load. A CSP meta only applies from
- * inside <head>, so we splice after the opening tag when one exists and
- * synthesize a head otherwise. Multiple policies intersect, so this only ever
- * tightens a page that already ships its own CSP. */
-function blockNetwork(source: string): string {
-  const meta = `<meta http-equiv="Content-Security-Policy" content="${BLOCK_NETWORK_CSP}">`;
-  if (/<head[^>]*>/i.test(source)) {
-    return source.replace(/<head[^>]*>/i, (m) => `${m}${meta}`);
-  }
-  if (/<html[^>]*>/i.test(source)) {
-    return source.replace(/<html[^>]*>/i, (m) => `${m}<head>${meta}</head>`);
-  }
-  return `<!doctype html><head>${meta}</head>${source}`;
-}
+  // Stage the page and load it from roomdoc://; if staging fails, fall back to
+  // a sandboxed srcDoc so at least static content still shows.
+  useEffect(() => {
+    let alive = true;
+    setUrl("");
+    setFailed(false);
+    api
+      .stagePreviewHtml(source)
+      .then((token) => {
+        if (alive) setUrl(`roomdoc://localhost/${token}`);
+      })
+      .catch(() => {
+        if (alive) setFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [source]);
 
-export default function HtmlView({ source }: Props) {
-  const [allowNetwork, setAllowNetwork] = useState(false);
-  const doc = useMemo(
-    () => (allowNetwork ? source : blockNetwork(source)),
-    [source, allowNetwork],
-  );
+  // Open the raw page in the real browser, where interactive pages AND external
+  // resources render fully. Leaves the private sandbox — an explicit escape hatch.
+  async function openInBrowser() {
+    if (opening) return;
+    setOpening(true);
+    try {
+      await api.openHtmlInBrowser(name ?? "preview", source);
+    } catch {
+      /* best-effort — the in-app preview still works */
+    } finally {
+      setOpening(false);
+    }
+  }
 
   return (
     <div className="html-view">
       <div className="html-view-bar">
         <span className="html-view-note">
-          {allowNetwork
-            ? "Network allowed — this page can reach external resources."
-            : "Running in a sandbox — network blocked for privacy."}
+          Running in a sandbox — the page runs, but can't reach the network.
         </span>
-        <button
-          className="subtle"
-          title={
-            allowNetwork
-              ? "Block this page from making any network request"
-              : "Let this page load external resources (images, scripts, fonts). Only for pages you trust."
-          }
-          onClick={() => setAllowNetwork((v) => !v)}
-        >
-          {allowNetwork ? "Block network" : "Allow network"}
-        </button>
+        <span className="html-view-actions">
+          <button
+            className="subtle"
+            title="Open this page in your default browser — allows external resources and leaves the private sandbox. Only for pages you trust."
+            onClick={openInBrowser}
+            disabled={opening}
+          >
+            {opening ? "Opening…" : "Open in browser ↗"}
+          </button>
+        </span>
       </div>
-      {/* Re-key on the mode so toggling network fully reloads the frame. */}
-      <iframe
-        key={allowNetwork ? "net" : "safe"}
-        className="html-view-frame"
-        sandbox="allow-scripts allow-modals"
-        srcDoc={doc}
-        title="HTML preview"
-      />
+      {url ? (
+        <iframe
+          key={url}
+          className="html-view-frame"
+          sandbox="allow-scripts allow-modals"
+          src={url}
+          title="HTML preview"
+        />
+      ) : failed ? (
+        <iframe
+          className="html-view-frame"
+          sandbox="allow-scripts allow-modals"
+          srcDoc={source}
+          title="HTML preview"
+        />
+      ) : null}
     </div>
   );
 }

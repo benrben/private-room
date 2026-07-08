@@ -27,9 +27,19 @@ computer: the AI runs locally through Ollama.
 
 ## Why it's different
 
-- 🔐 **One encrypted file, no cloud.** The whole workspace is a single
-  AES-256 SQLCipher document. No account, no sync, no server. Your password is
-  the key — lose it and not one byte is recoverable.
+- 📍 **A local AI that can't fake a citation.** Every claim is pinned to the
+  exact sentence in your document — and the app *verifies the quote before it
+  shows it.* If the words aren't really there you get "≈ closest match" or
+  nothing at all, never a confident invention. Each answer carries a 📍 chip
+  that re-opens the highlight right in the file.
+- 📤 **AirDrop your whole workspace as one file.** A room is a single document,
+  so handing someone an entire encrypted workspace — files, chats, memory, and
+  all — is one drop of one `.roomai` file. Seal it and send it; nothing is left
+  behind on a server.
+- 🔐 **One encrypted file, no cloud.** The whole workspace is a single AES-256
+  SQLCipher document. No account, no sync, no server. Your password is the key
+  — no backdoor, no cloud reset. (When you create a room you can print a
+  one-time recovery key to keep somewhere safe.)
 - 🖥️ **The AI runs on your Mac.** A local model answers, sees your images,
   and *drives the app* — opening files, editing text, highlighting quotes,
   marking up images. Cloud is opt-in and always labeled.
@@ -49,6 +59,11 @@ computer: the AI runs locally through Ollama.
 | **Chat** | Streaming conversations with the room's AI, grounded in your files; any reply can be saved back into the room as a new document |
 | **Memory** | Facts the AI should always remember, editable in the sidebar — the AI can add its own |
 | **Settings** | Per-room model, creativity (temperature), custom instructions, Touch ID, dictation, and online features |
+
+**Start from a template.** A new room can begin **Blank**, or as **Legal**,
+**Medical**, **Research**, or **Journal** — each pre-fills tuned instructions, a
+few starter memories, and a welcome note. It's all ordinary, editable content;
+nothing is locked in.
 
 ## The AI lives in the room
 
@@ -107,8 +122,9 @@ Everything that touches your data runs on your Mac, using capabilities that are
 already there.
 
 - **Encryption.** Your password is the SQLCipher key (PBKDF2-derived
-  internally). A wrong password can't read a single byte; there is no recovery,
-  no reset link, no backdoor.
+  internally). A wrong password can't read a single byte; there's no backdoor
+  and no cloud reset — the only other way in is a recovery key you chose to
+  print when you created the room.
 - **Touch ID unlock.** Opt in per room and unlock with a fingerprint. The
   password is sealed in the macOS Keychain behind a `biometryCurrentSet`
   access control — it never touches the room file or any plain file, and
@@ -134,6 +150,10 @@ already there.
   appears in Settings as an engine choice. The UI is blunt: cloud engines send
   your questions and room context to *your own* account — images never leave,
   and vision/marking always stays local.
+- **Share the room with other AI tools — with a door.** Flip a switch and an
+  unlocked room becomes a local MCP server that tools like Claude Desktop or
+  Cursor can read from — over loopback only, and every app has to be approved
+  once before it gets in. Lock the room and their access dies with it.
 
 ## Files, viewers & organization
 
@@ -180,7 +200,8 @@ all bundled locally, no CDN, no network fetch.
 ```
 
 1. **Create / unlock** — your password is the SQLCipher key. A wrong password
-   can't read a single byte; there is no recovery.
+   can't read a single byte; the only other way in is a recovery key you chose
+   to print at create time.
 2. **Import** — files are stored as encrypted blobs; readable text is extracted
    by built-in Rust extractors (PDF, DOCX, XLSX, HTML, Markdown, code, CSV,
    plain text), with on-device OCR / Whisper as fallbacks for scans and audio,
@@ -308,6 +329,8 @@ Shipped since the first cut:
 - [x] On-device OCR for scanned documents (Apple Vision)
 - [x] On-device dictation & transcription (Whisper)
 - [x] Folders, version history, and room export
+- [x] Room templates (Legal, Medical, Research, Journal)
+- [x] Room-as-MCP-server for other AI tools, with per-app approval
 
 Next:
 

@@ -1,0 +1,133 @@
+:root {
+  --bg: #0e1014;
+  /* Surface ramp — depth comes from surface contrast, not borders. */
+  --surface-1: #12161d;
+  --surface-2: #161a22;
+  --surface-3: #1c212c;
+  --surface-4: #232a37;
+  /* Legacy aliases kept so existing rules keep working. */
+  --panel: #161a22;
+  --panel-2: #1c212c;
+  /* Borders are now the exception — softened, plus a barely-there hairline. */
+  --border: #232a37;
+  --border-subtle: #1a1f28;
+  --text: #e8eaf0;
+  --text-dim: #8b93a7;
+  --text-faint: #626b7d;
+  --accent: #8b7cf6;
+  --accent-2: #a99df8;
+  --accent-soft: rgba(139, 124, 246, 0.16);
+  --accent-ghost: rgba(139, 124, 246, 0.08);
+  --danger: #e5646c;
+  --ok: #4cc38a;
+  --warn: #e3b341;
+  /* Spacing scale (documentation of the values used across the app). */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* Violet is reserved for primary actions, selection and AI. Everyday text
+   buttons read as slate and only warm up on hover. */
+button.subtle {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  padding: 2px 6px;
+}
+button.subtle:hover {
+  border-color: transparent;
+  color: var(--text);
+}
+/* Opt back into the accent where a button really is the accent action. */
+button.subtle.accent {
+  color: var(--accent);
+}
+button.subtle.accent:hover {
+  color: var(--accent-2);
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 12px;
+  outline: none;
+}
+
+input:focus,
+textarea:focus {
+  border-color: var(--accent);
+}
+
+code {
+  background: var(--panel-2);
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 12px;
+}
+
+/* buttons that pair an icon with a label */
+.btn-ic {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-ic svg {
+  flex-shrink: 0;
+}
+

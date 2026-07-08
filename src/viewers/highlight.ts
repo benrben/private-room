@@ -230,6 +230,63 @@ export function clearQuoteHighlight(): void {
   );
 }
 
+/* ============================ Receipts ============================ *
+ * A "receipt" is a quote the app can prove: found word-for-word in a source
+ * file, so it earns a green "verified" check. These are small, reusable
+ * helpers layered on top of the existing quote-anchoring above — the React
+ * shell (Workspace) verifies annotation chips with `isQuoteVerified`, and the
+ * imperative viewers (PdfView) drop `makeReceiptBadge()` next to a located
+ * highlight. No change to the highlight logic itself.
+ * ---------------------------------------------------------------- */
+
+/**
+ * Is `quote` present, word-for-word, in `source`? Uses the same
+ * normalization-tolerant match as the highlighters (case / whitespace /
+ * newlines / soft hyphens / typographic look-alikes), so a quote copied from
+ * a rendered document still verifies against the extracted text. A quote that
+ * resolves to a real span is a located, verbatim-verified quote — exactly what
+ * earns the badge.
+ */
+export function isQuoteVerified(source: string, quote: string): boolean {
+  if (!quote || quote.trim().length < 2) return false;
+  return locateQuote(source, quote) !== null;
+}
+
+/** Stable class name for the "verified" receipt badge (styled in App.css by
+ *  the CSS track). */
+export const RECEIPT_BADGE_CLASS = "receipt-badge";
+
+/** A framework-neutral description of the badge, so a React caller can render
+ *  `<span className={b.className} title={b.title}>{b.symbol} {b.label}</span>`
+ *  without pulling in any DOM helper. */
+export interface ReceiptBadge {
+  className: string;
+  symbol: string;
+  label: string;
+  title: string;
+}
+
+export function receiptBadge(label = "Verified"): ReceiptBadge {
+  return {
+    className: RECEIPT_BADGE_CLASS,
+    symbol: "✓",
+    label,
+    title: "This quote was found word-for-word in the source.",
+  };
+}
+
+/** DOM factory for imperative viewers that paint overlays by hand (PdfView).
+ *  Returns `<span class="receipt-badge">✓ Verified</span>`; the caller
+ *  positions it. Look (green, pill) is owned by the `.receipt-badge` CSS. */
+export function makeReceiptBadge(label = "Verified"): HTMLSpanElement {
+  const b = receiptBadge(label);
+  const el = document.createElement("span");
+  el.className = b.className;
+  el.title = b.title;
+  el.textContent = `${b.symbol} ${b.label}`;
+  return el;
+}
+
 /** "B7" -> zero-based row/col, or null. */
 export function parseA1(cell: string): { r: number; c: number } | null {
   const m = /^([A-Z]+)([0-9]+)$/.exec(cell.trim().toUpperCase());

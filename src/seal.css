@@ -1,0 +1,259 @@
+/* =====================================================================
+   THE SEAL — Private Room's signature ritual (owned by A3)
+   One deliberate, calm motion in BOTH directions, on the app's palette:
+   ink background (--bg), a single violet accent (--accent / --accent-2),
+   a keyhole/seal motif. No sound, nothing garish.
+
+     UNLOCK  .seal-unlocking          keyhole blooms OPEN, ink veil lifts (~520ms)
+             @keyframes seal-open-veil / seal-open-core / seal-open-ring
+     LOCK    .seal-locking-overlay    ink veil seals IN, keyhole contracts shut (~460ms)
+             @keyframes seal-close-veil / seal-close-core / seal-close-ring
+
+   Both are driven by App.tsx state (`entering` / `locking`) with matching
+   JS timeouts (SEAL_UNLOCK_MS / SEAL_LOCK_MS). Under prefers-reduced-motion
+   the ritual is skipped in JS AND neutralised here, so the state change is
+   instant with no motion — the lock/unlock still happens.
+
+   Imported from App.tsx AFTER App.css, so these rules intentionally take
+   precedence over the placeholder seal styles there.
+   ===================================================================== */
+
+/* Shared easing/timing so both directions feel like one gesture. */
+:root {
+  --seal-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --seal-unlock-dur: 0.52s;
+  --seal-lock-dur: 0.46s;
+}
+
+/* ---------- UNLOCK: the seal opens ---------- */
+
+/* An ink veil sits over the gate on a successful open, holds while the
+   keyhole is lit, then lifts to reveal the room the workspace mounts into. */
+.seal-unlocking {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  pointer-events: none;
+  background: var(--bg);
+  animation: seal-open-veil var(--seal-unlock-dur) var(--seal-ease) forwards;
+}
+
+/* The keyhole itself: a violet point that lights, holds, then irises open. */
+.seal-unlocking::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 132px;
+  height: 132px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgba(169, 157, 248, 0.95),
+    rgba(139, 124, 246, 0.32) 46%,
+    transparent 72%
+  );
+  transform: translate(-50%, -50%) scale(0.35);
+  animation: seal-open-core var(--seal-unlock-dur) var(--seal-ease) forwards;
+}
+
+/* The seal ring: a thin violet outline that opens outward past the frame. */
+.seal-unlocking::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 92px;
+  height: 92px;
+  border-radius: 50%;
+  border: 2px solid rgba(139, 124, 246, 0.7);
+  box-shadow: 0 0 24px rgba(139, 124, 246, 0.5);
+  transform: translate(-50%, -50%) scale(0.4);
+  opacity: 0;
+  animation: seal-open-ring var(--seal-unlock-dur) var(--seal-ease) forwards;
+}
+
+@keyframes seal-open-veil {
+  0% {
+    opacity: 1;
+  }
+  45% {
+    opacity: 1;
+  } /* hold — the keyhole is lit, the room still sealed */
+  100% {
+    opacity: 0;
+  } /* the seal lifts, the room is revealed */
+}
+
+@keyframes seal-open-core {
+  0% {
+    opacity: 0;
+    filter: blur(3px);
+    transform: translate(-50%, -50%) scale(0.35);
+  }
+  32% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translate(-50%, -50%) scale(0.7);
+  } /* keyhole lit */
+  100% {
+    opacity: 0;
+    filter: blur(10px);
+    transform: translate(-50%, -50%) scale(3);
+  } /* irises open */
+}
+
+@keyframes seal-open-ring {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.4);
+  }
+  30% {
+    opacity: 0.9;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(9);
+    border-width: 0.5px;
+  }
+}
+
+/* ---------- LOCK: the seal shuts ---------- */
+
+/* An ink veil closes over the workspace while the keyhole contracts to a
+   sealed point; the room dims and blurs behind it ("panel dimming and
+   sealing"). Ends on full ink so the swap to the (ink) gate is seamless. */
+.seal-locking-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  pointer-events: none;
+  background: var(--bg);
+  opacity: 0;
+  -webkit-backdrop-filter: blur(0px);
+  backdrop-filter: blur(0px);
+  animation: seal-close-veil var(--seal-lock-dur) var(--seal-ease) forwards;
+}
+
+/* The keyhole contracting inward to a bright sealed point, then fading right
+   at the end so the reveal of the gate underneath is pure ink. */
+.seal-locking-overlay::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 132px;
+  height: 132px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgba(169, 157, 248, 0.95),
+    rgba(139, 124, 246, 0.32) 46%,
+    transparent 72%
+  );
+  transform: translate(-50%, -50%) scale(2.6);
+  opacity: 0;
+  animation: seal-close-core var(--seal-lock-dur) var(--seal-ease) forwards;
+}
+
+/* The seal ring closing inward. */
+.seal-locking-overlay::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 92px;
+  height: 92px;
+  border-radius: 50%;
+  border: 2px solid rgba(139, 124, 246, 0.7);
+  box-shadow: 0 0 24px rgba(139, 124, 246, 0.45);
+  transform: translate(-50%, -50%) scale(9);
+  opacity: 0;
+  animation: seal-close-ring var(--seal-lock-dur) var(--seal-ease) forwards;
+}
+
+@keyframes seal-close-veil {
+  0% {
+    opacity: 0;
+    -webkit-backdrop-filter: blur(0px);
+    backdrop-filter: blur(0px);
+  }
+  50% {
+    opacity: 0.7;
+    -webkit-backdrop-filter: blur(5px);
+    backdrop-filter: blur(5px);
+  }
+  100% {
+    opacity: 1;
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+  } /* sealed shut on full ink */
+}
+
+@keyframes seal-close-core {
+  0% {
+    opacity: 0;
+    filter: blur(10px);
+    transform: translate(-50%, -50%) scale(2.6);
+  }
+  45% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translate(-50%, -50%) scale(0.7);
+  }
+  85% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translate(-50%, -50%) scale(0.5);
+  } /* the sealed point holds */
+  100% {
+    opacity: 0;
+    filter: blur(2px);
+    transform: translate(-50%, -50%) scale(0.42);
+  }
+}
+
+@keyframes seal-close-ring {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(9);
+    border-width: 0.5px;
+  }
+  35% {
+    opacity: 0.9;
+  }
+  85% {
+    opacity: 0.9;
+    transform: translate(-50%, -50%) scale(0.55);
+    border-width: 2px;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.45);
+  }
+}
+
+/* ---------- Reduced motion: no ritual, instant end-state ---------- */
+/* The JS in App.tsx already skips the overlays entirely under reduced
+   motion; this is belt-and-suspenders so no motion can ever play here. */
+@media (prefers-reduced-motion: reduce) {
+  .seal-unlocking,
+  .seal-locking-overlay {
+    animation: none;
+  }
+  .seal-unlocking {
+    opacity: 0; /* revealed instantly, no bloom */
+  }
+  .seal-locking-overlay {
+    opacity: 1; /* sealed instantly, no motion */
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .seal-unlocking::before,
+  .seal-unlocking::after,
+  .seal-locking-overlay::before,
+  .seal-locking-overlay::after {
+    animation: none;
+    opacity: 0;
+  }
+}

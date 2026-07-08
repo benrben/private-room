@@ -1,0 +1,132 @@
+/* ------------------------------------------------------------------ *
+ * Room Map — full-canvas constellation view.
+ *
+ * Owned by A5 (RoomMap.tsx imports this). New classes only; the shared
+ * `.room-map`, `.room-map-toolbar`, `.room-map-title`, `.room-map-count`
+ * and `.room-map-empty` rules live in App.css (owned by A2) and are reused
+ * as-is. Everything the full-canvas rework introduces is namespaced here so
+ * it never collides with A2's center-pane container `.room-map-canvas`.
+ * ------------------------------------------------------------------ */
+
+/* The canvas area under the header — fills all remaining space and is the
+   positioning context for the SVG, controls and tooltip. */
+.room-map-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Ink surface with a faint violet vignette so stars read with depth.
+   Sized 1:1 with the stage (viewBox === pixel size) so pan/zoom math is in
+   plain client pixels. */
+.room-map-svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  background:
+    radial-gradient(130% 100% at 50% 42%, rgba(139, 124, 246, 0.09), transparent 68%),
+    #0e1014;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.room-map-svg:active {
+  cursor: grabbing;
+}
+
+/* ---- persistent on-canvas labels (screen space, constant size) ---- */
+.rm-label-bg {
+  fill: rgba(10, 12, 16, 0.82);
+  stroke: rgba(139, 124, 246, 0.18);
+  stroke-width: 1;
+}
+/* The selected node's label gets a slightly stronger violet edge. */
+.rm-label-bg.is-focus {
+  fill: rgba(14, 12, 24, 0.9);
+  stroke: rgba(139, 124, 246, 0.55);
+}
+.rm-label-text {
+  font-size: 11px;
+  font-weight: 500;
+  fill: #e9e9f2;
+  paint-order: stroke;
+  /* thin ink halo so glyphs stay legible even if a pill edge clips a star */
+  stroke: rgba(10, 12, 16, 0.55);
+  stroke-width: 0.6px;
+  dominant-baseline: alphabetic;
+}
+.rm-label-text.is-memory {
+  fill: #bfe4d3;
+}
+
+/* ---- pan/zoom controls, top-right of the canvas ---- */
+.rm-controls {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 2;
+}
+.rm-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--text-dim, #b8b8c4);
+  background: color-mix(in srgb, var(--panel, #1a1c22) 86%, transparent);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.rm-btn:hover {
+  color: var(--accent, #8b7cf6);
+  border-color: color-mix(in srgb, var(--accent, #8b7cf6) 55%, transparent);
+  background: color-mix(in srgb, var(--panel, #1a1c22) 96%, transparent);
+}
+.rm-btn:focus-visible {
+  outline: 2px solid var(--accent, #8b7cf6);
+  outline-offset: 2px;
+}
+.rm-btn-reset {
+  margin-top: 2px;
+}
+
+/* ---- hover tooltip: node name / "why linked" edge reasons ---- */
+.rm-tip {
+  position: absolute;
+  z-index: 3;
+  max-width: 260px;
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text, #ececf2);
+  background: var(--surface-3, #23252e);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 9px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+.rm-tip-title {
+  font-weight: 600;
+}
+.rm-tip-line {
+  margin-top: 2px;
+  color: var(--text-dim, #b8b8c4);
+  font-size: 11px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rm-btn {
+    transition: none;
+  }
+}

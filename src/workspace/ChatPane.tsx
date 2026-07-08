@@ -1,0 +1,451 @@
+import { RoomInfo } from "../api";
+import {
+  CheckIcon,
+  DownloadIcon,
+  EmptyChatArt,
+  EyeIcon,
+  MemoryIcon,
+  PencilIcon,
+  TrashIcon,
+  UndoIcon,
+} from "../icons";
+import ChatAnnotatedImage from "../viewers/ChatAnnotatedImage";
+import MarkdownView from "../viewers/MarkdownView";
+import {
+  annotationTarget,
+  isCloudEngine,
+  patchStreamFences,
+  splitMarkupBlocks,
+} from "./markup";
+import { HELP_COMMAND, RECOMMENDED_MODELS } from "./constants";
+import DeleteControl from "./DeleteControl";
+import Composer from "./ComposerPane";
+import { WSState } from "./state";
+import { WSActions } from "./actions";
+
+/** Pane 3: the chat header, onboarding banners, the message transcript (with
+ * receipts/undo/regenerate/save), the streaming placeholder, the "worth
+ * remembering?" card, and the composer. Extracted verbatim. */
+export default function ChatPane({
+  s,
+  a,
+  info,
+}: {
+  s: WSState;
+  a: WSActions;
+  info: RoomInfo;
+}) {
+  const { ai, model, messages } = s;
+  const modelReady =
+    (ai?.running &&
+      (ai.models.includes(model) ||
+        ai.models.some((m) => m.startsWith(model + ":") || model.startsWith(m)))) ||
+    ai?.external.includes(model);
+  const lastAssistantId = [...messages]
+    .reverse()
+    .find((m) => m.role === "assistant")?.id;
+  return (
+    <main className="chat" style={{ width: s.chatW, maxWidth: "none", flex: "0 0 auto" }}>
+      <div className="chat-head">
+        {s.renaming ? (
+          <input
+            className="chat-select chat-rename"
+            autoFocus
+            dir="auto"
+            value={s.renameDraft}
+            onChange={(e) => s.setRenameDraft(e.target.value)}
+            onBlur={a.commitRename}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") a.commitRename();
+              if (e.key === "Escape") s.setRenaming(false);
+            }}
+          />
+        ) : (
+          <select
+            className="chat-select"
+            value={s.activeChatId ?? ""}
+            dir="auto"
+            onChange={(e) => s.setActiveChatId(e.target.value)}
+          >
+            {s.chats.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.title}
+              </option>
+            ))}
+          </select>
+        )}
+        <button
+          className="subtle btn-ic"
+          title="Rename this chat"
+          disabled={s.asking || !s.activeChatId || s.renaming}
+          onClick={a.startRename}
+        >
+          <PencilIcon size={13} />
+        </button>
+        <button className="subtle" title="New chat ⌘N" onClick={a.newChat}>
+          ＋ New
+        </button>
+        {s.activeChatId && (
+          <DeleteControl
+            k={`chat:${s.activeChatId}`}
+            trigger={<TrashIcon size={14} />}
+            onConfirm={() => a.removeChat(s.activeChatId!)}
+            title="Delete this chat session"
+            confirmDelete={s.confirmDelete}
+            askConfirm={a.askConfirm}
+            cancelConfirm={a.cancelConfirm}
+          />
+        )}
+      </div>
+
+      {s.showSyncWarn && (
+        <div className="banner">
+          This room lives in a synced folder. Never open it on two computers
+          at the same time — the file can be damaged. Lock it before
+          switching machines.{" "}
+          <button className="subtle" onClick={a.dismissSyncWarn}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      {ai && !ai.running && !ai.installed && (
+        <div className="banner onboard">
+          <span>
+            This room's AI runs on <strong>Ollama</strong>, a free app.
+          </span>
+          <span className="onboard-actions">
+            <button className="subtle" onClick={a.getOllama}>
+              Get Ollama
+            </button>
+            <button className="subtle" onClick={a.refreshAi}>
+              I installed it — check again
+            </button>
+          </span>
+        </div>
+      )}
+      {ai && !ai.running && ai.installed && (
+        <div className="banner onboard">
+          <span>
+            <strong>Ollama</strong> is installed but not running.
+          </span>
+          <span className="onboard-actions">
+            <button className="subtle" onClick={a.openOllamaApp}>
+              Open Ollama
+            </button>
+          </span>
+        </div>
+      )}
+      {ai?.running && !modelReady && (
+        <div className="banner onboard">
+          {s.pullingModel ? (
+            <span className="banner-pull">
+              <span className="banner-pull-label">
+                Downloading <strong>{model}</strong>…
+              </span>
+              <span className="pull-bar">
+                <span
+                  className="pull-bar-fill"
+                  style={{ width: `${s.pullPercent ?? 0}%` }}
+                />
+              </span>
+              <span className="banner-pull-status">
+                {s.pullStatus}
+                {s.pullPercent != null && ` — ${s.pullPercent.toFixed(0)}%`}
+              </span>
+            </span>
+          ) : (
+            <div className="model-pick">
+              <div className="model-pick-head">
+                <strong>Pick a model to download</strong>
+                <span className="model-pick-sub">
+                  It runs entirely on your Mac. You can switch or add more
+                  anytime in Settings.
+                </span>
+              </div>
+              <div className="model-pick-grid">
+                {RECOMMENDED_MODELS.map((m) => (
+                  <div className="model-pick-card" key={m.name}>
+                    {m.tag && (
+                      <span className="model-pick-tag">{m.tag}</span>
+                    )}
+                    <div className="model-pick-name">{m.name}</div>
+                    <div className="model-pick-meta">
+                      {m.label} · {m.size}
+                    </div>
+                    <div className="model-pick-blurb">{m.blurb}</div>
+                    <button
+                      className="subtle btn-ic model-pick-get"
+                      onClick={() => a.pickAndDownload(m.name)}
+                    >
+                      <DownloadIcon size={13} /> Download
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {s.pullError && <div className="banner-error">{s.pullError}</div>}
+        </div>
+      )}
+      <div className="messages" ref={s.chatRef}>
+        {messages.length === 0 && (
+          <div className="chat-hero">
+            <div className="chat-hero-icon">
+              <EmptyChatArt />
+            </div>
+            <h2>Ask your room</h2>
+            <p>
+              I can work across everything inside{" "}
+              {info.path.split("/").pop()}, using only the context you attach
+              or make available.
+            </p>
+            <div className="prompt-chips">
+              {[
+                "Summarize what's in this room",
+                "What are the key points across my files?",
+                "What did I add recently?",
+                "Draft a short memo from these files",
+              ].map((p) => (
+                <button
+                  key={p}
+                  className="prompt-chip"
+                  onClick={() => {
+                    s.setQuestion(p);
+                    s.composerRef.current?.focus();
+                  }}
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+            {s.commands.length > 0 && (
+              <div className="cmd-hints">
+                <span className="cmd-hints-label">Or run a command:</span>
+                {[...s.commands, HELP_COMMAND].map((c) => (
+                  <button
+                    key={c.name}
+                    className="cmd-hint-chip"
+                    title={`${c.summary} — ${c.usage}`}
+                    onClick={() => {
+                      s.setQuestion(`#${c.name} `);
+                      s.composerRef.current?.focus();
+                    }}
+                  >
+                    #{c.name}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {messages.map((m) => {
+          const { text, boxes, annotation } =
+            m.role === "assistant"
+              ? splitMarkupBlocks(m.content)
+              : { text: m.content, boxes: undefined, annotation: undefined };
+          const annotVerified = !!annotation?.quote && !annotation?.approx;
+          return (
+          <div key={m.id} id={`msg-${m.id}`} className={`msg ${m.role}`}>
+            <div className="msg-content" dir="auto">
+              {m.role === "assistant" ? (
+                <>
+                  <MarkdownView text={text} />
+                  {boxes && (
+                    <ChatAnnotatedImage
+                      fileId={boxes.fileId}
+                      boxes={boxes.boxes}
+                    />
+                  )}
+                  {annotation && (
+                    <div
+                      className="annot-chip-wrap"
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <button
+                        className={`annot-chip${annotVerified ? " receipt-verified" : ""}`}
+                        title="Show the highlight in the viewer"
+                        onClick={() =>
+                          a.viewFile(
+                            annotation.fileId,
+                            annotationTarget(annotation),
+                          )
+                        }
+                      >
+                        {annotVerified ? (
+                          <CheckIcon size={13} />
+                        ) : (
+                          <EyeIcon size={13} />
+                        )}{" "}
+                        {annotation.note ||
+                          annotation.quote ||
+                          annotation.range}{" "}
+                        — {annotation.name}
+                        {annotVerified && (
+                          <span className="receipt-badge">
+                            <CheckIcon size={11} /> Verified
+                          </span>
+                        )}
+                        {annotation.approx && (
+                          <span
+                            className="annot-approx"
+                            title="The exact quote wasn't found — the closest passage was highlighted"
+                          >
+                            {" "}
+                            · ≈ closest match
+                          </span>
+                        )}
+                      </button>
+                      {annotVerified && annotation.quote && (
+                        <button
+                          className="subtle"
+                          title="Copy this quote as a citation (quote · file · page)"
+                          onClick={() => a.copyReceipt(annotation)}
+                        >
+                          Copy as receipt
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </>
+              ) : (
+                text
+              )}
+            </div>
+            {m.role === "assistant" && (
+              <div className="msg-footer">
+                {m.sources.length > 0 && (
+                  <span className="msg-sources">
+                    {m.sources.map((src) => (
+                      <button
+                        key={src}
+                        className="source-chip"
+                        title={`Open ${src}`}
+                        onClick={() => a.openSource(src)}
+                      >
+                        {src}
+                      </button>
+                    ))}
+                  </span>
+                )}
+                <button
+                  className="subtle"
+                  title="Copy this answer"
+                  disabled={s.asking}
+                  onClick={() => a.copyMessage(m)}
+                >
+                  Copy
+                </button>
+                {s.undoByMsg[m.id] && (
+                  <button
+                    className="subtle undo-edit"
+                    title="Undo the file change this answer made (reversible via version history)"
+                    disabled={s.asking}
+                    onClick={() => a.undoEdits(m.id)}
+                  >
+                    <UndoIcon size={13} /> Undo{" "}
+                    {s.undoByMsg[m.id].length > 1 ? `${s.undoByMsg[m.id].length} edits` : "edit"}
+                  </button>
+                )}
+                {m.id === lastAssistantId && (
+                  <button
+                    className="subtle"
+                    title="Delete this answer and ask again (the original attachments are not re-sent)"
+                    disabled={s.asking}
+                    onClick={() => a.regenerate(m.id)}
+                  >
+                    Regenerate
+                  </button>
+                )}
+                {s.saveDraft?.id === m.id ? (
+                  <span className="save-form">
+                    <input
+                      value={s.saveDraft.name}
+                      autoFocus
+                      onChange={(e) =>
+                        s.setSaveDraft({ id: m.id, name: e.target.value })
+                      }
+                      onKeyDown={(e) => e.key === "Enter" && a.saveToRoom(m)}
+                    />
+                    <button className="subtle" onClick={() => a.saveToRoom(m)}>
+                      Save
+                    </button>
+                    <button className="subtle" onClick={() => s.setSaveDraft(null)}>
+                      Cancel
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    className="subtle"
+                    onClick={() => s.setSaveDraft({ id: m.id, name: "AI note.md" })}
+                  >
+                    Save to room
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          );
+        })}
+        {s.asking && (
+          <div className={`msg assistant ${s.streamText ? "" : "thinking"}`}>
+            {(s.lane || s.steps.length > 0) && (
+              <div className="step-chips">
+                {s.lane && <span className="lane-chip">{s.lane}</span>}
+                {s.steps.map((st, i) => (
+                  <span
+                    key={i}
+                    className={`step-chip${st.ok ? "" : " failed"}`}
+                    title={st.ok ? undefined : "This step didn't succeed"}
+                  >
+                    {st.ok ? "" : "⚠ "}
+                    {st.label}
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="msg-content" dir="auto">
+              {s.streamText ? (
+                <>
+                  <MarkdownView text={patchStreamFences(s.streamText)} />
+                  <span className="stream-cursor">▍</span>
+                </>
+              ) : isCloudEngine(model) ? (
+                "Asking your cloud AI — content leaves this Mac…"
+              ) : (
+                "Thinking locally…"
+              )}
+            </div>
+          </div>
+        )}
+        {s.memSuggestion && (
+          <div className="memory-suggestion">
+            <div className="memory-suggestion-head">
+              <MemoryIcon size={13} /> Worth remembering?
+            </div>
+            <div className="memory-suggestion-fact">
+              {s.memSuggestion.fact}
+            </div>
+            <div className="memory-suggestion-actions">
+              <button className="primary" onClick={a.saveSuggestedMemory}>
+                Save to memory
+              </button>
+              <button
+                className="subtle"
+                onClick={() => s.setMemSuggestion(null)}
+              >
+                Ignore
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <Composer s={s} a={a} />
+    </main>
+  );
+}

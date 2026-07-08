@@ -1,0 +1,269 @@
+/* ---------- workspace ---------- */
+
+.workspace {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  animation: room-in 0.45s ease;
+}
+
+@keyframes room-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+}
+
+.room-id {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  cursor: default;
+}
+
+.room-lock {
+  display: flex;
+  line-height: 0;
+}
+
+.room-lock svg {
+  filter: drop-shadow(0 0 8px rgba(139, 124, 246, 0.45));
+}
+
+.room-id-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.room-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.room-sub {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.room-path {
+  color: var(--text-dim);
+  font-size: 11px;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ai-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.ai-dot.ok {
+  background: var(--ok);
+}
+
+.ai-dot.warn {
+  background: var(--warn);
+}
+
+.ai-dot.down {
+  background: var(--danger);
+}
+
+/* Square, quiet icon buttons in the header. */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--text-dim);
+}
+.icon-btn:hover {
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text);
+}
+.lock-btn {
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+.lock-btn:hover {
+  border-color: var(--border);
+  background: var(--surface-4);
+}
+
+/* Branded model pill (replaces the native <select>). */
+.model-pill-wrap,
+.room-menu-wrap,
+.add-menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.model-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 10px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+  font-size: 12.5px;
+}
+.model-pill:hover {
+  border-color: var(--border);
+  background: var(--surface-4);
+}
+.model-pill.cloud {
+  background: rgba(227, 179, 65, 0.07);
+  border-color: rgba(227, 179, 65, 0.22);
+}
+.model-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-faint);
+}
+.model-dot.ok,
+.model-dot.local {
+  background: var(--ok);
+}
+.model-dot.warn,
+.model-dot.cloud {
+  background: var(--warn);
+}
+.model-dot.down {
+  background: var(--danger);
+}
+.model-pill-name {
+  font-weight: 500;
+  /* No clip/ellipsis — let the label size to its full name (e.g.
+     "Claude (cloud)") so cloud engines read clearly. */
+  white-space: nowrap;
+}
+.model-pill-tier {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.model-pill-tier::before {
+  content: "·";
+  margin-right: 6px;
+  color: var(--text-faint);
+}
+.model-pill-caret {
+  color: var(--text-dim);
+}
+
+/* Shared popover-menu shell (model picker, room menu, add menu). */
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+}
+.pop-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 46;
+  min-width: 200px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.pop-item,
+.model-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 7px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.pop-item:hover:not(:disabled),
+.model-menu-item:hover {
+  background: var(--accent-ghost);
+  border-color: transparent;
+}
+.pop-item svg {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.model-menu {
+  min-width: 240px;
+}
+.model-menu-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.model-menu-tier {
+  font-size: 11px;
+  color: var(--ok);
+}
+.model-menu-tier.cloud {
+  color: var(--warn);
+}
+.model-menu-item.sel {
+  background: var(--accent-ghost);
+}
+.model-menu-item svg:last-child {
+  color: var(--accent);
+  margin-left: auto;
+}
+.add-menu {
+  left: 0;
+  right: auto;
+}
+
+.body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+

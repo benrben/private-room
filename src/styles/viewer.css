@@ -1,0 +1,278 @@
+/* ---------- viewer (middle pane) ---------- */
+
+.viewer {
+  flex: 1.15;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.viewer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.viewer-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-body {
+  flex: 1;
+  overflow: auto;
+  padding: 18px 22px;
+}
+
+.viewer-body img {
+  max-width: 100%;
+  border-radius: 8px;
+}
+
+.viewer-body pre {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.viewer-body.fill {
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* Full-size host for the Room Map in the center pane (RoomMap fills this). */
+.room-map-canvas {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  background: var(--bg);
+}
+
+/* ---- Wave 2: data safety (ADD-1/2/3, HLT-6) ---- */
+
+/* Files-pane header actions (Export all… + Add). */
+.side-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ADD-2 — version history popover, anchored under the History button. */
+.history-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.history-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  width: 280px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+}
+
+.history-empty {
+  padding: 12px 10px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.history-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 8px;
+}
+
+.history-row:hover {
+  background: var(--panel);
+}
+
+.history-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.history-cause {
+  font-size: 13px;
+}
+
+.history-time {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* ADD-3 — inline "Delete? ✓ ✕" confirm affordance. */
+.confirm-del {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.confirm-q {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 0 4px;
+}
+
+.chip-btn.confirm-yes {
+  color: var(--ok);
+  opacity: 1;
+}
+
+.chip-btn.confirm-yes:hover {
+  background: rgba(90, 190, 130, 0.15);
+}
+
+.chip-btn.confirm-no {
+  opacity: 1;
+}
+
+.viewer-empty {
+  margin: auto;
+  max-width: 440px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-dim);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.viewer-empty-icon {
+  line-height: 0;
+  margin-bottom: 20px;
+  position: relative;
+}
+.viewer-empty-icon::after {
+  content: "";
+  position: absolute;
+  inset: -30% -20%;
+  background: radial-gradient(
+    closest-side,
+    rgba(139, 124, 246, 0.16),
+    transparent 70%
+  );
+  z-index: -1;
+}
+.viewer-empty-icon svg {
+  width: 200px;
+  height: auto;
+}
+
+.viewer-empty-title {
+  font-size: 21px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0 0 10px;
+}
+
+.viewer-empty-sub {
+  font-size: 13.5px;
+  line-height: 1.6;
+  max-width: 360px;
+  margin: 0 0 22px;
+}
+.viewer-empty-sub strong {
+  color: var(--text);
+}
+
+.viewer-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin-bottom: 26px;
+}
+.qa-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 15px;
+  font-size: 13px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text);
+}
+.qa-btn svg {
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+.qa-btn:hover:not(:disabled) {
+  border-color: var(--border);
+  background: var(--surface-4);
+}
+.qa-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.qa-btn.primary svg {
+  color: #fff;
+}
+.qa-btn.primary:hover:not(:disabled) {
+  background: #7d6ef0;
+}
+
+.viewer-empty-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  text-align: left;
+  max-width: 380px;
+  padding: 13px 15px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 11px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.viewer-empty-note svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--accent-2);
+}
+.viewer-empty-note strong {
+  color: var(--text);
+}
+
+.viewer-status {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 6px 0;
+}
+

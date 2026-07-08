@@ -7,218 +7,38 @@ import {
   type SaveDialogOptions,
 } from "@tauri-apps/plugin-dialog";
 
-export interface RoomInfo {
-  name: string;
-  path: string;
-  fileCount: number;
-  messageCount: number;
-  /** True when the room file lives in a cloud-sync folder (HLT-6). */
-  synced: boolean;
-  /** Set when the room has enabled MCP servers whose config fingerprint is
-   * not yet approved on this Mac — the UI must ask before anything runs
-   * (SEC-1). null when there's nothing to approve. */
-  pendingMcp: McpApproval | null;
-}
-
-/** An MCP config awaiting the user's approval before its servers start (SEC-1). */
-export interface McpApproval {
-  fingerprint: string;
-  servers: { name: string; command: string }[];
-}
-
-/** A prior saved state of a file (ADD-2). */
-export interface FileVersion {
-  id: string;
-  savedAt: string;
-  cause: string;
-}
-
-/** A recently opened room, listed on the start screen (ADD-5). */
-export interface RecentRoom {
-  name: string;
-  path: string;
-  /** Unix epoch millis of the last open; absent for entries saved earlier. */
-  openedAt?: number | null;
-}
-
-export interface FileMeta {
-  id: string;
-  name: string;
-  mimeType: string;
-  sizeBytes: number;
-  source: string;
-  hasText: boolean;
-  createdAt: string;
-  /** Folder this file sits in, or null for the top level (ADD-16). */
-  folderId: string | null;
-  /** True when only the first N chunks were indexed (HLT-4). */
-  partiallyIndexed: boolean;
-}
-
-/** A one-level folder inside the room (ADD-16). */
-export interface Folder {
-  id: string;
-  name: string;
-}
-
-/** A prebuilt "#name" chat workflow, for autocomplete/help. */
-export interface ChatCommand {
-  name: string;
-  summary: string;
-  usage: string;
-  needsRefs: boolean;
-}
-
-/** Grouped results of a room-wide search (ADD-6). */
-export interface SearchResults {
-  files: { id: string; name: string; snippet: string }[];
-  messages: { chatId: string; messageId: string; snippet: string }[];
-  memories: { id: string; snippet: string }[];
-}
-
-export interface ImportReport {
-  imported: FileMeta[];
-  errors: string[];
-}
-
-export interface Chat {
-  id: string;
-  title: string;
-  createdAt: string;
-}
-
-export interface Message {
-  id: string;
-  role: string;
-  content: string;
-  sources: string[];
-  createdAt: string;
-}
-
-export interface Memory {
-  id: string;
-  content: string;
-  createdAt: string;
-}
-
-export interface FileContent {
-  kind:
-    | "image"
-    | "pdf"
-    | "docx"
-    | "sheet"
-    | "csv"
-    | "markdown"
-    | "html"
-    | "code"
-    | "text"
-    | "audio"
-    | "video"
-    | "binary";
-  name: string;
-  mime: string;
-  editable: boolean;
-  text: string | null;
-  dataB64: string | null;
-}
-
-export interface AiStatus {
-  running: boolean;
-  /** True when Ollama is installed on this Mac even if not currently running
-   * — lets onboarding tell "not installed" from "not started" (ADD-10). */
-  installed: boolean;
-  models: string[];
-  defaultModel: string;
-  /** Cloud CLIs detected on this Mac ("claude-cli", "codex-cli"). */
-  external: string[];
-}
-
-export const ENGINE_LABELS: Record<string, string> = {
-  "claude-cli": "Claude Code (cloud)",
-  "codex-cli": "Codex (cloud)",
-};
-
-/** ADD-22: a local model's declared abilities (from Ollama /api/show), so the
- * picker can badge each model and warn when the chosen one can't drive the app. */
-export interface ModelCaps {
-  name: string;
-  tools: boolean;
-  vision: boolean;
-}
-
-/** ADD-18: state of the built-in dictation/transcription engine. The engine
- * (Whisper) is compiled into the app; only the model file downloads on demand. */
-export interface SttStatus {
-  installed: boolean;
-  downloading: boolean;
-  sizeMb: number;
-}
-
-/** Friendly display names for models we ship guidance for. The stored setting
- * always keeps the raw id — this is display only (CHG-4). Unknown models the
- * user pulled themselves fall through to their raw id. */
-const MODEL_LABELS: { match: (id: string) => boolean; label: string }[] = [
-  { match: (m) => m.startsWith("qwen3.5"), label: "Standard local AI (recommended)" },
-  { match: (m) => m.includes("qwen2.5vl") || m.includes("qwen2.5-vl"), label: "Vision helper (marks images)" },
-];
-
-/** Friendly name for a model id, or `null` if we ship no label for it. */
-export function modelLabel(id: string): string | null {
-  return MODEL_LABELS.find((m) => m.match(id))?.label ?? null;
-}
-
-export interface ImageBox {
-  label: string;
-  x1: number;
-  y1: number;
-  x2: number;
-  y2: number;
-}
-
-/** Where a viewer should navigate/highlight when a file opens. */
-export interface FileTarget {
-  page?: number;
-  cell?: string;
-  find?: string;
-  sheet?: string;
-  range?: string;
-  quote?: string;
-}
-
-/** Payload of an ```annotation block / agent-annotate event. */
-export interface AnnotationPayload {
-  fileId: string;
-  name?: string;
-  quote?: string;
-  page?: number;
-  sheet?: string;
-  range?: string;
-  note?: string;
-  /** ADD-22: true when the exact quote wasn't found and the closest passage was
-   * highlighted instead — the UI marks it "≈ closest match". */
-  approx?: boolean;
-}
-
-export interface McpServerStatus {
-  name: string;
-  status: "connecting" | "connected" | "failed" | "disabled";
-  error: string | null;
-  tools: string[];
-}
-
-/** SEC-1b: a pending per-call MCP approval prompt from the backend. */
-export interface McpApproveRequest {
-  id: string;
-  server: string;
-  tool: string;
-  args: string;
-}
-
-/** Payload of the agent-open-file event: a bare file id, or an id with a
- * navigation hint (page/cell/find). */
-export type AgentOpenFilePayload =
-  | string
-  | { id: string; page?: number; cell?: string; find?: string };
+export * from "./apiTypes";
+import type {
+  RoomInfo,
+  ImportReport,
+  FileMeta,
+  FileContent,
+  FileVersion,
+  RecentRoom,
+  Memory,
+  Folder,
+  SearchResults,
+  McpServerStatus,
+  AiStatus,
+  ModelCaps,
+  Chat,
+  Message,
+  ChatCommand,
+  ImageBox,
+  SttStatus,
+  AiActionDef,
+  AgentOpenFilePayload,
+  AnnotationPayload,
+  McpApproveRequest,
+  RecommendedModels,
+  RoomGraph,
+  FrontPage,
+  StudioPrompts,
+  MemorySuggestion,
+  FileMetaSuggestion,
+  RoomServerStatus,
+  RoomRole,
+} from "./apiTypes";
 
 export const api = {
   createRoom: (path: string, password: string) =>
@@ -259,6 +79,14 @@ export const api = {
   clearRecent: () => invoke<void>("clear_recent"),
   saveGeneratedFile: (name: string, content: string) =>
     invoke<FileMeta>("save_generated_file", { name, content }),
+  // Write an HTML file to temp and open it in the real browser (interactive
+  // pages render fully there; the in-app sandbox can't run their scripts).
+  openHtmlInBrowser: (name: string, html: string) =>
+    invoke<string>("open_html_in_browser", { name, html }),
+  // Stage a self-contained HTML page for the isolated roomdoc:// preview (runs
+  // its own JS/CSS, no network). Returns a token → roomdoc://localhost/<token>.
+  stagePreviewHtml: (html: string) =>
+    invoke<string>("stage_preview_html", { html }),
   addMemory: (content: string) => invoke<Memory>("add_memory", { content }),
   listMemories: () => invoke<Memory[]>("list_memories"),
   deleteMemory: (id: string) => invoke<void>("delete_memory", { id }),
@@ -352,6 +180,27 @@ export const api = {
   shapeText: (text: string, translate: boolean, mode: string) =>
     invoke<string>("shape_text", { text, translate, mode }),
 
+  // ---- AI actions (per-file / whole-room one-shot Markdown generators) ----
+  /** The catalog of AI actions (file- and room-scoped), for the menus. */
+  aiActionPrompts: () => invoke<AiActionDef[]>("ai_action_prompts"),
+  /** Run an AI action; saves a Markdown file and emits agent-open-file. */
+  aiAction: (
+    action: string,
+    opts: {
+      scope?: string | null;
+      refs?: string[] | null;
+      instructions?: string | null;
+      question?: string | null;
+    },
+  ) =>
+    invoke<FileMeta>("ai_action", {
+      action,
+      scope: opts.scope ?? null,
+      refs: opts.refs ?? null,
+      instructions: opts.instructions ?? null,
+      question: opts.question ?? null,
+    }),
+
   // ---- events (@tauri-apps/api/event) ----
   onSttDownloadProgress: (
     cb: (p: { got: number; total: number; percent: number }) => void,
@@ -413,6 +262,91 @@ export const api = {
   chooseOpenPath: (options?: OpenDialogOptions) => open(options),
   chooseSavePath: (options?: SaveDialogOptions) => save(options),
 };
+
+/* ============================================================
+ * Moonshot feature wrappers (Wave-3 API surface). Thin invoke() wrappers,
+ * imported by name by the Workspace / App / Settings / Viewers agents.
+ * Tauri maps snake_case Rust params → camelCase invoke keys.
+ * ============================================================ */
+
+/** D1: static list the picker uses to drive pulls. */
+export const recommendedModels = () =>
+  invoke<RecommendedModels>("recommended_models");
+
+/** D2: pull the embed model if missing, then backfill; no-op/quiet if offline. */
+export const ensureEmbedModel = () => invoke<void>("ensure_embed_model");
+
+/** D3: the room's similarity graph (files + memories). Model-free, instant. */
+export const roomGraph = () => invoke<RoomGraph>("room_graph");
+
+/** D4: instant Front Page snapshot (no model call, safe to call on unlock). */
+export const frontPage = () => invoke<FrontPage>("front_page");
+
+/** D4: lazy follow-up — up to 3 suggested questions; call after frontPage(). */
+export const frontPageSuggestions = () =>
+  invoke<string[]>("front_page_suggestions");
+
+export const studioPrompts = () => invoke<StudioPrompts>("studio_prompts");
+
+/** D5: build a self-contained flashcard deck (.html); opens in HtmlView.
+ *  `instructions` is the user-edited prompt; `refs` are file ids from any
+ *  @-mentioned files/folders (omit to use the current scope / whole room). */
+export const studioFlashcards = (
+  scope?: string,
+  instructions?: string,
+  refs?: string[],
+) => invoke<FileMeta>("studio_flashcards", { scope, instructions, refs });
+
+/** D5: build a self-contained mind map (.html). */
+export const studioMindmap = (
+  scope?: string,
+  instructions?: string,
+  refs?: string[],
+) => invoke<FileMeta>("studio_mindmap", { scope, instructions, refs });
+
+/** D12: render a two-host podcast script (.html); script only, no audio. */
+export const generatePodcastScript = (
+  scope?: string,
+  instructions?: string,
+  refs?: string[],
+) => invoke<FileMeta>("generate_podcast_script", { scope, instructions, refs });
+
+/** D6: does this chat's last exchange hold a fact worth remembering? */
+export const memorySuggestion = (chatId: string) =>
+  invoke<MemorySuggestion>("memory_suggestion", { chatId });
+
+/** D7: suggested title/folder/tags for a freshly imported file. */
+export const suggestFileMeta = (fileId: string) =>
+  invoke<FileMetaSuggestion>("suggest_file_meta", { fileId });
+
+/** D9: current state of the Room MCP server (the Leash). */
+export const roomServerStatus = () =>
+  invoke<RoomServerStatus>("room_server_status");
+
+/** D9: turn the Leash on/off; `allowCloud` gates non-local access. */
+export const setRoomServer = (enabled: boolean, allowCloud: boolean) =>
+  invoke<RoomServerStatus>("set_room_server", { enabled, allowCloud });
+
+/** D10: point the app at a remote Ollama ("the closet"); "" clears the override. */
+export const setOllamaUrl = (url: string) =>
+  invoke<void>("set_ollama_url", { url });
+
+/** D10: the Ollama base URL currently in effect. */
+export const getOllamaUrl = () => invoke<string>("get_ollama_url");
+
+/** D11: the catalog of room personas. */
+export const listRoles = () => invoke<RoomRole[]>("list_roles");
+
+/** A3: write a recovery sidecar for the OPEN room; returns the one-time code. */
+export const writeRecoveryKey = () => invoke<string>("write_recovery_key");
+
+/** A3: does the room file at `path` have a recovery sidecar? */
+export const hasRecoveryKey = (path: string) =>
+  invoke<boolean>("has_recovery_key", { path });
+
+/** A3: open a room using its recovery code instead of the password. */
+export const openRoomWithRecovery = (path: string, code: string) =>
+  invoke<RoomInfo>("open_room_with_recovery", { path, code });
 
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

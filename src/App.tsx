@@ -1,220 +1,41 @@
 import { useCallback, useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import { api, RoomInfo, RecentRoom } from "./api";
 import Workspace from "./Workspace";
-import { Logomark, CloseIcon } from "./icons";
+import { Logomark } from "./icons";
+import {
+  MIN_PASSWORD,
+  ROOM_FILTER,
+  ROOM_TEMPLATES,
+  RoomRole,
+  Screen,
+  SEAL_LOCK_MS,
+  SEAL_UNLOCK_MS,
+} from "./rooms/constants";
+import { prefersReducedMotion } from "./rooms/helpers";
+import { StartScreen } from "./screens/StartScreen";
+import { CreateScreen } from "./screens/CreateScreen";
+import { UnlockScreen } from "./screens/UnlockScreen";
+import { RecoveryModal } from "./screens/RecoveryModal";
+import {
+  SealLockingOverlay,
+  SealUnlockingOverlay,
+} from "./screens/SealOverlay";
 import "./App.css";
+import "./seal.css";
 
-type Screen =
-  | { kind: "start" }
-  | { kind: "create"; path: string }
-  | { kind: "unlock"; path: string }
-  | { kind: "workspace"; info: RoomInfo };
-
-const ROOM_FILTER = [{ name: "Private Room Project", extensions: ["roomai"] }];
-
-const MIN_PASSWORD = 8;
-
-// ADD-15 — Room templates.
-// Plain frontend data: each template pre-fills the room's custom
-// instructions, a couple of starter memories, and a Welcome.md note.
-// Applied AFTER create_room succeeds using ordinary APIs, so everything
-// a template makes is normal, editable content — no special machinery.
-// "Blank" is the default and seeds nothing (a room exactly like today).
-type RoomTemplate = {
-  key: string;
-  label: string;
-  // One-line description shown under the template pills so choosing one isn't
-  // a leap of faith about what it pre-fills.
-  blurb: string;
-  customInstructions: string;
-  memories: string[];
-  welcome: string;
-};
-
-const ROOM_TEMPLATES: RoomTemplate[] = [
-  {
-    key: "blank",
-    label: "Blank",
-    blurb: "An empty room. Add anything and set it up your own way.",
-    customInstructions: "",
-    memories: [],
-    welcome: "",
-  },
-  {
-    key: "legal",
-    label: "Legal",
-    blurb: "Contracts and letters — flags deadlines, obligations, odd clauses.",
-    customInstructions:
-      "This room holds legal documents and correspondence. Answer plainly " +
-      "and cite the exact file and clause you are drawing from. Flag " +
-      "deadlines, obligations, and anything that looks unusual. You are " +
-      "not a lawyer and do not give legal advice — when something has real " +
-      "consequences, say so and suggest checking with a professional.",
-    memories: [
-      "This room is for keeping and understanding legal paperwork.",
-      "Prefer quoting the document over paraphrasing when wording matters.",
-      "Always note dates, deadlines, and who is responsible for what.",
-    ],
-    welcome:
-      "# Welcome to your Legal room\n\n" +
-      "A quiet, private place for contracts, letters, and anything with " +
-      "fine print. Nothing here leaves your computer.\n\n" +
-      "## What to add here\n\n" +
-      "- Contracts and agreements (leases, employment, services)\n" +
-      "- Letters and notices you have sent or received\n" +
-      "- Terms, policies, and any document you want to actually understand\n\n" +
-      "## Three questions to try\n\n" +
-      "1. What are my main obligations and deadlines in this contract?\n" +
-      "2. Summarize this letter in plain language.\n" +
-      "3. Are there any unusual or one-sided clauses I should notice?\n",
-  },
-  {
-    key: "medical",
-    label: "Medical",
-    blurb: "Health records — plain-language explanations, tracks dates and meds.",
-    customInstructions:
-      "This room holds personal medical records and notes. Explain terms " +
-      "in plain, calm language and always point to the file a fact comes " +
-      "from. Help track dates, results, and medications. You are not a " +
-      "doctor and do not diagnose — for anything worrying, encourage the " +
-      "person to speak with a clinician.",
-    memories: [
-      "This room is for personal health records and understanding them.",
-      "Explain medical terms simply, without alarm.",
-      "Keep track of test dates, results, and medications when they appear.",
-    ],
-    welcome:
-      "# Welcome to your Medical room\n\n" +
-      "A private place to keep and make sense of your health records. " +
-      "Everything stays on this computer.\n\n" +
-      "## What to add here\n\n" +
-      "- Test and lab results, scans, and doctor's letters\n" +
-      "- Medication lists and prescriptions\n" +
-      "- Notes from appointments and questions for next time\n\n" +
-      "## Three questions to try\n\n" +
-      "1. What do the results in this report mean, in plain words?\n" +
-      "2. List every medication mentioned across my files.\n" +
-      "3. What questions should I bring to my next appointment?\n",
-  },
-  {
-    key: "research",
-    label: "Research",
-    blurb: "Papers and sources — compares, summarizes, cites every claim.",
-    customInstructions:
-      "This room is for research and reading. Help gather, compare, and " +
-      "summarize sources, and always cite the file behind each claim. When " +
-      "sources disagree, say so rather than smoothing it over. Keep a clear " +
-      "line between what a source states and your own reasoning.",
-    memories: [
-      "This room is for collecting and thinking through research material.",
-      "Cite the source file for every claim.",
-      "When sources conflict, surface the disagreement plainly.",
-    ],
-    welcome:
-      "# Welcome to your Research room\n\n" +
-      "A calm workspace for papers, articles, and notes on a topic you " +
-      "care about. Read, compare, and connect — all offline.\n\n" +
-      "## What to add here\n\n" +
-      "- Papers, PDFs, and saved web pages\n" +
-      "- Your own notes, outlines, and questions\n" +
-      "- Anything you want to compare, summarize, or cite later\n\n" +
-      "## Three questions to try\n\n" +
-      "1. Summarize the key findings across these documents.\n" +
-      "2. Where do these sources agree, and where do they disagree?\n" +
-      "3. What questions are still open based on what I have here?\n",
-  },
-  {
-    key: "journal",
-    label: "Journal",
-    blurb: "A private diary — a warm listener that notices patterns over time.",
-    customInstructions:
-      "This room is a personal journal. Be a warm, unhurried listener. " +
-      "Help reflect, notice patterns over time, and find past entries when " +
-      "asked. Never judge. Keep everything private and gentle in tone.",
-    memories: [
-      "This room is a private personal journal.",
-      "Respond with warmth and without judgement.",
-      "Help notice themes and patterns across entries over time.",
-    ],
-    welcome:
-      "# Welcome to your Journal\n\n" +
-      "A private space to write, reflect, and look back. No one else can " +
-      "read this — it lives only on your computer.\n\n" +
-      "## What to add here\n\n" +
-      "- Daily or occasional entries, however long or short\n" +
-      "- Thoughts, plans, gratitude, or things weighing on you\n" +
-      "- Photos or notes you want to remember\n\n" +
-      "## Three questions to try\n\n" +
-      "1. What themes come up most often in my entries?\n" +
-      "2. How was I feeling around last month?\n" +
-      "3. Find the entry where I wrote about a particular day or event.\n",
-  },
-];
-
-function fileNameOf(path: string): string {
-  return path.split("/").pop() ?? path;
-}
-
-type Strength = { score: 0 | 1 | 2 | 3; label: string; level: "weak" | "okay" | "strong" };
-
-// Simple, library-free estimate: length plus the mix of character kinds
-// (lowercase, uppercase, digit, symbol). Empty input scores nothing.
-function passwordStrength(pw: string): Strength {
-  if (!pw) return { score: 0, label: "", level: "weak" };
-  let kinds = 0;
-  if (/[a-z]/.test(pw)) kinds++;
-  if (/[A-Z]/.test(pw)) kinds++;
-  if (/[0-9]/.test(pw)) kinds++;
-  if (/[^A-Za-z0-9]/.test(pw)) kinds++;
-
-  let points = 0;
-  if (pw.length >= 8) points++;
-  if (pw.length >= 12) points++;
-  if (kinds >= 2) points++;
-  if (kinds >= 3) points++;
-
-  if (pw.length < 8 || points <= 1) {
-    return { score: 1, label: "Weak", level: "weak" };
-  }
-  if (points === 2 || points === 3) {
-    return { score: 2, label: "Okay", level: "okay" };
-  }
-  return { score: 3, label: "Strong", level: "strong" };
-}
-
-// Friendly "Opened 2 hours ago" for the Recent list.
-function relativeTime(ms?: number | null): string {
-  if (!ms) return "";
-  const diff = Date.now() - ms;
-  if (diff < 0) return "just now";
-  const min = Math.round(diff / 60000);
-  if (min < 1) return "just now";
-  if (min < 60) return `${min} min ago`;
-  const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr} hour${hr === 1 ? "" : "s"} ago`;
-  const day = Math.round(hr / 24);
-  if (day < 30) return `${day} day${day === 1 ? "" : "s"} ago`;
-  const mo = Math.round(day / 30);
-  if (mo < 12) return `${mo} month${mo === 1 ? "" : "s"} ago`;
-  const yr = Math.round(mo / 12);
-  return `${yr} year${yr === 1 ? "" : "s"} ago`;
-}
-
-// The check-off chips shown under the strength meter, so "how much more?" is
-// answerable rather than a mystery between Weak and Strong.
-function passwordCriteria(pw: string): { label: string; met: boolean }[] {
-  const kinds =
-    (/[a-z]/.test(pw) ? 1 : 0) +
-    (/[A-Z]/.test(pw) ? 1 : 0) +
-    (/[0-9]/.test(pw) ? 1 : 0) +
-    (/[^A-Za-z0-9]/.test(pw) ? 1 : 0);
-  return [
-    { label: "8+ characters", met: pw.length >= 8 },
-    { label: "12+ characters", met: pw.length >= 12 },
-    { label: "Mix of letters, numbers or symbols", met: kinds >= 2 },
-  ];
-}
+// CONTRACT-NOTE: the API agent is adding typed api.ts wrappers for
+// write_recovery_key / has_recovery_key / open_room_with_recovery / list_roles
+// (and icons.RecoveryIcon) in parallel. Until they land, this file calls the
+// backend commands directly (names + shapes per BACKEND-ACTUALS) so it builds
+// standalone. Integration can fold these into src/api.ts and swap the icon.
+const writeRecoveryKey = () => invoke<string>("write_recovery_key");
+const hasRecoveryKey = (path: string) =>
+  invoke<boolean>("has_recovery_key", { path });
+const openRoomWithRecovery = (path: string, code: string) =>
+  invoke<RoomInfo>("open_room_with_recovery", { path, code });
+const listRoles = () => invoke<RoomRole[]>("list_roles");
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>({ kind: "start" });
@@ -223,11 +44,27 @@ export default function App() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [entering, setEntering] = useState(false);
+  // Mirrors `entering`: true while the "sealing shut" lock ritual plays over
+  // the workspace, before the gate returns.
+  const [locking, setLocking] = useState(false);
   const [recent, setRecent] = useState<RecentRoom[]>([]);
   const [roomName, setRoomName] = useState("");
   const [templateKey, setTemplateKey] = useState("blank");
   // ADD-11: whether the room on the unlock screen has a Touch ID entry.
   const [canTouchId, setCanTouchId] = useState(false);
+  // Roles (create flow): the catalog and the chosen role. Default = "default".
+  const [roles, setRoles] = useState<RoomRole[]>([]);
+  const [roleId, setRoleId] = useState("default");
+  // Recovery reveal (create): the one-time code to show once, and the room to
+  // enter once the user dismisses the sheet.
+  const [recoveryCode, setRecoveryCode] = useState<string | null>(null);
+  const [pendingInfo, setPendingInfo] = useState<RoomInfo | null>(null);
+  // Recovery unlock (gate): whether the selected room has a recovery sidecar,
+  // and the "use a code instead" input state.
+  const [hasRecovery, setHasRecovery] = useState(false);
+  const [recoveryMode, setRecoveryMode] = useState(false);
+  const [recoveryInput, setRecoveryInput] = useState("");
+  const [recoveryCopied, setRecoveryCopied] = useState(false);
 
   const loadRecent = useCallback(() => {
     api
@@ -243,6 +80,12 @@ export default function App() {
     setRoomName("");
     setTemplateKey("blank");
     setCanTouchId(false);
+    setRoleId("default");
+    setRecoveryCode(null);
+    setPendingInfo(null);
+    setHasRecovery(false);
+    setRecoveryMode(false);
+    setRecoveryInput("");
     setScreen(next);
   }, []);
 
@@ -284,6 +127,40 @@ export default function App() {
     };
   }, [screen]);
 
+  // Load the role catalog when the create screen opens, so the picker can
+  // offer them. Failure just leaves the default role and hides the picker.
+  useEffect(() => {
+    if (screen.kind !== "create") return;
+    let live = true;
+    listRoles()
+      .then((r) => {
+        if (live) setRoles(r);
+      })
+      .catch(() => {
+        if (live) setRoles([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, [screen.kind]);
+
+  // When the unlock screen appears, ask (without prompting) whether this room
+  // has a recovery sidecar, so we can offer the "use a code" affordance.
+  useEffect(() => {
+    if (screen.kind !== "unlock") return;
+    let live = true;
+    hasRecoveryKey(screen.path)
+      .then((yes) => {
+        if (live) setHasRecovery(yes);
+      })
+      .catch(() => {
+        if (live) setHasRecovery(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [screen]);
+
   async function removeRecent(path: string) {
     await api.removeRecent(path);
     loadRecent();
@@ -310,14 +187,37 @@ export default function App() {
     if (typeof path === "string") goTo({ kind: "unlock", path });
   }
 
-  // Successful unlock plays a short "door opens" bloom on the gate
-  // before the workspace appears.
+  // "Try a demo room": jump straight into the create flow with the bundled
+  // demo template pre-selected, so the user only sets a password. goTo resets
+  // the picker to blank; the setters below run in the same batch and win.
+  function chooseDemo() {
+    goTo({ kind: "create", path: "" });
+    setTemplateKey("demo");
+    setRoomName("Demo Room");
+  }
+
+  // Successful unlock plays the seal ritual (the keyhole blooms open, ~520ms)
+  // on the gate before the workspace appears. Reduced motion skips straight in
+  // with no bloom, so the end-state change is instant.
   function enterRoom(info: RoomInfo) {
+    if (prefersReducedMotion()) {
+      goTo({ kind: "workspace", info });
+      return;
+    }
     setEntering(true);
     window.setTimeout(() => {
       setEntering(false);
       goTo({ kind: "workspace", info });
-    }, 700);
+    }, SEAL_UNLOCK_MS);
+  }
+
+  // The recovery sheet after create: dismissing it (saved or skipped) enters
+  // the room with the just-set password, playing the seal on the way in.
+  function dismissRecovery() {
+    const info = pendingInfo;
+    setRecoveryCode(null);
+    setPendingInfo(null);
+    if (info) enterRoom(info);
   }
 
   async function handleCreate() {
@@ -340,25 +240,57 @@ export default function App() {
     setBusy(true);
     try {
       const info = await api.createRoom(path, password);
-      // The room is now open. Seed the chosen template through ordinary
-      // APIs before entering. Blank seeds nothing (empty content array),
-      // so this loop is skipped and the room stays exactly like today.
+      // The room is now open. Seed the chosen template and role through
+      // ordinary APIs before entering. Everything created here is normal,
+      // editable content — no special machinery. Blank + default seed nothing.
       const tpl = ROOM_TEMPLATES.find((t) => t.key === templateKey);
-      if (tpl && tpl.key !== "blank") {
-        // Best-effort: a failed template must never trap the user outside
-        // their freshly created room. Surface a gentle note, still enter.
-        try {
-          await api.setSetting("custom_instructions", tpl.customInstructions);
+      const role = roles.find((r) => r.id === roleId);
+      // Best-effort: a failed template/role must never trap the user outside
+      // their freshly created room. Surface a gentle note, still continue.
+      try {
+        // Custom instructions = the template's plus the chosen role's guidance
+        // (either may be empty). Roles fold into the same setting.
+        const instructions = [
+          tpl?.customInstructions,
+          role && role.id !== "default" ? role.instructions : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+        if (instructions) {
+          await api.setSetting("custom_instructions", instructions);
+        }
+        // Remember the chosen role so Settings/Workspace can reflect it.
+        if (role && role.id !== "default") {
+          await api.setSetting("room_role", role.id);
+        }
+        // Starter memories, Welcome.md, and any sample files.
+        if (tpl && tpl.key !== "blank") {
           for (const memory of tpl.memories) {
             await api.addMemory(memory);
           }
-          await api.saveGeneratedFile("Welcome.md", tpl.welcome);
-        } catch (e) {
-          console.error("Failed to apply room template", e);
-          setError("Room created, but its starter content could not be added.");
+          if (tpl.welcome) {
+            await api.saveGeneratedFile("Welcome.md", tpl.welcome);
+          }
+          for (const f of tpl.files ?? []) {
+            await api.saveGeneratedFile(f.name, f.content);
+          }
         }
+      } catch (e) {
+        console.error("Failed to apply room template", e);
+        setError("Room created, but its starter content could not be added.");
       }
-      enterRoom(info);
+      // One-time recovery code: generate it now (the room is open with the
+      // just-set password) and reveal it once before entering. Recovery is
+      // additive and optional — if it can't be written, quietly enter anyway.
+      try {
+        const code = await writeRecoveryKey();
+        setPendingInfo(info);
+        setRecoveryCopied(false);
+        setRecoveryCode(code);
+      } catch (e) {
+        console.error("Could not create a recovery code", e);
+        enterRoom(info);
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -381,6 +313,23 @@ export default function App() {
     }
   }
 
+  // Unlock using a one-time recovery code instead of the password. Same
+  // success handling as a normal open; any failure surfaces a calm message.
+  async function handleRecoveryUnlock(path: string) {
+    const code = recoveryInput.trim();
+    if (!code) return;
+    setError("");
+    setBusy(true);
+    try {
+      const info = await openRoomWithRecovery(path, code);
+      enterRoom(info);
+    } catch {
+      setError("That recovery code didn't work. Check it and try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // ADD-11: unlock with a fingerprint. Any failure (cancel, no match) just
   // surfaces a message; the password field below stays available as fallback.
   async function handleTouchId(path: string) {
@@ -397,19 +346,41 @@ export default function App() {
   }
 
   async function handleLock() {
-    await api.closeRoom();
+    // Reduced motion: close and return to the gate instantly, no ritual.
+    if (prefersReducedMotion()) {
+      await api.closeRoom();
+      // Drop the room name from the title bar once locked (CHG-9).
+      getCurrentWindow().setTitle("Private Room").catch(() => {});
+      goTo({ kind: "start" });
+      return;
+    }
+    // Play the "sealing shut" ritual over the workspace. The room is closed
+    // for real right away; only the visual swap to the gate is delayed by the
+    // animation duration (~460ms). A failed close abandons the ritual and
+    // leaves the user in the room, exactly as before.
+    setLocking(true);
+    try {
+      await api.closeRoom();
+    } catch (e) {
+      setLocking(false);
+      throw e;
+    }
     // Drop the room name from the title bar once locked (CHG-9).
     getCurrentWindow().setTitle("Private Room").catch(() => {});
-    goTo({ kind: "start" });
+    window.setTimeout(() => {
+      setLocking(false);
+      goTo({ kind: "start" });
+    }, SEAL_LOCK_MS);
   }
 
   if (screen.kind === "workspace") {
-    return <Workspace info={screen.info} onLock={handleLock} />;
+    return (
+      <>
+        <Workspace info={screen.info} onLock={handleLock} />
+        {locking && <SealLockingOverlay />}
+      </>
+    );
   }
-
-  const strength = passwordStrength(password);
-  const tooShort = password.length > 0 && password.length < MIN_PASSWORD;
-  const mismatch = confirm.length > 0 && password !== confirm;
 
   return (
     <div className={`gate${entering ? " entering" : ""}`}>
@@ -420,246 +391,77 @@ export default function App() {
         <h1>Private Room</h1>
 
         {screen.kind === "start" && (
-          <>
-            <p className="gate-sub">
-              Your files, links, chats and AI — sealed inside one encrypted
-              file that never leaves this computer.
-            </p>
-            <ul className="gate-assurances">
-              <li>Offline by default</li>
-              <li>No account needed</li>
-              <li>One file, fully encrypted</li>
-            </ul>
-            <div className="gate-actions">
-              <button className="primary" onClick={chooseCreate}>
-                Create New Room
-              </button>
-              <button onClick={chooseOpen}>Open Room…</button>
-            </div>
-            {recent.length > 0 && (
-              <div className="recent">
-                <div className="recent-label">Recent</div>
-                <ul className="recent-list">
-                  {recent.map((room) => (
-                    <li key={room.path} className="recent-row">
-                      <button
-                        className="recent-open"
-                        onClick={() =>
-                          goTo({ kind: "unlock", path: room.path })
-                        }
-                      >
-                        <span className="recent-name">{room.name}</span>
-                        <span className="recent-path">{room.path}</span>
-                        {relativeTime(room.openedAt) && (
-                          <span className="recent-when">
-                            Opened {relativeTime(room.openedAt)}
-                          </span>
-                        )}
-                      </button>
-                      <button
-                        className="recent-remove"
-                        title="Remove from list"
-                        aria-label="Remove from list"
-                        onClick={() => removeRecent(room.path)}
-                      >
-                        <CloseIcon size={14} />
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-                <button className="recent-clear" onClick={clearRecent}>
-                  Clear list
-                </button>
-              </div>
-            )}
-          </>
+          <StartScreen
+            recent={recent}
+            onCreate={chooseCreate}
+            onOpen={chooseOpen}
+            onDemo={chooseDemo}
+            onOpenRecent={(path) => goTo({ kind: "unlock", path })}
+            onRemoveRecent={removeRecent}
+            onClearRecent={clearRecent}
+          />
         )}
 
         {screen.kind === "create" && (
-          <form
-            className="gate-form"
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleCreate();
-            }}
-          >
-            <p className="gate-sub">Name your room</p>
-            <input
-              type="text"
-              placeholder="e.g. Personal, Work, Journal"
-              value={roomName}
-              autoFocus
-              onChange={(e) => setRoomName(e.target.value)}
-            />
-            <div className="tpl-picker">
-              <div className="tpl-label">Start from a template</div>
-              <div className="tpl-chips">
-                {ROOM_TEMPLATES.map((tpl) => (
-                  <button
-                    key={tpl.key}
-                    type="button"
-                    className={`tpl-chip${
-                      templateKey === tpl.key ? " active" : ""
-                    }`}
-                    aria-pressed={templateKey === tpl.key}
-                    onClick={() => setTemplateKey(tpl.key)}
-                  >
-                    {tpl.label}
-                  </button>
-                ))}
-              </div>
-              <p className="tpl-blurb">
-                {ROOM_TEMPLATES.find((t) => t.key === templateKey)?.blurb}
-              </p>
-            </div>
-            <input
-              type="password"
-              placeholder="Choose a password"
-              className={tooShort ? "invalid" : undefined}
-              aria-invalid={tooShort}
-              value={password}
-              onChange={(e) => {
-                setPassword(e.target.value);
-                if (error) setError("");
-              }}
-            />
-            {password && (
-              <>
-                <div className={`pw-meter ${strength.level}`}>
-                  <div className="pw-meter-track">
-                    <div className="pw-meter-fill" />
-                  </div>
-                  <span className="pw-meter-label">{strength.label}</span>
-                </div>
-                <ul className="pw-criteria">
-                  {passwordCriteria(password).map((c) => (
-                    <li
-                      key={c.label}
-                      className={c.met ? "met" : undefined}
-                    >
-                      {c.met ? "✓" : "○"} {c.label}
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-            <input
-              type="password"
-              placeholder="Repeat password"
-              className={mismatch ? "invalid" : undefined}
-              aria-invalid={mismatch}
-              value={confirm}
-              onChange={(e) => {
-                setConfirm(e.target.value);
-                if (error) setError("");
-              }}
-            />
-            {mismatch && !error && (
-              <div className="gate-error" role="alert">
-                <span className="gate-error-ic" aria-hidden="true">!</span>
-                Passwords do not match.
-              </div>
-            )}
-            {error && (
-              <div className="gate-error" role="alert">
-                <span className="gate-error-ic" aria-hidden="true">!</span>
-                {error}
-              </div>
-            )}
-            <div className="gate-actions">
-              <button
-                className="primary"
-                type="submit"
-                disabled={
-                  busy ||
-                  password.length < MIN_PASSWORD ||
-                  password !== confirm
-                }
-              >
-                {busy ? "Creating…" : "Create & Enter"}
-              </button>
-              <button type="button" onClick={() => goTo({ kind: "start" })}>
-                Back
-              </button>
-            </div>
-            <p className="gate-note">
-              Longer is stronger. There is no recovery if you forget it.
-            </p>
-          </form>
+          <CreateScreen
+            roomName={roomName}
+            setRoomName={setRoomName}
+            templateKey={templateKey}
+            setTemplateKey={setTemplateKey}
+            roles={roles}
+            roleId={roleId}
+            setRoleId={setRoleId}
+            password={password}
+            setPassword={setPassword}
+            confirm={confirm}
+            setConfirm={setConfirm}
+            error={error}
+            setError={setError}
+            busy={busy}
+            onSubmit={handleCreate}
+            onBack={() => goTo({ kind: "start" })}
+          />
         )}
 
         {screen.kind === "unlock" && (
-          <form
-            className="gate-form"
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleUnlock(screen.path);
+          <UnlockScreen
+            path={screen.path}
+            recoveryMode={recoveryMode}
+            canTouchId={canTouchId}
+            hasRecovery={hasRecovery}
+            busy={busy}
+            password={password}
+            setPassword={setPassword}
+            recoveryInput={recoveryInput}
+            setRecoveryInput={setRecoveryInput}
+            error={error}
+            setError={setError}
+            onUnlock={() => handleUnlock(screen.path)}
+            onRecoveryUnlock={() => handleRecoveryUnlock(screen.path)}
+            onTouchId={() => handleTouchId(screen.path)}
+            onEnterRecoveryMode={() => {
+              setRecoveryMode(true);
+              setPassword("");
+              setError("");
             }}
-          >
-            <p className="gate-sub">
-              Unlock <strong>{fileNameOf(screen.path)}</strong>
-            </p>
-            {canTouchId && (
-              <button
-                type="button"
-                className="touchid-btn"
-                disabled={busy}
-                onClick={() => handleTouchId(screen.path)}
-              >
-                <svg
-                  width="18"
-                  height="18"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.7"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <path d="M12 10a2 2 0 0 0-2 2c0 1.5.1 3 .5 4.5" />
-                  <path d="M8.5 8a5 5 0 0 1 7.5 4.3c0 1.4.1 2.8.4 4.2" />
-                  <path d="M5 12a7 7 0 0 1 13-3.6" />
-                  <path d="M6.2 16.5c-.4-1.5-.5-3-.5-4.5" />
-                  <path d="M12 12v1.5c0 2 .2 4 .8 6" />
-                </svg>
-                Use Touch ID
-              </button>
-            )}
-            <input
-              type="password"
-              placeholder="Password"
-              className={error ? "invalid" : undefined}
-              aria-invalid={!!error}
-              value={password}
-              autoFocus
-              onChange={(e) => {
-                setPassword(e.target.value);
-                if (error) setError("");
-              }}
-            />
-            {error && (
-              <div className="gate-error" role="alert">
-                <span className="gate-error-ic" aria-hidden="true">!</span>
-                {error}
-              </div>
-            )}
-            {!canTouchId && (
-              <p className="gate-hint">
-                Tip: enable fingerprint unlock in Settings → Privacy.
-              </p>
-            )}
-            <div className="gate-actions">
-              <button className="primary" type="submit" disabled={busy}>
-                {busy ? "Unlocking…" : "Unlock"}
-              </button>
-              <button type="button" onClick={() => goTo({ kind: "start" })}>
-                Back
-              </button>
-            </div>
-          </form>
+            onExitRecoveryMode={() => {
+              setRecoveryMode(false);
+              setRecoveryInput("");
+              setError("");
+            }}
+            onBack={() => goTo({ kind: "start" })}
+          />
         )}
       </div>
+      {entering && <SealUnlockingOverlay />}
+      {recoveryCode && (
+        <RecoveryModal
+          recoveryCode={recoveryCode}
+          recoveryCopied={recoveryCopied}
+          setRecoveryCopied={setRecoveryCopied}
+          onDismiss={dismissRecovery}
+        />
+      )}
     </div>
   );
 }

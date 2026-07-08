@@ -1,0 +1,419 @@
+/* =====================================================================
+   Moonshot (Wave 3) — CSS agent additions
+   Calm, on-brand styles for new UI the other frontend agents mount.
+   Palette is the existing tokens (accent violet #8b7cf6, ink #0e1014,
+   panels --surface-* and --panel, border --border, ok green #4cc38a).
+
+   CLASS / KEYFRAME CONTRACT — markup agents must match these names:
+
+   THE SEAL (frontend-only ritual)
+     .seal-unlocking            full-screen unlock overlay (keyhole bloom)
+       @keyframes seal-bloom      overlay lifts (scale up + fade) ~700ms
+       @keyframes seal-glow         helper: the violet keyhole point
+     .seal-locking              collapse the workspace on lock ~500ms
+       @keyframes seal-fold         shrink toward center + fade + blur
+       @keyframes seal-fade         reduced-motion fallback (opacity only)
+     -> heavy transforms/blur disabled under prefers-reduced-motion.
+
+   ROOM MAP (VIEWERS RoomMap.tsx)
+     .room-map  .room-map-canvas  .room-map-legend  .room-map-legend-dot
+     .room-map-tooltip  .room-map-node  .room-map-edge  .room-map-empty
+
+   FRONT PAGE (Workspace, shown on unlock)
+     .front-page  .front-page-grid  .fp-card  .fp-card-title  .fp-card-list
+     .fp-card-empty  .fp-suggestions  .fp-suggestion (clickable chip)
+
+   STUDIO SHELF
+     .studio-shelf  .studio-shelf-title  .studio-btn  .studio-btn-label
+     .studio-btn-sub
+
+   RECEIPTS
+     .receipt-badge (green "verified" pill)
+     .annot-chip.receipt-verified (verified state on annotation chips)
+
+   MEMORY SUGGESTION CARD
+     .memory-suggestion  .memory-suggestion-head  .memory-suggestion-fact
+     .memory-suggestion-actions
+
+   SMART-IMPORT CHIP
+     .import-suggestion  .import-suggestion-text  .import-suggestion-actions
+
+   RECOVERY SHEET
+     .recovery-sheet  .recovery-sheet-title  .recovery-code
+     .recovery-sheet-note  .recovery-sheet-actions
+     -> @media print hides app chrome and prints the code big + mono.
+
+   TIME MACHINE
+     .time-machine  .tm-version  .tm-version-dot  .tm-cause  .tm-time
+     .tm-version.current
+   ===================================================================== */
+
+/* ---- THE SEAL: unlock (keyhole bloom + door-open) ---- */
+
+/* Sits over everything on a successful unlock, then lifts to reveal the room.
+   Matches the create-flow bloom vibe (gate-out / logo-bloom). */
+.seal-unlocking {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  pointer-events: none;
+  background: var(--bg);
+  animation: seal-bloom 0.7s ease forwards;
+}
+/* The violet keyhole: a bright point that blooms outward and dissolves. */
+.seal-unlocking::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 160px;
+  height: 160px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgba(139, 124, 246, 0.9),
+    rgba(139, 124, 246, 0.28) 45%,
+    transparent 70%
+  );
+  transform: translate(-50%, -50%) scale(0.3);
+  animation: seal-glow 0.7s ease forwards;
+}
+
+@keyframes seal-bloom {
+  0% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  55% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.06);
+  }
+}
+
+@keyframes seal-glow {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.3);
+    filter: blur(2px);
+  }
+  35% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+    filter: blur(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(2.4);
+    filter: blur(8px);
+  }
+}
+
+/* ---- THE SEAL: lock (workspace collapses into one file) ---- */
+
+/* Applied to the workspace container during the lock ritual: the panes fold
+   and shrink toward the center and fade, like closing everything into a file. */
+.seal-locking {
+  pointer-events: none;
+  transform-origin: center;
+  animation: seal-fold 0.5s ease forwards;
+}
+
+@keyframes seal-fold {
+  0% {
+    opacity: 1;
+    transform: scale(1);
+    filter: blur(0);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.82);
+    filter: blur(3px);
+  }
+}
+
+/* Reduced-motion fallback for the reveal/collapse. */
+@keyframes seal-fade {
+  to {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Drop the scale/blur/keyhole; keep a gentle fade so the transition still
+     reads without vestibular motion. */
+  .seal-unlocking {
+    animation: seal-fade 0.35s ease forwards;
+  }
+  .seal-unlocking::before {
+    animation: none;
+    opacity: 0;
+  }
+  .seal-locking {
+    animation: seal-fade 0.3s ease forwards;
+  }
+}
+
+/* ---- ROOM MAP (constellation of related files) ---- */
+
+.room-map {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  background: var(--bg);
+}
+
+/* Header row: icon · "Room map" · "N files · M links" — the gap keeps the
+   title and the count from running together ("Room map9 files"). */
+.room-map-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.room-map-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+.room-map-count {
+  font-size: 12px;
+  color: var(--slate);
+}
+
+/* NOTE: the center-pane host `.room-map-canvas` is defined once, near the top
+   of this file. RoomMap paints its own drawable surface (.room-map-svg, in
+   viewers/roomMap.css), so the old stale `.room-map-canvas` drawable rule that
+   used to live here was removed (it clobbered the flex host and leaked a grab
+   cursor onto the toolbar). */
+
+/* Violet nodes / subtle edges when the map is drawn with SVG rather than a
+   raster <canvas>. */
+.room-map-node {
+  fill: var(--accent);
+  stroke: rgba(139, 124, 246, 0.35);
+  stroke-width: 1;
+  cursor: pointer;
+  transition: fill 0.15s ease;
+}
+.room-map-node:hover,
+.room-map-node.active {
+  fill: var(--accent-2);
+}
+.room-map-node.memory {
+  fill: var(--text-dim);
+}
+.room-map-edge {
+  stroke: rgba(139, 124, 246, 0.18);
+  stroke-width: 1;
+  fill: none;
+}
+.room-map-edge.active {
+  stroke: rgba(139, 124, 246, 0.55);
+}
+
+/* Floating legend, bottom-left over the canvas. */
+.room-map-legend {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 9px 11px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
+.room-map-legend-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: 1px;
+}
+.room-map-legend-dot.memory {
+  background: var(--text-dim);
+}
+
+/* Hover tooltip (node name / shared reasons on an edge). */
+.room-map-tooltip {
+  position: absolute;
+  z-index: 3;
+  max-width: 240px;
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  transform: translate(-50%, calc(-100% - 10px));
+}
+.room-map-tooltip .shared {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.room-map-empty {
+  margin: auto;
+  max-width: 300px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* ---- FRONT PAGE (calm dashboard shown on unlock) ---- */
+
+.front-page {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 24px 26px 32px;
+}
+
+.front-page-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.fp-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 15px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 13px;
+}
+
+.fp-card-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.fp-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fp-card-empty {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  padding: 2px 0;
+}
+
+/* Suggested-question chips (span the grid, wrap). */
+.fp-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.fp-suggestion {
+  text-align: left;
+  padding: 9px 13px;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--accent-ghost);
+  border: 1px solid rgba(139, 124, 246, 0.2);
+  border-radius: 20px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.fp-suggestion:hover {
+  background: var(--accent-soft);
+  border-color: rgba(139, 124, 246, 0.4);
+}
+
+/* ---- STUDIO SHELF (flashcards / mindmap / podcast / briefing) ---- */
+
+.studio-shelf {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 13px;
+}
+
+.studio-shelf-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.studio-shelf .studio-btn + .studio-btn {
+  margin: 0;
+}
+
+/* The four action buttons — quiet slate cards that warm to violet on hover. */
+.studio-btn {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  text-align: left;
+  padding: 11px 13px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  color: var(--text);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.studio-btn:hover:not(:disabled) {
+  border-color: rgba(139, 124, 246, 0.4);
+  background: var(--accent-ghost);
+}
+.studio-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.studio-btn svg {
+  flex-shrink: 0;
+  color: var(--accent-2);
+}
+.studio-btn-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+.studio-btn-sub {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--text-dim);
+  margin-top: 1px;
+}
+
+/* When the shelf lays the four buttons out as a grid. */
+.studio-shelf.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
