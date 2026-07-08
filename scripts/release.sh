@@ -69,13 +69,21 @@ cat > "${STAGE}/latest.json" <<JSON
 }
 JSON
 
-echo "▶ Creating GitHub release ${TAG}…"
-gh release create "$TAG" \
-  --repo "$REPO" \
-  --title "Private Room ${VER}" \
-  --notes "$NOTES" \
-  "${STAGE}/Private.Room_${VER}_aarch64.dmg" \
-  "${STAGE}/Private.Room.app.tar.gz" \
+ASSETS=(
+  "${STAGE}/Private.Room_${VER}_aarch64.dmg"
+  "${STAGE}/Private.Room.app.tar.gz"
   "${STAGE}/latest.json"
+)
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+  # A release already exists for this tag (e.g. a DMG-only release cut without
+  # the signing key). Add/replace the signed assets — this is what turns on
+  # auto-update by publishing latest.json + the matching signed payload.
+  echo "▶ Release ${TAG} exists — uploading signed assets (clobber)…"
+  gh release upload "$TAG" --repo "$REPO" --clobber "${ASSETS[@]}"
+else
+  echo "▶ Creating GitHub release ${TAG}…"
+  gh release create "$TAG" --repo "$REPO" \
+    --title "Private Room ${VER}" --notes "$NOTES" "${ASSETS[@]}"
+fi
 
 echo "✓ Released ${TAG} — https://github.com/${REPO}/releases/tag/${TAG}"
