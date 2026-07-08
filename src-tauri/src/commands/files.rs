@@ -185,26 +185,17 @@ pub fn list_files(state: State<'_, AppState>) -> Result<Vec<FileMeta>, String> {
 pub(crate) const MAX_VIEWER_BYTES: usize = 50 * 1024 * 1024;
 
 #[tauri::command]
-pub fn get_file_content(state: State<'_, AppState>, id: String) -> Result<FileContent, String> {
+pub fn get_file_content(
+    state: State<'_, AppState>,
+    media: State<'_, MediaStreams>,
+    id: String,
+) -> Result<FileContent, String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
     let (name, mime, bytes, extracted) = db::get_file_full(&room.conn, &id)?;
     let mime = mime.unwrap_or_default();
-    let bytes = bytes.unwrap_or_default();
+    let mut bytes = bytes.unwrap_or_default();
     let ext = extraction::extension_of(&name);
-
-    let content = |kind: &str, editable: bool, text: Option<String>, b64: bool| FileContent {
-        kind: kind.into(),
-        name: name.clone(),
-        mime: mime.clone(),
-        editable,
-        text,
-        data_b64: if b64 {
-            Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
-        } else {
-            None
-        },
-    };
 
     // Clip huge extracted text at a char boundary for preview/edit payloads.
     let clip = |mut t: String| {
@@ -219,16 +210,40 @@ pub fn get_file_content(state: State<'_, AppState>, id: String) -> Result<FileCo
         t
     };
 
+    // ADD-24: recordings/videos stream through roommedia:// (Range-capable),
+    // so any size plays and seeks — no base64 through IPC, no 50MB ceiling.
+    // The timestamped transcript still rides along for "[m:ss]" seeking.
+    if let Some(kind) = stt::media_kind(&mime, &ext) {
+        let k = if kind == stt::MediaKind::Video { "video" } else { "audio" };
+        let playable = playable_media_mime(&mime, &ext, kind == stt::MediaKind::Video);
+        let token = stage_media_bytes(&media, std::mem::take(&mut bytes), &playable);
+        return Ok(FileContent {
+            kind: k.into(),
+            name,
+            mime,
+            editable: false,
+            text: extracted.map(clip),
+            data_b64: None,
+            media_token: Some(token),
+        });
+    }
+
+    let content = |kind: &str, editable: bool, text: Option<String>, b64: bool| FileContent {
+        kind: kind.into(),
+        name: name.clone(),
+        mime: mime.clone(),
+        editable,
+        text,
+        data_b64: if b64 {
+            Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
+        } else {
+            None
+        },
+        media_token: None,
+    };
+
     if extraction::is_image(&mime) && bytes.len() <= MAX_VIEWER_BYTES {
         return Ok(content("image", false, None, true));
-    }
-    // ADD-18: recordings/videos play in the audio/video viewer, carrying their
-    // timestamped transcript so "[m:ss]" lines can seek the player.
-    if let Some(kind) = stt::media_kind(&mime, &ext) {
-        if bytes.len() <= MAX_VIEWER_BYTES {
-            let k = if kind == stt::MediaKind::Video { "video" } else { "audio" };
-            return Ok(content(k, false, extracted.map(clip), true));
-        }
     }
     match ext.as_str() {
         // PDF/DOCX carry their extracted text too, so the viewer can offer
@@ -361,6 +376,15 @@ pub(crate) fn link_file_name(title: &str, url: &str) -> String {
     format!("{name}.md")
 }
 
+/// ADD-26: a YouTube transcript failure that means "this video just has no
+/// captions" (as opposed to a network/parse error) — the trigger for the
+/// download-and-transcribe fallback. Matches the messages youtube_transcript
+/// raises for the no-caption cases.
+fn is_missing_captions(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("no captions") || e.contains("came back empty") || e.contains("could not be read")
+}
+
 /// ADD-12: fetch a web page and save a readable offline copy as a Markdown file.
 /// Uses `web::fetch_page` WITH the SEC-5 guard, so private/loopback addresses
 /// are refused. An explicit user action, so it works even when the AI's web
@@ -371,7 +395,15 @@ pub async fn import_link(state: State<'_, AppState>, url: String) -> Result<File
     // transcript (no video download) instead of the watch page's JS soup.
     let is_youtube = web::youtube_video_id(&url).is_some();
     let (title, text) = if is_youtube {
-        web::youtube_transcript(&url).await?
+        // ADD-26: when a video simply has no captions, signal the frontend with
+        // a sentinel so it can auto-fall-back to downloading the video and
+        // transcribing it on-device — rather than surfacing a dead end. Genuine
+        // failures (network, blocked) still propagate verbatim.
+        match web::youtube_transcript(&url).await {
+            Ok(v) => v,
+            Err(e) if is_missing_captions(&e) => return Err("YT_NO_CAPTIONS".into()),
+            Err(e) => return Err(e),
+        }
     } else {
         web::fetch_page(&url).await?
     };

@@ -28,6 +28,7 @@ import type {
   SttStatus,
   AiActionDef,
   AgentOpenFilePayload,
+  AgentUiRequest,
   AnnotationPayload,
   McpApproveRequest,
   RecommendedModels,
@@ -257,6 +258,25 @@ export const api = {
     cb: (statuses: McpServerStatus[]) => void,
   ): Promise<UnlistenFn> =>
     listen<McpServerStatus[]>("mcp-status", (e) => cb(e.payload)),
+
+  // ADD-26: download a YouTube video into the room (yt-dlp on first use).
+  importYoutubeVideo: (url: string) =>
+    invoke<ImportReport>("import_youtube_video", { url }),
+  onYtdlpProgress: (
+    cb: (p: { status: string; percent: number | null }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ status: string; percent: number | null }>("ytdlp-progress", (e) =>
+      cb(e.payload),
+    ),
+
+  // ADD-25: the agent↔UI bridge — the backend asks the live webview for an
+  // element snapshot / click / frame grab; the driver answers by id.
+  onAgentUiRequest: (
+    cb: (req: AgentUiRequest) => void,
+  ): Promise<UnlistenFn> =>
+    listen<AgentUiRequest>("agent-ui-request", (e) => cb(e.payload)),
+  resolveAgentUi: (id: string, payload: unknown) =>
+    invoke<void>("resolve_agent_ui", { id, payload }),
 
   // ---- dialogs (@tauri-apps/plugin-dialog) ----
   chooseOpenPath: (options?: OpenDialogOptions) => open(options),

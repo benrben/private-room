@@ -1,8 +1,16 @@
-import { RoomInfo } from "../api";
+import { useEffect, useState } from "react";
+import { api, RoomInfo } from "../api";
 import { CloseIcon, LinkIcon, LockIcon } from "../icons";
 import Settings from "../Settings";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+
+/** ADD-26: is this a YouTube page URL? Checked against the URL with its
+ * scheme stripped, so "https://youtu.be/…" matches too. */
+function isYoutubeUrl(url: string): boolean {
+  const bare = url.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  return /(^|\.)((youtube(-nocookie)?\.com)|youtu\.be)\//i.test(bare);
+}
 
 /** Room settings, the SEC-1 MCP start-approval dialog, and the ADD-12 add-link
  * modal. Extracted verbatim. */
@@ -74,64 +82,210 @@ export default function SettingsModals({
         </div>
       )}
 
-      {s.showAddLink && (
-        <div
-          className="settings-backdrop"
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget && !s.importingLink)
-              s.setShowAddLink(false);
-          }}
-        >
-          <div className="settings add-link-modal">
-            <div className="settings-head">
-              <span className="badge-label">
-                <LinkIcon size={15} /> Add a web link
-              </span>
-              <button
-                className="subtle btn-ic"
-                title="Close"
-                onClick={() => s.setShowAddLink(false)}
-                disabled={s.importingLink}
-              >
-                <CloseIcon size={12} />
-              </button>
-            </div>
-            <div className="settings-body">
-              <p className="settings-hint">
-                This fetches one page from the internet.
-              </p>
+      {s.showAddLink && <AddLinkModal s={s} a={a} />}
+    </>
+  );
+}
+
+/** The ADD-12 add-link modal, plus the ADD-26 "also save the video" path for
+ * YouTube links. Mounted only while open, so the checkbox/progress state
+ * resets each time. */
+function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
+  const [saveVideo, setSaveVideo] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [ytProgress, setYtProgress] = useState<{
+    status: string;
+    percent: number | null;
+  } | null>(null);
+  const isYoutube = isYoutubeUrl(s.linkUrl);
+
+  // ADD-26: follow yt-dlp while the modal is open.
+  useEffect(() => {
+    const unlisten = api.onYtdlpProgress((p) => setYtProgress(p));
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  /** ADD-26: download the video and let the room transcribe it on-device.
+   * Shared by the explicit "also save the video" checkbox and the automatic
+   * no-captions fallback. The download can take minutes, so the modal stays
+   * open with progress. Returns true when a video landed. */
+  async function downloadAndTranscribe(url: string): Promise<boolean> {
+    setDownloading(true);
+    try {
+      const report = await api.importYoutubeVideo(url);
+      s.setFiles(await api.listFiles());
+      if (report.errors.length > 0) {
+        s.pushToast("error", report.errors.join("\n"));
+        return false;
+      }
+      const name = report.imported[0]?.name;
+      s.pushToast(
+        "success",
+        name
+          ? `Saved "${name}" — it will transcribe itself shortly.`
+          : "Video saved — it will transcribe itself shortly.",
+      );
+      s.setShowAddLink(false);
+      s.setLinkUrl("");
+      return true;
+    } catch (e) {
+      s.pushToast("error", String(e));
+      return false;
+    } finally {
+      setDownloading(false);
+      setYtProgress(null);
+    }
+  }
+
+  /** Checked path: captions page first, then the video itself. Missing
+   * captions are fine here — the video download transcribes anyway. */
+  async function submitWithVideo() {
+    const url = s.linkUrl.trim();
+    if (!url || s.importingLink) return;
+    s.setImportingLink(true);
+    try {
+      try {
+        const meta = await api.importLink(url);
+        s.setFiles(await api.listFiles());
+        s.pushToast("success", `Saved "${meta.name}" into the room.`);
+        a.viewFile(meta.id);
+      } catch (e) {
+        // No captions is expected — the download below transcribes it. Any
+        // other failure is worth showing, but we still try the video.
+        if (String(e) !== "YT_NO_CAPTIONS") s.pushToast("error", String(e));
+      }
+      await downloadAndTranscribe(url);
+    } finally {
+      s.setImportingLink(false);
+    }
+  }
+
+  /** Default path: save captions/page. ADD-26: if a YouTube video simply has
+   * no captions, automatically download it and transcribe on-device instead
+   * of failing — the user just gets a searchable, playable video either way. */
+  async function submitCaptionsOrFallback() {
+    const url = s.linkUrl.trim();
+    if (!url || s.importingLink) return;
+    s.setImportingLink(true);
+    try {
+      const meta = await api.importLink(url);
+      s.setFiles(await api.listFiles());
+      s.setShowAddLink(false);
+      s.setLinkUrl("");
+      s.pushToast("success", `Saved "${meta.name}" into the room.`);
+      a.viewFile(meta.id);
+    } catch (e) {
+      if (String(e) === "YT_NO_CAPTIONS") {
+        s.pushToast(
+          "info",
+          "This video has no captions — downloading it to transcribe on-device…",
+        );
+        await downloadAndTranscribe(url);
+      } else {
+        s.pushToast("error", String(e));
+      }
+    } finally {
+      s.setImportingLink(false);
+    }
+  }
+
+  function submit() {
+    if (isYoutube && saveVideo) void submitWithVideo();
+    else void submitCaptionsOrFallback();
+  }
+
+  return (
+    <div
+      className="settings-backdrop"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !s.importingLink)
+          s.setShowAddLink(false);
+      }}
+    >
+      <div className="settings add-link-modal">
+        <div className="settings-head">
+          <span className="badge-label">
+            <LinkIcon size={15} /> Add a web link
+          </span>
+          <button
+            className="subtle btn-ic"
+            title="Close"
+            onClick={() => s.setShowAddLink(false)}
+            disabled={s.importingLink}
+          >
+            <CloseIcon size={12} />
+          </button>
+        </div>
+        <div className="settings-body">
+          <p className="settings-hint">
+            This fetches one page from the internet.
+          </p>
+          <input
+            className="add-link-input"
+            autoFocus
+            dir="auto"
+            placeholder="https://example.com/article"
+            value={s.linkUrl}
+            onChange={(e) => s.setLinkUrl(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submit();
+              if (e.key === "Escape" && !s.importingLink) s.setShowAddLink(false);
+            }}
+          />
+          {isYoutube && (
+            <label className="settings-hint" style={{ display: "flex", alignItems: "center", gap: "6px" }}>
               <input
-                className="add-link-input"
-                autoFocus
-                dir="auto"
-                placeholder="https://example.com/article"
-                value={s.linkUrl}
-                onChange={(e) => s.setLinkUrl(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") a.submitLink();
-                  if (e.key === "Escape" && !s.importingLink) s.setShowAddLink(false);
-                }}
+                type="checkbox"
+                checked={saveVideo}
+                onChange={(e) => setSaveVideo(e.target.checked)}
+                disabled={s.importingLink}
               />
-              <div className="settings-actions">
-                <button
-                  className="subtle"
-                  onClick={() => s.setShowAddLink(false)}
-                  disabled={s.importingLink}
-                >
-                  Cancel
-                </button>
-                <button
-                  className="primary"
-                  onClick={a.submitLink}
-                  disabled={s.importingLink || !s.linkUrl.trim()}
-                >
-                  {s.importingLink ? "Fetching…" : "Save page"}
-                </button>
-              </div>
-            </div>
+              Also save the video (downloads via YouTube — larger, stays
+              offline afterward)
+            </label>
+          )}
+          {downloading && (
+            <span className="banner-pull">
+              <span className="banner-pull-label">
+                Downloading <strong>video</strong>…
+              </span>
+              <span className="pull-bar">
+                <span
+                  className="pull-bar-fill"
+                  style={{ width: `${ytProgress?.percent ?? 0}%` }}
+                />
+              </span>
+              <span className="banner-pull-status">
+                {ytProgress?.status ?? "Starting"}
+                {ytProgress?.percent != null &&
+                  ` — ${ytProgress.percent.toFixed(0)}%`}
+              </span>
+            </span>
+          )}
+          <div className="settings-actions">
+            <button
+              className="subtle"
+              onClick={() => s.setShowAddLink(false)}
+              disabled={s.importingLink}
+            >
+              Cancel
+            </button>
+            <button
+              className="primary"
+              onClick={submit}
+              disabled={s.importingLink || !s.linkUrl.trim()}
+            >
+              {downloading
+                ? "Downloading…"
+                : s.importingLink
+                  ? "Fetching…"
+                  : "Save page"}
+            </button>
           </div>
         </div>
-      )}
-    </>
+      </div>
+    </div>
   );
 }

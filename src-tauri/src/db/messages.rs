@@ -19,18 +19,24 @@ pub fn messages_like(conn: &Connection, needle: &str) -> Result<Vec<(String, Str
 }
 
 /// Insert a new message and return it (with the row's assigned timestamp).
+/// `effects` is the structured viewer payload (boxes/annotation) for the
+/// turn, stored as JSON in its own column — never folded into `content`, so
+/// the transcript stays plain prose (ADD-23).
 pub fn insert_message(
     conn: &Connection,
     chat_id: &str,
     role: &str,
     content: &str,
     sources: &[String],
+    effects: Option<&serde_json::Value>,
 ) -> Result<Message, String> {
     let id = Uuid::new_v4().to_string();
     let sources_json = serde_json::to_string(sources).map_err(|e| e.to_string())?;
+    let effects_json = effects.map(|v| v.to_string());
     conn.execute(
-        "INSERT INTO messages(id, chat_id, role, content, sources) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, chat_id, role, content, sources_json],
+        "INSERT INTO messages(id, chat_id, role, content, sources, effects)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, chat_id, role, content, sources_json, effects_json],
     )
     .map_err(|e| e.to_string())?;
     let created_at: String = conn
@@ -44,6 +50,7 @@ pub fn insert_message(
         content: content.into(),
         sources: sources.to_vec(),
         created_at,
+        effects: effects.cloned(),
     })
 }
 
@@ -51,13 +58,14 @@ pub fn insert_message(
 pub fn list_messages(conn: &Connection, chat_id: &str) -> Result<Vec<Message>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, role, content, sources, created_at FROM messages
+            "SELECT id, role, content, sources, created_at, effects FROM messages
              WHERE chat_id = ?1 ORDER BY rowid ASC",
         )
         .map_err(|e| e.to_string())?;
     let messages = stmt
         .query_map([chat_id], |r| {
             let sources_json: Option<String> = r.get(3)?;
+            let effects_json: Option<String> = r.get(5)?;
             Ok(Message {
                 id: r.get(0)?,
                 role: r.get(1)?,
@@ -66,6 +74,7 @@ pub fn list_messages(conn: &Connection, chat_id: &str) -> Result<Vec<Message>, S
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default(),
                 created_at: r.get(4)?,
+                effects: effects_json.and_then(|s| serde_json::from_str(&s).ok()),
             })
         })
         .map_err(|e| e.to_string())?

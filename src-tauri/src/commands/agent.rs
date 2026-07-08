@@ -460,7 +460,7 @@ pub async fn ask(
             ..Default::default()
         });
 
-        db::insert_message(conn, &chat_id, "user", &question, &[])?;
+        db::insert_message(conn, &chat_id, "user", &question, &[], None)?;
 
         // First question names the session.
         let mut title: String = question.chars().take(48).collect();
@@ -491,6 +491,9 @@ pub async fn ask(
     // (nothing in the reply depends on the boxes), so the warm chat model streams
     // the first token immediately instead of waiting on a vision-model load.
     let mut effects = ToolEffects::default();
+    // ADD-25: perception tools attach pixels only when the chat model can
+    // read them; otherwise they fall back to a local vision-model description.
+    effects.vision_chat = is_vision_chat_model(&model);
 
     // Phase 2 (unlocked): answer — through a cloud CLI if selected, or the
     // local model with full app-control tools. When the user pressed Stop
@@ -625,27 +628,51 @@ pub async fn ask(
     if stopped {
         content.push_str(" *(stopped)*");
     }
-    if let Some(payload) = &effects.boxes {
-        content.push_str(&format!("\n\n```boxes\n{payload}\n```"));
-    }
-    if let Some(payload) = &effects.annotation {
-        content.push_str(&format!("\n\n```annotation\n{payload}\n```"));
-    }
+    // ADD-23: viewer effects ride the message's own `effects` column as
+    // structured data — the visible answer stays plain prose. (Fenced
+    // ```boxes/```annotation blocks in old rooms are still parsed by the UI
+    // as a legacy fallback.)
+    let effects_value = effects_json(&effects);
 
     // Phase 3 (locked): save the assistant reply. HLT-7: if the room was
     // locked mid-answer it is already closed — return quietly with the
     // (unsaved) content instead of surfacing "No room is open" to the UI.
     let guard = state.room.lock().unwrap();
     match guard.as_ref() {
-        Some(room) => db::insert_message(&room.conn, &chat_id, "assistant", &content, &sources),
+        Some(room) => db::insert_message(
+            &room.conn,
+            &chat_id,
+            "assistant",
+            &content,
+            &sources,
+            effects_value.as_ref(),
+        ),
         None => Ok(Message {
             id: String::new(),
             role: "assistant".into(),
             content,
             sources,
             created_at: String::new(),
+            effects: effects_value,
         }),
     }
+}
+
+/// ADD-23: the message-row `effects` JSON for this turn's tool effects —
+/// `{"boxes": ..?, "annotation": ..?}` — or None when neither fired, so the
+/// column stays NULL for plain answers.
+pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
+    if effects.boxes.is_none() && effects.annotation.is_none() {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    if let Some(b) = &effects.boxes {
+        map.insert("boxes".into(), b.clone());
+    }
+    if let Some(a) = &effects.annotation {
+        map.insert("annotation".into(), a.clone());
+    }
+    Some(serde_json::Value::Object(map))
 }
 
 /// ADD-7: stop a running answer. Sets its cancel flag; a no-op for an unknown
@@ -674,6 +701,10 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "add_memory",
     "web_search",
     "fetch_page",
+    "ui_snapshot",
+    "ui_act",
+    "view_screenshot",
+    "view_media_frame",
 ];
 
 /// ADD-22: the file-MUTATING built-ins. A small model picks the right tool far
@@ -707,10 +738,27 @@ pub(crate) fn wants_write_tools(question: &str) -> bool {
     HINTS.iter().any(|h| q.contains(h))
 }
 
+/// ADD-25: keyword router for the UI/perception tools (ui_snapshot, ui_act,
+/// view_screenshot, view_media_frame). Same doctrine as wants_write_tools:
+/// deterministic, errs toward YES, and keeps the plain-question catalog short
+/// so a 4B model isn't choosing among tools it doesn't need.
+pub(crate) fn wants_ui_tools(question: &str) -> bool {
+    let q = question.to_lowercase();
+    const HINTS: &[&str] = &[
+        "click", "press ", "button", "screenshot", "screen", "scroll", "navigate",
+        "menu", "sidebar", "watch", "frame", "video", "look at", "looking at",
+        "interface", "use the app", "the app", "type in", "toggle", "what do you see",
+        "what am i", "on screen",
+    ];
+    HINTS.iter().any(|h| q.contains(h))
+}
+
 /// The lane label shown to the user (transparency: they see how the app framed
 /// their request, so an odd answer is explainable). Purely cosmetic.
 pub(crate) fn lane_label(question: &str, web_enabled: bool) -> &'static str {
-    if wants_write_tools(question) {
+    if wants_ui_tools(question) {
+        "Using the app"
+    } else if wants_write_tools(question) {
         "Working on your files"
     } else if web_enabled {
         "Answering (web available)"
@@ -853,6 +901,37 @@ pub(crate) fn consult_advisor_spec(advisors: &[String]) -> serde_json::Value {
     }})
 }
 
+/// ADD-25: the UI/perception tool specs. Deliberately NOT part of
+/// `tools_catalog` — the room MCP bridge is built from `tools_catalog`, so
+/// keeping these out means a cloud client on the Leash can never observe or
+/// drive this Mac's screen. The guard is structural, exactly like
+/// `consult_advisor_spec`. Injected by `agent_loop` only when the
+/// deterministic router (`wants_ui_tools`) fires.
+pub(crate) fn ui_tools_specs() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type": "function", "function": {"name": "ui_snapshot",
+            "description": "List every clickable/typable control currently visible in the app as numbered marks (role, label, region). Take a fresh snapshot before each ui_act — marks go stale when the screen changes. Consent-sensitive controls (settings, approvals) are never listed.",
+            "parameters": {"type": "object", "properties": {}}}}),
+        serde_json::json!({"type": "function", "function": {"name": "ui_act",
+            "description": "Operate one control from the latest ui_snapshot by its mark number. The user watches every action. Example: {\"mark\": 12, \"action\": \"click\"}",
+            "parameters": {"type": "object", "properties": {
+                "mark": {"type": "integer", "description": "Mark number from the latest ui_snapshot"},
+                "action": {"type": "string", "enum": ["click", "type", "set", "scroll"],
+                    "description": "click a control; type appends text into a field; set replaces the field's text; scroll moves the element's pane (text: \"up\" or \"down\")"},
+                "text": {"type": "string", "description": "For type/set: the text. For scroll: \"up\" or \"down\"."}},
+                "required": ["mark", "action"]}}}),
+        serde_json::json!({"type": "function", "function": {"name": "view_screenshot",
+            "description": "Capture what the user currently sees in the app window and look at it. Use when the words in the transcript aren't enough and you need the actual pixels (layout, an open image or PDF page, a chart).",
+            "parameters": {"type": "object", "properties": {}}}}),
+        serde_json::json!({"type": "function", "function": {"name": "view_media_frame",
+            "description": "Grab one frame from a video file in the room at a timestamp and look at it. Pair with the transcript's [m:ss] stamps to inspect the exact moment. Example: {\"name\": \"lecture.mp4\", \"at\": \"12:34\"}",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "Video file name or a distinctive part of it"},
+                "at": {"type": "string", "description": "Timestamp like \"1:23\" or \"1:02:03\", or plain seconds like \"75\""}},
+                "required": ["name", "at"]}}}),
+    ]
+}
+
 /// A connected MCP tool exposed to the model this turn: its catalog entry
 /// plus the client handle to call it with.
 pub(crate) struct McpRoute {
@@ -966,8 +1045,8 @@ pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<Str
     (routes, omitted)
 }
 
-/// Viewer payloads produced by tools during a turn; appended to the saved
-/// assistant message as fenced markup blocks.
+/// Viewer payloads produced by tools during a turn; persisted on the saved
+/// assistant message's `effects` column (ADD-23).
 #[derive(Default)]
 pub(crate) struct ToolEffects {
     pub(crate) boxes: Option<serde_json::Value>,
@@ -981,6 +1060,14 @@ pub(crate) struct ToolEffects {
     /// ADD-21: cloud-advisor consults spent this turn, capped at
     /// `MAX_ADVISOR_CALLS`.
     pub(crate) advisor_calls: u8,
+    /// ADD-25: base64 PNGs captured this round (view_screenshot /
+    /// view_media_frame). agent_loop drains them into a vision user-message
+    /// right after the tool result, so the model looks at what it captured.
+    pub(crate) pending_images: Vec<String>,
+    /// ADD-25: whether the CHAT model can read attached images. Set by the
+    /// caller from `is_vision_chat_model`; when false the perception tools
+    /// return a local vision-model description instead of attaching pixels.
+    pub(crate) vision_chat: bool,
 }
 
 /// CHG-4/CHG-30: keep the running message list within a char budget so many
@@ -1033,6 +1120,11 @@ pub(crate) fn tool_step_label(name: &str) -> String {
         "add_memory" => "Saved a memory",
         "web_search" => "Searched the web",
         "fetch_page" => "Fetched a page",
+        // ADD-25: the agent is operating the app with the user watching.
+        "ui_snapshot" => "Looked at the app's controls",
+        "ui_act" => "Operated the app",
+        "view_screenshot" => "Looked at the screen",
+        "view_media_frame" => "Looked at a video frame",
         // ADD-21: name the exfiltration plainly — the local model just chose to
         // send a subtask to the cloud.
         "consult_advisor" => "Consulting a cloud advisor (content leaves this Mac)",
@@ -1082,12 +1174,35 @@ pub(crate) async fn agent_loop(
         }
     }
     let (routes, omitted_mcp) = mcp_routes(state);
+    // ADD-25: UI/perception tools ride the same injection path as the advisor
+    // spec — never `tools_catalog`, so the room bridge can't hand a cloud
+    // client the user's screen. Offered only when the deterministic router
+    // hears an operate-the-app intent, keeping plain-question catalogs short.
+    let ui_enabled = wants_ui_tools(question);
     if let Some(arr) = tools.as_array_mut() {
         for r in &routes {
             arr.push(r.spec.clone());
         }
         if !advisors.is_empty() {
             arr.push(consult_advisor_spec(advisors));
+        }
+        if ui_enabled {
+            arr.extend(ui_tools_specs());
+        }
+    }
+    if ui_enabled {
+        if let Some(sys) = messages.first_mut() {
+            if sys.role == "system" {
+                sys.content.push_str(
+                    "\n\nYou can also OPERATE this app's own interface, with the user watching: \
+                     ui_snapshot lists every visible control as numbered marks; ui_act clicks, \
+                     types into, or scrolls one mark. view_screenshot attaches what the user \
+                     currently sees; view_media_frame grabs a video frame at a timestamp. Take a \
+                     fresh ui_snapshot before each ui_act. Privacy/consent controls (Settings, \
+                     approval dialogs) are excluded and will refuse. Prefer answering directly — \
+                     drive the interface only when the user asked you to do something in the app.",
+                );
+            }
         }
     }
     // ADD-21: tell the model the advisor exists and that it is a last resort —
@@ -1118,8 +1233,9 @@ pub(crate) async fn agent_loop(
         }
     }
     // Web flows chain search → fetch → answer; give them more rounds. A consult
-    // → synthesize path needs the extra room too.
-    let max_rounds = if routes.is_empty() && !web_enabled && advisors.is_empty() {
+    // → synthesize path needs the extra room too, and so does a snapshot →
+    // act → re-snapshot UI flow (ADD-25).
+    let max_rounds = if routes.is_empty() && !web_enabled && advisors.is_empty() && !ui_enabled {
         4
     } else {
         8
@@ -1232,6 +1348,21 @@ pub(crate) async fn agent_loop(
                 tool_name: Some(call.name.clone()),
                 ..Default::default()
             });
+            // ADD-25: a perception tool captured pixels this call — hand them
+            // to the (vision-capable) chat model as a user message right after
+            // the tool result, so it looks at what it just captured. Ollama
+            // reads images from user turns, not tool turns.
+            if !effects.pending_images.is_empty() {
+                let imgs: Vec<String> = effects.pending_images.drain(..).collect();
+                messages.push(ollama::ChatMessage {
+                    role: "user".into(),
+                    content: "[The capture you requested is attached. Look at it, then \
+                              continue — answer the user or take the next action.]"
+                        .into(),
+                    images: Some(imgs),
+                    ..Default::default()
+                });
+            }
         }
         // A round of only repeats means the model is stuck; force a tool-less
         // synthesis next round instead of looping to the budget.
@@ -1528,6 +1659,124 @@ pub(crate) async fn exec_tool(
                 .collect::<Vec<_>>()
                 .join(", ");
             Ok(format!("Set {summary} in \"{real_name}\"."))
+        }
+        // ADD-25: the agent↔UI tools. Each is one round-trip through the
+        // AgentUi bridge to the live webview driver; the driver enforces the
+        // data-agent-blocked consent denylist a second time at act time.
+        "ui_snapshot" => {
+            use tauri::Manager;
+            let ui = window.app_handle().state::<AgentUi>();
+            let v = request_ui(window, &ui, "ui_snapshot", serde_json::json!({})).await?;
+            let mut out = String::new();
+            if let Some(s) = v["summary"].as_str() {
+                out.push_str(s);
+                out.push('\n');
+            }
+            for e in v["elements"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                let mark = e["mark"].as_u64().unwrap_or(0);
+                let role = e["role"].as_str().unwrap_or("control");
+                let label = e["label"].as_str().unwrap_or("");
+                let region = e["region"].as_str().unwrap_or("app");
+                match e["state"].as_str().filter(|s| !s.is_empty()) {
+                    Some(st) => {
+                        out.push_str(&format!("[{mark}] {role} \"{label}\" — {region} ({st})\n"))
+                    }
+                    None => out.push_str(&format!("[{mark}] {role} \"{label}\" — {region}\n")),
+                }
+            }
+            if out.trim().is_empty() {
+                return Ok("No interactive controls are visible right now.".into());
+            }
+            Ok(clamp_tool_result(out))
+        }
+        "ui_act" => {
+            use tauri::Manager;
+            let mark = args["mark"]
+                .as_u64()
+                .ok_or("ui_act needs the mark number of a control from the latest ui_snapshot")?;
+            let action = args["action"].as_str().unwrap_or("click");
+            let text = args["text"].as_str().unwrap_or("");
+            let ui = window.app_handle().state::<AgentUi>();
+            let v = request_ui(
+                window,
+                &ui,
+                "ui_act",
+                serde_json::json!({ "mark": mark, "action": action, "text": text }),
+            )
+            .await?;
+            let desc = v["description"].as_str().unwrap_or("Done.").to_string();
+            // The generic "Operated the app" chip already fired; follow with
+            // the precise receipt so the user sees exactly what was touched.
+            let _ = window.emit("ask-step", desc.clone());
+            Ok(desc)
+        }
+        "view_screenshot" => {
+            use tauri::Manager;
+            // Native whole-window snapshot first (WKWebView takeSnapshot, no
+            // permissions); the driver's viewer-pane composite is the fallback
+            // (and the only path that can see <video> frames — hardware layers
+            // render blank in native snapshots).
+            let native: Result<Vec<u8>, String> =
+                match window.app_handle().get_webview_window("main") {
+                    Some(wv) => crate::snapshot::capture_webview_png(&wv),
+                    None => Err("The app window is gone.".into()),
+                };
+            let b64 = match native {
+                Ok(png) => downscale_png_b64(&png, 1280)?,
+                Err(_) => {
+                    let ui = window.app_handle().state::<AgentUi>();
+                    let v =
+                        request_ui(window, &ui, "view_screenshot", serde_json::json!({})).await?;
+                    v["imageB64"]
+                        .as_str()
+                        .ok_or("The screenshot came back empty.")?
+                        .to_string()
+                }
+            };
+            perceive_image(effects, b64, "a screenshot of the app window").await
+        }
+        "view_media_frame" => {
+            use tauri::Manager;
+            let name = args["name"].as_str().unwrap_or_default();
+            let at = match (&args["at"], args["at"].as_str()) {
+                (serde_json::Value::Number(n), _) => n.as_f64().unwrap_or(0.0),
+                (_, Some(s)) => parse_timestamp_secs(s)?,
+                _ => 0.0,
+            };
+            let (token, playable, real_name) = {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                // Resolve the target: the model's name if it matches, else fall
+                // back to the room's sole video (the common "look at the video"
+                // case where the user is watching the one video they added).
+                let (id, real_name) = resolve_video_file(&room.conn, name)?;
+                let (fname, mime, bytes, _) = db::get_file_full(&room.conn, &id)?;
+                let mime = mime.unwrap_or_default();
+                let ext = extraction::extension_of(&fname);
+                let playable = playable_media_mime(&mime, &ext, true);
+                let streams = window.app_handle().state::<MediaStreams>();
+                let token =
+                    stage_media_bytes(&streams, bytes.unwrap_or_default(), &playable);
+                (token, playable, real_name)
+            };
+            let ui = window.app_handle().state::<AgentUi>();
+            let v = request_ui(
+                window,
+                &ui,
+                "media_frame",
+                serde_json::json!({ "token": token, "mime": playable, "seconds": at }),
+            )
+            .await?;
+            let b64 = v["imageB64"]
+                .as_str()
+                .ok_or("The frame capture came back empty.")?
+                .to_string();
+            perceive_image(
+                effects,
+                b64,
+                &format!("the frame at {}s of \"{real_name}\"", at.round() as u64),
+            )
+            .await
         }
         "web_search" => {
             let query = args["query"].as_str().unwrap_or_default();
@@ -1899,6 +2148,146 @@ pub(crate) fn clamp_bytes(mut s: String, max: usize) -> String {
     s
 }
 
+/// ADD-25: hand a captured image (screenshot / video frame) to the model.
+/// Vision-capable chat model → queue the pixels; agent_loop attaches them as
+/// a user message right after this tool result. Text-only chat model → a
+/// LOCAL vision model describes the image and the description IS the result,
+/// so every model tier gets perception without any pixels leaving the Mac.
+pub(crate) async fn perceive_image(
+    effects: &mut ToolEffects,
+    image_b64: String,
+    caption: &str,
+) -> Result<String, String> {
+    if effects.vision_chat {
+        effects.pending_images.push(image_b64);
+        return Ok(format!(
+            "Captured {caption}. The image is attached to your context — look at it before \
+             answering."
+        ));
+    }
+    let models = ollama::list_models().await.unwrap_or_default();
+    if models.is_empty() {
+        return Err("No local model is available to look at the image.".into());
+    }
+    let mut vmodel = vision_model(&models, &models[0]);
+    if is_external_engine(&vmodel) {
+        vmodel = best_default(&models);
+    }
+    let messages = vec![ollama::ChatMessage {
+        role: "user".into(),
+        content: format!(
+            "This image is {caption}. Describe it precisely and concisely — visible text, \
+             labels, values, and anything unusual — so an assistant that cannot see it can act \
+             on your description."
+        ),
+        images: Some(vec![image_b64]),
+        ..Default::default()
+    }];
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"description": {"type": "string"}},
+        "required": ["description"]
+    });
+    // The describe pass may load a second model; release it quickly on
+    // low-RAM Macs (chat model unknown here, so "" never matches == warm).
+    let keep = vision_keep_alive(total_ram_bytes(), &vmodel, "");
+    let raw = ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &schema).await?;
+    let desc = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v["description"].as_str().map(str::to_string))
+        .unwrap_or(raw);
+    Ok(clamp_tool_result(format!(
+        "Your chat model can't view images, so a local vision model looked at {caption} and \
+         reports: {desc}"
+    )))
+}
+
+/// ADD-25: resolve the video a `view_media_frame` call means. First honor the
+/// model's `name` (if it matches a real file); when that name is generic
+/// ("the video") or missing, fall back to the room's sole video file — the
+/// common case where the user is watching the one video they added. Returns
+/// (file_id, display_name) or an Err string the model can relay.
+pub(crate) fn resolve_video_file(
+    conn: &Connection,
+    name: &str,
+) -> Result<(String, String), String> {
+    let is_video = |mime: &str, fname: &str| {
+        stt::media_kind(mime, &extraction::extension_of(fname)) == Some(stt::MediaKind::Video)
+    };
+    // A concrete name that resolves to a real file wins — but only if it's a
+    // video; a matched non-video is a clear, relayable error.
+    if !name.trim().is_empty() {
+        if let Ok((id, real_name)) = db::find_file_like(conn, name) {
+            let (fname, mime, _, _) = db::get_file_full(conn, &id)?;
+            let mime = mime.unwrap_or_default();
+            if is_video(&mime, &fname) {
+                return Ok((id, real_name));
+            }
+            if stt::media_kind(&mime, &extraction::extension_of(&fname)).is_some() {
+                return Err(format!(
+                    "\"{real_name}\" is audio-only — there is no frame to look at; read its \
+                     transcript instead."
+                ));
+            }
+            return Err(format!(
+                "\"{real_name}\" isn't a video — view_media_frame only works on video files."
+            ));
+        }
+    }
+    // No usable name → the sole video in the room, if there is exactly one.
+    let videos: Vec<FileMeta> = db::list_files(conn)?
+        .into_iter()
+        .filter(|f| is_video(&f.mime_type, &f.name))
+        .collect();
+    match videos.as_slice() {
+        [only] => Ok((only.id.clone(), only.name.clone())),
+        [] => Err("There are no video files in this room to look at.".into()),
+        many => Err(format!(
+            "There are several videos — say which one: {}.",
+            many.iter().map(|f| f.name.clone()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// ADD-25: shrink a captured PNG to at most `max_w` pixels wide (aspect kept)
+/// and return it base64-encoded. Retina window snapshots are ~3000px wide —
+/// far past what a 4-8B vision model can use, and slow to encode as context.
+pub(crate) fn downscale_png_b64(png: &[u8], max_w: u32) -> Result<String, String> {
+    let img = image::load_from_memory(png)
+        .map_err(|e| format!("couldn't decode the snapshot: {e}"))?;
+    let img = if img.width() > max_w {
+        img.resize(max_w, u32::MAX, image::imageops::FilterType::CatmullRom)
+    } else {
+        img
+    };
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| format!("couldn't re-encode the snapshot: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&out))
+}
+
+/// ADD-25: "1:23" / "1:02:03" / "75" / "75.5" → seconds. The tool accepts the
+/// same [m:ss] stamps the transcripts carry, so the model can quote them back.
+pub(crate) fn parse_timestamp_secs(s: &str) -> Result<f64, String> {
+    let s = s.trim().trim_start_matches('[').trim_end_matches(']');
+    if s.is_empty() {
+        return Err("Give a timestamp like \"1:23\" or seconds like \"75\".".into());
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() > 3 {
+        return Err(format!("\"{s}\" is not a timestamp (use h:mm:ss, m:ss, or seconds)."));
+    }
+    let mut secs = 0.0;
+    for p in &parts {
+        let v: f64 = p
+            .trim()
+            .parse()
+            .map_err(|_| format!("\"{s}\" is not a timestamp (use h:mm:ss, m:ss, or seconds)."))?;
+        secs = secs * 60.0 + v;
+    }
+    Ok(secs.max(0.0))
+}
+
 /// Clip a string to `max` chars at a trailing word boundary when possible,
 /// for one-line inventory descriptions. Never splits a char.
 pub(crate) fn clamp_words(s: &str, max: usize) -> String {
@@ -2119,6 +2508,55 @@ mod tests {
         // …plain informational questions keep the short read-only catalog.
         assert!(!wants_write_tools("what does the lease say about pets?"));
         assert!(!wants_write_tools("who are the parties in this agreement"));
+    }
+
+    #[test]
+    fn wants_ui_tools_routes_operate_intents() {
+        // Operate-the-app intents open the UI/perception tools…
+        assert!(wants_ui_tools("click the Save button"));
+        assert!(wants_ui_tools("take a screenshot of the chart"));
+        assert!(wants_ui_tools("scroll down in the sidebar"));
+        assert!(wants_ui_tools("what do you see on screen?"));
+        assert!(wants_ui_tools("look at the video at 2:15"));
+        // …a plain document question does not.
+        assert!(!wants_ui_tools("summarize the contract"));
+        assert!(!wants_ui_tools("who signed this agreement"));
+    }
+
+    #[test]
+    fn ui_tools_never_leak_into_the_room_bridge_catalog() {
+        // ADD-25 structural guard: the UI/perception tools must NOT be in
+        // tools_catalog (which builds the room MCP bridge) — only injected
+        // into the local agent loop. A regression here would hand a cloud
+        // client the user's screen.
+        let catalog = tools_catalog(true).to_string();
+        for name in ["ui_snapshot", "ui_act", "view_screenshot", "view_media_frame"] {
+            assert!(!catalog.contains(name), "{name} must not be in tools_catalog");
+        }
+        // But they ARE offered by the dedicated spec builder.
+        let specs = ui_tools_specs();
+        assert_eq!(specs.len(), 4);
+    }
+
+    #[test]
+    fn effects_json_is_none_until_a_tool_draws() {
+        let mut e = ToolEffects::default();
+        assert!(effects_json(&e).is_none(), "plain answer → NULL effects column");
+        e.annotation = Some(serde_json::json!({"fileId": "x", "quote": "hi"}));
+        let v = effects_json(&e).expect("annotation should produce effects");
+        assert!(v["annotation"].is_object());
+        assert!(v.get("boxes").is_none());
+    }
+
+    #[test]
+    fn timestamp_parsing_matches_transcript_stamps() {
+        assert_eq!(parse_timestamp_secs("75"), Ok(75.0));
+        assert_eq!(parse_timestamp_secs("1:15"), Ok(75.0));
+        assert_eq!(parse_timestamp_secs("1:02:03"), Ok(3723.0));
+        assert_eq!(parse_timestamp_secs("[12:34]"), Ok(754.0)); // the [m:ss] the UI prints
+        assert!(parse_timestamp_secs("1:2:3:4").is_err());
+        assert!(parse_timestamp_secs("abc").is_err());
+        assert!(parse_timestamp_secs("").is_err());
     }
 
     #[test]

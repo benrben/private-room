@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS messages (
   role TEXT NOT NULL,
   content TEXT NOT NULL,
   sources TEXT,
+  effects TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
@@ -285,6 +286,15 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     // invalidate a stale summary). Guarded ALTER, like folder_id above.
     if table_exists(conn, "files")? && !column_exists(conn, "files", "ai_summary")? {
         conn.execute("ALTER TABLE files ADD COLUMN ai_summary TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    // ADD-23: structured viewer effects (boxes/annotation) ride their own
+    // column so assistant `content` stays plain prose. Guarded ALTER for rooms
+    // created before the column existed; legacy fenced ```boxes/```annotation
+    // blocks inside old messages are still parsed by the UI as a fallback.
+    if table_exists(conn, "messages")? && !column_exists(conn, "messages", "effects")? {
+        conn.execute("ALTER TABLE messages ADD COLUMN effects TEXT", [])
             .map_err(|e| e.to_string())?;
     }
 

@@ -96,6 +96,28 @@ export interface Message {
   content: string;
   sources: string[];
   createdAt: string;
+  /** ADD-23: structured viewer effects (boxes/annotation) for this turn.
+   * Rendered from data — the message content itself stays plain prose.
+   * Null for plain answers and for user messages. */
+  effects: MessageEffects | null;
+}
+
+/** ADD-23: the `effects` column payload — what a turn's tools drew. */
+export interface MessageEffects {
+  boxes?: {
+    fileId: string;
+    name?: string;
+    boxes: { label: string; x1: number; y1: number; x2: number; y2: number }[];
+  };
+  annotation?: AnnotationPayload;
+}
+
+/** ADD-25: one backend→webview request on the agent↔UI bridge. The driver
+ * answers via api.resolveAgentUi(id, payload). */
+export interface AgentUiRequest {
+  id: string;
+  kind: "ui_snapshot" | "ui_act" | "view_screenshot" | "media_frame";
+  args: Record<string, unknown>;
 }
 
 export interface Memory {
@@ -123,6 +145,10 @@ export interface FileContent {
   editable: boolean;
   text: string | null;
   dataB64: string | null;
+  /** ADD-24: audio/video only — token for the roommedia:// streaming
+   * protocol (seekable, any size). The viewer plays
+   * `roommedia://localhost/<token>` instead of a base64 data URL. */
+  mediaToken: string | null;
 }
 
 export interface AiStatus {

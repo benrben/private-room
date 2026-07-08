@@ -30,6 +30,9 @@ mod docs_html;
 mod summarize;
 mod studios;
 mod moonshot;
+mod media;
+mod agent_ui;
+mod ytdlp;
 
 pub use external::*;
 pub use rooms::*;
@@ -51,6 +54,9 @@ pub(crate) use docs_html::*;
 pub use summarize::*;
 pub use studios::*;
 pub use moonshot::*;
+pub use media::*;
+pub use agent_ui::*;
+pub use ytdlp::*;
 
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.5:4b";
 pub(crate) const MAX_CONTEXT_CHUNKS: usize = 6;
@@ -290,6 +296,11 @@ pub struct Message {
     pub content: String,
     pub sources: Vec<String>,
     pub created_at: String,
+    /// Structured viewer effects (boxes/annotation) produced by tools during
+    /// this turn. Persisted as their own column so the message `content`
+    /// stays plain prose — the UI renders these from data, never by parsing
+    /// fenced blocks back out of the text.
+    pub effects: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Clone)]
@@ -318,6 +329,11 @@ pub struct FileContent {
     pub editable: bool,
     pub text: Option<String>,
     pub data_b64: Option<String>,
+    /// Audio/video only: token for the roommedia:// streaming protocol. The
+    /// viewer plays `roommedia://localhost/<token>` (seekable, any size)
+    /// instead of a base64 data URL, so large recordings stream instead of
+    /// riding through IPC.
+    pub media_token: Option<String>,
 }
 
 #[derive(Serialize, Clone)]

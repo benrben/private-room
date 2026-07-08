@@ -164,6 +164,7 @@ export default function ViewerRouter({
           kind={c.kind}
           mime={c.mime}
           dataB64={c.dataB64 ?? ""}
+          mediaToken={c.mediaToken}
           text={c.text}
           target={{ quote: t?.quote ?? t?.find }}
         />

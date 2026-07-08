@@ -253,7 +253,7 @@ pub async fn run_command(
             rows.reverse();
             rows
         };
-        db::insert_message(conn, &chat_id, "user", &raw, &[])?;
+        db::insert_message(conn, &chat_id, "user", &raw, &[], None)?;
         let mut title: String = raw.chars().take(48).collect();
         if raw.chars().count() > 48 {
             title.push('…');
@@ -310,26 +310,30 @@ pub async fn run_command(
     if stopped {
         content.push_str(" *(stopped)*");
     }
-    if let Some(payload) = &res.effects.boxes {
-        content.push_str(&format!("\n\n```boxes\n{payload}\n```"));
-    }
-    if let Some(payload) = &res.effects.annotation {
-        content.push_str(&format!("\n\n```annotation\n{payload}\n```"));
-    }
     if content.trim().is_empty() {
         content = "Done.".into();
     }
+    // ADD-23: viewer effects ride the `effects` column, not fenced markup.
+    let effects_value = effects_json(&res.effects);
 
     // Phase 3 (locked): save the assistant reply (HLT-7: room may have closed).
     let guard = state.room.lock().unwrap();
     match guard.as_ref() {
-        Some(room) => db::insert_message(&room.conn, &chat_id, "assistant", &content, &res.sources),
+        Some(room) => db::insert_message(
+            &room.conn,
+            &chat_id,
+            "assistant",
+            &content,
+            &res.sources,
+            effects_value.as_ref(),
+        ),
         None => Ok(Message {
             id: String::new(),
             role: "assistant".into(),
             content,
             sources: res.sources,
             created_at: String::new(),
+            effects: effects_value,
         }),
     }
 }

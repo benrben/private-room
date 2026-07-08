@@ -23,7 +23,9 @@ export default function DeleteControl({
 }: DeleteControlProps) {
   if (confirmDelete === k) {
     return (
-      <span className="confirm-del">
+      // ADD-25: an armed destructive confirm is a consent surface — the agent
+      // driver must not be able to click ✓ on a delete it didn't earn.
+      <span className="confirm-del" data-agent-blocked>
         <span className="confirm-q">Delete?</span>
         <button
           className="chip-btn confirm-yes"

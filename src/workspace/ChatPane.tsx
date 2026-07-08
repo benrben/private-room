@@ -239,9 +239,18 @@ export default function ChatPane({
           </div>
         )}
         {messages.map((m) => {
+          // ADD-23: structured effects ride on the message row; the content is
+          // plain prose. Legacy rooms (effects: null) still carry fenced
+          // ```boxes/```annotation blocks inside the text — split those out.
           const { text, boxes, annotation } =
             m.role === "assistant"
-              ? splitMarkupBlocks(m.content)
+              ? m.effects
+                ? {
+                    text: m.content,
+                    boxes: m.effects.boxes,
+                    annotation: m.effects.annotation,
+                  }
+                : splitMarkupBlocks(m.content)
               : { text: m.content, boxes: undefined, annotation: undefined };
           const annotVerified = !!annotation?.quote && !annotation?.approx;
           return (
@@ -423,7 +432,9 @@ export default function ChatPane({
           </div>
         )}
         {s.memSuggestion && (
-          <div className="memory-suggestion">
+          // ADD-25: saving a memory is the user's explicit choice — the agent
+          // driver must not be able to click "Save to memory" for them.
+          <div className="memory-suggestion" data-agent-blocked>
             <div className="memory-suggestion-head">
               <MemoryIcon size={13} /> Worth remembering?
             </div>

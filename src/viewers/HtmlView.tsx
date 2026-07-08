@@ -70,6 +70,7 @@ export default function HtmlView({ source, name }: Props) {
           <button
             className="subtle"
             title="Open this page in your default browser — allows external resources and leaves the private sandbox. Only for pages you trust."
+            data-agent-blocked
             onClick={openInBrowser}
             disabled={opening}
           >

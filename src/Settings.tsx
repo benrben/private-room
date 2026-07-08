@@ -165,7 +165,9 @@ export default function Settings({
   } = useRecovery();
 
   return (
-    <div className="settings-backdrop" onClick={onClose}>
+    // ADD-25: consent surface — the agent UI driver must never see or operate
+    // Settings (web/cloud/advisor/room-server switches, password, Touch ID).
+    <div className="settings-backdrop" data-agent-blocked onClick={onClose}>
       <div
         className="settings"
         ref={modalRef}

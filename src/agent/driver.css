@@ -1,0 +1,55 @@
+/* ADD-25: agent-driver visuals — Set-of-Marks badges over the snapshot's
+   numbered elements, plus the ghost-cursor ring flashed on whatever the agent
+   touches. These exist so the user always SEES what the local model is looking
+   at / acting on. Deliberately theme-agnostic (dark pill + rgba borders) so
+   the same rules read fine in light and dark without pulling in theme vars.
+   z-index sits above every app overlay — the badges must never hide behind a
+   modal the agent can see. */
+
+.agent-som-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2147483000;
+}
+
+.agent-som-badge {
+  position: absolute;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  box-sizing: border-box;
+  border-radius: 9px;
+  background: rgba(22, 22, 27, 0.9);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  font-family: -apple-system, system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+}
+
+/* Flashed at the acted-on element's rect for ~700ms; pointer-events none so
+   it can never swallow the very click it is announcing. */
+.agent-ghost-ring {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483000;
+  border-radius: 6px;
+  animation: agent-ghost-pulse 0.7s ease-out forwards;
+}
+
+@keyframes agent-ghost-pulse {
+  0% {
+    box-shadow:
+      0 0 0 2px rgba(88, 156, 255, 0.95),
+      0 0 0 6px rgba(88, 156, 255, 0.35);
+  }
+  100% {
+    box-shadow:
+      0 0 0 2px rgba(88, 156, 255, 0),
+      0 0 0 14px rgba(88, 156, 255, 0);
+  }
+}

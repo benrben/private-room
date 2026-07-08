@@ -179,7 +179,13 @@ export default function TopBar({
             </>
           )}
         </div>
-        <button className="lock-btn btn-ic" title="Lock ⌘L" onClick={a.handleLock}>
+        {/* ADD-25: locking the room is the user's call, never the agent's. */}
+        <button
+          className="lock-btn btn-ic"
+          title="Lock ⌘L"
+          data-agent-blocked
+          onClick={a.handleLock}
+        >
           <LockIcon size={14} /> Lock
         </button>
       </div>

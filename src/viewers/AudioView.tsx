@@ -14,6 +14,9 @@ interface Props {
   kind: "audio" | "video";
   mime: string;
   dataB64: string;
+  /** ADD-24: token for the roommedia:// streaming protocol (seekable, any
+   * size). Null for rooms saved before streaming existed → dataB64 fallback. */
+  mediaToken: string | null;
   /** Extracted text: provenance line + "[m:ss] …" rows (may be null). */
   text: string | null;
   target?: { quote?: string } | null;
@@ -59,22 +62,28 @@ function parseRows(text: string | null): Row[] {
     });
 }
 
-export default function AudioView({ kind, mime, dataB64, text, target }: Props) {
+export default function AudioView({ kind, mime, dataB64, mediaToken, text, target }: Props) {
   const mediaRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [activeIdx, setActiveIdx] = useState(-1);
 
   const rows = useMemo(() => parseRows(text), [text]);
 
-  // Blob URL for the encrypted-at-rest bytes; revoked on unmount. The stored
-  // mime is normalized first: mime-guessers label .m4a as audio/m4a or
-  // audio/mp4a-latm, which WKWebView's <audio> silently refuses to play —
-  // the type it accepts for AAC-in-MP4 is audio/mp4.
+  // ADD-24: with a mediaToken the player streams from the Range-capable
+  // roommedia:// protocol (any size, seekable; the response carries the right
+  // Content-Type server-side). Legacy fallback: a blob URL for the
+  // encrypted-at-rest bytes, revoked on unmount. The stored mime is normalized
+  // first: mime-guessers label .m4a as audio/m4a or audio/mp4a-latm, which
+  // WKWebView's <audio> silently refuses to play — the type it accepts for
+  // AAC-in-MP4 is audio/mp4.
   const src = useMemo(() => {
+    if (mediaToken) return `roommedia://localhost/${mediaToken}`;
     const bytes = base64ToBytes(dataB64);
     return URL.createObjectURL(new Blob([bytes], { type: playableMime(mime, kind) }));
-  }, [dataB64, mime, kind]);
-  useEffect(() => () => URL.revokeObjectURL(src), [src]);
+  }, [mediaToken, dataB64, mime, kind]);
+  useEffect(() => () => {
+    if (src.startsWith("blob:")) URL.revokeObjectURL(src);
+  }, [src]);
 
   // An AI quote targets a transcript row: scroll it into view and flash it.
   useEffect(() => {

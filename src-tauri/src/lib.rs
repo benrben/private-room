@@ -6,6 +6,7 @@ pub mod mcp;
 mod ocr;
 mod ollama;
 mod room_mcp;
+pub(crate) mod snapshot;
 pub mod stt;
 pub mod web;
 
@@ -22,6 +23,28 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
         .manage(commands::HtmlPreviews::default())
+        .manage(commands::MediaStreams::default())
+        .manage(commands::AgentUi::default())
+        // ADD-24: stream staged room media (audio/video) with HTTP Range
+        // support — WKWebView's media elements need 206 responses to seek, and
+        // large videos must never ride through IPC as base64. Bytes come from
+        // the in-memory MediaStreams map (decrypted, capped, cleared on lock).
+        .register_uri_scheme_protocol("roommedia", |ctx, request| {
+            use tauri::http::Response;
+            use tauri::Manager;
+            let streams = ctx.app_handle().state::<commands::MediaStreams>();
+            let range = request
+                .headers()
+                .get("range")
+                .and_then(|v| v.to_str().ok());
+            let (status, headers, body) =
+                commands::media_response(&streams, request.uri().path(), range);
+            let mut builder = Response::builder().status(status);
+            for (k, v) in headers {
+                builder = builder.header(k, v);
+            }
+            builder.body(body).unwrap()
+        })
         // THE SANDBOX: serve staged HTML pages from an isolated origin so their
         // own JS/CSS runs (like a real browser) while a strict per-response CSP
         // blocks every network request — the page can't phone home or reach the
@@ -153,6 +176,10 @@ pub fn run() {
             commands::set_ollama_url,
             commands::get_ollama_url,
             commands::list_roles,
+            // ADD-23..26: plain-text effects + media streaming + agent UI
+            // bridge + YouTube video import.
+            commands::resolve_agent_ui,
+            commands::import_youtube_video,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

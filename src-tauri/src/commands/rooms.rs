@@ -209,6 +209,13 @@ pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
     // any in-flight approval requests (their awaiters resolve to a decline).
     state.mcp_session_ok.lock().unwrap().clear();
     state.mcp_pending.lock().unwrap().clear();
+    // ADD-24/ADD-25: a locked room leaves no decrypted media staged for the
+    // streaming protocol, and no agent↔UI round-trip left hanging.
+    {
+        use tauri::Manager;
+        clear_media(&app.state::<MediaStreams>());
+        app.state::<AgentUi>().pending.lock().unwrap().clear();
+    }
     let _ = app.emit("mcp-status", Vec::<mcp::ServerStatus>::new());
     Ok(())
 }

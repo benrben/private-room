@@ -1,6 +1,6 @@
 [package]
 name = "private-room"
-version = "0.2.0"
+version = "0.2.1"
 description = "Private Room — an encrypted local AI workspace in a single file"
 authors = ["Ben Reich"]
 edition = "2021"
@@ -60,7 +60,23 @@ objc2-foundation = { version = "0.3", features = [
     "NSArray",
     "NSData",
     "NSDictionary",
+    "NSError",
     "NSString",
+] }
+# ADD-25: webview snapshots. block2 carries the ObjC completion-handler block;
+# objc2-web-kit exposes WKWebView.takeSnapshotWithConfiguration:; objc2-app-kit
+# does the NSImage → NSBitmapImageRep → PNG conversion.
+block2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSBitmapImageRep",
+    "NSGraphics",
+    "NSImage",
+    "NSImageRep",
+] }
+objc2-web-kit = { version = "0.3", features = [
+    "WKSnapshotConfiguration",
+    "WKWebView",
+    "block2",
 ] }
 objc2-vision = { version = "0.3", features = [
     "VNRequest",

@@ -16,7 +16,9 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
   return (
     <>
       {pendingApproval && (
-        <div className="approve-backdrop">
+        // ADD-25: consent surface — the agent must never be able to click its
+        // own tool-call approval ("Allow"), so the driver can't see it.
+        <div className="approve-backdrop" data-agent-blocked>
           <div className="approve-card" role="alertdialog" aria-modal="true">
             <div className="approve-title">
               <GlobeIcon size={17} /> Allow a connected tool to run?

@@ -138,6 +138,7 @@ export function makeChatActions(
       content: raw,
       sources: [],
       createdAt: "",
+      effects: null,
     };
     s.setMessages((m) => [...m, optimistic]);
     const chatId = s.activeChatId;
@@ -390,6 +391,7 @@ export function makeChatActions(
       content: raw,
       sources: [],
       createdAt: "",
+      effects: null,
     };
     s.setMessages((m) => [...m, optimistic]);
     const chatId = s.activeChatId;

@@ -176,6 +176,7 @@ export default function ViewerPane({
               <button
                 className="subtle btn-ic"
                 title="Export a normal copy out of the room"
+                data-agent-blocked
                 onClick={() => a.exportOne(openFile.id, openFile.content.name)}
               >
                 <DownloadIcon size={13} /> Export

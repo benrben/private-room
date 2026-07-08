@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { api, RoomInfo } from "../api";
+import { handleAgentUiRequest } from "../agent/driver";
 import { annotationTarget } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -95,6 +96,17 @@ export function useWorkspaceEffects(
     const unlistenMcpApprove = api.onMcpApproveRequest((req) => {
       s.setMcpApprovals((q) => [...q, req]);
     });
+    // ADD-25: the agent↔UI bridge — the backend's ui_snapshot / ui_act /
+    // view_screenshot / media_frame tools land here; the driver performs them
+    // against the live DOM (enforcing the data-agent-blocked consent denylist)
+    // and every outcome, including a thrown surprise, is answered so the
+    // backend's oneshot never waits out its timeout.
+    const unlistenAgentUi = api.onAgentUiRequest(async (req) => {
+      const payload = await handleAgentUiRequest(req).catch((e) => ({
+        error: String(e),
+      }));
+      api.resolveAgentUi(req.id, payload).catch(() => {});
+    });
     a.refreshWebAccess();
     a.refreshAutolock();
     if (info.synced) {
@@ -160,6 +172,7 @@ export function useWorkspaceEffects(
       unlistenFiles.then((fn) => fn());
       unlistenMcp.then((fn) => fn());
       unlistenMcpApprove.then((fn) => fn());
+      unlistenAgentUi.then((fn) => fn());
       window.clearInterval(s.recheckTimer.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

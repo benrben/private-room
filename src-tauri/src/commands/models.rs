@@ -25,6 +25,19 @@ pub(crate) fn best_default(models: &[String]) -> String {
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
+/// ADD-25: can this chat model READ an image (screenshot / video frame) fed
+/// into its context? Distinct from grounding accuracy (vision_model below) —
+/// gemma3 describes fine even though it aims boxes badly, and the default
+/// qwen3.5 is multimodal. Text-only chat models get a vision-model describe
+/// pass instead of an attached image.
+pub(crate) fn is_vision_chat_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    !is_embedding_model(&m)
+        && ["vl", "llava", "vision", "moondream", "minicpm-v", "gemma3", "qwen3.5"]
+            .iter()
+            .any(|k| m.contains(k))
+}
+
 /// Grounding ("where is X") routes to a Qwen-VL model: measured on a known
 /// target, gemma3 puts boxes in the wrong place while qwen2.5vl is accurate
 /// without qwen3's slow thinking pass.
