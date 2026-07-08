@@ -25,10 +25,15 @@ pub(crate) async fn resolve_local_model(state: &State<'_, AppState>) -> Option<S
     if models.is_empty() {
         return None;
     }
-    let mut model = explicit.unwrap_or_else(|| best_default(&models));
-    if is_external_engine(&model) {
-        model = best_default(&models);
-    }
+    let model = explicit.unwrap_or_else(|| best_default(&models));
+    // These commands make small structured calls that must stay on-device, so a
+    // cloud/external engine (which also can't be relied on for structured JSON)
+    // is swapped for a local model.
+    let model = if is_external_engine(&model) || is_cloud_model(&model) {
+        best_local_default(&models)
+    } else {
+        model
+    };
     Some(model)
 }
 

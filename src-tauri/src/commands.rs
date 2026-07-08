@@ -91,6 +91,11 @@ pub(crate) const MAX_MCP_CATALOG_CHARS: usize = 8_000;
 /// slow, paid cloud call; one per turn keeps the local loop from flailing into
 /// repeated exfiltration when it could just answer.
 pub(crate) const MAX_ADVISOR_CALLS: u8 = 1;
+/// Runaway backstop for the tool-enabled agent loop (not a working budget): the
+/// loop ends when the model stops calling tools, so this only bounds a
+/// pathological model that never stops. Set far above any real run — an agent /
+/// QA sweep can chain many snapshot → act → verify rounds without being cut off.
+pub(crate) const MAX_TOOL_ROUNDS: usize = 1_000;
 
 pub(crate) const MCP_CONFIG_KEY: &str = "mcp_config";
 /// Shown as the starting config. The web-search entry ships disabled so a

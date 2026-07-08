@@ -25,6 +25,23 @@ pub(crate) fn best_default(models: &[String]) -> String {
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
+/// A chat-capable model that runs ON THIS MAC — not an embedding model, not an
+/// external CLI, not an Ollama `:cloud` model. The tool-driving agent loop and
+/// on-device structured side-calls must run here, because `:cloud` models leak
+/// tool calls inline (see is_cloud_model) and can't be trusted to drive the app.
+/// Prefers the tuned default; falls back to the first eligible installed model,
+/// then to the default name (so an Ollama error names the missing model).
+pub(crate) fn best_local_default(models: &[String]) -> String {
+    if models.iter().any(|m| m.starts_with(DEFAULT_MODEL)) {
+        return DEFAULT_MODEL.to_string();
+    }
+    models
+        .iter()
+        .find(|m| !is_embedding_model(m) && !is_external_engine(m) && !is_cloud_model(m))
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
+
 /// ADD-25: can this chat model READ an image (screenshot / video frame) fed
 /// into its context? Distinct from grounding accuracy (vision_model below) —
 /// gemma3 describes fine even though it aims boxes badly, and the default
@@ -236,4 +253,25 @@ mod tests {
         assert!(best_default(&with_default).starts_with(DEFAULT_MODEL));
     }
 
+    #[test]
+    fn best_local_default_skips_cloud_embedding_and_external() {
+        assert!(is_cloud_model("minimax-m3:cloud"));
+        assert!(!is_cloud_model("qwen3.5:9b"));
+        // The failing QA env: a cloud model + embeddings + a local chat model.
+        // The tool loop must land on the local chat model, never the cloud one.
+        let models = vec![
+            "minimax-m3:cloud".to_string(),
+            "nomic-embed-text:latest".to_string(),
+            "qwen3.5:9b".to_string(),
+        ];
+        assert_eq!(best_local_default(&models), "qwen3.5:9b");
+        // Only a cloud model + embeddings installed → fall back to the default
+        // name so Ollama surfaces a clear "model not found" rather than driving
+        // the app with a cloud model that leaks tool calls.
+        let no_local = vec![
+            "minimax-m3:cloud".to_string(),
+            "nomic-embed-text:latest".to_string(),
+        ];
+        assert_eq!(best_local_default(&no_local), DEFAULT_MODEL);
+    }
 }

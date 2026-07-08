@@ -4,6 +4,16 @@ pub fn is_external_engine(model: &str) -> bool {
     model == "claude-cli" || model == "codex-cli"
 }
 
+/// An Ollama `:cloud` model (e.g. `minimax-m3:cloud`) runs remotely. Unlike
+/// local models it does NOT reliably emit tool calls in Ollama's structured
+/// `tool_calls` field — it leaks them inline as text (`<tool_call>…`), which the
+/// stream parser never sees, so the call silently never runs. It also ignores
+/// the `format` grammar constraint (see recover_json). Such models are unfit for
+/// the tool-driving agent loop and for on-device structured side-calls.
+pub fn is_cloud_model(model: &str) -> bool {
+    model.ends_with(":cloud")
+}
+
 /// Find cloud coding CLIs on this Mac. GUI apps launched from Finder/Dock get a
 /// bare launchd PATH, so ask an INTERACTIVE login shell (`-ilc`) for the user's
 /// real environment. Interactive matters: installers for these CLIs (and tools

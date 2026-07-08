@@ -206,6 +206,22 @@ fn recover_json(text: &str) -> String {
     }
 }
 
+/// Normalize a tool call's `arguments`. Ollama's native `/api/chat` returns
+/// them as a JSON object, but OpenAI-style engines and `:cloud` proxies return
+/// a JSON-ENCODED STRING (e.g. `"{\"old_text\":\"…\"}"`). Left as a string,
+/// every `args["field"]` lookup in exec_tool indexes into a scalar, yields
+/// null, and the tool reports the field "required" even though the model
+/// supplied it. Parse a string payload back into a value (tolerating fences /
+/// `<think>` via recover_json); pass objects through untouched.
+fn normalize_tool_arguments(v: &serde_json::Value) -> serde_json::Value {
+    match v.as_str() {
+        Some(s) => serde_json::from_str(s)
+            .or_else(|_| serde_json::from_str(&recover_json(s)))
+            .unwrap_or_else(|_| v.clone()),
+        None => v.clone(),
+    }
+}
+
 /// Streaming chat that can also carry a tool catalog and/or a `format` schema.
 /// `format`, when set, constrains the response to a JSON schema; it is mutually
 /// exclusive with tool calling in practice (Ollama injects tool specs into the
@@ -304,7 +320,7 @@ async fn chat_core(
                     if let Some(name) = c["function"]["name"].as_str() {
                         tool_calls.push(ToolCall {
                             name: name.to_string(),
-                            arguments: c["function"]["arguments"].clone(),
+                            arguments: normalize_tool_arguments(&c["function"]["arguments"]),
                             raw: c.clone(),
                         });
                     }
@@ -538,5 +554,33 @@ mod tests {
         assert_eq!(recover_json("<think>hmm</think>\n{\"a\":1}"), "{\"a\":1}");
         // A top-level array survives a bare fence.
         assert_eq!(recover_json("```\n[1,2,3]\n```"), "[1,2,3]");
+    }
+
+    // Tool-call arguments must resolve whether the engine returns them as a
+    // JSON object (Ollama native) or a JSON-encoded string (OpenAI-style /
+    // :cloud). The string form was silently dropping every field, so
+    // edit_file reported "old_text is required" on a correct call.
+    #[test]
+    fn normalize_tool_arguments_handles_stringified_payloads() {
+        // A native object passes through unchanged.
+        let obj = serde_json::json!({"old_text": "a", "new_text": "b"});
+        assert_eq!(normalize_tool_arguments(&obj), obj);
+        // A JSON-encoded string is parsed back into an object, so field lookups
+        // resolve instead of reading null.
+        let stringified = serde_json::json!("{\"old_text\":\"a\",\"new_text\":\"b\"}");
+        assert_eq!(normalize_tool_arguments(&stringified), obj);
+        assert_eq!(normalize_tool_arguments(&stringified)["old_text"], "a");
+        // HTML-with-quotes content (the reported failing case) round-trips.
+        let html = serde_json::json!("{\"old_text\":\"<p><strong>Test</strong></p>\"}");
+        assert_eq!(
+            normalize_tool_arguments(&html)["old_text"],
+            "<p><strong>Test</strong></p>"
+        );
+        // A fenced string payload is still recovered.
+        let fenced = serde_json::json!("```json\n{\"old_text\":\"a\"}\n```");
+        assert_eq!(normalize_tool_arguments(&fenced)["old_text"], "a");
+        // Garbage that can't parse is preserved verbatim rather than lost.
+        let junk = serde_json::json!("not json");
+        assert_eq!(normalize_tool_arguments(&junk), junk);
     }
 }

@@ -486,6 +486,21 @@ pub async fn ask(
     let model = explicit_model
         .clone()
         .unwrap_or_else(|| best_default(&models));
+    // A `:cloud` model can't drive the app: it leaks tool calls inline as text
+    // instead of the structured `tool_calls` field, so they silently never run
+    // (a room's edits/annotations would be lost). Run the tool loop on a local
+    // model and tell the user why. External CLIs (claude-cli/codex-cli) are a
+    // separate, supported path handled below.
+    let model = if is_cloud_model(&model) {
+        let local = best_local_default(&models);
+        let _ = window.emit(
+            "ask-step",
+            format!("{model} can't drive the app — using {local} for tools"),
+        );
+        local
+    } else {
+        model
+    };
 
     // CHG-19: the "where is X?" grounding pass is deferred to AFTER the answer
     // (nothing in the reply depends on the boxes), so the warm chat model streams
@@ -749,6 +764,12 @@ pub(crate) fn wants_ui_tools(question: &str) -> bool {
         "menu", "sidebar", "watch", "frame", "video", "look at", "looking at",
         "interface", "use the app", "the app", "type in", "toggle", "what do you see",
         "what am i", "on screen",
+        // "open the Room Map" / "switch to the Detail tab" / "generate flashcards"
+        // matched none of the above, so ui_act was never offered and the agent
+        // couldn't drive the app at all. App surfaces and navigation verbs:
+        "open ", "show me", "go to", "switch", "close ", "map", "panel", "tab",
+        "studio", "flashcard", "mind map", "mindmap", "podcast", "front page",
+        "dashboard", "play", "pause", "image", "photo", "picture",
     ];
     HINTS.iter().any(|h| q.contains(h))
 }
@@ -910,7 +931,7 @@ pub(crate) fn consult_advisor_spec(advisors: &[String]) -> serde_json::Value {
 pub(crate) fn ui_tools_specs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({"type": "function", "function": {"name": "ui_snapshot",
-            "description": "List every clickable/typable control currently visible in the app as numbered marks (role, label, region). Take a fresh snapshot before each ui_act — marks go stale when the screen changes. Consent-sensitive controls (settings, approvals) are never listed.",
+            "description": "List every clickable/typable control currently visible in the app as numbered marks (role, label, region). Call this FIRST when asked to open or use an app surface — the Room Map (the Map toggle), the Memory panel, Studio buttons (Flashcards, Mind map, Podcast script), a viewer tab, or History. Those are app controls, NOT files: never search_room for them. Take a fresh snapshot before each ui_act — marks go stale when the screen changes. Consent-sensitive controls (settings, approvals) are never listed.",
             "parameters": {"type": "object", "properties": {}}}}),
         serde_json::json!({"type": "function", "function": {"name": "ui_act",
             "description": "Operate one control from the latest ui_snapshot by its mark number. The user watches every action. Example: {\"mark\": 12, \"action\": \"click\"}",
@@ -1200,7 +1221,13 @@ pub(crate) async fn agent_loop(
                      currently sees; view_media_frame grabs a video frame at a timestamp. Take a \
                      fresh ui_snapshot before each ui_act. Privacy/consent controls (Settings, \
                      approval dialogs) are excluded and will refuse. Prefer answering directly — \
-                     drive the interface only when the user asked you to do something in the app.",
+                     drive the interface only when the user asked you to do something in the app. \
+                     Know the app's surfaces by name: the \"Room Map\" is the Map toggle in the \
+                     Files header (a constellation view of the files); the \"Memory panel\" lists \
+                     remembered facts in the sidebar; the \"Front Page\" dashboard has Studio \
+                     buttons (Flashcards, Mind map, Podcast script) and AI actions; file viewers \
+                     have their own tabs and a History button. When the user names one of these, \
+                     do not ask what they mean — ui_snapshot to find the control, then ui_act it.",
                 );
             }
         }
@@ -1232,13 +1259,18 @@ pub(crate) async fn agent_loop(
             }
         }
     }
-    // Web flows chain search → fetch → answer; give them more rounds. A consult
-    // → synthesize path needs the extra room too, and so does a snapshot →
-    // act → re-snapshot UI flow (ADD-25).
+    // Tool-driven flows chain many calls — web (search → fetch → answer),
+    // consult → synthesize, and especially a UI/agent sweep (snapshot → act →
+    // re-snapshot, repeated across a whole feature pass, ADD-25). Rather than a
+    // tight budget that cuts an agent off mid-task, the tool-enabled loop runs
+    // until the model stops calling tools; the loop already self-terminates via
+    // duplicate-call detection + forced synthesis + Stop. MAX_TOOL_ROUNDS is
+    // only a runaway backstop set far above any real run. The plain no-tool chat
+    // path needs just a couple of rounds.
     let max_rounds = if routes.is_empty() && !web_enabled && advisors.is_empty() && !ui_enabled {
         4
     } else {
-        8
+        MAX_TOOL_ROUNDS
     };
     // CHG-32: an empty catalog keeps num_ctx at 12288 (tools.is_some()) while
     // forbidding further tool calls — forces a grounded text answer on the
@@ -2169,10 +2201,29 @@ pub(crate) async fn perceive_image(
     if models.is_empty() {
         return Err("No local model is available to look at the image.".into());
     }
-    let mut vmodel = vision_model(&models, &models[0]);
-    if is_external_engine(&vmodel) {
-        vmodel = best_default(&models);
-    }
+    // This path only runs when the chat model itself can't read pixels, so we
+    // need a *separate* image-capable LOCAL model to describe them. Prefer a
+    // dedicated grounding VL model; otherwise any local vision-capable chat
+    // model (qwen3.5, gemma3, llava…). Refuse if there's no genuine on-device
+    // vision model: a text-only model just parrots the schema back
+    // (`{"properties":{"description":{}}}`), and an external engine would leak
+    // pixels this path promises never leave the Mac.
+    let vmodel = models
+        .iter()
+        .find(|m| m.contains("qwen2.5vl") || m.contains("qwen2.5-vl") || m.contains("qwen3-vl"))
+        .or_else(|| {
+            models
+                .iter()
+                .find(|m| !is_external_engine(m) && is_vision_chat_model(m))
+        })
+        .cloned();
+    let Some(vmodel) = vmodel else {
+        return Err(
+            "This room's chat model can't see images, and no local vision model is installed to \
+             describe them. Install one — for example `ollama pull qwen2.5vl:3b` — then try again."
+                .into(),
+        );
+    };
     let messages = vec![ollama::ChatMessage {
         role: "user".into(),
         content: format!(
@@ -2518,6 +2569,13 @@ mod tests {
         assert!(wants_ui_tools("scroll down in the sidebar"));
         assert!(wants_ui_tools("what do you see on screen?"));
         assert!(wants_ui_tools("look at the video at 2:15"));
+        // QA regression: these natural phrasings matched no hint, so ui_act was
+        // never offered and the agent couldn't drive the app.
+        assert!(wants_ui_tools("open the Room Map"));
+        assert!(wants_ui_tools("open the Memory panel"));
+        assert!(wants_ui_tools("switch the budget spreadsheet to the Detail tab"));
+        assert!(wants_ui_tools("generate flashcards from the clean code pdf"));
+        assert!(wants_ui_tools("mark the main subject in photo.jpg"));
         // …a plain document question does not.
         assert!(!wants_ui_tools("summarize the contract"));
         assert!(!wants_ui_tools("who signed this agreement"));
