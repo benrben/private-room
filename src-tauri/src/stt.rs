@@ -228,6 +228,128 @@ pub fn transcribe(model_path: &Path, pcm: &[f32], timestamps: bool) -> Result<St
     Ok(if timestamps { lines.join("\n") } else { lines.join(" ") })
 }
 
+// ------------------------------------------------- live segments (ADD-27)
+
+/// One decoded phrase for the live-recording engine: absolute centisecond
+/// span, text, and word-level timing for the transcript editor.
+#[derive(Default, Clone, Debug)]
+pub struct SegOut {
+    pub t0: i64,
+    pub t1: i64,
+    pub text: String,
+    /// (word, t0, t1) — absolute centiseconds like t0/t1 above.
+    pub words: Vec<(String, i64, i64)>,
+    pub lang: Option<String>,
+}
+
+/// True for a Whisper "segment" that is noise dressed as text — the classic
+/// silence hallucinations ("[BLANK_AUDIO]", "(music)", a lone ♪).
+fn is_junk_segment(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let bracketed = (t.starts_with('[') && t.ends_with(']'))
+        || (t.starts_with('(') && t.ends_with(')'))
+        || (t.starts_with('*') && t.ends_with('*'));
+    bracketed || t.chars().all(|c| !c.is_alphanumeric())
+}
+
+/// Transcribe one live phrase (mono 16 kHz) with word timestamps, shifting
+/// everything by `offset_cs` so timestamps are absolute on the recording's
+/// timeline. Same warm context as [`transcribe`]; equally blocking — the
+/// recording engine calls it from its dedicated decoder thread only.
+pub fn transcribe_segments(
+    model_path: &Path,
+    pcm: &[f32],
+    offset_cs: i64,
+) -> Result<Vec<SegOut>, String> {
+    use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+    if pcm.len() < 3200 {
+        return Ok(Vec::new()); // < 0.2 s: nothing decodable
+    }
+    let key = model_path.to_string_lossy().into_owned();
+    let mut guard = CTX.lock().map_err(|_| "stt context poisoned")?;
+    if guard.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
+        let ctx = WhisperContext::new_with_params(&key, WhisperContextParameters::default())
+            .map_err(|e| format!("model load failed: {e}"))?;
+        *guard = Some((key, ctx));
+    }
+    let (_, ctx) = guard.as_ref().expect("just set");
+
+    let mut state = ctx.create_state().map_err(|e| e.to_string())?;
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("auto"));
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_token_timestamps(true);
+    params.set_suppress_blank(true);
+    // Each phrase stands alone; carrying context across them makes the model
+    // repeat the previous phrase over silence.
+    params.set_no_context(true);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8) as i32)
+        .unwrap_or(4);
+    params.set_n_threads(threads);
+
+    state.full(params, pcm).map_err(|e| format!("transcription failed: {e}"))?;
+
+    let lang = whisper_rs::get_lang_str(state.full_lang_id_from_state()).map(str::to_string);
+    let n = state.full_n_segments();
+    let mut out: Vec<SegOut> = Vec::new();
+    for i in 0..n {
+        let Some(seg) = state.get_segment(i) else { continue };
+        let text = seg.to_str_lossy().map_err(|e| e.to_string())?.trim().to_string();
+        // Silence hallucination gates: whisper's own no-speech signal, junk
+        // shapes, and rock-bottom token confidence.
+        if is_junk_segment(&text) || seg.no_speech_probability() > 0.75 {
+            continue;
+        }
+        let mut words: Vec<(String, i64, i64)> = Vec::new();
+        let mut p_sum = 0f32;
+        let mut p_n = 0usize;
+        for j in 0..seg.n_tokens() {
+            let Some(tok) = seg.get_token(j) else { continue };
+            let Ok(piece) = tok.to_str_lossy() else { continue };
+            // Specials like "[_BEG_]" / "<|endoftext|>" carry no words.
+            if piece.starts_with("[_") || piece.starts_with("<|") {
+                continue;
+            }
+            let data = tok.token_data();
+            p_sum += data.p;
+            p_n += 1;
+            let t0 = offset_cs + data.t0.max(0);
+            let t1 = offset_cs + data.t1.max(data.t0.max(0));
+            // A leading space starts a new word; anything else glues onto the
+            // previous token (sub-word pieces, punctuation, CJK/Hebrew glyphs).
+            let starts_word = piece.starts_with(' ') || words.is_empty();
+            if starts_word {
+                let w = piece.trim().to_string();
+                if !w.is_empty() {
+                    words.push((w, t0, t1));
+                }
+            } else if let Some(last) = words.last_mut() {
+                last.0.push_str(piece.trim_end_matches('\n'));
+                last.2 = t1;
+            }
+        }
+        if p_n > 0 && p_sum / (p_n as f32) < 0.30 {
+            continue; // the model is guessing — worse than staying silent
+        }
+        out.push(SegOut {
+            t0: offset_cs + seg.start_timestamp().max(0),
+            t1: offset_cs + seg.end_timestamp().max(0),
+            text,
+            words,
+            lang: lang.clone(),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,16 +372,28 @@ mod tests {
         assert_eq!(format_ts(-300), "[0:00]");
     }
 
+    /// The model for on-device tests: the user-downloaded copy if present,
+    /// else the repo's bundled-resource copy (what release DMGs ship).
+    fn test_model() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap();
+        let downloaded = std::path::PathBuf::from(home)
+            .join("Library/Application Support/com.benreich.privateroom/models")
+            .join(MODEL_FILE);
+        if downloaded.exists() {
+            return downloaded;
+        }
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/models")
+            .join(MODEL_FILE)
+    }
+
     /// Full pipeline against the real model: macOS `say` synthesizes speech,
     /// decode_to_pcm converts it, Whisper transcribes it. Needs the downloaded
     /// model, so it's ignored in CI: `cargo test --lib stt -- --ignored`.
     #[test]
     #[ignore = "needs the downloaded model (Settings → Download voice model)"]
     fn e2e_say_roundtrip() {
-        let home = std::env::var("HOME").unwrap();
-        let model = std::path::PathBuf::from(home)
-            .join("Library/Application Support/com.benreich.privateroom/models")
-            .join(MODEL_FILE);
+        let model = test_model();
         assert!(model.exists(), "download the model first (Settings)");
         let aiff = std::env::temp_dir().join("pr-stt-e2e.aiff");
         let ok = std::process::Command::new("say")
@@ -279,6 +413,44 @@ mod tests {
             "unexpected transcript: {text}"
         );
         assert!(text.starts_with("[0:00]"), "missing timestamp: {text}");
+    }
+
+    #[test]
+    fn junk_segments_are_recognized() {
+        assert!(is_junk_segment("[BLANK_AUDIO]"));
+        assert!(is_junk_segment("(music)"));
+        assert!(is_junk_segment("♪ ♪"));
+        assert!(is_junk_segment("   "));
+        assert!(!is_junk_segment("Hello there"));
+        assert!(!is_junk_segment("שלום"));
+    }
+
+    /// Live-segment pipeline against the real model, like e2e_say_roundtrip:
+    /// `cargo test --lib stt -- --ignored`.
+    #[test]
+    #[ignore = "needs the downloaded model (Settings → Download voice model)"]
+    fn e2e_segments_with_words() {
+        let model = test_model();
+        assert!(model.exists(), "download the model first (Settings)");
+        let aiff = std::env::temp_dir().join("pr-stt-e2e-seg.aiff");
+        assert!(std::process::Command::new("say")
+            .args(["-o"])
+            .arg(&aiff)
+            .arg("The quick brown fox jumps over the lazy dog.")
+            .status()
+            .unwrap()
+            .success());
+        let pcm = decode_to_pcm(&aiff, MediaKind::Audio).unwrap();
+        let _ = std::fs::remove_file(&aiff);
+        let segs = transcribe_segments(&model, &pcm, 500).unwrap();
+        assert!(!segs.is_empty(), "no segments");
+        let all = segs.iter().map(|s| s.text.as_str()).collect::<String>().to_lowercase();
+        assert!(all.contains("quick brown fox"), "{all}");
+        let words: Vec<_> = segs.iter().flat_map(|s| s.words.iter()).collect();
+        assert!(words.len() >= 6, "expected word-level timing, got {words:?}");
+        // Timestamps carry the offset and are monotonic.
+        assert!(words.first().unwrap().1 >= 500);
+        assert!(words.windows(2).all(|w| w[0].1 <= w[1].1));
     }
 
     #[test]

@@ -119,23 +119,45 @@ fn map_send_err(e: reqwest::Error) -> String {
 /// `keep_alive` (HLT-5) is how long Ollama holds the model resident after this
 /// call (e.g. "30m" to stay warm, "2m"/"0" to release a vision model on
 /// low-RAM machines). The caller decides per model — see `vision_keep_alive`.
-/// ADD-22: the working-memory window (`num_ctx`) handed to Ollama. The base
-/// sizes stay small so a 16 GB Mac never OOMs on a model that declares a huge
-/// context; on high-RAM machines (>=32 GB) we allow more, so long conversations
-/// and big tool results are trimmed less often. Read once.
-fn num_ctx_for(has_tools: bool) -> u32 {
+/// ADD-27: which latency class a call belongs to, which decides how big a
+/// `num_ctx` it may allocate. `Chat` is the interactive path — prefill time is
+/// user-visible, so its window stays small. `Job` is background work (deep
+/// summaries, digests): prefill minutes are fine, so it gets the big window.
+#[derive(Clone, Copy)]
+pub enum CtxTier {
+    Chat,
+    Job,
+}
+
+/// ADD-22: the working-memory window (`num_ctx`) handed to Ollama, sized so a
+/// 16 GB Mac never OOMs. Measured 2026-07 on qwen3.5:9b (Q4_K_M, GQA cache
+/// ≈34 KB/token, 16 GB M-series): 12k ctx → 5.9 GB · 32k → 6.6 GB · 64k →
+/// 7.7 GB · 128k → 9.9 GB, all 100% GPU. Chat sizes stay small because the
+/// user waits for prefill (~210 tok/s on that machine); Job sizes go big
+/// because a background step can afford minutes. Read once.
+fn num_ctx_for(has_tools: bool, tier: CtxTier) -> u32 {
     static HIGH_RAM: OnceLock<bool> = OnceLock::new();
     let high = *HIGH_RAM.get_or_init(|| {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         sys.total_memory() >= 32 * 1024 * 1024 * 1024
     });
-    match (has_tools, high) {
-        (true, true) => 24576,
-        (true, false) => 12288,
-        (false, true) => 16384,
-        (false, false) => 8192,
+    match (tier, has_tools, high) {
+        (CtxTier::Job, _, true) => 131072,
+        (CtxTier::Job, _, false) => 65536,
+        (CtxTier::Chat, true, true) => 24576,
+        (CtxTier::Chat, true, false) => 12288,
+        (CtxTier::Chat, false, true) => 16384,
+        (CtxTier::Chat, false, false) => 8192,
     }
+}
+
+/// ADD-27: rough character budget for a background-job call (≈3 chars/token —
+/// a safe floor across English and Hebrew), so read-loop callers can size
+/// their windows to what the engine will actually see instead of a hardcoded
+/// snippet. 16 GB Mac → ~196k chars; 32 GB+ → ~393k.
+pub fn job_context_chars() -> usize {
+    num_ctx_for(true, CtxTier::Job) as usize * 3
 }
 
 pub async fn chat_stream_tools(
@@ -147,7 +169,33 @@ pub async fn chat_stream_tools(
     keep_alive: &str,
     on_delta: impl FnMut(&str),
 ) -> Result<(String, Vec<ToolCall>), String> {
-    chat_core(model, messages, tools, temperature, cancel, keep_alive, None, on_delta).await
+    chat_core(
+        model, messages, tools, temperature, cancel, keep_alive, None, false, CtxTier::Chat,
+        on_delta,
+    )
+    .await
+}
+
+/// ADD-27: like `chat_stream_tools`, but for BACKGROUND JOB rounds: runs at
+/// the Job context tier (big `num_ctx`) and lets a thinking-capable model
+/// think. Measured on qwen3.5: with `think: false` it answers directly and
+/// NEVER calls the offered tools, so tool-driven flows (the summarizer's read
+/// loop) silently degrade; with thinking on it reasons briefly and calls
+/// them. Interactive chat keeps the fast non-thinking, small-context default.
+pub async fn chat_stream_tools_thinking(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    tools: Option<&serde_json::Value>,
+    temperature: Option<f64>,
+    cancel: Option<Arc<AtomicBool>>,
+    keep_alive: &str,
+    on_delta: impl FnMut(&str),
+) -> Result<(String, Vec<ToolCall>), String> {
+    chat_core(
+        model, messages, tools, temperature, cancel, keep_alive, None, true, CtxTier::Job,
+        on_delta,
+    )
+    .await
 }
 
 /// ADD-22 training wheel: a one-shot call whose output is CONSTRAINED to a JSON
@@ -158,10 +206,35 @@ pub async fn chat_stream_tools(
 /// structurally invalid document, and constrained decoding is markedly faster.
 pub async fn chat_structured(
     model: &str,
+    messages: Vec<ChatMessage>,
+    temperature: Option<f64>,
+    keep_alive: &str,
+    schema: &serde_json::Value,
+) -> Result<String, String> {
+    chat_structured_tier(model, messages, temperature, keep_alive, schema, CtxTier::Chat).await
+}
+
+/// ADD-27: `chat_structured` at the Job context tier — for the final call of a
+/// background job whose messages carry big gathered windows (a deep summary's
+/// reads would overflow the small chat `num_ctx` and silently drop the user's
+/// question).
+pub async fn chat_structured_job(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    temperature: Option<f64>,
+    keep_alive: &str,
+    schema: &serde_json::Value,
+) -> Result<String, String> {
+    chat_structured_tier(model, messages, temperature, keep_alive, schema, CtxTier::Job).await
+}
+
+async fn chat_structured_tier(
+    model: &str,
     mut messages: Vec<ChatMessage>,
     temperature: Option<f64>,
     keep_alive: &str,
     schema: &serde_json::Value,
+    tier: CtxTier,
 ) -> Result<String, String> {
     // CRITICAL (Ollama's own guidance): `format` constrains the output GRAMMAR
     // but the model NEVER SEES the schema. Without the field names in the prompt
@@ -173,8 +246,11 @@ pub async fn chat_structured(
             serde_json::to_string(schema).unwrap_or_default()
         ));
     }
-    let (text, _) =
-        chat_core(model, messages, None, temperature, None, keep_alive, Some(schema), |_| {}).await?;
+    let (text, _) = chat_core(
+        model, messages, None, temperature, None, keep_alive, Some(schema), false, tier,
+        |_| {},
+    )
+    .await?;
     Ok(recover_json(&text))
 }
 
@@ -235,6 +311,8 @@ async fn chat_core(
     cancel: Option<Arc<AtomicBool>>,
     keep_alive: &str,
     format: Option<&serde_json::Value>,
+    think: bool,
+    tier: CtxTier,
     mut on_delta: impl FnMut(&str),
 ) -> Result<(String, Vec<ToolCall>), String> {
     use futures_util::StreamExt;
@@ -242,7 +320,7 @@ async fn chat_core(
     // Tool catalogs and tool results (search hits, fetched pages) need more
     // room than plain chat, but stay far below the model-declared maximums
     // that OOM 16 GB machines.
-    let num_ctx = num_ctx_for(tools.is_some());
+    let num_ctx = num_ctx_for(tools.is_some(), tier);
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
@@ -268,9 +346,12 @@ async fn chat_core(
     }
     // Qwen3 thinking variants burn thousands of hidden reasoning tokens
     // (measured: 90s for a one-line answer). Instruct variants don't think
-    // and reject the flag, so only send it to the thinking ones.
+    // and reject the flag, so only send it to the thinking ones. ADD-27:
+    // `think` re-enables it for short tool-decision rounds (see
+    // `chat_stream_tools_thinking`); it still only applies to models that
+    // accept the flag.
     if model.contains("qwen3") && !model.contains("instruct") {
-        body["think"] = serde_json::Value::Bool(false);
+        body["think"] = serde_json::Value::Bool(think);
     }
     let resp = client()?
         .post(format!("{}/api/chat", resolved_base_url()))

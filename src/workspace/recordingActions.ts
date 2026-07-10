@@ -1,6 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, FileTarget } from "../api";
 import { fileToBase64 } from "./composer";
+import { startMicTap, stopMicTap } from "./liveRec";
 import { WSState } from "./state";
 
 /** Dictation (one shared mic, several sinks) + model onboarding/status.
@@ -169,6 +170,82 @@ export function makeRecordingActions(
     });
   }
 
+  // ---- ADD-27: the live Recording file ----------------------------------
+  // The session is workspace-wide (it must survive switching files), so its
+  // lifecycle lives here, not in the view: backend engine via rec_* commands
+  // + the module-level mic tap (liveRec.ts).
+
+  async function startLiveRecording(
+    fileId?: string,
+    opts?: { systemAudio?: boolean; liveTranslate?: string | null },
+  ) {
+    if (s.recLive) {
+      s.pushToast("info", "A recording is already running.");
+      await viewFile(s.recLive.fileId);
+      return;
+    }
+    try {
+      const res = await api.recStart({
+        fileId: fileId ?? null,
+        systemAudio: opts?.systemAudio ?? true,
+        liveTranslate: opts?.liveTranslate ?? null,
+      });
+      s.setRecLive({ fileId: res.fileId, status: "recording" });
+      s.setFiles(await api.listFiles());
+      await viewFile(res.fileId);
+      try {
+        await startMicTap();
+      } catch (e) {
+        // Meeting audio may still be recording; say so instead of dying.
+        s.pushToast("error", `${e instanceof Error ? e.message : e} (the Mac's audio keeps recording)`);
+      }
+    } catch (e) {
+      if (String(e).includes("STT_MODEL_MISSING")) {
+        s.pushToast(
+          "error",
+          "Download the voice model first, in Settings → Model → Dictation.",
+          { label: "Open Settings", run: () => s.setShowSettings(true) },
+        );
+      } else {
+        s.pushToast("error", String(e));
+      }
+    }
+  }
+
+  async function pauseLiveRecording() {
+    stopMicTap();
+    try {
+      await api.recPause();
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
+  async function resumeLiveRecording() {
+    try {
+      await api.recResume();
+      await startMicTap();
+    } catch (e) {
+      s.pushToast("error", String(e instanceof Error ? e.message : e));
+    }
+  }
+
+  async function stopLiveRecording() {
+    stopMicTap();
+    const fileId = s.recLive?.fileId;
+    s.setRecLive((r) => (r ? { ...r, status: "saving" } : r));
+    try {
+      await api.recStop();
+      s.pushToast("success", "Recording saved — transcript included.");
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+    s.setRecLive(null);
+    s.setFiles(await api.listFiles());
+    // Refresh the open view so the player gets the freshly written audio.
+    if (fileId && s.openFileRef.current?.id === fileId) await viewFile(fileId);
+  }
+
   async function downloadModel(name: string) {
     if (s.pullingModel) return;
     s.setPullingModel(true);
@@ -226,5 +303,6 @@ export function makeRecordingActions(
     refreshAi, beginRecording, dictateTo, micState, recordVoiceNote,
     dictateJournal, dictateIntoFile, downloadModel, pickAndDownload,
     getOllama, openOllamaApp,
+    startLiveRecording, pauseLiveRecording, resumeLiveRecording, stopLiveRecording,
   };
 }

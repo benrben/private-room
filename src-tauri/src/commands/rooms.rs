@@ -162,6 +162,27 @@ pub fn touchid_open(
 #[tauri::command]
 pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     use tauri::Emitter;
+    // ADD-27: a live recording must land in the DB before the room locks.
+    // Stop it and wait for the engine's final flush (it drains its decoder
+    // first), bounded so a stuck decode can never wedge lock/close.
+    {
+        use tauri::Manager;
+        let rec = app.state::<RecState>();
+        let done_rx = {
+            let mut session = rec.session.lock().unwrap();
+            session.take().map(|live| {
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let _ = live.handle.tx.send(recording::EngineMsg::Stop { done: done_tx });
+                done_rx
+            })
+        };
+        if let Some(done_rx) = done_rx {
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                done_rx.recv_timeout(std::time::Duration::from_secs(30))
+            })
+            .await;
+        }
+    }
     // HLT-7: if an answer is streaming, cancel it and wait briefly for its
     // save-partial phase to finish, so locking never races the DB shut.
     {

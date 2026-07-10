@@ -28,7 +28,47 @@ pub(crate) fn clean_one_liner(raw: &str) -> String {
     line.chars().take(200).collect::<String>().trim().to_string()
 }
 
-/// ADD-17 map step: one short call describing a single file in a sentence.
+/// ADD-27: extra reads the model may request per file. Each is one more local
+/// round trip, so a file costs at most 1 (gather) + MAX_READS + 1 (answer)
+/// calls. The amount of TEXT per read is governed separately by the
+/// context-derived budget in `summarize_one_file`, not by this count.
+const MAX_READS: usize = 4;
+
+/// ADD-27: the one tool offered during the gather phase — a paged, filtered
+/// read over the file's own text.
+fn read_text_tool() -> serde_json::Value {
+    serde_json::json!([{"type": "function", "function": {"name": "read_text",
+        "description": "Read another part of this file's text. offset picks where to start \
+            (0 = beginning), limit is how many characters to read (200-6000), find jumps to \
+            the next place a word or phrase appears at or after offset.",
+        "parameters": {"type": "object", "properties": {
+            "offset": {"type": "integer", "description": "Character position to read from"},
+            "limit": {"type": "integer", "description": "How many characters to read"},
+            "find": {"type": "string", "description": "Optional word or phrase to jump to"}
+        }}}}])
+}
+
+/// ADD-27: pull (offset, limit, find) out of a read_text call, tolerating the
+/// numbers arriving as strings or floats (small models do all three).
+fn read_args(args: &serde_json::Value) -> (usize, usize, Option<String>) {
+    fn num(v: &serde_json::Value) -> Option<usize> {
+        v.as_u64()
+            .map(|n| n as usize)
+            .or_else(|| v.as_f64().map(|f| f.max(0.0) as usize))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    }
+    let offset = num(&args["offset"]).unwrap_or(0);
+    let limit = num(&args["limit"]).unwrap_or(extraction::READ_WINDOW_DEFAULT);
+    let find = args["find"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    (offset, limit, find)
+}
+
+/// ADD-17 map step: describe a single file in one sentence. ADD-27: `text` is
+/// now the file's FULL extracted text (it used to be a 1500-char snippet, so a
+/// 20 MB file was summarized from 0.008% of its content). The text is noise-
+/// filtered, and when it doesn't fit one window the MODEL drives the reading:
+/// it gets a `read_text(offset, limit, find)` tool and up to MAX_READS extra
+/// windows before a final schema-constrained call produces the sentence.
 /// `keep_alive` lets the background filler use a short warmth (CHG-22) so it
 /// never pins the model in RAM, while the interactive path keeps it warm.
 pub(crate) async fn summarize_one_file(
@@ -38,19 +78,151 @@ pub(crate) async fn summarize_one_file(
     text: &str,
     keep_alive: &str,
 ) -> Result<String, String> {
-    let messages = vec![
+    let filtered = extraction::smart_filter(text);
+    let head = extraction::read_window(&filtered, 0, extraction::READ_WINDOW_DEFAULT, None);
+    let whole = head.end >= filtered.len();
+    // ADD-27: deterministic baseline samples for a long file (used when !whole),
+    // and a cumulative read budget derived from the engine's REAL context —
+    // reserve room for prompts and the answer, spend everything else on file
+    // text instead of a fixed snippet.
+    let mid = extraction::read_window(&filtered, filtered.len() / 2, 2_000, None);
+    let tail =
+        extraction::read_window(&filtered, filtered.len().saturating_sub(2_000), 2_000, None);
+    let mut remaining = ollama::job_context_chars()
+        .saturating_sub(head.text.len() + mid.text.len() + tail.text.len() + 8_000);
+
+    let mut messages = vec![
         ollama::ChatMessage::new(
             "system",
-            "You describe a single file in ONE short, factual sentence based only on what is given.",
+            if whole {
+                "You describe a single file in ONE short, factual sentence based only on what is given."
+            } else {
+                "You describe a single file in ONE short, factual sentence based only on what you \
+                 read from it. You see samples of a longer file. If the samples hint that the \
+                 important content is elsewhere (a table of contents, a reference to a later \
+                 section, a phrase worth locating), you MUST call read_text to look there \
+                 (find jumps to a phrase, offset picks a position) before answering. If the \
+                 samples already show what the file is, answer directly."
+            },
         ),
         ollama::ChatMessage::new(
             "user",
-            format!(
-                "File name: {name}\nType: {mime}\n\nBeginning of its text:\n{text}\n\n\
-                 In one sentence, what is this file about?"
-            ),
+            if whole {
+                format!(
+                    "File name: {name}\nType: {mime}\n\nIts text:\n{}\n\n\
+                     In one sentence, what is this file about?",
+                    head.text
+                )
+            } else {
+                // Beginning, middle and end up front, so even a model that
+                // never touches read_text summarizes the file's whole shape
+                // instead of whatever happens to be on page one.
+                format!(
+                    "File name: {name}\nType: {mime}\nText length: {} characters\n\n\
+                     Characters 0-{} (beginning):\n{}\n\n\
+                     Characters {}-{} (middle):\n{}\n\n\
+                     Characters {}-{} (end):\n{}\n\n\
+                     In one sentence, what is this file about?",
+                    head.total,
+                    head.end,
+                    head.text,
+                    mid.offset,
+                    mid.end,
+                    mid.text,
+                    tail.offset,
+                    tail.end,
+                    tail.text,
+                )
+            },
         ),
     ];
+
+    if !whole {
+        let tools = read_text_tool();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut reads = 0;
+        'gather: while reads < MAX_READS && remaining >= extraction::READ_WINDOW_MIN {
+            // ADD-27: thinking ON for these rounds — without it, qwen3-family
+            // models answer straight from the samples and never touch the tool.
+            let round = ollama::chat_stream_tools_thinking(
+                model,
+                messages.clone(),
+                Some(&tools),
+                Some(0.2),
+                None,
+                keep_alive,
+                |_| {},
+            )
+            .await;
+            let calls = match round {
+                Ok((_, calls)) => calls,
+                Err(e) if e == "OLLAMA_DOWN" || e.starts_with("MODEL_MISSING") => return Err(e),
+                // A model with no tool support (Ollama rejects the request)
+                // must not lose its summary entirely: degrade to answering
+                // from the samples alone — exactly the pre-ADD-27 behavior.
+                Err(_) => break 'gather,
+            };
+            if calls.is_empty() {
+                break;
+            }
+            let raw_calls: Vec<serde_json::Value> = calls.iter().map(|c| c.raw.clone()).collect();
+            messages.push(ollama::ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(serde_json::json!(raw_calls)),
+                ..Default::default()
+            });
+            for call in &calls {
+                let result = if call.name != "read_text" {
+                    "Unknown tool: only read_text is available.".to_string()
+                } else if !seen.insert(call.arguments.to_string()) {
+                    "You already read exactly this window; ask for a different offset or find, \
+                     or answer now."
+                        .to_string()
+                } else {
+                    reads += 1;
+                    let (offset, limit, find) = read_args(&call.arguments);
+                    // Spend at most what's left of the context budget.
+                    let limit = limit.min(remaining);
+                    let mut w = extraction::read_window(&filtered, offset, limit, find.as_deref());
+                    // A find that lands inside the head sample the model has
+                    // already seen (typically the sought word appearing in
+                    // "see X below"-style text near the top) wastes the read —
+                    // jump to the next occurrence past the shown region.
+                    if w.found && w.offset < head.end {
+                        let again =
+                            extraction::read_window(&filtered, head.end, limit, find.as_deref());
+                        if again.found {
+                            w = again;
+                        }
+                    }
+                    remaining = remaining.saturating_sub(w.text.len());
+                    let note = match (&find, w.found) {
+                        (Some(f), false) => format!(" (\"{f}\" was not found after that offset)"),
+                        _ => String::new(),
+                    };
+                    format!(
+                        "Characters {}-{} of {}{}:\n{}",
+                        w.offset, w.end, w.total, note, w.text
+                    )
+                };
+                messages.push(ollama::ChatMessage {
+                    role: "tool".into(),
+                    content: result,
+                    tool_name: Some(call.name.clone()),
+                    ..Default::default()
+                });
+                if reads >= MAX_READS || remaining < extraction::READ_WINDOW_MIN {
+                    break;
+                }
+            }
+        }
+        messages.push(ollama::ChatMessage::new(
+            "user",
+            "Based on everything you read, in one sentence, what is this file about?",
+        ));
+    }
+
     // ADD-22: a single guaranteed string field, so a chatty model can't wrap the
     // sentence in preamble/markup that clean_one_liner then has to strip.
     let schema = serde_json::json!({
@@ -58,7 +230,8 @@ pub(crate) async fn summarize_one_file(
         "properties": {"summary": {"type": "string"}},
         "required": ["summary"]
     });
-    let raw = ollama::chat_structured(model, messages, Some(0.2), keep_alive, &schema).await?;
+    // Job tier: the gathered windows can far exceed the small chat num_ctx.
+    let raw = ollama::chat_structured_job(model, messages, Some(0.2), keep_alive, &schema).await?;
     let summary = serde_json::from_str::<serde_json::Value>(raw.trim())
         .ok()
         .and_then(|v| v.get("summary").and_then(|s| s.as_str()).map(str::to_string))
@@ -208,13 +381,22 @@ pub async fn summarize_room(
             // type only, never invent content.
             String::new()
         } else {
-            let snippet = f.text.as_deref().unwrap_or("");
+            // ADD-27: hand the summarizer the FULL extracted text (the listing
+            // row only carries a 1500-char probe); it filters and pages through
+            // it itself. Falls back to the probe if the row vanished mid-run.
+            let full = {
+                let guard = state.room.lock().unwrap();
+                guard
+                    .as_ref()
+                    .and_then(|room| db::get_file_extracted_text(&room.conn, &f.id))
+            }
+            .unwrap_or_else(|| f.text.clone().unwrap_or_default());
             // CHG-26: one flaky file must not abort the whole run. A
             // non-transient error (Ollama down / model missing) still aborts —
             // every remaining call would fail too — but a one-off error just
             // degrades this file to name-and-type (and, being uncached, retries
             // on the next run).
-            match summarize_one_file(&model, &f.name, &f.mime, snippet, KEEP_ALIVE_WARM).await {
+            match summarize_one_file(&model, &f.name, &f.mime, &full, KEEP_ALIVE_WARM).await {
                 Ok(liner) => {
                     if !liner.is_empty() {
                         if let Some(room) = state.room.lock().unwrap().as_ref() {
@@ -361,6 +543,54 @@ mod tests {
     fn cleans_model_one_liner() {
         assert_eq!(clean_one_liner("- A lease agreement.\nExtra"), "A lease agreement.");
         assert_eq!(clean_one_liner("\n\n  The résumé.  "), "The résumé.");
+    }
+
+    /// ADD-27 end-to-end proof: the answer is ONLY reachable by paging past the
+    /// first window, so a correct summary means the model really drove
+    /// read_text. Needs a running Ollama with a tool-capable local model:
+    /// `cargo test summarize_pages_past_first_window -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn summarize_pages_past_first_window() {
+        let mut text = String::from(
+            "NOTICE: This file's real content is described later in the document. \
+             To learn what this file actually is, search for the word MANIFEST \
+             and read what follows it.\n\n",
+        );
+        for i in 0..4000 {
+            text.push_str(&format!("Log entry {i}: heartbeat OK, no events recorded.\n"));
+        }
+        text.push_str(
+            "\nMANIFEST: This document is the official maintenance manual for the \
+             Zephyr-9 submarine engine, covering cooling, torque limits and \
+             emergency shutdown procedures.\n",
+        );
+        for i in 0..2000 {
+            text.push_str(&format!("Appendix row {i}: reserved.\n"));
+        }
+        let model = std::env::var("PR_TEST_MODEL").unwrap_or_else(|_| "qwen3.5:9b".into());
+        let liner = summarize_one_file(&model, "big.log", "text/plain", &text, "2m")
+            .await
+            .expect("summarize failed — is Ollama running?");
+        eprintln!("one-liner: {liner}");
+        assert!(
+            ["zephyr", "submarine", "engine", "maintenance", "manual"]
+                .iter()
+                .any(|w| liner.to_lowercase().contains(w)),
+            "summary never found the buried MANIFEST: {liner}"
+        );
+    }
+
+    #[test]
+    fn read_args_tolerates_model_typing() {
+        // ADD-27: numbers arrive as ints, floats, or strings; find may be "".
+        let (o, l, f) =
+            read_args(&serde_json::json!({"offset": 500, "limit": 3000, "find": "clause"}));
+        assert_eq!((o, l, f.as_deref()), (500, 3000, Some("clause")));
+        let (o, l, f) = read_args(&serde_json::json!({"offset": "12000", "limit": 2.5e3}));
+        assert_eq!((o, l, f), (12_000, 2_500, None));
+        let (o, l, f) = read_args(&serde_json::json!({"find": "  "}));
+        assert_eq!((o, l, f), (0, extraction::READ_WINDOW_DEFAULT, None));
     }
 
 }

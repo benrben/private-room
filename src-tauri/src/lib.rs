@@ -5,6 +5,7 @@ pub mod extraction;
 pub mod mcp;
 mod ocr;
 mod ollama;
+pub mod recording;
 mod room_mcp;
 pub(crate) mod snapshot;
 pub mod stt;
@@ -25,6 +26,7 @@ pub fn run() {
         .manage(commands::HtmlPreviews::default())
         .manage(commands::MediaStreams::default())
         .manage(commands::AgentUi::default())
+        .manage(commands::RecState::default())
         // ADD-24: stream staged room media (audio/video) with HTTP Range
         // support — WKWebView's media elements need 206 responses to seek, and
         // large videos must never ride through IPC as base64. Bytes come from
@@ -180,6 +182,21 @@ pub fn run() {
             // bridge + YouTube video import.
             commands::resolve_agent_ui,
             commands::import_youtube_video,
+            // ADD-27: live Recording file (streaming transcription, editing,
+            // translate). ADD-28: feedback → GitHub issue.
+            commands::rec_start,
+            commands::rec_push_audio,
+            commands::rec_pause,
+            commands::rec_resume,
+            commands::rec_stop,
+            commands::rec_live_status,
+            commands::rec_set_live_translate,
+            commands::rec_get,
+            commands::rec_delete_range,
+            commands::rec_export_clean,
+            commands::rec_translate,
+            commands::app_diag,
+            commands::feedback_draft,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

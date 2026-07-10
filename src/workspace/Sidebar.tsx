@@ -112,6 +112,19 @@ export default function Sidebar({
                   >
                     <LinkIcon size={14} /> Web link
                   </button>
+                  {/* ADD-27: a Recording file — live transcript while you
+                   * (or your meeting) speak. */}
+                  <button
+                    className="pop-item"
+                    disabled={s.recLive != null}
+                    title="Record mic + the Mac's audio with a live transcript — works with Meet, Zoom, Teams"
+                    onClick={() => {
+                      void a.startLiveRecording();
+                      s.setAddMenuOpen(false);
+                    }}
+                  >
+                    <MicIcon size={14} /> Live recording
+                  </button>
                   <button
                     className="pop-item"
                     disabled={a.micState("note").disabled}

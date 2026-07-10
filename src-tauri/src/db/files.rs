@@ -84,9 +84,11 @@ pub fn list_file_inventory(
     Ok(rows)
 }
 
-/// ADD-17: one file's fields needed to build the room summary. `text` is only
-/// the first ~1500 chars (clipped in SQL). `ai_summary` is the cached one-liner
-/// (None → still needs summarizing). `folder` is the owning folder's name.
+/// ADD-17: one file's fields needed to build the room summary. `text` is a
+/// ~1500-char probe (clipped in SQL) used to detect empty extractions — the
+/// summarizer loads the full text separately per file (ADD-27), so the listing
+/// stays cheap. `ai_summary` is the cached one-liner (None → still needs
+/// summarizing). `folder` is the owning folder's name.
 pub struct SummaryFile {
     pub id: String,
     pub name: String,
@@ -136,10 +138,11 @@ pub fn set_file_ai_summary(conn: &Connection, id: &str, summary: &str) -> Result
     Ok(())
 }
 
-/// CHG-22: files that still need a cached one-liner — (id, name, mime, first
-/// ~1500 chars of text). Skips images with no OCR (empty text) and the app's own
-/// generated summary file. Feeds the background one-liner filler so the work is
-/// done at ingest, not on the interactive Summarize-room path.
+/// CHG-22: files that still need a cached one-liner — (id, name, mime, ~1500-
+/// char text probe; the filler loads each file's full text one at a time,
+/// ADD-27). Skips images with no OCR (empty text) and the app's own generated
+/// summary file. Feeds the background one-liner filler so the work is done at
+/// ingest, not on the interactive Summarize-room path.
 pub fn files_missing_summary(
     conn: &Connection,
     limit: usize,

@@ -213,8 +213,16 @@ pub fn get_file_content(
     // ADD-24: recordings/videos stream through roommedia:// (Range-capable),
     // so any size plays and seeks — no base64 through IPC, no 50MB ceiling.
     // The timestamped transcript still rides along for "[m:ss]" seeking.
+    // ADD-27: a live-recording file (it has a recordings meta row) opens in
+    // the Recording editor instead of the plain player.
     if let Some(kind) = stt::media_kind(&mime, &ext) {
-        let k = if kind == stt::MediaKind::Video { "video" } else { "audio" };
+        let k = if db::get_rec_meta(&room.conn, &id).is_some() {
+            "recording"
+        } else if kind == stt::MediaKind::Video {
+            "video"
+        } else {
+            "audio"
+        };
         let playable = playable_media_mime(&mime, &ext, kind == stt::MediaKind::Video);
         let token = stage_media_bytes(&media, std::mem::take(&mut bytes), &playable);
         return Ok(FileContent {

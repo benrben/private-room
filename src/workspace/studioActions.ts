@@ -194,7 +194,8 @@ export function makeStudioActions(
   async function runAiActionFromModal() {
     if (!s.aiPrompt || s.aiBusy) return;
     const p = s.aiPrompt;
-    if (p.def.needsQuestion && !p.question.trim()) return;
+    // ADD-27: "translate" carries the target language in the question field.
+    if ((p.def.needsQuestion || p.def.needsLanguage) && !p.question.trim()) return;
     const { refIds } = resolveRefs(p.text, s.files, s.folders);
     const combined = [...(p.refs ?? []), ...refIds];
     const refs = combined.length ? Array.from(new Set(combined)) : null;
@@ -204,7 +205,7 @@ export function makeStudioActions(
         scope: p.scope,
         refs,
         instructions: p.text,
-        question: p.def.needsQuestion ? p.question : null,
+        question: p.def.needsQuestion || p.def.needsLanguage ? p.question : null,
       });
       s.setFiles(await api.listFiles());
       s.setAiPrompt(null);

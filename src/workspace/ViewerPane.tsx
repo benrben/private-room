@@ -162,7 +162,8 @@ export default function ViewerPane({
                 </button>
               )}
               {(openFile.content.kind === "audio" ||
-                openFile.content.kind === "video") &&
+                openFile.content.kind === "video" ||
+                openFile.content.kind === "recording") &&
                 openFile.content.text && (
                   <button
                     className="subtle"
@@ -206,6 +207,14 @@ export default function ViewerPane({
               editCell={a.editCell}
               saveEdit={a.saveEdit}
               saveEditAsCopy={a.saveEditAsCopy}
+              recording={{
+                live: s.recLive,
+                pushToast: s.pushToast,
+                onStart: a.startLiveRecording,
+                onPause: a.pauseLiveRecording,
+                onResume: a.resumeLiveRecording,
+                onStop: a.stopLiveRecording,
+              }}
             />
           </div>
         </>

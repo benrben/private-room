@@ -1,6 +1,7 @@
 import { FileContent } from "../api";
 import { OpenFile } from "./types";
 import AudioView from "../viewers/AudioView";
+import RecordingView, { RecordingLiveState } from "../viewers/RecordingView";
 import CodeEditor from "../viewers/CodeEditor";
 import DocxView from "../viewers/DocxView";
 import HtmlView from "../viewers/HtmlView";
@@ -19,6 +20,23 @@ interface ViewerRouterProps {
   editCell: (sheet: string, cell: string, value: string) => Promise<void>;
   saveEdit: (newText: string) => Promise<void>;
   saveEditAsCopy: (newText: string) => Promise<void>;
+  /** ADD-27: what the Recording editor needs from the workspace — the live
+   * session state plus the session-lifecycle handlers (recordingActions). */
+  recording: {
+    live: RecordingLiveState | null;
+    pushToast: (
+      kind: "info" | "success" | "error",
+      text: string,
+      action?: { label: string; run: () => void },
+    ) => void;
+    onStart: (
+      fileId: string,
+      opts: { systemAudio: boolean; liveTranslate: string | null },
+    ) => Promise<void>;
+    onPause: () => Promise<void>;
+    onResume: () => Promise<void>;
+    onStop: () => Promise<void>;
+  };
 }
 
 /** The middle-pane viewer dispatch: given the open FileContent + edit state,
@@ -32,6 +50,7 @@ export default function ViewerRouter({
   editCell,
   saveEdit,
   saveEditAsCopy,
+  recording,
 }: ViewerRouterProps) {
   const c = openFile.content;
   const t = openFile.target;
@@ -153,6 +172,22 @@ export default function ViewerRouter({
           key={`${openFile.id}-${viewerRev}`}
           text={c.text ?? ""}
           quote={t?.quote ?? t?.find}
+        />
+      );
+    // ADD-27: the live Recording file — its own editor (live transcript,
+    // speakers, transcript-based deletion, translate).
+    case "recording":
+      return (
+        <RecordingView
+          key={`${openFile.id}-${viewerRev}`}
+          fileId={openFile.id}
+          mediaToken={c.mediaToken}
+          live={recording.live}
+          pushToast={recording.pushToast}
+          onStart={recording.onStart}
+          onPause={recording.onPause}
+          onResume={recording.onResume}
+          onStop={recording.onStop}
         />
       );
     // ADD-18: recordings/videos with a clickable transcript.

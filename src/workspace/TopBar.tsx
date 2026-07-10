@@ -41,6 +41,22 @@ export default function TopBar({
         </div>
       </div>
       <div className="topbar-right">
+        {/* ADD-27: a recording keeps running while you work elsewhere — this
+         * chip is the always-visible way back to it. */}
+        {s.recLive && (
+          <button
+            className={`rec-indicator ${s.recLive.status}`}
+            title="A live recording is running — click to open it"
+            onClick={() => void a.viewFile(s.recLive!.fileId)}
+          >
+            <span className={`rec-dot ${s.recLive.status === "recording" ? "pulsing" : ""}`} />
+            {s.recLive.status === "recording"
+              ? "Recording"
+              : s.recLive.status === "paused"
+                ? "Recording paused"
+                : "Saving…"}
+          </button>
+        )}
         {ai && (ai.models.length > 0 || ai.external.length > 0) ? (
           <div className="model-pill-wrap">
             <button
@@ -174,6 +190,16 @@ export default function TopBar({
                   }}
                 >
                   Reveal in Finder
+                </button>
+                {/* ADD-28: feedback → GitHub issue (opens in YOUR browser). */}
+                <button
+                  className="pop-item"
+                  onClick={() => {
+                    s.setShowFeedback(true);
+                    s.setRoomMenuOpen(false);
+                  }}
+                >
+                  Send feedback…
                 </button>
               </div>
             </>

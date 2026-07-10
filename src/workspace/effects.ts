@@ -156,6 +156,29 @@ export function useWorkspaceEffects(
     const unlistenMcp = api.onMcpStatus((statuses) => {
       s.setMcpTools(a.connectedTools(statuses));
     });
+    // ADD-27: keep the workspace-wide live-recording state in sync with the
+    // engine (the TopBar chip + RecordingView both read s.recLive), re-attach
+    // to a session that survived a reload, and refresh the open view when a
+    // pause/stop lands fresh audio bytes.
+    void api.recLiveStatus().then((r) => {
+      if (r) s.setRecLive({ fileId: r.fileId, status: r.status });
+    }).catch(() => {});
+    const unlistenRecState = api.onRecState((p) => {
+      if (p.status === "saved") {
+        s.setRecLive(null);
+      } else {
+        s.setRecLive({ fileId: p.fileId, status: p.status });
+      }
+      if (
+        (p.status === "paused" || p.status === "saved") &&
+        s.openFileRef.current?.id === p.fileId
+      ) {
+        void a.viewFile(p.fileId);
+      }
+    });
+    const unlistenRecError = api.onRecError((p) => {
+      s.pushToast("error", p.message);
+    });
     return () => {
       unlisten.then((fn) => fn());
       unlistenStep.then((fn) => fn());
@@ -173,6 +196,8 @@ export function useWorkspaceEffects(
       unlistenMcp.then((fn) => fn());
       unlistenMcpApprove.then((fn) => fn());
       unlistenAgentUi.then((fn) => fn());
+      unlistenRecState.then((fn) => fn());
+      unlistenRecError.then((fn) => fn());
       window.clearInterval(s.recheckTimer.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

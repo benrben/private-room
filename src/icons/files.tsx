@@ -83,6 +83,25 @@ function FileIcon(p: IconProps) {
   return <Stroke {...p}>{docBase}</Stroke>;
 }
 
+/** ADD-27: live recordings — a record dot inside a ring. */
+function RecordingIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      className={className}
+      aria-hidden
+    >
+      <circle cx="12" cy="12" r="8.2" />
+      <circle cx="12" cy="12" r="3.2" fill="#e5484d" stroke="none" />
+    </svg>
+  );
+}
+
 /** AI-generated files get the violet spark, always accent-colored. */
 export function SparkIcon({ size = 16, className }: IconProps) {
   return (
@@ -125,6 +144,8 @@ export function FileTypeIcon({
       return <WebIcon size={size} />;
     case "text":
       return <TextIcon size={size} />;
+    case "recording":
+      return <RecordingIcon size={size} />;
     default:
       return <FileIcon size={size} />;
   }

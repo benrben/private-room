@@ -53,9 +53,23 @@ umya-spreadsheet = { version = "3.0.0", default-features = false }
 # same doctrine as Ollama models (never bundled, nothing else to install).
 whisper-rs = "0.16"
 
-# macOS-only native deps: ADD-14 OCR (Apple Vision) + ADD-11 Touch ID (Keychain).
+# macOS-only native deps: ADD-14 OCR (Apple Vision) + ADD-11 Touch ID (Keychain)
+# + ADD-27 system-audio capture (ScreenCaptureKit) for recording meetings.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+dispatch2 = "0.3"
+objc2-core-media = { version = "0.3", features = [
+    "CMSampleBuffer",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+] }
+objc2-screen-capture-kit = { version = "0.3", features = [
+    "SCStream",
+    "SCShareableContent",
+    "block2",
+    "dispatch2",
+    "objc2-core-media",
+] }
 objc2-foundation = { version = "0.3", features = [
     "NSArray",
     "NSData",
@@ -105,3 +119,5 @@ core-foundation-sys = "0.8"
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# ADD-27: mock-app harness for the live-recording engine integration test.
+tauri = { version = "2", features = ["test"] }

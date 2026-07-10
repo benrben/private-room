@@ -10,11 +10,14 @@ pub(crate) struct AiActionSpec {
     description: &'static str,
     scope: &'static str, // "file" | "room"
     needs_question: bool, // true only for "research"
+    /// ADD-27: true only for "translate" — the modal asks for a target
+    /// language, delivered through the same `question` parameter.
+    needs_language: bool,
     default_prompt: &'static str,
     system: &'static str,
 }
 
-/// The 13 actions, in menu order: 8 file-scope, then 5 room-scope. Order and the
+/// The 14 actions, in menu order: 9 file-scope, then 5 room-scope. Order and the
 /// scope/needs_question flags are the cross-agent contract with the frontend.
 pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
     // ---- file scope ----
@@ -24,6 +27,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "A one-line TL;DR and the key points.",
         scope: "file",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Summarize this material: a one-line TL;DR, then the key points as a short list.",
         system: "You summarize material into a single tight TL;DR line followed by a short list of \
                  its key points. Base everything only on the provided text and add nothing that \
@@ -35,6 +39,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "Structure, themes, sentiment, risks, and open questions.",
         scope: "file",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Analyze this material: its structure, main themes, sentiment, risks, and open questions.",
         system: "You analyze material and lay it out under clear markdown sections: Structure, \
                  Themes, Sentiment, Risks, and Open questions. Base everything only on the provided \
@@ -46,6 +51,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "A plain-language walkthrough of the material.",
         scope: "file",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Explain this material in plain language, as if to a smart friend new to the topic.",
         system: "You explain material in plain, jargon-free language — a clear walkthrough a \
                  newcomer can follow, defining any terms the text relies on. Base everything only \
@@ -57,6 +63,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "Entities, dates, figures, and action items as a table.",
         scope: "file",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Extract the entities, dates, figures, and action items from this material.",
         system: "You extract the key entities, dates, figures, and action items from material and \
                  present them as a single markdown table with columns Type, Detail, and Context. \
@@ -68,6 +75,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "A clean nested outline of the points.",
         scope: "file",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Turn this material into a clean, nested outline of its points.",
         system: "You turn material into a clean, nested markdown outline (bullets and sub-bullets) \
                  that mirrors its structure. Base everything only on the provided text.",
@@ -78,6 +86,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "A tightened, clearer version.",
         scope: "file",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Rewrite this material into a tighter, clearer version that keeps every point.",
         system: "You rewrite material into a tighter, clearer version that keeps all of its meaning \
                  and points but drops the padding. Base everything only on the provided text and add \
@@ -89,6 +98,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "Study question-and-answer pairs.",
         scope: "file",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Write a set of study question-and-answer pairs covering this material.",
         system: "You write study question-and-answer pairs that test real understanding of the \
                  material. Format each as a bold question line followed by its answer. Base every \
@@ -100,11 +110,27 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "Flag claims the material doesn't support.",
         scope: "file",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Fact-check this material and flag any claim it doesn't actually support.",
         system: "You fact-check material against itself: list its main claims and flag any that are \
                  unsupported, internally contradicted, or overstated by the text. Judge only against \
                  the provided material — never outside knowledge. Present the result as a markdown \
                  table with columns Claim, Verdict, and Why.",
+    },
+    // ADD-27: translate any file (including a recording's transcript) into a
+    // user-picked language. The language rides in the `question` parameter.
+    AiActionSpec {
+        id: "translate",
+        title: "Translate",
+        description: "Translate the material into any language.",
+        scope: "file",
+        needs_question: false,
+        needs_language: true,
+        default_prompt: "Translate this material into the target language, keeping its structure.",
+        system: "You are a careful translator. Translate the user's material into the requested \
+                 target language. Preserve the document structure (headings, lists, tables) and \
+                 the exact meaning and tone; keep any [m:ss] timestamps and speaker names \
+                 exactly as they appear in the source. Output only the translation.",
     },
     // ---- room scope ----
     AiActionSpec {
@@ -113,6 +139,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "Answer a question with a cited synthesis of the room.",
         scope: "room",
         needs_question: true,
+        needs_language: false,
         default_prompt: "Answer the question using this room, and cite the files you draw on.",
         system: "You answer a specific question by synthesizing across the room's material, citing \
                  the file each point comes from (by its heading). If the material doesn't answer the \
@@ -124,6 +151,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "Diff the files side by side.",
         scope: "room",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Compare these files side by side — what they agree on and where they differ.",
         system: "You compare the provided files side by side: what they share, where they differ, \
                  and any outright contradictions. Use a markdown table where it helps. Base \
@@ -135,6 +163,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "A chronology from the dated mentions.",
         scope: "room",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Build a chronological timeline from the dated events mentioned in this material.",
         system: "You build a chronological timeline from the dated events mentioned in the material, \
                  earliest first, as a markdown table with columns Date, Event, and Source. Include \
@@ -146,6 +175,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "Group the material into topic clusters.",
         scope: "room",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Group this material into its main themes, with the points under each.",
         system: "You group material into its main themes or topic clusters, listing the supporting \
                  points under each as a markdown outline. Base everything only on the provided text.",
@@ -156,6 +186,7 @@ pub(crate) const AI_ACTIONS: &[AiActionSpec] = &[
         description: "What's missing given the rest of the room.",
         scope: "room",
         needs_question: false,
+        needs_language: false,
         default_prompt: "Given this room, point out what's missing or still unanswered.",
         system: "You identify gaps: questions the material raises but doesn't answer, and the topics \
                  it would still need to be complete. Be specific and grounded — no generic advice. \
@@ -171,6 +202,8 @@ pub struct AiActionDef {
     pub description: String,
     pub scope: String, // "file" | "room"
     pub needs_question: bool, // true only for "research"
+    /// ADD-27: the modal shows a target-language picker (true for "translate").
+    pub needs_language: bool,
     pub default_prompt: String,
 }
 
@@ -187,6 +220,7 @@ pub fn ai_action_prompts() -> Vec<AiActionDef> {
             description: s.description.into(),
             scope: s.scope.into(),
             needs_question: s.needs_question,
+            needs_language: s.needs_language,
             default_prompt: s.default_prompt.into(),
         })
         .collect()
@@ -238,6 +272,11 @@ pub async fn ai_action(
     let ask = question.as_deref().map(str::trim).filter(|q| !q.is_empty());
     let user = match ask {
         Some(q) if spec.needs_question => format!("{instr}\n\nQuestion: {q}\n\n{base}"),
+        // ADD-27: for "translate" the question field carries the target language.
+        Some(q) if spec.needs_language => format!("{instr}\n\nTarget language: {q}\n\n{base}"),
+        None if spec.needs_language => {
+            return Err("Pick a target language first.".into());
+        }
         _ => format!("{instr}\n\n{base}"),
     };
     let messages = vec![
@@ -433,26 +472,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ai_action_prompts_lists_the_thirteen_actions_with_right_scope() {
+    fn ai_action_prompts_lists_the_fourteen_actions_with_right_scope() {
         let defs = ai_action_prompts();
-        // Exactly the 13 ids, in the contract's menu order.
+        // Exactly the 14 ids, in the contract's menu order.
         let ids: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
             vec![
                 // file scope
                 "summarize", "analyze", "explain", "extract", "outline", "rewrite", "qa_pack",
-                "fact_check", // room scope
+                "fact_check", "translate", // room scope
                 "research", "compare", "timeline", "themes", "gaps",
             ]
         );
-        assert_eq!(defs.len(), 13);
-        // First 8 are file scope, last 5 are room scope.
-        for d in defs.iter().take(8) {
+        assert_eq!(defs.len(), 14);
+        // First 9 are file scope, last 5 are room scope.
+        for d in defs.iter().take(9) {
             assert_eq!(d.scope, "file", "{} should be file scope", d.id);
         }
-        for d in defs.iter().skip(8) {
+        for d in defs.iter().skip(9) {
             assert_eq!(d.scope, "room", "{} should be room scope", d.id);
+        }
+        // ADD-27: only `translate` asks for a target language.
+        for d in &defs {
+            assert_eq!(d.needs_language, d.id == "translate", "{} needs_language", d.id);
         }
         // Only `research` asks a follow-up question, and every action ships a
         // non-empty default prompt.

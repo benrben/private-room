@@ -92,6 +92,12 @@ CREATE TABLE IF NOT EXISTS file_versions (
   cause TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_file_versions_file ON file_versions(file_id);
+-- ADD-27: live-recording metadata (word timings, speakers, cuts) as one JSON
+-- blob per file. Row existence marks the file as a Recording in the viewer.
+CREATE TABLE IF NOT EXISTS recordings (
+  file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  meta TEXT NOT NULL
+);
 "#;
 
 pub(crate) fn apply_key(conn: &Connection, password: &str) -> Result<(), String> {
@@ -261,6 +267,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
            query_key TEXT PRIMARY KEY,
            results_text TEXT NOT NULL,
            saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );",
+    )
+    .map_err(|e| e.to_string())?;
+
+    // ADD-27: live-recording metadata, one JSON row per recording file.
+    // Guarded like the tables above — old rooms never ran the new SCHEMA.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS recordings (
+           file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+           meta TEXT NOT NULL
          );",
     )
     .map_err(|e| e.to_string())?;

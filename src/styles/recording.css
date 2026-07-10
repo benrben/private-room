@@ -1,0 +1,295 @@
+/* ADD-27: the Recording file view — live transcript, meters, transcript
+ * editing. ADD-28: the feedback modal extras. Follows the app's flat-CSS
+ * conventions (vars from theme, .subtle/.primary buttons come from base). */
+
+.rec-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ---- header ---- */
+.rec-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.rec-head-right {
+  margin-left: auto;
+}
+
+.rec-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.rec-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #e5484d;
+  display: inline-block;
+  flex: none;
+}
+
+.rec-dot.pulsing {
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+
+.rec-live-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: #e5484d;
+}
+
+.rec-live-chip.paused {
+  color: var(--muted, #888);
+}
+
+.rec-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--muted, #888);
+  user-select: none;
+}
+
+.rec-opt input[type="number"] {
+  width: 44px;
+}
+
+.rec-meters {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.rec-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 130px;
+}
+
+.rec-meter i {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted, #888);
+  width: 26px;
+}
+
+.rec-meter b {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.15s linear;
+  min-width: 2px;
+}
+
+.rec-note {
+  padding: 8px 14px;
+  font-size: 12.5px;
+  background: rgba(229, 72, 77, 0.08);
+  color: #c0383d;
+  border-bottom: 1px solid var(--border);
+}
+
+.rec-player {
+  width: calc(100% - 28px);
+  margin: 10px 14px 0;
+}
+
+/* ---- transcript ---- */
+.rec-transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px 20px;
+  min-height: 0;
+}
+
+.rec-empty {
+  max-width: 480px;
+  margin: 40px auto;
+  line-height: 1.55;
+}
+
+.rec-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 8px;
+}
+
+.rec-row.active {
+  background: var(--accent-soft, rgba(120, 120, 255, 0.1));
+}
+
+.rec-row.ghost {
+  opacity: 0.55;
+}
+
+.rec-row.ghost .rec-words::after {
+  content: "▌";
+  animation: rec-pulse 1s infinite;
+  margin-inline-start: 2px;
+}
+
+.rec-stamp {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--muted, #888);
+  background: none;
+  border: none;
+  padding: 0 2px;
+  cursor: pointer;
+  min-width: 40px;
+  text-align: end;
+}
+
+.rec-stamp:hover {
+  color: var(--accent);
+}
+
+.rec-speaker {
+  flex: none;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft, rgba(120, 120, 255, 0.14));
+  color: var(--accent);
+  min-width: 34px;
+  text-align: center;
+}
+
+.rec-words {
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.rec-word.deleted {
+  text-decoration: line-through;
+  opacity: 0.45;
+}
+
+.rec-translation {
+  display: block;
+  font-size: 12.5px;
+  font-style: italic;
+  color: var(--muted, #888);
+  margin-top: 1px;
+}
+
+/* ---- selection bar + tools ---- */
+.rec-selectbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--panel, rgba(0, 0, 0, 0.03));
+  font-size: 12.5px;
+}
+
+.rec-selectbar .danger {
+  background: #e5484d;
+  color: #fff;
+  border: none;
+  border-radius: 7px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.rec-selectbar .danger:hover {
+  background: #c0383d;
+}
+
+.rec-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.rec-tool {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.rec-tool input {
+  width: 170px;
+}
+
+.rec-hint-inline {
+  font-size: 11.5px;
+  color: var(--muted, #888);
+  margin-left: auto;
+}
+
+/* ---- topbar chip ---- */
+.rec-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid rgba(229, 72, 77, 0.4);
+  background: rgba(229, 72, 77, 0.09);
+  color: #c0383d;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.rec-indicator.paused {
+  opacity: 0.75;
+}
+
+/* ---- feedback modal (ADD-28) ---- */
+.feedback-modal {
+  max-width: 560px;
+}
+
+.feedback-raw {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.feedback-raw textarea {
+  flex: 1;
+}
+
+.feedback-body {
+  width: 100%;
+  margin-top: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.feedback-diag {
+  margin-top: 8px;
+  display: flex;
+}

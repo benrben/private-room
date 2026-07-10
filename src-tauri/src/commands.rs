@@ -1,4 +1,4 @@
-use crate::{db, extraction, mcp, ocr, ollama, stt, web};
+use crate::{db, extraction, mcp, ocr, ollama, recording, stt, web};
 use base64::Engine;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,8 @@ mod moonshot;
 mod media;
 mod agent_ui;
 mod ytdlp;
+mod recording_cmds;
+mod feedback;
 
 pub use external::*;
 pub use rooms::*;
@@ -57,6 +59,8 @@ pub use moonshot::*;
 pub use media::*;
 pub use agent_ui::*;
 pub use ytdlp::*;
+pub use recording_cmds::*;
+pub use feedback::*;
 
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.5:4b";
 pub(crate) const MAX_CONTEXT_CHUNKS: usize = 6;

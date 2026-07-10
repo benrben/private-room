@@ -6,6 +6,7 @@ import Overlays from "./workspace/Overlays";
 import TopBar from "./workspace/TopBar";
 import StudioModal from "./workspace/StudioModal";
 import AiActionModal from "./workspace/AiActionModal";
+import FeedbackModal from "./workspace/FeedbackModal";
 import SettingsModals from "./workspace/SettingsModals";
 import Sidebar from "./workspace/Sidebar";
 import ViewerPane from "./workspace/ViewerPane";
@@ -27,6 +28,7 @@ export default function Workspace({ info, onLock }: Props) {
 
       <StudioModal s={s} a={a} />
       <AiActionModal s={s} a={a} />
+      <FeedbackModal s={s} />
       <SettingsModals s={s} a={a} info={info} />
 
       <div className="body">

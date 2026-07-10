@@ -250,19 +250,25 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String) {
         };
         for (id, name, mime, text) in batch {
             // Yield to any in-flight answer, and stop if the room changed.
-            {
+            // ADD-27: also load the file's FULL text here (the batch row only
+            // carries a probe snippet, so a whole batch never holds 50 large
+            // texts in memory at once) — the summarizer pages through it.
+            let full = {
                 let state = app.state::<AppState>();
                 if !state.cancels.lock().unwrap().is_empty() {
                     return;
                 }
                 let guard = state.room.lock().unwrap();
                 match guard.as_ref() {
-                    Some(room) if room.path == room_path => {}
+                    Some(room) if room.path == room_path => {
+                        db::get_file_extracted_text(&room.conn, &id)
+                    }
                     _ => return,
                 }
             }
+            .unwrap_or_else(|| text.clone());
             let liner =
-                match summarize_one_file(&model, &name, &mime, &text, KEEP_ALIVE_SHORT).await {
+                match summarize_one_file(&model, &name, &mime, &full, KEEP_ALIVE_SHORT).await {
                     Ok(l) => l,
                     // Ollama down / model unloaded under pressure → stop quietly.
                     Err(_) => return,

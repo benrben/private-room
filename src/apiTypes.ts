@@ -81,6 +81,8 @@ export interface AiActionDef {
   description: string;
   scope: "file" | "room";
   needsQuestion: boolean;
+  /** ADD-27: true only for "translate" — the modal shows a language picker. */
+  needsLanguage: boolean;
   defaultPrompt: string;
 }
 
@@ -139,6 +141,7 @@ export interface FileContent {
     | "text"
     | "audio"
     | "video"
+    | "recording"
     | "binary";
   name: string;
   mime: string;
@@ -149,6 +152,78 @@ export interface FileContent {
    * protocol (seekable, any size). The viewer plays
    * `roommedia://localhost/<token>` instead of a base64 data URL. */
   mediaToken: string | null;
+}
+
+// ---- ADD-27: the live Recording file ----
+
+/** One transcribed word on the recording's timeline (centiseconds). `del`
+ * marks words removed in the transcript editor — playback skips their span. */
+export interface RecWord {
+  w: string;
+  t0: number;
+  t1: number;
+  del?: boolean;
+}
+
+export interface RecSegment {
+  id: string;
+  /** Which capture lane heard it: your mic, or the Mac's (meeting) audio. */
+  source: "mic" | "sys";
+  /** "You" for the mic; "Speaker N" for clustered meeting voices. */
+  speaker: string;
+  t0: number;
+  t1: number;
+  text: string;
+  words: RecWord[];
+  lang?: string | null;
+}
+
+/** A span deleted from the transcript; playback skips it, export removes it. */
+export interface RecCut {
+  t0: number;
+  t1: number;
+}
+
+export interface RecMeta {
+  version: number;
+  durationCs: number;
+  segments: RecSegment[];
+  cuts: RecCut[];
+  /** 0 = speakers are discovered from their voices (always, from the UI).
+   * A non-zero value pins the participant count for an older room. */
+  maxSpeakers: number;
+}
+
+export interface RecStart {
+  fileId: string;
+  name: string;
+  meta: RecMeta;
+}
+
+export interface RecLive {
+  fileId: string;
+  status: string;
+  durationCs: number;
+}
+
+export interface RecFile {
+  name: string;
+  meta: RecMeta;
+}
+
+// ---- ADD-28: feedback → GitHub issue ----
+
+export interface FeedbackDraft {
+  title: string;
+  body: string;
+}
+
+export interface AppDiag {
+  version: string;
+  os: string;
+  arch: string;
+  /** "owner/repo" the issue opens against. */
+  repo: string;
 }
 
 export interface AiStatus {

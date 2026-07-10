@@ -9,6 +9,13 @@ import {
 
 export * from "./apiTypes";
 import type {
+  AppDiag,
+  FeedbackDraft,
+  RecFile,
+  RecLive,
+  RecMeta,
+  RecSegment,
+  RecStart,
   RoomInfo,
   ImportReport,
   FileMeta,
@@ -259,6 +266,75 @@ export const api = {
   ): Promise<UnlistenFn> =>
     listen<McpServerStatus[]>("mcp-status", (e) => cb(e.payload)),
 
+  // ---- ADD-27: live Recording file ----
+  /** Start recording — a fresh file (fileId omitted) or resume an existing
+   *  recording file. Mic PCM is pushed separately via recPushAudio. The
+   *  meeting's speakers are discovered from their voices; nothing to pre-set. */
+  recStart: (opts: {
+    fileId?: string | null;
+    systemAudio: boolean;
+    liveTranslate?: string | null;
+  }) =>
+    invoke<RecStart>("rec_start", {
+      fileId: opts.fileId ?? null,
+      systemAudio: opts.systemAudio,
+      liveTranslate: opts.liveTranslate ?? null,
+    }),
+  /** ~250ms of mic samples: little-endian f32 bytes, base64-packed. */
+  recPushAudio: (rate: number, dataB64: string) =>
+    invoke<void>("rec_push_audio", { rate, dataB64 }),
+  recPause: () => invoke<void>("rec_pause"),
+  recResume: () => invoke<void>("rec_resume"),
+  /** Stop and save; resolves once the tail phrases finished transcribing. */
+  recStop: () => invoke<RecMeta>("rec_stop"),
+  recLiveStatus: () => invoke<RecLive | null>("rec_live_status"),
+  recSetLiveTranslate: (language: string | null) =>
+    invoke<void>("rec_set_live_translate", { language }),
+  recGet: (id: string) => invoke<RecFile>("rec_get", { id }),
+  /** Studio-style edit: delete a [t0,t1) span from transcript + playback. */
+  recDeleteRange: (id: string, t0: number, t1: number) =>
+    invoke<RecMeta>("rec_delete_range", { id, t0, t1 }),
+  /** Render the cuts into a new "<name> (edited).wav" file. */
+  recExportClean: (id: string) => invoke<FileMeta>("rec_export_clean", { id }),
+  /** Translate the whole transcript on the local model into any language. */
+  recTranslate: (id: string, language: string) =>
+    invoke<FileMeta>("rec_translate", { id, language }),
+  onRecPartial: (
+    cb: (p: { fileId: string; source: "mic" | "sys"; t0: number; text: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-partial", (e) => cb(e.payload as never)),
+  onRecSegment: (
+    cb: (p: { fileId: string; segment: RecSegment }) => void,
+  ): Promise<UnlistenFn> => listen("rec-segment", (e) => cb(e.payload as never)),
+  /** The meeting's speakers were re-derived from every voice heard so far —
+   *  labels already on screen may change (that's the point). */
+  onRecRelabel: (
+    cb: (p: { fileId: string; labels: { id: string; speaker: string }[] }) => void,
+  ): Promise<UnlistenFn> => listen("rec-relabel", (e) => cb(e.payload as never)),
+  onRecLevel: (
+    cb: (p: { fileId: string; mic: number; sys: number; durationCs: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-level", (e) => cb(e.payload as never)),
+  onRecState: (
+    cb: (p: { fileId: string; status: string; durationCs: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-state", (e) => cb(e.payload as never)),
+  onRecSource: (
+    cb: (p: { fileId: string; source: string; status: string; message: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-source", (e) => cb(e.payload as never)),
+  onRecError: (
+    cb: (p: { fileId: string; message: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-error", (e) => cb(e.payload as never)),
+  onRecLiveTranslation: (
+    cb: (p: { fileId: string; segId: string; text: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-live-translation", (e) => cb(e.payload as never)),
+  onRecTranslateProgress: (
+    cb: (p: { fileId: string; done: number; total: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-translate-progress", (e) => cb(e.payload as never)),
+
+  // ---- ADD-28: feedback → GitHub issue ----
+  /** Draft an issue title/body from raw feedback on the LOCAL model. */
+  feedbackDraft: (text: string) =>
+    invoke<FeedbackDraft>("feedback_draft", { text }),
+  appDiag: () => invoke<AppDiag>("app_diag"),
+
   // ADD-26: download a YouTube video into the room (yt-dlp on first use).
   importYoutubeVideo: (url: string) =>
     invoke<ImportReport>("import_youtube_video", { url }),
@@ -383,10 +459,13 @@ export type FileKind =
   | "markdown"
   | "web"
   | "text"
+  | "recording"
   | "file";
 
 export function fileKind(f: FileMeta): FileKind {
   if (f.mimeType.startsWith("image/")) return "image";
+  // ADD-27: live recordings carry their own source tag and icon.
+  if (f.source === "recording") return "recording";
   if (f.source === "generated") return "generated";
   const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "pdf") return "pdf";

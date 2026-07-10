@@ -161,6 +161,10 @@ export function useWorkspaceState(info: RoomInfo) {
   const [importSuggestions, setImportSuggestions] = useState<
     { fileId: string; current: string; suggestion: FileMetaSuggestion }[]
   >([]);
+  // ADD-27: the workspace-wide live recording session (survives view/file
+  // switches; null when nothing records). ADD-28: the feedback modal flag.
+  const [recLive, setRecLive] = useState<{ fileId: string; status: string } | null>(null);
+  const [showFeedback, setShowFeedback] = useState(false);
 
   function pushToast(
     kind: Toast["kind"],
@@ -219,6 +223,7 @@ export function useWorkspaceState(info: RoomInfo) {
     studioPromptRef, studioAc, setStudioAc, aiActionDefs, setAiActionDefs,
     aiPrompt, setAiPrompt, aiBusy, setAiBusy, memSuggestion, setMemSuggestion,
     importSuggestions, setImportSuggestions, pushToast, dismissToast,
+    recLive, setRecLive, showFeedback, setShowFeedback,
   };
 }
 

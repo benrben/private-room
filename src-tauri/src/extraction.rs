@@ -5,9 +5,11 @@ mod docx;
 mod html;
 mod pdf;
 mod pptx;
+mod window;
 mod xlsx;
 
 pub use chunking::*;
+pub use window::*;
 pub use docx::*;
 pub use html::*;
 pub(crate) use pdf::*;
