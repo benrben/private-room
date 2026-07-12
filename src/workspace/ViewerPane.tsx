@@ -19,6 +19,18 @@ import FrontPage from "./FrontPage";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
+/** True when a media transcript carries real speech — at least one timestamped
+ * "[m:ss] …" row with words. The "(transcribed from recording)" provenance line
+ * and a lone silence "." don't count, so downstream actions (Minutes) don't
+ * offer to summarize a recording that has nothing to summarize. */
+function transcriptHasSpeech(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return text.split("\n").some((line) => {
+    const m = line.match(/^\[(?:\d+:)?\d{1,2}:\d{2}\]\s*(.*)$/);
+    return m ? /[\p{L}\p{N}]/u.test(m[1]) : false;
+  });
+}
+
 /** Pane 2: the Room Map host, the open-file viewer + head actions, the Front
  * Page dashboard, and the sealed-room empty state. Extracted verbatim. */
 export default function ViewerPane({
@@ -36,7 +48,7 @@ export default function ViewerPane({
       ? s.fp
       : null;
   return (
-    <section className="viewer">
+    <section className="viewer" aria-label="Workspace">
       {s.showMap ? (
         <>
           <div className="viewer-head">
@@ -95,7 +107,9 @@ export default function ViewerPane({
                       <div className="time-machine">
                         {s.versions.map((v) =>
                           s.confirmRestore === v.id ? (
-                            <div key={v.id} className="tm-confirm">
+                            // ADD-25: the agent driver must not be able to
+                            // confirm a restore it didn't earn.
+                            <div key={v.id} className="tm-confirm" data-agent-blocked>
                               <span className="tm-confirm-q">
                                 Restore this version? Current changes will be
                                 replaced.
@@ -164,7 +178,7 @@ export default function ViewerPane({
               {(openFile.content.kind === "audio" ||
                 openFile.content.kind === "video" ||
                 openFile.content.kind === "recording") &&
-                openFile.content.text && (
+                transcriptHasSpeech(openFile.content.text) && (
                   <button
                     className="subtle"
                     title="Turn this recording's transcript into timeline-style HTML minutes (summary, decisions, action items)"
@@ -209,12 +223,14 @@ export default function ViewerPane({
               saveEditAsCopy={a.saveEditAsCopy}
               recording={{
                 live: s.recLive,
+                saveProgress: s.recSave,
                 pushToast: s.pushToast,
                 onStart: a.startLiveRecording,
                 onPause: a.pauseLiveRecording,
                 onResume: a.resumeLiveRecording,
                 onStop: a.stopLiveRecording,
               }}
+              sttStatus={s.sttStatus}
             />
           </div>
         </>
@@ -237,8 +253,14 @@ export default function ViewerPane({
             </button>
             <button
               className="qa-btn"
-              disabled={s.summarizing || s.files.length === 0}
-              onClick={a.summarizeRoom}
+              disabled={
+                s.files.length === 0 ||
+                s.summaryStarting ||
+                s.jobs.some(
+                  (j) => j.status === "running" || j.status === "queued",
+                )
+              }
+              onClick={() => void a.startDeepSummary()}
             >
               <SparkIcon size={15} /> Summarize room
             </button>

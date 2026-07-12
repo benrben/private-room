@@ -262,8 +262,17 @@ export function makeChatActions(
         return;
       }
       if (e.key === "Escape") {
+        // The palette swallows Escape completely — nothing else (viewer
+        // close, app-level handlers) may react to the same keypress.
         e.preventDefault();
+        e.stopPropagation();
+        e.nativeEvent.stopImmediatePropagation();
         s.setAc(null);
+        // A bare trigger token was only there to open the palette; closing
+        // the palette takes it with it so the composer is back where it was.
+        if (s.question.trim() === "#" || s.question.trim() === "@")
+          s.setQuestion("");
+        s.composerRef.current?.focus();
         return;
       }
     }

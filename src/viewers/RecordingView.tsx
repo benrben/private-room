@@ -1,6 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { api, RecMeta } from "../api";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { api, RecMeta, RecSegment, RecWord } from "../api";
+import { liveSttOn, micMuted, noteLiveStt, setMicMuted } from "../workspace/liveRec";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+
+const SCREEN_CAPTURE_SETTINGS_URL =
+  "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
 
 /**
  * ADD-27: the Recording file — record live (mic + the Mac's own audio, so a
@@ -25,6 +30,9 @@ export interface RecordingViewProps {
   mediaToken: string | null;
   /** The workspace-wide live session (null when nothing is recording). */
   live: RecordingLiveState | null;
+  /** Stop→saved drain readout — the audio is already durable when this is
+   * non-null, and `remaining` counts the phrase decodes still queued. */
+  saveProgress: { stage: "transcribing" | "writing"; remaining: number } | null;
   pushToast: (
     kind: "info" | "success" | "error",
     text: string,
@@ -54,6 +62,34 @@ function speakerHue(speaker: string): number | null {
   return [155, 25, 265, 330, 95, 200][(n - 1) % 6];
 }
 
+/** One phrase inside a turn. `visible` is the words to draw ("Show deleted"
+ * already applied); null means the segment has no word timings — draw its
+ * plain text. */
+interface TurnSeg {
+  seg: RecSegment;
+  visible: RecWord[] | null;
+}
+
+/** A run of consecutive same-speaker segments, shown as one block: timestamp
+ * and speaker chip once, the phrases flowing together as a paragraph. */
+interface Turn {
+  key: string;
+  speaker: string;
+  t0: number;
+  dir: "rtl" | "ltr" | "auto";
+  segs: TurnSeg[];
+}
+
+/** The turn body needs an explicit direction: its per-segment children carry
+ * dir="auto" (so a mixed-language turn isolates each phrase), and HTML's
+ * dir="auto" resolution skips children that have a dir attribute — the parent
+ * would always fall back to LTR. So resolve "first strong letter wins" here. */
+function strongDir(text: string): "rtl" | "ltr" | null {
+  const m = text.match(/\p{L}/u);
+  if (!m) return null;
+  return /[\u0591-\u08FF\uFB1D-\uFDFD\uFE70-\uFEFC]/.test(m[0]) ? "rtl" : "ltr";
+}
+
 function fmt(cs: number): string {
   const s = Math.max(0, Math.floor(cs / 100));
   const h = Math.floor(s / 3600);
@@ -68,6 +104,7 @@ export default function RecordingView({
   fileId,
   mediaToken,
   live,
+  saveProgress,
   pushToast,
   onStart,
   onPause,
@@ -80,16 +117,25 @@ export default function RecordingView({
   const [durationCs, setDurationCs] = useState(0);
   const [liveTranslations, setLiveTranslations] = useState<Record<string, string>>({});
   const [sysNote, setSysNote] = useState<string | null>(null);
+  const [micNote, setMicNote] = useState<string | null>(null);
   const [showDeleted, setShowDeleted] = useState(false);
   const [selection, setSelection] = useState<{ t0: number; t1: number; words: number } | null>(null);
   const [translating, setTranslating] = useState<{ done: number; total: number } | null>(null);
+  const [retrans, setRetrans] = useState<{ doneCs: number; totalCs: number } | null>(null);
+  const [confirmRetrans, setConfirmRetrans] = useState(false);
   const [busy, setBusy] = useState(false);
   const [activeSeg, setActiveSeg] = useState<string | null>(null);
   // Pre-start choices (also editable mid-flight for live translate).
   const [withSystem, setWithSystem] = useState(true);
   const [liveLang, setLiveLang] = useState("");
   const [translateTo, setTranslateTo] = useState("");
+  // Session controls whose truth lives OUTSIDE this view (liveRec module
+  // state), because the view unmounts while the recording keeps running.
+  const [micIsMuted, setMicIsMuted] = useState(micMuted());
+  const [liveStt, setLiveStt] = useState(liveSttOn());
 
+  // The sys-lane failure toast fires once per outage, not on every event.
+  const sysToastedRef = useRef(false);
   const mediaRef = useRef<HTMLAudioElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const listEndRef = useRef<HTMLDivElement | null>(null);
@@ -111,6 +157,16 @@ export default function RecordingView({
         }
       })
       .catch((e) => pushToast("error", String(e)));
+    // A source may have died BEFORE this view mounted; the engine keeps the
+    // latest health durable exactly for this read.
+    void api
+      .recLiveStatus()
+      .then((r) => {
+        if (dead || !r || r.fileId !== fileId) return;
+        setSysNote(r.sys[0] === "error" ? r.sys[1] : null);
+        setMicNote(r.mic[0] === "error" ? r.mic[1] : null);
+      })
+      .catch(() => {});
     const subs: Promise<UnlistenFn>[] = [
       api.onRecSegment((p) => {
         if (p.fileId !== fileId) return;
@@ -123,6 +179,10 @@ export default function RecordingView({
           return { ...m, segments };
         });
         setPartials((prev) => ({ ...prev, [p.segment.source]: undefined }));
+      }),
+      api.onRecSegmentDrop((p) => {
+        if (p.fileId !== fileId) return;
+        setMeta((m) => (m ? { ...m, segments: m.segments.filter((s) => s.id !== p.id) } : m));
       }),
       api.onRecPartial((p) => {
         if (p.fileId !== fileId) return;
@@ -152,9 +212,21 @@ export default function RecordingView({
         setDurationCs(p.durationCs);
       }),
       api.onRecSource((p) => {
-        if (p.fileId !== fileId || p.source !== "sys") return;
-        setSysNote(p.status === "error" ? p.message : null);
-        if (p.status === "error") pushToast("error", p.message);
+        if (p.fileId !== fileId) return;
+        if (p.source === "sys") {
+          if (p.status === "error") {
+            setSysNote(p.message);
+            if (!sysToastedRef.current) {
+              sysToastedRef.current = true;
+              pushToast("error", p.message);
+            }
+          } else {
+            setSysNote(null);
+            sysToastedRef.current = false;
+          }
+        } else if (p.source === "mic") {
+          setMicNote(p.status === "error" ? p.message : null);
+        }
       }),
       api.onRecLiveTranslation((p) => {
         if (p.fileId !== fileId) return;
@@ -163,6 +235,10 @@ export default function RecordingView({
       api.onRecTranslateProgress((p) => {
         if (p.fileId !== fileId) return;
         setTranslating(p.done >= p.total ? null : { done: p.done, total: p.total });
+      }),
+      api.onRecRetranscribe((p) => {
+        if (p.fileId !== fileId) return;
+        setRetrans(p.doneCs >= p.totalCs ? null : { doneCs: p.doneCs, totalCs: p.totalCs });
       }),
     ];
     return () => {
@@ -181,6 +257,22 @@ export default function RecordingView({
     if (!recordingNow) setPartials({});
   }, [recordingNow]);
 
+  // Pause/stop tears the mic tap down, which resets the mute — re-read the
+  // module truth whenever the session status moves.
+  useEffect(() => {
+    setMicIsMuted(micMuted());
+  }, [status]);
+
+  // A dead session's sys-lane error must not greet the next one: the engine
+  // emits no rec-source on stop, so the banner/toast guard reset here.
+  useEffect(() => {
+    if (!isLive) {
+      setSysNote(null);
+      setMicNote(null);
+      sysToastedRef.current = false;
+    }
+  }, [isLive]);
+
   // Pause/stop rewrote the file (audio + transcript): reload the saved truth.
   useEffect(() => {
     if (status === "idle" || status === "paused") {
@@ -190,6 +282,37 @@ export default function RecordingView({
 
   const segments = meta?.segments ?? [];
   const cuts = useMemo(() => meta?.cuts ?? [], [meta]);
+
+  // Turns are derived, never stored: rec-segment / rec-relabel /
+  // rec-segment-drop keep editing the flat segment list, and the grouping
+  // re-splits on its own (e.g. a relabel that flips a middle segment's
+  // speaker breaks its old turn in two).
+  const turns = useMemo<Turn[]>(() => {
+    const out: Turn[] = [];
+    for (const seg of segments) {
+      const visible = seg.words.length
+        ? seg.words.filter((w) => showDeleted || !w.del)
+        : null;
+      // A word-timed segment whose every word is deleted (and hidden) has
+      // nothing to draw — seg.text still holds the original words, so it
+      // must not be the fallback here, or deleting a whole utterance leaves
+      // a dangling speaker header over an empty paragraph.
+      if (visible && visible.length === 0) continue;
+      if (!visible && !seg.text) continue;
+      const last = out[out.length - 1];
+      if (last && last.speaker === seg.speaker) last.segs.push({ seg, visible });
+      else out.push({ key: seg.id, speaker: seg.speaker, t0: seg.t0, dir: "auto", segs: [{ seg, visible }] });
+    }
+    for (const t of out) {
+      t.dir =
+        strongDir(
+          t.segs
+            .map(({ seg, visible }) => (visible ? visible.map((w) => w.w).join(" ") : seg.text))
+            .join(" "),
+        ) ?? "auto";
+    }
+    return out;
+  }, [segments, showDeleted]);
 
   // ---- playback (skips deleted spans) ------------------------------------
   const src = mediaToken && !isLive ? `roommedia://localhost/${mediaToken}` : null;
@@ -285,6 +408,46 @@ export default function RecordingView({
     }
   }
 
+  function toggleMicMute() {
+    const next = !micIsMuted;
+    setMicMuted(next);
+    setMicIsMuted(next);
+  }
+
+  async function toggleLiveStt(on: boolean) {
+    setLiveStt(on);
+    noteLiveStt(on);
+    // The engine clears its ghost lines itself; drop ours right away too.
+    if (!on) setPartials({});
+    try {
+      await api.recSetLiveStt(on);
+    } catch (e) {
+      // Nothing changed in the engine — the control must not lie.
+      setLiveStt(!on);
+      noteLiveStt(!on);
+      pushToast("error", String(e));
+    }
+  }
+
+  async function runRetranscribe() {
+    if (busy) return;
+    setConfirmRetrans(false);
+    setBusy(true);
+    setRetrans({ doneCs: 0, totalCs: Math.max(1, durationCs) });
+    try {
+      const updated = await api.recRetranscribe(fileId);
+      setMeta(updated);
+      setDurationCs(updated.durationCs);
+      setLiveTranslations({});
+      pushToast("success", "Transcript rebuilt from the audio — the old one is in this file's History.");
+    } catch (e) {
+      pushToast("error", String(e));
+    } finally {
+      setBusy(false);
+      setRetrans(null);
+    }
+  }
+
   async function toggleLiveLang(lang: string) {
     setLiveLang(lang);
     setLiveTranslations({});
@@ -298,8 +461,25 @@ export default function RecordingView({
   }
 
   // ---- render -------------------------------------------------------------
-  const canEdit = !isLive || status === "paused";
+  // Stop first, then edit: the backend refuses rec_delete_range while the
+  // file has a live session — even paused, the engine's in-memory meta would
+  // overwrite the edit on its next flush.
+  const canEdit = !isLive;
   const hasWords = segments.some((s) => s.words.length > 0);
+  // mediaToken too: a corrupted (unparseable) meta reads as durationCs 0,
+  // and re-transcribe is the rescue tool for exactly that file.
+  const canRetranscribe = !isLive && (durationCs > 0 || !!mediaToken);
+
+  // One "still speaking…" ghost per lane. A ghost whose speaker matches the
+  // last turn renders inside it (the same voice, mid-sentence); the rest —
+  // including everything when there are no finals yet — stand alone.
+  const ghosts = (["mic", "sys"] as const).flatMap((lane) => {
+    const text = partials[lane];
+    return text ? [{ lane, speaker: lane === "mic" ? "You" : "Meeting", text }] : [];
+  });
+  const lastTurn = turns[turns.length - 1];
+  const attachedGhosts = lastTurn ? ghosts.filter((g) => g.speaker === lastTurn.speaker) : [];
+  const standaloneGhosts = ghosts.filter((g) => !attachedGhosts.includes(g));
 
   return (
     <div className="rec-view">
@@ -333,12 +513,29 @@ export default function RecordingView({
             <span className="rec-live-chip">
               <span className="rec-dot pulsing" /> REC {fmt(durationCs)}
             </span>
+            <button
+              className={`rec-mute ${micIsMuted ? "muted" : ""}`}
+              title={
+                micIsMuted
+                  ? "Unmute the microphone"
+                  : "Mute the microphone (the Mac's audio keeps recording)"
+              }
+              onClick={toggleMicMute}
+            >
+              🎙
+            </button>
             <span className="rec-meters" title="Microphone / Mac audio levels">
-              <span className="rec-meter">
+              <span
+                className="rec-meter"
+                title="Your microphone — your own voice"
+              >
                 <i>Mic</i>
-                <b style={{ width: `${Math.min(100, levels.mic * 400)}%` }} />
+                <b style={{ width: `${micIsMuted ? 0 : Math.min(100, levels.mic * 400)}%` }} />
               </span>
-              <span className="rec-meter">
+              <span
+                className="rec-meter"
+                title="The Mac's own audio — the meeting or video playing on this computer"
+              >
                 <i>Mac</i>
                 <b style={{ width: `${Math.min(100, levels.sys * 400)}%` }} />
               </span>
@@ -352,9 +549,41 @@ export default function RecordingView({
             <span className="rec-live-chip paused">Paused at {fmt(durationCs)}</span>
           </>
         )}
-        {status === "saving" && <span className="rec-live-chip">Finishing the last words…</span>}
+        {status === "saving" && (
+          // The scariest moment of the flow, named precisely: the audio is
+          // already safe (the engine checkpoints it before the first save
+          // event), the wait is only the transcript tail — and the user is
+          // free to leave; the sidebar card keeps showing progress.
+          <span className="rec-live-chip saving">
+            {saveProgress?.stage === "writing"
+              ? "Audio saved — writing the recording into the room…"
+              : saveProgress
+                ? `Audio saved — finishing the transcript${
+                    saveProgress.remaining > 0
+                      ? ` (${saveProgress.remaining} to go)`
+                      : "…"
+                  }`
+                : "Saving…"}
+            <span className="rec-save-note">
+              You can keep working — this finishes on its own.
+            </span>
+          </span>
+        )}
 
         <span className="rec-head-right">
+          {isLive && (
+            <label
+              className="rec-opt"
+              title="Turn off to keep recording audio without writing live text — rebuild the missing part later with Re-transcribe"
+            >
+              <input
+                type="checkbox"
+                checked={liveStt}
+                onChange={(e) => void toggleLiveStt(e.target.checked)}
+              />
+              Live transcription
+            </label>
+          )}
           <label className="rec-opt" title="Translate each phrase as it lands (on this Mac)">
             Live translate
             <select value={liveLang} onChange={(e) => void toggleLiveLang(e.target.value)}>
@@ -367,7 +596,32 @@ export default function RecordingView({
         </span>
       </div>
 
-      {sysNote && <div className="rec-note">{sysNote}</div>}
+      {/* The Mac-audio lane died (in practice: the Screen & System Audio
+          Recording permission) — say so where it can't be missed, with the fix
+          one click away. Clears itself if a later rec-source says "on". */}
+      {sysNote && isLive && (
+        <div className="rec-sys-banner" role="alert">
+          <span className="rec-sys-banner-text">{sysNote}</span>
+          <button
+            onClick={() =>
+              void openUrl(SCREEN_CAPTURE_SETTINGS_URL).catch((e) =>
+                pushToast("error", String(e)),
+              )
+            }
+          >
+            Open System Settings
+          </button>
+          <span className="rec-sys-banner-note">
+            After granting, quit and reopen Private Room — macOS applies the
+            permission only to a fresh launch.
+          </span>
+        </div>
+      )}
+      {micNote && isLive && (
+        <div className="rec-sys-banner" role="alert">
+          <span className="rec-sys-banner-text">{micNote}</span>
+        </div>
+      )}
 
       {/* player (idle/paused, once there is audio) */}
       {src && durationCs > 0 && (
@@ -404,55 +658,79 @@ export default function RecordingView({
             )}
           </div>
         )}
-        {segments.map((seg) => {
-          const visible = seg.words.length
-            ? seg.words.filter((w) => showDeleted || !w.del)
-            : null;
-          if (visible && visible.length === 0 && !seg.text) return null;
-          const hue = speakerHue(seg.speaker);
-          const translation = liveTranslations[seg.id];
+        {turns.map((turn, ti) => {
+          const hue = speakerHue(turn.speaker);
+          // The still-speaking (partial) line joins the last turn when it is
+          // the same voice continuing; otherwise it gets its own ghost turn.
+          const inlineGhosts = ti === turns.length - 1 ? attachedGhosts : [];
           return (
-            <div key={seg.id} className={`rec-row ${activeSeg === seg.id ? "active" : ""}`}>
-              <button
-                className="rec-stamp"
-                title="Jump to this moment"
-                onClick={() => seek(seg.t0)}
-              >
-                {fmt(seg.t0)}
-              </button>
-              <span
-                className="rec-speaker"
-                style={hue == null ? undefined : { background: `hsl(${hue} 60% 45% / .18)`, color: `hsl(${hue} 70% 35%)` }}
-              >
-                {seg.speaker}
-              </span>
-              <span className="rec-words" dir="auto">
-                {visible
-                  ? visible.map((w, i) => (
+            <div
+              key={turn.key}
+              className={`rec-turn ${turn.segs.some(({ seg }) => seg.id === activeSeg) ? "active" : ""}`}
+            >
+              <div className="rec-turn-head">
+                <button
+                  className="rec-stamp"
+                  title="Jump to this moment"
+                  onClick={() => seek(turn.t0)}
+                >
+                  {fmt(turn.t0)}
+                </button>
+                <span
+                  className="rec-speaker"
+                  style={hue == null ? undefined : { background: `hsl(${hue} 60% 45% / .18)`, color: `hsl(${hue} 70% 35%)` }}
+                >
+                  {turn.speaker}
+                </span>
+              </div>
+              <div className="rec-turn-body" dir={turn.dir}>
+                {turn.segs.map(({ seg, visible }) => {
+                  const translation = liveTranslations[seg.id];
+                  return (
+                    <Fragment key={seg.id}>
                       <span
-                        key={i}
-                        data-t0={w.t0}
-                        data-t1={w.t1}
-                        className={w.del ? "rec-word deleted" : "rec-word"}
+                        className={`rec-seg ${activeSeg === seg.id ? "active" : ""}`}
+                        dir="auto"
                       >
-                        {w.w}{" "}
-                      </span>
-                    ))
-                  : seg.text}
-                {translation && <span className="rec-translation" dir="auto">{translation}</span>}
-              </span>
+                        {visible
+                          ? visible.map((w, i) => (
+                              <span
+                                key={i}
+                                data-t0={w.t0}
+                                data-t1={w.t1}
+                                className={w.del ? "rec-word deleted" : "rec-word"}
+                                onClick={() => {
+                                  // A drag is a delete-selection, not a seek.
+                                  if (window.getSelection()?.isCollapsed) seek(w.t0);
+                                }}
+                              >
+                                {w.w}{" "}
+                              </span>
+                            ))
+                          : seg.text}
+                        {translation && <span className="rec-translation" dir="auto">{translation}</span>}
+                      </span>{" "}
+                    </Fragment>
+                  );
+                })}
+                {inlineGhosts.map((g) => (
+                  <span key={g.lane} className="rec-seg ghost" dir="auto">{g.text}</span>
+                ))}
+              </div>
             </div>
           );
         })}
-        {(["mic", "sys"] as const).map((sourceKey) =>
-          partials[sourceKey] ? (
-            <div key={sourceKey} className="rec-row ghost">
+        {standaloneGhosts.map((g) => (
+          <div key={g.lane} className="rec-turn ghost">
+            <div className="rec-turn-head">
               <span className="rec-stamp">…</span>
-              <span className="rec-speaker">{sourceKey === "mic" ? "You" : "Meeting"}</span>
-              <span className="rec-words" dir="auto">{partials[sourceKey]}</span>
+              <span className="rec-speaker">{g.speaker}</span>
             </div>
-          ) : null,
-        )}
+            <div className="rec-turn-body" dir="auto">
+              <span className="rec-seg ghost" dir="auto">{g.text}</span>
+            </div>
+          </div>
+        ))}
         <div ref={listEndRef} />
       </div>
 
@@ -470,28 +748,56 @@ export default function RecordingView({
       )}
 
       {/* footer toolbar */}
-      {segments.length > 0 && (
+      {(segments.length > 0 || canRetranscribe) && (
         <div className="rec-tools">
-          <span className="rec-tool">
-            <input
-              list="rec-langs"
-              placeholder="Translate into…"
-              value={translateTo}
-              disabled={busy}
-              onChange={(e) => setTranslateTo(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void runTranslate();
-              }}
-            />
-            <datalist id="rec-langs">
-              {LANGS.map((l) => (
-                <option key={l} value={l} />
-              ))}
-            </datalist>
-            <button className="subtle" disabled={busy || !translateTo.trim()} onClick={() => void runTranslate()}>
-              {translating ? `Translating ${translating.done}/${translating.total}…` : "Translate"}
-            </button>
-          </span>
+          {segments.length > 0 && (
+            <span className="rec-tool">
+              <input
+                list="rec-langs"
+                placeholder="Translate into…"
+                value={translateTo}
+                disabled={busy}
+                onChange={(e) => setTranslateTo(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void runTranslate();
+                }}
+              />
+              <datalist id="rec-langs">
+                {LANGS.map((l) => (
+                  <option key={l} value={l} />
+                ))}
+              </datalist>
+              <button className="subtle" disabled={busy || !translateTo.trim()} onClick={() => void runTranslate()}>
+                {translating ? `Translating ${translating.done}/${translating.total}…` : "Translate"}
+              </button>
+            </span>
+          )}
+          {canRetranscribe &&
+            (confirmRetrans ? (
+              <span className="rec-tool rec-retrans-confirm">
+                <span>
+                  Rebuild the whole transcript from the audio? The current one moves to History;
+                  the audio is untouched.
+                </span>
+                <button className="danger" onClick={() => void runRetranscribe()}>
+                  Re-transcribe
+                </button>
+                <button className="subtle" onClick={() => setConfirmRetrans(false)}>
+                  Cancel
+                </button>
+              </span>
+            ) : (
+              <button
+                className="subtle"
+                disabled={busy}
+                title="Rebuild the transcript from the audio with the current pipeline — fixes recordings saved with garbled words, the wrong language, or old speaker labels"
+                onClick={() => setConfirmRetrans(true)}
+              >
+                {retrans
+                  ? `Re-transcribing ${Math.min(100, Math.round((retrans.doneCs / Math.max(1, retrans.totalCs)) * 100))}%…`
+                  : "Re-transcribe"}
+              </button>
+            ))}
           {hasWords && (
             <>
               <button
@@ -523,6 +829,10 @@ export default function RecordingView({
   );
 
   async function start() {
+    // Session controls reset with the session: live transcription is ON at
+    // every rec_start (the actions layer syncs the module mirror).
+    setLiveStt(true);
+    setMicIsMuted(false);
     await onStart(fileId, { systemAudio: withSystem, liveTranslate: liveLang || null });
   }
 }

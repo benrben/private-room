@@ -204,6 +204,10 @@ export interface RecLive {
   fileId: string;
   status: string;
   durationCs: number;
+  /** Durable per-source health [status, message] — lets a viewer that
+   *  mounted after a fast failure still show the banner. */
+  mic: [string, string];
+  sys: [string, string];
 }
 
 export interface RecFile {
@@ -405,4 +409,32 @@ export interface StudioPrompts {
   flashcards: string;
   mindmap: string;
   podcast: string;
+}
+
+/** ADD-30: a durable background job (deep summary) as the jobs panel sees it.
+ * `status` is queued | running | paused | error | done. */
+export interface Job {
+  id: string;
+  kind: string;
+  title: string;
+  plan: unknown;
+  state: unknown;
+  cursor: number;
+  total: number;
+  status: string;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** ADD-30: one `job-progress` event — live counts plus terminal flags. */
+export interface JobProgress {
+  jobId: string;
+  label: string;
+  done: number;
+  total: number;
+  finished?: boolean;
+  paused?: boolean;
+  failed?: boolean;
+  fileId?: string | null;
 }

@@ -215,7 +215,10 @@ pub fn transcribe(model_path: &Path, pcm: &[f32], timestamps: bool) -> Result<St
     for i in 0..n {
         let Some(seg) = state.get_segment(i) else { continue };
         let text = seg.to_str_lossy().map_err(|e| e.to_string())?.trim().to_string();
-        if text.is_empty() {
+        // Drop silence hallucinations the same way the live path does — a near-
+        // silent clip otherwise decodes to a lone "." or "[BLANK_AUDIO]" and gets
+        // stored as a real (misleading) transcript. An all-junk clip → "".
+        if is_junk_segment(&text) {
             continue;
         }
         if timestamps {
@@ -239,7 +242,46 @@ pub struct SegOut {
     pub text: String,
     /// (word, t0, t1) — absolute centiseconds like t0/t1 above.
     pub words: Vec<(String, i64, i64)>,
+    /// What the phrase was actually decoded as (the forced language when one
+    /// was forced) — this is what persists on the segment.
     pub lang: Option<String>,
+    /// Mean token probability — how sure the model was of THIS text. Callers
+    /// use it to tell degraded-echo garbage from real speech; it never
+    /// deletes anything here on its own.
+    pub mean_p: f32,
+}
+
+/// How a live phrase's language is chosen. Whisper's per-phrase detection is
+/// the whole bug: a short Hebrew phrase misread as English isn't transcribed
+/// badly, it comes back TRANSLATED. The engine's sticky-language policy
+/// (recording::LaneLang) picks the mode; this is its whisper side.
+#[derive(Clone, Copy, Debug)]
+pub enum LangMode<'a> {
+    /// Let whisper detect the phrase's language and report nothing — pre-lock
+    /// live partials, which are throwaway. The detector must NOT run here: a
+    /// partial fires every ~1.5 s on the one decode worker, and a lane can
+    /// stay unlocked for a long time (music, low-confidence audio).
+    Auto,
+    /// Auto decode PLUS a confidence-bearing detection report
+    /// (`whisper_lang_auto_detect` on the mel the decode left behind, one
+    /// extra encoder pass) — pre-lock finals, whose report earns the lock.
+    Sniff,
+    /// Force the decode to this language and skip detection — locked-lane
+    /// partials.
+    Forced(&'a str),
+    /// Force the decode to this language but ALSO report what the audio
+    /// sounds like, so the caller can spot a genuine language change.
+    Watch(&'a str),
+}
+
+/// A whole decoded phrase plus what the language detector heard.
+#[derive(Default, Debug)]
+pub struct PhraseOut {
+    pub segs: Vec<SegOut>,
+    /// Top detected language and its probability — the detector's own answer
+    /// (`lang_detect` over the phrase's mel), independent of the language the
+    /// decode ran in. Forced: absent.
+    pub detected: Option<(String, f32)>,
 }
 
 /// True for a Whisper "segment" that is noise dressed as text — the classic
@@ -255,6 +297,91 @@ fn is_junk_segment(text: &str) -> bool {
     bracketed || t.chars().all(|c| !c.is_alphanumeric())
 }
 
+/// The classic Whisper hallucinations: phrases the model emits from noise,
+/// music, or unintelligible speech, in whatever language it drifted into —
+/// "Thank you." and its cousins, and subtitle/credit lines learned from
+/// YouTube captions. Only ever consulted TOGETHER with low decode
+/// confidence: a real spoken "thank you" scores far higher and stays.
+fn is_stock_hallucination(text: &str) -> bool {
+    // Credit lines match anywhere in the segment.
+    const CREDIT_MARKS: [&str; 8] = [
+        "amara.org",
+        "subtitles by",
+        "captioned by",
+        "субтитры",
+        "продолжение следует",
+        "untertitel",
+        "sous-titres",
+        "כתוביות",
+    ];
+    // Stock phrases must BE the sentence (every sentence of the segment).
+    const STOCK: [&str; 14] = [
+        "thank you",
+        "thank you very much",
+        "thank you so much",
+        "thanks for watching",
+        "thank you for watching",
+        "please subscribe",
+        "ありがとうございました",
+        "ご視聴ありがとうございました",
+        "감사합니다",
+        "시청해주셔서 감사합니다",
+        "спасибо за просмотр",
+        "gracias por ver",
+        "תודה רבה",
+        "תודה שצפיתם",
+    ];
+    let lower = text.to_lowercase();
+    if CREDIT_MARKS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    let mut any = false;
+    for sentence in lower.split(['.', '!', '?', ',']) {
+        let t = sentence.trim().trim_matches(|c: char| !c.is_alphanumeric());
+        if t.is_empty() {
+            continue;
+        }
+        any = true;
+        if !STOCK.contains(&t) {
+            return false;
+        }
+    }
+    any
+}
+
+/// Assemble (word, t0, t1) triples from raw token pieces of one segment.
+///
+/// Whisper's BPE freely splits a multi-byte UTF-8 character across two tokens
+/// (routine in Hebrew/CJK), so decoding per TOKEN yields U+FFFD halves. Words
+/// must be joined as bytes and decoded per WORD: a piece whose bytes begin
+/// with b' ' opens a new word, and BPE never splits a character across a
+/// space boundary, so each completed word's bytes are whole characters.
+/// Timing is first-piece t0 / last-piece t1 per word.
+fn merge_token_words(pieces: &[(Vec<u8>, i64, i64)]) -> Vec<(String, i64, i64)> {
+    let mut words: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+    for (bytes, t0, t1) in pieces {
+        let mut b = bytes.as_slice();
+        while b.last() == Some(&b'\n') {
+            b = &b[..b.len() - 1];
+        }
+        if bytes.first() == Some(&b' ') || words.is_empty() {
+            words.push((b.to_vec(), *t0, *t1));
+        } else if let Some(last) = words.last_mut() {
+            last.0.extend_from_slice(b);
+            last.2 = *t1;
+        }
+    }
+    words
+        .into_iter()
+        .filter_map(|(bytes, t0, t1)| {
+            let w = String::from_utf8(bytes)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+            let w = w.trim().to_string();
+            (!w.is_empty()).then_some((w, t0, t1))
+        })
+        .collect()
+}
+
 /// Transcribe one live phrase (mono 16 kHz) with word timestamps, shifting
 /// everything by `offset_cs` so timestamps are absolute on the recording's
 /// timeline. Same warm context as [`transcribe`]; equally blocking — the
@@ -263,11 +390,12 @@ pub fn transcribe_segments(
     model_path: &Path,
     pcm: &[f32],
     offset_cs: i64,
-) -> Result<Vec<SegOut>, String> {
+    mode: LangMode<'_>,
+) -> Result<PhraseOut, String> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
     if pcm.len() < 3200 {
-        return Ok(Vec::new()); // < 0.2 s: nothing decodable
+        return Ok(PhraseOut::default()); // < 0.2 s: nothing decodable
     }
     let key = model_path.to_string_lossy().into_owned();
     let mut guard = CTX.lock().map_err(|_| "stt context poisoned")?;
@@ -278,15 +406,33 @@ pub fn transcribe_segments(
     }
     let (_, ctx) = guard.as_ref().expect("just set");
 
+    let forced = match mode {
+        LangMode::Auto | LangMode::Sniff => None,
+        LangMode::Forced(l) | LangMode::Watch(l) => Some(l),
+    };
     let mut state = ctx.create_state().map_err(|e| e.to_string())?;
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some("auto"));
+    // Finals (Sniff/Watch) decode with beam search — the reference quality
+    // setting (openai/faster-whisper default beam 5), barely slower on Metal.
+    // Partials (Auto/Forced) stay greedy: they are repainted every ~1.5 s, so
+    // latency wins; best_of=5 still lets whisper.cpp's temperature fallback
+    // sample candidates when a hard phrase makes the greedy pick fail.
+    let strategy = match mode {
+        LangMode::Sniff | LangMode::Watch(_) => SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: -1.0,
+        },
+        LangMode::Auto | LangMode::Forced(_) => SamplingStrategy::Greedy { best_of: 5 },
+    };
+    let mut params = FullParams::new(strategy);
+    params.set_language(Some(forced.unwrap_or("auto")));
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_token_timestamps(true);
     params.set_suppress_blank(true);
+    // Never emit music/sound-effect token spans (♪, bracketed noise) as words.
+    params.set_suppress_nst(true);
     // Each phrase stands alone; carrying context across them makes the model
     // repeat the previous phrase over silence.
     params.set_no_context(true);
@@ -297,47 +443,60 @@ pub fn transcribe_segments(
 
     state.full(params, pcm).map_err(|e| format!("transcription failed: {e}"))?;
 
+    // full_lang_id is the language the decode ran in — the forced one when
+    // one was forced — which is exactly what each segment must persist.
     let lang = whisper_rs::get_lang_str(state.full_lang_id_from_state()).map(str::to_string);
     let n = state.full_n_segments();
     let mut out: Vec<SegOut> = Vec::new();
     for i in 0..n {
         let Some(seg) = state.get_segment(i) else { continue };
         let text = seg.to_str_lossy().map_err(|e| e.to_string())?.trim().to_string();
-        // Silence hallucination gates: whisper's own no-speech signal, junk
-        // shapes, and rock-bottom token confidence.
-        if is_junk_segment(&text) || seg.no_speech_probability() > 0.75 {
+        if is_junk_segment(&text) {
             continue;
         }
-        let mut words: Vec<(String, i64, i64)> = Vec::new();
+        // RAW bytes per token, never per-token strings: BPE splits multi-byte
+        // characters across tokens, and lossy-decoding each half yields "�".
+        let mut pieces: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+        let mut plog_sum = 0f32;
         let mut p_sum = 0f32;
-        let mut p_n = 0usize;
+        let mut plog_n = 0usize;
         for j in 0..seg.n_tokens() {
             let Some(tok) = seg.get_token(j) else { continue };
-            let Ok(piece) = tok.to_str_lossy() else { continue };
+            let Ok(bytes) = tok.to_bytes() else { continue };
             // Specials like "[_BEG_]" / "<|endoftext|>" carry no words.
-            if piece.starts_with("[_") || piece.starts_with("<|") {
+            if bytes.starts_with(b"[_") || bytes.starts_with(b"<|") {
                 continue;
             }
             let data = tok.token_data();
+            plog_sum += data.plog;
             p_sum += data.p;
-            p_n += 1;
+            plog_n += 1;
             let t0 = offset_cs + data.t0.max(0);
             let t1 = offset_cs + data.t1.max(data.t0.max(0));
-            // A leading space starts a new word; anything else glues onto the
-            // previous token (sub-word pieces, punctuation, CJK/Hebrew glyphs).
-            let starts_word = piece.starts_with(' ') || words.is_empty();
-            if starts_word {
-                let w = piece.trim().to_string();
-                if !w.is_empty() {
-                    words.push((w, t0, t1));
-                }
-            } else if let Some(last) = words.last_mut() {
-                last.0.push_str(piece.trim_end_matches('\n'));
-                last.2 = t1;
-            }
+            pieces.push((bytes.to_vec(), t0, t1));
         }
-        if p_n > 0 && p_sum / (p_n as f32) < 0.30 {
-            continue; // the model is guessing — worse than staying silent
+        let words = merge_token_words(&pieces);
+        let mean_p = if plog_n > 0 { p_sum / plog_n as f32 } else { 0.0 };
+        // A stock hallucination the model itself wasn't sure about is noise
+        // dressed as text. A REAL "thank you" decodes confidently and stays —
+        // this pair of conditions is what the old unconditional confidence
+        // floor got wrong in both directions.
+        if is_stock_hallucination(&text) && mean_p < 0.5 {
+            continue;
+        }
+        // The REFERENCE silence rule (openai / faster-whisper / whisper.cpp
+        // all agree): text is dropped only when the model says "probably no
+        // speech here" AND the decode is low-confidence — both together.
+        // Low confidence alone is NOT a reason to delete: hard audio —
+        // accented, far-mic, compressed — decodes correct words at low
+        // probability, and deleting them punches holes in real speech. The
+        // old mean-p floors (0.30 short / 0.18 long) did exactly that on
+        // real-world meetings and are gone on purpose.
+        if plog_n > 0 {
+            let avg_logprob = plog_sum / plog_n as f32;
+            if seg.no_speech_probability() > 0.6 && avg_logprob < -1.0 {
+                continue;
+            }
         }
         out.push(SegOut {
             t0: offset_cs + seg.start_timestamp().max(0),
@@ -345,9 +504,27 @@ pub fn transcribe_segments(
             text,
             words,
             lang: lang.clone(),
+            mean_p,
         });
     }
-    Ok(out)
+    let detected = match mode {
+        LangMode::Forced(_) | LangMode::Auto => None,
+        // The state still holds this phrase's mel from full(), so
+        // lang_detect only re-runs the encoder plus one token to answer
+        // "what does this audio sound like?". Watch: the forced decode above
+        // never asked. Sniff: the auto decode DID pick a language, but
+        // exposes no confidence on that path — reporting it as 1.0 (as this
+        // used to) let one confidently-wrong first phrase lock a lane's
+        // sticky language with no gate at all. Best-effort: a detect failure
+        // just reports nothing, which the sticky policy treats as no vote.
+        LangMode::Sniff | LangMode::Watch(_) => {
+            state.lang_detect(0, threads as usize).ok().and_then(|(id, probs)| {
+                whisper_rs::get_lang_str(id)
+                    .map(|l| (l.to_string(), probs.get(id as usize).copied().unwrap_or(0.0)))
+            })
+        }
+    };
+    Ok(PhraseOut { segs: out, detected })
 }
 
 #[cfg(test)]
@@ -416,13 +593,81 @@ mod tests {
     }
 
     #[test]
+    fn merge_words_reassembles_utf8_split_across_tokens() {
+        // "שלום עולם" with a letter's two UTF-8 bytes split across tokens —
+        // exactly how Whisper's BPE tokenizes Hebrew. Per-token decoding
+        // would give "�" halves; byte-level assembly must not.
+        let shalom = "שלום".as_bytes(); // 4 letters × 2 bytes
+        let olam = " עולם".as_bytes(); // leading space starts the word
+        let pieces = vec![
+            (shalom[..3].to_vec(), 100, 110), // ש + first byte of ל
+            (shalom[3..].to_vec(), 110, 120), // second byte of ל + ום
+            (olam[..4].to_vec(), 130, 140),   // " ע" + first byte of ו
+            (olam[4..].to_vec(), 140, 150),   // rest
+        ];
+        let words = merge_token_words(&pieces);
+        assert_eq!(
+            words,
+            vec![("שלום".to_string(), 100, 120), ("עולם".to_string(), 130, 150)]
+        );
+        assert!(words.iter().all(|(w, _, _)| !w.contains('\u{FFFD}')));
+    }
+
+    #[test]
+    fn merge_words_ascii_subwords_and_punctuation() {
+        let p = |s: &str, t0, t1| (s.as_bytes().to_vec(), t0, t1);
+        let pieces = vec![
+            p(" Hel", 0, 5),
+            p("lo", 5, 10),
+            p(",", 10, 12), // punctuation glues onto the previous word
+            p(" world", 12, 20),
+            p("!\n", 20, 22), // trailing newline stripped
+        ];
+        assert_eq!(
+            merge_token_words(&pieces),
+            vec![("Hello,".to_string(), 0, 12), ("world!".to_string(), 12, 22)]
+        );
+        // First piece without a leading space still opens a word; empty
+        // pieces produce no words.
+        assert_eq!(
+            merge_token_words(&[p("Hi", 0, 3), p(" ", 3, 4)]),
+            vec![("Hi".to_string(), 0, 3)]
+        );
+        assert!(merge_token_words(&[]).is_empty());
+    }
+
+    #[test]
     fn junk_segments_are_recognized() {
         assert!(is_junk_segment("[BLANK_AUDIO]"));
         assert!(is_junk_segment("(music)"));
         assert!(is_junk_segment("♪ ♪"));
         assert!(is_junk_segment("   "));
+        // A lone "." is what Whisper emits for a near-silent clip — it must be
+        // dropped by the import path too, not stored as a real transcript.
+        assert!(is_junk_segment("."));
+        assert!(is_junk_segment(". . ."));
         assert!(!is_junk_segment("Hello there"));
         assert!(!is_junk_segment("שלום"));
+    }
+
+    /// The stock-hallucination list matches Whisper's noise phrases — even
+    /// repeated into one segment, and in every language it drifts into — but
+    /// never real sentences that merely CONTAIN a thank-you.
+    #[test]
+    fn stock_hallucinations_are_recognized() {
+        assert!(is_stock_hallucination("Thank you."));
+        assert!(is_stock_hallucination("Thank you. Thank you. Thank you."));
+        assert!(is_stock_hallucination("Thanks for watching!"));
+        assert!(is_stock_hallucination("ありがとうございました"));
+        assert!(is_stock_hallucination("감사합니다"));
+        assert!(is_stock_hallucination("Продолжение следует..."));
+        assert!(is_stock_hallucination("תודה רבה"));
+        assert!(is_stock_hallucination("Subtitles by the Amara.org community"));
+        // Real speech that happens to include the words stays real.
+        assert!(!is_stock_hallucination("Thank you for the report, let's move on."));
+        assert!(!is_stock_hallucination("תודה רבה שבאת, טוב להיות פה"));
+        assert!(!is_stock_hallucination("I want to thank you all for coming today"));
+        assert!(!is_stock_hallucination(""));
     }
 
     /// Live-segment pipeline against the real model, like e2e_say_roundtrip:
@@ -442,7 +687,7 @@ mod tests {
             .success());
         let pcm = decode_to_pcm(&aiff, MediaKind::Audio).unwrap();
         let _ = std::fs::remove_file(&aiff);
-        let segs = transcribe_segments(&model, &pcm, 500).unwrap();
+        let segs = transcribe_segments(&model, &pcm, 500, LangMode::Auto).unwrap().segs;
         assert!(!segs.is_empty(), "no segments");
         let all = segs.iter().map(|s| s.text.as_str()).collect::<String>().to_lowercase();
         assert!(all.contains("quick brown fox"), "{all}");
@@ -451,6 +696,44 @@ mod tests {
         // Timestamps carry the offset and are monotonic.
         assert!(words.first().unwrap().1 >= 500);
         assert!(words.windows(2).all(|w| w[0].1 <= w[1].1));
+    }
+
+    /// Hebrew word-level round trip against the real model: every emitted
+    /// word must be valid UTF-8 with no replacement characters. Skips when
+    /// the Carmit (Hebrew) voice isn't installed, like diarize's say() tests.
+    #[test]
+    #[ignore = "needs the downloaded model (Settings → Download voice model)"]
+    fn e2e_hebrew_words_no_mojibake() {
+        let model = test_model();
+        assert!(model.exists(), "download the model first (Settings)");
+        let aiff = std::env::temp_dir()
+            .join(format!("pr-stt-e2e-heb-{}.aiff", uuid::Uuid::new_v4()));
+        let ok = std::process::Command::new("say")
+            .args(["-v", "Carmit", "-o"])
+            .arg(&aiff)
+            .arg("שלום עולם, מה שלומך היום?")
+            .status()
+            .ok()
+            .filter(|s| s.success());
+        let Some(_) = ok else {
+            eprintln!("skipping: `say -v Carmit` unavailable");
+            return;
+        };
+        let pcm = decode_to_pcm(&aiff, MediaKind::Audio).unwrap();
+        let _ = std::fs::remove_file(&aiff);
+        let segs = transcribe_segments(&model, &pcm, 0, LangMode::Auto).unwrap().segs;
+        assert!(!segs.is_empty(), "no segments");
+        let words: Vec<_> =
+            segs.iter().flat_map(|s| s.words.iter().map(|w| w.0.clone())).collect();
+        assert!(!words.is_empty(), "no words: {segs:?}");
+        for w in &words {
+            assert!(!w.contains('\u{FFFD}'), "corrupted word {w:?} in {words:?}");
+        }
+        // The transcript really is Hebrew, not an empty/latin hallucination.
+        assert!(
+            words.iter().any(|w| w.chars().any(|c| ('א'..='ת').contains(&c))),
+            "no Hebrew letters in {words:?}"
+        );
     }
 
     #[test]

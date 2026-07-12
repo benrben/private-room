@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { api, RoomInfo } from "../api";
 import {
   CloseIcon,
@@ -37,8 +38,42 @@ export default function Sidebar({
     displayName(f.name).toLowerCase().includes(filterQ);
   const shownFiles = s.files.filter(matchesFilter);
   const looseFiles = shownFiles.filter((f) => f.folderId === null);
+
+  // A once-a-second tick so the running job card's elapsed time advances. Only
+  // armed while something is actually running, so an idle sidebar never re-renders.
+  const jobActive =
+    s.summaryStarting ||
+    s.recLive?.status === "saving" ||
+    s.jobs.some((j) => j.status === "running" || j.status === "queued");
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    if (!jobActive) return;
+    const t = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [jobActive]);
+  // Same dismissal grammar as the header popovers: Escape closes the Add menu.
+  useEffect(() => {
+    if (!s.addMenuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      s.setAddMenuOpen(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [s.addMenuOpen, s]);
+  const elapsedOf = useMemo(
+    () => (createdAt: string) => {
+      const start = Date.parse(createdAt);
+      if (Number.isNaN(start)) return "";
+      const s2 = Math.max(0, Math.round((nowTick - start) / 1000));
+      const m = Math.floor(s2 / 60);
+      return `${m}:${String(s2 % 60).padStart(2, "0")}`;
+    },
+    [nowTick],
+  );
   return (
-    <aside className="sidebar" style={{ width: s.sidebarW }}>
+    <aside className="sidebar" aria-label="Files" style={{ width: s.sidebarW }}>
       <div
         className={`side-head${s.dragOverFolder === "__root__" ? " drag-over" : ""}`}
         onDragOver={(e) => {
@@ -113,7 +148,9 @@ export default function Sidebar({
                     <LinkIcon size={14} /> Web link
                   </button>
                   {/* ADD-27: a Recording file — live transcript while you
-                   * (or your meeting) speak. */}
+                   * (or your meeting) speak. The three mic entries each say
+                   * what pressing them captures and saves — starting the
+                   * microphone must never be a surprise. */}
                   <button
                     className="pop-item"
                     disabled={s.recLive != null}
@@ -123,7 +160,13 @@ export default function Sidebar({
                       s.setAddMenuOpen(false);
                     }}
                   >
-                    <MicIcon size={14} /> Live recording
+                    <MicIcon size={14} />
+                    <span className="pop-item-body">
+                      Live recording
+                      <span className="pop-item-sub">
+                        Mic + Mac audio, transcribed as it happens
+                      </span>
+                    </span>
                   </button>
                   <button
                     className="pop-item"
@@ -133,7 +176,13 @@ export default function Sidebar({
                       s.setAddMenuOpen(false);
                     }}
                   >
-                    <MicIcon size={14} /> Voice note
+                    <MicIcon size={14} />
+                    <span className="pop-item-body">
+                      Voice note
+                      <span className="pop-item-sub">
+                        Starts the mic — saves the audio in this room
+                      </span>
+                    </span>
                   </button>
                   <button
                     className="pop-item"
@@ -143,7 +192,14 @@ export default function Sidebar({
                       s.setAddMenuOpen(false);
                     }}
                   >
-                    <MicIcon size={14} /> Journal entry
+                    <MicIcon size={14} />
+                    <span className="pop-item-body">
+                      Speak a journal entry
+                      <span className="pop-item-sub">
+                        Starts the mic — transcribed on this Mac into today's
+                        journal
+                      </span>
+                    </span>
                   </button>
                 </div>
               </>
@@ -151,6 +207,16 @@ export default function Sidebar({
           </div>
         </span>
       </div>
+      {/* ADD-31: live import queue — a multi-file import used to be invisible
+          until it was over. Names the current file and counts progress. */}
+      {s.importProgress && (
+        <div className="import-strip" role="status">
+          <span className="import-strip-count">
+            Importing {s.importProgress.done + 1} of {s.importProgress.total}
+          </span>
+          <span className="import-strip-name">{s.importProgress.name}</span>
+        </div>
+      )}
       <div className="side-search">
         <SearchIcon size={14} />
         <input
@@ -169,20 +235,176 @@ export default function Sidebar({
           </button>
         )}
       </div>
-      <button
-        className="summarize-btn"
-        title="Write a short overview of this room and what's inside"
-        disabled={s.summarizing}
-        onClick={a.summarizeRoom}
-      >
-        {s.summarizing ? (
-          s.summarizeProgress || "Summarizing…"
-        ) : (
-          <>
-            <SparkIcon size={14} /> Summarize room
-          </>
+      {(() => {
+        const jobRunning = s.jobs.some(
+          (j) => j.status === "running" || j.status === "queued",
+        );
+        const busy = s.summaryStarting || jobRunning;
+        return (
+          <button
+            className="summarize-btn"
+            title="Write a short overview of this room and what's inside — runs in the background"
+            disabled={busy}
+            onClick={() => void a.startDeepSummary()}
+          >
+            {s.summaryStarting && !jobRunning ? (
+              "Starting…"
+            ) : (
+              <>
+                <SparkIcon size={14} /> Summarize room
+              </>
+            )}
+          </button>
+        );
+      })()}
+      {/* Optimistic "Starting…" card the instant the button is pressed, before
+          the backend resolves — a cold local model can take seconds to answer,
+          and a click must never look like nothing happened. */}
+      {s.summaryStarting &&
+        !s.jobs.some((j) => j.status === "running" || j.status === "queued") && (
+          <div className="job-card running" role="status">
+            <div className="job-card-head">
+              <span className="job-card-title">Room summary</span>
+            </div>
+            <div className="job-card-bar">
+              <div className="job-card-fill indeterminate" />
+            </div>
+            <div className="job-card-foot">
+              <span className="job-card-label">Starting…</span>
+            </div>
+          </div>
         )}
-      </button>
+      {/* A recording being finalized keeps a visible card here, so leaving
+          the recording view never turns the save into a mystery. The audio
+          is already durable when this card appears — the label says so. */}
+      {s.recLive?.status === "saving" && (
+        <div className="job-card running" role="status">
+          <div className="job-card-head">
+            <span className="job-card-title">Saving recording</span>
+            {s.recSave && (
+              <span className="job-card-elapsed">{elapsedOf(s.recSave.startedAt)}</span>
+            )}
+          </div>
+          <div className="job-card-bar">
+            <div className="job-card-fill indeterminate" />
+          </div>
+          <div className="job-card-foot">
+            <span className="job-card-label">
+              {s.recSave?.stage === "writing"
+                ? "Audio saved — writing into the room…"
+                : s.recSave && s.recSave.remaining > 0
+                  ? `Audio saved — transcribing (${s.recSave.remaining} to go)`
+                  : "Audio saved — finishing the transcript…"}
+            </span>
+            <button
+              className="job-card-resume"
+              title="Open the recording"
+              onClick={() => {
+                const id = s.recLive?.fileId;
+                if (id) void a.viewFile(id);
+              }}
+            >
+              Open
+            </button>
+          </div>
+        </div>
+      )}
+      {/* ADD-30: background-job cards — live progress while running, Resume
+          for a job that was paused or parked by an error. */}
+      {s.jobs.map((j) => {
+        const live = s.jobProgress[j.id];
+        const running = j.status === "running" || j.status === "queued";
+        const done = live?.done ?? j.cursor;
+        const total = Math.max(live?.total ?? j.total, 1);
+        const friendlyError =
+          j.error === "OLLAMA_DOWN"
+            ? "The local AI isn't running."
+            : j.error?.startsWith("MODEL_MISSING")
+              ? "The AI model isn't installed."
+              : j.error;
+        return (
+          <div key={j.id} className={`job-card ${j.status}`} role="status">
+            <div className="job-card-head">
+              <span className="job-card-title">{j.title}</span>
+              {running ? (
+                <span className="job-card-elapsed">{elapsedOf(j.createdAt)}</span>
+              ) : (
+                <button
+                  className="chip-btn"
+                  title="Dismiss this job"
+                  onClick={() => void a.dismissJob(j.id)}
+                >
+                  <CloseIcon size={11} />
+                </button>
+              )}
+            </div>
+            {/* ADD-32: the pass mosaic — one cell per stretch of the file,
+                lighting up in spectral order as each part is read, so you can
+                watch the whole file being consumed window by window. */}
+            {j.kind === "file_pass" &&
+              (() => {
+                const plan = (j.plan ?? {}) as { windows?: unknown[] };
+                const nWin = Array.isArray(plan.windows) ? plan.windows.length : 0;
+                if (nWin < 2) return null;
+                const cells = Math.min(nWin, 192);
+                const mapsDone = Math.min(done, nWin);
+                const cellsDone = Math.floor((mapsDone * cells) / nWin);
+                const weaving = running && done >= nWin;
+                return (
+                  <div
+                    className={`pass-mosaic${weaving ? " weaving" : ""}`}
+                    title={`${mapsDone} of ${nWin} parts read`}
+                  >
+                    {Array.from({ length: cells }, (_, c) => (
+                      <span
+                        key={c}
+                        className={`pass-cell${c < cellsDone ? " on" : ""}${
+                          c === cellsDone && running && !weaving ? " now" : ""
+                        }`}
+                        style={{ "--h": Math.round((c * 300) / cells) } as CSSProperties}
+                      />
+                    ))}
+                  </div>
+                );
+              })()}
+            <div className="job-card-bar">
+              <div
+                className={`job-card-fill${running && !live ? " indeterminate" : ""}`}
+                style={
+                  running && !live
+                    ? undefined
+                    : { width: `${Math.min(100, Math.round((done / total) * 100))}%` }
+                }
+              />
+            </div>
+            <div className="job-card-foot">
+              <span className="job-card-label">
+                {running
+                  ? (live?.label ?? "Working…")
+                  : j.status === "error"
+                    ? (friendlyError ?? "Stopped.")
+                    : `Paused at ${done} of ${total}`}
+              </span>
+              {running ? (
+                <button
+                  className="job-card-resume"
+                  title="Stop — it checkpoints so you can resume later"
+                  onClick={() => void a.pauseJob(j.id)}
+                >
+                  Stop
+                </button>
+              ) : (
+                <button
+                  className="job-card-resume"
+                  onClick={() => void a.resumeJob(j.id)}
+                >
+                  {j.status === "error" ? "Retry" : "Resume"}
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      })}
       <button
         className={`memory-chip${s.showMemoryIntro ? " glow" : ""}`}
         title="What the AI remembers about you — visible and editable"

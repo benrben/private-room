@@ -10,9 +10,13 @@ pub(crate) fn normalize_for_match(s: &str) -> String {
         match c {
             '\u{2018}' | '\u{2019}' | '\u{02BC}' => folded.push('\''),
             '\u{201C}' | '\u{201D}' => folded.push('"'),
-            '\u{2013}' | '\u{2014}' => folded.push('-'),
+            // Hebrew maqaf ־ ≡ hyphen: models type בן-דוד for the file's בן־דוד.
+            '\u{2013}' | '\u{2014}' | '\u{05BE}' => folded.push('-'),
             '\u{FB01}' => folded.push_str("fi"),
             '\u{FB02}' => folded.push_str("fl"),
+            // Hebrew nikud/cantillation: search chunks are consonantal, file
+            // text may be pointed — fold both to consonants so quotes meet.
+            c if extraction::is_heb_mark(c) => {}
             _ => folded.push(c),
         }
     }
@@ -167,6 +171,14 @@ pub async fn ask(
         ask_id: ask_id.clone(),
     };
 
+    // ADD-31: the audit's worst wait was an anonymous "Thinking locally…" for
+    // 30+ seconds. Name the two hidden phases: waking the daemon (ADD-29 makes
+    // this implicit and slow the first time) and searching the room.
+    if !crate::ollama_lifecycle::is_awake(&ollama::resolved_base_url()).await {
+        let _ = window.emit("ask-step", "Starting the local AI…");
+    }
+    let _ = window.emit("ask-step", "Searching your files…");
+
     // ADD-13: embed the question BEFORE taking the room lock (the Ollama call is
     // async; the lock is not held across it). None on any failure → keyword-only.
     let question_embedding = embed_question(&question).await;
@@ -257,11 +269,12 @@ pub async fn ask(
                 if truncated {
                     text.push_str("\n… (truncated)");
                     // UX-4: the AI saw only the beginning — say so, by name.
+                    // ADD-32: and point at the tool that DOES cover everything.
                     let _ = window.emit(
                         "ask-notice",
                         format!(
                             "Only the beginning of \"{name}\" was included (file is large). \
-                             For full coverage, ask about it in sections."
+                             For guaranteed full coverage, ask me to run a full pass over it."
                         ),
                     );
                 }
@@ -486,21 +499,13 @@ pub async fn ask(
     let model = explicit_model
         .clone()
         .unwrap_or_else(|| best_default(&models));
-    // A `:cloud` model can't drive the app: it leaks tool calls inline as text
-    // instead of the structured `tool_calls` field, so they silently never run
-    // (a room's edits/annotations would be lost). Run the tool loop on a local
-    // model and tell the user why. External CLIs (claude-cli/codex-cli) are a
-    // separate, supported path handled below.
-    let model = if is_cloud_model(&model) {
-        let local = best_local_default(&models);
-        let _ = window.emit(
-            "ask-step",
-            format!("{model} can't drive the app — using {local} for tools"),
-        );
-        local
-    } else {
-        model
-    };
+    // ADD-29 parity: the selected engine drives the app itself — no silent
+    // reroute to a local model. Current `:cloud` models emit structured tool
+    // calls and honor the `format` grammar (verified on-device), and the
+    // `chat_core` inline-tool-call net (ADD-29) recovers any engine that leaks
+    // calls as text, so a cloud model runs the same tool loop a local one does.
+    // External CLIs (claude-cli/codex-cli) remain a separate subprocess path
+    // handled below.
 
     // CHG-19: the "where is X?" grounding pass is deferred to AFTER the answer
     // (nothing in the reply depends on the boxes), so the warm chat model streams
@@ -720,6 +725,8 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "ui_act",
     "view_screenshot",
     "view_media_frame",
+    "start_file_pass",
+    "job_status",
 ];
 
 /// ADD-22: the file-MUTATING built-ins. A small model picks the right tool far
@@ -774,6 +781,43 @@ pub(crate) fn wants_ui_tools(question: &str) -> bool {
     HINTS.iter().any(|h| q.contains(h))
 }
 
+/// ADD-32: keyword router for the whole-file pass tools (start_file_pass,
+/// job_status). Same doctrine as the other routers: deterministic, errs toward
+/// YES. Fires on whole-file intent ("the entire file", "all of it", "translate
+/// the book") and on job talk ("is it done yet?").
+pub(crate) fn wants_job_tools(question: &str) -> bool {
+    let q = question.to_lowercase();
+    const HINTS: &[&str] = &[
+        "whole", "entire", "entirely", "all of", "every ", "everything", "full",
+        "fully", "complete", "completely", "cover", "thorough", "in depth",
+        "in-depth", "translate", "book", "throughout", "end to end", "cover to cover",
+        "start to finish", "page by page", "chapter", "long file", "large file",
+        "big file", "deep", "job", "progress", "background", "pass", "digest",
+        "no matter", "don't miss", "do not miss", "line by line",
+    ];
+    HINTS.iter().any(|h| q.contains(h))
+}
+
+/// ADD-32: the whole-file pass tool specs. Injected by `agent_loop` (never via
+/// `tools_catalog`, so the room MCP bridge can't offer them to a cloud client —
+/// same structural guard as the UI tools; starting hours of local compute stays
+/// a local-agent decision).
+pub(crate) fn job_tools_specs() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type": "function", "function": {"name": "start_file_pass",
+            "description": "Start a durable BACKGROUND pass that reads an ENTIRE file part by part — every character, no matter how large the file is — and saves the result as a new file in the room. Use it whenever the user wants work covering a whole large file (summarize/analyze/translate it all), instead of answering from excerpts. It is slow (minutes to hours) but survives app restarts; the user sees a live progress card. mode \"merge\" (default) folds notes into one final document; mode \"stitch\" transforms each part and joins them in order (translation, rewriting). After starting it, tell the user it is underway — do not wait for it.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "File name or a distinctive part of it"},
+                "instruction": {"type": "string", "description": "What to do across the whole file, e.g. \"summarize thoroughly\", \"translate to French\", \"list every obligation with its section\""},
+                "mode": {"type": "string", "enum": ["merge", "stitch"],
+                    "description": "merge = one final document distilled from the whole file (default); stitch = transform each part and join them in order"}},
+                "required": ["name", "instruction"]}}}),
+        serde_json::json!({"type": "function", "function": {"name": "job_status",
+            "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along.",
+            "parameters": {"type": "object", "properties": {}}}}),
+    ]
+}
+
 /// The lane label shown to the user (transparency: they see how the app framed
 /// their request, so an odd answer is explainable). Purely cosmetic.
 pub(crate) fn lane_label(question: &str, web_enabled: bool) -> &'static str {
@@ -797,16 +841,16 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
             "description": "List every file stored in this room with its type and size.",
             "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "search_room",
-            "description": "Search all room files for content the excerpts already provided above do not cover. Use 2-4 keywords, not a full sentence. Results are verbatim file text safe to quote in annotate_file.",
+            "description": "Search all room files for content the excerpts already provided above do not cover. Use 2-4 keywords, not a full sentence. Results are verbatim file text safe to quote in annotate_file. To SHOW the user a passage you found, call open_file with find set to a short quote from these results — you never need a page number.",
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string"}}, "required": ["query"]}}},
         {"type": "function", "function": {"name": "open_file",
-            "description": "Open a file in the app's viewer pane so the user sees it. Optionally jump to a spot.",
+            "description": "Open a file in the app's viewer pane so the user sees it. To jump to a passage, pass find with a short exact quote (copied from search_room results) — the viewer locates the right page itself, in any language; never ask the user for a page number. page/cell also work when known.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "File name or a distinctive part of it"},
                 "page": {"type": "integer", "description": "PDF page number to show"},
                 "cell": {"type": "string", "description": "Spreadsheet cell to show, like B7"},
-                "find": {"type": "string", "description": "Exact text from the file to scroll to"}},
+                "find": {"type": "string", "description": "Short exact text from the file to locate, scroll to, and show — use this to jump to content found with search_room"}},
                 "required": ["name"]}}},
         {"type": "function", "function": {"name": "mark_image",
             "description": "Draw labeled boxes on an image in the room showing where something is.",
@@ -1146,6 +1190,9 @@ pub(crate) fn tool_step_label(name: &str) -> String {
         "ui_act" => "Operated the app",
         "view_screenshot" => "Looked at the screen",
         "view_media_frame" => "Looked at a video frame",
+        // ADD-32: the whole-file pass — durable background reading.
+        "start_file_pass" => "Started a whole-file pass",
+        "job_status" => "Checked the background jobs",
         // ADD-21: name the exfiltration plainly — the local model just chose to
         // send a subtask to the cloud.
         "consult_advisor" => "Consulting a cloud advisor (content leaves this Mac)",
@@ -1200,6 +1247,9 @@ pub(crate) async fn agent_loop(
     // client the user's screen. Offered only when the deterministic router
     // hears an operate-the-app intent, keeping plain-question catalogs short.
     let ui_enabled = wants_ui_tools(question);
+    // ADD-32: the whole-file pass tools ride the same injection path — never
+    // `tools_catalog`, so the room bridge can't hand them to a cloud client.
+    let jobs_enabled = wants_job_tools(question);
     if let Some(arr) = tools.as_array_mut() {
         for r in &routes {
             arr.push(r.spec.clone());
@@ -1209,6 +1259,23 @@ pub(crate) async fn agent_loop(
         }
         if ui_enabled {
             arr.extend(ui_tools_specs());
+        }
+        if jobs_enabled {
+            arr.extend(job_tools_specs());
+        }
+    }
+    if jobs_enabled {
+        if let Some(sys) = messages.first_mut() {
+            if sys.role == "system" {
+                sys.content.push_str(
+                    "\n\nFor work that must cover an ENTIRE file — summarize/analyze/translate \
+                     all of it, however large — do NOT try to read it through search_room \
+                     excerpts. Call start_file_pass instead: it reads every part of the file in \
+                     a durable background job and saves the result as a new file in the room. \
+                     Then tell the user it is underway (they see a live progress card) and do \
+                     not wait for it. job_status reports how background jobs are doing.",
+                );
+            }
         }
     }
     if ui_enabled {
@@ -1267,11 +1334,12 @@ pub(crate) async fn agent_loop(
     // duplicate-call detection + forced synthesis + Stop. MAX_TOOL_ROUNDS is
     // only a runaway backstop set far above any real run. The plain no-tool chat
     // path needs just a couple of rounds.
-    let max_rounds = if routes.is_empty() && !web_enabled && advisors.is_empty() && !ui_enabled {
-        4
-    } else {
-        MAX_TOOL_ROUNDS
-    };
+    let max_rounds =
+        if routes.is_empty() && !web_enabled && advisors.is_empty() && !ui_enabled && !jobs_enabled {
+            4
+        } else {
+            MAX_TOOL_ROUNDS
+        };
     // CHG-32: an empty catalog keeps num_ctx at 12288 (tools.is_some()) while
     // forbidding further tool calls — forces a grounded text answer on the
     // final round instead of letting side-effect tools run unread.
@@ -1502,22 +1570,52 @@ pub(crate) async fn exec_tool(
                 let room = guard.as_ref().ok_or("No room is open.")?;
                 db::find_file_like_full(&room.conn, &name)?
             };
+            // Ground `find` in the file's REAL text before the viewer hunts
+            // for it (same ADD-22 net as annotate_file): a model quoting from
+            // memory drifts — "בירושלים" for the file's "בירושלם" — and an
+            // exact-match viewer then silently stays on page 1. Verify the
+            // passage, or swap in the closest real one.
+            let (find, approx) = match (find, &text) {
+                (Some(f), Some(t)) => {
+                    let hay = normalize_for_match(t);
+                    let needle = normalize_for_match(f);
+                    let found = hay.contains(&needle)
+                        || hay.replace(' ', "").contains(&needle.replace(' ', ""));
+                    if found {
+                        (Some(f.to_string()), false)
+                    } else if let Some(snip) = closest_snippet(t, f) {
+                        (Some(snip), true)
+                    } else {
+                        (None, true) // nothing close — open plainly, tell the model
+                    }
+                }
+                (f, _) => (f.map(str::to_string), false),
+            };
             let _ = window.emit(
                 "agent-open-file",
                 serde_json::json!({ "id": id, "page": page, "cell": cell, "find": find }),
             );
-            let target = match (page, cell, find) {
+            let target = match (page, cell, &find) {
                 (Some(p), _, _) => format!(" at page {p}"),
                 (_, Some(c), _) => format!(" at cell {c}"),
                 (_, _, Some(f)) => format!(" at \"{f}\""),
                 _ => String::new(),
+            };
+            let note = if approx && find.is_some() {
+                "\n(The exact text you asked for isn't in the file — jumped to the closest \
+                 real passage instead. Quote text verbatim from search_room next time.)"
+            } else if approx {
+                "\n(That text isn't in this file — opened it from the start. Use search_room \
+                 first and copy the passage exactly.)"
+            } else {
+                ""
             };
             let snippet = text
                 // Char-safe prefix (was a raw byte slice that panicked on
                 // multibyte text).
                 .map(|t| format!("\nIt begins:\n{}", clamp_bytes(t, 1200)))
                 .unwrap_or_default();
-            Ok(format!("Opened \"{real_name}\" in the viewer{target}.{snippet}"))
+            Ok(format!("Opened \"{real_name}\" in the viewer{target}.{note}{snippet}"))
         }
         "annotate_file" => {
             let name = args["name"].as_str().unwrap_or_default();
@@ -2059,6 +2157,42 @@ pub(crate) async fn exec_tool(
             db::add_memory(&room.conn, content)?;
             Ok("Memory saved.".into())
         }
+        // ADD-32: kick off a durable whole-file pass. The heavy lifting is the
+        // deterministic job runner's; the agent only starts it and reports.
+        "start_file_pass" => {
+            let name = args["name"].as_str().unwrap_or_default();
+            let instruction = args["instruction"].as_str().unwrap_or_default();
+            let mode = args["mode"].as_str().unwrap_or("merge");
+            let (_job_id, real_name, parts) =
+                begin_file_pass(window, state.inner(), name, instruction, mode).await?;
+            Ok(format!(
+                "Started a full pass over \"{real_name}\": {parts} part(s) will be read one \
+                 after another in the background, and the finished result will be saved into \
+                 the room as a new file. The user can watch the live progress card in the \
+                 sidebar and stop or resume it any time. Do NOT wait for it or poll job_status \
+                 — tell the user it is underway and answer anything else they asked."
+            ))
+        }
+        // ADD-32: report background-job progress in plain words.
+        "job_status" => {
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let jobs = db::list_jobs(&room.conn)?;
+            if jobs.is_empty() {
+                return Ok("There are no background jobs in this room.".into());
+            }
+            let lines: Vec<String> = jobs
+                .iter()
+                .take(8)
+                .map(|j| {
+                    format!(
+                        "- {} — {} ({} of {} steps done)",
+                        j.title, j.status, j.cursor, j.total
+                    )
+                })
+                .collect();
+            Ok(clamp_tool_result(lines.join("\n")))
+        }
         // ADD-21: delegate a hard subtask to a cloud CLI. Gated: the tool is
         // only in the catalog when the advanced setting is on and a CLI exists,
         // but re-check the budget here so the model can't overspend the user's
@@ -2526,6 +2660,12 @@ mod tests {
     fn normalizes_for_quote_matching() {
         let doc = normalize_for_match("The  Fee is\n 5%  of total.");
         assert!(doc.contains(&normalize_for_match("fee is 5%")));
+        // A consonantal quote (from search chunks) must match pointed file
+        // text — nikud/cantillation fold away on both sides.
+        let pointed = normalize_for_match("דִּבְרֵי קֹהֶלֶת בֶּן־דָּוִד");
+        assert!(pointed.contains(&normalize_for_match("קהלת")));
+        // Maqaf ≡ hyphen: a model typing בן-דוד must match the file's בן־דוד.
+        assert!(pointed.contains(&normalize_for_match("בן-דוד")));
     }
 
     #[test]
@@ -2579,6 +2719,32 @@ mod tests {
         // …a plain document question does not.
         assert!(!wants_ui_tools("summarize the contract"));
         assert!(!wants_ui_tools("who signed this agreement"));
+    }
+
+    #[test]
+    fn wants_job_tools_routes_whole_file_intents() {
+        // Whole-file work opens the pass tools…
+        assert!(wants_job_tools("summarize the entire book"));
+        assert!(wants_job_tools("translate the whole contract to French"));
+        assert!(wants_job_tools("go through all of it, don't miss anything"));
+        assert!(wants_job_tools("read it cover to cover"));
+        assert!(wants_job_tools("is the background job done yet?"));
+        // …a pointed question about one clause does not.
+        assert!(!wants_job_tools("what does the lease say about pets?"));
+        assert!(!wants_job_tools("who signed this agreement"));
+    }
+
+    #[test]
+    fn job_tools_never_leak_into_the_room_bridge_catalog() {
+        // ADD-32 structural guard, same as the UI tools: the pass tools must
+        // NOT be in tools_catalog (which builds the room MCP bridge) — only
+        // injected into the local agent loop. A cloud client must not be able
+        // to start hours of local compute.
+        let catalog = tools_catalog(true).to_string();
+        for name in ["start_file_pass", "job_status"] {
+            assert!(!catalog.contains(name), "{name} must not be in tools_catalog");
+        }
+        assert_eq!(job_tools_specs().len(), 2);
     }
 
     #[test]

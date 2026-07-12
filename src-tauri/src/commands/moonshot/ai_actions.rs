@@ -255,7 +255,7 @@ pub async fn ai_action(
             None => gather_scope_text(&room.conn, scope.as_deref(), &room.name)?,
         }
     };
-    let model = resolve_local_model(&state)
+    let model = resolve_structured_model(&state)
         .await
         .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
     let _ = window.emit("ask-step", spec.title);
@@ -330,7 +330,7 @@ pub async fn memory_suggestion(
     let (Some(u), Some(a)) = (last_user, last_assistant) else {
         return Ok(MemorySuggestion { worth: false, fact: String::new() });
     };
-    let model = match resolve_local_model(&state).await {
+    let model = match resolve_structured_model(&state).await {
         Some(m) => m,
         None => return Ok(MemorySuggestion { worth: false, fact: String::new() }),
     };
@@ -412,10 +412,14 @@ pub async fn suggest_file_meta(
         folder: String::new(),
         tags: Vec::new(),
     };
-    if text.trim().is_empty() {
+    // A rename/file-under proposal is only as good as the text behind it. A
+    // failed or trivial extraction (a damaged PDF, an HTML error page saved
+    // as one) yields a few stray words — proposing metadata from that reads
+    // as nonsense ("Page Not Found in error_pages"), so stay quiet instead.
+    if text.trim().chars().count() < 80 {
         return Ok(echo());
     }
-    let model = match resolve_local_model(&state).await {
+    let model = match resolve_structured_model(&state).await {
         Some(m) => m,
         None => return Ok(echo()),
     };

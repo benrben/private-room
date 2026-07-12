@@ -57,12 +57,29 @@ pub fn extract_text(name: &str, bytes: &[u8]) -> Option<String> {
     .filter(|t| !t.trim().is_empty())
 }
 
+/// Hard ceiling on the decompressed size of a single Office zip entry
+/// (document.xml, slideN.xml, …). Real Office parts are a few MB at most; a
+/// tiny archive that inflates past this is a decompression bomb, not a doc.
+const MAX_ZIP_ENTRY_BYTES: u64 = 100 * 1024 * 1024;
+
 pub(crate) fn read_zip_entry(bytes: &[u8], entry: &str) -> Option<String> {
+    read_zip_entry_capped(bytes, entry, MAX_ZIP_ENTRY_BYTES)
+}
+
+fn read_zip_entry_capped(bytes: &[u8], entry: &str, cap: u64) -> Option<String> {
     let cursor = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
-    let mut file = archive.by_name(entry).ok()?;
+    let file = archive.by_name(entry).ok()?;
+    // Declared sizes can lie, so the `take` below is the real guard; checking
+    // the header first just skips the allocation for an honest oversized entry.
+    if file.size() > cap {
+        return None;
+    }
     let mut content = String::new();
-    file.read_to_string(&mut content).ok()?;
+    file.take(cap + 1).read_to_string(&mut content).ok()?;
+    if content.len() as u64 > cap {
+        return None;
+    }
     Some(content)
 }
 
@@ -136,6 +153,23 @@ fn normalize_whitespace(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_zip_entry_refuses_entries_over_cap() {
+        // Decompression-bomb guard: an entry whose decompressed size exceeds
+        // the cap must yield None instead of ballooning memory.
+        let bytes = fake_office_zip("word/document.xml", "0123456789");
+        assert_eq!(
+            read_zip_entry_capped(&bytes, "word/document.xml", 64).as_deref(),
+            Some("0123456789")
+        );
+        assert!(read_zip_entry_capped(&bytes, "word/document.xml", 9).is_none());
+    }
 }
 
 /// Shared test helper: build a minimal Office-style zip with a single entry.

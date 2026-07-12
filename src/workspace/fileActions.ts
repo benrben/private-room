@@ -137,6 +137,34 @@ export function makeFileActions(s: WSState) {
     s.setImportSuggestions((cur) => cur.filter((x) => x.fileId !== fileId));
   }
 
+  /** Rename + file one suggestion. Shared by the single-chip Apply and the
+   * batched "Apply all"; the caller owns the receipt toast. */
+  async function applyOneSuggestion(sug: {
+    fileId: string;
+    current: string;
+    suggestion: FileMetaSuggestion;
+  }) {
+    const title = sug.suggestion.title.trim();
+    if (title && title !== sug.current) {
+      const dot = sug.current.lastIndexOf(".");
+      const ext = dot > 0 ? sug.current.slice(dot) : "";
+      const name = /\.[^.]+$/.test(title) ? title : `${title}${ext}`;
+      await api.renameFile(sug.fileId, name);
+      if (s.openFileRef.current?.id === sug.fileId) {
+        s.setOpenFile((o) => (o ? { ...o, name } : o));
+      }
+    }
+    const folderName = sug.suggestion.folder.trim();
+    if (folderName) {
+      let folder = s.folders.find(
+        (f) => f.name.toLowerCase() === folderName.toLowerCase(),
+      );
+      if (!folder) folder = await api.createFolder(folderName);
+      await api.moveFileToFolder(sug.fileId, folder.id);
+      s.setFolders(await api.listFolders());
+    }
+  }
+
   async function applyImportSuggestion(sug: {
     fileId: string;
     current: string;
@@ -144,25 +172,7 @@ export function makeFileActions(s: WSState) {
   }) {
     dismissImportSuggestion(sug.fileId);
     try {
-      const title = sug.suggestion.title.trim();
-      if (title && title !== sug.current) {
-        const dot = sug.current.lastIndexOf(".");
-        const ext = dot > 0 ? sug.current.slice(dot) : "";
-        const name = /\.[^.]+$/.test(title) ? title : `${title}${ext}`;
-        await api.renameFile(sug.fileId, name);
-        if (s.openFileRef.current?.id === sug.fileId) {
-          s.setOpenFile((o) => (o ? { ...o, name } : o));
-        }
-      }
-      const folderName = sug.suggestion.folder.trim();
-      if (folderName) {
-        let folder = s.folders.find(
-          (f) => f.name.toLowerCase() === folderName.toLowerCase(),
-        );
-        if (!folder) folder = await api.createFolder(folderName);
-        await api.moveFileToFolder(sug.fileId, folder.id);
-        s.setFolders(await api.listFolders());
-      }
+      await applyOneSuggestion(sug);
       s.setFiles(await api.listFiles());
       s.pushToast("success", "Tidied up.");
     } catch (e) {
@@ -170,15 +180,48 @@ export function makeFileActions(s: WSState) {
     }
   }
 
-  /** Turn an import report into toasts (shared by the picker and drag-drop). */
-  function reportImport(report: { imported: FileMeta[]; errors: string[] }) {
-    if (report.imported.length > 0) {
+  /** Batched "Apply all" for the collapsed tidy-up card — one receipt at the
+   * end instead of a toast per file. */
+  async function applyAllImportSuggestions() {
+    const pending = s.importSuggestions;
+    s.setImportSuggestions([]);
+    let applied = 0;
+    for (const sug of pending) {
+      try {
+        await applyOneSuggestion(sug);
+        applied += 1;
+      } catch (e) {
+        s.pushToast("error", String(e));
+      }
+    }
+    s.setFiles(await api.listFiles());
+    if (applied > 0) {
       s.pushToast(
         "success",
-        `Added ${report.imported.length} file${report.imported.length === 1 ? "" : "s"} to the room.`,
+        applied === 1 ? "Tidied up 1 file." : `Tidied up ${applied} files.`,
       );
-      suggestImports(report.imported);
     }
+  }
+
+  function dismissAllImportSuggestions() {
+    s.setImportSuggestions([]);
+  }
+
+  /** Turn an import report into the ONE receipt toast (shared by the picker
+   * and drag-drop; the live sidebar strip shows per-file progress). */
+  function reportImport(report: { imported: FileMeta[]; errors: string[] }) {
+    if (report.imported.length === 1) {
+      s.pushToast(
+        "success",
+        `Added "${displayName(report.imported[0].name)}" to the room.`,
+      );
+    } else if (report.imported.length > 1) {
+      s.pushToast(
+        "success",
+        `Added ${report.imported.length} files to the room.`,
+      );
+    }
+    if (report.imported.length > 0) suggestImports(report.imported);
     if (report.errors.length > 3) {
       s.pushToast(
         "error",
@@ -193,15 +236,29 @@ export function makeFileActions(s: WSState) {
     const picked = await api.chooseOpenPath({ title: "Add files to this room", multiple: true });
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
-    const report = await api.importFiles(paths);
-    s.setFiles(await api.listFiles());
-    reportImport(report);
+    // Show the queue strip immediately: a handful of small files can finish
+    // importing before the first backend progress event paints, so the user
+    // otherwise sees nothing until the files just appear.
+    if (paths.length > 1) {
+      s.setImportProgress({ done: 0, total: paths.length, name: "Starting…" });
+    }
+    try {
+      const report = await api.importFiles(paths);
+      s.setFiles(await api.listFiles());
+      reportImport(report);
+    } finally {
+      s.setImportProgress(null);
+    }
   }
 
   async function removeFile(id: string) {
     await api.deleteFile(id);
     s.setFiles(await api.listFiles());
     s.setAttachments((a) => a.filter((f) => f.id !== id));
+    // A viewer left open on the deleted file would keep fetching a row that
+    // no longer exists ("Query returned no rows" toasts).
+    if (s.openFileRef.current?.id === id) s.setOpenFile(null);
+    s.setRecLive((r) => (r?.fileId === id ? null : r));
   }
 
   async function viewFile(id: string, target?: FileTarget) {
@@ -340,6 +397,7 @@ export function makeFileActions(s: WSState) {
   return {
     noteExportOnce, exportOne, exportAllFiles, openHistory, restoreVersion,
     undoEdits, suggestImports, dismissImportSuggestion, applyImportSuggestion,
+    applyAllImportSuggestions, dismissAllImportSuggestions,
     reportImport, importFiles, removeFile, viewFile, saveEdit, saveEditAsCopy,
     editCell, editModeOf, startCreateFolder, commitCreateFolder,
     commitFolderRename, deleteFolder, moveFile, commitRenameFile,

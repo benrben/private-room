@@ -45,7 +45,11 @@ export default function ChatPane({
     .reverse()
     .find((m) => m.role === "assistant")?.id;
   return (
-    <main className="chat" style={{ width: s.chatW, maxWidth: "none", flex: "0 0 auto" }}>
+    <main
+      className="chat"
+      aria-label="Chat"
+      style={{ width: s.chatW, maxWidth: "none", flex: "0 0 auto" }}
+    >
       <div className="chat-head">
         {s.renaming ? (
           <input

@@ -17,9 +17,17 @@ pub async fn generate_podcast_script(
     scope: Option<String>,
     instructions: Option<String>,
     refs: Option<Vec<String>>,
+    op_id: Option<String>,
 ) -> Result<FileMeta, String> {
     use tauri::Emitter;
+    // ADD-31: cancellable with visible stages (see studio_flashcards).
+    let cancel = register_studio_cancel(&state, &op_id);
+    let _cancel_guard = op_id.as_ref().map(|id| CancelGuard {
+        state: state.inner(),
+        ask_id: id.clone(),
+    });
     let instr = studio_instruction(instructions, STUDIO_PODCAST_PROMPT);
+    let _ = window.emit("studio-step", "Reading the material…");
     let (label, text) = {
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
@@ -28,17 +36,27 @@ pub async fn generate_podcast_script(
             None => gather_scope_text(&room.conn, scope.as_deref(), &room.name)?,
         }
     };
-    let model = resolve_local_model(&state)
+    let model = resolve_structured_model(&state)
         .await
         .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
-    let _ = window.emit("ask-step", "Designing the podcast page");
+    let _ = window.emit(
+        "studio-step",
+        if is_cloud_model(&model) {
+            "Writing the conversation — the cloud model is writing…"
+        } else {
+            "Writing the conversation — a local model can take a few minutes…"
+        },
+    );
     let page_role = "You are a front-end developer building a podcast transcript page for a warm, \
         two-host conversation that explains the material. Style each speaker's turns distinctly \
         (name + line), keep it readable, and add a small note that spoken audio is coming in a later \
         version. Base every line only on the provided material.";
-    let content = match generate_studio_html(&model, page_role, &instr, &label, &text).await? {
-        Some(html) => html,
-        None => {
+    let content = match generate_studio_html(&model, page_role, &instr, &label, &text, cancel.clone())
+        .await?
+    {
+        Some(html) if !cancel.load(Ordering::SeqCst) => html,
+        _ if cancel.load(Ordering::SeqCst) => return Err("Stopped.".into()),
+        _ => {
             // Fallback: structured turns -> built-in template.
             let schema = serde_json::json!({
                 "type": "object",
@@ -70,8 +88,18 @@ pub async fn generate_podcast_script(
                     format!("{instr}\n\nBase it only on this material about \"{label}\":\n\n{text}"),
                 ),
             ];
-            let raw =
-                ollama::chat_structured(&model, messages, Some(0.5), KEEP_ALIVE_WARM, &schema).await?;
+            let raw = ollama::chat_structured_cancel(
+                &model,
+                messages,
+                Some(0.5),
+                KEEP_ALIVE_WARM,
+                &schema,
+                cancel.clone(),
+            )
+            .await?;
+            if cancel.load(Ordering::SeqCst) {
+                return Err("Stopped.".into());
+            }
             let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).ok();
             let title = parsed
                 .as_ref()

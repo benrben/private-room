@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   AiActionDef,
   AiStatus,
@@ -9,6 +9,7 @@ import {
   FileVersion,
   Folder,
   FrontPage,
+  Job,
   McpApproveRequest,
   Memory,
   Message,
@@ -42,9 +43,12 @@ export function useWorkspaceState(info: RoomInfo) {
   const [undoByMsg, setUndoByMsg] = useState<Record<string, string[]>>({});
   const editedRef = useRef<Set<string>>(new Set());
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const [dictState, setDictState] = useState<"idle" | "recording" | "busy">(
-    "idle",
-  );
+  // "preparing" = between the click and the microphone actually opening
+  // (permission dialog, device wake) — the capture dock names this phase so a
+  // slow start never looks like a dead button.
+  const [dictState, setDictState] = useState<
+    "idle" | "preparing" | "recording" | "busy"
+  >("idle");
   const [dictOwner, setDictOwner] = useState<string | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const dictChunksRef = useRef<Blob[]>([]);
@@ -136,6 +140,25 @@ export function useWorkspaceState(info: RoomInfo) {
   const [studioBusy, setStudioBusy] = useState<
     "flashcards" | "mindmap" | "podcast" | null
   >(null);
+  // ADD-31: the running Studio's cancel handle + latest named stage, so the
+  // modal can offer a real Stop and say what's happening instead of "Running…".
+  const [studioOpId, setStudioOpId] = useState<string | null>(null);
+  const [studioStep, setStudioStep] = useState<string | null>(null);
+  // ADD-31: live import queue (null when idle) for the sidebar strip.
+  const [importProgress, setImportProgress] = useState<{
+    done: number;
+    total: number;
+    name: string;
+  } | null>(null);
+  // ADD-30: unfinished background jobs + their live progress (sidebar cards).
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [jobProgress, setJobProgress] = useState<
+    Record<string, { label: string; done: number; total: number }>
+  >({});
+  // The summary command can take seconds to RESOLVE on a cold local model
+  // (Ollama waking, listing models); this optimistic flag shows a "Starting…"
+  // card the instant the button is pressed, so a click is never silent.
+  const [summaryStarting, setSummaryStarting] = useState(false);
   const [studioDefaults, setStudioDefaults] = useState<StudioPrompts | null>(
     null,
   );
@@ -164,21 +187,40 @@ export function useWorkspaceState(info: RoomInfo) {
   // ADD-27: the workspace-wide live recording session (survives view/file
   // switches; null when nothing records). ADD-28: the feedback modal flag.
   const [recLive, setRecLive] = useState<{ fileId: string; status: string } | null>(null);
+  // Timers and event closures need the CURRENT session without re-arming:
+  // the auto-lock interval must see a recording the instant it starts.
+  const recLiveRef = useRef<{ fileId: string; status: string } | null>(null);
+  recLiveRef.current = recLive;
+  // Stop→saved drain: which phase the save is in and how many phrase decodes
+  // remain, plus when it began (for the sidebar card's elapsed clock). The
+  // audio is already durable when this is non-null — that's the whole point
+  // of surfacing it. Null outside a save.
+  const [recSave, setRecSave] = useState<{
+    stage: "transcribing" | "writing";
+    remaining: number;
+    startedAt: string;
+  } | null>(null);
+  // ADD-18 status of imported media transcriptions, keyed by file NAME (the
+  // backend's stt-progress payload): processing | done | none | model-missing.
+  const [sttStatus, setSttStatus] = useState<Record<string, string>>({});
   const [showFeedback, setShowFeedback] = useState(false);
 
-  function pushToast(
-    kind: Toast["kind"],
-    text: string,
-    action?: Toast["action"],
-  ) {
-    const id = ++toastSeq.current;
-    setToasts((t) => [...t, { id, kind, text, action }]);
-    const ttl = kind === "error" ? 9000 : 5000;
-    window.setTimeout(
-      () => setToasts((t) => t.filter((x) => x.id !== id)),
-      ttl,
-    );
-  }
+  // Stable identity: several mount-time event subscriptions (the rec-* set
+  // among them) list pushToast as an effect dependency — a per-render
+  // function would tear them down and back up on every render, and a fast
+  // event can land in the gap.
+  const pushToast = useCallback(
+    (kind: Toast["kind"], text: string, action?: Toast["action"]) => {
+      const id = ++toastSeq.current;
+      setToasts((t) => [...t, { id, kind, text, action }]);
+      const ttl = kind === "error" ? 9000 : 5000;
+      window.setTimeout(
+        () => setToasts((t) => t.filter((x) => x.id !== id)),
+        ttl,
+      );
+    },
+    [],
+  );
 
   function dismissToast(id: number) {
     setToasts((t) => t.filter((x) => x.id !== id));
@@ -219,11 +261,16 @@ export function useWorkspaceState(info: RoomInfo) {
     userPickedModelRef, memoryHeadRef, showMemoryIntro, setShowMemoryIntro,
     showMap, setShowMap, showMapRef, showHelp, setShowHelp,
     fp, setFp, fpSuggestions, setFpSuggestions, studioBusy, setStudioBusy,
+    studioOpId, setStudioOpId, studioStep, setStudioStep,
+    importProgress, setImportProgress,
+    jobs, setJobs, jobProgress, setJobProgress,
+    summaryStarting, setSummaryStarting,
     studioDefaults, setStudioDefaults, studioPrompt, setStudioPrompt,
     studioPromptRef, studioAc, setStudioAc, aiActionDefs, setAiActionDefs,
     aiPrompt, setAiPrompt, aiBusy, setAiBusy, memSuggestion, setMemSuggestion,
     importSuggestions, setImportSuggestions, pushToast, dismissToast,
-    recLive, setRecLive, showFeedback, setShowFeedback,
+    recLive, setRecLive, recLiveRef, recSave, setRecSave,
+    sttStatus, setSttStatus, showFeedback, setShowFeedback,
   };
 }
 

@@ -202,6 +202,10 @@ impl SysAudioTap {
     }
 }
 
-const PERMISSION_HINT: &str = "Couldn't hear the Mac's audio — allow Private Room under System \
-Settings → Privacy & Security → Screen & System Audio Recording, then press Record again. \
-Your microphone keeps recording either way.";
+// The switch can LOOK enabled while macOS still denies: the grant is pinned to
+// the code signature of the build that earned it, and this app is ad-hoc
+// signed, so every rebuild invalidates it silently ("Failed to match existing
+// code requirement" in tccd's log). Hence "off and back on".
+const PERMISSION_HINT: &str = "Couldn't hear the Mac's audio — macOS blocked system-audio capture. \
+In System Settings → Privacy & Security → Screen & System Audio Recording, switch Private Room on \
+(off and back on if it already looks enabled). Your microphone keeps recording either way.";

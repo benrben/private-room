@@ -14,12 +14,19 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
     (def.needsQuestion || def.needsLanguage) && !aiPrompt.question.trim();
   return (
     <div
-      className="studio-prompt-backdrop"
+      className={`studio-prompt-backdrop${running ? " running" : ""}`}
       onClick={() => {
         if (!running) s.setAiPrompt(null);
       }}
     >
-      <div className="studio-prompt" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="studio-prompt"
+        role="dialog"
+        aria-modal="true"
+        aria-label={def.title}
+        aria-busy={running}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="studio-prompt-title">
           {def.title} ·{" "}
           {aiPrompt.refs && aiPrompt.refs.length
@@ -172,11 +179,17 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
             Cancel
           </button>
           <button
-            className="primary"
+            className={`primary${running ? " running" : ""}`}
             disabled={running || !aiPrompt.text.trim() || questionMissing}
             onClick={() => void a.runAiActionFromModal()}
           >
-            {running ? "Running…" : "Run"}
+            {running ? (
+              <>
+                <span className="btn-spinner" aria-hidden="true" /> Running…
+              </>
+            ) : (
+              "Run"
+            )}
           </button>
         </div>
       </div>

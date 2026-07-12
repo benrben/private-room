@@ -32,6 +32,9 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+# Charset-aware decoding of fetched pages (legacy Hebrew sites serve
+# windows-1255); already in the tree via reqwest, so this pins nothing new.
+encoding_rs = "0.8"
 tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt", "net", "macros"] }
 futures-util = "0.3"
 base64 = "0.22"
@@ -52,6 +55,11 @@ umya-spreadsheet = { version = "3.0.0", default-features = false }
 # on Apple Silicon). The engine is built in; the model downloads on first use,
 # same doctrine as Ollama models (never bundled, nothing else to install).
 whisper-rs = "0.16"
+# ADD-27: neural speaker embeddings — TitaNet-small ONNX run by pure-Rust
+# tract (validated bit-exact against onnxruntime; do NOT swap in `ort`, and do
+# not assume tract runs other speaker models correctly — it silently
+# mis-executed CAM++). The 38 MB model ships as a bundled resource.
+tract-onnx = "0.23.4"
 
 # macOS-only native deps: ADD-14 OCR (Apple Vision) + ADD-11 Touch ID (Keychain)
 # + ADD-27 system-audio capture (ScreenCaptureKit) for recording meetings.

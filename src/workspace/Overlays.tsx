@@ -1,6 +1,64 @@
-import { DownloadIcon, GlobeIcon } from "../icons";
+import { useEffect, useState } from "react";
+import { DownloadIcon, GlobeIcon, MicIcon } from "../icons";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+
+/** Human name for whoever owns the shared dictation mic right now. */
+const CAPTURE_OWNER_LABEL: Record<string, string> = {
+  note: "Voice note",
+  journal: "Journal entry",
+  composer: "Dictation",
+  memory: "Spoken memory",
+  file: "Dictating to file",
+};
+
+/** The capture dock — the one unmistakable "the microphone is doing
+ * something" surface. Dictation-style capture (voice note, journal,
+ * composer dictation) used to run with no visible state at all: the mic
+ * was LIVE while the screen showed nothing. This pill names every phase —
+ * Preparing → Recording (red dot + timer + Stop) → Transcribing — and is
+ * fixed above the composer so it survives menu closes and view switches. */
+function CaptureDock({ s }: { s: WSState }) {
+  const [elapsed, setElapsed] = useState(0);
+  const recording = s.dictState === "recording";
+  useEffect(() => {
+    if (!recording) {
+      setElapsed(0);
+      return;
+    }
+    const t = window.setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => window.clearInterval(t);
+  }, [recording]);
+  if (s.dictState === "idle") return null;
+  const who = CAPTURE_OWNER_LABEL[s.dictOwner ?? ""] ?? "Recording";
+  const mm = Math.floor(elapsed / 60);
+  const ss = String(elapsed % 60).padStart(2, "0");
+  return (
+    <div className={`capture-dock ${s.dictState}`} role="status">
+      {s.dictState === "preparing" ? (
+        <span className="capture-label">
+          <MicIcon size={13} /> Preparing the microphone…
+        </span>
+      ) : s.dictState === "busy" ? (
+        <span className="capture-label">
+          <MicIcon size={13} /> {who} — transcribing on this Mac…
+        </span>
+      ) : (
+        <>
+          <span className="capture-label rec">
+            <span className="rec-dot pulsing" /> {who} · {mm}:{ss}
+          </span>
+          <button
+            className="capture-stop"
+            onClick={() => s.recorderRef.current?.stop()}
+          >
+            Stop &amp; save
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
 
 /** The fixed-position overlays that sit above everything: the MCP tool-call
  * approval card, the file context menu, the "Move to…" menu, the Finder-drop
@@ -15,6 +73,7 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
   const searchFlat = a.searchFlat();
   return (
     <>
+      <CaptureDock s={s} />
       {pendingApproval && (
         // ADD-25: consent surface — the agent must never be able to click its
         // own tool-call approval ("Allow"), so the driver can't see it.
@@ -92,7 +151,9 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
             )}
             <div className="ctx-sep" />
             {s.confirmDelete === `ctx-remove-${s.ctxMenu.file.id}` ? (
-              <div className="ctx-confirm">
+              // ADD-25: the agent driver must not be able to click ✓ on a
+              // removal it didn't earn.
+              <div className="ctx-confirm" data-agent-blocked>
                 <span className="ctx-confirm-q">Remove from room?</span>
                 <button
                   className="ctx-item danger"

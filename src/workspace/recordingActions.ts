@@ -1,7 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, FileTarget } from "../api";
 import { fileToBase64 } from "./composer";
-import { startMicTap, stopMicTap } from "./liveRec";
+import { acquireMic, attachMicTap, noteLiveStt, stopMicTap } from "./liveRec";
 import { WSState } from "./state";
 
 /** Dictation (one shared mic, several sinks) + model onboarding/status.
@@ -26,15 +26,22 @@ export function makeRecordingActions(
     owner: string,
     onDone: (blob: Blob, ext: string) => Promise<void>,
   ) {
-    if (s.dictState === "busy") return;
+    if (s.dictState === "busy" || s.dictState === "preparing") return;
     if (s.dictState === "recording") {
       if (s.dictOwner === owner) s.recorderRef.current?.stop();
       return;
     }
+    // Own the state BEFORE asking for the microphone: the permission dialog
+    // or a slow device can take seconds, and the capture dock must already be
+    // saying "Preparing microphone…" instead of the click doing nothing.
+    s.setDictOwner(owner);
+    s.setDictState("preparing");
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
+      s.setDictState("idle");
+      s.setDictOwner(null);
       const name = (e as { name?: string })?.name || "";
       const msg =
         name === "NotFoundError" || name === "OverconstrainedError"
@@ -113,7 +120,9 @@ export function makeRecordingActions(
           ? "Stop recording"
           : active === "busy"
             ? "Transcribing…"
-            : "Dictate (transcribed on this Mac)",
+            : active === "preparing"
+              ? "Preparing the microphone…"
+              : "Dictate (transcribed on this Mac)",
       disabled: s.dictState !== "idle" && s.dictOwner !== owner,
     };
   }
@@ -184,22 +193,32 @@ export function makeRecordingActions(
       await viewFile(s.recLive.fileId);
       return;
     }
+    // Open the microphone BEFORE anything else: WebKit grants capture only
+    // while the click that triggered this is still "active", and rec_start
+    // below costs several IPC round-trips. Asking afterwards fails with
+    // NotAllowedError even though permission was granted long ago.
+    let mic: MediaStream | null = null;
+    try {
+      mic = await acquireMic();
+    } catch (e) {
+      // Meeting audio can still be recorded; say so instead of dying.
+      s.pushToast("error", `${e instanceof Error ? e.message : e} (the Mac's audio keeps recording)`);
+    }
     try {
       const res = await api.recStart({
         fileId: fileId ?? null,
         systemAudio: opts?.systemAudio ?? true,
         liveTranslate: opts?.liveTranslate ?? null,
       });
+      // The engine always starts with live transcription ON — sync the
+      // session-scoped UI mirror (a previous session may have turned it off).
+      noteLiveStt(true);
       s.setRecLive({ fileId: res.fileId, status: "recording" });
       s.setFiles(await api.listFiles());
       await viewFile(res.fileId);
-      try {
-        await startMicTap();
-      } catch (e) {
-        // Meeting audio may still be recording; say so instead of dying.
-        s.pushToast("error", `${e instanceof Error ? e.message : e} (the Mac's audio keeps recording)`);
-      }
+      if (mic) await attachMicTap(mic);
     } catch (e) {
+      mic?.getTracks().forEach((t) => t.stop());
       if (String(e).includes("STT_MODEL_MISSING")) {
         s.pushToast(
           "error",
@@ -222,10 +241,18 @@ export function makeRecordingActions(
   }
 
   async function resumeLiveRecording() {
+    // Same rule as start: the microphone first, while the click still counts.
+    let mic: MediaStream | null = null;
+    try {
+      mic = await acquireMic();
+    } catch (e) {
+      s.pushToast("error", `${e instanceof Error ? e.message : e} (the Mac's audio keeps recording)`);
+    }
     try {
       await api.recResume();
-      await startMicTap();
+      if (mic) await attachMicTap(mic);
     } catch (e) {
+      mic?.getTracks().forEach((t) => t.stop());
       s.pushToast("error", String(e instanceof Error ? e.message : e));
     }
   }
@@ -236,7 +263,13 @@ export function makeRecordingActions(
     s.setRecLive((r) => (r ? { ...r, status: "saving" } : r));
     try {
       await api.recStop();
-      s.pushToast("success", "Recording saved — transcript included.");
+      // The receipt carries a direct way to the output — success must never
+      // require hunting the sidebar for a new row.
+      s.pushToast(
+        "success",
+        "Recording saved — transcript included.",
+        fileId ? { label: "Open", run: () => void viewFile(fileId) } : undefined,
+      );
     } catch (e) {
       s.pushToast("error", String(e));
     }

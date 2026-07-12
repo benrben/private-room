@@ -48,6 +48,96 @@ export function makeStudioActions(
     }
   }
 
+  // ---- ADD-30: durable background jobs (the sidebar cards) ----
+
+  /** Reload the cards: every job that isn't finished. */
+  async function refreshJobs() {
+    try {
+      const all = await api.listJobs();
+      s.setJobs(all.filter((j) => j.status !== "done"));
+    } catch {
+      /* room closing — the panel just stays as it was */
+    }
+  }
+
+  /** Kick off the room deep-summary as a background job. The sidebar card
+   *  shows progress; the finished summary opens itself. The optimistic
+   *  `summaryStarting` flag makes the click acknowledge instantly even when the
+   *  backend takes seconds to resolve on a cold local model. */
+  async function startDeepSummary() {
+    if (s.summaryStarting) return;
+    // Never a silent no-op: if a summary job already exists, act on it instead
+    // of ignoring the click. An in-flight one is surfaced; a paused/errored one
+    // is resumed rather than duplicated.
+    const existing = s.jobs.find((j) => j.kind === "deep_summary");
+    if (existing) {
+      if (existing.status === "running" || existing.status === "queued") {
+        s.pushToast("info", "Already summarizing — see the card in the sidebar.");
+        return;
+      }
+      await resumeJob(existing.id);
+      s.pushToast("info", "Resuming the room summary…");
+      return;
+    }
+    s.setSummaryStarting(true);
+    try {
+      await api.startDeepSummary();
+      await refreshJobs();
+      s.pushToast(
+        "info",
+        "Summarizing in the background — you can keep working.",
+      );
+    } catch (e) {
+      const msg = String(e);
+      if (isOllamaDown(msg)) {
+        s.pushToast(
+          "error",
+          "Ollama is not running. Start the Ollama app, then try again.",
+          { label: "Open Ollama", run: openOllamaApp },
+        );
+      } else {
+        s.pushToast("error", msg);
+      }
+      await refreshJobs();
+    } finally {
+      s.setSummaryStarting(false);
+    }
+  }
+
+  /** Pause a running job — it checkpoints and the card offers Resume. */
+  async function pauseJob(id: string) {
+    try {
+      await api.cancelJob(id);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
+  /** Continue a paused/errored job from its checkpoint. */
+  async function resumeJob(id: string) {
+    try {
+      await api.resumeJob(id);
+      await refreshJobs();
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
+  /** Remove a job card (stops it first if it happens to be running). */
+  async function dismissJob(id: string) {
+    try {
+      await api.deleteJob(id);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+    s.setJobProgress((p) => {
+      const next = { ...p };
+      delete next[id];
+      return next;
+    });
+    await refreshJobs();
+  }
+
   async function openStudioPrompt(
     kind: "flashcards" | "mindmap" | "podcast",
     scope?: string,
@@ -73,20 +163,27 @@ export function makeStudioActions(
     refs?: string[],
   ) {
     if (s.studioBusy) return;
+    // ADD-31: register a stoppable operation — the modal's Stop button flips
+    // this id's cancel flag through the same channel as chat's Stop.
+    const opId = crypto.randomUUID();
+    s.setStudioOpId(opId);
+    s.setStudioStep(null);
     s.setStudioBusy(kind);
     try {
       const meta =
         kind === "flashcards"
-          ? await studioFlashcards(scope, instructions, refs)
+          ? await studioFlashcards(scope, instructions, refs, opId)
           : kind === "mindmap"
-            ? await studioMindmap(scope, instructions, refs)
-            : await generatePodcastScript(scope, instructions, refs);
+            ? await studioMindmap(scope, instructions, refs, opId)
+            : await generatePodcastScript(scope, instructions, refs, opId);
       s.setFiles(await api.listFiles());
       viewFile(meta.id);
       s.pushToast("success", `Created "${meta.name}".`);
     } catch (e) {
       const msg = String(e);
-      if (isOllamaDown(msg)) {
+      if (msg.includes("Stopped.")) {
+        s.pushToast("info", "Stopped — nothing was saved.");
+      } else if (isOllamaDown(msg)) {
         s.pushToast(
           "error",
           "Ollama is not running. Start the Ollama app, then try again.",
@@ -97,7 +194,14 @@ export function makeStudioActions(
       }
     } finally {
       s.setStudioBusy(null);
+      s.setStudioOpId(null);
+      s.setStudioStep(null);
     }
+  }
+
+  /** ADD-31: stop the running Studio generation (keeps the prompt for retry). */
+  function stopStudio() {
+    if (s.studioOpId) void api.cancelAsk(s.studioOpId);
   }
 
   function studioAcItems() {
@@ -226,8 +330,9 @@ export function makeStudioActions(
   }
 
   return {
-    summarizeRoom, openStudioPrompt, runStudio, studioAcItems,
+    summarizeRoom, openStudioPrompt, runStudio, stopStudio, studioAcItems,
     acceptStudioMention, runStudioFromModal, loadAiActions, openAiAction,
     acceptAiMention, runAiActionFromModal,
+    refreshJobs, startDeepSummary, pauseJob, resumeJob, dismissJob,
   };
 }

@@ -35,6 +35,7 @@ mod agent_ui;
 mod ytdlp;
 mod recording_cmds;
 mod feedback;
+mod jobs;
 
 pub use external::*;
 pub use rooms::*;
@@ -61,6 +62,7 @@ pub use agent_ui::*;
 pub use ytdlp::*;
 pub use recording_cmds::*;
 pub use feedback::*;
+pub use jobs::*;
 
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.5:4b";
 pub(crate) const MAX_CONTEXT_CHUNKS: usize = 6;
@@ -146,6 +148,10 @@ pub struct AppState {
     /// stopped and cleared whenever the room locks/closes (see `close_room`) so a
     /// stale endpoint can never outlive a locked room.
     pub room_server: Mutex<Option<crate::room_mcp::Bridge>>,
+    /// ADD-30: one cancel flag per in-flight background job, keyed by job id.
+    /// `cancel_job` flips a flag; the runner sees it between waves, checkpoints,
+    /// and parks the job as 'paused'. The entry is removed when the job ends.
+    pub job_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 /// The user's answer to a per-call MCP approval prompt.

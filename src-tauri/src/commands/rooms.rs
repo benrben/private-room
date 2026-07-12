@@ -9,6 +9,12 @@ pub fn create_room(
 ) -> Result<RoomInfo, String> {
     let name = room_name_from_path(&path);
     let conn = db::create_room(&path, &password, &name)?;
+    // Creating a room while another is open must fully tear the old one down
+    // first — its MCP bridge (and bearer token) would otherwise survive and
+    // serve tools that now resolve against the NEW room.
+    if state.room.lock().unwrap().is_some() {
+        teardown_open_room(&app, &state);
+    }
     // D10 (the Closet): apply this room's saved remote-Ollama URL (a fresh room
     // has none, which clears any override the previous room set).
     apply_ollama_override(&conn);
@@ -21,6 +27,11 @@ pub fn create_room(
     let info = info_of(&app, &room)?;
     push_recent(&app, &room.name, &room.path);
     *state.room.lock().unwrap() = Some(room);
+    // ADD-30: a job left 'running' belongs to a process that's gone — mark it
+    // 'paused' so the UI offers Resume rather than a phantom active job.
+    if let Some(r) = state.room.lock().unwrap().as_ref() {
+        quiesce_stale_jobs(&r.conn);
+    }
     refresh_mcp(&app);
     spawn_reextract_backfill(&app);
     spawn_embedding_backfill(&app);
@@ -36,6 +47,14 @@ pub fn open_room(
     password: String,
 ) -> Result<RoomInfo, String> {
     let conn = db::open_room(&path, &password)?;
+    // Opening a room while another is open (Finder double-click on a second
+    // .roomai) must fully tear the old one down first — its MCP bridge (and
+    // bearer token) would otherwise survive and serve tools that now resolve
+    // against the NEW room. Runs only after the password proved right, so a
+    // failed unlock never locks the room the user is in.
+    if state.room.lock().unwrap().is_some() {
+        teardown_open_room(&app, &state);
+    }
     let name = db::get_meta(&conn, "name").unwrap_or_else(|| room_name_from_path(&path));
     // D10 (the Closet): re-apply this room's saved remote-Ollama URL on unlock.
     apply_ollama_override(&conn);
@@ -48,6 +67,17 @@ pub fn open_room(
     let info = info_of(&app, &room)?;
     push_recent(&app, &room.name, &room.path);
     *state.room.lock().unwrap() = Some(room);
+    // ADD-30: a job left 'running' belongs to a process that's gone — mark it
+    // 'paused' so the UI offers Resume rather than a phantom active job.
+    if let Some(r) = state.room.lock().unwrap().as_ref() {
+        quiesce_stale_jobs(&r.conn);
+        // A live recording that died with the app left audio checkpoints
+        // behind — splice them onto the WAV so nothing recorded is lost.
+        match db::recover_rec_chunks(&r.conn) {
+            Ok(0) | Err(_) => {}
+            Ok(n) => eprintln!("recovered {n} interrupted recording(s)"),
+        }
+    }
     refresh_mcp(&app);
     spawn_reextract_backfill(&app);
     spawn_embedding_backfill(&app);
@@ -161,7 +191,6 @@ pub fn touchid_open(
 
 #[tauri::command]
 pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    use tauri::Emitter;
     // ADD-27: a live recording must land in the DB before the room locks.
     // Stop it and wait for the engine's final flush (it drains its decoder
     // first), bounded so a stuck decode can never wedge lock/close.
@@ -201,6 +230,28 @@ pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
             }
         }
     }
+    // Background jobs (deep summary / file pass) must stop before the room
+    // state is torn down, so a runner can't keep writing after the lock.
+    // Signal every job's cancel flag and wait briefly — the runner removes its
+    // entry once it has parked the job 'paused' on this room's still-open
+    // conn. Bounded: a deep-summary model call doesn't observe the flag, so
+    // the wait is best-effort; each job's room pin (see `spawn_deep_summary` /
+    // `execute_pass_step`) is the correctness guarantee.
+    {
+        let flags: Vec<Arc<AtomicBool>> =
+            state.job_cancels.lock().unwrap().values().cloned().collect();
+        if !flags.is_empty() {
+            for f in &flags {
+                f.store(true, Ordering::SeqCst);
+            }
+            for _ in 0..20 {
+                if state.job_cancels.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
     // SEC-7: reclaim space before closing when a large amount was freed (e.g.
     // the user deleted big files). Small deletions skip the slow vacuum.
     {
@@ -211,9 +262,43 @@ pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
             }
         }
     }
+    // The synchronous teardown (room handle, MCP bridge + servers, consents,
+    // staged media, agent-UI round-trips) is shared with the open-over-open
+    // path — see `teardown_open_room`.
+    teardown_open_room(&app, &state);
+    Ok(())
+}
+
+/// Synchronously tear down every piece of per-room state: the room handle, the
+/// persistent MCP bridge (and its bearer token), connected MCP servers,
+/// per-session consents, staged media, and pending agent↔UI round-trips.
+/// Shared by `close_room` and the open-over-open path (`open_room` /
+/// `create_room` on top of an already-open room), so the old room's bridge can
+/// never keep serving tools that resolve against the new room. Cancel flags
+/// are signalled but not awaited — callers that can await (`close_room`) drain
+/// them first; a live recording is told to stop without waiting.
+pub(crate) fn teardown_open_room(app: &tauri::AppHandle, state: &AppState) {
+    use tauri::{Emitter, Manager};
+    // Signal every in-flight ask and background job to stop (no wait here).
+    for f in state.cancels.lock().unwrap().values() {
+        f.store(true, Ordering::SeqCst);
+    }
+    for f in state.job_cancels.lock().unwrap().values() {
+        f.store(true, Ordering::SeqCst);
+    }
+    // Best-effort: tell a live recording engine to stop and flush. No wait —
+    // the done receiver is dropped and the engine ignores the failed send.
+    {
+        let rec = app.state::<RecState>();
+        let taken = rec.session.lock().unwrap().take();
+        if let Some(live) = taken {
+            let (done_tx, _) = std::sync::mpsc::channel();
+            let _ = live.handle.tx.send(recording::EngineMsg::Stop { done: done_tx });
+        }
+    }
     *state.room.lock().unwrap() = None;
     // D9 (the Leash): a locked room must not leave its MCP endpoint reachable —
-    // stop and clear it here so close/lock always tears the server down.
+    // stop and clear it here so teardown always kills the server + its token.
     {
         let taken = state.room_server.lock().unwrap().take();
         if let Some(bridge) = taken {
@@ -232,13 +317,9 @@ pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
     state.mcp_pending.lock().unwrap().clear();
     // ADD-24/ADD-25: a locked room leaves no decrypted media staged for the
     // streaming protocol, and no agent↔UI round-trip left hanging.
-    {
-        use tauri::Manager;
-        clear_media(&app.state::<MediaStreams>());
-        app.state::<AgentUi>().pending.lock().unwrap().clear();
-    }
+    clear_media(&app.state::<MediaStreams>());
+    app.state::<AgentUi>().pending.lock().unwrap().clear();
     let _ = app.emit("mcp-status", Vec::<mcp::ServerStatus>::new());
-    Ok(())
 }
 
 #[tauri::command]

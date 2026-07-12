@@ -88,6 +88,11 @@ CREATE TABLE IF NOT EXISTS file_versions (
   id TEXT PRIMARY KEY,
   file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   bytes BLOB NOT NULL,
+  -- Compound snapshot: for Recordings the bytes are the unchanged WAV and the
+  -- overwrite replaces the TRANSCRIPT — so text + recording meta ride along,
+  -- or restore could never bring the old words/speakers/cuts back.
+  text TEXT,
+  rec_meta TEXT,
   saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   cause TEXT NOT NULL
 );
@@ -97,6 +102,40 @@ CREATE INDEX IF NOT EXISTS idx_file_versions_file ON file_versions(file_id);
 CREATE TABLE IF NOT EXISTS recordings (
   file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   meta TEXT NOT NULL
+);
+-- Live-recording audio checkpoints (raw 16-bit PCM since the last full WAV
+-- write). Normally empty: pause/stop assemble the WAV and clear them; rows
+-- surviving here mean a crashed session, recovered on the next room open.
+CREATE TABLE IF NOT EXISTS rec_chunks (
+  file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  pcm BLOB NOT NULL,
+  PRIMARY KEY (file_id, seq)
+);
+-- ADD-30/ADD-32: durable background jobs + their per-step artifacts. These
+-- MUST live in SCHEMA as well as migrate(): create_room runs only SCHEMA, so
+-- a table that exists only in migrate() is missing from a brand-new room
+-- until it is closed and reopened (a job started in a fresh room would fail
+-- with "no such table: jobs").
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  plan TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT '{}',
+  cursor INTEGER NOT NULL DEFAULT 0,
+  total INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'queued',
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE TABLE IF NOT EXISTS job_artifacts (
+  job_id TEXT NOT NULL,
+  step_id INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (job_id, step_id)
 );
 "#;
 
@@ -184,6 +223,43 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // ADD-30: durable background jobs (deep summaries, media digests, …). One
+    // row per job: `plan` is the immutable step DAG (JSON), `state` is the
+    // accumulating result + baton (JSON, rewritten each checkpoint), `cursor`
+    // is the number of finished steps, `status` is queued|running|paused|
+    // done|error. A job survives app restart and resumes from its cursor.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS jobs (
+           id TEXT PRIMARY KEY,
+           kind TEXT NOT NULL,
+           title TEXT NOT NULL DEFAULT '',
+           plan TEXT NOT NULL,
+           state TEXT NOT NULL DEFAULT '{}',
+           cursor INTEGER NOT NULL DEFAULT 0,
+           total INTEGER NOT NULL DEFAULT 0,
+           status TEXT NOT NULL DEFAULT 'queued',
+           error TEXT,
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );",
+    )
+    .map_err(|e| e.to_string())?;
+
+    // ADD-32: per-step artifacts for windowed file-pass jobs. The job `state`
+    // blob is rewritten on every checkpoint, so per-window outputs live here
+    // instead — one small INSERT per finished step, and a resumed job finds
+    // every artifact its cursor says exist. Deleted with the job.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS job_artifacts (
+           job_id TEXT NOT NULL,
+           step_id INTEGER NOT NULL,
+           content TEXT NOT NULL,
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           PRIMARY KEY (job_id, step_id)
+         );",
+    )
+    .map_err(|e| e.to_string())?;
+
     let has_chat_id = {
         let mut stmt = conn
             .prepare("PRAGMA table_info(messages)")
@@ -240,6 +316,20 @@ fn migrate(conn: &Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS idx_file_versions_file ON file_versions(file_id);",
     )
     .map_err(|e| e.to_string())?;
+    // Compound snapshots (see the base schema): older rooms lack the columns.
+    // SQLite has no ADD COLUMN IF NOT EXISTS, so the duplicate-column error
+    // is the idempotence check.
+    for stmt in [
+        "ALTER TABLE file_versions ADD COLUMN text TEXT",
+        "ALTER TABLE file_versions ADD COLUMN rec_meta TEXT",
+    ] {
+        if let Err(e) = conn.execute(stmt, []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                return Err(msg);
+            }
+        }
+    }
 
     // RM-2: the web_pages cache must be keyed by URL so save_web_page can upsert.
     // Old rooms opened via open_room never ran SCHEMA, so the table may not exist
@@ -277,6 +367,12 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         "CREATE TABLE IF NOT EXISTS recordings (
            file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
            meta TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS rec_chunks (
+           file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+           seq INTEGER NOT NULL,
+           pcm BLOB NOT NULL,
+           PRIMARY KEY (file_id, seq)
          );",
     )
     .map_err(|e| e.to_string())?;
@@ -376,6 +472,93 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             conn.execute("PRAGMA user_version = 1", [])
                 .map_err(|e| e.to_string())?;
         }
+        if user_version < 2 {
+            rebuild_marked_hebrew_chunks(conn)?;
+            conn.execute("PRAGMA user_version = 2", [])
+                .map_err(|e| e.to_string())?;
+        }
+        if user_version < 3 {
+            rebuild_capped_chunks(conn)?;
+            conn.execute("PRAGMA user_version = 3", [])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// One-time (user_version 3): CHUNK_CAP used to be 2000 (~2M chars), so a
+/// very long file's tail — the Hebrew Bible's last books — was silently
+/// absent from the search index. Re-chunk every file that hit the old cap
+/// under the raised one.
+fn rebuild_capped_chunks(conn: &Connection) -> Result<(), String> {
+    const OLD_CAP: i64 = 2000;
+    let capped: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_id FROM chunks GROUP BY file_id HAVING count(*) >= ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([OLD_CAP], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    for file_id in capped {
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT extracted_text FROM files WHERE id = ?1",
+                [&file_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        let Some(text) = text else { continue };
+        conn.execute("DELETE FROM chunks WHERE file_id = ?1", [&file_id])
+            .map_err(|e| e.to_string())?;
+        insert_chunks(conn, &file_id, Some(&text))?;
+    }
+    Ok(())
+}
+
+/// One-time (user_version 2): chunks indexed BEFORE nikud-stripping hold
+/// pointed Hebrew that the FTS tokenizer shredded into single-letter
+/// fragments — plain queries (קהלת) can never match them. Rebuild the chunks
+/// of every affected file from its stored extracted text; `insert_chunks` now
+/// strips the marks. Cheap (string filtering + SQL, no PDF parsing); the
+/// embedding backfill re-embeds the new chunks in the background.
+fn rebuild_marked_hebrew_chunks(conn: &Connection) -> Result<(), String> {
+    // A LIKE probe per common nikud char finds affected files cheaply.
+    let marked: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT file_id FROM chunks
+                 WHERE text LIKE '%\u{05B0}%' OR text LIKE '%\u{05B7}%'
+                    OR text LIKE '%\u{05B8}%' OR text LIKE '%\u{05B4}%'
+                    OR text LIKE '%\u{05B6}%' OR text LIKE '%\u{05BC}%'",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    for file_id in marked {
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT extracted_text FROM files WHERE id = ?1",
+                [&file_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        let Some(text) = text else { continue };
+        conn.execute("DELETE FROM chunks WHERE file_id = ?1", [&file_id])
+            .map_err(|e| e.to_string())?;
+        insert_chunks(conn, &file_id, Some(&text))?;
     }
     Ok(())
 }
@@ -390,6 +573,35 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE VIRTUAL TABLE t USING fts5(x);")
             .expect("FTS5 must be available in the bundled SQLCipher build");
+    }
+
+    #[test]
+    fn marked_chunks_migration_makes_old_rooms_searchable() {
+        // A room indexed BEFORE nikud-stripping: chunks hold pointed text the
+        // FTS tokenizer shredded. The v2 migration rebuilds them consonantal.
+        let conn = open_in_memory_schema();
+        let pointed = "דִּבְרֵי קֹהֶלֶת בֶּן־דָּוִד";
+        conn.execute(
+            "INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text)
+             VALUES ('f1', 'bible.pdf', 'application/pdf', 1, 'upload', x'00', ?1)",
+            [pointed],
+        )
+        .unwrap();
+        // Simulate the OLD indexing: pointed chunk text straight in.
+        conn.execute(
+            "INSERT INTO chunks(id, file_id, seq, text) VALUES ('c1', 'f1', 0, ?1)",
+            [pointed],
+        )
+        .unwrap();
+        let hits_before =
+            crate::db::search_chunks_fts_ranked(&conn, "\"קהלת\"", 10).unwrap();
+        assert!(hits_before.is_empty(), "pointed index must not match (the bug)");
+
+        rebuild_marked_hebrew_chunks(&conn).unwrap();
+        let hits_after =
+            crate::db::search_chunks_fts_ranked(&conn, "\"קהלת\"", 10).unwrap();
+        assert_eq!(hits_after.len(), 1, "consonantal rebuild must match");
+        assert_eq!(hits_after[0].1, "bible.pdf");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   CloseIcon,
   CloudIcon,
@@ -9,7 +10,7 @@ import {
   SparkIcon,
 } from "../icons";
 import { displayName } from "./composer";
-import { isCloudEngine } from "./markup";
+import { isCloudEngine, isExternalEngine } from "./markup";
 import Toasts from "./Toasts";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -18,38 +19,84 @@ import { WSActions } from "./actions";
  * attach nudge, attachment chips, the textarea + #/@ autocomplete popover, the
  * #help sheet, the tool row, mic, and send/stop. Extracted verbatim. */
 export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
+  // Several tidy-up suggestions collapse into ONE card (a stack of three chips
+  // over the composer read as noise); Review expands to the per-file chips.
+  const [tidyExpanded, setTidyExpanded] = useState(false);
+  useEffect(() => {
+    // A fresh batch after the last one cleared starts collapsed again.
+    if (s.importSuggestions.length === 0) setTidyExpanded(false);
+  }, [s.importSuggestions.length]);
+  const batchTidy = s.importSuggestions.length > 1 && !tidyExpanded;
+  // The #help sheet closes like every other popover: Escape, from anywhere.
+  useEffect(() => {
+    if (!s.showHelp) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      s.setShowHelp(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [s.showHelp, s]);
   return (
     <div className="composer">
       <Toasts toasts={s.toasts} dismissToast={s.dismissToast} />
-      {s.importSuggestions.map((sug) => (
-        <div className="import-suggestion" key={sug.fileId}>
-          <SparkIcon size={14} />
+      {batchTidy ? (
+        <div className="import-suggestion batch">
+          <SparkIcon size={13} />
           <span className="import-suggestion-text">
-            Tidy up <strong>{displayName(sug.current)}</strong> →{" "}
-            <strong>{sug.suggestion.title}</strong>
-            {sug.suggestion.folder ? (
-              <>
-                {" "}
-                in <strong>{sug.suggestion.folder}</strong>
-              </>
-            ) : null}
+            {s.importSuggestions.length} new files could be renamed and filed.
           </span>
           <span className="import-suggestion-actions">
             <button
               className="subtle accent"
-              onClick={() => a.applyImportSuggestion(sug)}
+              onClick={() => void a.applyAllImportSuggestions()}
             >
-              Apply
+              Tidy up
+            </button>
+            <button className="subtle quiet" onClick={() => setTidyExpanded(true)}>
+              Review
             </button>
             <button
-              className="subtle"
-              onClick={() => a.dismissImportSuggestion(sug.fileId)}
+              className="tidy-dismiss"
+              title="Dismiss"
+              onClick={() => a.dismissAllImportSuggestions()}
             >
-              Dismiss
+              <CloseIcon size={12} />
             </button>
           </span>
         </div>
-      ))}
+      ) : (
+        s.importSuggestions.map((sug) => (
+          <div className="import-suggestion" key={sug.fileId}>
+            <SparkIcon size={14} />
+            <span className="import-suggestion-text">
+              Tidy up <strong>{displayName(sug.current)}</strong> →{" "}
+              <strong>{sug.suggestion.title}</strong>
+              {sug.suggestion.folder ? (
+                <>
+                  {" "}
+                  in <strong>{sug.suggestion.folder}</strong>
+                </>
+              ) : null}
+            </span>
+            <span className="import-suggestion-actions">
+              <button
+                className="subtle accent"
+                onClick={() => a.applyImportSuggestion(sug)}
+              >
+                Apply
+              </button>
+              <button
+                className="subtle"
+                onClick={() => a.dismissImportSuggestion(sug.fileId)}
+              >
+                Dismiss
+              </button>
+            </span>
+          </div>
+        ))
+      )}
       {isCloudEngine(s.model) && (
         <div className="cloud-strip" title="This room is using a cloud model — your prompts and attached context are sent to it.">
           <span className="cloud-strip-label">
@@ -63,7 +110,9 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
           </button>
         </div>
       )}
-      {!isCloudEngine(s.model) && (s.webOn || s.mcpTools.length > 0) && (
+      {/* ADD-29 parity: a `:cloud` model drives the same tool loop as a local
+          one, so its tools chip stays; only external CLIs hide it. */}
+      {!isExternalEngine(s.model) && (s.webOn || s.mcpTools.length > 0) && (
         <div
           className="mcp-badge"
           title={[
@@ -117,15 +166,24 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
       <div className={`composer-card${s.asking ? " busy" : ""}`}>
         {s.ac && a.autocompleteItems().length > 0 && (
           <div className="ac-popover">
-            <div className="ac-hint">
-              {s.ac.kind === "cmd"
-                ? "Commands — run a prebuilt action"
-                : "Attach a file or folder as context"}
+            {/* The count says how much is below the fold; the key hints make
+                the whole list reachable without the mouse. */}
+            <div className="ac-hint ac-hint-row">
+              <span>
+                {s.ac.kind === "cmd"
+                  ? `${a.autocompleteItems().length} commands`
+                  : `${a.autocompleteItems().length} files & folders`}
+              </span>
+              <span className="ac-keys">↑↓ choose · Enter run · Esc close</span>
             </div>
             {a.autocompleteItems().map((it, i) => (
               <button
                 key={it.key}
                 className={`ac-item ${i === s.ac!.index ? "active" : ""}`}
+                ref={(el) => {
+                  // Arrow-keying below the fold must scroll the list with it.
+                  if (i === s.ac!.index) el?.scrollIntoView({ block: "nearest" });
+                }}
                 onMouseDown={(e) => {
                   e.preventDefault();
                   a.acceptAutocomplete(it.insert);

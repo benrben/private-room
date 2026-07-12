@@ -103,6 +103,49 @@ pub fn read_window(text: &str, offset: usize, limit: usize, find: Option<&str>) 
     }
 }
 
+/// ADD-32: partition a whole text into consecutive windows of ~`target` bytes
+/// for an exhaustive file pass — every byte lands in exactly one window (plus a
+/// small `overlap` carried from the previous window so nothing straddling a cut
+/// is lost). Cuts prefer a paragraph break, then a line break, then whitespace,
+/// searched in the last 20% of the window; a boundary is never forced onto a
+/// pathological wall of text — it just cuts at the byte limit (char-safe).
+/// Returns (start, end) byte spans into `text`; deterministic, so a resumed job
+/// re-derives the identical plan from the same text.
+pub fn partition_windows(text: &str, target: usize, overlap: usize) -> Vec<(usize, usize)> {
+    let total = text.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let target = target.max(READ_WINDOW_MIN);
+    let overlap = overlap.min(target / 4);
+    let mut spans = Vec::new();
+    let mut cursor = 0usize; // where un-covered text begins
+    while cursor < total {
+        let start = floor_char_boundary(text, cursor.saturating_sub(overlap));
+        let hard_end = ceil_char_boundary(text, (cursor + target).min(total));
+        let end = if hard_end >= total {
+            total
+        } else {
+            // Look for a natural seam in the tail 20% of the window.
+            let seam_from = floor_char_boundary(text, hard_end - (target / 5).min(hard_end - cursor));
+            let slice = &text[seam_from..hard_end];
+            let seam = slice
+                .rfind("\n\n")
+                .map(|i| i + 2)
+                .or_else(|| slice.rfind('\n').map(|i| i + 1))
+                .or_else(|| slice.rfind(char::is_whitespace).map(|i| i + 1));
+            match seam {
+                // A seam only counts if it still moves the cursor forward.
+                Some(i) if seam_from + i > cursor => ceil_char_boundary(text, seam_from + i),
+                _ => hard_end,
+            }
+        };
+        spans.push((start, end));
+        cursor = end;
+    }
+    spans
+}
+
 fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i = i.min(s.len());
     while i > 0 && !s.is_char_boundary(i) {
@@ -168,6 +211,54 @@ mod tests {
         let w = read_window(&text, 301, 301, None); // both land mid-char
         assert!(w.text.chars().all(|c| c == 'é'));
         assert!(text.is_char_boundary(w.offset) && text.is_char_boundary(w.end));
+    }
+
+    #[test]
+    fn partition_covers_everything_without_gaps() {
+        let text = "A paragraph of prose.\n\n".repeat(500); // ~11.5 KB
+        let spans = partition_windows(&text, 2_000, 200);
+        // Full coverage: first starts at 0, last ends at len, no gaps between
+        // one window's end and the next window's coverage (overlap ≤ 200 back).
+        assert_eq!(spans.first().unwrap().0, 0);
+        assert_eq!(spans.last().unwrap().1, text.len());
+        for w in spans.windows(2) {
+            let (_, prev_end) = w[0];
+            let (next_start, _) = w[1];
+            assert!(next_start <= prev_end, "gap between windows");
+            assert!(prev_end - next_start <= 200, "overlap exceeds the cap");
+        }
+        // Windows respect the target within the seam slack.
+        for &(s, e) in &spans {
+            assert!(e - s <= 2_000 + 200);
+            assert!(text.is_char_boundary(s) && text.is_char_boundary(e));
+        }
+    }
+
+    #[test]
+    fn partition_prefers_paragraph_seams() {
+        let text = format!("{}\n\n{}", "x".repeat(1_800), "y".repeat(3_000));
+        let spans = partition_windows(&text, 2_000, 100);
+        // First cut lands on the paragraph break, not mid-y.
+        assert_eq!(spans[0].1, 1_802);
+    }
+
+    #[test]
+    fn partition_survives_a_wall_of_text_and_multibyte() {
+        // No whitespace at all: it must still advance and never split a char.
+        let wall = "é".repeat(5_000); // 10 KB, 2 bytes/char
+        let spans = partition_windows(&wall, 2_000, 100);
+        assert!(spans.len() >= 4);
+        assert_eq!(spans.last().unwrap().1, wall.len());
+        for w in spans.windows(2) {
+            assert!(w[1].0 < w[1].1 && w[0].1 > w[0].0);
+            assert!(w[1].1 > w[0].1, "windows must make forward progress");
+        }
+        for &(s, e) in &spans {
+            assert!(wall.is_char_boundary(s) && wall.is_char_boundary(e));
+        }
+        // Empty text → no windows; tiny text → one window.
+        assert!(partition_windows("", 2_000, 100).is_empty());
+        assert_eq!(partition_windows("short", 2_000, 100), vec![(0, 5)]);
     }
 
     #[test]

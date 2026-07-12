@@ -12,11 +12,15 @@ pub use graph::*;
 pub use roles::*;
 pub use server::*;
 
-/// Resolve the LOCAL chat model for a model-dependent command, honoring the
-/// room's explicit `model` setting but never a cloud engine (these commands make
-/// small structured calls that must stay on-device). Returns None when Ollama is
-/// unreachable or has no models, so callers can degrade to empty/partial output.
-pub(crate) async fn resolve_local_model(state: &State<'_, AppState>) -> Option<String> {
+/// Resolve the chat model for a structured side-call (studios, AI actions,
+/// front page, feedback drafts), honoring the room's explicit `model` setting.
+/// ADD-29 parity: a selected `:cloud` model IS used — current cloud models honor
+/// the `format` grammar and emit structured tool_calls, and the UI labels them
+/// "Cloud · leaves this Mac". Only external CLI engines (claude-cli/codex-cli),
+/// which don't speak the Ollama API at all, are swapped for a local model.
+/// Returns None when Ollama is unreachable or has no models, so callers can
+/// degrade to empty/partial output.
+pub(crate) async fn resolve_structured_model(state: &State<'_, AppState>) -> Option<String> {
     let explicit = {
         let guard = state.room.lock().unwrap();
         guard.as_ref().and_then(|room| model_setting(&room.conn))
@@ -26,10 +30,7 @@ pub(crate) async fn resolve_local_model(state: &State<'_, AppState>) -> Option<S
         return None;
     }
     let model = explicit.unwrap_or_else(|| best_default(&models));
-    // These commands make small structured calls that must stay on-device, so a
-    // cloud/external engine (which also can't be relied on for structured JSON)
-    // is swapped for a local model.
-    let model = if is_external_engine(&model) || is_cloud_model(&model) {
+    let model = if is_external_engine(&model) {
         best_local_default(&models)
     } else {
         model

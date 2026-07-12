@@ -15,11 +15,22 @@ pub fn import_files(
     // photos. OCR runs in the background AFTER import returns, so a big scan
     // never freezes the import.
     let mut ocr_jobs: Vec<JobMeta> = Vec::new();
-    for path in paths {
+    let total = paths.len();
+    for (i, path) in paths.into_iter().enumerate() {
         let file_name = std::path::Path::new(&path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
+        // ADD-31: a big or multi-file import was invisible until it was over —
+        // name each file as it's read/extracted so the sidebar can show a
+        // live queue ("Importing 2 of 5 — lease.pdf").
+        {
+            use tauri::Emitter;
+            let _ = app.emit(
+                "import-progress",
+                serde_json::json!({ "done": i, "total": total, "name": file_name }),
+            );
+        }
         // No size cap on imports (removed by request). We still surface a clean
         // error if the file can't be stat'd (missing / no permission); the only
         // hard ceiling now is SQLite's ~1 GB per-blob limit, which fails at
@@ -69,6 +80,18 @@ pub fn import_files(
             }
             Err(e) => errors.push(format!("{file_name}: {e}")),
         }
+    }
+    // ADD-31: terminal receipt — the queue strip clears on total==done and the
+    // frontend toasts "Imported N files" (with the failure count when any).
+    {
+        use tauri::Emitter;
+        let _ = app.emit(
+            "import-progress",
+            serde_json::json!({
+                "done": total, "total": total, "name": "",
+                "imported": imported.len(), "failed": errors.len()
+            }),
+        );
     }
     // Release the room lock before kicking off background OCR/STT — the
     // worker lanes re-acquire it once, briefly, only when they have text.
@@ -326,7 +349,24 @@ pub fn update_file_content(
 }
 
 #[tauri::command]
-pub fn delete_file(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn delete_file(
+    state: State<'_, AppState>,
+    rec: State<'_, super::RecState>,
+    id: String,
+) -> Result<(), String> {
+    // ADD-27: deleting the file a live recording writes into must stop the
+    // engine first, or it keeps flushing into a row that no longer exists.
+    // The stop is NOT awaited — its final flush would only recreate nothing
+    // (the row is going away); dropping the session is what matters.
+    {
+        let mut session = rec.session.lock().unwrap();
+        if session.as_ref().map(|l| l.file_id == id).unwrap_or(false) {
+            if let Some(live) = session.take() {
+                let (done_tx, _) = std::sync::mpsc::channel();
+                let _ = live.handle.tx.send(crate::recording::EngineMsg::Stop { done: done_tx });
+            }
+        }
+    }
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
     db::delete_file(&room.conn, &id)

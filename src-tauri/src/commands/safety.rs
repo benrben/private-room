@@ -11,8 +11,12 @@ pub fn list_file_versions(
     db::list_file_versions(&room.conn, &id)
 }
 
-/// ADD-2: restore a saved version's bytes. Goes back through `store_file_bytes`,
+/// ADD-2: restore a saved version. Goes back through `store_file_bytes`,
 /// so the CURRENT state is snapshotted first — restoring is itself undoable.
+/// A version is a compound snapshot: bytes, extracted text, and (for a
+/// Recording) the transcript meta all come back together, in one
+/// transaction — a half-restored recording would show words from one era
+/// against speakers from another.
 #[tauri::command]
 pub fn restore_file_version(
     window: tauri::Window,
@@ -22,11 +26,25 @@ pub fn restore_file_version(
     use tauri::Emitter;
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    let (file_id, bytes) = db::get_version(&room.conn, &version_id)?;
-    let name = db::get_file_name(&room.conn, &file_id)?;
-    let text = extraction::extract_text(&name, &bytes)
-        .or_else(|| String::from_utf8(bytes.clone()).ok());
-    store_file_bytes(&room.conn, &file_id, &bytes, text.as_deref(), "Restored")?;
+    let (file_id, bytes, text, rec_meta) = db::get_version(&room.conn, &version_id)?;
+    // Versions saved before compound snapshots carry no text: re-derive it.
+    let text = text.or_else(|| {
+        let name = db::get_file_name(&room.conn, &file_id).ok()?;
+        extraction::extract_text(&name, &bytes).or_else(|| String::from_utf8(bytes.clone()).ok())
+    });
+    room.conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+    let restored = store_file_bytes(&room.conn, &file_id, &bytes, text.as_deref(), "Restored")
+        .and_then(|_| match &rec_meta {
+            Some(meta) => db::set_rec_meta(&room.conn, &file_id, meta),
+            None => Ok(()),
+        });
+    match restored {
+        Ok(()) => room.conn.execute_batch("COMMIT").map_err(|e| e.to_string())?,
+        Err(e) => {
+            let _ = room.conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
     let _ = window.emit("room-files-changed", ());
     let _ = window.emit("file-updated", &file_id);
     Ok(())
@@ -93,13 +111,16 @@ pub fn export_all(state: State<'_, AppState>, dest_dir: String) -> Result<u32, S
 }
 
 /// SEC-4: rotate the room's password. Verifies `current` on a second throwaway
-/// connection, then re-keys the live connection.
+/// connection, then re-keys the live connection. When the room has a recovery
+/// sidecar it is re-wrapped around the NEW password and the FRESH code is
+/// returned (to show once) — the old code decrypts to a password that no
+/// longer opens the room. Returns `None` when the room had no recovery.
 #[tauri::command]
 pub fn change_password(
     state: State<'_, AppState>,
     current: String,
     new_password: String,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     if new_password.chars().count() < 8 {
         return Err("Password must be at least 8 characters.".into());
     }
@@ -118,7 +139,23 @@ pub fn change_password(
     {
         let _ = crate::biometrics::delete(&room.path);
     }
-    Ok(())
+    // Same policy for the recovery sidecar: it wraps the password, so after a
+    // rekey the old code would recover a password that no longer opens the
+    // room. Re-wrap under the new password and hand back the fresh code; if
+    // re-wrapping fails, delete the stale sidecar so the unlock gate never
+    // offers a code that cannot work.
+    let new_code = if db::has_recovery(&room.path) {
+        match db::write_recovery(&room.path, &room.password) {
+            Ok(code) => Some(code),
+            Err(_) => {
+                let _ = db::remove_recovery(&room.path);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Ok(new_code)
 }
 
 /// ADD-4: a full copy of the open room as it is now, optionally with its own

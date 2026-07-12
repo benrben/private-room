@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { api, RoomInfo } from "../api";
+import { stopMicTap } from "./liveRec";
 import { handleAgentUiRequest } from "../agent/driver";
 import { annotationTarget } from "./markup";
 import { WSState } from "./state";
@@ -66,6 +67,40 @@ export function useWorkspaceEffects(
     const unlistenSummarize = api.onSummarizeProgress((text) => {
       s.setSummarizeProgress(text);
     });
+    // ADD-31: named stage inside the Studio modal while it generates.
+    const unlistenStudioStep = api.onStudioStep((text) => {
+      s.setStudioStep(text);
+    });
+    // ADD-31: live import queue. The receipt toast comes from reportImport
+    // (which knows names and errors) — this event only drives the strip.
+    const unlistenImport = api.onImportProgress((p) => {
+      s.setImportProgress(p.done >= p.total ? null : p);
+    });
+    // ADD-30: background-job cards — live counts, and on any terminal flag
+    // re-read the job list so the card flips to Resume / disappears.
+    void a.refreshJobs();
+    const unlistenJobs = api.onJobProgress((p) => {
+      if (p.finished || p.paused || p.failed) {
+        s.setJobProgress((m) => {
+          const next = { ...m };
+          delete next[p.jobId];
+          return next;
+        });
+        void a.refreshJobs();
+        if (p.finished) {
+          // The label names what finished ("Summary ready", "Full pass of …").
+          s.pushToast("success", p.label || "Background job finished.");
+          if (p.fileId) void a.viewFile(p.fileId);
+        } else if (p.paused) {
+          s.pushToast("info", "Paused — resume it any time from the sidebar.");
+        }
+      } else {
+        s.setJobProgress((m) => ({
+          ...m,
+          [p.jobId]: { label: p.label, done: p.done, total: p.total },
+        }));
+      }
+    });
     const unlistenPull = listen<{ status: string; percent: number | null }>(
       "pull-progress",
       (e) => {
@@ -83,12 +118,17 @@ export function useWorkspaceEffects(
       } else if (p.type === "drop") {
         s.setDragOver(false);
         if (p.paths && p.paths.length > 0) {
+          if (p.paths.length > 1) {
+            s.setImportProgress({ done: 0, total: p.paths.length, name: "Starting…" });
+          }
           try {
             const report = await api.importFiles(p.paths);
             s.setFiles(await api.listFiles());
             a.reportImport(report);
           } catch (e) {
             s.pushToast("error", String(e));
+          } finally {
+            s.setImportProgress(null);
           }
         }
       }
@@ -166,9 +206,14 @@ export function useWorkspaceEffects(
     const unlistenRecState = api.onRecState((p) => {
       if (p.status === "saved") {
         s.setRecLive(null);
+        // The engine can stop ITSELF (3-hour limit, room closed under it) —
+        // the microphone must never stay open past the session it fed.
+        stopMicTap();
       } else {
         s.setRecLive({ fileId: p.fileId, status: p.status });
       }
+      // The drain readout lives exactly as long as the save does.
+      if (p.status !== "saving") s.setRecSave(null);
       if (
         (p.status === "paused" || p.status === "saved") &&
         s.openFileRef.current?.id === p.fileId
@@ -176,8 +221,42 @@ export function useWorkspaceEffects(
         void a.viewFile(p.fileId);
       }
     });
+    // Stop→saved drain progress. First event = the audio bytes are durable;
+    // startedAt is kept from the first event so the card's clock measures the
+    // whole drain, not the latest decode.
+    const unlistenRecSave = api.onRecSaveProgress((p) => {
+      s.setRecSave((prev) => ({
+        stage: p.stage,
+        remaining: p.remaining,
+        startedAt: prev?.startedAt ?? new Date().toISOString(),
+      }));
+    });
+    // ADD-18: imported audio/video transcribes itself in the background —
+    // reflect that on the file (sidebar token + viewer status line) instead
+    // of letting the transcript just "appear". Keyed by file name.
+    const unlistenStt = api.onSttProgress(([name, stage]) => {
+      s.setSttStatus((m) => ({
+        ...m,
+        [name]: stage === "started" ? "processing" : stage,
+      }));
+      if (stage === "done") void api.listFiles().then(s.setFiles);
+    });
     const unlistenRecError = api.onRecError((p) => {
       s.pushToast("error", p.message);
+    });
+    // A capture lane dying must reach the user even when the recording's
+    // view is closed (they're usually in Zoom, not here). One toast per
+    // outage per source; the view's banner handles the on-screen case.
+    const flaggedSources = new Set<string>();
+    const unlistenRecSource = api.onRecSource((p) => {
+      const key = `${p.fileId}:${p.source}`;
+      if (p.status === "error") {
+        if (flaggedSources.has(key)) return;
+        flaggedSources.add(key);
+        if (s.openFileRef.current?.id !== p.fileId) s.pushToast("error", p.message);
+      } else {
+        flaggedSources.delete(key);
+      }
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -187,6 +266,9 @@ export function useWorkspaceEffects(
       unlistenRound.then((fn) => fn());
       unlistenNotice.then((fn) => fn());
       unlistenSummarize.then((fn) => fn());
+      unlistenStudioStep.then((fn) => fn());
+      unlistenImport.then((fn) => fn());
+      unlistenJobs.then((fn) => fn());
       unlistenPull.then((fn) => fn());
       unlistenDrop.then((fn) => fn());
       unlistenOpen.then((fn) => fn());
@@ -197,6 +279,9 @@ export function useWorkspaceEffects(
       unlistenMcpApprove.then((fn) => fn());
       unlistenAgentUi.then((fn) => fn());
       unlistenRecState.then((fn) => fn());
+      unlistenRecSave.then((fn) => fn());
+      unlistenStt.then((fn) => fn());
+      unlistenRecSource.then((fn) => fn());
       unlistenRecError.then((fn) => fn());
       window.clearInterval(s.recheckTimer.current);
     };
@@ -230,8 +315,20 @@ export function useWorkspaceEffects(
     const bump = () => {
       s.lastActivityRef.current = Date.now();
     };
-    window.addEventListener("mousemove", bump);
-    window.addEventListener("keydown", bump);
+    // Activity is ANY real interaction, not just mouse/keyboard hardware
+    // events. VoiceOver and other assistive tech drive the app through AX
+    // actions that surface as click/input/focus — without these, an active
+    // assisted session idle-locks mid-use and ejects the user to the gate.
+    const activityEvents = [
+      "mousemove",
+      "keydown",
+      "pointerdown",
+      "click",
+      "input",
+      "focusin",
+      "wheel",
+    ] as const;
+    for (const ev of activityEvents) window.addEventListener(ev, bump);
     let lastTick = Date.now();
     const interval = window.setInterval(() => {
       const now = Date.now();
@@ -242,6 +339,13 @@ export function useWorkspaceEffects(
       const limitMs = Number(setting) * 60_000;
       if (!Number.isFinite(limitMs) || limitMs <= 0) return;
       if (s.askingRef.current) return;
+      // A live recording IS activity. During a meeting the user is in
+      // Zoom/Meet, not here — locking would close the room and cut the
+      // recording at exactly the idle limit (a real on-device casualty).
+      if (s.recLiveRef.current) {
+        s.lastActivityRef.current = now;
+        return;
+      }
       const idle = now - s.lastActivityRef.current;
       const slept = gap > 45_000;
       if (idle >= limitMs || (slept && gap >= limitMs)) {
@@ -249,8 +353,7 @@ export function useWorkspaceEffects(
       }
     }, 30_000);
     return () => {
-      window.removeEventListener("mousemove", bump);
-      window.removeEventListener("keydown", bump);
+      for (const ev of activityEvents) window.removeEventListener(ev, bump);
       window.clearInterval(interval);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -315,16 +418,21 @@ export function useWorkspaceEffects(
       s.setSearchResults(null);
       return;
     }
+    let stale = false;
     const t = window.setTimeout(() => {
       api
         .searchAll(q)
         .then((r) => {
+          if (stale) return;
           s.setSearchResults(r);
           s.setSearchSel(0);
         })
         .catch(() => {});
     }, 200);
-    return () => window.clearTimeout(t);
+    return () => {
+      stale = true;
+      window.clearTimeout(t);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.searchQuery, s.showSearch]);
 

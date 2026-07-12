@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { locateQuote, makeReceiptBadge } from "./highlight";
+import { locateQuoteHebrewAware, makeReceiptBadge } from "./highlight";
 import { base64ToBytes } from "./util";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
-const MAX_PAGES = 100;
+/** Render this far beyond the viewport so scrolling never shows a blank page. */
+const RENDER_AHEAD_PX = 1500;
+/** Rasterized pages kept alive at once. Far pages collapse back to
+ * placeholders (their height preserved), so a 1,200-page book costs the
+ * memory of ~28 canvases, not 1,200 — the old fix for that was a hard
+ * MAX_PAGES=100 cap, which simply cut long documents off. */
+const MAX_LIVE_PAGES = 28;
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
 const SCALE_STEP = 0.25;
@@ -118,7 +124,9 @@ async function highlightQuoteOnPage(
   // look-alikes, and can span the many items pdf.js splits a line into.
   const items = await readTextItems(page);
   const { text, map } = pageSource(items);
-  const hit = locateQuote(text, quote);
+  // Hebrew-aware: visual-order PDFs store lines mirrored — the fallback
+  // mirrors them back and still maps the hit to original char positions.
+  const hit = locateQuoteHebrewAware(text, quote);
   if (!hit) return false;
 
   const canvas = wrap.querySelector("canvas");
@@ -175,25 +183,115 @@ export default function PdfView({
   const pdfRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
   const pageWrapsRef = useRef<HTMLDivElement[]>([]);
   const renderTokenRef = useRef(0);
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  /** Page numbers currently holding a live canvas, oldest-touched first. */
+  const livePagesRef = useRef<number[]>([]);
+  /** Placeholder height (css px) for un-rendered pages at the current scale. */
+  const estHeightRef = useRef(600);
+  /** Where the quote highlight lives, so a recycled page repaints it. */
+  const highlightRef = useRef<{ page: number; quote: string } | null>(null);
   const hoverRef = useRef(false);
   const targetRef = useRef(target);
   targetRef.current = target;
 
   const [status, setStatus] = useState("Rendering PDF…");
+  const [numPages, setNumPages] = useState(0);
   const [scale, setScale] = useState(1);
+  // A document that can't be opened gets a calm recovery panel, never a raw
+  // exception — the technical error goes to the console for debugging.
+  const [failed, setFailed] = useState(false);
   const scaleRef = useRef(scale);
   scaleRef.current = scale;
 
   const targetKey = JSON.stringify(target ?? null);
 
+  /** Collapse a rendered page back to a fixed-height placeholder. */
+  const recyclePage = useCallback((p: number) => {
+    const wrap = pageWrapsRef.current[p - 1];
+    if (!wrap || wrap.dataset.rendered !== "1") return;
+    // Keep the height the page actually had so the scroll length is stable.
+    const h = wrap.getBoundingClientRect().height;
+    wrap.replaceChildren();
+    wrap.style.minHeight = `${Math.max(h, 40)}px`;
+    delete wrap.dataset.rendered;
+  }, []);
+
+  /** Rasterize page `p` into its wrap (idempotent), then recycle the pages
+   * farthest from it once more than MAX_LIVE_PAGES are alive. */
+  const renderPage = useCallback(
+    async (p: number, token: number): Promise<void> => {
+      const pdf = pdfRef.current;
+      const container = containerRef.current;
+      const wrap = pageWrapsRef.current[p - 1];
+      if (!pdf || !container || !wrap) return;
+      if (token !== renderTokenRef.current) return;
+      if (wrap.dataset.rendered === "1" || wrap.dataset.rendering === "1") {
+        const live = livePagesRef.current;
+        const i = live.indexOf(p);
+        if (i >= 0) {
+          live.splice(i, 1);
+          live.push(p); // touch
+        }
+        return;
+      }
+      wrap.dataset.rendering = "1";
+      try {
+        const page = await pdf.getPage(p);
+        if (token !== renderTokenRef.current) return;
+        const fitWidth = Math.max(container.clientWidth - 16, 400);
+        const cssWidth = fitWidth * scaleRef.current;
+        const base = page.getViewport({ scale: 1 });
+        const dpr = window.devicePixelRatio || 1;
+        const viewport = page.getViewport({
+          scale: (cssWidth / base.width) * dpr,
+        });
+        const canvas = document.createElement("canvas");
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        canvas.style.width = `${cssWidth}px`;
+        canvas.className = "pdf-page";
+        await page.render({ canvas, viewport }).promise;
+        if (token !== renderTokenRef.current) return;
+        wrap.replaceChildren(canvas);
+        wrap.style.minHeight = "";
+        wrap.dataset.rendered = "1";
+
+        // UX-2: per-page copy button, hidden when the page has no text.
+        const pageText = pageTextFromItems(await readTextItems(page));
+        if (token !== renderTokenRef.current) return;
+        if (pageText) wrap.appendChild(makeCopyButton(pageText));
+
+        // If this page carries the target-quote highlight and was recycled
+        // meanwhile, repaint it (without stealing the scroll position).
+        const hl = highlightRef.current;
+        if (hl && hl.page === p) {
+          await highlightQuoteOnPage(page, wrap, hl.quote, false);
+        }
+
+        const live = livePagesRef.current;
+        live.push(p);
+        if (live.length > MAX_LIVE_PAGES) {
+          // Recycle the live pages farthest from the one just rendered.
+          live.sort((a, b) => Math.abs(b - p) - Math.abs(a - p));
+          while (live.length > MAX_LIVE_PAGES) {
+            const victim = live.shift();
+            if (victim != null && victim !== p) recyclePage(victim);
+          }
+        }
+      } finally {
+        delete wrap.dataset.rendering;
+      }
+    },
+    [recyclePage],
+  );
+
   /**
-   * Render every page into the container at `scale` (1 = fit width),
-   * attach per-page copy buttons, then re-run the quote highlight.
-   * `restoreIdx` (set on zoom re-renders) scrolls that page back to the
-   * top afterwards instead of auto-scrolling to the highlighted match.
-   * A monotonic token cancels a render that a newer one has superseded.
+   * Build one fixed-height placeholder per page — every page of the
+   * document, however many — and arm an IntersectionObserver that renders
+   * pages as they approach the viewport. `restoreIdx` (set on zoom
+   * re-renders) scrolls that page back to the top afterwards.
    */
-  const doRender = useCallback(
+  const buildPages = useCallback(
     async (renderScale: number, restoreIdx: number | null) => {
       const pdf = pdfRef.current;
       const container = containerRef.current;
@@ -202,141 +300,152 @@ export default function PdfView({
       const tgt = targetRef.current;
       const restoring = restoreIdx != null;
 
+      observerRef.current?.disconnect();
       container.innerHTML = "";
-      const pageWraps: HTMLDivElement[] = [];
-      pageWrapsRef.current = pageWraps;
-      const pages = Math.min(pdf.numPages, MAX_PAGES);
+      livePagesRef.current = [];
+      highlightRef.current = null;
+      const wraps: HTMLDivElement[] = [];
+      pageWrapsRef.current = wraps;
 
       try {
-        for (let p = 1; p <= pages; p++) {
-          if (token !== renderTokenRef.current) return;
-          const page = await pdf.getPage(p);
-          const fitWidth = Math.max(container.clientWidth - 16, 400);
-          const cssWidth = fitWidth * renderScale;
-          const base = page.getViewport({ scale: 1 });
-          const dpr = window.devicePixelRatio || 1;
-          const viewport = page.getViewport({
-            scale: (cssWidth / base.width) * dpr,
-          });
-          const canvas = document.createElement("canvas");
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          canvas.style.width = `${cssWidth}px`;
-          canvas.className = "pdf-page";
+        // Uniform placeholder height from page 1 (books are uniform; a page
+        // that differs corrects itself the moment it renders).
+        const page1 = await pdf.getPage(1);
+        if (token !== renderTokenRef.current) return;
+        const fitWidth = Math.max(container.clientWidth - 16, 400);
+        const cssWidth = fitWidth * renderScale;
+        const base1 = page1.getViewport({ scale: 1 });
+        const estH = (base1.height / base1.width) * cssWidth;
+        estHeightRef.current = estH;
+
+        for (let p = 1; p <= pdf.numPages; p++) {
           const wrap = document.createElement("div");
           wrap.className = "pdf-page-wrap";
-          wrap.appendChild(canvas);
+          wrap.dataset.page = String(p);
+          wrap.style.minHeight = `${estH}px`;
           container.appendChild(wrap);
-          pageWraps.push(wrap);
-          await page.render({ canvas, viewport }).promise;
-          if (token !== renderTokenRef.current) return;
-
-          // UX-2: per-page copy button, hidden when the page has no text.
-          const pageText = pageTextFromItems(await readTextItems(page));
-          if (pageText) wrap.appendChild(makeCopyButton(pageText));
-
-          // Keep the reader's place while pages stream in below.
-          if (restoring && p - 1 === restoreIdx) {
-            wrap.scrollIntoView({ block: "start" });
-          }
+          wraps.push(wrap);
         }
-        if (token !== renderTokenRef.current) return;
-        setStatus(
-          pdf.numPages > MAX_PAGES
-            ? `Showing first ${MAX_PAGES} of ${pdf.numPages} pages`
-            : "",
+
+        const obs = new IntersectionObserver(
+          (entries) => {
+            for (const e of entries) {
+              if (!e.isIntersecting) continue;
+              const p = Number((e.target as HTMLElement).dataset.page);
+              if (p >= 1) void renderPage(p, renderTokenRef.current);
+            }
+          },
+          { root: null, rootMargin: `${RENDER_AHEAD_PX}px 0px` },
         );
+        wraps.forEach((w) => obs.observe(w));
+        observerRef.current = obs;
+        setStatus("");
+
+        // Zoom re-render: put the page the reader was on back at the top.
+        if (restoring && restoreIdx != null) {
+          wraps[Math.min(restoreIdx, wraps.length - 1)]?.scrollIntoView({
+            block: "start",
+          });
+          return;
+        }
 
         if (tgt?.quote) {
+          // Find the quote by TEXT (no rasterizing needed), hinted page
+          // first — then render that one page and paint the highlight.
           const quote = tgt.quote;
-          // Search the hinted page first, then the rest; the match may live
-          // on a different page than the hint.
-          const runHighlight = async (): Promise<boolean> => {
-            const order = [...Array(pages).keys()].map((i) => i + 1);
-            if (tgt.page && tgt.page >= 1 && tgt.page <= pages) {
-              order.splice(order.indexOf(tgt.page), 1);
-              order.unshift(tgt.page);
-            }
-            for (const p of order) {
-              if (token !== renderTokenRef.current) return false;
-              const page = await pdf.getPage(p);
-              if (
-                await highlightQuoteOnPage(page, pageWraps[p - 1], quote, !restoring)
-              ) {
-                return true;
-              }
-            }
-            return false;
-          };
-          let found = await runHighlight();
-          if (!found && token === renderTokenRef.current) {
-            // A freshly-opened page's text layer may not be parsed on the
-            // first pass; wait one frame and retry once before giving up.
-            await new Promise<void>((r) => requestAnimationFrame(() => r()));
-            if (token !== renderTokenRef.current) return;
-            found = await runHighlight();
+          const order = [...Array(pdf.numPages).keys()].map((i) => i + 1);
+          if (tgt.page && tgt.page >= 1 && tgt.page <= pdf.numPages) {
+            order.splice(order.indexOf(tgt.page), 1);
+            order.unshift(tgt.page);
           }
-          if (!found && token === renderTokenRef.current && !restoring) {
+          let foundPage: number | null = null;
+          for (let k = 0; k < order.length; k++) {
+            const p = order[k];
+            if (token !== renderTokenRef.current) return;
+            // A long document takes a while to scan — narrate progress.
+            if (k % 50 === 0 && order.length > 100) {
+              setStatus(
+                `Searching the document for the passage… (page ${k + 1} of ${order.length})`,
+              );
+            }
+            const page = await pdf.getPage(p);
+            const { text } = pageSource(await readTextItems(page));
+            if (locateQuoteHebrewAware(text, quote)) {
+              foundPage = p;
+              break;
+            }
+          }
+          if (token === renderTokenRef.current) setStatus("");
+          if (token !== renderTokenRef.current) return;
+          if (foundPage != null) {
+            highlightRef.current = { page: foundPage, quote };
+            wraps[foundPage - 1]?.scrollIntoView({ block: "center" });
+            await renderPage(foundPage, token);
+            // renderPage repainted the highlight; now center on the box.
+            const box = wraps[foundPage - 1]?.querySelector(".pdf-hl");
+            box?.scrollIntoView({ block: "center", behavior: "smooth" });
+          } else {
             setStatus(
               tgt.page
                 ? `Couldn't locate the highlighted text — showing page ${tgt.page} instead.`
                 : "Couldn't locate the highlighted text in this PDF.",
             );
             if (tgt.page) {
-              pageWraps[Math.min(tgt.page, pages) - 1]?.scrollIntoView({
+              wraps[Math.min(tgt.page, pdf.numPages) - 1]?.scrollIntoView({
                 block: "start",
                 behavior: "smooth",
               });
             }
           }
-        } else if (tgt?.page && !restoring) {
-          pageWraps[Math.min(Math.max(tgt.page, 1), pages) - 1]?.scrollIntoView({
-            block: "start",
-            behavior: "smooth",
-          });
-        }
-
-        // UX-3: with every page now rendered at final height, put the page
-        // the reader was on before the zoom back at the top of the viewport.
-        // (Done here, not only mid-stream, so there is enough scroll room to
-        // actually reach it — the mid-loop scroll can fall short.)
-        if (restoreIdx != null && token === renderTokenRef.current) {
-          pageWraps[restoreIdx]?.scrollIntoView({ block: "start" });
+        } else if (tgt?.page) {
+          wraps[
+            Math.min(Math.max(tgt.page, 1), pdf.numPages) - 1
+          ]?.scrollIntoView({ block: "start", behavior: "smooth" });
         }
       } catch (e) {
         if (token === renderTokenRef.current) {
-          setStatus(`Could not render PDF: ${e}`);
+          console.error("PDF render failed:", e);
+          setStatus("");
+          setFailed(true);
         }
       }
     },
-    [],
+    [renderPage],
   );
 
-  // Load the document once per file/target, then render at current scale.
+  // Load the document once per file/target, then build the lazy pages.
   useEffect(() => {
     let cancelled = false;
     const container = containerRef.current;
     if (!container) return;
     setStatus("Rendering PDF…");
+    setFailed(false);
     const task = pdfjs.getDocument({ data: base64ToBytes(dataB64) });
     (async () => {
       try {
         const pdf = await task.promise;
         if (cancelled) return;
         pdfRef.current = pdf;
-        await doRender(scaleRef.current, null);
+        setNumPages(pdf.numPages);
+        await buildPages(scaleRef.current, null);
       } catch (e) {
-        if (!cancelled) setStatus(`Could not render PDF: ${e}`);
+        if (!cancelled) {
+          console.error("PDF open failed:", e);
+          setStatus("");
+          setFailed(true);
+        }
       }
     })();
     return () => {
       cancelled = true;
       renderTokenRef.current++; // cancel any in-flight render
+      observerRef.current?.disconnect();
+      observerRef.current = null;
       task.destroy();
       pdfRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataB64, targetKey, doRender]);
+  }, [dataB64, targetKey, buildPages]);
 
   // UX-3: re-render on zoom, debounced, preserving reading position.
   useEffect(() => {
@@ -353,10 +462,10 @@ export default function PdfView({
         }
       }
     }
-    const t = window.setTimeout(() => doRender(scale, topIdx), 200);
+    const t = window.setTimeout(() => buildPages(scale, topIdx), 200);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scale, doRender]);
+  }, [scale, buildPages]);
 
   const clamp = (s: number) =>
     Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(s * 100) / 100));
@@ -398,6 +507,18 @@ export default function PdfView({
         hoverRef.current = false;
       }}
     >
+      {failed && (
+        <div className="pdf-failed" role="alert">
+          <div className="pdf-failed-title">This PDF could not be opened.</div>
+          <p className="pdf-failed-body">
+            The file may be incomplete or damaged. You can{" "}
+            <strong>Export</strong> the original from the toolbar above to
+            inspect it, replace it by importing the file again, or{" "}
+            <strong>Close</strong> it.
+          </p>
+        </div>
+      )}
+      {!failed && (
       <div className="pdf-zoombar">
         <button
           type="button"
@@ -428,9 +549,20 @@ export default function PdfView({
         >
           Fit width
         </button>
+        {numPages > 0 && (
+          <span className="pdf-page-total">{numPages} pages</span>
+        )}
       </div>
+      )}
       {status && <div className="viewer-status">{status}</div>}
-      <div ref={containerRef} className="pdf-pages" />
+      {/* Named landmark + page count so assistive tech keeps its bearings
+          even when far pages are collapsed to placeholders. */}
+      <div
+        ref={containerRef}
+        className="pdf-pages"
+        role="document"
+        aria-label={numPages > 0 ? `PDF document, ${numPages} pages` : "PDF document"}
+      />
     </div>
   );
 }

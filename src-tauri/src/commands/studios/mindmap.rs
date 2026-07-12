@@ -19,9 +19,17 @@ pub async fn studio_mindmap(
     scope: Option<String>,
     instructions: Option<String>,
     refs: Option<Vec<String>>,
+    op_id: Option<String>,
 ) -> Result<FileMeta, String> {
     use tauri::Emitter;
+    // ADD-31: cancellable with visible stages (see studio_flashcards).
+    let cancel = register_studio_cancel(&state, &op_id);
+    let _cancel_guard = op_id.as_ref().map(|id| CancelGuard {
+        state: state.inner(),
+        ask_id: id.clone(),
+    });
     let instr = studio_instruction(instructions, STUDIO_MINDMAP_PROMPT);
+    let _ = window.emit("studio-step", "Reading the material…");
     let (label, text) = {
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
@@ -30,16 +38,27 @@ pub async fn studio_mindmap(
             None => gather_scope_text(&room.conn, scope.as_deref(), &room.name)?,
         }
     };
-    let model = resolve_local_model(&state)
+    let model = resolve_structured_model(&state)
         .await
         .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
-    let _ = window.emit("ask-step", "Designing an interactive mind map");
+    let _ = window.emit(
+        "studio-step",
+        if is_cloud_model(&model) {
+            "Drawing your mind map — the cloud model is writing…"
+        } else {
+            "Drawing your mind map — a local model can take a few minutes…"
+        },
+    );
     let page_role = "You are a front-end developer building an interactive mind-map page. Draw one \
         central topic with a tree of branches; let the reader expand and collapse nodes by clicking, \
         and gently pan the canvas if you can. Keep labels short. Base it only on the provided material.";
-    let content = match generate_studio_html(&model, page_role, &instr, &label, &text).await? {
-        Some(html) => html,
-        None => {
+    let content = match generate_studio_html(&model, page_role, &instr, &label, &text, cancel.clone())
+        .await?
+    {
+        Some(html) if !cancel.load(Ordering::SeqCst) => html,
+        _ if cancel.load(Ordering::SeqCst) => return Err("Stopped.".into()),
+        _ => {
+            let _ = window.emit("studio-step", "Extracting the topic tree…");
             // Fallback: extract the structured tree and render the built-in template.
             let schema = serde_json::json!({
                 "type": "object",
@@ -71,8 +90,18 @@ pub async fn studio_mindmap(
                     format!("{instr}\n\nBase it only on this material about \"{label}\":\n\n{text}"),
                 ),
             ];
-            let raw =
-                ollama::chat_structured(&model, messages, Some(0.3), KEEP_ALIVE_WARM, &schema).await?;
+            let raw = ollama::chat_structured_cancel(
+                &model,
+                messages,
+                Some(0.3),
+                KEEP_ALIVE_WARM,
+                &schema,
+                cancel.clone(),
+            )
+            .await?;
+            if cancel.load(Ordering::SeqCst) {
+                return Err("Stopped.".into());
+            }
             let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).ok();
             let root = parsed
                 .as_ref()

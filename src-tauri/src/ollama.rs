@@ -211,7 +211,32 @@ pub async fn chat_structured(
     keep_alive: &str,
     schema: &serde_json::Value,
 ) -> Result<String, String> {
-    chat_structured_tier(model, messages, temperature, keep_alive, schema, CtxTier::Chat).await
+    chat_structured_tier(model, messages, temperature, keep_alive, schema, CtxTier::Chat, None)
+        .await
+}
+
+/// ADD-31: `chat_structured` with a caller-owned cancel flag, for long
+/// structured generations the user must be able to stop (a Studio writing a
+/// whole HTML page on a local model runs for minutes). Flipping the flag
+/// abandons the stream promptly; the caller treats the partial as stopped.
+pub async fn chat_structured_cancel(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    temperature: Option<f64>,
+    keep_alive: &str,
+    schema: &serde_json::Value,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    chat_structured_tier(
+        model,
+        messages,
+        temperature,
+        keep_alive,
+        schema,
+        CtxTier::Chat,
+        Some(cancel),
+    )
+    .await
 }
 
 /// ADD-27: `chat_structured` at the Job context tier — for the final call of a
@@ -225,7 +250,31 @@ pub async fn chat_structured_job(
     keep_alive: &str,
     schema: &serde_json::Value,
 ) -> Result<String, String> {
-    chat_structured_tier(model, messages, temperature, keep_alive, schema, CtxTier::Job).await
+    chat_structured_tier(model, messages, temperature, keep_alive, schema, CtxTier::Job, None)
+        .await
+}
+
+/// ADD-32: `chat_structured_job` with a caller-owned cancel flag — a whole-file
+/// pass runs one Job-tier structured call per window for possibly hours, and
+/// Stop must be able to abandon the in-flight window, not just wait it out.
+pub async fn chat_structured_job_cancel(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    temperature: Option<f64>,
+    keep_alive: &str,
+    schema: &serde_json::Value,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    chat_structured_tier(
+        model,
+        messages,
+        temperature,
+        keep_alive,
+        schema,
+        CtxTier::Job,
+        Some(cancel),
+    )
+    .await
 }
 
 async fn chat_structured_tier(
@@ -235,6 +284,7 @@ async fn chat_structured_tier(
     keep_alive: &str,
     schema: &serde_json::Value,
     tier: CtxTier,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
     // CRITICAL (Ollama's own guidance): `format` constrains the output GRAMMAR
     // but the model NEVER SEES the schema. Without the field names in the prompt
@@ -247,7 +297,7 @@ async fn chat_structured_tier(
         ));
     }
     let (text, _) = chat_core(
-        model, messages, None, temperature, None, keep_alive, Some(schema), false, tier,
+        model, messages, None, temperature, cancel, keep_alive, Some(schema), false, tier,
         |_| {},
     )
     .await?;
@@ -280,6 +330,58 @@ fn recover_json(text: &str) -> String {
         (Some(a), Some(b)) if b >= a => s[a..=b].to_string(),
         _ => s.to_string(),
     }
+}
+
+/// ADD-29: recover tool calls a model emitted INLINE as text instead of in the
+/// structured `tool_calls` field. Some engines (historically Ollama `:cloud`
+/// proxies, some OpenAI-compatible backends) wrap a call in `<tool_call>…JSON…
+/// </tool_call>`; the stream parser never sees it, so the call silently never
+/// runs. This is the safety net that gives EVERY selected engine tool parity:
+/// after streaming, if no structured calls arrived, scan the text for these
+/// spans, parse each `{name, arguments}` object, and return the calls plus the
+/// text with those spans removed. Returns `(cleaned_text, calls)`.
+fn parse_inline_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let mut calls = Vec::new();
+    let mut cleaned = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<tool_call>") {
+        let (before, after_open) = rest.split_at(start);
+        cleaned.push_str(before);
+        let after_open = &after_open["<tool_call>".len()..];
+        let (inner, remainder) = match after_open.find("</tool_call>") {
+            Some(end) => (&after_open[..end], &after_open[end + "</tool_call>".len()..]),
+            // Unterminated: treat the remainder as the payload and stop.
+            None => (after_open, ""),
+        };
+        if let Some(call) = tool_call_from_json(inner) {
+            calls.push(call);
+        }
+        rest = remainder;
+    }
+    cleaned.push_str(rest);
+    (cleaned.trim().to_string(), calls)
+}
+
+/// Parse one `{"name": "...", "arguments": {...}}` object (tolerating fences /
+/// `<think>` via recover_json) into a ToolCall. `arguments` may be an object or
+/// a JSON-encoded string. Returns None if there's no usable name.
+fn tool_call_from_json(raw: &str) -> Option<ToolCall> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .or_else(|_| serde_json::from_str(&recover_json(raw)))
+        .ok()?;
+    let name = v["name"].as_str().or_else(|| v["function"]["name"].as_str())?;
+    let args_src = if v["arguments"].is_null() {
+        &v["function"]["arguments"]
+    } else {
+        &v["arguments"]
+    };
+    Some(ToolCall {
+        name: name.to_string(),
+        arguments: normalize_tool_arguments(args_src),
+        raw: serde_json::json!({
+            "function": { "name": name, "arguments": normalize_tool_arguments(args_src) }
+        }),
+    })
 }
 
 /// Normalize a tool call's `arguments`. Ollama's native `/api/chat` returns
@@ -353,8 +455,13 @@ async fn chat_core(
     if model.contains("qwen3") && !model.contains("instruct") {
         body["think"] = serde_json::Value::Bool(think);
     }
+    // ADD-29: start the daemon on demand and keep it awake for this call. The
+    // guard bumps the idle clock when the call ends, so the 5-minute sleep
+    // window is measured from here. Held to the end of the function.
+    let base = resolved_base_url();
+    let _busy = crate::ollama_lifecycle::ensure_up(&base).await?;
     let resp = client()?
-        .post(format!("{}/api/chat", resolved_base_url()))
+        .post(format!("{base}/api/chat"))
         .json(&body)
         .send()
         .await
@@ -415,6 +522,17 @@ async fn chat_core(
             }
         }
     }
+    // ADD-29 parity net: if tools were offered but none arrived structurally,
+    // the model may have leaked them inline as `<tool_call>…</tool_call>` text
+    // (some cloud/OpenAI-compatible engines do). Recover them so EVERY engine
+    // can drive the tool loop, and strip the spans from the visible answer.
+    if tools.is_some() && tool_calls.is_empty() && full.contains("<tool_call>") {
+        let (cleaned, inline) = parse_inline_tool_calls(&full);
+        if !inline.is_empty() {
+            full = cleaned;
+            tool_calls = inline;
+        }
+    }
     Ok((full, tool_calls))
 }
 
@@ -436,8 +554,10 @@ pub async fn embed(model: &str, texts: &[String], keep_alive: &str) -> Result<Ve
         "input": texts,
         "keep_alive": keep_alive,
     });
+    let base = resolved_base_url();
+    let _busy = crate::ollama_lifecycle::ensure_up(&base).await?;
     let resp = client()?
-        .post(format!("{}/api/embed", resolved_base_url()))
+        .post(format!("{base}/api/embed"))
         .json(&body)
         .send()
         .await
@@ -473,8 +593,10 @@ pub async fn warm(model: &str) -> Result<(), String> {
         "keep_alive": "30m",
         "options": { "num_ctx": 8192 },
     });
+    let base = resolved_base_url();
+    let _busy = crate::ollama_lifecycle::ensure_up(&base).await?;
     client()?
-        .post(format!("{}/api/generate", resolved_base_url()))
+        .post(format!("{base}/api/generate"))
         .json(&body)
         .send()
         .await
@@ -493,8 +615,10 @@ pub async fn pull(
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| e.to_string())?;
+    let base = resolved_base_url();
+    let _busy = crate::ollama_lifecycle::ensure_up(&base).await?;
     let resp = client
-        .post(format!("{}/api/pull", resolved_base_url()))
+        .post(format!("{base}/api/pull"))
         .json(&serde_json::json!({ "model": model, "stream": true }))
         .send()
         .await
@@ -663,5 +787,44 @@ mod tests {
         // Garbage that can't parse is preserved verbatim rather than lost.
         let junk = serde_json::json!("not json");
         assert_eq!(normalize_tool_arguments(&junk), junk);
+    }
+
+    // ADD-29: the parity net — a model that leaks tool calls inline as
+    // `<tool_call>…</tool_call>` text must still drive the tool loop. Verify
+    // the calls are recovered and stripped from the visible answer.
+    #[test]
+    fn parse_inline_tool_calls_recovers_and_strips() {
+        let text = "Let me look.\n<tool_call>{\"name\": \"read_text\", \
+                    \"arguments\": {\"offset\": 0, \"limit\": 500}}</tool_call>\nDone.";
+        let (cleaned, calls) = parse_inline_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_text");
+        assert_eq!(calls[0].arguments["offset"], 0);
+        assert_eq!(calls[0].arguments["limit"], 500);
+        assert!(!cleaned.contains("<tool_call>"));
+        assert!(cleaned.contains("Let me look."));
+        assert!(cleaned.contains("Done."));
+    }
+
+    #[test]
+    fn parse_inline_tool_calls_handles_multiple_and_openai_shape() {
+        // Two calls, one in the {function:{name,arguments}} shape.
+        let text = "<tool_call>{\"name\":\"a\",\"arguments\":{\"x\":1}}</tool_call>\
+                    <tool_call>{\"function\":{\"name\":\"b\",\"arguments\":\"{\\\"y\\\":2}\"}}</tool_call>";
+        let (cleaned, calls) = parse_inline_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[0].arguments["x"], 1);
+        assert_eq!(calls[1].name, "b");
+        // Stringified arguments are normalized back to an object.
+        assert_eq!(calls[1].arguments["y"], 2);
+        assert_eq!(cleaned, "");
+    }
+
+    #[test]
+    fn parse_inline_tool_calls_ignores_plain_text() {
+        let (cleaned, calls) = parse_inline_tool_calls("Just a normal answer, no tools.");
+        assert!(calls.is_empty());
+        assert_eq!(cleaned, "Just a normal answer, no tools.");
     }
 }

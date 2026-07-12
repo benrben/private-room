@@ -65,6 +65,77 @@
   margin-top: 14px;
 }
 
+/* ADD-31: live status line while a Studio generates — named stage + elapsed,
+   with a soft indeterminate shimmer so the wait reads as alive. */
+.studio-prompt-status {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent, #8b7cf6) 10%, transparent);
+  font-size: 12.5px;
+}
+.studio-prompt-stage {
+  color: var(--text, #e8eaf0);
+  animation: studio-stage-pulse 1.6s ease-in-out infinite;
+}
+.studio-prompt-elapsed {
+  color: var(--muted, #8b93a7);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+@keyframes studio-stage-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .studio-prompt-stage { animation: none; }
+}
+
+/* Modal focus treatment: the page behind blurs slightly so the dialog is
+   unmistakably the only live surface; while running, the backdrop stops
+   advertising click-to-close. */
+.studio-prompt-backdrop {
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+.studio-prompt-backdrop.running {
+  cursor: default;
+}
+/* A disabled prompt during a run reads as "held", not broken. */
+.studio-prompt-input:disabled,
+.studio-prompt-question:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Running is ALIVE — a spinner on a full-strength accent button — while plain
+   disabled (nothing to run yet) keeps the global washed-out look. */
+button.primary.running:disabled {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  opacity: 1;
+  cursor: progress;
+}
+.btn-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, currentColor 35%, transparent);
+  border-top-color: currentColor;
+  animation: btn-spin 0.8s linear infinite;
+}
+@keyframes btn-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn-spinner { animation-duration: 2.4s; }
+}
+
 /* The one-line "Your question" field shown for the "research" AI action. */
 .studio-prompt-question {
   width: 100%;
@@ -197,6 +268,44 @@
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
   animation: toast-in 0.2s ease-out;
+}
+
+/* Batched (N-files) tidy prompt: a quiet notification row, not a call-to-
+   action panel — it must never compete with an active chat answer. */
+.import-suggestion.batch {
+  gap: 8px;
+  margin-top: 8px;
+  padding: 5px 8px 5px 11px;
+  font-size: 12px;
+  background: transparent;
+  border-color: var(--border-subtle);
+  color: var(--text-dim);
+}
+.import-suggestion.batch svg {
+  color: var(--text-dim);
+}
+.import-suggestion.batch .import-suggestion-text {
+  color: var(--text-dim);
+}
+.import-suggestion.batch .subtle.quiet {
+  color: var(--text-dim);
+}
+.import-suggestion.batch .subtle.quiet:hover {
+  color: var(--text);
+}
+.tidy-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  background: none;
+  border: none;
+  color: var(--text-faint, var(--text-dim));
+  border-radius: 6px;
+}
+.tidy-dismiss:hover {
+  color: var(--text);
+  border-color: transparent;
 }
 .import-suggestion svg {
   flex-shrink: 0;

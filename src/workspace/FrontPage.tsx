@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { FrontPage as FrontPageData } from "../api";
 import { displayName } from "./composer";
 import StudioShelf from "./StudioShelf";
@@ -15,6 +16,7 @@ export default function FrontPage({
   s: WSState;
   a: WSActions;
 }) {
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const rowStyle = {
     textAlign: "left",
     width: "100%",
@@ -98,20 +100,31 @@ export default function FrontPage({
         <StudioShelf s={s} a={a} />
       </div>
 
+      {/* Suggested questions rest in a collapsed, low-contrast tray — the
+          dashboard's optional ideas must not compete with the actual work.
+          One click opens them; the count says what's inside. */}
       {s.fpSuggestions.length > 0 && (
         <div className="fp-suggestions">
-          {s.fpSuggestions.map((sug, i) => (
-            <button
-              key={i}
-              className="fp-suggestion"
-              onClick={() => {
-                s.setQuestion(sug);
-                s.composerRef.current?.focus();
-              }}
-            >
-              {sug}
-            </button>
-          ))}
+          <button
+            className="fp-suggestions-toggle"
+            aria-expanded={suggestionsOpen}
+            onClick={() => setSuggestionsOpen((o) => !o)}
+          >
+            Suggestions <span className="count">{s.fpSuggestions.length}</span>
+          </button>
+          {suggestionsOpen &&
+            s.fpSuggestions.map((sug, i) => (
+              <button
+                key={i}
+                className="fp-suggestion"
+                onClick={() => {
+                  s.setQuestion(sug);
+                  s.composerRef.current?.focus();
+                }}
+              >
+                {sug}
+              </button>
+            ))}
         </div>
       )}
     </div>

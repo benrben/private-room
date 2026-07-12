@@ -3,13 +3,24 @@ use super::*;
 fn is_public_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
             !(v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_unspecified()
-                || v4.is_broadcast())
+                || v4.is_broadcast()
+                || o[0] == 0 // "this network" 0.0.0.0/8
+                || (o[0] == 100 && (o[1] & 0xc0) == 0x40) // CGNAT/Tailscale 100.64.0.0/10
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol 192.0.0.0/24
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking 198.18.0.0/15
+                || o[0] >= 224) // multicast 224.0.0.0/4 + reserved 240.0.0.0/4
         }
         std::net::IpAddr::V6(v6) => {
+            // Classify IPv4-mapped addresses (::ffff:a.b.c.d) by their
+            // embedded IPv4, so e.g. ::ffff:192.168.1.1 can't slip through.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(std::net::IpAddr::V4(v4));
+            }
             let seg = v6.segments();
             !(v6.is_loopback()
                 || v6.is_unspecified()
@@ -30,9 +41,13 @@ pub fn check_public_http_url(url: &str) -> Result<reqwest::Url, String> {
         .host_str()
         .ok_or_else(|| "Invalid URL: no host.".to_string())?
         .to_lowercase();
+    // host_str() keeps the brackets on IPv6 literals ("[::1]"); strip them or
+    // the IpAddr parse below never fires for V6 and the literal check is moot.
     let local = host == "localhost"
         || host.ends_with(".local")
         || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .parse::<std::net::IpAddr>()
             .map_or(false, |ip| !is_public_ip(ip));
     if local {
@@ -72,7 +87,12 @@ pub(crate) fn hop_host_is_public(url: &reqwest::Url) -> bool {
     if host == "localhost" || host.ends_with(".local") {
         return false;
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+    // Same bracket-stripping as check_public_http_url, for IPv6 literals.
+    if let Ok(ip) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
         return is_public_ip(ip);
     }
     let port = url.port_or_known_default().unwrap_or(80);
@@ -102,6 +122,14 @@ mod tests {
             "http://127.0.0.1/x",
             "https://192.168.1.1/admin",
             "http://10.0.0.5/",
+            "http://100.64.1.1/",
+            "http://0.0.0.0/",
+            "http://192.0.0.8/",
+            "http://198.18.0.1/",
+            "http://224.0.0.251/",
+            "http://255.255.255.255/",
+            "http://[::ffff:192.168.1.1]/",
+            "http://[::ffff:127.0.0.1]/",
             "http://printer.local/",
             "ftp://example.com/",
             "file:///etc/passwd",
@@ -109,6 +137,10 @@ mod tests {
             assert!(check_public_http_url(url).is_err(), "should block {url}");
         }
         assert!(check_public_http_url("https://example.com/page").is_ok());
+        // Public neighbors of the newly blocked ranges stay reachable.
+        for url in ["http://100.63.1.1/", "http://100.128.1.1/", "http://198.17.0.1/"] {
+            assert!(check_public_http_url(url).is_ok(), "should allow {url}");
+        }
     }
 
     #[test]
@@ -117,7 +149,9 @@ mod tests {
             "http://192.168.0.1/",
             "http://10.1.2.3/",
             "http://127.0.0.1/",
+            "http://100.64.1.1/",
             "http://[::1]/",
+            "http://[::ffff:10.0.0.5]/",
             "http://localhost/",
             "http://printer.local/",
             "ftp://example.com/",

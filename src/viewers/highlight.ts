@@ -19,6 +19,7 @@ export function foldChar(ch: string): string {
       return '"';
     case "–":
     case "—":
+    case "־": // Hebrew maqaf ≡ hyphen (models type בן-דוד for בן־דוד)
       return "-";
     case "ﬁ":
       return "fi";
@@ -28,8 +29,23 @@ export function foldChar(ch: string): string {
       return " ";
     case "­": // soft hyphen — invisible, often present on one side only
       return "";
-    default:
+    default: {
+      // Hebrew nikud/cantillation (0591–05C7 minus the punctuation in that
+      // block): search results are consonantal while the rendered document
+      // may be pointed — fold both sides to consonants so quotes match.
+      const cp = ch.codePointAt(0) ?? 0;
+      if (
+        cp >= 0x0591 &&
+        cp <= 0x05c7 &&
+        cp !== 0x05be &&
+        cp !== 0x05c0 &&
+        cp !== 0x05c3 &&
+        cp !== 0x05c6
+      ) {
+        return "";
+      }
       return ch;
+    }
   }
 }
 
@@ -124,6 +140,61 @@ export function locateQuote(
   at = free.indexOf(freeNeedle);
   if (at >= 0) return { start: freeMap[at], end: freeMap[at + freeNeedle.length - 1] };
   return null;
+}
+
+/**
+ * `locateQuote`, plus a fallback for VISUAL-ORDER Hebrew documents (many
+ * Hebrew PDFs store each line character-mirrored; the app's extracted text
+ * is repaired to logical order, so a quoted passage won't match the raw
+ * page text). When the direct match fails and the quote contains Hebrew,
+ * mirror every Hebrew-bearing line of the source and retry, mapping the hit
+ * back to ORIGINAL source indices so highlight painting works unchanged.
+ */
+export function locateQuoteHebrewAware(
+  source: string,
+  quote: string,
+): { start: number; end: number } | null {
+  const direct = locateQuote(source, quote);
+  if (direct || !/[א-ת]/.test(quote)) return direct;
+
+  const mirrored: string[] = [];
+  const backMap: number[] = [];
+  let lineStart = 0;
+  const flushLine = (endExcl: number) => {
+    const line = source.slice(lineStart, endExcl);
+    if (/[א-ת]/.test(line)) {
+      for (let k = endExcl - 1; k >= lineStart; k--) {
+        mirrored.push(source[k]);
+        backMap.push(k);
+      }
+    } else {
+      for (let k = lineStart; k < endExcl; k++) {
+        mirrored.push(source[k]);
+        backMap.push(k);
+      }
+    }
+  };
+  for (let i = 0; i < source.length; i++) {
+    if (source[i] === "\n") {
+      flushLine(i);
+      mirrored.push("\n");
+      backMap.push(i);
+      lineStart = i + 1;
+    }
+  }
+  flushLine(source.length);
+
+  const hit = locateQuote(mirrored.join(""), quote);
+  if (!hit) return null;
+  // The mirrored span maps to a contiguous original range; take its bounds.
+  let lo = backMap[hit.start];
+  let hi = lo;
+  for (let k = hit.start; k <= hit.end; k++) {
+    const o = backMap[k];
+    if (o < lo) lo = o;
+    if (o > hi) hi = o;
+  }
+  return { start: lo, end: hi };
 }
 
 const HIGHLIGHT_NAME = "pr-annotation";

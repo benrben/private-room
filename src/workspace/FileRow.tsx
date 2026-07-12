@@ -67,6 +67,14 @@ export default function FileRow({
               ◐
             </span>
           )}
+          {/* ADD-18: media readiness scans from the row itself — a pulsing
+              dot while the voice model is transcribing this file. */}
+          {s.sttStatus[f.name] === "processing" && (
+            <span
+              className="stt-badge"
+              title="Transcribing on this Mac — the transcript appears when it's done."
+            />
+          )}
           <span className="file-size">{formatSize(f.sizeBytes)}</span>
         </button>
       )}

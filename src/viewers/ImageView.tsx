@@ -19,12 +19,31 @@ interface RecommendedModels {
   vision: string;
 }
 
+const MIN_ZOOM = 0.25;
+const MAX_ZOOM = 4;
+const ZOOM_STEP = 0.25;
+
 export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
   const imgRef = useRef<HTMLImageElement>(null);
   const [query, setQuery] = useState("");
   const [boxes, setBoxes] = useState<ImageBox[]>([]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
+
+  // Zoom: "fit" scales to the pane (the default); a number is a fraction of
+  // the image's natural size. The AI boxes are %-positioned, so they ride
+  // along with any zoom for free.
+  const [zoom, setZoom] = useState<number | "fit">("fit");
+  const [natW, setNatW] = useState(0);
+  const effectiveZoom = () => {
+    if (zoom !== "fit") return zoom;
+    const img = imgRef.current;
+    if (!img || !img.naturalWidth) return 1;
+    return img.clientWidth / img.naturalWidth;
+  };
+  const clampZoom = (z: number) =>
+    Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round(z * 20) / 20));
+  const zoomBy = (d: number) => setZoom(clampZoom(effectiveZoom() + d));
 
   // The recommended vision model, set only when it's worth offering to
   // download it (Ollama is up but nothing installed can mark images).
@@ -210,8 +229,62 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
       )}
 
       {status && <div className="viewer-status">{status}</div>}
-      <div className="img-wrap">
-        <img ref={imgRef} src={`data:${mime};base64,${dataB64}`} alt={name} />
+      <div className="pdf-zoombar img-zoombar">
+        <button
+          type="button"
+          className="pdf-zoom-btn"
+          onClick={() => zoomBy(-ZOOM_STEP)}
+          disabled={zoom !== "fit" && zoom <= MIN_ZOOM + 1e-9}
+          title="Zoom out"
+          aria-label="Zoom out"
+        >
+          −
+        </button>
+        <span className="pdf-zoom-pct">
+          {zoom === "fit" ? "Fit" : `${Math.round(zoom * 100)}%`}
+        </span>
+        <button
+          type="button"
+          className="pdf-zoom-btn"
+          onClick={() => zoomBy(ZOOM_STEP)}
+          disabled={zoom !== "fit" && zoom >= MAX_ZOOM - 1e-9}
+          title="Zoom in"
+          aria-label="Zoom in"
+        >
+          +
+        </button>
+        <button
+          type="button"
+          className="pdf-zoom-fit"
+          onClick={() => setZoom(1)}
+          title="Actual size"
+        >
+          100%
+        </button>
+        <button
+          type="button"
+          className="pdf-zoom-fit"
+          onClick={() => setZoom("fit")}
+          title="Fit to the pane"
+        >
+          Fit
+        </button>
+      </div>
+      <div className="img-scroll">
+      <div
+        className="img-wrap"
+        style={
+          zoom !== "fit" && natW
+            ? { width: natW * zoom, maxWidth: "none" }
+            : undefined
+        }
+      >
+        <img
+          ref={imgRef}
+          src={`data:${mime};base64,${dataB64}`}
+          alt={name}
+          onLoad={(e) => setNatW(e.currentTarget.naturalWidth)}
+        />
         {boxes.map((b, i) => {
           const color = BOX_COLORS[i % BOX_COLORS.length];
           return (
@@ -232,6 +305,7 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
             </div>
           );
         })}
+      </div>
       </div>
     </div>
   );

@@ -137,6 +137,16 @@ pub fn open_html_in_browser(name: Option<String>, html: String) -> Result<String
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Sweep the browser-preview folder `open_html_in_browser` writes into, so the
+/// decrypted HTML it leaves behind doesn't outlive the app. Called at startup
+/// (files from a crashed/force-quit session) and on exit. Best-effort: only our
+/// dedicated directory is touched, and a failure must never block startup/exit.
+/// Not called mid-session — `/usr/bin/open` returns before the browser has read
+/// the file, so an eager sweep could hand the browser a dead path.
+pub fn cleanup_browser_previews() {
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("private-room-preview"));
+}
+
 /// Stage a self-contained HTML page for the isolated in-app preview and return a
 /// token; the frontend loads it via `roomdoc://localhost/<token>`. Old entries
 /// are dropped so the store can't grow without bound.
@@ -206,15 +216,37 @@ Make it a polished, responsive, dark-themed page: near-black background (#0b0b12
 soft violet accent (#8b7cf6), light text, system font. Write correct JavaScript that \
 runs on load with no errors.";
 
+/// ADD-31: create this operation's cancel flag and, when the frontend supplied
+/// an op id, register it in the shared cancel registry — the same one chat's
+/// Stop uses — so `cancel_ask(opId)` stops a Studio run too. The caller keeps a
+/// `CancelGuard` so the entry is removed on every return path.
+pub(crate) fn register_studio_cancel(
+    state: &State<'_, AppState>,
+    op_id: &Option<String>,
+) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Some(id) = op_id {
+        state
+            .cancels
+            .lock()
+            .unwrap()
+            .insert(id.clone(), cancel.clone());
+    }
+    cancel
+}
+
 /// Ask the model to author a complete interactive HTML page for a Studio artifact.
 /// Returns cleaned HTML, or `None` when the output isn't usable HTML — the caller
-/// then falls back to a built-in template so the feature never hard-fails.
+/// then falls back to a built-in template so the caller never hard-fails.
 pub(crate) async fn generate_studio_html(
     model: &str,
     page_role: &str,
     instr: &str,
     label: &str,
     text: &str,
+    // ADD-31: the Studio's Stop flag — authoring a whole page on a local model
+    // runs for minutes and must be abandonable mid-stream.
+    cancel: Arc<AtomicBool>,
 ) -> Result<Option<String>, String> {
     let schema = serde_json::json!({
         "type": "object",
@@ -228,7 +260,10 @@ pub(crate) async fn generate_studio_html(
             format!("{instr}\n\nBuild it only from this material about \"{label}\":\n\n{text}"),
         ),
     ];
-    let raw = ollama::chat_structured(model, messages, Some(0.4), KEEP_ALIVE_WARM, &schema).await?;
+    let raw = ollama::chat_structured_cancel(
+        model, messages, Some(0.4), KEEP_ALIVE_WARM, &schema, cancel,
+    )
+    .await?;
     let html = serde_json::from_str::<serde_json::Value>(raw.trim())
         .ok()
         .and_then(|v| v.get("html").and_then(|s| s.as_str()).map(str::to_string))

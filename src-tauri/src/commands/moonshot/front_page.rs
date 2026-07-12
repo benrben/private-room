@@ -79,7 +79,7 @@ pub async fn front_page_suggestions(state: State<'_, AppState>) -> Result<Vec<St
     if file_names.is_empty() {
         return Ok(Vec::new());
     }
-    let model = match resolve_local_model(&state).await {
+    let model = match resolve_structured_model(&state).await {
         Some(m) => m,
         None => return Ok(cached), // offline: reuse whatever we cached before
     };

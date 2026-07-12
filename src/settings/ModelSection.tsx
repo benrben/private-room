@@ -68,8 +68,9 @@ export default function ModelSection({
     <section id="set-model">
       <h3>Model</h3>
             <p className="settings-hint">
-              The AI that lives in this room. Everything runs locally through
-              Ollama.
+              The AI that lives in this room. Models run locally through
+              Ollama — except <b>:cloud</b> models, which run on Ollama's
+              servers: your prompts and file context leave this Mac.
             </p>
             {ai?.running ? (
               <div className="model-list">
@@ -88,6 +89,14 @@ export default function ModelSection({
                         </span>
                       ) : (
                         m
+                      )}
+                      {m.endsWith(":cloud") && (
+                        <span
+                          className="model-badge model-badge-cloud"
+                          title="Runs on Ollama's servers — prompts and file context leave this Mac"
+                        >
+                          cloud · leaves this Mac
+                        </span>
                       )}
                       {(() => {
                         const cap = caps.find((c) => c.name === m);

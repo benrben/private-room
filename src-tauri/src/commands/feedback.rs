@@ -49,7 +49,7 @@ pub async fn feedback_draft(
     if text.is_empty() {
         return Err("Write a few words about what happened first.".into());
     }
-    let model = resolve_local_model(&state)
+    let model = resolve_structured_model(&state)
         .await
         .ok_or("The local AI (Ollama) isn't running — you can still write the issue yourself.")?;
     let schema = serde_json::json!({

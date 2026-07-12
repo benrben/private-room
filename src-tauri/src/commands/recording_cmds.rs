@@ -9,11 +9,40 @@ use crate::recording::{self, EngineMsg, RecCut, RecMeta};
 #[derive(Default)]
 pub struct RecState {
     pub session: Mutex<Option<LiveSession>>,
+    /// Files with a re-transcription in flight. rec_start / rec_delete_range
+    /// on them must refuse — a new live session's flush (or an edit) would
+    /// silently overwrite the rewrite the moment it lands.
+    pub retranscribing: Mutex<std::collections::HashSet<String>>,
 }
 
 pub struct LiveSession {
     pub file_id: String,
     pub handle: recording::EngineHandle,
+    /// `caffeinate -i` for the session's lifetime: a Mac that idle-sleeps
+    /// mid-meeting pauses capture, and nobody touches the machine while
+    /// they're in a call. Killed on drop, whichever path drops the session.
+    pub awake: Option<std::process::Child>,
+}
+
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.awake {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The engine can finish WITHOUT a command (3-hour ceiling, room closed under
+/// it). Its session entry would then sit stale, telling the next rec_start "a
+/// recording is already running" forever — so every reader clears it lazily.
+fn clear_finished(session: &mut Option<LiveSession>) {
+    if session
+        .as_ref()
+        .is_some_and(|l| l.handle.shared.status.lock().unwrap().as_str() == "saved")
+    {
+        *session = None;
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -30,6 +59,10 @@ pub struct RecLive {
     pub file_id: String,
     pub status: String,
     pub duration_cs: i64,
+    /// Durable per-source health, so a viewer mounted after a fast failure
+    /// still learns about it: [status, message] for mic and sys.
+    pub mic: (String, String),
+    pub sys: (String, String),
 }
 
 #[derive(Serialize, Clone)]
@@ -65,11 +98,15 @@ pub fn rec_start(
         return Err("STT_MODEL_MISSING".into());
     };
     let mut session = rec.session.lock().unwrap();
+    clear_finished(&mut session);
     if let Some(live) = session.as_ref() {
         return Err(format!(
             "A recording is already running (file {}). Stop it first.",
             live.file_id
         ));
+    }
+    if file_id.as_ref().is_some_and(|id| rec.retranscribing.lock().unwrap().contains(id)) {
+        return Err("This recording is being re-transcribed — wait for it to finish.".into());
     }
 
     let guard = state.room.lock().unwrap();
@@ -131,7 +168,11 @@ pub fn rec_start(
     if let Ok(wav_path) = std::env::var("PRIVATE_ROOM_QA_SYS_WAV") {
         spawn_qa_sys_feeder(handle.tx.clone(), wav_path);
     }
-    *session = Some(LiveSession { file_id: file_id.clone(), handle });
+    let awake = std::process::Command::new("/usr/bin/caffeinate")
+        .arg("-i") // prevent idle SYSTEM sleep; the display may still sleep
+        .spawn()
+        .ok();
+    *session = Some(LiveSession { file_id: file_id.clone(), handle, awake });
     use tauri::Emitter;
     let _ = app.emit("room-files-changed", ());
     Ok(RecStart { file_id, name, meta })
@@ -217,6 +258,102 @@ pub fn rec_set_live_translate(
     Ok(())
 }
 
+/// Toggle live transcription mid-recording. Off: audio keeps recording but no
+/// text is decoded (the gap is recoverable later via `rec_retranscribe`).
+/// Session-scoped — nothing persists; every rec_start begins ON.
+#[tauri::command]
+pub fn rec_set_live_stt(rec: State<'_, RecState>, on: bool) -> Result<(), String> {
+    let guard = rec.session.lock().unwrap();
+    let live = guard.as_ref().ok_or("No live recording.")?;
+    let _ = live.handle.tx.send(EngineMsg::SetLiveStt(on));
+    Ok(())
+}
+
+/// Rebuild a saved recording's whole transcript from its audio with the
+/// CURRENT pipeline (recording::retranscribe) — for old recordings saved with
+/// corrupted words, a wrong language lock, or older speaker logic, and for
+/// gaps recorded with live transcription off. The audio is untouched; the old
+/// transcript goes to version history ("Re-transcribed"). Progress arrives as
+/// `rec-retranscribe` events {fileId, doneCs, totalCs}, ending at
+/// doneCs == totalCs.
+#[tauri::command]
+pub async fn rec_retranscribe(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    rec: State<'_, RecState>,
+    id: String,
+) -> Result<RecMeta, String> {
+    {
+        let mut live = rec.session.lock().unwrap();
+        clear_finished(&mut live);
+        if live.as_ref().map(|l| l.file_id == id).unwrap_or(false) {
+            return Err("Stop the live recording before re-transcribing it.".into());
+        }
+    }
+    if !rec.retranscribing.lock().unwrap().insert(id.clone()) {
+        return Err("This recording is already being re-transcribed.".into());
+    }
+    let out = rec_retranscribe_inner(&app, &state, id.clone()).await;
+    rec.retranscribing.lock().unwrap().remove(&id);
+    out
+}
+
+async fn rec_retranscribe_inner(
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
+    id: String,
+) -> Result<RecMeta, String> {
+    use tauri::Emitter;
+    // Model resolution exactly like rec_start; the diarize weights ride along.
+    let Some(model) = stt_effective_model(app) else {
+        return Err("STT_MODEL_MISSING".into());
+    };
+    recording::install_diarize_model(app);
+    recording::install_vad_model(app);
+
+    let (samples, cuts, max_speakers) = {
+        let guard = state.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        let (_name, _mime, bytes, _text) = db::get_file_full(&room.conn, &id)?;
+        let samples = recording::decode_wav(&bytes.unwrap_or_default())?;
+        let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+        (samples, meta.cuts, meta.max_speakers)
+    };
+    if samples.is_empty() {
+        return Err("This recording has no audio yet.".into());
+    }
+
+    let progress_app = app.clone();
+    let progress_id = id.clone();
+    let meta = tauri::async_runtime::spawn_blocking(move || {
+        recording::retranscribe(&model, &samples, cuts, max_speakers, |done_cs, total_cs| {
+            let _ = progress_app.emit(
+                "rec-retranscribe",
+                serde_json::json!({ "fileId": progress_id, "doneCs": done_cs, "totalCs": total_cs }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    {
+        let guard = state.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        // Same bytes, new transcript — through the single snapshotting write
+        // path, so the old transcript stays recoverable via History.
+        let bytes = db::get_file_bytes(&room.conn, &id)?.unwrap_or_default();
+        let text = recording::transcript_text(&meta);
+        store_file_bytes(&room.conn, &id, &bytes, Some(&text), "Re-transcribed")?;
+        db::set_rec_meta(&room.conn, &id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
+    }
+    let _ = app.emit(
+        "rec-retranscribe",
+        serde_json::json!({ "fileId": id, "doneCs": meta.duration_cs, "totalCs": meta.duration_cs }),
+    );
+    let _ = app.emit("room-files-changed", ());
+    Ok(meta)
+}
+
 /// Stop and save. Waits for the tail phrases to finish transcribing (the
 /// engine drains its decoder before flushing), so the returned meta is final.
 #[tauri::command]
@@ -241,11 +378,17 @@ pub async fn rec_stop(rec: State<'_, RecState>) -> Result<RecMeta, String> {
 /// that kept running while the user looked at other files.
 #[tauri::command]
 pub fn rec_live_status(rec: State<'_, RecState>) -> Option<RecLive> {
-    let guard = rec.session.lock().unwrap();
-    guard.as_ref().map(|live| RecLive {
-        file_id: live.file_id.clone(),
-        status: live.handle.shared.status.lock().unwrap().clone(),
-        duration_cs: live.handle.shared.duration_cs.load(std::sync::atomic::Ordering::Relaxed),
+    let mut guard = rec.session.lock().unwrap();
+    clear_finished(&mut guard);
+    guard.as_ref().map(|live| {
+        let sources = live.handle.shared.sources.lock().unwrap().clone();
+        RecLive {
+            file_id: live.file_id.clone(),
+            status: live.handle.shared.status.lock().unwrap().clone(),
+            duration_cs: live.handle.shared.duration_cs.load(std::sync::atomic::Ordering::Relaxed),
+            mic: sources[0].clone(),
+            sys: sources[1].clone(),
+        }
     })
 }
 
@@ -276,10 +419,14 @@ pub fn rec_delete_range(
         return Err("Nothing selected.".into());
     }
     {
-        let live = rec.session.lock().unwrap();
+        let mut live = rec.session.lock().unwrap();
+        clear_finished(&mut live);
         if live.as_ref().map(|l| l.file_id == id).unwrap_or(false) {
             return Err("Pause the recording before editing the transcript.".into());
         }
+    }
+    if rec.retranscribing.lock().unwrap().contains(&id) {
+        return Err("This recording is being re-transcribed — wait for it to finish.".into());
     }
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
@@ -418,7 +565,7 @@ pub async fn rec_translate(
     if lines.is_empty() {
         return Err("No transcript to translate yet — record something first.".into());
     }
-    let model = resolve_local_model(&state)
+    let model = resolve_structured_model(&state)
         .await
         .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
 

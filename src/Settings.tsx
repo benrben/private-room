@@ -88,6 +88,10 @@ export default function Settings({
     pwError,
     pwSaved,
     changePassword,
+    pwRecoveryCode,
+    setPwRecoveryCode,
+    pwRecoveryCopied,
+    setPwRecoveryCopied,
     touchIdOn,
     toggleTouchId,
     touchIdErr,
@@ -268,7 +272,17 @@ export default function Settings({
               setPwRepeat={setPwRepeat}
               pwError={pwError}
               pwSaved={pwSaved}
-              changePassword={changePassword}
+              // Cross-hook wiring: this sheet and the Recovery section's show
+              // one-time codes for the SAME sidecar — starting a re-issue here
+              // dismisses the other sheet so two codes never contradict.
+              changePassword={() => {
+                setRecoveryCode(null);
+                changePassword();
+              }}
+              pwRecoveryCode={pwRecoveryCode}
+              setPwRecoveryCode={setPwRecoveryCode}
+              pwRecoveryCopied={pwRecoveryCopied}
+              setPwRecoveryCopied={setPwRecoveryCopied}
               touchIdOn={touchIdOn}
               toggleTouchId={toggleTouchId}
               touchIdErr={touchIdErr}
@@ -370,7 +384,11 @@ export default function Settings({
               setRecoveryCopied={setRecoveryCopied}
               setRecoveryCode={setRecoveryCode}
               recoveryBusy={recoveryBusy}
-              createRecoveryKey={createRecoveryKey}
+              // Cross-hook wiring: see PrivacySection's changePassword above.
+              createRecoveryKey={() => {
+                setPwRecoveryCode(null);
+                createRecoveryKey();
+              }}
               recoveryErr={recoveryErr}
             />
 

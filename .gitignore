@@ -24,6 +24,7 @@ dist-ssr
 # Bundled Whisper voice model — ~574 MB, shipped inside the DMG, never committed.
 # Fetch it into place before a release build (see README / RELEASING.md).
 src-tauri/resources/models/*.bin
+src-tauri/resources/models/*.onnx
 
 # Private Room project files are user data, never source
 *.roomai

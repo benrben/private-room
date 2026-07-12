@@ -7,6 +7,62 @@
   animation: room-in 0.45s ease;
 }
 
+/* Narrow windows: the side panes yield BEFORE the center pane clips. The
+   sidebar's inline (drag-resized) width is capped by max-width, and the chat
+   pane gives up its roomy minimum, so the workspace keeps a readable center
+   all the way down to the window's 900px floor. */
+@media (max-width: 1160px) {
+  .sidebar {
+    max-width: max(200px, 24vw);
+  }
+  /* !important: the chat pane carries an inline width + maxWidth:none from
+     the drag-resizer, which would silently defeat this cap. */
+  .chat {
+    min-width: 280px !important;
+    max-width: 380px !important;
+  }
+}
+
+/* Room Modes: below 1080px the window shows ONE readable pane — Workspace or
+   Chat — behind the segmented control, instead of two clipped ones. */
+.pane-switch {
+  display: flex;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+}
+.pane-switch button {
+  padding: 4px 18px;
+  font-size: 12.5px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-dim);
+}
+.pane-switch button.active {
+  background: var(--surface-3);
+  border-color: var(--border);
+  color: var(--text);
+}
+.body.narrow.show-workspace .chat,
+.body.narrow.show-workspace .pane-resizer:has(+ .chat) {
+  display: none;
+}
+.body.narrow.show-chat .viewer,
+.body.narrow.show-chat .pane-resizer:has(+ .chat) {
+  display: none;
+}
+/* The one visible pane owns the freed width (inline drag-resize sizes on
+   .chat must lose here, hence !important). */
+.body.narrow.show-chat .chat {
+  flex: 1 !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  width: auto !important;
+}
+
 @keyframes room-in {
   from {
     opacity: 0;
@@ -177,14 +233,24 @@
      "Claude (cloud)") so cloud engines read clearly. */
   white-space: nowrap;
 }
+/* Persistent, color-coded data-route badge — the always-visible answer to
+   "is what I type leaving this Mac?". Green = on-device, amber = cloud. */
 .model-pill-tier {
-  color: var(--text-dim);
-  font-size: 11px;
+  flex-shrink: 0;
+  margin-left: 2px;
+  padding: 1px 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  border-radius: 999px;
+  white-space: nowrap;
 }
-.model-pill-tier::before {
-  content: "·";
-  margin-right: 6px;
-  color: var(--text-faint);
+.model-pill-tier.local {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+.model-pill-tier.cloud {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
 }
 .model-pill-caret {
   color: var(--text-dim);
@@ -233,6 +299,26 @@
 .pop-item svg {
   color: var(--text-dim);
   flex-shrink: 0;
+}
+/* Two-line menu items: what it is, then what pressing it captures/saves. */
+.pop-item-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.pop-item-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: normal;
+  line-height: 1.35;
+  max-width: 240px;
+}
+.pop-item:has(.pop-item-sub) {
+  align-items: flex-start;
+}
+.pop-item:has(.pop-item-sub) svg {
+  margin-top: 2px;
 }
 .model-menu {
   min-width: 240px;

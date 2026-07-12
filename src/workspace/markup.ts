@@ -1,8 +1,22 @@
 import { AnnotationPayload, FileTarget } from "../api";
 
-/** Cloud CLI engines send questions off this Mac (SEC-6). */
-export function isCloudEngine(model: string): boolean {
+/** External CLI engines (Claude Code / Codex): a separate subprocess path —
+ * no in-app tool chips, no Ollama daemon needed. */
+export function isExternalEngine(model: string): boolean {
   return model === "claude-cli" || model === "codex-cli";
+}
+
+/** An Ollama `:cloud` model: listed alongside local models and driven through
+ * the same tool loop (ADD-29 parity), but it RUNS REMOTELY — prompts and file
+ * context leave this Mac. Must never be labeled "Local". */
+export function isRemoteModel(model: string): boolean {
+  return model.endsWith(":cloud");
+}
+
+/** Anything that sends room content off this Mac (SEC-6): drives the privacy
+ * strip and the Cloud tier label. */
+export function isCloudEngine(model: string): boolean {
+  return isExternalEngine(model) || isRemoteModel(model);
 }
 
 export interface BoxesPayload {

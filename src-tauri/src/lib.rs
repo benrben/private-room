@@ -5,6 +5,7 @@ pub mod extraction;
 pub mod mcp;
 mod ocr;
 mod ollama;
+mod ollama_lifecycle;
 pub mod recording;
 mod room_mcp;
 pub(crate) mod snapshot;
@@ -17,6 +18,9 @@ use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Sweep decrypted "Open in browser" previews left behind by a crashed or
+    // force-quit session before anything else runs.
+    commands::cleanup_browser_previews();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -191,16 +195,33 @@ pub fn run() {
             commands::rec_stop,
             commands::rec_live_status,
             commands::rec_set_live_translate,
+            commands::rec_set_live_stt,
             commands::rec_get,
             commands::rec_delete_range,
             commands::rec_export_clean,
             commands::rec_translate,
+            commands::rec_retranscribe,
             commands::app_diag,
             commands::feedback_draft,
+            // ADD-30: durable background job runner.
+            commands::list_jobs,
+            commands::cancel_job,
+            commands::delete_job,
+            commands::resume_job,
+            commands::start_deep_summary,
+            // ADD-32: whole-file pass — exhaustive windowed reading of one file.
+            commands::start_file_pass,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, _event| {
+            // ADD-29: never leak a background `ollama serve` WE started — stop it
+            // (and only it) as the app exits. A no-op for an external daemon.
+            if let tauri::RunEvent::Exit = _event {
+                ollama_lifecycle::stop_if_ours();
+                // Decrypted "Open in browser" previews must not outlive the app.
+                commands::cleanup_browser_previews();
+            }
             // Finder double-click on a .roomai file lands here on macOS.
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = _event {

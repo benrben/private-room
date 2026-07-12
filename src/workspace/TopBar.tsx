@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { ENGINE_LABELS, modelLabel, RoomInfo } from "../api";
 import {
@@ -8,7 +9,7 @@ import {
   Logomark,
   SearchIcon,
 } from "../icons";
-import { isCloudEngine } from "./markup";
+import { isCloudEngine, isExternalEngine, isRemoteModel } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
@@ -24,6 +25,20 @@ export default function TopBar({
   info: RoomInfo;
 }) {
   const { ai, model } = s;
+  // One dismissal grammar for the header popovers: Escape closes whichever
+  // is open (and never leaks to deeper layers while one is).
+  const anyMenuOpen = s.modelMenuOpen || s.roomMenuOpen;
+  useEffect(() => {
+    if (!anyMenuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      s.setModelMenuOpen(false);
+      s.setRoomMenuOpen(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [anyMenuOpen, s]);
   const modelReady =
     (ai?.running &&
       (ai.models.includes(model) ||
@@ -61,7 +76,11 @@ export default function TopBar({
           <div className="model-pill-wrap">
             <button
               className={`model-pill${isCloudEngine(model) ? " cloud" : ""}`}
-              onClick={() => s.setModelMenuOpen((o) => !o)}
+              onClick={() => {
+                // One popover at a time — never a menu stacked over a menu.
+                s.setRoomMenuOpen(false);
+                s.setModelMenuOpen((o) => !o);
+              }}
               title={
                 ai?.running
                   ? modelReady || isCloudEngine(model)
@@ -72,7 +91,9 @@ export default function TopBar({
             >
               <span
                 className={`model-dot ${
-                  isCloudEngine(model)
+                  // External CLIs need no daemon; a `:cloud` model still rides
+                  // through the local Ollama daemon, so its dot tracks it.
+                  isExternalEngine(model)
                     ? "ok"
                     : ai?.running
                       ? modelReady
@@ -82,8 +103,15 @@ export default function TopBar({
                 }`}
               />
               <span className="model-pill-name">{a.engineLabelOf(model)}</span>
-              <span className="model-pill-tier">
-                {isCloudEngine(model) ? "Cloud" : "Local"}
+              <span
+                className={`model-pill-tier ${isCloudEngine(model) ? "cloud" : "local"}`}
+                title={
+                  isCloudEngine(model)
+                    ? "This engine runs in the cloud — your prompts and context leave this Mac."
+                    : "This model runs entirely on this Mac — nothing leaves the device."
+                }
+              >
+                {isCloudEngine(model) ? "Cloud" : "On this Mac"}
               </span>
               <ChevronDownIcon size={13} className="model-pill-caret" />
             </button>
@@ -103,11 +131,15 @@ export default function TopBar({
                         s.setModelMenuOpen(false);
                       }}
                     >
-                      <span className="model-dot local" />
+                      <span
+                        className={`model-dot ${isRemoteModel(m) ? "cloud" : "local"}`}
+                      />
                       <span className="model-menu-name">
                         {modelLabel(m) ?? m}
                       </span>
-                      <span className="model-menu-tier">Local</span>
+                      <span className="model-menu-tier">
+                        {isRemoteModel(m) ? "Cloud" : "Local"}
+                      </span>
                       {m === model && <CheckIcon size={14} />}
                     </button>
                   ))}
@@ -151,7 +183,10 @@ export default function TopBar({
           <button
             className="icon-btn"
             title="Room menu"
-            onClick={() => s.setRoomMenuOpen((o) => !o)}
+            onClick={() => {
+              s.setModelMenuOpen(false);
+              s.setRoomMenuOpen((o) => !o);
+            }}
           >
             <DotsIcon size={16} />
           </button>

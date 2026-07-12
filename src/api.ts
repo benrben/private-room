@@ -20,6 +20,8 @@ import type {
   ImportReport,
   FileMeta,
   FileContent,
+  Job,
+  JobProgress,
   FileVersion,
   RecentRoom,
   Memory,
@@ -77,8 +79,11 @@ export const api = {
   exportFile: (id: string, destPath: string) =>
     invoke<void>("export_file", { id, destPath }),
   exportAll: (destDir: string) => invoke<number>("export_all", { destDir }),
+  // Returns a re-issued recovery code when the room had one (the old code
+  // wrapped the old password and is now useless) — show it once, like
+  // write_recovery_key's.
   changePassword: (current: string, newPassword: string) =>
-    invoke<void>("change_password", { current, newPassword }),
+    invoke<string | null>("change_password", { current, newPassword }),
   duplicateRoom: (destPath: string, newPassword: string | null) =>
     invoke<void>("duplicate_room", { destPath, newPassword }),
   compactRoom: () => invoke<string>("compact_room"),
@@ -130,6 +135,21 @@ export const api = {
   importLink: (url: string) => invoke<FileMeta>("import_link", { url }),
   // ADD-17: build/refresh the "Room summary.md" file; emits summarize-progress.
   summarizeRoom: () => invoke<FileMeta>("summarize_room"),
+  // ---- ADD-30: durable background jobs (the sidebar jobs panel) ----
+  listJobs: () => invoke<Job[]>("list_jobs"),
+  /** Start the room deep-summary job; returns its id. Progress → job-progress. */
+  startDeepSummary: () => invoke<string>("start_deep_summary"),
+  /** ADD-32: start a whole-file pass — reads the ENTIRE file window by window
+   *  in a durable background job and saves the result as a new room file.
+   *  mode "merge" folds notes into one document; "stitch" joins transformed
+   *  parts in order. Returns the job id; progress → job-progress. */
+  startFilePass: (file: string, instruction: string, mode?: "merge" | "stitch") =>
+    invoke<string>("start_file_pass", { file, instruction, mode }),
+  /** Pause a running job — it checkpoints and parks as 'paused'. */
+  cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
+  /** Continue a paused/errored job from its checkpoint. */
+  resumeJob: (id: string) => invoke<void>("resume_job", { id }),
+  deleteJob: (id: string) => invoke<void>("delete_job", { id }),
   aiStatus: () => invoke<AiStatus>("ai_status"),
   /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
   modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
@@ -244,6 +264,30 @@ export const api = {
   // ADD-17: progress while the room summary is being built.
   onSummarizeProgress: (cb: (text: string) => void): Promise<UnlistenFn> =>
     listen<string>("summarize-progress", (e) => cb(e.payload)),
+  // ADD-31: named stage while a Studio (flashcards/mindmap/podcast) runs.
+  onStudioStep: (cb: (text: string) => void): Promise<UnlistenFn> =>
+    listen<string>("studio-step", (e) => cb(e.payload)),
+  // ADD-30: live progress of a background job, plus its terminal flags.
+  onJobProgress: (cb: (p: JobProgress) => void): Promise<UnlistenFn> =>
+    listen<JobProgress>("job-progress", (e) => cb(e.payload)),
+  // ADD-31: live import queue — done/total/current name, plus a final receipt
+  // (done === total) carrying imported/failed counts.
+  onImportProgress: (
+    cb: (p: {
+      done: number;
+      total: number;
+      name: string;
+      imported?: number;
+      failed?: number;
+    }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{
+      done: number;
+      total: number;
+      name: string;
+      imported?: number;
+      failed?: number;
+    }>("import-progress", (e) => cb(e.payload)),
   onAgentOpenFile: (
     cb: (payload: AgentOpenFilePayload) => void,
   ): Promise<UnlistenFn> =>
@@ -290,6 +334,9 @@ export const api = {
   recLiveStatus: () => invoke<RecLive | null>("rec_live_status"),
   recSetLiveTranslate: (language: string | null) =>
     invoke<void>("rec_set_live_translate", { language }),
+  /** Live transcription on/off mid-recording. Off: the audio keeps recording
+   *  but no text is written (recoverable later with recRetranscribe). */
+  recSetLiveStt: (on: boolean) => invoke<void>("rec_set_live_stt", { on }),
   recGet: (id: string) => invoke<RecFile>("rec_get", { id }),
   /** Studio-style edit: delete a [t0,t1) span from transcript + playback. */
   recDeleteRange: (id: string, t0: number, t1: number) =>
@@ -299,12 +346,21 @@ export const api = {
   /** Translate the whole transcript on the local model into any language. */
   recTranslate: (id: string, language: string) =>
     invoke<FileMeta>("rec_translate", { id, language }),
+  /** Rebuild the whole transcript from the audio with the current pipeline
+   *  (saved recordings only; the audio is untouched, the old transcript goes
+   *  to History). Progress arrives via onRecRetranscribe. */
+  recRetranscribe: (id: string) => invoke<RecMeta>("rec_retranscribe", { id }),
   onRecPartial: (
     cb: (p: { fileId: string; source: "mic" | "sys"; t0: number; text: string }) => void,
   ): Promise<UnlistenFn> => listen("rec-partial", (e) => cb(e.payload as never)),
   onRecSegment: (
     cb: (p: { fileId: string; segment: RecSegment }) => void,
   ): Promise<UnlistenFn> => listen("rec-segment", (e) => cb(e.payload as never)),
+  /** A row already on screen was the microphone's echo of meeting audio the
+   *  system lane captured too — remove it. */
+  onRecSegmentDrop: (
+    cb: (p: { fileId: string; id: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-segment-drop", (e) => cb(e.payload as never)),
   /** The meeting's speakers were re-derived from every voice heard so far —
    *  labels already on screen may change (that's the point). */
   onRecRelabel: (
@@ -316,6 +372,11 @@ export const api = {
   onRecState: (
     cb: (p: { fileId: string; status: string; durationCs: number }) => void,
   ): Promise<UnlistenFn> => listen("rec-state", (e) => cb(e.payload as never)),
+  /** Stop→saved drain progress: the audio is already durable when the first
+   *  event arrives; `remaining` counts phrase decodes still queued. */
+  onRecSaveProgress: (
+    cb: (p: { fileId: string; stage: "transcribing" | "writing"; remaining: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-save-progress", (e) => cb(e.payload as never)),
   onRecSource: (
     cb: (p: { fileId: string; source: string; status: string; message: string }) => void,
   ): Promise<UnlistenFn> => listen("rec-source", (e) => cb(e.payload as never)),
@@ -328,6 +389,9 @@ export const api = {
   onRecTranslateProgress: (
     cb: (p: { fileId: string; done: number; total: number }) => void,
   ): Promise<UnlistenFn> => listen("rec-translate-progress", (e) => cb(e.payload as never)),
+  onRecRetranscribe: (
+    cb: (p: { fileId: string; doneCs: number; totalCs: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-retranscribe", (e) => cb(e.payload as never)),
 
   // ---- ADD-28: feedback → GitHub issue ----
   /** Draft an issue title/body from raw feedback on the LOCAL model. */
@@ -391,21 +455,30 @@ export const studioFlashcards = (
   scope?: string,
   instructions?: string,
   refs?: string[],
-) => invoke<FileMeta>("studio_flashcards", { scope, instructions, refs });
+  opId?: string,
+) => invoke<FileMeta>("studio_flashcards", { scope, instructions, refs, opId });
 
 /** D5: build a self-contained mind map (.html). */
 export const studioMindmap = (
   scope?: string,
   instructions?: string,
   refs?: string[],
-) => invoke<FileMeta>("studio_mindmap", { scope, instructions, refs });
+  opId?: string,
+) => invoke<FileMeta>("studio_mindmap", { scope, instructions, refs, opId });
 
 /** D12: render a two-host podcast script (.html); script only, no audio. */
 export const generatePodcastScript = (
   scope?: string,
   instructions?: string,
   refs?: string[],
-) => invoke<FileMeta>("generate_podcast_script", { scope, instructions, refs });
+  opId?: string,
+) =>
+  invoke<FileMeta>("generate_podcast_script", {
+    scope,
+    instructions,
+    refs,
+    opId,
+  });
 
 /** D6: does this chat's last exchange hold a fact worth remembering? */
 export const memorySuggestion = (chatId: string) =>
