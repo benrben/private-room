@@ -37,34 +37,11 @@ pub(crate) fn normalize_for_match(s: &str) -> String {
 /// string is always a real substring of `extracted` (byte-safe spans), and a
 /// strict word-majority is required so we never highlight something unrelated.
 pub(crate) fn closest_snippet(extracted: &str, quote: &str) -> Option<String> {
-    fn norm(w: &str) -> String {
-        w.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
-    }
     let q_words: Vec<String> = quote.split_whitespace().map(norm).filter(|w| !w.is_empty()).collect();
     if q_words.len() < 3 {
         return None; // too short to approximate safely
     }
-    // Haystack words with their original byte spans.
-    let mut h: Vec<(usize, usize, String)> = Vec::new();
-    let mut start: Option<usize> = None;
-    for (i, c) in extracted.char_indices() {
-        if c.is_whitespace() {
-            if let Some(s) = start.take() {
-                let w = norm(&extracted[s..i]);
-                if !w.is_empty() {
-                    h.push((s, i, w));
-                }
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-    }
-    if let Some(s) = start {
-        let w = norm(&extracted[s..]);
-        if !w.is_empty() {
-            h.push((s, extracted.len(), w));
-        }
-    }
+    let h = words_with_byte_spans(extracted);
     if h.is_empty() {
         return None;
     }
@@ -87,6 +64,49 @@ pub(crate) fn closest_snippet(extracted: &str, quote: &str) -> Option<String> {
         return None; // need a strict majority of the quote's words present
     }
     Some(extracted[h[si].0..h[ei - 1].1].to_string())
+}
+
+/// Validate every cell reference up front so a bad one fails before any write.
+fn validate_cell_refs(updates: &[(String, String)]) -> Result<(), String> {
+    for (cell, _) in updates {
+        if parse_a1(cell).is_none() {
+            return Err(format!("\"{cell}\" is not a cell — use A1 notation like B7."));
+        }
+    }
+    Ok(())
+}
+
+/// Collapse a token to its comparison key: lowercase alphanumerics only.
+fn norm(w: &str) -> String {
+    w.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// Each whitespace-delimited word of `text` as (byte start, byte end, key),
+/// where key is the [`norm`]-alized form; words that normalize to empty (pure
+/// punctuation) are dropped. The byte spans land on char boundaries, so slicing
+/// `text` with them is UTF-8-safe.
+fn words_with_byte_spans(text: &str) -> Vec<(usize, usize, String)> {
+    let mut words: Vec<(usize, usize, String)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                let w = norm(&text[s..i]);
+                if !w.is_empty() {
+                    words.push((s, i, w));
+                }
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        let w = norm(&text[s..]);
+        if !w.is_empty() {
+            words.push((s, text.len(), w));
+        }
+    }
+    words
 }
 
 pub(crate) fn build_annotation(
@@ -184,7 +204,7 @@ pub async fn ask(
     let question_embedding = embed_question(&question).await;
 
     // Phase 1 (locked): gather context, save the user message.
-    let (
+    let QuestionContext {
         explicit_model,
         chat_messages,
         sources,
@@ -194,7 +214,154 @@ pub async fn ask(
         advisors_on,
         advisor_tools_on,
         injected_rowids,
-    ) = {
+    } = gather_context_and_save_question(
+        &window,
+        &state,
+        &chat_id,
+        &question,
+        &attachments,
+        question_embedding.as_deref(),
+    )?;
+
+    let models = ollama::list_models().await.unwrap_or_default();
+    let model = explicit_model
+        .clone()
+        .unwrap_or_else(|| best_default(&models));
+    // ADD-29 parity: the selected engine drives the app itself — no silent
+    // reroute to a local model. Current `:cloud` models emit structured tool
+    // calls and honor the `format` grammar (verified on-device), and the
+    // `chat_core` inline-tool-call net (ADD-29) recovers any engine that leaks
+    // calls as text, so a cloud model runs the same tool loop a local one does.
+    // External CLIs (claude-cli/codex-cli) remain a separate subprocess path
+    // handled below.
+
+    // CHG-19: the "where is X?" grounding pass is deferred to AFTER the answer
+    // (nothing in the reply depends on the boxes), so the warm chat model streams
+    // the first token immediately instead of waiting on a vision-model load.
+    let mut effects = ToolEffects::default();
+    // ADD-25: perception tools attach pixels only when the chat model can
+    // read them; otherwise they fall back to a local vision-model description.
+    effects.vision_chat = is_vision_chat_model(&model);
+
+    // Phase 2 (unlocked): answer — through a cloud CLI if selected, or the
+    // local model with full app-control tools.
+    let answer = stream_answer(
+        &window,
+        &state,
+        &model,
+        &question,
+        chat_messages,
+        temperature,
+        &mut effects,
+        web_enabled,
+        advisors_on,
+        advisor_tools_on,
+        cancel.clone(),
+        &injected_rowids,
+    )
+    .await?;
+    let stopped = cancel.load(Ordering::SeqCst);
+
+    // CHG-19 + CHG-17: run the image-grounding pass now, AFTER the answer, and
+    // ONLY if the model didn't already mark the image via the mark_image tool
+    // (effects.boxes set) and the user didn't stop. This gives fast time-to-
+    // first-token and structurally eliminates the redundant second vision pass
+    // (chat→vision→chat→vision) that the old pre-answer ordering caused on
+    // 16 GB Macs. CHG-18: the trigger now also considers the image's file name.
+    if effects.boxes.is_none() && !stopped {
+        if let Some((img_id, img_name, img_bytes, w, h)) = &first_image {
+            if is_locate_intent(&question, Some(img_name)) {
+                let mut vmodel = vision_model(&models, &model);
+                if is_external_engine(&vmodel) {
+                    vmodel = best_default(&models);
+                }
+                if !models.is_empty() && !is_external_engine(&vmodel) {
+                    let messages = vec![ollama::ChatMessage {
+                        role: "user".into(),
+                        content: grounding_prompt(&question, *w, *h),
+                        images: Some(vec![
+                            base64::engine::general_purpose::STANDARD.encode(img_bytes),
+                        ]),
+                        ..Default::default()
+                    }];
+                    // HLT-5: short keep_alive for this vision pass on low-RAM Macs.
+                    let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &model);
+                    if let Ok(raw) =
+                        ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &boxes_schema(), Default::default())
+                            .await
+                    {
+                        let boxes = parse_boxes(&raw, *w, *h);
+                        if !boxes.is_empty() {
+                            effects.boxes = Some(serde_json::json!({
+                                "fileId": img_id,
+                                "name": img_name,
+                                "boxes": boxes,
+                            }));
+                            let _ = window.emit("ask-step", "Marked the image");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut content = answer;
+    // CHG-10: deterministic anti-fabrication gate. The prompt asks the model
+    // never to claim a change it didn't make; here the runtime KNOWS whether a
+    // write/highlight actually happened this turn (effects), so append a plain
+    // correction when the local answer claims one that didn't. Local path only
+    // (cloud has no tool effects) and never over a stopped partial.
+    if !is_external_engine(&model) && !stopped {
+        let highlighted = effects.annotation.is_some() || effects.boxes.is_some();
+        if claims_unbacked_action(&content, effects.wrote, highlighted) {
+            content.push_str(
+                "\n\n*(Correction: no file was actually changed this turn — the edit tool did \
+                 not run or failed.)*",
+            );
+        }
+    }
+    // ADD-7: mark the transcript so it matches what the user watched.
+    if stopped {
+        content.push_str(" *(stopped)*");
+    }
+    // ADD-23: viewer effects ride the message's own `effects` column as
+    // structured data — the visible answer stays plain prose. (Fenced
+    // ```boxes/```annotation blocks in old rooms are still parsed by the UI
+    // as a legacy fallback.)
+    let effects_value = effects_json(&effects);
+
+    // Phase 3 (locked): save the assistant reply.
+    persist_assistant_reply(&state, &chat_id, content, sources, effects_value)
+}
+
+/// Everything Phase 1 (the room-locked pass) produces for the rest of `ask`:
+/// resolved settings, the assembled chat messages, the source chips shown to the
+/// user, the first attached image (held back for the deferred grounding pass),
+/// and the flags/rowids the answer phase needs.
+struct QuestionContext {
+    explicit_model: Option<String>,
+    chat_messages: Vec<ollama::ChatMessage>,
+    sources: Vec<String>,
+    first_image: Option<(String, String, Vec<u8>, f64, f64)>,
+    temperature: Option<f64>,
+    web_enabled: bool,
+    advisors_on: bool,
+    advisor_tools_on: bool,
+    injected_rowids: HashSet<i64>,
+}
+
+/// Phase 1 (locked): gather the room's context and save the user's message.
+/// Runs entirely under the room mutex and performs NO `.await`, so the guard is
+/// never held across a suspension point — the lock discipline `ask` relies on.
+fn gather_context_and_save_question(
+    window: &tauri::Window,
+    state: &State<'_, AppState>,
+    chat_id: &str,
+    question: &str,
+    attachments: &[String],
+    question_embedding: Option<&[f32]>,
+) -> Result<QuestionContext, String> {
+    use tauri::Emitter;
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
         let conn = &room.conn;
@@ -210,13 +377,13 @@ pub async fn ask(
             .collect();
 
         let history: Vec<(String, String)> = {
-            let mut rows = db::recent_messages(conn, &chat_id, MAX_HISTORY_MESSAGES as i64)?;
+            let mut rows = db::recent_messages(conn, chat_id, MAX_HISTORY_MESSAGES as i64)?;
             rows.reverse();
             rows
         };
 
         let (context_chunks, context_fallback) =
-            retrieve_context(conn, &question, question_embedding.as_deref())?;
+            retrieve_context(conn, question, question_embedding)?;
         // CHG-16: rowids already injected as context, so a search_room repeat
         // of the same question returns the next-best chunks instead of dupes.
         let injected_rowids: HashSet<i64> = if context_fallback {
@@ -235,7 +402,7 @@ pub async fn ask(
         // context window; images are separately capped at MAX_ATTACHED_IMAGES.
         let mut text_budget = MAX_ATTACHED_TEXT_TOTAL;
         let mut skipped_attachments: Vec<String> = Vec::new();
-        for file_id in &attachments {
+        for file_id in attachments {
             let (name, mime, bytes, text) = match db::get_file_full(conn, file_id) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -439,7 +606,7 @@ pub async fn ask(
             // CHG-7 + ADD-22: budget-fitting, question-relevant memories are
             // injected HERE (the always-new user message) rather than the stable
             // system prompt, preserving KV-cache reuse of the system prefix.
-            let chosen = select_memories(&memories, &question, MAX_MEMORY_INJECT_CHARS);
+            let chosen = select_memories(&memories, question, MAX_MEMORY_INJECT_CHARS);
             if !chosen.is_empty() {
                 user_content.push_str("Notes to remember for this room:\n");
                 for m in &chosen {
@@ -473,16 +640,16 @@ pub async fn ask(
             ..Default::default()
         });
 
-        db::insert_message(conn, &chat_id, "user", &question, &[], None)?;
+        db::insert_message(conn, chat_id, "user", question, &[], None)?;
 
         // First question names the session.
         let mut title: String = question.chars().take(48).collect();
         if question.chars().count() > 48 {
             title.push('…');
         }
-        db::set_chat_title_if_new(conn, &chat_id, &title)?;
+        db::set_chat_title_if_new(conn, chat_id, &title)?;
 
-        (
+        Ok(QuestionContext {
             explicit_model,
             chat_messages,
             sources,
@@ -492,33 +659,35 @@ pub async fn ask(
             advisors_on,
             advisor_tools_on,
             injected_rowids,
-        )
-    };
+        })
+}
 
-    let models = ollama::list_models().await.unwrap_or_default();
-    let model = explicit_model
-        .clone()
-        .unwrap_or_else(|| best_default(&models));
-    // ADD-29 parity: the selected engine drives the app itself — no silent
-    // reroute to a local model. Current `:cloud` models emit structured tool
-    // calls and honor the `format` grammar (verified on-device), and the
-    // `chat_core` inline-tool-call net (ADD-29) recovers any engine that leaks
-    // calls as text, so a cloud model runs the same tool loop a local one does.
-    // External CLIs (claude-cli/codex-cli) remain a separate subprocess path
-    // handled below.
-
-    // CHG-19: the "where is X?" grounding pass is deferred to AFTER the answer
-    // (nothing in the reply depends on the boxes), so the warm chat model streams
-    // the first token immediately instead of waiting on a vision-model load.
-    let mut effects = ToolEffects::default();
-    // ADD-25: perception tools attach pixels only when the chat model can
-    // read them; otherwise they fall back to a local vision-model description.
-    effects.vision_chat = is_vision_chat_model(&model);
-
-    // Phase 2 (unlocked): answer — through a cloud CLI if selected, or the
-    // local model with full app-control tools. When the user pressed Stop
-    // mid-answer, a raised error is expected — swallow it and save the partial.
-    let run = if is_external_engine(&model) {
+/// Phase 2 (unlocked): produce the answer. This is deliberately the single place
+/// the answer is generated — a cloud CLI (`claude -p`/`codex`) for an external
+/// engine, otherwise the local Python/LangGraph sidecar (the SOLE local engine;
+/// no native fallback). Everything here awaits, so no room lock may be held
+/// across it.
+///
+/// MIGRATION Phase 2b: `_advisors_on`/`_advisor_tools_on`/`_injected_rowids` were
+/// consumed only by the now-deleted native `agent_loop` path; they are kept in the
+/// signature (caller shape unchanged) pending a later plumbing cleanup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_answer(
+    window: &tauri::Window,
+    state: &State<'_, AppState>,
+    model: &str,
+    question: &str,
+    chat_messages: Vec<ollama::ChatMessage>,
+    temperature: Option<f64>,
+    effects: &mut ToolEffects,
+    web_enabled: bool,
+    _advisors_on: bool,
+    _advisor_tools_on: bool,
+    cancel: Arc<AtomicBool>,
+    _injected_rowids: &HashSet<i64>,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    let run = if is_external_engine(model) {
         // CHG-5: a step chip, not fake live text (nothing streams for cloud).
         let _ = window.emit("ask-step", "Asking your cloud AI (content leaves this Mac)");
         // ADD-20: Claude Code gets the room's tools over a per-ask localhost
@@ -526,142 +695,103 @@ pub async fn ask(
         // stays in-process, and the bridge dies when this ask returns.
         let bridge = if model == "claude-cli" {
             use tauri::Manager;
-            crate::room_mcp::start(window.app_handle().clone(), web_enabled, false)
-                .await
-                .ok()
+            crate::room_mcp::start(
+                window.app_handle().clone(),
+                web_enabled,
+                crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: false },
+                None,
+            )
+            .await
+            .ok()
         } else {
             None
         };
         let res =
-            run_external(&model, &chat_messages, Some(cancel.clone()), bridge.as_ref()).await;
+            run_external(model, &chat_messages, Some(cancel.clone()), bridge.as_ref()).await;
         if let Some(b) = &bridge {
             b.stop();
         }
         res
     } else {
-        // ADD-21: resolve installed advisors only for a local answer with the
-        // setting on — the probe is cached, and it's skipped entirely otherwise.
-        let advisors = if advisors_on {
-            detected_externals(&state).await
-        } else {
-            Vec::new()
-        };
-        // Start the per-ask advisor bridge up front (not inside exec_tool, which
-        // would form an async-recursion cycle) when the sub-option is on and a
-        // Claude advisor exists. It gives that advisor the room's tools and is
-        // torn down when the answer completes, whether or not a consult happens.
-        let advisor_bridge = if advisor_tools_on && advisors.iter().any(|a| a == "claude-cli") {
-            use tauri::Manager;
-            crate::room_mcp::start(window.app_handle().clone(), web_enabled, true)
-                .await
-                .ok()
-        } else {
-            None
-        };
-        let res = agent_loop(
-            &window,
-            &state,
-            &model,
-            &question,
-            chat_messages,
+        // MIGRATION Phase 2b: the Python/LangGraph sidecar is the app's SOLE local
+        // AI engine — EVERY local turn routes through `/run`, including the
+        // app-driving/perception turns (the perception tools now hand their
+        // captured pixels back over the MCP bridge as `image` content, see
+        // `crate::room_mcp`). There is NO native Rust LLM fallback: `Unavailable`
+        // (the sidecar failed before any tool ran) surfaces a clear error rather
+        // than a silent native path; `Failed` (a tool already committed) keeps the
+        // partial so the committed side-effect stays visible. Neither re-runs.
+        use crate::sidecar::SidecarOutcome;
+        match crate::sidecar::run_via_sidecar(
+            window,
+            state,
+            model,
+            question,
+            chat_messages.clone(),
             temperature,
-            &mut effects,
+            effects,
             web_enabled,
-            &advisors,
-            advisor_bridge.as_ref(),
             cancel.clone(),
-            &injected_rowids,
         )
-        .await;
-        if let Some(b) = &advisor_bridge {
-            b.stop();
-        }
-        res
-    };
-    let stopped = cancel.load(Ordering::SeqCst);
-    let answer = match run {
-        Ok(text) => text,
-        // ADD-7: the child was killed / stream cut on purpose — keep partial.
-        Err(_) if stopped => String::new(),
-        Err(e) => return Err(e),
-    };
-
-    // CHG-19 + CHG-17: run the image-grounding pass now, AFTER the answer, and
-    // ONLY if the model didn't already mark the image via the mark_image tool
-    // (effects.boxes set) and the user didn't stop. This gives fast time-to-
-    // first-token and structurally eliminates the redundant second vision pass
-    // (chat→vision→chat→vision) that the old pre-answer ordering caused on
-    // 16 GB Macs. CHG-18: the trigger now also considers the image's file name.
-    if effects.boxes.is_none() && !stopped {
-        if let Some((img_id, img_name, img_bytes, w, h)) = &first_image {
-            if is_locate_intent(&question, Some(img_name)) {
-                let mut vmodel = vision_model(&models, &model);
-                if is_external_engine(&vmodel) {
-                    vmodel = best_default(&models);
+        .await
+        {
+            SidecarOutcome::Done(text) => Ok(text),
+            SidecarOutcome::Failed { text, error } => {
+                // A tool already committed a side-effect this turn (the write/
+                // annotation is now in the room and its effects are merged into
+                // `effects`). Returning `Err` here would make `ask`'s `?` discard
+                // BOTH the merged viewer effects and the assistant reply — the
+                // file would change on disk with no transcript entry and no viewer
+                // refresh. Instead return the partial as a normal answer with an
+                // in-transcript failure note, so `ask` persists the reply + effects
+                // and the viewer updates. We must NOT fall back to the native loop
+                // (that would re-run the committed tool and double it).
+                let mut out = text;
+                if !out.trim().is_empty() {
+                    out.push_str("\n\n");
                 }
-                if !models.is_empty() && !is_external_engine(&vmodel) {
-                    let messages = vec![ollama::ChatMessage {
-                        role: "user".into(),
-                        content: grounding_prompt(&question, *w, *h),
-                        images: Some(vec![
-                            base64::engine::general_purpose::STANDARD.encode(img_bytes),
-                        ]),
-                        ..Default::default()
-                    }];
-                    // HLT-5: short keep_alive for this vision pass on low-RAM Macs.
-                    let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &model);
-                    if let Ok(raw) =
-                        ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &boxes_schema())
-                            .await
-                    {
-                        let boxes = parse_boxes(&raw, *w, *h);
-                        if !boxes.is_empty() {
-                            effects.boxes = Some(serde_json::json!({
-                                "fileId": img_id,
-                                "name": img_name,
-                                "boxes": boxes,
-                            }));
-                            let _ = window.emit("ask-step", "Marked the image");
-                        }
-                    }
-                }
+                out.push_str(&format!(
+                    "*(The agent hit an error and stopped mid-run: {error}. Any change \
+                     shown here was already applied.)*"
+                ));
+                Ok(out)
+            }
+            SidecarOutcome::Unavailable(reason) => {
+                // MIGRATION (no fallback): the Python sidecar is the app's SOLE
+                // local AI engine. When it can't start/connect before any tool ran,
+                // we surface a clear error — there is NO native Rust LLM path to
+                // drop to (the native `agent_loop` is deleted). Log the underlying
+                // reason so a broken Python install is debuggable.
+                eprintln!("agent sidecar unavailable: {reason}");
+                Err("AI engine unavailable — the agent sidecar could not start.".to_string())
             }
         }
+    };
+    // When the user pressed Stop mid-answer, a raised error is expected —
+    // swallow it and keep the partial (ADD-7).
+    let stopped = cancel.load(Ordering::SeqCst);
+    match run {
+        Ok(text) => Ok(text),
+        Err(_) if stopped => Ok(String::new()),
+        Err(e) => Err(e),
     }
+}
 
-    let mut content = answer;
-    // CHG-10: deterministic anti-fabrication gate. The prompt asks the model
-    // never to claim a change it didn't make; here the runtime KNOWS whether a
-    // write/highlight actually happened this turn (effects), so append a plain
-    // correction when the local answer claims one that didn't. Local path only
-    // (cloud has no tool effects) and never over a stopped partial.
-    if !is_external_engine(&model) && !stopped {
-        let highlighted = effects.annotation.is_some() || effects.boxes.is_some();
-        if claims_unbacked_action(&content, effects.wrote, highlighted) {
-            content.push_str(
-                "\n\n*(Correction: no file was actually changed this turn — the edit tool did \
-                 not run or failed.)*",
-            );
-        }
-    }
-    // ADD-7: mark the transcript so it matches what the user watched.
-    if stopped {
-        content.push_str(" *(stopped)*");
-    }
-    // ADD-23: viewer effects ride the message's own `effects` column as
-    // structured data — the visible answer stays plain prose. (Fenced
-    // ```boxes/```annotation blocks in old rooms are still parsed by the UI
-    // as a legacy fallback.)
-    let effects_value = effects_json(&effects);
-
-    // Phase 3 (locked): save the assistant reply. HLT-7: if the room was
-    // locked mid-answer it is already closed — return quietly with the
-    // (unsaved) content instead of surfacing "No room is open" to the UI.
+/// Phase 3 (locked): save the assistant reply. HLT-7: if the room was locked
+/// mid-answer it is already closed — return quietly with the (unsaved) content
+/// instead of surfacing "No room is open" to the UI.
+pub(crate) fn persist_assistant_reply(
+    state: &State<'_, AppState>,
+    chat_id: &str,
+    content: String,
+    sources: Vec<String>,
+    effects_value: Option<serde_json::Value>,
+) -> Result<Message, String> {
     let guard = state.room.lock().unwrap();
     match guard.as_ref() {
         Some(room) => db::insert_message(
             &room.conn,
-            &chat_id,
+            chat_id,
             "assistant",
             &content,
             &sources,
@@ -729,21 +859,6 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "job_status",
 ];
 
-/// ADD-22: the file-MUTATING built-ins. A small model picks the right tool far
-/// more reliably from a short, relevant list (RAG-MCP / tool-filtering research),
-/// so these are withheld on a plain informational turn and only offered when the
-/// question sounds like it wants a change. Read/show tools (list/search/open/
-/// annotate/mark) are always offered.
-pub(crate) const WRITE_TOOL_NAMES: &[&str] = &[
-    "create_file",
-    "edit_file",
-    "write_file",
-    "set_cells",
-    "rename_file",
-    "move_file",
-    "add_memory",
-];
-
 /// Keyword router deciding whether to offer the write tools this turn. Erring
 /// toward YES is safe (it just restores the fuller catalog); the win is the
 /// large class of pure questions ("what does the contract say about X") that
@@ -760,6 +875,15 @@ pub(crate) fn wants_write_tools(question: &str) -> bool {
     HINTS.iter().any(|h| q.contains(h))
 }
 
+/// "open the Room Map" / "switch to the Detail tab" / "generate flashcards"
+/// matched none of the base UI hints, so ui_act was never offered and the agent
+/// couldn't drive the app at all. App surfaces and navigation verbs:
+const APP_NAVIGATION_VERBS: &[&str] = &[
+    "open ", "show me", "go to", "switch", "close ", "map", "panel", "tab",
+    "studio", "flashcard", "mind map", "mindmap", "podcast", "front page",
+    "dashboard", "play", "pause", "image", "photo", "picture",
+];
+
 /// ADD-25: keyword router for the UI/perception tools (ui_snapshot, ui_act,
 /// view_screenshot, view_media_frame). Same doctrine as wants_write_tools:
 /// deterministic, errs toward YES, and keeps the plain-question catalog short
@@ -771,14 +895,8 @@ pub(crate) fn wants_ui_tools(question: &str) -> bool {
         "menu", "sidebar", "watch", "frame", "video", "look at", "looking at",
         "interface", "use the app", "the app", "type in", "toggle", "what do you see",
         "what am i", "on screen",
-        // "open the Room Map" / "switch to the Detail tab" / "generate flashcards"
-        // matched none of the above, so ui_act was never offered and the agent
-        // couldn't drive the app at all. App surfaces and navigation verbs:
-        "open ", "show me", "go to", "switch", "close ", "map", "panel", "tab",
-        "studio", "flashcard", "mind map", "mindmap", "podcast", "front page",
-        "dashboard", "play", "pause", "image", "photo", "picture",
     ];
-    HINTS.iter().any(|h| q.contains(h))
+    HINTS.iter().any(|h| q.contains(h)) || APP_NAVIGATION_VERBS.iter().any(|h| q.contains(h))
 }
 
 /// ADD-32: keyword router for the whole-file pass tools (start_file_pass,
@@ -816,20 +934,6 @@ pub(crate) fn job_tools_specs() -> Vec<serde_json::Value> {
             "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along.",
             "parameters": {"type": "object", "properties": {}}}}),
     ]
-}
-
-/// The lane label shown to the user (transparency: they see how the app framed
-/// their request, so an odd answer is explainable). Purely cosmetic.
-pub(crate) fn lane_label(question: &str, web_enabled: bool) -> &'static str {
-    if wants_ui_tools(question) {
-        "Using the app"
-    } else if wants_write_tools(question) {
-        "Working on your files"
-    } else if web_enabled {
-        "Answering (web available)"
-    } else {
-        "Answering"
-    }
 }
 
 /// Tools the local model can use to drive the app. The web tools appear
@@ -933,37 +1037,6 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
         ));
     }
     tools
-}
-
-/// ADD-21: the `consult_advisor` tool spec, built from the advisors actually
-/// installed on this Mac so the `advisor` enum only ever offers a real choice.
-///
-/// Deliberately NOT part of `tools_catalog`: the room MCP bridge is built from
-/// `tools_catalog`, so keeping this tool out of it means a consulted cloud CLI
-/// can never be handed a tool that spawns another cloud CLI. The recursion
-/// guard is structural, not a runtime filter that could be forgotten.
-pub(crate) fn consult_advisor_spec(advisors: &[String]) -> serde_json::Value {
-    let mut names: Vec<&str> = Vec::new();
-    if advisors.iter().any(|a| a == "claude-cli") {
-        names.push("claude");
-    }
-    if advisors.iter().any(|a| a == "codex-cli") {
-        names.push("codex");
-    }
-    serde_json::json!({"type": "function", "function": {
-        "name": "consult_advisor",
-        "description": "Delegate ONE hard, self-contained subtask to a powerful cloud AI advisor \
-            (Claude or Codex) — deep research, complex reasoning, or difficult code you cannot do \
-            well yourself. It is SLOW (up to a few minutes) and the text you send LEAVES this Mac \
-            via the user's own cloud account, so use it rarely and only as a genuine last resort, \
-            not for things you can answer directly. The advisor sees nothing but your `question` — \
-            not the room, not this conversation — so put the FULL task and ALL needed context into \
-            it. Returns the advisor's written answer for you to use in your reply.",
-        "parameters": {"type": "object", "properties": {
-            "question": {"type": "string", "description": "The complete, self-contained task or question, including every piece of context the advisor needs. It cannot see the room or the chat."},
-            "advisor": {"type": "string", "enum": names, "description": "Which cloud advisor to ask. Use \"codex\" for heavy coding; \"claude\" otherwise."}
-        }, "required": ["question"]}
-    }})
 }
 
 /// ADD-25: the UI/perception tool specs. Deliberately NOT part of
@@ -1112,7 +1185,7 @@ pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<Str
 
 /// Viewer payloads produced by tools during a turn; persisted on the saved
 /// assistant message's `effects` column (ADD-23).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ToolEffects {
     pub(crate) boxes: Option<serde_json::Value>,
     pub(crate) annotation: Option<serde_json::Value>,
@@ -1133,350 +1206,6 @@ pub(crate) struct ToolEffects {
     /// caller from `is_vision_chat_model`; when false the perception tools
     /// return a local vision-model description instead of attaching pixels.
     pub(crate) vision_chat: bool,
-}
-
-/// CHG-4/CHG-30: keep the running message list within a char budget so many
-/// tool rounds can't silently overflow num_ctx (Ollama then drops the user's
-/// question and earliest tool results). Stubs the content of older tool-role
-/// messages (oldest first), preserving the system message, the user question,
-/// every assistant tool_calls message (role pairing), and the most recent
-/// results. Pure and testable.
-pub(crate) fn trim_messages_to_budget(messages: &mut [ollama::ChatMessage], tools_chars: usize) {
-    let msg_len = |m: &ollama::ChatMessage| {
-        m.content.len() + m.tool_calls.as_ref().map_or(0, |t| t.to_string().len())
-    };
-    let total: usize = tools_chars + messages.iter().map(msg_len).sum::<usize>();
-    if total <= CTX_CHAR_BUDGET {
-        return;
-    }
-    let mut over = total - CTX_CHAR_BUDGET;
-    // Never stub the most recent 4 messages (≈ the last round or two), nor the
-    // system message at index 0.
-    let keep_from = messages.len().saturating_sub(4);
-    for m in messages.iter_mut().take(keep_from).skip(1) {
-        if over == 0 {
-            break;
-        }
-        if m.role == "tool" && m.content.len() > 80 {
-            let label = m.tool_name.clone().unwrap_or_else(|| "tool".into());
-            let stub = format!("[{label} result trimmed to fit context — already used above]");
-            let saved = m.content.len().saturating_sub(stub.len());
-            m.content = stub;
-            over = over.saturating_sub(saved);
-        }
-    }
-}
-
-/// CHG-5: map a tool name to a short human label shown as a step chip while
-/// the answer streams (replaces the old inline "⚙ name…" text).
-pub(crate) fn tool_step_label(name: &str) -> String {
-    match name {
-        "list_room_files" => "Listed the room's files",
-        "search_room" => "Searched the room",
-        "open_file" => "Opened a file",
-        "mark_image" => "Marked an image",
-        "annotate_file" => "Highlighted a passage",
-        "create_file" => "Created a file",
-        "edit_file" => "Edited a file",
-        "write_file" => "Rewrote a file",
-        "set_cells" => "Updated spreadsheet cells",
-        "rename_file" => "Renamed a file",
-        "move_file" => "Moved a file",
-        "add_memory" => "Saved a memory",
-        "web_search" => "Searched the web",
-        "fetch_page" => "Fetched a page",
-        // ADD-25: the agent is operating the app with the user watching.
-        "ui_snapshot" => "Looked at the app's controls",
-        "ui_act" => "Operated the app",
-        "view_screenshot" => "Looked at the screen",
-        "view_media_frame" => "Looked at a video frame",
-        // ADD-32: the whole-file pass — durable background reading.
-        "start_file_pass" => "Started a whole-file pass",
-        "job_status" => "Checked the background jobs",
-        // ADD-21: name the exfiltration plainly — the local model just chose to
-        // send a subtask to the cloud.
-        "consult_advisor" => "Consulting a cloud advisor (content leaves this Mac)",
-        // Connected MCP tools are namespaced server_tool.
-        _ => return format!("Ran the {name} tool"),
-    }
-    .to_string()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn agent_loop(
-    window: &tauri::Window,
-    state: &State<'_, AppState>,
-    model: &str,
-    // ADD-22: the raw user question, used by the deterministic tool-subset router
-    // (not the model) to decide which built-in tools to offer this turn.
-    question: &str,
-    mut messages: Vec<ollama::ChatMessage>,
-    temperature: Option<f64>,
-    effects: &mut ToolEffects,
-    web_enabled: bool,
-    // ADD-21: cloud CLIs the model may consult as advisors this turn (empty
-    // when the advanced setting is off or none are installed). Injected here,
-    // never into `tools_catalog`, so it never reaches the room bridge.
-    advisors: &[String],
-    // ADD-21: per-ask bridge giving a Claude advisor the room's tools (when the
-    // sub-option is on); None otherwise.
-    advisor_bridge: Option<&crate::room_mcp::Bridge>,
-    cancel: Arc<AtomicBool>,
-    injected_rowids: &HashSet<i64>,
-) -> Result<String, String> {
-    use tauri::Emitter;
-    // ADD-22: let the user see which lane the deterministic router chose, so an
-    // odd answer is explainable ("oh, it thought I wanted an edit").
-    let _ = window.emit("ask-lane", lane_label(question, web_enabled));
-    let mut tools = tools_catalog(web_enabled);
-    // ADD-22: deterministic tool-subset router — withhold the file-mutating
-    // tools on a plain informational turn so the small model chooses from a
-    // short list. MCP + advisor tools are added afterward and never filtered
-    // (the user connected those explicitly).
-    if !wants_write_tools(question) {
-        if let Some(arr) = tools.as_array_mut() {
-            arr.retain(|t| {
-                let name = t["function"]["name"].as_str().unwrap_or("");
-                !WRITE_TOOL_NAMES.contains(&name)
-            });
-        }
-    }
-    let (routes, omitted_mcp) = mcp_routes(state);
-    // ADD-25: UI/perception tools ride the same injection path as the advisor
-    // spec — never `tools_catalog`, so the room bridge can't hand a cloud
-    // client the user's screen. Offered only when the deterministic router
-    // hears an operate-the-app intent, keeping plain-question catalogs short.
-    let ui_enabled = wants_ui_tools(question);
-    // ADD-32: the whole-file pass tools ride the same injection path — never
-    // `tools_catalog`, so the room bridge can't hand them to a cloud client.
-    let jobs_enabled = wants_job_tools(question);
-    if let Some(arr) = tools.as_array_mut() {
-        for r in &routes {
-            arr.push(r.spec.clone());
-        }
-        if !advisors.is_empty() {
-            arr.push(consult_advisor_spec(advisors));
-        }
-        if ui_enabled {
-            arr.extend(ui_tools_specs());
-        }
-        if jobs_enabled {
-            arr.extend(job_tools_specs());
-        }
-    }
-    if jobs_enabled {
-        if let Some(sys) = messages.first_mut() {
-            if sys.role == "system" {
-                sys.content.push_str(
-                    "\n\nFor work that must cover an ENTIRE file — summarize/analyze/translate \
-                     all of it, however large — do NOT try to read it through search_room \
-                     excerpts. Call start_file_pass instead: it reads every part of the file in \
-                     a durable background job and saves the result as a new file in the room. \
-                     Then tell the user it is underway (they see a live progress card) and do \
-                     not wait for it. job_status reports how background jobs are doing.",
-                );
-            }
-        }
-    }
-    if ui_enabled {
-        if let Some(sys) = messages.first_mut() {
-            if sys.role == "system" {
-                sys.content.push_str(
-                    "\n\nYou can also OPERATE this app's own interface, with the user watching: \
-                     ui_snapshot lists every visible control as numbered marks; ui_act clicks, \
-                     types into, or scrolls one mark. view_screenshot attaches what the user \
-                     currently sees; view_media_frame grabs a video frame at a timestamp. Take a \
-                     fresh ui_snapshot before each ui_act. Privacy/consent controls (Settings, \
-                     approval dialogs) are excluded and will refuse. Prefer answering directly — \
-                     drive the interface only when the user asked you to do something in the app. \
-                     Know the app's surfaces by name: the \"Room Map\" is the Map toggle in the \
-                     Files header (a constellation view of the files); the \"Memory panel\" lists \
-                     remembered facts in the sidebar; the \"Front Page\" dashboard has Studio \
-                     buttons (Flashcards, Mind map, Podcast script) and AI actions; file viewers \
-                     have their own tabs and a History button. When the user names one of these, \
-                     do not ask what they mean — ui_snapshot to find the control, then ui_act it.",
-                );
-            }
-        }
-    }
-    // ADD-21: tell the model the advisor exists and that it is a last resort —
-    // the tool description says the same, but the system prompt sets the bar.
-    if !advisors.is_empty() {
-        if let Some(sys) = messages.first_mut() {
-            if sys.role == "system" {
-                sys.content.push_str(
-                    "\n\nYou also have consult_advisor: a powerful CLOUD AI (Claude or Codex) you \
-                     can delegate ONE genuinely hard subtask to — deep research or complex \
-                     reasoning/coding beyond your own ability. It is slow and its input leaves this \
-                     Mac, so use it only as a last resort, never for something you can answer \
-                     yourself, and at most once. Put the whole self-contained task in `question`.",
-                );
-            }
-        }
-    }
-    // CHG-29: tell the model which connected tools were dropped for space so it
-    // doesn't try to call them.
-    if !omitted_mcp.is_empty() {
-        if let Some(sys) = messages.first_mut() {
-            if sys.role == "system" {
-                sys.content.push_str(&format!(
-                    "\n\nSome connected tools were omitted to save memory: {}.",
-                    omitted_mcp.join(", ")
-                ));
-            }
-        }
-    }
-    // Tool-driven flows chain many calls — web (search → fetch → answer),
-    // consult → synthesize, and especially a UI/agent sweep (snapshot → act →
-    // re-snapshot, repeated across a whole feature pass, ADD-25). Rather than a
-    // tight budget that cuts an agent off mid-task, the tool-enabled loop runs
-    // until the model stops calling tools; the loop already self-terminates via
-    // duplicate-call detection + forced synthesis + Stop. MAX_TOOL_ROUNDS is
-    // only a runaway backstop set far above any real run. The plain no-tool chat
-    // path needs just a couple of rounds.
-    let max_rounds =
-        if routes.is_empty() && !web_enabled && advisors.is_empty() && !ui_enabled && !jobs_enabled {
-            4
-        } else {
-            MAX_TOOL_ROUNDS
-        };
-    // CHG-32: an empty catalog keeps num_ctx at 12288 (tools.is_some()) while
-    // forbidding further tool calls — forces a grounded text answer on the
-    // final round instead of letting side-effect tools run unread.
-    let no_tools = serde_json::json!([]);
-    let tools_chars = tools.to_string().len();
-    // CHG-3: remember (name, args) of successful calls to skip exact repeats.
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    // CHG-3/CHG-32: force a tool-less synthesis round after an all-duplicate
-    // round (the model is looping) rather than burning the budget on repeats.
-    let mut force_synthesis = false;
-    let mut final_text = String::new();
-    for round in 0..max_rounds {
-        // ADD-7: stop between rounds too.
-        if cancel.load(Ordering::SeqCst) {
-            break;
-        }
-        // CHG-0/CHG-32: the final round (and any forced synthesis) is tool-less
-        // so the loop always ends with a text answer grounded in prior results.
-        let last = round + 1 == max_rounds || force_synthesis;
-        // CHG-4/CHG-30: keep the running context within budget before sending.
-        trim_messages_to_budget(&mut messages, tools_chars);
-        // CHG-5: a fresh model round begins — frontend clears its live text so
-        // the visible stream always equals only the current round's words.
-        let _ = window.emit("ask-round", ());
-        let offered = if last { &no_tools } else { &tools };
-        let (content, calls) = ollama::chat_stream_tools(
-            model,
-            messages.clone(),
-            Some(offered),
-            temperature,
-            Some(cancel.clone()),
-            // HLT-5: the chat model stays warm throughout the conversation.
-            KEEP_ALIVE_WARM,
-            |d| {
-                let _ = window.emit("ask-delta", d);
-            },
-        )
-        .await?;
-        if calls.is_empty() || cancel.load(Ordering::SeqCst) || last {
-            final_text = content;
-            break;
-        }
-        let raw_calls: Vec<serde_json::Value> = calls.iter().map(|c| c.raw.clone()).collect();
-        messages.push(ollama::ChatMessage {
-            role: "assistant".into(),
-            content: content.clone(),
-            tool_calls: Some(serde_json::json!(raw_calls)),
-            ..Default::default()
-        });
-        // Penultimate round: nudge the small model to wrap up next turn.
-        let near_budget = round + 2 >= max_rounds;
-        let mut all_dup = true;
-        for call in &calls {
-            // ADD-7: stop between tool calls.
-            if cancel.load(Ordering::SeqCst) {
-                break;
-            }
-            let key = (call.name.clone(), call.arguments.to_string());
-            if seen.contains(&key) {
-                // CHG-3: don't re-run an identical call or re-flood context.
-                messages.push(ollama::ChatMessage {
-                    role: "tool".into(),
-                    content: format!(
-                        "Duplicate call: you already ran {} with these exact arguments this \
-                         turn; the result is above. Use it, or call with different arguments.",
-                        call.name
-                    ),
-                    tool_name: Some(call.name.clone()),
-                    ..Default::default()
-                });
-                continue;
-            }
-            all_dup = false;
-            // CHG-5: human step label, not inline "⚙ name…" answer text.
-            let _ = window.emit("ask-step", tool_step_label(&call.name));
-            let outcome = exec_tool(
-                state,
-                window,
-                call,
-                effects,
-                &routes,
-                injected_rowids,
-                Some(cancel.clone()),
-                advisor_bridge,
-            )
-            .await;
-            // ADD-22: tell the UI whether this step succeeded, so a failed tool
-            // chip reads as failed instead of looking identical to a success.
-            let _ = window.emit("ask-step-status", serde_json::json!({ "ok": outcome.is_ok() }));
-            // Only remember successful calls, so a failed one may retry once.
-            let mut result = match outcome {
-                Ok(r) => {
-                    seen.insert(key);
-                    r
-                }
-                Err(e) => format!("Tool error: {e}"),
-            };
-            if near_budget {
-                result.push_str(
-                    "\n[Note: tool budget nearly exhausted — answer the user in your next reply.]",
-                );
-            }
-            messages.push(ollama::ChatMessage {
-                role: "tool".into(),
-                content: result,
-                tool_name: Some(call.name.clone()),
-                ..Default::default()
-            });
-            // ADD-25: a perception tool captured pixels this call — hand them
-            // to the (vision-capable) chat model as a user message right after
-            // the tool result, so it looks at what it just captured. Ollama
-            // reads images from user turns, not tool turns.
-            if !effects.pending_images.is_empty() {
-                let imgs: Vec<String> = effects.pending_images.drain(..).collect();
-                messages.push(ollama::ChatMessage {
-                    role: "user".into(),
-                    content: "[The capture you requested is attached. Look at it, then \
-                              continue — answer the user or take the next action.]"
-                        .into(),
-                    images: Some(imgs),
-                    ..Default::default()
-                });
-            }
-        }
-        // A round of only repeats means the model is stuck; force a tool-less
-        // synthesis next round instead of looping to the budget.
-        if all_dup {
-            force_synthesis = true;
-        }
-        final_text = content;
-    }
-    // Don't invent "Done." over a partial answer the user stopped. After the
-    // tool-less final round this is a genuine dead-path net, not the outcome.
-    if final_text.trim().is_empty() && !cancel.load(Ordering::SeqCst) {
-        final_text = "Done.".into();
-    }
-    Ok(final_text)
 }
 
 pub(crate) async fn exec_tool(
@@ -1762,12 +1491,7 @@ pub(crate) async fn exec_tool(
             if updates.is_empty() {
                 return Err("No cells given — pass updates: [{cell, value}, …].".into());
             }
-            // Validate every cell up front so a bad reference fails before any write.
-            for (cell, _) in &updates {
-                if parse_a1(cell).is_none() {
-                    return Err(format!("\"{cell}\" is not a cell — use A1 notation like B7."));
-                }
-            }
+            validate_cell_refs(&updates)?;
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
             let (id, real_name) = db::find_file_like(&room.conn, name)?;
@@ -2046,7 +1770,7 @@ pub(crate) async fn exec_tool(
             // HLT-5: short keep_alive on low-RAM machines when vision != chat.
             let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &chat_model);
             let raw =
-                ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &boxes_schema()).await?;
+                ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &boxes_schema(), Default::default()).await?;
             let boxes = parse_boxes(&raw, w, h);
             if boxes.is_empty() {
                 return Ok(format!("Could not locate \"{find}\" in {real_name}."));
@@ -2376,7 +2100,7 @@ pub(crate) async fn perceive_image(
     // The describe pass may load a second model; release it quickly on
     // low-RAM Macs (chat model unknown here, so "" never matches == warm).
     let keep = vision_keep_alive(total_ram_bytes(), &vmodel, "");
-    let raw = ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &schema).await?;
+    let raw = ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &schema, Default::default()).await?;
     let desc = serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
         .and_then(|v| v["description"].as_str().map(str::to_string))
@@ -2645,15 +2369,6 @@ mod tests {
         // A curly-quote string clipped mid-window is fine.
         let s = "“smart quotes” ".repeat(100);
         let _ = excerpt(&s, "missing", 800);
-    }
-
-    #[test]
-    fn tool_step_labels_are_human_friendly() {
-        assert_eq!(tool_step_label("search_room"), "Searched the room");
-        assert_eq!(tool_step_label("fetch_page"), "Fetched a page");
-        assert_eq!(tool_step_label("open_file"), "Opened a file");
-        // Unknown / MCP tools fall back to naming the tool, never panic.
-        assert_eq!(tool_step_label("weather_lookup"), "Ran the weather_lookup tool");
     }
 
     #[test]

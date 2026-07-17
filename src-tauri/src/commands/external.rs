@@ -39,19 +39,6 @@ pub(crate) fn detect_external_blocking() -> Vec<String> {
     found
 }
 
-/// ADD-21: cloud CLIs on this Mac, cached. Gates the advisor tool without
-/// paying the interactive-shell probe on every ask. `ai_status` refreshes it.
-pub(crate) async fn detected_externals(state: &State<'_, AppState>) -> Vec<String> {
-    if let Some(hit) = state.external_cache.lock().unwrap().clone() {
-        return hit;
-    }
-    let found = tauri::async_runtime::spawn_blocking(detect_external_blocking)
-        .await
-        .unwrap_or_default();
-    *state.external_cache.lock().unwrap() = Some(found.clone());
-    found
-}
-
 /// ADD-10: is Ollama installed on this Mac at all? Distinct from "running".
 /// Matches the interactive-login-shell PATH trick used for the cloud CLIs.
 pub(crate) fn ollama_installed_blocking() -> bool {

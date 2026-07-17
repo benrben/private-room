@@ -260,15 +260,16 @@ pub(crate) async fn generate_studio_html(
             format!("{instr}\n\nBuild it only from this material about \"{label}\":\n\n{text}"),
         ),
     ];
-    let raw = ollama::chat_structured_cancel(
-        model, messages, Some(0.4), KEEP_ALIVE_WARM, &schema, cancel,
+    let raw = ollama::chat_structured(
+        model,
+        messages,
+        Some(0.4),
+        KEEP_ALIVE_WARM,
+        &schema,
+        ollama::StructuredOpts::default().with_cancel(cancel),
     )
     .await?;
-    let html = serde_json::from_str::<serde_json::Value>(raw.trim())
-        .ok()
-        .and_then(|v| v.get("html").and_then(|s| s.as_str()).map(str::to_string))
-        .unwrap_or_default();
-    Ok(clean_studio_html(html))
+    Ok(clean_studio_html(json_str_field(&raw, "html").unwrap_or_default()))
 }
 
 /// Normalize model-authored HTML; return `None` if it isn't a real HTML page (so
@@ -301,6 +302,115 @@ pub(crate) fn clean_studio_html(html: String) -> Option<String> {
         );
     }
     Some(h)
+}
+
+// ---- the shared studio pipeline ---------------------------------------------
+
+/// The per-artifact differences between the Studio generators (flashcards, mind
+/// map, podcast script). Everything else — cancel wiring, room-locked text
+/// gathering, model resolution, the HTML-authoring primary path, the JSON
+/// fallback, and save/open — is identical and lives in `run_studio`.
+pub(crate) struct StudioSpec {
+    /// Default editable instruction used when the caller supplies none.
+    pub(crate) default_prompt: &'static str,
+    /// System prompt for the HTML-authoring primary path.
+    pub(crate) page_role: &'static str,
+    /// Leading clause of the "…is writing" step chip (the suffix is shared).
+    pub(crate) working_label: &'static str,
+    /// Optional step chip shown just before the JSON fallback runs.
+    pub(crate) fallback_step: Option<&'static str>,
+    /// JSON-fallback schema.
+    pub(crate) fallback_schema: serde_json::Value,
+    /// JSON-fallback system prompt.
+    pub(crate) fallback_system: &'static str,
+    /// JSON-fallback grounding clause, formatted as `{intro} "{label}"`.
+    pub(crate) fallback_intro: &'static str,
+    /// JSON-fallback sampling temperature.
+    pub(crate) fallback_temp: f64,
+    /// Parse the fallback JSON and render the built-in template, or Err when the
+    /// model returned nothing usable. Args: (raw JSON, scope label).
+    pub(crate) render: fn(&str, &str) -> Result<String, String>,
+    /// Output filename prefix, e.g. "Flashcards".
+    pub(crate) filename_prefix: &'static str,
+}
+
+/// The one Studio pipeline shared by flashcards, mind map and podcast script:
+/// register the Stop flag, gather the scope's text under the room lock, resolve a
+/// structured model, ask it to author a whole interactive HTML page, and — only
+/// if that isn't usable HTML — fall back to a structured extraction rendered by
+/// the artifact's built-in template. `spec` carries the only differences.
+pub(crate) async fn run_studio(
+    window: &tauri::Window,
+    state: &State<'_, AppState>,
+    spec: StudioSpec,
+    scope: Option<String>,
+    instructions: Option<String>,
+    refs: Option<Vec<String>>,
+    op_id: Option<String>,
+) -> Result<FileMeta, String> {
+    use tauri::Emitter;
+    // ADD-31: a cancellable operation with visible stages. The flag is
+    // registered under the caller's op id (same registry the chat Stop uses),
+    // so the modal's Stop button works mid-generation.
+    let cancel = register_studio_cancel(state, &op_id);
+    let _cancel_guard = op_id.as_ref().map(|id| CancelGuard {
+        state: state.inner(),
+        ask_id: id.clone(),
+    });
+    let instr = studio_instruction(instructions, spec.default_prompt);
+    let _ = window.emit("studio-step", "Reading the material…");
+    let (label, text) = state.with_room(|room| {
+        match refs.as_ref().filter(|r| !r.is_empty()) {
+            Some(ids) => gather_files_text(&room.conn, ids),
+            None => gather_scope_text(&room.conn, scope.as_deref(), &room.name),
+        }
+    })?;
+    let model = resolve_structured_model(state)
+        .await
+        .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
+    let _ = window.emit(
+        "studio-step",
+        if is_cloud_model(&model) {
+            format!("{} — the cloud model is writing…", spec.working_label)
+        } else {
+            format!("{} — a local model can take a few minutes…", spec.working_label)
+        },
+    );
+    let content = match generate_studio_html(&model, spec.page_role, &instr, &label, &text, cancel.clone())
+        .await?
+    {
+        Some(html) if !cancel.load(Ordering::SeqCst) => html,
+        _ if cancel.load(Ordering::SeqCst) => return Err("Stopped.".into()),
+        _ => {
+            if let Some(step) = spec.fallback_step {
+                let _ = window.emit("studio-step", step);
+            }
+            // Fallback: extract the structured artifact and render the built-in
+            // template (so the caller never hard-fails on unusable HTML).
+            let messages = vec![
+                ollama::ChatMessage::new("system", spec.fallback_system),
+                ollama::ChatMessage::new(
+                    "user",
+                    format!("{instr}\n\n{} \"{label}\":\n\n{text}", spec.fallback_intro),
+                ),
+            ];
+            let raw = ollama::chat_structured(
+                &model,
+                messages,
+                Some(spec.fallback_temp),
+                KEEP_ALIVE_WARM,
+                &spec.fallback_schema,
+                ollama::StructuredOpts::default().with_cancel(cancel.clone()),
+            )
+            .await?;
+            if cancel.load(Ordering::SeqCst) {
+                return Err("Stopped.".into());
+            }
+            (spec.render)(&raw, &label)?
+        }
+    };
+    let name = format!("{} - {}.html", spec.filename_prefix, safe_scope_name(&label));
+    save_and_open(window, state, &name, "text/html", &content, "generated")
 }
 
 // ---- AI actions -------------------------------------------------------------

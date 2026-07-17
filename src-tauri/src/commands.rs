@@ -27,6 +27,7 @@ mod retrieval;
 mod agent;
 mod chat_commands;
 mod docs_html;
+mod json;
 mod summarize;
 mod studios;
 mod moonshot;
@@ -54,6 +55,7 @@ pub(crate) use retrieval::*;
 pub use agent::*;
 pub use chat_commands::*;
 pub(crate) use docs_html::*;
+pub(crate) use json::*;
 pub use summarize::*;
 pub use studios::*;
 pub use moonshot::*;
@@ -85,9 +87,6 @@ pub(crate) const MAX_MEMORY_CONTENT_CHARS: usize = 500;
 /// External tool results (web pages, search results) can be huge; clamp
 /// them so a few rounds still fit the context window.
 pub(crate) const MAX_TOOL_RESULT_CHARS: usize = 4000;
-/// Cumulative context budget for the agent loop (chars): ~9K tokens of the
-/// 12,288-token num_ctx, leaving room for the tool catalog and generation.
-pub(crate) const CTX_CHAR_BUDGET: usize = 36_000;
 /// Keep the tool catalog small enough for an 8-12K context and a 4B model.
 /// A 4B model cannot reliably choose among more than ~12 tools.
 pub(crate) const MAX_MCP_TOOLS: usize = 12;
@@ -97,11 +96,6 @@ pub(crate) const MAX_MCP_CATALOG_CHARS: usize = 8_000;
 /// slow, paid cloud call; one per turn keeps the local loop from flailing into
 /// repeated exfiltration when it could just answer.
 pub(crate) const MAX_ADVISOR_CALLS: u8 = 1;
-/// Runaway backstop for the tool-enabled agent loop (not a working budget): the
-/// loop ends when the model stops calling tools, so this only bounds a
-/// pathological model that never stops. Set far above any real run — an agent /
-/// QA sweep can chain many snapshot → act → verify rounds without being cut off.
-pub(crate) const MAX_TOOL_ROUNDS: usize = 1_000;
 
 pub(crate) const MCP_CONFIG_KEY: &str = "mcp_config";
 /// Shown as the starting config. The web-search entry ships disabled so a
@@ -152,6 +146,28 @@ pub struct AppState {
     /// `cancel_job` flips a flag; the runner sees it between waves, checkpoints,
     /// and parks the job as 'paused'. The entry is removed when the job ends.
     pub job_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl AppState {
+    /// Run `f` with the open room held under the room lock, or return the standard
+    /// `"No room is open."` error. Replaces the two-line
+    /// `let guard = state.room.lock().unwrap(); let room = guard.as_ref().ok_or(...)?;`
+    /// prelude that recurs across the command layer.
+    ///
+    /// The closure is SYNCHRONOUS by design: a `MutexGuard` is not `Send`, so it
+    /// must never be held across an `.await`. This signature makes that a compile
+    /// error rather than a latent bug — exactly the locked/unlocked discipline the
+    /// async `ask`/`summarize`/chat paths already follow by hand. A site that needs
+    /// to await must still lock a short sync section, drop it, then await; it keeps
+    /// its explicit lock rather than using this helper.
+    pub(crate) fn with_room<T>(
+        &self,
+        f: impl FnOnce(&Room) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let guard = self.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        f(room)
+    }
 }
 
 /// The user's answer to a per-call MCP approval prompt.
@@ -368,14 +384,12 @@ pub struct AiStatus {
 /// path without the model, so a broken pipeline is visible immediately.
 #[tauri::command]
 pub async fn web_search_test(state: State<'_, AppState>) -> Result<String, String> {
-    let (provider, endpoint) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        (
+    let (provider, endpoint) = state.with_room(|room| {
+        Ok((
             db::get_setting(&room.conn, "web_provider").unwrap_or_default(),
             db::get_setting(&room.conn, "web_endpoint").unwrap_or_default(),
-        )
-    };
+        ))
+    })?;
     let hits = match provider.as_str() {
         "duckduckgo" | "brave" => web::search_duckduckgo("duckduckgo").await?,
         "searxng" => web::search_searxng(&endpoint, "searxng").await?,

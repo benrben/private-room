@@ -2,9 +2,9 @@ use super::*;
 
 #[tauri::command]
 pub fn mcp_get_config(state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string()))
+    state.with_room(|room| {
+        Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string()))
+    })
 }
 
 #[tauri::command]
@@ -14,11 +14,7 @@ pub fn mcp_apply_config(
     json: String,
 ) -> Result<Vec<mcp::ServerStatus>, String> {
     let servers = mcp::parse_config(&json)?;
-    {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
-    }
+    state.with_room(|room| db::set_setting(&room.conn, MCP_CONFIG_KEY, &json))?;
     // SEC-1: the user just typed and saved this config, which counts as
     // approval — remember its fingerprint so reopening the room won't re-ask.
     add_mcp_approval(&app, &mcp_fingerprint(&json));

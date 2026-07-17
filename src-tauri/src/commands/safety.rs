@@ -6,9 +6,7 @@ pub fn list_file_versions(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<FileVersion>, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::list_file_versions(&room.conn, &id)
+    state.with_room(|room| db::list_file_versions(&room.conn, &id))
 }
 
 /// ADD-2: restore a saved version. Goes back through `store_file_bytes`,
@@ -24,30 +22,30 @@ pub fn restore_file_version(
     version_id: String,
 ) -> Result<(), String> {
     use tauri::Emitter;
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let (file_id, bytes, text, rec_meta) = db::get_version(&room.conn, &version_id)?;
-    // Versions saved before compound snapshots carry no text: re-derive it.
-    let text = text.or_else(|| {
-        let name = db::get_file_name(&room.conn, &file_id).ok()?;
-        extraction::extract_text(&name, &bytes).or_else(|| String::from_utf8(bytes.clone()).ok())
-    });
-    room.conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
-    let restored = store_file_bytes(&room.conn, &file_id, &bytes, text.as_deref(), "Restored")
-        .and_then(|_| match &rec_meta {
-            Some(meta) => db::set_rec_meta(&room.conn, &file_id, meta),
-            None => Ok(()),
+    state.with_room(|room| {
+        let (file_id, bytes, text, rec_meta) = db::get_version(&room.conn, &version_id)?;
+        // Versions saved before compound snapshots carry no text: re-derive it.
+        let text = text.or_else(|| {
+            let name = db::get_file_name(&room.conn, &file_id).ok()?;
+            extraction::extract_text(&name, &bytes).or_else(|| String::from_utf8(bytes.clone()).ok())
         });
-    match restored {
-        Ok(()) => room.conn.execute_batch("COMMIT").map_err(|e| e.to_string())?,
-        Err(e) => {
-            let _ = room.conn.execute_batch("ROLLBACK");
-            return Err(e);
+        room.conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+        let restored = store_file_bytes(&room.conn, &file_id, &bytes, text.as_deref(), "Restored")
+            .and_then(|_| match &rec_meta {
+                Some(meta) => db::set_rec_meta(&room.conn, &file_id, meta),
+                None => Ok(()),
+            });
+        match restored {
+            Ok(()) => room.conn.execute_batch("COMMIT").map_err(|e| e.to_string())?,
+            Err(e) => {
+                let _ = room.conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
-    }
-    let _ = window.emit("room-files-changed", ());
-    let _ = window.emit("file-updated", &file_id);
-    Ok(())
+        let _ = window.emit("room-files-changed", ());
+        let _ = window.emit("file-updated", &file_id);
+        Ok(())
+    })
 }
 
 /// ADD-1: write one file's original bytes out as a normal (unencrypted) file.
@@ -57,12 +55,12 @@ pub fn export_file(
     id: String,
     dest_path: String,
 ) -> Result<(), String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let bytes = db::get_file_bytes(&room.conn, &id)?
-        .ok_or("This file has no stored content to export.")?;
-    std::fs::write(&dest_path, &bytes).map_err(|e| format!("Could not save the file: {e}"))?;
-    Ok(())
+    state.with_room(|room| {
+        let bytes = db::get_file_bytes(&room.conn, &id)?
+            .ok_or("This file has no stored content to export.")?;
+        std::fs::write(&dest_path, &bytes).map_err(|e| format!("Could not save the file: {e}"))?;
+        Ok(())
+    })
 }
 
 /// Choose a destination name inside a folder that will not overwrite anything:
@@ -90,24 +88,24 @@ pub(crate) fn unique_export_name(name: &str, is_taken: impl Fn(&str) -> bool) ->
 /// number written.
 #[tauri::command]
 pub fn export_all(state: State<'_, AppState>, dest_dir: String) -> Result<u32, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let dir = std::path::Path::new(&dest_dir);
-    if !dir.is_dir() {
-        return Err("Choose a folder to export into.".into());
-    }
-    let files = db::list_files(&room.conn)?;
-    let mut written = 0u32;
-    for f in files {
-        let bytes = db::get_file_bytes(&room.conn, &f.id)?.unwrap_or_default();
-        // Files written earlier this run land on disk, so the existence check
-        // also dedups same-named files against each other.
-        let name = unique_export_name(&f.name, |candidate| dir.join(candidate).exists());
-        std::fs::write(dir.join(&name), &bytes)
-            .map_err(|e| format!("Could not write \"{name}\": {e}"))?;
-        written += 1;
-    }
-    Ok(written)
+    state.with_room(|room| {
+        let dir = std::path::Path::new(&dest_dir);
+        if !dir.is_dir() {
+            return Err("Choose a folder to export into.".into());
+        }
+        let files = db::list_files(&room.conn)?;
+        let mut written = 0u32;
+        for f in files {
+            let bytes = db::get_file_bytes(&room.conn, &f.id)?.unwrap_or_default();
+            // Files written earlier this run land on disk, so the existence check
+            // also dedups same-named files against each other.
+            let name = unique_export_name(&f.name, |candidate| dir.join(candidate).exists());
+            std::fs::write(dir.join(&name), &bytes)
+                .map_err(|e| format!("Could not write \"{name}\": {e}"))?;
+            written += 1;
+        }
+        Ok(written)
+    })
 }
 
 /// SEC-4: rotate the room's password. Verifies `current` on a second throwaway
@@ -174,30 +172,30 @@ pub fn duplicate_room(
     if std::path::Path::new(&dest_path).exists() {
         return Err("A file already exists at that location.".into());
     }
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::vacuum_into(&room.conn, &dest_path)?;
-    if let Some(pw) = new_password {
-        if let Err(e) = db::rekey_copy(&dest_path, &room.password, &pw) {
-            let _ = std::fs::remove_file(&dest_path);
-            return Err(e);
+    state.with_room(|room| {
+        db::vacuum_into(&room.conn, &dest_path)?;
+        if let Some(pw) = new_password {
+            if let Err(e) = db::rekey_copy(&dest_path, &room.password, &pw) {
+                let _ = std::fs::remove_file(&dest_path);
+                return Err(e);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// SEC-7: compact the open room on demand, reporting how much was reclaimed.
 #[tauri::command]
 pub fn compact_room(state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let reclaimable = db::reclaimable_bytes(&room.conn)?;
-    let mb = reclaimable as f64 / (1024.0 * 1024.0);
-    if mb < 0.05 {
-        return Ok("Nothing to recover.".into());
-    }
-    db::vacuum(&room.conn)?;
-    Ok(format!("Recovered {mb:.1} MB."))
+    state.with_room(|room| {
+        let reclaimable = db::reclaimable_bytes(&room.conn)?;
+        let mb = reclaimable as f64 / (1024.0 * 1024.0);
+        if mb < 0.05 {
+            return Ok("Nothing to recover.".into());
+        }
+        db::vacuum(&room.conn)?;
+        Ok(format!("Recovered {mb:.1} MB."))
+    })
 }
 
 // ---------------------------------------------------------------- recent rooms (ADD-5)

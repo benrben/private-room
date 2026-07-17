@@ -14,7 +14,8 @@ pub fn put_web_search(
     results: &str,
 ) -> Result<(), String> {
     let key = search_key(provider, endpoint, query);
-    conn.execute(
+    execute_one(
+        conn,
         "INSERT INTO web_searches(query_key, results_text, saved_at)
          VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
          ON CONFLICT(query_key) DO UPDATE SET
@@ -22,8 +23,6 @@ pub fn put_web_search(
            saved_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
         params![key, results],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// CHG-33: a cached web_search result list if searched within the TTL, else None.
@@ -51,7 +50,8 @@ pub fn get_fresh_web_search(
 /// Callers ignore failures here (the fetch already succeeded; caching is
 /// best-effort).
 pub fn save_web_page(conn: &Connection, url: &str, title: &str, text: &str) -> Result<(), String> {
-    conn.execute(
+    execute_one(
+        conn,
         "INSERT INTO web_pages(id, url, title, readable_text) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(url) DO UPDATE SET
            title = excluded.title,
@@ -59,8 +59,6 @@ pub fn save_web_page(conn: &Connection, url: &str, title: &str, text: &str) -> R
            saved_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
         params![Uuid::new_v4().to_string(), url, title, text],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// Return a cached (title, readable_text) for this exact URL if it was fetched

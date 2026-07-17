@@ -21,122 +21,64 @@ pub async fn studio_flashcards(
     refs: Option<Vec<String>>,
     op_id: Option<String>,
 ) -> Result<FileMeta, String> {
-    use tauri::Emitter;
-    // ADD-31: a cancellable operation with visible stages. The flag is
-    // registered under the caller's op id (same registry the chat Stop uses),
-    // so the modal's Stop button works mid-generation.
-    let cancel = register_studio_cancel(&state, &op_id);
-    let _cancel_guard = op_id.as_ref().map(|id| CancelGuard {
-        state: state.inner(),
-        ask_id: id.clone(),
-    });
-    let instr = studio_instruction(instructions, STUDIO_FLASHCARDS_PROMPT);
-    let _ = window.emit("studio-step", "Reading the material…");
-    let (label, text) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        match refs.as_ref().filter(|r| !r.is_empty()) {
-            Some(ids) => gather_files_text(&room.conn, ids)?,
-            None => gather_scope_text(&room.conn, scope.as_deref(), &room.name)?,
-        }
-    };
-    let model = resolve_structured_model(&state)
-        .await
-        .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
-    let _ = window.emit(
-        "studio-step",
-        if is_cloud_model(&model) {
-            "Designing your deck — the cloud model is writing…"
-        } else {
-            "Designing your deck — a local model can take a few minutes…"
-        },
-    );
-    let page_role = "You are a front-end developer building an interactive flashcards study page. \
-        Show a deck of cards the reader flips (click, or Space/Enter, or the arrow keys) to reveal \
-        the answer, with an optional hint, a card counter, and next/previous controls. Base every \
-        card only on the provided material — test real understanding, not formatting trivia.";
-    let content = match generate_studio_html(&model, page_role, &instr, &label, &text, cancel.clone())
-        .await?
-    {
-        Some(html) if !cancel.load(Ordering::SeqCst) => html,
-        _ if cancel.load(Ordering::SeqCst) => return Err("Stopped.".into()),
-        _ => {
-            let _ = window.emit("studio-step", "Extracting question/answer pairs…");
-            // Fallback: extract structured cards and render the built-in template.
-            let schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "cards": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "q": {"type": "string"},
-                                "a": {"type": "string"},
-                                "hint": {"type": "string"}
-                            },
-                            "required": ["q", "a"]
-                        }
+    run_studio(&window, &state, flashcards_spec(), scope, instructions, refs, op_id).await
+}
+
+/// The flashcards artifact spec for the shared `run_studio` pipeline.
+pub(crate) fn flashcards_spec() -> StudioSpec {
+    StudioSpec {
+        default_prompt: STUDIO_FLASHCARDS_PROMPT,
+        page_role: "You are a front-end developer building an interactive flashcards study page. \
+            Show a deck of cards the reader flips (click, or Space/Enter, or the arrow keys) to reveal \
+            the answer, with an optional hint, a card counter, and next/previous controls. Base every \
+            card only on the provided material — test real understanding, not formatting trivia.",
+        working_label: "Designing your deck",
+        fallback_step: Some("Extracting question/answer pairs…"),
+        fallback_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cards": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "q": {"type": "string"},
+                            "a": {"type": "string"},
+                            "hint": {"type": "string"}
+                        },
+                        "required": ["q", "a"]
                     }
-                },
-                "required": ["cards"]
-            });
-            let messages = vec![
-                ollama::ChatMessage::new(
-                    "system",
-                    "You turn study material into flashcards. Write clear question/answer pairs (and a \
-                     short optional hint) that test understanding of the material — not trivia about its \
-                     formatting. Base every card only on the provided text.",
-                ),
-                ollama::ChatMessage::new(
-                    "user",
-                    format!("{instr}\n\nBase every card only on this material about \"{label}\":\n\n{text}"),
-                ),
-            ];
-            let raw = ollama::chat_structured_cancel(
-                &model,
-                messages,
-                Some(0.3),
-                KEEP_ALIVE_WARM,
-                &schema,
-                cancel.clone(),
-            )
-            .await?;
-            if cancel.load(Ordering::SeqCst) {
-                return Err("Stopped.".into());
-            }
-            let cards: Vec<StudioCard> = serde_json::from_str::<serde_json::Value>(raw.trim())
-                .ok()
-                .and_then(|v| v.get("cards").and_then(|c| c.as_array()).cloned())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|c| {
-                            let q = c.get("q").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-                            let a = c.get("a").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-                            let hint =
-                                c.get("hint").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-                            (!q.is_empty() && !a.is_empty()).then_some(StudioCard { q, a, hint })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if cards.is_empty() {
-                return Err(
-                    "The model didn't return any usable flashcards — try a different file.".into(),
-                );
-            }
-            render_flashcards_html(&label, &cards)
-        }
-    };
-    let name = format!("Flashcards - {}.html", safe_scope_name(&label));
-    let meta = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        db::insert_file(&room.conn, &name, "text/html", content.as_bytes(), Some(&content), "generated")?
-    };
-    let _ = window.emit("room-files-changed", ());
-    let _ = window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
-    Ok(meta)
+                }
+            },
+            "required": ["cards"]
+        }),
+        fallback_system: "You turn study material into flashcards. Write clear question/answer pairs (and a \
+             short optional hint) that test understanding of the material — not trivia about its \
+             formatting. Base every card only on the provided text.",
+        fallback_intro: "Base every card only on this material about",
+        fallback_temp: 0.3,
+        render: fallback_flashcards,
+        filename_prefix: "Flashcards",
+    }
+}
+
+/// Fallback: parse extracted cards and render the built-in flashcards template.
+fn fallback_flashcards(raw: &str, label: &str) -> Result<String, String> {
+    let cards: Vec<StudioCard> = json_array(raw, "cards")
+        .iter()
+        .filter_map(|c| {
+            let (q, a) = (value_str(c, "q"), value_str(c, "a"));
+            (!q.is_empty() && !a.is_empty()).then_some(StudioCard {
+                q,
+                a,
+                hint: value_str(c, "hint"),
+            })
+        })
+        .collect();
+    if cards.is_empty() {
+        return Err("The model didn't return any usable flashcards — try a different file.".into());
+    }
+    Ok(render_flashcards_html(label, &cards))
 }
 
 /// D5: render a flashcard deck as a self-contained HTML page. The cards are

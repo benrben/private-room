@@ -299,8 +299,8 @@ fn pitch_dims(f0s: &mut Vec<f32>) -> [f32; 2] {
     f0s.sort_by(f32::total_cmp);
     let floor = f0s[f0s.len() / 4].clamp(F0_CLAMP.0, F0_CLAMP.1);
     let theta = PITCH_RAD_PER_OCTAVE * (floor / F0_CLAMP.0).log2();
-    let w = PITCH_WEIGHT * (f0s.len() as f32 / MIN_PITCHED_FRAMES as f32).min(1.0);
-    [w * theta.cos(), w * theta.sin()]
+    let pitch_confidence = PITCH_WEIGHT * (f0s.len() as f32 / MIN_PITCHED_FRAMES as f32).min(1.0);
+    [pitch_confidence * theta.cos(), pitch_confidence * theta.sin()]
 }
 
 /// One phrase's voiceprint plus how much real speech went into it — the
@@ -513,6 +513,28 @@ fn center_prints(vecs: &[&[f32]]) -> Vec<Vec<f32>> {
         .collect()
 }
 
+/// Otsu's method over sorted pairwise similarities: the split index `k` (in
+/// `1..sims.len()`) that maximizes between-class variance. `sims` must already
+/// be sorted ascending.
+fn otsu_split(sims: &[f32]) -> usize {
+    let n = sims.len();
+    let total: f32 = sims.iter().sum();
+    let (mut best_score, mut best_k) = (f32::MIN, 1usize);
+    let mut low_sum = 0.0f32;
+    for k in 1..n {
+        low_sum += sims[k - 1];
+        let (weight_low, weight_high) = (k as f32 / n as f32, (n - k) as f32 / n as f32);
+        let low_class_mean = low_sum / k as f32;
+        let high_class_mean = (total - low_sum) / (n - k) as f32;
+        let score = weight_low * weight_high * (high_class_mean - low_class_mean).powi(2);
+        if score > best_score {
+            best_score = score;
+            best_k = k;
+        }
+    }
+    best_k
+}
+
 /// The legacy DSP space's session threshold — the pre-neural rule, kept
 /// verbatim for the fallback because that space has NO absolute operating
 /// point (clean cross-voice pairs reach 0.57 while device same-voice pairs
@@ -526,21 +548,7 @@ fn dsp_split_threshold(mut sims: Vec<f32>) -> Option<f32> {
         _ => {}
     }
     sims.sort_by(f32::total_cmp);
-    let n = sims.len();
-    let total: f32 = sims.iter().sum();
-    let (mut best_score, mut best_k) = (f32::MIN, 1usize);
-    let mut low_sum = 0.0f32;
-    for k in 1..n {
-        low_sum += sims[k - 1];
-        let (w0, w1) = (k as f32 / n as f32, (n - k) as f32 / n as f32);
-        let mu0 = low_sum / k as f32;
-        let mu1 = (total - low_sum) / (n - k) as f32;
-        let score = w0 * w1 * (mu1 - mu0).powi(2);
-        if score > best_score {
-            best_score = score;
-            best_k = k;
-        }
-    }
+    let best_k = otsu_split(&sims);
     let cut = (sims[best_k - 1] + sims[best_k]) / 2.0;
     let gap = sims[best_k] - sims[best_k - 1];
     if gap < 0.15 || cut > 0.80 {

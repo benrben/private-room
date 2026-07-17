@@ -28,9 +28,8 @@ fn extract_pptx_budgeted(bytes: &[u8], budget: u64) -> Option<String> {
             break;
         }
         if let Some(xml) = read_zip_entry_capped(bytes, entry, remaining) {
-            let xml = xml.replace("</a:p>", "</a:p>\n");
             out.push_str(&format!("[slide {}]\n", i + 1));
-            out.push_str(&strip_tags(&xml));
+            out.push_str(&xml_paras_to_text(&xml, "</a:p>"));
             out.push('\n');
         }
     }

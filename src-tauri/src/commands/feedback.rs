@@ -49,44 +49,25 @@ pub async fn feedback_draft(
     if text.is_empty() {
         return Err("Write a few words about what happened first.".into());
     }
+    // The empty-text guard and model resolution stay in Rust (DB work); the prompt,
+    // schema, model call, parse and the words-survive-any-misfire fallback now live
+    // in the sidecar's /feedback_draft. It returns the finished {title, body}; a
+    // genuine engine failure comes back as a 502 we map to the same sentinel
+    // chat_structured produced (so the "Ollama isn't running" surface is unchanged).
     let model = resolve_structured_model(&state)
         .await
         .ok_or("The local AI (Ollama) isn't running — you can still write the issue yourself.")?;
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "title": {"type": "string"},
-            "body": {"type": "string"}
-        },
-        "required": ["title", "body"]
+    let body = serde_json::json!({
+        "model": model,
+        "base_url": ollama::resolved_base_url(),
+        "text": text,
     });
-    let messages = vec![
-        ollama::ChatMessage::new(
-            "system",
-            "You turn a user's raw feedback about the Private Room desktop app into a clear \
-             GitHub issue. Title: one short, specific English summary line (under 70 \
-             characters, no trailing period). Body: GitHub Markdown with '## What happened' \
-             and, only when the feedback implies them, '## Expected' and '## Steps to \
-             reproduce'. Preserve the user's meaning exactly — never invent details. If the \
-             feedback is not in English, keep the original text quoted in the body and add \
-             an English summary above it.",
-        ),
-        ollama::ChatMessage::new("user", text.clone()),
-    ];
-    let raw = ollama::chat_structured(&model, messages, Some(0.3), KEEP_ALIVE_SHORT, &schema).await?;
-    let parsed: Option<(String, String)> = serde_json::from_str::<serde_json::Value>(raw.trim())
-        .ok()
-        .and_then(|v| {
-            let title = v.get("title")?.as_str()?.trim().to_string();
-            let body = v.get("body")?.as_str()?.trim().to_string();
-            (!title.is_empty() && !body.is_empty()).then_some((title, body))
-        });
-    // Resilience: the words survive any model misfire.
-    let (title, body) = parsed.unwrap_or_else(|| {
-        let title: String = text.lines().next().unwrap_or("Feedback").chars().take(70).collect();
-        (title, format!("## What happened\n\n{text}"))
-    });
-    Ok(FeedbackDraft { title: title.chars().take(120).collect(), body })
+    let v = crate::sidecar::sidecar_json("/feedback_draft", &body)
+        .await
+        .map_err(|e| e.sentinel(Some(&model)))?;
+    let title = v["title"].as_str().unwrap_or_default().to_string();
+    let body = v["body"].as_str().unwrap_or_default().to_string();
+    Ok(FeedbackDraft { title, body })
 }
 
 #[cfg(test)]

@@ -9,6 +9,13 @@
 //! watcher leaves it strictly alone. Remote engines (the "closet box" base-URL
 //! override) are never started or stopped from here — you can't manage someone
 //! else's machine.
+//!
+//! MIGRATION (sidecar-only): model I/O now flows through the Python sidecar,
+//! which talks to Ollama itself but CANNOT start it. So [`ensure_up`] (+ the
+//! [`Busy`] guard and idle watcher) is wired into the Ollama gateway via
+//! `ollama::wake_daemon`, called before every model-loading sidecar request and
+//! held for the call's duration — Rust still owns the `ollama serve` process
+//! lifecycle (on-demand spawn here, app-exit teardown via [`stop_if_ours`]).
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};

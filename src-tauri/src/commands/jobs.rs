@@ -180,9 +180,7 @@ fn emit_progress(window: &tauri::Window, job_id: &str, label: &str, done: usize,
 /// List every job in the open room, newest first — feeds the jobs panel.
 #[tauri::command]
 pub fn list_jobs(state: State<'_, AppState>) -> Result<Vec<db::Job>, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::list_jobs(&room.conn)
+    state.with_room(|room| db::list_jobs(&room.conn))
 }
 
 /// Cancel (pause) a running job. The running loop sees the flag between waves,
@@ -201,9 +199,7 @@ pub fn delete_job(state: State<'_, AppState>, id: String) -> Result<(), String> 
     if let Some(flag) = state.job_cancels.lock().unwrap().get(&id) {
         flag.store(true, Ordering::SeqCst);
     }
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::delete_job(&room.conn, &id)
+    state.with_room(|room| db::delete_job(&room.conn, &id))
 }
 
 /// On room open, any job left 'running' belongs to a process that's gone — mark
@@ -228,17 +224,15 @@ pub(crate) fn quiesce_stale_jobs(conn: &Connection) {
 async fn deep_summary_plan(
     state: &AppState,
 ) -> Result<(Vec<db::SummaryFile>, String, Vec<Step>, String), String> {
-    let (files, model, room_path) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    let (files, model, room_path) = state.with_room(|room| {
         let all = db::list_files_for_summary(&room.conn)?;
         let files: Vec<db::SummaryFile> = all
             .into_iter()
             .filter(|f| !is_summary_file(&f.name, &f.source))
             .take(MAX_SUMMARY_FILES)
             .collect();
-        (files, model_setting(&room.conn), room.path.clone())
-    };
+        Ok((files, model_setting(&room.conn), room.path.clone()))
+    })?;
     if files.is_empty() {
         return Err("This room has no files to summarize yet.".into());
     }
@@ -298,6 +292,9 @@ fn spawn_deep_summary(
         }
 
         let total = steps.len();
+        // Surface the card immediately, even before the first file resolves (and
+        // even when the job was started outside the UI).
+        emit_progress(&window, &job_id, "Starting…", start_cursor, total);
         // Last checkpointed cursor, so pause/error events report real progress.
         let last_cursor = Arc::new(std::sync::atomic::AtomicUsize::new(start_cursor));
         let lc = last_cursor.clone();
@@ -450,9 +447,7 @@ pub async fn start_deep_summary(
     let plan = serde_json::json!({ "steps": steps });
     let total = steps.len() as i64;
 
-    let (job_id, room_path) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    let (job_id, room_path) = state.with_room(|room| {
         // The plan was read before an await (the Ollama model probe) — a room
         // swapped in that window must not receive a job built from the old
         // room's files.
@@ -460,8 +455,8 @@ pub async fn start_deep_summary(
             return Err("The room changed while starting this job.".into());
         }
         let id = db::create_job(&room.conn, "deep_summary", "Room summary", &plan, total)?;
-        (id, room.path.clone())
-    };
+        Ok((id, room.path.clone()))
+    })?;
 
     let cancel = Arc::new(AtomicBool::new(false));
     state
@@ -485,11 +480,9 @@ pub async fn resume_job(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let (job, room_path) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        (db::get_job(&room.conn, &id)?, room.path.clone())
-    };
+    let (job, room_path) = state.with_room(|room| {
+        Ok((db::get_job(&room.conn, &id)?, room.path.clone()))
+    })?;
     // One heavy background job at a time — mirrors the start paths' guard
     // (any live job blocks a resume, including this same job resumed twice),
     // so the per-job LocalLlm lane serialization is never defeated.
@@ -524,13 +517,11 @@ pub async fn resume_job(
         "file_pass" => {
             let plan: PassPlan = serde_json::from_value(job.plan.clone())
                 .map_err(|_| "This job's plan is unreadable.")?;
-            let filtered = {
-                let guard = state.room.lock().unwrap();
-                let room = guard.as_ref().ok_or("No room is open.")?;
+            let filtered = state.with_room(|room| {
                 let text = db::get_file_extracted_text(&room.conn, &plan.file_id)
                     .ok_or("The file this pass was reading is no longer in the room.")?;
-                extraction::smart_filter(&text)
-            };
+                Ok(extraction::smart_filter(&text))
+            })?;
             if filtered.len() != plan.text_len {
                 return Err(
                     "The file changed since this pass started — start a new pass instead."
@@ -637,15 +628,17 @@ pub(crate) async fn begin_file_pass(
     // The pinning room_path is captured HERE, together with the text read —
     // the engine probe below awaits an HTTP call, and a room swapped in that
     // window must not get a job pinned to it but built from this room's text.
-    let (file_id, real_name, filtered, room_path) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        let (id, real_name) = db::find_file_like(&room.conn, file)?;
+    let (file_id, real_name, filtered, room_path) = state.with_room(|room| {
+        // A whole-file pass must resolve the SOURCE file, never the app's own
+        // generated "Full pass — …"/"Room summary" output — those are newer and
+        // name-match, so a plain find_file_like would make a re-run summarize
+        // the previous run's tiny output instead of the book.
+        let (id, real_name) = db::find_source_file_like(&room.conn, file)?;
         let text = db::get_file_extracted_text(&room.conn, &id).ok_or_else(|| {
             format!("\"{real_name}\" has no readable text — a pass needs extracted text.")
         })?;
-        (id, real_name, extraction::smart_filter(&text), room.path.clone())
-    };
+        Ok((id, real_name, extraction::smart_filter(&text), room.path.clone()))
+    })?;
     let windows = extraction::partition_windows(
         &filtered,
         file_pass::PASS_WINDOW_CHARS,
@@ -668,14 +661,12 @@ pub(crate) async fn begin_file_pass(
     };
     let plan_json = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
     let title = format!("Full pass — {real_name}");
-    let job_id = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    let job_id = state.with_room(|room| {
         if room.path != room_path {
             return Err("The room changed while starting this pass.".into());
         }
-        db::create_job(&room.conn, "file_pass", &title, &plan_json, steps.len() as i64)?
-    };
+        db::create_job(&room.conn, "file_pass", &title, &plan_json, steps.len() as i64)
+    })?;
     let cancel = Arc::new(AtomicBool::new(false));
     state
         .job_cancels
@@ -746,6 +737,11 @@ fn spawn_file_pass(
             }
         }
         let total = steps.len();
+        // Surface the card the instant the pass starts — a fresh cold model can
+        // take tens of seconds on the first window, and a pass the AGENT started
+        // has no UI action to seed the sidebar (the frontend pulls the job in on
+        // this first tick).
+        emit_progress(&window, &job_id, "Starting the pass…", start_cursor, total);
         let published: Arc<std::sync::Mutex<Option<FileMeta>>> =
             Arc::new(std::sync::Mutex::new(None));
         let last_cursor = Arc::new(std::sync::atomic::AtomicUsize::new(start_cursor));

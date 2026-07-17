@@ -93,9 +93,7 @@ pub fn open_room(
 /// it must be, or it couldn't unlock the file it lives beside).
 #[tauri::command]
 pub fn write_recovery_key(state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::write_recovery(&room.path, &room.password)
+    state.with_room(|room| db::write_recovery(&room.path, &room.password))
 }
 
 /// True when the room at `path` has a recovery sidecar — the gate shows
@@ -145,7 +143,14 @@ pub(crate) fn spawn_room_server_if_enabled(app: &tauri::AppHandle) {
                 return;
             }
         }
-        if let Ok(bridge) = crate::room_mcp::start(app.clone(), web_enabled, false).await {
+        if let Ok(bridge) = crate::room_mcp::start(
+            app.clone(),
+            web_enabled,
+            crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: false },
+            None,
+        )
+        .await
+        {
             let state = app.state::<AppState>();
             *state.room_server.lock().unwrap() = Some(bridge);
         }
@@ -165,9 +170,7 @@ pub fn touchid_has(path: String) -> Result<bool, String> {
 /// from a file and never written anywhere but the Keychain.
 #[tauri::command]
 pub fn touchid_enable(state: State<'_, AppState>) -> Result<(), String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    crate::biometrics::store(&room.path, &room.password)
+    state.with_room(|room| crate::biometrics::store(&room.path, &room.password))
 }
 
 /// Turn Touch ID off for a room: delete its Keychain entry (idempotent).

@@ -90,8 +90,8 @@ function strongDir(text: string): "rtl" | "ltr" | null {
   return /[\u0591-\u08FF\uFB1D-\uFDFD\uFE70-\uFEFC]/.test(m[0]) ? "rtl" : "ltr";
 }
 
-function fmt(cs: number): string {
-  const s = Math.max(0, Math.floor(cs / 100));
+function formatTimestamp(centiseconds: number): string {
+  const s = Math.max(0, Math.floor(centiseconds / 100));
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
@@ -379,7 +379,6 @@ export default function RecordingView({
     }
   }
 
-  // ---- toolbar actions ----------------------------------------------------
   async function runTranslate() {
     if (!translateTo.trim() || busy) return;
     setBusy(true);
@@ -511,7 +510,7 @@ export default function RecordingView({
             <button className="subtle rec-btn" onClick={() => void onPause()}>⏸ Pause</button>
             <button className="primary rec-btn" onClick={() => void onStop()}>■ Stop &amp; save</button>
             <span className="rec-live-chip">
-              <span className="rec-dot pulsing" /> REC {fmt(durationCs)}
+              <span className="rec-dot pulsing" /> REC {formatTimestamp(durationCs)}
             </span>
             <button
               className={`rec-mute ${micIsMuted ? "muted" : ""}`}
@@ -546,7 +545,7 @@ export default function RecordingView({
           <>
             <button className="primary rec-btn" onClick={() => void onResume()}>● Resume</button>
             <button className="subtle rec-btn" onClick={() => void onStop()}>■ Stop &amp; save</button>
-            <span className="rec-live-chip paused">Paused at {fmt(durationCs)}</span>
+            <span className="rec-live-chip paused">Paused at {formatTimestamp(durationCs)}</span>
           </>
         )}
         {status === "saving" && (
@@ -674,7 +673,7 @@ export default function RecordingView({
                   title="Jump to this moment"
                   onClick={() => seek(turn.t0)}
                 >
-                  {fmt(turn.t0)}
+                  {formatTimestamp(turn.t0)}
                 </button>
                 <span
                   className="rec-speaker"
@@ -738,7 +737,7 @@ export default function RecordingView({
       {selection && canEdit && (
         <div className="rec-selectbar">
           <span>
-            {selection.words} word{selection.words > 1 ? "s" : ""} · {fmt(selection.t0)}–{fmt(selection.t1)}
+            {selection.words} word{selection.words > 1 ? "s" : ""} · {formatTimestamp(selection.t0)}–{formatTimestamp(selection.t1)}
           </span>
           <button className="danger" onClick={() => void deleteSelection()}>
             Delete from recording

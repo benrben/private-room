@@ -78,6 +78,11 @@ export function useWorkspaceEffects(
     });
     // ADD-30: background-job cards — live counts, and on any terminal flag
     // re-read the job list so the card flips to Resume / disappears.
+    // Job ids we've already pulled into `s.jobs`. A running tick for an id NOT in
+    // here belongs to a job started outside the UI (e.g. the agent's whole-file
+    // pass tool) with no frontend action to seed the list — refresh once so its
+    // card appears instead of the progress landing nowhere.
+    const seenJobs = new Set<string>();
     void a.refreshJobs();
     const unlistenJobs = api.onJobProgress((p) => {
       if (p.finished || p.paused || p.failed) {
@@ -95,6 +100,10 @@ export function useWorkspaceEffects(
           s.pushToast("info", "Paused — resume it any time from the sidebar.");
         }
       } else {
+        if (!seenJobs.has(p.jobId)) {
+          seenJobs.add(p.jobId);
+          void a.refreshJobs();
+        }
         s.setJobProgress((m) => ({
           ...m,
           [p.jobId]: { label: p.label, done: p.done, total: p.total },

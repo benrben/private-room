@@ -139,13 +139,13 @@ impl CmdCtx<'_> {
             ollama::ChatMessage::new("user", user),
         ];
         let window = self.window;
-        let (out, _) = ollama::chat_stream_tools(
-            self.model,
-            messages,
-            None,
-            self.temperature,
+        // MIGRATION Phase 2a: streamed through the sidecar `/generate_stream`
+        // (no tools, no `format`); the per-token `ask-delta` events are unchanged.
+        let body = ollama::plain_generate_body(self.model, &messages, self.temperature, KEEP_ALIVE_WARM);
+        let out = crate::sidecar::generate_stream(
+            "/generate_stream",
+            &body,
             Some(self.cancel.clone()),
-            KEEP_ALIVE_WARM,
             |d| {
                 let _ = window.emit("ask-delta", d);
             },
@@ -161,17 +161,9 @@ impl CmdCtx<'_> {
             ollama::ChatMessage::new("system", system),
             ollama::ChatMessage::new("user", user),
         ];
-        let (out, _) = ollama::chat_stream_tools(
-            self.model,
-            messages,
-            None,
-            temp,
-            Some(self.cancel.clone()),
-            KEEP_ALIVE_WARM,
-            |_| {},
-        )
-        .await?;
-        Ok(out)
+        // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools); the
+        // Stop flag still abandons a long quiet step promptly.
+        ollama::generate(self.model, messages, temp, KEEP_ALIVE_WARM, Some(self.cancel.clone())).await
     }
 
     /// ADD-22: like `ask_quiet`, but the reply is CONSTRAINED to `schema` via
@@ -188,7 +180,15 @@ impl CmdCtx<'_> {
             ollama::ChatMessage::new("system", system),
             ollama::ChatMessage::new("user", user),
         ];
-        ollama::chat_structured(self.model, messages, temp, KEEP_ALIVE_WARM, schema).await
+        ollama::chat_structured(
+            self.model,
+            messages,
+            temp,
+            KEEP_ALIVE_WARM,
+            schema,
+            Default::default(),
+        )
+        .await
     }
 }
 
@@ -316,26 +316,9 @@ pub async fn run_command(
     // ADD-23: viewer effects ride the `effects` column, not fenced markup.
     let effects_value = effects_json(&res.effects);
 
-    // Phase 3 (locked): save the assistant reply (HLT-7: room may have closed).
-    let guard = state.room.lock().unwrap();
-    match guard.as_ref() {
-        Some(room) => db::insert_message(
-            &room.conn,
-            &chat_id,
-            "assistant",
-            &content,
-            &res.sources,
-            effects_value.as_ref(),
-        ),
-        None => Ok(Message {
-            id: String::new(),
-            role: "assistant".into(),
-            content,
-            sources: res.sources,
-            created_at: String::new(),
-            effects: effects_value,
-        }),
-    }
+    // Phase 3 (locked): save the assistant reply (HLT-7: room may have closed) —
+    // same persistence seam as `ask`.
+    persist_assistant_reply(&state, &chat_id, content, res.sources, effects_value)
 }
 
 // ================================================================= moonshot (Section D)

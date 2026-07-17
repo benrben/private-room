@@ -2,12 +2,10 @@ use super::*;
 
 pub(crate) async fn cmd_summarize(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     if let Some(file_id) = ctx.refs.first() {
-        let (name, text) = {
-            let guard = ctx.state.room.lock().unwrap();
-            let room = guard.as_ref().ok_or("No room is open.")?;
+        let (name, text) = ctx.state.with_room(|room| {
             let (name, _m, _b, text) = db::get_file_full(&room.conn, file_id)?;
-            (name, text.unwrap_or_default())
-        };
+            Ok((name, text.unwrap_or_default()))
+        })?;
         if text.trim().is_empty() {
             return Err(format!("\"{name}\" has no readable text to summarize."));
         }
@@ -28,11 +26,7 @@ pub(crate) async fn cmd_summarize(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
         });
     }
     // Whole-room overview from the file inventory + cached one-liners.
-    let inventory = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        db::list_file_inventory(&room.conn)?
-    };
+    let inventory = ctx.state.with_room(|room| db::list_file_inventory(&room.conn))?;
     if inventory.is_empty() {
         return Err("This room has no files to summarize yet.".into());
     }
@@ -66,11 +60,7 @@ pub(crate) async fn cmd_compare(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
     if ctx.refs.len() < 2 {
         return Err("Add at least two files with @ — e.g. #compare @plan-a.md @plan-b.md".into());
     }
-    let (refctx, names) = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        refs_context(&room.conn, ctx.refs, 9000)
-    };
+    let (refctx, names) = ctx.state.with_room(|room| Ok(refs_context(&room.conn, ctx.refs, 9000)))?;
     if refctx.trim().is_empty() {
         return Err("Those files have no readable text to compare.".into());
     }
@@ -92,12 +82,10 @@ pub(crate) async fn cmd_transcribe(ctx: &CmdCtx<'_>) -> Result<CommandResult, St
         .refs
         .first()
         .ok_or("Add a recording with @ — e.g. #transcribe @meeting.m4a")?;
-    let (name, mime, text) = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    let (name, mime, text) = ctx.state.with_room(|room| {
         let (name, mime, _b, text) = db::get_file_full(&room.conn, file_id)?;
-        (name, mime.unwrap_or_default(), text.unwrap_or_default())
-    };
+        Ok((name, mime.unwrap_or_default(), text.unwrap_or_default()))
+    })?;
     let ext = extraction::extension_of(&name);
     let is_media = stt::media_kind(&mime, &ext).is_some();
     if text.trim().is_empty() {
@@ -121,13 +109,11 @@ pub(crate) async fn cmd_transcribe(ctx: &CmdCtx<'_>) -> Result<CommandResult, St
             "ask-step",
             format!("Transcribing {name} (long recordings take a while)…"),
         );
-        let (bytes, room_path) = {
-            let guard = ctx.state.room.lock().unwrap();
-            let room = guard.as_ref().ok_or("No room is open.")?;
+        let (bytes, room_path) = ctx.state.with_room(|room| {
             let bytes = db::get_file_bytes(&room.conn, file_id)?
                 .ok_or("This recording has no stored audio.")?;
-            (bytes, room.path.clone())
-        };
+            Ok((bytes, room.path.clone()))
+        })?;
         let kind = stt::media_kind(&mime, &ext).unwrap_or(stt::MediaKind::Audio);
         let ext_owned = ext.clone();
         let model_for_job = model_path.clone();
@@ -176,11 +162,7 @@ pub(crate) async fn cmd_transcribe(ctx: &CmdCtx<'_>) -> Result<CommandResult, St
 /// recent chat when no @ files are pinned.
 pub(crate) async fn cmd_minutes(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     use tauri::Emitter;
-    let (refctx, ref_names) = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        refs_context(&room.conn, ctx.refs, 12000)
-    };
+    let (refctx, ref_names) = ctx.state.with_room(|room| Ok(refs_context(&room.conn, ctx.refs, 12000)))?;
     // A pinned file with no readable text is usually an un-transcribed recording.
     if !ctx.refs.is_empty() && refctx.trim().is_empty() {
         return Err(
@@ -235,11 +217,7 @@ pub(crate) async fn cmd_minutes(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
     let body = render_minutes_html(&parsed, &title);
     let doc = html_document(&title, &body);
     let name = html_note_name(&title);
-    let meta = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        create_note(&room.conn, &name, &doc)?
-    };
+    let meta = ctx.state.with_room(|room| create_note(&room.conn, &name, &doc))?;
     let _ = ctx.window.emit("room-files-changed", ());
     let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
     Ok(CommandResult {
@@ -257,11 +235,7 @@ pub(crate) async fn cmd_to_sheet(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         return Err("No table found in a recent answer to convert.".into());
     };
     let csv = serialize_delim(&rows, ',');
-    let meta = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        create_note(&room.conn, "table.csv", &csv)?
-    };
+    let meta = ctx.state.with_room(|room| create_note(&room.conn, "table.csv", &csv))?;
     let _ = ctx.window.emit("room-files-changed", ());
     let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
     Ok(CommandResult {
@@ -292,12 +266,10 @@ pub(crate) async fn cmd_translate(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
     if lang.is_empty() {
         return Err("Say the target language — e.g. #translate @notes.md to Spanish".into());
     }
-    let (name, text) = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    let (name, text) = ctx.state.with_room(|room| {
         let (name, _m, _b, text) = db::get_file_full(&room.conn, file_id)?;
-        (name, text.unwrap_or_default())
-    };
+        Ok((name, text.unwrap_or_default()))
+    })?;
     if text.trim().is_empty() {
         return Err(format!("\"{name}\" has no readable text to translate."));
     }
@@ -331,11 +303,7 @@ pub(crate) async fn cmd_translate(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
     }
     let base = name.rsplit_once('.').map(|(b, _)| b).unwrap_or(&name);
     let fname = format!("{base} ({lang}).md");
-    let meta = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        create_note(&room.conn, &fname, &out)?
-    };
+    let meta = ctx.state.with_room(|room| create_note(&room.conn, &fname, &out))?;
     let _ = ctx.window.emit("room-files-changed", ());
     let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
     Ok(CommandResult {
@@ -367,14 +335,12 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
 
     // (1) Require a web provider. If off, tell the user how to turn one on — a
     // saved assistant message, not an error toast, since it is actionable.
-    let (provider, endpoint) = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        (
+    let (provider, endpoint) = ctx.state.with_room(|room| {
+        Ok((
             db::get_setting(&room.conn, "web_provider").unwrap_or_default(),
             db::get_setting(&room.conn, "web_endpoint").unwrap_or_default(),
-        )
-    };
+        ))
+    })?;
     if !matches!(provider.as_str(), "duckduckgo" | "brave" | "searxng") {
         return Ok(CommandResult {
             content: "Web access is off in this room. Turn on a provider in \

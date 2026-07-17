@@ -87,7 +87,7 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
                   }}
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    a.acceptStudioMention(it.insert);
+                    a.acceptMention(it.insert, s.studioPrompt, s.setStudioPrompt);
                   }}
                 >
                   <span className="ac-label">{it.label}</span>
@@ -137,8 +137,10 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
                 }
                 if (e.key === "Enter" || e.key === "Tab") {
                   e.preventDefault();
-                  a.acceptStudioMention(
+                  a.acceptMention(
                     items[Math.min(s.studioAc.index, items.length - 1)].insert,
+                    s.studioPrompt,
+                    s.setStudioPrompt,
                   );
                   return;
                 }

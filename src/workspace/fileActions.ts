@@ -7,6 +7,7 @@ import {
   suggestFileMeta,
 } from "../api";
 import { displayName } from "./composer";
+import { tryToast } from "./guard";
 import { WSState } from "./state";
 
 /** File + folder + open-file state handlers (import/view/edit/versions/folders).
@@ -315,12 +316,11 @@ export function makeFileActions(s: WSState) {
     const name = s.creatingFolder.trim();
     s.setCreatingFolder(null);
     if (!name) return;
-    try {
-      await api.createFolder(name);
-      s.setFolders(await api.listFolders());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.createFolder(name),
+      async () => s.setFolders(await api.listFolders()),
+    );
   }
 
   async function commitFolderRename() {
@@ -329,32 +329,27 @@ export function makeFileActions(s: WSState) {
     const trimmed = name.trim();
     s.setRenamingFolder(null);
     if (!trimmed) return;
-    try {
-      await api.renameFolder(id, trimmed);
-      s.setFolders(await api.listFolders());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.renameFolder(id, trimmed),
+      async () => s.setFolders(await api.listFolders()),
+    );
   }
 
   async function deleteFolder(id: string) {
-    try {
-      await api.deleteFolder(id);
+    await tryToast(s, () => api.deleteFolder(id), async () => {
       s.setFolders(await api.listFolders());
       s.setFiles(await api.listFiles());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    });
   }
 
   async function moveFile(fileId: string, folderId: string | null) {
     s.setMoveMenuFor(null);
-    try {
-      await api.moveFileToFolder(fileId, folderId);
-      s.setFiles(await api.listFiles());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.moveFileToFolder(fileId, folderId),
+      async () => s.setFiles(await api.listFiles()),
+    );
   }
 
   async function commitRenameFile() {
@@ -364,15 +359,12 @@ export function makeFileActions(s: WSState) {
     const name = pending.name.trim();
     const original = s.files.find((f) => f.id === pending.id);
     if (!name || name === original?.name) return;
-    try {
-      await api.renameFile(pending.id, name);
+    await tryToast(s, () => api.renameFile(pending.id, name), async () => {
       s.setFiles(await api.listFiles());
       if (s.openFileRef.current?.id === pending.id) {
         s.setOpenFile((o) => (o ? { ...o, name } : o));
       }
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    });
   }
 
   function toggleFolderCollapse(id: string) {

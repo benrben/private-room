@@ -83,35 +83,24 @@ pub async fn front_page_suggestions(state: State<'_, AppState>) -> Result<Vec<St
         Some(m) => m,
         None => return Ok(cached), // offline: reuse whatever we cached before
     };
-    let list = file_names.join("\n");
-    let messages = vec![
-        ollama::ChatMessage::new(
-            "system",
-            "You suggest example questions a user could ask about their own documents. Give up to \
-             three short, specific questions these files would actually answer.",
-        ),
-        ollama::ChatMessage::new("user", format!("Room name: {room_name}\n\nFiles:\n{list}")),
-    ];
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {"questions": {"type": "array", "items": {"type": "string"}}},
-        "required": ["questions"]
+    // The prompt/schema/parse (keep every non-blank question, take 3) now live in
+    // the sidecar's /label. It is resilient by design — any engine failure or
+    // unparseable reply comes back as 200 {questions: []}, mirroring the old
+    // `chat_structured(...).unwrap_or_default()`. So a mapped-error here is only a
+    // dead sidecar; we degrade to the cached list exactly as offline does.
+    let body = serde_json::json!({
+        "model": model,
+        "base_url": ollama::resolved_base_url(),
+        "room_name": room_name,
+        "files": file_names,
     });
-    let raw = ollama::chat_structured(&model, messages, Some(0.4), KEEP_ALIVE_WARM, &schema)
-        .await
-        .unwrap_or_default();
-    let questions: Vec<String> = serde_json::from_str::<serde_json::Value>(raw.trim())
-        .ok()
-        .and_then(|v| {
-            v.get("questions").and_then(|q| q.as_array()).map(|a| {
-                a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<String>>()
-            })
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|q| !q.trim().is_empty())
-        .take(3)
-        .collect();
+    let questions: Vec<String> = match crate::sidecar::sidecar_json("/label", &body).await {
+        Ok(v) => v["questions"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
     if questions.is_empty() {
         return Ok(cached);
     }

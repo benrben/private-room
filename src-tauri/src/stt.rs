@@ -287,14 +287,14 @@ pub struct PhraseOut {
 /// True for a Whisper "segment" that is noise dressed as text — the classic
 /// silence hallucinations ("[BLANK_AUDIO]", "(music)", a lone ♪).
 fn is_junk_segment(text: &str) -> bool {
-    let t = text.trim();
-    if t.is_empty() {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return true;
     }
-    let bracketed = (t.starts_with('[') && t.ends_with(']'))
-        || (t.starts_with('(') && t.ends_with(')'))
-        || (t.starts_with('*') && t.ends_with('*'));
-    bracketed || t.chars().all(|c| !c.is_alphanumeric())
+    let bracketed = (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        || (trimmed.starts_with('(') && trimmed.ends_with(')'))
+        || (trimmed.starts_with('*') && trimmed.ends_with('*'));
+    bracketed || trimmed.chars().all(|c| !c.is_alphanumeric())
 }
 
 /// The classic Whisper hallucinations: phrases the model emits from noise,
@@ -360,14 +360,14 @@ fn is_stock_hallucination(text: &str) -> bool {
 fn merge_token_words(pieces: &[(Vec<u8>, i64, i64)]) -> Vec<(String, i64, i64)> {
     let mut words: Vec<(Vec<u8>, i64, i64)> = Vec::new();
     for (bytes, t0, t1) in pieces {
-        let mut b = bytes.as_slice();
-        while b.last() == Some(&b'\n') {
-            b = &b[..b.len() - 1];
+        let mut remaining = bytes.as_slice();
+        while remaining.last() == Some(&b'\n') {
+            remaining = &remaining[..remaining.len() - 1];
         }
         if bytes.first() == Some(&b' ') || words.is_empty() {
-            words.push((b.to_vec(), *t0, *t1));
+            words.push((remaining.to_vec(), *t0, *t1));
         } else if let Some(last) = words.last_mut() {
-            last.0.extend_from_slice(b);
+            last.0.extend_from_slice(remaining);
             last.2 = *t1;
         }
     }

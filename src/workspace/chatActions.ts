@@ -3,7 +3,8 @@ import {
   KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { api, FileTarget, memorySuggestion, Message } from "../api";
-import { fileToBase64, isOllamaDown, parseComposer, tokenAtCaret } from "./composer";
+import { fileToBase64, parseComposer, tokenAtCaret } from "./composer";
+import { runGuarded } from "./guard";
 import { splitMarkupBlocks } from "./markup";
 import { HELP_COMMAND } from "./constants";
 import { WSState } from "./state";
@@ -48,62 +49,60 @@ export function makeChatActions(
     if (!s.activeChatId) return;
     const chatId = s.activeChatId;
     const askId = crypto.randomUUID();
-    s.askIdRef.current = askId;
-    s.setAsking(true);
-    s.setStreamText("");
-    s.setSteps([]);
-    s.setLane("");
-    s.setMemSuggestion(null);
-    s.editedRef.current = new Set();
-    try {
-      await run(askId);
-    } catch (e) {
-      const msg = String(e);
-      if (!/cancel/i.test(msg)) {
-        if (isOllamaDown(msg)) {
-          s.pushToast(
-            "error",
-            "Ollama is not running. Start the Ollama app, then try again.",
-            { label: "Open Ollama", run: openOllamaApp },
-          );
-        } else if (msg.includes("MODEL_MISSING")) {
-          s.pushToast(
-            "error",
-            `Model "${s.model}" is not downloaded yet.`,
-            { label: "Download", run: () => downloadModel(s.model) },
-          );
-        } else {
-          s.pushToast("error", msg);
-        }
+    await runGuarded(s, () => run(askId), {
+      begin: () => {
+        s.askIdRef.current = askId;
+        s.setAsking(true);
+        s.setStreamText("");
+        s.setSteps([]);
+        s.setLane("");
+        s.setMemSuggestion(null);
+        s.editedRef.current = new Set();
+      },
+      // A user-pressed Stop is not a failure: no toast, and the model state is
+      // not worth re-polling.
+      ignore: (msg) => /cancel/i.test(msg),
+      handle: (msg) => {
+        if (!msg.includes("MODEL_MISSING")) return false;
+        s.pushToast(
+          "error",
+          `Model "${s.model}" is not downloaded yet.`,
+          { label: "Download", run: () => downloadModel(s.model) },
+        );
+        return true;
+      },
+      onError: () => {
         refreshAi();
-      }
-    } finally {
-      s.askIdRef.current = null;
-      const msgs = await api.getMessages(chatId);
-      s.setMessages(msgs);
-      const lastMsg = msgs[msgs.length - 1];
-      if (lastMsg?.role === "assistant" && lastMsg.content.trim()) {
-        memorySuggestion(chatId)
-          .then((sug) => {
-            if (sug.worth && sug.fact.trim()) s.setMemSuggestion({ fact: sug.fact.trim() });
-          })
-          .catch(() => {});
-      }
-      const edited = [...s.editedRef.current];
-      if (edited.length) {
-        const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
-        if (lastAssistant) {
-          s.setUndoByMsg((u) => ({ ...u, [lastAssistant.id]: edited }));
+      },
+      openOllamaApp,
+      finish: async () => {
+        s.askIdRef.current = null;
+        const msgs = await api.getMessages(chatId);
+        s.setMessages(msgs);
+        const lastMsg = msgs[msgs.length - 1];
+        if (lastMsg?.role === "assistant" && lastMsg.content.trim()) {
+          memorySuggestion(chatId)
+            .then((sug) => {
+              if (sug.worth && sug.fact.trim()) s.setMemSuggestion({ fact: sug.fact.trim() });
+            })
+            .catch(() => {});
         }
-      }
-      s.setChats(await api.listChats());
-      api.listFiles().then(s.setFiles);
-      api.listMemories().then(s.setMemories);
-      s.setAsking(false);
-      s.setStreamText("");
-      s.setSteps([]);
-      s.setLane("");
-    }
+        const edited = [...s.editedRef.current];
+        if (edited.length) {
+          const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+          if (lastAssistant) {
+            s.setUndoByMsg((u) => ({ ...u, [lastAssistant.id]: edited }));
+          }
+        }
+        s.setChats(await api.listChats());
+        api.listFiles().then(s.setFiles);
+        api.listMemories().then(s.setMemories);
+        s.setAsking(false);
+        s.setStreamText("");
+        s.setSteps([]);
+        s.setLane("");
+      },
+    });
   }
 
   async function askOnce(q: string, attachmentIds: string[]) {

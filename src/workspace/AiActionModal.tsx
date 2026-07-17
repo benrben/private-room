@@ -102,7 +102,7 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
                   className={`ac-item ${i === s.studioAc!.index ? "active" : ""}`}
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    a.acceptAiMention(it.insert);
+                    a.acceptMention(it.insert, s.aiPrompt, s.setAiPrompt);
                   }}
                 >
                   <span className="ac-label">{it.label}</span>
@@ -152,8 +152,10 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
                 }
                 if (e.key === "Enter" || e.key === "Tab") {
                   e.preventDefault();
-                  a.acceptAiMention(
+                  a.acceptMention(
                     items[Math.min(s.studioAc.index, items.length - 1)].insert,
+                    s.aiPrompt,
+                    s.setAiPrompt,
                   );
                   return;
                 }

@@ -16,61 +16,20 @@ pub(crate) fn is_summary_file(name: &str, source: &str) -> bool {
     (name == SUMMARY_FILE_NAME || name == "Room summary.md") && source == "generated"
 }
 
-/// Trim a model reply down to a single clean sentence for a file one-liner.
-pub(crate) fn clean_one_liner(raw: &str) -> String {
-    let line = strip_markup_blocks(raw)
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .trim_start_matches(['-', '*', '#', '>', ' '])
-        .to_string();
-    line.chars().take(200).collect::<String>().trim().to_string()
-}
-
-/// ADD-27: extra reads the model may request per file. Each is one more local
-/// round trip, so a file costs at most 1 (gather) + MAX_READS + 1 (answer)
-/// calls. The amount of TEXT per read is governed separately by the
-/// context-derived budget in `summarize_one_file`, not by this count.
-const MAX_READS: usize = 4;
-
-/// ADD-27: the one tool offered during the gather phase — a paged, filtered
-/// read over the file's own text.
-fn read_text_tool() -> serde_json::Value {
-    serde_json::json!([{"type": "function", "function": {"name": "read_text",
-        "description": "Read another part of this file's text. offset picks where to start \
-            (0 = beginning), limit is how many characters to read (200-6000), find jumps to \
-            the next place a word or phrase appears at or after offset.",
-        "parameters": {"type": "object", "properties": {
-            "offset": {"type": "integer", "description": "Character position to read from"},
-            "limit": {"type": "integer", "description": "How many characters to read"},
-            "find": {"type": "string", "description": "Optional word or phrase to jump to"}
-        }}}}])
-}
-
-/// ADD-27: pull (offset, limit, find) out of a read_text call, tolerating the
-/// numbers arriving as strings or floats (small models do all three).
-fn read_args(args: &serde_json::Value) -> (usize, usize, Option<String>) {
-    fn num(v: &serde_json::Value) -> Option<usize> {
-        v.as_u64()
-            .map(|n| n as usize)
-            .or_else(|| v.as_f64().map(|f| f.max(0.0) as usize))
-            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
-    }
-    let offset = num(&args["offset"]).unwrap_or(0);
-    let limit = num(&args["limit"]).unwrap_or(extraction::READ_WINDOW_DEFAULT);
-    let find = args["find"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
-    (offset, limit, find)
-}
-
 /// ADD-17 map step: describe a single file in one sentence. ADD-27: `text` is
-/// now the file's FULL extracted text (it used to be a 1500-char snippet, so a
-/// 20 MB file was summarized from 0.008% of its content). The text is noise-
-/// filtered, and when it doesn't fit one window the MODEL drives the reading:
-/// it gets a `read_text(offset, limit, find)` tool and up to MAX_READS extra
-/// windows before a final schema-constrained call produces the sentence.
-/// `keep_alive` lets the background filler use a short warmth (CHG-22) so it
-/// never pins the model in RAM, while the interactive path keeps it warm.
+/// the file's FULL extracted text; the sidecar noise-filters it and, when it
+/// doesn't fit one window, the MODEL drives the reading (a `read_text` tool loop)
+/// before a final schema-constrained call produces the sentence.
+///
+/// MIGRATION Phase 3: all of that compute now lives in the sidecar's
+/// `/summarize_file` — the smart_filter, the read_text paging, the final
+/// structured call and `clean_one_liner` are byte-reproduced there. Rust gathers
+/// the full text (callers already do) and stores the returned one-liner. The
+/// error rule is preserved by the sentinel mapping: the endpoint returns 502
+/// (→ `OLLAMA_DOWN`/`MODEL_MISSING:<model>`) only for a FATAL engine failure and
+/// otherwise degrades internally to a samples-only answer, so this function's
+/// callers keep aborting the run only on those two sentinels. `keep_alive` still
+/// lets the background filler release the model (CHG-22).
 pub(crate) async fn summarize_one_file(
     model: &str,
     name: &str,
@@ -78,165 +37,19 @@ pub(crate) async fn summarize_one_file(
     text: &str,
     keep_alive: &str,
 ) -> Result<String, String> {
-    let filtered = extraction::smart_filter(text);
-    let head = extraction::read_window(&filtered, 0, extraction::READ_WINDOW_DEFAULT, None);
-    let whole = head.end >= filtered.len();
-    // ADD-27: deterministic baseline samples for a long file (used when !whole),
-    // and a cumulative read budget derived from the engine's REAL context —
-    // reserve room for prompts and the answer, spend everything else on file
-    // text instead of a fixed snippet.
-    let mid = extraction::read_window(&filtered, filtered.len() / 2, 2_000, None);
-    let tail =
-        extraction::read_window(&filtered, filtered.len().saturating_sub(2_000), 2_000, None);
-    let mut remaining = ollama::job_context_chars()
-        .saturating_sub(head.text.len() + mid.text.len() + tail.text.len() + 8_000);
-
-    let mut messages = vec![
-        ollama::ChatMessage::new(
-            "system",
-            if whole {
-                "You describe a single file in ONE short, factual sentence based only on what is given."
-            } else {
-                "You describe a single file in ONE short, factual sentence based only on what you \
-                 read from it. You see samples of a longer file. If the samples hint that the \
-                 important content is elsewhere (a table of contents, a reference to a later \
-                 section, a phrase worth locating), you MUST call read_text to look there \
-                 (find jumps to a phrase, offset picks a position) before answering. If the \
-                 samples already show what the file is, answer directly."
-            },
-        ),
-        ollama::ChatMessage::new(
-            "user",
-            if whole {
-                format!(
-                    "File name: {name}\nType: {mime}\n\nIts text:\n{}\n\n\
-                     In one sentence, what is this file about?",
-                    head.text
-                )
-            } else {
-                // Beginning, middle and end up front, so even a model that
-                // never touches read_text summarizes the file's whole shape
-                // instead of whatever happens to be on page one.
-                format!(
-                    "File name: {name}\nType: {mime}\nText length: {} characters\n\n\
-                     Characters 0-{} (beginning):\n{}\n\n\
-                     Characters {}-{} (middle):\n{}\n\n\
-                     Characters {}-{} (end):\n{}\n\n\
-                     In one sentence, what is this file about?",
-                    head.total,
-                    head.end,
-                    head.text,
-                    mid.offset,
-                    mid.end,
-                    mid.text,
-                    tail.offset,
-                    tail.end,
-                    tail.text,
-                )
-            },
-        ),
-    ];
-
-    if !whole {
-        let tools = read_text_tool();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut reads = 0;
-        'gather: while reads < MAX_READS && remaining >= extraction::READ_WINDOW_MIN {
-            // ADD-27: thinking ON for these rounds — without it, qwen3-family
-            // models answer straight from the samples and never touch the tool.
-            let round = ollama::chat_stream_tools_thinking(
-                model,
-                messages.clone(),
-                Some(&tools),
-                Some(0.2),
-                None,
-                keep_alive,
-                |_| {},
-            )
-            .await;
-            let calls = match round {
-                Ok((_, calls)) => calls,
-                Err(e) if e == "OLLAMA_DOWN" || e.starts_with("MODEL_MISSING") => return Err(e),
-                // A model with no tool support (Ollama rejects the request)
-                // must not lose its summary entirely: degrade to answering
-                // from the samples alone — exactly the pre-ADD-27 behavior.
-                Err(_) => break 'gather,
-            };
-            if calls.is_empty() {
-                break;
-            }
-            let raw_calls: Vec<serde_json::Value> = calls.iter().map(|c| c.raw.clone()).collect();
-            messages.push(ollama::ChatMessage {
-                role: "assistant".into(),
-                content: String::new(),
-                tool_calls: Some(serde_json::json!(raw_calls)),
-                ..Default::default()
-            });
-            for call in &calls {
-                let result = if call.name != "read_text" {
-                    "Unknown tool: only read_text is available.".to_string()
-                } else if !seen.insert(call.arguments.to_string()) {
-                    "You already read exactly this window; ask for a different offset or find, \
-                     or answer now."
-                        .to_string()
-                } else {
-                    reads += 1;
-                    let (offset, limit, find) = read_args(&call.arguments);
-                    // Spend at most what's left of the context budget.
-                    let limit = limit.min(remaining);
-                    let mut w = extraction::read_window(&filtered, offset, limit, find.as_deref());
-                    // A find that lands inside the head sample the model has
-                    // already seen (typically the sought word appearing in
-                    // "see X below"-style text near the top) wastes the read —
-                    // jump to the next occurrence past the shown region.
-                    if w.found && w.offset < head.end {
-                        let again =
-                            extraction::read_window(&filtered, head.end, limit, find.as_deref());
-                        if again.found {
-                            w = again;
-                        }
-                    }
-                    remaining = remaining.saturating_sub(w.text.len());
-                    let note = match (&find, w.found) {
-                        (Some(f), false) => format!(" (\"{f}\" was not found after that offset)"),
-                        _ => String::new(),
-                    };
-                    format!(
-                        "Characters {}-{} of {}{}:\n{}",
-                        w.offset, w.end, w.total, note, w.text
-                    )
-                };
-                messages.push(ollama::ChatMessage {
-                    role: "tool".into(),
-                    content: result,
-                    tool_name: Some(call.name.clone()),
-                    ..Default::default()
-                });
-                if reads >= MAX_READS || remaining < extraction::READ_WINDOW_MIN {
-                    break;
-                }
-            }
-        }
-        messages.push(ollama::ChatMessage::new(
-            "user",
-            "Based on everything you read, in one sentence, what is this file about?",
-        ));
-    }
-
-    // ADD-22: a single guaranteed string field, so a chatty model can't wrap the
-    // sentence in preamble/markup that clean_one_liner then has to strip.
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {"summary": {"type": "string"}},
-        "required": ["summary"]
+    let body = serde_json::json!({
+        "model": model,
+        "name": name,
+        "text": text,
+        "mime": mime,
+        "base_url": ollama::resolved_base_url(),
+        "keep_alive": keep_alive,
     });
-    // Job tier: the gathered windows can far exceed the small chat num_ctx.
-    let raw = ollama::chat_structured_job(model, messages, Some(0.2), keep_alive, &schema).await?;
-    let summary = serde_json::from_str::<serde_json::Value>(raw.trim())
-        .ok()
-        .and_then(|v| v.get("summary").and_then(|s| s.as_str()).map(str::to_string))
-        .unwrap_or(raw);
-    Ok(clean_one_liner(&summary))
+    let v = crate::sidecar::sidecar_json("/summarize_file", &body)
+        .await
+        .map_err(|e| e.sentinel(Some(model)))?;
+    // Already clean_one_liner'd on the sidecar (≤200 chars, may be "").
+    Ok(v["summary"].as_str().unwrap_or_default().to_string())
 }
 
 /// ADD-17 reduce step: one call producing the "What this room is for" paragraph
@@ -248,57 +61,29 @@ pub(crate) async fn combine_summary(
     memories: &[String],
     file_lines: &str,
 ) -> Result<(String, Vec<String>), String> {
-    let mut context = format!("Room name: {room_name}\n\nFiles and what each is:\n{file_lines}\n");
-    if !memories.is_empty() {
-        context.push_str("\nMemory notes the user saved for this room:\n");
-        for m in memories {
-            context.push_str(&format!("- {m}\n"));
-        }
-    }
-
-    // ADD-22 (fix): the old design asked one constrained call for a nested
-    // {purpose, questions[3]} object and often got empty strings back — a small
-    // model can't fill a JSON shape it never sees. Split into TWO single-purpose
-    // calls instead: free-text prose for the purpose (what a 4B model does most
-    // reliably), and a plain string array for the questions (grounded by the
-    // schema-in-prompt that chat_structured now adds).
-    let purpose = {
-        let messages = vec![
-            ollama::ChatMessage::new(
-                "system",
-                "You describe what a personal document room is for. In 2-4 sentences, say what \
-                 the room is about and the main topics it covers, based only on the file list. \
-                 Be specific and concrete. No preamble, no bullet lists, no file names.",
-            ),
-            ollama::ChatMessage::new("user", context.clone()),
-        ];
-        let (t, _) =
-            ollama::chat_stream_tools(model, messages, None, Some(0.4), None, KEEP_ALIVE_WARM, |_| {})
-                .await?;
-        strip_think_spans(&t).trim().to_string()
-    };
-
-    let questions = {
-        let messages = vec![
-            ollama::ChatMessage::new(
-                "system",
-                "You suggest example questions a user could ask about their own documents. Give \
-                 exactly three short, specific questions that these files would actually answer.",
-            ),
-            ollama::ChatMessage::new("user", context),
-        ];
-        let schema = serde_json::json!({
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 3,
-            "maxItems": 3
-        });
-        let raw = ollama::chat_structured(model, messages, Some(0.4), KEEP_ALIVE_WARM, &schema)
-            .await
-            .unwrap_or_default();
-        parse_string_list(&raw).into_iter().take(3).collect()
-    };
-
+    // MIGRATION Phase 3: the two reduce calls (free-text purpose + string-array
+    // questions), the context assembly and the questions cap now live in the
+    // sidecar's `/combine_summary`. Rust still builds `file_lines` deterministically
+    // from the cached per-file one-liners (see write_room_summary). Error rule
+    // reproduced: the purpose call propagates (→ this `?`), the questions call
+    // swallows to `[]` — both handled inside the endpoint, so a 502 here means the
+    // purpose call failed, mapped to the same sentinel it produced before.
+    let body = serde_json::json!({
+        "model": model,
+        "room_name": room_name,
+        "file_lines": file_lines,
+        "memories": memories,
+        "base_url": ollama::resolved_base_url(),
+        "keep_alive": KEEP_ALIVE_WARM,
+    });
+    let v = crate::sidecar::sidecar_json("/combine_summary", &body)
+        .await
+        .map_err(|e| e.sentinel(Some(model)))?;
+    let purpose = v["purpose"].as_str().unwrap_or_default().to_string();
+    let questions: Vec<String> = v["questions"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
     Ok((purpose, questions))
 }
 
@@ -584,12 +369,6 @@ mod tests {
         assert!(!is_summary_file("notes.md", "generated"));
     }
 
-    #[test]
-    fn cleans_model_one_liner() {
-        assert_eq!(clean_one_liner("- A lease agreement.\nExtra"), "A lease agreement.");
-        assert_eq!(clean_one_liner("\n\n  The résumé.  "), "The résumé.");
-    }
-
     /// ADD-27 end-to-end proof: the answer is ONLY reachable by paging past the
     /// first window, so a correct summary means the model really drove
     /// read_text. Needs a running Ollama with a tool-capable local model:
@@ -652,18 +431,6 @@ mod tests {
             pinned_room(&None, Some("/tmp/a.roomai")).err().as_deref(),
             Some("the room this job belongs to was closed")
         );
-    }
-
-    #[test]
-    fn read_args_tolerates_model_typing() {
-        // ADD-27: numbers arrive as ints, floats, or strings; find may be "".
-        let (o, l, f) =
-            read_args(&serde_json::json!({"offset": 500, "limit": 3000, "find": "clause"}));
-        assert_eq!((o, l, f.as_deref()), (500, 3000, Some("clause")));
-        let (o, l, f) = read_args(&serde_json::json!({"offset": "12000", "limit": 2.5e3}));
-        assert_eq!((o, l, f), (12_000, 2_500, None));
-        let (o, l, f) = read_args(&serde_json::json!({"find": "  "}));
-        assert_eq!((o, l, f), (0, extraction::READ_WINDOW_DEFAULT, None));
     }
 
 }

@@ -37,8 +37,9 @@ pub fn room_server_status(state: State<'_, AppState>) -> Result<RoomServerStatus
 /// D9: turn the persistent room MCP server on/off. `allow_cloud` mirrors the
 /// advisor sub-option (include the room's connected MCP tools). Persists the
 /// toggle so unlock can restore it (see `spawn_room_server_if_enabled`).
-/// CONTRACT-NOTE: `room_mcp::start(app, web_enabled, include_mcp)` — `allow_cloud`
-/// maps to `include_mcp`.
+/// CONTRACT-NOTE: `room_mcp::start(app, web_enabled, ToolScope::CloudAdvisor {
+/// include_mcp }, None)` — `allow_cloud` maps to `include_mcp`. This is a cloud
+/// scope: it never serves the app-driving/job tools (ADD-33).
 #[tauri::command]
 pub async fn set_room_server(
     app: tauri::AppHandle,
@@ -48,16 +49,20 @@ pub async fn set_room_server(
 ) -> Result<RoomServerStatus, String> {
     // Persist the toggle + read whether web tools should be exposed, all under
     // the room lock, which is dropped before any await.
-    let web_enabled = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    let web_enabled = state.with_room(|room| {
         db::set_setting(&room.conn, "room_server_enabled", if enabled { "1" } else { "0" })?;
-        web_access_enabled(&room.conn)
-    };
+        Ok(web_access_enabled(&room.conn))
+    })?;
     if enabled {
         let already = state.room_server.lock().unwrap().is_some();
         if !already {
-            let bridge = crate::room_mcp::start(app.clone(), web_enabled, allow_cloud).await?;
+            let bridge = crate::room_mcp::start(
+                app.clone(),
+                web_enabled,
+                crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: allow_cloud },
+                None,
+            )
+            .await?;
             *state.room_server.lock().unwrap() = Some(bridge);
         }
     } else {

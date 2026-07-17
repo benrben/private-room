@@ -117,11 +117,8 @@ pub async fn import_youtube_video(
     if web::youtube_video_id(&url).is_none() {
         return Err("That doesn't look like a YouTube video link.".into());
     }
-    {
-        // Fail fast (and don't fetch anything) when no room is open.
-        let guard = state.room.lock().unwrap();
-        guard.as_ref().ok_or("No room is open.")?;
-    }
+    // Fail fast (and don't fetch anything) when no room is open.
+    state.with_room(|_room| Ok(()))?;
     let bin = ensure_ytdlp(&app, &window).await?;
 
     let work_dir = std::env::temp_dir().join(format!("private-room-yt-{}", Uuid::new_v4()));

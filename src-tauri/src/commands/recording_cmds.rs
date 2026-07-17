@@ -311,14 +311,12 @@ async fn rec_retranscribe_inner(
     recording::install_diarize_model(app);
     recording::install_vad_model(app);
 
-    let (samples, cuts, max_speakers) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    let (samples, cuts, max_speakers) = state.with_room(|room| {
         let (_name, _mime, bytes, _text) = db::get_file_full(&room.conn, &id)?;
         let samples = recording::decode_wav(&bytes.unwrap_or_default())?;
         let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
-        (samples, meta.cuts, meta.max_speakers)
-    };
+        Ok((samples, meta.cuts, meta.max_speakers))
+    })?;
     if samples.is_empty() {
         return Err("This recording has no audio yet.".into());
     }
@@ -336,16 +334,15 @@ async fn rec_retranscribe_inner(
     .await
     .map_err(|e| e.to_string())?;
 
-    {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    state.with_room(|room| {
         // Same bytes, new transcript — through the single snapshotting write
         // path, so the old transcript stays recoverable via History.
         let bytes = db::get_file_bytes(&room.conn, &id)?.unwrap_or_default();
         let text = recording::transcript_text(&meta);
         store_file_bytes(&room.conn, &id, &bytes, Some(&text), "Re-transcribed")?;
         db::set_rec_meta(&room.conn, &id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
-    }
+        Ok(())
+    })?;
     let _ = app.emit(
         "rec-retranscribe",
         serde_json::json!({ "fileId": id, "doneCs": meta.duration_cs, "totalCs": meta.duration_cs }),
@@ -396,11 +393,11 @@ pub fn rec_live_status(rec: State<'_, RecState>) -> Option<RecLive> {
 /// speakers, cuts).
 #[tauri::command]
 pub fn rec_get(state: State<'_, AppState>, id: String) -> Result<RecFile, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let name = db::get_file_name(&room.conn, &id)?;
-    let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
-    Ok(RecFile { name, meta })
+    state.with_room(|room| {
+        let name = db::get_file_name(&room.conn, &id)?;
+        let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+        Ok(RecFile { name, meta })
+    })
 }
 
 /// Studio-style transcript editing: delete a time span. The words inside it
@@ -428,27 +425,27 @@ pub fn rec_delete_range(
     if rec.retranscribing.lock().unwrap().contains(&id) {
         return Err("This recording is being re-transcribed — wait for it to finish.".into());
     }
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let mut meta = parse_meta(db::get_rec_meta(&room.conn, &id));
-    for seg in &mut meta.segments {
-        for w in &mut seg.words {
-            if w.t0 < t1 && w.t1 > t0 {
-                w.del = true;
+    state.with_room(|room| {
+        let mut meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+        for seg in &mut meta.segments {
+            for w in &mut seg.words {
+                if w.t0 < t1 && w.t1 > t0 {
+                    w.del = true;
+                }
+            }
+            // A segment without word timings (legacy) is dropped wholesale when
+            // the cut swallows it.
+            if seg.words.is_empty() && seg.t0 >= t0 && seg.t1 <= t1 {
+                seg.text.clear();
             }
         }
-        // A segment without word timings (legacy) is dropped wholesale when
-        // the cut swallows it.
-        if seg.words.is_empty() && seg.t0 >= t0 && seg.t1 <= t1 {
-            seg.text.clear();
-        }
-    }
-    recording::add_cut(&mut meta.cuts, RecCut { t0, t1 });
-    let bytes = db::get_file_bytes(&room.conn, &id)?.unwrap_or_default();
-    let text = recording::transcript_text(&meta);
-    store_file_bytes(&room.conn, &id, &bytes, Some(&text), "Edited transcript")?;
-    db::set_rec_meta(&room.conn, &id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
-    Ok(meta)
+        recording::add_cut(&mut meta.cuts, RecCut { t0, t1 });
+        let bytes = db::get_file_bytes(&room.conn, &id)?.unwrap_or_default();
+        let text = recording::transcript_text(&meta);
+        store_file_bytes(&room.conn, &id, &bytes, Some(&text), "Edited transcript")?;
+        db::set_rec_meta(&room.conn, &id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
+        Ok(meta)
+    })
 }
 
 /// Render the edits into a new file: cut spans removed from the audio,
@@ -545,9 +542,7 @@ pub async fn rec_translate(
     if language.is_empty() {
         return Err("Pick a language first.".into());
     }
-    let (name, lines) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    let (name, lines) = state.with_room(|room| {
         let name = db::get_file_name(&room.conn, &id)?;
         let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
         let lines: Vec<String> = meta
@@ -560,8 +555,8 @@ pub async fn rec_translate(
                 })
             })
             .collect();
-        (name, lines)
-    };
+        Ok((name, lines))
+    })?;
     if lines.is_empty() {
         return Err("No transcript to translate yet — record something first.".into());
     }
@@ -586,9 +581,8 @@ pub async fn rec_translate(
             batch.len()
         );
         let messages = vec![ollama::ChatMessage::new("user", prompt)];
-        let (out, _) =
-            ollama::chat_stream_tools(&model, messages, None, Some(0.2), None, KEEP_ALIVE_WARM, |_| {})
-                .await?;
+        // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools, no Stop).
+        let out = ollama::generate(&model, messages, Some(0.2), KEEP_ALIVE_WARM, None).await?;
         let out = strip_think_spans(&out);
         let got: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         if got.len() == batch.len() {
@@ -610,11 +604,9 @@ pub async fn rec_translate(
         "# {stem} — {language}\n\n_Translated on this Mac from the recording's transcript._\n\n{}\n",
         translated.join("\n\n")
     );
-    let meta = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        db::insert_file(&room.conn, &out_name, "text/markdown", content.as_bytes(), Some(&content), "generated")?
-    };
+    let meta = state.with_room(|room| {
+        db::insert_file(&room.conn, &out_name, "text/markdown", content.as_bytes(), Some(&content), "generated")
+    })?;
     let _ = window.emit("room-files-changed", ());
     let _ = window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
     Ok(meta)

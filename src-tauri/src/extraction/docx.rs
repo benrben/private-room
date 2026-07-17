@@ -2,9 +2,7 @@ use super::*;
 
 pub(crate) fn extract_docx(bytes: &[u8]) -> Option<String> {
     let xml = read_zip_entry(bytes, "word/document.xml")?;
-    // Paragraph ends become newlines so the text keeps its structure.
-    let xml = xml.replace("</w:p>", "</w:p>\n");
-    Some(strip_tags(&xml))
+    Some(xml_paras_to_text(&xml, "</w:p>"))
 }
 
 fn encode_xml_text(s: &str) -> String {

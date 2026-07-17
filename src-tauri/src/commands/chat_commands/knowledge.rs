@@ -6,18 +6,18 @@ pub(crate) async fn cmd_remember(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         return Err("Usage: #remember <fact>".into());
     }
     let fact = clamp_bytes(fact.to_string(), MAX_MEMORY_CONTENT_CHARS);
-    let guard = ctx.state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    if duplicate_memory(&room.conn, &fact)?.is_some() {
-        return Ok(CommandResult {
-            content: "That's already in this room's memory.".into(),
+    ctx.state.with_room(|room| {
+        if duplicate_memory(&room.conn, &fact)?.is_some() {
+            return Ok(CommandResult {
+                content: "That's already in this room's memory.".into(),
+                ..Default::default()
+            });
+        }
+        db::add_memory(&room.conn, &fact)?;
+        Ok(CommandResult {
+            content: format!("Saved to memory:\n\n> {fact}"),
             ..Default::default()
-        });
-    }
-    db::add_memory(&room.conn, &fact)?;
-    Ok(CommandResult {
-        content: format!("Saved to memory:\n\n> {fact}"),
-        ..Default::default()
+        })
     })
 }
 
@@ -27,9 +27,8 @@ pub(crate) async fn cmd_find(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> 
         return Err("Usage: #find <keywords>".into());
     }
     let emb = embed_question(query).await;
-    let guard = ctx.state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let (chunks, fallback) = retrieve_context(&room.conn, query, emb.as_deref())?;
+    let (chunks, fallback) =
+        ctx.state.with_room(|room| retrieve_context(&room.conn, query, emb.as_deref()))?;
     if fallback || chunks.is_empty() {
         return Ok(CommandResult {
             content: format!("No matches found for **{query}**."),
@@ -60,22 +59,25 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     let lower = a.to_lowercase();
     if let Some(pos) = lower.find("for each") {
         let subject = a[pos + "for each".len()..].trim().trim_start_matches(':').trim();
-        // Enumerate: the one genuinely fuzzy step gets the model, forced to a
-        // list. ADD-22: the array shape is guaranteed by `format`, so the model
-        // can only return strings; parse_string_list just dedupes and caps.
-        let items = parse_string_list(
-            &ctx.ask_structured(
-                "You extract a list of short names from a conversation.",
-                format!(
-                    "From the conversation below, list the {subject} as short names (max 12). \
-                     If there are none, return an empty array.\n\nConversation:\n{}",
-                    ctx.history
-                ),
-                Some(0.0),
-                &serde_json::json!({"type": "array", "items": {"type": "string"}}),
-            )
-            .await?,
-        );
+        // Enumerate: the one genuinely fuzzy step. MIGRATION Phase 3: the prompt,
+        // schema and `parse_string_list` (dedupe + cap 12) live in the sidecar's
+        // /knowledge_extract mode:list, which returns the finished `items`. Rust
+        // keeps the subject parse, the empty-list error, and the per-item loop.
+        let req = serde_json::json!({
+            "model": ctx.model,
+            "base_url": ollama::resolved_base_url(),
+            "mode": "list",
+            "subject": subject,
+            "conversation": ctx.history,
+            "temperature": 0.0,
+            "keep_alive": KEEP_ALIVE_WARM,
+        });
+        let items: Vec<String> = crate::sidecar::sidecar_json("/knowledge_extract", &req)
+            .await
+            .map_err(|e| e.sentinel(Some(ctx.model)))?["items"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
         if items.is_empty() {
             return Err(
                 "Couldn't find a list to iterate over in this chat. Name the items explicitly, \
@@ -92,18 +94,23 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
                 "ask-step",
                 format!("Creating file for {item} ({}/{})", i + 1, items.len()),
             );
-            let body = ctx
-                .ask_quiet(
-                    DOC_SYS,
-                    format!(
-                        "Write a concise, useful note about \"{item}\", grounded in this \
-                         conversation where relevant:\n\n{}",
-                        ctx.history
-                    ),
-                    Some(0.4),
-                )
-                .await
-                .unwrap_or_default();
+            // MIGRATION Phase 3: the DOC_SYS document-body generation lives in the
+            // sidecar's /generate_doc mode:each. Cancellation stays Rust-side (the
+            // POST is blocking): a Stop drops the request; an error/stop → empty →
+            // skip, matching the old `ask_quiet(...).unwrap_or_default()`.
+            let req = serde_json::json!({
+                "model": ctx.model,
+                "base_url": ollama::resolved_base_url(),
+                "mode": "each",
+                "item": item,
+                "history": ctx.history,
+                "temperature": 0.4,
+                "keep_alive": KEEP_ALIVE_WARM,
+            });
+            let body = match crate::sidecar::sidecar_json_cancellable("/generate_doc", &req, &ctx.cancel).await {
+                Ok(Some(v)) => v["text"].as_str().unwrap_or_default().to_string(),
+                _ => String::new(),
+            };
             if body.trim().is_empty() {
                 continue;
             }
@@ -137,18 +144,24 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         }
         _ => (None, a.to_string()),
     };
-    let refctx = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        refs_context(&room.conn, ctx.refs, 8000).0
+    let refctx = ctx.state.with_room(|room| Ok(refs_context(&room.conn, ctx.refs, 8000).0))?;
+    // MIGRATION Phase 3: the DOC_SYS body generation lives in the sidecar's
+    // /generate_doc mode:single (which builds "{context}Write a … document about:
+    // {topic}"). Rust keeps refs_context, the empty-body error, and the naming.
+    let req = serde_json::json!({
+        "model": ctx.model,
+        "base_url": ollama::resolved_base_url(),
+        "mode": "single",
+        "topic": topic,
+        "context": refctx,
+        "temperature": 0.4,
+        "keep_alive": KEEP_ALIVE_WARM,
+    });
+    let body = match crate::sidecar::sidecar_json_cancellable("/generate_doc", &req, &ctx.cancel).await {
+        Ok(Some(v)) => v["text"].as_str().unwrap_or_default().to_string(),
+        Ok(None) => String::new(),
+        Err(e) => return Err(e.sentinel(Some(ctx.model))),
     };
-    let body = ctx
-        .ask_quiet(
-            DOC_SYS,
-            format!("{refctx}Write a well-structured document about: {topic}"),
-            Some(0.4),
-        )
-        .await?;
     if body.trim().is_empty() {
         return Err("The model returned nothing — try rephrasing the topic.".into());
     }
@@ -159,13 +172,7 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         None => html_note_name(&topic),
     };
     let doc = html_titled_doc(&name, &title_from_name(&name), &body);
-    let meta = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        create_note(&room.conn, &name, &doc)?
-    };
-    let _ = ctx.window.emit("room-files-changed", ());
-    let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
+    let meta = save_and_open(ctx.window, ctx.state, &name, &note_mime(&name), &doc, "generated")?;
     Ok(CommandResult {
         content: format!("Created **{}** and opened it.", meta.name),
         sources: vec![meta.name],
@@ -189,12 +196,10 @@ pub(crate) async fn cmd_highlight(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
     if thing.is_empty() {
         return Err("Say what to highlight — e.g. #highlight the signature in @contract.pdf".into());
     }
-    let (real_name, extracted) = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    let (real_name, extracted) = ctx.state.with_room(|room| {
         let (name, _mime, _bytes, text) = db::get_file_full(&room.conn, file_id)?;
-        (name, text.unwrap_or_default())
-    };
+        Ok((name, text.unwrap_or_default()))
+    })?;
     if extracted.trim().is_empty() {
         return Err(format!("\"{real_name}\" has no readable text to highlight."));
     }
@@ -249,15 +254,13 @@ pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
     if fields.is_empty() {
         return Err("Say which fields to extract — e.g. #extract revenue, CEO from @a @b".into());
     }
-    let files: Vec<(String, String)> = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        ctx.refs
+    let files: Vec<(String, String)> = ctx.state.with_room(|room| {
+        Ok(ctx.refs
             .iter()
             .filter_map(|id| db::get_file_full(&room.conn, id).ok())
             .map(|(name, _m, _b, text)| (name, text.unwrap_or_default()))
-            .collect()
-    };
+            .collect())
+    })?;
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut header = vec!["File".to_string()];
     header.extend(fields.iter().cloned());
@@ -270,52 +273,36 @@ pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
             .window
             .emit("ask-step", format!("Reading {name} ({}/{})", i + 1, files.len()));
         let doc = clamp_bytes(text.clone(), 6000);
-        let field_lines = fields.join("\n");
-        // ADD-22: one string property per requested field, so the reply is a
-        // guaranteed JSON object keyed exactly by the field names — no more
-        // hoping the model honors a "Field: value" line format.
-        let mut props = serde_json::Map::new();
-        for f in &fields {
-            props.insert(f.clone(), serde_json::json!({"type": "string"}));
-        }
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": props,
-            "required": fields,
+        // MIGRATION Phase 3: the per-field schema, prompt, structured call and
+        // "(not found)" defaulting live in the sidecar's /knowledge_extract
+        // mode:fields, which returns `values` keyed by every requested field. Rust
+        // keeps the 6000-char clamp, the CSV assembly and the ask-step emits. To
+        // preserve the old best-effort behavior (a failed structured call became a
+        // `(not found)` row rather than aborting the whole run), a sidecar error
+        // maps to an all-`(not found)` row for this file.
+        let req = serde_json::json!({
+            "model": ctx.model,
+            "base_url": ollama::resolved_base_url(),
+            "mode": "fields",
+            "fields": fields,
+            "document": doc,
+            "temperature": 0.0,
+            "keep_alive": KEEP_ALIVE_WARM,
         });
-        let reply = ctx
-            .ask_structured(
-                "You extract specific fields from a document. Fill each field with its value \
-                 copied from the document, or \"(not found)\" if it is absent.",
-                format!("Fields:\n{field_lines}\n\nDocument:\n{doc}"),
-                Some(0.0),
-                &schema,
-            )
+        let values = crate::sidecar::sidecar_json("/knowledge_extract", &req)
             .await
-            .unwrap_or_default();
-        let parsed: serde_json::Value =
-            serde_json::from_str(reply.trim()).unwrap_or_else(|_| serde_json::json!({}));
+            .ok()
+            .map(|v| v["values"].clone())
+            .unwrap_or_else(|| serde_json::json!({}));
         let mut row = vec![name.clone()];
         for f in &fields {
-            let val = parsed
-                .get(f)
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("(not found)")
-                .to_string();
-            row.push(val);
+            let val = value_str(&values, f);
+            row.push(if val.is_empty() { "(not found)".to_string() } else { val });
         }
         rows.push(row);
     }
     let csv = serialize_delim(&rows, ',');
-    let meta = {
-        let guard = ctx.state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        create_note(&room.conn, "extract.csv", &csv)?
-    };
-    let _ = ctx.window.emit("room-files-changed", ());
-    let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
+    let meta = save_and_open(ctx.window, ctx.state, "extract.csv", &note_mime("extract.csv"), &csv, "generated")?;
     Ok(CommandResult {
         content: format!(
             "Extracted {} field(s) from {} file(s) into **{}**.",

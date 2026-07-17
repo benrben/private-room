@@ -19,129 +19,68 @@ pub async fn generate_podcast_script(
     refs: Option<Vec<String>>,
     op_id: Option<String>,
 ) -> Result<FileMeta, String> {
-    use tauri::Emitter;
-    // ADD-31: cancellable with visible stages (see studio_flashcards).
-    let cancel = register_studio_cancel(&state, &op_id);
-    let _cancel_guard = op_id.as_ref().map(|id| CancelGuard {
-        state: state.inner(),
-        ask_id: id.clone(),
-    });
-    let instr = studio_instruction(instructions, STUDIO_PODCAST_PROMPT);
-    let _ = window.emit("studio-step", "Reading the material…");
-    let (label, text) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        match refs.as_ref().filter(|r| !r.is_empty()) {
-            Some(ids) => gather_files_text(&room.conn, ids)?,
-            None => gather_scope_text(&room.conn, scope.as_deref(), &room.name)?,
-        }
-    };
-    let model = resolve_structured_model(&state)
-        .await
-        .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
-    let _ = window.emit(
-        "studio-step",
-        if is_cloud_model(&model) {
-            "Writing the conversation — the cloud model is writing…"
-        } else {
-            "Writing the conversation — a local model can take a few minutes…"
-        },
-    );
-    let page_role = "You are a front-end developer building a podcast transcript page for a warm, \
-        two-host conversation that explains the material. Style each speaker's turns distinctly \
-        (name + line), keep it readable, and add a small note that spoken audio is coming in a later \
-        version. Base every line only on the provided material.";
-    let content = match generate_studio_html(&model, page_role, &instr, &label, &text, cancel.clone())
-        .await?
-    {
-        Some(html) if !cancel.load(Ordering::SeqCst) => html,
-        _ if cancel.load(Ordering::SeqCst) => return Err("Stopped.".into()),
-        _ => {
-            // Fallback: structured turns -> built-in template.
-            let schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "turns": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "speaker": {"type": "string"},
-                                "line": {"type": "string"}
-                            },
-                            "required": ["speaker", "line"]
-                        }
+    run_studio(&window, &state, podcast_spec(), scope, instructions, refs, op_id).await
+}
+
+/// The podcast-script artifact spec for the shared `run_studio` pipeline.
+pub(crate) fn podcast_spec() -> StudioSpec {
+    StudioSpec {
+        default_prompt: STUDIO_PODCAST_PROMPT,
+        page_role: "You are a front-end developer building a podcast transcript page for a warm, \
+            two-host conversation that explains the material. Style each speaker's turns distinctly \
+            (name + line), keep it readable, and add a small note that spoken audio is coming in a later \
+            version. Base every line only on the provided material.",
+        working_label: "Writing the conversation",
+        fallback_step: None,
+        fallback_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "turns": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "speaker": {"type": "string"},
+                            "line": {"type": "string"}
+                        },
+                        "required": ["speaker", "line"]
                     }
-                },
-                "required": ["title", "turns"]
-            });
-            let messages = vec![
-                ollama::ChatMessage::new(
-                    "system",
-                    "You write a short two-host podcast script that explains material in a warm, \
-                     conversational back-and-forth. Use two recurring host names as speakers. Keep each \
-                     turn to a couple of sentences. Base everything on the provided text.",
-                ),
-                ollama::ChatMessage::new(
-                    "user",
-                    format!("{instr}\n\nBase it only on this material about \"{label}\":\n\n{text}"),
-                ),
-            ];
-            let raw = ollama::chat_structured_cancel(
-                &model,
-                messages,
-                Some(0.5),
-                KEEP_ALIVE_WARM,
-                &schema,
-                cancel.clone(),
-            )
-            .await?;
-            if cancel.load(Ordering::SeqCst) {
-                return Err("Stopped.".into());
-            }
-            let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).ok();
-            let title = parsed
-                .as_ref()
-                .and_then(|v| v.get("title").and_then(|s| s.as_str()))
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(&label)
-                .trim()
-                .to_string();
-            let turns: Vec<PodcastTurn> = parsed
-                .as_ref()
-                .and_then(|v| v.get("turns").and_then(|t| t.as_array()).cloned())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|t| {
-                            let speaker =
-                                t.get("speaker").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-                            let line = t.get("line").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-                            (!line.is_empty()).then_some(PodcastTurn {
-                                speaker: if speaker.is_empty() { "Host".into() } else { speaker },
-                                line,
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if turns.is_empty() {
-                return Err(
-                    "The model didn't return a usable script — try a different file.".into(),
-                );
-            }
-            render_podcast_html(&title, &turns)
-        }
-    };
-    let name = format!("Podcast script - {}.html", safe_scope_name(&label));
-    let meta = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        db::insert_file(&room.conn, &name, "text/html", content.as_bytes(), Some(&content), "generated")?
-    };
-    let _ = window.emit("room-files-changed", ());
-    let _ = window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
-    Ok(meta)
+                }
+            },
+            "required": ["title", "turns"]
+        }),
+        fallback_system: "You write a short two-host podcast script that explains material in a warm, \
+             conversational back-and-forth. Use two recurring host names as speakers. Keep each \
+             turn to a couple of sentences. Base everything on the provided text.",
+        fallback_intro: "Base it only on this material about",
+        fallback_temp: 0.5,
+        render: fallback_podcast,
+        filename_prefix: "Podcast script",
+    }
+}
+
+/// Fallback: parse structured turns and render the built-in podcast template.
+/// The title defaults to the scope label when the model omits it.
+fn fallback_podcast(raw: &str, label: &str) -> Result<String, String> {
+    let title = json_str_field(raw, "title")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| label.trim().to_string());
+    let turns: Vec<PodcastTurn> = json_array(raw, "turns")
+        .iter()
+        .filter_map(|t| {
+            let speaker = value_str(t, "speaker");
+            let line = value_str(t, "line");
+            (!line.is_empty()).then_some(PodcastTurn {
+                speaker: if speaker.is_empty() { "Host".into() } else { speaker },
+                line,
+            })
+        })
+        .collect();
+    if turns.is_empty() {
+        return Err("The model didn't return a usable script — try a different file.".into());
+    }
+    Ok(render_podcast_html(&title, &turns))
 }
 
 /// D12: render a two-host podcast script as a self-contained HTML transcript,

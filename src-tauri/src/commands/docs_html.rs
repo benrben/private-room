@@ -3,6 +3,15 @@ use super::*;
 mod minutes;
 pub(crate) use minutes::*;
 
+/// The mime a generated file gets from its name. `create_note` and
+/// `save_and_open` must agree on it, so it lives in one place.
+pub(crate) fn note_mime(name: &str) -> String {
+    mime_guess::from_path(name)
+        .first_or(mime_guess::mime::TEXT_PLAIN)
+        .essence_str()
+        .to_string()
+}
+
 /// Save a generated text file into the room (Markdown by default). Reused by
 /// several commands. Emits nothing — the caller decides what to open/announce.
 pub(crate) fn create_note(conn: &Connection, name: &str, content: &str) -> Result<FileMeta, String> {
@@ -11,11 +20,30 @@ pub(crate) fn create_note(conn: &Connection, name: &str, content: &str) -> Resul
     } else {
         name.to_string()
     };
-    let mime = mime_guess::from_path(&name)
-        .first_or(mime_guess::mime::TEXT_PLAIN)
-        .essence_str()
-        .to_string();
-    db::insert_file(conn, &name, &mime, content.as_bytes(), Some(content), "generated")
+    db::insert_file(conn, &name, &note_mime(&name), content.as_bytes(), Some(content), "generated")
+}
+
+/// Save a file a generator just produced and put it in front of the user: insert
+/// it, tell the Files list to reload, then tell the viewer to open it. Every
+/// generator (studios, AI actions, #add-file, #extract) ends this way, and the
+/// two events must both fire — the file appears in the sidebar AND jumps into
+/// the viewer. Taking the room lock only for the insert keeps it off the await
+/// paths the callers run on.
+pub(crate) fn save_and_open(
+    window: &tauri::Window,
+    state: &State<'_, AppState>,
+    name: &str,
+    mime: &str,
+    content: &str,
+    source: &str,
+) -> Result<FileMeta, String> {
+    use tauri::Emitter;
+    let meta = state.with_room(|room| {
+        db::insert_file(&room.conn, name, mime, content.as_bytes(), Some(content), source)
+    })?;
+    let _ = window.emit("room-files-changed", ());
+    let _ = window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
+    Ok(meta)
 }
 
 // ---- HTML-first output (the app defaults generated documents to HTML) ----
@@ -242,43 +270,9 @@ pub(crate) fn html_note_name(topic: &str) -> String {
     format!("{}.html", md.strip_suffix(".md").unwrap_or(&md))
 }
 
-/// Parse a JSON array of strings from a model reply, tolerating leading/trailing
-/// prose; falls back to splitting on newlines/commas. Deduped, trimmed, capped.
-pub(crate) fn parse_string_list(raw: &str) -> Vec<String> {
-    let cleaned = strip_think_spans(raw);
-    let mut items: Vec<String> = Vec::new();
-    // Try a JSON array first.
-    if let Some(start) = cleaned.find('[') {
-        let mut de = serde_json::Deserializer::from_str(&cleaned[start..])
-            .into_iter::<serde_json::Value>();
-        if let Some(Ok(serde_json::Value::Array(arr))) = de.next() {
-            for v in arr {
-                if let Some(s) = v.as_str() {
-                    items.push(s.to_string());
-                }
-            }
-        }
-    }
-    // Fallback: split lines, stripping list markers.
-    if items.is_empty() {
-        for line in cleaned.lines() {
-            let t = line
-                .trim()
-                .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '-' | '*' | '.' | ')' | ' '))
-                .trim();
-            if !t.is_empty() && t.len() < 80 {
-                items.push(t.to_string());
-            }
-        }
-    }
-    let mut seen = HashSet::new();
-    items
-        .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && seen.insert(s.to_lowercase()))
-        .take(12)
-        .collect()
-}
+// MIGRATION Phase 3: `parse_string_list` (the JSON-array-or-prose list parser used
+// by #add-file's enumeration) moved into the sidecar's /knowledge_extract mode:list,
+// which returns the finished `items`. It's gone from Rust.
 
 /// Extract the LAST markdown table in `text` as rows of cells (header first).
 /// "Last" so #to-sheet, scanning conversation history, picks the most recent
@@ -314,14 +308,9 @@ pub(crate) fn extract_md_table(text: &str) -> Option<Vec<Vec<String>>> {
     last
 }
 
-// ADD-22 (HTML-first): generated documents default to HTML. The model writes
-// only simple BODY markup; the app wraps it in a styled, sandboxed page.
-pub(crate) const DOC_SYS: &str = "You write the body of a single clear, well-structured HTML document \
-using simple tags only: <h2>, <h3>, <p>, <ul>/<li>, <ol>/<li>, <strong>, <em>, <a>, \
-<blockquote>, <table>/<tr>/<td>. Open with ONE short <p> that sums up the document, then \
-organize the rest under <h2> section headings. Do NOT repeat the document's title as a \
-heading — it is added for you. Output ONLY the inner HTML — no <html>, <head>, <body>, <h1> \
-or <style> tags, no code fences, no preamble, no \"Here is\".";
+// ADD-22 (HTML-first): generated documents default to HTML. MIGRATION Phase 3: the
+// DOC_SYS system prompt moved with #add-file's body generation into the sidecar's
+// /generate_doc, which owns the prompt now, so it no longer lives here.
 
 // ---- individual commands ----
 
@@ -329,19 +318,6 @@ or <style> tags, no code fences, no preamble, no \"Here is\".";
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_string_list_handles_json_and_prose() {
-        // JSON array wins even with leading prose.
-        let a = parse_string_list("Sure, here they are: [\"AAPL\", \"MSFT\", \"NVDA\"]");
-        assert_eq!(a, vec!["AAPL", "MSFT", "NVDA"]);
-        // Falls back to line/bullet splitting; dedups case-insensitively.
-        let b = parse_string_list("1. Apple\n2. apple\n- Microsoft");
-        assert_eq!(b, vec!["Apple", "Microsoft"]);
-        // <think> spans are stripped before parsing.
-        let c = parse_string_list("<think>hmm</think>[\"x\"]");
-        assert_eq!(c, vec!["x"]);
-    }
 
     #[test]
     fn extract_md_table_parses_and_skips_separator() {

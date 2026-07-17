@@ -8,6 +8,8 @@ mod ollama;
 mod ollama_lifecycle;
 pub mod recording;
 mod room_mcp;
+mod sidecar;
+mod sidecar_lifecycle;
 pub(crate) mod snapshot;
 pub mod stt;
 pub mod web;
@@ -219,6 +221,8 @@ pub fn run() {
             // (and only it) as the app exits. A no-op for an external daemon.
             if let tauri::RunEvent::Exit = _event {
                 ollama_lifecycle::stop_if_ours();
+                // ADD-33: never leak the Python agent sidecar we spawned.
+                sidecar_lifecycle::stop_if_ours();
                 // Decrypted "Open in browser" previews must not outlive the app.
                 commands::cleanup_browser_previews();
             }

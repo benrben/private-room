@@ -126,6 +126,13 @@ pub(crate) fn strip_tags(input: &str) -> String {
     decode_basic_entities(&out)
 }
 
+/// Text of an OOXML part, keeping its paragraph structure: the paragraph close
+/// tag (`</w:p>` in Word, `</a:p>` in PowerPoint) becomes a newline before the
+/// markup is stripped, so paragraphs don't collapse into one run-on line.
+pub(crate) fn xml_paras_to_text(xml: &str, para_close: &str) -> String {
+    strip_tags(&xml.replace(para_close, &format!("{para_close}\n")))
+}
+
 pub(crate) fn decode_basic_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&lt;", "<")

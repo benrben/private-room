@@ -39,6 +39,18 @@ if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
   exit 1
 fi
 
+# ADD-33: build + stage the Python agent sidecar (onedir PyInstaller bundle) into
+# src-tauri/resources/sidecar/ BEFORE the app build, so tauri.conf.json's resource
+# map can bundle it into Contents/Resources/. Skipped if the toolchain is absent
+# (the app still ships; the sidecar just isn't available and the agent uses the
+# native engine).
+if command -v uv >/dev/null 2>&1; then
+  echo "▶ Building the agent sidecar…"
+  ./sidecar/build-sidecar.sh
+else
+  echo "⚠ uv not found — skipping the sidecar bundle (app will use the native engine)."
+fi
+
 # The /usr/bin PATH shim keeps the real xattr/hdiutil ahead of any overrides so
 # the bundlers work (project memory: private-room-build-xattr-shim).
 echo "▶ Building the app…"
@@ -57,10 +69,32 @@ DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null \
 
 if [[ -n "$DEV_ID" ]]; then
   echo "▶ Signing with: ${DEV_ID}"
+  # 1. Deep-sign the whole app with our identity. This re-signs the sidecar's
+  #    bundled dylibs (python.org/Homebrew build, a foreign Team ID that the
+  #    hardened runtime's library validation would otherwise reject) under our
+  #    single identity, so they become consistent.
   codesign --force --deep --sign "$DEV_ID" \
     --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" \
     "$APP"
+  # 2. ADD-33: re-sign JUST the sidecar executable with its OWN entitlements —
+  #    disable-library-validation + allow-unsigned-executable-memory, which CPython
+  #    needs under the hardened runtime and which the app's entitlements omit.
+  # 3. Re-seal the app top-level (no --deep, so the sidecar's signature is left
+  #    intact) so Contents/_CodeSignature reflects the modified sidecar.
+  # NOTE: validated locally only with an ad-hoc identity (no Developer ID cert
+  # here); confirm on a notarizing machine that the sidecar launches post-staple.
+  SIDECAR="${APP}/Contents/Resources/sidecar/privateroom-sidecar/privateroom-sidecar"
+  if [[ -f "$SIDECAR" ]]; then
+    echo "▶ Re-signing the agent sidecar with its entitlements…"
+    codesign --force --options runtime --timestamp \
+      --entitlements "sidecar/sidecar-entitlements.plist" \
+      --sign "$DEV_ID" "$SIDECAR"
+    codesign --force --sign "$DEV_ID" \
+      --options runtime --timestamp \
+      --entitlements "$ENTITLEMENTS" \
+      "$APP"
+  fi
   codesign --verify --strict --deep "$APP"
   if [[ -n "${APPLE_NOTARY_PROFILE:-}" ]]; then
     echo "▶ Notarizing…"

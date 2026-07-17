@@ -3,6 +3,7 @@
 //! so a job resumes from `cursor` across app restarts. Pure DB plumbing — the
 //! scheduler and step semantics live in `commands::jobs`.
 
+use super::{execute_one, query_one, query_rows};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -55,12 +56,12 @@ pub fn create_job(
     total: i64,
 ) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
-    conn.execute(
+    execute_one(
+        conn,
         "INSERT INTO jobs(id, kind, title, plan, total, status) \
          VALUES(?1, ?2, ?3, ?4, ?5, 'queued')",
         params![id, kind, title, plan.to_string(), total],
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
     Ok(id)
 }
 
@@ -72,13 +73,12 @@ pub fn checkpoint_job(
     cursor: i64,
     state: &serde_json::Value,
 ) -> Result<(), String> {
-    conn.execute(
+    execute_one(
+        conn,
         "UPDATE jobs SET cursor = ?2, state = ?3, \
          updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1",
         params![id, cursor, state.to_string()],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// Move a job to a terminal or paused status. `error` is set only for 'error'.
@@ -88,61 +88,51 @@ pub fn set_job_status(
     status: &str,
     error: Option<&str>,
 ) -> Result<(), String> {
-    conn.execute(
+    execute_one(
+        conn,
         "UPDATE jobs SET status = ?2, error = ?3, \
          updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1",
         params![id, status, error],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 pub fn get_job(conn: &Connection, id: &str) -> Result<Job, String> {
-    conn.query_row(
+    query_one(
+        conn,
         &format!("SELECT {COLS} FROM jobs WHERE id = ?1"),
         [id],
         row_to_job,
     )
-    .map_err(|e| e.to_string())
 }
 
 /// All jobs, newest first — for the jobs panel.
 pub fn list_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
-    let mut stmt = conn
-        .prepare(&format!("SELECT {COLS} FROM jobs ORDER BY created_at DESC"))
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], row_to_job)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+    query_rows(
+        conn,
+        &format!("SELECT {COLS} FROM jobs ORDER BY created_at DESC"),
+        [],
+        row_to_job,
+    )
 }
 
 /// Jobs that were mid-flight — 'running' or 'queued' or 'paused'. On app start
 /// any 'running' row is really stale (the process that ran it is gone), so the
 /// caller marks those 'paused' and offers Resume.
 pub fn unfinished_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
-    let mut stmt = conn
-        .prepare(&format!(
+    query_rows(
+        conn,
+        &format!(
             "SELECT {COLS} FROM jobs \
              WHERE status IN ('running','queued','paused') ORDER BY created_at ASC"
-        ))
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], row_to_job)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+        ),
+        [],
+        row_to_job,
+    )
 }
 
 pub fn delete_job(conn: &Connection, id: &str) -> Result<(), String> {
-    conn.execute("DELETE FROM job_artifacts WHERE job_id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM jobs WHERE id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    execute_one(conn, "DELETE FROM job_artifacts WHERE job_id = ?1", [id])?;
+    execute_one(conn, "DELETE FROM jobs WHERE id = ?1", [id])
 }
 
 // ---------------------------------------------------------------- artifacts
@@ -155,12 +145,11 @@ pub fn put_job_artifact(
     step_id: usize,
     content: &str,
 ) -> Result<(), String> {
-    conn.execute(
+    execute_one(
+        conn,
         "INSERT OR REPLACE INTO job_artifacts(job_id, step_id, content) VALUES(?1, ?2, ?3)",
         params![job_id, step_id as i64, content],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 pub fn get_job_artifact(conn: &Connection, job_id: &str, step_id: usize) -> Option<String> {

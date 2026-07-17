@@ -200,9 +200,7 @@ pub(crate) fn run_ocr_job(app: &tauri::AppHandle, job: JobMeta) {
 
 #[tauri::command]
 pub fn list_files(state: State<'_, AppState>) -> Result<Vec<FileMeta>, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::list_files(&room.conn)
+    state.with_room(|room| db::list_files(&room.conn))
 }
 
 pub(crate) const MAX_VIEWER_BYTES: usize = 50 * 1024 * 1024;
@@ -339,13 +337,13 @@ pub fn update_file_content(
     id: String,
     content: String,
 ) -> Result<FileMeta, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let name = db::get_file_name(&room.conn, &id)?;
-    let bytes = content.as_bytes();
-    let text = extraction::extract_text(&name, bytes).unwrap_or_else(|| content.clone());
-    store_file_bytes(&room.conn, &id, bytes, Some(&text), "You saved")?;
-    db::get_file_meta(&room.conn, &id)
+    state.with_room(|room| {
+        let name = db::get_file_name(&room.conn, &id)?;
+        let bytes = content.as_bytes();
+        let text = extraction::extract_text(&name, bytes).unwrap_or_else(|| content.clone());
+        store_file_bytes(&room.conn, &id, bytes, Some(&text), "You saved")?;
+        db::get_file_meta(&room.conn, &id)
+    })
 }
 
 #[tauri::command]
@@ -367,9 +365,7 @@ pub fn delete_file(
             }
         }
     }
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::delete_file(&room.conn, &id)
+    state.with_room(|room| db::delete_file(&room.conn, &id))
 }
 
 #[tauri::command]
@@ -378,25 +374,25 @@ pub fn save_generated_file(
     name: String,
     content: String,
 ) -> Result<FileMeta, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let name = if extraction::extension_of(&name).is_empty() {
-        format!("{name}.md")
-    } else {
-        name
-    };
-    let mime = mime_guess::from_path(&name)
-        .first_or(mime_guess::mime::TEXT_PLAIN)
-        .essence_str()
-        .to_string();
-    db::insert_file(
-        &room.conn,
-        &name,
-        &mime,
-        content.as_bytes(),
-        Some(&content),
-        "generated",
-    )
+    state.with_room(|room| {
+        let name = if extraction::extension_of(&name).is_empty() {
+            format!("{name}.md")
+        } else {
+            name
+        };
+        let mime = mime_guess::from_path(&name)
+            .first_or(mime_guess::mime::TEXT_PLAIN)
+            .essence_str()
+            .to_string();
+        db::insert_file(
+            &room.conn,
+            &name,
+            &mime,
+            content.as_bytes(),
+            Some(&content),
+            "generated",
+        )
+    })
 }
 
 // ---------------------------------------------------------------- import link (ADD-12)
@@ -455,32 +451,30 @@ pub async fn import_link(state: State<'_, AppState>, url: String) -> Result<File
     } else {
         web::fetch_page(&url).await?
     };
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let saved = db::current_date(&room.conn);
-    let name = if is_youtube {
-        link_file_name(&format!("{title} (transcript)"), &url)
-    } else {
-        link_file_name(&title, &url)
-    };
-    let content = format!("# {title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
-    db::insert_file(
-        &room.conn,
-        &name,
-        "text/markdown",
-        content.as_bytes(),
-        Some(&content),
-        "web",
-    )
+    state.with_room(|room| {
+        let saved = db::current_date(&room.conn);
+        let name = if is_youtube {
+            link_file_name(&format!("{title} (transcript)"), &url)
+        } else {
+            link_file_name(&title, &url)
+        };
+        let content = format!("# {title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
+        db::insert_file(
+            &room.conn,
+            &name,
+            "text/markdown",
+            content.as_bytes(),
+            Some(&content),
+            "web",
+        )
+    })
 }
 
 // ---------------------------------------------------------------- summarize room (ADD-17)
 
 #[tauri::command]
 pub fn rename_file(state: State<'_, AppState>, id: String, name: String) -> Result<(), String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::rename_file(&room.conn, &id, &name)
+    state.with_room(|room| db::rename_file(&room.conn, &id, &name))
 }
 
 

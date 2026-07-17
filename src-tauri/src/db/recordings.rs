@@ -7,13 +7,12 @@ use super::*;
 // search, RAG and every AI action already find it.
 
 pub fn set_rec_meta(conn: &Connection, file_id: &str, meta_json: &str) -> Result<(), String> {
-    conn.execute(
+    execute_one(
+        conn,
         "INSERT INTO recordings(file_id, meta) VALUES (?1, ?2)
          ON CONFLICT(file_id) DO UPDATE SET meta = excluded.meta",
         params![file_id, meta_json],
     )
-    .map(|_| ())
-    .map_err(|e| e.to_string())
 }
 
 pub fn get_rec_meta(conn: &Connection, file_id: &str) -> Option<String> {
@@ -40,52 +39,40 @@ pub fn append_rec_chunk(conn: &Connection, file_id: &str, samples: &[f32]) -> Re
     for s in samples {
         pcm.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
     }
-    conn.execute(
+    execute_one(
+        conn,
         "INSERT INTO rec_chunks(file_id, seq, pcm)
          VALUES (?1, 1 + COALESCE((SELECT MAX(seq) FROM rec_chunks WHERE file_id = ?1), 0), ?2)",
         params![file_id, pcm],
     )
-    .map(|_| ())
-    .map_err(|e| e.to_string())
 }
 
 /// Drop a file's checkpoints — the full WAV was just written.
 pub fn clear_rec_chunks(conn: &Connection, file_id: &str) -> Result<(), String> {
-    conn.execute("DELETE FROM rec_chunks WHERE file_id = ?1", [file_id])
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    execute_one(conn, "DELETE FROM rec_chunks WHERE file_id = ?1", [file_id])
 }
 
 /// Recover any recording whose live session died before its final write:
 /// splice the checkpointed tail onto the stored WAV and clear the chunks.
 /// Idempotent, and free when there is nothing to recover (the normal case).
 pub fn recover_rec_chunks(conn: &Connection) -> Result<usize, String> {
-    let ids: Vec<String> = {
-        let mut stmt =
-            conn.prepare("SELECT DISTINCT file_id FROM rec_chunks").map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| r.get(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        rows
-    };
+    let ids: Vec<String> = query_rows(
+        conn,
+        "SELECT DISTINCT file_id FROM rec_chunks",
+        [],
+        |r| r.get(0),
+    )?;
     for id in &ids {
         let mut samples = get_file_bytes(conn, id)?
             .map(|b| crate::recording::decode_wav(&b))
             .transpose()?
             .unwrap_or_default();
-        let chunks: Vec<Vec<u8>> = {
-            let mut stmt = conn
-                .prepare("SELECT pcm FROM rec_chunks WHERE file_id = ?1 ORDER BY seq")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([id.as_str()], |r| r.get(0))
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            rows
-        };
+        let chunks: Vec<Vec<u8>> = query_rows(
+            conn,
+            "SELECT pcm FROM rec_chunks WHERE file_id = ?1 ORDER BY seq",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
         for pcm in chunks {
             samples.extend(
                 pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),

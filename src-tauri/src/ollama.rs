@@ -62,8 +62,9 @@ pub fn resolved_base_url() -> String {
 }
 
 /// ADD-13: default local embedding model for meaning-based retrieval. Small
-/// (~270 MB), served by Ollama's `/api/embed`. Both chunk vectors (stored in
-/// `chunks.embedding`) and the question vector are produced by this model.
+/// (~270 MB), run by Ollama via the sidecar `/embed` endpoint. Both chunk
+/// vectors (stored in `chunks.embedding`) and the question vector are produced
+/// by this model.
 pub const EMBED_MODEL: &str = "nomic-embed-text";
 
 #[derive(Serialize, Clone, Default)]
@@ -92,7 +93,6 @@ impl ChatMessage {
 pub struct ToolCall {
     pub name: String,
     pub arguments: serde_json::Value,
-    pub raw: serde_json::Value,
 }
 
 fn client() -> Result<reqwest::Client, String> {
@@ -110,6 +110,108 @@ fn map_send_err(e: reqwest::Error) -> String {
     }
 }
 
+// MIGRATION Phase 1: the Python/LangGraph sidecar is the app's SOLE AI service.
+// Every non-agent LLM call in this file POSTs to it (after ensuring it is up)
+// instead of hitting Ollama directly — Rust gathers the DB text, the sidecar owns
+// all model I/O. There is NO native fallback: if the sidecar can't start, the call
+// errors. The Ollama base URL the sidecar should talk to is `resolved_base_url()`
+// (the runtime "closet supercomputer" override still lives HERE on the Rust side),
+// so we pass it in every request body rather than the sidecar holding its own copy.
+
+/// POST a JSON body to a sidecar gateway endpoint, returning the parsed JSON.
+/// Ensures the sidecar is up first (no native fallback). A classified engine
+/// failure comes back as a non-2xx `{code,error}` body; `model` (when known) lets
+/// us rebuild the `MODEL_MISSING:<model>` sentinel the callers still branch on.
+async fn sidecar_post(
+    path: &str,
+    body: &serde_json::Value,
+    model: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let base = crate::sidecar_lifecycle::ensure_up().await?;
+    let resp = client()?
+        .post(format!("{base}{path}"))
+        .json(body)
+        .send()
+        .await
+        .map_err(map_send_err)?;
+    let status = resp.status();
+    if status.is_success() {
+        return resp.json().await.map_err(|e| e.to_string());
+    }
+    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+    Err(map_sidecar_error(&v, model, status))
+}
+
+/// Rebuild the pre-migration error sentinels from the sidecar's `{code,error}`
+/// envelope: `OLLAMA_DOWN` straight through, `MODEL_MISSING` re-tagged with the
+/// model name (the sidecar doesn't echo it back), anything else a plain engine
+/// error — so summarize.rs / jobs.rs / file_pass.rs match exactly what they did
+/// when Rust called Ollama directly.
+fn map_sidecar_error(
+    v: &serde_json::Value,
+    model: Option<&str>,
+    status: reqwest::StatusCode,
+) -> String {
+    match v["code"].as_str() {
+        Some("OLLAMA_DOWN") => "OLLAMA_DOWN".to_string(),
+        Some("MODEL_MISSING") => match model {
+            Some(m) => format!("MODEL_MISSING:{m}"),
+            None => "MODEL_MISSING".to_string(),
+        },
+        _ => format!(
+            "Local AI error ({status}): {}",
+            v["error"].as_str().unwrap_or("unknown error")
+        ),
+    }
+}
+
+/// MIGRATION follow-up (ADD-33): the Python sidecar TALKS to Ollama but cannot
+/// START it. Before any model-loading gateway call, ensure the local
+/// `ollama serve` daemon is up (spawned on demand — local base URLs only) and
+/// hold the returned `Busy` guard for the call's whole duration so the idle
+/// watcher won't sleep it mid-request. A remote or unstartable daemon yields the
+/// same `OLLAMA_DOWN` surface the callers already handle. Metadata reads
+/// (`list_models`/`capabilities`/`delete_model`) deliberately SKIP this — they
+/// must never boot a sleeping daemon just to inspect state.
+pub async fn wake_daemon() -> Result<crate::ollama_lifecycle::Busy, String> {
+    crate::ollama_lifecycle::ensure_up(&resolved_base_url()).await
+}
+
+/// POST `/generate`, but honour a caller-owned cancel flag (ADD-31/ADD-32): a
+/// Studio writing a whole HTML page, or a whole-file pass running one Job-tier
+/// call per window, runs for minutes and Stop must abandon it promptly. The
+/// sidecar `/generate` is non-streaming, so there is no partial text to keep —
+/// we race the request against the flag and DROP it on Stop (dropping the reqwest
+/// future closes the connection, which stops Ollama), returning an empty `text`
+/// the caller treats as a stopped run (same "partial == stopped" contract as the
+/// old streamed path, minus the partial tokens the non-streaming endpoint can't
+/// surface).
+async fn post_generate_cancellable(
+    body: &serde_json::Value,
+    model: &str,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<serde_json::Value, String> {
+    // Ensure the local Ollama daemon is up (the sidecar can't start it) and hold
+    // the guard across the request; both branches below await under it.
+    let _daemon = wake_daemon().await?;
+    let Some(flag) = cancel else {
+        return sidecar_post("/generate", body, Some(model)).await;
+    };
+    let fut = sidecar_post("/generate", body, Some(model));
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            res = &mut fut => return res,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if flag.load(Ordering::SeqCst) {
+                    // Returning here drops `fut`, aborting the in-flight request.
+                    return Ok(serde_json::json!({ "text": "" }));
+                }
+            }
+        }
+    }
+}
+
 /// Streaming chat that can also carry a tool catalog. Returns the streamed
 /// text plus any tool calls the model made this round.
 ///
@@ -123,8 +225,9 @@ fn map_send_err(e: reqwest::Error) -> String {
 /// `num_ctx` it may allocate. `Chat` is the interactive path — prefill time is
 /// user-visible, so its window stays small. `Job` is background work (deep
 /// summaries, digests): prefill minutes are fine, so it gets the big window.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub enum CtxTier {
+    #[default]
     Chat,
     Job,
 }
@@ -156,135 +259,53 @@ fn num_ctx_for(has_tools: bool, tier: CtxTier) -> u32 {
 /// a safe floor across English and Hebrew), so read-loop callers can size
 /// their windows to what the engine will actually see instead of a hardcoded
 /// snippet. 16 GB Mac → ~196k chars; 32 GB+ → ~393k.
+///
+/// MIGRATION: the read-loop callers that used this (the summarizer's paging) now
+/// gather their text inside the sidecar, so nothing in Rust calls this today. Kept
+/// per the migration spec as a pure sizing helper the engine config still describes.
+#[allow(dead_code)]
 pub fn job_context_chars() -> usize {
     num_ctx_for(true, CtxTier::Job) as usize * 3
 }
 
-pub async fn chat_stream_tools(
-    model: &str,
-    messages: Vec<ChatMessage>,
-    tools: Option<&serde_json::Value>,
-    temperature: Option<f64>,
-    cancel: Option<Arc<AtomicBool>>,
-    keep_alive: &str,
-    on_delta: impl FnMut(&str),
-) -> Result<(String, Vec<ToolCall>), String> {
-    chat_core(
-        model, messages, tools, temperature, cancel, keep_alive, None, false, CtxTier::Chat,
-        on_delta,
-    )
-    .await
+/// The knobs a `chat_structured` caller may vary. `Default` is the interactive
+/// case: Chat context tier, no cancellation.
+#[derive(Default, Clone)]
+pub struct StructuredOpts {
+    /// ADD-27: which `num_ctx` the call may allocate. `Job` is for the final
+    /// call of a background job whose messages carry big gathered windows (a
+    /// deep summary's reads would overflow the small chat `num_ctx` and
+    /// silently drop the user's question).
+    pub tier: CtxTier,
+    /// ADD-31/ADD-32: a caller-owned flag for long structured generations the
+    /// user must be able to stop — a Studio writing a whole HTML page on a
+    /// local model runs for minutes, and a whole-file pass runs one Job-tier
+    /// call per window for possibly hours. Flipping the flag abandons the
+    /// stream promptly; the caller treats the partial as stopped.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
-/// ADD-27: like `chat_stream_tools`, but for BACKGROUND JOB rounds: runs at
-/// the Job context tier (big `num_ctx`) and lets a thinking-capable model
-/// think. Measured on qwen3.5: with `think: false` it answers directly and
-/// NEVER calls the offered tools, so tool-driven flows (the summarizer's read
-/// loop) silently degrade; with thinking on it reasons briefly and calls
-/// them. Interactive chat keeps the fast non-thinking, small-context default.
-pub async fn chat_stream_tools_thinking(
-    model: &str,
-    messages: Vec<ChatMessage>,
-    tools: Option<&serde_json::Value>,
-    temperature: Option<f64>,
-    cancel: Option<Arc<AtomicBool>>,
-    keep_alive: &str,
-    on_delta: impl FnMut(&str),
-) -> Result<(String, Vec<ToolCall>), String> {
-    chat_core(
-        model, messages, tools, temperature, cancel, keep_alive, None, true, CtxTier::Job,
-        on_delta,
-    )
-    .await
+impl StructuredOpts {
+    /// Attach a caller-owned cancel flag.
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
 }
 
 /// ADD-22 training wheel: a one-shot call whose output is CONSTRAINED to a JSON
 /// schema via Ollama's `format` (grammar-based token masking). No tools, no
-/// streaming, no cancel — for the small side-jobs (grounding boxes, field
-/// extraction, list-making, summaries) that used to beg the model for JSON in
-/// prose and salvage-parse the result. The model literally cannot emit a
-/// structurally invalid document, and constrained decoding is markedly faster.
+/// streaming — for the small side-jobs (grounding boxes, field extraction,
+/// list-making, summaries) that used to beg the model for JSON in prose and
+/// salvage-parse the result. The model literally cannot emit a structurally
+/// invalid document, and constrained decoding is markedly faster.
 pub async fn chat_structured(
-    model: &str,
-    messages: Vec<ChatMessage>,
-    temperature: Option<f64>,
-    keep_alive: &str,
-    schema: &serde_json::Value,
-) -> Result<String, String> {
-    chat_structured_tier(model, messages, temperature, keep_alive, schema, CtxTier::Chat, None)
-        .await
-}
-
-/// ADD-31: `chat_structured` with a caller-owned cancel flag, for long
-/// structured generations the user must be able to stop (a Studio writing a
-/// whole HTML page on a local model runs for minutes). Flipping the flag
-/// abandons the stream promptly; the caller treats the partial as stopped.
-pub async fn chat_structured_cancel(
-    model: &str,
-    messages: Vec<ChatMessage>,
-    temperature: Option<f64>,
-    keep_alive: &str,
-    schema: &serde_json::Value,
-    cancel: Arc<AtomicBool>,
-) -> Result<String, String> {
-    chat_structured_tier(
-        model,
-        messages,
-        temperature,
-        keep_alive,
-        schema,
-        CtxTier::Chat,
-        Some(cancel),
-    )
-    .await
-}
-
-/// ADD-27: `chat_structured` at the Job context tier — for the final call of a
-/// background job whose messages carry big gathered windows (a deep summary's
-/// reads would overflow the small chat `num_ctx` and silently drop the user's
-/// question).
-pub async fn chat_structured_job(
-    model: &str,
-    messages: Vec<ChatMessage>,
-    temperature: Option<f64>,
-    keep_alive: &str,
-    schema: &serde_json::Value,
-) -> Result<String, String> {
-    chat_structured_tier(model, messages, temperature, keep_alive, schema, CtxTier::Job, None)
-        .await
-}
-
-/// ADD-32: `chat_structured_job` with a caller-owned cancel flag — a whole-file
-/// pass runs one Job-tier structured call per window for possibly hours, and
-/// Stop must be able to abandon the in-flight window, not just wait it out.
-pub async fn chat_structured_job_cancel(
-    model: &str,
-    messages: Vec<ChatMessage>,
-    temperature: Option<f64>,
-    keep_alive: &str,
-    schema: &serde_json::Value,
-    cancel: Arc<AtomicBool>,
-) -> Result<String, String> {
-    chat_structured_tier(
-        model,
-        messages,
-        temperature,
-        keep_alive,
-        schema,
-        CtxTier::Job,
-        Some(cancel),
-    )
-    .await
-}
-
-async fn chat_structured_tier(
     model: &str,
     mut messages: Vec<ChatMessage>,
     temperature: Option<f64>,
     keep_alive: &str,
     schema: &serde_json::Value,
-    tier: CtxTier,
-    cancel: Option<Arc<AtomicBool>>,
+    opts: StructuredOpts,
 ) -> Result<String, String> {
     // CRITICAL (Ollama's own guidance): `format` constrains the output GRAMMAR
     // but the model NEVER SEES the schema. Without the field names in the prompt
@@ -296,12 +317,107 @@ async fn chat_structured_tier(
             serde_json::to_string(schema).unwrap_or_default()
         ));
     }
-    let (text, _) = chat_core(
-        model, messages, None, temperature, cancel, keep_alive, Some(schema), false, tier,
-        |_| {},
-    )
-    .await?;
-    Ok(recover_json(&text))
+    // The no-tools window at the caller's tier — the old `chat_core` sized this
+    // from `num_ctx_for(tools.is_some()==false, tier)`. Compute it HERE and pass
+    // it explicitly so a Job-tier deep summary still gets the big window (the
+    // sidecar's own chat default is the smaller tool tier and would truncate it).
+    let num_ctx = num_ctx_for(false, opts.tier);
+    let body = serde_json::json!({
+        "model": model,
+        // Images (vision grounding) ride inline on the user messages; the sidecar
+        // reads them straight off the message dicts, so no separate `images` field.
+        "messages": messages,
+        "base_url": resolved_base_url(),
+        // `null` when unset — the sidecar treats a null temperature as "omit".
+        "temperature": temperature,
+        "num_ctx": num_ctx,
+        "keep_alive": keep_alive,
+        // ADD-22: the structured-output grammar (token masking) — the sidecar
+        // passes it to Ollama as `format`.
+        "format": schema,
+    });
+    let value = post_generate_cancellable(&body, model, opts.cancel).await?;
+    let text = value["text"].as_str().unwrap_or_default();
+    Ok(recover_json(text))
+}
+
+// MIGRATION Phase 2a: the PLAIN-GENERATION path (no tools, no `format` schema)
+// off the old streaming native chat path. These replace the tool-less streaming
+// calls whose only job was to turn a prompt into text — STT/recording naming +
+// shaping (non-streaming, `generate`) and the interactive #command answers
+// streamed into the chat (streaming, `sidecar::generate_stream`). Both POST the
+// SAME `/generate` request schema (`plain_generate_body`), so the streamed and
+// non-streamed variants size `num_ctx`, think-disable, and pass the base URL
+// identically to how the old native chat did for a no-tools Chat call.
+
+/// Build the `/generate`(`_stream`) request body for a tool-less, plain-text chat
+/// at the interactive (Chat) context tier — the shared schema the streaming
+/// ([`crate::sidecar::generate_stream`]) and non-streaming ([`generate`]) plain
+/// paths both POST. Sizes `num_ctx` exactly as the old native chat did for a
+/// no-tools Chat call (so streamed tokens match byte-for-byte) and passes the
+/// runtime-overridable Ollama base URL the sidecar should talk to. No `format`
+/// (that is `chat_structured`'s grammar path) and no `tools`.
+pub fn plain_generate_body(
+    model: &str,
+    messages: &[ChatMessage],
+    temperature: Option<f64>,
+    keep_alive: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "base_url": resolved_base_url(),
+        // `null` when unset — the sidecar treats a null temperature as "omit".
+        "temperature": temperature,
+        "num_ctx": num_ctx_for(false, CtxTier::Chat),
+        "keep_alive": keep_alive,
+    })
+}
+
+/// Non-streaming plain-text generation through the sidecar `/generate`. The
+/// drop-in for the tool-less streaming calls whose output was NOT
+/// streamed (a #command's quiet step, dictation shaping, recording/segment
+/// naming + translation): same messages/temperature/keep_alive and Chat-tier
+/// `num_ctx` the old native chat used, returning the model's RAW text (no
+/// `recover_json` — these are prose, not JSON; callers `strip_think_spans`
+/// themselves as before). Engine failures come back as the same `OLLAMA_DOWN` /
+/// `MODEL_MISSING:<model>` sentinels.
+///
+/// `cancel` (ADD-7/ADD-31): a quiet #command step the user must be able to Stop
+/// races the request against the flag and drops it on Stop, yielding empty text
+/// the caller treats as stopped (same "partial == stopped" contract the old
+/// streamed path had). Callers with no Stop affordance pass `None`.
+pub async fn generate(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    temperature: Option<f64>,
+    keep_alive: &str,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<String, String> {
+    let body = plain_generate_body(model, &messages, temperature, keep_alive);
+    let value = post_generate_cancellable(&body, model, cancel).await?;
+    Ok(value["text"].as_str().unwrap_or_default().to_string())
+}
+
+/// Remove the `<think>…</think>` reasoning spans a model leaks into its visible
+/// answer (thinking-capable models do it even with the flag off, and `:cloud`
+/// proxies pass them straight through). An UNTERMINATED `<think>` truncates the
+/// rest: everything after it is unclosed reasoning, not answer.
+pub fn strip_think_spans(raw: &str) -> String {
+    let mut out = raw.to_string();
+    while let Some(start) = out.find("<think>") {
+        match out[start..].find("</think>") {
+            Some(rel) => {
+                let end = start + rel + "</think>".len();
+                out.replace_range(start..end, "");
+            }
+            None => {
+                out.truncate(start);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Recover the JSON payload from a structured-output response. Models that honor
@@ -312,16 +428,7 @@ async fn chat_structured_tier(
 /// Drop any `<think>` span, then slice from the first opening bracket to the last
 /// closing one so callers can parse it regardless of the model's framing.
 fn recover_json(text: &str) -> String {
-    let mut s = text.trim().to_string();
-    while let Some(a) = s.find("<think>") {
-        match s[a..].find("</think>") {
-            Some(rel) => {
-                let b = a + rel + "</think>".len();
-                s.replace_range(a..b, "");
-            }
-            None => break,
-        }
-    }
+    let s = strip_think_spans(text.trim());
     let s = s.trim();
     match (
         s.find(|c| c == '{' || c == '['),
@@ -332,245 +439,28 @@ fn recover_json(text: &str) -> String {
     }
 }
 
-/// ADD-29: recover tool calls a model emitted INLINE as text instead of in the
-/// structured `tool_calls` field. Some engines (historically Ollama `:cloud`
-/// proxies, some OpenAI-compatible backends) wrap a call in `<tool_call>…JSON…
-/// </tool_call>`; the stream parser never sees it, so the call silently never
-/// runs. This is the safety net that gives EVERY selected engine tool parity:
-/// after streaming, if no structured calls arrived, scan the text for these
-/// spans, parse each `{name, arguments}` object, and return the calls plus the
-/// text with those spans removed. Returns `(cleaned_text, calls)`.
-fn parse_inline_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
-    let mut calls = Vec::new();
-    let mut cleaned = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("<tool_call>") {
-        let (before, after_open) = rest.split_at(start);
-        cleaned.push_str(before);
-        let after_open = &after_open["<tool_call>".len()..];
-        let (inner, remainder) = match after_open.find("</tool_call>") {
-            Some(end) => (&after_open[..end], &after_open[end + "</tool_call>".len()..]),
-            // Unterminated: treat the remainder as the payload and stop.
-            None => (after_open, ""),
-        };
-        if let Some(call) = tool_call_from_json(inner) {
-            calls.push(call);
-        }
-        rest = remainder;
-    }
-    cleaned.push_str(rest);
-    (cleaned.trim().to_string(), calls)
-}
-
-/// Parse one `{"name": "...", "arguments": {...}}` object (tolerating fences /
-/// `<think>` via recover_json) into a ToolCall. `arguments` may be an object or
-/// a JSON-encoded string. Returns None if there's no usable name.
-fn tool_call_from_json(raw: &str) -> Option<ToolCall> {
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .or_else(|_| serde_json::from_str(&recover_json(raw)))
-        .ok()?;
-    let name = v["name"].as_str().or_else(|| v["function"]["name"].as_str())?;
-    let args_src = if v["arguments"].is_null() {
-        &v["function"]["arguments"]
-    } else {
-        &v["arguments"]
-    };
-    Some(ToolCall {
-        name: name.to_string(),
-        arguments: normalize_tool_arguments(args_src),
-        raw: serde_json::json!({
-            "function": { "name": name, "arguments": normalize_tool_arguments(args_src) }
-        }),
-    })
-}
-
-/// Normalize a tool call's `arguments`. Ollama's native `/api/chat` returns
-/// them as a JSON object, but OpenAI-style engines and `:cloud` proxies return
-/// a JSON-ENCODED STRING (e.g. `"{\"old_text\":\"…\"}"`). Left as a string,
-/// every `args["field"]` lookup in exec_tool indexes into a scalar, yields
-/// null, and the tool reports the field "required" even though the model
-/// supplied it. Parse a string payload back into a value (tolerating fences /
-/// `<think>` via recover_json); pass objects through untouched.
-fn normalize_tool_arguments(v: &serde_json::Value) -> serde_json::Value {
-    match v.as_str() {
-        Some(s) => serde_json::from_str(s)
-            .or_else(|_| serde_json::from_str(&recover_json(s)))
-            .unwrap_or_else(|_| v.clone()),
-        None => v.clone(),
-    }
-}
-
-/// Streaming chat that can also carry a tool catalog and/or a `format` schema.
-/// `format`, when set, constrains the response to a JSON schema; it is mutually
-/// exclusive with tool calling in practice (Ollama injects tool specs into the
-/// prompt but masks tokens for `format`), so tool callers pass None.
-#[allow(clippy::too_many_arguments)]
-async fn chat_core(
-    model: &str,
-    messages: Vec<ChatMessage>,
-    tools: Option<&serde_json::Value>,
-    temperature: Option<f64>,
-    cancel: Option<Arc<AtomicBool>>,
-    keep_alive: &str,
-    format: Option<&serde_json::Value>,
-    think: bool,
-    tier: CtxTier,
-    mut on_delta: impl FnMut(&str),
-) -> Result<(String, Vec<ToolCall>), String> {
-    use futures_util::StreamExt;
-
-    // Tool catalogs and tool results (search hits, fetched pages) need more
-    // room than plain chat, but stay far below the model-declared maximums
-    // that OOM 16 GB machines.
-    let num_ctx = num_ctx_for(tools.is_some(), tier);
-    let mut body = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "stream": true,
-        // HLT-5: how long Ollama keeps this model resident after the call.
-        // Chat passes "30m" to stay warm; vision/grounding calls pass a short
-        // value on low-RAM machines so both models never sit resident at once.
-        "keep_alive": keep_alive,
-        // CRITICAL: some models (qwen3-vl) declare a 256K context window and
-        // Ollama will allocate ~30 GB of KV cache for it, OOM-killing the
-        // server on a 16 GB machine. Our prompts fit comfortably in 8K.
-        "options": { "num_ctx": num_ctx },
-    });
-    if let Some(t) = temperature {
-        body["options"]["temperature"] = serde_json::json!(t);
-    }
-    if let Some(tools) = tools {
-        body["tools"] = tools.clone();
-    }
-    // ADD-22: constrain the output to a JSON schema (grammar token masking).
-    if let Some(fmt) = format {
-        body["format"] = fmt.clone();
-    }
-    // Qwen3 thinking variants burn thousands of hidden reasoning tokens
-    // (measured: 90s for a one-line answer). Instruct variants don't think
-    // and reject the flag, so only send it to the thinking ones. ADD-27:
-    // `think` re-enables it for short tool-decision rounds (see
-    // `chat_stream_tools_thinking`); it still only applies to models that
-    // accept the flag.
-    if model.contains("qwen3") && !model.contains("instruct") {
-        body["think"] = serde_json::Value::Bool(think);
-    }
-    // ADD-29: start the daemon on demand and keep it awake for this call. The
-    // guard bumps the idle clock when the call ends, so the 5-minute sleep
-    // window is measured from here. Held to the end of the function.
-    let base = resolved_base_url();
-    let _busy = crate::ollama_lifecycle::ensure_up(&base).await?;
-    let resp = client()?
-        .post(format!("{base}/api/chat"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(map_send_err)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if status.as_u16() == 404 && text.contains("not found") {
-            return Err(format!("MODEL_MISSING:{model}"));
-        }
-        return Err(format!("Local AI error ({status}): {text}"));
-    }
-
-    let mut full = String::new();
-    let mut tool_calls: Vec<ToolCall> = Vec::new();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        // ADD-7: user pressed Stop — abandon the stream, keep partial text.
-        if let Some(flag) = &cancel {
-            if flag.load(Ordering::SeqCst) {
-                break;
-            }
-        }
-        let chunk = chunk.map_err(|e| format!("Local AI stream failed: {e}"))?;
-        buf.extend_from_slice(&chunk);
-        // Ollama streams newline-delimited JSON objects.
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line);
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let v: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(err) = v["error"].as_str() {
-                return Err(format!("Local AI error: {err}"));
-            }
-            if let Some(calls) = v["message"]["tool_calls"].as_array() {
-                for c in calls {
-                    if let Some(name) = c["function"]["name"].as_str() {
-                        tool_calls.push(ToolCall {
-                            name: name.to_string(),
-                            arguments: normalize_tool_arguments(&c["function"]["arguments"]),
-                            raw: c.clone(),
-                        });
-                    }
-                }
-            }
-            if let Some(delta) = v["message"]["content"].as_str() {
-                if !delta.is_empty() {
-                    full.push_str(delta);
-                    on_delta(delta);
-                }
-            }
-        }
-    }
-    // ADD-29 parity net: if tools were offered but none arrived structurally,
-    // the model may have leaked them inline as `<tool_call>…</tool_call>` text
-    // (some cloud/OpenAI-compatible engines do). Recover them so EVERY engine
-    // can drive the tool loop, and strip the spans from the visible answer.
-    if tools.is_some() && tool_calls.is_empty() && full.contains("<tool_call>") {
-        let (cleaned, inline) = parse_inline_tool_calls(&full);
-        if !inline.is_empty() {
-            full = cleaned;
-            tool_calls = inline;
-        }
-    }
-    Ok((full, tool_calls))
-}
-
-/// ADD-13: embed one or more texts via Ollama's `/api/embed`. Returns one f32
-/// vector per input, in the same order. `keep_alive` (HLT-5) controls how long
-/// Ollama holds the (small) embed model resident after the call — a query pass
-/// keeps it briefly warm; a background batch pass uses a short value so the
-/// model releases itself once indexing goes idle.
+/// ADD-13: embed one or more texts through the sidecar `/embed` (the ollama
+/// client's `embed` underneath). Returns one f32 vector per input, in the same
+/// order. `keep_alive` (HLT-5) controls how long Ollama holds the (small) embed
+/// model resident after the call — a query pass keeps it briefly warm; a
+/// background batch pass uses a short value so the model releases itself once
+/// indexing goes idle.
 ///
 /// A missing model surfaces as `MODEL_MISSING:<model>` and a stopped server as
-/// `OLLAMA_DOWN`, mirroring `chat_stream_tools`; callers treat any error as a
+/// `OLLAMA_DOWN`, like the other gateway calls; callers treat any error as a
 /// silent signal to fall back to the keyword path.
 pub async fn embed(model: &str, texts: &[String], keep_alive: &str) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
+    let _daemon = wake_daemon().await?;
     let body = serde_json::json!({
         "model": model,
-        "input": texts,
+        "texts": texts,
+        "base_url": resolved_base_url(),
         "keep_alive": keep_alive,
     });
-    let base = resolved_base_url();
-    let _busy = crate::ollama_lifecycle::ensure_up(&base).await?;
-    let resp = client()?
-        .post(format!("{base}/api/embed"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(map_send_err)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if status.as_u16() == 404 && text.contains("not found") {
-            return Err(format!("MODEL_MISSING:{model}"));
-        }
-        return Err(format!("Local AI error ({status}): {text}"));
-    }
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let v = sidecar_post("/embed", &body, Some(model)).await?;
     let embeddings = v["embeddings"]
         .as_array()
         .ok_or("Embed response had no embeddings")?;
@@ -588,19 +478,15 @@ pub async fn embed(model: &str, texts: &[String], keep_alive: &str) -> Result<Ve
 /// Load a model into memory without generating anything, so the first real
 /// request is fast. Fire-and-forget.
 pub async fn warm(model: &str) -> Result<(), String> {
+    let _daemon = wake_daemon().await?;
     let body = serde_json::json!({
         "model": model,
+        "base_url": resolved_base_url(),
         "keep_alive": "30m",
-        "options": { "num_ctx": 8192 },
     });
-    let base = resolved_base_url();
-    let _busy = crate::ollama_lifecycle::ensure_up(&base).await?;
-    client()?
-        .post(format!("{base}/api/generate"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(map_send_err)?;
+    // Fire-and-forget: the sidecar loads the weights (a no-prompt generate with a
+    // small window) and we ignore the body — only a transport/engine failure surfaces.
+    sidecar_post("/warm", &body, Some(model)).await?;
     Ok(())
 }
 
@@ -612,14 +498,18 @@ pub async fn pull(
 ) -> Result<(), String> {
     use futures_util::StreamExt;
 
+    // The sidecar streams the download as ndjson progress lines (so the UI bar
+    // still updates); ensure it is up, then read those lines exactly as we used to
+    // read Ollama's own `/api/pull` stream. Not the shared `client()`: a pull must
+    // run without its 600s timeout.
+    let _daemon = wake_daemon().await?;
+    let base = crate::sidecar_lifecycle::ensure_up().await?;
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| e.to_string())?;
-    let base = resolved_base_url();
-    let _busy = crate::ollama_lifecycle::ensure_up(&base).await?;
     let resp = client
-        .post(format!("{base}/api/pull"))
-        .json(&serde_json::json!({ "model": model, "stream": true }))
+        .post(format!("{base}/pull"))
+        .json(&serde_json::json!({ "model": model, "base_url": resolved_base_url() }))
         .send()
         .await
         .map_err(map_send_err)?;
@@ -645,8 +535,14 @@ pub async fn pull(
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // A classified failure line from the sidecar: rebuild the sentinels so
+            // the UI maps a missing/unreachable engine the same way it always has.
             if let Some(err) = v["error"].as_str() {
-                return Err(err.to_string());
+                return Err(match v["code"].as_str() {
+                    Some("OLLAMA_DOWN") => "OLLAMA_DOWN".to_string(),
+                    Some("MODEL_MISSING") => format!("MODEL_MISSING:{model}"),
+                    _ => err.to_string(),
+                });
             }
             let status = v["status"].as_str().unwrap_or("");
             let percent = match (v["completed"].as_f64(), v["total"].as_f64()) {
@@ -660,51 +556,49 @@ pub async fn pull(
 }
 
 pub async fn delete_model(model: &str) -> Result<(), String> {
-    let resp = client()?
-        .delete(format!("{}/api/delete", resolved_base_url()))
-        .json(&serde_json::json!({ "model": model }))
-        .send()
-        .await
-        .map_err(map_send_err)?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Could not delete model: {}",
-            resp.text().await.unwrap_or_default()
-        ))
-    }
+    // Model management goes through the sidecar (`/delete` → the ollama client's
+    // `delete`), same as `/models`, `/warm`, `/pull`. Rust makes no direct Ollama
+    // HTTP call. Success returns `{ "ok": true }`; a classified engine failure
+    // comes back as a non-2xx `{code,error}` body `sidecar_post` maps for us.
+    let body = serde_json::json!({ "model": model, "base_url": resolved_base_url() });
+    sidecar_post("/delete", &body, Some(model)).await?;
+    Ok(())
 }
 
 pub async fn list_models() -> Result<Vec<String>, String> {
-    let resp = client()?
-        .get(format!("{}/api/tags", resolved_base_url()))
-        .send()
-        .await
-        .map_err(map_send_err)?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let body = serde_json::json!({ "base_url": resolved_base_url() });
+    let v = sidecar_post("/models", &body, None).await?;
     Ok(v["models"]
         .as_array()
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| m["name"].as_str().map(String::from))
+                .filter_map(|m| m.as_str().map(String::from))
                 .collect()
         })
         .unwrap_or_default())
 }
 
-/// ADD-22: a model's declared capabilities via `/api/show` (e.g. "tools",
-/// "vision", "completion"). This is a metadata call — it does NOT load the model
-/// into memory. Empty on any error, so callers treat "unknown" as "no special
-/// capability" rather than failing (the Settings badges just don't show).
+/// ADD-22: a model's declared capabilities via the sidecar `/capabilities`
+/// (Ollama's `/api/show` underneath) — e.g. "tools", "vision", "completion".
+/// This is a metadata call — it does NOT load the model into memory. Empty on
+/// any error, so callers treat "unknown" as "no special capability" rather than
+/// failing (the Settings badges just don't show).
 pub async fn capabilities(model: &str) -> Vec<String> {
+    // Empty on ANY error (sidecar down, engine error, bad JSON): callers treat
+    // "unknown" as "no special capability" so the Settings badges just don't show.
+    let Ok(base) = crate::sidecar_lifecycle::ensure_up().await else {
+        return Vec::new();
+    };
     let Ok(client) = client() else { return Vec::new() };
-    let resp = client
-        .post(format!("{}/api/show", resolved_base_url()))
-        .json(&serde_json::json!({ "model": model }))
+    let body = serde_json::json!({ "model": model, "base_url": resolved_base_url() });
+    let Ok(resp) = client
+        .post(format!("{base}/capabilities"))
+        .json(&body)
         .send()
-        .await;
-    let Ok(resp) = resp else { return Vec::new() };
+        .await
+    else {
+        return Vec::new();
+    };
     if !resp.status().is_success() {
         return Vec::new();
     }
@@ -747,84 +641,17 @@ mod tests {
     // preamble (Ollama cloud models, which ignore `format`).
     #[test]
     fn recover_json_unwraps_fences_think_and_prose() {
-        // Bare JSON is returned unchanged.
-        assert_eq!(recover_json("{\"markdown\":\"hi\"}"), "{\"markdown\":\"hi\"}");
-        // A ```json code fence (the cloud-model failure that reported "nothing
-        // usable") is stripped down to the JSON.
-        assert_eq!(
-            recover_json("```json\n{\"markdown\":\"hi\"}\n```"),
-            "{\"markdown\":\"hi\"}"
-        );
-        // A <think> reasoning preamble is dropped.
-        assert_eq!(recover_json("<think>hmm</think>\n{\"a\":1}"), "{\"a\":1}");
-        // A top-level array survives a bare fence.
-        assert_eq!(recover_json("```\n[1,2,3]\n```"), "[1,2,3]");
+        // The ```json-fence row is the cloud-model failure that reported
+        // "nothing usable"; the last is a top-level array under a bare fence.
+        let cases = [
+            ("{\"markdown\":\"hi\"}", "{\"markdown\":\"hi\"}"),
+            ("```json\n{\"markdown\":\"hi\"}\n```", "{\"markdown\":\"hi\"}"),
+            ("<think>hmm</think>\n{\"a\":1}", "{\"a\":1}"),
+            ("```\n[1,2,3]\n```", "[1,2,3]"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(recover_json(input), expected);
+        }
     }
 
-    // Tool-call arguments must resolve whether the engine returns them as a
-    // JSON object (Ollama native) or a JSON-encoded string (OpenAI-style /
-    // :cloud). The string form was silently dropping every field, so
-    // edit_file reported "old_text is required" on a correct call.
-    #[test]
-    fn normalize_tool_arguments_handles_stringified_payloads() {
-        // A native object passes through unchanged.
-        let obj = serde_json::json!({"old_text": "a", "new_text": "b"});
-        assert_eq!(normalize_tool_arguments(&obj), obj);
-        // A JSON-encoded string is parsed back into an object, so field lookups
-        // resolve instead of reading null.
-        let stringified = serde_json::json!("{\"old_text\":\"a\",\"new_text\":\"b\"}");
-        assert_eq!(normalize_tool_arguments(&stringified), obj);
-        assert_eq!(normalize_tool_arguments(&stringified)["old_text"], "a");
-        // HTML-with-quotes content (the reported failing case) round-trips.
-        let html = serde_json::json!("{\"old_text\":\"<p><strong>Test</strong></p>\"}");
-        assert_eq!(
-            normalize_tool_arguments(&html)["old_text"],
-            "<p><strong>Test</strong></p>"
-        );
-        // A fenced string payload is still recovered.
-        let fenced = serde_json::json!("```json\n{\"old_text\":\"a\"}\n```");
-        assert_eq!(normalize_tool_arguments(&fenced)["old_text"], "a");
-        // Garbage that can't parse is preserved verbatim rather than lost.
-        let junk = serde_json::json!("not json");
-        assert_eq!(normalize_tool_arguments(&junk), junk);
-    }
-
-    // ADD-29: the parity net — a model that leaks tool calls inline as
-    // `<tool_call>…</tool_call>` text must still drive the tool loop. Verify
-    // the calls are recovered and stripped from the visible answer.
-    #[test]
-    fn parse_inline_tool_calls_recovers_and_strips() {
-        let text = "Let me look.\n<tool_call>{\"name\": \"read_text\", \
-                    \"arguments\": {\"offset\": 0, \"limit\": 500}}</tool_call>\nDone.";
-        let (cleaned, calls) = parse_inline_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read_text");
-        assert_eq!(calls[0].arguments["offset"], 0);
-        assert_eq!(calls[0].arguments["limit"], 500);
-        assert!(!cleaned.contains("<tool_call>"));
-        assert!(cleaned.contains("Let me look."));
-        assert!(cleaned.contains("Done."));
-    }
-
-    #[test]
-    fn parse_inline_tool_calls_handles_multiple_and_openai_shape() {
-        // Two calls, one in the {function:{name,arguments}} shape.
-        let text = "<tool_call>{\"name\":\"a\",\"arguments\":{\"x\":1}}</tool_call>\
-                    <tool_call>{\"function\":{\"name\":\"b\",\"arguments\":\"{\\\"y\\\":2}\"}}</tool_call>";
-        let (cleaned, calls) = parse_inline_tool_calls(text);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "a");
-        assert_eq!(calls[0].arguments["x"], 1);
-        assert_eq!(calls[1].name, "b");
-        // Stringified arguments are normalized back to an object.
-        assert_eq!(calls[1].arguments["y"], 2);
-        assert_eq!(cleaned, "");
-    }
-
-    #[test]
-    fn parse_inline_tool_calls_ignores_plain_text() {
-        let (cleaned, calls) = parse_inline_tool_calls("Just a normal answer, no tools.");
-        assert!(calls.is_empty());
-        assert_eq!(cleaned, "Just a normal answer, no tools.");
-    }
 }

@@ -10,12 +10,14 @@
 //!   2. N chained `map` steps walk the file IN ORDER, each receiving its
 //!      window plus a short `thread` carried from the previous step — the
 //!      long, monotonic read. Each writes an artifact row.
-//!   3. `merge` steps fold artifacts together in groups of `PASS_MERGE_GROUP`,
-//!      level by level, until one remains (merge mode), then `compose` turns
-//!      the final notes into the deliverable. Stitch mode skips both — its
+//!   3. Merge mode: `compose` steps each write ONE ordered HTML section from a
+//!      group of `PASS_SECTION_WINDOWS` consecutive windows' notes — no global
+//!      fold, so no single call must hold the whole file (a small model
+//!      collapsed the old whole-file merge). Stitch mode has no compose — its
 //!      deliverable is the ordered concatenation of the map outputs.
-//!   4. A `publish` step (no model) writes the result into the room as a new
-//!      file, with an honest coverage line.
+//!   4. A `publish` step (no model) writes the result into the room: merge mode
+//!      concatenates the section HTML in order; stitch joins the map outputs.
+//!      Both carry an honest coverage line.
 //!
 //! Every step is checkpointed via the ADD-30 job runner, so a pass survives
 //! Stop, app quit, and crashes, and resumes from its cursor. The plan (the
@@ -24,23 +26,26 @@
 
 use super::*;
 
-/// One window of file text per map call (~5.3K tokens) — small enough that a
-/// step finishes in well under a minute on a 16 GB Mac (responsive Stop, cheap
-/// crash recovery, and a 4B model attends better over short contexts), big
-/// enough that a book is hundreds of steps, not thousands.
-pub(crate) const PASS_WINDOW_CHARS: usize = 16_000;
+/// One window of file text per map call (~10K tokens). A 44-document,
+/// 116-run sweep across window sizes 16K–64K found 32K the sweet spot: it
+/// roughly HALVES the window count (so ~40 % less map-phase time) for only ~4 %
+/// recall loss, and stays well inside the Job num_ctx. Smaller (16K) is slower
+/// for no real quality gain; bigger (48K+) stops helping and starts dropping
+/// real detail (64K ≈ −7 % recall). Still small vs num_ctx, so Stop stays
+/// responsive and crash recovery cheap.
+pub(crate) const PASS_WINDOW_CHARS: usize = 32_000;
 /// Carried back from the previous window so nothing straddling a cut is lost.
 pub(crate) const PASS_WINDOW_OVERLAP: usize = 400;
-/// Artifacts folded per merge call: 6 × notes cap + prompt fits the Job tier.
-pub(crate) const PASS_MERGE_GROUP: usize = 6;
-/// Per-window notes cap (merge mode) — sized so merge groups always fit.
-const PASS_NOTES_MAX: usize = 2_400;
-/// The running thread handed from window to window.
-const PASS_THREAD_MAX: usize = 1_200;
-/// A merged notes section may grow past a single window's cap.
-const PASS_MERGE_MAX: usize = 8_000;
-/// The composed final document.
-const PASS_COMPOSE_MAX: usize = 120_000;
+/// Windows composed per section (merge mode). Each section is written from just
+/// these windows' notes and the sections are concatenated in order — so no single
+/// model call ever holds the whole file. A global fold DID (map→merge tree→one
+/// compose), and a small local model collapsed the big folds (an 850 KB book's
+/// merge came back empty), losing most chapters. Six windows (~2–3 chapters) is
+/// well within reach and was the size validated on the real book.
+pub(crate) const PASS_SECTION_WINDOWS: usize = 6;
+// MIGRATION Phase 3: the per-window/thread/merge/compose byte caps moved with the
+// prompts into the sidecar's /file_pass_* endpoints, which apply them before
+// returning the artifact — so they no longer live here.
 
 /// The immutable plan stored on the jobs row. `windows` are byte spans into
 /// the `smart_filter`ed text; `text_len` and `text_sha256` let a resume detect
@@ -51,8 +56,9 @@ pub struct PassPlan {
     pub file_id: String,
     pub file_name: String,
     pub instruction: String,
-    /// "merge" (notes → folded → composed document) or "stitch" (each window
-    /// transformed; outputs concatenated in order — translation, rewriting).
+    /// "merge" (notes → composed per-section → concatenated document) or "stitch"
+    /// (each window transformed; outputs concatenated in order — translation,
+    /// rewriting).
     pub mode: String,
     pub text_len: usize,
     /// SHA-256 (hex) of the filtered text — catches a same-length content
@@ -91,44 +97,37 @@ pub fn build_pass_steps(n_windows: usize, mode: &str, model_lane: Lane) -> Vec<S
         });
         return steps;
     }
-    // Merge tree: fold artifact ids level by level until one remains. A
-    // leftover group of one passes through untouched — no wasted model call.
-    let mut level: Vec<usize> = (0..n_windows).collect();
-    while level.len() > 1 {
-        let mut next = Vec::new();
-        for group in level.chunks(PASS_MERGE_GROUP) {
-            if group.len() == 1 {
-                next.push(group[0]);
-                continue;
-            }
-            steps.push(Step {
-                id: next_id,
-                lane: model_lane,
-                kind: "merge".into(),
-                params: serde_json::json!({ "inputs": group }),
-                depends_on: group.to_vec(),
-            });
-            next.push(next_id);
-            next_id += 1;
-        }
-        level = next;
+    // Sectioned compose: group consecutive windows into sections of
+    // PASS_SECTION_WINDOWS, compose EACH section's HTML from just its windows'
+    // notes, and let publish concatenate the sections in order. No global fold —
+    // every compose sees at most PASS_SECTION_WINDOWS windows, which a small local
+    // model can hold, so a big file stays complete instead of collapsing in a
+    // whole-file merge.
+    let total_sections = n_windows.div_ceil(PASS_SECTION_WINDOWS);
+    let mut section_ids: Vec<usize> = Vec::with_capacity(total_sections);
+    for sec in 0..total_sections {
+        let start = sec * PASS_SECTION_WINDOWS;
+        let end = (start + PASS_SECTION_WINDOWS).min(n_windows);
+        steps.push(Step {
+            id: next_id,
+            lane: model_lane,
+            kind: "compose".into(),
+            params: serde_json::json!({
+                "windows": (start..end).collect::<Vec<usize>>(),
+                "section": sec,
+                "total": total_sections,
+            }),
+            depends_on: (start..end).collect(),
+        });
+        section_ids.push(next_id);
+        next_id += 1;
     }
-    let top = level[0];
-    steps.push(Step {
-        id: next_id,
-        lane: model_lane,
-        kind: "compose".into(),
-        params: serde_json::json!({ "input": top }),
-        depends_on: vec![top],
-    });
-    let compose_id = next_id;
-    next_id += 1;
     steps.push(Step {
         id: next_id,
         lane: Lane::Cpu,
         kind: "publish".into(),
-        params: serde_json::json!({ "input": compose_id }),
-        depends_on: vec![compose_id],
+        params: serde_json::json!({ "sections": section_ids }),
+        depends_on: section_ids,
     });
     steps
 }
@@ -169,41 +168,6 @@ fn store_artifact(
 /// the pass survives (the window is marked skipped, coverage stays honest).
 fn is_fatal(e: &str) -> bool {
     e == "OLLAMA_DOWN" || e.starts_with("MODEL_MISSING")
-}
-
-/// Run one structured model call with a single retry on transient failure.
-async fn model_call(
-    model: &str,
-    messages: Vec<ollama::ChatMessage>,
-    schema: &serde_json::Value,
-    cancel: &Arc<AtomicBool>,
-) -> Result<Option<serde_json::Value>, String> {
-    for attempt in 0..2 {
-        if cancel.load(Ordering::SeqCst) {
-            return Err("STOPPED".into());
-        }
-        match ollama::chat_structured_job_cancel(
-            model,
-            messages.clone(),
-            Some(0.2),
-            KEEP_ALIVE_WARM,
-            schema,
-            cancel.clone(),
-        )
-        .await
-        {
-            Ok(raw) => match serde_json::from_str::<serde_json::Value>(raw.trim()) {
-                Ok(v) => return Ok(Some(v)),
-                Err(_) if attempt == 0 => continue,
-                Err(_) => return Ok(None),
-            },
-            Err(e) if is_fatal(&e) => return Err(e),
-            Err(_) if cancel.load(Ordering::SeqCst) => return Err("STOPPED".into()),
-            Err(_) if attempt == 0 => continue,
-            Err(_) => return Ok(None),
-        }
-    }
-    Ok(None)
 }
 
 /// Execute one pass step. `filtered` is the smart-filtered file text the plan's
@@ -251,74 +215,42 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                     .map(|a| a.thread)
                     .unwrap_or_default()
             };
-            let stitch = plan.mode == "stitch";
-            let system = if stitch {
-                "You transform one long file part by part, in order, following the instruction \
-                 exactly. Output ONLY the transformed text for the given part — the parts are \
-                 joined afterward, so no headers, no preamble, no commentary. Also keep a short \
-                 thread of notes (names, terminology, tone decisions) so the next part stays \
-                 consistent."
-            } else {
-                "You are reading one long file part by part, in order, so that together your \
-                 notes cover the ENTIRE file. For the given part, write dense factual notes — \
-                 every important fact, number, name, date, decision, obligation or plot point — \
-                 serving the stated goal. Also keep a short running thread that connects the \
-                 parts (where the text is going, open questions, running totals)."
-            };
-            let thread_block = if thread.is_empty() {
-                String::from("(this is the first part)")
-            } else {
-                thread.clone()
-            };
-            let user = format!(
-                "File: {}\nGoal: {}\nThis is part {} of {} — characters {}-{} of {}.\n\n\
-                 Thread from the earlier parts:\n{}\n\nText of THIS part:\n{}",
-                plan.file_name,
-                plan.instruction,
-                i + 1,
-                n,
-                start,
-                end,
-                plan.text_len,
-                thread_block,
-                window_text,
-            );
-            let (result_key, result_cap) = if stitch {
-                ("result", window_text.len().saturating_mul(3).max(PASS_NOTES_MAX))
-            } else {
-                ("notes", PASS_NOTES_MAX)
-            };
-            let schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    result_key: {"type": "string"},
-                    "thread": {"type": "string"}
-                },
-                "required": [result_key, "thread"]
+            // MIGRATION Phase 3: the prompts (merge vs stitch system + the part
+            // user message), the result-key/cap choice, the schema, the retrying
+            // model call and the clamps all live in the sidecar's /file_pass_map;
+            // it returns the full `{result, thread, skipped}` artifact, having
+            // absorbed a transient failure into a skipped window itself. Rust keeps
+            // the plan, the window slice and the thread it loaded from the prior
+            // artifact. Cancellation is Rust-side (the POST is blocking): Stop drops
+            // the in-flight request and we return the STOPPED sentinel.
+            let body = serde_json::json!({
+                "model": model,
+                "base_url": ollama::resolved_base_url(),
+                "mode": plan.mode,
+                "file_name": plan.file_name,
+                "instruction": plan.instruction,
+                "part": i,
+                "total": n,
+                "start": start,
+                "end": end,
+                "text_len": plan.text_len,
+                "thread": thread.clone(),
+                "window_text": window_text,
+                "keep_alive": KEEP_ALIVE_WARM,
             });
-            let messages = vec![
-                ollama::ChatMessage::new("system", system),
-                ollama::ChatMessage::new("user", user),
-            ];
-            let artifact = match model_call(model, messages, &schema, cancel).await? {
-                Some(v) => PassArtifact {
-                    result: clamp_bytes(
-                        v[result_key].as_str().unwrap_or_default().trim().to_string(),
-                        result_cap,
-                    ),
-                    thread: clamp_bytes(
-                        v["thread"].as_str().unwrap_or_default().trim().to_string(),
-                        PASS_THREAD_MAX,
-                    ),
-                    skipped: false,
-                },
-                // Transient double-failure: keep the thread flowing so the
-                // NEXT window still reads in context; mark this one skipped.
-                None => PassArtifact {
-                    result: String::new(),
-                    thread,
-                    skipped: true,
-                },
+            let artifact = match crate::sidecar::sidecar_json_cancellable("/file_pass_map", &body, cancel).await {
+                Ok(Some(v)) => serde_json::from_value(v).unwrap_or_default(),
+                Ok(None) => return Err("STOPPED".into()),
+                Err(e) => {
+                    // A FATAL engine failure parks the job for Resume (is_fatal);
+                    // any other transient client error degrades this window like
+                    // the old double-failure — keep the thread flowing, mark skipped.
+                    let s = e.sentinel(Some(model));
+                    if is_fatal(&s) {
+                        return Err(s);
+                    }
+                    PassArtifact { result: String::new(), thread, skipped: true }
+                }
             };
             let guard = state.room.lock().unwrap();
             let room = guard
@@ -327,11 +259,18 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                 .ok_or("The room this job belongs to is no longer open.")?;
             store_artifact(&room.conn, job_id, step.id, &artifact)
         }
-        "merge" => {
-            let inputs: Vec<usize> = step.params["inputs"]
+        "compose" => {
+            // Sectioned compose: gather this section-group's window notes (in
+            // order, skipping empties) and write ONE ordered HTML section from
+            // them. Publish concatenates the sections, so — unlike the old global
+            // fold — no single call holds the whole file, which is what keeps a
+            // big file complete instead of collapsing in the merge.
+            let windows: Vec<usize> = step.params["windows"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect())
                 .unwrap_or_default();
+            let section = step.params["section"].as_u64().unwrap_or(0) as usize;
+            let total = step.params["total"].as_u64().unwrap_or(1) as usize;
             let (sections, missing) = {
                 let guard = state.room.lock().unwrap();
                 let room = guard
@@ -340,8 +279,8 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                     .ok_or("The room this job belongs to is no longer open.")?;
                 let mut sections: Vec<String> = Vec::new();
                 let mut missing = 0usize;
-                for &sid in &inputs {
-                    match load_artifact(&room.conn, job_id, sid) {
+                for &w in &windows {
+                    match load_artifact(&room.conn, job_id, w) {
                         Some(a) if !a.skipped && !a.result.trim().is_empty() => {
                             sections.push(a.result)
                         }
@@ -351,6 +290,8 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                 (sections, missing)
             };
             if sections.is_empty() {
+                // The whole group was unreadable — a skipped section. Publish
+                // marks it in place, and coverage still counts the skipped windows.
                 let guard = state.room.lock().unwrap();
                 let room = guard
                     .as_ref()
@@ -363,102 +304,37 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                     &PassArtifact { skipped: true, ..Default::default() },
                 );
             }
-            let mut user = format!(
-                "Goal: {}\n\nThese are consecutive sections of notes taken over one long file, \
-                 in order. Combine them into ONE continuous set of notes. Preserve every \
-                 important specific — numbers, names, dates, obligations, sequence of events. \
-                 Remove only repetition. Never invent anything.\n",
-                plan.instruction
-            );
-            if missing > 0 {
-                user.push_str(&format!("({missing} section(s) were unreadable and are absent.)\n"));
-            }
-            for (k, s) in sections.iter().enumerate() {
-                user.push_str(&format!("\n--- Section {} ---\n{}\n", k + 1, s));
-            }
-            let schema = serde_json::json!({
-                "type": "object",
-                "properties": {"notes": {"type": "string"}},
-                "required": ["notes"]
+            // The section prompt, schema, retrying call, the clamp AND the
+            // empty/double-failure fallback (publish the group's raw notes) live in
+            // the sidecar's /file_pass_section. Rust gathers this section's windows'
+            // notes + the missing count and stores the returned HTML artifact.
+            let body = serde_json::json!({
+                "model": model,
+                "base_url": ollama::resolved_base_url(),
+                "instruction": plan.instruction,
+                "file_name": plan.file_name,
+                "section": section,
+                "total": total,
+                "sections": sections,
+                "missing": missing,
+                "keep_alive": KEEP_ALIVE_WARM,
             });
-            let messages = vec![
-                ollama::ChatMessage::new(
-                    "system",
-                    "You merge sequential note sections into one, losslessly and faithfully.",
-                ),
-                ollama::ChatMessage::new("user", user),
-            ];
-            let artifact = match model_call(model, messages, &schema, cancel).await? {
-                Some(v) => PassArtifact {
-                    result: clamp_bytes(
-                        v["notes"].as_str().unwrap_or_default().trim().to_string(),
-                        PASS_MERGE_MAX,
-                    ),
-                    thread: String::new(),
-                    skipped: false,
-                },
-                // Merge failed twice: fall back to verbatim concatenation so
-                // nothing already read is ever lost to a bad fold.
-                None => PassArtifact {
-                    result: clamp_bytes(sections.join("\n\n"), PASS_MERGE_MAX),
-                    thread: String::new(),
-                    skipped: false,
-                },
-            };
-            let guard = state.room.lock().unwrap();
-            let room = guard
-                .as_ref()
-                .filter(|r| r.path == room_path)
-                .ok_or("The room this job belongs to is no longer open.")?;
-            store_artifact(&room.conn, job_id, step.id, &artifact)
-        }
-        "compose" => {
-            let input = step.params["input"].as_u64().unwrap_or(0) as usize;
-            let notes = {
-                let guard = state.room.lock().unwrap();
-                let room = guard
-                    .as_ref()
-                    .filter(|r| r.path == room_path)
-                    .ok_or("The room this job belongs to is no longer open.")?;
-                load_artifact(&room.conn, job_id, input)
-                    .map(|a| a.result)
-                    .unwrap_or_default()
-            };
-            if notes.trim().is_empty() {
-                return Err("the pass produced no readable notes to compose from".into());
-            }
-            let user = format!(
-                "Goal: {}\nFile: {} ({} characters, read completely in {} parts).\n\n\
-                 Complete notes covering the ENTIRE file:\n{}\n\n\
-                 Produce the final deliverable for the goal as clean, simple HTML body markup \
-                 (<h2>, <p>, <ul>, <table> — no <html> or <head>). Be thorough and specific; \
-                 the reader has not seen the file.",
-                plan.instruction, plan.file_name, plan.text_len, n, notes
-            );
-            let schema = serde_json::json!({
-                "type": "object",
-                "properties": {"html": {"type": "string"}},
-                "required": ["html"]
-            });
-            let messages = vec![
-                ollama::ChatMessage::new(
-                    "system",
-                    "You write the final document for a completed whole-file reading job.",
-                ),
-                ollama::ChatMessage::new("user", user),
-            ];
-            let artifact = match model_call(model, messages, &schema, cancel).await? {
-                Some(v) => PassArtifact {
-                    result: clamp_bytes(
-                        v["html"].as_str().unwrap_or_default().trim().to_string(),
-                        PASS_COMPOSE_MAX,
-                    ),
-                    thread: String::new(),
-                    skipped: false,
-                },
-                // Composing failed: publish the raw merged notes rather than
-                // nothing — the reading work is preserved either way.
-                None => PassArtifact { result: notes, thread: String::new(), skipped: false },
+            let artifact = match crate::sidecar::sidecar_json_cancellable("/file_pass_section", &body, cancel).await {
+                Ok(Some(v)) => serde_json::from_value(v).unwrap_or_default(),
+                Ok(None) => return Err("STOPPED".into()),
+                Err(e) => {
+                    let s = e.sentinel(Some(model));
+                    if is_fatal(&s) {
+                        return Err(s);
+                    }
+                    // Transient client failure: keep the reading by publishing the
+                    // group's raw notes rather than dropping the section.
+                    PassArtifact {
+                        result: sections.join("\n\n"),
+                        thread: String::new(),
+                        skipped: false,
+                    }
+                }
             };
             let guard = state.room.lock().unwrap();
             let room = guard
@@ -522,11 +398,25 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                     "generated",
                 )?
             } else {
-                let input = step.params["input"].as_u64().unwrap_or(0) as usize;
-                let html_body = load_artifact(&room.conn, job_id, input)
-                    .map(|a| a.result)
-                    .filter(|r| !r.trim().is_empty())
-                    .ok_or("the composed document is missing")?;
+                // Sectioned: concatenate each section's composed HTML in order.
+                let section_ids: Vec<usize> = step.params["sections"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect())
+                    .unwrap_or_default();
+                let mut html_body = String::new();
+                for &sid in &section_ids {
+                    match load_artifact(&room.conn, job_id, sid) {
+                        Some(a) if !a.skipped && !a.result.trim().is_empty() => {
+                            html_body.push_str(a.result.trim());
+                            html_body.push('\n');
+                        }
+                        _ => html_body
+                            .push_str("<p><em>[a section could not be composed]</em></p>\n"),
+                    }
+                }
+                if html_body.trim().is_empty() {
+                    return Err("the pass produced no readable sections to publish".into());
+                }
                 let name = format!("Full pass — {}.html", plan.file_name);
                 let body = format!(
                     "{html_body}\n<hr/>\n<p><em>{coverage}</em></p>"
@@ -565,9 +455,13 @@ pub(crate) fn pass_progress_label(plan: &PassPlan, steps: &[Step], done: usize) 
             end
         )
     } else if done < steps.len() {
-        match steps[done].kind.as_str() {
-            "merge" => "Weaving the part-notes into one thread…".to_string(),
-            "compose" => "Composing the final document…".to_string(),
+        let step = &steps[done];
+        match step.kind.as_str() {
+            "compose" => {
+                let sec = step.params["section"].as_u64().unwrap_or(0) as usize;
+                let total = step.params["total"].as_u64().unwrap_or(1) as usize;
+                format!("Writing section {} of {}…", sec + 1, total)
+            }
             _ => "Saving the result into the room…".to_string(),
         }
     } else {
@@ -594,14 +488,31 @@ mod tests {
     }
 
     #[test]
-    fn merge_plan_folds_to_one_then_composes_and_publishes() {
-        // 50 windows, groups of 6 → 9 merges → 2 merges → 1 merge, compose, publish.
-        let steps = build_pass_steps(50, "merge", Lane::LocalLlm);
-        let merges = steps.iter().filter(|s| s.kind == "merge").count();
-        assert_eq!(merges, 9 + 2 + 1);
-        let compose = steps.iter().find(|s| s.kind == "compose").unwrap();
-        let publish = steps.iter().find(|s| s.kind == "publish").unwrap();
-        assert_eq!(publish.depends_on, vec![compose.id]);
+    fn merge_plan_is_maps_then_ordered_sections_then_publish() {
+        // 50 windows, sections of PASS_SECTION_WINDOWS(6) → 9 section composes
+        // (the last covers the tail of 2), then one publish.
+        let n = 50;
+        let steps = build_pass_steps(n, "merge", Lane::LocalLlm);
+        let sections = n.div_ceil(PASS_SECTION_WINDOWS);
+        assert_eq!(sections, 9);
+        let composes: Vec<&Step> = steps.iter().filter(|s| s.kind == "compose").collect();
+        assert_eq!(composes.len(), sections);
+        // Section 0 composes windows 0..6, and knows its index + the total.
+        assert_eq!(composes[0].depends_on, (0..PASS_SECTION_WINDOWS).collect::<Vec<_>>());
+        assert_eq!(composes[0].params["section"], 0);
+        assert_eq!(composes[0].params["total"], sections);
+        assert_eq!(composes[0].lane, Lane::LocalLlm);
+        // The last section covers only the tail windows (48, 49).
+        let last_start = (sections - 1) * PASS_SECTION_WINDOWS;
+        assert_eq!(composes.last().unwrap().depends_on, (last_start..n).collect::<Vec<_>>());
+        // Publish is CPU work depending on every section, in order.
+        let publish = steps.last().unwrap();
+        assert_eq!(publish.kind, "publish");
+        assert_eq!(publish.lane, Lane::Cpu);
+        let section_ids: Vec<usize> = composes.iter().map(|s| s.id).collect();
+        assert_eq!(publish.depends_on, section_ids);
+        // No fold steps remain.
+        assert!(steps.iter().all(|s| s.kind != "merge"));
         // Topological ids: every dependency is lower than its step (this is
         // what makes cursor-based resume valid).
         for s in &steps {
@@ -616,17 +527,23 @@ mod tests {
     }
 
     #[test]
-    fn merge_plan_single_window_skips_merging() {
+    fn merge_plan_sections_cover_every_window_once() {
+        // 1 window → a single section over [0], then publish.
         let steps = build_pass_steps(1, "merge", Lane::Cloud);
         let kinds: Vec<&str> = steps.iter().map(|s| s.kind.as_str()).collect();
         assert_eq!(kinds, vec!["map", "compose", "publish"]);
-        // A leftover group of one is passed through, never "merged" alone.
+        assert_eq!(steps[1].depends_on, vec![0]);
+        assert_eq!(steps[1].params["total"], 1);
+
+        // 7 windows → 2 sections ([0..6], [6..7]); together they cover 0..7 once.
         let steps = build_pass_steps(7, "merge", Lane::Cloud);
-        // 7 → one merge of 6 + a pass-through, then a merge of [merge, 6].
-        let merges: Vec<&Step> = steps.iter().filter(|s| s.kind == "merge").collect();
-        assert_eq!(merges.len(), 2);
-        assert_eq!(merges[0].depends_on.len(), 6);
-        assert_eq!(merges[1].depends_on, vec![merges[0].id, 6]);
+        let composes: Vec<&Step> = steps.iter().filter(|s| s.kind == "compose").collect();
+        assert_eq!(composes.len(), 2);
+        assert_eq!(composes[0].depends_on, (0..6).collect::<Vec<_>>());
+        assert_eq!(composes[1].depends_on, vec![6]);
+        let covered: Vec<usize> =
+            composes.iter().flat_map(|s| s.depends_on.clone()).collect();
+        assert_eq!(covered, (0..7).collect::<Vec<_>>());
     }
 
     #[test]
@@ -642,7 +559,7 @@ mod tests {
     }
 
     /// REAL end-to-end: a temp encrypted room, a multi-window document, and the
-    /// actual local Ollama model running the full map → merge → compose →
+    /// actual local Ollama model running the full map → section-compose →
     /// publish pipeline — including a mid-run Stop and a resume from the
     /// checkpoint. Gated behind --ignored because it needs a running Ollama.
     /// Run: cargo test --lib file_pass_end_to_end -- --ignored --nocapture
@@ -875,9 +792,9 @@ mod tests {
             pass_progress_label(&plan, &steps, 2),
             "Reading part 3 of 3 — characters 31200–40000"
         );
-        // After the maps: the fold, the compose, the save.
-        assert!(pass_progress_label(&plan, &steps, 3).contains("Weaving"));
-        assert!(pass_progress_label(&plan, &steps, 4).contains("Composing"));
-        assert!(pass_progress_label(&plan, &steps, 5).contains("Saving"));
+        // After the maps: 3 windows fit in one section, then the save. (Step 3 is
+        // the lone section compose; step 4 is publish.)
+        assert_eq!(pass_progress_label(&plan, &steps, 3), "Writing section 1 of 1…");
+        assert!(pass_progress_label(&plan, &steps, 4).contains("Saving"));
     }
 }

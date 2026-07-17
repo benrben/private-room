@@ -162,15 +162,15 @@ pub fn set_cell(
     value: String,
 ) -> Result<(), String> {
     use tauri::Emitter;
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let (name, bytes) = db::get_file_bytes_named(&room.conn, &id)?;
-    let bytes = bytes.ok_or("File has no stored content.")?;
-    let (new_bytes, text) = set_cell_in_bytes(&name, &bytes, sheet.as_deref(), &cell, &value)?;
-    store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref(), "You edited")?;
-    let _ = window.emit("room-files-changed", ());
-    let _ = window.emit("file-updated", &id);
-    Ok(())
+    state.with_room(|room| {
+        let (name, bytes) = db::get_file_bytes_named(&room.conn, &id)?;
+        let bytes = bytes.ok_or("File has no stored content.")?;
+        let (new_bytes, text) = set_cell_in_bytes(&name, &bytes, sheet.as_deref(), &cell, &value)?;
+        store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref(), "You edited")?;
+        let _ = window.emit("room-files-changed", ());
+        let _ = window.emit("file-updated", &id);
+        Ok(())
+    })
 }
 
 

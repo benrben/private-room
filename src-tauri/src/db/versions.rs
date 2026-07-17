@@ -10,54 +10,46 @@ use super::*;
 /// bring the old words, speakers, or cuts back. A file with no stored bytes
 /// yet (nothing to preserve) is a no-op.
 pub fn snapshot_file_version(conn: &Connection, file_id: &str, cause: &str) -> Result<(), String> {
-    let current: Option<(Option<Vec<u8>>, Option<String>)> = conn
-        .query_row(
-            "SELECT original_bytes, extracted_text FROM files WHERE id = ?1",
-            [file_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
+    let current: Option<(Option<Vec<u8>>, Option<String>)> = query_opt(
+        conn,
+        "SELECT original_bytes, extracted_text FROM files WHERE id = ?1",
+        [file_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     let Some((Some(bytes), text)) = current else { return Ok(()) };
     let rec_meta: Option<String> = conn
         .query_row("SELECT meta FROM recordings WHERE file_id = ?1", [file_id], |r| r.get(0))
         .ok();
-    conn.execute(
+    execute_one(
+        conn,
         "INSERT INTO file_versions(id, file_id, bytes, text, rec_meta, cause)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![Uuid::new_v4().to_string(), file_id, bytes, text, rec_meta, cause],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
+    )?;
+    execute_one(
+        conn,
         "DELETE FROM file_versions WHERE file_id = ?1 AND id NOT IN (
            SELECT id FROM file_versions WHERE file_id = ?1
            ORDER BY saved_at DESC, rowid DESC LIMIT 10)",
         [file_id],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// A file's saved versions, newest first.
 pub fn list_file_versions(conn: &Connection, file_id: &str) -> Result<Vec<FileVersion>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, saved_at, cause FROM file_versions WHERE file_id = ?1
-             ORDER BY saved_at DESC, rowid DESC",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([file_id], |r| {
+    query_rows(
+        conn,
+        "SELECT id, saved_at, cause FROM file_versions WHERE file_id = ?1
+         ORDER BY saved_at DESC, rowid DESC",
+        [file_id],
+        |r| {
             Ok(FileVersion {
                 id: r.get(0)?,
                 saved_at: r.get(1)?,
                 cause: r.get(2)?,
             })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+        },
+    )
 }
 
 /// One saved version's full snapshot: (owning file id, bytes, extracted

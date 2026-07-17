@@ -10,6 +10,7 @@ import {
   modelLabel,
   RoomInfo,
 } from "../api";
+import { runGuarded, tryToast } from "./guard";
 import { FlatResult } from "./types";
 import { WSState } from "./state";
 
@@ -76,19 +77,21 @@ export function makeMiscActions(
   async function submitLink() {
     const url = s.linkUrl.trim();
     if (!url || s.importingLink) return;
-    s.setImportingLink(true);
-    try {
-      const meta = await api.importLink(url);
-      s.setFiles(await api.listFiles());
-      s.setShowAddLink(false);
-      s.setLinkUrl("");
-      s.pushToast("success", `Saved "${meta.name}" into the room.`);
-      viewFile(meta.id);
-    } catch (e) {
-      s.pushToast("error", String(e));
-    } finally {
-      s.setImportingLink(false);
-    }
+    await runGuarded(
+      s,
+      async () => {
+        const meta = await api.importLink(url);
+        s.setFiles(await api.listFiles());
+        s.setShowAddLink(false);
+        s.setLinkUrl("");
+        s.pushToast("success", `Saved "${meta.name}" into the room.`);
+        viewFile(meta.id);
+      },
+      {
+        begin: () => s.setImportingLink(true),
+        finish: () => s.setImportingLink(false),
+      },
+    );
   }
 
   function loadFrontPage(withSuggestions: boolean) {
@@ -111,13 +114,14 @@ export function makeMiscActions(
     const fact = s.memSuggestion?.fact;
     if (!fact) return;
     s.setMemSuggestion(null);
-    try {
-      await api.addMemory(fact);
-      s.setMemories(await api.listMemories());
-      s.pushToast("success", "Saved to memory.");
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.addMemory(fact),
+      async () => {
+        s.setMemories(await api.listMemories());
+        s.pushToast("success", "Saved to memory.");
+      },
+    );
   }
 
   function copyReceipt(a: AnnotationPayload) {
@@ -159,9 +163,16 @@ export function makeMiscActions(
   async function addMemory() {
     const content = s.memoryDraft.trim();
     if (!content) return;
-    await api.addMemory(content);
-    s.setMemories(await api.listMemories());
-    s.setMemoryDraft("");
+    // The draft is only cleared once the memory is actually stored, so a failed
+    // save leaves the text where the user can retry it.
+    await tryToast(
+      s,
+      () => api.addMemory(content),
+      async () => {
+        s.setMemories(await api.listMemories());
+        s.setMemoryDraft("");
+      },
+    );
   }
 
   async function saveMemoryEdit() {
@@ -170,12 +181,11 @@ export function makeMiscActions(
     const trimmed = content.trim();
     s.setEditingMemory(null);
     if (!trimmed) return;
-    try {
-      await api.updateMemory(id, trimmed);
-      s.setMemories(await api.listMemories());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.updateMemory(id, trimmed),
+      async () => s.setMemories(await api.listMemories()),
+    );
   }
 
   function activateResult(r: FlatResult) {

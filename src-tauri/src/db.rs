@@ -1,6 +1,6 @@
 use crate::commands::{Chat, FileMeta, FileVersion, Folder, Memory, Message};
 use crate::extraction;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use uuid::Uuid;
 
 // A3 recovery-key crypto. aes-gcm 0.10 / pbkdf2 0.12 / rand 0.8 are added to
@@ -23,6 +23,7 @@ mod meta;
 mod recordings;
 mod schema;
 mod settings;
+mod util;
 mod versions;
 mod web_cache;
 
@@ -37,6 +38,7 @@ pub use meta::*;
 pub use recordings::*;
 pub use schema::*;
 pub use settings::*;
+pub(crate) use util::*;
 pub use versions::*;
 pub use web_cache::*;
 
