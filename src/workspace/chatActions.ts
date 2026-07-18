@@ -372,6 +372,7 @@ export function makeChatActions(
 
   async function regenerate(assistantId: string) {
     if (s.asking || !s.activeChatId) return;
+    const chatId = s.activeChatId;
     const idx = s.messages.findIndex((m) => m.id === assistantId);
     if (idx < 0) return;
     let userText = "";
@@ -388,8 +389,19 @@ export function makeChatActions(
       s.pushToast("error", String(e));
       return;
     }
-    s.setMessages(await api.getMessages(s.activeChatId));
-    await askOnce(userText, []);
+    s.setMessages(await api.getMessages(chatId));
+    // Re-run the original turn the SAME way it was first sent: a #command
+    // re-executes as a command (not resent as literal text), and any @-mentioned
+    // files are re-attached (parsed back out of the text). Paperclip-only
+    // attachments aren't stored on the message, so those can't be recovered here.
+    const parsed = parseComposer(userText, s.commands, s.files, s.folders);
+    if (parsed.command) {
+      await runTurn((askId) =>
+        api.runCommand(chatId, parsed.command!, parsed.args, parsed.refIds, userText, askId),
+      );
+    } else {
+      await askOnce(userText, parsed.refIds);
+    }
   }
 
   function copyMessage(m: Message) {

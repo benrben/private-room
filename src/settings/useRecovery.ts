@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { writeRecoveryKey } from "../api";
 
 /** RECOVERY — one-time code that can reopen the room (write_recovery_key). */
 export function useRecovery() {
@@ -13,8 +13,7 @@ export function useRecovery() {
     setRecoveryErr("");
     setRecoveryBusy(true);
     try {
-      // CONTRACT-NOTE: intended wrapper writeRecoveryKey(); uses the open room.
-      const code = await invoke<string>("write_recovery_key");
+      const code = await writeRecoveryKey();
       setRecoveryCopied(false);
       setRecoveryCode(code);
     } catch (e) {

@@ -167,8 +167,6 @@ export const api = {
     invoke<void>("resolve_edit_approval", { id, decision }),
   // ADD-12: fetch a web page and save it as a readable room file.
   importLink: (url: string) => invoke<FileMeta>("import_link", { url }),
-  // ADD-17: build/refresh the "Room summary.md" file; emits summarize-progress.
-  summarizeRoom: () => invoke<FileMeta>("summarize_room"),
   // ---- ADD-30: durable background jobs (the sidebar jobs panel) ----
   listJobs: () => invoke<Job[]>("list_jobs"),
   /** Start the room deep-summary job; returns its id. Progress → job-progress. */
@@ -380,9 +378,6 @@ export const api = {
     listen("ask-round", () => cb()),
   onAskNotice: (cb: (text: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-notice", (e) => cb(e.payload)),
-  // ADD-17: progress while the room summary is being built.
-  onSummarizeProgress: (cb: (text: string) => void): Promise<UnlistenFn> =>
-    listen<string>("summarize-progress", (e) => cb(e.payload)),
   // ADD-31: named stage while a Studio (flashcards/mindmap/podcast) runs.
   onStudioStep: (cb: (text: string) => void): Promise<UnlistenFn> =>
     listen<string>("studio-step", (e) => cb(e.payload)),

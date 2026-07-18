@@ -86,8 +86,6 @@ export function useWorkspaceState(info: RoomInfo) {
   const [mcpTools, setMcpTools] = useState<string[]>([]);
   const [mcpDialogDismissed, setMcpDialogDismissed] = useState(false);
   const [approvingMcp, setApprovingMcp] = useState(false);
-  const [summarizing, setSummarizing] = useState(false);
-  const [summarizeProgress, setSummarizeProgress] = useState("");
   const [showAddLink, setShowAddLink] = useState(false);
   const [linkUrl, setLinkUrl] = useState("");
   const [importingLink, setImportingLink] = useState(false);
@@ -323,7 +321,6 @@ export function useWorkspaceState(info: RoomInfo) {
     showMemory, setShowMemory, saveDraft, setSaveDraft,
     showSettings, setShowSettings, mcpTools, setMcpTools,
     mcpDialogDismissed, setMcpDialogDismissed, approvingMcp, setApprovingMcp,
-    summarizing, setSummarizing, summarizeProgress, setSummarizeProgress,
     showAddLink, setShowAddLink, linkUrl, setLinkUrl, importingLink, setImportingLink,
     webOn, setWebOn, showHistory, setShowHistory, versions, setVersions,
     confirmRestore, setConfirmRestore, compare, setCompare,

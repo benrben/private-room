@@ -22,13 +22,9 @@ export type IconComponent = ComponentType<{
 export const FOCUSABLE_SELECTOR =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-// CONTRACT-NOTE: these mirror the BACKEND-ACTUALS return structs. The typed
-// api.ts wrappers meant for these (getOllamaUrl/setOllamaUrl/listRoles/
-// writeRecoveryKey/recommendedModels) and the icons (ServerIcon/RecoveryIcon)
-// are being added in parallel. Until they land we call the confirmed tauri
-// commands directly via invoke() and keep the section headers icon-free to
-// match every existing settings section. Fold these into api.ts wrappers
-// during integration. (RoomServerStatus is folded — Wave 1a.)
+// Settings-local mirrors of a few BACKEND-ACTUALS return structs. Callers reach
+// the backend through the typed api.ts wrappers (getOllamaUrl/setOllamaUrl/
+// listRoles/writeRecoveryKey/recommendedModels).
 export interface RoomRole {
   id: string;
   name: string;

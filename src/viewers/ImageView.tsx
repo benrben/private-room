@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { api, ImageBox } from "../api";
+import { api, ImageBox, recommendedModels } from "../api";
 import { BOX_COLORS } from "./util";
 
 interface Props {
@@ -9,14 +8,6 @@ interface Props {
   name: string;
   mime: string;
   dataB64: string;
-}
-
-// CONTRACT-NOTE: mirrors recommended_models() (BACKEND-ACTUALS). Swap for
-// api.recommendedModels() once the API agent adds the wrapper.
-interface RecommendedModels {
-  chat: string[];
-  embed: string;
-  vision: string;
 }
 
 const MIN_ZOOM = 0.25;
@@ -59,8 +50,7 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
     let alive = true;
     (async () => {
       try {
-        // CONTRACT-NOTE: recommended_models has no api.ts wrapper yet.
-        const rec = await invoke<RecommendedModels>("recommended_models");
+        const rec = await recommendedModels();
         const vision = rec.vision?.trim();
         if (!vision) return;
         const [st, caps] = await Promise.all([

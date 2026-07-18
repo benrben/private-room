@@ -3,6 +3,7 @@ import { DownloadIcon, GlobeIcon, MicIcon, ScriptIcon } from "../icons";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import DiffPreview from "../viewers/DiffPreview";
+import { languageForFile } from "../viewers/monacoSetup";
 
 /** Human name for whoever owns the shared dictation mic right now. */
 const CAPTURE_OWNER_LABEL: Record<string, string> = {
@@ -191,7 +192,12 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
                   {pendingEdit.files.length > 1 && (
                     <div className="approve-diff-name">{f.name}</div>
                   )}
-                  <DiffPreview before={f.before} after={f.after} clipped={f.clipped} />
+                  <DiffPreview
+                    before={f.before}
+                    after={f.after}
+                    clipped={f.clipped}
+                    language={languageForFile(f.name)}
+                  />
                 </div>
               ))}
               {pendingEdit.files.length > 5 && (

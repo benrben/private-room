@@ -304,24 +304,10 @@ export function clearQuoteHighlight(): void {
 /* ============================ Receipts ============================ *
  * A "receipt" is a quote the app can prove: found word-for-word in a source
  * file, so it earns a green "verified" check. These are small, reusable
- * helpers layered on top of the existing quote-anchoring above — the React
- * shell (Workspace) verifies annotation chips with `isQuoteVerified`, and the
+ * helpers layered on top of the existing quote-anchoring above — the
  * imperative viewers (PdfView) drop `makeReceiptBadge()` next to a located
  * highlight. No change to the highlight logic itself.
  * ---------------------------------------------------------------- */
-
-/**
- * Is `quote` present, word-for-word, in `source`? Uses the same
- * normalization-tolerant match as the highlighters (case / whitespace /
- * newlines / soft hyphens / typographic look-alikes), so a quote copied from
- * a rendered document still verifies against the extracted text. A quote that
- * resolves to a real span is a located, verbatim-verified quote — exactly what
- * earns the badge.
- */
-export function isQuoteVerified(source: string, quote: string): boolean {
-  if (!quote || quote.trim().length < 2) return false;
-  return locateQuote(source, quote) !== null;
-}
 
 /** Stable class name for the "verified" receipt badge (styled in App.css by
  *  the CSS track). */

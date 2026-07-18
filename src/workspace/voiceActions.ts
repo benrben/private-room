@@ -24,11 +24,6 @@ export function makeVoiceActions(s: WSState) {
     });
   }
 
-  function stopSpeaking() {
-    voice.cancelAll();
-    s.setSpeakingMsgId(null);
-  }
-
   function toggleAutoSpeak() {
     voice.ensureUnlocked();
     const next = !s.autoSpeak;
@@ -43,5 +38,5 @@ export function makeVoiceActions(s: WSState) {
     api.setSetting("voice_handsfree", next ? "1" : "0").catch(() => {});
   }
 
-  return { speakMessage, stopSpeaking, toggleAutoSpeak, toggleHandsFree };
+  return { speakMessage, toggleAutoSpeak, toggleHandsFree };
 }

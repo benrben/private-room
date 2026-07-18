@@ -39,10 +39,6 @@ function floatsToBase64(chunks: Float32Array[], length: number): string {
   return btoa(bin);
 }
 
-export function micTapRunning(): boolean {
-  return teardown != null;
-}
-
 /** Mute/unmute the microphone lane while the Mac/meeting lane keeps
  * recording. Track-level (`enabled = false` — WebKit then delivers silence),
  * so the engine's VAD just sees a quiet lane; no backend involved. Module

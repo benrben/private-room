@@ -9,5 +9,5 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   </React.StrictMode>,
 );
 
-// Fire-and-forget launch update check (no-ops until updater is configured).
+// Fire-and-forget launch update check (visually silent on launch; logs outcome).
 void checkForUpdatesQuietly();

@@ -77,7 +77,6 @@ export interface ChatCommand {
   name: string;
   summary: string;
   usage: string;
-  needsRefs: boolean;
 }
 
 /** Grouped results of a room-wide search (ADD-6). */

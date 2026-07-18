@@ -486,7 +486,6 @@ function viewScreenshot(): Record<string, unknown> {
   };
   const pane =
     document.querySelector(".viewer") ??
-    document.querySelector(".viewer-pane") ??
     document.querySelector('main [class*="viewer"]');
   if (!pane) return noVisual;
 

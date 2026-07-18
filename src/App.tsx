@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
-import { api, RoomInfo, RecentRoom } from "./api";
+import {
+  api,
+  RoomInfo,
+  RecentRoom,
+  listRoles,
+  writeRecoveryKey,
+  hasRecoveryKey,
+  openRoomWithRecovery,
+} from "./api";
 import Workspace from "./Workspace";
 import { Logomark } from "./icons";
 import {
@@ -24,18 +31,6 @@ import {
 } from "./screens/SealOverlay";
 import "./App.css";
 import "./seal.css";
-
-// CONTRACT-NOTE: the API agent is adding typed api.ts wrappers for
-// write_recovery_key / has_recovery_key / open_room_with_recovery / list_roles
-// (and icons.RecoveryIcon) in parallel. Until they land, this file calls the
-// backend commands directly (names + shapes per BACKEND-ACTUALS) so it builds
-// standalone. Integration can fold these into src/api.ts and swap the icon.
-const writeRecoveryKey = () => invoke<string>("write_recovery_key");
-const hasRecoveryKey = (path: string) =>
-  invoke<boolean>("has_recovery_key", { path });
-const openRoomWithRecovery = (path: string, code: string) =>
-  invoke<RoomInfo>("open_room_with_recovery", { path, code });
-const listRoles = () => invoke<RoomRole[]>("list_roles");
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>({ kind: "start" });

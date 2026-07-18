@@ -89,9 +89,6 @@ export function useWorkspaceEffects(
     const unlistenNotice = api.onAskNotice((text) => {
       s.pushToast("info", text);
     });
-    const unlistenSummarize = api.onSummarizeProgress((text) => {
-      s.setSummarizeProgress(text);
-    });
     // ADD-31: named stage inside the Studio modal while it generates.
     const unlistenStudioStep = api.onStudioStep((text) => {
       s.setStudioStep(text);
@@ -373,7 +370,6 @@ export function useWorkspaceEffects(
       unlistenStepStatus.then((fn) => fn());
       unlistenRound.then((fn) => fn());
       unlistenNotice.then((fn) => fn());
-      unlistenSummarize.then((fn) => fn());
       unlistenStudioStep.then((fn) => fn());
       unlistenImport.then((fn) => fn());
       unlistenJobs.then((fn) => fn());

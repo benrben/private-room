@@ -11,16 +11,6 @@ export function LockIcon(p: IconProps) {
   );
 }
 
-export function UnlockIcon(p: IconProps) {
-  return (
-    <Stroke {...p}>
-      <rect x="5" y="11" width="14" height="9.5" rx="2.5" />
-      <path d="M8.5 11V7.5a3.5 3.5 0 0 1 6.8-1.1" />
-      <circle cx="12" cy="15.7" r="1.3" fill="currentColor" stroke="none" />
-    </Stroke>
-  );
-}
-
 export function EyeIcon(p: IconProps) {
   return (
     <Stroke {...p}>

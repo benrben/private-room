@@ -16,7 +16,7 @@ import { FlatResult } from "./types";
 import { WSState } from "./state";
 
 /** Memory, MCP approvals, front page, search, panes, and model-switch handlers.
- * Cross-hook: `viewFile` (files) is threaded in for submitLink/search. */
+ * Cross-hook: `viewFile` (files) is threaded in for search. */
 export function makeMiscActions(
   s: WSState,
   info: RoomInfo,
@@ -94,26 +94,6 @@ export function makeMiscActions(
 
   function keepMcpOff() {
     s.setMcpDialogDismissed(true);
-  }
-
-  async function submitLink() {
-    const url = s.linkUrl.trim();
-    if (!url || s.importingLink) return;
-    await runGuarded(
-      s,
-      async () => {
-        const meta = await api.importLink(url);
-        s.setFiles(await api.listFiles());
-        s.setShowAddLink(false);
-        s.setLinkUrl("");
-        s.pushToast("success", `Saved "${meta.name}" into the room.`);
-        viewFile(meta.id);
-      },
-      {
-        begin: () => s.setImportingLink(true),
-        finish: () => s.setImportingLink(false),
-      },
-    );
   }
 
   function loadFrontPage(withSuggestions: boolean) {
@@ -265,16 +245,6 @@ export function makeMiscActions(
     s.setEditApprovals((q) => q.filter((r) => r.id !== req.id));
   }
 
-  // Wave 2 (Idea 6): when a run ends or is stopped, decline every still-queued
-  // edit-approval card and clear them — so a card left over from a dead run can
-  // never apply an edit into a turn that no longer exists (second-pass addendum).
-  function clearPendingEditApprovals() {
-    s.setEditApprovals((q) => {
-      for (const r of q) api.resolveEditApproval(r.id, "deny").catch(() => {});
-      return [];
-    });
-  }
-
   function revealMemory() {
     s.setShowMemory(true);
     s.setShowMemoryIntro(false);
@@ -391,10 +361,10 @@ export function makeMiscActions(
 
   return {
     refreshWebAccess, refreshAutolock, refreshMemAutoSave, dismissSyncWarn,
-    connectedTools, approveMcp, keepMcpOff, submitLink, loadFrontPage,
+    connectedTools, approveMcp, keepMcpOff, loadFrontPage,
     saveSuggestedMemory, enableMemoryAutoSave, openScratchPad,
     copyReceipt, playSealSound, addMemory, saveMemoryEdit, activateResult,
-    resolveMcpApproval, resolveEditApproval, clearPendingEditApprovals,
+    resolveMcpApproval, resolveEditApproval,
     revealMemory, changeModel, engineLabelOf,
     recordEngineModels,
     askConfirm, cancelConfirm, startPaneResize, searchFlat, onSearchKey,

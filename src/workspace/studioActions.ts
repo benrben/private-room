@@ -24,30 +24,6 @@ export function makeStudioActions(
 ) {
   const { viewFile, openOllamaApp } = deps;
 
-  async function summarizeRoom() {
-    if (s.summarizing) return;
-    await runGuarded(
-      s,
-      async () => {
-        const result = await api.summarizeRoom();
-        s.setFiles(await api.listFiles());
-        viewFile(result.id);
-        s.pushToast("success", "Room summary is ready.");
-      },
-      {
-        begin: () => {
-          s.setSummarizing(true);
-          s.setSummarizeProgress("");
-        },
-        finish: () => {
-          s.setSummarizing(false);
-          s.setSummarizeProgress("");
-        },
-        openOllamaApp,
-      },
-    );
-  }
-
   // ---- ADD-30: durable background jobs (the sidebar cards) ----
 
   /** Reload the cards: every job that isn't finished. */
@@ -294,7 +270,7 @@ export function makeStudioActions(
   }
 
   return {
-    summarizeRoom, openStudioPrompt, runStudio, stopStudio, studioAcItems,
+    openStudioPrompt, runStudio, stopStudio, studioAcItems,
     acceptMention, runStudioFromModal, loadAiActions, openAiAction,
     runAiActionFromModal,
     refreshJobs, startDeepSummary, pauseJob, resumeJob, dismissJob,
