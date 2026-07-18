@@ -182,7 +182,14 @@ pub async fn set_room_server(
             let bridge = crate::room_mcp::start(app.clone(), web_enabled, want, None, opts).await?;
             let (port, token, bscope) = (bridge.port, bridge.token.clone(), bridge.scope);
             if store_bridge_if_current(&state, &room_path, bridge) {
-                let _ = write_discovery(&app, port, &token, scope_name(bscope), &room_name);
+                // Only the full tier advertises itself on disk — the files-tier
+                // UI promises the token reaches the room by paste only, so we
+                // must not drop its bearer token into ~/.private-room/leash.json.
+                if matches!(bscope, crate::room_mcp::ToolScope::ExternalAgent) {
+                    let _ = write_discovery(&app, port, &token, scope_name(bscope), &room_name);
+                } else {
+                    let _ = remove_discovery(&app);
+                }
             }
         }
     } else {

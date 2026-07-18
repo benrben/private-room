@@ -312,6 +312,13 @@ where
             continue;
         }
         let (status, body) = dispatch(request.body).await;
+        // A stop that arrived while the dispatch ran revokes the response too:
+        // a tier downgrade or token rotation must not hand a result back on
+        // the old scope. (The dispatch's side effects have already happened —
+        // this severs delivery, the strongest guarantee available post-read.)
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         write_response(&mut stream, status, &body).await?;
     }
 }
@@ -362,11 +369,28 @@ async fn read_framed_request(
     Ok(Some(FramedRequest { head, body }))
 }
 
-/// The request carries the run's fresh bearer token, or it is rejected.
+/// The request carries the run's bearer token, or it is rejected. The compare
+/// is constant-time over the supplied bytes: the full-tier token is long-lived
+/// (persisted across restarts), so a short-circuiting `==` would hand a local
+/// prober a timing oracle it never had against the old per-run tokens.
 fn authorize(head: &str, token: &str) -> bool {
+    let expected = format!("Bearer {token}");
     header_value(head, "authorization")
-        .map(|v| v.trim() == format!("Bearer {token}"))
+        .map(|v| ct_eq(v.trim().as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
+}
+
+/// Length-independent byte equality: XOR-folds every position of the longer
+/// input so timing does not reveal a prefix-match length.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Dispatch one JSON-RPC request to its handler, returning (HTTP status, body).
@@ -659,6 +683,19 @@ mod tests {
         assert!(authorize(head, "secret"));
         assert!(!authorize(head, "other"));
         assert!(!authorize("POST /mcp HTTP/1.1", "secret"));
+        // A prefix of the real token must be rejected too — the constant-time
+        // compare folds the length mismatch, so a partial match never passes.
+        let head_prefix = "POST /mcp HTTP/1.1\r\nAuthorization: Bearer sec";
+        assert!(!authorize(head_prefix, "secret"));
+    }
+
+    #[test]
+    fn ct_eq_rejects_length_and_content_mismatch() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab")); // prefix, differing length
+        assert!(!ct_eq(b"ab", b"abc"));
+        assert!(ct_eq(b"", b""));
     }
 
     #[test]
