@@ -439,7 +439,7 @@ pub(crate) async fn run_dict_pass(model: &str, steps: &[&str], text: &str) -> Re
         ..Default::default()
     }];
     // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools, no Stop).
-    ollama::generate(model, messages, Some(0.2), "5m", None).await
+    ollama::generate(model, messages, Some(0.2), "5m", None, ollama::CtxTier::Chat).await
 }
 
 // ---------------------------------------------------------------- Touch ID (ADD-11)

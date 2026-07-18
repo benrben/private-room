@@ -700,6 +700,7 @@ pub(crate) async fn stream_answer(
                 web_enabled,
                 crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: false },
                 None,
+                crate::room_mcp::StartOpts::default(),
             )
             .await
             .ok()
@@ -934,6 +935,49 @@ pub(crate) fn job_tools_specs() -> Vec<serde_json::Value> {
             "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along.",
             "parameters": {"type": "object", "properties": {}}}}),
     ]
+}
+
+/// Wave 1a: tools served ONLY to an external agent on the Leash's full tier
+/// (`ToolScope::ExternalAgent`). Never in `tools_catalog` and never routed to
+/// the in-room engines — the local model IS the thing `local_generate` runs,
+/// and a cloud advisor must not command local compute (same structural guard
+/// as the job tools above).
+pub(crate) fn external_agent_tools_specs() -> Vec<serde_json::Value> {
+    vec![serde_json::json!({"type": "function", "function": {"name": "local_generate",
+        "description": "Run one prompt on the user's LOCAL model on this Mac and return its text (or JSON when a schema is given). Slow but private — use it for steps whose content must not leave this machine. For reading a whole huge file use start_file_pass instead.",
+        "parameters": {"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "The full, self-contained prompt"},
+            "system": {"type": "string", "description": "Optional system instruction"},
+            "schema": {"type": "object", "description": "Optional JSON Schema — the reply is constrained to match it"},
+            "temperature": {"type": "number"},
+            "long": {"type": "boolean", "description": "true to allow a big-context call for large prompts (slower prefill)"}},
+            "required": ["prompt"]}}})]
+}
+
+/// Wave 1a: the CONTENT subset of the UI/perception specs. `view_media_frame`
+/// reads a room video's pixels — room content, like open_file — not the user's
+/// screen, so the external tier serves it while ui_snapshot/ui_act/
+/// view_screenshot stay LocalEngine-only.
+pub(crate) fn media_tools_specs() -> Vec<serde_json::Value> {
+    ui_tools_specs()
+        .into_iter()
+        .filter(|s| s["function"]["name"] == "view_media_frame")
+        .collect()
+}
+
+/// Wave 1a: the model `local_generate` runs on. The tool PROMISES local
+/// execution, so the room's chat model is honored only when it actually runs
+/// on this Mac — an external CLI engine or an Ollama `:cloud` proxy is swapped
+/// for `best_local_default`, which also refuses `:cloud` picks (unlike
+/// `best_default`/`resolve_pass_engine`, whose cloud lane would betray the
+/// promise). With nothing local installed it falls back to the default NAME,
+/// so the surfaced `MODEL_MISSING:<model>` error tells the agent exactly what
+/// to install (open decision 3: error, never a silent cloud fallback).
+pub(crate) fn resolve_local_generate_model(explicit: Option<String>, models: &[String]) -> String {
+    match explicit {
+        Some(m) if !is_external_engine(&m) && !is_cloud_model(&m) => m,
+        _ => best_local_default(models),
+    }
 }
 
 /// Tools the local model can use to drive the app. The web tools appear
@@ -1917,6 +1961,52 @@ pub(crate) async fn exec_tool(
                 .collect();
             Ok(clamp_tool_result(lines.join("\n")))
         }
+        // Wave 1a: run one prompt on the LOCAL model for an external agent on
+        // the Leash's full tier (only `ToolScope::ExternalAgent` advertises
+        // it). Never touches `effects` — the bridge passes a throwaway sink
+        // for this scope. No `clamp_tool_result`: the output is
+        // generation-bounded and the external client has a big context.
+        "local_generate" => {
+            let prompt = args["prompt"].as_str().unwrap_or_default().trim().to_string();
+            if prompt.is_empty() {
+                return Err("local_generate needs a non-empty `prompt`.".into());
+            }
+            let explicit = {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                model_setting(&room.conn)
+            };
+            let models = ollama::list_models().await.unwrap_or_default();
+            let model = resolve_local_generate_model(explicit, &models);
+            let mut messages = Vec::new();
+            if let Some(sys) = args["system"].as_str().filter(|s| !s.trim().is_empty()) {
+                messages.push(ollama::ChatMessage::new("system", sys));
+            }
+            messages.push(ollama::ChatMessage::new("user", prompt));
+            let temperature = args["temperature"].as_f64();
+            // `long` buys the Job-tier window: an external agent's big prompt
+            // must not be silently truncated at the interactive chat window.
+            let tier = if args["long"].as_bool().unwrap_or(false) {
+                ollama::CtxTier::Job
+            } else {
+                ollama::CtxTier::Chat
+            };
+            if args["schema"].is_object() {
+                ollama::chat_structured(
+                    &model,
+                    messages,
+                    temperature,
+                    KEEP_ALIVE_WARM,
+                    &args["schema"],
+                    ollama::StructuredOpts { tier, cancel: None },
+                )
+                .await
+            } else {
+                let raw = ollama::generate(&model, messages, temperature, KEEP_ALIVE_WARM, None, tier)
+                    .await?;
+                Ok(strip_think_spans(&raw).trim().to_string())
+            }
+        }
         // ADD-21: delegate a hard subtask to a cloud CLI. Gated: the tool is
         // only in the catalog when the advanced setting is on and a CLI exists,
         // but re-check the budget here so the model can't overspend the user's
@@ -2460,6 +2550,57 @@ mod tests {
             assert!(!catalog.contains(name), "{name} must not be in tools_catalog");
         }
         assert_eq!(job_tools_specs().len(), 2);
+    }
+
+    #[test]
+    fn external_agent_tools_never_leak_into_the_room_bridge_catalog() {
+        // Wave 1a structural guard, same as the job/UI tools: local_generate
+        // is NOT in tools_catalog — only the bridge's ExternalAgent scope
+        // advertises it, so no in-room engine or cloud advisor ever sees it.
+        assert!(!tools_catalog(true).to_string().contains("local_generate"));
+        let specs = external_agent_tools_specs();
+        assert_eq!(specs.len(), 1);
+        let f = &specs[0]["function"];
+        assert_eq!(f["name"], "local_generate");
+        assert_eq!(f["parameters"]["required"], serde_json::json!(["prompt"]));
+        for p in ["prompt", "system", "schema", "temperature", "long"] {
+            assert!(f["parameters"]["properties"][p].is_object(), "missing param {p}");
+        }
+        // The content-perception subset is exactly view_media_frame.
+        let media = media_tools_specs();
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0]["function"]["name"], "view_media_frame");
+    }
+
+    #[test]
+    fn local_generate_never_resolves_to_a_cloud_model() {
+        // Wave 1a amendment: the tool promises LOCAL execution. A :cloud chat
+        // model, an external CLI engine, and a :cloud-first install must all
+        // land on a genuinely local model — resolve_pass_engine's cloud lane
+        // is deliberately NOT the template here.
+        let models = vec![
+            "minimax-m3:cloud".to_string(),
+            "nomic-embed-text:latest".to_string(),
+            "qwen3.5:9b".to_string(),
+        ];
+        assert_eq!(
+            resolve_local_generate_model(Some("minimax-m3:cloud".into()), &models),
+            "qwen3.5:9b"
+        );
+        assert_eq!(
+            resolve_local_generate_model(Some("claude-cli::opus".into()), &models),
+            "qwen3.5:9b"
+        );
+        // An explicit local pick is honored.
+        assert_eq!(
+            resolve_local_generate_model(Some("qwen3.5:9b".into()), &models),
+            "qwen3.5:9b"
+        );
+        assert_eq!(resolve_local_generate_model(None, &models), "qwen3.5:9b");
+        // Nothing local installed → the default NAME, so Ollama surfaces a
+        // clear MODEL_MISSING instead of silently running on the cloud.
+        let no_local = vec!["minimax-m3:cloud".to_string()];
+        assert_eq!(resolve_local_generate_model(None, &no_local), DEFAULT_MODEL);
     }
 
     #[test]

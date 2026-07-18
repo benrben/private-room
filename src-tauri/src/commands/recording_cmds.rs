@@ -582,7 +582,15 @@ pub async fn rec_translate(
         );
         let messages = vec![ollama::ChatMessage::new("user", prompt)];
         // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools, no Stop).
-        let out = ollama::generate(&model, messages, Some(0.2), KEEP_ALIVE_WARM, None).await?;
+        let out = ollama::generate(
+            &model,
+            messages,
+            Some(0.2),
+            KEEP_ALIVE_WARM,
+            None,
+            ollama::CtxTier::Chat,
+        )
+        .await?;
         let out = strip_think_spans(&out);
         let got: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         if got.len() == batch.len() {

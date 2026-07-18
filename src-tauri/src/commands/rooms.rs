@@ -116,22 +116,44 @@ pub fn open_room_with_recovery(
     open_room(app, state, path, password)
 }
 
-/// D9 (the Leash): on unlock, restart the persistent room MCP server if its
-/// toggle (`room_server_enabled`) was left on. Fire-and-forget — starting the
-/// server is async and must never block the unlock path. The advisor/cloud
-/// sub-option is not persisted, so a restart begins with cloud MCP OFF (the
-/// safe default); the user re-enables it from Settings if they want it.
+/// D9/Wave 1a (the Leash): on unlock, restart the persistent room MCP server
+/// if its toggle (`room_server_enabled`) was left on, at the PERSISTED tier
+/// (`room_server_scope`). Fire-and-forget — starting the server is async and
+/// must never block the unlock path. Deliberate asymmetry: the advisor/cloud
+/// sub-option is not persisted, so a files-tier restart begins with cloud MCP
+/// OFF (the safe default), while the user-configured full tier IS restored —
+/// with its persisted `leash_port`/`leash_token`, so a pasted external-agent
+/// config keeps working across restarts (loopback + bearer + explicit opt-in).
 pub(crate) fn spawn_room_server_if_enabled(app: &tauri::AppHandle) {
     use tauri::Manager as _;
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let (enabled, web_enabled) = {
+        let (enabled, web_enabled, scope, opts, room_path, room_name) = {
             let state = app.state::<AppState>();
             let guard = state.room.lock().unwrap();
             let Some(room) = guard.as_ref() else { return };
             let enabled =
                 db::get_setting(&room.conn, "room_server_enabled").as_deref() == Some("1");
-            (enabled, web_access_enabled(&room.conn))
+            let scope_setting = db::get_setting(&room.conn, "room_server_scope");
+            let scope = leash_scope(scope_setting.as_deref(), false);
+            let opts = if scope == crate::room_mcp::ToolScope::ExternalAgent {
+                match leash_identity(&room.conn) {
+                    Ok((port, token)) => {
+                        crate::room_mcp::StartOpts { port: Some(port), token: Some(token) }
+                    }
+                    Err(_) => return,
+                }
+            } else {
+                crate::room_mcp::StartOpts::default()
+            };
+            (
+                enabled,
+                web_access_enabled(&room.conn),
+                scope,
+                opts,
+                room.path.clone(),
+                room.name.clone(),
+            )
         };
         if !enabled {
             return;
@@ -143,16 +165,17 @@ pub(crate) fn spawn_room_server_if_enabled(app: &tauri::AppHandle) {
                 return;
             }
         }
-        if let Ok(bridge) = crate::room_mcp::start(
-            app.clone(),
-            web_enabled,
-            crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: false },
-            None,
-        )
-        .await
+        if let Ok(bridge) =
+            crate::room_mcp::start(app.clone(), web_enabled, scope, None, opts).await
         {
             let state = app.state::<AppState>();
-            *state.room_server.lock().unwrap() = Some(bridge);
+            // Store only if this room is still the open one — a teardown
+            // (close, open-over-open) during the await must win, or the
+            // stale bridge would serve the NEXT room with THIS room's token.
+            let (port, token, bscope) = (bridge.port, bridge.token.clone(), bridge.scope);
+            if store_bridge_if_current(&state, &room_path, bridge) {
+                let _ = write_discovery(&app, port, &token, scope_name(bscope), &room_name);
+            }
         }
     });
 }
@@ -301,11 +324,14 @@ pub(crate) fn teardown_open_room(app: &tauri::AppHandle, state: &AppState) {
     }
     *state.room.lock().unwrap() = None;
     // D9 (the Leash): a locked room must not leave its MCP endpoint reachable —
-    // stop and clear it here so teardown always kills the server + its token.
+    // stop and clear it here so teardown always kills the server + its token
+    // (live connections included — the bridge's shutdown channel severs them),
+    // and the discovery file never advertises a dead or foreign endpoint.
     {
         let taken = state.room_server.lock().unwrap().take();
         if let Some(bridge) = taken {
             bridge.stop();
+            remove_discovery(app);
         }
     }
     // Dropping the clients kills the server processes (kill_on_drop).

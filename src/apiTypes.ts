@@ -431,11 +431,17 @@ export interface FileMetaSuggestion {
   tags: string[];
 }
 
-/** D9: state of the persistent Room MCP server (the Leash). */
+/** D9: state of the persistent Room MCP server (the Leash). Wave 1a: `scope`
+ * is the running trust tier; `stable` means the fixed port was bound (the
+ * pasted config survives restarts); `allowCloud` echoes the effective cloud
+ * sub-option so Settings shows the truth after reopening. */
 export interface RoomServerStatus {
   running: boolean;
   url: string;
   config: string;
+  scope: "files" | "full";
+  stable: boolean;
+  allowCloud: boolean;
 }
 
 /** D11: a selectable room persona (tutor, critic, opposing-counsel, …). */

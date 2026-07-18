@@ -148,11 +148,14 @@ export default function Settings({
   const {
     leash,
     allowCloud,
+    scope,
     leashBusy,
     leashErr,
     leashCopied,
     toggleLeash,
     toggleAllowCloud,
+    changeScope,
+    regenerateToken,
     copyLeashConfig,
   } = useRoomServer();
 
@@ -355,6 +358,9 @@ export default function Settings({
               toggleLeash={toggleLeash}
               allowCloud={allowCloud}
               toggleAllowCloud={toggleAllowCloud}
+              scope={scope}
+              changeScope={changeScope}
+              regenerateToken={regenerateToken}
               copyLeashConfig={copyLeashConfig}
               leashCopied={leashCopied}
               leashErr={leashErr}

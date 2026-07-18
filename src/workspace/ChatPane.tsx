@@ -14,6 +14,7 @@ import MarkdownView from "../viewers/MarkdownView";
 import {
   annotationTarget,
   isCloudEngine,
+  isModelReady,
   patchStreamFences,
   splitMarkupBlocks,
 } from "./markup";
@@ -36,11 +37,7 @@ export default function ChatPane({
   info: RoomInfo;
 }) {
   const { ai, model, messages } = s;
-  const modelReady =
-    (ai?.running &&
-      (ai.models.includes(model) ||
-        ai.models.some((m) => m.startsWith(model + ":") || model.startsWith(m)))) ||
-    ai?.external.includes(model);
+  const modelReady = isModelReady(ai, model);
   const lastAssistantId = [...messages]
     .reverse()
     .find((m) => m.role === "assistant")?.id;

@@ -350,18 +350,20 @@ pub async fn chat_structured(
 // non-streamed variants size `num_ctx`, think-disable, and pass the base URL
 // identically to how the old native chat did for a no-tools Chat call.
 
-/// Build the `/generate`(`_stream`) request body for a tool-less, plain-text chat
-/// at the interactive (Chat) context tier — the shared schema the streaming
-/// ([`crate::sidecar::generate_stream`]) and non-streaming ([`generate`]) plain
-/// paths both POST. Sizes `num_ctx` exactly as the old native chat did for a
-/// no-tools Chat call (so streamed tokens match byte-for-byte) and passes the
-/// runtime-overridable Ollama base URL the sidecar should talk to. No `format`
-/// (that is `chat_structured`'s grammar path) and no `tools`.
+/// Build the `/generate`(`_stream`) request body for a tool-less, plain-text
+/// chat — the shared schema the streaming ([`crate::sidecar::generate_stream`])
+/// and non-streaming ([`generate`]) plain paths both POST. Sizes `num_ctx` for
+/// the caller's `tier` exactly as the old native chat did for a no-tools call
+/// (the streaming caller stays `Chat`, so streamed tokens match byte-for-byte;
+/// Wave 1a's `local_generate long=true` is the `Job`-tier caller) and passes
+/// the runtime-overridable Ollama base URL the sidecar should talk to. No
+/// `format` (that is `chat_structured`'s grammar path) and no `tools`.
 pub fn plain_generate_body(
     model: &str,
     messages: &[ChatMessage],
     temperature: Option<f64>,
     keep_alive: &str,
+    tier: CtxTier,
 ) -> serde_json::Value {
     serde_json::json!({
         "model": model,
@@ -369,7 +371,7 @@ pub fn plain_generate_body(
         "base_url": resolved_base_url(),
         // `null` when unset — the sidecar treats a null temperature as "omit".
         "temperature": temperature,
-        "num_ctx": num_ctx_for(false, CtxTier::Chat),
+        "num_ctx": num_ctx_for(false, tier),
         "keep_alive": keep_alive,
     })
 }
@@ -387,14 +389,19 @@ pub fn plain_generate_body(
 /// races the request against the flag and drops it on Stop, yielding empty text
 /// the caller treats as stopped (same "partial == stopped" contract the old
 /// streamed path had). Callers with no Stop affordance pass `None`.
+///
+/// `tier` (Wave 1a): the `num_ctx` class. Every interactive caller passes
+/// `Chat`; `local_generate` with `long=true` passes `Job` so a big external
+/// prompt is not silently truncated at the small chat window.
 pub async fn generate(
     model: &str,
     messages: Vec<ChatMessage>,
     temperature: Option<f64>,
     keep_alive: &str,
     cancel: Option<Arc<AtomicBool>>,
+    tier: CtxTier,
 ) -> Result<String, String> {
-    let body = plain_generate_body(model, &messages, temperature, keep_alive);
+    let body = plain_generate_body(model, &messages, temperature, keep_alive, tier);
     let value = post_generate_cancellable(&body, model, cancel).await?;
     Ok(value["text"].as_str().unwrap_or_default().to_string())
 }
@@ -634,6 +641,21 @@ mod tests {
         // ...and an empty/whitespace-only string clears it too (same as None).
         set_base_url_override(Some("   ".to_string()));
         assert_eq!(resolved_base_url(), base_url());
+    }
+
+    // Wave 1a: the plain-generation body honors the caller's context tier —
+    // a `local_generate long=true` call gets the Job window instead of being
+    // silently truncated at the small interactive Chat window.
+    #[test]
+    fn plain_generate_body_sizes_num_ctx_by_tier() {
+        let messages = vec![ChatMessage::new("user", "hi")];
+        let chat = plain_generate_body("m", &messages, None, "30m", CtxTier::Chat);
+        let job = plain_generate_body("m", &messages, None, "30m", CtxTier::Job);
+        let (chat_ctx, job_ctx) = (chat["num_ctx"].as_u64().unwrap(), job["num_ctx"].as_u64().unwrap());
+        assert!(job_ctx > chat_ctx, "Job tier must widen the window ({job_ctx} vs {chat_ctx})");
+        // Whatever the machine's RAM, these are the two no-tools tiers.
+        assert_eq!(chat_ctx as u32, num_ctx_for(false, CtxTier::Chat));
+        assert_eq!(job_ctx as u32, num_ctx_for(false, CtxTier::Job));
     }
 
     // A structured-output response must parse whether the model returns bare

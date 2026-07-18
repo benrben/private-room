@@ -142,6 +142,12 @@ pub fn change_password(
     // room. Re-wrap under the new password and hand back the fresh code; if
     // re-wrapping fails, delete the stale sidecar so the unlock gate never
     // offers a code that cannot work.
+    // Wave 1a, chosen behavior: the Leash's `leash_token` is NOT rotated here —
+    // it is a separate credential for a separate boundary (loopback MCP, not
+    // the file), and silently breaking every pasted external-agent config on a
+    // password change would look like data loss. Revocation is the explicit
+    // "Regenerate token" action (`regenerate_leash_token`), which also severs
+    // live connections.
     let new_code = if db::has_recovery(&room.path) {
         match db::write_recovery(&room.path, &room.password) {
             Ok(code) => Some(code),

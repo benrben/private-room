@@ -6,6 +6,9 @@ interface Props {
   toggleLeash: () => void;
   allowCloud: boolean;
   toggleAllowCloud: (next: boolean) => void;
+  scope: "files" | "full";
+  changeScope: (next: "files" | "full") => void;
+  regenerateToken: () => void;
   copyLeashConfig: () => void;
   leashCopied: boolean;
   leashErr: string;
@@ -18,6 +21,9 @@ export default function RoomServerSection({
   toggleLeash,
   allowCloud,
   toggleAllowCloud,
+  scope,
+  changeScope,
+  regenerateToken,
   copyLeashConfig,
   leashCopied,
   leashErr,
@@ -52,6 +58,57 @@ export default function RoomServerSection({
             </div>
             {leash.running && (
               <>
+                <label className="settings-label">Access level</label>
+                {(
+                  [
+                    [
+                      "files",
+                      "Files only",
+                      "Read, search and edit files.",
+                    ],
+                    [
+                      "full",
+                      "Full agent",
+                      "Files + background jobs + local AI (for Claude Code, Codex…).",
+                    ],
+                  ] as const
+                ).map(([id, name, blurb]) => (
+                  <label
+                    key={id}
+                    className={`model-row ${scope === id ? "active" : ""}`}
+                    style={{ alignItems: "flex-start", gap: 8, cursor: "pointer" }}
+                  >
+                    <input
+                      type="radio"
+                      name="leash-scope"
+                      checked={scope === id}
+                      disabled={leashBusy}
+                      onChange={() => changeScope(id)}
+                      style={{ marginTop: 3 }}
+                    />
+                    <span
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 2,
+                        flex: 1,
+                      }}
+                    >
+                      <span className="model-label">{name}</span>
+                      <span className="settings-hint" style={{ margin: 0 }}>
+                        {blurb}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+                {scope === "full" && (
+                  <p className="settings-hint">
+                    <AlertIcon size={13} className="warn-ic" /> An external
+                    agent at this level can start hours of local compute and
+                    run the local model. It still can't see your screen or
+                    drive the app.
+                  </p>
+                )}
                 <label className="settings-label">Address</label>
                 <input
                   readOnly
@@ -73,35 +130,63 @@ export default function RoomServerSection({
                   <button className="btn-ic" onClick={copyLeashConfig}>
                     {leashCopied ? "Copied ✓" : "Copy config"}
                   </button>
-                </div>
-                <p className="settings-hint">
-                  Only apps you paste this into can reach the unlocked room; it
-                  dies when you lock.
-                </p>
-                <label className="settings-label">Allow cloud AI clients</label>
-                <div className="settings-toggle-row">
-                  <label className="switch">
-                    <input
-                      type="checkbox"
-                      checked={allowCloud}
+                  {scope === "full" && (
+                    <button
+                      className="btn-ic"
                       disabled={leashBusy}
-                      onChange={(e) => toggleAllowCloud(e.target.checked)}
-                    />
-                    <span className="switch-track" aria-hidden="true">
-                      <span className="switch-thumb" />
-                    </span>
-                  </label>
-                  <span>
-                    {allowCloud
-                      ? "Cloud AI clients may connect."
-                      : "Local apps only."}
-                  </span>
+                      onClick={regenerateToken}
+                    >
+                      Regenerate token
+                    </button>
+                  )}
                 </div>
-                <p className="settings-hint">
-                  <AlertIcon size={13} className="warn-ic" /> With this on, a
-                  cloud AI can read this room through the bridge — and what they
-                  retrieve, they keep. Leave it off unless you mean it.
-                </p>
+                {scope === "full" ? (
+                  <p className="settings-hint">
+                    {leash.stable
+                      ? "This address and config survive restarts. "
+                      : ""}
+                    Agents can also self-configure from
+                    {" ~/.private-room/leash.json"} (written only while the
+                    room is open). Regenerate the token to revoke every pasted
+                    config at once.
+                  </p>
+                ) : (
+                  <p className="settings-hint">
+                    Only apps you paste this into can reach the unlocked room;
+                    it dies when you lock.
+                  </p>
+                )}
+                {scope !== "full" && (
+                  <>
+                    <label className="settings-label">
+                      Allow cloud AI clients
+                    </label>
+                    <div className="settings-toggle-row">
+                      <label className="switch">
+                        <input
+                          type="checkbox"
+                          checked={allowCloud}
+                          disabled={leashBusy}
+                          onChange={(e) => toggleAllowCloud(e.target.checked)}
+                        />
+                        <span className="switch-track" aria-hidden="true">
+                          <span className="switch-thumb" />
+                        </span>
+                      </label>
+                      <span>
+                        {allowCloud
+                          ? "Cloud AI clients may connect."
+                          : "Local apps only."}
+                      </span>
+                    </div>
+                    <p className="settings-hint">
+                      <AlertIcon size={13} className="warn-ic" /> With this on,
+                      a cloud AI can read this room through the bridge — and
+                      what they retrieve, they keep. Leave it off unless you
+                      mean it.
+                    </p>
+                  </>
+                )}
               </>
             )}
             {leashErr && <div className="gate-error">{leashErr}</div>}

@@ -1832,7 +1832,16 @@ fn spawn_live_translation<R: tauri::Runtime>(
         );
         let messages = vec![crate::ollama::ChatMessage::new("user", prompt)];
         // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools, no Stop).
-        if let Ok(out) = crate::ollama::generate(&model, messages, Some(0.2), "5m", None).await {
+        if let Ok(out) = crate::ollama::generate(
+            &model,
+            messages,
+            Some(0.2),
+            "5m",
+            None,
+            crate::ollama::CtxTier::Chat,
+        )
+        .await
+        {
             let text = crate::commands::strip_think_spans(&out).trim().to_string();
             if !text.is_empty() {
                 let _ = app.emit(

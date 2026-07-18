@@ -12,13 +12,22 @@
 //! If the room closes mid-run, `exec_tool` itself errors ("No room is open"),
 //! so a stale client can never read a locked room.
 //!
-//! ADD-33: the same bridge now feeds two very different clients, so what it
-//! advertises is scoped (see [`ToolScope`]). A CLOUD CLI (`claude -p`, a consulted
-//! advisor) gets ONLY the built-in file tools — never the app-driving UI tools,
-//! the hours-of-local-compute job tools, or `consult_advisor`. The LOCAL Python
-//! agent engine is trusted exactly like the native `agent_loop`, so it gets the
-//! full local tool set. The scope is the security boundary; do not widen the
-//! cloud scope.
+//! ADD-33/Wave 1a: the same bridge now feeds three different clients, so what
+//! it advertises is scoped (see [`ToolScope`]) — the scope is the security
+//! boundary; do not widen the cloud scope.
+//! - `CloudAdvisor` — a CLOUD CLI (`claude -p`, a consulted advisor): ONLY the
+//!   built-in file tools — never the app-driving UI tools, the
+//!   hours-of-local-compute job tools, or `consult_advisor`.
+//! - `LocalEngine` — the LOCAL Python agent engine, trusted exactly like the
+//!   native `agent_loop`: the full local tool set.
+//! - `ExternalAgent` (Wave 1a) — an external agent the user explicitly opted
+//!   in per room (Claude Code, Codex, Claude Desktop on the Leash's full
+//!   tier): the file tools plus the job tools, `local_generate`, and the
+//!   content-perception `view_media_frame`. NEVER the UI-driving tools
+//!   (ui_snapshot/ui_act/view_screenshot — an external agent must not observe
+//!   or operate the user's screen) and NEVER `consult_advisor` (that tool
+//!   lives outside every catalog, keeping the cloud-recursion path closed) —
+//!   the only two intentional gaps from in-room-agent parity.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,8 +38,10 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::commands;
 
 /// Which tools this bridge advertises — the trust boundary between a cloud
-/// client and the local engine.
-#[derive(Clone, Copy)]
+/// client, the local engine, and a user-configured external agent.
+/// `PartialEq` because `set_room_server` restarts a running bridge on a scope
+/// mismatch (a flipped cloud sub-option counts — `include_mcp` compares too).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ToolScope {
     /// A CLOUD client (top-level `claude -p`, or a consulted advisor). Built-in
     /// file tools only. `include_mcp` (ADD-21) additionally advertises the room's
@@ -45,17 +56,35 @@ pub enum ToolScope {
     /// lives outside every catalog by design, keeping the cloud-recursion path
     /// closed no matter which engine is driving.
     LocalEngine,
+    /// Wave 1a: an EXTERNAL agent the user explicitly opted in per room (the
+    /// Leash's full tier — Claude Code, Codex, Claude Desktop). Built-in tools
+    /// PLUS the job tools, `local_generate`, the content-perception
+    /// `view_media_frame`, and the room's connected MCP servers. NEVER the
+    /// UI-driving tools and NEVER `consult_advisor` (see the module doc).
+    ExternalAgent,
 }
 
 impl ToolScope {
     fn include_mcp(self) -> bool {
         match self {
             ToolScope::CloudAdvisor { include_mcp } => include_mcp,
-            ToolScope::LocalEngine => true,
+            ToolScope::LocalEngine | ToolScope::ExternalAgent => true,
         }
     }
-    fn include_app_tools(self) -> bool {
+    /// The app-driving/screen-observing tools: the local engine's alone.
+    fn include_ui_tools(self) -> bool {
         matches!(self, ToolScope::LocalEngine)
+    }
+    /// The whole-file-pass job tools: hours of local compute, so only the
+    /// trusted local engine or an explicitly opted-in external agent.
+    fn include_job_tools(self) -> bool {
+        matches!(self, ToolScope::LocalEngine | ToolScope::ExternalAgent)
+    }
+    /// `local_generate` + `view_media_frame`: what an external orchestrator
+    /// needs for parity that the in-room engines get another way (the local
+    /// engine IS the model; its perception specs ride `include_ui_tools`).
+    fn include_external_tools(self) -> bool {
+        matches!(self, ToolScope::ExternalAgent)
     }
 }
 
@@ -72,7 +101,18 @@ pub(crate) type EffectsSink = std::sync::Arc<tokio::sync::Mutex<commands::ToolEf
 pub struct Bridge {
     pub port: u16,
     pub token: String,
+    /// The tier this bridge serves for its whole lifetime — echoed by the
+    /// Leash status snapshot and compared for the scope-mismatch restart.
+    pub scope: ToolScope,
+    /// Wave 1a: true when the requested fixed port was actually bound (the
+    /// pasted config survives restarts); false for ephemeral, including the
+    /// fixed-port-taken fallback.
+    pub stable: bool,
     shutdown: tokio::sync::watch::Sender<bool>,
+    /// The accept-loop task, so `stop_and_wait` can await the listener's death
+    /// before a caller rebinds the same fixed port (fire-and-forget `stop`
+    /// races EADDRINUSE on an immediate restart).
+    task: tauri::async_runtime::JoinHandle<()>,
     /// Set true the instant a `tools/call` is dispatched to `exec_tool` — the
     /// AUTHORITATIVE "a tool ran on this bridge" signal. The sidecar client's own
     /// fallback guard keys off the `step` NDJSON line, but that line and the tool's
@@ -110,29 +150,85 @@ impl Bridge {
         format!("http://127.0.0.1:{}/mcp", self.port)
     }
 
+    /// Fire-and-forget stop: signals the accept loop AND every live connection
+    /// (each `handle_conn` selects on the same watch channel). Callers that
+    /// immediately rebind the same fixed port must use `stop_and_wait`.
     pub fn stop(&self) {
         let _ = self.shutdown.send(true);
     }
+
+    /// Stop and WAIT for the accept loop to die, releasing the bound port —
+    /// the restart paths (scope flip, token rotation) rebind the fixed Leash
+    /// port right after, and a fire-and-forget stop races EADDRINUSE there.
+    pub async fn stop_and_wait(self) {
+        let _ = self.shutdown.send(true);
+        let _ = self.task.await;
+    }
 }
 
-/// Bind 127.0.0.1:ephemeral and serve MCP until `stop()`. `scope` fixes what the
-/// bridge advertises for its whole lifetime (see [`ToolScope`]).
+/// Wave 1a: how `start` binds. Default = today's behavior (ephemeral port,
+/// fresh token). The Leash's full tier passes its persisted port + token so a
+/// pasted external-agent config survives restarts.
+#[derive(Default)]
+pub struct StartOpts {
+    pub port: Option<u16>,
+    pub token: Option<String>,
+}
+
+/// Bind loopback and serve MCP until `stop()`. `scope` fixes what the bridge
+/// advertises for its whole lifetime (see [`ToolScope`]). A fixed `opts.port`
+/// is retried briefly (a just-stopped listener may still hold it), then falls
+/// back to ephemeral with `stable: false` rather than failing the start.
 pub async fn start(
     app: tauri::AppHandle,
     web_enabled: bool,
     scope: ToolScope,
     effects: Option<EffectsSink>,
+    opts: StartOpts,
 ) -> Result<Bridge, String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|e| format!("mcp bridge bind failed: {e}"))?;
+    let (listener, stable) = match opts.port {
+        Some(fixed) => {
+            let mut bound = None;
+            for _ in 0..5 {
+                match TcpListener::bind(("127.0.0.1", fixed)).await {
+                    Ok(l) => {
+                        bound = Some(l);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+            match bound {
+                Some(l) => (l, true),
+                None => (
+                    TcpListener::bind(("127.0.0.1", 0))
+                        .await
+                        .map_err(|e| format!("mcp bridge bind failed: {e}"))?,
+                    false,
+                ),
+            }
+        }
+        None => (
+            TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .map_err(|e| format!("mcp bridge bind failed: {e}"))?,
+            false,
+        ),
+    };
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let token = uuid::Uuid::new_v4().simple().to_string();
+    let token = opts
+        .token
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let (tx, mut rx) = tokio::sync::watch::channel(false);
     let tok = token.clone();
     let tool_ran = Arc::new(AtomicBool::new(false));
     let tool_ran_task = tool_ran.clone();
-    tauri::async_runtime::spawn(async move {
+    let task = tauri::async_runtime::spawn(async move {
+        // Each connection watches the same shutdown channel, so `stop()`
+        // severs LIVE keep-alive connections too — not just future accepts (a
+        // downgraded/stopped bridge must not keep serving its captured scope
+        // and token).
+        let conn_rx = rx.clone();
         loop {
             tokio::select! {
                 _ = rx.changed() => break,
@@ -142,32 +238,70 @@ pub async fn start(
                     let tok = tok.clone();
                     let effects = effects.clone();
                     let tool_ran = tool_ran_task.clone();
+                    let rx = conn_rx.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _ = handle_conn(stream, app, tok, web_enabled, scope, effects, tool_ran).await;
+                        let _ = handle_conn(stream, app, tok, web_enabled, scope, effects, tool_ran, rx)
+                            .await;
                     });
                 }
             }
         }
     });
-    Ok(Bridge { port, token, shutdown: tx, tool_ran })
+    Ok(Bridge { port, token, scope, stable, shutdown: tx, task, tool_ran })
 }
 
-/// Serve HTTP/1.1 requests on one connection until the peer hangs up. Only
-/// what the MCP client actually sends is implemented: POST /mcp with a
-/// Content-Length JSON-RPC body (a GET — the optional SSE channel — gets 405).
+/// One bridge connection: `serve_conn` with the real JSON-RPC dispatcher.
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn(
-    mut stream: TcpStream,
+    stream: TcpStream,
     app: tauri::AppHandle,
     token: String,
     web_enabled: bool,
     scope: ToolScope,
     effects: Option<EffectsSink>,
     tool_ran: Arc<AtomicBool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
+    let dispatch = move |body: Vec<u8>| {
+        let app = app.clone();
+        let effects = effects.clone();
+        let tool_ran = tool_ran.clone();
+        async move {
+            dispatch_jsonrpc(&app, &body, web_enabled, scope, effects.as_ref(), &tool_ran).await
+        }
+    };
+    serve_conn(stream, token, shutdown, dispatch).await
+}
+
+/// Serve HTTP/1.1 requests on one connection until the peer hangs up OR the
+/// bridge stops (`shutdown` is the bridge-wide watch channel — MCP clients
+/// hold keep-alive connections, and a stopped or tier-downgraded bridge must
+/// not keep serving them with the captured scope and token). Only what the
+/// MCP client actually sends is implemented: POST /mcp with a Content-Length
+/// JSON-RPC body (a GET — the optional SSE channel — gets 405). Generic over
+/// the dispatcher so the severing behavior is testable without an AppHandle.
+async fn serve_conn<F, Fut>(
+    mut stream: TcpStream,
+    token: String,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut dispatch: F,
+) -> Result<(), String>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = (u16, Vec<u8>)>,
+{
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     loop {
-        let Some(request) = read_framed_request(&mut stream, &mut buf).await? else {
-            return Ok(()); // peer closed between requests
+        // `biased` so an already-signalled stop always wins over a request
+        // that raced in — the connection is severed, never served once more.
+        // A closed channel (Bridge dropped without stop) severs too.
+        let request = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return Ok(()),
+            read = read_framed_request(&mut stream, &mut buf) => match read? {
+                Some(request) => request,
+                None => return Ok(()), // peer closed between requests
+            },
         };
         if !authorize(&request.head, &token) {
             write_response(&mut stream, 401, b"{}").await?;
@@ -177,9 +311,7 @@ async fn handle_conn(
             write_response(&mut stream, 405, b"{}").await?;
             continue;
         }
-        let (status, body) =
-            dispatch_jsonrpc(&app, &request.body, web_enabled, scope, effects.as_ref(), &tool_ran)
-                .await;
+        let (status, body) = dispatch(request.body).await;
         write_response(&mut stream, status, &body).await?;
     }
 }
@@ -300,32 +432,44 @@ fn builtin_mcp_tools(web_enabled: bool) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The full list served over the bridge for `scope`: the built-ins, plus —
-/// - for a CloudAdvisor with the advisor sub-option on (ADD-21) — the room's
-///   connected MCP tools;
-/// - for the LocalEngine (ADD-33) — the room's connected MCP tools AND the
-///   UI/perception and whole-file-pass tools the native loop injects.
-/// NEVER includes `consult_advisor` — that tool lives outside `tools_catalog` by
-/// design, closing the cloud-recursion path for every scope.
+/// The app-handle-free part of the served catalog: the built-ins plus the
+/// scope's extra specs. Pure — this is what the tier tests exercise.
+/// - `include_ui_tools` (LocalEngine): the UI/perception tools the native
+///   loop injects.
+/// - `include_job_tools` (LocalEngine | ExternalAgent): the whole-file-pass
+///   tools.
+/// - `include_external_tools` (ExternalAgent): `local_generate` plus the
+///   content-perception `view_media_frame` (a room video's pixels — content,
+///   not the user's screen).
+/// NEVER includes `consult_advisor` — that tool lives outside `tools_catalog`
+/// by design, closing the cloud-recursion path for every scope.
+fn scoped_specs(web_enabled: bool, scope: ToolScope) -> Vec<serde_json::Value> {
+    let mut list = builtin_mcp_tools(web_enabled);
+    let mut extras: Vec<serde_json::Value> = Vec::new();
+    if scope.include_ui_tools() {
+        extras.extend(commands::ui_tools_specs());
+    }
+    if scope.include_job_tools() {
+        extras.extend(commands::job_tools_specs());
+    }
+    if scope.include_external_tools() {
+        extras.extend(commands::external_agent_tools_specs());
+        extras.extend(commands::media_tools_specs());
+    }
+    list.extend(extras.iter().filter_map(to_mcp_tool));
+    list
+}
+
+/// The full list served over the bridge for `scope`: the pure tier catalog
+/// (`scoped_specs`) plus, when the scope includes them, the room's connected
+/// MCP tools (which need the app handle).
 fn served_tools(
     app: &tauri::AppHandle,
     web_enabled: bool,
     scope: ToolScope,
 ) -> Vec<serde_json::Value> {
     use tauri::Manager;
-    let mut list = builtin_mcp_tools(web_enabled);
-    if scope.include_app_tools() {
-        // ADD-33: the app-driving + job tools ride the same trusted path as the
-        // native loop's injection. Cloud scopes never reach this branch.
-        for spec in commands::ui_tools_specs()
-            .iter()
-            .chain(commands::job_tools_specs().iter())
-        {
-            if let Some(rec) = to_mcp_tool(spec) {
-                list.push(rec);
-            }
-        }
-    }
+    let mut list = scoped_specs(web_enabled, scope);
     if scope.include_mcp() {
         let state = app.state::<commands::AppState>();
         let (routes, _omitted) = commands::mcp_routes(&state);
@@ -415,15 +559,26 @@ async fn tool_call(
             (outcome, images)
         }
         None => {
-            // A cloud scope has no effects sink; any pixels a tool captured are
-            // correctly discarded (unchanged pre-migration behavior) — a cloud
-            // client is never handed the user's screen.
+            // No effects sink here — CloudAdvisor AND ExternalAgent both ride
+            // this branch deliberately: the job tools emit via the window, not
+            // the sink, so an externally-started pass still shows the normal
+            // sidebar progress card. A cloud scope's captured pixels stay
+            // correctly discarded (a cloud client is never handed the user's
+            // screen).
             let mut effects = commands::ToolEffects::default();
+            // Wave 1a: the external tier's one perception tool is
+            // view_media_frame — a room video's pixels, content like
+            // open_file, never the screen. Mark the consumer vision-capable so
+            // the frame rides back as an MCP `image` block (parity with what
+            // the in-room agent sees) instead of a slower local vision-model
+            // description.
+            effects.vision_chat = matches!(scope, ToolScope::ExternalAgent);
             let outcome = commands::exec_tool(
                 &state, &window, &call, &mut effects, &routes, &HashSet::new(), None, None,
             )
             .await;
-            (outcome, Vec::new())
+            let images: Vec<String> = effects.pending_images.drain(..).collect();
+            (outcome, images)
         }
     };
     let (text, is_error) = match outcome {
@@ -525,6 +680,87 @@ mod tests {
         // AppHandle; here we assert the built-in catalog stays minimal.)
         assert!(!tools.iter().any(|t| t["name"] == "ui_act"));
         assert!(!tools.iter().any(|t| t["name"] == "start_file_pass"));
+        // Wave 1a: the external tier's tools never reach a cloud scope either.
+        let cloud = scoped_specs(false, ToolScope::CloudAdvisor { include_mcp: true });
+        for name in ["local_generate", "start_file_pass", "job_status", "view_media_frame"] {
+            assert!(!cloud.iter().any(|t| t["name"] == name), "{name} leaked to cloud");
+        }
+    }
+
+    #[test]
+    fn external_scope_serves_job_and_generate_tools() {
+        // Wave 1a: the ExternalAgent tier = file tools + job tools +
+        // local_generate + the content-perception view_media_frame…
+        let ext = scoped_specs(false, ToolScope::ExternalAgent);
+        for name in ["list_room_files", "start_file_pass", "job_status", "local_generate",
+                     "view_media_frame"] {
+            assert!(ext.iter().any(|t| t["name"] == name), "{name} missing from external tier");
+        }
+        // …and NEVER the UI-driving/screen tools or consult_advisor (the two
+        // intentional gaps from in-room parity — see the module doc).
+        for name in ["ui_act", "ui_snapshot", "view_screenshot", "consult_advisor"] {
+            assert!(!ext.iter().any(|t| t["name"] == name), "{name} leaked to external tier");
+        }
+        // The local engine keeps its full set but has no local_generate — it
+        // IS the local model already.
+        let local = scoped_specs(false, ToolScope::LocalEngine);
+        for name in ["ui_act", "ui_snapshot", "view_screenshot", "view_media_frame",
+                     "start_file_pass", "job_status"] {
+            assert!(local.iter().any(|t| t["name"] == name), "{name} missing from local tier");
+        }
+        assert!(!local.iter().any(|t| t["name"] == "local_generate"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_severs_live_connections() {
+        // Wave 1a BLOCKER regression: MCP clients hold keep-alive connections,
+        // and Bridge::stop() must sever LIVE connections — not just the accept
+        // loop — or a tier downgrade/off leaves an open connection serving the
+        // old scope and token forever. Exercises `serve_conn` (the exact
+        // production per-connection loop; `start` hands every connection a
+        // clone of the same shutdown channel this drives).
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = serve_conn(stream, "tok".into(), rx, |_body: Vec<u8>| async {
+                (200u16, b"{}".to_vec())
+            })
+            .await;
+        });
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nAuthorization: Bearer tok\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        conn.write_all(head.as_bytes()).await.unwrap();
+        conn.write_all(body).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert!(
+            std::str::from_utf8(&buf[..n]).unwrap().starts_with("HTTP/1.1 200"),
+            "first request on the live connection must be served"
+        );
+        // Stop. The SAME socket: the write may land in the OS buffer, but no
+        // response ever comes back — the connection is severed (EOF/reset),
+        // never served once more with its captured scope and token.
+        tx.send(true).unwrap();
+        let _ = conn.write_all(head.as_bytes()).await;
+        let _ = conn.write_all(body).await;
+        let mut rest = Vec::new();
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_to_end(&mut rest))
+                .await
+                .expect("severed connection must not hang");
+        match read {
+            Ok(_) => assert!(
+                !String::from_utf8_lossy(&rest).contains("HTTP/1.1 200"),
+                "stopped bridge served a request on a live connection"
+            ),
+            Err(_) => {} // reset — also severed
+        }
     }
 
     #[test]

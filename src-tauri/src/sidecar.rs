@@ -354,6 +354,7 @@ pub async fn run_via_sidecar(
         web_enabled,
         ToolScope::LocalEngine,
         Some(sink.clone()),
+        room_mcp::StartOpts::default(),
     )
     .await
     {

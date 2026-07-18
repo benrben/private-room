@@ -8,7 +8,7 @@ import {
   Logomark,
   SearchIcon,
 } from "../icons";
-import { isCloudEngine, isExternalEngine } from "./markup";
+import { isCloudEngine, isExternalEngine, isModelReady } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import EngineModelPicker from "./EngineModelPicker";
@@ -39,11 +39,7 @@ export default function TopBar({
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
   }, [anyMenuOpen, s]);
-  const modelReady =
-    (ai?.running &&
-      (ai.models.includes(model) ||
-        ai.models.some((m) => m.startsWith(model + ":") || model.startsWith(m)))) ||
-    ai?.external.includes(model);
+  const modelReady = isModelReady(ai, model);
   return (
     <header className="topbar">
       <div className="room-id" title={info.path}>

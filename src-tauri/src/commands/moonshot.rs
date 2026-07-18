@@ -1,12 +1,14 @@
 use super::*;
 
 mod ai_actions;
+mod discovery;
 mod front_page;
 mod graph;
 mod roles;
 mod server;
 
 pub use ai_actions::*;
+pub(crate) use discovery::*;
 pub use front_page::*;
 pub use graph::*;
 pub use roles::*;

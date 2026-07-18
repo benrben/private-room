@@ -182,6 +182,7 @@ pub fn run() {
             commands::suggest_file_meta,
             commands::room_server_status,
             commands::set_room_server,
+            commands::regenerate_leash_token,
             commands::set_ollama_url,
             commands::get_ollama_url,
             commands::list_roles,
@@ -226,6 +227,10 @@ pub fn run() {
                 sidecar_lifecycle::stop_if_ours();
                 // Decrypted "Open in browser" previews must not outlive the app.
                 commands::cleanup_browser_previews();
+                // Wave 1a: Cmd-Q skips teardown_open_room, so drop the Leash
+                // discovery file here too — it must exist exactly while the
+                // Leash runs, never advertising a dead endpoint.
+                commands::remove_discovery(_app);
             }
             // Finder double-click on a .roomai file lands here on macOS.
             #[cfg(target_os = "macos")]

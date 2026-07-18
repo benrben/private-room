@@ -497,9 +497,19 @@ export const suggestFileMeta = (fileId: string) =>
 export const roomServerStatus = () =>
   invoke<RoomServerStatus>("room_server_status");
 
-/** D9: turn the Leash on/off; `allowCloud` gates non-local access. */
-export const setRoomServer = (enabled: boolean, allowCloud: boolean) =>
-  invoke<RoomServerStatus>("set_room_server", { enabled, allowCloud });
+/** D9/Wave 1a: turn the Leash on/off at a trust tier — "files" (read/search/
+ * edit) or "full" (external-agent parity: + background jobs + local AI).
+ * `allowCloud` gates non-local access (files tier only). */
+export const setRoomServer = (
+  enabled: boolean,
+  allowCloud: boolean,
+  scope: "files" | "full",
+) => invoke<RoomServerStatus>("set_room_server", { enabled, allowCloud, scope });
+
+/** Wave 1a: mint a new full-tier bearer token (revokes the old one everywhere,
+ * severing live external-agent connections) and rewrite the discovery file. */
+export const regenerateLeashToken = () =>
+  invoke<RoomServerStatus>("regenerate_leash_token");
 
 /** D10: point the app at a remote Ollama ("the closet"); "" clears the override. */
 export const setOllamaUrl = (url: string) =>

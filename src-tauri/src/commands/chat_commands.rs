@@ -141,7 +141,13 @@ impl CmdCtx<'_> {
         let window = self.window;
         // MIGRATION Phase 2a: streamed through the sidecar `/generate_stream`
         // (no tools, no `format`); the per-token `ask-delta` events are unchanged.
-        let body = ollama::plain_generate_body(self.model, &messages, self.temperature, KEEP_ALIVE_WARM);
+        let body = ollama::plain_generate_body(
+            self.model,
+            &messages,
+            self.temperature,
+            KEEP_ALIVE_WARM,
+            ollama::CtxTier::Chat,
+        );
         let out = crate::sidecar::generate_stream(
             "/generate_stream",
             &body,
@@ -163,7 +169,15 @@ impl CmdCtx<'_> {
         ];
         // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools); the
         // Stop flag still abandons a long quiet step promptly.
-        ollama::generate(self.model, messages, temp, KEEP_ALIVE_WARM, Some(self.cancel.clone())).await
+        ollama::generate(
+            self.model,
+            messages,
+            temp,
+            KEEP_ALIVE_WARM,
+            Some(self.cancel.clone()),
+            ollama::CtxTier::Chat,
+        )
+        .await
     }
 
     /// ADD-22: like `ask_quiet`, but the reply is CONSTRAINED to `schema` via
