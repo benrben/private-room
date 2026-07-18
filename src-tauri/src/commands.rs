@@ -64,7 +64,7 @@ pub use edit_gate::*;
 pub use chat_commands::*;
 pub(crate) use docs_html::*;
 pub(crate) use json::*;
-pub use summarize::*;
+pub(crate) use summarize::*;
 pub use studios::*;
 pub use moonshot::*;
 pub use media::*;

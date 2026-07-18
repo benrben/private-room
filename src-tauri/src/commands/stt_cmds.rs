@@ -199,7 +199,7 @@ pub(crate) fn run_stt_job(app: &tauri::AppHandle, job: JobMeta) {
 /// it has already debounced ~30 s, so stacking the old fixed 45 s on top would
 /// make tiny drops look stalled); yields to any streaming answer; uses a short
 /// keep-alive so it never pins the model in RAM. All failures are silent —
-/// summarize_room remains the full fallback.
+/// the ADD-30 deep-summary job (`#summarize`) remains the full path.
 pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, delay_secs: u64) {
     use tauri::Manager;
     let state = app.state::<AppState>();

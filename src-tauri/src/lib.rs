@@ -111,7 +111,6 @@ pub fn run() {
             commands::save_generated_file,
             commands::open_scratch_pad,
             commands::import_link,
-            commands::summarize_room,
             commands::list_file_versions,
             commands::restore_file_version,
             commands::get_file_version,

@@ -197,6 +197,39 @@ pub(crate) fn boxes_from_items(items: Vec<serde_json::Value>, img_w: f64, img_h:
     boxes
 }
 
+/// Shared inline image-grounding used by the agent's `mark_image` tool and its
+/// post-answer auto-ground pass: run the vision model on a PREPARED (square-
+/// stretched) image and parse the boxes. (The `locate_in_image` command grounds
+/// via the sidecar's `/vision_locate` instead; unifying all three on the sidecar
+/// is a follow-up that needs on-device vision QA.)
+pub(crate) async fn ground_prepared_image(
+    vmodel: &str,
+    chat_model: &str,
+    prepared: &[u8],
+    query: &str,
+    w: f64,
+    h: f64,
+) -> Result<Vec<ImageBox>, String> {
+    let messages = vec![ollama::ChatMessage {
+        role: "user".into(),
+        content: grounding_prompt(query, w, h),
+        images: Some(vec![base64::engine::general_purpose::STANDARD.encode(prepared)]),
+        ..Default::default()
+    }];
+    // HLT-5: short keep_alive for this vision pass on low-RAM Macs.
+    let keep = vision_keep_alive(total_ram_bytes(), vmodel, chat_model);
+    let raw = ollama::chat_structured(
+        vmodel,
+        messages,
+        Some(0.0),
+        keep,
+        &boxes_schema(),
+        Default::default(),
+    )
+    .await?;
+    Ok(parse_boxes(&raw, w, h))
+}
+
 #[tauri::command]
 pub async fn locate_in_image(
     state: State<'_, AppState>,

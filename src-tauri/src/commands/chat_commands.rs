@@ -13,8 +13,6 @@ pub struct ChatCommandInfo {
     pub name: &'static str,
     pub summary: &'static str,
     pub usage: &'static str,
-    /// True when the command works on @-pinned files.
-    pub needs_refs: bool,
 }
 
 /// The command catalog. Keep in sync with the `run_command` dispatch below.
@@ -23,67 +21,56 @@ pub const CHAT_COMMANDS: &[ChatCommandInfo] = &[
         name: "add-file",
         summary: "Write a new note or document — or one per item with \"for each\"",
         usage: "#add-file <name>: <topic>   ·   #add-file for each <thing>",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "remember",
         summary: "Save a fact to the room's permanent memory",
         usage: "#remember <fact>",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "find",
         summary: "Search the room's files for content and list what matches",
         usage: "#find <keywords>",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "highlight",
         summary: "Mark an exact passage in a file so you can see it in the viewer",
         usage: "#highlight <thing> in @file",
-        needs_refs: true,
     },
     ChatCommandInfo {
         name: "extract",
         summary: "Pull the same fields out of several files into a spreadsheet",
         usage: "#extract <field, field…> from @a @b",
-        needs_refs: true,
     },
     ChatCommandInfo {
         name: "summarize",
         summary: "Summarize the whole room, or one @file",
         usage: "#summarize   ·   #summarize @file",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "compare",
         summary: "Compare two or more @files side by side",
         usage: "#compare @a @b",
-        needs_refs: true,
     },
     ChatCommandInfo {
         name: "transcribe",
         summary: "Show the transcript of an @recording",
         usage: "#transcribe @recording",
-        needs_refs: true,
     },
     ChatCommandInfo {
         name: "minutes",
         summary: "Turn a meeting transcript or notes into timeline-style HTML minutes",
         usage: "#minutes @recording   ·   #minutes @notes.md",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "to-sheet",
         summary: "Turn the table in the last answer into a spreadsheet",
         usage: "#to-sheet",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "translate",
         summary: "Translate an @file into another language",
         usage: "#translate @file to <language>",
-        needs_refs: true,
     },
     // D8 (the Airlock): search the web, pull each source into the room as an
     // owned offline copy, then answer from those files — so the sources stay
@@ -92,7 +79,6 @@ pub const CHAT_COMMANDS: &[ChatCommandInfo] = &[
         name: "research",
         summary: "Search the web, save each source into the room, then answer offline",
         usage: "#research <question>",
-        needs_refs: false,
     },
     // Wave 3 (Idea 9): one-click "commit" — a named whole-room checkpoint from
     // the composer, no model call. Rollback stays gated in Settings.
@@ -100,7 +86,6 @@ pub const CHAT_COMMANDS: &[ChatCommandInfo] = &[
         name: "checkpoint",
         summary: "Save a named checkpoint of the whole room (roll back later in Settings)",
         usage: "#checkpoint   ·   #checkpoint before cleanup",
-        needs_refs: false,
     },
 ];
 

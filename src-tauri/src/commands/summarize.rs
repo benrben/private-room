@@ -87,108 +87,6 @@ pub(crate) async fn combine_summary(
     Ok((purpose, questions))
 }
 
-/// ADD-17: generate (or refresh) the room's single "Room summary.md" via a
-/// two-step map-reduce, caching each file's one-liner so re-runs only summarize
-/// new or changed files. Emits `summarize-progress` while running. Writes
-/// nothing if the model is unreachable (returns the normal friendly error).
-#[tauri::command]
-pub async fn summarize_room(
-    window: tauri::Window,
-    state: State<'_, AppState>,
-) -> Result<FileMeta, String> {
-    use tauri::Emitter;
-
-    // Phase 1 (locked): pull the file rows that need a one-liner. The room's
-    // path pins the final write — the map loop below awaits model calls, and a
-    // room swapped mid-run must never receive this room's summary.
-    // Wave 3 (Idea 9): don't start a room summarize while a rollback is swapping.
-    if state.rolling_back() {
-        return Err(ROLLBACK_BUSY.into());
-    }
-    let (explicit_model, files, room_path, room_epoch) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        let conn = &room.conn;
-        let files: Vec<db::SummaryFile> = db::list_files_for_summary(conn)?
-            .into_iter()
-            .filter(|f| !is_summary_file(&f.name, &f.source))
-            .collect();
-        (model_setting(conn), files, room.path.clone(), state.room_epoch())
-    };
-
-    if files.is_empty() {
-        return Err("This room has no files to summarize yet.".into());
-    }
-
-    // The map-reduce drives the Ollama API directly, so an external CLI engine
-    // falls back to the default model; a `:cloud` model works (ADD-29 parity).
-    let models = ollama::list_models()
-        .await
-        .map_err(|_| "The local AI (Ollama) isn't running — start it and try again.".to_string())?;
-    if models.is_empty() {
-        return Err("No local AI model is installed yet — download one first.".into());
-    }
-    let mut model = explicit_model.unwrap_or_else(|| best_default(&models));
-    if is_external_engine(&model) {
-        model = best_default(&models);
-    }
-
-    let to_do = files.len().min(MAX_SUMMARY_FILES);
-
-    // Map: fill the per-file one-liner CACHE for any gaps. The reduce + HTML
-    // write below (write_room_summary) reads the cache back, so this loop and
-    // the ADD-30 deep-summary job feed the exact same writer.
-    for (i, f) in files.iter().take(MAX_SUMMARY_FILES).enumerate() {
-        let _ = window.emit(
-            "summarize-progress",
-            format!("Summarizing file {} of {}…", i + 1, to_do),
-        );
-        // Wave 1b (idea 8): the auto-index '' sentinel counts as MISSING here —
-        // a user-started run is the explicit "try again" for stuck files.
-        let cached = f.ai_summary.as_deref().is_some_and(|s| !s.trim().is_empty());
-        if cached || f.text.as_deref().map_or(true, |t| t.trim().is_empty()) {
-            // Cached already, or no extractable text (e.g. an image without
-            // OCR): the writer lists it by name and type, never invents content.
-            continue;
-        }
-        // ADD-27: hand the summarizer the FULL extracted text (the listing
-        // row only carries a 1500-char probe); it filters and pages through
-        // it itself. Falls back to the probe if the row vanished mid-run.
-        let full = {
-            let guard = state.room.lock().unwrap();
-            guard
-                .as_ref()
-                .and_then(|room| db::get_file_extracted_text(&room.conn, &f.id))
-        }
-        .unwrap_or_else(|| f.text.clone().unwrap_or_default());
-        // CHG-26: one flaky file must not abort the whole run. A
-        // non-transient error (Ollama down / model missing) still aborts —
-        // every remaining call would fail too — but a one-off error just
-        // degrades this file to name-and-type (and, being uncached, retries
-        // on the next run).
-        match summarize_one_file(&model, &f.name, &f.mime, &full, KEEP_ALIVE_WARM).await {
-            Ok(liner) => {
-                if !liner.is_empty() {
-                    // Wave 3 (Idea 9): pin the write by path AND epoch — this map
-                    // loop awaits model calls, and a room swapped mid-run (close,
-                    // switch, or rollback) must never receive this room's summary.
-                    if let Some(room) = state.room.lock().unwrap().as_ref() {
-                        if room.path == room_path && state.room_epoch() == room_epoch {
-                            let _ = db::set_file_ai_summary(&room.conn, &f.id, &liner);
-                        }
-                    }
-                }
-            }
-            Err(e) if e == "OLLAMA_DOWN" || e.starts_with("MODEL_MISSING") => {
-                return Err(e);
-            }
-            Err(_) => {}
-        }
-    }
-
-    write_room_summary(&window, state.inner(), &model, Some(&room_path)).await
-}
-
 /// Resolve the open room, honoring an optional pin (the path of the room the
 /// caller started in). With a pin, a room that was closed or swapped mid-run
 /// counts as gone — the caller's writes must never land in whatever room
@@ -204,8 +102,8 @@ fn pinned_room<'a>(guard: &'a Option<Room>, pin: Option<&str>) -> Result<&'a Roo
 }
 
 /// Reduce + write: assemble "Room summary.html" from the CACHED per-file
-/// one-liners and save it into the room. The cache is filled beforehand — by
-/// summarize_room's foreground loop or by the ADD-30 deep-summary job — so this
+/// one-liners and save it into the room. The cache is filled beforehand by the
+/// ADD-30 deep-summary job (or the `#summarize` command) — so this
 /// makes exactly two model calls (purpose + questions) regardless of room size.
 /// `pin` (the originating room's path) guards EVERY room access here: the
 /// reduce awaits model calls that can take minutes, and a room swapped in that

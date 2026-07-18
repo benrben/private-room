@@ -282,21 +282,9 @@ pub async fn ask(
                     vmodel = best_default(&models);
                 }
                 if !models.is_empty() && !is_external_engine(&vmodel) {
-                    let messages = vec![ollama::ChatMessage {
-                        role: "user".into(),
-                        content: grounding_prompt(&question, *w, *h),
-                        images: Some(vec![
-                            base64::engine::general_purpose::STANDARD.encode(img_bytes),
-                        ]),
-                        ..Default::default()
-                    }];
-                    // HLT-5: short keep_alive for this vision pass on low-RAM Macs.
-                    let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &model);
-                    if let Ok(raw) =
-                        ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &boxes_schema(), Default::default())
-                            .await
+                    if let Ok(boxes) =
+                        ground_prepared_image(&vmodel, &model, img_bytes, &question, *w, *h).await
                     {
-                        let boxes = parse_boxes(&raw, *w, *h);
                         if !boxes.is_empty() {
                             effects.boxes = Some(serde_json::json!({
                                 "fileId": img_id,
@@ -428,6 +416,11 @@ fn gather_context_and_save_question(
         let custom_instructions: Option<String> = db::get_setting(conn, "custom_instructions");
         // Wave 1b (idea 12): the user's chosen response register for this room.
         let response_style: Option<String> = db::get_setting(conn, "response_style");
+        // D11: the room's chosen persona (room_role). Written by the Settings
+        // "Role" section; its instructions are injected into the system prompt
+        // below. (Before this it was persisted but never read — the persona had
+        // no effect on answers.)
+        let room_role: Option<String> = db::get_setting(conn, "room_role");
 
         let memories: Vec<String> = db::list_memories(conn)?
             .into_iter()
@@ -655,6 +648,18 @@ fn gather_context_and_save_question(
                 "You can see an image's pixels only when the user attaches it to a question \
                  (paperclip); otherwise you still know it exists by name.",
             );
+        }
+
+        // D11: the room's chosen persona (room_role) rides just before the
+        // response-style + custom instructions. Byte-stable (a constant chosen by
+        // a setting), so the ADD-22 KV-cache invariant holds; the plain "default"
+        // role has empty instructions and injects nothing.
+        if let Some(role_id) = &room_role {
+            let instructions = role_instructions(role_id);
+            if !instructions.trim().is_empty() {
+                system.push_str("\n\n");
+                system.push_str(instructions.trim());
+            }
         }
 
         // Wave 1b (idea 12): the response-style preset rides immediately before
@@ -1973,17 +1978,7 @@ pub(crate) async fn exec_tool(
                 let v = vision_model(&models, &chat_model);
                 if is_external_engine(&v) { chat_model.clone() } else { v }
             };
-            let messages = vec![ollama::ChatMessage {
-                role: "user".into(),
-                content: grounding_prompt(find, w, h),
-                images: Some(vec![base64::engine::general_purpose::STANDARD.encode(&prepared)]),
-                ..Default::default()
-            }];
-            // HLT-5: short keep_alive on low-RAM machines when vision != chat.
-            let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &chat_model);
-            let raw =
-                ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &boxes_schema(), Default::default()).await?;
-            let boxes = parse_boxes(&raw, w, h);
+            let boxes = ground_prepared_image(&vmodel, &chat_model, &prepared, find, w, h).await?;
             if boxes.is_empty() {
                 return Ok(format!("Could not locate \"{find}\" in {real_name}."));
             }

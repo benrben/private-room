@@ -3,29 +3,9 @@
 //! seeing the first snippet. Pure functions — the LLM plumbing lives in
 //! `commands::summarize`.
 
-/// Window size handed out when the model doesn't ask for one.
-pub const READ_WINDOW_DEFAULT: usize = 4_000;
-/// Hard bounds on ONE model-requested window, so a hallucinated `limit` can
-/// neither blow the context (too big) nor spin uselessly (too small). The
-/// cumulative cap across a whole task is the caller's job — it derives a
-/// budget from the engine's real context (`ollama::context_chars`) instead of
-/// hardcoding a number here.
+/// Floor on a partition window's target size, so a caller can't ask
+/// `partition_windows` for pathologically tiny windows.
 pub const READ_WINDOW_MIN: usize = 200;
-pub const READ_WINDOW_MAX: usize = 32_000;
-
-/// One window of a file's text. Offsets are byte positions into the (filtered)
-/// text, always snapped to char boundaries so slicing can never panic.
-pub struct TextWindow {
-    pub text: String,
-    /// Where this window actually starts (after clamping/snapping/find).
-    pub offset: usize,
-    /// One past the last byte included.
-    pub end: usize,
-    /// Total length of the searched text.
-    pub total: usize,
-    /// Whether `find` matched (the window then starts just before the match).
-    pub found: bool,
-}
 
 /// Drop the low-signal lines a 20 MB extraction is full of — binary/base64
 /// junk, repeated boilerplate lines, runs of blank lines — so every character
@@ -74,33 +54,6 @@ fn looks_like_noise(line: &str) -> bool {
         return true;
     }
     line.split_whitespace().any(|w| w.len() > 80)
-}
-
-/// Cut one window out of `text`. `limit` is clamped to the bounds above.
-/// `find`, when given, jumps the window to the first occurrence of that
-/// phrase at-or-after `offset` (ASCII case-insensitive, so byte offsets stay
-/// exact), starting ~200 bytes early for surrounding context; no match leaves
-/// the window at `offset` with `found: false` so the model learns it missed.
-pub fn read_window(text: &str, offset: usize, limit: usize, find: Option<&str>) -> TextWindow {
-    let total = text.len();
-    let limit = limit.clamp(READ_WINDOW_MIN, READ_WINDOW_MAX);
-    let mut start = floor_char_boundary(text, offset.min(total));
-    let mut found = false;
-    if let Some(needle) = find.map(str::trim).filter(|s| !s.is_empty()) {
-        let hay = text[start..].to_ascii_lowercase();
-        if let Some(pos) = hay.find(&needle.to_ascii_lowercase()) {
-            start = floor_char_boundary(text, (start + pos).saturating_sub(200));
-            found = true;
-        }
-    }
-    let end = ceil_char_boundary(text, (start + limit).min(total));
-    TextWindow {
-        text: text[start..end].to_string(),
-        offset: start,
-        end,
-        total,
-        found,
-    }
 }
 
 /// ADD-32: partition a whole text into consecutive windows of ~`target` bytes
@@ -192,28 +145,6 @@ mod tests {
     }
 
     #[test]
-    fn window_clamps_and_reports_bounds() {
-        let text = "abc ".repeat(3000); // 12_000 bytes
-        let w = read_window(&text, 0, 50, None); // below MIN → clamped up
-        assert_eq!(w.offset, 0);
-        assert_eq!(w.end, READ_WINDOW_MIN);
-        assert_eq!(w.total, 12_000);
-        let w = read_window(&text, 11_900, 999_999, None); // beyond MAX → clamped down, hits end
-        assert_eq!(w.end, 12_000);
-        let w = read_window(&text, 999_999, 500, None); // offset past end → empty tail
-        assert_eq!(w.offset, 12_000);
-        assert!(w.text.is_empty());
-    }
-
-    #[test]
-    fn window_never_splits_multibyte_chars() {
-        let text = "é".repeat(2_000); // 2 bytes per char
-        let w = read_window(&text, 301, 301, None); // both land mid-char
-        assert!(w.text.chars().all(|c| c == 'é'));
-        assert!(text.is_char_boundary(w.offset) && text.is_char_boundary(w.end));
-    }
-
-    #[test]
     fn partition_covers_everything_without_gaps() {
         let text = "A paragraph of prose.\n\n".repeat(500); // ~11.5 KB
         let spans = partition_windows(&text, 2_000, 200);
@@ -259,19 +190,5 @@ mod tests {
         // Empty text → no windows; tiny text → one window.
         assert!(partition_windows("", 2_000, 100).is_empty());
         assert_eq!(partition_windows("short", 2_000, 100), vec![(0, 5)]);
-    }
-
-    #[test]
-    fn find_jumps_case_insensitively() {
-        let mut text = "x".repeat(10_000);
-        text.push_str("The TERMINATION clause begins here.");
-        let w = read_window(&text, 0, 300, Some("termination"));
-        assert!(w.found);
-        assert!(w.text.contains("TERMINATION clause"));
-        assert!(w.offset >= 10_000 - 200);
-        // No match: stays at the requested offset and says so.
-        let w = read_window(&text, 0, 300, Some("no-such-phrase"));
-        assert!(!w.found);
-        assert_eq!(w.offset, 0);
     }
 }
