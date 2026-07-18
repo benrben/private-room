@@ -4,6 +4,7 @@ import "./settingsA11y.css";
 import { Props } from "./settings/types";
 import ModelSection from "./settings/ModelSection";
 import BehaviorSection from "./settings/BehaviorSection";
+import VoiceSection from "./settings/VoiceSection";
 import PrivacySection from "./settings/PrivacySection";
 import OnlineSection from "./settings/OnlineSection";
 import AdvisorsSection from "./settings/AdvisorsSection";
@@ -16,6 +17,7 @@ import RecoverySection from "./settings/RecoverySection";
 import { useFocusTrap } from "./settings/useFocusTrap";
 import { useModelManagement } from "./settings/useModelManagement";
 import { useBehaviorSettings } from "./settings/useBehaviorSettings";
+import { useVoiceSettings } from "./settings/useVoiceSettings";
 import { usePrivacy } from "./settings/usePrivacy";
 import { useOnlineSearch } from "./settings/useOnlineSearch";
 import { useAdvisors } from "./settings/useAdvisors";
@@ -75,6 +77,8 @@ export default function Settings({
     saveTuning,
     saved,
   } = useBehaviorSettings(() => setError(""));
+
+  const voiceSettings = useVoiceSettings();
 
   const {
     autolock,
@@ -194,6 +198,7 @@ export default function Settings({
               [
                 ["set-model", "Model"],
                 ["set-behavior", "Behavior"],
+                ["set-voice", "Spoken voice"],
                 ["set-privacy", "Privacy"],
                 ["set-online", "Online"],
                 ["set-advisors", "AI advisors"],
@@ -258,6 +263,8 @@ export default function Settings({
               saveTuning={saveTuning}
               saved={saved}
             />
+
+            <VoiceSection {...voiceSettings} />
 
             <PrivacySection
               autolock={autolock}

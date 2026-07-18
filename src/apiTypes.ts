@@ -306,6 +306,13 @@ export interface SttStatus {
   sizeMb: number;
 }
 
+/** Idea 3: one installed system speech voice (AVSpeechSynthesisVoice). */
+export interface VoiceInfo {
+  id: string;
+  name: string;
+  lang: string;
+}
+
 /** Friendly display names for models we ship guidance for. The stored setting
  * always keeps the raw id — this is display only (CHG-4). Unknown models the
  * user pulled themselves fall through to their raw id. */

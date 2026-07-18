@@ -6,6 +6,7 @@ import { api, RoomInfo } from "../api";
 import { stopMicTap } from "./liveRec";
 import { handleAgentUiRequest } from "../agent/driver";
 import { annotationTarget } from "./markup";
+import * as voice from "./voice";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
@@ -45,6 +46,12 @@ export function useWorkspaceEffects(
     });
     const unlisten = api.onAskDelta((delta) => {
       s.setStreamText((t) => t + delta);
+      // Idea 3: feed the spoken voice (no-ops when auto-speak is off).
+      // Cross-wave constraint: ask-delta is a global, unkeyed stream — if a
+      // future headless path (scheduled workflows' agent_run) ever emits it,
+      // that fix must suppress the events at the source or key them, or a
+      // background run would speak aloud here.
+      voice.feedStreamDelta(delta);
     });
     const unlistenStep = api.onAskStep((label) => {
       s.setSteps((st) => [...st, { label, ok: true }]);
@@ -60,6 +67,10 @@ export function useWorkspaceEffects(
     });
     const unlistenRound = api.onAskRound(() => {
       s.setStreamText("");
+      // Idea 3: a new round discards the previous round's text — drop its
+      // queued/in-flight audio the same way (spoken deliberation must not
+      // outlive the text the user no longer sees).
+      voice.roundBoundary();
     });
     const unlistenNotice = api.onAskNotice((text) => {
       s.pushToast("info", text);
@@ -158,6 +169,41 @@ export function useWorkspaceEffects(
     });
     a.refreshWebAccess();
     a.refreshAutolock();
+    // Idea 3: the spoken voice's per-room config + the hands-free re-arm.
+    void Promise.all([
+      api.getSetting("voice_archetype"),
+      api.getSetting("voice_params"),
+      api.getSetting("voice_id"),
+      api.getSetting("voice_autospeak"),
+      api.getSetting("voice_handsfree"),
+    ]).then(([arch, params, voiceId, auto, hands]) => {
+      let parsed: voice.VoiceParams | null = null;
+      try {
+        parsed = params ? (JSON.parse(params) as voice.VoiceParams) : null;
+      } catch {
+        /* malformed save — fall back to the archetype's defaults */
+      }
+      const archetype = (arch as voice.VoiceArchetype) || "off";
+      voice.configure({
+        archetype,
+        params:
+          parsed ??
+          voice.ARCHETYPE_DEFAULTS[
+            archetype === "custom" ? "off" : archetype
+          ],
+        voiceId: voiceId || null,
+        autoSpeak: auto === "1",
+      });
+      s.setAutoSpeak(auto === "1");
+      s.setHandsFree(hands === "1");
+    }).catch(() => {});
+    // Hands-free: when a streamed turn's audio has fully finished playing,
+    // re-arm the composer mic through the ordinary dictation path — never
+    // earlier, so the microphone can't capture the speaker's own voice.
+    voice.setTurnAudioDoneListener(() => {
+      if (!s.handsFreeRef.current || s.askingRef.current) return;
+      a.dictateTo("composer", (text) => void a.send(text));
+    });
     if (info.synced) {
       api
         .getSetting("hlt6_sync_dismissed")
@@ -268,6 +314,13 @@ export function useWorkspaceEffects(
       }
     });
     return () => {
+      // Idea 3: the voice singleton outlives the Workspace by design — this
+      // cleanup is the catch-all "no lock path may keep speaking decrypted
+      // content" stop (autolock and handleLock also cancel explicitly,
+      // because under StrictMode's dev double-invoke the initRef guard means
+      // this cleanup never runs for the second, real mount).
+      voice.cancelAll();
+      voice.setTurnAudioDoneListener(null);
       unlisten.then((fn) => fn());
       unlistenStep.then((fn) => fn());
       unlistenLane.then((fn) => fn());
@@ -355,9 +408,21 @@ export function useWorkspaceEffects(
         s.lastActivityRef.current = now;
         return;
       }
+      // Idea 3 decision: playing speech IS activity too (same rationale —
+      // listening to a multi-minute answer produces no input events, and
+      // idle-locking would cut audio the user is actively consuming).
+      // Autolock resumes counting the moment playback ends.
+      if (voice.isSpeaking()) {
+        s.lastActivityRef.current = now;
+        return;
+      }
       const idle = now - s.lastActivityRef.current;
       const slept = gap > 45_000;
       if (idle >= limitMs || (slept && gap >= limitMs)) {
+        // Silence speech at the call site as well as in handleLock/unmount:
+        // this timer calls onLock() directly, bypassing both, and the
+        // unmount cleanup is unreliable under StrictMode (initRef guard).
+        voice.cancelAll();
         onLock();
       }
     }, 30_000);

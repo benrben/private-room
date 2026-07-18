@@ -4,8 +4,10 @@ import {
   DownloadIcon,
   EmptyChatArt,
   EyeIcon,
+  HandsFreeIcon,
   MemoryIcon,
   PencilIcon,
+  SpeakerIcon,
   TrashIcon,
   UndoIcon,
 } from "../icons";
@@ -88,6 +90,30 @@ export default function ChatPane({
         </button>
         <button className="subtle" title="New chat ⌘N" onClick={a.newChat}>
           ＋ New
+        </button>
+        <button
+          className={`subtle btn-ic${s.autoSpeak ? " accent" : ""}`}
+          title={
+            s.autoSpeak
+              ? "Auto-speak is on — answers are read aloud (voice: Settings → Spoken voice)"
+              : "Speak answers aloud as they stream"
+          }
+          aria-pressed={s.autoSpeak}
+          onClick={a.toggleAutoSpeak}
+        >
+          <SpeakerIcon size={14} />
+        </button>
+        <button
+          className={`subtle btn-ic${s.handsFree ? " accent" : ""}`}
+          title={
+            s.handsFree
+              ? "Hands-free is on — the mic re-arms after each spoken answer"
+              : "Hands-free: re-arm the mic after each spoken answer"
+          }
+          aria-pressed={s.handsFree}
+          onClick={a.toggleHandsFree}
+        >
+          <HandsFreeIcon size={14} />
         </button>
         {s.activeChatId && (
           <DeleteControl
@@ -345,6 +371,17 @@ export default function ChatPane({
                     ))}
                   </span>
                 )}
+                <button
+                  className="subtle"
+                  title={
+                    s.speakingMsgId === m.id
+                      ? "Stop speaking"
+                      : "Read this answer aloud"
+                  }
+                  onClick={() => a.speakMessage(m)}
+                >
+                  {s.speakingMsgId === m.id ? "◼ Stop" : "▶ Play"}
+                </button>
                 <button
                   className="subtle"
                   title="Copy this answer"

@@ -37,6 +37,7 @@ mod ytdlp;
 mod recording_cmds;
 mod feedback;
 mod jobs;
+mod speech_cmds;
 
 pub use external::*;
 pub use rooms::*;
@@ -65,6 +66,7 @@ pub use ytdlp::*;
 pub use recording_cmds::*;
 pub use feedback::*;
 pub use jobs::*;
+pub use speech_cmds::*;
 
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.5:4b";
 pub(crate) const MAX_CONTEXT_CHUNKS: usize = 6;

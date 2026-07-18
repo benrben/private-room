@@ -7,6 +7,7 @@ import { fileToBase64, parseComposer, tokenAtCaret } from "./composer";
 import { runGuarded } from "./guard";
 import { splitMarkupBlocks } from "./markup";
 import { HELP_COMMAND } from "./constants";
+import * as voice from "./voice";
 import { WSState } from "./state";
 
 /** Chat sessions + the AI-turn flow + the composer's #/@ autocomplete. Cross-hook
@@ -58,6 +59,10 @@ export function makeChatActions(
         s.setLane("");
         s.setMemSuggestion(null);
         s.editedRef.current = new Set();
+        // Idea 3: a new turn silences the old answer and opens a fresh voice
+        // epoch (stale synthesis/decodes can never schedule audio into it).
+        voice.beginTurn();
+        s.setSpeakingMsgId(null);
       },
       // A user-pressed Stop is not a failure: no toast, and the model state is
       // not worth re-polling.
@@ -80,6 +85,16 @@ export function makeChatActions(
         const msgs = await api.getMessages(chatId);
         s.setMessages(msgs);
         const lastMsg = msgs[msgs.length - 1];
+        // Idea 3: flush the voice's sentence remainder. The fallback text
+        // covers external CLI engines (they emit no ask-delta — the pipeline
+        // was fed nothing, so endOfTurn speaks the persisted answer instead).
+        // runGuarded runs this in `finally`, so a user-pressed Stop reaches
+        // here too — endOfTurn no-ops then (stopAsk killed the turn's epoch).
+        voice.endOfTurn(
+          lastMsg?.role === "assistant"
+            ? (lastMsg.effects ? lastMsg.content : splitMarkupBlocks(lastMsg.content).text)
+            : undefined,
+        );
         if (lastMsg?.role === "assistant" && lastMsg.content.trim()) {
           memorySuggestion(chatId)
             .then((sug) => {
@@ -111,8 +126,14 @@ export function makeChatActions(
     await runTurn((askId) => api.ask(chatId, q, attachmentIds, askId));
   }
 
-  async function send() {
-    const raw = s.question.trim();
+  /** `text` overrides the composer draft (hands-free dictation sends the
+   * transcript directly — state updates would race a same-tick send). */
+  async function send(text?: string) {
+    // Sending is always a click/Enter/dictation gesture — the one reliable
+    // moment to unlock the AudioContext for this turn's auto-speak (same
+    // "must be first in the gesture" doctrine as acquireMic).
+    voice.ensureUnlocked();
+    const raw = (text ?? s.question).trim();
     if (!raw || s.asking || !s.activeChatId) return;
     if (/^#help(\s|$)/i.test(raw)) {
       s.setQuestion("");
@@ -282,11 +303,20 @@ export function makeChatActions(
   }
 
   function stopAsk() {
+    // Stop must silence speech NOW — and kill the turn's voice epoch so the
+    // cancelled ask's endOfTurn (runGuarded's finally) can't speak the
+    // leftover sentence buffer, and no in-flight speak_text lands late.
+    voice.cancelAll();
+    s.setSpeakingMsgId(null);
     const id = s.askIdRef.current;
     if (id) api.cancelAsk(id).catch(() => {});
   }
 
   async function handleLock() {
+    // The lock gate must never keep speaking decrypted room content. Every
+    // OTHER lock path is covered too: the autolock call site and the
+    // workspace unmount cleanup (effects.ts) both cancel as well.
+    voice.cancelAll();
     if (s.askingRef.current && s.askIdRef.current) {
       try {
         await api.cancelAsk(s.askIdRef.current);

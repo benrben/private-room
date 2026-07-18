@@ -49,6 +49,7 @@ import type {
   RoomServerStatus,
   RoomRole,
   ExternalModelInfo,
+  VoiceInfo,
 } from "./apiTypes";
 
 export const api = {
@@ -212,6 +213,18 @@ export const api = {
    *  commit/notes/prompt). mode="off" && !translate returns text unchanged. */
   shapeText: (text: string, translate: boolean, mode: string) =>
     invoke<string>("shape_text", { text, translate, mode }),
+
+  // ---- Idea 3: supernatural voice (on-device AVSpeech synthesis) ----
+  /** Synthesize one sentence-sized chunk (≤1,000 chars) to WAV, base64. */
+  speakText: (
+    text: string,
+    voiceId: string | null,
+    rate: number,
+    pitch: number,
+    volume: number,
+  ) => invoke<string>("speak_text", { text, voiceId, rate, pitch, volume }),
+  /** Installed system voices, for the Settings picker. */
+  listSpeechVoices: () => invoke<VoiceInfo[]>("list_speech_voices"),
 
   // ---- AI actions (per-file / whole-room one-shot Markdown generators) ----
   /** The catalog of AI actions (file- and room-scoped), for the menus. */

@@ -30,6 +30,29 @@ export function MicIcon(p: IconProps) {
   );
 }
 
+/** Idea 3: the room's spoken voice (auto-speak toggle, per-message Play). */
+export function SpeakerIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M4 9.5v5h3.5l4.5 4v-13l-4.5 4H4z" />
+      <path d="M15 9.5a3.6 3.6 0 0 1 0 5" />
+      <path d="M17.5 7a7 7 0 0 1 0 10" />
+    </Stroke>
+  );
+}
+
+/** Idea 3: hands-free loop — the mic re-arms itself after the voice finishes. */
+export function HandsFreeIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <rect x="9" y="3" width="6" height="9.5" rx="3" />
+      <path d="M12 15.5v2.5" />
+      <path d="M5.5 18a8.5 8.5 0 0 0 13 0" />
+      <path d="M18.5 18v3M18.5 21h-3" />
+    </Stroke>
+  );
+}
+
 export function UndoIcon(p: IconProps) {
   return (
     <Stroke {...p}>
