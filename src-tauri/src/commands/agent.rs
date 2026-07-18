@@ -578,7 +578,15 @@ fn gather_context_and_save_question(
              The room keeps one shared working-notes file named \"Scratch pad.md\": when the \
              user asks to jot, note, write down, or record something temporarily, edit_file or \
              write_file that file instead of making a new file; read it with open_file when \
-             asked what is on the pad.",
+             asked what is on the pad.\n\n\
+             Scripts: a .py or .js file in the room can be Run with one click and scheduled. \
+             When you create or edit a runnable Python script that imports third-party packages, \
+             you MUST declare them inline so they install automatically on Run — the user should \
+             never have to pip install anything. Put a PEP-723 block at the very top:\n    \
+             # /// script\n    # dependencies = [\"pandas\", \"yfinance\"]\n    # ///\n\
+             (a bare `# dependencies = [\"pkg\", ...]` line also works). List every third-party \
+             import; the standard library needs no declaration. Do not tell the user to run pip \
+             or create a venv — declaring the dependencies is how the install happens.",
         );
         if web_enabled {
             system.push_str(

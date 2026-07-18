@@ -367,10 +367,22 @@ pub fn resolve_interpreter(manifest: &ScriptManifest) -> Result<Runner, String> 
         }
     })?;
     Ok(match choice {
-        RunnerChoice::Uv => Runner {
-            program: uv_bin().unwrap_or_default(),
-            argv_prefix: vec!["run".into(), "--no-project".into()],
-        },
+        RunnerChoice::Uv => {
+            // Install declared deps via explicit `--with` flags rather than
+            // relying on uv's own PEP-723 parse: a bare `# dependencies = [...]`
+            // line (no full `# /// script ... # ///` fence) then still installs,
+            // so the assistant only has to list the packages — uv does the rest,
+            // no manual pip. `--with` is idempotent and cached across runs.
+            let mut argv = vec!["run".into(), "--no-project".into()];
+            for d in &manifest.deps {
+                argv.push("--with".into());
+                argv.push(d.clone());
+            }
+            Runner {
+                program: uv_bin().unwrap_or_default(),
+                argv_prefix: argv,
+            }
+        }
         RunnerChoice::Python3 => Runner {
             program: python3_bin().unwrap_or_default(),
             argv_prefix: vec![],
@@ -815,11 +827,35 @@ async fn run_and_import<R: tauri::Runtime>(
     if out.exit_code != 0 {
         // Nonzero exit → surface the stderr tail as the parking error.
         let tail = out.stderr_tail.trim();
-        return Err(if tail.is_empty() {
+        let mut msg = if tail.is_empty() {
             format!("The script exited with code {}.", out.exit_code)
         } else {
             format!("The script failed (exit {}):\n{}", out.exit_code, tail)
-        });
+        };
+        // A missing package is the common failure. Point at the real fix —
+        // declaring deps so they auto-install — instead of leaving a raw
+        // traceback the user is expected to pip-install their way out of.
+        let missing = tail.contains("ModuleNotFoundError")
+            || tail.contains("No module named")
+            || tail.contains("Cannot find module");
+        if missing {
+            if manifest.deps.is_empty() {
+                msg.push_str(
+                    "\n\nThis script imports a package it never declared, so nothing was \
+                     installed. Add a dependencies line near the top and it installs \
+                     automatically on the next run — no manual pip. For example:\n    \
+                     # dependencies = [\"pandas\", \"yfinance\"]\nOr just ask the assistant \
+                     to declare the script's dependencies.",
+                );
+            } else {
+                msg.push_str(&format!(
+                    "\n\nThe declared packages ({}) install automatically, but the script \
+                     imports another one that isn't listed — add it to the dependencies line.",
+                    manifest.deps.join(", ")
+                ));
+            }
+        }
+        return Err(msg);
     }
     // (g) exit 0 → import back under the room lock, room-pinned.
     let cause = format!("Script ran — {script_name}");
@@ -844,6 +880,29 @@ async fn run_and_import<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uv_runner_installs_declared_deps_with_explicit_with_flags() {
+        // Declared deps must reach uv as `--with <pkg>` so a bare dependencies
+        // line installs them even without a full PEP-723 fence. Only meaningful
+        // when uv is actually resolvable on this machine.
+        if uv_bin().is_none() {
+            return;
+        }
+        let m = parse_script_manifest(
+            "sync.py",
+            "# dependencies = [\"pandas\", \"yfinance\"]\nimport pandas\n",
+        );
+        assert_eq!(m.deps, vec!["pandas", "yfinance"]);
+        let r = resolve_interpreter(&m).expect("uv present → resolves");
+        assert!(r.argv_prefix.starts_with(&["run".to_string(), "--no-project".to_string()]));
+        // Each dep appears as a `--with <dep>` pair.
+        for dep in ["pandas", "yfinance"] {
+            let at = r.argv_prefix.iter().position(|a| a == dep);
+            assert!(at.is_some_and(|i| i > 0 && r.argv_prefix[i - 1] == "--with"),
+                "expected `--with {dep}` in {:?}", r.argv_prefix);
+        }
+    }
 
     #[test]
     fn parses_pep723_deps_and_room_keys() {
