@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, Schedule, Workflow, WorkflowTemplate } from "../../api";
+import { api, Schedule, Workflow, WorkflowRun, WorkflowTemplate } from "../../api";
 import { WSState } from "../state";
 import { WSActions } from "../actions";
 
@@ -68,9 +68,22 @@ function bindingBadge(w: Workflow): string | null {
   return parts.length ? `On: ${parts.join(", ")}` : "On: files";
 }
 
+/** The colored last-run status dot for a card, or null if it never ran. */
+function lastRunBadge(run: WorkflowRun | null | undefined) {
+  if (!run) return null;
+  const map: Record<string, [string, string]> = {
+    done: ["dot-ok", "Ran OK"],
+    error: ["dot-err", "Failed"],
+    running: ["dot-run", "Running"],
+  };
+  const [cls, label] = map[run.status] ?? ["dot-ok", run.status];
+  return <span className={`wf-badge ${cls}`}>{label}</span>;
+}
+
 export function WorkflowLibrary({ s, a }: Props) {
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
   const [schedules, setSchedules] = useState<Record<string, Schedule | null>>({});
+  const [lastRuns, setLastRuns] = useState<Record<string, WorkflowRun | null>>({});
   const [now, setNow] = useState(() => Date.now());
 
   // Wave 5 (Idea 13): the per-script auto-workflows (created_by='script') have
@@ -95,6 +108,25 @@ export function WorkflowLibrary({ s, a }: Props) {
       ),
     ).then((pairs) => {
       if (live) setSchedules(Object.fromEntries(pairs));
+    });
+    return () => {
+      live = false;
+    };
+  }, [visible]);
+
+  // Fetch each workflow's most recent run for its last-run status dot. Refreshes
+  // with the workflows list (a finished run emits workflows-changed).
+  useEffect(() => {
+    let live = true;
+    Promise.all(
+      visible.map((w) =>
+        api
+          .getWorkflowRuns(w.id)
+          .then((runs) => [w.id, runs[0] ?? null] as const)
+          .catch(() => [w.id, null] as const),
+      ),
+    ).then((pairs) => {
+      if (live) setLastRuns(Object.fromEntries(pairs));
     });
     return () => {
       live = false;
@@ -171,6 +203,7 @@ export function WorkflowLibrary({ s, a }: Props) {
               {w.description && <div className="wf-card-desc">{w.description}</div>}
               <div className="wf-badges">
                 {w.status === "draft" && <span className="wf-badge draft">Draft</span>}
+                {lastRunBadge(lastRuns[w.id])}
                 {w.createdBy === "agent" && <span className="wf-badge agent">Drafted by the agent</span>}
                 {sc?.enabled && (
                   <span className="wf-badge">

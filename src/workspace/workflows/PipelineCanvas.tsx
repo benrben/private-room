@@ -103,11 +103,17 @@ export function PipelineCanvas({
             const mx = (x1 + x2) / 2;
             const live = status?.[e.from]?.status === "done";
             return (
-              <path
-                key={i}
-                className={live ? "live" : undefined}
-                d={`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`}
-              />
+              <g key={i}>
+                <path
+                  className={live ? "live" : undefined}
+                  d={`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`}
+                />
+                {e.branch && (
+                  <text className="pipeline-edge-branch" x={mx} y={(y1 + y2) / 2 - 5} textAnchor="middle">
+                    {e.branch}
+                  </text>
+                )}
+              </g>
             );
           })}
         </svg>
@@ -131,11 +137,29 @@ export function PipelineCanvas({
             </div>
           );
         })}
-        {editable && (
+        {editable &&
+          def.nodes.map((n) => {
+            const p = pos.get(n.id)!;
+            return (
+              <button
+                key={`add-${n.id}`}
+                className="pipeline-add"
+                title="Add a step after this one"
+                style={{ left: p.x + NODE_W - 9, top: p.y + NODE_H / 2 - 11, zIndex: 3 }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAddAfter?.(n.id);
+                }}
+              >
+                +
+              </button>
+            );
+          })}
+        {editable && def.nodes.length === 0 && (
           <button
             className="pipeline-add"
             title="Add a step"
-            style={{ left: width - PAD + 2, top: PAD + NODE_H / 2 - 11 }}
+            style={{ left: PAD, top: PAD + NODE_H / 2 - 11 }}
             onClick={() => onAddAfter?.(null)}
           >
             +

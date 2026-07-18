@@ -141,15 +141,25 @@ export default function RoomServerSection({
                   )}
                 </div>
                 {scope === "full" ? (
-                  <p className="settings-hint">
-                    {leash.stable
-                      ? "This address and config survive restarts. "
-                      : ""}
-                    Agents can also self-configure from
-                    {" ~/.private-room/leash.json"} (written only while the
-                    room is open). Regenerate the token to revoke every pasted
-                    config at once.
-                  </p>
+                  <>
+                    {!leash.stable && (
+                      <p className="settings-hint">
+                        <AlertIcon size={13} className="warn-ic" /> The fixed
+                        Leash port (17872) was already in use, so this address is
+                        temporary and will change on the next restart — re-paste
+                        the config, or free that port for a stable address.
+                      </p>
+                    )}
+                    <p className="settings-hint">
+                      {leash.stable
+                        ? "This address and config survive restarts. "
+                        : ""}
+                      Agents can also self-configure from
+                      {" ~/.private-room/leash.json"} (written only while the
+                      room is open). Regenerate the token to revoke every pasted
+                      config at once.
+                    </p>
+                  </>
                 ) : (
                   <p className="settings-hint">
                     Only apps you paste this into can reach the unlocked room;

@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, Schedule, Workflow, WorkflowDef, WorkflowNode, WorkflowRun } from "../../api";
+import {
+  api,
+  Schedule,
+  Workflow,
+  WorkflowBinding,
+  WorkflowDef,
+  WorkflowEdge,
+  WorkflowNode,
+  WorkflowRun,
+} from "../../api";
 import { WSState } from "../state";
 import { WSActions } from "../actions";
 import { PipelineCanvas } from "./PipelineCanvas";
@@ -13,6 +22,18 @@ const KIND_UNION = [
 ];
 
 type Props = { s: WSState; a: WSActions; workflow: Workflow };
+
+/** The comma-joined extension list for a binding's text input. */
+function extsOf(b: WorkflowBinding): string {
+  return b.scope === "file" ? (b.exts ?? []).join(", ") : "";
+}
+/** Parse a comma-separated extension list (drops leading dots, lowercases). */
+function parseExts(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((x) => x.trim().replace(/^\./, "").toLowerCase())
+    .filter(Boolean);
+}
 
 function newNode(idx: number): WorkflowNode {
   return {
@@ -29,6 +50,8 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   const [name, setName] = useState(workflow.name);
   const [emoji, setEmoji] = useState(workflow.emoji || "⚙️");
   const [binding, setBinding] = useState(workflow.binding);
+  // Raw text mirror of binding.exts so trailing commas survive as the user types.
+  const [extsText, setExtsText] = useState(() => extsOf(workflow.binding));
   const [selected, setSelected] = useState<string | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
   const [dirty, setDirty] = useState(false);
@@ -42,6 +65,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
     setName(workflow.name);
     setEmoji(workflow.emoji || "⚙️");
     setBinding(workflow.binding);
+    setExtsText(extsOf(workflow.binding));
     setDirty(false);
   }, [workflow.id, workflow.updatedAt]);
 
@@ -86,11 +110,28 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
     setSelected(null);
     setDirty(true);
   }
-  function addNode() {
+  function updateEdges(edges: WorkflowEdge[]) {
+    setDef((d) => ({ ...d, edges }));
+    setDirty(true);
+  }
+  /** Add a step. With `afterId`, splice it in right after that node — rewiring
+   * that node's successors through the new step (branch labels are dropped since
+   * the new step is a plain generate node). Without it, append at the tail. */
+  function addNode(afterId?: string | null) {
     setDef((d) => {
       const n = newNode(d.nodes.length);
-      const last = d.nodes[d.nodes.length - 1];
-      const edges = last ? [...d.edges, { from: last.id, to: n.id }] : d.edges;
+      if (!afterId) {
+        const last = d.nodes[d.nodes.length - 1];
+        const edges = last ? [...d.edges, { from: last.id, to: n.id }] : d.edges;
+        return { ...d, nodes: [...d.nodes, n], edges };
+      }
+      const successors = d.edges.filter((e) => e.from === afterId);
+      const rest = d.edges.filter((e) => e.from !== afterId);
+      const edges: WorkflowEdge[] = [
+        ...rest,
+        { from: afterId, to: n.id },
+        ...successors.map((e) => ({ from: n.id, to: e.to })),
+      ];
       return { ...d, nodes: [...d.nodes, n], edges };
     });
     setDirty(true);
@@ -110,6 +151,17 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
     const kinds = binding.kinds ?? [];
     const next = kinds.includes(k) ? kinds.filter((x) => x !== k) : [...kinds, k];
     setBinding({ ...binding, kinds: next });
+    setDirty(true);
+  }
+  function setBindingExts(raw: string) {
+    if (binding.scope !== "file") return;
+    setExtsText(raw);
+    setBinding({ ...binding, exts: parseExts(raw) });
+    setDirty(true);
+  }
+  function setBindingFile(fileId: string | null) {
+    if (binding.scope !== "file") return;
+    setBinding({ ...binding, file_id: fileId });
     setDirty(true);
   }
 
@@ -214,6 +266,9 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
             node={selectedNode}
             onChange={updateNode}
             onDelete={() => deleteNode(selectedNode.id)}
+            edges={def.edges}
+            allNodes={def.nodes}
+            onEdgesChange={updateEdges}
           />
         )}
 
@@ -235,6 +290,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
                 className={binding.scope === "file" ? "active" : ""}
                 onClick={() => {
                   setBinding({ scope: "file", kinds: [], exts: [] });
+                  setExtsText("");
                   setDirty(true);
                 }}
               >
@@ -243,21 +299,51 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
             </div>
           </label>
           {binding.scope === "file" && (
-            <label>
-              File kinds it runs on
-              <div className="wf-badges">
-                {KIND_UNION.map((k) => (
-                  <button
-                    key={k}
-                    className={`wf-badge ${(binding.kinds ?? []).includes(k) ? "agent" : ""}`}
-                    style={{ cursor: "pointer", border: "none" }}
-                    onClick={() => toggleKind(k)}
-                  >
-                    {k}
-                  </button>
-                ))}
-              </div>
-            </label>
+            <>
+              <label>
+                File kinds it runs on
+                <div className="wf-badges">
+                  {KIND_UNION.map((k) => (
+                    <button
+                      key={k}
+                      className={`wf-badge ${(binding.kinds ?? []).includes(k) ? "agent" : ""}`}
+                      style={{ cursor: "pointer", border: "none" }}
+                      onClick={() => toggleKind(k)}
+                    >
+                      {k}
+                    </button>
+                  ))}
+                </div>
+              </label>
+              <label>
+                File extensions{" "}
+                <span style={{ opacity: 0.6, fontWeight: 400 }}>(comma-separated, e.g. pdf, docx)</span>
+                <input
+                  type="text"
+                  value={extsText}
+                  placeholder="pdf, docx, md"
+                  onChange={(e) => setBindingExts(e.target.value)}
+                />
+              </label>
+              <label>
+                Only this specific file{" "}
+                <span style={{ opacity: 0.6, fontWeight: 400 }}>(optional — overrides kinds/exts)</span>
+                <select
+                  value={binding.file_id ?? ""}
+                  onChange={(e) => setBindingFile(e.target.value || null)}
+                >
+                  <option value="">Any matching file</option>
+                  {binding.file_id && !s.files.some((f) => f.id === binding.file_id) && (
+                    <option value={binding.file_id}>(bound file — not in this room)</option>
+                  )}
+                  {s.files.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </>
           )}
         </div>
 
