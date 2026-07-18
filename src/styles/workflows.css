@@ -17,27 +17,125 @@
   padding: 1rem 1.25rem 2rem;
 }
 
+/* ---------------- AI compose bar ---------------- */
+.wf-compose {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: linear-gradient(180deg, var(--accent-ghost), transparent), var(--surface-2);
+  padding: 0.85rem 1rem 0.95rem;
+  margin-bottom: 1.4rem;
+}
+.wf-compose-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 0.6rem;
+}
+.wf-compose-spark {
+  font-size: 1rem;
+  line-height: 1;
+}
+.wf-compose-row {
+  display: flex;
+  gap: 0.5rem;
+}
+.wf-compose-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 0.55rem 0.7rem;
+  color: var(--text);
+  font-size: 0.85rem;
+}
+.wf-compose-input::placeholder {
+  color: var(--text-faint);
+}
+.wf-compose-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.wf-compose-btn {
+  flex: 0 0 auto;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 9px;
+  padding: 0 1rem;
+  font-size: 0.83rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.12s;
+}
+.wf-compose-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.wf-compose-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------------- toolbar / section labels ---------------- */
+.wf-section-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 0.6rem;
+}
+.wf-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.wf-new-btn {
+  background: var(--surface-3);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.82rem;
+  cursor: pointer;
+  margin-bottom: 0.6rem;
+}
+.wf-new-btn:hover {
+  border-color: var(--accent);
+}
+
 /* ---------------- library grid ---------------- */
 .wf-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 0.9rem;
 }
 .wf-card {
-  border: 1px solid var(--border, #e2e2e6);
+  border: 1px solid var(--border);
   border-radius: 12px;
   padding: 0.9rem 1rem;
-  background: var(--card-bg, #fff);
+  background: var(--surface-2);
   cursor: pointer;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
-  transition: border-color 0.12s, box-shadow 0.12s;
+  gap: 0.45rem;
+  transition: border-color 0.12s, background 0.12s, transform 0.12s;
   position: relative;
 }
 .wf-card:hover {
-  border-color: var(--accent, #6b6bff);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+  border-color: var(--accent);
+  background: var(--surface-3);
+  transform: translateY(-1px);
+}
+.wf-card-blank {
+  border-style: dashed;
+  background: transparent;
+}
+.wf-card-blank:hover {
+  background: var(--surface-2);
 }
 .wf-card-top {
   display: flex;
@@ -50,6 +148,7 @@
 }
 .wf-card-name {
   font-weight: 600;
+  color: var(--text);
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -58,8 +157,19 @@
 }
 .wf-card-desc {
   font-size: 0.82rem;
-  opacity: 0.72;
-  line-height: 1.35;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+.wf-card-cta {
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--accent-2);
+  opacity: 0;
+  transition: opacity 0.12s;
+  margin-top: 0.15rem;
+}
+.wf-card.tmpl:hover .wf-card-cta {
+  opacity: 1;
 }
 .wf-badges {
   display: flex;
@@ -69,27 +179,32 @@
 }
 .wf-badge {
   font-size: 0.68rem;
-  padding: 0.1rem 0.45rem;
+  font-weight: 500;
+  padding: 0.12rem 0.5rem;
   border-radius: 999px;
-  background: var(--chip-bg, #f0f0f4);
-  opacity: 0.9;
+  background: var(--surface-4);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  white-space: nowrap;
 }
 .wf-badge.draft {
-  background: #f6e6c8;
-  color: #7a5a12;
+  background: rgba(227, 179, 65, 0.16);
+  color: var(--warn);
+  border-color: transparent;
 }
 .wf-badge.agent {
-  background: #e2ddff;
-  color: #4b3fa8;
+  background: var(--accent-soft);
+  color: var(--accent-2);
+  border-color: transparent;
 }
 .wf-badge.dot-ok::before {
   content: "●";
-  color: #37a24a;
+  color: var(--ok);
   margin-right: 0.25rem;
 }
 .wf-badge.dot-err::before {
   content: "●";
-  color: #d33;
+  color: var(--danger);
   margin-right: 0.25rem;
 }
 
@@ -351,9 +466,17 @@
 }
 .wf-empty {
   text-align: center;
-  padding: 2rem 1rem;
-  opacity: 0.85;
+  padding: 1.6rem 1rem 1.4rem;
 }
 .wf-empty h3 {
-  margin: 0 0 0.4rem;
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+  color: var(--text);
+}
+.wf-empty-sub {
+  margin: 0 auto;
+  max-width: 44ch;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--text-dim);
 }

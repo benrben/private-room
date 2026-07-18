@@ -5,6 +5,52 @@ import { WSActions } from "../actions";
 
 type Props = { s: WSState; a: WSActions };
 
+/** The AI-authoring bar: describe a workflow in plain language and let the
+ * in-room agent compose it with the save_workflow tool. The resulting draft
+ * appears in the library on its own (the onWorkflowsChanged event refreshes
+ * it), so the user reviews and activates it here. */
+function ComposeBar({ s, a }: Props) {
+  const [desc, setDesc] = useState("");
+  const busy = s.asking;
+
+  function compose() {
+    const d = desc.trim();
+    if (!d || busy) return;
+    const prompt =
+      `Create a workflow for this room: ${d}\n\n` +
+      `Use the save_workflow tool to save it as a draft I can review. Choose suitable ` +
+      `node kinds (generate, summarize_file, file_pass, save_file, condition), a short ` +
+      `name, and a fitting emoji. Don't run it — just save the draft.`;
+    setDesc("");
+    void a.send(prompt);
+    s.pushToast("info", "Composing — the draft will appear here when the assistant is done.");
+  }
+
+  return (
+    <div className="wf-compose">
+      <div className="wf-compose-head">
+        <span className="wf-compose-spark">✨</span>
+        <span>Describe a workflow and let the assistant build it</span>
+      </div>
+      <div className="wf-compose-row">
+        <input
+          className="wf-compose-input"
+          placeholder="e.g. every morning, summarize any new PDFs and save a digest"
+          value={desc}
+          disabled={busy}
+          onChange={(e) => setDesc(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") compose();
+          }}
+        />
+        <button className="wf-compose-btn" onClick={compose} disabled={busy || !desc.trim()}>
+          {busy ? "Assistant busy…" : "Compose with AI"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function countdown(nextRunAt: string | null, now: number): string {
   if (!nextRunAt) return "";
   const t = Date.parse(nextRunAt);
@@ -71,31 +117,31 @@ export function WorkflowLibrary({ s, a }: Props) {
       <div className="wf-body">
         <div className="wf-empty">
           <h3>Automate your room with workflows</h3>
-          <p className="caption">
-            Compose multi-step LLM pipelines — run them by hand, on a schedule, or from a file's
-            Actions menu. Start from a template:
+          <p className="wf-empty-sub">
+            Multi-step LLM pipelines you can run by hand, on a schedule, or from a file's Actions
+            menu. Describe one below, or start from a template.
           </p>
         </div>
+        <ComposeBar s={s} a={a} />
+        <div className="wf-section-label">Start from a template</div>
         <div className="wf-grid">
           {templates.map((t) => (
-            <div key={t.name} className="wf-card" onClick={() => void a.instantiateTemplate(t)}>
+            <div key={t.name} className="wf-card tmpl" onClick={() => void a.instantiateTemplate(t)}>
               <div className="wf-card-top">
                 <span className="wf-card-emoji">{t.emoji}</span>
                 <span className="wf-card-name">{t.name}</span>
+                {t.schedule && <span className="wf-badge">{t.schedule.kind}</span>}
               </div>
               <div className="wf-card-desc">{t.description}</div>
-              <div className="wf-badges">
-                {t.schedule && <span className="wf-badge">{t.schedule.kind}</span>}
-                <span className="wf-badge">Use this template</span>
-              </div>
+              <div className="wf-card-cta">Use template →</div>
             </div>
           ))}
-          <div className="wf-card" onClick={() => void a.createBlankWorkflow()}>
+          <div className="wf-card wf-card-blank" onClick={() => void a.createBlankWorkflow()}>
             <div className="wf-card-top">
-              <span className="wf-card-emoji">➕</span>
+              <span className="wf-card-emoji">＋</span>
               <span className="wf-card-name">Blank workflow</span>
             </div>
-            <div className="wf-card-desc">Start from an empty pipeline.</div>
+            <div className="wf-card-desc">Start from an empty pipeline and add steps yourself.</div>
           </div>
         </div>
       </div>
@@ -104,9 +150,11 @@ export function WorkflowLibrary({ s, a }: Props) {
 
   return (
     <div className="wf-body">
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "0.6rem" }}>
-        <button className="subtle btn-ic" onClick={() => void a.createBlankWorkflow()}>
-          ➕ New workflow
+      <ComposeBar s={s} a={a} />
+      <div className="wf-toolbar">
+        <div className="wf-section-label">Your workflows</div>
+        <button className="wf-new-btn" onClick={() => void a.createBlankWorkflow()}>
+          ＋ New workflow
         </button>
       </div>
       <div className="wf-grid">
