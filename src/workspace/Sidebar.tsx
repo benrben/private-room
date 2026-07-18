@@ -5,6 +5,7 @@ import {
   DownloadIcon,
   FolderIcon,
   GraphIcon,
+  WorkflowsIcon,
   LinkIcon,
   MemoryIcon,
   MicIcon,
@@ -115,6 +116,16 @@ export default function Sidebar({
               <GraphIcon size={14} /> Map
             </button>
           )}
+          {/* Wave 4a: the flagship Workflows entry, beside Map. */}
+          <button
+            className={`add-btn${s.showWorkflows ? " active" : ""}`}
+            title="Workflows — automate multi-step pipelines"
+            onClick={() =>
+              s.showWorkflows ? a.closeWorkflows() : a.openWorkflows()
+            }
+          >
+            <WorkflowsIcon size={14} /> Workflows
+          </button>
           <div className="add-menu-wrap">
             <button
               className="add-btn"
@@ -324,7 +335,14 @@ export default function Sidebar({
           for a job that was paused or parked by an error. */}
       {s.jobs.map((j) => {
         const live = s.jobProgress[j.id];
-        const running = j.status === "running" || j.status === "queued";
+        // Wave 4a: a QUEUED job is waiting for the single heavy-work slot — it is
+        // not actually running yet, so it shows "Waiting — Nth in line" with a
+        // "Remove" affordance (Stop on it is a no-op; cancel_job parks the row).
+        const queued = j.status === "queued";
+        const running = j.status === "running" || queued;
+        const queuePos = queued
+          ? s.jobs.filter((o) => o.status === "queued" && o.createdAt <= j.createdAt).length
+          : 0;
         const done = live?.done ?? j.cursor;
         const total = Math.max(live?.total ?? j.total, 1);
         const friendlyError =
@@ -390,13 +408,23 @@ export default function Sidebar({
             </div>
             <div className="job-card-foot">
               <span className="job-card-label">
-                {running
-                  ? (live?.label ?? "Working…")
-                  : j.status === "error"
-                    ? (friendlyError ?? "Stopped.")
-                    : `Paused at ${done} of ${total}`}
+                {queued
+                  ? `Waiting — ${queuePos}${queuePos === 1 ? "st" : queuePos === 2 ? "nd" : queuePos === 3 ? "rd" : "th"} in line`
+                  : running
+                    ? (live?.label ?? "Working…")
+                    : j.status === "error"
+                      ? (friendlyError ?? "Stopped.")
+                      : `Paused at ${done} of ${total}`}
               </span>
-              {running ? (
+              {queued ? (
+                <button
+                  className="job-card-resume"
+                  title="Remove this job from the queue"
+                  onClick={() => void a.pauseJob(j.id)}
+                >
+                  Remove
+                </button>
+              ) : running ? (
                 <button
                   className="job-card-resume"
                   title="Stop — it checkpoints so you can resume later"

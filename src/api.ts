@@ -22,6 +22,12 @@ import type {
   FileContent,
   Job,
   JobProgress,
+  Workflow,
+  WorkflowRun,
+  Schedule,
+  ScheduleArg,
+  WorkflowTemplate,
+  WorkflowNodeEvent,
   FileVersion,
   VersionContent,
   CheckpointMeta,
@@ -175,6 +181,47 @@ export const api = {
   /** Continue a paused/errored job from its checkpoint. */
   resumeJob: (id: string) => invoke<void>("resume_job", { id }),
   deleteJob: (id: string) => invoke<void>("delete_job", { id }),
+  // ---- Wave 4a (Idea 2): LLM graph workflows ----
+  listWorkflows: () => invoke<Workflow[]>("list_workflows"),
+  getWorkflow: (id: string) => invoke<Workflow>("get_workflow", { id }),
+  getWorkflowSchedule: (id: string) =>
+    invoke<Schedule | null>("get_workflow_schedule", { id }),
+  workflowTemplates: () => invoke<WorkflowTemplate[]>("workflow_templates"),
+  saveWorkflow: (w: {
+    name: string;
+    description?: string;
+    emoji?: string;
+    definition: unknown;
+    binding?: unknown;
+    createdBy?: string;
+    schedule?: ScheduleArg;
+  }) => invoke<string>("save_workflow", w),
+  updateWorkflow: (w: {
+    id: string;
+    name?: string;
+    description?: string;
+    emoji?: string;
+    definition?: unknown;
+    binding?: unknown;
+    schedule?: ScheduleArg;
+  }) => invoke<void>("update_workflow", w),
+  deleteWorkflow: (id: string) => invoke<void>("delete_workflow", { id }),
+  setWorkflowStatus: (id: string, status: "active" | "draft") =>
+    invoke<void>("set_workflow_status", { id, status }),
+  setWorkflowPinned: (id: string, pinned: boolean) =>
+    invoke<void>("set_workflow_pinned", { id, pinned }),
+  setWorkflowSchedule: (id: string, schedule: ScheduleArg) =>
+    invoke<void>("set_workflow_schedule", { id, schedule }),
+  /** Validate a definition WITHOUT saving — the canvas round-trips edits here. */
+  validateWorkflow: (definition: unknown, binding?: unknown) =>
+    invoke<string[]>("validate_workflow", { definition, binding }),
+  getWorkflowRuns: (id: string) =>
+    invoke<WorkflowRun[]>("get_workflow_runs", { id }),
+  getJobStepArtifact: (jobId: string, stepId: number) =>
+    invoke<string | null>("get_job_step_artifact", { jobId, stepId }),
+  /** Run a workflow now; `fileId` for a file-scoped (Actions-menu) run. */
+  runWorkflow: (id: string, fileId?: string) =>
+    invoke<string>("run_workflow", { id, fileId }),
   aiStatus: () => invoke<AiStatus>("ai_status"),
   /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
   modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
@@ -315,6 +362,12 @@ export const api = {
   // ADD-30: live progress of a background job, plus its terminal flags.
   onJobProgress: (cb: (p: JobProgress) => void): Promise<UnlistenFn> =>
     listen<JobProgress>("job-progress", (e) => cb(e.payload)),
+  // Wave 4a: a workflow node's live status during a run (drives the pipeline
+  // animation) and any workflow save/update/delete (refresh the library).
+  onWorkflowNode: (cb: (e: WorkflowNodeEvent) => void): Promise<UnlistenFn> =>
+    listen<WorkflowNodeEvent>("workflow-node", (e) => cb(e.payload)),
+  onWorkflowsChanged: (cb: () => void): Promise<UnlistenFn> =>
+    listen("workflows-changed", () => cb()),
   // ADD-31: live import queue — done/total/current name, plus a final receipt
   // (done === total) carrying imported/failed counts.
   onImportProgress: (

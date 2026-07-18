@@ -441,6 +441,134 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
     }
 }
 
+/// Wave 4a: drive a whole-file pass INLINE as a workflow node's child job.
+/// Generic over the runtime so the workflow executor (and its mock e2e harness)
+/// can drive it. Creates a CHILD job row (parent-tagged, so pump/resume/quiesce
+/// skip it — the parent workflow holds the lane slot and re-drives this node on
+/// its own resume), runs the pass on the PARENT's cancel flag, and returns the
+/// published file plus an honest coverage line. Returns `Err("STOPPED")` when the
+/// parent was cancelled mid-pass, so the workflow parks and resumes cleanly.
+pub(crate) async fn drive_file_pass<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    parent_job_id: &str,
+    room_path: &str,
+    file_id: &str,
+    file_name: &str,
+    instruction: &str,
+    mode: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(String, Option<FileMeta>), String> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let mode = if mode == "stitch" { "stitch" } else { "merge" };
+    let instruction = {
+        let t = instruction.trim();
+        if t.is_empty() {
+            "Summarize this file completely and thoroughly.".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    let filtered = {
+        let guard = state.room.lock().unwrap();
+        let room = guard
+            .as_ref()
+            .filter(|r| r.path == room_path)
+            .ok_or("The room this job belongs to is no longer open.")?;
+        let text = db::get_file_extracted_text(&room.conn, file_id)
+            .ok_or_else(|| format!("\"{file_name}\" has no readable text for a pass."))?;
+        extraction::smart_filter(&text)
+    };
+    let windows =
+        extraction::partition_windows(&filtered, PASS_WINDOW_CHARS, PASS_WINDOW_OVERLAP);
+    if windows.is_empty() {
+        return Err(format!("\"{file_name}\" has no readable text after filtering."));
+    }
+    let (chat_model, lane) = resolve_pass_engine(&state).await;
+    let steps = build_pass_steps(windows.len(), mode, lane);
+    let plan = PassPlan {
+        file_id: file_id.to_string(),
+        file_name: file_name.to_string(),
+        instruction,
+        mode: mode.into(),
+        text_len: filtered.len(),
+        text_sha256: Some(text_digest(&filtered)),
+        windows,
+    };
+    let plan_json = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
+    let title = format!("Full pass — {file_name}");
+    let child_id = {
+        let guard = state.room.lock().unwrap();
+        let room = guard
+            .as_ref()
+            .filter(|r| r.path == room_path)
+            .ok_or("The room this job belongs to is no longer open.")?;
+        db::create_child_job(&room.conn, "file_pass", &title, &plan_json,
+            steps.len() as i64, parent_job_id)?
+    };
+    {
+        let guard = state.room.lock().unwrap();
+        if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+            let _ = db::set_job_status(&r.conn, &child_id, "running", None);
+        }
+    }
+    let filtered = Arc::new(filtered);
+    let published: std::sync::Mutex<Option<FileMeta>> = std::sync::Mutex::new(None);
+    let outcome = run_plan(
+        &steps,
+        std::collections::HashSet::new(),
+        cancel.clone(),
+        |s| {
+            let app = app.clone();
+            let child_id = child_id.clone();
+            let room_path = room_path.to_string();
+            let plan = plan.clone();
+            let model = chat_model.clone();
+            let cancel = cancel.clone();
+            let filtered = filtered.clone();
+            let published = &published;
+            async move {
+                execute_pass_step(
+                    &app, &child_id, &room_path, &plan, &model, &filtered, &s, &cancel,
+                    published,
+                )
+                .await
+            }
+        },
+        |done| {
+            let cursor = dense_prefix(done) as i64;
+            let guard = state.room.lock().unwrap();
+            if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+                let _ = db::checkpoint_job(&r.conn, &child_id, cursor, &serde_json::json!({}));
+            }
+        },
+        |_, _| {},
+    )
+    .await;
+    let (status, err): (&str, Option<String>) = match &outcome {
+        RunOutcome::Done => ("done", None),
+        RunOutcome::Paused => ("paused", None),
+        RunOutcome::Error(e) => ("error", Some(e.clone())),
+    };
+    {
+        let guard = state.room.lock().unwrap();
+        if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+            let _ = db::set_job_status(&r.conn, &child_id, status, err.as_deref());
+        }
+    }
+    match outcome {
+        RunOutcome::Done => {
+            let meta = published.lock().unwrap().take();
+            let name = meta.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+            Ok((format!("Saved a full pass of \"{file_name}\" as \"{name}\"."), meta))
+        }
+        // The parent's cancel tripped — surface STOPPED so the workflow parks and
+        // re-drives this node on resume.
+        RunOutcome::Paused => Err("STOPPED".into()),
+        RunOutcome::Error(e) => Err(e),
+    }
+}
+
 /// The human label for the progress card at `done` finished steps — names the
 /// exact part being read (with its character span) so the pass is watchable.
 pub(crate) fn pass_progress_label(plan: &PassPlan, steps: &[Step], done: usize) -> String {
@@ -674,7 +802,7 @@ mod tests {
             let cs = cursor_store.clone();
             run_plan(
                 &steps,
-                0,
+                std::collections::HashSet::new(),
                 cancel.clone(),
                 move |s| {
                     let handle = handle.clone();
@@ -695,7 +823,7 @@ mod tests {
                         r
                     }
                 },
-                |c| cs.store(c, Ordering::SeqCst),
+                |done| cs.store(dense_prefix(done), Ordering::SeqCst),
                 |done, total| eprintln!("leg1 {done}/{total}"),
             )
             .await
@@ -721,7 +849,7 @@ mod tests {
             let label_steps = steps.clone();
             run_plan(
                 &steps,
-                resume_from,
+                (0..resume_from).collect(),
                 cancel.clone(),
                 move |s| {
                     let handle = handle.clone();
@@ -740,7 +868,7 @@ mod tests {
                         .await
                     }
                 },
-                |c| cs.store(c, Ordering::SeqCst),
+                |done| cs.store(dense_prefix(done), Ordering::SeqCst),
                 move |done, total| {
                     eprintln!(
                         "leg2 {done}/{total} — {}",

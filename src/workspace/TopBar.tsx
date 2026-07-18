@@ -12,6 +12,7 @@ import { isCloudEngine, isExternalEngine, isModelReady } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import EngineModelPicker from "./EngineModelPicker";
+import { QuickActionsMenu, QuickAction } from "./QuickActions";
 
 /** The top bar: room identity, the engine pill/menu, search, room menu, lock.
  * Extracted verbatim from the <header className="topbar"> block. */
@@ -27,7 +28,7 @@ export default function TopBar({
   const { ai, model } = s;
   // One dismissal grammar for the header popovers: Escape closes whichever
   // is open (and never leaks to deeper layers while one is).
-  const anyMenuOpen = s.modelMenuOpen || s.roomMenuOpen;
+  const anyMenuOpen = s.modelMenuOpen || s.roomMenuOpen || s.qaMenuOpen;
   useEffect(() => {
     if (!anyMenuOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -35,10 +36,21 @@ export default function TopBar({
       e.stopPropagation();
       s.setModelMenuOpen(false);
       s.setRoomMenuOpen(false);
+      s.setQaMenuOpen(false);
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
   }, [anyMenuOpen, s]);
+  // Wave 4a: pinned general-purpose workflows as one-click top-bar shortcuts.
+  const pinnedActions: QuickAction[] = s.workflows
+    .filter((w) => w.pinned && w.status === "active" && w.binding.scope === "general")
+    .map((w) => ({
+      id: w.id,
+      label: w.name,
+      icon: w.emoji || "⚙️",
+      hint: w.name,
+      onRun: () => void a.runWorkflowNow(w.id),
+    }));
   const modelReady = isModelReady(ai, model);
   return (
     <header className="topbar">
@@ -68,6 +80,23 @@ export default function TopBar({
                 : "Saving…"}
           </button>
         )}
+        {/* Wave 4a: pinned-workflow shortcuts, left of the model pill (⌘J). */}
+        <QuickActionsMenu
+          actions={pinnedActions}
+          open={s.qaMenuOpen}
+          onOpenChange={(o) => {
+            if (o) {
+              s.setModelMenuOpen(false);
+              s.setRoomMenuOpen(false);
+            }
+            s.setQaMenuOpen(o);
+          }}
+          buttonLabel="Workflows"
+          buttonIcon="⚡"
+          inlineMax={3}
+          pill
+          footer={{ label: "All workflows…", onClick: a.openWorkflows }}
+        />
         {ai && (ai.models.length > 0 || ai.external.length > 0) ? (
           <div className="model-pill-wrap">
             <button

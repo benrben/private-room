@@ -809,6 +809,7 @@ pub(crate) async fn stream_answer(
             effects,
             web_enabled,
             cancel.clone(),
+            false, // visible chat turn — emit the ask-* stream events
         )
         .await
         {
@@ -944,6 +945,13 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "view_media_frame",
     "start_file_pass",
     "job_status",
+    // Wave 4a (Idea 2): the workflow authoring tools (LocalEngine/ExternalAgent
+    // scopes only, never tools_catalog). Reserved so an MCP route can't shadow
+    // their exec_tool arms.
+    "list_workflows",
+    "save_workflow",
+    "update_workflow",
+    "run_workflow",
     // Reserved even though they are never in the room bridge's own catalog:
     // an MCP route sanitizing to one of these names would shadow the built-in
     // exec_tool arm and skip the SEC-1b consent gate (e.g. server "consult" +
@@ -1006,6 +1014,9 @@ pub(crate) fn wants_job_tools(question: &str) -> bool {
         "start to finish", "page by page", "chapter", "long file", "large file",
         "big file", "deep", "job", "progress", "background", "pass", "digest",
         "no matter", "don't miss", "do not miss", "line by line",
+        // Wave 4a: the workflow authoring tools ride the jobs routing flag.
+        "workflow", "automate", "automat", "every morning", "every day", "every week",
+        "each morning", "each day", "schedule", "recurring", "routine", "pipeline",
     ];
     HINTS.iter().any(|h| q.contains(h))
 }
@@ -2158,6 +2169,16 @@ pub(crate) async fn exec_tool(
                 .collect();
             Ok(clamp_tool_result(lines.join("\n")))
         }
+        // Wave 4a (Idea 2): the workflow authoring tools. All logic lives in
+        // commands::jobs::workflow; these arms just route args + the agent
+        // messages. Drafts require explicit user activation (the review gate).
+        "list_workflows" => {
+            let name = args["name"].as_str();
+            Ok(clamp_tool_result(agent_list_workflows(state.inner(), name)?))
+        }
+        "save_workflow" => agent_save_workflow(state.inner(), window, args, "agent").await,
+        "update_workflow" => agent_update_workflow(state.inner(), window, args).await,
+        "run_workflow" => agent_run_workflow(window, state.inner(), args).await,
         // Wave 1a: run one prompt on the LOCAL model for an external agent on
         // the Leash's full tier (only `ToolScope::ExternalAgent` advertises
         // it). Never touches `effects` — the bridge passes a throwaway sink
@@ -2747,6 +2768,31 @@ mod tests {
             assert!(!catalog.contains(name), "{name} must not be in tools_catalog");
         }
         assert_eq!(job_tools_specs().len(), 2);
+    }
+
+    #[test]
+    fn workflow_tools_never_leak_into_the_room_bridge_catalog() {
+        // Wave 4a structural guard: the four workflow tools are LocalEngine/
+        // ExternalAgent-only (served over the bridge, gated by the jobs router) —
+        // never in tools_catalog, so a cloud client can never reach them. Each is
+        // also reserved in BUILTIN_TOOL_NAMES against MCP shadowing.
+        let catalog = tools_catalog(true).to_string();
+        let specs = workflow_tools_specs();
+        assert_eq!(specs.len(), 4);
+        for name in ["list_workflows", "save_workflow", "update_workflow", "run_workflow"] {
+            assert!(!catalog.contains(name), "{name} must not be in tools_catalog");
+            assert!(BUILTIN_TOOL_NAMES.contains(&name), "{name} must be reserved");
+            assert!(specs.iter().any(|s| s["function"]["name"] == name), "{name} spec missing");
+        }
+    }
+
+    #[test]
+    fn wants_job_tools_routes_workflow_intents() {
+        // Wave 4a: the workflow keywords ride the jobs routing flag.
+        assert!(wants_job_tools("make me a workflow that summarizes new files every morning"));
+        assert!(wants_job_tools("automate a weekly review"));
+        assert!(wants_job_tools("set up a recurring pipeline"));
+        assert!(wants_job_tools("run the morning digest workflow"));
     }
 
     #[test]

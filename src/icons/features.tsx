@@ -3,6 +3,18 @@ import { Stroke } from "./base";
 
 /* ---------- moonshot feature icons (24px grid, 1.6px stroke) ---------- */
 
+/** Workflows: a small left-to-right pipeline of linked nodes. */
+export function WorkflowsIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <rect x="3" y="9.5" width="5" height="5" rx="1.3" />
+      <rect x="16" y="4.5" width="5" height="5" rx="1.3" />
+      <rect x="16" y="14.5" width="5" height="5" rx="1.3" />
+      <path d="M8 12h4.5M12.5 12V7h3.5M12.5 12v5h3.5" />
+    </Stroke>
+  );
+}
+
 /** Room Map: a small constellation / node graph. */
 export function GraphIcon(p: IconProps) {
   return (

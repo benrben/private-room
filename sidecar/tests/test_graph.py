@@ -117,6 +117,24 @@ async def test_consult_advisor_is_never_offered_even_if_the_bridge_serves_it() -
     assert "consult_advisor" not in out.chat.offered_names[0]
 
 
+async def test_workflow_tools_are_dropped_off_a_plain_turn() -> None:
+    # Wave 4a: the bridge always serves the workflow tools (LocalEngine scope),
+    # so _filter_catalog must drop them unless the jobs router fires — else they'd
+    # bloat every turn's catalog.
+    mcp = FakeMCP(tools=specs(["search_room", "save_workflow", "run_workflow"]))
+    chat = FakeChatModel([Round(content="ok")])
+    out = await drive(make_request("what is the rent"), chat, mcp)
+    offered = set(out.chat.offered_names[0])
+    assert "save_workflow" not in offered
+    assert "run_workflow" not in offered
+    # …but a workflow-intent turn offers them.
+    chat2 = FakeChatModel([Round(content="ok")])
+    out2 = await drive(
+        make_request("make me a workflow to summarize new files every morning"), chat2, mcp
+    )
+    assert {"save_workflow", "run_workflow"} <= set(out2.chat.offered_names[0])
+
+
 # --------------------------------------------------------------------------- #
 # system-prompt appends
 # --------------------------------------------------------------------------- #

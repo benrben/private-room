@@ -16,6 +16,13 @@ JOBS_PROMPT = (
     "a durable background job and saves the result as a new file in the room. "
     "Then tell the user it is underway (they see a live progress card) and do "
     "not wait for it. job_status reports how background jobs are doing."
+    "\n\nFor RECURRING or multi-step automation — 'every morning', 'summarize new "
+    "files daily', a saved pipeline — use the workflow tools: list_workflows to "
+    "see or fetch one, save_workflow to draft a new multi-step pipeline (nodes + "
+    "edges), update_workflow to change one, run_workflow to run an active one now. "
+    "save_workflow always creates a DRAFT the user reviews and activates on the "
+    "Workflows page; if a definition is invalid it comes back with a numbered list "
+    "to fix and retry."
 )
 
 #: ADD-25 — appended when `wants_ui_tools` fires (agent.rs:1284).

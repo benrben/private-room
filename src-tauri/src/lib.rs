@@ -223,6 +223,21 @@ pub fn run() {
             commands::start_deep_summary,
             // ADD-32: whole-file pass — exhaustive windowed reading of one file.
             commands::start_file_pass,
+            // Wave 4a (Idea 2): LLM graph workflows + scheduler + shortcuts.
+            commands::save_workflow,
+            commands::update_workflow,
+            commands::delete_workflow,
+            commands::list_workflows,
+            commands::get_workflow,
+            commands::get_workflow_schedule,
+            commands::workflow_templates,
+            commands::run_workflow,
+            commands::set_workflow_schedule,
+            commands::set_workflow_status,
+            commands::set_workflow_pinned,
+            commands::validate_workflow,
+            commands::get_workflow_runs,
+            commands::get_job_step_artifact,
             // Idea 3: supernatural voice — on-device speech synthesis.
             commands::speak_text,
             commands::list_speech_voices,

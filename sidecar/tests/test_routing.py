@@ -105,7 +105,25 @@ def test_show_tools_are_not_write_tools() -> None:
 
 def test_ui_and_job_tool_names() -> None:
     assert UI_TOOL_NAMES == ("ui_snapshot", "ui_act", "view_screenshot", "view_media_frame")
-    assert JOB_TOOL_NAMES == ("start_file_pass", "job_status")
+    # Wave 4a: the four workflow authoring tools join the job tools so
+    # _filter_catalog drops them off a plain turn (kept in sync with agent.rs).
+    assert JOB_TOOL_NAMES == (
+        "start_file_pass",
+        "job_status",
+        "list_workflows",
+        "save_workflow",
+        "update_workflow",
+        "run_workflow",
+    )
+
+
+def test_wants_job_tools_fires_on_workflow_intents() -> None:
+    from privateroom_sidecar.routing import wants_job_tools
+
+    assert wants_job_tools("make me a workflow that summarizes new files every morning")
+    assert wants_job_tools("automate a weekly review")
+    assert wants_job_tools("set up a recurring pipeline")
+    assert not wants_job_tools("what does the lease say about pets?")
 
 
 # --- wants_write_tools ------------------------------------------------------

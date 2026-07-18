@@ -18,6 +18,8 @@ import {
   RoomInfo,
   SearchResults,
   StudioPrompts,
+  Workflow,
+  WorkflowNodeEvent,
 } from "../api";
 import { AutocompleteState } from "./composer";
 import { OpenFile, Toast } from "./types";
@@ -174,6 +176,22 @@ export function useWorkspaceState(info: RoomInfo) {
   const [showMap, setShowMap] = useState(false);
   const showMapRef = useRef(false);
   showMapRef.current = showMap;
+  // Wave 4a (Idea 2): the full-pane Workflows view, mirroring showMap (+ ref for
+  // the mount-once Escape handler). `wfDetailId` selects a workflow inside it.
+  const [showWorkflows, setShowWorkflows] = useState(false);
+  const showWorkflowsRef = useRef(false);
+  showWorkflowsRef.current = showWorkflows;
+  const [wfDetailId, setWfDetailId] = useState<string | null>(null);
+  // The room's workflows (one source of truth for the page, top bar, and the
+  // file-header Actions menu). Loaded on mount, refreshed on workflows-changed.
+  const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  // Per-job map of node id → live status, driving the pipeline animation.
+  const [wfNodeStatus, setWfNodeStatus] = useState<
+    Record<string, Record<string, WorkflowNodeEvent>>
+  >({});
+  // The top-bar pinned-workflows popover (⌘J) and the file-header Actions menu.
+  const [qaMenuOpen, setQaMenuOpen] = useState(false);
+  const [qaFileMenuOpen, setQaFileMenuOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [fp, setFp] = useState<FrontPage | null>(null);
   const [fpSuggestions, setFpSuggestions] = useState<string[]>([]);
@@ -313,6 +331,9 @@ export function useWorkspaceState(info: RoomInfo) {
     askingRef, prevAskingRef, askIdRef, recheckTimer, prevModelRef,
     userPickedModelRef, memoryHeadRef, showMemoryIntro, setShowMemoryIntro,
     showMap, setShowMap, showMapRef, showHelp, setShowHelp,
+    showWorkflows, setShowWorkflows, showWorkflowsRef, wfDetailId, setWfDetailId,
+    workflows, setWorkflows, wfNodeStatus, setWfNodeStatus,
+    qaMenuOpen, setQaMenuOpen, qaFileMenuOpen, setQaFileMenuOpen,
     fp, setFp, fpSuggestions, setFpSuggestions, studioBusy, setStudioBusy,
     studioOpId, setStudioOpId, studioStep, setStudioStep,
     importProgress, setImportProgress,

@@ -130,6 +130,11 @@ CREATE TABLE IF NOT EXISTS jobs (
   total INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'queued',
   error TEXT,
+  -- Wave 4a: set on a child job a workflow drives INLINE (a file_pass node). The
+  -- queue pump, resume_job and quiesce all skip these — the parent workflow job
+  -- holds the lane slot and re-drives the child on its own resume, so a child
+  -- must never start (or be Resumed) independently.
+  parent_job_id TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
@@ -140,6 +145,48 @@ CREATE TABLE IF NOT EXISTS job_artifacts (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   PRIMARY KEY (job_id, step_id)
 );
+-- Wave 4a (Idea 2): LLM graph workflows. `definition` is the immutable
+-- WorkflowDef JSON (nodes + edges); a RUN snapshots it into the jobs plan, so a
+-- later edit never corrupts a paused run. `binding` (shortcuts extension) scopes
+-- where a workflow surfaces (general vs file-kind); `pinned` shows it in the top
+-- bar. MUST live in SCHEMA and migrate() (the schema.rs:115-119 rule).
+CREATE TABLE IF NOT EXISTS workflows (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  emoji TEXT NOT NULL DEFAULT '',
+  definition TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  created_by TEXT NOT NULL DEFAULT 'user',
+  binding TEXT NOT NULL DEFAULT '{"scope":"general"}',
+  pinned INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE TABLE IF NOT EXISTS workflow_runs (
+  id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+  job_id TEXT,
+  trigger TEXT NOT NULL DEFAULT 'manual',
+  status TEXT NOT NULL DEFAULT 'running',
+  error TEXT,
+  input_file_id TEXT,
+  started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_wf ON workflow_runs(workflow_id);
+CREATE TABLE IF NOT EXISTS schedules (
+  id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  param TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  catch_up INTEGER NOT NULL DEFAULT 1,
+  next_run_at TEXT,
+  last_run_at TEXT,
+  last_job_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_schedules_wf ON schedules(workflow_id);
 "#;
 
 pub(crate) fn apply_key(conn: &Connection, password: &str) -> Result<(), String> {
@@ -216,7 +263,7 @@ pub fn open_room(path: &str, password: &str) -> Result<Connection, String> {
 }
 
 /// Bring rooms created by older app versions up to the current schema.
-fn migrate(conn: &Connection) -> Result<(), String> {
+pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS chats (
            id TEXT PRIMARY KEY,
@@ -262,6 +309,77 @@ fn migrate(conn: &Connection) -> Result<(), String> {
          );",
     )
     .map_err(|e| e.to_string())?;
+
+    // Wave 4a: a workflow's inline file_pass child rides the parent's lane slot,
+    // so it must be invisible to pump/resume/quiesce. Guarded ALTER for rooms
+    // whose jobs table predates the column (mirrors the folder_id/ai_summary
+    // migrations above).
+    if table_exists(conn, "jobs")? && !column_exists(conn, "jobs", "parent_job_id")? {
+        conn.execute("ALTER TABLE jobs ADD COLUMN parent_job_id TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Wave 4a (Idea 2): LLM graph workflows, their run history, and their
+    // schedules. Old rooms opened via open_room never ran the new SCHEMA, so
+    // mirror the three tables (+ indexes) here with IF NOT EXISTS.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workflows (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL,
+           description TEXT NOT NULL DEFAULT '',
+           emoji TEXT NOT NULL DEFAULT '',
+           definition TEXT NOT NULL,
+           status TEXT NOT NULL DEFAULT 'draft',
+           created_by TEXT NOT NULL DEFAULT 'user',
+           binding TEXT NOT NULL DEFAULT '{\"scope\":\"general\"}',
+           pinned INTEGER NOT NULL DEFAULT 0,
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );
+         CREATE TABLE IF NOT EXISTS workflow_runs (
+           id TEXT PRIMARY KEY,
+           workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+           job_id TEXT,
+           trigger TEXT NOT NULL DEFAULT 'manual',
+           status TEXT NOT NULL DEFAULT 'running',
+           error TEXT,
+           input_file_id TEXT,
+           started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           finished_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_workflow_runs_wf ON workflow_runs(workflow_id);
+         CREATE TABLE IF NOT EXISTS schedules (
+           id TEXT PRIMARY KEY,
+           workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+           kind TEXT NOT NULL,
+           param TEXT NOT NULL DEFAULT '',
+           enabled INTEGER NOT NULL DEFAULT 1,
+           catch_up INTEGER NOT NULL DEFAULT 1,
+           next_run_at TEXT,
+           last_run_at TEXT,
+           last_job_id TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_schedules_wf ON schedules(workflow_id);",
+    )
+    .map_err(|e| e.to_string())?;
+    // Shortcuts extension: a workflows table created before the binding/pinned
+    // columns existed gains them here (guarded ALTER precedent). input_file_id
+    // rides workflow_runs the same way.
+    if table_exists(conn, "workflows")? && !column_exists(conn, "workflows", "binding")? {
+        conn.execute(
+            "ALTER TABLE workflows ADD COLUMN binding TEXT NOT NULL DEFAULT '{\"scope\":\"general\"}'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if table_exists(conn, "workflows")? && !column_exists(conn, "workflows", "pinned")? {
+        conn.execute("ALTER TABLE workflows ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", [])
+            .map_err(|e| e.to_string())?;
+    }
+    if table_exists(conn, "workflow_runs")? && !column_exists(conn, "workflow_runs", "input_file_id")? {
+        conn.execute("ALTER TABLE workflow_runs ADD COLUMN input_file_id TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
 
     let has_chat_id = {
         let mut stmt = conn

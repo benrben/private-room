@@ -20,6 +20,15 @@ pub use file_pass::*;
 mod auto_index;
 pub(crate) use auto_index::*;
 
+// Wave 4a (Idea 2): the LLM graph workflow engine, the job queue, and the
+// workflow scheduler.
+mod workflow;
+pub use workflow::*;
+mod queue;
+pub(crate) use queue::*;
+mod scheduler;
+pub use scheduler::*;
+
 /// Where a step runs — decides how many may run at once. Local-model work is
 /// serial because only one model is resident; CPU and cloud work fan out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -105,6 +114,21 @@ fn plan_is_stuck(steps: &[Step], done: &HashSet<usize>, running: &HashSet<usize>
         && plan_dispatch(steps, done, running).is_empty()
 }
 
+/// Wave 4a [BLOCKER] fix: the largest CONTIGUOUS done prefix — the smallest id
+/// NOT in `done`. `run_plan` no longer stores `done.len()` as the resume cursor,
+/// because a branched multi-lane plan (a workflow) can finish a wave leaving a
+/// NON-dense done-set (e.g. `{0,1,3}` while step 2 waits its lane slot). Storing
+/// the count there would seed resume as `0..count` = `{0,1,2}`, marking step 2
+/// done though it never ran and re-running step 3. The dense prefix is always a
+/// valid `0..n` resume seed: every id below it is genuinely finished, and any
+/// done-but-above-prefix step simply re-runs (all step side-effects are
+/// idempotent — `INSERT OR REPLACE` artifacts). deep_summary/file_pass are
+/// single-slot serial in practice, so for them the prefix equals the count and
+/// their resume is unchanged.
+pub(crate) fn dense_prefix(done: &HashSet<usize>) -> usize {
+    (0..).find(|i| !done.contains(i)).unwrap_or(0)
+}
+
 /// How a plan run ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -116,15 +140,21 @@ pub enum RunOutcome {
 }
 
 /// Drive a plan to completion. Plans are built in dependency order (a step's
-/// deps always have lower ids), so `start_done` is seeded as `0..cursor` on
-/// resume. Each wave dispatches every ready step its lanes allow, runs them
-/// concurrently, then `checkpoint(done_count)` persists progress and
+/// deps always have lower ids). Each wave dispatches every ready step its lanes
+/// allow, runs them concurrently, then `checkpoint(&done)` persists progress and
 /// `progress(done, total)` updates the UI. A set `cancel` flag pauses between
 /// waves; a step error parks the job. Generic over `execute` so it is unit-
 /// tested without the app.
+///
+/// Wave 4a [BLOCKER] fix: `start_done` is the actual set of finished step ids
+/// (seeded `0..cursor` for the serial job kinds, an arbitrary persisted set for
+/// a branched workflow), and the checkpoint callback receives the whole `&done`
+/// set — NOT a scalar count — so a workflow spawner can serialize the real
+/// done-set for a correct resume, and the serial spawners can keep storing their
+/// dense-prefix cursor.
 pub async fn run_plan<F, Fut, C>(
     steps: &[Step],
-    start_cursor: usize,
+    start_done: HashSet<usize>,
     cancel: Arc<AtomicBool>,
     mut execute: F,
     mut checkpoint: C,
@@ -133,11 +163,11 @@ pub async fn run_plan<F, Fut, C>(
 where
     F: FnMut(Step) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
-    C: FnMut(usize),
+    C: FnMut(&HashSet<usize>),
 {
     use futures_util::future::join_all;
     let total = steps.len();
-    let mut done: HashSet<usize> = (0..start_cursor).collect();
+    let mut done: HashSet<usize> = start_done;
     progress(done.len(), total);
 
     while !plan_complete(steps, &done) {
@@ -161,9 +191,7 @@ where
             }
             done.insert(id);
         }
-        // Cursor advances to the count of finished steps (topo order makes this
-        // a valid resume point).
-        checkpoint(done.len());
+        checkpoint(&done);
         progress(done.len(), total);
     }
     RunOutcome::Done
@@ -191,8 +219,26 @@ pub fn list_jobs(state: State<'_, AppState>) -> Result<Vec<db::Job>, String> {
 /// checkpoints, and parks the job as 'paused' — Resume continues from there.
 #[tauri::command]
 pub fn cancel_job(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    if let Some(flag) = state.job_cancels.lock().unwrap().get(&id) {
-        flag.store(true, Ordering::SeqCst);
+    let has_flag = {
+        let flags = state.job_cancels.lock().unwrap();
+        if let Some(flag) = flags.get(&id) {
+            flag.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    };
+    // Wave 4a: a QUEUED job has no in-memory cancel flag (it never spawned), so
+    // the flag flip above is a no-op — park the row directly instead, so
+    // "Remove from queue" actually stops it starting later.
+    if !has_flag {
+        let _ = state.with_room(|room| {
+            let job = db::get_job(&room.conn, &id)?;
+            if job.status == "queued" {
+                db::set_job_status(&room.conn, &id, "paused", None)?;
+            }
+            Ok(())
+        });
     }
     Ok(())
 }
@@ -344,7 +390,7 @@ fn spawn_deep_summary(
         let lc = last_cursor.clone();
         let outcome = run_plan(
             &steps,
-            start_cursor,
+            (0..start_cursor).collect(),
             cancel.clone(),
             |s| {
                 let state = app.state::<AppState>();
@@ -402,7 +448,10 @@ fn spawn_deep_summary(
                     }
                 }
             },
-            |cursor| {
+            |done_set| {
+                // deep_summary steps are independent and single-lane serial, so
+                // the done-set is always a dense prefix — the cursor is its size.
+                let cursor = dense_prefix(done_set);
                 lc.store(cursor, Ordering::SeqCst);
                 let state = app.state::<AppState>();
                 let guard = state.room.lock().unwrap();
@@ -506,6 +555,8 @@ fn spawn_deep_summary(
             }),
         };
         let _ = window.emit("job-progress", payload);
+        // Wave 4a: free the queue slot and start the next waiting job.
+        queue::finish_and_pump(&app, &window, &job_id).await;
     });
 }
 
@@ -529,11 +580,6 @@ pub(crate) async fn start_deep_summary_inner(
     if state.rolling_back() {
         return Err(ROLLBACK_BUSY.into());
     }
-    // One heavy background job at a time — the local lane is serial anyway, and
-    // two concurrent summaries would just fight over the same cache.
-    if !state.job_cancels.lock().unwrap().is_empty() {
-        return Err("A background job is already running.".into());
-    }
     let (files, chat_model, steps, plan_room, has_summary_page) =
         deep_summary_plan(state, auto).await?;
     if files.is_empty() {
@@ -555,28 +601,37 @@ pub(crate) async fn start_deep_summary_inner(
         if room.path != plan_room {
             return Err("The room changed while starting this job.".into());
         }
+        // Wave 4a: too many jobs already waiting — refuse rather than pile up.
+        if queue::at_capacity(&room.conn) {
+            return Err("Too many background jobs are already waiting — let some finish first.".into());
+        }
         let id = db::create_job(&room.conn, "deep_summary", title, &plan, total)?;
         Ok((id, room.path.clone()))
     })?;
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    state
-        .job_cancels
-        .lock()
-        .unwrap()
-        .insert(job_id.clone(), cancel.clone());
-    spawn_deep_summary(
-        window,
-        job_id.clone(),
-        room_path,
-        files,
-        chat_model,
-        steps,
-        0,
-        cancel,
-        auto,
-        reduce,
-    );
+    // Wave 4a: start now if the single heavy-work slot is free, else leave the
+    // row 'queued' — the queue pump (or room-open) starts it later. Clicking
+    // Summarize while a job runs now enqueues instead of erroring.
+    if queue::try_reserve(state, &job_id) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        state
+            .job_cancels
+            .lock()
+            .unwrap()
+            .insert(job_id.clone(), cancel.clone());
+        spawn_deep_summary(
+            window,
+            job_id.clone(),
+            room_path,
+            files,
+            chat_model,
+            steps,
+            0,
+            cancel,
+            auto,
+            reduce,
+        );
+    }
     Ok(job_id)
 }
 
@@ -604,124 +659,21 @@ pub async fn resume_job(
     if state.rolling_back() {
         return Err(ROLLBACK_BUSY.into());
     }
-    let (job, room_path) = state.with_room(|room| {
-        Ok((db::get_job(&room.conn, &id)?, room.path.clone()))
-    })?;
-    // One heavy background job at a time — mirrors the start paths' guard
-    // (any live job blocks a resume, including this same job resumed twice),
-    // so the per-job LocalLlm lane serialization is never defeated.
-    if !state.job_cancels.lock().unwrap().is_empty() {
-        return Err("A background job is already running.".into());
+    // The job must exist and be resumable, and must not be an inline child (a
+    // workflow's file_pass child is re-driven by its parent, never on its own).
+    let job = state.with_room(|room| db::get_job(&room.conn, &id))?;
+    if job.parent_job_id.is_some() {
+        return Err("This job runs as part of a workflow — resume the workflow instead.".into());
     }
-    match job.kind.as_str() {
-        "deep_summary" => {
-            // Wave 1b (idea 8): resume must KEEP auto semantics — the flags are
-            // read back from the stored plan (an auto job resumed after restart
-            // must not run the reduce, write a summary page, or hijack the
-            // viewer like a manual job would).
-            let auto = job.plan.get("auto").and_then(|v| v.as_bool()).unwrap_or(false);
-            let reduce = if auto {
-                job.plan.get("reduce").and_then(|v| v.as_bool()).unwrap_or(false)
-            } else {
-                true
-            };
-            let (files, chat_model, steps, plan_room, _) =
-                deep_summary_plan(state.inner(), auto).await?;
-            // The plan was read after an await — a room swapped since the job
-            // row was read must not run a plan built from the other room.
-            if plan_room != room_path {
-                return Err("The room changed while resuming this job.".into());
-            }
-            // An auto plan is re-derived from the CURRENT missing set, so a
-            // resumed job whose work has since been finished (or superseded by
-            // a newer auto run) simply completes.
-            if auto && files.is_empty() {
-                state.with_room(|room| db::set_job_status(&room.conn, &id, "done", None))?;
-                use tauri::Emitter;
-                let _ = window.emit(
-                    "job-progress",
-                    serde_json::json!({
-                        "jobId": id, "label": "Indexing finished",
-                        "done": job.total, "total": job.total, "finished": true,
-                    }),
-                );
-                return Ok(());
-            }
-            // Resume point: a MANUAL plan is positional (whole-room list), so
-            // skip the already-summarized prefix — the '' sentinel counts as
-            // unsummarized so a user-started resume retries stuck files. An
-            // AUTO plan contains ONLY missing files by construction: cursor 0.
-            let cursor = if auto {
-                0
-            } else {
-                files.iter().take_while(|f| has_liner(f)).count()
-            };
-            let cancel = Arc::new(AtomicBool::new(false));
-            state
-                .job_cancels
-                .lock()
-                .unwrap()
-                .insert(id.clone(), cancel.clone());
-            spawn_deep_summary(
-                window, id, room_path, files, chat_model, steps, cursor, cancel, auto, reduce,
-            );
-            Ok(())
-        }
-        // ADD-32: a whole-file pass resumes from its IMMUTABLE stored plan —
-        // the windows must be byte-identical to the ones the artifacts were
-        // made from, so they are never re-derived, only verified.
-        "file_pass" => {
-            let plan: PassPlan = serde_json::from_value(job.plan.clone())
-                .map_err(|_| "This job's plan is unreadable.")?;
-            let filtered = state.with_room(|room| {
-                let text = db::get_file_extracted_text(&room.conn, &plan.file_id)
-                    .ok_or("The file this pass was reading is no longer in the room.")?;
-                Ok(extraction::smart_filter(&text))
-            })?;
-            if filtered.len() != plan.text_len {
-                return Err(
-                    "The file changed since this pass started — start a new pass instead."
-                        .into(),
-                );
-            }
-            // Equal length is not equal content — the digest catches a
-            // same-length replacement the cheap check above misses. Plans
-            // persisted before the digest existed (None) keep the length
-            // check as their only guard.
-            if plan
-                .text_sha256
-                .as_deref()
-                .is_some_and(|h| h != text_digest(&filtered))
-            {
-                return Err(
-                    "The file changed since this pass started — start a new pass instead."
-                        .into(),
-                );
-            }
-            let (chat_model, lane) = resolve_pass_engine(state.inner()).await;
-            let steps = build_pass_steps(plan.windows.len(), &plan.mode, lane);
-            let cursor = usize::try_from(job.cursor).unwrap_or(0).min(steps.len());
-            let cancel = Arc::new(AtomicBool::new(false));
-            state
-                .job_cancels
-                .lock()
-                .unwrap()
-                .insert(id.clone(), cancel.clone());
-            spawn_file_pass(
-                window,
-                id,
-                room_path,
-                plan,
-                chat_model,
-                steps,
-                cursor,
-                cancel,
-                Arc::new(filtered),
-            );
-            Ok(())
-        }
-        _ => Err("This job can't be resumed.".into()),
+    if !matches!(job.kind.as_str(), "deep_summary" | "file_pass" | "workflow") {
+        return Err("This job can't be resumed.".into());
     }
+    // Wave 4a: resume through the QUEUE — set the row back to 'queued' and submit.
+    // If the single slot is free it starts now (queue::start_job_from_row rebuilds
+    // the plan, exactly as the old resume did); if a job is already running it
+    // waits and the running job's epilogue pumps it — no "already running" error.
+    state.with_room(|room| db::set_job_status(&room.conn, &id, "queued", None))?;
+    queue::submit(&window, state.inner(), id).await
 }
 
 // ------------------------------------------------------------ file pass (ADD-32)
@@ -770,11 +722,6 @@ pub(crate) async fn begin_file_pass(
     // Wave 3 (Idea 9): don't start a file pass while a rollback is swapping.
     if state.rolling_back() {
         return Err(ROLLBACK_BUSY.into());
-    }
-    if !state.job_cancels.lock().unwrap().is_empty() {
-        return Err(
-            "A background job is already running — stop it or let it finish first.".into(),
-        );
     }
     let mode = if mode == "stitch" { "stitch" } else { "merge" };
     let instruction = {
@@ -825,25 +772,31 @@ pub(crate) async fn begin_file_pass(
         if room.path != room_path {
             return Err("The room changed while starting this pass.".into());
         }
+        if queue::at_capacity(&room.conn) {
+            return Err("Too many background jobs are already waiting — let some finish first.".into());
+        }
         db::create_job(&room.conn, "file_pass", &title, &plan_json, steps.len() as i64)
     })?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    state
-        .job_cancels
-        .lock()
-        .unwrap()
-        .insert(job_id.clone(), cancel.clone());
-    spawn_file_pass(
-        window.clone(),
-        job_id.clone(),
-        room_path,
-        plan,
-        chat_model,
-        steps,
-        0,
-        cancel,
-        Arc::new(filtered),
-    );
+    // Wave 4a: start now if the heavy-work slot is free, else leave it queued.
+    if queue::try_reserve(state, &job_id) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        state
+            .job_cancels
+            .lock()
+            .unwrap()
+            .insert(job_id.clone(), cancel.clone());
+        spawn_file_pass(
+            window.clone(),
+            job_id.clone(),
+            room_path,
+            plan,
+            chat_model,
+            steps,
+            0,
+            cancel,
+            Arc::new(filtered),
+        );
+    }
     Ok((job_id, real_name, n_windows))
 }
 
@@ -916,7 +869,7 @@ fn spawn_file_pass(
         let exec_published = published.clone();
         let outcome = run_plan(
             &steps,
-            start_cursor,
+            (0..start_cursor).collect(),
             cancel.clone(),
             |s| {
                 let app = exec_app.clone();
@@ -935,7 +888,13 @@ fn spawn_file_pass(
                     .await
                 }
             },
-            |cursor| {
+            |done_set| {
+                // Store the dense prefix, not the count: a file_pass on the Cloud
+                // lane (4 slots) can finish a compose section out of id order,
+                // leaving a non-dense done-set — the prefix is the only valid
+                // `0..cursor` resume seed (artifacts are idempotent, so a
+                // done-but-above-prefix step simply re-runs).
+                let cursor = dense_prefix(done_set);
                 lc.store(cursor, Ordering::SeqCst);
                 let state = app.state::<AppState>();
                 let guard = state.room.lock().unwrap();
@@ -998,6 +957,8 @@ fn spawn_file_pass(
             }),
         };
         let _ = window.emit("job-progress", payload);
+        // Wave 4a: free the queue slot and start the next waiting job.
+        queue::finish_and_pump(&app, &window, &job_id).await;
     });
 }
 
@@ -1088,6 +1049,48 @@ mod tests {
         assert!(!plan_is_stuck(&steps, &HashSet::new(), &[0].into_iter().collect()));
     }
 
+    #[test]
+    fn dense_prefix_is_smallest_missing_id() {
+        // Wave 4a: a dense set's prefix is its size; a hole caps it at the hole.
+        assert_eq!(dense_prefix(&HashSet::new()), 0);
+        assert_eq!(dense_prefix(&[0, 1, 2].into_iter().collect()), 3);
+        // {0,1,3}: step 2 is a hole, so the valid resume prefix is 2 (NOT 3).
+        assert_eq!(dense_prefix(&[0, 1, 3].into_iter().collect()), 2);
+        // A set missing 0 entirely resumes from scratch.
+        assert_eq!(dense_prefix(&[1, 2, 3].into_iter().collect()), 0);
+    }
+
+    #[tokio::test]
+    async fn run_plan_checkpoints_dense_prefix_not_count_on_branched_plan() {
+        // Wave 4a [BLOCKER] regression: a fan-out where a Cpu sibling (id 2) is
+        // ready alongside a LocalLlm step (id 1) but the LocalLlm slot is taken,
+        // so a wave can finish {0,2} leaving id 1 pending — a NON-dense done-set.
+        // The stored resume point MUST be the dense prefix (1), never the count
+        // (2), or resume would mark id 1 done though it never ran.
+        let steps = vec![
+            step(0, Lane::LocalLlm, &[]),
+            step(1, Lane::LocalLlm, &[0]),
+            step(2, Lane::Cpu, &[0]),
+        ];
+        let prefixes = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let p2 = prefixes.clone();
+        let outcome = run_plan(
+            &steps,
+            HashSet::new(),
+            Arc::new(AtomicBool::new(false)),
+            move |_s| async move { Ok(()) },
+            move |done| p2.lock().unwrap().push(dense_prefix(done)),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Done);
+        // Every checkpointed prefix is a valid contiguous resume point (each id
+        // below it genuinely ran), ending at the full count.
+        let cps = prefixes.lock().unwrap().clone();
+        assert_eq!(*cps.last().unwrap(), 3);
+        assert!(cps.iter().all(|&p| p <= 3));
+    }
+
     #[tokio::test]
     async fn run_plan_runs_deps_before_dependents_and_checkpoints() {
         // digest 0,1,2 (cloud) → reduce 3 (local). Record execution order.
@@ -1103,7 +1106,7 @@ mod tests {
         let c2 = checkpoints.clone();
         let outcome = run_plan(
             &steps,
-            0,
+            HashSet::new(),
             Arc::new(AtomicBool::new(false)),
             move |s| {
                 let o = o2.clone();
@@ -1112,7 +1115,7 @@ mod tests {
                     Ok(())
                 }
             },
-            move |cursor| c2.lock().unwrap().push(cursor),
+            move |done| c2.lock().unwrap().push(done.len()),
             |_, _| {},
         )
         .await;
@@ -1137,7 +1140,7 @@ mod tests {
         let lc2 = last_cursor.clone();
         let outcome = run_plan(
             &steps,
-            0,
+            HashSet::new(),
             cancel.clone(),
             move |_s| {
                 let ran = ran2.clone();
@@ -1152,7 +1155,7 @@ mod tests {
                     Ok(())
                 }
             },
-            move |cursor| lc2.store(cursor, Ordering::SeqCst),
+            move |done| lc2.store(dense_prefix(done), Ordering::SeqCst),
             |_, _| {},
         )
         .await;
@@ -1166,7 +1169,7 @@ mod tests {
         let rr = ran_resume.clone();
         let outcome = run_plan(
             &steps,
-            2,
+            (0..2).collect(),
             Arc::new(AtomicBool::new(false)),
             move |s| {
                 let rr = rr.clone();
@@ -1194,7 +1197,7 @@ mod tests {
         let c2 = cancel.clone();
         let outcome = run_plan(
             &steps,
-            0,
+            HashSet::new(),
             cancel.clone(),
             move |_s| {
                 let c = c2.clone();
@@ -1216,7 +1219,7 @@ mod tests {
         let steps = vec![step(0, Lane::LocalLlm, &[]), step(1, Lane::LocalLlm, &[0])];
         let outcome = run_plan(
             &steps,
-            0,
+            HashSet::new(),
             Arc::new(AtomicBool::new(false)),
             move |s| async move {
                 if s.id == 0 {

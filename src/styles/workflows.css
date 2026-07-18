@@ -1,0 +1,359 @@
+/* Wave 4a (Idea 2): the Workflows flagship page + header shortcuts.
+   Matches the existing viewer / fp-card / pop-menu grammar. */
+
+.wf-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.wf-page .viewer-head {
+  gap: 0.5rem;
+}
+.wf-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 1rem 1.25rem 2rem;
+}
+
+/* ---------------- library grid ---------------- */
+.wf-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 0.9rem;
+}
+.wf-card {
+  border: 1px solid var(--border, #e2e2e6);
+  border-radius: 12px;
+  padding: 0.9rem 1rem;
+  background: var(--card-bg, #fff);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  transition: border-color 0.12s, box-shadow 0.12s;
+  position: relative;
+}
+.wf-card:hover {
+  border-color: var(--accent, #6b6bff);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+}
+.wf-card-top {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+.wf-card-emoji {
+  font-size: 1.4rem;
+  line-height: 1;
+}
+.wf-card-name {
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wf-card-desc {
+  font-size: 0.82rem;
+  opacity: 0.72;
+  line-height: 1.35;
+}
+.wf-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.2rem;
+}
+.wf-badge {
+  font-size: 0.68rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: var(--chip-bg, #f0f0f4);
+  opacity: 0.9;
+}
+.wf-badge.draft {
+  background: #f6e6c8;
+  color: #7a5a12;
+}
+.wf-badge.agent {
+  background: #e2ddff;
+  color: #4b3fa8;
+}
+.wf-badge.dot-ok::before {
+  content: "●";
+  color: #37a24a;
+  margin-right: 0.25rem;
+}
+.wf-badge.dot-err::before {
+  content: "●";
+  color: #d33;
+  margin-right: 0.25rem;
+}
+
+/* ---------------- pipeline canvas ---------------- */
+.pipeline-wrap {
+  position: relative;
+  overflow: auto;
+  border: 1px solid var(--border, #e2e2e6);
+  border-radius: 12px;
+  background:
+    radial-gradient(circle, rgba(120, 120, 140, 0.08) 1px, transparent 1px);
+  background-size: 22px 22px;
+  min-height: 260px;
+}
+.pipeline-canvas {
+  position: relative;
+}
+.pipeline-edges {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.pipeline-edges path {
+  stroke: var(--border-strong, #b9b9c4);
+  stroke-width: 2;
+  fill: none;
+}
+.pipeline-edges path.live {
+  stroke: var(--accent, #6b6bff);
+}
+.pipeline-node {
+  position: absolute;
+  width: 150px;
+  border: 1.5px solid var(--border, #d5d5de);
+  border-radius: 10px;
+  background: var(--card-bg, #fff);
+  padding: 0.5rem 0.6rem;
+  cursor: pointer;
+  box-sizing: border-box;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.pipeline-node:hover {
+  border-color: var(--accent, #6b6bff);
+}
+.pipeline-node.selected {
+  border-color: var(--accent, #6b6bff);
+  box-shadow: 0 0 0 2px rgba(107, 107, 255, 0.25);
+}
+.pipeline-node-kind {
+  font-size: 0.64rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  opacity: 0.55;
+}
+.pipeline-node-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  line-height: 1.25;
+  word-break: break-word;
+}
+.pipeline-node.done {
+  border-color: #37a24a;
+}
+.pipeline-node.skipped {
+  border-style: dashed;
+  opacity: 0.5;
+}
+.pipeline-node.error {
+  border-color: #d33;
+}
+.pipeline-node.running {
+  border-color: var(--accent, #6b6bff);
+  animation: wf-pulse 1.1s ease-in-out infinite;
+}
+@keyframes wf-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(107, 107, 255, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(107, 107, 255, 0);
+  }
+}
+.pipeline-node-status {
+  font-size: 0.62rem;
+  margin-top: 0.2rem;
+  opacity: 0.7;
+}
+.pipeline-add {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px dashed var(--border-strong, #b9b9c4);
+  background: var(--card-bg, #fff);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+  color: var(--accent, #6b6bff);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.pipeline-add:hover {
+  border-style: solid;
+  border-color: var(--accent, #6b6bff);
+}
+
+/* ---------------- param sheet ---------------- */
+.node-param-sheet {
+  border: 1px solid var(--border, #e2e2e6);
+  border-radius: 12px;
+  padding: 0.9rem 1rem;
+  margin-top: 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.node-param-sheet label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.node-param-sheet textarea,
+.node-param-sheet input[type="text"],
+.node-param-sheet select {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--border, #d5d5de);
+  border-radius: 8px;
+  background: var(--input-bg, #fff);
+}
+.node-param-sheet textarea {
+  min-height: 84px;
+  resize: vertical;
+}
+.wf-seg {
+  display: inline-flex;
+  border: 1px solid var(--border, #d5d5de);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.wf-seg button {
+  border: none;
+  background: transparent;
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+  font: inherit;
+}
+.wf-seg button.active {
+  background: var(--accent, #6b6bff);
+  color: #fff;
+}
+.wf-errors {
+  border: 1px solid #e7b7b7;
+  background: #fdeeee;
+  color: #8a2b2b;
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+}
+.wf-errors ul {
+  margin: 0.2rem 0 0;
+  padding-left: 1.1rem;
+}
+
+/* ---------------- run history ---------------- */
+.run-history {
+  margin-top: 1rem;
+}
+.run-row {
+  border: 1px solid var(--border, #e2e2e6);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  margin-bottom: 0.5rem;
+}
+.run-row-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  cursor: pointer;
+  font-size: 0.82rem;
+}
+.run-row-trigger {
+  font-size: 0.68rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--chip-bg, #f0f0f4);
+}
+.run-step {
+  font-size: 0.76rem;
+  padding: 0.3rem 0.5rem;
+  border-top: 1px solid var(--border, #eee);
+}
+.run-step pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0.25rem 0 0;
+  max-height: 180px;
+  overflow: auto;
+  background: var(--chip-bg, #f5f5f8);
+  border-radius: 6px;
+  padding: 0.4rem;
+  font-size: 0.72rem;
+}
+
+/* ---------------- schedule popover ---------------- */
+.wf-popover {
+  position: absolute;
+  z-index: 40;
+  min-width: 240px;
+  background: var(--card-bg, #fff);
+  border: 1px solid var(--border, #d5d5de);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.14);
+  padding: 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.wf-popover .caption {
+  font-size: 0.72rem;
+  opacity: 0.65;
+  line-height: 1.35;
+}
+.wf-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.82rem;
+}
+
+/* ---------------- QuickActions (shortcuts) ---------------- */
+.qa-pill {
+  border: 1px solid var(--border, #d5d5de);
+  background: var(--card-bg, #fff);
+  border-radius: 999px;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+}
+.qa-pill:hover {
+  border-color: var(--accent, #6b6bff);
+}
+.qa-menu {
+  max-height: 320px;
+  overflow-y: auto;
+}
+.qa-menu .pop-menu-item {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+.wf-empty {
+  text-align: center;
+  padding: 2rem 1rem;
+  opacity: 0.85;
+}
+.wf-empty h3 {
+  margin: 0 0 0.4rem;
+}

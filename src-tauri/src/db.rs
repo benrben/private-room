@@ -26,6 +26,7 @@ mod settings;
 mod util;
 mod versions;
 mod web_cache;
+mod workflows;
 
 pub use chats::*;
 pub use embeddings::*;
@@ -41,6 +42,7 @@ pub use settings::*;
 pub(crate) use util::*;
 pub use versions::*;
 pub use web_cache::*;
+pub use workflows::*;
 
 // ==================================================================
 // Room-persistence CRUD. Everything below is the only place raw SQL

@@ -22,6 +22,10 @@ pub struct Job {
     pub total: i64,
     pub status: String,
     pub error: Option<String>,
+    /// Wave 4a: set on a child job a workflow drives INLINE (a file_pass node).
+    /// pump/resume/quiesce and the Sidebar skip children — the parent holds the
+    /// lane slot and re-drives the child on its own resume.
+    pub parent_job_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -39,13 +43,14 @@ fn row_to_job(r: &rusqlite::Row) -> rusqlite::Result<Job> {
         total: r.get(6)?,
         status: r.get(7)?,
         error: r.get(8)?,
-        created_at: r.get(9)?,
-        updated_at: r.get(10)?,
+        parent_job_id: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
     })
 }
 
-const COLS: &str =
-    "id, kind, title, plan, state, cursor, total, status, error, created_at, updated_at";
+const COLS: &str = "id, kind, title, plan, state, cursor, total, status, error, \
+     parent_job_id, created_at, updated_at";
 
 /// Insert a queued job with its immutable plan. Returns the new id.
 pub fn create_job(
@@ -55,12 +60,37 @@ pub fn create_job(
     plan: &serde_json::Value,
     total: i64,
 ) -> Result<String, String> {
+    create_job_inner(conn, kind, title, plan, total, None)
+}
+
+/// Wave 4a: insert a CHILD job (a workflow's inline file_pass) tagged with its
+/// parent so pump/resume/quiesce and the Sidebar skip it — the parent workflow
+/// job owns its lifecycle.
+pub fn create_child_job(
+    conn: &Connection,
+    kind: &str,
+    title: &str,
+    plan: &serde_json::Value,
+    total: i64,
+    parent_job_id: &str,
+) -> Result<String, String> {
+    create_job_inner(conn, kind, title, plan, total, Some(parent_job_id))
+}
+
+fn create_job_inner(
+    conn: &Connection,
+    kind: &str,
+    title: &str,
+    plan: &serde_json::Value,
+    total: i64,
+    parent_job_id: Option<&str>,
+) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
     execute_one(
         conn,
-        "INSERT INTO jobs(id, kind, title, plan, total, status) \
-         VALUES(?1, ?2, ?3, ?4, ?5, 'queued')",
-        params![id, kind, title, plan.to_string(), total],
+        "INSERT INTO jobs(id, kind, title, plan, total, status, parent_job_id) \
+         VALUES(?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+        params![id, kind, title, plan.to_string(), total, parent_job_id],
     )?;
     Ok(id)
 }
@@ -105,11 +135,13 @@ pub fn get_job(conn: &Connection, id: &str) -> Result<Job, String> {
     )
 }
 
-/// All jobs, newest first — for the jobs panel.
+/// All jobs, newest first — for the jobs panel. Wave 4a: children (a workflow's
+/// inline file_pass) are hidden; their progress shows through the parent
+/// workflow's animated pipeline, never a second sidebar card.
 pub fn list_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
     query_rows(
         conn,
-        &format!("SELECT {COLS} FROM jobs ORDER BY created_at DESC"),
+        &format!("SELECT {COLS} FROM jobs WHERE parent_job_id IS NULL ORDER BY created_at DESC"),
         [],
         row_to_job,
     )
@@ -117,13 +149,15 @@ pub fn list_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
 
 /// Jobs that were mid-flight — 'running' or 'queued' or 'paused'. On app start
 /// any 'running' row is really stale (the process that ran it is gone), so the
-/// caller marks those 'paused' and offers Resume.
+/// caller marks those 'paused' and offers Resume. Wave 4a: children are excluded
+/// — they must never be pumped/resumed/quiesced independently of their parent.
 pub fn unfinished_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
     query_rows(
         conn,
         &format!(
             "SELECT {COLS} FROM jobs \
-             WHERE status IN ('running','queued','paused') ORDER BY created_at ASC"
+             WHERE status IN ('running','queued','paused') AND parent_job_id IS NULL \
+             ORDER BY created_at ASC"
         ),
         [],
         row_to_job,
@@ -185,7 +219,7 @@ mod tests {
                id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
                plan TEXT NOT NULL, state TEXT NOT NULL DEFAULT '{}',
                cursor INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0,
-               status TEXT NOT NULL DEFAULT 'queued', error TEXT,
+               status TEXT NOT NULL DEFAULT 'queued', error TEXT, parent_job_id TEXT,
                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
              );
@@ -271,6 +305,33 @@ mod tests {
                                 &serde_json::json!({ "steps": [] }), 3).unwrap();
         let m = get_job(&conn, &manual).unwrap();
         assert!(m.plan.get("auto").is_none());
+    }
+
+    #[test]
+    fn child_jobs_are_hidden_from_lists_and_the_pump() {
+        // Wave 4a [MAJOR]: a workflow's inline file_pass child must be invisible
+        // to list_jobs (no phantom sidebar card) and to unfinished_jobs (never
+        // pumped/quiesced/resumed on its own) — the parent owns its lifecycle.
+        let conn = mem();
+        let parent = create_job(&conn, "workflow", "Morning digest",
+            &serde_json::json!({}), 3).unwrap();
+        let child = create_child_job(&conn, "file_pass", "Full pass — book.pdf",
+            &serde_json::json!({}), 5, &parent).unwrap();
+        set_job_status(&conn, &parent, "running", None).unwrap();
+        set_job_status(&conn, &child, "running", None).unwrap();
+
+        let listed = list_jobs(&conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, parent);
+
+        let unfinished = unfinished_jobs(&conn).unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].id, parent);
+
+        // The child is still fetchable directly (its artifacts back the parent's
+        // pipeline node), and carries its parent pointer.
+        let c = get_job(&conn, &child).unwrap();
+        assert_eq!(c.parent_job_id.as_deref(), Some(parent.as_str()));
     }
 
     #[test]

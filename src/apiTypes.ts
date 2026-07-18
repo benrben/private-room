@@ -526,6 +526,8 @@ export interface Job {
   total: number;
   status: string;
   error: string | null;
+  /** Wave 4a: set on a workflow's inline child job (hidden from the sidebar). */
+  parentJobId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -540,4 +542,105 @@ export interface JobProgress {
   paused?: boolean;
   failed?: boolean;
   fileId?: string | null;
+}
+
+// ------------------------------------------------------------ Wave 4a: workflows
+
+/** Where a workflow surfaces. `general` = library/top bar; `file` = a file's
+ * Actions menu, run on that file. */
+export type WorkflowBinding =
+  | { scope: "general" }
+  | { scope: "file"; kinds?: string[]; exts?: string[]; file_id?: string | null };
+
+/** A saved LLM graph workflow. `definition`/`binding` are opaque JSON here. */
+export interface Workflow {
+  id: string;
+  name: string;
+  description: string;
+  emoji: string;
+  definition: WorkflowDef;
+  status: "draft" | "active";
+  createdBy: "user" | "agent";
+  binding: WorkflowBinding;
+  pinned: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The node graph. Nodes carry a `kind` discriminant plus its params. */
+export interface WorkflowDef {
+  version: number;
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+}
+
+export interface WorkflowNode {
+  id: string;
+  label?: string;
+  kind:
+    | "generate"
+    | "summarize_file"
+    | "file_pass"
+    | "agent_run"
+    | "save_file"
+    | "condition";
+  // Kind-specific params (flattened): prompt/model/select/instruction/mode/
+  // name_template/format/question/op/value. Kept loose so the param sheet edits
+  // them generically.
+  [key: string]: unknown;
+}
+
+export interface WorkflowEdge {
+  from: string;
+  to: string;
+  branch?: "then" | "else" | null;
+}
+
+export interface Schedule {
+  id: string;
+  workflowId: string;
+  kind: "interval" | "daily" | "weekly";
+  param: string;
+  enabled: boolean;
+  catchUp: boolean;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastJobId: string | null;
+}
+
+export interface ScheduleArg {
+  kind: string; // interval|daily|weekly, or "" to clear
+  param?: string;
+  enabled?: boolean;
+  catchUp?: boolean;
+}
+
+export interface WorkflowRun {
+  id: string;
+  workflowId: string;
+  jobId: string | null;
+  trigger: string;
+  status: string;
+  error: string | null;
+  inputFileId: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+export interface WorkflowTemplate {
+  name: string;
+  description: string;
+  emoji: string;
+  binding: WorkflowBinding;
+  schedule?: ScheduleArg;
+  definition: WorkflowDef;
+}
+
+/** One `workflow-node` event — a node's live status during a run. */
+export interface WorkflowNodeEvent {
+  jobId: string;
+  workflowId: string;
+  nodeId: string;
+  status: "running" | "done" | "skipped" | "error";
+  peek?: string | null;
 }

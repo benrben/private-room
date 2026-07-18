@@ -159,6 +159,17 @@ pub struct AppState {
     /// `cancel_job` flips a flag; the runner sees it between waves, checkpoints,
     /// and parks the job as 'paused'. The entry is removed when the job ends.
     pub job_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Wave 4a: the job QUEUE's single running slot. `None` = free; `Some(id)` =
+    /// that job holds the one heavy-work slot (one resident local model makes
+    /// concurrent heavy jobs strictly slower). `queue::submit`/`pump` reserve it;
+    /// each job's terminal epilogue clears it (only when it equals its own id) and
+    /// pumps the next queued row. A start-fresh process is empty (Default), and
+    /// `quiesce_stale_jobs` reconciles the DB — so a crash never strands the slot.
+    pub running_job: Mutex<Option<String>>,
+    /// Wave 4a: generation stamp for the workflow scheduler tick loop (the
+    /// backfill.rs pattern). Every room open bumps it and spawns one loop; a loop
+    /// whose stamp is stale exits, so at most one scheduler is ever live.
+    pub sched_generation: Arc<AtomicU64>,
     /// Wave 1b (idea 8): generation stamp for the debounced auto-index
     /// scheduler. Every ingest event bumps it and spawns one waiter carrying
     /// the new stamp; a waiter whose stamp is stale exits silently, so a

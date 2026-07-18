@@ -40,6 +40,9 @@ pub fn create_room(
     spawn_reextract_backfill(&app);
     spawn_embedding_backfill(&app);
     spawn_room_server_if_enabled(&app);
+    // Wave 4a: start the workflow scheduler and pump any jobs left queued.
+    spawn_workflow_scheduler(&app);
+    pump_on_open(&app);
     Ok(info)
 }
 
@@ -107,6 +110,10 @@ pub(crate) fn open_room_impl(
     spawn_embedding_backfill(app);
     // D9 (the Leash): if the user left the room server on, start it again now.
     spawn_room_server_if_enabled(app);
+    // Wave 4a: start the workflow scheduler and pump any jobs left queued from a
+    // previous session (open decision 2: auto-start at unlock).
+    spawn_workflow_scheduler(app);
+    pump_on_open(app);
     Ok(info)
 }
 

@@ -41,10 +41,17 @@ UI_TOOL_NAMES: tuple[str, ...] = (
     "view_media_frame",
 )
 
-#: The whole-file pass tools (ADD-32).
+#: The whole-file pass tools (ADD-32) plus the Wave 4a workflow authoring tools.
+#: These MUST be dropped when the jobs router does not fire (graph._filter_catalog
+#: is a drop-list) — else they'd bloat every turn's catalog and defeat the
+#: short-catalog doctrine. Kept in sync with agent.rs BUILTIN_TOOL_NAMES.
 JOB_TOOL_NAMES: tuple[str, ...] = (
     "start_file_pass",
     "job_status",
+    "list_workflows",
+    "save_workflow",
+    "update_workflow",
+    "run_workflow",
 )
 
 #: Never offered to anyone but the top-level local agent — closes the recursion
@@ -82,6 +89,9 @@ _JOB_HINTS: tuple[str, ...] = (
     "start to finish", "page by page", "chapter", "long file", "large file",
     "big file", "deep", "job", "progress", "background", "pass", "digest",
     "no matter", "don't miss", "do not miss", "line by line",
+    # Wave 4a: the workflow authoring tools ride the jobs routing flag.
+    "workflow", "automate", "automat", "every morning", "every day", "every week",
+    "each morning", "each day", "schedule", "recurring", "routine", "pipeline",
 )
 
 

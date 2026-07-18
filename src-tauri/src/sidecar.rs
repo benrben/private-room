@@ -317,6 +317,7 @@ pub enum SidecarOutcome {
 /// Run the answer through the sidecar, accumulating tool effects into `effects`.
 /// Emits the same events the native loop does.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_via_sidecar(
     window: &tauri::Window,
     state: &State<'_, AppState>,
@@ -327,6 +328,10 @@ pub async fn run_via_sidecar(
     effects: &mut ToolEffects,
     web_enabled: bool,
     cancel: Arc<AtomicBool>,
+    // Wave 4a: HEADLESS mode for a workflow agent_run node — suppress the global
+    // ask-* stream events so a background/scheduled turn never corrupts (or
+    // interleaves with) the visible chat. Ordinary chat asks pass `false`.
+    headless: bool,
 ) -> SidecarOutcome {
     use tauri::Manager;
 
@@ -390,7 +395,7 @@ pub async fn run_via_sidecar(
         "run_id": bridge.token,
     });
 
-    let streamed = stream_run(&base, &body, window, &cancel).await;
+    let streamed = stream_run(&base, &body, window, &cancel, headless).await;
     // The bridge's own record of whether a tool was dispatched to `exec_tool`.
     // This is the crash-safe source of truth: the in-stream `step` line and the
     // tool's side-effect commit travel on two independent connections, so a
@@ -443,6 +448,7 @@ async fn stream_run(
     body: &serde_json::Value,
     window: &tauri::Window,
     cancel: &Arc<AtomicBool>,
+    headless: bool,
 ) -> StreamResult {
     use futures_util::StreamExt;
     use tauri::Emitter;
@@ -526,22 +532,34 @@ async fn stream_run(
                 Err(_) => continue, // skip a malformed line rather than abort
             };
             match ev.get("t").and_then(|t| t.as_str()) {
+                // Wave 4a: headless runs (a workflow agent_run node) suppress every
+                // ask-* emit so a background turn never streams into the chat UI.
                 Some("lane") => {
-                    let _ = window.emit("ask-lane", str_v(&ev));
+                    if !headless {
+                        let _ = window.emit("ask-lane", str_v(&ev));
+                    }
                 }
                 Some("round") => {
-                    let _ = window.emit("ask-round", ());
+                    if !headless {
+                        let _ = window.emit("ask-round", ());
+                    }
                 }
                 Some("delta") => {
-                    let _ = window.emit("ask-delta", str_v(&ev));
+                    if !headless {
+                        let _ = window.emit("ask-delta", str_v(&ev));
+                    }
                 }
                 Some("step") => {
                     tool_ran = true;
-                    let _ = window.emit("ask-step", str_v(&ev));
+                    if !headless {
+                        let _ = window.emit("ask-step", str_v(&ev));
+                    }
                 }
                 Some("step_status") => {
-                    let ok = ev.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
-                    let _ = window.emit("ask-step-status", serde_json::json!({ "ok": ok }));
+                    if !headless {
+                        let ok = ev.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+                        let _ = window.emit("ask-step-status", serde_json::json!({ "ok": ok }));
+                    }
                 }
                 Some("final") => {
                     final_text = str_v(&ev).to_string();

@@ -39,6 +39,9 @@ tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt",
 futures-util = "0.3"
 base64 = "0.22"
 sha2 = "0.10"
+# Wave 4a (Idea 2): local-time schedule arithmetic (next daily/weekly run,
+# DST-aware). Already in the lock as a transitive dep, so this builds offline.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # ADD-19: recovery-key sidecar crypto (AES-256-GCM + PBKDF2). base64/sha2
 # above are reused; these three are the only new crypto deps.
 aes-gcm = "0.10"

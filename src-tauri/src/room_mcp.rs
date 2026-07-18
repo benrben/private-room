@@ -475,6 +475,11 @@ fn scoped_specs(web_enabled: bool, scope: ToolScope) -> Vec<serde_json::Value> {
     }
     if scope.include_job_tools() {
         extras.extend(commands::job_tools_specs());
+        // Wave 4a: the workflow authoring tools share the job tools' trust class
+        // (LocalEngine + ExternalAgent). save/update only produce drafts a human
+        // must activate, and run_workflow is the same compute class as
+        // start_file_pass, which the external tier already grants.
+        extras.extend(commands::workflow_tools_specs());
     }
     if scope.include_external_tools() {
         extras.extend(commands::external_agent_tools_specs());
@@ -750,6 +755,18 @@ mod tests {
             assert!(local.iter().any(|t| t["name"] == name), "{name} missing from local tier");
         }
         assert!(!local.iter().any(|t| t["name"] == "local_generate"));
+
+        // Wave 4a: the workflow authoring tools ride the job-tools trust class —
+        // served to LocalEngine and ExternalAgent, NEVER to a cloud advisor.
+        let wf_names = ["list_workflows", "save_workflow", "update_workflow", "run_workflow"];
+        for name in wf_names {
+            assert!(local.iter().any(|t| t["name"] == name), "{name} missing from local tier");
+            assert!(ext.iter().any(|t| t["name"] == name), "{name} missing from external tier");
+        }
+        let cloud = scoped_specs(false, ToolScope::CloudAdvisor { include_mcp: true });
+        for name in wf_names {
+            assert!(!cloud.iter().any(|t| t["name"] == name), "{name} leaked to cloud");
+        }
     }
 
     #[tokio::test]

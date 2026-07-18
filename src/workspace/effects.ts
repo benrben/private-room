@@ -39,6 +39,9 @@ export function useWorkspaceEffects(
       .catch(() => {});
     api.listChatCommands().then(s.setCommands).catch(() => {});
     void a.loadAiActions();
+    // Wave 4a: load the room's workflows once — one source of truth for the
+    // page, the top-bar pins, and the file-header Actions menu.
+    void a.refreshWorkflows();
     a.refreshAi();
     a.loadFrontPage(true);
     api.warmModel().catch(() => {});
@@ -128,6 +131,17 @@ export function useWorkspaceEffects(
           [p.jobId]: { label: p.label, done: p.done, total: p.total },
         }));
       }
+    });
+    // Wave 4a: per-node run status feeds the pipeline animation; a save/update/
+    // delete refreshes the library (esp. an agent-authored draft appearing).
+    const unlistenWfNode = api.onWorkflowNode((e) => {
+      s.setWfNodeStatus((m) => ({
+        ...m,
+        [e.jobId]: { ...(m[e.jobId] ?? {}), [e.nodeId]: e },
+      }));
+    });
+    const unlistenWfChanged = api.onWorkflowsChanged(() => {
+      void a.refreshWorkflows();
     });
     const unlistenPull = listen<{ status: string; percent: number | null }>(
       "pull-progress",
@@ -351,6 +365,8 @@ export function useWorkspaceEffects(
       unlistenStudioStep.then((fn) => fn());
       unlistenImport.then((fn) => fn());
       unlistenJobs.then((fn) => fn());
+      unlistenWfNode.then((fn) => fn());
+      unlistenWfChanged.then((fn) => fn());
       unlistenPull.then((fn) => fn());
       unlistenDrop.then((fn) => fn());
       unlistenOpen.then((fn) => fn());
@@ -475,6 +491,12 @@ export function useWorkspaceEffects(
           s.setShowMap(false);
           return;
         }
+        // Wave 4a: Escape closes the full-pane Workflows view.
+        if (s.showWorkflowsRef.current) {
+          e.preventDefault();
+          s.setShowWorkflows(false);
+          return;
+        }
         const t = e.target as HTMLElement | null;
         const typing =
           t != null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
@@ -499,6 +521,10 @@ export function useWorkspaceEffects(
       } else if (k === ",") {
         e.preventDefault();
         s.setShowSettings(true);
+      } else if (k === "j") {
+        // Wave 4a: toggle the top-bar pinned-workflows menu (no-op if none).
+        e.preventDefault();
+        s.setQaMenuOpen((o) => !o);
       }
     }
     window.addEventListener("keydown", onKey);

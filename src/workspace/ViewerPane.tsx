@@ -18,6 +18,8 @@ import ViewerRouter from "./ViewerRouter";
 import FrontPage from "./FrontPage";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import { WorkflowsPage } from "./workflows/WorkflowsPage";
+import { QuickActionsMenu, bindingMatches, QuickAction } from "./QuickActions";
 
 /** True when a media transcript carries real speech — at least one timestamped
  * "[m:ss] …" row with words. The "(transcribed from recording)" provenance line
@@ -49,7 +51,9 @@ export default function ViewerPane({
       : null;
   return (
     <section className="viewer" aria-label="Workspace">
-      {s.showMap ? (
+      {s.showWorkflows ? (
+        <WorkflowsPage s={s} a={a} />
+      ) : s.showMap ? (
         <>
           <div className="viewer-head">
             <span className="viewer-title">Room map</span>
@@ -202,6 +206,37 @@ export default function ViewerPane({
                     <SparkIcon size={13} /> Minutes
                   </button>
                 )}
+              {(() => {
+                // Wave 4a shortcuts: file-scoped ACTIVE workflows matching this
+                // file, run on the open file with one click.
+                const fileActions: QuickAction[] = s.workflows
+                  .filter(
+                    (w) =>
+                      w.status === "active" &&
+                      bindingMatches(
+                        w.binding,
+                        openFile.content.kind,
+                        openFile.content.name,
+                        openFile.id,
+                      ),
+                  )
+                  .map((w) => ({
+                    id: w.id,
+                    label: w.name,
+                    icon: w.emoji || "⚙️",
+                    onRun: () =>
+                      void a.runWorkflowOn(w.id, openFile.id, openFile.content.name),
+                  }));
+                return (
+                  <QuickActionsMenu
+                    actions={fileActions}
+                    open={s.qaFileMenuOpen ?? false}
+                    onOpenChange={(o) => s.setQaFileMenuOpen(o)}
+                    buttonLabel="Actions"
+                    buttonIcon={<SparkIcon size={13} />}
+                  />
+                );
+              })()}
               <button
                 className="subtle btn-ic"
                 title="Export a normal copy out of the room"
