@@ -124,21 +124,14 @@ async def test_map_merge_mode_builds_notes_prompt_and_artifact(monkeypatch: pyte
 async def test_calls_pass_an_output_cap_to_stop_runaway_generation(monkeypatch: pytest.MonkeyPatch) -> None:
     # Every pass model call sets num_predict so a degenerate loop can't fill the
     # whole num_ctx window (~72 min on a 4B). Map uses the small notes cap; the
-    # doc-level steps (merge/compose/section) use the larger one.
+    # doc-level step (section) uses the larger one.
     fake = set_replies(monkeypatch,
                        json.dumps({"notes": "n", "thread": "t"}),   # map
-                       json.dumps({"notes": "m"}),                   # merge
-                       json.dumps({"html": "<p>c</p>"}),             # compose
                        json.dumps({"html": "<p>s</p>"}))             # section
     await file_pass.run_map(model="m", base_url="http://h:1", mode="merge", file_name="f",
                             instruction="i", part=0, total=1, start=0, end=10, text_len=10,
                             thread="", window_text="w")
     assert fake.calls[-1]["num_predict"] == file_pass.PASS_MAP_PREDICT
-    await file_pass.run_merge(model="m", base_url="http://h:1", instruction="g", sections=["s"])
-    assert fake.calls[-1]["num_predict"] == file_pass.PASS_DOC_PREDICT
-    await file_pass.run_compose(model="m", base_url="http://h:1", instruction="g", file_name="f",
-                                text_len=10, total=1, notes="notes")
-    assert fake.calls[-1]["num_predict"] == file_pass.PASS_DOC_PREDICT
     await file_pass.run_section(model="m", base_url="http://h:1", instruction="g", file_name="f",
                                 section=0, total=1, sections=["s"])
     assert fake.calls[-1]["num_predict"] == file_pass.PASS_DOC_PREDICT
@@ -237,69 +230,6 @@ async def test_map_transient_engine_error_retries(monkeypatch: pytest.MonkeyPatc
     assert len(fake.calls) == 2
 
 
-# --- merge ------------------------------------------------------------------
-
-
-async def test_merge_empty_sections_skips_without_a_model_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = set_replies(monkeypatch, RuntimeError("must not be called"))
-    art = await file_pass.run_merge(model="m", base_url="http://h:1", instruction="i", sections=[])
-    assert art == {"result": "", "thread": "", "skipped": True}
-    assert fake.calls == []
-
-
-async def test_merge_combines_and_notes_the_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = set_replies(monkeypatch, json.dumps({"notes": "combined"}))
-    art = await file_pass.run_merge(
-        model="m", base_url="http://h:1", instruction="the goal",
-        sections=["first section", "second section"], missing=2,
-    )
-    assert art == {"result": "combined", "thread": "", "skipped": False}
-    user = fake.user_of()
-    assert user.startswith("Goal: the goal\n\n")
-    assert "(2 section(s) were unreadable and are absent.)" in user
-    assert "--- Section 1 ---\nfirst section" in user
-    assert "--- Section 2 ---\nsecond section" in user
-    assert fake.system_of() == file_pass.MERGE_SYSTEM
-
-
-async def test_merge_no_missing_line_when_zero(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = set_replies(monkeypatch, json.dumps({"notes": "c"}))
-    await file_pass.run_merge(model="m", base_url="http://h:1", instruction="g", sections=["a"], missing=0)
-    assert "were unreadable" not in fake.user_of()
-
-
-async def test_merge_double_failure_falls_back_to_verbatim_concat(monkeypatch: pytest.MonkeyPatch) -> None:
-    set_replies(monkeypatch, "nope", "nope")
-    art = await file_pass.run_merge(
-        model="m", base_url="http://h:1", instruction="g", sections=["alpha", "beta"],
-    )
-    # verbatim join, NOT skipped — nothing already read is lost to a bad fold
-    assert art == {"result": "alpha\n\nbeta", "thread": "", "skipped": False}
-
-
-async def test_merge_empty_reply_falls_back_to_verbatim_concat(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A VALID reply whose notes are empty (a small model can return {"notes": ""}
-    # when folding a large group) must NOT emit an empty result — that would
-    # silently drop the whole fold. Fall back to the verbatim concat, like a
-    # double failure does. One reply, no retry (it parsed fine).
-    fake = set_replies(monkeypatch, json.dumps({"notes": "   "}))
-    art = await file_pass.run_merge(
-        model="m", base_url="http://h:1", instruction="g", sections=["alpha", "beta"],
-    )
-    assert art == {"result": "alpha\n\nbeta", "thread": "", "skipped": False}
-    assert len(fake.calls) == 1
-
-
-async def test_compose_empty_reply_publishes_raw_notes(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A valid-but-empty compose reply publishes the merged notes, never an empty doc.
-    set_replies(monkeypatch, json.dumps({"html": ""}))
-    art = await file_pass.run_compose(
-        model="m", base_url="http://h:1", instruction="g", file_name="f",
-        text_len=10, total=1, notes="the merged notes",
-    )
-    assert art == {"result": "the merged notes", "thread": "", "skipped": False}
-
-
 async def test_map_empty_reply_skips_and_keeps_incoming_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     # A valid-but-empty map reply marks the window skipped (honest coverage) and
     # keeps the INCOMING thread flowing, exactly like a double parse failure.
@@ -310,61 +240,6 @@ async def test_map_empty_reply_skips_and_keeps_incoming_thread(monkeypatch: pyte
     )
     assert art == {"result": "", "thread": "carried", "skipped": True}
     assert len(fake.calls) == 1  # parsed fine, no retry
-
-
-async def test_merge_result_is_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The merge cap is the context-scaled ceiling (not the old fixed 8 KB), so a
-    # reply larger than it is clamped to exactly the ceiling for this RAM tier.
-    cap = file_pass._merge_ceiling()
-    assert cap >= file_pass.PASS_MERGE_FLOOR
-    set_replies(monkeypatch, json.dumps({"notes": "m" * (cap + 5000)}))
-    art = await file_pass.run_merge(model="m", base_url="http://h:1", instruction="g", sections=["s"])
-    assert len(art["result"].encode("utf-8")) == cap
-
-
-async def test_merge_fatal_error_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
-    set_replies(monkeypatch, llm.LlmError("MODEL_MISSING", "model 'x' not found"))
-    with pytest.raises(llm.LlmError) as ei:
-        await file_pass.run_merge(model="m", base_url="http://h:1", instruction="g", sections=["s"])
-    assert ei.value.code == "MODEL_MISSING"
-
-
-# --- compose ----------------------------------------------------------------
-
-
-async def test_compose_builds_html_prompt_and_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = set_replies(monkeypatch, json.dumps({"html": "  <h2>Title</h2><p>Body</p>  "}))
-    art = await file_pass.run_compose(
-        model="m", base_url="http://h:1", instruction="the goal",
-        file_name="book.txt", text_len=40000, total=3, notes="all the notes",
-    )
-    assert art == {"result": "<h2>Title</h2><p>Body</p>", "thread": "", "skipped": False}
-    user = fake.user_of()
-    assert user.startswith("Goal: the goal\n")
-    assert "File: book.txt (40000 characters, read completely in 3 parts)." in user
-    assert "Complete notes covering the ENTIRE file, in the file's own order:\nall the notes" in user
-    assert "clean, simple HTML body markup" in user
-    assert fake.system_of() == file_pass.COMPOSE_SYSTEM
-    assert fake.calls[0]["format"]["required"] == ["html"]
-
-
-async def test_compose_double_failure_publishes_raw_notes(monkeypatch: pytest.MonkeyPatch) -> None:
-    set_replies(monkeypatch, "not html json", "still not")
-    art = await file_pass.run_compose(
-        model="m", base_url="http://h:1", instruction="g", file_name="f",
-        text_len=10, total=1, notes="the raw merged notes",
-    )
-    # the reading work is preserved: publish the raw notes rather than nothing
-    assert art == {"result": "the raw merged notes", "thread": "", "skipped": False}
-
-
-async def test_compose_result_is_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
-    set_replies(monkeypatch, json.dumps({"html": "h" * 200000}))
-    art = await file_pass.run_compose(
-        model="m", base_url="http://h:1", instruction="g", file_name="f",
-        text_len=10, total=1, notes="notes",
-    )
-    assert len(art["result"].encode("utf-8")) == file_pass.PASS_COMPOSE_MAX
 
 
 # --- section (sectioned compose) --------------------------------------------
@@ -468,43 +343,6 @@ async def test_route_file_pass_map_fatal_is_502_with_code(monkeypatch: pytest.Mo
     assert resp.json()["code"] == "OLLAMA_DOWN"
 
 
-async def test_route_file_pass_merge_returns_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
-    set_replies(monkeypatch, json.dumps({"notes": "combined"}))
-    app = create_app()
-    async with client_for(app) as c:
-        resp = await c.post(
-            "/file_pass_merge",
-            json={"model": "m", "base_url": "http://h:1", "instruction": "g",
-                  "sections": ["a", "b"], "missing": 0},
-        )
-    assert resp.status_code == 200
-    assert resp.json() == {"result": "combined", "thread": "", "skipped": False}
-
-
-async def test_route_file_pass_merge_empty_sections(monkeypatch: pytest.MonkeyPatch) -> None:
-    set_replies(monkeypatch, RuntimeError("must not be called"))
-    app = create_app()
-    async with client_for(app) as c:
-        resp = await c.post(
-            "/file_pass_merge",
-            json={"model": "m", "base_url": "http://h:1", "instruction": "g", "sections": []},
-        )
-    assert resp.json() == {"result": "", "thread": "", "skipped": True}
-
-
-async def test_route_file_pass_compose_returns_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
-    set_replies(monkeypatch, json.dumps({"html": "<p>done</p>"}))
-    app = create_app()
-    async with client_for(app) as c:
-        resp = await c.post(
-            "/file_pass_compose",
-            json={"model": "m", "base_url": "http://h:1", "instruction": "g",
-                  "file_name": "f", "text_len": 10, "total": 1, "notes": "notes"},
-        )
-    assert resp.status_code == 200
-    assert resp.json() == {"result": "<p>done</p>", "thread": "", "skipped": False}
-
-
 async def test_route_file_pass_section_returns_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
     set_replies(monkeypatch, json.dumps({"html": "<h2>Ch 1</h2><p>ok</p>"}))
     app = create_app()
@@ -527,19 +365,6 @@ async def test_route_file_pass_section_fatal_is_502(monkeypatch: pytest.MonkeyPa
             "/file_pass_section",
             json={"model": "m", "base_url": "http://h:1", "instruction": "g",
                   "file_name": "f", "section": 0, "total": 1, "sections": ["s"]},
-        )
-    assert resp.status_code == 502
-    assert resp.json()["code"] == "MODEL_MISSING"
-
-
-async def test_route_file_pass_compose_fatal_is_502(monkeypatch: pytest.MonkeyPatch) -> None:
-    set_replies(monkeypatch, llm.LlmError("MODEL_MISSING", "not found"))
-    app = create_app()
-    async with client_for(app) as c:
-        resp = await c.post(
-            "/file_pass_compose",
-            json={"model": "m", "base_url": "http://h:1", "instruction": "g",
-                  "file_name": "f", "text_len": 10, "total": 1, "notes": "notes"},
         )
     assert resp.status_code == 502
     assert resp.json()["code"] == "MODEL_MISSING"

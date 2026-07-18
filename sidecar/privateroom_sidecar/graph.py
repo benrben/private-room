@@ -15,7 +15,9 @@ and each one exists because the naive version misbehaved on a 4B local model:
   side-effect call whose result nobody ever reads, and the user gets no answer.
   A tool-less round forces a text answer grounded in the results already in hand.
 * **Only SUCCESSFUL calls are memoised.** A failed call is not in ``seen``, so
-  the model may retry it once — transient failures shouldn't be permanent.
+  the model may re-attempt it in a LATER round — transient failures shouldn't be
+  permanent. This is NOT a hard "one retry" cap: a call that keeps failing can be
+  re-attempted once per round, bounded only by the round budget, until synthesis.
 * **An all-duplicate round forces synthesis.** If every call this round was an
   exact repeat, the model is looping; spending the remaining budget on repeats
   helps nobody, so the next round is the tool-less one.
@@ -295,7 +297,8 @@ async def execute_tools(state: AgentState, config: RunnableConfig) -> dict[str, 
         await deps.emit({"t": "step_status", "ok": ok})
 
         if ok:
-            # Only remember successful calls, so a failed one may retry once.
+            # Only remember successful calls, so a failed one may be re-attempted
+            # in a later round (bounded by the round budget, not a single-retry cap).
             seen.add(key)
             result = outcome.text
         else:

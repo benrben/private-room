@@ -80,6 +80,8 @@ class McpClient:
         self._client = client
         self._owns_client = client is None
         self._ids = itertools.count(1)
+        #: whether the MCP lifecycle handshake (initialize + initialized) has run.
+        self._initialized = False
 
     async def __aenter__(self) -> McpClient:
         return self
@@ -149,7 +151,28 @@ class McpClient:
             },
         )
         await self.notify("notifications/initialized")
+        self._initialized = True
         return result if isinstance(result, dict) else {}
+
+    async def ensure_ready(self) -> None:
+        """Run the MCP lifecycle handshake once, before any tool traffic.
+
+        The room's own Leash is lenient and serves tools without it, but a
+        stricter third-party MCP server rejects ``tools/list`` / ``tools/call``
+        until the client has sent ``initialize`` followed by the
+        ``notifications/initialized`` notification (MCP lifecycle). Best-effort
+        and idempotent: a server that does not implement ``initialize`` must not
+        have its connection torn down over the handshake — swallow that failure
+        and let the actual tool call surface any genuine transport/auth error.
+        """
+        if self._initialized:
+            return
+        try:
+            await self.initialize()
+        except McpError:
+            # Don't re-handshake on every call; a real failure resurfaces on the
+            # actual tools/* request the caller is about to make.
+            self._initialized = True
 
     async def ping(self) -> None:
         await self._rpc("ping")
@@ -161,6 +184,7 @@ class McpClient:
         ``consult_advisor`` must never appear — if it ever does, drop it, so the
         recursion path stays closed even if the host regresses.
         """
+        await self.ensure_ready()
         result = await self._rpc("tools/list")
         raw = result.get("tools", []) if isinstance(result, dict) else []
         tools: list[ToolSpec] = []
@@ -187,6 +211,7 @@ class McpClient:
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         """Run one tool. A tool failure arrives as ``isError: true``, not an exception."""
         try:
+            await self.ensure_ready()
             result = await self._rpc("tools/call", {"name": name, "arguments": arguments})
         except McpError as exc:
             # Unknown tool / transport death: surface it to the model the same way

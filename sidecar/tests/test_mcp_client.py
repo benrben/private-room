@@ -228,3 +228,19 @@ async def test_call_ids_increment() -> None:
         await mcp.ping()
     ids = [b["id"] for b in http.seen]  # type: ignore[attr-defined]
     assert ids == [1, 2]
+
+
+async def test_handshake_precedes_tool_traffic_and_runs_once() -> None:
+    # The MCP lifecycle handshake (initialize + notifications/initialized) is run
+    # automatically before the first tools/* call — a stricter third-party server
+    # rejects tool traffic until it has — and exactly once per connection.
+    http = bridge()
+    async with McpClient(URL, TOKEN, client=http) as mcp:
+        await mcp.list_tools()
+        await mcp.call_tool("search_room", {"query": "rent"})
+    methods = [b.get("method") for b in http.seen]  # type: ignore[attr-defined]
+    assert methods[0] == "initialize"
+    assert methods[1] == "notifications/initialized"
+    assert methods.count("initialize") == 1
+    assert methods.index("initialize") < methods.index("tools/list")
+    assert methods.index("notifications/initialized") < methods.index("tools/call")

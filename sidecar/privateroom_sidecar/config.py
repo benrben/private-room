@@ -32,9 +32,6 @@ KEEP_ALIVE_SHORT: str = "2m"
 NUM_CTX_LOW: int = 12288
 NUM_CTX_HIGH: int = 24576
 
-#: Backwards-compatible alias for the low/minimum window.
-NUM_CTX: int = NUM_CTX_LOW
-
 #: ollama.rs:224-231 ``num_ctx_for(has_tools=false, Chat)`` — the SMALLER no-tools
 #: Chat window. The chat_commands one-shot calls (``ask_structured`` / ``ask_quiet``
 #: in chat_commands.rs) allocate this tier, not the tools-tier window above.
@@ -370,7 +367,6 @@ __all__ = [
     "PLAIN_MAX_ROUNDS",
     "KEEP_ALIVE_WARM",
     "KEEP_ALIVE_SHORT",
-    "NUM_CTX",
     "NUM_CTX_LOW",
     "NUM_CTX_HIGH",
     "NUM_CTX_NOTOOLS_LOW",

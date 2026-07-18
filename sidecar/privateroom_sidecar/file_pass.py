@@ -88,25 +88,6 @@ PASS_MAP_PREDICT: int = 2_048
 PASS_DOC_PREDICT: int = 8_192
 
 
-def _merge_ceiling() -> int:
-    """Byte cap for a merged notes section, scaled to the Job context window.
-
-    The old fixed 8 KB cap funneled an ENTIRE file down to 8 KB before compose
-    ever saw it: a merge re-clamped to 8 KB at every level, so a 55-part book and
-    a 6-part memo both reached compose as ~8 KB — losing most sections and their
-    order, and forcing the model to confabulate across the gaps. The Job tier
-    already runs each call at 65 K–131 K tokens (:func:`num_ctx_for_job`), of
-    which 8 KB is ~3 %.
-
-    A merge folds up to ``PASS_MERGE_GROUP`` siblings, so the NEXT fold's input is
-    ``GROUP × ceiling``. Sizing the ceiling at ≈75 % of the context ÷ (GROUP + 1)
-    (≈3 bytes/token, conservative) keeps that fold's gathered input *plus* its own
-    generated output inside the window, while letting a big file's notes reach
-    compose at tens of KB instead of 8 KB.
-    """
-    ctx_bytes = num_ctx_for_job() * 3
-    return max(PASS_MERGE_FLOOR, (ctx_bytes * 3 // 4) // (PASS_MERGE_GROUP + 1))
-
 # --- exact prompts (file_pass.rs execute_pass_step) ------------------------
 MAP_SYSTEM_STITCH: str = (
     "You transform one long file part by part, in order, following the instruction "
@@ -122,8 +103,6 @@ MAP_SYSTEM_MERGE: str = (
     "serving the stated goal. Also keep a short running thread that connects the "
     "parts (where the text is going, open questions, running totals)."
 )
-MERGE_SYSTEM: str = "You merge sequential note sections into one, losslessly and faithfully."
-COMPOSE_SYSTEM: str = "You write the final document for a completed whole-file reading job."
 SECTION_SYSTEM: str = (
     "You write ONE ordered section of the final document for a whole-file reading job. "
     "The sections are concatenated in order afterward, so cover exactly the material in "
@@ -337,116 +316,6 @@ async def run_map(
     }
 
 
-async def run_merge(
-    *,
-    model: str,
-    base_url: str,
-    instruction: str,
-    sections: list[str],
-    missing: int = 0,
-    keep_alive: str = KEEP_ALIVE_WARM,
-) -> dict[str, Any]:
-    """Fold sibling note ``sections`` (already loaded, in order) into one.
-
-    ``sections`` is the Rust-gathered set of non-skipped, non-empty inputs;
-    ``missing`` counts the inputs that were unreadable. Empty ``sections`` → a
-    skipped artifact with no model call (file_pass.rs ``if sections.is_empty()``).
-    A double model failure falls back to the verbatim concatenation so nothing
-    already read is ever lost to a bad fold.
-    """
-    if not sections:
-        return {"result": "", "thread": "", "skipped": True}
-    cap = _merge_ceiling()
-    user = (
-        f"Goal: {instruction}\n\n"
-        "These are consecutive sections of notes taken over one long file, in "
-        "order. Combine them into ONE continuous set of notes, keeping them in "
-        "this SAME order — do not reorder, regroup by theme, or summarise the "
-        "detail away. This is a lossless fold, not a summary: preserve every "
-        "important specific (numbers, names, dates, obligations, the sequence of "
-        "events) and any chapter or section headings the notes carry. Remove only "
-        "literal repetition. Never invent anything or add facts not in the sections.\n"
-    )
-    if missing > 0:
-        user += f"({missing} section(s) were unreadable and are absent.)\n"
-    for k, s in enumerate(sections):
-        user += f"\n--- Section {k + 1} ---\n{s}\n"
-    schema = {
-        "type": "object",
-        "properties": {"notes": {"type": "string"}},
-        "required": ["notes"],
-    }
-    messages = [system_message(MERGE_SYSTEM), user_message(user)]
-    parsed = await _structured_call(model, messages, schema, base_url, keep_alive=keep_alive)
-    notes = "" if parsed is _SKIP else _field(parsed, "notes").strip()
-    if not notes:
-        # _SKIP (double failure) OR a valid-but-EMPTY reply — a small model can
-        # return {"notes": ""} when asked to fold a large group (the fold whose
-        # gathered sections are big). NEVER emit empty when there was input: fall
-        # back to the verbatim concatenation so no section already read is lost to
-        # one bad fold. (Ordered concat, then clamped to the ceiling.)
-        return {
-            "result": clamp_bytes("\n\n".join(sections), cap),
-            "thread": "",
-            "skipped": False,
-        }
-    return {
-        "result": clamp_bytes(notes, cap),
-        "thread": "",
-        "skipped": False,
-    }
-
-
-async def run_compose(
-    *,
-    model: str,
-    base_url: str,
-    instruction: str,
-    file_name: str,
-    text_len: int,
-    total: int,
-    notes: str,
-    keep_alive: str = KEEP_ALIVE_WARM,
-) -> dict[str, Any]:
-    """Write the final HTML deliverable from the merged ``notes``.
-
-    Rust guards ``notes.trim().is_empty()`` BEFORE calling this (that empty-notes
-    condition is a DB-gathered precondition and its own Rust error surface —
-    "the pass produced no readable notes to compose from" — so it stays on the Rust
-    side). A double model failure publishes the raw notes rather than nothing —
-    the reading work is preserved either way.
-    """
-    user = (
-        f"Goal: {instruction}\n"
-        f"File: {file_name} ({text_len} characters, read completely in {total} parts).\n\n"
-        f"Complete notes covering the ENTIRE file, in the file's own order:\n{notes}\n\n"
-        "Produce the final deliverable for the goal as clean, simple HTML body markup "
-        "(<h2>, <p>, <ul>, <table> — no <html> or <head>). Work through the notes from "
-        "beginning to end in the order given — do not reorder or skip material. Cover "
-        "every part: if the goal asks for per-chapter or per-section treatment, produce "
-        "one section per chapter/section in the order they appear and omit none, and "
-        "never merge distinct chapters together. Be thorough and specific — the reader "
-        "has not seen the file — but use ONLY what the notes contain; never invent facts."
-    )
-    schema = {
-        "type": "object",
-        "properties": {"html": {"type": "string"}},
-        "required": ["html"],
-    }
-    messages = [system_message(COMPOSE_SYSTEM), user_message(user)]
-    parsed = await _structured_call(model, messages, schema, base_url, keep_alive=keep_alive)
-    html = "" if parsed is _SKIP else _field(parsed, "html").strip()
-    if not html:
-        # Composing failed (_SKIP) OR returned an empty document: publish the raw
-        # merged notes rather than nothing — the reading work is preserved either way.
-        return {"result": notes, "thread": "", "skipped": False}
-    return {
-        "result": clamp_bytes(html, PASS_COMPOSE_MAX),
-        "thread": "",
-        "skipped": False,
-    }
-
-
 async def run_section(
     *,
     model: str,
@@ -464,11 +333,11 @@ async def run_section(
 
     ``sections`` are the group's non-skipped map notes, in order (Rust-gathered);
     ``missing`` counts the windows in the group that were unreadable. Publishing
-    concatenates every section's HTML in order, so — unlike the single global
-    ``run_compose`` — no one model call must hold the whole file's notes: a call
-    that only ever sees a handful of windows stays well inside a small model's
-    reach, which is what keeps big files complete instead of collapsing in the
-    fold. Empty ``sections`` → a skipped artifact with no model call. A double
+    concatenates every section's HTML in order, so no one model call must hold the
+    whole file's notes: a call that only ever sees a handful of windows stays well
+    inside a small model's reach, which is what keeps big files complete instead of
+    collapsing in a single global fold. Empty ``sections`` → a skipped artifact
+    with no model call. A double
     failure OR an empty reply falls back to the group's raw notes so the reading
     is never lost.
     """
@@ -536,34 +405,6 @@ class FilePassMapRequest(BaseModel):
     keep_alive: str = KEEP_ALIVE_WARM
 
 
-class FilePassMergeRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    model: str
-    base_url: str = "http://127.0.0.1:11434"
-    instruction: str = ""
-    #: the non-skipped, non-empty sibling note sections, in order (Rust-gathered).
-    sections: list[str] = Field(default_factory=list)
-    #: count of inputs that were unreadable/absent (drives the "N section(s)…" line).
-    missing: int = 0
-    keep_alive: str = KEEP_ALIVE_WARM
-
-
-class FilePassComposeRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    model: str
-    base_url: str = "http://127.0.0.1:11434"
-    instruction: str = ""
-    file_name: str = ""
-    text_len: int = 0
-    total: int = 1
-    #: the merged notes (the single input artifact's result); Rust guarantees it is
-    #: non-empty before calling (its own "no readable notes" error surface).
-    notes: str = ""
-    keep_alive: str = KEEP_ALIVE_WARM
-
-
 class FilePassSectionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -593,19 +434,13 @@ __all__ = [
     "PASS_DOC_PREDICT",
     "MAP_SYSTEM_STITCH",
     "MAP_SYSTEM_MERGE",
-    "MERGE_SYSTEM",
-    "COMPOSE_SYSTEM",
     "SECTION_SYSTEM",
     "clamp_bytes",
     "strip_think_spans",
     "recover_json",
     "run_map",
-    "run_merge",
-    "run_compose",
     "run_section",
     "num_ctx_for_job",
     "FilePassMapRequest",
-    "FilePassMergeRequest",
-    "FilePassComposeRequest",
     "FilePassSectionRequest",
 ]

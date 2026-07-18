@@ -394,10 +394,17 @@ async def test_live_seam_single_tool_run():
     assert tc["arguments"] == {"query": "pets"}
     assert tc["auth"] == f"Bearer {token}"
 
-    # (f) The bridge saw tools/list before tools/call, both bearer-authed; the run
-    #     path uses exactly those two JSON-RPC methods (no initialize in-run).
+    # (f) The bridge saw the MCP lifecycle handshake (initialize + its
+    #     notifications/initialized notification) BEFORE the first tools/* call,
+    #     then tools/list before tools/call — all bearer-authed. The handshake is
+    #     what lets a stricter third-party MCP server accept the subsequent calls.
     methods = [r["method"] for r in bridge_state.rpc]
-    assert methods == ["tools/list", "tools/call"], methods
+    assert methods == [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "tools/call",
+    ], methods
     assert all(r["auth"] == f"Bearer {token}" for r in bridge_state.rpc)
 
     # (g) The model was called exactly twice (two rounds) and its second request
@@ -488,8 +495,9 @@ async def test_health_endpoint():
 
 # --------------------------------------------------------------------------- #
 # Test 4 — the real McpClient against the faithful bridge: bearer auth +
-# notification (no-id) -> 202. Exercises the wire directly (the run path uses
-# only tools/list + tools/call, so initialize/notify are covered here).
+# notification (no-id) -> 202. Exercises the initialize/ping/notify wire directly
+# (the run path now runs the initialize handshake before tool traffic too; see
+# Test 1 assertion (f)).
 # --------------------------------------------------------------------------- #
 
 

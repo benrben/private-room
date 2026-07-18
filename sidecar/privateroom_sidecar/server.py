@@ -20,7 +20,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import __version__, ai_actions, chat_docs, features, file_pass, llm, studios, vision
+from . import __version__, ai_actions, chat_docs, features, file_pass, llm, vision
 from . import summarize as summarize_feature
 from .chat import ChatModel, OllamaChatModel
 from .config import (
@@ -299,22 +299,6 @@ def create_app(
             return exc.response()
         return {"boxes": boxes}
 
-    @app.post("/studio")
-    async def studio(req: studios.StudioRequest) -> Any:
-        # studios.rs run_studio: author one self-contained interactive HTML page,
-        # and ONLY if that isn't usable HTML, extract structured data and render
-        # the built-in template. Returns {html, data}. An engine failure surfaces
-        # as 502 {error, code} like /generate (Rust rebuilds OLLAMA_DOWN /
-        # MODEL_MISSING:<model>); an unusable fallback surfaces as 422
-        # {error, code: STUDIO_EMPTY}, the verbatim "try a different file" toast.
-        try:
-            result = await studios.run_studio(req, llm.generate)
-        except studios.StudioEmpty as exc:
-            return exc.response()
-        except llm.LlmError as exc:
-            return exc.response()
-        return {"html": result.html, "data": result.data}
-
     @app.post("/knowledge_extract")
     async def knowledge_extract(req: KnowledgeExtractRequest) -> Any:
         # knowledge.rs cmd_extract (mode="fields") / cmd_add_file "for each"
@@ -397,36 +381,6 @@ def create_app(
                 text_len=req.text_len,
                 thread=req.thread,
                 window_text=req.window_text,
-                keep_alive=req.keep_alive,
-            )
-        except llm.LlmError as exc:
-            return exc.response()
-
-    @app.post("/file_pass_merge")
-    async def file_pass_merge(req: file_pass.FilePassMergeRequest) -> Any:
-        try:
-            return await file_pass.run_merge(
-                model=req.model,
-                base_url=req.base_url,
-                instruction=req.instruction,
-                sections=req.sections,
-                missing=req.missing,
-                keep_alive=req.keep_alive,
-            )
-        except llm.LlmError as exc:
-            return exc.response()
-
-    @app.post("/file_pass_compose")
-    async def file_pass_compose(req: file_pass.FilePassComposeRequest) -> Any:
-        try:
-            return await file_pass.run_compose(
-                model=req.model,
-                base_url=req.base_url,
-                instruction=req.instruction,
-                file_name=req.file_name,
-                text_len=req.text_len,
-                total=req.total,
-                notes=req.notes,
                 keep_alive=req.keep_alive,
             )
         except llm.LlmError as exc:
