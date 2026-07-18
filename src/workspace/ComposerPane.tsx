@@ -299,7 +299,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               <button
                 className="send-btn"
                 title="Send ⏎"
-                onClick={a.send}
+                onClick={() => void a.send()}
                 disabled={!s.question.trim()}
               >
                 <SendIcon size={16} />

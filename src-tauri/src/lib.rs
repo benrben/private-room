@@ -11,6 +11,7 @@ mod room_mcp;
 mod sidecar;
 mod sidecar_lifecycle;
 pub(crate) mod snapshot;
+pub mod speech;
 pub mod stt;
 pub mod web;
 
@@ -216,6 +217,9 @@ pub fn run() {
             commands::start_deep_summary,
             // ADD-32: whole-file pass — exhaustive windowed reading of one file.
             commands::start_file_pass,
+            // Idea 3: supernatural voice — on-device speech synthesis.
+            commands::speak_text,
+            commands::list_speech_voices,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

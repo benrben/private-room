@@ -100,6 +100,17 @@ objc2-web-kit = { version = "0.3", features = [
     "WKWebView",
     "block2",
 ] }
+# Idea 3: on-device speech synthesis (AVSpeechSynthesizer write-to-buffer —
+# no temp files, pitchMultiplier only exists in the API, not in `say`).
+# "AVAudioTypes" is required explicitly: AVAudioPCMBuffer::frameLength is
+# gated on it and nothing enables it transitively.
+objc2-avf-audio = { version = "0.3", features = [
+    "AVSpeechSynthesis",
+    "AVAudioBuffer",
+    "AVAudioFormat",
+    "AVAudioTypes",
+    "block2",
+] }
 objc2-vision = { version = "0.3", features = [
     "VNRequest",
     "VNRequestHandler",
@@ -109,6 +120,10 @@ objc2-vision = { version = "0.3", features = [
 objc2-core-foundation = { version = "0.3", features = [
     "CFData",
     "CFCGTypes",
+    # Idea 3: speech synthesis pumps the main run loop when called headless
+    # (tests) — AVSpeech's buffer callback rides the main queue.
+    "CFRunLoop",
+    "CFDate",
 ] }
 objc2-core-graphics = { version = "0.3", features = [
     "CGColorSpace",
@@ -129,3 +144,10 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # ADD-27: mock-app harness for the live-recording engine integration test.
 tauri = { version = "2", features = ["test"] }
+
+# Idea 3: AVSpeechSynthesizer delivers write-to-buffer chunks via the main run
+# loop, so the on-device synthesis smoke test must OWN the real main thread —
+# a harness would run it on a worker and starve the callback queue.
+[[test]]
+name = "tts_smoke"
+harness = false

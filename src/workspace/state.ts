@@ -230,6 +230,14 @@ export function useWorkspaceState(info: RoomInfo) {
   // backend's stt-progress payload): processing | done | none | model-missing.
   const [sttStatus, setSttStatus] = useState<Record<string, string>>({});
   const [showFeedback, setShowFeedback] = useState(false);
+  // Idea 3: the room's spoken voice — chat-header toggles + per-message Play.
+  const [autoSpeak, setAutoSpeak] = useState(false);
+  const [handsFree, setHandsFree] = useState(false);
+  const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
+  // The turn-audio-done listener (hands-free re-arm) is registered once at
+  // mount; it must see the current toggle without re-subscribing.
+  const handsFreeRef = useRef(false);
+  handsFreeRef.current = handsFree;
 
   // Stable identity: several mount-time event subscriptions (the rec-* set
   // among them) list pushToast as an effect dependency — a per-render
@@ -300,6 +308,8 @@ export function useWorkspaceState(info: RoomInfo) {
     importSuggestions, setImportSuggestions, pushToast, dismissToast,
     recLive, setRecLive, recLiveRef, recSave, setRecSave,
     sttStatus, setSttStatus, showFeedback, setShowFeedback,
+    autoSpeak, setAutoSpeak, handsFree, setHandsFree, handsFreeRef,
+    speakingMsgId, setSpeakingMsgId,
   };
 }
 
