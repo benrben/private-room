@@ -84,9 +84,12 @@ pub fn import_audio_bytes(
             room.path.clone(),
         ))
     })?;
+    // Wave 3 (Idea 9): epoch-stamp the queued transcription so a rollback drops
+    // it rather than writing the transcript into the swapped room.
+    let epoch = state.room_epoch();
     enqueue_stt(
         &app,
-        JobMeta { id: meta.id.clone(), name, mime, ext, room_path },
+        JobMeta { id: meta.id.clone(), name, mime, ext, room_path, epoch },
     );
     Ok(meta)
 }

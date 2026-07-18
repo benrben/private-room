@@ -39,6 +39,10 @@ const listRoles = () => invoke<RoomRole[]>("list_roles");
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>({ kind: "start" });
+  // Idea 9: bumped on a checkpoint rollback so the Workspace remounts against
+  // the swapped DB — every pane (files, chats, open file, jobs, front page) is
+  // rebuilt, and the Settings modal closes, which is correct after a rollback.
+  const [roomEpoch, setRoomEpoch] = useState(0);
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
@@ -136,6 +140,19 @@ export default function App() {
     });
     const unlisten = api.onOpenRoomFile((path) => {
       gateTo(path);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [goTo]);
+
+  // Idea 9: a checkpoint rollback reopened the room against the swapped DB.
+  // Remount the workspace (new key) and land on it — safer than piecemeal
+  // refresh, and it closes any open modal (Settings).
+  useEffect(() => {
+    const unlisten = api.onRoomRolledBack((info) => {
+      setRoomEpoch((e) => e + 1);
+      goTo({ kind: "workspace", info });
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -455,7 +472,11 @@ export default function App() {
   if (screen.kind === "workspace") {
     return (
       <>
-        <Workspace info={screen.info} onLock={handleLock} />
+        <Workspace
+          key={`${screen.info.path}:${roomEpoch}`}
+          info={screen.info}
+          onLock={handleLock}
+        />
         {locking && <SealLockingOverlay />}
       </>
     );

@@ -9,6 +9,38 @@ pub fn list_file_versions(
     state.with_room(|room| db::list_file_versions(&room.conn, &id))
 }
 
+/// Idea 11: the text of one saved version alongside the file's CURRENT text,
+/// both shaped by `content_text` so the compare view diffs like-for-like. Pure
+/// over a connection (no `State`) so it is unit-testable against
+/// `open_in_memory_schema`. Text-only; bytes never cross the boundary.
+pub(crate) fn version_content(
+    conn: &Connection,
+    version_id: &str,
+) -> Result<VersionContent, String> {
+    let (file_id, vbytes, vtext, _rec_meta) = db::get_version(conn, version_id)?;
+    let (name, mime, cbytes, cextracted) = db::get_file_full(conn, &file_id)?;
+    let mime = mime.unwrap_or_default();
+    // Versions saved before compound snapshots carry no text: re-derive it
+    // exactly as `restore_file_version` does, so the diff matches a restore.
+    let vtext = vtext.or_else(|| {
+        extraction::extract_text(&name, &vbytes).or_else(|| String::from_utf8(vbytes.clone()).ok())
+    });
+    let version_text = content_text(&name, &mime, &vbytes, vtext);
+    let current_text = content_text(&name, &mime, &cbytes.unwrap_or_default(), cextracted);
+    Ok(VersionContent { file_name: name, version_text, current_text })
+}
+
+/// Idea 11: read one saved version's comparable text (and the file's current
+/// text) WITHOUT restoring — the compare view's only new command. A pure read:
+/// no version row is written, `file-updated` never fires.
+#[tauri::command]
+pub fn get_file_version(
+    state: State<'_, AppState>,
+    version_id: String,
+) -> Result<VersionContent, String> {
+    state.with_room(|room| version_content(&room.conn, &version_id))
+}
+
 /// ADD-2: restore a saved version. Goes back through `store_file_bytes`,
 /// so the CURRENT state is snapshotted first — restoring is itself undoable.
 /// A version is a compound snapshot: bytes, extracted text, and (for a
@@ -122,21 +154,36 @@ pub fn change_password(
     if new_password.chars().count() < 8 {
         return Err("Password must be at least 8 characters.".into());
     }
-    let mut guard = state.room.lock().unwrap();
-    let room = guard.as_mut().ok_or("No room is open.")?;
-    db::verify_password(&room.path, &current)?;
-    db::rekey(&room.conn, &new_password)?;
-    room.password = new_password;
-    // ADD-11: keep Touch ID working after a password change. Chosen behavior:
-    // UPDATE the Keychain entry with the new password (re-store overwrites it).
-    // Storing creates a fresh biometric item and needs no prompt. If it somehow
-    // fails, delete the stale entry so Touch ID can never hand back the old
-    // password — the room then falls back to typing until re-enabled.
-    if crate::biometrics::has(&room.path)
-        && crate::biometrics::store(&room.path, &room.password).is_err()
-    {
-        let _ = crate::biometrics::delete(&room.path);
+    // Wave 3 (Idea 9): a rollback is verifying/rekeying checkpoints of its own —
+    // don't rekey the live room + its checkpoints underneath it.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
     }
+    // Rekey the live room under the lock (fast: one SQLCipher rekey plus the
+    // biometrics/recovery re-wrap). Capture the path and the OLD password —
+    // `current` is already verified — so the per-checkpoint rekey below runs
+    // WITHOUT the room mutex: Wave 3 (Idea 9) each `.roomck` is a full room copy
+    // (possibly GB-scale), and rekey_copy rewrites every page; holding the room
+    // lock across that loop would freeze every ask/save/job for minutes.
+    let room_path = {
+        let mut guard = state.room.lock().unwrap();
+        let room = guard.as_mut().ok_or("No room is open.")?;
+        db::verify_password(&room.path, &current)?;
+        db::rekey(&room.conn, &new_password)?;
+        room.password = new_password.clone();
+        // ADD-11: keep Touch ID working after a password change. Chosen
+        // behavior: UPDATE the Keychain entry with the new password (re-store
+        // overwrites it). Storing creates a fresh biometric item and needs no
+        // prompt. If it somehow fails, delete the stale entry so Touch ID can
+        // never hand back the old password — the room then falls back to typing
+        // until re-enabled.
+        if crate::biometrics::has(&room.path)
+            && crate::biometrics::store(&room.path, &room.password).is_err()
+        {
+            let _ = crate::biometrics::delete(&room.path);
+        }
+        room.path.clone()
+    };
     // Same policy for the recovery sidecar: it wraps the password, so after a
     // rekey the old code would recover a password that no longer opens the
     // room. Re-wrap under the new password and hand back the fresh code; if
@@ -148,17 +195,27 @@ pub fn change_password(
     // password change would look like data loss. Revocation is the explicit
     // "Regenerate token" action (`regenerate_leash_token`), which also severs
     // live connections.
-    let new_code = if db::has_recovery(&room.path) {
-        match db::write_recovery(&room.path, &room.password) {
+    let new_code = if db::has_recovery(&room_path) {
+        match db::write_recovery(&room_path, &new_password) {
             Ok(code) => Some(code),
             Err(_) => {
-                let _ = db::remove_recovery(&room.path);
+                let _ = db::remove_recovery(&room_path);
                 None
             }
         }
     } else {
         None
     };
+    // Wave 3 (Idea 9): `vacuum_into` copies keep the key of the moment they were
+    // made, so a later rekey would strand every checkpoint. Re-key each one from
+    // the OLD password (`current`) to the new, off the room lock. A failure is
+    // logged, not fatal — the password change still succeeds, and a stranded
+    // checkpoint is caught (with a clear error) by verify_password at rollback.
+    for ck in checkpoint_ck_paths(&room_path) {
+        if let Err(e) = db::rekey_copy(&ck, &current, &new_password) {
+            eprintln!("checkpoint rekey failed for {ck}: {e}");
+        }
+    }
     Ok(new_code)
 }
 
@@ -231,4 +288,82 @@ mod tests {
         assert_eq!(unique_export_name(".gitignore", |c| taken.contains(c)), ".gitignore (2)");
     }
 
+    // ------------------------------------------------ Idea 11: version compare
+
+    #[test]
+    fn version_content_returns_stored_text_and_current() {
+        // (a) a compound (text-bearing) version diffs its stored text against
+        // the file's current text — for a .txt both are the RAW bytes' text,
+        // so indentation is preserved (no whitespace normalization). This is
+        // the second-pass addendum's corrected expectation.
+        let conn = db::open_in_memory_schema();
+        let fid = db::insert_file(
+            &conn, "note.txt", "text/plain",
+            b"line one\n  indented two", Some("line one\n  indented two"), "upload",
+        ).unwrap().id;
+        db::snapshot_file_version(&conn, &fid, "Edited").unwrap();
+        let vid = db::list_file_versions(&conn, &fid).unwrap()[0].id.clone();
+        db::update_file_content(&conn, &fid, b"line one\n  changed two", Some("line one\n  changed two")).unwrap();
+
+        let vc = version_content(&conn, &vid).unwrap();
+        assert_eq!(vc.file_name, "note.txt");
+        assert_eq!(vc.version_text.as_deref(), Some("line one\n  indented two"));
+        assert_eq!(vc.current_text.as_deref(), Some("line one\n  changed two"));
+    }
+
+    #[test]
+    fn version_content_rederives_null_text() {
+        // (b) a pre-compound version row with text = NULL still yields text —
+        // re-derived from its bytes, matching what restore would produce.
+        let conn = db::open_in_memory_schema();
+        let fid = db::insert_file(
+            &conn, "old.txt", "text/plain", b"current", Some("current"), "upload",
+        ).unwrap().id;
+        conn.execute(
+            "INSERT INTO file_versions(id, file_id, bytes, text, rec_meta, cause)
+             VALUES ('v-legacy', ?1, ?2, NULL, NULL, 'legacy')",
+            rusqlite::params![fid, b"legacy bytes".to_vec()],
+        ).unwrap();
+        let vc = version_content(&conn, "v-legacy").unwrap();
+        assert_eq!(vc.version_text.as_deref(), Some("legacy bytes"));
+        assert_eq!(vc.current_text.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn version_content_unknown_id_errors() {
+        // (c) an unknown version id returns the "no longer available" error.
+        let conn = db::open_in_memory_schema();
+        assert!(version_content(&conn, "does-not-exist").is_err());
+    }
+
+    // ------------------------------------------------ Idea 9: password rekey
+
+    #[test]
+    fn change_password_rekeys_checkpoints() {
+        // The change_password loop re-keys every checkpoint via rekey_copy so a
+        // password change never strands them from a later rollback. Exercise
+        // the exact mechanism (checkpoint_ck_paths + rekey_copy round-trip) on
+        // a real SQLCipher room + checkpoint.
+        let path = db::temp_room_path();
+        let dir = checkpoints_dir(&path);
+        let ck_id = {
+            let conn = db::create_room(&path, "old-password", "Room").unwrap();
+            db::insert_file(&conn, "a.txt", "text/plain", b"hi", Some("hi"), "upload").unwrap();
+            write_checkpoint(&conn, &dir, "cp", false).unwrap().id
+        };
+        let ck_path = checkpoint_file_path(&dir, &ck_id);
+        // Before: only the old password opens the checkpoint.
+        assert!(db::verify_password(&ck_path, "old-password").is_ok());
+        assert!(db::verify_password(&ck_path, "new-password-xx").is_err());
+        // The loop change_password runs off the room lock:
+        for ck in checkpoint_ck_paths(&path) {
+            db::rekey_copy(&ck, "old-password", "new-password-xx").unwrap();
+        }
+        // After: the NEW password opens it; the old no longer does.
+        assert!(db::verify_password(&ck_path, "new-password-xx").is_ok());
+        assert!(db::verify_password(&ck_path, "old-password").is_err());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

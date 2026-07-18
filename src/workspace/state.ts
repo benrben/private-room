@@ -91,6 +91,17 @@ export function useWorkspaceState(info: RoomInfo) {
   const [showHistory, setShowHistory] = useState(false);
   const [versions, setVersions] = useState<FileVersion[]>([]);
   const [confirmRestore, setConfirmRestore] = useState<string | null>(null);
+  // Idea 11: the open side-by-side compare (null when closed). Holds both
+  // diff texts (fetched once), plus the version id so the modal's own
+  // "Restore this version" can re-arm the popover's confirm.
+  const [compare, setCompare] = useState<{
+    versionId: string;
+    cause: string;
+    savedAt: string;
+    versionText: string | null;
+    currentText: string | null;
+    fileName: string;
+  } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [showSyncWarn, setShowSyncWarn] = useState(false);
   const [folders, setFolders] = useState<Folder[]>([]);
@@ -283,7 +294,8 @@ export function useWorkspaceState(info: RoomInfo) {
     summarizing, setSummarizing, summarizeProgress, setSummarizeProgress,
     showAddLink, setShowAddLink, linkUrl, setLinkUrl, importingLink, setImportingLink,
     webOn, setWebOn, showHistory, setShowHistory, versions, setVersions,
-    confirmRestore, setConfirmRestore, confirmDelete, setConfirmDelete,
+    confirmRestore, setConfirmRestore, compare, setCompare,
+    confirmDelete, setConfirmDelete,
     showSyncWarn, setShowSyncWarn, folders, setFolders,
     collapsedFolders, setCollapsedFolders, moveMenuFor, setMoveMenuFor,
     ctxMenu, setCtxMenu, ctxMenuRef, ctxMenuElRef, moveMenuElRef,

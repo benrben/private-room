@@ -176,7 +176,9 @@ pub(crate) fn run_stt_job(app: &tauri::AppHandle, job: JobMeta) {
         let state = app.state::<AppState>();
         let guard = state.room.lock().unwrap();
         match guard.as_ref() {
-            Some(room) if room.path == job.room_path => {
+            // Wave 3 (Idea 9): epoch pin — a transcription queued before a
+            // rollback must not land in the swapped room (path is unchanged).
+            Some(room) if room.path == job.room_path && state.room_epoch() == job.epoch => {
                 let _ = db::update_file_content(&room.conn, &job.id, &bytes, Some(&full_text));
             }
             _ => return,
@@ -206,6 +208,9 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, del
         return;
     }
     let flag = state.summary_filler.clone();
+    // Wave 3 (Idea 9): the epoch at scheduling time — re-checked before every
+    // ai_summary write so a rollback drops a filler that was mid-run.
+    let epoch = state.room_epoch();
     tauri::async_runtime::spawn(async move {
         // Reset the single-flight flag on every exit path.
         struct Reset(Arc<AtomicBool>);
@@ -249,7 +254,8 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, del
             let state = app.state::<AppState>();
             let guard = state.room.lock().unwrap();
             let Some(room) = guard.as_ref() else { return };
-            if room.path != room_path {
+            // Wave 3 (Idea 9): a rollback bumped the epoch — abandon the filler.
+            if room.path != room_path || state.room_epoch() != epoch {
                 return;
             }
             db::files_missing_summary(&room.conn, MAX_SUMMARY_FILES).unwrap_or_default()
@@ -285,7 +291,9 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, del
             let state = app.state::<AppState>();
             let guard = state.room.lock().unwrap();
             match guard.as_ref() {
-                Some(room) if room.path == room_path => {
+                // Wave 3 (Idea 9): epoch pin — never write a one-liner into a
+                // room the rollback swapped out from under this pass.
+                Some(room) if room.path == room_path && state.room_epoch() == epoch => {
                     let _ = db::set_file_ai_summary(&room.conn, &id, &liner);
                 }
                 _ => return,

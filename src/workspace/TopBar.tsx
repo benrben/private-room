@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { ENGINE_LABELS, RoomInfo, splitExternalModel } from "../api";
+import { api, ENGINE_LABELS, RoomInfo, splitExternalModel } from "../api";
 import {
   ChevronDownIcon,
   DotsIcon,
@@ -182,6 +182,26 @@ export default function TopBar({
                   }}
                 >
                   Room settings
+                </button>
+                {/* Idea 9: one-click "commit" — a named checkpoint (default
+                    name "Checkpoint — {date}") with a toast that names it.
+                    Rolling back stays gated in Settings → Checkpoints. */}
+                <button
+                  className="pop-item"
+                  onClick={() => {
+                    s.setRoomMenuOpen(false);
+                    api
+                      .createRoomCheckpoint("")
+                      .then((meta) =>
+                        s.pushToast(
+                          "success",
+                          `Saved checkpoint “${meta.name}”. Roll back in Settings → Checkpoints.`,
+                        ),
+                      )
+                      .catch((e) => s.pushToast("error", String(e)));
+                  }}
+                >
+                  Save a checkpoint
                 </button>
                 {s.files.length > 0 && (
                   <button

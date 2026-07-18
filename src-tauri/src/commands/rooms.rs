@@ -7,6 +7,10 @@ pub fn create_room(
     path: String,
     password: String,
 ) -> Result<RoomInfo, String> {
+    // Wave 3 (Idea 9): don't create/switch rooms while a rollback is swapping.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
     let name = room_name_from_path(&path);
     let conn = db::create_room(&path, &password, &name)?;
     // Creating a room while another is open must fully tear the old one down
@@ -46,6 +50,26 @@ pub fn open_room(
     path: String,
     password: String,
 ) -> Result<RoomInfo, String> {
+    // Wave 3 (Idea 9): a rollback is mid-swap — opening a (different) room now
+    // would tear down the room it is about to reopen. The rollback path itself
+    // reopens via `open_room_impl`, which skips this guard.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+    open_room_impl(&app, &state, path, password)
+}
+
+/// The body of `open_room`, without the rollback-in-flight guard, so
+/// `rollback_room_checkpoint` can reopen the swapped file while its own flag is
+/// still set. Takes references (not `State` by value) so the rollback path can
+/// call it on both its error and success branches. Every other caller goes
+/// through the guarded command.
+pub(crate) fn open_room_impl(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    path: String,
+    password: String,
+) -> Result<RoomInfo, String> {
     let conn = db::open_room(&path, &password)?;
     // Opening a room while another is open (Finder double-click on a second
     // .roomai) must fully tear the old one down first — its MCP bridge (and
@@ -53,7 +77,7 @@ pub fn open_room(
     // against the NEW room. Runs only after the password proved right, so a
     // failed unlock never locks the room the user is in.
     if state.room.lock().unwrap().is_some() {
-        teardown_open_room(&app, &state);
+        teardown_open_room(app, state);
     }
     let name = db::get_meta(&conn, "name").unwrap_or_else(|| room_name_from_path(&path));
     // D10 (the Closet): re-apply this room's saved remote-Ollama URL on unlock.
@@ -64,8 +88,8 @@ pub fn open_room(
         name,
         password,
     };
-    let info = info_of(&app, &room)?;
-    push_recent(&app, &room.name, &room.path);
+    let info = info_of(app, &room)?;
+    push_recent(app, &room.name, &room.path);
     *state.room.lock().unwrap() = Some(room);
     // ADD-30: a job left 'running' belongs to a process that's gone — mark it
     // 'paused' so the UI offers Resume rather than a phantom active job.
@@ -78,11 +102,11 @@ pub fn open_room(
             Ok(n) => eprintln!("recovered {n} interrupted recording(s)"),
         }
     }
-    refresh_mcp(&app);
-    spawn_reextract_backfill(&app);
-    spawn_embedding_backfill(&app);
+    refresh_mcp(app);
+    spawn_reextract_backfill(app);
+    spawn_embedding_backfill(app);
     // D9 (the Leash): if the user left the room server on, start it again now.
-    spawn_room_server_if_enabled(&app);
+    spawn_room_server_if_enabled(app);
     Ok(info)
 }
 
@@ -217,11 +241,55 @@ pub fn touchid_open(
 
 #[tauri::command]
 pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    // ADD-27: a live recording must land in the DB before the room locks.
-    // Stop it and wait for the engine's final flush (it drains its decoder
-    // first), bounded so a stuck decode can never wedge lock/close.
+    // Wave 3 (Idea 9): the rollback path tears the room down itself via
+    // teardown_open_room — a concurrent close_room mid-swap must not race it
+    // (a user LOCKING mid-rollback would otherwise get the room reopened under
+    // them by step 6.7). Refuse; the rollback finishes in a moment.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+    // Stop the live recording, cancel in-flight asks and background jobs, and
+    // wait (bounded) for each to finish writing — the same drain the rollback
+    // path uses (Wave 3, Idea 9). close_room ignores whether every writer
+    // reported done; the teardown below is the correctness backstop.
+    let _ = drain_inflight(&app, &state).await;
+    // SEC-7: reclaim space before closing when a large amount was freed (e.g.
+    // the user deleted big files). Small deletions skip the slow vacuum.
     {
-        use tauri::Manager;
+        let guard = state.room.lock().unwrap();
+        if let Some(room) = guard.as_ref() {
+            if db::reclaimable_bytes(&room.conn).unwrap_or(0) > 10 * 1024 * 1024 {
+                let _ = db::vacuum(&room.conn);
+            }
+        }
+    }
+    // The synchronous teardown (room handle, MCP bridge + servers, consents,
+    // staged media, agent-UI round-trips) is shared with the open-over-open
+    // path — see `teardown_open_room`.
+    teardown_open_room(&app, &state);
+    Ok(())
+}
+
+/// Wave 3 (Idea 9): what `drain_inflight` observed — whether each cancellable
+/// writer class emptied within its bounded wait. `close_room` ignores this;
+/// `rollback_room_checkpoint` refuses on any `false`, so a straggler that never
+/// observed the cancel flag can't slip past the swap.
+pub(crate) struct DrainReport {
+    pub asks_drained: bool,
+    pub jobs_drained: bool,
+}
+
+/// Stop the live recording (waiting for its final flush) and signal every
+/// in-flight ask + background job to cancel, waiting briefly for each registry
+/// to empty. Extracted from `close_room` (behavior-preserving) so the rollback
+/// path drains the exact same writers before it swaps the DB. The recording
+/// flush is awaited (bounded 30s); the ask/job waits are bounded and reported.
+pub(crate) async fn drain_inflight(app: &tauri::AppHandle, state: &AppState) -> DrainReport {
+    use tauri::Manager;
+    // ADD-27: a live recording must land in the DB before the room changes.
+    // Stop it and wait for the engine's final flush (it drains its decoder
+    // first), bounded so a stuck decode can never wedge lock/close/rollback.
+    {
         let rec = app.state::<RecState>();
         let done_rx = {
             let mut session = rec.session.lock().unwrap();
@@ -239,60 +307,53 @@ pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
         }
     }
     // HLT-7: if an answer is streaming, cancel it and wait briefly for its
-    // save-partial phase to finish, so locking never races the DB shut.
-    {
+    // save-partial phase to finish, so the swap never races the DB shut.
+    let asks_drained = {
         let flags: Vec<Arc<AtomicBool>> =
             state.cancels.lock().unwrap().values().cloned().collect();
+        for f in &flags {
+            f.store(true, Ordering::SeqCst);
+        }
+        // Up to ~1s; the ask/command removes its own entry once it has saved.
+        let mut drained = true;
         if !flags.is_empty() {
-            for f in &flags {
-                f.store(true, Ordering::SeqCst);
-            }
-            // Up to ~1s; the ask removes its own entry once it has saved.
+            drained = false;
             for _ in 0..20 {
                 if state.cancels.lock().unwrap().is_empty() {
+                    drained = true;
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
-    }
+        drained
+    };
     // Background jobs (deep summary / file pass) must stop before the room
-    // state is torn down, so a runner can't keep writing after the lock.
+    // state is torn down, so a runner can't keep writing after the swap.
     // Signal every job's cancel flag and wait briefly — the runner removes its
-    // entry once it has parked the job 'paused' on this room's still-open
-    // conn. Bounded: a deep-summary model call doesn't observe the flag, so
-    // the wait is best-effort; each job's room pin (see `spawn_deep_summary` /
-    // `execute_pass_step`) is the correctness guarantee.
-    {
+    // entry once it has parked the job 'paused'. Bounded: a model call doesn't
+    // observe the flag, so the wait is best-effort here; the room-epoch pin is
+    // the correctness guarantee, and rollback refuses if this returns false.
+    let jobs_drained = {
         let flags: Vec<Arc<AtomicBool>> =
             state.job_cancels.lock().unwrap().values().cloned().collect();
+        for f in &flags {
+            f.store(true, Ordering::SeqCst);
+        }
+        let mut drained = true;
         if !flags.is_empty() {
-            for f in &flags {
-                f.store(true, Ordering::SeqCst);
-            }
+            drained = false;
             for _ in 0..20 {
                 if state.job_cancels.lock().unwrap().is_empty() {
+                    drained = true;
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
-    }
-    // SEC-7: reclaim space before closing when a large amount was freed (e.g.
-    // the user deleted big files). Small deletions skip the slow vacuum.
-    {
-        let guard = state.room.lock().unwrap();
-        if let Some(room) = guard.as_ref() {
-            if db::reclaimable_bytes(&room.conn).unwrap_or(0) > 10 * 1024 * 1024 {
-                let _ = db::vacuum(&room.conn);
-            }
-        }
-    }
-    // The synchronous teardown (room handle, MCP bridge + servers, consents,
-    // staged media, agent-UI round-trips) is shared with the open-over-open
-    // path — see `teardown_open_room`.
-    teardown_open_room(&app, &state);
-    Ok(())
+        drained
+    };
+    DrainReport { asks_drained, jobs_drained }
 }
 
 /// Synchronously tear down every piece of per-room state: the room handle, the
@@ -323,6 +384,13 @@ pub(crate) fn teardown_open_room(app: &tauri::AppHandle, state: &AppState) {
         }
     }
     *state.room.lock().unwrap() = None;
+    // Wave 3 (Idea 9): bump the room epoch the instant the room handle drops.
+    // Every path-pinned background writer (OCR/STT lanes, summary filler,
+    // re-extract backfill, room summarize) captured the old epoch at spawn and
+    // re-checks it before writing, so a straggler that was mid-await when a
+    // rollback swapped the DB can't land its write against the reopened room
+    // (the room PATH is unchanged after a rollback, so the path pin can't tell).
+    state.room_epoch.fetch_add(1, Ordering::SeqCst);
     // D9 (the Leash): a locked room must not leave its MCP endpoint reachable —
     // stop and clear it here so teardown always kills the server + its token
     // (live connections included — the bridge's shutdown channel severs them),

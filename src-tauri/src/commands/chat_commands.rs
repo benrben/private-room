@@ -94,6 +94,14 @@ pub const CHAT_COMMANDS: &[ChatCommandInfo] = &[
         usage: "#research <question>",
         needs_refs: false,
     },
+    // Wave 3 (Idea 9): one-click "commit" — a named whole-room checkpoint from
+    // the composer, no model call. Rollback stays gated in Settings.
+    ChatCommandInfo {
+        name: "checkpoint",
+        summary: "Save a named checkpoint of the whole room (roll back later in Settings)",
+        usage: "#checkpoint   ·   #checkpoint before cleanup",
+        needs_refs: false,
+    },
 ];
 
 /// The catalog, for the frontend autocomplete and help.
@@ -275,6 +283,15 @@ pub async fn run_command(
         db::set_chat_title_if_new(conn, &chat_id, &title)?;
         (model_setting(conn), history, temperature)
     };
+
+    // Wave 3 (Idea 9): #checkpoint is a one-click "commit" — it never calls the
+    // model, so short-circuit before the Ollama probe (a checkpoint must work
+    // even with the local AI stopped). Rollback stays gated in Settings.
+    if command == "checkpoint" {
+        let meta = create_checkpoint_core(state.inner(), args.trim(), false)?;
+        let content = format!("Saved checkpoint **{}**. Roll back to it in Settings → Checkpoints.", meta.name);
+        return persist_assistant_reply(&state, &chat_id, content, Vec::new(), None);
+    }
 
     let models = ollama::list_models().await.unwrap_or_default();
     if models.is_empty() {

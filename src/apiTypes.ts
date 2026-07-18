@@ -24,6 +24,26 @@ export interface FileVersion {
   cause: string;
 }
 
+/** Idea 11: a saved version's extracted text next to the file's current text,
+ * for the read-only side-by-side compare view. Either side is null when that
+ * file kind has no comparable text (image/binary). */
+export interface VersionContent {
+  fileName: string;
+  versionText: string | null;
+  currentText: string | null;
+}
+
+/** Idea 9: one whole-room checkpoint — a full encrypted copy of the room file
+ * beside it, with plaintext metadata only (name/date/size). `auto` marks the
+ * pre-rollback safety copies (capped, pruned) apart from user checkpoints. */
+export interface CheckpointMeta {
+  id: string;
+  name: string;
+  createdAt: string;
+  sizeBytes: number;
+  auto: boolean;
+}
+
 /** A recently opened room, listed on the start screen (ADD-5). */
 export interface RecentRoom {
   name: string;

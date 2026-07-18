@@ -6,6 +6,7 @@ import { useWorkspaceEffects } from "./workspace/effects";
 import Overlays from "./workspace/Overlays";
 import TopBar from "./workspace/TopBar";
 import StudioModal from "./workspace/StudioModal";
+import CompareModal from "./workspace/CompareModal";
 import AiActionModal from "./workspace/AiActionModal";
 import FeedbackModal from "./workspace/FeedbackModal";
 import SettingsModals from "./workspace/SettingsModals";
@@ -51,6 +52,7 @@ export default function Workspace({ info, onLock }: Props) {
       <TopBar s={s} a={a} info={info} />
 
       <StudioModal s={s} a={a} />
+      <CompareModal s={s} a={a} />
       <AiActionModal s={s} a={a} />
       <FeedbackModal s={s} />
       <SettingsModals s={s} a={a} info={info} />

@@ -133,18 +133,32 @@ export default function ViewerPane({
                               </div>
                             </div>
                           ) : (
-                            <button
-                              key={v.id}
-                              className="tm-version"
-                              title="Restore this saved version"
-                              onClick={() => s.setConfirmRestore(v.id)}
-                            >
+                            // Idea 11: the row is no longer one restore button —
+                            // it offers a read-only Compare (safe for the agent)
+                            // and an armed Restore (still data-agent-blocked).
+                            <div key={v.id} className="tm-version">
                               <span className="tm-version-dot" />
                               <span className="tm-cause">{v.cause}</span>
                               <span className="tm-time">
                                 {formatWhen(v.savedAt)}
                               </span>
-                            </button>
+                              <span className="tm-actions">
+                                <button
+                                  className="subtle tm-action"
+                                  title="See what changed, side by side"
+                                  onClick={() => void a.openCompare(v)}
+                                >
+                                  Compare
+                                </button>
+                                <button
+                                  className="subtle tm-action"
+                                  title="Restore this saved version"
+                                  onClick={() => s.setConfirmRestore(v.id)}
+                                >
+                                  Restore
+                                </button>
+                              </span>
+                            </div>
                           ),
                         )}
                       </div>

@@ -94,6 +94,10 @@ pub fn rec_start(
     system_audio: bool,
     live_translate: Option<String>,
 ) -> Result<RecStart, String> {
+    // Wave 3 (Idea 9): don't begin a recording while a rollback is swapping.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
     let Some(model) = stt_effective_model(&app) else {
         return Err("STT_MODEL_MISSING".into());
     };
