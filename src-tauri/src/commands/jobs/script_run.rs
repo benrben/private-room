@@ -55,6 +55,11 @@ fn missing_module(stderr: &str) -> Option<String> {
 /// Auto-import caps for NEW (undeclared) files a script creates (decision 2).
 const MAX_NEW_FILES: usize = 20;
 const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+/// Cap on room files auto-materialized by name-reference (read side). Bounds the
+/// pre-run copy so a room with a huge file list can't balloon the workspace; any
+/// matches beyond the cap are skipped (the script can still declare them via
+/// `# room-inputs:`).
+const MAX_AUTO_MATERIALIZE: usize = 20;
 /// Grace between SIGTERM and SIGKILL when killing the process group.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
@@ -478,6 +483,60 @@ fn materialize_inputs(
     Ok(out)
 }
 
+/// Room-file names that appear VERBATIM (exact-name substring) in the script
+/// text, in the room's listing order, capped at `cap`. Pure — no I/O, and no
+/// dedup against declared inputs (the caller handles that). Empty names never
+/// match. This lets `pd.read_csv('ETF Tracker — AI Full Stack.csv')` find its
+/// file even when the script declared no `# room-inputs:`.
+pub(crate) fn referenced_room_files(text: &str, room_files: &[String], cap: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in room_files {
+        if name.is_empty() || out.iter().any(|n| n == name) {
+            continue;
+        }
+        if text.contains(name.as_str()) {
+            out.push(name.clone());
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Materialize specific room files by their EXACT name into the workspace,
+/// skipping any whose `safe_name` collides with a file already materialized (a
+/// declared input). Used for the auto-materialized name-referenced files, which
+/// we resolve precisely (`file_by_exact_name`) rather than fuzzily. Records each
+/// as `Materialized` so import-back knows it was "used" and can save it if the
+/// script modified it in place.
+fn materialize_named(
+    conn: &Connection,
+    ws: &Path,
+    names: &[String],
+    already: &HashSet<String>,
+) -> Result<Vec<Materialized>, String> {
+    let mut out: Vec<Materialized> = Vec::new();
+    for name in names {
+        let safe = safe_name(name);
+        if already.contains(&safe) || out.iter().any(|m| m.name == safe) {
+            continue;
+        }
+        let Some(meta) = db::file_by_exact_name(conn, name)? else {
+            continue;
+        };
+        let Some(bytes) = db::get_file_bytes(conn, &meta.id)? else {
+            continue;
+        };
+        std::fs::write(ws.join(&safe), &bytes).map_err(|e| e.to_string())?;
+        out.push(Materialized {
+            name: safe,
+            sha: script_fingerprint(&bytes),
+        });
+    }
+    Ok(out)
+}
+
 /// Keep a file name to its basename so a room name can never escape the
 /// workspace (defence in depth — room names are user-controlled).
 fn safe_name(name: &str) -> String {
@@ -620,6 +679,21 @@ fn tail_string(buf: &Arc<Mutex<Vec<u8>>>) -> String {
 
 // ---------------------------------------------------------------- import-back
 
+/// Whether a materialized file (a declared input OR one auto-materialized because
+/// the script referenced its name) should be saved back: its bytes CHANGED during
+/// the run (`current_sha` differs from the hash at materialization) AND it was not
+/// a declared output (declared outputs already write back via the output path).
+/// Pure — the caller reads the file and hashes it.
+pub(crate) fn is_modified_used_file(
+    original_sha: &str,
+    current_sha: &str,
+    name: &str,
+    declared_outputs: &[String],
+) -> bool {
+    current_sha != original_sha
+        && !declared_outputs.iter().any(|o| safe_name(o) == safe_name(name))
+}
+
 /// Import the script's outputs back into the room after a clean exit
 /// (decision 2). Returns the imported files (for the report + terminal auto-open)
 /// and a list of human-readable skip notes. All writes are versioned via
@@ -686,22 +760,40 @@ pub fn import_outputs(
         }
     }
 
-    // 3. A materialized INPUT modified in place but NOT declared as an output is
-    //    a destructive write that never appeared on the consent card — do NOT
-    //    write it back; just log it (decision 2).
+    // 3. A materialized file (a declared input OR one auto-materialized because
+    //    the script referenced its name) that the script MODIFIED IN PLACE but did
+    //    not declare as an output. This intentionally RELAXES the old rule ("a
+    //    modified undeclared input is never written back") so a read→modify→write
+    //    "sync" script just works without the user declaring room-outputs. It is
+    //    safe because: the script demonstrably READ the file (we materialized it
+    //    only because it was declared or its name appears in the script), running
+    //    it at all required consent, and every write is versioned via
+    //    `store_file_bytes` → fully undoable through Time Machine.
     for m in materialized {
-        if manifest.outputs.iter().any(|o| safe_name(o) == m.name) {
+        let path = ws.join(&m.name);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let current = script_fingerprint(&bytes);
+        if !is_modified_used_file(&m.sha, &current, &m.name, &manifest.outputs) {
             continue;
         }
-        let path = ws.join(&m.name);
-        if let Ok(bytes) = std::fs::read(&path) {
-            if script_fingerprint(&bytes) != m.sha {
-                skipped.push(format!(
-                    "{}: the script changed this input in place — not saved back (declare it as room-outputs to keep the change)",
-                    m.name
-                ));
-            }
+        if bytes.len() as u64 > MAX_IMPORT_BYTES {
+            skipped.push(format!(
+                "{}: over the {}MB import cap — not saved back",
+                m.name,
+                MAX_IMPORT_BYTES / 1024 / 1024
+            ));
+            continue;
         }
+        let meta = write_output(conn, &m.name, &bytes, cause)?;
+        imported.push(meta);
+        // Surfaced in the report's notes so the user sees it was an in-place
+        // overwrite (a new version they can undo), not a brand-new file.
+        skipped.push(format!(
+            "{}: updated in place by the script — saved back as a new version (undo via Time Machine)",
+            m.name
+        ));
     }
 
     Ok((imported, skipped))
@@ -798,7 +890,26 @@ pub(crate) async fn run_script_process<R: tauri::Runtime>(
             .ok_or("The room this script belongs to is no longer open.")?;
         // Write the script itself so `<runtime> <script>` can run it.
         std::fs::write(ws.join(&safe_script), &script_bytes).map_err(|e| e.to_string())?;
-        materialize_inputs(&room.conn, &ws, &manifest.inputs)?
+        let mut mats = materialize_inputs(&room.conn, &ws, &manifest.inputs)?;
+        // Auto-materialize any room file whose exact name appears in the script
+        // text (e.g. `read_csv('ETF Tracker — AI Full Stack.csv')`), even if it
+        // was never declared as a room-input — so scripts "just work". Read-only
+        // copy; capped so a huge room can't balloon the workspace. Deduped
+        // against the declared inputs already written above; recorded as
+        // Materialized so the write-back phase knows these were used.
+        let room_names: Vec<String> = db::list_files(&room.conn)?
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        let referenced = referenced_room_files(&text, &room_names, MAX_AUTO_MATERIALIZE);
+        let already: HashSet<String> = mats
+            .iter()
+            .map(|m| m.name.clone())
+            .chain(std::iter::once(safe_script.clone()))
+            .collect();
+        let extra = materialize_named(&room.conn, &ws, &referenced, &already)?;
+        mats.extend(extra);
+        mats
     };
 
     // (d/e/f) Spawn + watch + drain. `finally` removes the workspace on EVERY
@@ -1090,6 +1201,53 @@ mod tests {
         }
     }
 
+    // ---- pure helpers: the referenced-file scan + modified-file detection ----
+
+    #[test]
+    fn referenced_room_files_matches_exact_names_and_caps() {
+        // Test (a): given a script's text and the room's file names, return the
+        // ones the script actually references by exact name.
+        let text = "import pandas as pd\n\
+                    df = pd.read_csv('ETF Tracker — AI Full Stack.csv')\n\
+                    notes = open('meeting notes.md').read()\n\
+                    df.to_csv('ETF Tracker — AI Full Stack.csv')\n";
+        let room = vec![
+            "ETF Tracker — AI Full Stack.csv".to_string(),
+            "meeting notes.md".to_string(),
+            "unrelated.pdf".to_string(),
+        ];
+        let hit = referenced_room_files(text, &room, 20);
+        assert!(hit.contains(&"ETF Tracker — AI Full Stack.csv".to_string()));
+        assert!(hit.contains(&"meeting notes.md".to_string()));
+        assert!(
+            !hit.contains(&"unrelated.pdf".to_string()),
+            "a file whose name never appears in the script is not materialized"
+        );
+        // A name used several times is returned once.
+        assert_eq!(
+            hit.iter().filter(|n| n.as_str() == "ETF Tracker — AI Full Stack.csv").count(),
+            1
+        );
+        // Empty room names never match.
+        assert!(referenced_room_files("a b c", &["".to_string()], 20).is_empty());
+        // The cap bounds how many are auto-materialized.
+        let many: Vec<String> = (0..30).map(|i| format!("f{i}.csv")).collect();
+        let uses = many.join(" ");
+        assert_eq!(referenced_room_files(&uses, &many, 5).len(), 5, "capped at 5");
+    }
+
+    #[test]
+    fn is_modified_used_file_selects_changed_undeclared_files() {
+        // Test (b): a materialized file whose hash changed (and that isn't a
+        // declared output) is selected for save-back.
+        let orig = script_fingerprint(b"orig");
+        let changed = script_fingerprint(b"changed");
+        assert!(is_modified_used_file(&orig, &changed, "in.csv", &[]), "changed → save back");
+        assert!(!is_modified_used_file(&orig, &orig, "in.csv", &[]), "unchanged → leave it");
+        // Changed but ALSO declared as an output → the declared-output path owns it.
+        assert!(!is_modified_used_file(&orig, &changed, "in.csv", &["in.csv".to_string()]));
+    }
+
     #[test]
     fn declared_existing_output_is_a_versioned_overwrite() {
         let conn = db::mem();
@@ -1130,19 +1288,54 @@ mod tests {
     }
 
     #[test]
-    fn modified_undeclared_input_is_not_written_back() {
+    fn modified_used_input_is_saved_back_versioned() {
+        // The old "a modified undeclared input is never written back" rule is
+        // intentionally RELAXED: a materialized file the script changes in place is
+        // now saved back as a NEW VERSION even without a room-outputs declaration —
+        // the script demonstrably read it, running required consent, and the write
+        // is undoable via Time Machine. This is the write side of test (b).
         let conn = db::mem();
-        let input = db::insert_file(&conn, "in.csv", "text/csv", b"orig", Some("orig"), "upload").unwrap();
+        let input =
+            db::insert_file(&conn, "in.csv", "text/csv", b"orig", Some("orig"), "upload").unwrap();
         let ws = tmp_ws();
         // The script modified the input in place but did NOT declare it as output.
-        std::fs::write(ws.join("in.csv"), b"tampered").unwrap();
+        std::fs::write(ws.join("in.csv"), b"updated").unwrap();
         let materialized = vec![Materialized { name: "in.csv".into(), sha: script_fingerprint(b"orig") }];
         let (imported, skipped) =
+            import_outputs(&conn, &ws, &manifest_out(&[]), &materialized, "s.py", "Script ran — s.py").unwrap();
+        // Saved back onto the SAME file id (a versioned overwrite, not a new file).
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].id, input.id, "overwrote the same file id");
+        assert_eq!(db::get_file_bytes(&conn, &input.id).unwrap().unwrap(), b"updated");
+        // A snapshot of the pre-run bytes exists → the change is undoable.
+        let versions = db::list_file_versions(&conn, &input.id).unwrap();
+        assert_eq!(versions.len(), 1);
+        // The report notes it was an in-place overwrite.
+        assert!(
+            skipped.iter().any(|s| s.contains("in.csv") && s.contains("updated in place")),
+            "the overwrite is noted: {skipped:?}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn untouched_materialized_input_is_not_re_imported() {
+        // A materialized file the script did NOT modify stays out of the room —
+        // no needless new version.
+        let conn = db::mem();
+        let input =
+            db::insert_file(&conn, "keep.csv", "text/csv", b"same", Some("same"), "upload").unwrap();
+        let ws = tmp_ws();
+        std::fs::write(ws.join("keep.csv"), b"same").unwrap();
+        let materialized = vec![Materialized { name: "keep.csv".into(), sha: script_fingerprint(b"same") }];
+        let (imported, skipped) =
             import_outputs(&conn, &ws, &manifest_out(&[]), &materialized, "s.py", "c").unwrap();
-        assert!(imported.is_empty(), "a modified-but-undeclared input is never saved back");
-        assert!(skipped.iter().any(|s| s.contains("in.csv")), "the skip is logged: {skipped:?}");
-        // The room copy is untouched.
-        assert_eq!(db::get_file_bytes(&conn, &input.id).unwrap().unwrap(), b"orig");
+        assert!(imported.is_empty(), "an unchanged input is not re-imported");
+        assert!(skipped.is_empty(), "nothing to note: {skipped:?}");
+        assert!(
+            db::list_file_versions(&conn, &input.id).unwrap().is_empty(),
+            "no snapshot for an untouched file"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 

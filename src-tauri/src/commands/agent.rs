@@ -586,7 +586,12 @@ fn gather_context_and_save_question(
              # /// script\n    # dependencies = [\"pandas\", \"yfinance\"]\n    # ///\n\
              (a bare `# dependencies = [\"pkg\", ...]` line also works). List every third-party \
              import; the standard library needs no declaration. Do not tell the user to run pip \
-             or create a venv — declaring the dependencies is how the install happens.",
+             or create a venv — declaring the dependencies is how the install happens. \
+             When a script reads or writes room files, refer to each by its EXACT room file name \
+             (e.g. open(\"ETF Tracker.csv\")); you MAY also list them under \
+             `# room-inputs:` / `# room-outputs:` for clarity, but you do not have to — the runner \
+             auto-copies any room file whose name appears in the script and saves back any it \
+             modifies in place (every write is versioned and undoable).",
         );
         if web_enabled {
             system.push_str(

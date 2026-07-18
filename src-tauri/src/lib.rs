@@ -236,6 +236,7 @@ pub fn run() {
             commands::set_workflow_status,
             commands::set_workflow_pinned,
             commands::validate_workflow,
+            commands::compose_workflow,
             commands::get_workflow_runs,
             commands::get_job_step_artifact,
             // Wave 5 (Idea 13): runnable & schedulable scripts.

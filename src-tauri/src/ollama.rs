@@ -434,7 +434,7 @@ pub fn strip_think_spans(raw: &str) -> String {
 /// `serde_json::from_str` then rejects (the caller reports "nothing usable").
 /// Drop any `<think>` span, then slice from the first opening bracket to the last
 /// closing one so callers can parse it regardless of the model's framing.
-fn recover_json(text: &str) -> String {
+pub(crate) fn recover_json(text: &str) -> String {
     let s = strip_think_spans(text.trim());
     let s = s.trim();
     match (

@@ -218,6 +218,11 @@ export const api = {
   /** Validate a definition WITHOUT saving — the canvas round-trips edits here. */
   validateWorkflow: (definition: unknown, binding?: unknown) =>
     invoke<string[]>("validate_workflow", { definition, binding }),
+  /** Compose a workflow from a plain-language description on any engine (the
+   * model returns JSON as text; the backend validates + saves a draft). Returns
+   * the new workflow's id. */
+  composeWorkflow: (description: string) =>
+    invoke<string>("compose_workflow", { description }),
   getWorkflowRuns: (id: string) =>
     invoke<WorkflowRun[]>("get_workflow_runs", { id }),
   getJobStepArtifact: (jobId: string, stepId: number) =>

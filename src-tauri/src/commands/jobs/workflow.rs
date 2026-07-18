@@ -1918,6 +1918,139 @@ pub(crate) async fn agent_save_workflow(
     ))
 }
 
+/// The instruction handed to the model to turn a plain-language request into a
+/// WorkflowDef JSON. Deliberately reuses the save_workflow tool's schema prose so
+/// the two stay in sync.
+fn compose_prompt(description: &str) -> String {
+    format!(
+        "You compose an automation workflow for a note-taking app, as JSON only.\n\n\
+         Output ONE JSON object with keys: \"name\" (short), \"emoji\" (one emoji), \
+         \"description\" (one sentence), \"definition\", and optionally \"binding\" and \
+         \"schedule\". No prose, no code fence — JSON only.\n\n\
+         `definition` is a small graph: {{\"version\":1,\"nodes\":[...],\"edges\":[...]}}. \
+         Node kinds and their fields:\n\
+         - generate {{prompt, model:\"auto\"}}\n\
+         - summarize_file {{select}}\n\
+         - file_pass {{select, instruction, mode}}\n\
+         - agent_run {{question}}\n\
+         - save_file {{name_template, format:\"html\"|\"md\", mode:\"create\"}}\n\
+         - condition {{op, value}}\n\
+         Each node needs a unique \"id\" and \"kind\". edges are [{{\"from\",\"to\",\"branch\"?}}] \
+         (branch \"then\"/\"else\" only from a condition). Prompts may use {{{{input}}}} \
+         (upstream results), {{{{files}}}} (the room's file list), {{{{date}}}}.\n\
+         For a workflow that runs on the file the user is viewing, set \
+         \"binding\":{{\"scope\":\"file\",\"kinds\":[\"pdf\"]}} and give input-taking nodes \
+         \"select\":{{\"type\":\"run_input\"}}. Otherwise omit binding (general).\n\
+         For a schedule use \"schedule\":{{\"kind\":\"daily\",\"param\":\"08:00\"}} \
+         (kind interval|daily|weekly).\n\n\
+         Example: {{\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"description\":\"Digest new files each morning.\",\
+         \"definition\":{{\"version\":1,\"nodes\":[{{\"id\":\"gen\",\"kind\":\"generate\",\"model\":\"auto\",\
+         \"prompt\":\"Digest the files:\\n{{{{files}}}}\"}},{{\"id\":\"save\",\"kind\":\"save_file\",\
+         \"name_template\":\"Digest {{{{date}}}}\",\"format\":\"html\",\"mode\":\"create\"}}],\
+         \"edges\":[{{\"from\":\"gen\",\"to\":\"save\"}}]}},\"schedule\":{{\"kind\":\"daily\",\"param\":\"08:00\"}}}}\n\n\
+         The workflow the user wants: {description}"
+    )
+}
+
+/// Generate text from whatever engine the room is set to — a local/cloud Ollama
+/// model or an external CLI (Codex/Claude). Used by `compose_workflow` so it works
+/// on ANY engine, including a plain-text external CLI that has no room tools.
+async fn generate_text_any_engine(model: &str, prompt: &str) -> Result<String, String> {
+    let msgs = vec![ollama::ChatMessage::new("user", prompt)];
+    if is_external_engine(model) {
+        crate::commands::run_external(model, &msgs, None, None).await
+    } else {
+        ollama::generate(model, msgs, Some(0.2), KEEP_ALIVE_WARM, None, ollama::CtxTier::Job)
+            .await
+            .map(|t| ollama::strip_think_spans(&t))
+    }
+}
+
+/// `compose_workflow` command: turn a plain-language description into a saved DRAFT
+/// workflow, engine-agnostically. It asks the model for the definition JSON as TEXT
+/// (not a tool call — so it works even with an external CLI that has no room tools),
+/// recovers/validates it (one repair retry), and saves it for review. Returns the
+/// new workflow's id so the UI can open it.
+#[tauri::command]
+pub async fn compose_workflow(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    description: String,
+) -> Result<String, String> {
+    let description = description.trim();
+    if description.is_empty() {
+        return Err("Describe the workflow you want.".into());
+    }
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+    let room_model = state.with_room(|room| Ok(model_setting(&room.conn)))?;
+    let models = ollama::list_models().await.unwrap_or_default();
+    let model = match room_model {
+        Some(m) if !m.trim().is_empty() => m,
+        _ => default_resolved_model(&None, &models),
+    };
+
+    let base = compose_prompt(description);
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        let prompt = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}\n\nYour previous attempt was rejected: {last_err}\nReturn corrected JSON only.")
+        };
+        let raw = generate_text_any_engine(&model, &prompt).await?;
+        let json = ollama::recover_json(&raw);
+        let val: serde_json::Value = match serde_json::from_str(&json) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = format!("output was not valid JSON ({e})");
+                continue;
+            }
+        };
+        let Some(definition) = val.get("definition").cloned() else {
+            last_err = "the JSON had no `definition` object".into();
+            continue;
+        };
+        let def = match parse_def(&definition) {
+            Ok(d) => d,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
+        let binding = parse_binding(val.get("binding"));
+        let errs = validate_workflow_inner(&state, &def, &binding).await;
+        if !errs.is_empty() {
+            last_err = errs.join("; ");
+            continue;
+        }
+        let name = val["name"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("New workflow");
+        let emoji = val["emoji"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("✨");
+        let binding_json =
+            serde_json::to_value(&binding).unwrap_or(serde_json::json!({"scope": "general"}));
+        let id = state.with_room(|room| {
+            db::create_workflow(
+                &room.conn,
+                name,
+                val["description"].as_str().unwrap_or("").trim(),
+                emoji,
+                &definition,
+                "agent",
+                &binding_json,
+            )
+        })?;
+        if let Some(s) = schedule_from_args(&val) {
+            apply_schedule(&state, &id, &def, &s.kind, &s.param, s.enabled, s.catch_up).await?;
+        }
+        emit_workflows_changed(&window);
+        return Ok(id);
+    }
+    Err(format!(
+        "Couldn't compose a valid workflow ({last_err}). Try describing it more specifically."
+    ))
+}
+
 /// Agent tool `update_workflow`: same validation; an update to an ACTIVE workflow
 /// drops it back to draft (its schedule pauses) — the review gate.
 pub(crate) async fn agent_update_workflow(

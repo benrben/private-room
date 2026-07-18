@@ -5,25 +5,30 @@ import { WSActions } from "../actions";
 
 type Props = { s: WSState; a: WSActions };
 
-/** The AI-authoring bar: describe a workflow in plain language and let the
- * in-room agent compose it with the save_workflow tool. The resulting draft
- * appears in the library on its own (the onWorkflowsChanged event refreshes
- * it), so the user reviews and activates it here. */
+/** The AI-authoring bar: describe a workflow in plain language and the backend
+ * composes it on whatever engine the room uses (the model returns the definition
+ * as JSON text, validated + saved as a draft in Rust — so it works even with an
+ * external CLI like Codex that has no room tools). On success we open the draft. */
 function ComposeBar({ s, a }: Props) {
   const [desc, setDesc] = useState("");
-  const busy = s.asking;
+  const [busy, setBusy] = useState(false);
 
-  function compose() {
+  async function compose() {
     const d = desc.trim();
     if (!d || busy) return;
-    const prompt =
-      `Create a workflow for this room: ${d}\n\n` +
-      `Use the save_workflow tool to save it as a draft I can review. Choose suitable ` +
-      `node kinds (generate, summarize_file, file_pass, save_file, condition), a short ` +
-      `name, and a fitting emoji. Don't run it — just save the draft.`;
-    setDesc("");
-    void a.send(prompt);
-    s.pushToast("info", "Composing — the draft will appear here when the assistant is done.");
+    setBusy(true);
+    s.pushToast("info", "Composing a workflow…");
+    try {
+      const id = await api.composeWorkflow(d);
+      setDesc("");
+      await a.refreshWorkflows();
+      a.openWorkflowDetail(id);
+      s.pushToast("success", "Draft ready — review and activate it.");
+    } catch (e) {
+      s.pushToast("error", typeof e === "string" ? e : "Couldn't compose that workflow.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -40,11 +45,11 @@ function ComposeBar({ s, a }: Props) {
           disabled={busy}
           onChange={(e) => setDesc(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") compose();
+            if (e.key === "Enter") void compose();
           }}
         />
-        <button className="wf-compose-btn" onClick={compose} disabled={busy || !desc.trim()}>
-          {busy ? "Assistant busy…" : "Compose with AI"}
+        <button className="wf-compose-btn" onClick={() => void compose()} disabled={busy || !desc.trim()}>
+          {busy ? "Composing…" : "Compose with AI"}
         </button>
       </div>
     </div>
