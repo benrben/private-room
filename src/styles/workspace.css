@@ -342,6 +342,103 @@
   color: var(--accent);
   margin-left: auto;
 }
+
+/* EngineModelPicker: Local/Cloud toggle, shared by the composer's model pill
+ * and Settings' Model section. */
+.engine-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.engine-tier-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  background: var(--surface-2);
+  border-radius: 8px;
+}
+.engine-tier-tab {
+  flex: 1;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.engine-tier-tab.active {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.engine-tier-tab:disabled {
+  opacity: 0.5;
+}
+.engine-tier-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.model-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.model-menu-row .model-menu-item {
+  flex: 1;
+}
+.engine-cloud-group {
+  display: flex;
+  flex-direction: column;
+}
+.engine-expand-caret {
+  margin-left: auto;
+  transition: transform 0.12s ease;
+}
+.engine-expand-caret.open {
+  transform: rotate(180deg);
+}
+.engine-submodel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: 16px;
+  border-left: 1px solid var(--border);
+  margin: 2px 0 2px 14px;
+}
+.engine-submodel-loading {
+  padding: 6px 10px;
+}
+.engine-submodel-default {
+  color: var(--text-dim);
+}
+.engine-submodel {
+  display: flex;
+  flex-direction: column;
+}
+.effort-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 10px 6px 27px;
+}
+.effort-chip {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: capitalize;
+}
+.effort-chip:hover {
+  color: var(--text);
+}
+.effort-chip.sel {
+  background: var(--accent-ghost);
+  border-color: var(--accent);
+  color: var(--text);
+}
 .add-menu {
   left: 0;
   right: auto;

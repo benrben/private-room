@@ -693,7 +693,7 @@ pub(crate) async fn stream_answer(
         // ADD-20: Claude Code gets the room's tools over a per-ask localhost
         // MCP bridge — same exec_tool dispatch as the local agent, decryption
         // stays in-process, and the bridge dies when this ask returns.
-        let bridge = if model == "claude-cli" {
+        let bridge = if split_external_model(model).0 == "claude-cli" {
             use tauri::Manager;
             crate::room_mcp::start(
                 window.app_handle().clone(),

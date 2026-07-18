@@ -1,17 +1,17 @@
 import { useEffect } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { ENGINE_LABELS, modelLabel, RoomInfo } from "../api";
+import { ENGINE_LABELS, RoomInfo, splitExternalModel } from "../api";
 import {
-  CheckIcon,
   ChevronDownIcon,
   DotsIcon,
   LockIcon,
   Logomark,
   SearchIcon,
 } from "../icons";
-import { isCloudEngine, isExternalEngine, isRemoteModel } from "./markup";
+import { isCloudEngine, isExternalEngine } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import EngineModelPicker from "./EngineModelPicker";
 
 /** The top bar: room identity, the engine pill/menu, search, room menu, lock.
  * Extracted verbatim from the <header className="topbar"> block. */
@@ -122,44 +122,25 @@ export default function TopBar({
                   onMouseDown={() => s.setModelMenuOpen(false)}
                 />
                 <div className="pop-menu model-menu">
-                  {ai.models.map((m) => (
-                    <button
-                      key={m}
-                      className={`model-menu-item${m === model ? " sel" : ""}`}
-                      onClick={() => {
-                        a.changeModel(m);
-                        s.setModelMenuOpen(false);
-                      }}
-                    >
-                      <span
-                        className={`model-dot ${isRemoteModel(m) ? "cloud" : "local"}`}
-                      />
-                      <span className="model-menu-name">
-                        {modelLabel(m) ?? m}
-                      </span>
-                      <span className="model-menu-tier">
-                        {isRemoteModel(m) ? "Cloud" : "Local"}
-                      </span>
-                      {m === model && <CheckIcon size={14} />}
-                    </button>
-                  ))}
-                  {ai.external.map((e) => (
-                    <button
-                      key={e}
-                      className={`model-menu-item${e === model ? " sel" : ""}`}
-                      onClick={() => {
-                        a.changeModel(e);
-                        s.setModelMenuOpen(false);
-                      }}
-                    >
-                      <span className="model-dot cloud" />
-                      <span className="model-menu-name">
-                        {ENGINE_LABELS[e] ?? e}
-                      </span>
-                      <span className="model-menu-tier cloud">Cloud</span>
-                      {e === model && <CheckIcon size={14} />}
-                    </button>
-                  ))}
+                  <EngineModelPicker
+                    ai={ai}
+                    model={model}
+                    engineModels={s.engineModels}
+                    onModelsLoaded={a.recordEngineModels}
+                    onSelect={(m) => {
+                      a.changeModel(m);
+                      // Keep the menu open only when the pick is a cloud model
+                      // that still has an effort to choose (its chips just
+                      // appeared); otherwise this is a final choice — close.
+                      const [engine, sub, effort] = splitExternalModel(m);
+                      const hasEfforts =
+                        !!ENGINE_LABELS[engine] &&
+                        !!sub &&
+                        !effort &&
+                        (s.engineModels[engine]?.find((x) => x.slug === sub)?.efforts.length ?? 0) > 0;
+                      if (!hasEfforts) s.setModelMenuOpen(false);
+                    }}
+                  />
                 </div>
               </>
             )}

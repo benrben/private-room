@@ -141,6 +141,7 @@ pub fn run() {
             commands::resolve_mcp_call,
             commands::ai_status,
             commands::model_capabilities,
+            commands::list_engine_models,
             commands::open_ollama,
             commands::warm_model,
             commands::pull_model,

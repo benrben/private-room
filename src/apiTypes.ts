@@ -242,9 +242,53 @@ export interface AiStatus {
 }
 
 export const ENGINE_LABELS: Record<string, string> = {
-  "claude-cli": "Claude (cloud)",
-  "codex-cli": "OpenAI (cloud)",
+  "claude-cli": "Claude Code",
+  "codex-cli": "Codex",
 };
+
+/** A specific model offered by a cloud engine (the Cloud picker's second
+ * level) — `slug` is what gets sent to the CLI via `--model`, `label` is the
+ * friendly display name, `efforts` are its supported reasoning levels (empty
+ * if the engine has no effort knob), `defaultEffort` the engine-reported
+ * default if any. */
+export interface ExternalModelInfo {
+  slug: string;
+  label: string;
+  efforts: string[];
+  defaultEffort: string | null;
+}
+
+/** A cloud engine selection, most-specific-last:
+ *   "claude-cli"                    bare engine (CLI default model+effort)
+ *   "codex-cli::gpt-5.6-sol"        a specific model
+ *   "codex-cli::gpt-5.6-sol::high"  a specific model AND reasoning effort
+ * Mirrors the Rust-side `split_external_model`. Returns
+ * [engine, model|null, effort|null]. */
+export function splitExternalModel(
+  model: string,
+): [string, string | null, string | null] {
+  const parts = model.split("::");
+  const engine = parts[0];
+  if (engine !== "claude-cli" && engine !== "codex-cli") return [model, null, null];
+  return [engine, parts[1] ?? null, parts[2] ?? null];
+}
+
+/** Friendly label for any model id — local, bare cloud engine, or a composite
+ * cloud-engine + model (+ effort) selection. `engineModels` is an optional
+ * cache of the fetched model list per engine, used to turn a slug into its
+ * display label; the effort (if any) is appended as "· <effort>". */
+export function engineModelLabel(
+  model: string,
+  engineModels?: Record<string, ExternalModelInfo[]>,
+): string {
+  const [engine, submodel, effort] = splitExternalModel(model);
+  const engineLabel = ENGINE_LABELS[engine];
+  if (!engineLabel) return modelLabel(model) ?? model;
+  if (!submodel) return engineLabel;
+  const known = engineModels?.[engine]?.find((m) => m.slug === submodel)?.label;
+  const base = `${engineLabel} — ${known ?? submodel}`;
+  return effort ? `${base} · ${effort}` : base;
+}
 
 /** ADD-22: a local model's declared abilities (from Ollama /api/show), so the
  * picker can badge each model and warn when the chosen one can't drive the app. */

@@ -1,4 +1,4 @@
-import { ENGINE_LABELS, modelLabel } from "./api";
+import { ENGINE_LABELS } from "./api";
 import { AlertIcon, CloseIcon, DownloadIcon, EyeIcon, TrashIcon } from "./icons";
 import "./settingsA11y.css";
 import { Props } from "./settings/types";
@@ -225,8 +225,6 @@ export default function Settings({
               model={model}
               onModelChange={onModelChange}
               caps={caps}
-              modelLabel={modelLabel}
-              ENGINE_LABELS={ENGINE_LABELS}
               confirmModel={confirmModel}
               confirmRemoveModel={confirmRemoveModel}
               cancelRemoveModel={cancelRemoveModel}

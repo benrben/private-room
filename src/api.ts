@@ -48,6 +48,7 @@ import type {
   FileMetaSuggestion,
   RoomServerStatus,
   RoomRole,
+  ExternalModelInfo,
 } from "./apiTypes";
 
 export const api = {
@@ -153,6 +154,10 @@ export const api = {
   aiStatus: () => invoke<AiStatus>("ai_status"),
   /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
   modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
+  /** Models available for a detected cloud engine ("claude-cli"/"codex-cli"),
+   *  for the Cloud picker's second level. */
+  listEngineModels: (engine: string) =>
+    invoke<ExternalModelInfo[]>("list_engine_models", { engine }),
   warmModel: () => invoke<void>("warm_model"),
   pullModel: (name: string) => invoke<void>("pull_model", { name }),
   deleteModel: (name: string) => invoke<void>("delete_model", { name }),

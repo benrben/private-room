@@ -1,9 +1,12 @@
-import { AnnotationPayload, FileTarget } from "../api";
+import { AnnotationPayload, FileTarget, splitExternalModel } from "../api";
 
 /** External CLI engines (Claude Code / Codex): a separate subprocess path —
- * no in-app tool chips, no Ollama daemon needed. */
+ * no in-app tool chips, no Ollama daemon needed. Recognizes both a bare
+ * engine id and a composite "engine::submodel" selection from the Cloud
+ * picker. */
 export function isExternalEngine(model: string): boolean {
-  return model === "claude-cli" || model === "codex-cli";
+  const [engine] = splitExternalModel(model);
+  return engine === "claude-cli" || engine === "codex-cli";
 }
 
 /** An Ollama `:cloud` model: listed alongside local models and driven through

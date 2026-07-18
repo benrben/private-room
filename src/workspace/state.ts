@@ -4,6 +4,7 @@ import {
   AiStatus,
   Chat,
   ChatCommand,
+  ExternalModelInfo,
   FileMeta,
   FileMetaSuggestion,
   FileVersion,
@@ -31,6 +32,12 @@ export function useWorkspaceState(info: RoomInfo) {
   const [memories, setMemories] = useState<Memory[]>([]);
   const [ai, setAi] = useState<AiStatus | null>(null);
   const [model, setModel] = useState("");
+  /** {engine: ExternalModelInfo[]} — populated as the Cloud picker fetches each
+   * engine's model list, so a chosen sub-model shows its friendly name (not
+   * the raw slug) in the model pill and toasts, without re-fetching. */
+  const [engineModels, setEngineModels] = useState<
+    Record<string, ExternalModelInfo[]>
+  >({});
   const [attachments, setAttachments] = useState<FileMeta[]>([]);
   const [question, setQuestion] = useState("");
   const [commands, setCommands] = useState<ChatCommand[]>([]);
@@ -229,6 +236,7 @@ export function useWorkspaceState(info: RoomInfo) {
   return {
     files, setFiles, chats, setChats, activeChatId, setActiveChatId,
     messages, setMessages, memories, setMemories, ai, setAi, model, setModel,
+    engineModels, setEngineModels,
     attachments, setAttachments, question, setQuestion, commands, setCommands,
     ac, setAc, composerRef, asking, setAsking, streamText, setStreamText,
     steps, setSteps, lane, setLane, undoByMsg, setUndoByMsg, editedRef,

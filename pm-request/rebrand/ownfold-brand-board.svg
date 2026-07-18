@@ -1,0 +1,103 @@
+<svg width="1600" height="1000" viewBox="0 0 1600 1000" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="1000" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7F4EC"/>
+      <stop offset="1" stop-color="#ECE7DA"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="92" y1="92" x2="420" y2="420" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#20332F"/>
+      <stop offset="1" stop-color="#101A19"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="130" y1="130" x2="370" y2="370" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8BC7BA"/>
+      <stop offset="1" stop-color="#3C8D83"/>
+    </linearGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="14" stdDeviation="22" flood-color="#20332F" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="1000" fill="url(#bg)"/>
+  <circle cx="1482" cy="72" r="260" fill="#8BC7BA" fill-opacity="0.10"/>
+  <circle cx="92" cy="920" r="250" fill="#C87941" fill-opacity="0.07"/>
+
+  <text x="84" y="74" fill="#5A6763" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="650" letter-spacing="2.6">RECOMMENDED BRAND DIRECTION · 18 JULY 2026</text>
+
+  <!-- Main identity -->
+  <g filter="url(#cardShadow)">
+    <rect x="84" y="112" width="660" height="420" rx="32" fill="#FFFDF8"/>
+  </g>
+  <rect x="130" y="160" width="206" height="206" rx="52" fill="url(#tile)"/>
+  <path d="M164 194H244V232H204V294H244V332H164V194Z" fill="#F5F1E8"/>
+  <path d="M222 194H302V332H222V294H262V232H222V194Z" fill="url(#accent)"/>
+  <path d="M204 232H244L228 248H204V232Z" fill="#C87941"/>
+  <path d="M222 294H262V278L246 294H222Z" fill="#B96838"/>
+
+  <text x="378" y="246" fill="#14201E" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="74" font-weight="720" letter-spacing="-4">ownfold</text>
+  <text x="380" y="292" fill="#3E504B" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="22">OWN-fold</text>
+  <line x1="130" y1="404" x2="698" y2="404" stroke="#DCD6C9"/>
+  <text x="130" y="452" fill="#14201E" font-family="Georgia, 'Times New Roman', serif" font-size="34">Your work. Your AI.</text>
+  <text x="130" y="494" fill="#14201E" font-family="Georgia, 'Times New Roman', serif" font-size="34">One private file.</text>
+
+  <!-- Why the mark -->
+  <g filter="url(#cardShadow)">
+    <rect x="780" y="112" width="736" height="420" rx="32" fill="#14201E"/>
+  </g>
+  <text x="826" y="168" fill="#8BC7BA" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" letter-spacing="2.2">THE FOLD MARK</text>
+  <text x="826" y="222" fill="#FFFDF8" font-family="Georgia, 'Times New Roman', serif" font-size="38">Two parts fold inward.</text>
+  <text x="826" y="266" fill="#FFFDF8" font-family="Georgia, 'Times New Roman', serif" font-size="38">The center stays open.</text>
+  <text x="826" y="322" fill="#A8B4B0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21">It can read as an O, a document, or a doorway.</text>
+  <text x="826" y="354" fill="#A8B4B0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21">It does not use a lock, shield, cloud, or AI sparkle.</text>
+  <text x="826" y="418" fill="#F5F1E8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="18" font-weight="650">The idea:</text>
+  <text x="826" y="452" fill="#8BC7BA" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="25" font-weight="650">everything comes in; nothing leaks out.</text>
+
+  <!-- Color system -->
+  <text x="84" y="602" fill="#14201E" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="18" font-weight="750" letter-spacing="2.2">COLOR</text>
+  <g>
+    <rect x="84" y="626" width="214" height="112" rx="20" fill="#14201E"/>
+    <text x="104" y="700" fill="#FFFDF8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="650">Ink</text>
+    <text x="104" y="724" fill="#A8B4B0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">#14201E</text>
+
+    <rect x="312" y="626" width="214" height="112" rx="20" fill="#F5F1E8" stroke="#D7D0C3"/>
+    <text x="332" y="700" fill="#14201E" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="650">Paper</text>
+    <text x="332" y="724" fill="#64706C" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">#F5F1E8</text>
+
+    <rect x="540" y="626" width="214" height="112" rx="20" fill="#3C8D83"/>
+    <text x="560" y="700" fill="#FFFFFF" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="650">Mineral</text>
+    <text x="560" y="724" fill="#D8F3ED" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">#3C8D83</text>
+
+    <rect x="768" y="626" width="214" height="112" rx="20" fill="#8BC7BA"/>
+    <text x="788" y="700" fill="#14201E" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="650">Sea glass</text>
+    <text x="788" y="724" fill="#264B45" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">#8BC7BA</text>
+
+    <rect x="996" y="626" width="214" height="112" rx="20" fill="#C87941"/>
+    <text x="1016" y="700" fill="#FFFFFF" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="650">Receipt</text>
+    <text x="1016" y="724" fill="#FFE5D4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">#C87941</text>
+
+    <rect x="1224" y="626" width="292" height="112" rx="20" fill="#FFFDF8" stroke="#D7D0C3"/>
+    <text x="1244" y="680" fill="#14201E" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="650">Copper means “proof.”</text>
+    <text x="1244" y="710" fill="#64706C" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15">Use it for source receipts and</text>
+    <text x="1244" y="732" fill="#64706C" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15">clear online-data warnings only.</text>
+  </g>
+
+  <!-- Voice and icon samples -->
+  <g filter="url(#cardShadow)">
+    <rect x="84" y="786" width="914" height="154" rx="24" fill="#FFFDF8"/>
+  </g>
+  <text x="116" y="826" fill="#3C8D83" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="750" letter-spacing="1.8">VOICE</text>
+  <text x="116" y="866" fill="#14201E" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="24" font-weight="700">Plain. Calm. Exact.</text>
+  <text x="116" y="904" fill="#64706C" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="18">“Cloud is on. This question and the attached text will leave your Mac.”</text>
+
+  <g filter="url(#cardShadow)">
+    <rect x="1022" y="786" width="494" height="154" rx="24" fill="#FFFDF8"/>
+  </g>
+  <text x="1054" y="826" fill="#3C8D83" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="750" letter-spacing="1.8">ICON RULE</text>
+  <g stroke="#14201E" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M1060 875h30v28h-30zM1066 875v-8h18v8"/>
+    <path d="M1128 866h28l8 8v29h-36zM1156 866v10h8"/>
+    <path d="M1204 883c0-9 7-16 16-16s16 7 16 16-7 16-16 16h-16v-16z"/>
+    <path d="M1282 871h35v28h-35zM1290 871v-7h19v7M1290 886h19"/>
+  </g>
+  <text x="1352" y="878" fill="#14201E" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="16" font-weight="650">1.75–2 px stroke</text>
+  <text x="1352" y="904" fill="#64706C" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15">No emoji. No glow.</text>
+</svg>

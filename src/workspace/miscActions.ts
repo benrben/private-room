@@ -2,12 +2,12 @@ import { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } fr
 import {
   AnnotationPayload,
   api,
-  ENGINE_LABELS,
+  engineModelLabel,
+  ExternalModelInfo,
   frontPage,
   frontPageSuggestions,
   McpApproveRequest,
   McpServerStatus,
-  modelLabel,
   RoomInfo,
 } from "../api";
 import { runGuarded, tryToast } from "./guard";
@@ -233,7 +233,13 @@ export function makeMiscActions(
   }
 
   function engineLabelOf(m: string): string {
-    return ENGINE_LABELS[m] ?? modelLabel(m) ?? m;
+    return engineModelLabel(m, s.engineModels);
+  }
+
+  /** Cache a cloud engine's fetched model list (Cloud picker second level) so
+   * the model pill/toasts can show friendly names without re-fetching. */
+  function recordEngineModels(engine: string, models: ExternalModelInfo[]) {
+    s.setEngineModels((prev) => ({ ...prev, [engine]: models }));
   }
 
   // ---- ADD-3: two-step delete ----
@@ -326,6 +332,7 @@ export function makeMiscActions(
     approveMcp, keepMcpOff, submitLink, loadFrontPage, saveSuggestedMemory,
     copyReceipt, playSealSound, addMemory, saveMemoryEdit, activateResult,
     resolveMcpApproval, revealMemory, changeModel, engineLabelOf,
+    recordEngineModels,
     askConfirm, cancelConfirm, startPaneResize, searchFlat, onSearchKey,
   };
 }
