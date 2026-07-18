@@ -174,7 +174,7 @@ async fn fire(app: &tauri::AppHandle, sched: &db::Schedule, wf: &db::Workflow, t
     let window = webview.as_ref().window();
     let state = app.state::<AppState>();
     let next = next_run_from_now(&sched.kind, &sched.param);
-    match start_workflow_run(&window, &state, &wf.id, trigger, None).await {
+    match start_workflow_run(&window, &state, &wf.id, trigger, None, &std::collections::HashSet::new()).await {
         Ok(job_id) => {
             let _ = state.with_room(|room| {
                 db::mark_schedule_run(&room.conn, &sched.id, &job_id, next.as_deref())

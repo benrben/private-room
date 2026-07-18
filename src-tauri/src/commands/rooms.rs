@@ -422,6 +422,8 @@ pub(crate) fn teardown_open_room(app: &tauri::AppHandle, state: &AppState) {
     // Wave 2 (Idea 6): drop any in-flight diff-preview approval requests too —
     // their awaiters resolve to a decline, so nothing lands after a room closes.
     state.edit_pending.lock().unwrap().clear();
+    // Wave 5 (Idea 13): drop any in-flight script-run approval requests too.
+    state.script_pending.lock().unwrap().clear();
     // ADD-24/ADD-25: a locked room leaves no decrypted media staged for the
     // streaming protocol, and no agent↔UI round-trip left hanging.
     clear_media(&app.state::<MediaStreams>());

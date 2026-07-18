@@ -6,6 +6,7 @@ import {
   FolderIcon,
   GraphIcon,
   WorkflowsIcon,
+  ScriptIcon,
   LinkIcon,
   MemoryIcon,
   MicIcon,
@@ -125,6 +126,14 @@ export default function Sidebar({
             }
           >
             <WorkflowsIcon size={14} /> Workflows
+          </button>
+          {/* Wave 5 (Idea 13): the Scripts entry, beside Workflows. */}
+          <button
+            className={`add-btn${s.showScripts ? " active" : ""}`}
+            title="Scripts — run and schedule .py/.js files in this room"
+            onClick={() => (s.showScripts ? a.closeScripts() : a.openScripts())}
+          >
+            <ScriptIcon size={14} /> Scripts
           </button>
           <div className="add-menu-wrap">
             <button

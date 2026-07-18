@@ -238,10 +238,22 @@ pub fn run() {
             commands::validate_workflow,
             commands::get_workflow_runs,
             commands::get_job_step_artifact,
+            // Wave 5 (Idea 13): runnable & schedulable scripts.
+            commands::list_scripts,
+            commands::get_script_manifest,
+            commands::run_script,
+            commands::set_script_schedule,
+            commands::resolve_script_run,
             // Idea 3: supernatural voice — on-device speech synthesis.
             commands::speak_text,
             commands::list_speech_voices,
         ])
+        .setup(|app| {
+            // Wave 5 (Idea 13): sweep orphaned script-run workspaces left by a
+            // crash before anything runs (the quiesce_stale_jobs spirit).
+            commands::sweep_script_workspaces(app.handle());
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, _event| {

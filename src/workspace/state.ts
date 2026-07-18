@@ -17,6 +17,8 @@ import {
   Message,
   RoomInfo,
   SearchResults,
+  ScriptInfo,
+  ScriptApproveRequest,
   StudioPrompts,
   Workflow,
   WorkflowNodeEvent,
@@ -185,6 +187,16 @@ export function useWorkspaceState(info: RoomInfo) {
   // The room's workflows (one source of truth for the page, top bar, and the
   // file-header Actions menu). Loaded on mount, refreshed on workflows-changed.
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  // Wave 5 (Idea 13): the full-pane Scripts view (mirrors showWorkflows) + the
+  // scripts index (one source of truth for the page, the file-header Run button,
+  // and the header/global shortcut bars). Loaded on mount, refreshed on
+  // room-files-changed / workflows-changed.
+  const [showScripts, setShowScripts] = useState(false);
+  const showScriptsRef = useRef(false);
+  showScriptsRef.current = showScripts;
+  const [scripts, setScripts] = useState<ScriptInfo[]>([]);
+  // Queued script-run consent cards, mirroring mcpApprovals.
+  const [scriptApprovals, setScriptApprovals] = useState<ScriptApproveRequest[]>([]);
   // Per-job map of node id → live status, driving the pipeline animation.
   const [wfNodeStatus, setWfNodeStatus] = useState<
     Record<string, Record<string, WorkflowNodeEvent>>
@@ -192,6 +204,8 @@ export function useWorkspaceState(info: RoomInfo) {
   // The top-bar pinned-workflows popover (⌘J) and the file-header Actions menu.
   const [qaMenuOpen, setQaMenuOpen] = useState(false);
   const [qaFileMenuOpen, setQaFileMenuOpen] = useState(false);
+  // Wave 5 (Idea 13): the file-header "Scripts" shortcut menu open flag.
+  const [qaScriptMenuOpen, setQaScriptMenuOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [fp, setFp] = useState<FrontPage | null>(null);
   const [fpSuggestions, setFpSuggestions] = useState<string[]>([]);
@@ -333,7 +347,10 @@ export function useWorkspaceState(info: RoomInfo) {
     showMap, setShowMap, showMapRef, showHelp, setShowHelp,
     showWorkflows, setShowWorkflows, showWorkflowsRef, wfDetailId, setWfDetailId,
     workflows, setWorkflows, wfNodeStatus, setWfNodeStatus,
+    showScripts, setShowScripts, showScriptsRef, scripts, setScripts,
+    scriptApprovals, setScriptApprovals,
     qaMenuOpen, setQaMenuOpen, qaFileMenuOpen, setQaFileMenuOpen,
+    qaScriptMenuOpen, setQaScriptMenuOpen,
     fp, setFp, fpSuggestions, setFpSuggestions, studioBusy, setStudioBusy,
     studioOpId, setStudioOpId, studioStep, setStudioStep,
     importProgress, setImportProgress,

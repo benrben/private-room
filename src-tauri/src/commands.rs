@@ -40,6 +40,7 @@ mod ytdlp;
 mod recording_cmds;
 mod feedback;
 mod jobs;
+mod scripts;
 mod speech_cmds;
 
 pub use external::*;
@@ -72,6 +73,7 @@ pub use ytdlp::*;
 pub use recording_cmds::*;
 pub use feedback::*;
 pub use jobs::*;
+pub use scripts::*;
 pub use speech_cmds::*;
 
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.5:4b";
@@ -149,6 +151,11 @@ pub struct AppState {
     /// request id); the frontend answers via `resolve_edit_approval`. Cleared on
     /// room close next to `mcp_pending` so a pending card can never outlive a room.
     pub edit_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<EditDecision>>>,
+    /// Wave 5 (Idea 13): per-run script consent, mirroring `mcp_pending`. Holds the
+    /// reply channel for each in-flight script-run approval card (keyed by request
+    /// id); the frontend answers via `resolve_script_run`. Cleared on room close so
+    /// a pending card can never outlive a room.
+    pub script_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<McpDecision>>>,
     /// D9 (the Leash): the room's persistent MCP server, when the user has turned
     /// it on. Unlike the per-`ask` bridge in `run_external`, this one lives for as
     /// long as the room is open so an external CLI/agent can hold a session. It is

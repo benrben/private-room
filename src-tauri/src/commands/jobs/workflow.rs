@@ -110,6 +110,10 @@ pub enum NodeKind {
         #[serde(default)]
         value: Option<String>,
     },
+    /// Wave 5 (Idea 13): run a `.py`/`.js` room script in a throwaway workspace,
+    /// importing its declared + new outputs back into the room. `file` is the
+    /// script's file id (or a name). The consent hash lives in the plan snapshot.
+    ScriptRun { file: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +158,12 @@ pub struct WorkflowPlan {
     /// `new_files_since_last_run`.
     #[serde(default)]
     pub prev_run_at: Option<String>,
+    /// Wave 5 (Idea 13): per-script-node consent snapshot (script file id →
+    /// approved SHA-256 of the script bytes), stamped at ENQUEUE from the just-
+    /// granted hash (manual) or the approvals file (scheduled). The executor re-
+    /// hashes the script and PARKS on mismatch, so a mid-run edit never runs.
+    #[serde(default)]
+    pub script_consents: std::collections::HashMap<String, String>,
     pub steps: Vec<Step>,
 }
 
@@ -181,6 +191,7 @@ const NODE_KINDS: &[&str] = &[
     "agent_run",
     "save_file",
     "condition",
+    "script_run",
 ];
 const FILE_SELECTORS: &[&str] = &[
     "newest",
@@ -298,6 +309,20 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                     ));
                 }
             }
+            NodeKind::ScriptRun { file } => {
+                if file.trim().is_empty() {
+                    errs.push(format!("Node '{}' (script_run) has no script file.", n.id));
+                } else if script_lang_of(file).is_none() && extraction::extension_of(file).is_empty()
+                {
+                    // A bare id (no extension) is fine — it's resolved at run
+                    // time; a name WITH an extension must be .py/.js.
+                } else if script_lang_of(file).is_none() {
+                    errs.push(format!(
+                        "Node '{}' points at '{}' — only .py or .js scripts can run.",
+                        n.id, file
+                    ));
+                }
+            }
         }
     }
     // The `kind` tag is validated by serde at parse time; a defensive check keeps
@@ -373,6 +398,7 @@ fn node_kind_tag(kind: &NodeKind) -> &'static str {
         NodeKind::AgentRun { .. } => "agent_run",
         NodeKind::SaveFile { .. } => "save_file",
         NodeKind::Condition { .. } => "condition",
+        NodeKind::ScriptRun { .. } => "script_run",
     }
 }
 
@@ -493,9 +519,9 @@ pub fn compile_workflow(
             NodeKind::SummarizeFile { .. }
             | NodeKind::FilePass { .. }
             | NodeKind::AgentRun { .. } => resolve_node_model("auto", room_model, models),
-            NodeKind::SaveFile { .. } | NodeKind::Condition { .. } => {
-                (String::new(), Lane::Cpu)
-            }
+            NodeKind::SaveFile { .. }
+            | NodeKind::Condition { .. }
+            | NodeKind::ScriptRun { .. } => (String::new(), Lane::Cpu),
         };
         steps.push(Step {
             id: idx,
@@ -913,6 +939,9 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 ..Default::default()
             })
         }
+        NodeKind::ScriptRun { file } => {
+            run_script_node(app, job_id, room_path, plan, file, cancel, published).await
+        }
     };
 
     match result {
@@ -960,6 +989,56 @@ async fn run_file_pass_node<R: tauri::Runtime>(
         *published.lock().unwrap() = Some(m);
     }
     Ok(WfArtifact { result: summary, file_id, ..Default::default() })
+}
+
+/// Wave 5 (Idea 13): the `script_run` node arm. Resolves the script file id, reads
+/// its consent hash from the IMMUTABLE plan snapshot (a mid-run script edit parks,
+/// never silently runs new code), runs it, records the report JSON as the step
+/// artifact, and publishes the first imported output (the terminal auto-open is
+/// gated to MANUAL runs in `spawn_workflow_job`).
+async fn run_script_node<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    job_id: &str,
+    room_path: &str,
+    plan: &WorkflowPlan,
+    file: &str,
+    cancel: &Arc<AtomicBool>,
+    published: &std::sync::Mutex<Option<FileMeta>>,
+) -> Result<WfArtifact, String> {
+    use tauri::Manager;
+    // Resolve the node's `file` (a stored file id, or a name) to a file id.
+    let file_id = {
+        let state = app.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        let room = guard
+            .as_ref()
+            .filter(|r| r.path == room_path)
+            .ok_or("The room this job belongs to is no longer open.")?;
+        // An exact id first, then a fuzzy name match (the same resolution the
+        // consent-stamping used at enqueue).
+        if room
+            .conn
+            .query_row("SELECT 1 FROM files WHERE id = ?1", [file], |_| Ok(()))
+            .is_ok()
+        {
+            file.to_string()
+        } else {
+            db::find_file_like(&room.conn, file)?.0
+        }
+    };
+    let consent = plan.script_consents.get(&file_id).cloned().unwrap_or_default();
+    let report =
+        run_script_process(app, job_id, room_path, &file_id, &consent, cancel).await?;
+    // Publish the first imported output so a MANUAL run can auto-open it.
+    if let Some(first) = report.imported.first() {
+        *published.lock().unwrap() = Some(first.clone());
+    }
+    let n = report.imported.len();
+    let result = serde_json::to_string(&report).unwrap_or_else(|_| {
+        format!("Script finished (exit {}), {n} file(s) imported.", report.exit_code)
+    });
+    let file_id = report.imported.first().map(|m| m.id.clone());
+    Ok(WfArtifact { result, file_id, ..Default::default() })
 }
 
 /// Write the workflow's output as a room file. Idempotent: if this node already
@@ -1255,6 +1334,42 @@ pub(crate) fn spawn_workflow_job(
 
 // ---------------------------------------------------------------- run orchestration
 
+/// Wave 5: for every `script_run` node, resolve its script file id and hash the
+/// current bytes; if that hash is approved (per-Mac approvals ∪ this run's
+/// grants), record `file_id → hash` so the executor runs it. An unapproved or
+/// unresolvable script gets no entry, so the executor parks with an empty consent
+/// — a scheduled run never silently executes new/changed code.
+pub(crate) fn stamp_script_consents(
+    conn: &Connection,
+    def: &WorkflowDef,
+    approved: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for node in &def.nodes {
+        if let NodeKind::ScriptRun { file } = &node.kind {
+            // Resolve `file` (a stored id, or a name) to a file id + bytes.
+            let resolved: Option<(String, Vec<u8>)> = if let Ok((name, bytes)) =
+                db::get_file_bytes_named(conn, file)
+            {
+                let _ = name;
+                Some((file.clone(), bytes.unwrap_or_default()))
+            } else if let Ok((id, _)) = db::find_file_like(conn, file) {
+                let bytes = db::get_file_bytes(conn, &id).ok().flatten().unwrap_or_default();
+                Some((id, bytes))
+            } else {
+                None
+            };
+            if let Some((id, bytes)) = resolved {
+                let sha = script_fingerprint(&bytes);
+                if approved.contains(&sha) {
+                    out.insert(id, sha);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The previous run's start time (for since_last_run / new_files_since_last_run).
 fn previous_run_at(conn: &Connection, workflow_id: &str) -> Option<String> {
     conn.query_row(
@@ -1268,14 +1383,19 @@ fn previous_run_at(conn: &Connection, workflow_id: &str) -> Option<String> {
 /// Compile a workflow and enqueue a run. Shared by the command, the agent tool,
 /// and the scheduler. Returns the new job id. `trigger` = manual|schedule|
 /// catchup|agent; `input_file_id` is the header-run's current file (validated by
-/// the caller for run_input defs).
+/// the caller for run_input defs). `extra_consents` are script fingerprints
+/// granted for THIS invocation (a manual "run once" grant that isn't in the
+/// approvals file) — folded into the plan's `script_consents` alongside the
+/// per-Mac approvals file (Wave 5, decision 5).
 pub(crate) async fn start_workflow_run(
     window: &tauri::Window,
     state: &AppState,
     workflow_id: &str,
     trigger: &str,
     input_file_id: Option<String>,
+    extra_consents: &std::collections::HashSet<String>,
 ) -> Result<String, String> {
+    use tauri::Manager;
     if state.rolling_back() {
         return Err(ROLLBACK_BUSY.into());
     }
@@ -1295,6 +1415,18 @@ pub(crate) async fn start_workflow_run(
     if def_uses_run_input(&def) && input_file_id.is_none() {
         return Err("This workflow runs on a chosen file — start it from a file's Actions menu.".into());
     }
+    // Wave 5: stamp the consent snapshot for any script_run nodes (approvals
+    // file on this Mac ∪ this invocation's grants). Read under the room lock.
+    let app = window.app_handle().clone();
+    let approved: std::collections::HashSet<String> = {
+        let mut set: std::collections::HashSet<String> =
+            crate::commands::read_script_approvals(&app).into_iter().collect();
+        set.extend(extra_consents.iter().cloned());
+        set
+    };
+    let script_consents = state.with_room(|room| {
+        Ok(stamp_script_consents(&room.conn, &def, &approved))
+    })?;
     let models = ollama::list_models().await.unwrap_or_default();
     let steps = compile_workflow(&def, &room_model, &models)
         .map_err(|errs| errs.join(" "))?;
@@ -1307,6 +1439,7 @@ pub(crate) async fn start_workflow_run(
         resolved_model,
         input_file_id: input_file_id.clone(),
         prev_run_at,
+        script_consents,
         steps: steps.clone(),
     };
     let plan_json = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
@@ -1626,7 +1759,7 @@ pub async fn run_workflow(
                 .ok_or_else(|| "That file is no longer in this room.".to_string())
         })?;
     }
-    start_workflow_run(&window, state.inner(), &id, "manual", file_id).await
+    start_workflow_run(&window, state.inner(), &id, "manual", file_id, &std::collections::HashSet::new()).await
 }
 
 /// The prebuilt template gallery (empty-state) — also the agent's few-shot set.
@@ -1816,7 +1949,7 @@ pub(crate) async fn agent_run_workflow(
         })?),
         None => None,
     };
-    start_workflow_run(window, state, &wf.id, "manual", file_id).await?;
+    start_workflow_run(window, state, &wf.id, "manual", file_id, &std::collections::HashSet::new()).await?;
     Ok(format!(
         "Started \"{}\" in the background — the user can watch it on the Workflows page. Do not wait for it.",
         wf.name

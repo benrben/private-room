@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { api, ENGINE_LABELS, RoomInfo, splitExternalModel } from "../api";
 import {
@@ -6,6 +6,7 @@ import {
   DotsIcon,
   LockIcon,
   Logomark,
+  ScriptIcon,
   SearchIcon,
 } from "../icons";
 import { isCloudEngine, isExternalEngine, isModelReady } from "./markup";
@@ -26,6 +27,9 @@ export default function TopBar({
   info: RoomInfo;
 }) {
   const { ai, model } = s;
+  // Wave 5 (Idea 13): the global-scripts shortcut menu open flag (local — it
+  // sits beside the pinned-workflows menu in the top bar).
+  const [scriptMenuOpen, setScriptMenuOpen] = useState(false);
   // One dismissal grammar for the header popovers: Escape closes whichever
   // is open (and never leaks to deeper layers while one is).
   const anyMenuOpen = s.modelMenuOpen || s.roomMenuOpen || s.qaMenuOpen;
@@ -50,6 +54,16 @@ export default function TopBar({
       icon: w.emoji || "⚙️",
       hint: w.name,
       onRun: () => void a.runWorkflowNow(w.id),
+    }));
+  // Wave 5 (Idea 13): `room-shortcut: global` scripts as one-click top-bar runs.
+  const globalScriptActions: QuickAction[] = s.scripts
+    .filter((sc) => sc.shortcut === "global")
+    .map((sc) => ({
+      id: sc.fileId,
+      label: sc.name,
+      icon: "▶",
+      hint: `Run ${sc.name}`,
+      onRun: () => void a.runScript(sc.fileId),
     }));
   const modelReady = isModelReady(ai, model);
   return (
@@ -97,6 +111,20 @@ export default function TopBar({
           pill
           footer={{ label: "All workflows…", onClick: a.openWorkflows }}
         />
+        {/* Wave 5: global-shortcut scripts, beside the workflow pins (only when
+            a script opts into `room-shortcut: global`). */}
+        {globalScriptActions.length > 0 && (
+          <QuickActionsMenu
+            actions={globalScriptActions}
+            open={scriptMenuOpen}
+            onOpenChange={setScriptMenuOpen}
+            buttonLabel="Scripts"
+            buttonIcon={<ScriptIcon size={14} />}
+            inlineMax={2}
+            pill
+            footer={{ label: "All scripts…", onClick: a.openScripts }}
+          />
+        )}
         {ai && (ai.models.length > 0 || ai.external.length > 0) ? (
           <div className="model-pill-wrap">
             <button

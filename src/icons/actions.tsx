@@ -123,3 +123,22 @@ export function PlusIcon(p: IconProps) {
     </Stroke>
   );
 }
+
+/** Wave 5 (Idea 13): Run a script — a play triangle. */
+export function PlayIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M7 5.5l11 6.5-11 6.5V5.5z" />
+    </Stroke>
+  );
+}
+
+/** A clock face — the schedule affordance. */
+export function ClockIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 7.5V12l3 1.8" />
+    </Stroke>
+  );
+}

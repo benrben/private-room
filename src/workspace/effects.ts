@@ -42,6 +42,9 @@ export function useWorkspaceEffects(
     // Wave 4a: load the room's workflows once — one source of truth for the
     // page, the top-bar pins, and the file-header Actions menu.
     void a.refreshWorkflows();
+    // Wave 5 (Idea 13): load the room's scripts once — one source of truth for
+    // the Scripts page, the file-header Run button, and the shortcut bars.
+    void a.refreshScripts();
     a.refreshAi();
     a.loadFrontPage(true);
     api.warmModel().catch(() => {});
@@ -142,6 +145,12 @@ export function useWorkspaceEffects(
     });
     const unlistenWfChanged = api.onWorkflowsChanged(() => {
       void a.refreshWorkflows();
+      // Wave 5: a script's run finished → its last-run/status changed.
+      void a.refreshScripts();
+    });
+    // Wave 5 (Idea 13): queue a script-run consent card (data-agent-blocked).
+    const unlistenScriptApprove = api.onScriptApproveRequest((req) => {
+      s.setScriptApprovals((q) => [...q, req]);
     });
     const unlistenPull = listen<{ status: string; percent: number | null }>(
       "pull-progress",
@@ -280,6 +289,9 @@ export function useWorkspaceEffects(
       api.listFiles().then(s.setFiles);
       api.listFolders().then(s.setFolders).catch(() => {});
       a.loadFrontPage(false);
+      // Wave 5: scripts ARE files — a new/edited/imported script updates the
+      // index (and a script that just ran wrote its outputs here).
+      void a.refreshScripts();
     });
     api.mcpStatus().then((st) => s.setMcpTools(a.connectedTools(st))).catch(() => {});
     const unlistenMcp = api.onMcpStatus((statuses) => {
@@ -367,6 +379,7 @@ export function useWorkspaceEffects(
       unlistenJobs.then((fn) => fn());
       unlistenWfNode.then((fn) => fn());
       unlistenWfChanged.then((fn) => fn());
+      unlistenScriptApprove.then((fn) => fn());
       unlistenPull.then((fn) => fn());
       unlistenDrop.then((fn) => fn());
       unlistenOpen.then((fn) => fn());
@@ -495,6 +508,12 @@ export function useWorkspaceEffects(
         if (s.showWorkflowsRef.current) {
           e.preventDefault();
           s.setShowWorkflows(false);
+          return;
+        }
+        // Wave 5: Escape closes the full-pane Scripts view.
+        if (s.showScriptsRef.current) {
+          e.preventDefault();
+          s.setShowScripts(false);
           return;
         }
         const t = e.target as HTMLElement | null;

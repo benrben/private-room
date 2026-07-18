@@ -29,6 +29,11 @@ pub(crate) use queue::*;
 mod scheduler;
 pub use scheduler::*;
 
+// Wave 5 (Idea 13): the runnable/schedulable SCRIPT runner — a new `script_run`
+// node kind in the workflow engine (no parallel job system).
+mod script_run;
+pub use script_run::*;
+
 /// Where a step runs — decides how many may run at once. Local-model work is
 /// serial because only one model is resident; CPU and cloud work fan out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

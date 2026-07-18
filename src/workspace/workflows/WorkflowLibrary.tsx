@@ -27,17 +27,24 @@ export function WorkflowLibrary({ s, a }: Props) {
   const [schedules, setSchedules] = useState<Record<string, Schedule | null>>({});
   const [now, setNow] = useState(() => Date.now());
 
+  // Wave 5 (Idea 13): the per-script auto-workflows (created_by='script') have
+  // their own home on the Scripts page — hide them from the workflow library.
+  const visible = useMemo(
+    () => s.workflows.filter((w) => w.createdBy !== "script"),
+    [s.workflows],
+  );
+
   useEffect(() => {
-    if (s.workflows.length === 0) {
+    if (visible.length === 0) {
       api.workflowTemplates().then(setTemplates).catch(() => {});
     }
-  }, [s.workflows.length]);
+  }, [visible.length]);
 
   // Fetch each workflow's schedule for its badge/countdown.
   useEffect(() => {
     let live = true;
     Promise.all(
-      s.workflows.map((w) =>
+      visible.map((w) =>
         api.getWorkflowSchedule(w.id).then((sc) => [w.id, sc] as const).catch(() => [w.id, null] as const),
       ),
     ).then((pairs) => {
@@ -46,7 +53,7 @@ export function WorkflowLibrary({ s, a }: Props) {
     return () => {
       live = false;
     };
-  }, [s.workflows]);
+  }, [visible]);
 
   // Tick once a minute for the countdowns (only when something is scheduled).
   const anyScheduled = useMemo(
@@ -59,7 +66,7 @@ export function WorkflowLibrary({ s, a }: Props) {
     return () => window.clearInterval(t);
   }, [anyScheduled]);
 
-  if (s.workflows.length === 0) {
+  if (visible.length === 0) {
     return (
       <div className="wf-body">
         <div className="wf-empty">
@@ -103,7 +110,7 @@ export function WorkflowLibrary({ s, a }: Props) {
         </button>
       </div>
       <div className="wf-grid">
-        {s.workflows.map((w) => {
+        {visible.map((w) => {
           const sc = schedules[w.id];
           const bb = bindingBadge(w);
           return (

@@ -7,7 +7,9 @@ import {
   LockIcon,
   MicIcon,
   PencilIcon,
+  PlayIcon,
   PlusIcon,
+  ScriptIcon,
   SendIcon,
   SparkIcon,
   TimeMachineIcon,
@@ -19,7 +21,14 @@ import FrontPage from "./FrontPage";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkflowsPage } from "./workflows/WorkflowsPage";
+import { ScriptsPage } from "./scripts/ScriptsPage";
 import { QuickActionsMenu, bindingMatches, QuickAction } from "./QuickActions";
+
+/** True when a file name is a runnable script (.py/.js). */
+function isScriptName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower.endsWith(".py") || lower.endsWith(".js");
+}
 
 /** True when a media transcript carries real speech — at least one timestamped
  * "[m:ss] …" row with words. The "(transcribed from recording)" provenance line
@@ -53,6 +62,8 @@ export default function ViewerPane({
     <section className="viewer" aria-label="Workspace">
       {s.showWorkflows ? (
         <WorkflowsPage s={s} a={a} />
+      ) : s.showScripts ? (
+        <ScriptsPage s={s} a={a} />
       ) : s.showMap ? (
         <>
           <div className="viewer-head">
@@ -93,6 +104,58 @@ export default function ViewerPane({
                       : "Edit"}
                 </button>
               )}
+              {/* Wave 5 (Idea 13): a .py/.js file runs from its own header —
+                  outputs are saved back into the room, versioned + undoable. */}
+              {isScriptName(openFile.content.name) &&
+                (() => {
+                  const sc = s.scripts.find((x) => x.fileId === openFile.id);
+                  const running = !!(sc?.lastRun?.jobId && s.jobProgress[sc.lastRun.jobId]);
+                  return (
+                    <button
+                      className="subtle btn-ic"
+                      title="Run this script — outputs are saved into the room"
+                      disabled={running}
+                      onClick={() => {
+                        if (s.editMode && s.editorDirtyRef.current) {
+                          s.pushToast("info", "Save your edits first, then run the script.");
+                          return;
+                        }
+                        void a.runScript(openFile.id);
+                      }}
+                    >
+                      <PlayIcon size={13} /> Run
+                    </button>
+                  );
+                })()}
+              {(() => {
+                // Wave 5 shortcuts: OTHER scripts whose declared inputs/outputs
+                // name the open file render as one-click chips (e.g. "▶
+                // update_portfolio" on portfolio.csv). Reuses the shared menu.
+                const name = openFile.content.name;
+                const scriptActions: QuickAction[] = s.scripts
+                  .filter(
+                    (sc) =>
+                      sc.fileId !== openFile.id &&
+                      (sc.inputs.includes(name) || sc.outputs.includes(name)),
+                  )
+                  .map((sc) => ({
+                    id: sc.fileId,
+                    label: sc.name,
+                    icon: "▶",
+                    hint: `Run ${sc.name}`,
+                    onRun: () => void a.runScript(sc.fileId),
+                  }));
+                return (
+                  <QuickActionsMenu
+                    actions={scriptActions}
+                    open={s.qaScriptMenuOpen ?? false}
+                    onOpenChange={(o) => s.setQaScriptMenuOpen(o)}
+                    buttonLabel="Scripts"
+                    buttonIcon={<ScriptIcon size={13} />}
+                    inlineMax={2}
+                  />
+                );
+              })()}
               <span className="history-wrap">
                 <button
                   className={`subtle btn-ic ${s.showHistory ? "active" : ""}`}

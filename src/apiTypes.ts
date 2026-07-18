@@ -560,7 +560,7 @@ export interface Workflow {
   emoji: string;
   definition: WorkflowDef;
   status: "draft" | "active";
-  createdBy: "user" | "agent";
+  createdBy: "user" | "agent" | "script";
   binding: WorkflowBinding;
   pinned: boolean;
   createdAt: string;
@@ -643,4 +643,49 @@ export interface WorkflowNodeEvent {
   nodeId: string;
   status: "running" | "done" | "skipped" | "error";
   peek?: string | null;
+}
+
+// ------------------------------------------------------------ Wave 5: scripts
+
+/** A `.py`/`.js` room file as a first-class runnable/schedulable script. Its run
+ * history/schedule come from the same `workflow_runs`/`schedules` rows as
+ * everything else, via a hidden per-script auto-workflow. */
+export interface ScriptInfo {
+  fileId: string;
+  name: string;
+  lang: "py" | "js";
+  deps: string[];
+  inputs: string[];
+  outputs: string[];
+  /** Where it surfaces as a one-click shortcut. */
+  shortcut: "global" | "file" | "none";
+  /** True when this exact content is approved to run on this Mac. */
+  approved: boolean;
+  /** Ran/scheduled before, but the current content isn't approved (edited). */
+  changedSinceApproval: boolean;
+  workflowId: string | null;
+  schedule: Schedule | null;
+  lastRun: WorkflowRun | null;
+}
+
+/** The parsed PEP-723 + room-* manifest for one script. */
+export interface ScriptManifest {
+  interpreter: "py" | "js";
+  deps: string[];
+  inputs: string[];
+  outputs: string[];
+  timeoutSecs: number;
+  shortcut: "global" | "file" | "none";
+}
+
+/** A pending script-run consent prompt from the backend (SEC-1 doctrine). */
+export interface ScriptApproveRequest {
+  id: string;
+  name: string;
+  /** The exact command line that would run, e.g. "uv run --no-project x.py". */
+  interpreterLine: string;
+  deps: string[];
+  inputs: string[];
+  outputs: string[];
+  timeout: number;
 }

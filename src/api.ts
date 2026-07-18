@@ -28,6 +28,9 @@ import type {
   ScheduleArg,
   WorkflowTemplate,
   WorkflowNodeEvent,
+  ScriptInfo,
+  ScriptManifest,
+  ScriptApproveRequest,
   FileVersion,
   VersionContent,
   CheckpointMeta,
@@ -222,6 +225,25 @@ export const api = {
   /** Run a workflow now; `fileId` for a file-scoped (Actions-menu) run. */
   runWorkflow: (id: string, fileId?: string) =>
     invoke<string>("run_workflow", { id, fileId }),
+  // ---- Wave 5 (Idea 13): runnable & schedulable scripts ----
+  /** Every `.py`/`.js` room file as a script, with status/last-run/schedule. */
+  listScripts: () => invoke<ScriptInfo[]>("list_scripts"),
+  /** The parsed manifest for one script (viewer header / consent card). */
+  getScriptManifest: (fileId: string) =>
+    invoke<ScriptManifest>("get_script_manifest", { fileId }),
+  /** Run a script now. May raise a consent card first; returns the job id.
+   *  Progress arrives via job-progress; the run is a hidden auto-workflow. */
+  runScript: (fileId: string) => invoke<string>("run_script", { fileId }),
+  /** Schedule (or clear, kind="") a script. Requires the script to be approved. */
+  setScriptSchedule: (
+    fileId: string,
+    kind: string,
+    param: string,
+    enabled: boolean,
+  ) => invoke<void>("set_script_schedule", { fileId, kind, param, enabled }),
+  /** Answer a script-run consent card ("once" | "always" | "deny"). */
+  resolveScriptRun: (id: string, decision: "once" | "always" | "deny") =>
+    invoke<void>("resolve_script_run", { id, decision }),
   aiStatus: () => invoke<AiStatus>("ai_status"),
   /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
   modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
@@ -368,6 +390,12 @@ export const api = {
     listen<WorkflowNodeEvent>("workflow-node", (e) => cb(e.payload)),
   onWorkflowsChanged: (cb: () => void): Promise<UnlistenFn> =>
     listen("workflows-changed", () => cb()),
+  // Wave 5 (Idea 13): the backend is about to run a script from this room and
+  // needs the user's consent (SEC-1 — the card is data-agent-blocked).
+  onScriptApproveRequest: (
+    cb: (req: ScriptApproveRequest) => void,
+  ): Promise<UnlistenFn> =>
+    listen<ScriptApproveRequest>("script-approve-request", (e) => cb(e.payload)),
   // ADD-31: live import queue — done/total/current name, plus a final receipt
   // (done === total) carrying imported/failed counts.
   onImportProgress: (

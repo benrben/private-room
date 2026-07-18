@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { DownloadIcon, GlobeIcon, MicIcon } from "../icons";
+import { DownloadIcon, GlobeIcon, MicIcon, ScriptIcon } from "../icons";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import DiffPreview from "../viewers/DiffPreview";
@@ -67,6 +67,7 @@ function CaptureDock({ s }: { s: WSState }) {
 export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
   const pendingApproval = s.mcpApprovals[0];
   const pendingEdit = s.editApprovals[0];
+  const pendingScript = s.scriptApprovals[0];
   const searchResults = s.searchResults;
   const msgOffset = searchResults ? searchResults.files.length : 0;
   const memOffset = searchResults
@@ -76,6 +77,59 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
   return (
     <>
       <CaptureDock s={s} />
+      {pendingScript && (
+        // Wave 5 (Idea 13): the script-run consent card. Same data-agent-blocked
+        // surface as the MCP/edit cards — the UI-driving agent must never approve
+        // its own script. The two honest sentences state the real trust class.
+        <div className="approve-backdrop" data-agent-blocked>
+          <div className="approve-card" role="alertdialog" aria-modal="true">
+            <div className="approve-title">
+              <ScriptIcon size={17} /> Run a script from this room?
+            </div>
+            <p className="approve-body">
+              <strong>{pendingScript.name}</strong> is a real program:{" "}
+              <strong>it can reach the internet.</strong> While it runs, the files it uses are
+              placed in a temporary folder outside the room's encryption.
+            </p>
+            <pre className="approve-args">{pendingScript.interpreterLine}</pre>
+            {pendingScript.deps.length > 0 && (
+              <div className="script-approve-line">
+                <span className="script-approve-key">Installs</span>
+                <pre className="approve-args">{pendingScript.deps.join(", ")}</pre>
+              </div>
+            )}
+            {pendingScript.inputs.length > 0 && (
+              <div className="script-approve-line">
+                <span className="script-approve-key">Reads</span>
+                <pre className="approve-args">{pendingScript.inputs.join(", ")}</pre>
+              </div>
+            )}
+            {pendingScript.outputs.length > 0 && (
+              <div className="script-approve-line">
+                <span className="script-approve-key">Writes back</span>
+                <pre className="approve-args">{pendingScript.outputs.join(", ")}</pre>
+              </div>
+            )}
+            <div className="approve-actions">
+              <button
+                className="primary"
+                onClick={() => a.resolveScriptApproval(pendingScript, "once")}
+              >
+                Run once
+              </button>
+              <button onClick={() => a.resolveScriptApproval(pendingScript, "always")}>
+                Always allow this exact script
+              </button>
+              <button
+                className="danger"
+                onClick={() => a.resolveScriptApproval(pendingScript, "deny")}
+              >
+                Don't run
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {pendingApproval && (
         // ADD-25: consent surface — the agent must never be able to click its
         // own tool-call approval ("Allow"), so the driver can't see it.

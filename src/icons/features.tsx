@@ -85,6 +85,17 @@ export function RecoveryIcon(p: IconProps) {
   );
 }
 
+/** Scripts: a document with an angle-bracket "code" glyph. */
+export function ScriptIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M6 3.5h8l4 4V20a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1z" />
+      <path d="M13.5 3.5V8h4.5" />
+      <path d="M10.5 12.5 8.5 14.5l2 2M13.5 12.5l2 2-2 2" />
+    </Stroke>
+  );
+}
+
 /** Server: a rack (the Leash / persistent Room MCP server). */
 export function ServerIcon(p: IconProps) {
   return (
