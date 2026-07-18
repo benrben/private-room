@@ -184,17 +184,21 @@ pub(crate) fn run_stt_job(app: &tauri::AppHandle, job: JobMeta) {
     }
     let _ = app.emit("room-files-changed", ());
     let _ = app.emit("stt-progress", (&job.name, "done"));
-    // CHG-22: newly-transcribed file → let the one-liner filler pick it up.
-    spawn_summary_filler(app.clone(), job.room_path.clone());
+    // CHG-22 → Wave 1b (idea 8): newly-transcribed file goes through the
+    // debounced auto-index scheduler (which falls back to the quiet filler
+    // when the feature is off or the drop is tiny).
+    schedule_auto_index(app, job.room_path.clone());
 }
 
 /// CHG-22: opportunistically fill cached one-liners (files.ai_summary) in the
 /// background so the interactive "Summarize room" collapses to a single reduce
-/// call. Single-flight; starts after a short delay so it never races the user's
-/// first post-import question; yields to any streaming answer; uses a short
+/// call. Single-flight; starts after `delay_secs` so it never races the user's
+/// first post-import question (Wave 1b: the auto-index scheduler passes 0 —
+/// it has already debounced ~30 s, so stacking the old fixed 45 s on top would
+/// make tiny drops look stalled); yields to any streaming answer; uses a short
 /// keep-alive so it never pins the model in RAM. All failures are silent —
 /// summarize_room remains the full fallback.
-pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String) {
+pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, delay_secs: u64) {
     use tauri::Manager;
     let state = app.state::<AppState>();
     // Single-flight: bail if a filler is already running.
@@ -213,7 +217,9 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String) {
         let _reset = Reset(flag);
 
         // Let the user's first question take priority.
-        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        if delay_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        }
 
         let models = ollama::list_models().await.unwrap_or_default();
         if models.is_empty() {

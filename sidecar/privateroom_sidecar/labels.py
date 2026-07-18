@@ -20,6 +20,8 @@ _LABELS: dict[str, str] = {
     "rename_file": "Renamed a file",
     "move_file": "Moved a file",
     "add_memory": "Saved a memory",
+    # Wave 1b (idea 5): read-back for the budget-truncated injection.
+    "list_memories": "Listed the saved memories",
     "web_search": "Searched the web",
     "fetch_page": "Fetched a page",
     # ADD-25: the agent is operating the app with the user watching.

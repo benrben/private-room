@@ -82,8 +82,35 @@ export function makeChatActions(
         const lastMsg = msgs[msgs.length - 1];
         if (lastMsg?.role === "assistant" && lastMsg.content.trim()) {
           memorySuggestion(chatId)
-            .then((sug) => {
-              if (sug.worth && sug.fact.trim()) s.setMemSuggestion({ fact: sug.fact.trim() });
+            .then(async (sug) => {
+              if (!(sug.worth && sug.fact.trim())) return;
+              const fact = sug.fact.trim();
+              // Wave 1b (idea 5): opt-in auto-save replaces the chip entirely.
+              if (s.memAutoSaveRef.current) {
+                try {
+                  const m = await api.addMemory(fact);
+                  s.setMemories(await api.listMemories());
+                  // addMemory dedups by returning the EXISTING row — only a
+                  // genuinely new memory earns the toast + Forget undo, or the
+                  // undo would delete a memory the user saved long ago.
+                  const isNew =
+                    Math.abs(Date.now() - Date.parse(m.createdAt)) < 10_000;
+                  if (isNew) {
+                    s.pushToast("success", `Remembered: ${fact}`, {
+                      label: "Forget",
+                      run: () => {
+                        void api.deleteMemory(m.id).then(async () => {
+                          s.setMemories(await api.listMemories());
+                        });
+                      },
+                    });
+                  }
+                } catch {
+                  /* auto-save must never disturb the finished answer */
+                }
+              } else {
+                s.setMemSuggestion({ fact });
+              }
             })
             .catch(() => {});
         }

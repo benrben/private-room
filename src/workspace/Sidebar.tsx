@@ -20,6 +20,17 @@ import FileRow from "./FileRow";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
+/** Wave 1b (idea 5): fixed display order for the memory groups; null = the
+ * uncategorized bucket every legacy memory lives in. */
+const MEMORY_GROUPS: { key: string | null; label: string }[] = [
+  { key: "instruction", label: "Instructions" },
+  { key: "preference", label: "Preferences" },
+  { key: "project", label: "Projects" },
+  { key: "fact", label: "Facts" },
+  { key: null, label: "Other" },
+];
+const CATEGORY_OPTIONS = ["preference", "fact", "project", "instruction"];
+
 /** Pane 1: file explorer + folders + client filter + Summarize/Memory chips +
  * the Memory panel. Extracted verbatim from the pane-1 block. */
 export default function Sidebar({
@@ -415,6 +426,17 @@ export default function Sidebar({
         </span>
         <span className="count">{s.memories.length}</span>
       </button>
+      {/* Wave 1b (idea 10): the canonical shared working-notes file. Always
+          opens exactly ONE pad (get-or-create on the backend). */}
+      <button
+        className="memory-chip"
+        title='Shared working notes — you and the AI both write "Scratch pad.md"'
+        onClick={() => void a.openScratchPad()}
+      >
+        <span className="memory-chip-label">
+          <PencilIcon size={14} /> Scratch pad
+        </span>
+      </button>
       {s.showMemoryIntro && (
         <div className="memory-intro">
           This is your room's memory — everything the AI remembers about
@@ -565,66 +587,112 @@ export default function Sidebar({
       </div>
       {s.showMemory && (
         <div className="memory-panel">
-          {s.memories.map((m) =>
-            s.editingMemory?.id === m.id ? (
-              <div key={m.id} className="memory-row editing">
-                <input
-                  className="memory-edit-input"
-                  autoFocus
-                  dir="auto"
-                  value={s.editingMemory.content}
-                  onChange={(e) =>
-                    s.setEditingMemory({ id: m.id, content: e.target.value })
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") a.saveMemoryEdit();
-                    if (e.key === "Escape") s.setEditingMemory(null);
-                  }}
-                />
-                <button
-                  className="chip-btn"
-                  title="Save"
-                  onClick={a.saveMemoryEdit}
-                >
-                  ✓
-                </button>
-                <button
-                  className="chip-btn"
-                  title="Cancel"
-                  onClick={() => s.setEditingMemory(null)}
-                >
-                  ✕
-                </button>
-              </div>
-            ) : (
-              <div key={m.id} className="memory-row">
-                <span dir="auto">{m.content}</span>
-                <span className="memory-actions">
-                  <button
-                    className="chip-btn"
-                    title="Edit this memory"
-                    onClick={() =>
-                      s.setEditingMemory({ id: m.id, content: m.content })
-                    }
-                  >
-                    <PencilIcon size={13} />
-                  </button>
-                  <DeleteControl
-                    k={`mem:${m.id}`}
-                    trigger="×"
-                    onConfirm={async () => {
-                      await api.deleteMemory(m.id);
-                      s.setMemories(await api.listMemories());
-                    }}
-                    title="Forget this"
-                    confirmDelete={s.confirmDelete}
-                    askConfirm={a.askConfirm}
-                    cancelConfirm={a.cancelConfirm}
-                  />
-                </span>
-              </div>
-            ),
-          )}
+          {/* Wave 1b (idea 5): grouped under small category headers (fixed
+              order, empty groups hidden). When nothing is categorized the
+              panel keeps its legacy flat look — no lone "Other" header. */}
+          {MEMORY_GROUPS.filter((g) =>
+            s.memories.some((m) => (m.category ?? null) === g.key),
+          ).map((g, _, shown) => (
+            <div key={g.key ?? "other"} className="memory-group">
+              {!(shown.length === 1 && g.key === null) && (
+                <div className="memory-group-head">{g.label}</div>
+              )}
+              {s.memories
+                .filter((m) => (m.category ?? null) === g.key)
+                .map((m) =>
+                  s.editingMemory?.id === m.id ? (
+                    <div key={m.id} className="memory-row editing">
+                      <input
+                        className="memory-edit-input"
+                        autoFocus
+                        dir="auto"
+                        value={s.editingMemory.content}
+                        onChange={(e) =>
+                          s.setEditingMemory({
+                            id: m.id,
+                            content: e.target.value,
+                            category: s.editingMemory?.category ?? null,
+                          })
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") a.saveMemoryEdit();
+                          if (e.key === "Escape") s.setEditingMemory(null);
+                        }}
+                      />
+                      <select
+                        className="memory-cat-select"
+                        title="Category"
+                        value={s.editingMemory.category ?? ""}
+                        onChange={(e) =>
+                          s.setEditingMemory({
+                            id: m.id,
+                            content: s.editingMemory?.content ?? m.content,
+                            category: e.target.value || null,
+                          })
+                        }
+                      >
+                        <option value="">no category</option>
+                        {CATEGORY_OPTIONS.map((c) => (
+                          <option key={c} value={c}>
+                            {c}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        className="chip-btn"
+                        title="Save"
+                        onClick={a.saveMemoryEdit}
+                      >
+                        ✓
+                      </button>
+                      <button
+                        className="chip-btn"
+                        title="Cancel"
+                        onClick={() => s.setEditingMemory(null)}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ) : (
+                    <div key={m.id} className="memory-row">
+                      <span dir="auto">
+                        {m.content}
+                        {m.category && (
+                          <span className="memory-cat-pill">{m.category}</span>
+                        )}
+                      </span>
+                      <span className="memory-actions">
+                        <button
+                          className="chip-btn"
+                          title="Edit this memory"
+                          onClick={() =>
+                            s.setEditingMemory({
+                              id: m.id,
+                              content: m.content,
+                              category: m.category ?? null,
+                            })
+                          }
+                        >
+                          <PencilIcon size={13} />
+                        </button>
+                        <DeleteControl
+                          k={`mem:${m.id}`}
+                          trigger="×"
+                          onConfirm={async () => {
+                            await api.deleteMemory(m.id);
+                            s.setMemories(await api.listMemories());
+                          }}
+                          title="Forget this"
+                          confirmDelete={s.confirmDelete}
+                          askConfirm={a.askConfirm}
+                          cancelConfirm={a.cancelConfirm}
+                        />
+                      </span>
+                    </div>
+                  ),
+                )}
+            </div>
+          ))}
           <div className="memory-add">
             <input
               placeholder="Something the AI should always remember…"
@@ -649,6 +717,19 @@ export default function Sidebar({
             >
               <MicIcon size={12} />
             </button>
+            <select
+              className="memory-cat-select"
+              title="Category for the new memory"
+              value={s.memoryDraftCat}
+              onChange={(e) => s.setMemoryDraftCat(e.target.value)}
+            >
+              <option value="">no category</option>
+              {CATEGORY_OPTIONS.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
             <button className="subtle" onClick={a.addMemory}>
               Add
             </button>

@@ -139,7 +139,10 @@ pub async fn summarize_room(
             "summarize-progress",
             format!("Summarizing file {} of {}…", i + 1, to_do),
         );
-        if f.ai_summary.is_some() || f.text.as_deref().map_or(true, |t| t.trim().is_empty()) {
+        // Wave 1b (idea 8): the auto-index '' sentinel counts as MISSING here —
+        // a user-started run is the explicit "try again" for stuck files.
+        let cached = f.ai_summary.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if cached || f.text.as_deref().map_or(true, |t| t.trim().is_empty()) {
             // Cached already, or no extractable text (e.g. an image without
             // OCR): the writer lists it by name and type, never invents content.
             continue;

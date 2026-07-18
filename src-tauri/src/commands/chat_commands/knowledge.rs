@@ -13,7 +13,8 @@ pub(crate) async fn cmd_remember(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
                 ..Default::default()
             });
         }
-        db::add_memory(&room.conn, &fact)?;
+        // #remember stays uncategorized (Wave 1b: categories are optional).
+        db::add_memory(&room.conn, &fact, None)?;
         Ok(CommandResult {
             content: format!("Saved to memory:\n\n> {fact}"),
             ..Default::default()

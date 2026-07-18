@@ -16,6 +16,10 @@ use std::collections::HashSet;
 mod file_pass;
 pub use file_pass::*;
 
+// Wave 1b (idea 8): the debounced always-on-indexing scheduler.
+mod auto_index;
+pub(crate) use auto_index::*;
+
 /// Where a step runs — decides how many may run at once. Local-model work is
 /// serial because only one model is resident; CPU and cloud work fan out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -217,23 +221,53 @@ pub(crate) fn quiesce_stale_jobs(conn: &Connection) {
     }
 }
 
+/// Wave 1b (idea 8): a cached one-liner that actually says something. The ''
+/// sentinel an auto job writes for a stuck file (see `spawn_deep_summary`)
+/// counts as MISSING here, so a user-started run retries it while the auto
+/// scheduler (which reads `files_missing_summary`, NULL-only) leaves it alone.
+fn has_liner(f: &db::SummaryFile) -> bool {
+    f.ai_summary.as_deref().is_some_and(|s| !s.trim().is_empty())
+}
+
 /// Build the deep-summary plan for the room's CURRENT files: one step per file,
 /// on the lane the selected engine implies. Shared by start and resume. Also
 /// returns the path of the room the files were read from, so callers can
-/// verify the room didn't swap across this function's await.
+/// verify the room didn't swap across this function's await, and whether a
+/// generated Room summary page already exists (the auto reduce rule).
+///
+/// `auto` (Wave 1b, idea 8): a MANUAL plan is the capped whole-room list
+/// (unchanged behavior); an AUTO plan is built from the files still MISSING a
+/// one-liner — uncapped, newest drops included — because in a ≥50-file room
+/// the capped list's `take()` would never reach freshly imported files (they
+/// sort last) and the job would do nothing for them. An auto plan may be
+/// EMPTY (nothing to index); auto callers handle that, manual callers keep
+/// today's error.
 async fn deep_summary_plan(
     state: &AppState,
-) -> Result<(Vec<db::SummaryFile>, String, Vec<Step>, String), String> {
-    let (files, model, room_path) = state.with_room(|room| {
+    auto: bool,
+) -> Result<(Vec<db::SummaryFile>, String, Vec<Step>, String, bool), String> {
+    let (files, model, room_path, has_summary_page) = state.with_room(|room| {
         let all = db::list_files_for_summary(&room.conn)?;
-        let files: Vec<db::SummaryFile> = all
-            .into_iter()
-            .filter(|f| !is_summary_file(&f.name, &f.source))
-            .take(MAX_SUMMARY_FILES)
-            .collect();
-        Ok((files, model_setting(&room.conn), room.path.clone()))
+        let has_summary_page = all
+            .iter()
+            .any(|f| f.name == SUMMARY_FILE_NAME && f.source == "generated");
+        let files: Vec<db::SummaryFile> = if auto {
+            all.into_iter()
+                .filter(|f| !is_summary_file(&f.name, &f.source))
+                .filter(|f| {
+                    f.ai_summary.is_none()
+                        && f.text.as_deref().is_some_and(|t| !t.trim().is_empty())
+                })
+                .collect()
+        } else {
+            all.into_iter()
+                .filter(|f| !is_summary_file(&f.name, &f.source))
+                .take(MAX_SUMMARY_FILES)
+                .collect()
+        };
+        Ok((files, model_setting(&room.conn), room.path.clone(), has_summary_page))
     })?;
-    if files.is_empty() {
+    if files.is_empty() && !auto {
         return Err("This room has no files to summarize yet.".into());
     }
     let models = ollama::list_models().await.unwrap_or_default();
@@ -259,7 +293,7 @@ async fn deep_summary_plan(
             depends_on: vec![],
         })
         .collect();
-    Ok((files, chat_model, steps, room_path))
+    Ok((files, chat_model, steps, room_path, has_summary_page))
 }
 
 /// Spawn the checkpointed runner for a deep-summary job (fresh or resumed).
@@ -269,6 +303,14 @@ async fn deep_summary_plan(
 /// `room_path` pins the job to the room it was started in: every read/write
 /// re-checks the CURRENT room against it, so a room closed or swapped mid-run
 /// can never receive this job's writes.
+///
+/// Wave 1b (idea 8): `auto` marks a self-started indexing run — a stuck file
+/// (empty/errored one-liner) gets the '' sentinel so it leaves the missing set
+/// and the scheduler terminates, and the terminal event neither hijacks the
+/// viewer nor claims "Summary ready". `reduce` says whether the final
+/// Room-summary write runs at all: always for manual jobs; for auto jobs only
+/// when a generated summary page already existed at plan time (refresh, never
+/// create unasked).
 #[allow(clippy::too_many_arguments)]
 fn spawn_deep_summary(
     window: tauri::Window,
@@ -279,6 +321,8 @@ fn spawn_deep_summary(
     steps: Vec<Step>,
     start_cursor: usize,
     cancel: Arc<AtomicBool>,
+    auto: bool,
+    reduce: bool,
 ) {
     use tauri::Manager;
     let app = window.app_handle().clone();
@@ -308,8 +352,9 @@ fn spawn_deep_summary(
                 let model = chat_model.clone();
                 let room_path = room_path.clone();
                 async move {
-                    // Skip files that already have a cached one-liner.
-                    if f.ai_summary.is_some() {
+                    // Skip files that already have a REAL cached one-liner (the
+                    // '' sentinel counts as missing, so a manual run retries it).
+                    if has_liner(&f) {
                         return Ok(());
                     }
                     let full = {
@@ -322,19 +367,38 @@ fn spawn_deep_summary(
                     let Some(full) = full.filter(|t| !t.trim().is_empty()) else {
                         return Ok(()); // no text (e.g. image w/o OCR) — nothing to do
                     };
+                    // Wave 1b (idea 8): an auto job writes the '' sentinel for a
+                    // file that yields no liner, so it leaves files_missing_summary
+                    // and the scheduler can't loop over it forever. Cleared back to
+                    // NULL whenever the file's content changes; a manual run still
+                    // retries it (has_liner treats '' as missing).
+                    let mark = |liner: &str| {
+                        let guard = state.room.lock().unwrap();
+                        if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+                            let _ = db::set_file_ai_summary(&r.conn, &f.id, liner);
+                        }
+                    };
                     match summarize_one_file(&model, &f.name, &f.mime, &full, KEEP_ALIVE_WARM).await {
                         Ok(liner) if !liner.is_empty() => {
-                            let guard = state.room.lock().unwrap();
-                            if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
-                                let _ = db::set_file_ai_summary(&r.conn, &f.id, &liner);
+                            mark(&liner);
+                            Ok(())
+                        }
+                        Ok(_) => {
+                            if auto {
+                                mark("");
                             }
                             Ok(())
                         }
-                        Ok(_) => Ok(()),
                         // A hard error (server down / model gone) parks the job;
-                        // a one-off failure just leaves this file uncached.
+                        // a one-off failure just leaves this file uncached (or
+                        // sentinel-marked on an auto run).
                         Err(e) if e == "OLLAMA_DOWN" || e.starts_with("MODEL_MISSING") => Err(e),
-                        Err(_) => Ok(()),
+                        Err(_) => {
+                            if auto {
+                                mark("");
+                            }
+                            Ok(())
+                        }
                     }
                 }
             },
@@ -350,7 +414,11 @@ fn spawn_deep_summary(
                 emit_progress(
                     &window,
                     &job_id,
-                    &format!("Summarizing file {done} of {total}…"),
+                    &if auto {
+                        format!("Indexing file {done} of {total}…")
+                    } else {
+                        format!("Summarizing file {done} of {total}…")
+                    },
                     done,
                     total,
                 );
@@ -364,6 +432,11 @@ fn spawn_deep_summary(
         // front (fast fail) AND passed into write_room_summary, whose every
         // room access re-checks it — a room closed or swapped mid-reduce can
         // never receive this job's writes.
+        //
+        // Wave 1b (idea 8): an auto job runs this only when `reduce` says an
+        // existing generated summary page should stay fresh — "done" for a
+        // plain auto job means all one-liners cached, and no summary page is
+        // ever created unasked.
         let mut summary_file: Option<FileMeta> = None;
         let outcome = if matches!(outcome, RunOutcome::Done) {
             // A Stop pressed during the final wave is only observable AFTER
@@ -371,6 +444,8 @@ fn spawn_deep_summary(
             // cancelled. Resume re-derives the cursor and retries the reduce.
             if cancel.load(Ordering::SeqCst) {
                 RunOutcome::Paused
+            } else if !reduce {
+                outcome
             } else {
                 let pinned = {
                     let guard = state.room.lock().unwrap();
@@ -412,9 +487,14 @@ fn spawn_deep_summary(
         use tauri::Emitter;
         let done_now = last_cursor.load(Ordering::SeqCst);
         let payload = match &outcome {
+            // Wave 1b (idea 8): an auto job's terminal event says what actually
+            // happened and NEVER carries a fileId — effects.ts force-opens any
+            // fileId in the viewer, unacceptable for a job the user never started.
             RunOutcome::Done => serde_json::json!({
-                "jobId": job_id, "label": "Summary ready", "done": total, "total": total,
-                "finished": true, "fileId": summary_file.map(|m| m.id),
+                "jobId": job_id,
+                "label": if auto { "Indexing finished" } else { "Summary ready" },
+                "done": total, "total": total, "finished": true,
+                "fileId": if auto { None } else { summary_file.map(|m| m.id) },
             }),
             RunOutcome::Paused => serde_json::json!({
                 "jobId": job_id, "label": "Paused", "done": done_now, "total": total,
@@ -433,19 +513,36 @@ fn spawn_deep_summary(
 /// checkpointed step; the reduce + HTML write run once every step is done.
 /// Returns the job id immediately; progress arrives via `job-progress` and the
 /// finished summary via `room-files-changed`.
-#[tauri::command]
-pub async fn start_deep_summary(
+///
+/// Wave 1b (idea 8) — AUTO-INDEX ENTRY POINT: `auto: true` is how the
+/// `auto_index` scheduler starts an indexing run (missing-set plan, honest
+/// labels, no unasked summary page). INTEGRATION DECISION (2026-07-18): Wave
+/// 4a's "new-file summarizer" workflow template must call THIS machinery
+/// (`schedule_auto_index` / `start_deep_summary_inner(auto = true)`) — it must
+/// not grow its own scheduler or plan builder.
+pub(crate) async fn start_deep_summary_inner(
     window: tauri::Window,
-    state: State<'_, AppState>,
+    state: &AppState,
+    auto: bool,
 ) -> Result<String, String> {
     // One heavy background job at a time — the local lane is serial anyway, and
     // two concurrent summaries would just fight over the same cache.
     if !state.job_cancels.lock().unwrap().is_empty() {
         return Err("A background job is already running.".into());
     }
-    let (files, chat_model, steps, plan_room) = deep_summary_plan(state.inner()).await?;
-    let plan = serde_json::json!({ "steps": steps });
+    let (files, chat_model, steps, plan_room, has_summary_page) =
+        deep_summary_plan(state, auto).await?;
+    if files.is_empty() {
+        // Only reachable for auto plans (manual ones error inside the builder):
+        // everything is already indexed, nothing to start.
+        return Err("Nothing to index — every file already has a description.".into());
+    }
+    // The auto reduce rule is decided at START time and stored in the plan, so
+    // a resume after restart keeps the same semantics (no plan re-reading races).
+    let reduce = !auto || has_summary_page;
+    let plan = serde_json::json!({ "steps": steps, "auto": auto, "reduce": reduce });
     let total = steps.len() as i64;
+    let title = if auto { "Indexing new files" } else { "Room summary" };
 
     let (job_id, room_path) = state.with_room(|room| {
         // The plan was read before an await (the Ollama model probe) — a room
@@ -454,7 +551,7 @@ pub async fn start_deep_summary(
         if room.path != plan_room {
             return Err("The room changed while starting this job.".into());
         }
-        let id = db::create_job(&room.conn, "deep_summary", "Room summary", &plan, total)?;
+        let id = db::create_job(&room.conn, "deep_summary", title, &plan, total)?;
         Ok((id, room.path.clone()))
     })?;
 
@@ -464,8 +561,27 @@ pub async fn start_deep_summary(
         .lock()
         .unwrap()
         .insert(job_id.clone(), cancel.clone());
-    spawn_deep_summary(window, job_id.clone(), room_path, files, chat_model, steps, 0, cancel);
+    spawn_deep_summary(
+        window,
+        job_id.clone(),
+        room_path,
+        files,
+        chat_model,
+        steps,
+        0,
+        cancel,
+        auto,
+        reduce,
+    );
     Ok(job_id)
+}
+
+#[tauri::command]
+pub async fn start_deep_summary(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    start_deep_summary_inner(window, state.inner(), false).await
 }
 
 /// Resume a paused (or errored) job from its checkpoint. For a deep summary
@@ -491,24 +607,56 @@ pub async fn resume_job(
     }
     match job.kind.as_str() {
         "deep_summary" => {
-            let (files, chat_model, steps, plan_room) = deep_summary_plan(state.inner()).await?;
+            // Wave 1b (idea 8): resume must KEEP auto semantics — the flags are
+            // read back from the stored plan (an auto job resumed after restart
+            // must not run the reduce, write a summary page, or hijack the
+            // viewer like a manual job would).
+            let auto = job.plan.get("auto").and_then(|v| v.as_bool()).unwrap_or(false);
+            let reduce = if auto {
+                job.plan.get("reduce").and_then(|v| v.as_bool()).unwrap_or(false)
+            } else {
+                true
+            };
+            let (files, chat_model, steps, plan_room, _) =
+                deep_summary_plan(state.inner(), auto).await?;
             // The plan was read after an await — a room swapped since the job
             // row was read must not run a plan built from the other room.
             if plan_room != room_path {
                 return Err("The room changed while resuming this job.".into());
             }
-            // Skip the already-summarized prefix; every uncached file (newly
-            // added, moved, or transiently failed) sits at or after this stop
-            // point and gets dispatched again — cached ones beyond it are
-            // skipped for free by the in-step cache check.
-            let cursor = files.iter().take_while(|f| f.ai_summary.is_some()).count();
+            // An auto plan is re-derived from the CURRENT missing set, so a
+            // resumed job whose work has since been finished (or superseded by
+            // a newer auto run) simply completes.
+            if auto && files.is_empty() {
+                state.with_room(|room| db::set_job_status(&room.conn, &id, "done", None))?;
+                use tauri::Emitter;
+                let _ = window.emit(
+                    "job-progress",
+                    serde_json::json!({
+                        "jobId": id, "label": "Indexing finished",
+                        "done": job.total, "total": job.total, "finished": true,
+                    }),
+                );
+                return Ok(());
+            }
+            // Resume point: a MANUAL plan is positional (whole-room list), so
+            // skip the already-summarized prefix — the '' sentinel counts as
+            // unsummarized so a user-started resume retries stuck files. An
+            // AUTO plan contains ONLY missing files by construction: cursor 0.
+            let cursor = if auto {
+                0
+            } else {
+                files.iter().take_while(|f| has_liner(f)).count()
+            };
             let cancel = Arc::new(AtomicBool::new(false));
             state
                 .job_cancels
                 .lock()
                 .unwrap()
                 .insert(id.clone(), cancel.clone());
-            spawn_deep_summary(window, id, room_path, files, chat_model, steps, cursor, cancel);
+            spawn_deep_summary(
+                window, id, room_path, files, chat_model, steps, cursor, cancel, auto, reduce,
+            );
             Ok(())
         }
         // ADD-32: a whole-file pass resumes from its IMMUTABLE stored plan —

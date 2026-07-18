@@ -23,6 +23,45 @@ pub(crate) fn create_note(conn: &Connection, name: &str, content: &str) -> Resul
     db::insert_file(conn, &name, &note_mime(&name), content.as_bytes(), Some(content), "generated")
 }
 
+// ---- Wave 1b (idea 10): the canonical shared scratch pad -------------------
+
+/// The one canonical, per-room working-notes file — a convention layer over
+/// ordinary `files` rows (versioning, editing, and the agent's write tools all
+/// apply unchanged). Follows the `SUMMARY_FILE_NAME` pattern (summarize.rs).
+pub(crate) const SCRATCH_PAD_NAME: &str = "Scratch pad.md";
+/// Body a fresh pad starts with.
+pub(crate) const SCRATCH_PAD_TEMPLATE: &str = "# Scratch pad\n\nShared working notes. \
+    You or the AI can rewrite this file at any time; every change is kept in History.\n";
+
+/// True when an agent-supplied file name means THE scratch pad: the exact stem
+/// (any case), bare or with `.md`. Other extensions stay ordinary files, so a
+/// deliberate "Scratch pad.html" is never hijacked.
+pub(crate) fn is_scratch_pad_name(name: &str) -> bool {
+    let ext = extraction::extension_of(name);
+    let stem = match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
+    };
+    stem.trim().eq_ignore_ascii_case("scratch pad") && (ext.is_empty() || ext == "md")
+}
+
+/// Get-or-create the room's scratch pad. Exact-name lookup first — newest
+/// match, ANY source, so a user-made pad is adopted rather than duplicated —
+/// else a fresh pad is created from the template.
+pub(crate) fn ensure_scratch_pad(conn: &Connection) -> Result<FileMeta, String> {
+    if let Some(meta) = db::file_by_exact_name(conn, SCRATCH_PAD_NAME)? {
+        return Ok(meta);
+    }
+    create_note(conn, SCRATCH_PAD_NAME, SCRATCH_PAD_TEMPLATE)
+}
+
+/// Wave 1b (idea 10): the sidebar chip's entry point. Returns the pad's meta
+/// only — the frontend opens it in the viewer itself.
+#[tauri::command]
+pub fn open_scratch_pad(state: State<'_, AppState>) -> Result<FileMeta, String> {
+    state.with_room(|room| ensure_scratch_pad(&room.conn))
+}
+
 /// Save a file a generator just produced and put it in front of the user: insert
 /// it, tell the Files list to reload, then tell the viewer to open it. Every
 /// generator (studios, AI actions, #add-file, #extract) ends this way, and the
@@ -379,4 +418,48 @@ mod tests {
 
     // ---- Section D: pure command tests --------------------------------------
 
+    #[test]
+    fn scratch_pad_get_or_create_is_idempotent() {
+        let conn = db::mem();
+        let first = ensure_scratch_pad(&conn).unwrap();
+        assert_eq!(first.name, SCRATCH_PAD_NAME);
+        let second = ensure_scratch_pad(&conn).unwrap();
+        assert_eq!(first.id, second.id, "two calls must resolve to ONE pad");
+        // Exactly one pad row exists.
+        let pads = db::list_files(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.name == SCRATCH_PAD_NAME)
+            .count();
+        assert_eq!(pads, 1);
+    }
+
+    #[test]
+    fn scratch_pad_adopts_user_file() {
+        let conn = db::mem();
+        // A user-uploaded pad (any source) is adopted, never duplicated.
+        let user = db::insert_file(
+            &conn,
+            SCRATCH_PAD_NAME,
+            "text/markdown",
+            b"my own notes",
+            Some("my own notes"),
+            "upload",
+        )
+        .unwrap();
+        let got = ensure_scratch_pad(&conn).unwrap();
+        assert_eq!(got.id, user.id);
+    }
+
+    #[test]
+    fn scratch_pad_name_matcher_covers_variants_only() {
+        // The create_file redirect fires for the pad's stem, bare or .md…
+        assert!(is_scratch_pad_name("Scratch pad.md"));
+        assert!(is_scratch_pad_name("scratch pad"));
+        assert!(is_scratch_pad_name("SCRATCH PAD.MD"));
+        // …but never for other extensions or other names.
+        assert!(!is_scratch_pad_name("Scratch pad.html"));
+        assert!(!is_scratch_pad_name("Scratch pads.md"));
+        assert!(!is_scratch_pad_name("notes.md"));
+    }
 }

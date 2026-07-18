@@ -337,6 +337,56 @@ pub async fn ask(
 /// Everything Phase 1 (the room-locked pass) produces for the rest of `ask`:
 /// resolved settings, the assembled chat messages, the source chips shown to the
 /// user, the first attached image (held back for the deferred grounding pass),
+// ---- Wave 1b (idea 12): response-style presets --------------------------------
+
+/// Canned register paragraphs, tuned for a 4B model: short, imperative, one
+/// anchored example each. These are BYTE-STABLE constants (ADD-22): the system
+/// prompt only changes when the `response_style` setting changes, exactly like
+/// custom instructions, so KV-cache reuse is preserved within a conversation.
+const STYLE_TERSE: &str = "Response style: TERSE. Answer in the fewest words that fully \
+    answer. Use short sentences or bullets. Use precise technical vocabulary; never \
+    simplify terminology. No greetings, no restating the question, no \"Sure\" or \
+    \"Great question\", no closing offers like \"Let me know if you need more\". \
+    Example — Q: \"When does the lease end?\" A: \"March 31, 2027 (lease.pdf, section 2).\"";
+const STYLE_FRIENDLY: &str = "Response style: FRIENDLY. Sound like a helpful colleague: \
+    warm, plain everyday words, address the user as \"you\". At most one short warm \
+    phrase per answer, then get straight to the point — the answer itself must arrive \
+    in the first sentence. After the direct answer, briefly explain the why or the \
+    context. Example — Q: \"When does the lease end?\" A: \"Good news — your lease runs \
+    until March 31, 2027 (it's in lease.pdf, section 2).\"";
+const STYLE_FORMAL: &str = "Response style: FORMAL. Write complete sentences in \
+    professional business language. No slang, no contractions, no exclamation marks, \
+    no emoji. State findings precisely and cite the file. For multi-part answers, use \
+    short headings or numbered points. Example — Q: \"When does the lease end?\" A: \
+    \"The lease terminates on 31 March 2027, as stated in Section 2 of lease.pdf.\"";
+
+/// Map the stored `response_style` setting to its preset paragraph. Anything
+/// else — `None`, `"default"`, an unknown value — maps to `None`, so absent or
+/// unrecognized settings produce a system prompt byte-identical to today's.
+pub(crate) fn style_paragraph(style: Option<&str>) -> Option<&'static str> {
+    match style {
+        Some("terse") => Some(STYLE_TERSE),
+        Some("friendly") => Some(STYLE_FRIENDLY),
+        Some("formal") => Some(STYLE_FORMAL),
+        _ => None,
+    }
+}
+
+/// The injectable style block: the preset paragraph plus — only when the user
+/// ALSO has custom instructions — one precedence sentence (triage rule: free
+/// text always wins over the preset). Pure so tests can pin byte-stability.
+pub(crate) fn style_block(style: Option<&str>, has_custom_instructions: bool) -> Option<String> {
+    let para = style_paragraph(style)?;
+    Some(if has_custom_instructions {
+        format!(
+            "{para} If the user's standing preferences below say otherwise, follow the \
+             user's preferences."
+        )
+    } else {
+        para.to_string()
+    })
+}
+
 /// and the flags/rowids the answer phase needs.
 struct QuestionContext {
     explicit_model: Option<String>,
@@ -370,6 +420,8 @@ fn gather_context_and_save_question(
         let temperature: Option<f64> = db::get_setting(conn, "temperature")
             .and_then(|s| s.parse().ok());
         let custom_instructions: Option<String> = db::get_setting(conn, "custom_instructions");
+        // Wave 1b (idea 12): the user's chosen response register for this room.
+        let response_style: Option<String> = db::get_setting(conn, "response_style");
 
         let memories: Vec<String> = db::list_memories(conn)?
             .into_iter()
@@ -514,7 +566,11 @@ fn gather_context_and_save_question(
              annotate_file (or mark_image) returned success this turn — a guessed quote that \
              fails to match is NOT a highlight.\n\
              - If a tool call fails or you cannot find the exact text, say so plainly and stop; \
-             do not narrate success you did not achieve.",
+             do not narrate success you did not achieve.\n\n\
+             The room keeps one shared working-notes file named \"Scratch pad.md\": when the \
+             user asks to jot, note, write down, or record something temporarily, edit_file or \
+             write_file that file instead of making a new file; read it with open_file when \
+             asked what is on the pad.",
         );
         if web_enabled {
             system.push_str(
@@ -578,6 +634,18 @@ fn gather_context_and_save_question(
                 "You can see an image's pixels only when the user attaches it to a question \
                  (paperclip); otherwise you still know it exists by name.",
             );
+        }
+
+        // Wave 1b (idea 12): the response-style preset rides immediately before
+        // the custom instructions. Byte-stable (a constant chosen by a setting),
+        // so the ADD-22 KV-cache invariant holds — and when custom text is also
+        // present the block itself states that the free text below wins.
+        let has_custom = custom_instructions
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty());
+        if let Some(block) = style_block(response_style.as_deref(), has_custom) {
+            system.push_str("\n\n");
+            system.push_str(&block);
         }
 
         if let Some(custom) = &custom_instructions {
@@ -850,6 +918,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "rename_file",
     "move_file",
     "add_memory",
+    "list_memories",
     "web_search",
     "fetch_page",
     "ui_snapshot",
@@ -858,6 +927,13 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "view_media_frame",
     "start_file_pass",
     "job_status",
+    // Reserved even though they are never in the room bridge's own catalog:
+    // an MCP route sanitizing to one of these names would shadow the built-in
+    // exec_tool arm and skip the SEC-1b consent gate (e.g. server "consult" +
+    // tool "advisor" reaching the cloud-CLI path). Colliding routes rename to
+    // `<name>_2` and stay on the gated fallback.
+    "local_generate",
+    "consult_advisor",
 ];
 
 /// Keyword router deciding whether to offer the write tools this turn. Erring
@@ -1060,7 +1136,13 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
         {"type": "function", "function": {"name": "add_memory",
             "description": "Save a permanent memory note that the assistant will always see in this room.",
             "parameters": {"type": "object", "properties": {
-                "content": {"type": "string"}}, "required": ["content"]}}}
+                "content": {"type": "string"},
+                "category": {"type": "string", "enum": ["preference", "fact", "project", "instruction"],
+                    "description": "What kind of note this is (optional)"}},
+                "required": ["content"]}}},
+        {"type": "function", "function": {"name": "list_memories",
+            "description": "List every memory note saved in this room. Use it when asked what you remember, or when the notes shown in context look incomplete.",
+            "parameters": {"type": "object", "properties": {}}}}
     ]);
     if web_enabled {
         let arr = tools.as_array_mut().unwrap();
@@ -1832,6 +1914,37 @@ pub(crate) async fn exec_tool(
             let content = args["content"].as_str().unwrap_or_default().to_string();
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
+            // Wave 1b (idea 10): the canonical scratch pad is get-or-create.
+            // Every name resolver returns the NEWEST match, so a duplicate
+            // "Scratch pad.md" would silently shadow the real pad (and its
+            // notes) for the chip and every future agent edit — redirect a
+            // create onto the existing pad as a normal versioned overwrite.
+            if is_scratch_pad_name(&name) {
+                if let Some(meta) = db::file_by_exact_name(&room.conn, SCRATCH_PAD_NAME)? {
+                    store_file_bytes(&room.conn, &meta.id, content.as_bytes(), Some(&content), "AI edit")?;
+                    let _ = window.emit("room-files-changed", ());
+                    let _ = window.emit("file-updated", &meta.id);
+                    effects.wrote = true;
+                    return Ok(format!(
+                        "\"{}\" already exists — rewrote it instead of creating a duplicate. \
+                         The previous notes are kept in History.",
+                        meta.name
+                    ));
+                }
+                // No pad yet: create it under the CANONICAL name (never the
+                // HTML-defaulted variant), so the chip and prompt line resolve it.
+                let meta = db::insert_file(
+                    &room.conn,
+                    SCRATCH_PAD_NAME,
+                    &note_mime(SCRATCH_PAD_NAME),
+                    content.as_bytes(),
+                    Some(&content),
+                    "generated",
+                )?;
+                let _ = window.emit("room-files-changed", ());
+                effects.wrote = true;
+                return Ok(format!("Created \"{}\" in the room.", meta.name));
+            }
             // ADD-22 (HTML-first): a document with no explicit extension defaults
             // to HTML; body/plain content is wrapped in a styled standalone page
             // (a no-op when the model already returned a full HTML document).
@@ -1916,14 +2029,36 @@ pub(crate) async fn exec_tool(
                 ));
             }
             let content = raw;
+            // Wave 1b (idea 5): optional category. Normalized leniently — a 4B
+            // model misspelling the enum degrades to uncategorized, never errors.
+            let category = args["category"].as_str().and_then(normalize_category);
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
             // UX-5: don't store an exact duplicate; tell the model so it stops.
             if duplicate_memory(&room.conn, content)?.is_some() {
                 return Ok("Already remembered.".into());
             }
-            db::add_memory(&room.conn, content)?;
+            db::add_memory(&room.conn, content, category)?;
             Ok("Memory saved.".into())
+        }
+        // Wave 1b (idea 5): read the FULL memory set on demand. The per-question
+        // injection is budgeted (MAX_MEMORY_INJECT_CHARS) and can truncate; this
+        // keeps every saved note reachable when the injected slice is partial.
+        "list_memories" => {
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let memories = db::list_memories(&room.conn)?;
+            if memories.is_empty() {
+                return Ok("No memories are saved in this room yet.".into());
+            }
+            let lines: Vec<String> = memories
+                .iter()
+                .map(|m| match m.category.as_deref() {
+                    Some(c) => format!("- [{c}] {}", m.content),
+                    None => format!("- {}", m.content),
+                })
+                .collect();
+            Ok(clamp_tool_result(lines.join("\n")))
         }
         // ADD-32: kick off a durable whole-file pass. The heavy lifting is the
         // deterministic job runner's; the agent only starts it and reports.
@@ -2553,6 +2688,22 @@ mod tests {
     }
 
     #[test]
+    fn exec_tool_arms_are_reserved_against_mcp_shadowing() {
+        // Every exec_tool arm that dispatches to a built-in (not the `other =>`
+        // MCP fallback) must be in BUILTIN_TOOL_NAMES, or a connected MCP server
+        // whose sanitized name collides could shadow the built-in and skip the
+        // SEC-1b consent gate. `consult_advisor` and `local_generate` are never
+        // in any bridge catalog but ARE exec_tool arms, so they are the two that
+        // the plain leak guards above don't already cover.
+        for name in ["consult_advisor", "local_generate"] {
+            assert!(
+                BUILTIN_TOOL_NAMES.contains(&name),
+                "{name} is an exec_tool arm but not reserved — an MCP route could shadow it"
+            );
+        }
+    }
+
+    #[test]
     fn external_agent_tools_never_leak_into_the_room_bridge_catalog() {
         // Wave 1a structural guard, same as the job/UI tools: local_generate
         // is NOT in tools_catalog — only the bridge's ExternalAgent scope
@@ -2616,6 +2767,54 @@ mod tests {
         // But they ARE offered by the dedicated spec builder.
         let specs = ui_tools_specs();
         assert_eq!(specs.len(), 4);
+    }
+
+    #[test]
+    fn style_paragraph_maps_known_styles() {
+        // Wave 1b (idea 12): each register maps to its constant…
+        assert!(style_paragraph(Some("terse")).unwrap().starts_with("Response style: TERSE."));
+        assert!(style_paragraph(Some("friendly")).unwrap().starts_with("Response style: FRIENDLY."));
+        assert!(style_paragraph(Some("formal")).unwrap().starts_with("Response style: FORMAL."));
+        // …and the audited register halves are present: terse keeps "technical",
+        // friendly keeps "explanatory", formal keeps "structured".
+        assert!(style_paragraph(Some("terse")).unwrap().contains("precise technical vocabulary"));
+        assert!(style_paragraph(Some("friendly")).unwrap().contains("briefly explain the why"));
+        assert!(style_paragraph(Some("formal")).unwrap().contains("short headings or numbered points"));
+    }
+
+    #[test]
+    fn style_paragraph_none_for_default_and_unknown() {
+        // Byte-stability guard: absent/default/unknown values inject NOTHING,
+        // so those rooms' system prompts stay byte-identical to today's.
+        assert!(style_paragraph(None).is_none());
+        assert!(style_paragraph(Some("default")).is_none());
+        assert!(style_paragraph(Some("")).is_none());
+        assert!(style_paragraph(Some("TERSE")).is_none(), "stored values are exact, not folded");
+        assert!(style_paragraph(Some("shakespearean")).is_none());
+    }
+
+    #[test]
+    fn style_block_appends_precedence_sentence_only_with_custom_text() {
+        // Free text wins (triage rule): the sentence appears exactly when
+        // custom instructions ride below the preset.
+        let plain = style_block(Some("terse"), false).unwrap();
+        assert_eq!(plain, STYLE_TERSE);
+        let with_custom = style_block(Some("terse"), true).unwrap();
+        assert!(with_custom.starts_with(STYLE_TERSE));
+        assert!(with_custom.ends_with("follow the user's preferences."));
+        // No preset → nothing, regardless of custom text.
+        assert!(style_block(None, true).is_none());
+    }
+
+    #[test]
+    fn list_memories_rides_the_base_catalog() {
+        // Wave 1b (idea 5): the read-back tool is part of tools_catalog (served
+        // to every scope like list_room_files) and carries no parameters; the
+        // add_memory spec gained the optional category enum.
+        let catalog = tools_catalog(false).to_string();
+        assert!(catalog.contains("\"list_memories\""));
+        assert!(catalog.contains("\"category\""));
+        assert!(BUILTIN_TOOL_NAMES.contains(&"list_memories"));
     }
 
     #[test]

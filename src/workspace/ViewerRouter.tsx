@@ -112,6 +112,9 @@ interface ViewerRouterProps {
   editCell: (sheet: string, cell: string, value: string) => Promise<void>;
   saveEdit: (newText: string) => Promise<void>;
   saveEditAsCopy: (newText: string) => Promise<void>;
+  /** Wave 1b (idea 10): mirrors the editable Monaco buffer's dirty flag out to
+   * the workspace so agent writes can't silently blow unsaved user edits. */
+  onDirtyChange?: (dirty: boolean) => void;
   /** ADD-27: what the Recording editor needs from the workspace — the live
    * session state plus the session-lifecycle handlers (recordingActions). */
   /** ADD-18: background-transcription state by file NAME (stt-progress) —
@@ -159,6 +162,7 @@ function ViewerBody({
   editCell,
   saveEdit,
   saveEditAsCopy,
+  onDirtyChange,
   recording,
   sttStatus,
 }: ViewerRouterProps) {
@@ -189,6 +193,7 @@ function ViewerBody({
         language={languageForFile(c.name)}
         onSave={saveEdit}
         find={t?.find}
+        onDirtyChange={onDirtyChange}
       />
     );
   }
@@ -201,6 +206,7 @@ function ViewerBody({
         onSave={saveEditAsCopy}
         saveLabel="Save copy"
         find={t?.find}
+        onDirtyChange={onDirtyChange}
       />
     );
   }

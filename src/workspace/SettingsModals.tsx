@@ -35,6 +35,9 @@ export default function SettingsModals({
             s.setShowSettings(false);
             a.refreshWebAccess();
             a.refreshAutolock();
+            // Wave 1b (idea 5): the Behavior checkbox only writes the DB —
+            // re-read it so auto-save flips without reopening the room.
+            a.refreshMemAutoSave();
           }}
         />
       )}

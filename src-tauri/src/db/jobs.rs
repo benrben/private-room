@@ -256,6 +256,24 @@ mod tests {
     }
 
     #[test]
+    fn auto_flags_roundtrip_through_the_plan_json() {
+        // Wave 1b (idea 8): resume_job re-reads `auto`/`reduce` from the stored
+        // plan — they must survive create_job/get_job byte-exactly.
+        let conn = mem();
+        let plan = serde_json::json!({ "steps": [], "auto": true, "reduce": false });
+        let id = create_job(&conn, "deep_summary", "Indexing new files", &plan, 7).unwrap();
+        let j = get_job(&conn, &id).unwrap();
+        assert_eq!(j.title, "Indexing new files");
+        assert_eq!(j.plan.get("auto").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(j.plan.get("reduce").and_then(|v| v.as_bool()), Some(false));
+        // A manual job's plan simply lacks the flags — read as false/absent.
+        let manual = create_job(&conn, "deep_summary", "Room summary",
+                                &serde_json::json!({ "steps": [] }), 3).unwrap();
+        let m = get_job(&conn, &manual).unwrap();
+        assert!(m.plan.get("auto").is_none());
+    }
+
+    #[test]
     fn error_status_carries_a_message() {
         let conn = mem();
         let id = create_job(&conn, "deep_summary", "x", &serde_json::json!({}), 1).unwrap();

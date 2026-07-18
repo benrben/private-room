@@ -141,6 +141,22 @@ pub fn files_missing_summary(
     )
 }
 
+/// Wave 1b (idea 10): the NEWEST file whose name equals `name` exactly — any
+/// source, so a user-made "Scratch pad.md" is adopted by the get-or-create
+/// convention instead of being shadowed by a generated duplicate.
+pub fn file_by_exact_name(conn: &Connection, name: &str) -> Result<Option<FileMeta>, String> {
+    query_rows(
+        conn,
+        &format!(
+            "SELECT {FILE_META_COLS} FROM files f WHERE f.name = ?1 \
+             ORDER BY f.created_at DESC, f.rowid DESC LIMIT 1"
+        ),
+        [name],
+        file_meta_row,
+    )
+    .map(|rows| rows.into_iter().next())
+}
+
 /// Full metadata row for one file by id.
 pub fn get_file_meta(conn: &Connection, id: &str) -> Result<FileMeta, String> {
     query_one(
@@ -480,6 +496,27 @@ mod tests {
             .map(|(id, ..)| id)
             .collect();
         assert_eq!(ids, vec![uploaded]);
+    }
+
+    #[test]
+    fn empty_liner_sentinel_leaves_the_missing_set() {
+        // Wave 1b (idea 8): a file whose one-liner persistently fails gets the
+        // '' sentinel from an auto job, which must remove it from the missing
+        // set (auto-index termination) — while a NULL keeps it in.
+        let conn = mem();
+        let stuck = add_file(&conn, "stuck.pdf", "text the model chokes on");
+        let fresh = add_file(&conn, "fresh.pdf", "normal text");
+        assert_eq!(files_missing_summary(&conn, 10).unwrap().len(), 2);
+        set_file_ai_summary(&conn, &stuck, "").unwrap();
+        let ids: Vec<String> = files_missing_summary(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        assert_eq!(ids, vec![fresh]);
+        // A content change clears the sentinel back to NULL → retried.
+        update_file_content(&conn, &stuck, b"new bytes", Some("new text")).unwrap();
+        assert_eq!(files_missing_summary(&conn, 10).unwrap().len(), 2);
     }
 
     #[test]

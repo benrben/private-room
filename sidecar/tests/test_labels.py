@@ -19,6 +19,7 @@ EXPECTED = {
     "rename_file": "Renamed a file",
     "move_file": "Moved a file",
     "add_memory": "Saved a memory",
+    "list_memories": "Listed the saved memories",
     "web_search": "Searched the web",
     "fetch_page": "Fetched a page",
     "ui_snapshot": "Looked at the app's controls",

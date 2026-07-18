@@ -74,6 +74,12 @@ export default function Settings({
     setInstructions,
     saveTuning,
     saved,
+    responseStyle,
+    changeResponseStyle,
+    autoIndex,
+    changeAutoIndex,
+    memoryAutoSave,
+    changeMemoryAutoSave,
   } = useBehaviorSettings(() => setError(""));
 
   const {
@@ -260,6 +266,12 @@ export default function Settings({
               setInstructions={setInstructions}
               saveTuning={saveTuning}
               saved={saved}
+              responseStyle={responseStyle}
+              changeResponseStyle={changeResponseStyle}
+              autoIndex={autoIndex}
+              changeAutoIndex={changeAutoIndex}
+              memoryAutoSave={memoryAutoSave}
+              changeMemoryAutoSave={changeMemoryAutoSave}
             />
 
             <PrivacySection

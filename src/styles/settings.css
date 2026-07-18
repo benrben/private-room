@@ -351,3 +351,30 @@
   font-weight: 600;
 }
 
+
+/* Wave 1b (idea 12): the response-style segmented control — four exclusive
+   registers, immediate-apply (no Save gate). */
+.style-seg {
+  display: flex;
+  gap: 6px;
+  margin: 4px 0 6px;
+}
+
+.style-seg-opt {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--surface-3);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: center;
+}
+
+.style-seg-opt.active {
+  border-color: var(--accent, #8b7cf6);
+  background: color-mix(in srgb, var(--accent, #8b7cf6) 10%, transparent);
+  color: var(--text);
+  font-weight: 600;
+}

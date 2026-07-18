@@ -66,6 +66,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
   content TEXT NOT NULL,
+  -- Wave 1b (idea 5): preference | fact | project | instruction; NULL =
+  -- uncategorized (every legacy row). Organizational only in v1.
+  category TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE TABLE IF NOT EXISTS web_pages (
@@ -401,6 +404,13 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
+    // Wave 1b (idea 5): memory categories. Guarded ALTER like ai_summary above;
+    // NULL = uncategorized, so legacy rooms open unchanged and keep every memory.
+    if table_exists(conn, "memories")? && !column_exists(conn, "memories", "category")? {
+        conn.execute("ALTER TABLE memories ADD COLUMN category TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
     // ADD-23: structured viewer effects (boxes/annotation) ride their own
     // column so assistant `content` stays plain prose. Guarded ALTER for rooms
     // created before the column existed; legacy fenced ```boxes/```annotation
@@ -602,6 +612,34 @@ mod tests {
             crate::db::search_chunks_fts_ranked(&conn, "\"קהלת\"", 10).unwrap();
         assert_eq!(hits_after.len(), 1, "consonantal rebuild must match");
         assert_eq!(hits_after[0].1, "bible.pdf");
+    }
+
+    #[test]
+    fn memories_category_migration_alters_legacy_rooms() {
+        // Wave 1b (idea 5): a room created BEFORE the category column existed
+        // gains it on migrate(), and its rows read back as uncategorized. Start
+        // from the full schema (migrate touches messages/chats too), then shape
+        // the memories table exactly as legacy rooms had it.
+        let conn = open_in_memory_schema();
+        conn.execute_batch(
+            "DROP TABLE memories;
+             CREATE TABLE memories (
+               id TEXT PRIMARY KEY,
+               content TEXT NOT NULL,
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             );
+             INSERT INTO memories(id, content) VALUES ('m1', 'the dog is named Rex');",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "memories", "category").unwrap());
+        migrate(&conn).unwrap();
+        assert!(column_exists(&conn, "memories", "category").unwrap());
+        let got = crate::db::list_memories(&conn).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "the dog is named Rex");
+        assert!(got[0].category.is_none(), "legacy rows are uncategorized");
+        // Idempotent on a second open.
+        migrate(&conn).unwrap();
     }
 
     #[test]

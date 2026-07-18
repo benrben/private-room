@@ -101,11 +101,14 @@ export const api = {
   // its own JS/CSS, no network). Returns a token → roomdoc://localhost/<token>.
   stagePreviewHtml: (html: string) =>
     invoke<string>("stage_preview_html", { html }),
-  addMemory: (content: string) => invoke<Memory>("add_memory", { content }),
+  addMemory: (content: string, category?: string | null) =>
+    invoke<Memory>("add_memory", { content, category: category ?? null }),
   listMemories: () => invoke<Memory[]>("list_memories"),
   deleteMemory: (id: string) => invoke<void>("delete_memory", { id }),
-  updateMemory: (id: string, content: string) =>
-    invoke<void>("update_memory", { id, content }),
+  updateMemory: (id: string, content: string, category?: string | null) =>
+    invoke<void>("update_memory", { id, content, category: category ?? null }),
+  // Wave 1b (idea 10): get-or-create the room's canonical "Scratch pad.md".
+  openScratchPad: () => invoke<FileMeta>("open_scratch_pad"),
   // ---- Wave 4: folders (ADD-16) ----
   listFolders: () => invoke<Folder[]>("list_folders"),
   createFolder: (name: string) => invoke<Folder>("create_folder", { name }),

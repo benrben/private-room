@@ -69,7 +69,12 @@ export function useWorkspaceState(info: RoomInfo) {
   const [openFile, setOpenFile] = useState<OpenFile | null>(null);
   const [viewerRev, setViewerRev] = useState(0);
   const [editMode, setEditMode] = useState(false);
+  // Wave 1b (idea 10): file id whose viewer content went stale because the AI
+  // wrote it while the user had unsaved edits — drives the choice banner.
+  const [staleFile, setStaleFile] = useState<string | null>(null);
   const [memoryDraft, setMemoryDraft] = useState("");
+  // Wave 1b (idea 5): category picked in the memory-panel add row ("" = none).
+  const [memoryDraftCat, setMemoryDraftCat] = useState("");
   const [showMemory, setShowMemory] = useState(false);
   const [saveDraft, setSaveDraft] = useState<{ id: string; name: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -111,7 +116,11 @@ export function useWorkspaceState(info: RoomInfo) {
   const [chatW, setChatW] = useState(400);
   const [renamingFolder, setRenamingFolder] = useState<{ id: string; name: string } | null>(null);
   const [creatingFolder, setCreatingFolder] = useState<string | null>(null);
-  const [editingMemory, setEditingMemory] = useState<{ id: string; content: string } | null>(null);
+  const [editingMemory, setEditingMemory] = useState<{
+    id: string;
+    content: string;
+    category: string | null;
+  } | null>(null);
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResults | null>(null);
@@ -121,6 +130,16 @@ export function useWorkspaceState(info: RoomInfo) {
   const toastSeq = useRef(0);
   const openFileRef = useRef<OpenFile | null>(null);
   openFileRef.current = openFile;
+  // Wave 1b (idea 10): the mount-once onFileUpdated listener captures the
+  // first render's closure, so it reads edit state through refs (the
+  // openFileRef pattern above). editorDirtyRef mirrors the Monaco buffer's
+  // dirty flag via CodeEditor's onDirtyChange.
+  const editModeRef = useRef(false);
+  editModeRef.current = editMode;
+  const editorDirtyRef = useRef(false);
+  // Wave 1b (idea 5): the auto-save switch, mirrored as a ref for the same
+  // mount-once-listener reason; re-read when Settings closes.
+  const memAutoSaveRef = useRef(false);
   const showSearchRef = useRef(false);
   showSearchRef.current = showSearch;
   const showSettingsRef = useRef(false);
@@ -245,7 +264,9 @@ export function useWorkspaceState(info: RoomInfo) {
     renameDraft, setRenameDraft, pullingModel, setPullingModel,
     pullStatus, setPullStatus, pullPercent, setPullPercent, pullError, setPullError,
     openFile, setOpenFile, viewerRev, setViewerRev, editMode, setEditMode,
-    memoryDraft, setMemoryDraft, showMemory, setShowMemory, saveDraft, setSaveDraft,
+    staleFile, setStaleFile, editModeRef, editorDirtyRef, memAutoSaveRef,
+    memoryDraft, setMemoryDraft, memoryDraftCat, setMemoryDraftCat,
+    showMemory, setShowMemory, saveDraft, setSaveDraft,
     showSettings, setShowSettings, mcpTools, setMcpTools,
     mcpDialogDismissed, setMcpDialogDismissed, approvingMcp, setApprovingMcp,
     summarizing, setSummarizing, summarizeProgress, setSummarizeProgress,

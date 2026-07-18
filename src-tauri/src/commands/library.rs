@@ -10,16 +10,35 @@ pub(crate) fn duplicate_memory(conn: &Connection, content: &str) -> Result<Optio
         .find(|m| normalize_for_match(&m.content) == norm))
 }
 
+/// Wave 1b (idea 5): fold a raw category string onto the fixed vocabulary.
+/// Anything else (misspellings, free-form tags, empty) → None, never an error —
+/// a 4B model cannot be trusted to reproduce an enum exactly.
+pub(crate) fn normalize_category(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "preference" => Some("preference"),
+        "fact" => Some("fact"),
+        "project" => Some("project"),
+        "instruction" => Some("instruction"),
+        _ => None,
+    }
+}
+
 #[tauri::command]
-pub fn add_memory(state: State<'_, AppState>, content: String) -> Result<Memory, String> {
+pub fn add_memory(
+    state: State<'_, AppState>,
+    content: String,
+    category: Option<String>,
+) -> Result<Memory, String> {
     state.with_room(|room| {
         // CHG-7: cap length so injected memories stay within the prompt budget.
         let content = clamp_bytes(content, MAX_MEMORY_CONTENT_CHARS);
-        // UX-5: never store an exact duplicate; hand back the existing entry instead.
+        // UX-5: never store an exact duplicate; hand back the existing entry
+        // instead (callers can tell by its old created_at).
         if let Some(existing) = duplicate_memory(&room.conn, &content)? {
             return Ok(existing);
         }
-        db::add_memory(&room.conn, &content)
+        let category = category.as_deref().and_then(normalize_category);
+        db::add_memory(&room.conn, &content, category)
     })
 }
 
@@ -28,12 +47,18 @@ pub fn list_memories(state: State<'_, AppState>) -> Result<Vec<Memory>, String> 
     state.with_room(|room| db::list_memories(&room.conn))
 }
 
-/// UX-5: edit a memory's text in place.
+/// UX-5: edit a memory's text (and, Wave 1b, its category) in place.
 #[tauri::command]
-pub fn update_memory(state: State<'_, AppState>, id: String, content: String) -> Result<(), String> {
+pub fn update_memory(
+    state: State<'_, AppState>,
+    id: String,
+    content: String,
+    category: Option<String>,
+) -> Result<(), String> {
     state.with_room(|room| {
         let content = clamp_bytes(content, MAX_MEMORY_CONTENT_CHARS);
-        db::update_memory(&room.conn, &id, &content)
+        let category = category.as_deref().and_then(normalize_category);
+        db::update_memory(&room.conn, &id, &content, category)
     })
 }
 
@@ -107,4 +132,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_category_accepts_vocab_rejects_junk() {
+        // The fixed vocabulary, case/whitespace-tolerant…
+        assert_eq!(normalize_category("preference"), Some("preference"));
+        assert_eq!(normalize_category(" Fact "), Some("fact"));
+        assert_eq!(normalize_category("PROJECT"), Some("project"));
+        assert_eq!(normalize_category("instruction"), Some("instruction"));
+        // …and everything else degrades to uncategorized, never an error.
+        assert_eq!(normalize_category("preferences"), None);
+        assert_eq!(normalize_category("misc"), None);
+        assert_eq!(normalize_category(""), None);
+    }
 }

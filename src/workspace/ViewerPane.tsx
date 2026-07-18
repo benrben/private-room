@@ -204,6 +204,36 @@ export default function ViewerPane({
               </button>
             </span>
           </div>
+          {/* Wave 1b (idea 10): the AI wrote this file while the user's editor
+              buffer was dirty — the reload was skipped, the user chooses. Both
+              paths are safe: every overwrite snapshots to History first. */}
+          {s.staleFile === openFile.id && (
+            <div className="stale-banner" role="status">
+              <span className="stale-banner-text">
+                The AI changed this file while you were editing.
+              </span>
+              <span className="stale-banner-actions">
+                <button
+                  className="primary"
+                  title="Show the AI's version (your unsaved edits are discarded)"
+                  onClick={() => {
+                    s.setStaleFile(null);
+                    s.editorDirtyRef.current = false;
+                    void a.viewFile(openFile.id);
+                  }}
+                >
+                  Load AI version
+                </button>
+                <button
+                  className="subtle"
+                  title="Keep your buffer — your next ⌘S overwrites; the AI's version stays in History"
+                  onClick={() => s.setStaleFile(null)}
+                >
+                  Keep editing
+                </button>
+              </span>
+            </div>
+          )}
           <div
             className={`viewer-body ${
               openFile.content.kind === "code" ||
@@ -221,6 +251,9 @@ export default function ViewerPane({
               editCell={a.editCell}
               saveEdit={a.saveEdit}
               saveEditAsCopy={a.saveEditAsCopy}
+              onDirtyChange={(d) => {
+                s.editorDirtyRef.current = d;
+              }}
               recording={{
                 live: s.recLive,
                 saveProgress: s.recSave,

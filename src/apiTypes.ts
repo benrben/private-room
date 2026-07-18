@@ -125,6 +125,9 @@ export interface AgentUiRequest {
 export interface Memory {
   id: string;
   content: string;
+  /** Wave 1b (idea 5): preference | fact | project | instruction, or null =
+   * uncategorized (every pre-category row). */
+  category: string | null;
   createdAt: string;
 }
 

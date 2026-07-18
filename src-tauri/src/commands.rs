@@ -146,6 +146,11 @@ pub struct AppState {
     /// `cancel_job` flips a flag; the runner sees it between waves, checkpoints,
     /// and parks the job as 'paused'. The entry is removed when the job ends.
     pub job_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Wave 1b (idea 8): generation stamp for the debounced auto-index
+    /// scheduler. Every ingest event bumps it and spawns one waiter carrying
+    /// the new stamp; a waiter whose stamp is stale exits silently, so a
+    /// multi-file drop coalesces into one indexing decision.
+    pub auto_index_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -347,6 +352,10 @@ pub struct Chat {
 pub struct Memory {
     pub id: String,
     pub content: String,
+    /// Wave 1b (idea 5): preference | fact | project | instruction, or None =
+    /// uncategorized (every pre-category row). Organizational only in v1 —
+    /// prompt injection stays content-only.
+    pub category: Option<String>,
     pub created_at: String,
 }
 

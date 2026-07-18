@@ -39,6 +39,27 @@ export function makeMiscActions(
       .catch(() => {});
   }
 
+  /** Wave 1b (idea 5): re-read the auto-save switch into the workspace ref.
+   * Called when Settings closes — the BehaviorSection checkbox only writes the
+   * DB setting, and the ref must follow without a room reopen. */
+  function refreshMemAutoSave() {
+    api
+      .getSetting("memory_auto_save")
+      .then((v) => {
+        s.memAutoSaveRef.current = v === "1";
+      })
+      .catch(() => {});
+  }
+
+  /** Wave 1b (idea 10): open (get-or-create) the canonical scratch pad. */
+  async function openScratchPad() {
+    await tryToast(s, async () => {
+      const meta = await api.openScratchPad();
+      s.setFiles(await api.listFiles());
+      await viewFile(meta.id);
+    });
+  }
+
   async function dismissSyncWarn() {
     s.setShowSyncWarn(false);
     try {
@@ -124,6 +145,26 @@ export function makeMiscActions(
     );
   }
 
+  /** Wave 1b (idea 5): the chip's third button — flip the room to auto-save
+   * mode AND save the current suggestion. The click is the user's explicit
+   * consent (the whole chip stays data-agent-blocked, ADD-25). */
+  async function enableMemoryAutoSave() {
+    const fact = s.memSuggestion?.fact;
+    s.setMemSuggestion(null);
+    s.memAutoSaveRef.current = true;
+    await tryToast(s, async () => {
+      await api.setSetting("memory_auto_save", "1");
+      if (fact) {
+        await api.addMemory(fact);
+        s.setMemories(await api.listMemories());
+      }
+      s.pushToast(
+        "success",
+        "Suggested memories now save automatically — turn this off any time in Settings → Behavior.",
+      );
+    });
+  }
+
   function copyReceipt(a: AnnotationPayload) {
     const parts = [`"${a.quote}"`, `— ${a.name ?? "this room"}`];
     if (a.page) parts.push(`p. ${a.page}`);
@@ -167,23 +208,24 @@ export function makeMiscActions(
     // save leaves the text where the user can retry it.
     await tryToast(
       s,
-      () => api.addMemory(content),
+      () => api.addMemory(content, s.memoryDraftCat || null),
       async () => {
         s.setMemories(await api.listMemories());
         s.setMemoryDraft("");
+        s.setMemoryDraftCat("");
       },
     );
   }
 
   async function saveMemoryEdit() {
     if (!s.editingMemory) return;
-    const { id, content } = s.editingMemory;
+    const { id, content, category } = s.editingMemory;
     const trimmed = content.trim();
     s.setEditingMemory(null);
     if (!trimmed) return;
     await tryToast(
       s,
-      () => api.updateMemory(id, trimmed),
+      () => api.updateMemory(id, trimmed, category),
       async () => s.setMemories(await api.listMemories()),
     );
   }
@@ -328,8 +370,9 @@ export function makeMiscActions(
   }
 
   return {
-    refreshWebAccess, refreshAutolock, dismissSyncWarn, connectedTools,
-    approveMcp, keepMcpOff, submitLink, loadFrontPage, saveSuggestedMemory,
+    refreshWebAccess, refreshAutolock, refreshMemAutoSave, dismissSyncWarn,
+    connectedTools, approveMcp, keepMcpOff, submitLink, loadFrontPage,
+    saveSuggestedMemory, enableMemoryAutoSave, openScratchPad,
     copyReceipt, playSealSound, addMemory, saveMemoryEdit, activateResult,
     resolveMcpApproval, revealMemory, changeModel, engineLabelOf,
     recordEngineModels,

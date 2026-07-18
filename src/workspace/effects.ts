@@ -28,6 +28,14 @@ export function useWorkspaceEffects(
     api.listFiles().then(s.setFiles);
     api.listFolders().then(s.setFolders).catch(() => {});
     api.listMemories().then(s.setMemories);
+    // Wave 1b (idea 5): seed the auto-save ref; re-read when Settings closes
+    // (a.refreshMemAutoSave) so the off-switch applies without a room reopen.
+    api
+      .getSetting("memory_auto_save")
+      .then((v) => {
+        s.memAutoSaveRef.current = v === "1";
+      })
+      .catch(() => {});
     api.listChatCommands().then(s.setCommands).catch(() => {});
     void a.loadAiActions();
     a.refreshAi();
@@ -191,6 +199,14 @@ export function useWorkspaceEffects(
       s.editedRef.current.add(fileId);
       const current = s.openFileRef.current;
       if (current && current.id === fileId) {
+        // Wave 1b (idea 10): reloading remounts the keyed Monaco editor and
+        // would silently discard a dirty buffer — if the user is mid-edit,
+        // park the reload behind the choice banner instead. Refs, not state:
+        // this listener is mount-once and captures the first render.
+        if (s.editModeRef.current && s.editorDirtyRef.current) {
+          s.setStaleFile(fileId);
+          return;
+        }
         const content = await api.getFileContent(current.id);
         s.setOpenFile({ ...current, content });
         s.setViewerRev((r) => r + 1);
@@ -447,6 +463,10 @@ export function useWorkspaceEffects(
 
   useEffect(() => {
     s.setShowHistory(false);
+    // Wave 1b (idea 10): a different file means a fresh buffer — clear the
+    // stale-write banner and the dirty mirror so old state can't leak onto it.
+    s.setStaleFile(null);
+    s.editorDirtyRef.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.openFile?.id]);
 

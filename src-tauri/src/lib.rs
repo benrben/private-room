@@ -108,6 +108,7 @@ pub fn run() {
             commands::set_cell,
             commands::delete_file,
             commands::save_generated_file,
+            commands::open_scratch_pad,
             commands::import_link,
             commands::summarize_room,
             commands::list_file_versions,

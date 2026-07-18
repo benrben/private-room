@@ -104,8 +104,9 @@ pub fn import_files(
             enqueue_ocr(&app, job);
         }
     }
-    // CHG-22: fill one-liners for freshly-imported text files in the background.
-    spawn_summary_filler(app.clone(), room_path.clone());
+    // CHG-22 → Wave 1b (idea 8): freshly-imported files go through the
+    // debounced auto-index scheduler (one decision per drop, after the lock).
+    schedule_auto_index(&app, room_path.clone());
     Ok(ImportReport { imported, errors })
 }
 
@@ -194,8 +195,9 @@ pub(crate) fn run_ocr_job(app: &tauri::AppHandle, job: JobMeta) {
     }
     let _ = app.emit("room-files-changed", ());
     let _ = app.emit("ocr-progress", (&job.name, "done"));
-    // CHG-22: newly-readable file → let the one-liner filler pick it up.
-    spawn_summary_filler(app.clone(), job.room_path.clone());
+    // CHG-22 → Wave 1b (idea 8): newly-readable file goes through the
+    // debounced auto-index scheduler.
+    schedule_auto_index(app, job.room_path.clone());
 }
 
 #[tauri::command]

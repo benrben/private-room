@@ -452,6 +452,16 @@ export default function ChatPane({
               >
                 Ignore
               </button>
+              {/* Wave 1b (idea 5): opt into auto-save. The click is the
+                  consent; the agent driver still can't press it (the chip is
+                  data-agent-blocked). Off-switch: Settings → Behavior. */}
+              <button
+                className="subtle"
+                title="Save this and every future suggestion automatically (turn off in Settings → Behavior)"
+                onClick={a.enableMemoryAutoSave}
+              >
+                Always save
+              </button>
             </div>
           </div>
         )}
