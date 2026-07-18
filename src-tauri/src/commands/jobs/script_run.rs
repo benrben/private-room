@@ -33,6 +33,25 @@ const MIN_TIMEOUT_SECS: u64 = 5;
 const MAX_TIMEOUT_SECS: u64 = 3600;
 /// Stdout/stderr are drained into 32 KB ring tails.
 const RING_BYTES: usize = 32 * 1024;
+/// How many times the uv runner will auto-install a missing package and retry
+/// before giving up (one new package per round). Bounds the loop; enough for a
+/// typical data-science script (pandas + yfinance + a couple more).
+const MAX_HEAL_ROUNDS: usize = 8;
+
+/// The top-level package name from a Python `ModuleNotFoundError` stderr, if any.
+/// `No module named 'pandas.core'` → `pandas`. Used to auto-install a package the
+/// script imported but never declared, so the user never has to pip install.
+fn missing_module(stderr: &str) -> Option<String> {
+    let at = stderr.find("No module named '")?;
+    let rest = &stderr[at + "No module named '".len()..];
+    let name = rest.split('\'').next()?;
+    let top = name.split('.').next()?.trim();
+    // Only plain package tokens — never shell out with something odd.
+    if top.is_empty() || !top.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    Some(top.to_string())
+}
 /// Auto-import caps for NEW (undeclared) files a script creates (decision 2).
 const MAX_NEW_FILES: usize = 20;
 const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
@@ -823,7 +842,39 @@ async fn run_and_import<R: tauri::Runtime>(
     cancel: &Arc<AtomicBool>,
 ) -> Result<ScriptRunReport, String> {
     use tauri::Manager;
-    let out = execute_script_in_workspace(ws, runner, safe_script, manifest.timeout_secs, cancel).await?;
+    // uv is detected by its `run` argv prefix; only it can install on the fly.
+    let is_uv = runner.argv_prefix.first().map(|s| s == "run").unwrap_or(false);
+    let mut out = execute_script_in_workspace(ws, runner, safe_script, manifest.timeout_secs, cancel).await?;
+
+    // Auto-heal: if the script imports a package it never declared, install it and
+    // retry — the user should never have to pip install or declare anything for a
+    // script to run. Bounded, uv-only, and stops the moment adding a module fails
+    // to clear it (its PyPI package name differs from the import name, e.g.
+    // PIL→Pillow), which then falls through to the actionable message below.
+    let mut healed: Vec<String> = Vec::new();
+    if is_uv {
+        for _ in 0..MAX_HEAL_ROUNDS {
+            if out.exit_code == 0 || cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            let Some(missing) = missing_module(&out.stderr_tail) else { break };
+            if healed.contains(&missing) {
+                break; // we added it last round and it's still missing → can't heal
+            }
+            healed.push(missing);
+            let mut argv = runner.argv_prefix.clone();
+            for pkg in &healed {
+                argv.push("--with".into());
+                argv.push(pkg.clone());
+            }
+            let healed_runner = Runner {
+                program: runner.program.clone(),
+                argv_prefix: argv,
+            };
+            out = execute_script_in_workspace(ws, &healed_runner, safe_script, manifest.timeout_secs, cancel).await?;
+        }
+    }
+
     if out.exit_code != 0 {
         // Nonzero exit → surface the stderr tail as the parking error.
         let tail = out.stderr_tail.trim();
@@ -832,28 +883,28 @@ async fn run_and_import<R: tauri::Runtime>(
         } else {
             format!("The script failed (exit {}):\n{}", out.exit_code, tail)
         };
-        // A missing package is the common failure. Point at the real fix —
-        // declaring deps so they auto-install — instead of leaving a raw
-        // traceback the user is expected to pip-install their way out of.
-        let missing = tail.contains("ModuleNotFoundError")
+        let stuck = healed.last().filter(|s| out.stderr_tail.contains(s.as_str()));
+        if let Some(pkg) = stuck {
+            // Auto-install tried but couldn't resolve this one: its PyPI package
+            // name differs from the import name. Name it so it can be declared.
+            msg.push_str(&format!(
+                "\n\nCouldn't auto-install '{pkg}' — its package name on PyPI probably \
+                 differs from the import name (e.g. PIL → Pillow, cv2 → opencv-python). \
+                 Declare it explicitly in a dependencies line, or ask the assistant to."
+            ));
+        } else if tail.contains("ModuleNotFoundError")
             || tail.contains("No module named")
-            || tail.contains("Cannot find module");
-        if missing {
-            if manifest.deps.is_empty() {
-                msg.push_str(
-                    "\n\nThis script imports a package it never declared, so nothing was \
-                     installed. Add a dependencies line near the top and it installs \
-                     automatically on the next run — no manual pip. For example:\n    \
-                     # dependencies = [\"pandas\", \"yfinance\"]\nOr just ask the assistant \
-                     to declare the script's dependencies.",
-                );
-            } else {
-                msg.push_str(&format!(
-                    "\n\nThe declared packages ({}) install automatically, but the script \
-                     imports another one that isn't listed — add it to the dependencies line.",
-                    manifest.deps.join(", ")
-                ));
-            }
+            || tail.contains("Cannot find module")
+        {
+            // A missing package auto-heal didn't engage on (JS, or an odd trace).
+            // Point at declaring deps rather than leaving a raw traceback.
+            msg.push_str(
+                "\n\nThis script imports a package that isn't installed. Declare it in a \
+                 dependencies line near the top and it installs automatically on the next \
+                 run — no manual pip. For example:\n    \
+                 # dependencies = [\"pandas\", \"yfinance\"]\nOr ask the assistant to declare \
+                 the script's dependencies.",
+            );
         }
         return Err(msg);
     }
@@ -880,6 +931,23 @@ async fn run_and_import<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_module_extracts_top_level_package() {
+        assert_eq!(
+            missing_module("Traceback...\nModuleNotFoundError: No module named 'pandas'"),
+            Some("pandas".into())
+        );
+        // Sub-module error → the installable top-level package.
+        assert_eq!(
+            missing_module("No module named 'yfinance.utils'"),
+            Some("yfinance".into())
+        );
+        // No such error → nothing to heal.
+        assert_eq!(missing_module("ValueError: bad input"), None);
+        // Reject anything that isn't a plain package token.
+        assert_eq!(missing_module("No module named '../evil'"), None);
+    }
 
     #[test]
     fn uv_runner_installs_declared_deps_with_explicit_with_flags() {
