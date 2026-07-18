@@ -11,7 +11,7 @@ import {
   McpServerStatus,
   RoomInfo,
 } from "../api";
-import { runGuarded, tryToast } from "./guard";
+import { tryToast } from "./guard";
 import { FlatResult } from "./types";
 import { WSState } from "./state";
 
