@@ -31,6 +31,15 @@ export default function SettingsModals({
           model={s.model}
           onModelChange={a.changeModel}
           onModelsChanged={a.refreshAi}
+          // Idea 9: CheckpointsSection can't reach WSState, so compute the
+          // rollback-disable gate here (same signals as the Summarize button).
+          busy={
+            s.jobs.some(
+              (j) => j.status === "running" || j.status === "queued",
+            ) ||
+            s.recLive !== null ||
+            s.asking
+          }
           onClose={() => {
             s.setShowSettings(false);
             a.refreshWebAccess();

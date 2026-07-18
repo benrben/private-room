@@ -525,6 +525,10 @@ pub(crate) async fn start_deep_summary_inner(
     state: &AppState,
     auto: bool,
 ) -> Result<String, String> {
+    // Wave 3 (Idea 9): don't start heavy work while a rollback is swapping.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
     // One heavy background job at a time — the local lane is serial anyway, and
     // two concurrent summaries would just fight over the same cache.
     if !state.job_cancels.lock().unwrap().is_empty() {
@@ -596,6 +600,10 @@ pub async fn resume_job(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
+    // Wave 3 (Idea 9): don't resume a job while a rollback is swapping the DB.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
     let (job, room_path) = state.with_room(|room| {
         Ok((db::get_job(&room.conn, &id)?, room.path.clone()))
     })?;
@@ -759,6 +767,10 @@ pub(crate) async fn begin_file_pass(
     instruction: &str,
     mode: &str,
 ) -> Result<(String, String, usize), String> {
+    // Wave 3 (Idea 9): don't start a file pass while a rollback is swapping.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
     if !state.job_cancels.lock().unwrap().is_empty() {
         return Err(
             "A background job is already running — stop it or let it finish first.".into(),

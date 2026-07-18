@@ -14,6 +14,7 @@ mod external;
 mod rooms;
 mod recent;
 mod safety;
+mod room_checkpoints;
 mod files;
 mod spreadsheet;
 mod stt_cmds;
@@ -43,6 +44,7 @@ pub use external::*;
 pub use rooms::*;
 pub use recent::*;
 pub use safety::*;
+pub use room_checkpoints::*;
 pub use files::*;
 pub use spreadsheet::*;
 pub use stt_cmds::*;
@@ -153,7 +155,26 @@ pub struct AppState {
     /// the new stamp; a waiter whose stamp is stale exits silently, so a
     /// multi-file drop coalesces into one indexing decision.
     pub auto_index_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Wave 3 (Idea 9): bumped by `teardown_open_room` on every room close /
+    /// rollback swap. Long-lived background writers that pin only by room path
+    /// (OCR/STT lanes, summary filler, re-extract backfill, room summarize)
+    /// capture this at spawn and re-check it before writing — a rollback leaves
+    /// the path UNCHANGED, so the path pin alone would let a straggler land its
+    /// write against the reopened, rolled-back DB. Generalizes the
+    /// embed_generation pin to every path-pinned writer.
+    pub room_epoch: Arc<AtomicU64>,
+    /// Wave 3 (Idea 9): true while `rollback_room_checkpoint` is between the
+    /// drain and the reopen. New asks/jobs/studios/recordings AND the room
+    /// lifecycle commands (open/close/create) refuse while it is set, turning
+    /// the drain + re-check from best-effort into real mutual exclusion; the
+    /// same flag makes `delete_room_checkpoint` refuse mid-rollback.
+    pub rollback_in_flight: Arc<AtomicBool>,
 }
+
+/// Wave 3 (Idea 9): the message every command entry point returns when a
+/// rollback is in flight — the room is being swapped, so starting new work now
+/// would either fail or land against the wrong DB.
+pub(crate) const ROLLBACK_BUSY: &str = "The room is rolling back — try again in a moment.";
 
 impl AppState {
     /// Run `f` with the open room held under the room lock, or return the standard
@@ -174,6 +195,19 @@ impl AppState {
         let guard = self.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
         f(room)
+    }
+
+    /// Wave 3 (Idea 9): the current room epoch. A background writer captures
+    /// this at spawn and re-checks `self.room_epoch() == captured` before its
+    /// write, alongside the room-path pin.
+    pub(crate) fn room_epoch(&self) -> u64 {
+        self.room_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Wave 3 (Idea 9): true while a checkpoint rollback is between drain and
+    /// reopen. Command entry points return `ROLLBACK_BUSY` when set.
+    pub(crate) fn rolling_back(&self) -> bool {
+        self.rollback_in_flight.load(Ordering::SeqCst)
     }
 }
 
@@ -246,6 +280,20 @@ pub struct FileVersion {
     pub id: String,
     pub saved_at: String,
     pub cause: String,
+}
+
+/// Idea 11: a saved version's extracted text next to the file's CURRENT text,
+/// for the read-only side-by-side compare view. Text-only — v1 diffs extracted
+/// text, never bytes (per the triage scope guard). Both sides are shaped by the
+/// same `content_text` helper so a code/markdown diff isn't dominated by
+/// representation noise. Either side is `None` when that kind has no comparable
+/// text (image/binary), and the modal shows a "no text" message instead.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionContent {
+    pub file_name: String,
+    pub version_text: Option<String>,
+    pub current_text: Option<String>,
 }
 
 /// Recent rooms live OUTSIDE any room, in the app's own data folder. Rooms are

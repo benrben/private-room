@@ -6,6 +6,7 @@ import ModelSection from "./settings/ModelSection";
 import BehaviorSection from "./settings/BehaviorSection";
 import VoiceSection from "./settings/VoiceSection";
 import PrivacySection from "./settings/PrivacySection";
+import CheckpointsSection from "./settings/CheckpointsSection";
 import OnlineSection from "./settings/OnlineSection";
 import AdvisorsSection from "./settings/AdvisorsSection";
 import McpSection from "./settings/McpSection";
@@ -19,6 +20,7 @@ import { useModelManagement } from "./settings/useModelManagement";
 import { useBehaviorSettings } from "./settings/useBehaviorSettings";
 import { useVoiceSettings } from "./settings/useVoiceSettings";
 import { usePrivacy } from "./settings/usePrivacy";
+import { useCheckpoints } from "./settings/useCheckpoints";
 import { useOnlineSearch } from "./settings/useOnlineSearch";
 import { useAdvisors } from "./settings/useAdvisors";
 import { useMcpConfig } from "./settings/useMcpConfig";
@@ -33,6 +35,7 @@ export default function Settings({
   onModelChange,
   onModelsChanged,
   onClose,
+  busy,
 }: Props) {
   // Each section owns its state + handlers via a per-concern hook. The shell
   // only threads those returns to the presentational section components and
@@ -123,6 +126,8 @@ export default function Settings({
     compactErr,
   } = usePrivacy();
 
+  const checkpoints = useCheckpoints();
+
   const {
     webProvider,
     setWebProvider,
@@ -209,6 +214,7 @@ export default function Settings({
                 ["set-behavior", "Behavior"],
                 ["set-voice", "Spoken voice"],
                 ["set-privacy", "Privacy"],
+                ["set-checkpoints", "Checkpoints"],
                 ["set-online", "Online"],
                 ["set-advisors", "AI advisors"],
                 ["set-mcp", "Connections"],
@@ -323,6 +329,8 @@ export default function Settings({
               setCompactMsg={setCompactMsg}
               compactErr={compactErr}
             />
+
+            <CheckpointsSection {...checkpoints} busy={busy} />
 
             <OnlineSection
               webProvider={webProvider}

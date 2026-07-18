@@ -23,6 +23,8 @@ import type {
   Job,
   JobProgress,
   FileVersion,
+  VersionContent,
+  CheckpointMeta,
   RecentRoom,
   Memory,
   Folder,
@@ -78,6 +80,20 @@ export const api = {
     invoke<FileVersion[]>("list_file_versions", { id }),
   restoreFileVersion: (versionId: string) =>
     invoke<void>("restore_file_version", { versionId }),
+  // Idea 11: read a saved version's text (+ the current text) without restoring.
+  getFileVersion: (versionId: string) =>
+    invoke<VersionContent>("get_file_version", { versionId }),
+  // Idea 9: whole-room checkpoints.
+  createRoomCheckpoint: (name: string) =>
+    invoke<CheckpointMeta>("create_room_checkpoint", { name }),
+  listRoomCheckpoints: () =>
+    invoke<{ entries: CheckpointMeta[]; totalBytes: number }>(
+      "list_room_checkpoints",
+    ),
+  deleteRoomCheckpoint: (id: string) =>
+    invoke<void>("delete_room_checkpoint", { id }),
+  rollbackRoomCheckpoint: (id: string) =>
+    invoke<RoomInfo>("rollback_room_checkpoint", { id }),
   exportFile: (id: string, destPath: string) =>
     invoke<void>("export_file", { id, destPath }),
   exportAll: (destDir: string) => invoke<number>("export_all", { destDir }),
@@ -264,6 +280,10 @@ export const api = {
     listen<[string, string]>("stt-progress", (e) => cb(e.payload)),
   onOpenRoomFile: (cb: (path: string) => void): Promise<UnlistenFn> =>
     listen<string>("open-room-file", (e) => cb(e.payload)),
+  // Idea 9: the room was rolled back to a checkpoint — the whole workspace
+  // remounts against the swapped DB. Payload is the reopened room's info.
+  onRoomRolledBack: (cb: (info: RoomInfo) => void): Promise<UnlistenFn> =>
+    listen<RoomInfo>("room-rolled-back", (e) => cb(e.payload)),
   onAskDelta: (cb: (delta: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-delta", (e) => cb(e.payload)),
   // CHG-5: structured turn events. `ask-step` fires when a tool runs;

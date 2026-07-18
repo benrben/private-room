@@ -134,6 +134,123 @@
   color: var(--text-dim);
 }
 
+/* Idea 11 — the side-by-side compare modal. */
+.compare-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgba(0, 0, 0, 0.55);
+}
+.compare-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(1200px, 96vw);
+  height: min(80vh, 900px);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+.compare-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.compare-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.compare-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compare-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.compare-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.compare-confirm {
+  display: inline-flex;
+  gap: 6px;
+}
+.compare-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.compare-diff-host {
+  flex: 1;
+  min-height: 0;
+}
+.compare-empty {
+  margin: auto;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+.compare-plain {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+}
+.compare-pane {
+  margin: 0;
+  padding: 12px 14px;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.compare-pane-label {
+  position: sticky;
+  top: -12px;
+  margin: -12px -14px 8px;
+  padding: 6px 14px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.compare-rtl-hint {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
 /* ADD-3 — inline "Delete? ✓ ✕" confirm affordance. */
 .confirm-del {
   display: inline-flex;

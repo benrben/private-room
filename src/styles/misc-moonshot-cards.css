@@ -517,6 +517,25 @@ button.primary.running:disabled {
   gap: 8px;
 }
 
+/* Idea 11: per-row Compare / Restore actions, revealed on hover so the row
+   stays calm at rest. */
+.tm-actions {
+  flex-shrink: 0;
+  display: inline-flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.tm-version:hover .tm-actions,
+.tm-version:focus-within .tm-actions {
+  opacity: 1;
+}
+.tm-action {
+  font-size: 11px;
+  padding: 3px 7px;
+  border-radius: 7px;
+}
+
 /* The version currently loaded reads as the live, accented point. */
 .tm-version.current {
   background: var(--accent-ghost);

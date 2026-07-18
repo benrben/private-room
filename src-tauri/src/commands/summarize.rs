@@ -101,7 +101,11 @@ pub async fn summarize_room(
     // Phase 1 (locked): pull the file rows that need a one-liner. The room's
     // path pins the final write — the map loop below awaits model calls, and a
     // room swapped mid-run must never receive this room's summary.
-    let (explicit_model, files, room_path) = {
+    // Wave 3 (Idea 9): don't start a room summarize while a rollback is swapping.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+    let (explicit_model, files, room_path, room_epoch) = {
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
         let conn = &room.conn;
@@ -109,7 +113,7 @@ pub async fn summarize_room(
             .into_iter()
             .filter(|f| !is_summary_file(&f.name, &f.source))
             .collect();
-        (model_setting(conn), files, room.path.clone())
+        (model_setting(conn), files, room.path.clone(), state.room_epoch())
     };
 
     if files.is_empty() {
@@ -165,8 +169,13 @@ pub async fn summarize_room(
         match summarize_one_file(&model, &f.name, &f.mime, &full, KEEP_ALIVE_WARM).await {
             Ok(liner) => {
                 if !liner.is_empty() {
+                    // Wave 3 (Idea 9): pin the write by path AND epoch — this map
+                    // loop awaits model calls, and a room swapped mid-run (close,
+                    // switch, or rollback) must never receive this room's summary.
                     if let Some(room) = state.room.lock().unwrap().as_ref() {
-                        let _ = db::set_file_ai_summary(&room.conn, &f.id, &liner);
+                        if room.path == room_path && state.room_epoch() == room_epoch {
+                            let _ = db::set_file_ai_summary(&room.conn, &f.id, &liner);
+                        }
                     }
                 }
             }

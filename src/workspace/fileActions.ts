@@ -4,6 +4,7 @@ import {
   FileMeta,
   FileMetaSuggestion,
   FileTarget,
+  FileVersion,
   suggestFileMeta,
 } from "../api";
 import { displayName } from "./composer";
@@ -59,6 +60,29 @@ export function makeFileActions(s: WSState) {
       const vs = await api.listFileVersions(s.openFile.id);
       s.setVersions([...vs].sort((a, b) => b.savedAt.localeCompare(a.savedAt)));
       s.setShowHistory(true);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
+  // ---- Idea 11: open a read-only side-by-side compare of a version ----
+  async function openCompare(v: FileVersion) {
+    if (!s.openFile) return;
+    try {
+      const vc = await api.getFileVersion(v.id);
+      s.setCompare({
+        versionId: v.id,
+        cause: v.cause,
+        savedAt: v.savedAt,
+        // The command shapes BOTH sides identically (same clip + size gates),
+        // so we take the current text from its result, not s.openFile — the
+        // viewer's raw text isn't clipped on the md/csv/code branches.
+        versionText: vc.versionText,
+        currentText: vc.currentText,
+        fileName: vc.fileName,
+      });
+      // Close the popover; the modal takes over (its own Restore re-opens it).
+      s.setShowHistory(false);
     } catch (e) {
       s.pushToast("error", String(e));
     }
@@ -387,7 +411,7 @@ export function makeFileActions(s: WSState) {
   }
 
   return {
-    noteExportOnce, exportOne, exportAllFiles, openHistory, restoreVersion,
+    noteExportOnce, exportOne, exportAllFiles, openHistory, openCompare, restoreVersion,
     undoEdits, suggestImports, dismissImportSuggestion, applyImportSuggestion,
     applyAllImportSuggestions, dismissAllImportSuggestions,
     reportImport, importFiles, removeFile, viewFile, saveEdit, saveEditAsCopy,

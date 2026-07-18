@@ -27,12 +27,14 @@ pub(crate) fn spawn_reextract_backfill(app: &tauri::AppHandle) {
     use tauri::{Emitter as _, Manager as _};
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let (path, candidates) = {
+        let (path, epoch, candidates) = {
             let state = app.state::<AppState>();
             let guard = state.room.lock().unwrap();
             let Some(room) = guard.as_ref() else { return };
             let list = db::files_missing_text(&room.conn).unwrap_or_default();
-            (room.path.clone(), list)
+            // Wave 3 (Idea 9): capture the room epoch — this pass writes bytes
+            // captured NOW, so a rollback mid-pass must drop the write.
+            (room.path.clone(), state.room_epoch(), list)
         };
         let mut fixed = 0usize;
         for (id, name, mime, bytes) in candidates {
@@ -50,7 +52,9 @@ pub(crate) fn spawn_reextract_backfill(app: &tauri::AppHandle) {
             let state = app.state::<AppState>();
             let guard = state.room.lock().unwrap();
             let Some(room) = guard.as_ref() else { return };
-            if room.path != path {
+            // Wave 3 (Idea 9): epoch pin — a rollback swapped the DB, so these
+            // pre-rollback bytes must not be written into the restored room.
+            if room.path != path || state.room_epoch() != epoch {
                 return;
             }
             if db::update_file_content(&room.conn, &id, &bytes, Some(&text)).is_ok() {

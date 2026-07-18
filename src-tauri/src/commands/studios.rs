@@ -349,6 +349,11 @@ pub(crate) async fn run_studio(
     op_id: Option<String>,
 ) -> Result<FileMeta, String> {
     use tauri::Emitter;
+    // Wave 3 (Idea 9): a Studio run writes a file at the end — don't start one
+    // while a rollback is swapping the DB.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
     // ADD-31: a cancellable operation with visible stages. The flag is
     // registered under the caller's op id (same registry the chat Stop uses),
     // so the modal's Stop button works mid-generation.

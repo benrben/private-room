@@ -178,6 +178,12 @@ pub async fn ask(
 ) -> Result<Message, String> {
     use tauri::Emitter;
 
+    // Wave 3 (Idea 9): don't start a turn while a rollback is swapping the DB —
+    // it would save messages that either fail or land against the wrong room.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+
     // ADD-7: register this ask's cancel flag; the guard removes it on return
     // (success, error, or cancel) so `close_room`'s wait can see us finish.
     let cancel = Arc::new(AtomicBool::new(false));

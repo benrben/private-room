@@ -49,6 +49,10 @@ export interface Props {
   onModelChange: (model: string) => void;
   onModelsChanged: () => void;
   onClose: () => void;
+  /** Idea 9: true when a job runs/queues, a recording is live, or an answer is
+   * streaming — CheckpointsSection disables Roll back (it can't reach WSState
+   * itself). The backend refuses regardless; this is UX. */
+  busy: boolean;
 }
 
 export interface PullProgress {
