@@ -82,6 +82,8 @@ export default function Settings({
     changeAutoIndex,
     memoryAutoSave,
     changeMemoryAutoSave,
+    editApproval,
+    changeEditApproval,
   } = useBehaviorSettings(() => setError(""));
 
   const voiceSettings = useVoiceSettings();
@@ -277,6 +279,8 @@ export default function Settings({
               changeAutoIndex={changeAutoIndex}
               memoryAutoSave={memoryAutoSave}
               changeMemoryAutoSave={changeMemoryAutoSave}
+              editApproval={editApproval}
+              changeEditApproval={changeEditApproval}
             />
 
             <VoiceSection {...voiceSettings} />

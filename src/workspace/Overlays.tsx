@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { DownloadIcon, GlobeIcon, MicIcon } from "../icons";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import DiffPreview from "../viewers/DiffPreview";
 
 /** Human name for whoever owns the shared dictation mic right now. */
 const CAPTURE_OWNER_LABEL: Record<string, string> = {
@@ -65,6 +66,7 @@ function CaptureDock({ s }: { s: WSState }) {
  * highlight, and the ⌘F search overlay. Extracted verbatim. */
 export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
   const pendingApproval = s.mcpApprovals[0];
+  const pendingEdit = s.editApprovals[0];
   const searchResults = s.searchResults;
   const msgOffset = searchResults ? searchResults.files.length : 0;
   const memOffset = searchResults
@@ -109,6 +111,58 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
                 onClick={() => a.resolveMcpApproval(pendingApproval, "deny")}
               >
                 Don't allow
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {pendingEdit && (
+        // Wave 2 (Idea 6): the diff-preview approval card. Same data-agent-blocked
+        // consent surface as the MCP card — the UI-driving agent must never be
+        // able to approve its own edit.
+        <div className="approve-backdrop" data-agent-blocked>
+          <div className="approve-card approve-card-wide" role="alertdialog" aria-modal="true">
+            <div className="approve-title">
+              Apply {pendingEdit.files.length > 1 ? "these changes" : "this change"} to{" "}
+              {pendingEdit.files.length === 1 ? (
+                <em>{pendingEdit.files[0].name}</em>
+              ) : (
+                <strong>{pendingEdit.files.length} files</strong>
+              )}
+              ?
+            </div>
+            <div className="approve-diffs">
+              {pendingEdit.files.slice(0, 5).map((f, i) => (
+                <div className="approve-diff-file" key={`${f.name}-${i}`}>
+                  {pendingEdit.files.length > 1 && (
+                    <div className="approve-diff-name">{f.name}</div>
+                  )}
+                  <DiffPreview before={f.before} after={f.after} clipped={f.clipped} />
+                </div>
+              ))}
+              {pendingEdit.files.length > 5 && (
+                <div className="approve-diff-more">
+                  …and {pendingEdit.files.length - 5} more file(s) in this change.
+                </div>
+              )}
+            </div>
+            <div className="approve-actions">
+              <button
+                className="primary"
+                onClick={() => a.resolveEditApproval(pendingEdit, "once")}
+              >
+                Apply
+              </button>
+              {pendingEdit.allowTurn && (
+                <button onClick={() => a.resolveEditApproval(pendingEdit, "turn")}>
+                  Apply for the rest of this answer
+                </button>
+              )}
+              <button
+                className="danger"
+                onClick={() => a.resolveEditApproval(pendingEdit, "deny")}
+              >
+                Don't apply
               </button>
             </div>
           </div>

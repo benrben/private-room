@@ -14,7 +14,16 @@ interface Props {
   /** Wave 1b (idea 5): auto-save suggested memories — persists immediately. */
   memoryAutoSave: boolean;
   changeMemoryAutoSave: (on: boolean) => void;
+  /** Wave 2 (idea 6): ask-before-edit cadence — persists immediately. */
+  editApproval: string;
+  changeEditApproval: (v: string) => void;
 }
+
+const EDIT_APPROVAL_OPTIONS: { value: string; label: string }[] = [
+  { value: "off", label: "Off — undo covers mistakes" },
+  { value: "turn", label: "Once per answer" },
+  { value: "edit", label: "Every edit" },
+];
 
 const STYLE_OPTIONS: { value: string; label: string }[] = [
   { value: "default", label: "Default" },
@@ -36,6 +45,8 @@ export default function BehaviorSection({
   changeAutoIndex,
   memoryAutoSave,
   changeMemoryAutoSave,
+  editApproval,
+  changeEditApproval,
 }: Props) {
   return (
     <section id="set-behavior">
@@ -107,6 +118,25 @@ export default function BehaviorSection({
               />{" "}
               Save suggested memories automatically
             </label>
+            <label className="settings-label" htmlFor="edit-approval-select">
+              Ask before the AI edits files
+            </label>
+            <select
+              id="edit-approval-select"
+              value={editApproval}
+              onChange={(e) => changeEditApproval(e.target.value)}
+            >
+              {EDIT_APPROVAL_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <p className="settings-hint">
+              When on, the AI shows a before/after diff and waits for your approval
+              before changing any file. Off by default — every edit is auto-saved
+              to History and one-click undoable.
+            </p>
     </section>
   );
 }

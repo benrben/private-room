@@ -143,6 +143,14 @@ export function makeChatActions(
         s.setStreamText("");
         s.setSteps([]);
         s.setLane("");
+        // Wave 2 (Idea 6): the run is over (finished OR stopped — this is
+        // runGuarded's `finally`). Decline any diff-preview card still queued: the
+        // tools/call task that awaits it is gone, so applying now would mutate a
+        // turn that no longer exists (second-pass addendum).
+        s.setEditApprovals((q) => {
+          for (const r of q) api.resolveEditApproval(r.id, "deny").catch(() => {});
+          return [];
+        });
       },
     });
   }

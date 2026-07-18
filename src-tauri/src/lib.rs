@@ -141,6 +141,7 @@ pub fn run() {
             commands::mcp_status,
             commands::approve_mcp,
             commands::resolve_mcp_call,
+            commands::resolve_edit_approval,
             commands::ai_status,
             commands::model_capabilities,
             commands::list_engine_models,

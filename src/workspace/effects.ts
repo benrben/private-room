@@ -164,6 +164,10 @@ export function useWorkspaceEffects(
     const unlistenMcpApprove = api.onMcpApproveRequest((req) => {
       s.setMcpApprovals((q) => [...q, req]);
     });
+    // Wave 2 (Idea 6): queue a diff-preview approval card.
+    const unlistenEditApprove = api.onEditApproveRequest((req) => {
+      s.setEditApprovals((q) => [...q, req]);
+    });
     // ADD-25: the agent↔UI bridge — the backend's ui_snapshot / ui_act /
     // view_screenshot / media_frame tools land here; the driver performs them
     // against the live DOM (enforcing the data-agent-blocked consent denylist)
@@ -355,6 +359,7 @@ export function useWorkspaceEffects(
       unlistenFiles.then((fn) => fn());
       unlistenMcp.then((fn) => fn());
       unlistenMcpApprove.then((fn) => fn());
+      unlistenEditApprove.then((fn) => fn());
       unlistenAgentUi.then((fn) => fn());
       unlistenRecState.then((fn) => fn());
       unlistenRecSave.then((fn) => fn());

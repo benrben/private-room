@@ -73,16 +73,25 @@ def test_hint_lists_are_verbatim_ports_of_the_rust_arrays() -> None:
 
 
 def test_write_tool_names_match_the_rust_list() -> None:
-    # agent.rs:737 — exactly these seven, in this order.
+    # agent.rs BUILTIN_TOOL_NAMES — the file-mutating built-ins, in this order.
+    # Wave 2 (Idea 7) added `edit_files` right after `edit_file`.
     assert WRITE_TOOL_NAMES == (
         "create_file",
         "edit_file",
+        "edit_files",
         "write_file",
         "set_cells",
         "rename_file",
         "move_file",
         "add_memory",
     )
+
+
+def test_edit_files_is_a_write_tool() -> None:
+    # Wave 2 (Idea 7): the atomic batch tool must be gated off read-only turns
+    # (the sidecar filter DROPS listed write tools when write=False), and the
+    # Rust/Python change lands in the same commit per the routing docstring.
+    assert "edit_files" in WRITE_TOOL_NAMES
 
 
 def test_show_tools_are_not_write_tools() -> None:

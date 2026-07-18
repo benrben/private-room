@@ -2,6 +2,7 @@ import { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } fr
 import {
   AnnotationPayload,
   api,
+  EditApproveRequest,
   engineModelLabel,
   ExternalModelInfo,
   frontPage,
@@ -255,6 +256,25 @@ export function makeMiscActions(
     s.setMcpApprovals((q) => q.filter((r) => r.id !== req.id));
   }
 
+  // Wave 2 (Idea 6): answer a diff-preview approval card.
+  function resolveEditApproval(
+    req: EditApproveRequest,
+    decision: "once" | "turn" | "deny",
+  ) {
+    api.resolveEditApproval(req.id, decision).catch(() => {});
+    s.setEditApprovals((q) => q.filter((r) => r.id !== req.id));
+  }
+
+  // Wave 2 (Idea 6): when a run ends or is stopped, decline every still-queued
+  // edit-approval card and clear them — so a card left over from a dead run can
+  // never apply an edit into a turn that no longer exists (second-pass addendum).
+  function clearPendingEditApprovals() {
+    s.setEditApprovals((q) => {
+      for (const r of q) api.resolveEditApproval(r.id, "deny").catch(() => {});
+      return [];
+    });
+  }
+
   function revealMemory() {
     s.setShowMemory(true);
     s.setShowMemoryIntro(false);
@@ -374,7 +394,8 @@ export function makeMiscActions(
     connectedTools, approveMcp, keepMcpOff, submitLink, loadFrontPage,
     saveSuggestedMemory, enableMemoryAutoSave, openScratchPad,
     copyReceipt, playSealSound, addMemory, saveMemoryEdit, activateResult,
-    resolveMcpApproval, revealMemory, changeModel, engineLabelOf,
+    resolveMcpApproval, resolveEditApproval, clearPendingEditApprovals,
+    revealMemory, changeModel, engineLabelOf,
     recordEngineModels,
     askConfirm, cancelConfirm, startPaneResize, searchFlat, onSearchKey,
   };

@@ -14,6 +14,7 @@ EXPECTED = {
     "annotate_file": "Highlighted a passage",
     "create_file": "Created a file",
     "edit_file": "Edited a file",
+    "edit_files": "Edited several files",
     "write_file": "Rewrote a file",
     "set_cells": "Updated spreadsheet cells",
     "rename_file": "Renamed a file",

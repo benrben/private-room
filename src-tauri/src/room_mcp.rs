@@ -566,6 +566,10 @@ async fn tool_call(
     let (outcome, images) = match effects_sink {
         Some(sink) => {
             let mut effects = sink.lock().await;
+            // Wave 2 (Idea 6): only the run-scoped LocalEngine sink lives for the
+            // whole answer, so "Apply for the rest of this answer" is meaningful
+            // here (and hidden for the sink-less cloud/external scopes below).
+            effects.run_scoped = true;
             let outcome = commands::exec_tool(
                 &state, &window, &call, &mut effects, &routes, &HashSet::new(), None, None,
             )

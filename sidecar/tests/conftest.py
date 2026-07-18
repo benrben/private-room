@@ -24,6 +24,7 @@ BUILTIN_TOOL_NAMES = [
     "annotate_file",
     "create_file",
     "edit_file",
+    "edit_files",
     "write_file",
     "set_cells",
     "rename_file",

@@ -7,6 +7,7 @@ import {
   ExternalModelInfo,
   FileMeta,
   FileMetaSuggestion,
+  EditApproveRequest,
   FileVersion,
   Folder,
   FrontPage,
@@ -109,6 +110,8 @@ export function useWorkspaceState(info: RoomInfo) {
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [mcpApprovals, setMcpApprovals] = useState<McpApproveRequest[]>([]);
+  // Wave 2 (Idea 6): queued diff-preview approval cards, mirroring mcpApprovals.
+  const [editApprovals, setEditApprovals] = useState<EditApproveRequest[]>([]);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
   const internalDragRef = useRef(false);
   const paneKey = `paneWidths:${info.name}`;
@@ -287,6 +290,7 @@ export function useWorkspaceState(info: RoomInfo) {
     renamingFile, setRenamingFile, fileFilter, setFileFilter,
     addMenuOpen, setAddMenuOpen, roomMenuOpen, setRoomMenuOpen,
     modelMenuOpen, setModelMenuOpen, mcpApprovals, setMcpApprovals,
+    editApprovals, setEditApprovals,
     dragOverFolder, setDragOverFolder, internalDragRef, paneKey,
     sidebarW, setSidebarW, chatW, setChatW, renamingFolder, setRenamingFolder,
     creatingFolder, setCreatingFolder, editingMemory, setEditingMemory,

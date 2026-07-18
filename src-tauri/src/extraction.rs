@@ -38,6 +38,52 @@ pub fn is_text_extension(ext: &str) -> bool {
     TEXT_EXTENSIONS.contains(&ext)
 }
 
+/// Wave 2 (Idea 4): how one character folds when matching an edit's `old_text`
+/// against a file's raw bytes. This is the ONE normalization table shared by
+/// the plain-text fuzzy matcher (`commands::edit_match`) and the docx run-split
+/// matcher (`extraction::docx`), so both tolerate the same typographic drift a
+/// model introduces (curly quotes, NBSP/narrow-NBSP/CRLF, dash variants, ligatures).
+///
+/// Deliberately NOT `normalize_for_match` (agent.rs): that one lowercases and
+/// strips nikud for ANNOTATION lookup, which is safe because it only highlights.
+/// Edits rewrite bytes, so case must stay exact — a fuzzy hit must never land on
+/// a case-variant of a different passage. No lowercasing, no nikud stripping here.
+pub(crate) enum FoldOut {
+    /// Any whitespace (space, tab, CR, LF, NBSP U+00A0, narrow-NBSP U+202F,
+    /// U+2000–U+200A, U+3000, …). Collapsed to a single space by the matchers.
+    Space,
+    /// Zero-widths — dropped entirely so they never block a match.
+    Drop,
+    /// A 1:1 fold to the given char (or the char unchanged).
+    Char(char),
+    /// A byte-safe 1→2 expansion (ligatures). Both chars map to the ORIGINAL
+    /// char's byte span, so span math stays char-boundary-safe on either side.
+    Pair(char, char),
+}
+
+pub(crate) fn fold_edit_char(c: char) -> FoldOut {
+    match c {
+        // Zero-widths: must precede the whitespace guard (U+200B is NOT
+        // White_Space in Unicode, and U+FEFF is a BOM/no-break marker).
+        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => FoldOut::Drop,
+        // Curly / modifier apostrophes → straight single quote.
+        '\u{2018}' | '\u{2019}' | '\u{02BC}' => FoldOut::Char('\''),
+        // Curly double quotes → straight double quote.
+        '\u{201C}' | '\u{201D}' => FoldOut::Char('"'),
+        // Hyphen/dash/minus/maqaf family → ASCII hyphen.
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2212}'
+        | '\u{05BE}' => FoldOut::Char('-'),
+        // fi/fl ligatures — byte-safe expansion, parity with normalize_for_match.
+        // Extracted PDF/docx text often carries these while the model types ASCII.
+        '\u{FB01}' => FoldOut::Pair('f', 'i'),
+        '\u{FB02}' => FoldOut::Pair('f', 'l'),
+        // All remaining whitespace — Rust's is_whitespace covers NBSP, narrow
+        // NBSP, en/em spaces, ideographic space, CR/LF/tab, line/para separators.
+        c if c.is_whitespace() => FoldOut::Space,
+        _ => FoldOut::Char(c),
+    }
+}
+
 /// Extract readable text from a file's bytes, best-effort. Returns None for
 /// formats we can't read (images, unknown binaries).
 pub fn extract_text(name: &str, bytes: &[u8]) -> Option<String> {

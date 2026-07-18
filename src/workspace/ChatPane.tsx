@@ -269,13 +269,18 @@ export default function ChatPane({
           // ADD-23: structured effects ride on the message row; the content is
           // plain prose. Legacy rooms (effects: null) still carry fenced
           // ```boxes/```annotation blocks inside the text — split those out.
+          // Wave 2 (Idea 4): key off the two VIEWER keys, NOT effects-null — an
+          // edit turn now writes an "edits"-only effects object, and a message
+          // with no boxes/annotation must still run splitMarkupBlocks so a
+          // hallucinated fenced block is stripped rather than shown raw.
+          const hasViewerEffect = !!(m.effects && (m.effects.boxes || m.effects.annotation));
           const { text, boxes, annotation } =
             m.role === "assistant"
-              ? m.effects
+              ? hasViewerEffect
                 ? {
                     text: m.content,
-                    boxes: m.effects.boxes,
-                    annotation: m.effects.annotation,
+                    boxes: m.effects!.boxes,
+                    annotation: m.effects!.annotation,
                   }
                 : splitMarkupBlocks(m.content)
               : { text: m.content, boxes: undefined, annotation: undefined };

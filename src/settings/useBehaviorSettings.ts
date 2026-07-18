@@ -18,6 +18,8 @@ export function useBehaviorSettings(clearError: () => void) {
   const [autoIndex, setAutoIndex] = useState(true);
   // Wave 1b (idea 5): strictly opt-in, default off.
   const [memoryAutoSave, setMemoryAutoSave] = useState(false);
+  // Wave 2 (idea 6): "off" (default — undo covers mistakes) | "turn" | "edit".
+  const [editApproval, setEditApproval] = useState("off");
 
   useEffect(() => {
     api.getSetting("temperature").then((v) => {
@@ -42,6 +44,12 @@ export function useBehaviorSettings(clearError: () => void) {
       if (v) setResponseStyle(v);
     });
     api.getSetting("auto_index").then((v) => setAutoIndex(v !== "0")).catch(() => {});
+    api
+      .getSetting("edit_approval")
+      .then((v) => {
+        if (v === "turn" || v === "edit") setEditApproval(v);
+      })
+      .catch(() => {});
     api
       .getSetting("memory_auto_save")
       .then((v) => setMemoryAutoSave(v === "1"))
@@ -72,6 +80,12 @@ export function useBehaviorSettings(clearError: () => void) {
     api.setSetting("memory_auto_save", on ? "1" : "0").catch(() => {});
   }
 
+  /** Wave 2 (idea 6): persist immediately, like the other segmented controls. */
+  function changeEditApproval(v: string) {
+    setEditApproval(v);
+    api.setSetting("edit_approval", v).catch(() => {});
+  }
+
   return {
     temperature,
     setTemperature,
@@ -85,5 +99,7 @@ export function useBehaviorSettings(clearError: () => void) {
     changeAutoIndex,
     memoryAutoSave,
     changeMemoryAutoSave,
+    editApproval,
+    changeEditApproval,
   };
 }

@@ -284,6 +284,46 @@ button.danger:hover {
   padding: 9px;
 }
 
+/* Wave 2 (Idea 6): the diff-preview approval card is wider and stacks one
+   read-only Monaco diff per touched file. */
+.approve-card-wide {
+  max-width: 860px;
+}
+.approve-diffs {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0 0 14px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.approve-diff-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.approve-diff-more {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.diff-preview {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.diff-preview-host {
+  height: 260px;
+  width: 100%;
+}
+.diff-preview-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 5px 9px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
 /* ---- icon + text alignment (emoji → SVG swap) ---- */
 .badge-label,
 .memory-chip-label {

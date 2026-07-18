@@ -112,6 +112,9 @@ export interface MessageEffects {
     boxes: { label: string; x1: number; y1: number; x2: number; y2: number }[];
   };
   annotation?: AnnotationPayload;
+  /** Wave 2 (Idea 4): content-free per-edit outcome records for the turn
+   * (`{tool, outcome, n}`). Telemetry only — the UI renders nothing from it. */
+  edits?: { tool: string; outcome: string; n?: number; files?: number }[];
 }
 
 /** ADD-25: one backend→webview request on the agent↔UI bridge. The driver
@@ -374,6 +377,26 @@ export interface McpApproveRequest {
   server: string;
   tool: string;
   args: string;
+}
+
+/** Wave 2 (Idea 6): one file's before/after in a diff-preview approval card. */
+export interface EditPreviewFile {
+  name: string;
+  before: string;
+  after: string;
+  /** True when the preview text was clipped to the size ceiling. */
+  clipped: boolean;
+}
+
+/** Wave 2 (Idea 6): a pending diff-preview approval prompt from the backend.
+ * `allowTurn` is true only when the cadence is "Once per answer" AND the request
+ * came from the run-scoped local engine — so the "rest of this answer" button is
+ * never offered to a sink-less cloud/external client. */
+export interface EditApproveRequest {
+  id: string;
+  tool: string;
+  allowTurn: boolean;
+  files: EditPreviewFile[];
 }
 
 /** Payload of the agent-open-file event: a bare file id, or an id with a

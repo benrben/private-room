@@ -25,6 +25,8 @@ mod vision;
 mod chat;
 mod retrieval;
 mod agent;
+mod edit_match;
+mod edit_gate;
 mod chat_commands;
 mod docs_html;
 mod json;
@@ -54,6 +56,8 @@ pub use vision::*;
 pub use chat::*;
 pub(crate) use retrieval::*;
 pub use agent::*;
+pub(crate) use edit_match::*;
+pub use edit_gate::*;
 pub use chat_commands::*;
 pub(crate) use docs_html::*;
 pub(crate) use json::*;
@@ -138,6 +142,11 @@ pub struct AppState {
     /// user chose "always allow" for, cleared when the room closes.
     pub mcp_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<McpDecision>>>,
     pub mcp_session_ok: Mutex<HashSet<String>>,
+    /// Wave 2 (Idea 6): per-call diff-preview consent, mirroring `mcp_pending`.
+    /// Holds the reply channel for each in-flight edit-approval request (keyed by
+    /// request id); the frontend answers via `resolve_edit_approval`. Cleared on
+    /// room close next to `mcp_pending` so a pending card can never outlive a room.
+    pub edit_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<EditDecision>>>,
     /// D9 (the Leash): the room's persistent MCP server, when the user has turned
     /// it on. Unlike the per-`ask` bridge in `run_external`, this one lives for as
     /// long as the room is open so an external CLI/agent can hold a session. It is
@@ -182,6 +191,15 @@ impl AppState {
 pub struct McpDecision {
     pub approved: bool,
     pub remember: bool,
+}
+
+/// Wave 2 (Idea 6): the user's answer to a diff-preview approval card.
+/// `rest_of_turn` maps the "Apply for the rest of this answer" button — honored
+/// only on the run-scoped LocalEngine sink (see `ToolEffects::run_scoped`).
+#[derive(Clone, Copy)]
+pub struct EditDecision {
+    pub approved: bool,
+    pub rest_of_turn: bool,
 }
 
 /// Removes an ask's cancel flag from the registry when the ask returns, on

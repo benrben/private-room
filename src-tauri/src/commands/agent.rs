@@ -547,7 +547,9 @@ fn gather_context_and_save_question(
              page, cell, or text), mark_image (draw boxes on an image), annotate_file \
              (highlight an exact quote or a cell range in a document or spreadsheet so the \
              user sees it), create_file (save a new note/document into the room), edit_file \
-             (replace exact text inside an existing file — text, code, csv, or docx), \
+             (replace exact text in ONE place in an existing file — text, code, csv, or docx), \
+             edit_files (change several places/files, or rename + update references, in ONE \
+             atomic step — all succeed or none do), \
              write_file (rewrite a whole text file), set_cells (change a spreadsheet cell by \
              A1 reference like B7), rename_file (rename a file), move_file (move a file into a \
              folder), add_memory (remember something permanently). Use them \
@@ -881,7 +883,7 @@ pub(crate) fn persist_assistant_reply(
 /// `{"boxes": ..?, "annotation": ..?}` — or None when neither fired, so the
 /// column stays NULL for plain answers.
 pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
-    if effects.boxes.is_none() && effects.annotation.is_none() {
+    if effects.boxes.is_none() && effects.annotation.is_none() && effects.edit_outcomes.is_empty() {
         return None;
     }
     let mut map = serde_json::Map::new();
@@ -890,6 +892,14 @@ pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
     }
     if let Some(a) = &effects.annotation {
         map.insert("annotation".into(), a.clone());
+    }
+    // Wave 2 (Idea 4): content-free edit outcomes for this turn. The frontend
+    // renders nothing from this key — it is telemetry (see edit_match).
+    if !effects.edit_outcomes.is_empty() {
+        map.insert(
+            "edits".into(),
+            serde_json::Value::Array(effects.edit_outcomes.clone()),
+        );
     }
     Some(serde_json::Value::Object(map))
 }
@@ -913,6 +923,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "annotate_file",
     "create_file",
     "edit_file",
+    "edit_files",
     "write_file",
     "set_cells",
     "rename_file",
@@ -1098,12 +1109,24 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                 "name": {"type": "string"}, "content": {"type": "string"}},
                 "required": ["name", "content"]}}},
         {"type": "function", "function": {"name": "edit_file",
-            "description": "Change part of an existing file (text, code, notes, csv, or docx) by replacing exact text. Copy old_text exactly as it appears in the file. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
+            "description": "Change ONE place in ONE file (text, code, notes, csv, or docx) by replacing exact text. Copy old_text exactly as it appears in the file — curly quotes, spacing and dashes are matched tolerantly, but old_text must identify a UNIQUE spot: if it appears more than once you get an error with the count, then either add surrounding text to pick one place or pass all: true to replace every occurrence. To change several places or several files at once, use edit_files. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "File name or part of it"},
                 "old_text": {"type": "string", "description": "Exact text currently in the file"},
-                "new_text": {"type": "string", "description": "Text to replace it with"}},
+                "new_text": {"type": "string", "description": "Text to replace it with"},
+                "all": {"type": "boolean", "description": "Replace EVERY occurrence of old_text (default false → the text must appear exactly once)"}},
                 "required": ["name", "old_text", "new_text"]}}},
+        {"type": "function", "function": {"name": "edit_files",
+            "description": "Change several files (or several places in one file) in ONE atomic step: every edit is checked first, then all are applied together — if any single edit can't match, none are applied. Also renames files as part of the same atomic change, so \"rename X and update every reference\" fully lands or fully doesn't. Prefer this over repeated edit_file calls when a change spans files. Example: {\"edits\": [{\"name\": \"a.md\", \"old_text\": \"foo\", \"new_text\": \"bar\"}, {\"name\": \"old.md\", \"new_name\": \"new.md\"}]}",
+            "parameters": {"type": "object", "properties": {
+                "edits": {"type": "array", "description": "The changes to apply atomically. Each is either an edit {name, old_text, new_text} or a rename {name, new_name}.",
+                    "items": {"type": "object", "properties": {
+                        "name": {"type": "string", "description": "File name or part of it"},
+                        "old_text": {"type": "string", "description": "For an edit: exact text currently in the file"},
+                        "new_text": {"type": "string", "description": "For an edit: text to replace it with"},
+                        "new_name": {"type": "string", "description": "For a rename: the file's new name"}},
+                        "required": ["name"]}}},
+                "required": ["edits"]}}},
         {"type": "function", "function": {"name": "write_file",
             "description": "Replace the entire content of an existing text file. For small changes prefer edit_file.",
             "parameters": {"type": "object", "properties": {
@@ -1332,6 +1355,21 @@ pub(crate) struct ToolEffects {
     /// caller from `is_vision_chat_model`; when false the perception tools
     /// return a local vision-model description instead of attaching pixels.
     pub(crate) vision_chat: bool,
+    /// Wave 2 (Idea 4): content-free per-edit outcome records for this turn —
+    /// each `{"tool", "outcome", "n", …}`, never `old_text`/`new_text`. Emitted
+    /// under the `"edits"` key of the message's `effects` column so failure rates
+    /// are measurable per turn. The frontend ignores unknown effects keys.
+    pub(crate) edit_outcomes: Vec<serde_json::Value>,
+    /// Wave 2 (Idea 6): true only on the run-scoped LocalEngine sink (set by the
+    /// bridge's LocalEngine path). The diff-preview "Apply for the rest of this
+    /// answer" cadence is meaningful only here — a sink-less cloud/external scope
+    /// gets a throwaway `ToolEffects` per call, so it always prompts per edit and
+    /// the turn button is hidden (Idea 6 review amendment 2 / second-pass).
+    pub(crate) run_scoped: bool,
+    /// Wave 2 (Idea 6): set true when the user chose "Apply for the rest of this
+    /// answer" on an approval card. Turn-scoped by construction: it rides the
+    /// run-scoped sink, which lives exactly one answer.
+    pub(crate) edit_approved_this_turn: bool,
 }
 
 pub(crate) async fn exec_tool(
@@ -1506,90 +1544,112 @@ pub(crate) async fn exec_tool(
             let name = args["name"].as_str().unwrap_or_default();
             let old_text = args["old_text"].as_str().unwrap_or_default();
             let new_text = args["new_text"].as_str().unwrap_or_default();
+            // Idea 4: `all` is the escape hatch for a deliberate multi-occurrence
+            // replace (schema-visible in tools_catalog so the model can discover it).
+            let all = args["all"].as_bool().unwrap_or(false);
             if old_text.is_empty() {
                 return Err("old_text is required — copy the exact text to replace.".into());
             }
-            let guard = state.room.lock().unwrap();
-            let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = db::find_file_like(&room.conn, name)?;
-            let bytes = db::get_file_bytes(&room.conn, &id)?.ok_or("File has no stored content.")?;
-            let ext = extraction::extension_of(&real_name);
-            let (new_bytes, count) = match ext.as_str() {
-                "docx" => extraction::docx_replace_text(&bytes, old_text, new_text)?,
-                "xlsx" | "xls" => {
-                    return Err(
-                        "Spreadsheet cells are edited with set_cells (e.g. cell B7), not edit_file."
-                            .into(),
-                    )
+            // Idea 6: the diff-preview gate wraps this whole edit (compute under the
+            // lock, await approval unlocked, re-lock + staleness-check + apply). When
+            // the cadence setting is off (default) it applies inside the phase-1 lock,
+            // byte-identical to the pre-Wave-2 behavior.
+            let edit = PreviewEdit {
+                name: name.to_string(),
+                old_text: old_text.to_string(),
+                new_text: new_text.to_string(),
+                all,
+            };
+            match gated_write("edit_file", "AI edit", state, window, effects, |conn| {
+                plan_single_edit(conn, &edit)
+            })
+            .await
+            {
+                GateOutcome::Applied(plans) => {
+                    let p = &plans[0];
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_file",
+                        "outcome": p.method.map(EditMethod::outcome).unwrap_or("exact"),
+                        "n": p.count
+                    }));
+                    let base = format!(
+                        "Replaced {} occurrence(s) in \"{}\". The user sees the updated file.",
+                        p.count, p.real_name
+                    );
+                    Ok(if p.method == Some(EditMethod::Fuzzy) {
+                        format!("Matched your text despite quote/spacing differences. {base}")
+                    } else {
+                        base
+                    })
                 }
-                "pdf" => {
-                    return Err(
-                        "PDF text cannot be edited in place. Use annotate_file to highlight, \
-                         or create_file to save a corrected copy of its text."
-                            .into(),
-                    )
+                GateOutcome::Declined(msg) => Ok(msg),
+                GateOutcome::Error(e) => {
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_file", "outcome": e.outcome, "n": 0
+                    }));
+                    Err(e.message)
                 }
-                ext if extraction::is_text_extension(ext) => {
-                    let content = String::from_utf8_lossy(&bytes).into_owned();
-                    let count = content.matches(old_text).count();
-                    if count == 0 {
-                        // ADD-22: show the closest real passage so the model can
-                        // retry with the exact text instead of guessing again.
-                        let hint = closest_snippet(&content, old_text)
-                            .map(|s| format!(" The closest text in the file is: \"{}\".", clamp_bytes(s, 200)))
-                            .unwrap_or_default();
-                        return Err(format!(
-                            "Could not find that exact text in \"{real_name}\". Copy it exactly, \
-                             including spacing and punctuation.{hint}"
-                        ));
-                    }
-                    (content.replace(old_text, new_text).into_bytes(), count)
-                }
-                _ => {
-                    return Err(
-                        "This file type cannot be edited in place. Use create_file to save an \
-                         edited copy of its text instead."
-                            .into(),
-                    )
+            }
+        }
+        "edit_files" => {
+            let ops = match parse_batch_ops(args) {
+                Ok(o) => o,
+                Err(msg) => {
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_files", "outcome": "failed"
+                    }));
+                    return Err(msg);
                 }
             };
-            let text = extraction::extract_text(&real_name, &new_bytes)
-                .or_else(|| String::from_utf8(new_bytes.clone()).ok());
-            store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref(), "AI edit")?;
-            let _ = window.emit("room-files-changed", ());
-            let _ = window.emit("file-updated", &id);
-            effects.wrote = true;
-            Ok(format!(
-                "Replaced {count} occurrence(s) in \"{real_name}\". The user sees the updated file."
-            ))
+            let (n_edits, n_renames) = count_batch_ops(&ops);
+            let batch_id: String = Uuid::new_v4().to_string().chars().take(8).collect();
+            let cause = format!("AI edit (batch {batch_id})");
+            match gated_write("edit_files", &cause, state, window, effects, |conn| {
+                plan_batch(conn, &ops).map_err(|m| EditError::batch_failure(m))
+            })
+            .await
+            {
+                GateOutcome::Applied(plans) => {
+                    let total = n_edits + n_renames;
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_files", "outcome": "applied",
+                        "files": plans.len(), "n": total
+                    }));
+                    Ok(format!(
+                        "Applied {total} change(s) across {} file(s) atomically.",
+                        plans.len()
+                    ))
+                }
+                GateOutcome::Declined(msg) => Ok(msg),
+                GateOutcome::Error(e) => {
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_files", "outcome": e.outcome
+                    }));
+                    Err(e.message)
+                }
+            }
         }
         "write_file" => {
-            let name = args["name"].as_str().unwrap_or_default();
-            let content = args["content"].as_str().unwrap_or_default();
-            let guard = state.room.lock().unwrap();
-            let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = db::find_file_like(&room.conn, name)?;
-            let ext = extraction::extension_of(&real_name);
-            if !extraction::is_text_extension(&ext) {
-                return Err(format!(
-                    "\"{real_name}\" is not a plain-text file — write_file only rewrites text \
-                     files. Use edit_file (docx), set_cells (spreadsheets), or create_file."
-                ));
+            let name = args["name"].as_str().unwrap_or_default().to_string();
+            let content = args["content"].as_str().unwrap_or_default().to_string();
+            // Idea 6: the diff-preview gate wraps the rewrite (off by default →
+            // byte-identical to before).
+            match gated_write("write_file", "AI rewrite", state, window, effects, |conn| {
+                plan_write_file(conn, &name, &content)
+            })
+            .await
+            {
+                GateOutcome::Applied(plans) => {
+                    let p = &plans[0];
+                    Ok(format!("Rewrote \"{}\" ({} characters).", p.real_name, p.count))
+                }
+                GateOutcome::Declined(msg) => Ok(msg),
+                GateOutcome::Error(e) => Err(e.message),
             }
-            let text = extraction::extract_text(&real_name, content.as_bytes())
-                .unwrap_or_else(|| content.to_string());
-            store_file_bytes(&room.conn, &id, content.as_bytes(), Some(&text), "AI rewrite")?;
-            let _ = window.emit("room-files-changed", ());
-            let _ = window.emit("file-updated", &id);
-            effects.wrote = true;
-            Ok(format!(
-                "Rewrote \"{real_name}\" ({} characters).",
-                content.chars().count()
-            ))
         }
         "set_cells" => {
-            let name = args["name"].as_str().unwrap_or_default();
-            let sheet = args["sheet"].as_str();
+            let name = args["name"].as_str().unwrap_or_default().to_string();
+            let sheet = args["sheet"].as_str().map(str::to_string);
             // CHG-2: accept a batch of {cell, value} in one call so filling a
             // column doesn't burn one inference round per cell. Fall back to the
             // legacy single top-level cell/value for older prompts.
@@ -1618,27 +1678,23 @@ pub(crate) async fn exec_tool(
                 return Err("No cells given — pass updates: [{cell, value}, …].".into());
             }
             validate_cell_refs(&updates)?;
-            let guard = state.room.lock().unwrap();
-            let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = db::find_file_like(&room.conn, name)?;
-            let mut bytes =
-                db::get_file_bytes(&room.conn, &id)?.ok_or("File has no stored content.")?;
-            let mut text = None;
-            for (cell, value) in &updates {
-                let (nb, t) = set_cell_in_bytes(&real_name, &bytes, sheet, cell, value)?;
-                bytes = nb;
-                text = t;
-            }
-            store_file_bytes(&room.conn, &id, &bytes, text.as_deref(), "AI cell change")?;
-            let _ = window.emit("room-files-changed", ());
-            let _ = window.emit("file-updated", &id);
-            effects.wrote = true;
             let summary = updates
                 .iter()
                 .map(|(c, v)| format!("{c}={v}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            Ok(format!("Set {summary} in \"{real_name}\"."))
+            // Idea 6: gate the cell change too.
+            match gated_write("set_cells", "AI cell change", state, window, effects, |conn| {
+                plan_set_cells(conn, &name, sheet.as_deref(), &updates)
+            })
+            .await
+            {
+                GateOutcome::Applied(plans) => {
+                    Ok(format!("Set {summary} in \"{}\".", plans[0].real_name))
+                }
+                GateOutcome::Declined(msg) => Ok(msg),
+                GateOutcome::Error(e) => Err(e.message),
+            }
         }
         // ADD-25: the agent↔UI tools. Each is one round-trip through the
         // AgentUi bridge to the live webview driver; the driver enforces the
@@ -2825,6 +2881,26 @@ mod tests {
         let v = effects_json(&e).expect("annotation should produce effects");
         assert!(v["annotation"].is_object());
         assert!(v.get("boxes").is_none());
+        // Wave 2 (Idea 4): an edit-only turn also flips the column non-null, under
+        // the content-free "edits" key.
+        let mut e2 = ToolEffects::default();
+        e2.edit_outcomes.push(serde_json::json!({"tool": "edit_file", "outcome": "fuzzy", "n": 1}));
+        let v2 = effects_json(&e2).expect("edit outcomes should produce effects");
+        assert!(v2["edits"].is_array());
+        assert_eq!(v2["edits"][0]["outcome"], "fuzzy");
+        assert!(v2.get("boxes").is_none() && v2.get("annotation").is_none());
+    }
+
+    #[test]
+    fn edit_files_is_served_over_the_bridge_catalog() {
+        // Idea 7: unlike the job/UI tools, edit_files MUST be in tools_catalog so
+        // the sidecar and Leash clients can call it — and its name is reserved
+        // against MCP shadowing.
+        let catalog = tools_catalog(false).to_string();
+        assert!(catalog.contains("\"edit_files\""));
+        assert!(BUILTIN_TOOL_NAMES.contains(&"edit_files"));
+        // Idea 4: the `all` escape hatch is schema-visible, not just prose.
+        assert!(catalog.contains("\"all\""));
     }
 
     #[test]

@@ -39,6 +39,7 @@ import type {
   AgentOpenFilePayload,
   AgentUiRequest,
   AnnotationPayload,
+  EditApproveRequest,
   McpApproveRequest,
   RecommendedModels,
   RoomGraph,
@@ -136,6 +137,9 @@ export const api = {
   // SEC-1b: answer a per-call MCP approval prompt ("once" | "always" | "deny").
   resolveMcpCall: (id: string, decision: "once" | "always" | "deny") =>
     invoke<void>("resolve_mcp_call", { id, decision }),
+  // Wave 2 (Idea 6): answer a diff-preview approval ("once" | "turn" | "deny").
+  resolveEditApproval: (id: string, decision: "once" | "turn" | "deny") =>
+    invoke<void>("resolve_edit_approval", { id, decision }),
   // ADD-12: fetch a web page and save it as a readable room file.
   importLink: (url: string) => invoke<FileMeta>("import_link", { url }),
   // ADD-17: build/refresh the "Room summary.md" file; emits summarize-progress.
@@ -326,6 +330,12 @@ export const api = {
     cb: (req: McpApproveRequest) => void,
   ): Promise<UnlistenFn> =>
     listen<McpApproveRequest>("mcp-approve-request", (e) => cb(e.payload)),
+  // Wave 2 (Idea 6): the AI is about to change a file and (with the gate on)
+  // needs the user to approve the before/after diff.
+  onEditApproveRequest: (
+    cb: (req: EditApproveRequest) => void,
+  ): Promise<UnlistenFn> =>
+    listen<EditApproveRequest>("edit-approve-request", (e) => cb(e.payload)),
   onMcpStatus: (
     cb: (statuses: McpServerStatus[]) => void,
   ): Promise<UnlistenFn> =>

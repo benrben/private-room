@@ -25,6 +25,7 @@ from __future__ import annotations
 WRITE_TOOL_NAMES: tuple[str, ...] = (
     "create_file",
     "edit_file",
+    "edit_files",
     "write_file",
     "set_cells",
     "rename_file",
