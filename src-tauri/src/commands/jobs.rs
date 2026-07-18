@@ -262,11 +262,12 @@ pub fn delete_job(state: State<'_, AppState>, id: String) -> Result<(), String> 
 /// job. Called from the room-open path.
 pub(crate) fn quiesce_stale_jobs(conn: &Connection) {
     if let Ok(jobs) = db::unfinished_jobs(conn) {
-        // Any job still 'running' OR 'queued' belongs to a process that's gone
-        // (in-memory cancel flags don't survive a restart) — park both as
-        // 'paused' so the UI offers Resume instead of a phantom-active card that
-        // would leave the Summarize button disabled forever.
-        for j in jobs.iter().filter(|j| j.status == "running" || j.status == "queued") {
+        // A job left 'running' belongs to a process that's gone (in-memory cancel
+        // flags don't survive a restart) — park it 'paused' so the UI offers
+        // Resume instead of a phantom-active card. A 'queued' job never started,
+        // so it is LEFT queued: `pump_on_open` auto-resumes it at unlock (engine
+        // review #3 — demoting queued here made pump_on_open a dead no-op).
+        for j in jobs.iter().filter(|j| j.status == "running") {
             let _ = db::set_job_status(conn, &j.id, "paused", None);
         }
     }
@@ -1067,33 +1068,43 @@ mod tests {
 
     #[tokio::test]
     async fn run_plan_checkpoints_dense_prefix_not_count_on_branched_plan() {
-        // Wave 4a [BLOCKER] regression: a fan-out where a Cpu sibling (id 2) is
-        // ready alongside a LocalLlm step (id 1) but the LocalLlm slot is taken,
-        // so a wave can finish {0,2} leaving id 1 pending — a NON-dense done-set.
-        // The stored resume point MUST be the dense prefix (1), never the count
-        // (2), or resume would mark id 1 done though it never ran.
+        // Wave 4a [BLOCKER] regression (engine-review #4): to actually exercise a
+        // NON-dense done-set the contention must be SAME-lane. LocalLlm concurrency
+        // is 1, so with two LocalLlm steps (1,2) both ready after 0, only one runs
+        // per wave while the Cpu step (3) runs alongside — a wave finishes {0,1,3}
+        // with id 2 still pending. dense_prefix there is 2, but done.len() is 3.
+        // The checkpoint MUST record the prefix (2), never the count (3): recording
+        // 3 would mark id 2 done though it never ran. We assert some checkpoint saw
+        // prefix < done_count, which a regression to checkpoint(done.len()) fails.
         let steps = vec![
             step(0, Lane::LocalLlm, &[]),
             step(1, Lane::LocalLlm, &[0]),
-            step(2, Lane::Cpu, &[0]),
+            step(2, Lane::LocalLlm, &[0]),
+            step(3, Lane::Cpu, &[0]),
         ];
-        let prefixes = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
-        let p2 = prefixes.clone();
+        // Record (dense_prefix, done_count) at every checkpoint.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
+        let s2 = seen.clone();
         let outcome = run_plan(
             &steps,
             HashSet::new(),
             Arc::new(AtomicBool::new(false)),
             move |_s| async move { Ok(()) },
-            move |done| p2.lock().unwrap().push(dense_prefix(done)),
+            move |done| s2.lock().unwrap().push((dense_prefix(done), done.len())),
             |_, _| {},
         )
         .await;
         assert_eq!(outcome, RunOutcome::Done);
-        // Every checkpointed prefix is a valid contiguous resume point (each id
-        // below it genuinely ran), ending at the full count.
-        let cps = prefixes.lock().unwrap().clone();
-        assert_eq!(*cps.last().unwrap(), 3);
-        assert!(cps.iter().all(|&p| p <= 3));
+        let cps = seen.lock().unwrap().clone();
+        // The whole point: the stored resume value is the contiguous prefix, which
+        // is strictly below the raw done-count at least once (the non-dense wave).
+        assert!(
+            cps.iter().any(|&(prefix, count)| prefix < count),
+            "expected a non-dense checkpoint (prefix < done_count); saw {cps:?}"
+        );
+        // Every recorded prefix is a valid contiguous resume point, ending full.
+        assert!(cps.iter().all(|&(prefix, _)| prefix <= 4));
+        assert_eq!(cps.last().unwrap().0, 4);
     }
 
     #[tokio::test]

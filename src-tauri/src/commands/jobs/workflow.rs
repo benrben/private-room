@@ -1415,6 +1415,29 @@ pub(crate) async fn start_workflow_run(
     if def_uses_run_input(&def) && input_file_id.is_none() {
         return Err("This workflow runs on a chosen file — start it from a file's Actions menu.".into());
     }
+    // Engine-review #1: never pile up runs of the SAME workflow. Without this a
+    // scheduled workflow whose runtime exceeds its interval accumulates duplicate
+    // queued runs (each re-firing save_file → a growing pile of output files).
+    // A scheduled trigger skips silently (the tick still advances next_run_at); a
+    // manual trigger tells the user why. Also honor the shared queue cap, which
+    // the scheduler path previously bypassed.
+    let (has_inflight, full) = state.with_room(|room| {
+        Ok((has_inflight_run(&room.conn, workflow_id), queue::at_capacity(&room.conn)))
+    })?;
+    if has_inflight {
+        return if trigger == "manual" {
+            Err("This workflow is already running or queued.".into())
+        } else {
+            Ok(String::new())
+        };
+    }
+    if full {
+        return if trigger == "manual" {
+            Err("Too many jobs are queued — try again once some finish.".into())
+        } else {
+            Ok(String::new())
+        };
+    }
     // Wave 5: stamp the consent snapshot for any script_run nodes (approvals
     // file on this Mac ∪ this invocation's grants). Read under the room lock.
     let app = window.app_handle().clone();
@@ -1680,6 +1703,22 @@ pub async fn set_workflow_schedule(
     let def = parse_def(&wf.definition)?;
     apply_schedule(state.inner(), &id, &def, &schedule.kind, &schedule.param, schedule.enabled, schedule.catch_up).await?;
     Ok(())
+}
+
+/// True if this workflow already has a job in flight (running/queued/paused) —
+/// the guard against duplicate/pile-up runs. Mirrors delete_workflow's status
+/// check over the workflow's run rows.
+fn has_inflight_run(conn: &Connection, workflow_id: &str) -> bool {
+    let Ok(runs) = db::list_workflow_runs(conn, workflow_id) else {
+        return false;
+    };
+    runs.iter().any(|r| {
+        r.job_id
+            .as_ref()
+            .and_then(|jid| db::get_job(conn, jid).ok())
+            .map(|j| matches!(j.status.as_str(), "running" | "queued" | "paused"))
+            .unwrap_or(false)
+    })
 }
 
 #[tauri::command]

@@ -175,6 +175,13 @@ async fn fire(app: &tauri::AppHandle, sched: &db::Schedule, wf: &db::Workflow, t
     let state = app.state::<AppState>();
     let next = next_run_from_now(&sched.kind, &sched.param);
     match start_workflow_run(&window, &state, &wf.id, trigger, None, &std::collections::HashSet::new()).await {
+        // An empty id means the run was skipped (already in flight, or the queue
+        // is full) — advance the schedule without recording a phantom run.
+        Ok(job_id) if job_id.is_empty() => {
+            let _ = state.with_room(|room| {
+                db::set_schedule_next_run(&room.conn, &sched.id, next.as_deref())
+            });
+        }
         Ok(job_id) => {
             let _ = state.with_room(|room| {
                 db::mark_schedule_run(&room.conn, &sched.id, &job_id, next.as_deref())
