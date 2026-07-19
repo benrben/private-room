@@ -48,6 +48,11 @@ to point a room at a cloud engine, the app says so out loud, everywhere.
   SQLCipher document. No account, no sync, no server. Your password is the key
   — no backdoor, no cloud reset. (When you create a room you can print a
   one-time recovery key to keep somewhere safe.)
+- 🕶️ **Cloud models never see your private details.** If you do point a room
+  at a cloud engine, a mechanical gatekeeper swaps protected details for
+  neutral tags (`[Person A]`) before anything leaves — at every exit, with a
+  per-file "Cloud view" showing exactly what the model would receive. See
+  [Cloud privacy](#cloud-privacy-mechanically-enforced).
 - 🔁 **It works while you don't.** Workflows chain AI steps into pipelines that
   run on a schedule; room scripts are real Python/JavaScript files that run
   against your files with explicit consent; studios turn sources into
@@ -182,6 +187,37 @@ workflow steps. No feature quietly falls back to a different brain.
 
 Four things intentionally stay on-device no matter the engine: dictation,
 quick local generation, image grounding boxes, and the UI-driving tools.
+
+## Cloud privacy, mechanically enforced
+
+![Settings → Cloud privacy: the door, the block list, private topics, and scan status](docs/screens/cloud-privacy.png)
+
+Choosing a cloud engine doesn't have to mean handing over your life. With
+**Hide private details from cloud AI** on (per room, over a global default),
+private details are swapped for stable neutral tags — `[Person A]`,
+`[Address B]` — before anything reaches a cloud model, and put back in the
+answer you read. The enforcement is **mechanical, not a prompt**: the same
+redaction door sits at every exit — the AI engine gateway, Ollama `:cloud`
+models, the Claude/Codex CLIs, and the MCP bridge outside agents use to read
+room files. Images never leave while the door is on.
+
+- **A local model builds the map.** Each imported file is scanned once,
+  on-device, for names, addresses, phone numbers, health details — re-run
+  automatically on import, transcription, and rule changes.
+- **"Never share these" is a guarantee.** Exact words you add are blocked
+  mechanically on every request — no AI judgment involved. Private topics in
+  your own words ("my health") are the best-effort layer on top.
+- **See it before you trust it.** Every file has a **Cloud view** toggle —
+  the blocked version, blackouts included, exactly as a cloud model would
+  receive it. Chat shows a green "N details hidden" receipt on protected
+  turns, a loud red banner if privacy is off on a cloud engine, and a
+  confirmed "Ask again with real details (this once)" valve when you need
+  the model to see the real thing.
+- **Honest limits, stated in-product.** Hiding names can't stop every
+  inference from remaining context, and anything already sent to a cloud
+  can't be recalled — the Settings page says so.
+
+![Cloud view: the exact redacted document a cloud model would receive](docs/screens/cloud-view.png)
 
 ### The Leash: let outside agents work in your room
 

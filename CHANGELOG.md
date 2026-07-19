@@ -3,7 +3,34 @@
 All notable, user-facing changes to Private Room. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
-## Unreleased
+## 0.4.0 — 2026-07-19
+
+### Cloud privacy, mechanically enforced
+
+- **The gatekeeper.** With the door on, private details are swapped for
+  stable neutral tags (`[Person A]`, `[Address B]`, …) before anything
+  reaches a cloud model — and put back in the answer you read. Enforcement
+  is mechanical at **every** exit: the sidecar chat/features gateway, Ollama
+  `:cloud` models, the Claude/Codex CLIs, and the MCP bridge cloud agents
+  use to read room files. Images never leave while the door is on.
+- **The scanner.** A local model reads each imported file once and builds
+  the room's protected-entity map; it re-runs automatically on import,
+  transcription, and rule changes. ("Scan now" also stopped failing
+  silently — it never woke the local engine, and the 4B model's off-schema
+  replies were discarded; errors now show under the button.)
+- **The live guard.** The question you type is scanned before any cloud
+  turn, so a name the scanner never met is still caught.
+- **Settings → Cloud privacy.** Per-room switch over a global default, an
+  iron-clad "Never share these" block list (mechanical, guaranteed),
+  best-effort private topics in your own words, and scan status — plus an
+  honest-limits note about what redaction can and cannot promise.
+- **Cloud view.** Every file gets a toggle showing the blocked version,
+  blackouts included — exactly what a cloud model would receive.
+- **Chat receipts.** A green "N details hidden" receipt on protected cloud
+  turns, a loud red banner when privacy is off on a cloud engine, and a
+  confirmed "Ask again with real details (this once)" valve.
+
+### Voice
 
 - **Neural spoken voice is the new default.** Answers are read aloud with
   Andrew (en-US, multilingual) — a neural synthetic voice, not a human
