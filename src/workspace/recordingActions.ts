@@ -1,7 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, FileTarget } from "../api";
 import { fileToBase64 } from "./composer";
-import { acquireMic, attachMicTap, noteLiveStt, stopMicTap } from "./liveRec";
+import { acquireMic, attachMicTap, createPcmTap, noteLiveStt, stopMicTap } from "./liveRec";
 import { WSState } from "./state";
 
 /** Dictation (one shared mic, several sinks) + model onboarding/status.
@@ -88,27 +88,109 @@ export function makeRecordingActions(
     s.setDictState("recording");
   }
 
-  function dictateTo(owner: string, sink: (text: string) => void | Promise<void>) {
-    void beginRecording(owner, async (blob, ext) => {
-      const b64 = await fileToBase64(new File([blob], `dictation.${ext}`));
-      let text = (await api.transcribeAudio(b64, ext, false)).trim();
-      if (!text) {
-        s.pushToast("info", "No speech detected.");
+  /** Streaming dictation (Metal wave): raw PCM flows to the Rust session
+   * WHILE the user speaks, and rolling whole-utterance partials stream back
+   * as `dict-partial` events — the composer paints them live, so the wait
+   * that used to start at Stop overlaps the speaking instead. The final text
+   * is still one whole-buffer decode at Stop (same quality as the old batch
+   * path), then the usual local-only shaping. `onPartial` is optional:
+   * journal/file/memory sinks and hands-free just get the faster final. */
+  function dictateTo(
+    owner: string,
+    sink: (text: string) => void | Promise<void>,
+    onPartial?: (text: string) => void,
+  ) {
+    if (s.dictState === "busy" || s.dictState === "preparing") return;
+    if (s.dictState === "recording") {
+      if (s.dictOwner === owner) s.dictStreamRef.current?.();
+      return;
+    }
+    // Own the state BEFORE asking for the microphone (same doctrine as
+    // beginRecording): the permission dialog can take seconds, and the
+    // capture dock must already be saying "Preparing microphone…".
+    s.setDictOwner(owner);
+    s.setDictState("preparing");
+    void (async () => {
+      const fail = (msg: string) => {
+        s.setDictState("idle");
+        s.setDictOwner(null);
+        s.pushToast("error", msg);
+      };
+      let mic: MediaStream;
+      try {
+        mic = await acquireMic();
+      } catch (e) {
+        fail(e instanceof Error ? e.message : String(e));
         return;
       }
+      let unlisten: (() => void) | null = null;
+      let tapDown: (() => Promise<void>) | null = null;
       try {
-        const [translate, mode] = await Promise.all([
-          api.getSetting("dict_translate"),
-          api.getSetting("dict_mode"),
-        ]);
-        if (translate === "on" || (mode && mode !== "off")) {
-          text = (await api.shapeText(text, translate === "on", mode || "off")).trim() || text;
-        }
+        await api.dictStart(); // the model check runs before any audio flows
+        unlisten = await api.onDictPartial((text) => {
+          s.setDictPartial(text);
+          onPartial?.(text);
+        });
+        tapDown = await createPcmTap(mic, (rate, b64) => api.dictPushAudio(rate, b64));
       } catch (e) {
-        s.pushToast("info", `Kept the exact transcript — ${e}`);
+        mic.getTracks().forEach((t) => t.stop());
+        unlisten?.();
+        void api.dictCancel().catch(() => {});
+        if (String(e).includes("STT_MODEL_MISSING")) {
+          s.setDictState("idle");
+          s.setDictOwner(null);
+          s.pushToast(
+            "error",
+            "Download the voice model first, in Settings → Model → Dictation.",
+            { label: "Open Settings", run: () => s.setShowSettings(true) },
+          );
+        } else {
+          fail(`Dictation failed: ${e}`);
+        }
+        return;
       }
-      await sink(text);
-    });
+      s.setDictState("recording");
+      s.dictStreamRef.current = () => {
+        s.dictStreamRef.current = null;
+        s.setDictState("busy");
+        void (async () => {
+          try {
+            // Teardown AWAITS the final flush, so dict_stop is ordered after
+            // the last samples and the closing word is never clipped.
+            await tapDown!();
+            mic.getTracks().forEach((t) => t.stop());
+            const raw = (await api.dictStop()).trim();
+            if (!raw) {
+              onPartial?.(""); // wipe any painted partials
+              s.pushToast("info", "No speech detected.");
+              return;
+            }
+            let text = raw;
+            try {
+              const [translate, mode] = await Promise.all([
+                api.getSetting("dict_translate"),
+                api.getSetting("dict_mode"),
+              ]);
+              if (translate === "on" || (mode && mode !== "off")) {
+                text =
+                  (await api.shapeText(raw, translate === "on", mode || "off")).trim() || raw;
+              }
+            } catch (e) {
+              s.pushToast("info", `Kept the exact transcript — ${e}`);
+            }
+            await sink(text);
+          } catch (e) {
+            onPartial?.("");
+            s.pushToast("error", `Dictation failed: ${e}`);
+          } finally {
+            unlisten?.();
+            s.setDictPartial("");
+            s.setDictState("idle");
+            s.setDictOwner(null);
+          }
+        })();
+      };
+    })();
   }
 
   function micState(owner: string) {

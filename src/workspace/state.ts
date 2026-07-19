@@ -65,6 +65,11 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [dictOwner, setDictOwner] = useState<string | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const dictChunksRef = useRef<Blob[]>([]);
+  // Streaming dictation (Metal wave): the active session's stop function
+  // (the mic re-click and the dock's Stop call it) + the rolling partial
+  // transcript the capture dock shows for non-composer owners.
+  const dictStreamRef = useRef<(() => void) | null>(null);
+  const [dictPartial, setDictPartial] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameDraft, setRenameDraft] = useState("");
@@ -322,7 +327,8 @@ export function useWorkspaceState(_info: RoomInfo) {
     ac, setAc, composerRef, asking, setAsking, streamText, setStreamText,
     steps, setSteps, lane, setLane, undoByMsg, setUndoByMsg, editedRef,
     toasts, setToasts, dictState, setDictState, dictOwner, setDictOwner,
-    recorderRef, dictChunksRef, dragOver, setDragOver, renaming, setRenaming,
+    recorderRef, dictChunksRef, dictStreamRef, dictPartial, setDictPartial,
+    dragOver, setDragOver, renaming, setRenaming,
     renameDraft, setRenameDraft, pullingModel, setPullingModel,
     pullStatus, setPullStatus, pullPercent, setPullPercent, pullError, setPullError,
     openFile, setOpenFile, viewerRev, setViewerRev, editMode, setEditMode,

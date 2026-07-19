@@ -34,6 +34,7 @@ pub fn run() {
         .manage(commands::MediaStreams::default())
         .manage(commands::AgentUi::default())
         .manage(commands::RecState::default())
+        .manage(commands::DictState::default())
         // ADD-24: stream staged room media (audio/video) with HTTP Range
         // support — WKWebView's media elements need 206 responses to seek, and
         // large videos must never ride through IPC as base64. Bytes come from
@@ -179,6 +180,10 @@ pub fn run() {
             commands::stt_delete_model,
             commands::transcribe_audio,
             commands::shape_text,
+            commands::dict_start,
+            commands::dict_push_audio,
+            commands::dict_stop,
+            commands::dict_cancel,
             // Moonshot (Section D)
             commands::recommended_models,
             commands::ensure_embed_model,
@@ -270,6 +275,10 @@ pub fn run() {
             // ADD-29: never leak a background `ollama serve` WE started — stop it
             // (and only it) as the app exits. A no-op for an external daemon.
             if let tauri::RunEvent::Exit = _event {
+                // Metal wave: the warm Whisper context must drop BEFORE ggml's
+                // atexit teardown, or its resident GPU buffers turn Quit into
+                // a ggml_metal_device_free assert (a crash report).
+                stt::unload_ctx();
                 ollama_lifecycle::stop_if_ours();
                 // ADD-33: never leak the Python agent sidecar we spawned.
                 sidecar_lifecycle::stop_if_ours();

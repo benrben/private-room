@@ -66,23 +66,29 @@ export function liveSttOn(): boolean {
   return liveStt;
 }
 
-/** Batch raw quanta into ~250 ms pushes to the engine. `flush` sends
- * whatever is still pending — teardown calls it so the final partial batch
- * isn't discarded on pause/stop/fallback-rebuild. */
-function makeSink(rate: number): {
+/** Batch raw quanta into ~250 ms pushes. `flush` sends whatever is still
+ * pending and resolves when the LAST push has landed — the dictation stop
+ * path awaits it so its Stop command is ordered after the final samples
+ * (recording teardown ignores the promise; that engine drains via Stop). */
+function makeSink(
+  rate: number,
+  push: (rate: number, b64: string) => Promise<void>,
+): {
   push: (frame: Float32Array) => void;
-  flush: () => void;
+  flush: () => Promise<void>;
 } {
   let pending: Float32Array[] = [];
   let pendingLen = 0;
+  let inflight: Promise<void> = Promise.resolve();
   const batch = Math.round(rate / 4);
   const send = () => {
-    if (pendingLen === 0) return;
+    if (pendingLen === 0) return inflight;
     const b64 = floatsToBase64(pending, pendingLen);
     pending = [];
     pendingLen = 0;
-    // Fire-and-forget: one dropped batch must never stall the tap.
-    api.recPushAudio(rate, b64).catch(() => {});
+    // Failures swallowed: one dropped batch must never stall the tap.
+    inflight = push(rate, b64).catch(() => {});
+    return inflight;
   };
   return {
     push: (frame) => {
@@ -99,13 +105,14 @@ async function workletTap(
   audio: AudioContext,
   source: MediaStreamAudioSourceNode,
   sink: (frame: Float32Array) => void,
+  onDead: () => void,
 ): Promise<() => void> {
   await audio.audioWorklet.addModule(WORKLET_URL);
   const node = new AudioWorkletNode(audio, "pr-rec-tap");
   node.port.onmessage = (e: MessageEvent<Float32Array>) => sink(e.data);
   // A worklet can die AFTER loading (processor exception). Frames then stop
   // silently — rebuild the tap on the deprecated-but-sturdy fallback.
-  node.onprocessorerror = () => rebuildOnFallback();
+  node.onprocessorerror = () => onDead();
   source.connect(node);
   // A worklet only runs while the graph reaches the destination; a muted
   // gain keeps it silent so the recording is never played back at you.
@@ -180,7 +187,7 @@ export async function attachMicTap(mic: MediaStream): Promise<void> {
   ctx = new AudioContext();
   if (ctx.state === "suspended") await ctx.resume().catch(() => {});
   const source = ctx.createMediaStreamSource(mic);
-  const rawSink = makeSink(ctx.sampleRate);
+  const rawSink = makeSink(ctx.sampleRate, (r, b64) => api.recPushAudio(r, b64));
   let gotFrame = false;
   const sink = (frame: Float32Array) => {
     gotFrame = true;
@@ -188,7 +195,7 @@ export async function attachMicTap(mic: MediaStream): Promise<void> {
   };
 
   try {
-    teardown = await workletTap(ctx, source, sink);
+    teardown = await workletTap(ctx, source, sink, rebuildOnFallback);
   } catch {
     teardown = scriptProcessorTap(ctx, source, sink);
   }
@@ -198,7 +205,7 @@ export async function attachMicTap(mic: MediaStream): Promise<void> {
     // sink after the flush sends the final partial batch.
     stop();
     source.disconnect();
-    rawSink.flush();
+    void rawSink.flush();
   };
   // First-frame acknowledgement: a worklet that loaded but never produces a
   // quantum (seen with throttled WebViews) would otherwise record silence
@@ -215,12 +222,67 @@ function rebuildOnFallback(): void {
   if (!ctx || !stream || !teardown) return;
   teardown();
   const source = ctx.createMediaStreamSource(stream);
-  const sink = makeSink(ctx.sampleRate);
+  const sink = makeSink(ctx.sampleRate, (r, b64) => api.recPushAudio(r, b64));
   const stop = scriptProcessorTap(ctx, source, (f) => sink.push(f));
   teardown = () => {
     stop();
     source.disconnect();
-    sink.flush();
+    void sink.flush();
+  };
+}
+
+/** The dictation tap's AudioContext, kept for the app's lifetime (voice.ts
+ * doctrine): hands-free re-arms the microphone OUTSIDE a user gesture, where
+ * a freshly created context starts suspended in WKWebView and never produces
+ * a frame — a context first resumed under a real gesture keeps running. */
+let dictCtx: AudioContext | null = null;
+
+/** Self-contained PCM tap for streaming dictation: the same worklet →
+ * ScriptProcessor ladder as the recording tap, but with its own closure
+ * state, so a dictation can run without touching the recording singleton
+ * above. Returns an async teardown that detaches and AWAITS the final flush
+ * (the caller sends its Stop only after the last samples landed). The caller
+ * owns the MediaStream's tracks; the shared context persists. */
+export async function createPcmTap(
+  mic: MediaStream,
+  push: (rate: number, b64: string) => Promise<void>,
+): Promise<() => Promise<void>> {
+  if (!dictCtx) dictCtx = new AudioContext();
+  const audio = dictCtx;
+  if (audio.state === "suspended") await audio.resume().catch(() => {});
+  const sink = makeSink(audio.sampleRate, push);
+  let gotFrame = false;
+  let dead = false;
+  let source = audio.createMediaStreamSource(mic);
+  let stop: (() => void) | null = null;
+  const frame = (f: Float32Array) => {
+    gotFrame = true;
+    sink.push(f);
+  };
+  // Worklet died after load, or never produced a first quantum: rebuild on
+  // the deprecated-but-sturdy fallback (same doctrine as rebuildOnFallback).
+  const useFallback = () => {
+    if (dead) return;
+    stop?.();
+    source.disconnect();
+    source = audio.createMediaStreamSource(mic);
+    stop = scriptProcessorTap(audio, source, frame);
+  };
+  try {
+    stop = await workletTap(audio, source, frame, useFallback);
+  } catch {
+    stop = scriptProcessorTap(audio, source, frame);
+  }
+  window.setTimeout(() => {
+    if (!gotFrame) useFallback();
+  }, 2000);
+  return async () => {
+    dead = true;
+    stop?.();
+    source.disconnect();
+    await sink.flush();
+    // No audio.close(): the shared context must survive for the next
+    // (possibly gesture-less, hands-free) dictation.
   };
 }
 

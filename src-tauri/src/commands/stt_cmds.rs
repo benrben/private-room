@@ -300,6 +300,169 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, del
     });
 }
 
+// ------------------------------------------------- streaming dictation (Metal wave)
+// The mic's PCM streams into a worker thread WHILE the user speaks, and the
+// rolling transcript streams back as `dict-partial` events — the wait that
+// used to start at Stop now overlaps the speaking. Deliberately NOT the
+// ADD-27 recording engine: dictation must never create a Recording file,
+// touch diarization, or take the room lock. The final text is still one
+// whole-utterance decode at Stop — identical quality to the old batch path.
+
+/// One in-flight streaming dictation (the composer/journal/file/memory mics
+/// share one microphone, so one session). Commands only send messages; the
+/// worker owns the audio.
+#[derive(Default)]
+pub struct DictState {
+    pub session: Mutex<Option<DictSession>>,
+}
+
+pub struct DictSession {
+    tx: std::sync::mpsc::Sender<DictMsg>,
+}
+
+enum DictMsg {
+    Audio { rate: u32, samples: Vec<f32> },
+    Stop { done: std::sync::mpsc::Sender<Result<String, String>> },
+}
+
+/// ~0.7 s of fresh audio between partial repaints: short enough to feel live,
+/// long enough that each repaint (a whole-buffer redecode — the partial IS
+/// the full text so far) outpaces the microphone on Metal. When a decode
+/// falls behind, the drain loop below simply skips to the newest audio.
+const DICT_PARTIAL_STEP_SECS: f64 = 0.7;
+/// Leak guard, not a UX limit: audio past this is dropped (10 min of speech
+/// in one dictation is a stuck mic, not a user).
+const DICT_MAX_SECS: usize = 600;
+
+#[tauri::command]
+pub fn dict_start(app: tauri::AppHandle, dict: State<'_, DictState>) -> Result<(), String> {
+    let Some(model) = stt_effective_model(&app) else {
+        return Err("STT_MODEL_MISSING".into());
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Replacing a stale session drops its sender; that worker sees the
+    // disconnect and exits on its own.
+    *dict.session.lock().unwrap() = Some(DictSession { tx });
+    std::thread::spawn(move || dict_worker(app, model, rx));
+    Ok(())
+}
+
+/// Same wire format as `rec_push_audio`: ~250 ms of little-endian f32 mic
+/// samples, base64-packed, at the AudioContext's native rate.
+#[tauri::command]
+pub fn dict_push_audio(
+    dict: State<'_, DictState>,
+    rate: u32,
+    data_b64: String,
+) -> Result<(), String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64)
+        .map_err(|e| e.to_string())?;
+    let samples: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let guard = dict.session.lock().unwrap();
+    let session = guard.as_ref().ok_or("No dictation in progress.")?;
+    let _ = session.tx.send(DictMsg::Audio { rate, samples });
+    Ok(())
+}
+
+/// Close the session and return the final whole-utterance transcript (may be
+/// empty — the caller shows "No speech detected"). The frontend AWAITS its
+/// last audio push before invoking this, so Stop is ordered after the final
+/// samples on the worker's channel and the last word is never clipped.
+#[tauri::command]
+pub async fn dict_stop(dict: State<'_, DictState>) -> Result<String, String> {
+    let done_rx = {
+        let mut guard = dict.session.lock().unwrap();
+        let session = guard.take().ok_or("No dictation in progress.")?;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        session
+            .tx
+            .send(DictMsg::Stop { done: done_tx })
+            .map_err(|_| "The dictation engine stopped unexpectedly.".to_string())?;
+        done_rx
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .map_err(|_| "Transcribing the dictation timed out.".to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Abandon the session without a final decode (setup failed mid-way).
+#[tauri::command]
+pub fn dict_cancel(dict: State<'_, DictState>) -> Result<(), String> {
+    dict.session.lock().unwrap().take();
+    Ok(())
+}
+
+fn dict_worker<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    model: std::path::PathBuf,
+    rx: std::sync::mpsc::Receiver<DictMsg>,
+) {
+    use tauri::Emitter;
+    let mut native: Vec<f32> = Vec::new(); // at the tap's native rate
+    let mut rate: u32 = 16000;
+    let mut decoded_len = 0usize;
+    let mut last_text = String::new();
+    let finalize = |native: &[f32], rate: u32,
+                    done: std::sync::mpsc::Sender<Result<String, String>>| {
+        let pcm = recording::resample_to_16k(native, rate);
+        let _ = done.send(stt::transcribe(&model, &pcm, false));
+    };
+    loop {
+        match rx.recv() {
+            Ok(DictMsg::Audio { rate: r, samples }) => {
+                rate = r;
+                if native.len() < rate as usize * DICT_MAX_SECS {
+                    native.extend(samples);
+                }
+                // Drain everything already queued before deciding to decode —
+                // a partial that took longer than 250 ms must not make the
+                // loop fall ever further behind the microphone.
+                loop {
+                    match rx.try_recv() {
+                        Ok(DictMsg::Audio { rate: r, samples }) => {
+                            rate = r;
+                            if native.len() < rate as usize * DICT_MAX_SECS {
+                                native.extend(samples);
+                            }
+                        }
+                        Ok(DictMsg::Stop { done }) => {
+                            finalize(&native, rate, done);
+                            return;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let step = (rate as f64 * DICT_PARTIAL_STEP_SECS) as usize;
+                if native.len() - decoded_len >= step {
+                    decoded_len = native.len();
+                    let pcm = recording::resample_to_16k(&native, rate);
+                    // Partial failures are cosmetic — the final decode at
+                    // Stop is the one that must not lose words.
+                    if let Ok(text) = stt::transcribe(&model, &pcm, false) {
+                        if text != last_text {
+                            last_text = text.clone();
+                            let _ = app.emit("dict-partial", text);
+                        }
+                    }
+                }
+            }
+            Ok(DictMsg::Stop { done }) => {
+                finalize(&native, rate, done);
+                return;
+            }
+            Err(_) => return, // session replaced or cancelled
+        }
+    }
+}
+
 // ------------------------------------------------------- dictation shaping (ADD-18)
 // Ported from alfred's proven dictation pipeline (voicebridge.py): the same
 // battle-tested prompt texts, combined into ONE local-model call. Two findings
@@ -460,3 +623,87 @@ pub(crate) async fn run_dict_pass(model: &str, steps: &[&str], text: &str) -> Re
 
 // ---------------------------------------------------------------- Touch ID (ADD-11)
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The streaming dictation worker end-to-end against the real model:
+    /// audio chunks in → at least one `dict-partial` while "speaking" → the
+    /// final whole-utterance transcript at Stop. Ignored like stt.rs's e2e
+    /// tests: `cargo test --lib stt_cmds -- --ignored`.
+    #[test]
+    #[ignore = "needs the downloaded model (Settings → Download voice model)"]
+    fn e2e_dict_worker_partials_then_final() {
+        use tauri::Listener;
+        let home = std::env::var("HOME").unwrap();
+        let downloaded = std::path::PathBuf::from(home)
+            .join("Library/Application Support/com.benreich.privateroom/models")
+            .join(stt::MODEL_FILE);
+        let model = if downloaded.exists() {
+            downloaded
+        } else {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources/models")
+                .join(stt::MODEL_FILE)
+        };
+        assert!(model.exists(), "download the model first (Settings)");
+
+        let aiff = std::env::temp_dir()
+            .join(format!("pr-dict-e2e-{}.aiff", uuid::Uuid::new_v4()));
+        assert!(std::process::Command::new("say")
+            .args(["-o"])
+            .arg(&aiff)
+            .arg("The quick brown fox jumps over the lazy dog.")
+            .status()
+            .unwrap()
+            .success());
+        let pcm = stt::decode_to_pcm(&aiff, stt::MediaKind::Audio).unwrap();
+        let _ = std::fs::remove_file(&aiff);
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel::<String>();
+        app.listen("dict-partial", move |event| {
+            // The payload is the JSON-encoded partial string.
+            if let Ok(text) = serde_json::from_str::<String>(event.payload()) {
+                let _ = partial_tx.send(text);
+            }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = {
+            let app = app.handle().clone();
+            let model = model.clone();
+            std::thread::spawn(move || dict_worker(app, model, rx))
+        };
+        // ~250 ms chunks at 16 kHz, like the tap pushes (already 16k mono, so
+        // resample_to_16k is an identity pass).
+        for chunk in pcm.chunks(4000) {
+            tx.send(DictMsg::Audio { rate: 16000, samples: chunk.to_vec() }).unwrap();
+        }
+        // A partial must arrive while the "speaking" is still open (generous
+        // window: a cold context loads the model first).
+        let partial = partial_rx
+            .recv_timeout(std::time::Duration::from_secs(90))
+            .expect("no dict-partial arrived");
+        assert!(
+            partial.to_lowercase().contains("quick brown fox"),
+            "unexpected partial: {partial}"
+        );
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        tx.send(DictMsg::Stop { done: done_tx }).unwrap();
+        let final_text = done_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("worker never finalized")
+            .expect("final transcribe failed");
+        assert!(
+            final_text.to_lowercase().contains("quick brown fox"),
+            "unexpected final: {final_text}"
+        );
+        handle.join().unwrap();
+        stt::unload_ctx();
+    }
+}

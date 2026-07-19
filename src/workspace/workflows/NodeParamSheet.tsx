@@ -15,6 +15,7 @@ type Props = {
 
 const FILE_SELECTORS = [
   ["newest", "Newest file"],
+  ["all", "All files"],
   ["name_like", "Name contains…"],
   ["missing_summary", "Files missing a summary"],
   ["since_last_run", "Added since last run"],

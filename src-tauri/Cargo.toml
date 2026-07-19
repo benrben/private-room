@@ -60,7 +60,10 @@ umya-spreadsheet = { version = "3.0.0", default-features = false }
 # ADD-18: on-device speech-to-text — whisper.cpp compiled into the app (Metal
 # on Apple Silicon). The engine is built in; the model downloads on first use,
 # same doctrine as Ollama models (never bundled, nothing else to install).
-whisper-rs = "0.16"
+# `metal` must be requested EXPLICITLY: whisper-rs-sys passes GGML_METAL=OFF
+# without it (inverting whisper.cpp's Apple default), silently pinning the
+# engine to CPU — 26 s model loads and ~6x-realtime decodes on an M-series.
+whisper-rs = { version = "0.16", features = ["metal"] }
 # ADD-27: neural speaker embeddings — TitaNet-small ONNX run by pure-Rust
 # tract (validated bit-exact against onnxruntime; do NOT swap in `ort`, and do
 # not assume tract runs other speaker models correctly — it silently

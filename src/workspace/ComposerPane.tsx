@@ -284,13 +284,17 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               className={`icon-btn mic-btn ${a.micState("composer").cls}`}
               title={a.micState("composer").title}
               disabled={a.micState("composer").disabled || s.asking}
-              onClick={() =>
-                a.dictateTo("composer", (text) =>
-                  s.setQuestion((q) =>
-                    q.trim() ? `${q.trimEnd()} ${text}` : text,
-                  ),
-                )
-              }
+              onClick={() => {
+                // Streaming dictation paints the words into the box as they
+                // are spoken; the shaped final replaces them. `base` is what
+                // was typed before the mic opened — captured ONCE, so partial
+                // repaints never compound. (The stop re-click lands in the
+                // dictateTo toggle branch; its callbacks are discarded.)
+                const base = s.question.trim() ? s.question.trimEnd() : "";
+                const paint = (t: string) =>
+                  s.setQuestion(base && t ? `${base} ${t}` : base || t);
+                a.dictateTo("composer", paint, paint);
+              }}
             >
               <MicIcon size={16} />
             </button>

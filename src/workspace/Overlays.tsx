@@ -53,9 +53,22 @@ function CaptureDock({ s }: { s: WSState }) {
           <span className="capture-label rec">
             <span className="rec-dot pulsing" /> {who} · {mm}:{ss}
           </span>
+          {/* Live partial transcript for the non-composer mics (the composer
+              paints its partials into the box itself). Voice notes have no
+              partials — the span just stays empty for them. */}
+          {s.dictPartial && s.dictOwner !== "composer" && (
+            <span className="capture-partial" dir="auto">
+              {s.dictPartial}
+            </span>
+          )}
           <button
             className="capture-stop"
-            onClick={() => s.recorderRef.current?.stop()}
+            onClick={() => {
+              // Voice notes still run on MediaRecorder; streaming dictation
+              // stops through its session ref. Only one is ever active.
+              s.recorderRef.current?.stop();
+              s.dictStreamRef.current?.();
+            }}
           >
             Stop &amp; save
           </button>

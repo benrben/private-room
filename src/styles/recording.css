@@ -114,6 +114,18 @@
   font-weight: 600;
 }
 
+/* Streaming dictation's rolling partial (journal/file/memory mics — the
+   composer paints its own). One line, tail kept: the newest words matter. */
+.capture-partial {
+  max-width: 340px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: inherit;
+  color: var(--text-2, #b8b6c8);
+  font-size: 12px;
+}
+
 .capture-stop {
   padding: 4px 14px;
   font-size: 12px;

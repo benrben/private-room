@@ -350,6 +350,20 @@ export const api = {
    *  commit/notes/prompt). mode="off" && !translate returns text unchanged. */
   shapeText: (text: string, translate: boolean, mode: string) =>
     invoke<string>("shape_text", { text, translate, mode }),
+  // ---- Streaming dictation (Metal wave): partials while you speak ----
+  /** Open a streaming dictation session. Rejects with STT_MODEL_MISSING
+   *  before any audio flows when the voice model isn't installed. */
+  dictStart: () => invoke<void>("dict_start"),
+  /** ~250ms of mic samples, same wire format as recPushAudio. */
+  dictPushAudio: (rate: number, dataB64: string) =>
+    invoke<void>("dict_push_audio", { rate, dataB64 }),
+  /** Close the session: one final whole-utterance decode (may be ""). */
+  dictStop: () => invoke<string>("dict_stop"),
+  /** Abandon the session without a final decode (setup failed mid-way). */
+  dictCancel: () => invoke<void>("dict_cancel"),
+  /** The rolling partial transcript — the FULL text so far, repainted. */
+  onDictPartial: (cb: (text: string) => void): Promise<UnlistenFn> =>
+    listen<string>("dict-partial", (e) => cb(e.payload)),
 
   // ---- Idea 3: supernatural voice (on-device AVSpeech synthesis) ----
   /** Synthesize one sentence-sized chunk (≤1,000 chars) to WAV, base64. */

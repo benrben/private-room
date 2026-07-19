@@ -42,7 +42,7 @@ pub struct WorkflowNode {
 }
 
 /// A file-choosing selector shared by summarize_file / file_pass nodes. `type` is
-/// newest | name_like | missing_summary | since_last_run | run_input.
+/// newest | all | name_like | missing_summary | since_last_run | run_input.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileSelector {
     #[serde(rename = "type", default = "sel_newest")]
@@ -195,6 +195,7 @@ const NODE_KINDS: &[&str] = &[
 ];
 const FILE_SELECTORS: &[&str] = &[
     "newest",
+    "all",
     "name_like",
     "missing_summary",
     "since_last_run",
@@ -682,6 +683,14 @@ fn resolve_files<R: tauri::Runtime>(
             conn,
             "SELECT id, name, coalesce(mime_type,'') FROM files \
              WHERE source != 'generated' ORDER BY created_at DESC LIMIT 1",
+            [],
+        )?,
+        // Same 50-file cap as the other bulk selectors; a file_pass node still
+        // takes only the first row, i.e. the newest file.
+        "all" => query_files(
+            conn,
+            "SELECT id, name, coalesce(mime_type,'') FROM files \
+             WHERE source != 'generated' ORDER BY created_at DESC LIMIT 50",
             [],
         )?,
         "name_like" => {
@@ -1948,6 +1957,12 @@ fn compose_prompt(description: &str) -> String {
          - agent_run {{question}}\n\
          - save_file {{name_template, format:\"html\"|\"md\", mode:\"create\"}}\n\
          - condition {{op, value}}\n\
+         `select` is {{\"type\":...,\"pattern\"?}}. The ONLY valid types: \"newest\" (latest \
+         file), \"all\" (every file), \"name_like\" (needs \"pattern\"), \"missing_summary\" \
+         (files with no summary yet), \"since_last_run\" (files added since the previous \
+         run), \"run_input\" (the file the workflow is invoked on — file binding only). \
+         `op` must be one of: contains, not_contains, is_empty, not_empty, \
+         new_files_since_last_run.\n\
          Each node needs a unique \"id\" and \"kind\". edges are [{{\"from\",\"to\",\"branch\"?}}] \
          (branch \"then\"/\"else\" only from a condition). Prompts may use {{{{input}}}} \
          (upstream results), {{{{files}}}} (the room's file list), {{{{date}}}}.\n\
@@ -2151,7 +2166,7 @@ pub fn workflow_tools_specs() -> Vec<serde_json::Value> {
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Optional: a workflow name to fetch its full definition"}}}}}),
         serde_json::json!({"type": "function", "function": {"name": "save_workflow",
-            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph: nodes from the palette (generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, agent_run {question}, save_file {name_template, format, mode}, condition {op, value}) plus edges [{from, to, branch?}]. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix.",
+            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph: nodes from the palette (generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, agent_run {question}, save_file {name_template, format, mode}, condition {op, value}) plus edges [{from, to, branch?}]. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string"},
                 "description": {"type": "string"},
@@ -2356,6 +2371,28 @@ mod tests {
         let errs = validate_definition(&def).unwrap_err();
         assert!(errs.iter().any(|e| e.contains("file selector")), "{errs:?}");
         assert!(errs.iter().any(|e| e.contains("condition")), "{errs:?}");
+    }
+
+    #[test]
+    fn all_is_a_valid_selector() {
+        let def = parse(serde_json::json!({
+            "nodes": [ { "id": "s", "kind": "summarize_file", "select": { "type": "all" } } ],
+            "edges": []
+        }));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    // The composer model can only pick selectors/ops it was told about — the
+    // original 'all' bug was the prompt teaching none of them.
+    #[test]
+    fn compose_prompt_teaches_the_full_palette() {
+        let prompt = compose_prompt("x");
+        for sel in FILE_SELECTORS {
+            assert!(prompt.contains(sel), "selector '{sel}' missing from compose prompt");
+        }
+        for op in CONDITION_OPS {
+            assert!(prompt.contains(op), "condition op '{op}' missing from compose prompt");
+        }
     }
 
     #[test]

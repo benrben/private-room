@@ -161,6 +161,18 @@ fn parse_wav_to_mono_f32(path: &Path) -> Result<Vec<f32>, String> {
 /// can't reclaim — and saves the multi-second reload on every dictation.
 static CTX: Mutex<Option<(String, whisper_rs::WhisperContext)>> = Mutex::new(None);
 
+/// Drop the warm context on app exit. With Metal, ggml ASSERTS during process
+/// teardown when GPU buffers are still resident (`rsets->data count == 0` in
+/// ggml_metal_device_free) — the context must die before atexit runs, or Quit
+/// becomes a crash report. try_lock, not lock: blocking exit behind a long
+/// transcription would read as a hang; a decode in flight at Quit keeps the
+/// old abort-at-exit, now confined to that rare race.
+pub fn unload_ctx() {
+    if let Ok(mut guard) = CTX.try_lock() {
+        *guard = None;
+    }
+}
+
 fn format_ts(centis: i64) -> String {
     let s = (centis / 100).max(0);
     let (h, rem) = (s / 3600, s % 3600);
@@ -590,6 +602,48 @@ mod tests {
             "unexpected transcript: {text}"
         );
         assert!(text.starts_with("[0:00]"), "missing timestamp: {text}");
+        // Every model-loading test unloads on its way out: with Metal, a warm
+        // context alive at process exit trips a ggml assert (see unload_ctx).
+        unload_ctx();
+    }
+
+    /// Timing harness (the Metal-vs-CPU question): synthesize ~60 s of speech,
+    /// warm the context on a short clip, then time one full transcribe and
+    /// print the realtime factor. Run with:
+    /// `cargo test --release --lib stt -- --ignored bench_transcribe --nocapture`
+    #[test]
+    #[ignore = "timing bench; needs the downloaded model"]
+    fn bench_transcribe_60s() {
+        let model = test_model();
+        assert!(model.exists(), "download the model first (Settings)");
+        let aiff = std::env::temp_dir().join("pr-stt-bench.aiff");
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(20);
+        assert!(std::process::Command::new("say")
+            .args(["-o"])
+            .arg(&aiff)
+            .arg(&text)
+            .status()
+            .unwrap()
+            .success());
+        let pcm = decode_to_pcm(&aiff, MediaKind::Audio).unwrap();
+        let _ = std::fs::remove_file(&aiff);
+        let audio_secs = pcm.len() as f64 / 16000.0;
+
+        // Warm the context so model load isn't counted in the decode number.
+        let t0 = std::time::Instant::now();
+        transcribe(&model, &pcm[..16000], false).unwrap();
+        let load_secs = t0.elapsed().as_secs_f64();
+
+        let t1 = std::time::Instant::now();
+        let out = transcribe(&model, &pcm, false).unwrap();
+        let decode_secs = t1.elapsed().as_secs_f64();
+        assert!(out.to_lowercase().contains("quick brown fox"), "{out}");
+        eprintln!(
+            "STT BENCH: audio {audio_secs:.1}s | ctx load+1s clip {load_secs:.1}s | \
+             decode {decode_secs:.1}s | {:.1}x realtime",
+            audio_secs / decode_secs
+        );
+        unload_ctx();
     }
 
     #[test]
@@ -696,6 +750,7 @@ mod tests {
         // Timestamps carry the offset and are monotonic.
         assert!(words.first().unwrap().1 >= 500);
         assert!(words.windows(2).all(|w| w[0].1 <= w[1].1));
+        unload_ctx();
     }
 
     /// Hebrew word-level round trip against the real model: every emitted
@@ -734,6 +789,7 @@ mod tests {
             words.iter().any(|w| w.chars().any(|c| ('א'..='ת').contains(&c))),
             "no Hebrew letters in {words:?}"
         );
+        unload_ctx();
     }
 
     #[test]
