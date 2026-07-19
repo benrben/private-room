@@ -39,6 +39,9 @@ tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt",
 futures-util = "0.3"
 base64 = "0.22"
 sha2 = "0.10"
+# PRIV-1: fast multi-pattern find/replace for the privacy gatekeeper's
+# mechanical door (already in the lock as a transitive dep of regex).
+aho-corasick = "1"
 # Wave 4a (Idea 2): local-time schedule arithmetic (next daily/weekly run,
 # DST-aware). Already in the lock as a transitive dep, so this builds offline.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -21,6 +21,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__, ai_actions, chat_docs, features, file_pass, llm, vision
+from . import privacy as privacy_mod
+from . import privacy_scan as privacy_scan_mod
 from . import summarize as summarize_feature
 from . import tts as tts_mod
 from .chat import ChatModel, OllamaChatModel
@@ -36,6 +38,7 @@ from .config import (
     KnowledgeExtractRequest,
     LabelRequest,
     ModelsRequest,
+    PrivacyScanRequest,
     PullRequest,
     RunRequest,
     TtsRequest,
@@ -112,6 +115,38 @@ def create_app(
         mcp = mcp_factory(req)
         chat = chat_factory(req)
 
+        # PRIV-1: resolve the room policy once per run and hand it to the model
+        # seam — the agent loop then talks to a ``:cloud`` model only through
+        # the door. Local models: the guard is a no-op.
+        policy = privacy_mod.policy_from_payload(req.privacy)
+        engaged = (
+            policy is not None
+            and policy.active
+            and privacy_mod.is_nonlocal_model(req.model)
+        )
+        if engaged:
+            # The live guard (PRIV-2): the user's freshly TYPED question can't
+            # have import-time marks, so when concept rules exist, a local model
+            # scans it now and its findings become request-scoped rules. Best
+            # effort — the exact rules below enforce regardless.
+            guard_model = str((req.privacy or {}).get("guard_model") or "")
+            if policy.concepts and guard_model:
+                try:
+                    findings = await privacy_scan_mod.scan_text(
+                        req.question,
+                        model=guard_model,
+                        base_url=req.ollama_base_url,
+                        concepts=policy.concepts,
+                        known=[r for r, _ in policy.rules],
+                    )
+                    taken = {p for _, p in policy.rules}
+                    policy.add_rules(
+                        privacy_scan_mod.mint_ephemeral_rules(findings, taken)
+                    )
+                except Exception:  # noqa: BLE001 - guard is best-effort by design
+                    log.warning("privacy live guard unavailable; exact rules still apply")
+            chat.privacy = policy  # type: ignore[attr-defined]
+
         def deps_factory(emit: Emit) -> Deps:
             return Deps(chat=chat, emit=emit, cancel=token, mcp=mcp)
 
@@ -119,6 +154,13 @@ def create_app(
             try:
                 async for event in stream_events(req, deps_factory):
                     yield (compact_json(event) + "\n").encode("utf-8")
+                if engaged and policy is not None:
+                    # After the final event: what the door actually did, for the
+                    # chat indicator ("N details hidden from the cloud model").
+                    yield (
+                        compact_json({"t": "privacy", "v": policy.report.as_payload()})
+                        + "\n"
+                    ).encode("utf-8")
             except httpx.HTTPError as exc:
                 # The bridge died mid-run: tell the host so it can fall back to
                 # the native engine instead of hanging.
@@ -150,7 +192,9 @@ def create_app(
     @app.post("/embed")
     async def embed(req: EmbedRequest) -> Any:
         try:
-            vectors = await llm.embed(req.model, req.texts, req.base_url, req.keep_alive)
+            vectors = await llm.embed(
+                req.model, req.texts, req.base_url, req.keep_alive, privacy=req.privacy
+            )
         except llm.LlmError as exc:
             return exc.response()
         return {"embeddings": vectors}
@@ -167,6 +211,7 @@ def create_app(
                 keep_alive=req.keep_alive,
                 format=req.format,
                 images=req.images,
+                privacy=req.privacy,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -191,6 +236,7 @@ def create_app(
                     keep_alive=req.keep_alive,
                     format=req.format,
                     images=req.images,
+                    privacy=req.privacy,
                 ):
                     yield (compact_json({"t": "delta", "v": delta}) + "\n").encode("utf-8")
                 yield (compact_json({"t": "done"}) + "\n").encode("utf-8")
@@ -291,7 +337,7 @@ def create_app(
         # here — graph.rs build_room_graph is model-free by design.
         try:
             questions = await features.front_page_labels(
-                req.model, req.room_name, req.files, req.base_url
+                req.model, req.room_name, req.files, req.base_url, privacy=req.privacy
             )
         except llm.LlmError:
             # Front page is resilient: any engine failure yields no suggestions,
@@ -302,7 +348,9 @@ def create_app(
     @app.post("/feedback_draft")
     async def feedback_draft(req: FeedbackDraftRequest) -> Any:
         try:
-            draft = await features.feedback_draft(req.model, req.text, req.base_url)
+            draft = await features.feedback_draft(
+                req.model, req.text, req.base_url, privacy=req.privacy
+            )
         except llm.LlmError as exc:
             return exc.response()
         return draft
@@ -322,6 +370,7 @@ def create_app(
                 temperature=req.temperature,
                 num_ctx=req.num_ctx,
                 keep_alive=req.keep_alive,
+                privacy=req.privacy,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -346,6 +395,7 @@ def create_app(
                     req.conversation,
                     temperature=req.temperature,
                     keep_alive=req.keep_alive,
+                    privacy=req.privacy,
                 )
                 return {"items": items}
             values = await chat_docs.extract_fields(
@@ -355,6 +405,7 @@ def create_app(
                 req.document,
                 temperature=req.temperature,
                 keep_alive=req.keep_alive,
+                privacy=req.privacy,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -376,6 +427,7 @@ def create_app(
                 history=req.history,
                 temperature=req.temperature,
                 keep_alive=req.keep_alive,
+                privacy=req.privacy,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -410,6 +462,7 @@ def create_app(
                 thread=req.thread,
                 window_text=req.window_text,
                 keep_alive=req.keep_alive,
+                privacy=req.privacy,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -429,6 +482,7 @@ def create_app(
                 sections=req.sections,
                 missing=req.missing,
                 keep_alive=req.keep_alive,
+                privacy=req.privacy,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -451,6 +505,7 @@ def create_app(
                 base_url=req.base_url,
                 instructions=req.instructions,
                 question=req.question,
+                privacy=req.privacy,
             )
         except (ai_actions.ActionError, llm.LlmError) as exc:
             return exc.response()
@@ -459,14 +514,41 @@ def create_app(
     @app.post("/memory_suggestion")
     async def memory_suggestion(req: ai_actions.MemorySuggestionRequest) -> Any:
         return await ai_actions.memory_suggestion(
-            req.model, req.user_text, req.assistant_text, req.base_url
+            req.model, req.user_text, req.assistant_text, req.base_url, privacy=req.privacy
         )
 
     @app.post("/suggest_file_meta")
     async def suggest_file_meta(req: ai_actions.FileMetaRequest) -> Any:
         return await ai_actions.suggest_file_meta(
-            req.model, req.current_name, req.text, req.base_url
+            req.model, req.current_name, req.text, req.base_url, privacy=req.privacy
         )
+
+    # --- privacy scanner (PRIV-2) -------------------------------------------
+    #
+    # The judgment half of the privacy gatekeeper: a LOCAL model reads document
+    # text (import scan / re-scan job) or a typed chat message (live guard) and
+    # names the sensitive strings. Rust stores the findings as marks + stable
+    # placeholders; the mechanical door (privacy.py) enforces them at send time.
+
+    @app.post("/privacy_scan")
+    async def privacy_scan(req: PrivacyScanRequest) -> Any:
+        try:
+            entities = await privacy_scan_mod.scan_text(
+                req.text,
+                model=req.model,
+                base_url=req.base_url,
+                concepts=req.concepts,
+                known=req.known,
+            )
+        except ValueError as exc:
+            # A non-local scan model is refused outright: scanning private text
+            # through the very door being guarded would BE the leak.
+            return JSONResponse(
+                status_code=400, content={"error": str(exc), "code": "BAD_REQUEST"}
+            )
+        except llm.LlmError as exc:
+            return exc.response()
+        return {"entities": entities}
 
     # --- summarize (MIGRATION Phase 2) --------------------------------------
     #
@@ -480,7 +562,7 @@ def create_app(
 
     @app.post("/summarize_file")
     async def summarize_file(req: summarize_feature.SummarizeFileRequest) -> Any:
-        client = summarize_feature.OllamaModelClient(req.base_url)
+        client = summarize_feature.OllamaModelClient(req.base_url, req.privacy)
         try:
             summary = await summarize_feature.summarize_one_file(
                 client, req.model, req.name, req.mime, req.text, req.keep_alive
@@ -491,7 +573,7 @@ def create_app(
 
     @app.post("/combine_summary")
     async def combine_summary(req: summarize_feature.CombineSummaryRequest) -> Any:
-        client = summarize_feature.OllamaModelClient(req.base_url)
+        client = summarize_feature.OllamaModelClient(req.base_url, req.privacy)
         try:
             purpose, questions = await summarize_feature.combine_summary(
                 client, req.model, req.room_name, req.memories, req.file_lines

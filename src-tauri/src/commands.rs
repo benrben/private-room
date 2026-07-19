@@ -40,6 +40,7 @@ mod ytdlp;
 mod recording_cmds;
 mod feedback;
 mod jobs;
+mod privacy;
 mod scripts;
 mod speech_cmds;
 
@@ -73,6 +74,7 @@ pub use ytdlp::*;
 pub use recording_cmds::*;
 pub use feedback::*;
 pub use jobs::*;
+pub use privacy::*;
 pub use scripts::*;
 pub use speech_cmds::*;
 

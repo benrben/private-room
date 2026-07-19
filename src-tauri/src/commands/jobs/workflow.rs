@@ -1157,7 +1157,7 @@ pub(crate) async fn run_agent_headless(
         .await
         .ok();
         let messages = vec![ollama::ChatMessage::new("user", question)];
-        let res = run_external(&chat_model, &messages, Some(cancel), bridge.as_ref()).await;
+        let res = run_external(&chat_model, &messages, Some(cancel), bridge.as_ref(), false).await;
         if let Some(b) = &bridge {
             b.stop();
         }
@@ -1174,7 +1174,8 @@ pub(crate) async fn run_agent_headless(
         &mut effects,
         web_enabled,
         cancel,
-        true, // headless — no ask-* events into the chat UI
+        true,  // headless — no ask-* events into the chat UI
+        false, // background turns never bypass the privacy door
     )
     .await;
     match outcome {
@@ -1970,7 +1971,7 @@ fn compose_prompt(description: &str) -> String {
 async fn generate_text_any_engine(model: &str, prompt: &str) -> Result<String, String> {
     let msgs = vec![ollama::ChatMessage::new("user", prompt)];
     if is_external_engine(model) {
-        crate::commands::run_external(model, &msgs, None, None).await
+        crate::commands::run_external(model, &msgs, None, None, false).await
     } else {
         ollama::generate(model, msgs, Some(0.2), KEEP_ALIVE_WARM, None, ollama::CtxTier::Job)
             .await

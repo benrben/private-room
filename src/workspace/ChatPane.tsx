@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { RoomInfo } from "../api";
 import {
   CheckIcon,
@@ -41,6 +42,8 @@ export default function ChatPane({
 }) {
   const { ai, model, messages } = s;
   const modelReady = isModelReady(ai, model);
+  // PRIV-1: two-step confirm for the "send real details this once" valve.
+  const [confirmReal, setConfirmReal] = useState(false);
   const lastAssistantId = [...messages]
     .reverse()
     .find((m) => m.role === "assistant")?.id;
@@ -130,6 +133,14 @@ export default function ChatPane({
           <button className="subtle" onClick={a.dismissSyncWarn}>
             Dismiss
           </button>
+        </div>
+      )}
+      {/* PRIV-1: OFF must be loud — a room talking to a cloud model with the
+          door open says so persistently, not in a setting nobody reopens. */}
+      {isCloudEngine(model) && s.privacyOn === false && (
+        <div className="banner privacy-off-banner" role="alert">
+          Privacy is off — cloud models can see everything in this room,
+          names and all. Turn it back on in Settings → Cloud privacy.
         </div>
       )}
       {ai && !ai.running && !ai.installed && (
@@ -481,6 +492,57 @@ export default function ChatPane({
                 "Thinking locally…"
               )}
             </div>
+          </div>
+        )}
+        {!s.asking && s.askPrivacy && (
+          <div className="privacy-receipt" role="status">
+            {s.askPrivacy.bypassed ? (
+              <span className="privacy-receipt-chip bypassed">
+                Real details were shared this once
+              </span>
+            ) : (
+              <span className="privacy-receipt-chip">
+                {(s.askPrivacy.entities_hidden ?? 0) > 0
+                  ? `${s.askPrivacy.entities_hidden} private detail${
+                      (s.askPrivacy.entities_hidden ?? 0) === 1 ? "" : "s"
+                    } hidden from the cloud model`
+                  : "Shielded — nothing private needed hiding"}
+                {(s.askPrivacy.images_blocked ?? 0) > 0 &&
+                  ` · ${s.askPrivacy.images_blocked} image${
+                    (s.askPrivacy.images_blocked ?? 0) === 1 ? "" : "s"
+                  } kept on this Mac`}
+              </span>
+            )}
+            {/* The valve: only offered when something was actually hidden, and
+                only through a human click — the agent driver is fenced out. */}
+            {!s.askPrivacy.bypassed &&
+              (s.askPrivacy.entities_hidden ?? 0) > 0 &&
+              (confirmReal ? (
+                <span className="privacy-valve-confirm" data-agent-blocked>
+                  Send this question again with the real details?
+                  <button
+                    className="subtle danger"
+                    onClick={() => {
+                      setConfirmReal(false);
+                      void a.askAgainWithRealDetails();
+                    }}
+                  >
+                    Yes, this once
+                  </button>
+                  <button className="subtle" onClick={() => setConfirmReal(false)}>
+                    Cancel
+                  </button>
+                </span>
+              ) : (
+                <button
+                  className="subtle privacy-valve"
+                  data-agent-blocked
+                  title="The hidden details made this answer vague? Re-ask sharing the real values — for this one question only."
+                  onClick={() => setConfirmReal(true)}
+                >
+                  Ask again with real details…
+                </button>
+              ))}
           </div>
         )}
         {s.memSuggestion && (

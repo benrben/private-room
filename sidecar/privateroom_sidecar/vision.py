@@ -281,6 +281,7 @@ async def vision_locate(
     temperature: float | None = 0.0,
     num_ctx: int | None = None,
     keep_alive: str | None = None,
+    privacy: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Ground ``query`` in the image and return normalized boxes.
 
@@ -308,6 +309,7 @@ async def vision_locate(
         keep_alive=keep_alive,
         format=schema,
         images=[prepared_b64],
+        privacy=privacy,
     )
     return parse_boxes(recover_json(text), w, h)
 

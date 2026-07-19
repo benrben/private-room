@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import {
   AiActionDef,
   AiStatus,
+  AskPrivacy,
   Chat,
   ChatCommand,
   ExternalModelInfo,
@@ -89,6 +90,12 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [linkUrl, setLinkUrl] = useState("");
   const [importingLink, setImportingLink] = useState(false);
   const [webOn, setWebOn] = useState(false);
+  // PRIV-1: is the cloud-privacy door effectively ON for this room? null =
+  // not loaded yet. Drives the loud OFF banner and the composer badge truth.
+  const [privacyOn, setPrivacyOn] = useState<boolean | null>(null);
+  // PRIV-1: what the door did on the latest finished turn (the chat chip);
+  // cleared when the next turn starts.
+  const [askPrivacy, setAskPrivacy] = useState<AskPrivacy | null>(null);
   // Engine parity: mirrors the "let a cloud AI use this room's tools" switch,
   // so the composer badge can tell the truth for external engines.
   const [advisorToolsOn, setAdvisorToolsOn] = useState(false);
@@ -326,6 +333,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     mcpDialogDismissed, setMcpDialogDismissed, approvingMcp, setApprovingMcp,
     showAddLink, setShowAddLink, linkUrl, setLinkUrl, importingLink, setImportingLink,
     webOn, setWebOn, advisorToolsOn, setAdvisorToolsOn,
+    privacyOn, setPrivacyOn, askPrivacy, setAskPrivacy,
     showHistory, setShowHistory, versions, setVersions,
     confirmRestore, setConfirmRestore, compare, setCompare,
     confirmDelete, setConfirmDelete,

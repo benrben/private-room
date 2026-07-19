@@ -190,6 +190,7 @@ pub(crate) fn run_stt_job(app: &tauri::AppHandle, job: JobMeta) {
     // debounced auto-index scheduler (which falls back to the quiet filler
     // when the feature is off or the drop is tiny).
     schedule_auto_index(app, job.room_path.clone());
+    schedule_privacy_scan(app.clone());
 }
 
 /// CHG-22: opportunistically fill cached one-liners (files.ai_summary) in the

@@ -37,6 +37,14 @@ export function makeMiscActions(
       .catch(() => {});
   }
 
+  // PRIV-1: whether the cloud-privacy door is effectively on for this room.
+  function refreshPrivacy() {
+    api
+      .privacyStatus()
+      .then((st) => s.setPrivacyOn(st.effectiveOn))
+      .catch(() => s.setPrivacyOn(null));
+  }
+
   function refreshAutolock() {
     api
       .getSetting("autolock_minutes")
@@ -322,7 +330,7 @@ export function makeMiscActions(
   }
 
   return {
-    refreshWebAccess, refreshAutolock, refreshMemAutoSave, dismissSyncWarn,
+    refreshWebAccess, refreshAutolock, refreshPrivacy, refreshMemAutoSave, dismissSyncWarn,
     connectedTools, approveMcp, keepMcpOff, loadFrontPage,
     saveSuggestedMemory, enableMemoryAutoSave, openScratchPad,
     copyReceipt, playSealSound, addMemory, saveMemoryEdit, activateResult,

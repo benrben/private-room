@@ -114,6 +114,10 @@ pub(crate) fn open_room_impl(
     // previous session (open decision 2: auto-start at unlock).
     spawn_workflow_scheduler(app);
     pump_on_open(app);
+    // PRIV-1: resolve this room's privacy policy into the cache, and catch up
+    // on any files imported while the door was off/absent.
+    refresh_policy(app, state);
+    schedule_privacy_scan(app.clone());
     Ok(info)
 }
 
@@ -170,7 +174,7 @@ pub(crate) fn spawn_room_server_if_enabled(app: &tauri::AppHandle) {
             let opts = if scope == crate::room_mcp::ToolScope::ExternalAgent {
                 match leash_identity(&room.conn) {
                     Ok((port, token)) => {
-                        crate::room_mcp::StartOpts { port: Some(port), token: Some(token) }
+                        crate::room_mcp::StartOpts { port: Some(port), token: Some(token), ..Default::default() }
                     }
                     Err(_) => return,
                 }
@@ -391,6 +395,9 @@ pub(crate) fn teardown_open_room(app: &tauri::AppHandle, state: &AppState) {
         }
     }
     *state.room.lock().unwrap() = None;
+    // PRIV-1: the cached privacy policy holds the room's protected strings —
+    // it must not outlive the room handle (same invariant as the MCP token).
+    clear_policy();
     // Wave 3 (Idea 9): bump the room epoch the instant the room handle drops.
     // Every path-pinned background writer (OCR/STT lanes, summary filler,
     // re-extract backfill, room summarize) captured the old epoch at spawn and

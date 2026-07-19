@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse
 from ollama import AsyncClient, ResponseError
 
 from . import external_llm
+from . import privacy as privacy_mod
 from .chat import OllamaChatModel
 from .messages import Message
 
@@ -85,10 +86,20 @@ async def embed(
     texts: list[str],
     base_url: str,
     keep_alive: str | None = None,
+    *,
+    privacy: dict[str, Any] | None = None,
 ) -> list[list[float]]:
-    """One embedding vector per input text, in order (ollama.rs ``embed``)."""
+    """One embedding vector per input text, in order (ollama.rs ``embed``).
+
+    PRIV-1: embedding models are local in practice, but if one ever carries the
+    ``:cloud`` tag the same door applies — protected strings are replaced before
+    the text leaves (vectors come back, nothing to restore).
+    """
     if not texts:
         return []
+    policy = privacy_mod.policy_from_payload(privacy)
+    if policy is not None and policy.active and privacy_mod.is_nonlocal_model(model):
+        texts = [policy.redact_text(t) for t in texts]
     try:
         client = AsyncClient(host=base_url)
         resp = await client.embed(model=model, input=list(texts), keep_alive=keep_alive)
@@ -108,6 +119,7 @@ async def generate(
     keep_alive: str | None = None,
     format: dict[str, Any] | None = None,  # noqa: A002 - matches the Ollama arg name
     images: list[str] | None = None,
+    privacy: dict[str, Any] | None = None,
 ) -> str:
     """One non-streaming assistant turn (ollama.rs ``chat_structured`` gateway).
 
@@ -123,9 +135,16 @@ async def generate(
     :mod:`.external_llm` instead of Ollama — same messages, schema folded into
     the prompt — so every feature built on this gateway honors the room's
     chosen engine.
+
+    PRIV-1: ``privacy`` is the room's policy payload. The guard runs BEFORE the
+    engine split, so both ways out of the Mac (Ollama ``:cloud`` relay, cloud
+    CLI) see only redacted text; the answer is restored before returning.
     """
+    policy = privacy_mod.policy_from_payload(privacy)
+    messages, images, engaged = privacy_mod.guard_outbound(model, messages, policy, images)
     if external_llm.is_external_model(model):
-        return await external_llm.generate_external(model, messages, format=format)
+        text = await external_llm.generate_external(model, messages, format=format)
+        return engaged.restore_text(text) if engaged else text
     kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
     if temperature is not None:
         kwargs["temperature"] = temperature
@@ -137,9 +156,10 @@ async def generate(
         kwargs["keep_alive"] = keep_alive
     chat = OllamaChatModel(**kwargs)
     try:
-        return await chat.generate(messages, format=format, images=images)
+        text = await chat.generate(messages, format=format, images=images)
     except Exception as exc:  # noqa: BLE001
         raise _classify(exc) from exc
+    return engaged.restore_text(text) if engaged else text
 
 
 async def generate_stream(
@@ -152,6 +172,7 @@ async def generate_stream(
     keep_alive: str | None = None,
     format: dict[str, Any] | None = None,  # noqa: A002 - matches the Ollama arg name
     images: list[str] | None = None,
+    privacy: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     """Streaming twin of :func:`generate` (ollama.rs ``chat_core`` streaming text).
 
@@ -164,9 +185,15 @@ async def generate_stream(
 
     Engine parity: an external CLI cannot stream tokens, so its whole reply is
     yielded as one final delta — callers see a single chunk instead of many.
+
+    PRIV-1: guarded like :func:`generate`; a placeholder split across deltas is
+    re-joined by the stream restorer before the caller sees it.
     """
+    policy = privacy_mod.policy_from_payload(privacy)
+    messages, images, engaged = privacy_mod.guard_outbound(model, messages, policy, images)
     if external_llm.is_external_model(model):
-        yield await external_llm.generate_external(model, messages, format=format)
+        text = await external_llm.generate_external(model, messages, format=format)
+        yield engaged.restore_text(text) if engaged else text
         return
     kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
     if temperature is not None:
@@ -176,11 +203,20 @@ async def generate_stream(
     if keep_alive is not None:
         kwargs["keep_alive"] = keep_alive
     chat = OllamaChatModel(**kwargs)
+    restorer = engaged.restorer() if engaged else None
     try:
         async for delta in chat.generate_stream(messages, format=format, images=images):
+            if restorer is not None:
+                delta = restorer.feed(delta)
+                if not delta:
+                    continue
             yield delta
     except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
         raise _classify(exc) from exc
+    if restorer is not None:
+        tail = restorer.flush()
+        if tail:
+            yield tail
 
 
 async def delete(model: str, base_url: str) -> None:

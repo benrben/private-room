@@ -210,6 +210,7 @@ async def _structured_call(
     *,
     keep_alive: str,
     num_predict: int = PASS_DOC_PREDICT,
+    privacy: dict[str, Any] | None = None,
 ) -> Any:
     """One structured model call with a single retry (file_pass.rs ``model_call``).
 
@@ -237,6 +238,7 @@ async def _structured_call(
                 num_predict=num_predict,
                 keep_alive=keep_alive,
                 format=schema,
+                privacy=privacy,
             )
         except llm.LlmError as exc:
             if _is_fatal(exc.code):
@@ -271,6 +273,7 @@ async def run_map(
     thread: str,
     window_text: str,
     keep_alive: str = KEEP_ALIVE_WARM,
+    privacy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One map window: dense notes (merge) or transformed text (stitch) + a thread.
 
@@ -301,7 +304,14 @@ async def run_map(
     }
     messages = [system_message(system), user_message(user)]
     parsed = await _structured_call(
-        model, messages, schema, base_url, keep_alive=keep_alive, num_predict=PASS_MAP_PREDICT)
+        model,
+        messages,
+        schema,
+        base_url,
+        keep_alive=keep_alive,
+        num_predict=PASS_MAP_PREDICT,
+        privacy=privacy,
+    )
     result = "" if parsed is _SKIP else _field(parsed, result_key).strip()
     if not result:
         # A double-failure (_SKIP) OR a valid-but-EMPTY reply (a small model can
@@ -327,6 +337,7 @@ async def run_section(
     sections: list[str],
     missing: int = 0,
     keep_alive: str = KEEP_ALIVE_WARM,
+    privacy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compose ONE ordered section of the deliverable from a small group of
     consecutive windows' notes (the sectioned path).
@@ -365,7 +376,9 @@ async def run_section(
         "required": ["html"],
     }
     messages = [system_message(SECTION_SYSTEM), user_message(user)]
-    parsed = await _structured_call(model, messages, schema, base_url, keep_alive=keep_alive)
+    parsed = await _structured_call(
+        model, messages, schema, base_url, keep_alive=keep_alive, privacy=privacy
+    )
     html = "" if parsed is _SKIP else _field(parsed, "html").strip()
     if not html:
         # Composing this section failed or came back empty: keep the reading by
@@ -403,6 +416,8 @@ class FilePassMapRequest(BaseModel):
     thread: str = ""
     window_text: str = ""
     keep_alive: str = KEEP_ALIVE_WARM
+    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
+    privacy: dict[str, Any] | None = None
 
 
 class FilePassSectionRequest(BaseModel):
@@ -420,6 +435,8 @@ class FilePassSectionRequest(BaseModel):
     #: count of the group's windows that were unreadable/absent.
     missing: int = 0
     keep_alive: str = KEEP_ALIVE_WARM
+    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
+    privacy: dict[str, Any] | None = None
 
 
 __all__ = [

@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { RoomInfo } from "../api";
 import {
   CloseIcon,
@@ -19,6 +20,7 @@ import {
 import RoomMap from "../viewers/RoomMap";
 import { displayName, formatWhen } from "./composer";
 import ViewerRouter from "./ViewerRouter";
+import CloudView from "../viewers/CloudView";
 import FrontPage from "./FrontPage";
 import MemoryView from "./MemoryView";
 import { WSState } from "./state";
@@ -66,6 +68,14 @@ export default function ViewerPane({
   area: WorkArea;
 }) {
   const { openFile } = s;
+  // PRIV-1: the reader's "blocked version" toggle — resets per file.
+  const [cloudView, setCloudView] = useState(false);
+  useEffect(() => setCloudView(false), [openFile?.id]);
+  const cloudViewable =
+    openFile != null &&
+    !["image", "audio", "video", "recording", "binary"].includes(
+      openFile.content.kind,
+    );
   const frontPageView =
     s.fp && (s.fp.fileCount > 0 || s.fp.chatCount > 0 || s.fp.memories.length > 0)
       ? s.fp
@@ -126,7 +136,20 @@ export default function ViewerPane({
           <div className="viewer-head">
             <span className="viewer-title">{openFile.content.name}</span>
             <span className="viewer-actions">
-              {a.editModeOf(openFile.content) && (
+              {cloudViewable && (
+                <button
+                  className={`subtle btn-ic${cloudView ? " cloudview-on" : ""}`}
+                  title={
+                    cloudView
+                      ? "Back to the normal view"
+                      : "See this file exactly as a cloud model would receive it"
+                  }
+                  onClick={() => setCloudView(!cloudView)}
+                >
+                  {cloudView ? "Normal view" : "Cloud view"}
+                </button>
+              )}
+              {!cloudView && a.editModeOf(openFile.content) && (
                 <button
                   className="subtle btn-ic"
                   title={
@@ -395,6 +418,9 @@ export default function ViewerPane({
                 : ""
             }`}
           >
+            {cloudView ? (
+              <CloudView fileId={openFile.id} />
+            ) : (
             <ViewerRouter
               openFile={openFile}
               viewerRev={s.viewerRev}
@@ -417,6 +443,7 @@ export default function ViewerPane({
               }}
               sttStatus={s.sttStatus}
             />
+            )}
           </div>
         </>
       ) : s.showWorkflows ? (

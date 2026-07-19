@@ -5,6 +5,7 @@ import { Props } from "./settings/types";
 import ModelSection from "./settings/ModelSection";
 import BehaviorSection from "./settings/BehaviorSection";
 import VoiceSection from "./settings/VoiceSection";
+import CloudPrivacySection from "./settings/CloudPrivacySection";
 import PrivacySection from "./settings/PrivacySection";
 import CheckpointsSection from "./settings/CheckpointsSection";
 import OnlineSection from "./settings/OnlineSection";
@@ -228,6 +229,7 @@ export default function Settings({
                 ]],
                 ["Voice & dictation", [["set-voice", "Spoken voice"]]],
                 ["Privacy & recovery", [
+                  ["set-cloud-privacy", "Cloud privacy"],
                   ["set-privacy", "Privacy"],
                   ["set-recovery", "Recovery key"],
                 ]],
@@ -308,6 +310,8 @@ export default function Settings({
             />
 
             <VoiceSection {...voiceSettings} />
+
+            <CloudPrivacySection />
 
             <PrivacySection
               autolock={autolock}

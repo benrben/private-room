@@ -186,6 +186,7 @@ async def _structured(
     *,
     temperature: float,
     keep_alive: str,
+    privacy: dict[str, Any] | None = None,
 ) -> str:
     """One structured turn = chat_structured: prime the prompt with the schema,
     generate with ``format=schema`` at the no-tools Chat window, recover the JSON."""
@@ -198,6 +199,7 @@ async def _structured(
         num_ctx=num_ctx_chat_notools(),
         keep_alive=keep_alive,
         format=schema,
+        privacy=privacy,
     )
     return recover_json(raw)
 
@@ -209,6 +211,7 @@ async def _plain(
     *,
     temperature: float,
     keep_alive: str,
+    privacy: dict[str, Any] | None = None,
 ) -> str:
     """One plain turn = ask_quiet: no ``format``, no priming, no JSON recovery."""
     return await llm.generate(
@@ -218,6 +221,7 @@ async def _plain(
         temperature=temperature,
         num_ctx=num_ctx_chat_notools(),
         keep_alive=keep_alive,
+        privacy=privacy,
     )
 
 
@@ -232,6 +236,7 @@ async def extract_fields(
     *,
     temperature: float = 0.0,
     keep_alive: str = KEEP_ALIVE_WARM,
+    privacy: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """knowledge.rs cmd_extract, one document. One string property per requested
     field (all required) so the reply is a JSON object keyed by the field names;
@@ -244,7 +249,13 @@ async def extract_fields(
         user_message(f"Fields:\n{field_lines}\n\nDocument:\n{document}"),
     ]
     reply = await _structured(
-        model, base_url, messages, schema, temperature=temperature, keep_alive=keep_alive
+        model,
+        base_url,
+        messages,
+        schema,
+        temperature=temperature,
+        keep_alive=keep_alive,
+        privacy=privacy,
     )
     try:
         parsed = json.loads(reply.strip())
@@ -265,6 +276,7 @@ async def enumerate_names(
     *,
     temperature: float = 0.0,
     keep_alive: str = KEEP_ALIVE_WARM,
+    privacy: dict[str, Any] | None = None,
 ) -> list[str]:
     """knowledge.rs cmd_add_file "for each" — enumerate the ``subject`` as short
     names from the conversation (max 12), guaranteed a JSON string array."""
@@ -277,7 +289,13 @@ async def enumerate_names(
         ),
     ]
     reply = await _structured(
-        model, base_url, messages, schema, temperature=temperature, keep_alive=keep_alive
+        model,
+        base_url,
+        messages,
+        schema,
+        temperature=temperature,
+        keep_alive=keep_alive,
+        privacy=privacy,
     )
     return parse_string_list(reply)
 
@@ -293,6 +311,7 @@ async def generate_doc(
     history: str = "",
     temperature: float = 0.4,
     keep_alive: str = KEEP_ALIVE_WARM,
+    privacy: dict[str, Any] | None = None,
 ) -> str:
     """knowledge.rs cmd_add_file document body (DOC_SYS). ``mode``:
 
@@ -310,7 +329,14 @@ async def generate_doc(
     else:  # "single"
         user = f"{context}Write a well-structured document about: {topic}"
     messages = [system_message(DOC_SYS), user_message(user)]
-    return await _plain(model, base_url, messages, temperature=temperature, keep_alive=keep_alive)
+    return await _plain(
+        model,
+        base_url,
+        messages,
+        temperature=temperature,
+        keep_alive=keep_alive,
+        privacy=privacy,
+    )
 
 
 __all__ = [

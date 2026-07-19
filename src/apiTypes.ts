@@ -123,6 +123,55 @@ export interface Message {
   effects: MessageEffects | null;
 }
 
+/** PRIV-1: one protected entity in the room's map. */
+export interface PrivacyEntity {
+  id: string;
+  realText: string;
+  placeholder: string;
+  category: string;
+  /** "user" (block list) | "scan" (found by the local scanner). */
+  source: string;
+}
+
+/** PRIV-1: the Settings section's full picture. */
+export interface PrivacyStatus {
+  globalDefaultOn: boolean;
+  /** The room's explicit override: "on" | "off" | null (= follow global). */
+  roomSetting: string | null;
+  effectiveOn: boolean;
+  entities: PrivacyEntity[];
+  concepts: string[];
+  pendingFiles: number;
+  scanning: boolean;
+}
+
+/** PRIV-1: the reader's cloud view — the file exactly as a non-local model
+ * would receive it. */
+export interface PrivacyPreview {
+  text: string;
+  entitiesHidden: number;
+  replacements: number;
+  present: string[];
+}
+
+/** PRIV-1: the ask-privacy event — what the door did on one turn. */
+export interface AskPrivacy {
+  entities_hidden?: number;
+  replacements?: number;
+  images_blocked?: number;
+  bypassed?: boolean;
+}
+
+/** PRIV-2: privacy-scan progress events. */
+export interface PrivacyScanProgress {
+  running: boolean;
+  done: number;
+  total: number;
+  label?: string;
+  /** Terminal events only: why the scan stopped without finishing. */
+  error?: string | null;
+}
+
 /** ADD-23: the `effects` column payload — what a turn's tools drew. */
 export interface MessageEffects {
   boxes?: {

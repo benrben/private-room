@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
 
 from .config import KEEP_ALIVE_WARM, num_ctx_for_chat
 from .messages import Message, ToolCall, attach_images
+from .privacy import PrivacyPolicy, guard_outbound
 
 #: Called with each streamed text delta.
 DeltaSink = Callable[[str], Awaitable[None]]
@@ -140,6 +141,9 @@ class OllamaChatModel:
         # fills the whole num_ctx window (~72 min on a 4B) — it stops at the cap.
         self.num_predict = num_predict
         self.keep_alive = keep_alive
+        # PRIV-1: the /run handler attaches the room's resolved policy here; the
+        # agent loop then talks to a ``:cloud`` model only through the door.
+        self.privacy: PrivacyPolicy | None = None
 
     def _llm(self) -> Any:
         from langchain_ollama import ChatOllama
@@ -250,13 +254,20 @@ class OllamaChatModel:
     ) -> tuple[str, list[ToolCall]]:
         from langchain_core.messages import AIMessageChunk
 
+        # PRIV-1: every round of the agent loop passes the door — the composed
+        # history (system prompt, question, tool results with document text) is
+        # redacted for a non-local model, and the reply deltas are restored so
+        # the user (and the locally-running tools) see real values.
+        send, _, engaged = guard_outbound(self.model, messages, self.privacy)
+        restorer = engaged.restorer() if engaged else None
+
         llm: Any = self._llm()
         if tools:
             llm = llm.bind_tools(tools)
 
         parts: list[str] = []
         merged: AIMessageChunk | None = None
-        stream = llm.astream(_to_langchain(messages))
+        stream = llm.astream(_to_langchain(send))
         async for chunk in stream:
             # ADD-7 / F1: Stop must break the token stream mid-flight, not only
             # between rounds. On the plain-chat path the whole answer is one
@@ -270,9 +281,16 @@ class OllamaChatModel:
                 continue
             merged = chunk if merged is None else merged + chunk
             delta = _chunk_text(chunk.content)
+            if restorer is not None:
+                delta = restorer.feed(delta)
             if delta:
                 parts.append(delta)
                 await on_delta(delta)
+        if restorer is not None:
+            tail = restorer.flush()
+            if tail:
+                parts.append(tail)
+                await on_delta(tail)
 
         content = "".join(parts)
         calls: list[ToolCall] = []
@@ -284,6 +302,8 @@ class OllamaChatModel:
                 if not name:
                     continue
                 args = tc.get("args") or {}
+                if engaged is not None:
+                    args = engaged.restore_value(args)
                 call_id = str(tc.get("id") or f"call_{i}")
                 calls.append(
                     ToolCall(

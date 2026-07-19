@@ -96,6 +96,10 @@ export function useWorkspaceEffects(
     const unlistenNotice = api.onAskNotice((text) => {
       s.pushToast("info", text);
     });
+    // PRIV-1: the door's per-turn receipt ("N details hidden" / bypassed).
+    const unlistenPrivacy = api.onAskPrivacy((p) => {
+      s.setAskPrivacy(p);
+    });
     // ADD-31: live import queue. The receipt toast comes from reportImport
     // (which knows names and errors) — this event only drives the strip.
     const unlistenImport = api.onImportProgress((p) => {
@@ -204,6 +208,7 @@ export function useWorkspaceEffects(
     });
     a.refreshWebAccess();
     a.refreshAutolock();
+    a.refreshPrivacy();
     // Idea 3: the spoken voice's per-room config + the hands-free re-arm.
     void Promise.all([
       api.getSetting("voice_archetype"),
@@ -393,6 +398,7 @@ export function useWorkspaceEffects(
       unlistenStepStatus.then((fn) => fn());
       unlistenRound.then((fn) => fn());
       unlistenNotice.then((fn) => fn());
+      unlistenPrivacy.then((fn) => fn());
       unlistenImport.then((fn) => fn());
       unlistenJobs.then((fn) => fn());
       unlistenWfNode.then((fn) => fn());

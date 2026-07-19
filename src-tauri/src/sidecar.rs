@@ -108,6 +108,12 @@ pub async fn sidecar_json(
     path: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, SidecarError> {
+    // PRIV-1: THE Rust-side injection point — when the body's model is
+    // non-local and the room's door is on, the privacy policy rides along so
+    // the sidecar's mechanical seam engages. Bodies without a model (or with a
+    // local one) pass through untouched.
+    let injected = crate::commands::inject_policy(body);
+    let body = injected.as_ref().unwrap_or(body);
     // A dead sidecar is the no-fallback OLLAMA_DOWN surface (see module note).
     let base = match sidecar_lifecycle::ensure_up().await {
         Ok(b) => b,
@@ -187,6 +193,10 @@ pub async fn generate_stream(
     mut on_delta: impl FnMut(&str),
 ) -> Result<String, String> {
     use futures_util::StreamExt;
+
+    // PRIV-1: same single injection as `sidecar_json` — the streaming twin.
+    let injected = crate::commands::inject_policy(body);
+    let body = injected.as_ref().unwrap_or(body);
 
     // The sidecar doesn't echo the model back on the error line, so rebuild the
     // `MODEL_MISSING:<model>` sentinel from the body's model (Copy `Option<&str>`).
@@ -361,6 +371,9 @@ pub async fn run_via_sidecar(
     // ask-* stream events so a background/scheduled turn never corrupts (or
     // interleaves with) the visible chat. Ordinary chat asks pass `false`.
     headless: bool,
+    // PRIV-1: "send real details this once" — the user explicitly confirmed
+    // sharing real values for THIS turn, so the policy is not attached.
+    privacy_bypass: bool,
 ) -> SidecarOutcome {
     use tauri::Manager;
 
@@ -423,6 +436,14 @@ pub async fn run_via_sidecar(
         "advisors": Vec::<String>::new(),
         "run_id": bridge.token,
     });
+    // PRIV-1: attach the room policy for a non-local model (the sidecar's chat
+    // seam + live guard engage on it) — unless the user opened the door for
+    // this one turn.
+    let body = if privacy_bypass {
+        body
+    } else {
+        crate::commands::inject_policy(&body).unwrap_or(body)
+    };
 
     let streamed = stream_run(&base, &body, window, &cancel, headless).await;
     // The bridge's own record of whether a tool was dispatched to `exec_tool`.
@@ -592,6 +613,16 @@ async fn stream_run(
                 }
                 Some("final") => {
                     final_text = str_v(&ev).to_string();
+                }
+                // PRIV-1: what the door did this turn ("N details hidden") —
+                // arrives after `final`, rendered on the finished message.
+                Some("privacy") => {
+                    if !headless {
+                        let _ = window.emit(
+                            "ask-privacy",
+                            ev.get("v").cloned().unwrap_or(serde_json::Value::Null),
+                        );
+                    }
                 }
                 Some("error") => {
                     return StreamResult::Failed {

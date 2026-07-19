@@ -66,7 +66,13 @@ def _parse_questions(raw: str) -> list[str]:
     return [q for q in strings if q.strip()][:3]
 
 
-async def front_page_labels(model: str, room_name: str, files: list[str], base_url: str) -> list[str]:
+async def front_page_labels(
+    model: str,
+    room_name: str,
+    files: list[str],
+    base_url: str,
+    privacy: dict[str, Any] | None = None,
+) -> list[str]:
     """Up to three starter questions for the room's front page (D4).
 
     Raises :class:`.llm.LlmError` on an engine failure; the route swallows it to
@@ -84,6 +90,7 @@ async def front_page_labels(model: str, room_name: str, files: list[str], base_u
         temperature=0.4,
         keep_alive=KEEP_ALIVE_WARM,
         format=_SUGGESTIONS_SCHEMA,
+        privacy=privacy,
     )
     return _parse_questions(raw)
 
@@ -129,7 +136,9 @@ def _parse_or_fallback(raw: str, text: str) -> tuple[str, str]:
     return (first_line or "Feedback")[:70], f"## What happened\n\n{text}"
 
 
-async def feedback_draft(model: str, text: str, base_url: str) -> dict[str, str]:
+async def feedback_draft(
+    model: str, text: str, base_url: str, privacy: dict[str, Any] | None = None
+) -> dict[str, str]:
     """Shape raw feedback into a GitHub-ready ``{title, body}`` (ADD-28).
 
     Raises :class:`.llm.LlmError` on an engine failure (the route surfaces it,
@@ -144,6 +153,7 @@ async def feedback_draft(model: str, text: str, base_url: str) -> dict[str, str]
         temperature=0.3,
         keep_alive=KEEP_ALIVE_SHORT,
         format=_FEEDBACK_SCHEMA,
+        privacy=privacy,
     )
     title, body = _parse_or_fallback(raw, text)
     return {"title": title[:120], "body": body}

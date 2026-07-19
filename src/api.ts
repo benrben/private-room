@@ -62,6 +62,11 @@ import type {
   RoomRole,
   ExternalModelInfo,
   VoiceInfo,
+  AskPrivacy,
+  PrivacyEntity,
+  PrivacyPreview,
+  PrivacyScanProgress,
+  PrivacyStatus,
 } from "./apiTypes";
 
 export const api = {
@@ -149,6 +154,20 @@ export const api = {
   // ---- Wave 4: room-wide search (ADD-6) ----
   searchAll: (query: string) => invoke<SearchResults>("search_all", { query }),
   getSetting: (key: string) => invoke<string | null>("get_setting", { key }),
+  // PRIV-1: the cloud-privacy gatekeeper (switch, block list, preview, scan).
+  privacyStatus: () => invoke<PrivacyStatus>("privacy_status"),
+  setPrivacyRoom: (mode: "on" | "off" | "default") =>
+    invoke<void>("set_privacy_room", { mode }),
+  setPrivacyGlobal: (on: boolean) => invoke<void>("set_privacy_global", { on }),
+  addPrivacyBlock: (text: string, category: string) =>
+    invoke<PrivacyEntity>("add_privacy_block", { text, category }),
+  removePrivacyEntity: (id: string) =>
+    invoke<void>("remove_privacy_entity", { id }),
+  setPrivacyConcepts: (concepts: string[]) =>
+    invoke<void>("set_privacy_concepts", { concepts }),
+  privacyPreview: (fileId: string) =>
+    invoke<PrivacyPreview>("privacy_preview", { fileId }),
+  startPrivacyScan: () => invoke<void>("start_privacy_scan"),
   webSearchTest: () => invoke<string>("web_search_test"),
   setSetting: (key: string, value: string) =>
     invoke<void>("set_setting", { key, value }),
@@ -276,8 +295,21 @@ export const api = {
   getMessages: (chatId: string) => invoke<Message[]>("get_messages", { chatId }),
   deleteMessage: (id: string) => invoke<void>("delete_message", { id }),
   // ADD-7: each ask carries an id so it can be cancelled mid-stream.
-  ask: (chatId: string, question: string, attachments: string[], askId: string) =>
-    invoke<Message>("ask", { chatId, question, attachments, askId }),
+  // PRIV-1: `privacyBypass` is the confirmed "send real details this once".
+  ask: (
+    chatId: string,
+    question: string,
+    attachments: string[],
+    askId: string,
+    privacyBypass?: boolean,
+  ) =>
+    invoke<Message>("ask", {
+      chatId,
+      question,
+      attachments,
+      askId,
+      privacyBypass: privacyBypass ?? null,
+    }),
   cancelAsk: (askId: string) => invoke<void>("cancel_ask", { askId }),
   /** Run a prebuilt "#name" workflow. `refs` are @-pinned file ids; `raw` is
    *  the full line the user typed (saved verbatim as the user message). Streams
@@ -392,6 +424,13 @@ export const api = {
     listen("ask-round", () => cb()),
   onAskNotice: (cb: (text: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-notice", (e) => cb(e.payload)),
+  // PRIV-1: what the privacy door did on this turn ("N details hidden"), or
+  // { bypassed: true } when the user shared real details this once.
+  onAskPrivacy: (cb: (p: AskPrivacy) => void): Promise<UnlistenFn> =>
+    listen<AskPrivacy>("ask-privacy", (e) => cb(e.payload)),
+  // PRIV-2: background privacy-scan progress for the Settings section.
+  onPrivacyScan: (cb: (p: PrivacyScanProgress) => void): Promise<UnlistenFn> =>
+    listen<PrivacyScanProgress>("privacy-scan", (e) => cb(e.payload)),
   // ADD-31: named stage while a Studio (flashcards/mindmap/podcast) runs.
   onStudioStep: (cb: (text: string) => void): Promise<UnlistenFn> =>
     listen<string>("studio-step", (e) => cb(e.payload)),

@@ -196,6 +196,8 @@ pub(crate) async fn run_external(
     // ADD-20: when present, the CLI is given the room's tools over a scoped
     // localhost MCP bridge (claude-cli only for now).
     bridge: Option<&crate::room_mcp::Bridge>,
+    // PRIV-1: "send real details this once" — skip the door for this one turn.
+    privacy_bypass: bool,
 ) -> Result<String, String> {
     use std::io::Write;
 
@@ -203,6 +205,37 @@ pub(crate) async fn run_external(
     // a composite one carrying the specific model and/or reasoning effort the
     // Cloud picker chose ("codex-cli::gpt-5.6-sol::high").
     let (engine, submodel, effort) = split_external_model(engine);
+
+    // PRIV-1: the door, inside the leaf — EVERY caller of this function ships
+    // content to a cloud CLI, so the policy engages here regardless of which
+    // feature composed the messages. Protected strings become placeholders,
+    // attached images stay on the Mac (pixels can't be redacted), and the
+    // reply is restored below before anyone sees it.
+    let policy = if privacy_bypass {
+        None
+    } else {
+        crate::commands::active_policy()
+    };
+    let mut privacy_report = crate::commands::PrivacyReport::default();
+    let guarded: Vec<ollama::ChatMessage>;
+    let messages: &[ollama::ChatMessage] = match &policy {
+        Some(p) => {
+            guarded = messages
+                .iter()
+                .map(|m| {
+                    let mut mm = m.clone();
+                    mm.content = p.redactor.redact(&m.content, &mut privacy_report);
+                    if let Some(images) = &mm.images {
+                        privacy_report.images_blocked += images.len();
+                        mm.images = None;
+                    }
+                    mm
+                })
+                .collect();
+            &guarded
+        }
+        None => messages,
+    };
 
     let tmp_dir =
         std::env::temp_dir().join(format!("private-room-cli-{}", Uuid::new_v4()));
@@ -364,7 +397,12 @@ pub(crate) async fn run_external(
 
     // Decrypted content must not linger on disk.
     let _ = std::fs::remove_dir_all(&tmp_dir);
-    result
+    // PRIV-1: put the real values back into the reply — the cloud only ever
+    // saw the placeholders; the user reads a normal answer.
+    match (&policy, result) {
+        (Some(p), Ok(text)) => Ok(p.redactor.restore(&text)),
+        (_, r) => r,
+    }
 }
 
 #[cfg(test)]

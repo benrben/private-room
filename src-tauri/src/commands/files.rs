@@ -112,6 +112,9 @@ pub fn import_files(
     // CHG-22 → Wave 1b (idea 8): freshly-imported files go through the
     // debounced auto-index scheduler (one decision per drop, after the lock).
     schedule_auto_index(&app, room_path.clone());
+    // PRIV-2: newly imported text gets its privacy scan (no-op when the door
+    // is off for this room).
+    schedule_privacy_scan(app.clone());
     Ok(ImportReport { imported, errors })
 }
 
@@ -211,6 +214,7 @@ pub(crate) fn run_ocr_job(app: &tauri::AppHandle, job: JobMeta) {
     // CHG-22 → Wave 1b (idea 8): newly-readable file goes through the
     // debounced auto-index scheduler.
     schedule_auto_index(app, job.room_path.clone());
+    schedule_privacy_scan(app.clone());
 }
 
 #[tauri::command]

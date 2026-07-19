@@ -106,8 +106,19 @@ pub fn get_setting(state: State<'_, AppState>, key: String) -> Result<Option<Str
 }
 
 #[tauri::command]
-pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {
-    state.with_room(|room| db::set_setting(&room.conn, &key, &value))
+pub fn set_setting(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    state.with_room(|room| db::set_setting(&room.conn, &key, &value))?;
+    // PRIV-1: privacy keys written through the generic path (or a model change,
+    // which alters the guard model) keep the cached policy current.
+    if key.starts_with("cloud_privacy") || key == "model" {
+        refresh_policy(&app, &state);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- mcp

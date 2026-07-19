@@ -404,8 +404,13 @@ class OllamaModelClient:
     :class:`.llm.LlmError` contract.
     """
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, privacy: dict[str, Any] | None = None) -> None:
+        from .privacy import policy_from_payload
+
         self.base_url = base_url
+        # PRIV-1: the room's policy rides the request body; the door engages in
+        # _chat only when the model is non-local.
+        self.privacy = policy_from_payload(privacy)
 
     async def _chat(
         self,
@@ -425,10 +430,14 @@ class OllamaModelClient:
         # tool-calls — the gather loop already degrades to sample-based
         # summaries when a model returns no calls, so (text, []) slots in.
         from .external_llm import generate_external, is_external_model
+        from .privacy import guard_outbound
+
+        # PRIV-1: one guard ahead of the engine split covers both ways out.
+        messages, _, engaged = guard_outbound(model, messages, self.privacy)
 
         if is_external_model(model):
             text = await generate_external(model, messages, format=format)
-            return text, []
+            return (engaged.restore_text(text) if engaged else text), []
 
         options: dict[str, Any] = {"num_ctx": num_ctx}
         if temperature is not None:
@@ -449,12 +458,16 @@ class OllamaModelClient:
         except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
             raise _classify(exc) from exc
         content = resp.message.content or ""
+        if engaged is not None:
+            content = engaged.restore_text(content)
         calls: list[ToolCall] = []
         for i, tc in enumerate(resp.message.tool_calls or []):
             name = getattr(tc.function, "name", "") or ""
             if not name:
                 continue
             args = dict(tc.function.arguments or {})
+            if engaged is not None:
+                args = engaged.restore_value(args)
             cid = f"call_{i}"
             calls.append(
                 ToolCall(
@@ -779,6 +792,8 @@ class SummarizeFileRequest(BaseModel):
     mime: str = ""
     base_url: str = "http://127.0.0.1:11434"
     keep_alive: str = "30m"
+    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
+    privacy: dict[str, Any] | None = None
 
 
 class CombineSummaryRequest(BaseModel):
@@ -792,6 +807,8 @@ class CombineSummaryRequest(BaseModel):
     memories: list[str] = Field(default_factory=list)
     base_url: str = "http://127.0.0.1:11434"
     keep_alive: str = "30m"
+    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
+    privacy: dict[str, Any] | None = None
 
 
 __all__ = [

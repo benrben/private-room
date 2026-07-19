@@ -173,6 +173,9 @@ impl Bridge {
 pub struct StartOpts {
     pub port: Option<u16>,
     pub token: Option<String>,
+    /// PRIV-1: "send real details this once" — this bridge's turn skips the
+    /// privacy door (per-ask bridges only; persistent bridges keep false).
+    pub privacy_bypass: bool,
 }
 
 /// Bind loopback and serve MCP until `stop()`. `scope` fixes what the bridge
@@ -223,6 +226,7 @@ pub async fn start(
     let tok = token.clone();
     let tool_ran = Arc::new(AtomicBool::new(false));
     let tool_ran_task = tool_ran.clone();
+    let privacy_bypass = opts.privacy_bypass;
     let task = tauri::async_runtime::spawn(async move {
         // Each connection watches the same shutdown channel, so `stop()`
         // severs LIVE keep-alive connections too — not just future accepts (a
@@ -240,8 +244,11 @@ pub async fn start(
                     let tool_ran = tool_ran_task.clone();
                     let rx = conn_rx.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _ = handle_conn(stream, app, tok, web_enabled, scope, effects, tool_ran, rx)
-                            .await;
+                        let _ = handle_conn(
+                            stream, app, tok, web_enabled, scope, effects, tool_ran, rx,
+                            privacy_bypass,
+                        )
+                        .await;
                     });
                 }
             }
@@ -261,13 +268,17 @@ async fn handle_conn(
     effects: Option<EffectsSink>,
     tool_ran: Arc<AtomicBool>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    privacy_bypass: bool,
 ) -> Result<(), String> {
     let dispatch = move |body: Vec<u8>| {
         let app = app.clone();
         let effects = effects.clone();
         let tool_ran = tool_ran.clone();
         async move {
-            dispatch_jsonrpc(&app, &body, web_enabled, scope, effects.as_ref(), &tool_ran).await
+            dispatch_jsonrpc(
+                &app, &body, web_enabled, scope, effects.as_ref(), &tool_ran, privacy_bypass,
+            )
+            .await
         }
     };
     serve_conn(stream, token, shutdown, dispatch).await
@@ -394,6 +405,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Dispatch one JSON-RPC request to its handler, returning (HTTP status, body).
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_jsonrpc(
     app: &tauri::AppHandle,
     body: &[u8],
@@ -401,6 +413,7 @@ async fn dispatch_jsonrpc(
     scope: ToolScope,
     effects: Option<&EffectsSink>,
     tool_ran: &AtomicBool,
+    privacy_bypass: bool,
 ) -> (u16, Vec<u8>) {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -420,7 +433,10 @@ async fn dispatch_jsonrpc(
         })),
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => Ok(serde_json::json!({ "tools": served_tools(app, web_enabled, scope) })),
-        "tools/call" => tool_call(app, &req["params"], web_enabled, scope, effects, tool_ran).await,
+        "tools/call" => {
+            tool_call(app, &req["params"], web_enabled, scope, effects, tool_ran, privacy_bypass)
+                .await
+        }
         _ => Err(format!("method not found: {method}")),
     };
     let reply = match result {
@@ -513,6 +529,7 @@ fn served_tools(
 
 /// Execute one tool through the room's own dispatch. Tool errors come back as
 /// MCP `isError` results (the model can react), not JSON-RPC failures.
+#[allow(clippy::too_many_arguments)]
 async fn tool_call(
     app: &tauri::AppHandle,
     params: &serde_json::Value,
@@ -520,8 +537,21 @@ async fn tool_call(
     scope: ToolScope,
     effects_sink: Option<&EffectsSink>,
     tool_ran: &AtomicBool,
+    privacy_bypass: bool,
 ) -> Result<serde_json::Value, String> {
     use tauri::Manager;
+    // PRIV-1: a CLOUD-bound bridge (a consulted advisor or an external CLI
+    // agent) is part of the door — the client sends placeholders in its tool
+    // arguments (restore them so the room tools see real values) and every
+    // tool RESULT it gets back is redacted before it leaves. The LocalEngine
+    // scope is exempt: its tool results flow to the sidecar, whose own chat
+    // seam redacts them if (and only if) the chat model is non-local.
+    let cloud_policy = match scope {
+        ToolScope::CloudAdvisor { .. } | ToolScope::ExternalAgent if !privacy_bypass => {
+            commands::active_policy()
+        }
+        _ => None,
+    };
     let name = params
         .get("name")
         .and_then(|n| n.as_str())
@@ -546,6 +576,12 @@ async fn tool_call(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    // Placeholders in from the cloud client → real values for the room tools
+    // (a search for "[Person A]" must find the actual name in the DB).
+    let arguments = match &cloud_policy {
+        Some(p) => p.redactor.restore_value(&arguments),
+        None => arguments,
+    };
     let call = crate::ollama::ToolCall { name, arguments };
     let window = app
         .get_webview_window("main")
@@ -617,6 +653,15 @@ async fn tool_call(
     let (text, is_error) = match outcome {
         Ok(text) => (text, false),
         Err(msg) => (msg, true),
+    };
+    // Real values out of the room tools → placeholders for the cloud client,
+    // and no pixels at all (an image can't be redacted, so it doesn't leave).
+    let (text, images) = match &cloud_policy {
+        Some(p) => {
+            let mut report = commands::PrivacyReport::default();
+            (p.redactor.redact(&text, &mut report), Vec::new())
+        }
+        None => (text, images),
     };
     Ok(tool_result(text, is_error, images))
 }

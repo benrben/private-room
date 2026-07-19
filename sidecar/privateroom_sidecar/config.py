@@ -123,6 +123,9 @@ class RunRequest(BaseModel):
     web_enabled: bool = False
     max_rounds: int | None = None
     run_id: str = ""
+    #: PRIV-1: the room's resolved privacy policy (:func:`.privacy.policy_from_payload`
+    #: shape). Engages only when ``model`` is non-local; None/absent = door open.
+    privacy: dict[str, Any] | None = None
 
     #: How many connected (third-party) MCP tools the host routed this turn, and
     #: which cloud advisors are available. Both only feed the max_rounds choice
@@ -176,6 +179,8 @@ class EmbedRequest(BaseModel):
     texts: list[str] = Field(default_factory=list)
     base_url: str = "http://127.0.0.1:11434"
     keep_alive: str | None = None
+    #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
+    privacy: dict[str, Any] | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -192,6 +197,8 @@ class GenerateRequest(BaseModel):
     format: dict[str, Any] | None = None
     #: Base64 PNGs attached to the last user turn (vision).
     images: list[str] | None = None
+    #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
+    privacy: dict[str, Any] | None = None
 
 
 class ModelsRequest(BaseModel):
@@ -269,6 +276,8 @@ class LabelRequest(BaseModel):
     base_url: str = "http://127.0.0.1:11434"
     room_name: str = ""
     files: list[str] = Field(default_factory=list)
+    #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
+    privacy: dict[str, Any] | None = None
 
 
 class FeedbackDraftRequest(BaseModel):
@@ -282,6 +291,8 @@ class FeedbackDraftRequest(BaseModel):
     model: str
     base_url: str = "http://127.0.0.1:11434"
     text: str = ""
+    #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
+    privacy: dict[str, Any] | None = None
 
 
 class VisionLocateRequest(BaseModel):
@@ -311,6 +322,8 @@ class VisionLocateRequest(BaseModel):
     #: window (a fallback, NOT the original size).
     num_ctx: int | None = None
     keep_alive: str | None = None
+    #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
+    privacy: dict[str, Any] | None = None
 
 
 class KnowledgeExtractRequest(BaseModel):
@@ -344,6 +357,8 @@ class KnowledgeExtractRequest(BaseModel):
     conversation: str = ""
     temperature: float = 0.0
     keep_alive: str = KEEP_ALIVE_WARM
+    #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
+    privacy: dict[str, Any] | None = None
 
 
 class GenerateDocRequest(BaseModel):
@@ -371,6 +386,26 @@ class GenerateDocRequest(BaseModel):
     history: str = ""
     temperature: float = 0.4
     keep_alive: str = KEEP_ALIVE_WARM
+    #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
+    privacy: dict[str, Any] | None = None
+
+
+class PrivacyScanRequest(BaseModel):
+    """Body of ``POST /privacy_scan`` (PRIV-2 — the import-time scanner and the
+    chat live guard). ``model`` MUST be local — the route rejects a non-local
+    model rather than scan private text through the very door being guarded.
+
+    ``known`` carries the reals already in the room's entity map so the reply
+    holds only NEW findings; ``concepts`` are the user's own topic rules.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    model: str
+    base_url: str = "http://127.0.0.1:11434"
+    text: str = ""
+    concepts: list[str] = Field(default_factory=list)
+    known: list[str] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):
@@ -407,4 +442,5 @@ __all__ = [
     "VisionLocateRequest",
     "KnowledgeExtractRequest",
     "GenerateDocRequest",
+    "PrivacyScanRequest",
 ]

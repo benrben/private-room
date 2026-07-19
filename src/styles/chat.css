@@ -291,3 +291,41 @@
   padding: 4px 8px;
   width: 160px;
 }
+
+/* ---------- PRIV-1: privacy receipt + valve + OFF banner ---------- */
+.privacy-off-banner {
+  border-color: var(--red);
+  color: var(--red);
+}
+.privacy-receipt {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 2px 4px 6px;
+  font-size: 12px;
+}
+.privacy-receipt-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 99px;
+  border: 1px solid var(--green);
+  color: var(--green);
+}
+.privacy-receipt-chip.bypassed {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+.privacy-valve {
+  font-size: 12px;
+}
+.privacy-valve-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--amber);
+  font-size: 12px;
+}
+button.subtle.danger { color: var(--red); }

@@ -54,6 +54,7 @@ export function makeChatActions(
       begin: () => {
         s.askIdRef.current = askId;
         s.setAsking(true);
+        s.setAskPrivacy(null);
         s.setStreamText("");
         s.setSteps([]);
         s.setLane("");
@@ -155,10 +156,29 @@ export function makeChatActions(
     });
   }
 
-  async function askOnce(q: string, attachmentIds: string[]) {
+  async function askOnce(q: string, attachmentIds: string[], privacyBypass?: boolean) {
     const chatId = s.activeChatId;
     if (!chatId) return;
-    await runTurn((askId) => api.ask(chatId, q, attachmentIds, askId));
+    await runTurn((askId) => api.ask(chatId, q, attachmentIds, askId, privacyBypass));
+  }
+
+  /** PRIV-1 — the "this once" valve: re-ask the last question with the privacy
+   * door open for one turn. Only ever called from the confirmed chat control
+   * (which is agent-blocked); the confirm text says exactly what will leave. */
+  async function askAgainWithRealDetails() {
+    if (s.asking) return;
+    const lastUser = [...s.messages].reverse().find((m) => m.role === "user");
+    if (!lastUser) return;
+    const optimistic: Message = {
+      id: `pending-${Date.now()}`,
+      role: "user",
+      content: lastUser.content,
+      sources: [],
+      createdAt: "",
+      effects: null,
+    };
+    s.setMessages((m) => [...m, optimistic]);
+    await askOnce(lastUser.content, [], true);
   }
 
   /** `text` overrides the composer draft (hands-free dictation sends the
@@ -503,7 +523,7 @@ export function makeChatActions(
   }
 
   return {
-    newChat, removeChat, runTurn, askOnce, send, autocompleteItems,
+    newChat, removeChat, runTurn, askOnce, askAgainWithRealDetails, send, autocompleteItems,
     refreshAutocomplete, insertComposerToken, acceptAutocomplete,
     onComposerKeyDown, stopAsk, handleLock, regenerate, copyMessage,
     copyAllText, openSource, startRename, commitRename, onComposerPaste,

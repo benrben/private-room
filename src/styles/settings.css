@@ -481,3 +481,109 @@
   justify-content: flex-end;
   gap: 8px;
 }
+
+/* ---------- PRIV-1: Cloud privacy section ---------- */
+.cpv-off-warning {
+  margin: 6px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--red);
+  border-radius: var(--radius, 8px);
+  color: var(--red);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.cpv-add-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 6px 0 8px;
+}
+.cpv-add-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: 13px;
+}
+.cpv-cat {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 7px 8px;
+  font-size: 12.5px;
+}
+.cpv-list {
+  list-style: none;
+  margin: 4px 0 10px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.cpv-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12.5px;
+  background: var(--panel);
+}
+.cpv-real {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40%;
+}
+.cpv-arrow { color: var(--faint); }
+.cpv-placeholder {
+  font-family: var(--mono, ui-monospace, monospace);
+  color: var(--muted);
+}
+.cpv-source {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 99px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.cpv-source.user { color: var(--green); border-color: var(--green); }
+.cpv-remove {
+  background: none;
+  border: none;
+  color: var(--faint);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+}
+.cpv-remove:hover { color: var(--red); }
+.cpv-concepts {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+.cpv-scan-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 8px;
+}
+.cpv-inline-hint { margin: 0; }
+.cpv-honesty { margin-top: 10px; opacity: 0.85; }

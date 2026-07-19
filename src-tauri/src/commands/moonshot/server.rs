@@ -153,7 +153,7 @@ pub async fn set_room_server(
         db::set_setting(&room.conn, "room_server_scope", if want_full { "full" } else { "files" })?;
         let opts = if want_full {
             let (port, token) = leash_identity(&room.conn)?;
-            crate::room_mcp::StartOpts { port: Some(port), token: Some(token) }
+            crate::room_mcp::StartOpts { port: Some(port), token: Some(token), ..Default::default() }
         } else {
             // Files tier keeps the fresh-token / ephemeral-port behavior.
             crate::room_mcp::StartOpts::default()
@@ -219,7 +219,7 @@ pub async fn regenerate_leash_token(
         let (port, token) = leash_identity(&room.conn)?;
         Ok((
             web_access_enabled(&room.conn),
-            crate::room_mcp::StartOpts { port: Some(port), token: Some(token) },
+            crate::room_mcp::StartOpts { port: Some(port), token: Some(token), ..Default::default() },
             room.path.clone(),
             room.name.clone(),
         ))

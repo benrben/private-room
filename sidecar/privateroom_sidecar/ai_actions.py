@@ -79,6 +79,8 @@ class AiActionRequest(BaseModel):
     #: research's follow-up question OR translate's target language (else null).
     question: str | None = None
     base_url: str = "http://127.0.0.1:11434"
+    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
+    privacy: dict[str, Any] | None = None
 
 
 class MemorySuggestionRequest(BaseModel):
@@ -94,6 +96,8 @@ class MemorySuggestionRequest(BaseModel):
     user_text: str = ""
     assistant_text: str = ""
     base_url: str = "http://127.0.0.1:11434"
+    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
+    privacy: dict[str, Any] | None = None
 
 
 class FileMetaRequest(BaseModel):
@@ -107,6 +111,8 @@ class FileMetaRequest(BaseModel):
     #: The file's extracted text (Rust pulls it; <80 chars skips the model).
     text: str = ""
     base_url: str = "http://127.0.0.1:11434"
+    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
+    privacy: dict[str, Any] | None = None
 
 # --- the 14 AI actions ------------------------------------------------------
 #
@@ -444,6 +450,7 @@ async def run_ai_action(
     base_url: str,
     instructions: str | None = None,
     question: str | None = None,
+    privacy: dict[str, Any] | None = None,
 ) -> str:
     """Run one AI action over the gathered ``text`` and return its markdown.
 
@@ -482,6 +489,7 @@ async def run_ai_action(
         num_ctx=num_ctx_chat_notools(),
         keep_alive=KEEP_ALIVE_WARM,
         format=_MARKDOWN_SCHEMA,
+        privacy=privacy,
     )
     markdown = _str_field(_load_obj(raw), "markdown")
     if not markdown:
@@ -499,6 +507,7 @@ async def run_ai_action(
             temperature=0.3,
             num_ctx=num_ctx_chat_notools(),
             keep_alive=KEEP_ALIVE_WARM,
+            privacy=privacy,
         )
         obj = _load_obj(plain)
         markdown = (
@@ -537,6 +546,7 @@ async def memory_suggestion(
     user_text: str,
     assistant_text: str,
     base_url: str,
+    privacy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Judge whether one durable fact from the exchange is worth remembering (D6).
 
@@ -565,6 +575,7 @@ async def memory_suggestion(
             num_ctx=num_ctx_chat_notools(),
             keep_alive=KEEP_ALIVE_WARM,
             format=_MEMORY_SCHEMA,
+            privacy=privacy,
         )
     except llm.LlmError:
         # Model down: not worth (Rust unwrap_or_default -> empty raw -> false).
@@ -600,6 +611,7 @@ async def suggest_file_meta(
     current_name: str,
     text: str,
     base_url: str,
+    privacy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Propose a title, one folder, and up to five tags for a file (D7).
 
@@ -633,6 +645,7 @@ async def suggest_file_meta(
             num_ctx=num_ctx_chat_notools(),
             keep_alive=KEEP_ALIVE_WARM,
             format=_FILE_META_SCHEMA,
+            privacy=privacy,
         )
     except llm.LlmError:
         return echo()

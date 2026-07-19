@@ -85,6 +85,28 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- PRIV-1: the room's protected-entity map — one row per real string that must
+-- never reach a non-local model. `placeholder` is stable for the room's life so
+-- cloud conversations stay coherent across turns ("[Person A]" is always the
+-- same person) and answers can be re-personalized locally. `source` is 'user'
+-- (the block list — iron-clad, added by hand) or 'scan' (found by the local
+-- import-time scanner — reviewable in the reader's blackout view).
+CREATE TABLE IF NOT EXISTS privacy_entities (
+  id TEXT PRIMARY KEY,
+  real_text TEXT NOT NULL UNIQUE,
+  placeholder TEXT NOT NULL UNIQUE,
+  category TEXT NOT NULL DEFAULT 'concept',
+  source TEXT NOT NULL DEFAULT 'scan',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+-- PRIV-2: per-file scan bookkeeping — which text + which rules the last scan
+-- reflects, so imports/rule-edits re-scan only what actually changed.
+CREATE TABLE IF NOT EXISTS privacy_scans (
+  file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  text_sha256 TEXT NOT NULL,
+  rules_sha256 TEXT NOT NULL,
+  scanned_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
 -- ADD-2: previous bytes of a file, captured before each overwrite so any
 -- change can be undone. Dropped automatically when the file is deleted.
 CREATE TABLE IF NOT EXISTS file_versions (
@@ -611,6 +633,26 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
     }
+
+    // PRIV-1/PRIV-2: the privacy gatekeeper's entity map + scan bookkeeping.
+    // Guarded CREATEs like every table above — old rooms gain them on open.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS privacy_entities (
+           id TEXT PRIMARY KEY,
+           real_text TEXT NOT NULL UNIQUE,
+           placeholder TEXT NOT NULL UNIQUE,
+           category TEXT NOT NULL DEFAULT 'concept',
+           source TEXT NOT NULL DEFAULT 'scan',
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );
+         CREATE TABLE IF NOT EXISTS privacy_scans (
+           file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+           text_sha256 TEXT NOT NULL,
+           rules_sha256 TEXT NOT NULL,
+           scanned_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );",
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

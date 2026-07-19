@@ -323,7 +323,9 @@ def patch_model(monkeypatch: pytest.MonkeyPatch):
     """Swap the real Ollama-backed client for a scripted fake in the routes."""
 
     def install(fake: FakeModelClient) -> None:
-        monkeypatch.setattr(summarize, "OllamaModelClient", lambda base_url: fake)
+        monkeypatch.setattr(
+            summarize, "OllamaModelClient", lambda base_url, privacy=None: fake
+        )
 
     return install
 

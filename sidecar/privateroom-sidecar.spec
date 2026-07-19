@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import copy_metadata
 datas = []
 binaries = []
 hiddenimports = []
+datas += copy_metadata('edge-tts')
 datas += copy_metadata('langgraph')
 datas += copy_metadata('langchain-core')
 datas += copy_metadata('langchain-ollama')
@@ -32,6 +33,10 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('pydantic')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('pydantic_core')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('edge_tts')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('aiohttp')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

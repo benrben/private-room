@@ -175,6 +175,9 @@ pub async fn ask(
     chat_id: String,
     question: String,
     attachments: Vec<String>,
+    // PRIV-1: "send real details this once" — set only by the chat valve's
+    // confirmed re-ask; absent for every ordinary turn.
+    privacy_bypass: Option<bool>,
 ) -> Result<Message, String> {
     use tauri::Emitter;
 
@@ -264,6 +267,7 @@ pub async fn ask(
         advisor_tools_on,
         cancel.clone(),
         &injected_rowids,
+        privacy_bypass.unwrap_or(false),
     )
     .await?;
     let stopped = cancel.load(Ordering::SeqCst);
@@ -782,11 +786,43 @@ pub(crate) async fn stream_answer(
     advisor_tools_on: bool,
     cancel: Arc<AtomicBool>,
     _injected_rowids: &HashSet<i64>,
+    // PRIV-1: "send real details this once" — the user confirmed sharing real
+    // values for THIS turn only.
+    privacy_bypass: bool,
 ) -> Result<String, String> {
     use tauri::Emitter;
+    // PRIV-1: an explicit bypass is loud — the transcript records that real
+    // details were shared this once (both engine branches).
+    if privacy_bypass && crate::commands::active_policy().is_some() {
+        let _ = window.emit("ask-privacy", serde_json::json!({ "bypassed": true }));
+    }
     let run = if is_external_engine(model) {
         // CHG-5: a step chip, not fake live text (nothing streams for cloud).
         let _ = window.emit("ask-step", "Asking your cloud AI (content leaves this Mac)");
+        // PRIV-1: redact HERE (counted, for the indicator) and hand the CLI the
+        // guarded copy. `run_external`'s own internal guard then finds nothing
+        // left to hide — it exists for the callers that don't count.
+        let policy = if privacy_bypass {
+            None
+        } else {
+            crate::commands::active_policy()
+        };
+        let mut privacy_report = crate::commands::PrivacyReport::default();
+        let guarded: Vec<ollama::ChatMessage> = match &policy {
+            Some(p) => chat_messages
+                .iter()
+                .map(|m| {
+                    let mut mm = m.clone();
+                    mm.content = p.redactor.redact(&m.content, &mut privacy_report);
+                    if let Some(images) = &mm.images {
+                        privacy_report.images_blocked += images.len();
+                        mm.images = None;
+                    }
+                    mm
+                })
+                .collect(),
+            None => chat_messages.clone(),
+        };
         // ADD-20 / engine parity: BOTH cloud CLIs (Claude Code and Codex) get
         // the room's tools over a per-ask localhost MCP bridge — the same
         // exec_tool dispatch as the local agent, decryption stays in-process,
@@ -799,15 +835,32 @@ pub(crate) async fn stream_answer(
                 web_enabled,
                 crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: advisor_tools_on },
                 None,
-                crate::room_mcp::StartOpts::default(),
+                crate::room_mcp::StartOpts { privacy_bypass, ..Default::default() },
             )
             .await
             .ok()
         };
         let res =
-            run_external(model, &chat_messages, Some(cancel.clone()), bridge.as_ref()).await;
+            run_external(model, &guarded, Some(cancel.clone()), bridge.as_ref(), privacy_bypass)
+                .await;
         if let Some(b) = &bridge {
             b.stop();
+        }
+        // Restore is idempotent: run_external already put real values back for
+        // its own guard's rules; this covers the pre-redacted copy's rules.
+        let res = match &policy {
+            Some(p) => res.map(|t| p.redactor.restore(&t)),
+            None => res,
+        };
+        if policy.is_some() {
+            let _ = window.emit(
+                "ask-privacy",
+                serde_json::json!({
+                    "entities_hidden": privacy_report.entities_hidden,
+                    "replacements": privacy_report.replacements,
+                    "images_blocked": privacy_report.images_blocked,
+                }),
+            );
         }
         res
     } else {
@@ -831,6 +884,7 @@ pub(crate) async fn stream_answer(
             web_enabled,
             cancel.clone(),
             false, // visible chat turn — emit the ask-* stream events
+            privacy_bypass,
         )
         .await
         {
@@ -2261,7 +2315,7 @@ pub(crate) async fn exec_tool(
             // exec_tool → start → bridge → exec_tool, so it is passed in.
             let bridge = if engine == "claude-cli" { advisor_bridge } else { None };
             let msgs = vec![ollama::ChatMessage::new("user", question)];
-            let res = run_external(engine, &msgs, cancel.clone(), bridge).await;
+            let res = run_external(engine, &msgs, cancel.clone(), bridge, false).await;
             match res {
                 Ok(answer) => Ok(format!(
                     "Advisor ({want}) replied:\n\n{}",
