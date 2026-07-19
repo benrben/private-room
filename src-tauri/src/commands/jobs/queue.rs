@@ -151,6 +151,7 @@ async fn start_job_from_row(
             .await
             .map(|_| true),
         "workflow" => start_workflow_row(window, &state, &job, &room_path, cancel).map(|_| true),
+        "studio" => start_studio_row(window, &state, &job, &room_path, cancel).map(|_| true),
         _ => Err("This job kind can't be started.".into()),
     };
     match started {
@@ -276,6 +277,39 @@ async fn start_file_pass_row(
         cursor,
         cancel,
         Arc::new(filtered),
+    );
+    Ok(())
+}
+
+/// Rebuild + spawn a studio job from its plan. A studio run is a SINGLE atomic
+/// unit — no immutable-input verification, no cursor — so this just reads the
+/// plan's `kind` + inputs and re-spawns (a fresh generation each time).
+fn start_studio_row(
+    window: &tauri::Window,
+    _state: &AppState,
+    job: &db::Job,
+    room_path: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let kind = job
+        .plan
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or("This job's plan is unreadable.")?;
+    let scope = job.plan.get("scope").and_then(|v| v.as_str()).map(String::from);
+    let instructions = job.plan.get("instructions").and_then(|v| v.as_str()).map(String::from);
+    let refs = job.plan.get("refs").and_then(|v| v.as_array()).map(|a| {
+        a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<String>>()
+    });
+    spawn_studio(
+        window.clone(),
+        job.id.clone(),
+        room_path.to_string(),
+        kind.to_string(),
+        scope,
+        instructions,
+        refs,
+        cancel,
     );
     Ok(())
 }

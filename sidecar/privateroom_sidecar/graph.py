@@ -404,6 +404,17 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     write, ui, jobs = req.resolved_routing()
     max_rounds = req.resolved_max_rounds(ui, jobs)
 
+    # The ask lives in `question` (a REQUIRED field); `messages` is optional
+    # history. Chat callers ALSO append the ask as the final user turn, but
+    # headless callers (workflow agent_run) send only `question` with an empty
+    # history. If no user turn is present, seed one from `question` — otherwise
+    # the model is called with zero messages, and Ollama answers an empty
+    # conversation with just a done_reason='load' response, which langchain_ollama
+    # skips, leaving zero generation chunks → "No generation chunks were returned".
+    messages: list[Message] = [dict(m) for m in req.messages]  # type: ignore[misc]
+    if req.question.strip() and not any(m.get("role") == "user" for m in messages):
+        messages.append(user_message(req.question))
+
     initial: AgentState = {
         "question": req.question,
         "web_enabled": req.web_enabled,
@@ -411,7 +422,7 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
         "ui": ui,
         "jobs": jobs,
         "max_rounds": max_rounds,
-        "messages": [dict(m) for m in req.messages],  # type: ignore[misc]
+        "messages": messages,
         "seen": set(),
         "force_synthesis": False,
         "round": 0,

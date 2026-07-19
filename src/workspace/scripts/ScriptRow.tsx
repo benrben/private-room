@@ -123,8 +123,17 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
             )}
           </span>
         ) : (
-          <span className="caption script-sched-hint" title="Run it once and choose “Always allow” to enable scheduling.">
-            Approve to schedule
+          // Scheduling is locked until the script is approved. Render a clearly
+          // DISABLED Schedule button — not tappable text that reads like an
+          // action — so a click can't feel like a silent no-op. The wrapping
+          // span carries the tooltip, since a disabled button swallows hover.
+          <span
+            className="script-sched-wrap"
+            title="Run this script once and choose “Always allow” — then you can schedule it."
+          >
+            <button className="subtle btn-ic" disabled aria-disabled="true">
+              <ClockIcon size={13} /> Schedule
+            </button>
           </span>
         )}
         {sc.workflowId && (

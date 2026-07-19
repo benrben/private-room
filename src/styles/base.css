@@ -8,6 +8,12 @@
   /* Legacy aliases kept so existing rules keep working. */
   --panel: #161a22;
   --panel-2: #1c212c;
+  /* Component surfaces referenced by workflows.css. These were UNDEFINED, so
+     every `var(--card-bg, #fff)` etc. fell back to white in the dark UI (node
+     boxes, chips, inputs). Define them on the dark ramp. */
+  --card-bg: #161a22;
+  --chip-bg: #1c212c;
+  --input-bg: #1c212c;
   /* Borders are now the exception — softened, plus a barely-there hairline. */
   --border: #232a37;
   --border-subtle: #1a1f28;

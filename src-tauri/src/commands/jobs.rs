@@ -649,6 +649,146 @@ pub async fn start_deep_summary(
     start_deep_summary_inner(window, state.inner(), false).await
 }
 
+// ------------------------------------------------------------ studio (background)
+
+/// Run one Studio artifact (flashcards / mind map / podcast script) as a durable
+/// background job — a SINGLE atomic unit (`total = 1`), unlike deep_summary's
+/// per-file checkpointed steps. There is no mid-work checkpoint, so a Stop or
+/// crash parks the job and resuming re-runs it from scratch (a fresh file).
+/// Reports via the terminal `job-progress` event carrying the generated file's
+/// id (the frontend auto-opens it), then frees the queue slot.
+#[allow(clippy::too_many_arguments)]
+fn spawn_studio(
+    window: tauri::Window,
+    job_id: String,
+    room_path: String,
+    kind: String,
+    scope: Option<String>,
+    instructions: Option<String>,
+    refs: Option<Vec<String>>,
+    cancel: Arc<AtomicBool>,
+) {
+    use tauri::Manager;
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        // Status → running, room-pinned so a swapped room can't be mislabeled.
+        {
+            let guard = state.room.lock().unwrap();
+            if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+                let _ = db::set_job_status(&r.conn, &job_id, "running", None);
+            }
+        }
+        emit_progress(&window, &job_id, "Starting…", 0, 1);
+
+        // Ok(meta) = done; Err(None) = paused (Stop); Err(Some(e)) = error.
+        let outcome: Result<FileMeta, Option<String>> = match studio_spec_for(&kind) {
+            Some(spec) => match run_studio_core(
+                &window,
+                &state,
+                spec,
+                scope,
+                instructions,
+                refs,
+                cancel.clone(),
+                Some(&room_path),
+            )
+            .await
+            {
+                Ok(meta) => Ok(meta),
+                // A Stop surfaces as Err("Stopped."); treat any error while the
+                // cancel flag is set as a clean Paused, like the file-pass runner.
+                Err(_) if cancel.load(Ordering::SeqCst) => Err(None),
+                Err(e) => Err(Some(e)),
+            },
+            None => Err(Some(format!("Unknown studio kind '{kind}'."))),
+        };
+
+        // Terminal status write (room-pinned).
+        {
+            let guard = state.room.lock().unwrap();
+            if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+                let (status, err) = match &outcome {
+                    Ok(_) => ("done", None),
+                    Err(None) => ("paused", None),
+                    Err(Some(e)) => ("error", Some(e.as_str())),
+                };
+                let _ = db::set_job_status(&r.conn, &job_id, status, err);
+            }
+        }
+        state.job_cancels.lock().unwrap().remove(&job_id);
+
+        use tauri::Emitter;
+        let payload = match outcome {
+            Ok(meta) => serde_json::json!({
+                "jobId": job_id,
+                "label": format!("{} ready", studio_title(&kind)),
+                "done": 1, "total": 1, "finished": true,
+                "fileId": meta.id,
+            }),
+            Err(None) => serde_json::json!({
+                "jobId": job_id, "label": "Paused", "done": 0, "total": 1, "paused": true,
+            }),
+            Err(Some(e)) => serde_json::json!({
+                "jobId": job_id, "label": format!("Stopped — {e}"), "done": 0, "total": 1,
+                "failed": true,
+            }),
+        };
+        let _ = window.emit("job-progress", payload);
+        queue::finish_and_pump(&app, &window, &job_id).await;
+    });
+}
+
+/// Enqueue a Studio generation as a background job and return its id immediately.
+/// The result arrives via `room-files-changed` + the terminal `job-progress`
+/// (which auto-opens the generated HTML). If the single job slot is busy the job
+/// waits in the queue and the running job's epilogue pumps it.
+pub(crate) async fn start_studio_job_inner(
+    window: tauri::Window,
+    state: &AppState,
+    kind: String,
+    scope: Option<String>,
+    instructions: Option<String>,
+    refs: Option<Vec<String>>,
+) -> Result<String, String> {
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+    if studio_spec_for(&kind).is_none() {
+        return Err("Unknown studio kind.".into());
+    }
+    let title = studio_title(&kind);
+    // Borrow into the plan so the values stay owned for spawn_studio below.
+    let plan = serde_json::json!({
+        "kind": &kind, "scope": &scope, "instructions": &instructions, "refs": &refs,
+    });
+    let (job_id, room_path) = state.with_room(|room| {
+        if queue::at_capacity(&room.conn) {
+            return Err("Too many background jobs are already waiting — let one finish first.".into());
+        }
+        let id = db::create_job(&room.conn, "studio", title, &plan, 1)?;
+        Ok((id, room.path.clone()))
+    })?;
+    if queue::try_reserve(state, &job_id) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.job_cancels.lock().unwrap().insert(job_id.clone(), cancel.clone());
+        spawn_studio(window, job_id.clone(), room_path, kind, scope, instructions, refs, cancel);
+    }
+    Ok(job_id)
+}
+
+#[tauri::command]
+pub async fn start_studio_job(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    kind: String,
+    scope: Option<String>,
+    instructions: Option<String>,
+    refs: Option<Vec<String>>,
+) -> Result<String, String> {
+    start_studio_job_inner(window, state.inner(), kind, scope, instructions, refs).await
+}
+
 /// Resume a paused (or errored) job from its checkpoint. For a deep summary
 /// the plan is rebuilt from the room's CURRENT files and the resume point is
 /// re-derived from the one-liner cache — the stored cursor is positional and
@@ -671,7 +811,7 @@ pub async fn resume_job(
     if job.parent_job_id.is_some() {
         return Err("This job runs as part of a workflow — resume the workflow instead.".into());
     }
-    if !matches!(job.kind.as_str(), "deep_summary" | "file_pass" | "workflow") {
+    if !matches!(job.kind.as_str(), "deep_summary" | "file_pass" | "workflow" | "studio") {
         return Err("This job can't be resumed.".into());
     }
     // Wave 4a: resume through the QUEUE — set the row back to 'queued' and submit.
@@ -692,9 +832,14 @@ async fn resolve_pass_engine(state: &AppState) -> (String, Lane) {
         guard.as_ref().and_then(|r| model_setting(&r.conn))
     };
     let models = ollama::list_models().await.unwrap_or_default();
-    let mut chat_model = explicit.unwrap_or_else(|| best_default(&models));
-    if is_external_engine(&chat_model) {
-        chat_model = best_default(&models);
+    // Pipelines run ON-DEVICE (privacy + reliability): a `:cloud` model would
+    // ship file content off-Mac AND fails outright once the cloud quota is
+    // exhausted — its stream returns nothing, surfacing as LangChain's
+    // "No generation chunks were returned". Exclude cloud + external, exactly
+    // like the agent loop and #-commands do.
+    let mut chat_model = explicit.unwrap_or_else(|| best_local_default(&models));
+    if is_external_engine(&chat_model) || is_cloud_model(&chat_model) {
+        chat_model = best_local_default(&models);
     }
     let lane = if is_cloud_model(&chat_model) {
         Lane::Cloud

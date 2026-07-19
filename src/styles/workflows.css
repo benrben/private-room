@@ -256,6 +256,7 @@
   border: 1.5px solid var(--border, #d5d5de);
   border-radius: 10px;
   background: var(--card-bg, #fff);
+  color: var(--text, #e8eaf0);
   padding: 0.5rem 0.6rem;
   cursor: pointer;
   box-sizing: border-box;
@@ -354,7 +355,13 @@
   padding: 0.4rem 0.5rem;
   border: 1px solid var(--border, #d5d5de);
   border-radius: 8px;
-  background: var(--input-bg, #fff);
+  /* Was `var(--input-bg, #fff)` — a var defined NOWHERE, so these inputs fell
+     back to white in the dark UI. Use the real dark input surface + text color
+     like every other themed field; `color-scheme` darkens the native select
+     popup and caret. */
+  background: var(--surface-3, #1c212c);
+  color: var(--text, #e8eaf0);
+  color-scheme: dark;
 }
 .node-param-sheet textarea {
   min-height: 84px;
@@ -460,6 +467,25 @@
   border-radius: 6px;
   padding: 0.4rem;
   font-size: 0.72rem;
+}
+
+/* A script node's step result, rendered as exit code + stdout/stderr instead
+   of the raw ScriptRunReport JSON. */
+.script-report {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-top: 0.25rem;
+}
+.script-stream > strong {
+  display: block;
+  opacity: 0.6;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.script-stream.err > strong {
+  color: #b33;
 }
 
 /* ---------------- schedule popover ---------------- */

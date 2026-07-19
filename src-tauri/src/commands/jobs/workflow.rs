@@ -960,6 +960,10 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
             Ok(())
         }
         Err(e) => {
+            // Single funnel for EVERY node kind — clean an empty-generation /
+            // cloud-quota failure into one actionable line here, so agent_run
+            // (which passes its error through raw) reads the same as generate.
+            let e = crate::sidecar::humanize_empty_generation(&e).unwrap_or(e);
             emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "error", Some(&e));
             Err(e)
         }

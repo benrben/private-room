@@ -348,7 +348,6 @@ pub(crate) async fn run_studio(
     refs: Option<Vec<String>>,
     op_id: Option<String>,
 ) -> Result<FileMeta, String> {
-    use tauri::Emitter;
     // Wave 3 (Idea 9): a Studio run writes a file at the end — don't start one
     // while a rollback is swapping the DB.
     if state.rolling_back() {
@@ -356,15 +355,59 @@ pub(crate) async fn run_studio(
     }
     // ADD-31: a cancellable operation with visible stages. The flag is
     // registered under the caller's op id (same registry the chat Stop uses),
-    // so the modal's Stop button works mid-generation.
+    // so a foreground Stop button works mid-generation.
     let cancel = register_studio_cancel(state, &op_id);
     let _cancel_guard = op_id.as_ref().map(|id| CancelGuard {
         state: state.inner(),
         ask_id: id.clone(),
     });
+    run_studio_core(window, state, spec, scope, instructions, refs, cancel, None).await
+}
+
+/// Reconstruct a studio's `StudioSpec` from the durable job plan's `kind` string
+/// (the spec holds fn pointers + `&'static str`, so it can't be serialized into
+/// the plan). Returns None for an unknown kind.
+pub(crate) fn studio_spec_for(kind: &str) -> Option<StudioSpec> {
+    match kind {
+        "flashcards" => Some(flashcards_spec()),
+        "mindmap" => Some(mindmap_spec()),
+        "podcast" => Some(podcast_spec()),
+        _ => None,
+    }
+}
+
+/// Human title for a studio job card (e.g. its background-job label).
+pub(crate) fn studio_title(kind: &str) -> &'static str {
+    match kind {
+        "flashcards" => "Flashcards",
+        "mindmap" => "Mind map",
+        "podcast" => "Podcast script",
+        _ => "Studio",
+    }
+}
+
+/// The shared Studio pipeline, driven by an explicit `cancel` flag so a
+/// background job's own `job_cancels` flag can Stop it (the foreground path
+/// passes its chat-registry flag instead). `room_path`, when set, pins every
+/// room access: a job that runs for minutes must not gather from — or write its
+/// result into — a room the user swapped away from mid-run.
+pub(crate) async fn run_studio_core(
+    window: &tauri::Window,
+    state: &State<'_, AppState>,
+    spec: StudioSpec,
+    scope: Option<String>,
+    instructions: Option<String>,
+    refs: Option<Vec<String>>,
+    cancel: Arc<AtomicBool>,
+    room_path: Option<&str>,
+) -> Result<FileMeta, String> {
+    use tauri::Emitter;
     let instr = studio_instruction(instructions, spec.default_prompt);
     let _ = window.emit("studio-step", "Reading the material…");
     let (label, text) = state.with_room(|room| {
+        if room_path.is_some_and(|rp| room.path != rp) {
+            return Err("the room this job belongs to was closed".to_string());
+        }
         match refs.as_ref().filter(|r| !r.is_empty()) {
             Some(ids) => gather_files_text(&room.conn, ids),
             None => gather_scope_text(&room.conn, scope.as_deref(), &room.name),
@@ -414,6 +457,17 @@ pub(crate) async fn run_studio(
             (spec.render)(&raw, &label)?
         }
     };
+    // Pin the write too: bail if the room was swapped between gather and save,
+    // so the generated file can never land in the wrong room.
+    if let Some(rp) = room_path {
+        let ok = {
+            let guard = state.room.lock().unwrap();
+            guard.as_ref().is_some_and(|r| r.path == rp)
+        };
+        if !ok {
+            return Err("the room this job belongs to was closed".into());
+        }
+    }
     let name = format!("{} - {}.html", spec.filename_prefix, safe_scope_name(&label));
     save_and_open(window, state, &name, "text/html", &content, "generated")
 }

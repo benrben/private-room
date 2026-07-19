@@ -347,6 +347,12 @@
 }
 
 /* password strength meter (create form only) */
+/* Always laid out so the confirm field below it never jumps when the meter
+   appears; `.reserved` (no password yet) hides it while keeping its space. */
+.pw-feedback.reserved {
+  visibility: hidden;
+}
+
 .pw-meter {
   display: flex;
   align-items: center;

@@ -69,8 +69,33 @@ impl SidecarError {
                 Some(m) => format!("MODEL_MISSING:{m}"),
                 None => "MODEL_MISSING".to_string(),
             },
-            _ => format!("Local AI error ({}): {}", self.status, self.error),
+            _ => humanize_empty_generation(&self.error)
+                .unwrap_or_else(|| format!("Local AI error ({}): {}", self.status, self.error)),
         }
+    }
+}
+
+/// When an engine error means "the model gave us nothing usable" — a cloud model
+/// out of quota (the provider's "usage limit" text), or an empty generation the
+/// non-streamed langchain path masks as "No generation chunks were returned" —
+/// return one actionable line; otherwise None. Shared by `SidecarError::sentinel`
+/// AND the workflow node-error funnel, so an `agent_run`/`generate` failure reads
+/// the same clear message no matter which path surfaced it.
+pub(crate) fn humanize_empty_generation(msg: &str) -> Option<String> {
+    let e = msg.to_lowercase();
+    if e.contains("usage limit")
+        || e.contains("reached your")
+        || e.contains("no generation chunks")
+        || e.contains("quota")
+    {
+        Some(
+            "The AI model returned nothing. If this room uses a cloud model, it may \
+             have hit its usage limit — switch to an on-device model in Settings → \
+             Model, or try again later."
+                .to_string(),
+        )
+    } else {
+        None
     }
 }
 

@@ -12,6 +12,82 @@ function fmt(ts: string | null): string {
   return Number.isNaN(d.getTime()) ? ts : d.toLocaleString();
 }
 
+type ScriptReport = {
+  exitCode: number;
+  imported?: { name?: string }[];
+  skipped?: string[];
+  stdoutTail?: string;
+  stderrTail?: string;
+};
+
+/** A script node's step result is a ScriptRunReport JSON. Recognize it so we can
+ * render stdout/stderr instead of dumping the raw internal object. */
+function asScriptReport(result: string): ScriptReport | null {
+  try {
+    const r = JSON.parse(result);
+    if (
+      r &&
+      typeof r === "object" &&
+      typeof r.exitCode === "number" &&
+      ("stdoutTail" in r || "stderrTail" in r)
+    ) {
+      return r as ScriptReport;
+    }
+  } catch {
+    /* not JSON — a plain-text artifact */
+  }
+  return null;
+}
+
+/** One step's stored artifact. Artifacts are a WfArtifact JSON
+ * ({ result, skipped, ... }); unwrap to the human-facing `result`, and for a
+ * script node — whose result is itself a ScriptRunReport JSON — show a clean
+ * stdout / stderr / exit-code view instead of the raw internal JSON. */
+function StepArtifact({ raw }: { raw: string }) {
+  let result = raw;
+  let skipped = false;
+  try {
+    const wf = JSON.parse(raw);
+    if (wf && typeof wf === "object") {
+      if (typeof wf.result === "string") result = wf.result;
+      skipped = wf.skipped === true;
+    }
+  } catch {
+    /* not a WfArtifact wrapper — show the raw string as-is */
+  }
+
+  const report = asScriptReport(result);
+  if (report) {
+    const imported = (report.imported ?? []).map((f) => f.name).filter(Boolean);
+    return (
+      <div className="script-report">
+        <span className={`wf-badge ${report.exitCode === 0 ? "dot-ok" : "dot-err"}`}>
+          exit {report.exitCode}
+        </span>
+        {report.stdoutTail?.trim() ? (
+          <div className="script-stream">
+            <strong>stdout</strong>
+            <pre>{report.stdoutTail}</pre>
+          </div>
+        ) : null}
+        {report.stderrTail?.trim() ? (
+          <div className="script-stream err">
+            <strong>stderr</strong>
+            <pre>{report.stderrTail}</pre>
+          </div>
+        ) : null}
+        {imported.length > 0 && (
+          <div className="caption">Imported {imported.length} file(s): {imported.join(", ")}</div>
+        )}
+      </div>
+    );
+  }
+  if (skipped && !result.trim()) {
+    return <div className="caption">Step skipped.</div>;
+  }
+  return <pre>{result}</pre>;
+}
+
 export function RunHistory({ runs, nodeCount }: Props) {
   const [openRun, setOpenRun] = useState<string | null>(null);
   const [artifacts, setArtifacts] = useState<Record<string, (string | null)[]>>({});
@@ -56,7 +132,7 @@ export function RunHistory({ runs, nodeCount }: Props) {
                 a == null ? null : (
                   <div key={i} className="run-step">
                     <strong>Step {i + 1}</strong>
-                    <pre>{a}</pre>
+                    <StepArtifact raw={a} />
                   </div>
                 ),
               )}

@@ -233,6 +233,38 @@ pub(crate) async fn cmd_highlight(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
     })
 }
 
+/// Deterministic column extraction for a CSV/TSV file: if EVERY requested field
+/// names a column header (case-insensitively), return one output row per data
+/// row holding just those columns — no model call at all. A small local model
+/// can't reliably pull columns from a table via the per-field string schema (it
+/// hands back `(not found)` for every field), whereas a direct column read is
+/// exact, instant, and gives the user the per-row sheet they expect. Returns
+/// `None` for a non-tabular file, or when any requested field doesn't match a
+/// header, so the caller falls back to the model-based scalar path.
+fn tabular_field_rows(name: &str, text: &str, fields: &[String]) -> Option<Vec<Vec<String>>> {
+    let delim = match extraction::extension_of(name).as_str() {
+        "csv" => ',',
+        "tsv" => '\t',
+        _ => return None,
+    };
+    let table = parse_delim(text, delim);
+    let header = table.first()?;
+    let norm = |s: &str| s.trim().to_lowercase();
+    // Resolve each requested field to a header column; bail to the model path if
+    // any is absent (the fields may be computed values, not column names).
+    let cols: Vec<usize> = fields
+        .iter()
+        .map(|f| header.iter().position(|h| norm(h) == norm(f)))
+        .collect::<Option<Vec<usize>>>()?;
+    let rows = table
+        .iter()
+        .skip(1)
+        .filter(|r| r.iter().any(|c| !c.trim().is_empty()))
+        .map(|r| cols.iter().map(|&c| r.get(c).cloned().unwrap_or_default()).collect())
+        .collect();
+    Some(rows)
+}
+
 pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     use tauri::Emitter;
     if ctx.refs.is_empty() {
@@ -273,6 +305,17 @@ pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
         let _ = ctx
             .window
             .emit("ask-step", format!("Reading {name} ({}/{})", i + 1, files.len()));
+        // A CSV/TSV whose columns match the requested fields is read directly —
+        // exact, instant, per-row, and model-free (a local model can't pull
+        // table columns via the field schema; see tabular_field_rows).
+        if let Some(data_rows) = tabular_field_rows(name, text, &fields) {
+            for data_row in data_rows {
+                let mut row = vec![name.clone()];
+                row.extend(data_row);
+                rows.push(row);
+            }
+            continue;
+        }
         let doc = clamp_bytes(text.clone(), 6000);
         // MIGRATION Phase 3: the per-field schema, prompt, structured call and
         // "(not found)" defaulting live in the sidecar's /knowledge_extract
@@ -314,4 +357,44 @@ pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
         sources: vec![meta.name],
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn tabular_field_rows_reads_matching_columns_per_row() {
+        let csv = "product,category,units_sold,unit_price,revenue\n\
+                   Widget A,Gadgets,120,19.99,2398.80\n\
+                   Widget B,Gadgets,80,29.99,2399.20\n";
+        // Case-insensitive header match, requested out of source order.
+        let rows = tabular_field_rows("sales.csv", csv, &s(&["Product", "revenue"])).unwrap();
+        assert_eq!(rows, vec![s(&["Widget A", "2398.80"]), s(&["Widget B", "2399.20"])]);
+    }
+
+    #[test]
+    fn tabular_field_rows_bails_when_a_field_is_not_a_column() {
+        let csv = "product,revenue\nWidget A,2398.80\n";
+        // "total profit" isn't a header → None → caller uses the model path.
+        assert!(tabular_field_rows("sales.csv", csv, &s(&["product", "total profit"])).is_none());
+    }
+
+    #[test]
+    fn tabular_field_rows_only_for_tabular_extensions() {
+        let csv = "product,revenue\nWidget A,2398.80\n";
+        // Same content, non-tabular extension → not treated as a table.
+        assert!(tabular_field_rows("notes.md", csv, &s(&["product", "revenue"])).is_none());
+    }
+
+    #[test]
+    fn tabular_field_rows_handles_tsv_and_quoted_commas() {
+        let tsv = "name\tnote\nAcme\t\"a, b, c\"\n";
+        let rows = tabular_field_rows("data.tsv", tsv, &s(&["note", "name"])).unwrap();
+        assert_eq!(rows, vec![s(&["a, b, c", "Acme"])]);
+    }
 }

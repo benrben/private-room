@@ -158,15 +158,31 @@ pub fn markitdown_extract(path: &str) -> Option<String> {
 pub(crate) fn strip_tags(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_tag = false;
+    // Track the open quote while inside a tag so a `>` embedded in a quoted
+    // attribute value doesn't terminate the tag early. Parsoid-rendered
+    // Wikipedia pages carry whole infobox/template wikitext inside
+    // `data-mw='{…}'` attributes whose JSON holds literal `<ref>`/`<br/>`
+    // markup; without quote-awareness the first stray `>` flipped the scanner
+    // back out of the tag and dumped that raw template JSON into the text.
+    let mut quote: Option<char> = None;
     for c in input.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                out.push(' ');
+        if in_tag {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None => match c {
+                    '"' | '\'' => quote = Some(c),
+                    '>' => {
+                        in_tag = false;
+                        out.push(' ');
+                    }
+                    _ => {}
+                },
             }
-            c if !in_tag => out.push(c),
-            _ => {}
+        } else if c == '<' {
+            in_tag = true;
+        } else {
+            out.push(c);
         }
     }
     decode_basic_entities(&out)
@@ -222,6 +238,19 @@ mod tests {
             Some("0123456789")
         );
         assert!(read_zip_entry_capped(&bytes, "word/document.xml", 9).is_none());
+    }
+
+    #[test]
+    fn strip_tags_ignores_gt_inside_quoted_attribute() {
+        // Regression: Parsoid-rendered Wikipedia carries whole template wikitext
+        // inside a single-quoted `data-mw='{…}'` attribute whose JSON holds
+        // literal `<ref>`/`>` markup. A quote-naive scanner treated the first
+        // stray `>` as the tag close and dumped the raw JSON into the text.
+        let html = r#"<div data-mw='{"wt":"{{coord|52|N}}<ref>x</ref>"}'>Berlin</div>"#;
+        assert_eq!(strip_tags(html).trim(), "Berlin");
+        // Both quote styles, and normal tags, still strip cleanly.
+        assert_eq!(strip_tags(r#"<a href="x>y">link</a>"#).trim(), "link");
+        assert_eq!(strip_tags("<b>bold</b> text").trim(), "bold  text".trim());
     }
 }
 

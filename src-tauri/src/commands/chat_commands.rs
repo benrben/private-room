@@ -119,6 +119,12 @@ pub(crate) struct CommandResult {
     effects: ToolEffects,
 }
 
+/// Wall-clock ceiling for a single non-streamed command step (`ask_quiet`).
+/// Well above a normal local generation (seconds) but far below the shared
+/// 10-minute HTTP timeout, so a stalled model fails fast with a clear message
+/// instead of freezing the step chip.
+const COMMAND_STEP_TIMEOUT_SECS: u64 = 180;
+
 impl CmdCtx<'_> {
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
@@ -162,15 +168,31 @@ impl CmdCtx<'_> {
         ];
         // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools); the
         // Stop flag still abandons a long quiet step promptly.
-        ollama::generate(
+        let fut = ollama::generate(
             self.model,
             messages,
             temp,
             KEEP_ALIVE_WARM,
             Some(self.cancel.clone()),
             ollama::CtxTier::Chat,
+        );
+        // A quiet step streams no tokens, so a stalled model would otherwise
+        // freeze the command's step chip until the shared 10-minute HTTP
+        // timeout. Cap it at a responsive ceiling and surface a clean,
+        // actionable error instead of a silent multi-minute wait (the reported
+        // #translate "hang"). Dropping `fut` on timeout aborts the request, the
+        // same as a Stop.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(COMMAND_STEP_TIMEOUT_SECS),
+            fut,
         )
         .await
+        {
+            Ok(res) => res,
+            Err(_) => Err("The model took too long to respond. Try a shorter \
+                           selection, or switch to a faster model in Settings."
+                .into()),
+        }
     }
 
     /// ADD-22: like `ask_quiet`, but the reply is CONSTRAINED to `schema` via
@@ -282,9 +304,17 @@ pub async fn run_command(
     if models.is_empty() {
         return Err("No local AI model is installed yet — download one first.".into());
     }
-    let mut model = explicit_model.unwrap_or_else(|| best_default(&models));
-    if is_external_engine(&model) {
-        model = best_default(&models);
+    // Commands run a pipeline of small calls over the room's files (see the
+    // run_command doc), so they must stay ON THIS MAC — a `:cloud` model would
+    // ship that file content off to Ollama's servers, breaking the app's core
+    // promise. `is_external_engine` already forces the CLI engines to local but
+    // MISSES Ollama `:cloud` tags (they slip through as a bare model id), so
+    // exclude those too and always resolve to a genuine on-device model, exactly
+    // like the agent loop does. (#extract compensates for the smaller local
+    // model with a direct CSV/TSV column read; see tabular_field_rows.)
+    let mut model = explicit_model.unwrap_or_else(|| best_local_default(&models));
+    if is_external_engine(&model) || is_cloud_model(&model) {
+        model = best_local_default(&models);
     }
     let history_text = format_history(&history, 8000);
 

@@ -65,6 +65,41 @@ def test_routers() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# the ask reaches the model (question vs. messages)
+# --------------------------------------------------------------------------- #
+
+
+async def test_question_only_request_seeds_a_user_turn() -> None:
+    """A headless caller (workflow ``agent_run``) sends ``question`` with NO
+    history. The graph must seed a user turn from it — otherwise the model is
+    called with zero messages, Ollama answers the empty conversation with only a
+    ``done_reason='load'`` response, langchain_ollama skips it, and the run dies
+    with "No generation chunks were returned"."""
+    chat = FakeChatModel([Round(content="up 3%")])
+    out = await drive(make_request("predict ETF performance", messages=[]), chat)
+    seen = out.chat.seen_messages[0]
+    assert any(
+        m.get("role") == "user" and "predict ETF performance" in (m.get("content") or "")
+        for m in seen
+    ), seen
+    assert out.final == "up 3%"
+
+
+async def test_question_is_not_duplicated_when_history_already_has_the_user_turn() -> None:
+    """Chat callers include the ask as the final user turn AND set ``question``.
+    The seed must not double it."""
+    chat = FakeChatModel([Round(content="ok")])
+    msgs: list[Message] = [
+        {"role": "system", "content": "You are the room assistant."},
+        {"role": "user", "content": "hello there"},
+    ]
+    out = await drive(make_request("hello there", messages=msgs), chat)
+    seen = out.chat.seen_messages[0]
+    users = [m for m in seen if m.get("role") == "user"]
+    assert len(users) == 1, users
+
+
+# --------------------------------------------------------------------------- #
 # the tool catalog
 # --------------------------------------------------------------------------- #
 

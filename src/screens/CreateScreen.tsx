@@ -108,26 +108,27 @@ export function CreateScreen({
           if (error) setError("");
         }}
       />
-      {password && (
-        <>
-          <div className={`pw-meter ${strength.level}`}>
-            <div className="pw-meter-track">
-              <div className="pw-meter-fill" />
-            </div>
-            <span className="pw-meter-label">{strength.label}</span>
+      {/* Always mounted so the meter appearing on the first keystroke doesn't
+          shove the "Repeat password" field down mid-type. It just reserves its
+          space (invisible) until the user starts typing. */}
+      <div className={`pw-feedback${password ? "" : " reserved"}`} aria-hidden={!password}>
+        <div className={`pw-meter ${strength.level}`}>
+          <div className="pw-meter-track">
+            <div className="pw-meter-fill" />
           </div>
-          <ul className="pw-criteria">
-            {passwordCriteria(password).map((c) => (
-              <li
-                key={c.label}
-                className={c.met ? "met" : undefined}
-              >
-                {c.met ? "✓" : "○"} {c.label}
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
+          <span className="pw-meter-label">{strength.label}</span>
+        </div>
+        <ul className="pw-criteria">
+          {passwordCriteria(password).map((c) => (
+            <li
+              key={c.label}
+              className={c.met ? "met" : undefined}
+            >
+              {c.met ? "✓" : "○"} {c.label}
+            </li>
+          ))}
+        </ul>
+      </div>
       <input
         type="password"
         placeholder="Repeat password"

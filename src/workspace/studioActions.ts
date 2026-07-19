@@ -1,20 +1,12 @@
 import { Dispatch, SetStateAction } from "react";
-import {
-  AiActionDef,
-  api,
-  FileTarget,
-  generatePodcastScript,
-  studioFlashcards,
-  studioMindmap,
-  studioPrompts,
-} from "../api";
+import { AiActionDef, api, FileTarget, studioPrompts } from "../api";
 import { resolveRefs } from "./composer";
 import { runGuarded, tryToast } from "./guard";
 import { WSState } from "./state";
 
-/** Studio Shelf + whole-room AI actions + room summary. Cross-hook: `viewFile`
- * (files) opens the generated file; `openOllamaApp` (recording) is the "model is
- * down" remediation. */
+/** Studio Shelf + whole-room AI actions + room summary. Studio/summary results
+ * now open themselves via the terminal job-progress event, so this only needs
+ * `openOllamaApp` (recording) as the "model is down" remediation. */
 export function makeStudioActions(
   s: WSState,
   deps: {
@@ -22,7 +14,7 @@ export function makeStudioActions(
     openOllamaApp: () => Promise<void>;
   },
 ) {
-  const { viewFile, openOllamaApp } = deps;
+  const { openOllamaApp } = deps;
 
   // ---- ADD-30: durable background jobs (the sidebar cards) ----
 
@@ -99,7 +91,6 @@ export function makeStudioActions(
     kind: "flashcards" | "mindmap" | "podcast",
     scope?: string,
   ) {
-    if (s.studioBusy) return;
     let d = s.studioDefaults;
     if (!d) {
       try {
@@ -113,53 +104,25 @@ export function makeStudioActions(
     s.setStudioPrompt({ kind, scope, text: d ? d[kind] : "" });
   }
 
+  /** Kick off a Studio artifact as a background job (like the room summary): the
+   *  sidebar card shows progress and the finished HTML opens itself via the
+   *  terminal job-progress event. Stop/Resume live on the card, so there's no
+   *  in-modal running state anymore. */
   async function runStudio(
     kind: "flashcards" | "mindmap" | "podcast",
     scope?: string,
     instructions?: string,
     refs?: string[],
   ) {
-    if (s.studioBusy) return;
-    // ADD-31: register a stoppable operation — the modal's Stop button flips
-    // this id's cancel flag through the same channel as chat's Stop.
-    const opId = crypto.randomUUID();
     await runGuarded(
       s,
       async () => {
-        const meta =
-          kind === "flashcards"
-            ? await studioFlashcards(scope, instructions, refs, opId)
-            : kind === "mindmap"
-              ? await studioMindmap(scope, instructions, refs, opId)
-              : await generatePodcastScript(scope, instructions, refs, opId);
-        s.setFiles(await api.listFiles());
-        viewFile(meta.id);
-        s.pushToast("success", `Created "${meta.name}".`);
+        await api.startStudioJob(kind, scope, instructions, refs);
+        await refreshJobs();
+        s.pushToast("info", "Generating in the background — you can keep working.");
       },
-      {
-        begin: () => {
-          s.setStudioOpId(opId);
-          s.setStudioStep(null);
-          s.setStudioBusy(kind);
-        },
-        finish: () => {
-          s.setStudioBusy(null);
-          s.setStudioOpId(null);
-          s.setStudioStep(null);
-        },
-        handle: (msg) => {
-          if (!msg.includes("Stopped.")) return false;
-          s.pushToast("info", "Stopped — nothing was saved.");
-          return true;
-        },
-        openOllamaApp,
-      },
+      { onError: refreshJobs, openOllamaApp },
     );
-  }
-
-  /** ADD-31: stop the running Studio generation (keeps the prompt for retry). */
-  function stopStudio() {
-    if (s.studioOpId) void api.cancelAsk(s.studioOpId);
   }
 
   function studioAcItems() {
@@ -212,11 +175,13 @@ export function makeStudioActions(
   }
 
   async function runStudioFromModal() {
-    if (!s.studioPrompt || s.studioBusy) return;
+    if (!s.studioPrompt) return;
     const p = s.studioPrompt;
     const { refIds } = resolveRefs(p.text, s.files, s.folders);
-    await runStudio(p.kind, p.scope, p.text, refIds);
+    // Close the modal immediately — it's a background job now; the sidebar card
+    // takes over and the finished file opens itself.
     s.setStudioPrompt(null);
+    await runStudio(p.kind, p.scope, p.text, refIds);
   }
 
   async function loadAiActions(): Promise<AiActionDef[]> {
@@ -270,7 +235,7 @@ export function makeStudioActions(
   }
 
   return {
-    openStudioPrompt, runStudio, stopStudio, studioAcItems,
+    openStudioPrompt, runStudio, studioAcItems,
     acceptMention, runStudioFromModal, loadAiActions, openAiAction,
     runAiActionFromModal,
     refreshJobs, startDeepSummary, pauseJob, resumeJob, dismissJob,

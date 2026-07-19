@@ -56,8 +56,17 @@ export default function EngineModelPicker({
   })();
   const startsInCloud = selEngine !== null;
 
+  // Ollama `:cloud` models RUN REMOTELY — prompts and file context leave this
+  // Mac (see markup.isRemoteModel) — so they belong under the Cloud tab, never
+  // under "On this Mac". Split the raw Ollama list so each tab shows only its
+  // own; the two were previously conflated, which listed cloud models (badged
+  // "Cloud") inside the "On this Mac" tab.
+  const localModels = ai.models.filter((m) => !isRemoteModel(m));
+  const remoteModels = ai.models.filter((m) => isRemoteModel(m));
+  const hasCloud = ai.external.length > 0 || remoteModels.length > 0;
+
   const [tier, setTier] = useState<"local" | "cloud">(
-    startsInCloud ? "cloud" : "local",
+    startsInCloud || isRemoteModel(model) ? "cloud" : "local",
   );
   const [expanded, setExpanded] = useState<string | null>(
     startsInCloud ? selEngine : null,
@@ -114,10 +123,10 @@ export default function EngineModelPicker({
           aria-selected={tier === "cloud"}
           className={`engine-tier-tab${tier === "cloud" ? " active" : ""}`}
           onClick={() => setTier("cloud")}
-          disabled={ai.external.length === 0}
+          disabled={!hasCloud}
           title={
-            ai.external.length === 0
-              ? "No cloud AI CLIs (Claude Code, Codex) detected on this Mac"
+            !hasCloud
+              ? "No cloud AI models or CLIs (Claude Code, Codex) detected on this Mac"
               : undefined
           }
         >
@@ -127,10 +136,10 @@ export default function EngineModelPicker({
 
       {tier === "local" && (
         <div className="engine-tier-body">
-          {ai.models.length === 0 && (
+          {localModels.length === 0 && (
             <div className="settings-hint">{localEmptyHint ?? "No models installed yet."}</div>
           )}
-          {ai.models.map((m) => (
+          {localModels.map((m) => (
             // A sibling row div, not one big <button>: renderLocalExtra (Settings'
             // delete button) must never nest inside the row's own select button.
             <div key={m} className="model-menu-row">
@@ -140,11 +149,9 @@ export default function EngineModelPicker({
                 aria-pressed={m === model}
                 onClick={() => onSelect(m)}
               >
-                <span className={`model-dot ${isRemoteModel(m) ? "cloud" : "local"}`} />
+                <span className="model-dot local" />
                 <span className="model-menu-name">{modelLabel(m) ?? m}</span>
-                <span className={`model-menu-tier${isRemoteModel(m) ? " cloud" : ""}`}>
-                  {isRemoteModel(m) ? "Cloud" : "Local"}
-                </span>
+                <span className="model-menu-tier">Local</span>
                 {m === model && <CheckIcon size={14} />}
               </button>
               {renderLocalExtra?.(m)}
@@ -155,6 +162,25 @@ export default function EngineModelPicker({
 
       {tier === "cloud" && (
         <div className="engine-tier-body">
+          {/* Ollama `:cloud` models (bare ids, selected directly like local
+              ones) live here — they run remotely. renderLocalExtra still gives
+              them Settings' delete button and capability badges. */}
+          {remoteModels.map((m) => (
+            <div key={m} className="model-menu-row">
+              <button
+                type="button"
+                className={`model-menu-item${m === model ? " sel" : ""}`}
+                aria-pressed={m === model}
+                onClick={() => onSelect(m)}
+              >
+                <span className="model-dot cloud" />
+                <span className="model-menu-name">{modelLabel(m) ?? m}</span>
+                <span className="model-menu-tier cloud">Cloud</span>
+                {m === model && <CheckIcon size={14} />}
+              </button>
+              {renderLocalExtra?.(m)}
+            </div>
+          ))}
           {ai.external.map((engine) => {
             const models = engineModels[engine] ?? [];
             return (

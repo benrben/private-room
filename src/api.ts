@@ -171,6 +171,16 @@ export const api = {
   listJobs: () => invoke<Job[]>("list_jobs"),
   /** Start the room deep-summary job; returns its id. Progress → job-progress. */
   startDeepSummary: () => invoke<string>("start_deep_summary"),
+  /** Start a Studio artifact (flashcards / mindmap / podcast) as a background
+   *  job; returns its id. The finished HTML opens itself via the terminal
+   *  job-progress event's fileId. `scope` = a file id (else whole room);
+   *  `refs` = @-mentioned file ids. */
+  startStudioJob: (
+    kind: "flashcards" | "mindmap" | "podcast",
+    scope?: string,
+    instructions?: string,
+    refs?: string[],
+  ) => invoke<string>("start_studio_job", { kind, scope, instructions, refs }),
   /** ADD-32: start a whole-file pass — reads the ENTIRE file window by window
    *  in a durable background job and saves the result as a new room file.
    *  mode "merge" folds notes into one document; "stitch" joins transformed

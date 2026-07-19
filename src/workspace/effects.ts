@@ -89,10 +89,6 @@ export function useWorkspaceEffects(
     const unlistenNotice = api.onAskNotice((text) => {
       s.pushToast("info", text);
     });
-    // ADD-31: named stage inside the Studio modal while it generates.
-    const unlistenStudioStep = api.onStudioStep((text) => {
-      s.setStudioStep(text);
-    });
     // ADD-31: live import queue. The receipt toast comes from reportImport
     // (which knows names and errors) — this event only drives the strip.
     const unlistenImport = api.onImportProgress((p) => {
@@ -370,7 +366,6 @@ export function useWorkspaceEffects(
       unlistenStepStatus.then((fn) => fn());
       unlistenRound.then((fn) => fn());
       unlistenNotice.then((fn) => fn());
-      unlistenStudioStep.then((fn) => fn());
       unlistenImport.then((fn) => fn());
       unlistenJobs.then((fn) => fn());
       unlistenWfNode.then((fn) => fn());

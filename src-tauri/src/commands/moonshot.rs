@@ -31,8 +31,12 @@ pub(crate) async fn resolve_structured_model(state: &State<'_, AppState>) -> Opt
     if models.is_empty() {
         return None;
     }
-    let model = explicit.unwrap_or_else(|| best_default(&models));
-    let model = if is_external_engine(&model) {
+    // Studio / AI-action generation runs ON-DEVICE like the other pipelines: a
+    // `:cloud` model would leak file content off-Mac and dies when the cloud
+    // quota is exhausted (empty stream → "No generation chunks were returned").
+    // Exclude cloud + external, matching resolve_pass_engine and the agent loop.
+    let model = explicit.unwrap_or_else(|| best_local_default(&models));
+    let model = if is_external_engine(&model) || is_cloud_model(&model) {
         best_local_default(&models)
     } else {
         model

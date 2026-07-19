@@ -76,8 +76,17 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
     onEdgesChange?.((edges ?? []).filter((_, i) => i !== globalIdx));
   }
   function addBranch() {
-    const target = otherNodes[0]?.id;
-    if (!target) return;
+    // Default the new branch FORWARD — to the node right after this condition in
+    // pipeline order (nodes are appended in order) — so a fresh branch never
+    // wires back into an earlier node and forms a cycle. When the condition is
+    // the last node, leave the target unset ("") so validation prompts for a
+    // real forward pick instead of silently emitting a back-edge into the root.
+    const nodes = allNodes ?? [];
+    const idx = nodes.findIndex((n) => n.id === node.id);
+    // idx >= 0 in practice (the edited node is one of allNodes); guard the -1
+    // case explicitly so a not-found node never falls back to nodes[0] (the
+    // root) and re-creates the very back-edge cycle this fix removes.
+    const target = idx >= 0 ? (nodes[idx + 1]?.id ?? "") : "";
     onEdgesChange?.([...(edges ?? []), { from: node.id, to: target, branch: "then" }]);
   }
 

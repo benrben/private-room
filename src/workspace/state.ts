@@ -207,13 +207,6 @@ export function useWorkspaceState(info: RoomInfo) {
   const [showHelp, setShowHelp] = useState(false);
   const [fp, setFp] = useState<FrontPage | null>(null);
   const [fpSuggestions, setFpSuggestions] = useState<string[]>([]);
-  const [studioBusy, setStudioBusy] = useState<
-    "flashcards" | "mindmap" | "podcast" | null
-  >(null);
-  // ADD-31: the running Studio's cancel handle + latest named stage, so the
-  // modal can offer a real Stop and say what's happening instead of "Running…".
-  const [studioOpId, setStudioOpId] = useState<string | null>(null);
-  const [studioStep, setStudioStep] = useState<string | null>(null);
   // ADD-31: live import queue (null when idle) for the sidebar strip.
   const [importProgress, setImportProgress] = useState<{
     done: number;
@@ -348,8 +341,7 @@ export function useWorkspaceState(info: RoomInfo) {
     scriptApprovals, setScriptApprovals,
     qaMenuOpen, setQaMenuOpen, qaFileMenuOpen, setQaFileMenuOpen,
     qaScriptMenuOpen, setQaScriptMenuOpen,
-    fp, setFp, fpSuggestions, setFpSuggestions, studioBusy, setStudioBusy,
-    studioOpId, setStudioOpId, studioStep, setStudioStep,
+    fp, setFp, fpSuggestions, setFpSuggestions,
     importProgress, setImportProgress,
     jobs, setJobs, jobProgress, setJobProgress,
     summaryStarting, setSummaryStarting,

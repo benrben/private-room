@@ -20,47 +20,32 @@ export default function StudioShelf({
       </div>
       <button
         className="studio-btn"
-        disabled={s.studioBusy !== null}
         onClick={() => a.openStudioPrompt("flashcards", scope)}
       >
         <StudioIcon size={18} />
         <span className="studio-btn-label">
           Flashcards
-          <span className="studio-btn-sub">
-            {s.studioBusy === "flashcards"
-              ? "Building…"
-              : "A flip-card deck you can review"}
-          </span>
+          <span className="studio-btn-sub">A flip-card deck you can review</span>
         </span>
       </button>
       <button
         className="studio-btn"
-        disabled={s.studioBusy !== null}
         onClick={() => a.openStudioPrompt("mindmap", scope)}
       >
         <GraphIcon size={18} />
         <span className="studio-btn-label">
           Mind map
-          <span className="studio-btn-sub">
-            {s.studioBusy === "mindmap"
-              ? "Building…"
-              : "See how the ideas connect"}
-          </span>
+          <span className="studio-btn-sub">See how the ideas connect</span>
         </span>
       </button>
       <button
         className="studio-btn"
-        disabled={s.studioBusy !== null}
         onClick={() => a.openStudioPrompt("podcast", scope)}
       >
         <PodcastIcon size={18} />
         <span className="studio-btn-label">
           Podcast script
-          <span className="studio-btn-sub">
-            {s.studioBusy === "podcast"
-              ? "Writing…"
-              : "A two-host transcript (script only)"}
-          </span>
+          <span className="studio-btn-sub">A two-host transcript (script only)</span>
         </span>
       </button>
       {(s.aiActionDefs ?? []).some((x) => x.scope === "room") && (

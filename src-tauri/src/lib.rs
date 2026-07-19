@@ -220,6 +220,7 @@ pub fn run() {
             commands::delete_job,
             commands::resume_job,
             commands::start_deep_summary,
+            commands::start_studio_job,
             // ADD-32: whole-file pass — exhaustive windowed reading of one file.
             commands::start_file_pass,
             // Wave 4a (Idea 2): LLM graph workflows + scheduler + shortcuts.

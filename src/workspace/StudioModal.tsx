@@ -1,30 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import { tokenAtCaret } from "./composer";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
-/** The "edit the prompt first" modal for Studio actions. Extracted verbatim from
- * renderStudioPromptModal. */
+/** The "edit the prompt first" modal for Studio actions. Run fires a background
+ * job and closes the modal immediately — progress and the finished file live on
+ * the sidebar job card, so there is no in-modal running state. */
 export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
-  // ADD-31: elapsed-seconds ticker while a run is in flight, so the wait is
-  // visibly alive even between stage changes.
-  const [elapsed, setElapsed] = useState(0);
-  const busy = s.studioBusy !== null;
-  const stopBtnRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    if (!busy) {
-      setElapsed(0);
-      return;
-    }
-    const t = window.setInterval(() => setElapsed((n) => n + 1), 1000);
-    // The textarea just went disabled, dropping focus to <body> — hand it to
-    // Stop so Space/Enter keeps working and a screen reader hears the switch.
-    stopBtnRef.current?.focus();
-    return () => window.clearInterval(t);
-  }, [busy]);
-  // Escape closes the modal while idle (running keeps it up — Stop is the
-  // explicit exit). Capture-phase so the app-level Escape (close file viewer)
-  // never fires underneath the dialog.
+  // Escape closes the modal (unless the autocomplete's own Escape closes it
+  // first). Capture-phase so the app-level Escape (close file viewer) never
+  // fires underneath the dialog.
   const open = s.studioPrompt !== null;
   useEffect(() => {
     if (!open) return;
@@ -32,12 +17,12 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
       if (e.key !== "Escape") return;
       e.stopPropagation();
       if (s.studioAc) return; // the autocomplete's own Escape closes it first
-      if (s.studioBusy === null) s.setStudioPrompt(null);
+      s.setStudioPrompt(null);
     }
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, s.studioAc, s.studioBusy]);
+  }, [open, s.studioAc]);
   if (!s.studioPrompt) return null;
   const studioPrompt = s.studioPrompt;
   const label =
@@ -46,20 +31,16 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
       : studioPrompt.kind === "mindmap"
         ? "Mind map"
         : "Podcast script";
-  const running = s.studioBusy !== null;
   return (
     <div
-      className={`studio-prompt-backdrop${running ? " running" : ""}`}
-      onClick={() => {
-        if (!running) s.setStudioPrompt(null);
-      }}
+      className="studio-prompt-backdrop"
+      onClick={() => s.setStudioPrompt(null)}
     >
       <div
         className="studio-prompt"
         role="dialog"
         aria-modal="true"
         aria-label={label}
-        aria-busy={running}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="studio-prompt-title">
@@ -101,7 +82,6 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
             className="studio-prompt-input"
             value={studioPrompt.text}
             autoFocus
-            disabled={running}
             rows={4}
             dir="auto"
             onChange={(e) => {
@@ -157,46 +137,16 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
             }}
           />
         </div>
-        {/* ADD-31: a live status line replaces the anonymous "Running…" —
-            named stage plus elapsed seconds, and a Stop that actually works. */}
-        {running && (
-          <div className="studio-prompt-status" role="status">
-            <span className="studio-prompt-stage">
-              {s.studioStep ?? "Starting…"}
-            </span>
-            <span className="studio-prompt-elapsed">
-              {Math.floor(elapsed / 60) > 0
-                ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
-                : `${elapsed}s`}
-            </span>
-          </div>
-        )}
         <div className="studio-prompt-actions">
-          {running ? (
-            <button
-              ref={stopBtnRef}
-              className="subtle"
-              onClick={() => a.stopStudio()}
-            >
-              Stop
-            </button>
-          ) : (
-            <button className="subtle" onClick={() => s.setStudioPrompt(null)}>
-              Cancel
-            </button>
-          )}
+          <button className="subtle" onClick={() => s.setStudioPrompt(null)}>
+            Cancel
+          </button>
           <button
-            className={`primary${running ? " running" : ""}`}
-            disabled={running || !studioPrompt.text.trim()}
+            className="primary"
+            disabled={!studioPrompt.text.trim()}
             onClick={() => void a.runStudioFromModal()}
           >
-            {running ? (
-              <>
-                <span className="btn-spinner" aria-hidden="true" /> Running…
-              </>
-            ) : (
-              "Run"
-            )}
+            Run
           </button>
         </div>
       </div>
