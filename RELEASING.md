@@ -44,25 +44,22 @@ and/or CI secret (`TAURI_SIGNING_PRIVATE_KEY` /
 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`).
 
 > **Key history:** v0.1.0–v0.2.3 were signed with an ephemeral dev key that
-> lived at `/tmp/pr_updater.key` and did not survive the machine. **That key
-> is lost.** The v0.3.0 release therefore shipped **DMG-first** (see §3): the
-> release is live for downloads, and the updater manifest is published as a
-> follow-up once a key decision is made:
+> lived at `/tmp/pr_updater.key` and did not survive the machine. That key is
+> lost, so **the keypair was rotated at v0.3.0**: the key of record now lives
+> at `~/.tauri/private-room.key` (no password — back it up in your password
+> manager and/or a CI secret; do NOT regenerate, that would orphan 0.3.0+
+> installs the same way). Consequences of the rotation: 0.2.x installs cannot
+> verify the new signature, so those users download the DMG once; auto-update
+> is live again from 0.3.0 onward.
 >
-> - **If a backup of the old key exists**, sign with it — nothing else
->   changes, and 0.2.x installs auto-update normally.
-> - **Otherwise, rotate:** generate a new keypair, commit the new pubkey, and
->   ship it in the next build. Installs of builds carrying the *old* pubkey
->   (0.2.x) cannot verify anything signed with the *new* key — those users
->   download the DMG once, and auto-update resumes from then on.
->
-> Generate a keypair (do this interactively; pick a real password and save it
-> in your password manager):
+> If the key is ever lost again: generate a new one and update the committed
+> pubkey —
 > ```sh
 > npm run tauri signer generate -- -w ~/.tauri/private-room.key
 > ```
-> Then put the printed **public key** into `tauri.conf.json` →
-> `plugins.updater.pubkey` and commit it. Keep the private key out of git.
+> then put the printed **public key** into `tauri.conf.json` →
+> `plugins.updater.pubkey`, commit it, and ship a release built from that
+> config. Keep the private key out of git.
 
 ### Voice model
 
