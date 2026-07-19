@@ -247,6 +247,7 @@ pub fn run() {
             commands::resolve_script_run,
             // Idea 3: supernatural voice — on-device speech synthesis.
             commands::speak_text,
+            commands::speak_text_neural,
             commands::list_speech_voices,
         ])
         .setup(|app| {

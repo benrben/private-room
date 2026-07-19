@@ -3,6 +3,18 @@
 All notable, user-facing changes to Private Room. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## Unreleased
+
+- **Neural spoken voice is the new default.** Answers are read aloud with
+  Andrew (en-US, multilingual) — a neural synthetic voice, not a human
+  recording — via Microsoft's Edge TTS at +22% rate / −2 Hz pitch, loudness
+  normalized to ≈−16 LUFS with a no-clip soft limiter. Only the sentence
+  being spoken leaves the Mac, only while speaking is on, and Settings
+  disclose exactly that. The original on-device voice remains one switch
+  away (Settings → Spoken voice → On-device) and is the automatic
+  per-sentence fallback when offline. Voice archetypes (Demon, Ghost,
+  Wraith, Ancient, Custom) apply to both engines.
+
 ## 0.3.1 — 2026-07-19
 
 - **Fix:** the library's "Add page or source" menu opened downward past the

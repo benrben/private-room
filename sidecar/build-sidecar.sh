@@ -49,6 +49,9 @@ uv pip install --python "$VENV/bin/python" -e . pyinstaller
   --collect-all uvicorn \
   --collect-all pydantic \
   --collect-all pydantic_core \
+  --collect-all edge_tts \
+  --collect-all aiohttp \
+  --copy-metadata edge-tts \
   --copy-metadata langgraph \
   --copy-metadata langchain-core \
   --copy-metadata langchain-ollama \

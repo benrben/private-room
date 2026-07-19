@@ -4,13 +4,15 @@ import * as voice from "../workspace/voice";
 import {
   ARCHETYPE_DEFAULTS,
   VoiceArchetype,
+  VoiceEngine,
   VoiceParams,
 } from "../workspace/voice";
 
-/** Idea 3: Spoken-voice section — archetype + sliders + system voice,
- * persisted per room (settings K/V). Saving also reconfigures the live voice
- * singleton so the change applies without reopening the room. */
+/** Idea 3: Spoken-voice section — engine + archetype + sliders + system
+ * voice, persisted per room (settings K/V). Saving also reconfigures the
+ * live voice singleton so the change applies without reopening the room. */
 export function useVoiceSettings() {
+  const [engine, setEngine] = useState<VoiceEngine>("neural");
   const [archetype, setArchetype] = useState<VoiceArchetype>("off");
   const [params, setParams] = useState<VoiceParams>({
     ...ARCHETYPE_DEFAULTS.off,
@@ -22,6 +24,10 @@ export function useVoiceSettings() {
 
   useEffect(() => {
     api.listSpeechVoices().then(setVoices).catch(() => {});
+    api.getSetting("voice_engine").then((v) => {
+      // Neural is the default; "device" is the explicit opt-out.
+      if (v === "device") setEngine("device");
+    });
     api.getSetting("voice_archetype").then((v) => {
       if (v) setArchetype(v as VoiceArchetype);
     });
@@ -51,10 +57,11 @@ export function useVoiceSettings() {
   }
 
   async function save() {
+    await api.setSetting("voice_engine", engine);
     await api.setSetting("voice_archetype", archetype);
     await api.setSetting("voice_params", JSON.stringify(params));
     await api.setSetting("voice_id", voiceId);
-    voice.configure({ archetype, params, voiceId: voiceId || null });
+    voice.configure({ engine, archetype, params, voiceId: voiceId || null });
     setSaved(true);
     window.setTimeout(() => setSaved(false), 1600);
   }
@@ -70,6 +77,7 @@ export function useVoiceSettings() {
     voice.ensureUnlocked();
     setPreviewing(true);
     voice.speakText("I have read every page you keep in this room.", {
+      engine,
       archetype,
       params,
       voiceId: voiceId || null,
@@ -80,6 +88,8 @@ export function useVoiceSettings() {
   }
 
   return {
+    engine,
+    setEngine,
     archetype,
     pickArchetype,
     params,

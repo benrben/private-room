@@ -127,6 +127,14 @@ The model isn't a chat box bolted on the side — it can act on the room.
   including pointed Hebrew against unpointed quotes), anchors to the closest
   match if it's slightly off, and each reply carries a 📍 chip that re-opens
   the highlight.
+- 🗣️ **It can speak.** Answers can be read aloud — per message or for every
+  answer — through the room's voice archetypes. The default voice is Andrew
+  (en-US, multilingual), a **neural synthetic voice, not a human recording**,
+  synthesized by Microsoft's Edge TTS service at +22% rate / −2 Hz pitch and
+  normalized to ≈−16 LUFS; only the sentence being spoken leaves the Mac,
+  and only while speaking is on. Prefer zero network? Settings → Spoken
+  voice switches to the fully on-device macOS voice — which is also the
+  automatic fallback whenever you're offline.
 - 🧠 **It remembers — with your approval.** Memory suggestions from
   conversations wait for a yes by default (or flow in automatically if you
   opt in), and everything it knows is visible and editable in the Memory area.

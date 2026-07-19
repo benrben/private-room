@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__, ai_actions, chat_docs, features, file_pass, llm, vision
 from . import summarize as summarize_feature
+from . import tts as tts_mod
 from .chat import ChatModel, OllamaChatModel
 from .config import (
     CancelRequest,
@@ -37,6 +38,7 @@ from .config import (
     ModelsRequest,
     PullRequest,
     RunRequest,
+    TtsRequest,
     VisionLocateRequest,
     WarmRequest,
 )
@@ -256,6 +258,32 @@ def create_app(
     #   /label          swallows it -> {"questions": []} (front_page.rs
     #                   unwrap_or_default -> the Rust caller reuses its cache).
     #   /feedback_draft surfaces it -> 502 {error, code} (feedback.rs `?`).
+
+    @app.post("/tts")
+    async def tts_route(req: TtsRequest) -> Any:
+        """Neural spoken voice: sentence text -> normalized WAV (b64).
+
+        The one seam where reply text leaves for speech (see tts.py). A dead
+        or offline service is a clean 502 so the webview can fall back to the
+        on-device AVSpeech voice for that sentence.
+        """
+        text = req.text.strip()
+        if not text:
+            return JSONResponse(
+                {"code": "TTS_BAD_REQUEST", "error": "empty text"}, status_code=400
+            )
+        if len(text) > tts_mod.MAX_TTS_CHARS:
+            return JSONResponse(
+                {"code": "TTS_BAD_REQUEST", "error": "text too long"}, status_code=400
+            )
+        try:
+            wav = await tts_mod.synthesize_wav(text, req.voice, req.rate, req.pitch)
+        except tts_mod.TtsError as exc:
+            return JSONResponse(
+                {"code": "TTS_UNAVAILABLE", "error": str(exc)}, status_code=502
+            )
+        return {"audio_b64": tts_mod.wav_b64(wav)}
+
 
     @app.post("/label")
     async def label(req: LabelRequest) -> Any:

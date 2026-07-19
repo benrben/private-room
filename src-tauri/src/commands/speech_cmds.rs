@@ -24,6 +24,32 @@ pub fn list_speech_voices() -> Result<Vec<crate::speech::VoiceInfo>, String> {
     crate::speech::list_voices()
 }
 
+/// Neural spoken voice (the default engine): proxy one sentence to the
+/// sidecar's `/tts` — Edge neural synthesis, loudness-normalized WAV back as
+/// base64 (the same shape `speak_text` returns, so the webview's decode +
+/// archetype DSP chain is engine-agnostic). Stateless like `speak_text`: no
+/// AppState, no room access — only the sentence travels. The sidecar owns
+/// the voice/prosody defaults; a failure (offline, service down) surfaces as
+/// an Err the webview maps to the on-device fallback for that sentence.
+#[tauri::command]
+pub async fn speak_text_neural(text: String) -> Result<String, String> {
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("nothing to speak".into());
+    }
+    if trimmed.chars().count() > crate::speech::MAX_SPEAK_CHARS {
+        return Err("text too long to speak in one chunk".into());
+    }
+    let body = serde_json::json!({ "text": trimmed });
+    let resp = crate::sidecar::sidecar_json("/tts", &body)
+        .await
+        .map_err(|e| e.error)?;
+    resp.get("audio_b64")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "neural voice returned no audio".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -35,5 +61,14 @@ mod tests {
         assert!(speak_text("".into(), None, 0.5, 1.0, 1.0).await.is_err());
         let long = "a".repeat(crate::speech::MAX_SPEAK_CHARS + 1);
         assert!(speak_text(long, None, 0.5, 1.0, 1.0).await.is_err());
+    }
+
+    /// Same validation seam for the neural path — rejected before any
+    /// sidecar call, so no server is needed.
+    #[tokio::test]
+    async fn speak_text_neural_rejects_empty_and_oversize() {
+        assert!(speak_text_neural("  ".into()).await.is_err());
+        let long = "a".repeat(crate::speech::MAX_SPEAK_CHARS + 1);
+        assert!(speak_text_neural(long).await.is_err());
     }
 }

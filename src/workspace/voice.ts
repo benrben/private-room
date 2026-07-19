@@ -17,6 +17,16 @@ import { base64ToBytes } from "../viewers/util";
 
 export type VoiceArchetype = "off" | "demon" | "ghost" | "wraith" | "ancient" | "custom";
 
+/** Which synthesizer voices the room:
+ *  - "neural" (default): Edge neural TTS via the sidecar — Andrew
+ *    multilingual at +22% rate / -2 Hz pitch, normalized to ~-16 LUFS. A
+ *    neural synthetic voice, not a human recording; the sentence text goes
+ *    to Microsoft's service (Settings discloses this).
+ *  - "device": the original on-device AVSpeech path — nothing leaves the Mac.
+ *  Neural failures (offline, sidecar down) fall back to "device" per
+ *  sentence, so speech degrades instead of going silent. */
+export type VoiceEngine = "neural" | "device";
+
 export interface VoiceParams {
   /** AVSpeech pitchMultiplier, 0.5–2.0. */
   pitch: number;
@@ -46,6 +56,7 @@ interface VoiceConfig {
   params: VoiceParams;
   voiceId: string | null;
   autoSpeak: boolean;
+  engine: VoiceEngine;
 }
 
 // ---- module state ---------------------------------------------------------
@@ -56,6 +67,7 @@ let cfg: VoiceConfig = {
   params: { ...ARCHETYPE_DEFAULTS.off },
   voiceId: null,
   autoSpeak: false,
+  engine: "neural",
 };
 
 /** Generation token: any async continuation captured under an older value is
@@ -230,6 +242,7 @@ export function speakText(
     archetype?: VoiceArchetype;
     params?: VoiceParams;
     voiceId?: string | null;
+    engine?: VoiceEngine;
     onState?: (playing: boolean) => void;
   },
 ): void {
@@ -237,11 +250,17 @@ export function speakText(
   epoch += 1;
   turnEpoch = epoch;
   streamedTurn = false;
-  if (opts?.archetype !== undefined || opts?.params || opts?.voiceId !== undefined) {
+  if (
+    opts?.archetype !== undefined ||
+    opts?.params ||
+    opts?.voiceId !== undefined ||
+    opts?.engine !== undefined
+  ) {
     overrides = {
       archetype: opts?.archetype ?? cfg.archetype,
       params: opts?.params ?? cfg.params,
       voiceId: opts?.voiceId === undefined ? cfg.voiceId : opts.voiceId,
+      engine: opts?.engine ?? cfg.engine,
     };
   } else {
     overrides = null;
@@ -255,8 +274,12 @@ export function speakText(
 }
 
 /** Active per-call overrides (manual speakText only). */
-let overrides: { archetype: VoiceArchetype; params: VoiceParams; voiceId: string | null } | null =
-  null;
+let overrides: {
+  archetype: VoiceArchetype;
+  params: VoiceParams;
+  voiceId: string | null;
+  engine: VoiceEngine;
+} | null = null;
 
 export function setTurnAudioDoneListener(cb: (() => void) | null): void {
   onTurnAudioDone = cb;
@@ -272,6 +295,10 @@ function activeParams(): VoiceParams {
 
 function activeVoiceId(): string | null {
   return overrides?.voiceId ?? cfg.voiceId;
+}
+
+function activeEngine(): VoiceEngine {
+  return overrides?.engine ?? cfg.engine;
 }
 
 // ---- sentence chunker ------------------------------------------------------
@@ -372,7 +399,20 @@ async function pump(): Promise<void> {
       const volume = ARCHETYPE_VOLUME[activeArchetype()] ?? 1.0;
       let b64: string;
       try {
-        b64 = await api.speakText(text, activeVoiceId(), p.rate, p.pitch, volume);
+        if (activeEngine() === "neural") {
+          try {
+            // Default: Edge neural (Andrew, +22%, -2 Hz, ~-16 LUFS) via the
+            // sidecar. Volume shaping for whispery archetypes still applies
+            // in the DSP graph via `master.gain`, not synthesis-side.
+            b64 = await api.speakTextNeural(text);
+          } catch {
+            // Offline / sidecar down: this sentence falls back to the
+            // on-device voice rather than going silent.
+            b64 = await api.speakText(text, activeVoiceId(), p.rate, p.pitch, volume);
+          }
+        } else {
+          b64 = await api.speakText(text, activeVoiceId(), p.rate, p.pitch, volume);
+        }
       } catch {
         continue; // one failed sentence must not kill the rest
       }

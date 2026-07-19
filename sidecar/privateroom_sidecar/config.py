@@ -239,6 +239,22 @@ class DeleteRequest(BaseModel):
 # user's model preference) and named per request, same as the gateway bodies.
 
 
+class TtsRequest(BaseModel):
+    """Body of ``POST /tts`` — the neural spoken-voice synthesis seam.
+
+    Only the sentence text (plus prosody knobs) reaches the service; the
+    defaults are the product voice spec (Andrew multilingual, +22% rate,
+    -2 Hz pitch). See :mod:`.tts` for the privacy doctrine.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
+    voice: str = "en-US-AndrewMultilingualNeural"
+    rate: str = "+22%"
+    pitch: str = "-2Hz"
+
+
 class LabelRequest(BaseModel):
     """Body of ``POST /label`` — front_page.rs ``front_page_suggestions``.
 
@@ -386,6 +402,7 @@ __all__ = [
     "CapabilitiesRequest",
     "DeleteRequest",
     "LabelRequest",
+    "TtsRequest",
     "FeedbackDraftRequest",
     "VisionLocateRequest",
     "KnowledgeExtractRequest",

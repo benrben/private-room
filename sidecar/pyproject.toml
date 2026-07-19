@@ -26,6 +26,9 @@ dependencies = [
     # grounding canvas — which needs a real image codec. Pillow is the codec; it
     # is pure-wheel and PyInstaller-bundles cleanly (no system libs required).
     "pillow>=10.0",
+    # Neural spoken voice (default engine): Edge neural TTS. The only network
+    # call it makes is the user-facing speech synthesis seam in tts.py.
+    "edge-tts>=7.0",
 ]
 
 [project.optional-dependencies]

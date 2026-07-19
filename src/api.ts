@@ -328,6 +328,10 @@ export const api = {
     pitch: number,
     volume: number,
   ) => invoke<string>("speak_text", { text, voiceId, rate, pitch, volume }),
+  /** Neural spoken voice (default engine): one chunk via the sidecar's Edge
+   *  TTS seam — normalized WAV, base64. Fails when offline; callers fall back
+   *  to speakText (on-device) per sentence. */
+  speakTextNeural: (text: string) => invoke<string>("speak_text_neural", { text }),
   /** Installed system voices, for the Settings picker. */
   listSpeechVoices: () => invoke<VoiceInfo[]>("list_speech_voices"),
 

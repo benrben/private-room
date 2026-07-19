@@ -211,7 +211,8 @@ export function useWorkspaceEffects(
       api.getSetting("voice_id"),
       api.getSetting("voice_autospeak"),
       api.getSetting("voice_handsfree"),
-    ]).then(([arch, params, voiceId, auto, hands]) => {
+      api.getSetting("voice_engine"),
+    ]).then(([arch, params, voiceId, auto, hands, engine]) => {
       let parsed: voice.VoiceParams | null = null;
       try {
         parsed = params ? (JSON.parse(params) as voice.VoiceParams) : null;
@@ -228,6 +229,8 @@ export function useWorkspaceEffects(
           ],
         voiceId: voiceId || null,
         autoSpeak: auto === "1",
+        // Neural is the product default; "device" is the explicit opt-out.
+        engine: engine === "device" ? "device" : "neural",
       });
       s.setAutoSpeak(auto === "1");
       s.setHandsFree(hands === "1");
