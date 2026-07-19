@@ -3,6 +3,23 @@
 All notable, user-facing changes to Private Room. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.4.1 — 2026-07-19
+
+Post-incident hardening: the "every model feels stuck" failure chain can't
+happen again.
+
+- **The scan yields to you.** The document scanner pauses between files
+  whenever a chat turn is in flight (Settings shows "Paused while you
+  chat"), so questions never queue behind library scanning on the same
+  local model. It quietly resumes when you stop chatting.
+- **No more orphan sidecars.** Each sidecar watches its parent app and
+  exits within seconds if the app dies (crash, force-quit, reinstall) — a
+  leftover process can never hog the local model with nobody listening.
+- **The live privacy guard can't stall chat.** Hard-capped at 8 seconds
+  and skipped while the scan runs; the mechanical exact-word rules apply
+  regardless.
+- The sidecar's `/health` now reports the real app version.
+
 ## 0.4.0 — 2026-07-19
 
 ### Cloud privacy, mechanically enforced
