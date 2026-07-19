@@ -89,10 +89,12 @@ export APPLE_NOTARY_PROFILE="private-room"
 
 ## 2. Every release
 
-1. **Bump the version** in all three places (keep them in sync):
+1. **Bump the version** in all five places (keep them in sync):
    - `package.json` → `version`
    - `src-tauri/tauri.conf.json` → `version`
    - `src-tauri/Cargo.toml` → `[package] version`
+   - `sidecar/pyproject.toml` → `version` (the sidecar's `/health` reports it)
+   - `sidecar/privateroom_sidecar/__init__.py` → `__version__`
 2. **Update `CHANGELOG.md`** — the release notes come from it.
 3. **Merge to `main`, tag, push:**
    ```sh
