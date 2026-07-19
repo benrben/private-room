@@ -147,13 +147,23 @@ pub(crate) struct PolicyState {
 impl PolicyState {
     /// The wire payload the sidecar's `policy_from_payload` parses.
     pub(crate) fn payload(&self) -> serde_json::Value {
+        // While the background document scan is grinding through the library
+        // it monopolizes the local model — a live-guard call would queue
+        // behind it and make cloud chat feel stuck. Withholding the guard
+        // model skips the live guard for those turns; the exact rules (the
+        // real protection) are enforced mechanically regardless.
+        let guard_model = if scan_running() {
+            None
+        } else {
+            Some(self.guard_model.clone())
+        };
         serde_json::json!({
             "active": self.active,
             "rules": self.rules.iter().map(|(r, p)| serde_json::json!({
                 "real": r, "placeholder": p
             })).collect::<Vec<_>>(),
             "concepts": self.concepts,
-            "guard_model": self.guard_model,
+            "guard_model": guard_model,
         })
     }
 }
@@ -630,6 +640,28 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
         for (i, (file_id, name, text)) in work.into_iter().enumerate() {
             if scan_generation().load(Ordering::SeqCst) != generation {
                 break; // rules changed mid-run — restart with a fresh list
+            }
+            // Step aside while the user is chatting: an interactive ask shares
+            // the local model with the scanner, and the answer always matters
+            // more than the scan. (`cancels` holds one entry per in-flight
+            // ask, cleaned on every exit path by CancelGuard.)
+            loop {
+                let chatting = {
+                    let state = app.state::<AppState>();
+                    let busy = !state.cancels.lock().unwrap().is_empty();
+                    busy
+                };
+                if !chatting || scan_generation().load(Ordering::SeqCst) != generation {
+                    break;
+                }
+                let _ = app.emit(
+                    "privacy-scan",
+                    serde_json::json!({
+                        "running": true, "done": i, "total": total,
+                        "label": "Paused while you chat"
+                    }),
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             let _ = app.emit(
                 "privacy-scan",

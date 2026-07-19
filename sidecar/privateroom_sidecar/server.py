@@ -13,6 +13,7 @@ and a log line is a copy of them that outlives the run (SPEC §6).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, AsyncIterator, Callable
 
@@ -132,12 +133,19 @@ def create_app(
             guard_model = str((req.privacy or {}).get("guard_model") or "")
             if policy.concepts and guard_model:
                 try:
-                    findings = await privacy_scan_mod.scan_text(
-                        req.question,
-                        model=guard_model,
-                        base_url=req.ollama_base_url,
-                        concepts=policy.concepts,
-                        known=[r for r, _ in policy.rules],
+                    # Hard cap: the guard must never make chat FEEL stuck. A
+                    # busy local model (e.g. the background document scan) can
+                    # queue this call for minutes — after 8s the turn proceeds
+                    # with the exact rules alone, which never need a model.
+                    findings = await asyncio.wait_for(
+                        privacy_scan_mod.scan_text(
+                            req.question,
+                            model=guard_model,
+                            base_url=req.ollama_base_url,
+                            concepts=policy.concepts,
+                            known=[r for r, _ in policy.rules],
+                        ),
+                        timeout=8.0,
                     )
                     taken = {p for _, p in policy.rules}
                     policy.add_rules(

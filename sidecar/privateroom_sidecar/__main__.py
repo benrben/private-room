@@ -12,13 +12,31 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import socket
 import sys
+import threading
+import time
 
 import uvicorn
 
 from . import LOOPBACK_HOST, __version__
 from .server import create_app
+
+
+def _watch_parent() -> None:
+    """Exit when the parent app dies (PRIV-1 incident hardening).
+
+    The Rust host is our only legitimate parent. If it goes away — force-quit,
+    crash, reinstall — launchd re-parents us to PID 1 and we would otherwise
+    live on as an orphan, possibly mid-generation, monopolizing the local
+    Ollama model with nobody listening (observed: several orphans pinned the
+    GPU and every model "felt stuck"). Poll cheaply and self-terminate.
+    """
+    while True:
+        if os.getppid() == 1:
+            os._exit(0)
+        time.sleep(2.0)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -56,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
     bound_port = sock.getsockname()[1]
     # The host parses this line to find us. Keep the format stable.
     print(f"SIDECAR_PORT={bound_port}", flush=True)
+
+    threading.Thread(target=_watch_parent, daemon=True, name="parent-watch").start()
 
     config = uvicorn.Config(
         create_app(),
