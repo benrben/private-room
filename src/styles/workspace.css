@@ -226,6 +226,12 @@
 .add-menu {
   left: 0;
   right: auto;
+  /* The button lives in the library pane's bottom footer and the pane clips
+     overflow — a drop-DOWN would render past the pane edge, invisible. */
+  top: auto;
+  bottom: calc(100% + 6px);
+  max-height: min(70vh, 480px);
+  overflow-y: auto;
 }
 
 
