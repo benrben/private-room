@@ -12,6 +12,12 @@ as React components in `src/icons.tsx`; the favicon is `public/logo.svg`.
 | `dmg-bg.svg` | `src-tauri/dmg-background.tiff` | render at 660×400 and 1320×800, then `tiffutil -cathidpicheck a.png b.png -out …` |
 | `banner.svg` | `docs/banner.png` (README banner) | render at 2560×1280 |
 
+`private-room-productivity-witness-protection.mp4` is the 74-second launch
+video (1080p): "one job, seven apps" → product tour → the chaos enters
+witness protection. Its end-card poster frame is `docs/video-poster.png`,
+which the README links to the raw mp4; the video is also attached to GitHub
+releases as an asset.
+
 The README badge pills (`docs/badge-*.svg`) are hand-authored SVGs, not
 generated — edit them directly, keeping the pill recipe: `#161a22` fill,
 `#262d3b` stroke, 28px tall with `rx≈14`, a 4px status dot, slate `#8b93a7`

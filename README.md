@@ -18,6 +18,11 @@ Nothing leaves your Mac unless you say so.</p>
 
 ![The Private Room workspace: library, document, and AI side by side](docs/screens/workspace.png)
 
+<p align="center">
+  <a href="https://github.com/benrben/private-room/raw/main/art/private-room-productivity-witness-protection.mp4"><img src="docs/video-poster.png" alt="Watch the video — the chaos has entered witness protection" width="720"></a><br>
+  <b>🎬 Watch the video (74 s)</b> — <i>one job, seven apps… until the chaos enters witness protection.</i>
+</p>
+
 ---
 
 A `.roomai` file works like a document. Double-click it in Finder, unlock it
