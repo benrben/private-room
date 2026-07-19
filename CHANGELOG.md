@@ -3,6 +3,12 @@
 All notable, user-facing changes to Private Room. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.3.1 — 2026-07-19
+
+- **Fix:** the library's "Add page or source" menu opened downward past the
+  pane's clipped edge and was invisible. It now opens upward from the footer
+  button, capped to the viewport with its own scroll.
+
 ## 0.3.0 — 2026-07-19
 
 The platform release: one AI engine under everything, any brain on top of it,
