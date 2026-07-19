@@ -3,6 +3,28 @@
 All notable, user-facing changes to Private Room. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.5.0 — 2026-07-20
+
+### Dictation that keeps up with you
+
+- **Words appear as you speak.** Dictation now streams: the composer paints
+  your words into the box live while you talk, and the journal, file, and
+  memory mics show the rolling transcript in the capture pill. The wait that
+  used to start when you hit Stop now happens while you're speaking — Stop
+  just finalizes. Still 100% on this Mac, nothing leaves the room.
+- **The voice engine finally uses your GPU.** Whisper now runs on Metal on
+  Apple Silicon: transcription runs ~2.5× faster (about 15× realtime), and
+  the first-dictation model load dropped from ~26 seconds to a few. Live
+  recording transcripts and imported audio/video transcription get the same
+  speedup.
+
+### Workflows
+
+- New **"All files"** selector for summarize and file-pass nodes.
+- The workflow composer is now taught every selector and condition it may
+  use, so AI-drafted workflows stop failing validation on selectors the
+  model was never told about.
+
 ## 0.4.1 — 2026-07-19
 
 Post-incident hardening: the "every model feels stuck" failure chain can't
