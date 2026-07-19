@@ -421,6 +421,15 @@ class OllamaModelClient:
     ) -> tuple[str, list[ToolCall]]:
         from ollama import AsyncClient
 
+        # Engine parity: an external CLI answers as plain text with no Ollama
+        # tool-calls — the gather loop already degrades to sample-based
+        # summaries when a model returns no calls, so (text, []) slots in.
+        from .external_llm import generate_external, is_external_model
+
+        if is_external_model(model):
+            text = await generate_external(model, messages, format=format)
+            return text, []
+
         options: dict[str, Any] = {"num_ctx": num_ctx}
         if temperature is not None:
             options["temperature"] = temperature

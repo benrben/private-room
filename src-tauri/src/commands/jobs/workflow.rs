@@ -445,33 +445,22 @@ fn topo_order(def: &WorkflowDef) -> Result<Vec<String>, Vec<String>> {
 // ---------------------------------------------------------------- compiler
 
 /// Resolve a node's model choice to (model_name, lane). Mirrors
-/// `resolve_pass_engine`'s doctrine: auto honors the room model then
-/// best_default (external CLIs swapped out), lane = cloud ? Cloud : LocalLlm.
+/// `resolve_pass_engine`'s doctrine — engine parity: "auto" and a literal
+/// honor whatever the user chose, INCLUDING external CLIs (the sidecar's
+/// external backend runs them); "local" stays a hard local pick; "cloud"
+/// prefers an installed `:cloud` proxy. Lane = remote engines → Cloud.
 fn resolve_node_model(choice: &str, room_model: &Option<String>, models: &[String]) -> (String, Lane) {
     let name = match choice.trim() {
-        "" | "auto" => {
-            let m = room_model.clone().unwrap_or_else(|| best_default(models));
-            if is_external_engine(&m) {
-                best_default(models)
-            } else {
-                m
-            }
-        }
+        "" | "auto" => room_model.clone().unwrap_or_else(|| best_default(models)),
         "local" => best_local_default(models),
         "cloud" => models
             .iter()
             .find(|m| is_cloud_model(m))
             .cloned()
             .unwrap_or_else(|| best_default(models)),
-        literal => {
-            if is_external_engine(literal) {
-                best_default(models)
-            } else {
-                literal.to_string()
-            }
-        }
+        literal => literal.to_string(),
     };
-    let lane = if is_cloud_model(&name) {
+    let lane = if is_cloud_model(&name) || is_external_engine(&name) {
         Lane::Cloud
     } else {
         Lane::LocalLlm
@@ -1127,7 +1116,8 @@ fn save_file_node<R: tauri::Runtime>(
 
 // ---------------------------------------------------------------- spawner
 
-/// One headless agent turn on the LOCAL engine — tools available, but NEVER
+/// One headless agent turn on the room's CHOSEN engine — tools available (the
+/// sidecar loop locally, the room bridge for an external CLI), but NEVER
 /// streamed into the chat (headless mode suppresses the ask-* events). Pinned to
 /// `room_path`: refuses if the room swapped underneath the run.
 pub(crate) async fn run_agent_headless(
@@ -1151,9 +1141,27 @@ pub(crate) async fn run_agent_headless(
         (models_room, web_access_enabled(&room.conn))
     };
     let models = ollama::list_models().await.unwrap_or_default();
-    let mut chat_model = model.unwrap_or_else(|| best_default(&models));
+    let chat_model = model.unwrap_or_else(|| best_default(&models));
+    // Engine parity: an external CLI runs the grounded turn ITSELF — it is an
+    // agent, so it gets the same per-run room bridge as a chat ask
+    // (CloudAdvisor scope: file + web tools, never UI/job tools, no MCP
+    // connectors in a headless run) and the same cancel watcher.
     if is_external_engine(&chat_model) {
-        chat_model = best_default(&models);
+        let bridge = crate::room_mcp::start(
+            app.clone(),
+            web_enabled,
+            crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: false },
+            None,
+            crate::room_mcp::StartOpts::default(),
+        )
+        .await
+        .ok();
+        let messages = vec![ollama::ChatMessage::new("user", question)];
+        let res = run_external(&chat_model, &messages, Some(cancel), bridge.as_ref()).await;
+        if let Some(b) = &bridge {
+            b.stop();
+        }
+        return res;
     }
     let mut effects = ToolEffects::default();
     let outcome = crate::sidecar::run_via_sidecar(
@@ -2262,6 +2270,28 @@ mod tests {
 
     fn parse(v: serde_json::Value) -> WorkflowDef {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn resolve_node_model_honors_external_engines_on_the_cloud_lane() {
+        let models = vec!["qwen3.5:4b".to_string(), "minimax-m3:cloud".to_string()];
+        // Engine parity: "auto" keeps the room's external CLI choice.
+        let (m, lane) =
+            resolve_node_model("auto", &Some("claude-cli::opus".into()), &models);
+        assert_eq!(m, "claude-cli::opus");
+        assert!(matches!(lane, Lane::Cloud));
+        // A literal external engine is honored too.
+        let (m, lane) = resolve_node_model("codex-cli", &None, &models);
+        assert_eq!(m, "codex-cli");
+        assert!(matches!(lane, Lane::Cloud));
+        // "local" stays a hard local pick whatever the room engine is.
+        let (m, lane) =
+            resolve_node_model("local", &Some("codex-cli".into()), &models);
+        assert_eq!(m, "qwen3.5:4b");
+        assert!(matches!(lane, Lane::LocalLlm));
+        // `:cloud` proxies keep riding the cloud lane.
+        let (_, lane) = resolve_node_model("cloud", &None, &models);
+        assert!(matches!(lane, Lane::Cloud));
     }
 
     fn linear_def() -> WorkflowDef {

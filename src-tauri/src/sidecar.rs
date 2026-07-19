@@ -207,10 +207,14 @@ pub async fn generate_stream(
     };
     // The sidecar reaches Ollama but can't START it: ensure the local daemon is up
     // and hold the guard for the stream's whole duration (idle watcher won't sleep
-    // it mid-answer).
-    let _daemon = match crate::ollama::wake_daemon().await {
-        Ok(g) => g,
-        Err(e) => return Err(sentinel("OLLAMA_DOWN", &e)),
+    // it mid-answer). Engine parity: an external CLI model never touches Ollama,
+    // so don't boot (or fail on) the daemon for it.
+    let _daemon = match model.map(crate::commands::is_external_engine) {
+        Some(true) => None,
+        _ => match crate::ollama::wake_daemon().await {
+            Ok(g) => Some(g),
+            Err(e) => return Err(sentinel("OLLAMA_DOWN", &e)),
+        },
     };
     // No request timeout: a stream delivers tokens incrementally and the shared
     // 600s cap would abort a long answer mid-way.

@@ -192,8 +192,14 @@ async fn post_generate_cancellable(
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<serde_json::Value, String> {
     // Ensure the local Ollama daemon is up (the sidecar can't start it) and hold
-    // the guard across the request; both branches below await under it.
-    let _daemon = wake_daemon().await?;
+    // the guard across the request; both branches below await under it. Engine
+    // parity: an external CLI model never touches Ollama — booting (or failing
+    // to boot) the daemon would only block a room that runs entirely on a CLI.
+    let _daemon = if crate::commands::is_external_engine(model) {
+        None
+    } else {
+        Some(wake_daemon().await?)
+    };
     let Some(flag) = cancel else {
         return sidecar_post("/generate", body, Some(model)).await;
     };

@@ -26,6 +26,7 @@ import httpx
 from fastapi.responses import JSONResponse
 from ollama import AsyncClient, ResponseError
 
+from . import external_llm
 from .chat import OllamaChatModel
 from .messages import Message
 
@@ -117,7 +118,14 @@ async def generate(
     background jobs set it so a runaway loop can't fill the whole window. Rust keeps
     the schema-in-prompt priming and the fence/`<think>` JSON recovery, so this
     returns the model's raw text verbatim.
+
+    Engine parity: an external-CLI model ("claude-cli…"/"codex-cli…") routes to
+    :mod:`.external_llm` instead of Ollama — same messages, schema folded into
+    the prompt — so every feature built on this gateway honors the room's
+    chosen engine.
     """
+    if external_llm.is_external_model(model):
+        return await external_llm.generate_external(model, messages, format=format)
     kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
     if temperature is not None:
         kwargs["temperature"] = temperature
@@ -153,7 +161,13 @@ async def generate_stream(
     A classified engine failure is re-raised as :class:`LlmError` so the route can
     emit the terminal ``{"t":"error","code":...}`` line — the SAME sentinels
     (OLLAMA_DOWN / MODEL_MISSING) the non-streaming paths use.
+
+    Engine parity: an external CLI cannot stream tokens, so its whole reply is
+    yielded as one final delta — callers see a single chunk instead of many.
     """
+    if external_llm.is_external_model(model):
+        yield await external_llm.generate_external(model, messages, format=format)
+        return
     kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
     if temperature is not None:
         kwargs["temperature"] = temperature

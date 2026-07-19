@@ -16,32 +16,30 @@ pub use server::*;
 
 /// Resolve the chat model for a structured side-call (studios, AI actions,
 /// front page, feedback drafts), honoring the room's explicit `model` setting.
-/// ADD-29 parity: a selected `:cloud` model IS used — current cloud models honor
-/// the `format` grammar and emit structured tool_calls, and the UI labels them
-/// "Cloud · leaves this Mac". Only external CLI engines (claude-cli/codex-cli),
-/// which don't speak the Ollama API at all, are swapped for a local model.
+/// Engine parity: the CHOSEN engine is used as-is — a `:cloud` model rides the
+/// Ollama proxy, an external CLI (claude-cli/codex-cli) routes through the
+/// sidecar's external backend, and both carry the UI's visible
+/// "Cloud · leaves this Mac" labeling the user accepted when picking them.
+/// The structured contract holds everywhere because every sidecar structured
+/// caller runs `recover_json` unconditionally (the `:cloud` compensation).
 /// Returns None when Ollama is unreachable or has no models, so callers can
-/// degrade to empty/partial output.
+/// degrade to empty/partial output. An external engine needs no local models
+/// installed at all — it still resolves.
 pub(crate) async fn resolve_structured_model(state: &State<'_, AppState>) -> Option<String> {
     let explicit = {
         let guard = state.room.lock().unwrap();
         guard.as_ref().and_then(|room| model_setting(&room.conn))
     };
+    if let Some(m) = &explicit {
+        if is_external_engine(m) {
+            return Some(m.clone());
+        }
+    }
     let models = ollama::list_models().await.ok()?;
     if models.is_empty() {
         return None;
     }
-    // Studio / AI-action generation runs ON-DEVICE like the other pipelines: a
-    // `:cloud` model would leak file content off-Mac and dies when the cloud
-    // quota is exhausted (empty stream → "No generation chunks were returned").
-    // Exclude cloud + external, matching resolve_pass_engine and the agent loop.
-    let model = explicit.unwrap_or_else(|| best_local_default(&models));
-    let model = if is_external_engine(&model) || is_cloud_model(&model) {
-        best_local_default(&models)
-    } else {
-        model
-    };
-    Some(model)
+    Some(explicit.unwrap_or_else(|| best_local_default(&models)))
 }
 
 // ---- D1: recommended models -------------------------------------------------

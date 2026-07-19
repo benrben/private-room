@@ -485,6 +485,26 @@ async def run_ai_action(
     )
     markdown = _str_field(_load_obj(raw), "markdown")
     if not markdown:
+        # Small local models sometimes choke on grammar-constrained LONG output
+        # (translate over a whole file being the classic case): the constrained
+        # call returns an empty/mangled envelope. Retry ONCE without the schema
+        # — plain prose from the same prompt IS the markdown we wanted. If the
+        # retry STILL answers with a JSON envelope, read its markdown field
+        # (possibly empty → the honest EMPTY_RESULT below) rather than passing
+        # the raw envelope through as literal text.
+        plain = await llm.generate(
+            model,
+            [system_message(spec.system), user_message(user)],
+            base_url,
+            temperature=0.3,
+            num_ctx=num_ctx_chat_notools(),
+            keep_alive=KEEP_ALIVE_WARM,
+        )
+        obj = _load_obj(plain)
+        markdown = (
+            _str_field(obj, "markdown") if obj else _strip_think_spans(plain).strip()
+        )
+    if not markdown:
         raise ActionError(
             "EMPTY_RESULT",
             "The model didn't return anything usable — try a different file.",

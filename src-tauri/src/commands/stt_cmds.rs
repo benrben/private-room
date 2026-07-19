@@ -243,11 +243,8 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, del
         if !still_open {
             return;
         }
-        let model = if is_external_engine(&model) {
-            best_default(&models)
-        } else {
-            model
-        };
+        // Engine parity: the filler honors the room's chosen engine — an
+        // external CLI runs through the sidecar's external backend.
 
         // One bounded batch, then exit — a fresh import/OCR event re-triggers.
         let batch = {
@@ -392,7 +389,11 @@ pub async fn shape_text(
     }
 
     // Shaping always runs on a LOCAL model — dictated words never go to a
-    // cloud engine, whatever the chat model is set to.
+    // cloud engine, whatever the chat model is set to. That is the Settings
+    // screen's explicit promise, so it is the ONE deliberate exception to
+    // engine parity: external CLIs AND `:cloud` proxies are both swapped for
+    // a genuinely local model (the old check missed `:cloud`, silently
+    // shipping dictated words to Ollama's servers).
     let models = ollama::list_models()
         .await
         .map_err(|_| "The local AI (Ollama) isn't running — raw transcript kept.".to_string())?;
@@ -404,10 +405,10 @@ pub async fn shape_text(
         guard
             .as_ref()
             .and_then(|room| model_setting(&room.conn))
-            .unwrap_or_else(|| best_default(&models))
+            .unwrap_or_else(|| best_local_default(&models))
     };
-    if is_external_engine(&model) {
-        model = best_default(&models);
+    if is_external_engine(&model) || is_cloud_model(&model) {
+        model = best_local_default(&models);
     }
 
     // Pass 1: translate on its own. A failure/empty result keeps the prior text.

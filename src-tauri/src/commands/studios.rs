@@ -418,8 +418,8 @@ pub(crate) async fn run_studio_core(
         .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
     let _ = window.emit(
         "studio-step",
-        if is_cloud_model(&model) {
-            format!("{} — the cloud model is writing…", spec.working_label)
+        if is_cloud_model(&model) || is_external_engine(&model) {
+            format!("{} — your cloud AI is writing (content leaves this Mac)…", spec.working_label)
         } else {
             format!("{} — a local model can take a few minutes…", spec.working_label)
         },

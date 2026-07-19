@@ -241,23 +241,39 @@ pub(crate) async fn run_external(
     }
     if bridge.is_some() {
         prompt.push_str(
-            "You are connected to the user's Private Room through MCP tools \
-             (mcp__room__*). Use them to list, search, open, edit, create, or \
-             annotate the room's files whenever the question involves files — \
-             do not guess file contents from memory.\n\n",
+            "You are connected to the user's Private Room through the MCP \
+             server named \"room\". Use its tools to list, search, open, edit, \
+             create, or annotate the room's files whenever the question \
+             involves files — do not guess file contents from memory.\n\n",
         );
     }
     prompt.push_str("Respond to the last user message. Reply with the answer only.");
 
-    // ADD-20: hand the bridge to claude via --mcp-config. The config JSON is
-    // written next to the (temp) work dir and removed with it.
+    // ADD-20 / engine parity: hand the bridge to BOTH CLIs. Claude takes a
+    // JSON `--mcp-config` file (written next to the temp work dir, removed
+    // with it); Codex takes per-invocation `-c mcp_servers.room.*` TOML
+    // overrides with the bearer token passed through a child-process env var
+    // (verified against codex-cli 0.144.5: `codex mcp add --url/--bearer-
+    // token-env-var` documents exactly these config fields).
     let mut mcp_config_path: Option<std::path::PathBuf> = None;
+    let mut codex_bridge_env: Option<String> = None;
+    let mut codex_mcp_flags = String::new();
     if let Some(b) = bridge {
-        if engine == "claude-cli" {
-            std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
-            let p = tmp_dir.join("mcp-room.json");
-            std::fs::write(&p, b.mcp_config_json()).map_err(|e| e.to_string())?;
-            mcp_config_path = Some(p);
+        match engine {
+            "claude-cli" => {
+                std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+                let p = tmp_dir.join("mcp-room.json");
+                std::fs::write(&p, b.mcp_config_json()).map_err(|e| e.to_string())?;
+                mcp_config_path = Some(p);
+            }
+            "codex-cli" => {
+                codex_mcp_flags = format!(
+                    " -c 'mcp_servers.room.url=\"{}\"' -c 'mcp_servers.room.bearer_token_env_var=\"PR_ROOM_MCP_TOKEN\"'",
+                    b.mcp_url()
+                );
+                codex_bridge_env = Some(b.token.clone());
+            }
+            _ => {}
         }
     }
     // Single-quoted, matching the mcp_config_path quoting just above — safe
@@ -279,7 +295,9 @@ pub(crate) async fn run_external(
             p.to_string_lossy()
         ),
         ("claude-cli", None) => format!("claude -p{model_flag}{effort_flag}"),
-        ("codex-cli", _) => format!("codex exec --skip-git-repo-check{model_flag}{effort_flag} -"),
+        ("codex-cli", _) => format!(
+            "codex exec --skip-git-repo-check{codex_mcp_flags}{model_flag}{effort_flag} -"
+        ),
         _ => return Err("Unknown engine".into()),
     };
     let engine_name = engine.to_string();
@@ -292,12 +310,18 @@ pub(crate) async fn run_external(
         // Interactive login shell (`-ilc`), same as detection: from a GUI launch
         // the CLI is only on PATH via `.zshrc`, and the CLI also needs the user's
         // full env to reach its own subtools (git, node, …).
-        let mut child = std::process::Command::new("zsh")
+        let mut command = std::process::Command::new("zsh");
+        command
             .args(["-ilc", cmdline.as_str()])
             .current_dir(&work_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // The bridge token rides an env var (never argv, which `ps` can read).
+        if let Some(token) = &codex_bridge_env {
+            command.env("PR_ROOM_MCP_TOKEN", token);
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| format!("Could not start {engine_name}: {e}"))?;
         let pid = child.id();

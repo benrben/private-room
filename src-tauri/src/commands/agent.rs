@@ -762,9 +762,12 @@ fn gather_context_and_save_question(
 /// no native fallback). Everything here awaits, so no room lock may be held
 /// across it.
 ///
-/// MIGRATION Phase 2b: `_advisors_on`/`_advisor_tools_on`/`_injected_rowids` were
-/// consumed only by the now-deleted native `agent_loop` path; they are kept in the
-/// signature (caller shape unchanged) pending a later plumbing cleanup.
+/// MIGRATION Phase 2b: `_advisors_on`/`_injected_rowids` were consumed only by
+/// the now-deleted native `agent_loop` path; they are kept in the signature
+/// (caller shape unchanged) pending a later plumbing cleanup.
+/// `advisor_tools_on` is live again: it is the user's "let a cloud AI use this
+/// room's connected tools" switch, so it gates the bridge's MCP pass-through
+/// for external-engine turns.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_answer(
     window: &tauri::Window,
@@ -776,7 +779,7 @@ pub(crate) async fn stream_answer(
     effects: &mut ToolEffects,
     web_enabled: bool,
     _advisors_on: bool,
-    _advisor_tools_on: bool,
+    advisor_tools_on: bool,
     cancel: Arc<AtomicBool>,
     _injected_rowids: &HashSet<i64>,
 ) -> Result<String, String> {
@@ -784,22 +787,22 @@ pub(crate) async fn stream_answer(
     let run = if is_external_engine(model) {
         // CHG-5: a step chip, not fake live text (nothing streams for cloud).
         let _ = window.emit("ask-step", "Asking your cloud AI (content leaves this Mac)");
-        // ADD-20: Claude Code gets the room's tools over a per-ask localhost
-        // MCP bridge — same exec_tool dispatch as the local agent, decryption
-        // stays in-process, and the bridge dies when this ask returns.
-        let bridge = if split_external_model(model).0 == "claude-cli" {
+        // ADD-20 / engine parity: BOTH cloud CLIs (Claude Code and Codex) get
+        // the room's tools over a per-ask localhost MCP bridge — the same
+        // exec_tool dispatch as the local agent, decryption stays in-process,
+        // and the bridge dies when this ask returns. Connected MCP servers ride
+        // along only when the user's advisor-tools switch says so (ADD-21).
+        let bridge = {
             use tauri::Manager;
             crate::room_mcp::start(
                 window.app_handle().clone(),
                 web_enabled,
-                crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: false },
+                crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: advisor_tools_on },
                 None,
                 crate::room_mcp::StartOpts::default(),
             )
             .await
             .ok()
-        } else {
-            None
         };
         let res =
             run_external(model, &chat_messages, Some(cancel.clone()), bridge.as_ref()).await;

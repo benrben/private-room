@@ -300,22 +300,23 @@ pub async fn run_command(
         return persist_assistant_reply(&state, &chat_id, content, Vec::new(), None);
     }
 
+    // Engine parity: `#`-commands honor the room's CHOSEN engine, exactly like
+    // chat does — external CLIs route through the sidecar's external backend,
+    // `:cloud` rides the proxy, and both wear the visible "leaves this Mac"
+    // labels the user accepted when picking that engine. Only a room with no
+    // model setting falls back to the best local model. (#extract still
+    // compensates for smaller local models with a direct CSV/TSV column read;
+    // see tabular_field_rows.)
     let models = ollama::list_models().await.unwrap_or_default();
-    if models.is_empty() {
-        return Err("No local AI model is installed yet — download one first.".into());
-    }
-    // Commands run a pipeline of small calls over the room's files (see the
-    // run_command doc), so they must stay ON THIS MAC — a `:cloud` model would
-    // ship that file content off to Ollama's servers, breaking the app's core
-    // promise. `is_external_engine` already forces the CLI engines to local but
-    // MISSES Ollama `:cloud` tags (they slip through as a bare model id), so
-    // exclude those too and always resolve to a genuine on-device model, exactly
-    // like the agent loop does. (#extract compensates for the smaller local
-    // model with a direct CSV/TSV column read; see tabular_field_rows.)
-    let mut model = explicit_model.unwrap_or_else(|| best_local_default(&models));
-    if is_external_engine(&model) || is_cloud_model(&model) {
-        model = best_local_default(&models);
-    }
+    let model = match explicit_model {
+        Some(m) => m,
+        None => {
+            if models.is_empty() {
+                return Err("No local AI model is installed yet — download one first.".into());
+            }
+            best_local_default(&models)
+        }
+    };
     let history_text = format_history(&history, 8000);
 
     let ctx = CmdCtx {

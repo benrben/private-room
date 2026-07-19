@@ -323,13 +323,11 @@ async fn deep_summary_plan(
         return Err("This room has no files to summarize yet.".into());
     }
     let models = ollama::list_models().await.unwrap_or_default();
-    let mut chat_model = model.unwrap_or_else(|| best_default(&models));
-    // External CLIs don't speak the Ollama API the summarizer drives — swap in
-    // the default model. A `:cloud` model does (ADD-29 parity) and fans out.
-    if is_external_engine(&chat_model) {
-        chat_model = best_default(&models);
-    }
-    let lane = if is_cloud_model(&chat_model) {
+    // Engine parity: the room's chosen engine drives the summarizer — external
+    // CLIs go through the sidecar's external backend, `:cloud` through the
+    // proxy; both ride the Cloud lane (remote capacity, visible labeling).
+    let chat_model = model.unwrap_or_else(|| best_default(&models));
+    let lane = if is_cloud_model(&chat_model) || is_external_engine(&chat_model) {
         Lane::Cloud
     } else {
         Lane::LocalLlm
@@ -824,24 +822,18 @@ pub async fn resume_job(
 
 // ------------------------------------------------------------ file pass (ADD-32)
 
-/// The engine a pass runs on: the room's chosen model (external CLIs can't be
-/// driven by the job runner → default), and the lane its concurrency implies.
+/// The engine a pass runs on: the room's CHOSEN model — engine parity means
+/// external CLIs (sidecar external backend) and `:cloud` proxies are honored,
+/// riding the Cloud lane with the same visible labeling as chat. Only a room
+/// with no model setting falls back to the best local model.
 async fn resolve_pass_engine(state: &AppState) -> (String, Lane) {
     let explicit = {
         let guard = state.room.lock().unwrap();
         guard.as_ref().and_then(|r| model_setting(&r.conn))
     };
     let models = ollama::list_models().await.unwrap_or_default();
-    // Pipelines run ON-DEVICE (privacy + reliability): a `:cloud` model would
-    // ship file content off-Mac AND fails outright once the cloud quota is
-    // exhausted — its stream returns nothing, surfacing as LangChain's
-    // "No generation chunks were returned". Exclude cloud + external, exactly
-    // like the agent loop and #-commands do.
-    let mut chat_model = explicit.unwrap_or_else(|| best_local_default(&models));
-    if is_external_engine(&chat_model) || is_cloud_model(&chat_model) {
-        chat_model = best_local_default(&models);
-    }
-    let lane = if is_cloud_model(&chat_model) {
+    let chat_model = explicit.unwrap_or_else(|| best_local_default(&models));
+    let lane = if is_cloud_model(&chat_model) || is_external_engine(&chat_model) {
         Lane::Cloud
     } else {
         Lane::LocalLlm
