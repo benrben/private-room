@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { api } from "../../api";
+import { api, roomGraph } from "../../api";
 import type { RoomGraph, GraphEdge, SimNode, SimEdge, View } from "./types";
 import { MAX_EDGES, MAX_NODES, AREA_PER_NODE, COOL } from "./constants";
 import { seedFrom, mulberry32, runTick, computeFit } from "./layout";
@@ -49,9 +48,7 @@ export function useRoomGraph({
   useEffect(() => {
     let alive = true;
     const load = () => {
-      // CONTRACT-NOTE: no api.roomGraph() wrapper yet — call the command
-      // directly. Fold into api.ts when it lands.
-      invoke<RoomGraph>("room_graph")
+      roomGraph()
         .then((g) => {
           if (!alive) return;
           setGraph(g);

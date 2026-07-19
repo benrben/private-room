@@ -1,0 +1,177 @@
+/* Wave 5 (Idea 13): the Scripts page + rows. Leans on the workflow/viewer
+ * tokens (wf-badge, dot-ok/dot-err, caption, approve-*) so scripts read as one
+ * system with the rest of the automation surfaces. */
+
+.scripts-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.scripts-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 1rem 1.2rem;
+}
+
+.scripts-empty {
+  max-width: 42rem;
+  margin: 2rem auto;
+  text-align: left;
+}
+
+.scripts-empty h3 {
+  margin: 0 0 0.4rem;
+}
+
+.scripts-manifest-example {
+  margin: 0.8rem 0;
+  padding: 0.7rem 0.9rem;
+  border-radius: 8px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.08));
+  font-size: 0.82rem;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.scripts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.script-row {
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.22));
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+  background: var(--surface-1, rgba(127, 127, 127, 0.04));
+}
+
+.script-row.needs-review {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--amber) 35%, transparent);
+}
+
+.script-row-main {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.script-row-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 600;
+}
+
+.script-lang {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.05rem 0.35rem;
+  border-radius: 5px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  opacity: 0.8;
+}
+
+.script-ribbon {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 16%, transparent);
+  padding: 0.1rem 0.45rem;
+  border-radius: 6px;
+}
+
+.script-row-status {
+  margin-left: auto;
+  font-size: 0.8rem;
+}
+
+.script-running {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--accent, #7c5cff);
+}
+
+.script-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0.5rem 0 0.1rem;
+}
+
+.script-chip {
+  font-size: 0.74rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 6px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.1));
+  white-space: nowrap;
+}
+
+.script-chip.deps {
+  background: rgba(124, 92, 255, 0.12);
+}
+.script-chip.in {
+  background: rgba(64, 148, 255, 0.12);
+}
+.script-chip.out {
+  background: rgba(64, 191, 128, 0.14);
+}
+.script-chip.shortcut {
+  opacity: 0.75;
+}
+
+.script-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.6rem;
+  position: relative;
+}
+
+.script-sched-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.script-sched-pop {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  z-index: 30;
+}
+
+.script-sched-hint {
+  font-size: 0.76rem;
+  opacity: 0.7;
+}
+
+.script-history {
+  margin-top: 0.6rem;
+  border-top: 1px dashed var(--border, rgba(127, 127, 127, 0.22));
+  padding-top: 0.5rem;
+}
+
+/* The consent card's per-field rows (Reads / Writes back / Installs). */
+.script-approve-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+}
+
+.script-approve-key {
+  font-size: 0.74rem;
+  font-weight: 600;
+  opacity: 0.75;
+  min-width: 5.5rem;
+  text-align: right;
+}

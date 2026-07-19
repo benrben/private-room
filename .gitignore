@@ -24,6 +24,7 @@ dist-ssr
 # Bundled Whisper voice model — ~574 MB, shipped inside the DMG, never committed.
 # Fetch it into place before a release build (see README / RELEASING.md).
 src-tauri/resources/models/*.bin
+src-tauri/resources/models/*.onnx
 
 # Private Room project files are user data, never source
 *.roomai
@@ -32,3 +33,23 @@ src-tauri/resources/models/*.bin
 *.njsproj
 *.sln
 *.sw?
+
+# --- Python agent sidecar (ADD-33) ---
+# Byte-compiled files, caches, and test/type-check artifacts — never source.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# Local virtualenvs, if a dev creates one inside the repo tree.
+.venv/
+venv/
+# PyInstaller packaging: the one-file binary bundle for a release build.
+# (dist/ is already covered by the bare `dist` rule above.)
+sidecar/build/
+sidecar/.build-venv/
+*.spec.bak
+# The ~21 MB sidecar binary staged into the Tauri resource tree by
+# build-sidecar.sh — a build artifact, rebuilt per release like the models.
+src-tauri/resources/sidecar/

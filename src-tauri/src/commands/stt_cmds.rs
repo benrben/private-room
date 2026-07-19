@@ -176,7 +176,9 @@ pub(crate) fn run_stt_job(app: &tauri::AppHandle, job: JobMeta) {
         let state = app.state::<AppState>();
         let guard = state.room.lock().unwrap();
         match guard.as_ref() {
-            Some(room) if room.path == job.room_path => {
+            // Wave 3 (Idea 9): epoch pin — a transcription queued before a
+            // rollback must not land in the swapped room (path is unchanged).
+            Some(room) if room.path == job.room_path && state.room_epoch() == job.epoch => {
                 let _ = db::update_file_content(&room.conn, &job.id, &bytes, Some(&full_text));
             }
             _ => return,
@@ -184,17 +186,21 @@ pub(crate) fn run_stt_job(app: &tauri::AppHandle, job: JobMeta) {
     }
     let _ = app.emit("room-files-changed", ());
     let _ = app.emit("stt-progress", (&job.name, "done"));
-    // CHG-22: newly-transcribed file → let the one-liner filler pick it up.
-    spawn_summary_filler(app.clone(), job.room_path.clone());
+    // CHG-22 → Wave 1b (idea 8): newly-transcribed file goes through the
+    // debounced auto-index scheduler (which falls back to the quiet filler
+    // when the feature is off or the drop is tiny).
+    schedule_auto_index(app, job.room_path.clone());
 }
 
 /// CHG-22: opportunistically fill cached one-liners (files.ai_summary) in the
 /// background so the interactive "Summarize room" collapses to a single reduce
-/// call. Single-flight; starts after a short delay so it never races the user's
-/// first post-import question; yields to any streaming answer; uses a short
+/// call. Single-flight; starts after `delay_secs` so it never races the user's
+/// first post-import question (Wave 1b: the auto-index scheduler passes 0 —
+/// it has already debounced ~30 s, so stacking the old fixed 45 s on top would
+/// make tiny drops look stalled); yields to any streaming answer; uses a short
 /// keep-alive so it never pins the model in RAM. All failures are silent —
-/// summarize_room remains the full fallback.
-pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String) {
+/// the ADD-30 deep-summary job (`#summarize`) remains the full path.
+pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, delay_secs: u64) {
     use tauri::Manager;
     let state = app.state::<AppState>();
     // Single-flight: bail if a filler is already running.
@@ -202,6 +208,9 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String) {
         return;
     }
     let flag = state.summary_filler.clone();
+    // Wave 3 (Idea 9): the epoch at scheduling time — re-checked before every
+    // ai_summary write so a rollback drops a filler that was mid-run.
+    let epoch = state.room_epoch();
     tauri::async_runtime::spawn(async move {
         // Reset the single-flight flag on every exit path.
         struct Reset(Arc<AtomicBool>);
@@ -213,7 +222,9 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String) {
         let _reset = Reset(flag);
 
         // Let the user's first question take priority.
-        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        if delay_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        }
 
         let models = ollama::list_models().await.unwrap_or_default();
         if models.is_empty() {
@@ -232,37 +243,41 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String) {
         if !still_open {
             return;
         }
-        let model = if is_external_engine(&model) {
-            best_default(&models)
-        } else {
-            model
-        };
+        // Engine parity: the filler honors the room's chosen engine — an
+        // external CLI runs through the sidecar's external backend.
 
         // One bounded batch, then exit — a fresh import/OCR event re-triggers.
         let batch = {
             let state = app.state::<AppState>();
             let guard = state.room.lock().unwrap();
             let Some(room) = guard.as_ref() else { return };
-            if room.path != room_path {
+            // Wave 3 (Idea 9): a rollback bumped the epoch — abandon the filler.
+            if room.path != room_path || state.room_epoch() != epoch {
                 return;
             }
             db::files_missing_summary(&room.conn, MAX_SUMMARY_FILES).unwrap_or_default()
         };
         for (id, name, mime, text) in batch {
             // Yield to any in-flight answer, and stop if the room changed.
-            {
+            // ADD-27: also load the file's FULL text here (the batch row only
+            // carries a probe snippet, so a whole batch never holds 50 large
+            // texts in memory at once) — the summarizer pages through it.
+            let full = {
                 let state = app.state::<AppState>();
                 if !state.cancels.lock().unwrap().is_empty() {
                     return;
                 }
                 let guard = state.room.lock().unwrap();
                 match guard.as_ref() {
-                    Some(room) if room.path == room_path => {}
+                    Some(room) if room.path == room_path => {
+                        db::get_file_extracted_text(&room.conn, &id)
+                    }
                     _ => return,
                 }
             }
+            .unwrap_or_else(|| text.clone());
             let liner =
-                match summarize_one_file(&model, &name, &mime, &text, KEEP_ALIVE_SHORT).await {
+                match summarize_one_file(&model, &name, &mime, &full, KEEP_ALIVE_SHORT).await {
                     Ok(l) => l,
                     // Ollama down / model unloaded under pressure → stop quietly.
                     Err(_) => return,
@@ -273,7 +288,9 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String) {
             let state = app.state::<AppState>();
             let guard = state.room.lock().unwrap();
             match guard.as_ref() {
-                Some(room) if room.path == room_path => {
+                // Wave 3 (Idea 9): epoch pin — never write a one-liner into a
+                // room the rollback swapped out from under this pass.
+                Some(room) if room.path == room_path && state.room_epoch() == epoch => {
                     let _ = db::set_file_ai_summary(&room.conn, &id, &liner);
                 }
                 _ => return,
@@ -372,7 +389,11 @@ pub async fn shape_text(
     }
 
     // Shaping always runs on a LOCAL model — dictated words never go to a
-    // cloud engine, whatever the chat model is set to.
+    // cloud engine, whatever the chat model is set to. That is the Settings
+    // screen's explicit promise, so it is the ONE deliberate exception to
+    // engine parity: external CLIs AND `:cloud` proxies are both swapped for
+    // a genuinely local model (the old check missed `:cloud`, silently
+    // shipping dictated words to Ollama's servers).
     let models = ollama::list_models()
         .await
         .map_err(|_| "The local AI (Ollama) isn't running — raw transcript kept.".to_string())?;
@@ -384,10 +405,10 @@ pub async fn shape_text(
         guard
             .as_ref()
             .and_then(|room| model_setting(&room.conn))
-            .unwrap_or_else(|| best_default(&models))
+            .unwrap_or_else(|| best_local_default(&models))
     };
-    if is_external_engine(&model) {
-        model = best_default(&models);
+    if is_external_engine(&model) || is_cloud_model(&model) {
+        model = best_local_default(&models);
     }
 
     // Pass 1: translate on its own. A failure/empty result keeps the prior text.
@@ -432,9 +453,8 @@ pub(crate) async fn run_dict_pass(model: &str, steps: &[&str], text: &str) -> Re
         content: prompt,
         ..Default::default()
     }];
-    let (out, _) =
-        ollama::chat_stream_tools(model, messages, None, Some(0.2), None, "5m", |_| {}).await?;
-    Ok(out)
+    // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools, no Stop).
+    ollama::generate(model, messages, Some(0.2), "5m", None, ollama::CtxTier::Chat).await
 }
 
 // ---------------------------------------------------------------- Touch ID (ADD-11)

@@ -56,29 +56,23 @@ pub fn chunks_missing_embedding(
     conn: &Connection,
     limit: usize,
 ) -> Result<Vec<(String, String, String)>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.id, f.name, c.text
-             FROM chunks c JOIN files f ON f.id = c.file_id
-             WHERE c.embedding IS NULL LIMIT ?1",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+    query_rows(
+        conn,
+        "SELECT c.id, f.name, c.text
+         FROM chunks c JOIN files f ON f.id = c.file_id
+         WHERE c.embedding IS NULL LIMIT ?1",
+        [limit as i64],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
 }
 
 /// ADD-13: store an embedding BLOB on one chunk (by chunk id).
 pub fn set_chunk_embedding(conn: &Connection, id: &str, blob: &[u8]) -> Result<(), String> {
-    conn.execute(
+    execute_one(
+        conn,
         "UPDATE chunks SET embedding = ?2 WHERE id = ?1",
         params![id, blob],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// CHG-15: every chunk's (rowid, embedding blob) — NO text. The brute-force
@@ -87,15 +81,12 @@ pub fn set_chunk_embedding(conn: &Connection, id: &str, blob: &[u8]) -> Result<(
 /// embedded chunk on every question — tens of MB of discarded String allocation
 /// under the room mutex on a large room. The rowid keys the keyword/vector blend.
 pub fn chunk_embedding_vectors(conn: &Connection) -> Result<Vec<(i64, Vec<u8>)>, String> {
-    let mut stmt = conn
-        .prepare("SELECT rowid, embedding FROM chunks WHERE embedding IS NOT NULL")
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+    query_rows(
+        conn,
+        "SELECT rowid, embedding FROM chunks WHERE embedding IS NOT NULL",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
 }
 
 /// CHG-15: fetch (rowid, file name, chunk text) for a specific set of chunk
@@ -117,15 +108,11 @@ pub fn chunks_by_rowids(
          FROM chunks c JOIN files f ON f.id = c.file_id
          WHERE c.rowid IN ({placeholders})"
     );
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let params: Vec<&dyn rusqlite::ToSql> =
         rowids.iter().map(|r| r as &dyn rusqlite::ToSql).collect();
-    let rows = stmt
-        .query_map(params.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+    query_rows(conn, &sql, params.as_slice(), |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })
 }
 
 /// ADD-13: like `search_chunks_fts` but also returns each hit's chunk rowid so
@@ -136,42 +123,30 @@ pub fn search_chunks_fts_ranked(
     match_expr: &str,
     limit: usize,
 ) -> Result<Vec<(i64, String, String, f64)>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT chunks_fts.rowid, f.name, c.text, bm25(chunks_fts)
-             FROM chunks_fts
-             JOIN chunks c ON c.rowid = chunks_fts.rowid
-             JOIN files f ON f.id = c.file_id
-             WHERE chunks_fts MATCH ?1
-             ORDER BY bm25(chunks_fts)
-             LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![match_expr, limit as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+    query_rows(
+        conn,
+        "SELECT chunks_fts.rowid, f.name, c.text, bm25(chunks_fts)
+         FROM chunks_fts
+         JOIN chunks c ON c.rowid = chunks_fts.rowid
+         JOIN files f ON f.id = c.file_id
+         WHERE chunks_fts MATCH ?1
+         ORDER BY bm25(chunks_fts)
+         LIMIT ?2",
+        params![match_expr, limit as i64],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
 }
 
 /// (file name, chunk text) for the most recently added chunks — the fallback
 /// context when a question matches nothing in the FTS index (CHG-10).
 pub fn recent_chunks(conn: &Connection, limit: usize) -> Result<Vec<(String, String)>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT f.name, c.text FROM chunks c JOIN files f ON f.id = c.file_id
-             ORDER BY f.created_at DESC, c.seq ASC LIMIT ?1",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+    query_rows(
+        conn,
+        "SELECT f.name, c.text FROM chunks c JOIN files f ON f.id = c.file_id
+         ORDER BY f.created_at DESC, c.seq ASC LIMIT ?1",
+        [limit as i64],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
 }
 
 #[cfg(test)]

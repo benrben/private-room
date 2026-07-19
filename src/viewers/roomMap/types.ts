@@ -1,6 +1,6 @@
-// CONTRACT-NOTE: mirrors room_graph()'s RoomGraph (see BACKEND-ACTUALS).
-// If the API agent exposes `api.roomGraph()` + these interfaces in ../api,
-// prefer importing them over this local copy and the invoke() below.
+// Graph shapes for the Room Map. Data comes from api.roomGraph(); these local
+// interfaces are the layout module's working copies (SimNode/SimEdge build on
+// them).
 export interface GraphNode {
   id: string;
   name: string;

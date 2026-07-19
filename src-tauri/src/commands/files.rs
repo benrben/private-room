@@ -9,17 +9,32 @@ pub fn import_files(
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
     let room_path = room.path.clone();
+    // Wave 3 (Idea 9): stamp queued OCR/STT jobs with the current room epoch so
+    // a rollback between enqueue and execution drops them instead of writing
+    // into the swapped room.
+    let room_epoch = state.room_epoch();
     let mut imported = Vec::new();
     let mut errors = Vec::new();
     // ADD-14: files that arrived with no extractable text and could be scans or
     // photos. OCR runs in the background AFTER import returns, so a big scan
     // never freezes the import.
     let mut ocr_jobs: Vec<JobMeta> = Vec::new();
-    for path in paths {
+    let total = paths.len();
+    for (i, path) in paths.into_iter().enumerate() {
         let file_name = std::path::Path::new(&path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
+        // ADD-31: a big or multi-file import was invisible until it was over —
+        // name each file as it's read/extracted so the sidebar can show a
+        // live queue ("Importing 2 of 5 — lease.pdf").
+        {
+            use tauri::Emitter;
+            let _ = app.emit(
+                "import-progress",
+                serde_json::json!({ "done": i, "total": total, "name": file_name }),
+            );
+        }
         // No size cap on imports (removed by request). We still surface a clean
         // error if the file can't be stat'd (missing / no permission); the only
         // hard ceiling now is SQLite's ~1 GB per-blob limit, which fails at
@@ -60,6 +75,7 @@ pub fn import_files(
                                 mime: mime.clone(),
                                 ext,
                                 room_path: room_path.clone(),
+                                epoch: room_epoch,
                             });
                         }
                         imported.push(meta);
@@ -69,6 +85,18 @@ pub fn import_files(
             }
             Err(e) => errors.push(format!("{file_name}: {e}")),
         }
+    }
+    // ADD-31: terminal receipt — the queue strip clears on total==done and the
+    // frontend toasts "Imported N files" (with the failure count when any).
+    {
+        use tauri::Emitter;
+        let _ = app.emit(
+            "import-progress",
+            serde_json::json!({
+                "done": total, "total": total, "name": "",
+                "imported": imported.len(), "failed": errors.len()
+            }),
+        );
     }
     // Release the room lock before kicking off background OCR/STT — the
     // worker lanes re-acquire it once, briefly, only when they have text.
@@ -81,8 +109,9 @@ pub fn import_files(
             enqueue_ocr(&app, job);
         }
     }
-    // CHG-22: fill one-liners for freshly-imported text files in the background.
-    spawn_summary_filler(app.clone(), room_path.clone());
+    // CHG-22 → Wave 1b (idea 8): freshly-imported files go through the
+    // debounced auto-index scheduler (one decision per drop, after the lock).
+    schedule_auto_index(&app, room_path.clone());
     Ok(ImportReport { imported, errors })
 }
 
@@ -97,6 +126,12 @@ pub(crate) struct JobMeta {
     pub(crate) mime: String,
     pub(crate) ext: String,
     pub(crate) room_path: String,
+    /// Wave 3 (Idea 9): the room epoch at enqueue. The OCR/STT worker lanes are
+    /// static queues whose entries survive a teardown; a queued transcription
+    /// started before a rollback must NOT land its transcript in the swapped
+    /// room (the path is unchanged, so the path pin alone would pass). The write
+    /// sites require this to still equal `state.room_epoch()`.
+    pub(crate) epoch: u64,
 }
 
 /// CHG-27: two lazily-started, long-lived worker lanes (OCR and STT) draining an
@@ -140,7 +175,9 @@ pub(crate) fn read_job_bytes(app: &tauri::AppHandle, job: &JobMeta) -> Option<Ve
     let state = app.state::<AppState>();
     let guard = state.room.lock().unwrap();
     match guard.as_ref() {
-        Some(room) if room.path == job.room_path => {
+        // Wave 3 (Idea 9): the epoch pin drops a job queued before a rollback —
+        // the room path is unchanged after a rollback, so it alone would pass.
+        Some(room) if room.path == job.room_path && state.room_epoch() == job.epoch => {
             db::get_file_bytes(&room.conn, &job.id).ok().flatten()
         }
         _ => None,
@@ -163,7 +200,7 @@ pub(crate) fn run_ocr_job(app: &tauri::AppHandle, job: JobMeta) {
         let state = app.state::<AppState>();
         let guard = state.room.lock().unwrap();
         match guard.as_ref() {
-            Some(room) if room.path == job.room_path => {
+            Some(room) if room.path == job.room_path && state.room_epoch() == job.epoch => {
                 let _ = db::update_file_content(&room.conn, &job.id, &bytes, Some(&full_text));
             }
             _ => return,
@@ -171,18 +208,75 @@ pub(crate) fn run_ocr_job(app: &tauri::AppHandle, job: JobMeta) {
     }
     let _ = app.emit("room-files-changed", ());
     let _ = app.emit("ocr-progress", (&job.name, "done"));
-    // CHG-22: newly-readable file → let the one-liner filler pick it up.
-    spawn_summary_filler(app.clone(), job.room_path.clone());
+    // CHG-22 → Wave 1b (idea 8): newly-readable file goes through the
+    // debounced auto-index scheduler.
+    schedule_auto_index(app, job.room_path.clone());
 }
 
 #[tauri::command]
 pub fn list_files(state: State<'_, AppState>) -> Result<Vec<FileMeta>, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::list_files(&room.conn)
+    state.with_room(|room| db::list_files(&room.conn))
 }
 
 pub(crate) const MAX_VIEWER_BYTES: usize = 50 * 1024 * 1024;
+
+/// Clip huge extracted text at a char boundary for preview/edit payloads.
+/// Lifted out of `get_file_content` (Idea 11) so the version-compare command
+/// shapes its payload identically — both sides are clipped the same way, so a
+/// >1 MB file never shows its truncation tail as a phantom one-sided diff.
+pub(crate) fn clip_preview(mut t: String) -> String {
+    if t.len() > 1_000_000 {
+        let mut cut = 1_000_000;
+        while !t.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        t.truncate(cut);
+        t.push_str("\n\n… (truncated preview)");
+    }
+    t
+}
+
+/// The text representation `get_file_content` exposes for a file's bytes,
+/// factored out so the Idea 11 compare view can shape BOTH the stored version
+/// and the current file the SAME way. Mirrors get_file_content's kind/text
+/// branching (including its 10 MB raw-text size gates), so the two diff sides
+/// pick the same representation for the same bytes — for md/csv/code that is
+/// the RAW bytes' text (extract_text early-returns it verbatim, no whitespace
+/// normalization), for html the raw source, and for pdf/docx/pptx the extracted
+/// text. Every branch runs through `clip_preview` so truncation is symmetric.
+/// None = a kind with no comparable text (images, spreadsheets, un-extractable
+/// binaries) → the modal shows "no text to compare".
+pub(crate) fn content_text(
+    name: &str,
+    mime: &str,
+    bytes: &[u8],
+    extracted: Option<String>,
+) -> Option<String> {
+    let ext = extraction::extension_of(name);
+    // Media (audio/video/recording): the transcript is the comparable text.
+    if stt::media_kind(mime, &ext).is_some() {
+        return extracted.map(clip_preview);
+    }
+    if extraction::is_image(mime) {
+        return None;
+    }
+    match ext.as_str() {
+        "pdf" | "docx" => return extracted.map(clip_preview),
+        "xlsx" | "xls" => return None,
+        "csv" | "tsv" | "md" | "markdown" => {
+            return Some(clip_preview(String::from_utf8_lossy(bytes).into_owned()));
+        }
+        "html" | "htm" if bytes.len() <= 10 * 1024 * 1024 => {
+            return Some(clip_preview(String::from_utf8_lossy(bytes).into_owned()));
+        }
+        _ => {}
+    }
+    if extraction::is_text_extension(&ext) && bytes.len() <= 10 * 1024 * 1024 {
+        return Some(clip_preview(String::from_utf8_lossy(bytes).into_owned()));
+    }
+    // Binary formats with extracted text (pptx, markitdown): read-only preview.
+    extracted.map(clip_preview)
+}
 
 #[tauri::command]
 pub fn get_file_content(
@@ -197,24 +291,23 @@ pub fn get_file_content(
     let mut bytes = bytes.unwrap_or_default();
     let ext = extraction::extension_of(&name);
 
-    // Clip huge extracted text at a char boundary for preview/edit payloads.
-    let clip = |mut t: String| {
-        if t.len() > 1_000_000 {
-            let mut cut = 1_000_000;
-            while !t.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            t.truncate(cut);
-            t.push_str("\n\n… (truncated preview)");
-        }
-        t
-    };
+    // Idea 11: the clip closure is now a shared free fn (both the viewer and the
+    // compare view shape text through it).
+    let clip = clip_preview;
 
     // ADD-24: recordings/videos stream through roommedia:// (Range-capable),
     // so any size plays and seeks — no base64 through IPC, no 50MB ceiling.
     // The timestamped transcript still rides along for "[m:ss]" seeking.
+    // ADD-27: a live-recording file (it has a recordings meta row) opens in
+    // the Recording editor instead of the plain player.
     if let Some(kind) = stt::media_kind(&mime, &ext) {
-        let k = if kind == stt::MediaKind::Video { "video" } else { "audio" };
+        let k = if db::get_rec_meta(&room.conn, &id).is_some() {
+            "recording"
+        } else if kind == stt::MediaKind::Video {
+            "video"
+        } else {
+            "audio"
+        };
         let playable = playable_media_mime(&mime, &ext, kind == stt::MediaKind::Video);
         let token = stage_media_bytes(&media, std::mem::take(&mut bytes), &playable);
         return Ok(FileContent {
@@ -308,20 +401,35 @@ pub fn update_file_content(
     id: String,
     content: String,
 ) -> Result<FileMeta, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let name = db::get_file_name(&room.conn, &id)?;
-    let bytes = content.as_bytes();
-    let text = extraction::extract_text(&name, bytes).unwrap_or_else(|| content.clone());
-    store_file_bytes(&room.conn, &id, bytes, Some(&text), "You saved")?;
-    db::get_file_meta(&room.conn, &id)
+    state.with_room(|room| {
+        let name = db::get_file_name(&room.conn, &id)?;
+        let bytes = content.as_bytes();
+        let text = extraction::extract_text(&name, bytes).unwrap_or_else(|| content.clone());
+        store_file_bytes(&room.conn, &id, bytes, Some(&text), "You saved")?;
+        db::get_file_meta(&room.conn, &id)
+    })
 }
 
 #[tauri::command]
-pub fn delete_file(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::delete_file(&room.conn, &id)
+pub fn delete_file(
+    state: State<'_, AppState>,
+    rec: State<'_, super::RecState>,
+    id: String,
+) -> Result<(), String> {
+    // ADD-27: deleting the file a live recording writes into must stop the
+    // engine first, or it keeps flushing into a row that no longer exists.
+    // The stop is NOT awaited — its final flush would only recreate nothing
+    // (the row is going away); dropping the session is what matters.
+    {
+        let mut session = rec.session.lock().unwrap();
+        if session.as_ref().map(|l| l.file_id == id).unwrap_or(false) {
+            if let Some(live) = session.take() {
+                let (done_tx, _) = std::sync::mpsc::channel();
+                let _ = live.handle.tx.send(crate::recording::EngineMsg::Stop { done: done_tx });
+            }
+        }
+    }
+    state.with_room(|room| db::delete_file(&room.conn, &id))
 }
 
 #[tauri::command]
@@ -330,25 +438,25 @@ pub fn save_generated_file(
     name: String,
     content: String,
 ) -> Result<FileMeta, String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let name = if extraction::extension_of(&name).is_empty() {
-        format!("{name}.md")
-    } else {
-        name
-    };
-    let mime = mime_guess::from_path(&name)
-        .first_or(mime_guess::mime::TEXT_PLAIN)
-        .essence_str()
-        .to_string();
-    db::insert_file(
-        &room.conn,
-        &name,
-        &mime,
-        content.as_bytes(),
-        Some(&content),
-        "generated",
-    )
+    state.with_room(|room| {
+        let name = if extraction::extension_of(&name).is_empty() {
+            format!("{name}.md")
+        } else {
+            name
+        };
+        let mime = mime_guess::from_path(&name)
+            .first_or(mime_guess::mime::TEXT_PLAIN)
+            .essence_str()
+            .to_string();
+        db::insert_file(
+            &room.conn,
+            &name,
+            &mime,
+            content.as_bytes(),
+            Some(&content),
+            "generated",
+        )
+    })
 }
 
 // ---------------------------------------------------------------- import link (ADD-12)
@@ -407,32 +515,30 @@ pub async fn import_link(state: State<'_, AppState>, url: String) -> Result<File
     } else {
         web::fetch_page(&url).await?
     };
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let saved = db::current_date(&room.conn);
-    let name = if is_youtube {
-        link_file_name(&format!("{title} (transcript)"), &url)
-    } else {
-        link_file_name(&title, &url)
-    };
-    let content = format!("# {title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
-    db::insert_file(
-        &room.conn,
-        &name,
-        "text/markdown",
-        content.as_bytes(),
-        Some(&content),
-        "web",
-    )
+    state.with_room(|room| {
+        let saved = db::current_date(&room.conn);
+        let name = if is_youtube {
+            link_file_name(&format!("{title} (transcript)"), &url)
+        } else {
+            link_file_name(&title, &url)
+        };
+        let content = format!("# {title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
+        db::insert_file(
+            &room.conn,
+            &name,
+            "text/markdown",
+            content.as_bytes(),
+            Some(&content),
+            "web",
+        )
+    })
 }
 
 // ---------------------------------------------------------------- summarize room (ADD-17)
 
 #[tauri::command]
 pub fn rename_file(state: State<'_, AppState>, id: String, name: String) -> Result<(), String> {
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    db::rename_file(&room.conn, &id, &name)
+    state.with_room(|room| db::rename_file(&room.conn, &id, &name))
 }
 
 

@@ -3,6 +3,18 @@ import { Stroke } from "./base";
 
 /* ---------- moonshot feature icons (24px grid, 1.6px stroke) ---------- */
 
+/** Workflows: a small left-to-right pipeline of linked nodes. */
+export function WorkflowsIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <rect x="3" y="9.5" width="5" height="5" rx="1.3" />
+      <rect x="16" y="4.5" width="5" height="5" rx="1.3" />
+      <rect x="16" y="14.5" width="5" height="5" rx="1.3" />
+      <path d="M8 12h4.5M12.5 12V7h3.5M12.5 12v5h3.5" />
+    </Stroke>
+  );
+}
+
 /** Room Map: a small constellation / node graph. */
 export function GraphIcon(p: IconProps) {
   return (
@@ -51,37 +63,13 @@ export function PodcastIcon(p: IconProps) {
   );
 }
 
-/** Airlock: a shield with an arrow pointing safely inward. */
-export function AirlockIcon(p: IconProps) {
+/** Scripts: a document with an angle-bracket "code" glyph. */
+export function ScriptIcon(p: IconProps) {
   return (
     <Stroke {...p}>
-      <path d="M12 3l7 2.6v5.6c0 4.5-3 7.8-7 9.2-4-1.4-7-4.7-7-9.2V5.6L12 3z" />
-      <path d="M12 7v6" />
-      <path d="M9 10.5l3 3 3-3" />
-    </Stroke>
-  );
-}
-
-/** Recovery: a key (recovery code). */
-export function RecoveryIcon(p: IconProps) {
-  return (
-    <Stroke {...p}>
-      <circle cx="7.5" cy="7.5" r="4.5" />
-      <path d="M10.7 10.7l8.3 8.3" />
-      <path d="M15.5 15.5l1.8-1.8M17.5 17.5l1.5-1.5" />
-    </Stroke>
-  );
-}
-
-/** Server: a rack (the Leash / persistent Room MCP server). */
-export function ServerIcon(p: IconProps) {
-  return (
-    <Stroke {...p}>
-      <rect x="3.5" y="4.5" width="17" height="6" rx="1.8" />
-      <rect x="3.5" y="13.5" width="17" height="6" rx="1.8" />
-      <path d="M14 7.5h3.5M14 16.5h3.5" />
-      <circle cx="7" cy="7.5" r="0.9" fill="currentColor" stroke="none" />
-      <circle cx="7" cy="16.5" r="0.9" fill="currentColor" stroke="none" />
+      <path d="M6 3.5h8l4 4V20a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1z" />
+      <path d="M13.5 3.5V8h4.5" />
+      <path d="M10.5 12.5 8.5 14.5l2 2M13.5 12.5l2 2-2 2" />
     </Stroke>
   );
 }

@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   CloseIcon,
   CloudIcon,
@@ -9,8 +10,7 @@ import {
   SparkIcon,
 } from "../icons";
 import { displayName } from "./composer";
-import { isCloudEngine } from "./markup";
-import Toasts from "./Toasts";
+import { isCloudEngine, isExternalEngine } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
@@ -18,38 +18,83 @@ import { WSActions } from "./actions";
  * attach nudge, attachment chips, the textarea + #/@ autocomplete popover, the
  * #help sheet, the tool row, mic, and send/stop. Extracted verbatim. */
 export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
+  // Several tidy-up suggestions collapse into ONE card (a stack of three chips
+  // over the composer read as noise); Review expands to the per-file chips.
+  const [tidyExpanded, setTidyExpanded] = useState(false);
+  useEffect(() => {
+    // A fresh batch after the last one cleared starts collapsed again.
+    if (s.importSuggestions.length === 0) setTidyExpanded(false);
+  }, [s.importSuggestions.length]);
+  const batchTidy = s.importSuggestions.length > 1 && !tidyExpanded;
+  // The #help sheet closes like every other popover: Escape, from anywhere.
+  useEffect(() => {
+    if (!s.showHelp) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      s.setShowHelp(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [s.showHelp, s]);
   return (
     <div className="composer">
-      <Toasts toasts={s.toasts} dismissToast={s.dismissToast} />
-      {s.importSuggestions.map((sug) => (
-        <div className="import-suggestion" key={sug.fileId}>
-          <SparkIcon size={14} />
+      {batchTidy ? (
+        <div className="import-suggestion batch">
+          <SparkIcon size={13} />
           <span className="import-suggestion-text">
-            Tidy up <strong>{displayName(sug.current)}</strong> →{" "}
-            <strong>{sug.suggestion.title}</strong>
-            {sug.suggestion.folder ? (
-              <>
-                {" "}
-                in <strong>{sug.suggestion.folder}</strong>
-              </>
-            ) : null}
+            {s.importSuggestions.length} new files could be renamed and filed.
           </span>
           <span className="import-suggestion-actions">
             <button
               className="subtle accent"
-              onClick={() => a.applyImportSuggestion(sug)}
+              onClick={() => void a.applyAllImportSuggestions()}
             >
-              Apply
+              Tidy up
+            </button>
+            <button className="subtle quiet" onClick={() => setTidyExpanded(true)}>
+              Review
             </button>
             <button
-              className="subtle"
-              onClick={() => a.dismissImportSuggestion(sug.fileId)}
+              className="tidy-dismiss"
+              title="Dismiss"
+              onClick={() => a.dismissAllImportSuggestions()}
             >
-              Dismiss
+              <CloseIcon size={12} />
             </button>
           </span>
         </div>
-      ))}
+      ) : (
+        s.importSuggestions.map((sug) => (
+          <div className="import-suggestion" key={sug.fileId}>
+            <SparkIcon size={14} />
+            <span className="import-suggestion-text">
+              Tidy up <strong>{displayName(sug.current)}</strong> →{" "}
+              <strong>{sug.suggestion.title}</strong>
+              {sug.suggestion.folder ? (
+                <>
+                  {" "}
+                  in <strong>{sug.suggestion.folder}</strong>
+                </>
+              ) : null}
+            </span>
+            <span className="import-suggestion-actions">
+              <button
+                className="subtle accent"
+                onClick={() => a.applyImportSuggestion(sug)}
+              >
+                Apply
+              </button>
+              <button
+                className="subtle"
+                onClick={() => a.dismissImportSuggestion(sug.fileId)}
+              >
+                Dismiss
+              </button>
+            </span>
+          </div>
+        ))
+      )}
       {isCloudEngine(s.model) && (
         <div className="cloud-strip" title="This room is using a cloud model — your prompts and attached context are sent to it.">
           <span className="cloud-strip-label">
@@ -63,23 +108,34 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
           </button>
         </div>
       )}
-      {!isCloudEngine(s.model) && (s.webOn || s.mcpTools.length > 0) && (
-        <div
-          className="mcp-badge"
-          title={[
-            s.webOn ? "Web search: on" : null,
-            s.mcpTools.length > 0
-              ? `Connected tools: ${s.mcpTools.join(", ")}`
-              : null,
-          ]
-            .filter(Boolean)
-            .join("\n")}
-        >
-          <span className="badge-label">
-            <GlobeIcon size={13} /> This room can reach the internet
-          </span>
-        </div>
-      )}
+      {/* Engine parity: every engine can reach these tools now — local and
+          `:cloud` through the sidecar loop, external CLIs through the room
+          bridge (web always when enabled; connected MCP tools only when the
+          advisor-tools switch says so). The badge states the truth per engine. */}
+      {(() => {
+        const external = isExternalEngine(s.model);
+        const webReach = s.webOn;
+        const mcpReach =
+          s.mcpTools.length > 0 && (!external || s.advisorToolsOn);
+        if (!webReach && !mcpReach) return null;
+        return (
+          <div
+            className="mcp-badge"
+            title={[
+              webReach ? "Web search: on" : null,
+              mcpReach
+                ? `Connected tools: ${s.mcpTools.join(", ")}`
+                : null,
+            ]
+              .filter(Boolean)
+              .join("\n")}
+          >
+            <span className="badge-label">
+              <GlobeIcon size={13} /> This room can reach the internet
+            </span>
+          </div>
+        );
+      })()}
       {(() => {
         const q = s.question.trim().toLowerCase();
         if (!q) return null;
@@ -117,15 +173,24 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
       <div className={`composer-card${s.asking ? " busy" : ""}`}>
         {s.ac && a.autocompleteItems().length > 0 && (
           <div className="ac-popover">
-            <div className="ac-hint">
-              {s.ac.kind === "cmd"
-                ? "Commands — run a prebuilt action"
-                : "Attach a file or folder as context"}
+            {/* The count says how much is below the fold; the key hints make
+                the whole list reachable without the mouse. */}
+            <div className="ac-hint ac-hint-row">
+              <span>
+                {s.ac.kind === "cmd"
+                  ? `${a.autocompleteItems().length} commands`
+                  : `${a.autocompleteItems().length} files & folders`}
+              </span>
+              <span className="ac-keys">↑↓ choose · Enter run · Esc close</span>
             </div>
             {a.autocompleteItems().map((it, i) => (
               <button
                 key={it.key}
                 className={`ac-item ${i === s.ac!.index ? "active" : ""}`}
+                ref={(el) => {
+                  // Arrow-keying below the fold must scroll the list with it.
+                  if (i === s.ac!.index) el?.scrollIntoView({ block: "nearest" });
+                }}
                 onMouseDown={(e) => {
                   e.preventDefault();
                   a.acceptAutocomplete(it.insert);
@@ -241,7 +306,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               <button
                 className="send-btn"
                 title="Send ⏎"
-                onClick={a.send}
+                onClick={() => void a.send()}
                 disabled={!s.question.trim()}
               >
                 <SendIcon size={16} />

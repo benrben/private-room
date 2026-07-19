@@ -19,98 +19,68 @@ pub async fn studio_mindmap(
     scope: Option<String>,
     instructions: Option<String>,
     refs: Option<Vec<String>>,
+    op_id: Option<String>,
 ) -> Result<FileMeta, String> {
-    use tauri::Emitter;
-    let instr = studio_instruction(instructions, STUDIO_MINDMAP_PROMPT);
-    let (label, text) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        match refs.as_ref().filter(|r| !r.is_empty()) {
-            Some(ids) => gather_files_text(&room.conn, ids)?,
-            None => gather_scope_text(&room.conn, scope.as_deref(), &room.name)?,
-        }
-    };
-    let model = resolve_local_model(&state)
-        .await
-        .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
-    let _ = window.emit("ask-step", "Designing an interactive mind map");
-    let page_role = "You are a front-end developer building an interactive mind-map page. Draw one \
-        central topic with a tree of branches; let the reader expand and collapse nodes by clicking, \
-        and gently pan the canvas if you can. Keep labels short. Base it only on the provided material.";
-    let content = match generate_studio_html(&model, page_role, &instr, &label, &text).await? {
-        Some(html) => html,
-        None => {
-            // Fallback: extract the structured tree and render the built-in template.
-            let schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "root": {"type": "string"},
-                    "nodes": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "label": {"type": "string"},
-                                "parent": {"type": "string"}
-                            },
-                            "required": ["label", "parent"]
-                        }
+    run_studio(&window, &state, mindmap_spec(), scope, instructions, refs, op_id).await
+}
+
+/// The mind-map artifact spec for the shared `run_studio` pipeline.
+pub(crate) fn mindmap_spec() -> StudioSpec {
+    StudioSpec {
+        default_prompt: STUDIO_MINDMAP_PROMPT,
+        page_role: "You are a front-end developer building an interactive mind-map page. Draw one \
+            central topic with a tree of branches; let the reader expand and collapse nodes by clicking, \
+            and gently pan the canvas if you can. Keep labels short. Base it only on the provided material.",
+        working_label: "Drawing your mind map",
+        fallback_step: Some("Extracting the topic tree…"),
+        fallback_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "root": {"type": "string"},
+                "nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "parent": {"type": "string"}
+                        },
+                        "required": ["label", "parent"]
                     }
-                },
-                "required": ["root", "nodes"]
-            });
-            let messages = vec![
-                ollama::ChatMessage::new(
-                    "system",
-                    "You organize material into a mind map: one central root topic and a tree of nodes, \
-                     each naming its parent (the root, or another node's exact label). Keep labels short. \
-                     Base it only on the provided text.",
-                ),
-                ollama::ChatMessage::new(
-                    "user",
-                    format!("{instr}\n\nBase it only on this material about \"{label}\":\n\n{text}"),
-                ),
-            ];
-            let raw =
-                ollama::chat_structured(&model, messages, Some(0.3), KEEP_ALIVE_WARM, &schema).await?;
-            let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).ok();
-            let root = parsed
-                .as_ref()
-                .and_then(|v| v.get("root").and_then(|s| s.as_str()))
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(&label)
-                .trim()
-                .to_string();
-            let nodes: Vec<MindNode> = parsed
-                .as_ref()
-                .and_then(|v| v.get("nodes").and_then(|n| n.as_array()).cloned())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|n| {
-                            let l = n.get("label").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-                            let p = n.get("parent").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-                            (!l.is_empty()).then_some(MindNode { label: l, parent: p })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if nodes.is_empty() {
-                return Err(
-                    "The model didn't return a usable mind map — try a different file.".into(),
-                );
-            }
-            render_mindmap_html(&label, &root, &nodes)
-        }
-    };
-    let name = format!("Mind map - {}.html", safe_scope_name(&label));
-    let meta = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        db::insert_file(&room.conn, &name, "text/html", content.as_bytes(), Some(&content), "generated")?
-    };
-    let _ = window.emit("room-files-changed", ());
-    let _ = window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
-    Ok(meta)
+                }
+            },
+            "required": ["root", "nodes"]
+        }),
+        fallback_system: "You organize material into a mind map: one central root topic and a tree of nodes, \
+             each naming its parent (the root, or another node's exact label). Keep labels short. \
+             Base it only on the provided text.",
+        fallback_intro: "Base it only on this material about",
+        fallback_temp: 0.3,
+        render: fallback_mindmap,
+        filename_prefix: "Mind map",
+    }
+}
+
+/// Fallback: parse the extracted topic tree and render the built-in mind-map
+/// template. The root defaults to the scope label when the model omits it.
+fn fallback_mindmap(raw: &str, label: &str) -> Result<String, String> {
+    let root = json_str_field(raw, "root")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| label.trim().to_string());
+    let nodes: Vec<MindNode> = json_array(raw, "nodes")
+        .iter()
+        .filter_map(|n| {
+            let l = value_str(n, "label");
+            (!l.is_empty()).then_some(MindNode {
+                label: l,
+                parent: value_str(n, "parent"),
+            })
+        })
+        .collect();
+    if nodes.is_empty() {
+        return Err("The model didn't return a usable mind map — try a different file.".into());
+    }
+    Ok(render_mindmap_html(label, &root, &nodes))
 }
 
 /// D5: render a collapsible mind-map tree as a self-contained HTML page. Built

@@ -155,12 +155,40 @@
   z-index: 20;
 }
 
+/* A list that scrolls must LOOK like it scrolls — always-visible thumb. */
+.ac-popover::-webkit-scrollbar {
+  width: 8px;
+}
+.ac-popover::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}
+
 .ac-hint {
   font-size: 11px;
   color: var(--text-dim);
   padding: 4px 8px 6px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* Count on the left, keyboard cheatsheet on the right — the overflow cue. */
+.ac-hint-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  position: sticky;
+  top: -4px;
+  background: var(--panel-2);
+  z-index: 1;
+}
+
+.ac-keys {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-faint, var(--text-dim));
+  flex: 0 0 auto;
 }
 
 .ac-item {

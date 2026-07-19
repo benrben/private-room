@@ -2,9 +2,7 @@ use super::*;
 
 pub(crate) fn extract_docx(bytes: &[u8]) -> Option<String> {
     let xml = read_zip_entry(bytes, "word/document.xml")?;
-    // Paragraph ends become newlines so the text keeps its structure.
-    let xml = xml.replace("</w:p>", "</w:p>\n");
-    Some(strip_tags(&xml))
+    Some(xml_paras_to_text(&xml, "</w:p>"))
 }
 
 fn encode_xml_text(s: &str) -> String {
@@ -53,17 +51,34 @@ fn scan_docx_text(xml: &str) -> (Vec<DocxTextNode>, Vec<char>, Vec<(usize, usize
                 let text: Vec<char> =
                     decode_basic_entities(&xml[body_start..body_end]).chars().collect();
                 let ni = nodes.len();
+                // Wave 2 (Idea 4): fold each char through the shared edit table so
+                // a docx match tolerates the same curly-quote/NBSP/dash/ligature
+                // drift the plain-text matcher does. Paragraph bounds stay via the
+                // '\u{0}' separators below — this only touches within-run chars.
                 for (ci, &ch) in text.iter().enumerate() {
-                    if ch.is_whitespace() {
-                        if !last_space {
-                            hay.push(' ');
-                            map.push((ni, ci));
-                            last_space = true;
+                    match fold_edit_char(ch) {
+                        FoldOut::Space => {
+                            if !last_space {
+                                hay.push(' ');
+                                map.push((ni, ci));
+                                last_space = true;
+                            }
                         }
-                    } else {
-                        hay.push(ch);
-                        map.push((ni, ci));
-                        last_space = false;
+                        FoldOut::Drop => {}
+                        FoldOut::Char(c) => {
+                            hay.push(c);
+                            map.push((ni, ci));
+                            last_space = false;
+                        }
+                        FoldOut::Pair(a, b) => {
+                            // Both halves map back to the SAME source char, so a
+                            // match spanning either replaces that whole char.
+                            hay.push(a);
+                            map.push((ni, ci));
+                            hay.push(b);
+                            map.push((ni, ci));
+                            last_space = false;
+                        }
                     }
                 }
                 nodes.push(DocxTextNode { tag_start: t, body_start, body_end, text });
@@ -89,14 +104,26 @@ fn collapse_ws(s: &str) -> Vec<char> {
     let mut out = Vec::new();
     let mut last_space = true;
     for ch in s.chars() {
-        if ch.is_whitespace() {
-            if !last_space {
-                out.push(' ');
-                last_space = true;
+        // Wave 2 (Idea 4): the needle folds through the same table as the hay,
+        // so a straight-quote/plain-space/ASCII-ligature needle meets a
+        // curly-quote/NBSP/ligature file in the middle.
+        match fold_edit_char(ch) {
+            FoldOut::Space => {
+                if !last_space {
+                    out.push(' ');
+                    last_space = true;
+                }
             }
-        } else {
-            out.push(ch);
-            last_space = false;
+            FoldOut::Drop => {}
+            FoldOut::Char(c) => {
+                out.push(c);
+                last_space = false;
+            }
+            FoldOut::Pair(a, b) => {
+                out.push(a);
+                out.push(b);
+                last_space = false;
+            }
         }
     }
     while out.last() == Some(&' ') {
@@ -283,6 +310,30 @@ mod tests {
         let xml = r#"<w:p><w:t>end here.</w:t></w:p><w:p><w:t>Next para</w:t></w:p>"#;
         let (_, n) = replace_in_text_nodes(xml, "here. Next", "x");
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn text_node_replace_folds_curly_quotes_and_nbsp() {
+        // Wave 2 (Idea 4): a straight-quote/plain-space needle matches a
+        // curly-quote/NBSP file spanning two runs → exactly one match, and it
+        // round-trips through extract_text.
+        let xml = "<w:p><w:r><w:t>the \u{201C}fee\u{201D}\u{00A0}is</w:t></w:r>\
+                   <w:r><w:t> 5% today</w:t></w:r></w:p>";
+        let (out, n) = replace_in_text_nodes(xml, "the \"fee\" is 5%", "the \"fee\" is 7%");
+        assert_eq!(n, 1);
+        let bytes = fake_office_zip("word/document.xml", &format!("<w:document>{out}</w:document>"));
+        let text = extract_text("c.docx", &bytes).expect("docx text");
+        assert!(text.contains("7% today"), "got: {text}");
+        assert!(!text.contains("5%"));
+    }
+
+    #[test]
+    fn docx_replace_all_guard_matches_the_text_branch() {
+        // Wave 2 (Idea 4 review amendment): a multi-occurrence docx match returns a
+        // count so the caller (run_edit_file) can refuse a silent replace-all.
+        let xml = r#"<w:p><w:t>fee is 5% and fee is 5%</w:t></w:p>"#;
+        let (_, n) = replace_in_text_nodes(xml, "fee is 5%", "fee is 7%");
+        assert_eq!(n, 2, "count exposes the ambiguity for the uniqueness guard");
     }
 
     #[test]

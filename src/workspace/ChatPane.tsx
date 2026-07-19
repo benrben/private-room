@@ -4,8 +4,11 @@ import {
   DownloadIcon,
   EmptyChatArt,
   EyeIcon,
+  HandsFreeIcon,
   MemoryIcon,
   PencilIcon,
+  SparkIcon,
+  SpeakerIcon,
   TrashIcon,
   UndoIcon,
 } from "../icons";
@@ -14,6 +17,7 @@ import MarkdownView from "../viewers/MarkdownView";
 import {
   annotationTarget,
   isCloudEngine,
+  isModelReady,
   patchStreamFences,
   splitMarkupBlocks,
 } from "./markup";
@@ -36,16 +40,12 @@ export default function ChatPane({
   info: RoomInfo;
 }) {
   const { ai, model, messages } = s;
-  const modelReady =
-    (ai?.running &&
-      (ai.models.includes(model) ||
-        ai.models.some((m) => m.startsWith(model + ":") || model.startsWith(m)))) ||
-    ai?.external.includes(model);
+  const modelReady = isModelReady(ai, model);
   const lastAssistantId = [...messages]
     .reverse()
     .find((m) => m.role === "assistant")?.id;
   return (
-    <main className="chat" style={{ width: s.chatW, maxWidth: "none", flex: "0 0 auto" }}>
+    <div className="chat" aria-label="Chat">
       <div className="chat-head">
         {s.renaming ? (
           <input
@@ -84,6 +84,30 @@ export default function ChatPane({
         </button>
         <button className="subtle" title="New chat ⌘N" onClick={a.newChat}>
           ＋ New
+        </button>
+        <button
+          className={`subtle btn-ic${s.autoSpeak ? " accent" : ""}`}
+          title={
+            s.autoSpeak
+              ? "Auto-speak is on — answers are read aloud (voice: Settings → Spoken voice)"
+              : "Speak answers aloud as they stream"
+          }
+          aria-pressed={s.autoSpeak}
+          onClick={a.toggleAutoSpeak}
+        >
+          <SpeakerIcon size={14} />
+        </button>
+        <button
+          className={`subtle btn-ic${s.handsFree ? " accent" : ""}`}
+          title={
+            s.handsFree
+              ? "Hands-free is on — the mic re-arms after each answer"
+              : "Hands-free: re-arm the mic after each answer to keep talking"
+          }
+          aria-pressed={s.handsFree}
+          onClick={a.toggleHandsFree}
+        >
+          <HandsFreeIcon size={14} />
         </button>
         {s.activeChatId && (
           <DeleteControl
@@ -242,19 +266,30 @@ export default function ChatPane({
           // ADD-23: structured effects ride on the message row; the content is
           // plain prose. Legacy rooms (effects: null) still carry fenced
           // ```boxes/```annotation blocks inside the text — split those out.
+          // Wave 2 (Idea 4): key off the two VIEWER keys, NOT effects-null — an
+          // edit turn now writes an "edits"-only effects object, and a message
+          // with no boxes/annotation must still run splitMarkupBlocks so a
+          // hallucinated fenced block is stripped rather than shown raw.
+          const hasViewerEffect = !!(m.effects && (m.effects.boxes || m.effects.annotation));
           const { text, boxes, annotation } =
             m.role === "assistant"
-              ? m.effects
+              ? hasViewerEffect
                 ? {
                     text: m.content,
-                    boxes: m.effects.boxes,
-                    annotation: m.effects.annotation,
+                    boxes: m.effects!.boxes,
+                    annotation: m.effects!.annotation,
                   }
                 : splitMarkupBlocks(m.content)
               : { text: m.content, boxes: undefined, annotation: undefined };
           const annotVerified = !!annotation?.quote && !annotation?.approx;
           return (
           <div key={m.id} id={`msg-${m.id}`} className={`msg ${m.role}`}>
+            <div className="msg-label">
+              <span className="msg-avatar" aria-hidden>
+                {m.role === "assistant" ? <SparkIcon size={12} /> : "•"}
+              </span>
+              {m.role === "assistant" ? "Room AI" : "You"}
+            </div>
             <div className="msg-content" dir="auto">
               {m.role === "assistant" ? (
                 <>
@@ -343,6 +378,17 @@ export default function ChatPane({
                 )}
                 <button
                   className="subtle"
+                  title={
+                    s.speakingMsgId === m.id
+                      ? "Stop speaking"
+                      : "Read this answer aloud"
+                  }
+                  onClick={() => a.speakMessage(m)}
+                >
+                  {s.speakingMsgId === m.id ? "◼ Stop" : "▶ Play"}
+                </button>
+                <button
+                  className="subtle"
                   title="Copy this answer"
                   disabled={s.asking}
                   onClick={() => a.copyMessage(m)}
@@ -402,6 +448,12 @@ export default function ChatPane({
         })}
         {s.asking && (
           <div className={`msg assistant ${s.streamText ? "" : "thinking"}`}>
+            <div className="msg-label">
+              <span className="msg-avatar" aria-hidden>
+                <SparkIcon size={12} />
+              </span>
+              Room AI
+            </div>
             {(s.lane || s.steps.length > 0) && (
               <div className="step-chips">
                 {s.lane && <span className="lane-chip">{s.lane}</span>}
@@ -451,12 +503,22 @@ export default function ChatPane({
               >
                 Ignore
               </button>
+              {/* Wave 1b (idea 5): opt into auto-save. The click is the
+                  consent; the agent driver still can't press it (the chip is
+                  data-agent-blocked). Off-switch: Settings → Behavior. */}
+              <button
+                className="subtle"
+                title="Save this and every future suggestion automatically (turn off in Settings → Behavior)"
+                onClick={a.enableMemoryAutoSave}
+              >
+                Always save
+              </button>
             </div>
           </div>
         )}
       </div>
 
       <Composer s={s} a={a} />
-    </main>
+    </div>
   );
 }

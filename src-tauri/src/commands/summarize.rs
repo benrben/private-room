@@ -16,21 +16,20 @@ pub(crate) fn is_summary_file(name: &str, source: &str) -> bool {
     (name == SUMMARY_FILE_NAME || name == "Room summary.md") && source == "generated"
 }
 
-/// Trim a model reply down to a single clean sentence for a file one-liner.
-pub(crate) fn clean_one_liner(raw: &str) -> String {
-    let line = strip_markup_blocks(raw)
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .trim_start_matches(['-', '*', '#', '>', ' '])
-        .to_string();
-    line.chars().take(200).collect::<String>().trim().to_string()
-}
-
-/// ADD-17 map step: one short call describing a single file in a sentence.
-/// `keep_alive` lets the background filler use a short warmth (CHG-22) so it
-/// never pins the model in RAM, while the interactive path keeps it warm.
+/// ADD-17 map step: describe a single file in one sentence. ADD-27: `text` is
+/// the file's FULL extracted text; the sidecar noise-filters it and, when it
+/// doesn't fit one window, the MODEL drives the reading (a `read_text` tool loop)
+/// before a final schema-constrained call produces the sentence.
+///
+/// MIGRATION Phase 3: all of that compute now lives in the sidecar's
+/// `/summarize_file` — the smart_filter, the read_text paging, the final
+/// structured call and `clean_one_liner` are byte-reproduced there. Rust gathers
+/// the full text (callers already do) and stores the returned one-liner. The
+/// error rule is preserved by the sentinel mapping: the endpoint returns 502
+/// (→ `OLLAMA_DOWN`/`MODEL_MISSING:<model>`) only for a FATAL engine failure and
+/// otherwise degrades internally to a samples-only answer, so this function's
+/// callers keep aborting the run only on those two sentinels. `keep_alive` still
+/// lets the background filler release the model (CHG-22).
 pub(crate) async fn summarize_one_file(
     model: &str,
     name: &str,
@@ -38,32 +37,19 @@ pub(crate) async fn summarize_one_file(
     text: &str,
     keep_alive: &str,
 ) -> Result<String, String> {
-    let messages = vec![
-        ollama::ChatMessage::new(
-            "system",
-            "You describe a single file in ONE short, factual sentence based only on what is given.",
-        ),
-        ollama::ChatMessage::new(
-            "user",
-            format!(
-                "File name: {name}\nType: {mime}\n\nBeginning of its text:\n{text}\n\n\
-                 In one sentence, what is this file about?"
-            ),
-        ),
-    ];
-    // ADD-22: a single guaranteed string field, so a chatty model can't wrap the
-    // sentence in preamble/markup that clean_one_liner then has to strip.
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {"summary": {"type": "string"}},
-        "required": ["summary"]
+    let body = serde_json::json!({
+        "model": model,
+        "name": name,
+        "text": text,
+        "mime": mime,
+        "base_url": ollama::resolved_base_url(),
+        "keep_alive": keep_alive,
     });
-    let raw = ollama::chat_structured(model, messages, Some(0.2), keep_alive, &schema).await?;
-    let summary = serde_json::from_str::<serde_json::Value>(raw.trim())
-        .ok()
-        .and_then(|v| v.get("summary").and_then(|s| s.as_str()).map(str::to_string))
-        .unwrap_or(raw);
-    Ok(clean_one_liner(&summary))
+    let v = crate::sidecar::sidecar_json("/summarize_file", &body)
+        .await
+        .map_err(|e| e.sentinel(Some(model)))?;
+    // Already clean_one_liner'd on the sidecar (≤200 chars, may be "").
+    Ok(v["summary"].as_str().unwrap_or_default().to_string())
 }
 
 /// ADD-17 reduce step: one call producing the "What this room is for" paragraph
@@ -75,85 +61,70 @@ pub(crate) async fn combine_summary(
     memories: &[String],
     file_lines: &str,
 ) -> Result<(String, Vec<String>), String> {
-    let mut context = format!("Room name: {room_name}\n\nFiles and what each is:\n{file_lines}\n");
-    if !memories.is_empty() {
-        context.push_str("\nMemory notes the user saved for this room:\n");
-        for m in memories {
-            context.push_str(&format!("- {m}\n"));
-        }
-    }
-
-    // ADD-22 (fix): the old design asked one constrained call for a nested
-    // {purpose, questions[3]} object and often got empty strings back — a small
-    // model can't fill a JSON shape it never sees. Split into TWO single-purpose
-    // calls instead: free-text prose for the purpose (what a 4B model does most
-    // reliably), and a plain string array for the questions (grounded by the
-    // schema-in-prompt that chat_structured now adds).
-    let purpose = {
-        let messages = vec![
-            ollama::ChatMessage::new(
-                "system",
-                "You describe what a personal document room is for. In 2-4 sentences, say what \
-                 the room is about and the main topics it covers, based only on the file list. \
-                 Be specific and concrete. No preamble, no bullet lists, no file names.",
-            ),
-            ollama::ChatMessage::new("user", context.clone()),
-        ];
-        let (t, _) =
-            ollama::chat_stream_tools(model, messages, None, Some(0.4), None, KEEP_ALIVE_WARM, |_| {})
-                .await?;
-        strip_think_spans(&t).trim().to_string()
-    };
-
-    let questions = {
-        let messages = vec![
-            ollama::ChatMessage::new(
-                "system",
-                "You suggest example questions a user could ask about their own documents. Give \
-                 exactly three short, specific questions that these files would actually answer.",
-            ),
-            ollama::ChatMessage::new("user", context),
-        ];
-        let schema = serde_json::json!({
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 3,
-            "maxItems": 3
-        });
-        let raw = ollama::chat_structured(model, messages, Some(0.4), KEEP_ALIVE_WARM, &schema)
-            .await
-            .unwrap_or_default();
-        parse_string_list(&raw).into_iter().take(3).collect()
-    };
-
+    // MIGRATION Phase 3: the two reduce calls (free-text purpose + string-array
+    // questions), the context assembly and the questions cap now live in the
+    // sidecar's `/combine_summary`. Rust still builds `file_lines` deterministically
+    // from the cached per-file one-liners (see write_room_summary). Error rule
+    // reproduced: the purpose call propagates (→ this `?`), the questions call
+    // swallows to `[]` — both handled inside the endpoint, so a 502 here means the
+    // purpose call failed, mapped to the same sentinel it produced before.
+    let body = serde_json::json!({
+        "model": model,
+        "room_name": room_name,
+        "file_lines": file_lines,
+        "memories": memories,
+        "base_url": ollama::resolved_base_url(),
+        "keep_alive": KEEP_ALIVE_WARM,
+    });
+    let v = crate::sidecar::sidecar_json("/combine_summary", &body)
+        .await
+        .map_err(|e| e.sentinel(Some(model)))?;
+    let purpose = v["purpose"].as_str().unwrap_or_default().to_string();
+    let questions: Vec<String> = v["questions"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
     Ok((purpose, questions))
 }
 
-/// ADD-17: generate (or refresh) the room's single "Room summary.md" via a
-/// two-step map-reduce, caching each file's one-liner so re-runs only summarize
-/// new or changed files. Emits `summarize-progress` while running. Writes
-/// nothing if the model is unreachable (returns the normal friendly error).
-#[tauri::command]
-pub async fn summarize_room(
-    window: tauri::Window,
-    state: State<'_, AppState>,
+/// Resolve the open room, honoring an optional pin (the path of the room the
+/// caller started in). With a pin, a room that was closed or swapped mid-run
+/// counts as gone — the caller's writes must never land in whatever room
+/// happens to be open NOW.
+fn pinned_room<'a>(guard: &'a Option<Room>, pin: Option<&str>) -> Result<&'a Room, String> {
+    match pin {
+        Some(p) => guard
+            .as_ref()
+            .filter(|r| r.path == p)
+            .ok_or_else(|| "the room this job belongs to was closed".to_string()),
+        None => guard.as_ref().ok_or_else(|| "No room is open.".to_string()),
+    }
+}
+
+/// Reduce + write: assemble "Room summary.html" from the CACHED per-file
+/// one-liners and save it into the room. The cache is filled beforehand by the
+/// ADD-30 deep-summary job (or the `#summarize` command) — so this
+/// makes exactly two model calls (purpose + questions) regardless of room size.
+/// `pin` (the originating room's path) guards EVERY room access here: the
+/// reduce awaits model calls that can take minutes, and a room swapped in that
+/// window must error out, never receive the old room's summary.
+pub(crate) async fn write_room_summary(
+    window: &tauri::Window,
+    state: &AppState,
+    model: &str,
+    pin: Option<&str>,
 ) -> Result<FileMeta, String> {
     use tauri::Emitter;
 
-    // Phase 1 (locked): pull the room name, memories and the file rows.
-    let (room_name, explicit_model, memories, files, existing_id, legacy_md_id) = {
+    let (room_name, memories, files, existing_id, legacy_md_id) = {
         let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+        let room = pinned_room(&guard, pin)?;
         let conn = &room.conn;
         let all = db::list_files_for_summary(conn)?;
-        // Overwrite the current (HTML) summary in place.
         let existing_id = all
             .iter()
             .find(|f| f.name == SUMMARY_FILE_NAME && f.source == "generated")
             .map(|f| f.id.clone());
-        // ADD-22: the pre-HTML "Room summary.md" (from an older app version) is
-        // removed once we regenerate, so the room isn't left with a stale
-        // duplicate summary in the other format.
         let legacy_md_id = all
             .iter()
             .find(|f| f.name == "Room summary.md" && f.source == "generated")
@@ -164,77 +135,31 @@ pub async fn summarize_room(
             .collect();
         let memories: Vec<String> =
             db::list_memories(conn)?.into_iter().map(|m| m.content).collect();
-        (room.name.clone(), model_setting(conn), memories, files, existing_id, legacy_md_id)
+        (room.name.clone(), memories, files, existing_id, legacy_md_id)
     };
-
     if files.is_empty() {
         return Err("This room has no files to summarize yet.".into());
     }
-
-    // Summarization always runs on a LOCAL model (map-reduce needs many small
-    // calls); if a cloud engine is selected, fall back to the default local one.
-    let models = ollama::list_models()
-        .await
-        .map_err(|_| "The local AI (Ollama) isn't running — start it and try again.".to_string())?;
-    if models.is_empty() {
-        return Err("No local AI model is installed yet — download one first.".into());
-    }
-    let mut model = explicit_model.unwrap_or_else(|| best_default(&models));
-    if is_external_engine(&model) {
-        model = best_default(&models);
-    }
-
     let capped = files.len() > MAX_SUMMARY_FILES;
-    let to_do = files.len().min(MAX_SUMMARY_FILES);
 
-    // Map: a one-liner per file, reusing the cache and filling any gaps.
     // `file_lines` is the text context handed to the reduce step; `file_items`
     // (display, one-liner) drives the deterministic HTML file list.
     let mut file_lines = String::new();
     let mut file_items: Vec<(String, Option<String>)> = Vec::new();
-    for (i, f) in files.iter().take(MAX_SUMMARY_FILES).enumerate() {
-        let _ = window.emit(
-            "summarize-progress",
-            format!("Summarizing file {} of {}…", i + 1, to_do),
-        );
+    for f in files.iter().take(MAX_SUMMARY_FILES) {
         let display = match &f.folder {
             Some(folder) => format!("{folder}/{}", f.name),
             None => f.name.clone(),
         };
-        let one_liner = if let Some(cached) = &f.ai_summary {
-            cached.clone()
-        } else if f.text.as_deref().map_or(true, |t| t.trim().is_empty()) {
-            // No extractable text (e.g. an image without OCR): list by name and
-            // type only, never invent content.
-            String::new()
-        } else {
-            let snippet = f.text.as_deref().unwrap_or("");
-            // CHG-26: one flaky file must not abort the whole run. A
-            // non-transient error (Ollama down / model missing) still aborts —
-            // every remaining call would fail too — but a one-off error just
-            // degrades this file to name-and-type (and, being uncached, retries
-            // on the next run).
-            match summarize_one_file(&model, &f.name, &f.mime, snippet, KEEP_ALIVE_WARM).await {
-                Ok(liner) => {
-                    if !liner.is_empty() {
-                        if let Some(room) = state.room.lock().unwrap().as_ref() {
-                            let _ = db::set_file_ai_summary(&room.conn, &f.id, &liner);
-                        }
-                    }
-                    liner
-                }
-                Err(e) if e == "OLLAMA_DOWN" || e.starts_with("MODEL_MISSING") => {
-                    return Err(e);
-                }
-                Err(_) => String::new(),
+        match f.ai_summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(liner) => {
+                file_lines.push_str(&format!("- {display} — {liner}\n"));
+                file_items.push((display, Some(liner.to_string())));
             }
-        };
-        if one_liner.is_empty() {
-            file_lines.push_str(&format!("- {display} ({})\n", f.mime));
-            file_items.push((display, None));
-        } else {
-            file_lines.push_str(&format!("- {display} — {one_liner}\n"));
-            file_items.push((display, Some(one_liner)));
+            None => {
+                file_lines.push_str(&format!("- {display} ({})\n", f.mime));
+                file_items.push((display, None));
+            }
         }
     }
 
@@ -243,7 +168,7 @@ pub async fn summarize_room(
     // for the deterministic "## Files" section and is appended AFTER, so it
     // never crowds the 8K context the model actually needs here.
     let _ = window.emit("summarize-progress", "Writing the summary…");
-    let (purpose, questions) = combine_summary(&model, &room_name, &memories, &file_lines).await?;
+    let (purpose, questions) = combine_summary(model, &room_name, &memories, &file_lines).await?;
 
     if capped {
         for f in files.iter().skip(MAX_SUMMARY_FILES) {
@@ -260,10 +185,7 @@ pub async fn summarize_room(
     // guaranteed fields; the file list is deterministic. Everything is escaped.
     let saved_date = {
         let guard = state.room.lock().unwrap();
-        guard
-            .as_ref()
-            .map(|room| db::current_date(&room.conn))
-            .unwrap_or_default()
+        db::current_date(&pinned_room(&guard, pin)?.conn)
     };
     let mut body = doc_hero(
         "Room summary",
@@ -318,7 +240,7 @@ pub async fn summarize_room(
     // Phase 3 (locked): write the ONE canonical summary file — overwrite in
     // place (ADD-2 keeps the previous versions) or create it the first time.
     let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
+    let room = pinned_room(&guard, pin)?;
     let meta = match existing_id {
         Some(id) => {
             store_file_bytes(&room.conn, &id, content.as_bytes(), Some(&content), "Summarized")?;
@@ -357,10 +279,68 @@ mod tests {
         assert!(!is_summary_file("notes.md", "generated"));
     }
 
+    /// ADD-27 end-to-end proof: the answer is ONLY reachable by paging past the
+    /// first window, so a correct summary means the model really drove
+    /// read_text. Needs a running Ollama with a tool-capable local model:
+    /// `cargo test summarize_pages_past_first_window -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn summarize_pages_past_first_window() {
+        let mut text = String::from(
+            "NOTICE: This file's real content is described later in the document. \
+             To learn what this file actually is, search for the word MANIFEST \
+             and read what follows it.\n\n",
+        );
+        for i in 0..4000 {
+            text.push_str(&format!("Log entry {i}: heartbeat OK, no events recorded.\n"));
+        }
+        text.push_str(
+            "\nMANIFEST: This document is the official maintenance manual for the \
+             Zephyr-9 submarine engine, covering cooling, torque limits and \
+             emergency shutdown procedures.\n",
+        );
+        for i in 0..2000 {
+            text.push_str(&format!("Appendix row {i}: reserved.\n"));
+        }
+        let model = std::env::var("PR_TEST_MODEL").unwrap_or_else(|_| "qwen3.5:9b".into());
+        let liner = summarize_one_file(&model, "big.log", "text/plain", &text, "2m")
+            .await
+            .expect("summarize failed — is Ollama running?");
+        eprintln!("one-liner: {liner}");
+        assert!(
+            ["zephyr", "submarine", "engine", "maintenance", "manual"]
+                .iter()
+                .any(|w| liner.to_lowercase().contains(w)),
+            "summary never found the buried MANIFEST: {liner}"
+        );
+    }
+
     #[test]
-    fn cleans_model_one_liner() {
-        assert_eq!(clean_one_liner("- A lease agreement.\nExtra"), "A lease agreement.");
-        assert_eq!(clean_one_liner("\n\n  The résumé.  "), "The résumé.");
+    fn pinned_room_rejects_a_swapped_or_closed_room() {
+        let room = Some(Room {
+            conn: Connection::open_in_memory().unwrap(),
+            path: "/tmp/a.roomai".into(),
+            name: "A".into(),
+            password: String::new(),
+        });
+        // Unpinned and matching-pin lookups resolve the open room.
+        assert!(pinned_room(&room, None).is_ok());
+        assert!(pinned_room(&room, Some("/tmp/a.roomai")).is_ok());
+        // A pin for a DIFFERENT room (swapped mid-run) must error, never
+        // hand back the room that is currently open.
+        assert_eq!(
+            pinned_room(&room, Some("/tmp/b.roomai")).err().as_deref(),
+            Some("the room this job belongs to was closed")
+        );
+        // No room open: the pinned path keeps the job-style message.
+        assert_eq!(
+            pinned_room(&None, None).err().as_deref(),
+            Some("No room is open.")
+        );
+        assert_eq!(
+            pinned_room(&None, Some("/tmp/a.roomai")).err().as_deref(),
+            Some("the room this job belongs to was closed")
+        );
     }
 
 }

@@ -10,6 +10,10 @@ interface Props {
   pwError: string;
   pwSaved: boolean;
   changePassword: () => void;
+  pwRecoveryCode: string | null;
+  setPwRecoveryCode: (v: string | null) => void;
+  pwRecoveryCopied: boolean;
+  setPwRecoveryCopied: (v: boolean) => void;
   touchIdOn: boolean;
   toggleTouchId: () => void;
   touchIdErr: string;
@@ -43,6 +47,10 @@ export default function PrivacySection({
   pwError,
   pwSaved,
   changePassword,
+  pwRecoveryCode,
+  setPwRecoveryCode,
+  pwRecoveryCopied,
+  setPwRecoveryCopied,
   touchIdOn,
   toggleTouchId,
   touchIdErr,
@@ -105,7 +113,10 @@ export default function PrivacySection({
               />
             </div>
             <p className="settings-hint">
-              There is no recovery if you forget it.
+              {/* One consistent story with the Recovery key section — a flat
+                  "no recovery" here contradicted it and read as a threat. */}
+              There is no password reset. A recovery key (Settings → Recovery
+              key) is the only way back in if you forget it.
             </p>
             {pwError && <div className="gate-error">{pwError}</div>}
             <div className="settings-actions">
@@ -113,6 +124,46 @@ export default function PrivacySection({
                 {pwSaved ? "Password changed ✓" : "Change password"}
               </button>
             </div>
+            {pwRecoveryCode && (
+              // The old recovery key wrapped the old password, so changing it
+              // re-issues the key. Same one-time sheet as the Recovery
+              // section (the App.css print block keys off .recovery-sheet).
+              <div className="recovery-sheet">
+                <div className="recovery-sheet-title">
+                  Your new recovery key
+                </div>
+                <div className="recovery-code">{pwRecoveryCode}</div>
+                <div className="recovery-sheet-note">
+                  Changing your password re-issued this room's recovery key —
+                  the old one no longer works. This is shown only once; copy
+                  or print it now, then store it away from this Mac.
+                </div>
+                <div className="recovery-sheet-actions">
+                  <button
+                    className="primary"
+                    onClick={() => {
+                      setPwRecoveryCopied(true);
+                      try {
+                        void navigator.clipboard.writeText(pwRecoveryCode);
+                      } catch {
+                        /* clipboard unavailable — code is still on screen */
+                      }
+                    }}
+                  >
+                    {pwRecoveryCopied ? "Copied ✓" : "Copy code"}
+                  </button>
+                  <button className="subtle" onClick={() => window.print()}>
+                    Print
+                  </button>
+                  <button
+                    className="subtle"
+                    onClick={() => setPwRecoveryCode(null)}
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* ADD-11 — Touch ID unlock */}
             <label className="settings-label">Touch ID unlock</label>

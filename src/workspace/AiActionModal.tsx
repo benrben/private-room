@@ -9,15 +9,24 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
   const aiPrompt = s.aiPrompt;
   const def = aiPrompt.def;
   const running = s.aiBusy;
-  const questionMissing = def.needsQuestion && !aiPrompt.question.trim();
+  // ADD-27: "translate" reuses the question field to carry the language.
+  const questionMissing =
+    (def.needsQuestion || def.needsLanguage) && !aiPrompt.question.trim();
   return (
     <div
-      className="studio-prompt-backdrop"
+      className={`studio-prompt-backdrop${running ? " running" : ""}`}
       onClick={() => {
         if (!running) s.setAiPrompt(null);
       }}
     >
-      <div className="studio-prompt" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="studio-prompt"
+        role="dialog"
+        aria-modal="true"
+        aria-label={def.title}
+        aria-busy={running}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="studio-prompt-title">
           {def.title} ·{" "}
           {aiPrompt.refs && aiPrompt.refs.length
@@ -30,6 +39,39 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
           {def.description} Edit the prompt the AI will follow, then run it.
           Type <strong>@</strong> to add a specific file or folder as context.
         </p>
+        {def.needsLanguage && (
+          <>
+            <input
+              className="studio-prompt-question"
+              list="ai-action-langs"
+              placeholder="Target language — English, עברית, Español, 中文…"
+              value={aiPrompt.question}
+              autoFocus
+              disabled={running}
+              dir="auto"
+              onChange={(e) => {
+                const q = e.target.value;
+                s.setAiPrompt((p) => (p ? { ...p, question: q } : p));
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  void a.runAiActionFromModal();
+                }
+              }}
+            />
+            <datalist id="ai-action-langs">
+              {[
+                "English", "עברית (Hebrew)", "Español (Spanish)", "Français (French)",
+                "Deutsch (German)", "العربية (Arabic)", "Русский (Russian)", "中文 (Chinese)",
+                "日本語 (Japanese)", "Português (Portuguese)", "Italiano (Italian)",
+                "हिन्दी (Hindi)", "Українська (Ukrainian)", "Türkçe (Turkish)",
+              ].map((l) => (
+                <option key={l} value={l} />
+              ))}
+            </datalist>
+          </>
+        )}
         {def.needsQuestion && (
           <input
             className="studio-prompt-question"
@@ -60,7 +102,7 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
                   className={`ac-item ${i === s.studioAc!.index ? "active" : ""}`}
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    a.acceptAiMention(it.insert);
+                    a.acceptMention(it.insert, s.aiPrompt, s.setAiPrompt);
                   }}
                 >
                   <span className="ac-label">{it.label}</span>
@@ -110,8 +152,10 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
                 }
                 if (e.key === "Enter" || e.key === "Tab") {
                   e.preventDefault();
-                  a.acceptAiMention(
+                  a.acceptMention(
                     items[Math.min(s.studioAc.index, items.length - 1)].insert,
+                    s.aiPrompt,
+                    s.setAiPrompt,
                   );
                   return;
                 }
@@ -137,11 +181,17 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
             Cancel
           </button>
           <button
-            className="primary"
+            className={`primary${running ? " running" : ""}`}
             disabled={running || !aiPrompt.text.trim() || questionMissing}
             onClick={() => void a.runAiActionFromModal()}
           >
-            {running ? "Running…" : "Run"}
+            {running ? (
+              <>
+                <span className="btn-spinner" aria-hidden="true" /> Running…
+              </>
+            ) : (
+              "Run"
+            )}
           </button>
         </div>
       </div>

@@ -9,11 +9,31 @@ import {
 
 export * from "./apiTypes";
 import type {
+  AppDiag,
+  FeedbackDraft,
+  RecFile,
+  RecLive,
+  RecMeta,
+  RecSegment,
+  RecStart,
   RoomInfo,
   ImportReport,
   FileMeta,
   FileContent,
+  Job,
+  JobProgress,
+  Workflow,
+  WorkflowRun,
+  Schedule,
+  ScheduleArg,
+  WorkflowTemplate,
+  WorkflowNodeEvent,
+  ScriptInfo,
+  ScriptManifest,
+  ScriptApproveRequest,
   FileVersion,
+  VersionContent,
+  CheckpointMeta,
   RecentRoom,
   Memory,
   Folder,
@@ -30,6 +50,7 @@ import type {
   AgentOpenFilePayload,
   AgentUiRequest,
   AnnotationPayload,
+  EditApproveRequest,
   McpApproveRequest,
   RecommendedModels,
   RoomGraph,
@@ -39,6 +60,8 @@ import type {
   FileMetaSuggestion,
   RoomServerStatus,
   RoomRole,
+  ExternalModelInfo,
+  VoiceInfo,
 } from "./apiTypes";
 
 export const api = {
@@ -67,11 +90,28 @@ export const api = {
     invoke<FileVersion[]>("list_file_versions", { id }),
   restoreFileVersion: (versionId: string) =>
     invoke<void>("restore_file_version", { versionId }),
+  // Idea 11: read a saved version's text (+ the current text) without restoring.
+  getFileVersion: (versionId: string) =>
+    invoke<VersionContent>("get_file_version", { versionId }),
+  // Idea 9: whole-room checkpoints.
+  createRoomCheckpoint: (name: string) =>
+    invoke<CheckpointMeta>("create_room_checkpoint", { name }),
+  listRoomCheckpoints: () =>
+    invoke<{ entries: CheckpointMeta[]; totalBytes: number }>(
+      "list_room_checkpoints",
+    ),
+  deleteRoomCheckpoint: (id: string) =>
+    invoke<void>("delete_room_checkpoint", { id }),
+  rollbackRoomCheckpoint: (id: string) =>
+    invoke<RoomInfo>("rollback_room_checkpoint", { id }),
   exportFile: (id: string, destPath: string) =>
     invoke<void>("export_file", { id, destPath }),
   exportAll: (destDir: string) => invoke<number>("export_all", { destDir }),
+  // Returns a re-issued recovery code when the room had one (the old code
+  // wrapped the old password and is now useless) — show it once, like
+  // write_recovery_key's.
   changePassword: (current: string, newPassword: string) =>
-    invoke<void>("change_password", { current, newPassword }),
+    invoke<string | null>("change_password", { current, newPassword }),
   duplicateRoom: (destPath: string, newPassword: string | null) =>
     invoke<void>("duplicate_room", { destPath, newPassword }),
   compactRoom: () => invoke<string>("compact_room"),
@@ -88,11 +128,14 @@ export const api = {
   // its own JS/CSS, no network). Returns a token → roomdoc://localhost/<token>.
   stagePreviewHtml: (html: string) =>
     invoke<string>("stage_preview_html", { html }),
-  addMemory: (content: string) => invoke<Memory>("add_memory", { content }),
+  addMemory: (content: string, category?: string | null) =>
+    invoke<Memory>("add_memory", { content, category: category ?? null }),
   listMemories: () => invoke<Memory[]>("list_memories"),
   deleteMemory: (id: string) => invoke<void>("delete_memory", { id }),
-  updateMemory: (id: string, content: string) =>
-    invoke<void>("update_memory", { id, content }),
+  updateMemory: (id: string, content: string, category?: string | null) =>
+    invoke<void>("update_memory", { id, content, category: category ?? null }),
+  // Wave 1b (idea 10): get-or-create the room's canonical "Scratch pad.md".
+  openScratchPad: () => invoke<FileMeta>("open_scratch_pad"),
   // ---- Wave 4: folders (ADD-16) ----
   listFolders: () => invoke<Folder[]>("list_folders"),
   createFolder: (name: string) => invoke<Folder>("create_folder", { name }),
@@ -119,13 +162,108 @@ export const api = {
   // SEC-1b: answer a per-call MCP approval prompt ("once" | "always" | "deny").
   resolveMcpCall: (id: string, decision: "once" | "always" | "deny") =>
     invoke<void>("resolve_mcp_call", { id, decision }),
+  // Wave 2 (Idea 6): answer a diff-preview approval ("once" | "turn" | "deny").
+  resolveEditApproval: (id: string, decision: "once" | "turn" | "deny") =>
+    invoke<void>("resolve_edit_approval", { id, decision }),
   // ADD-12: fetch a web page and save it as a readable room file.
   importLink: (url: string) => invoke<FileMeta>("import_link", { url }),
-  // ADD-17: build/refresh the "Room summary.md" file; emits summarize-progress.
-  summarizeRoom: () => invoke<FileMeta>("summarize_room"),
+  // ---- ADD-30: durable background jobs (the sidebar jobs panel) ----
+  listJobs: () => invoke<Job[]>("list_jobs"),
+  /** Start the room deep-summary job; returns its id. Progress → job-progress. */
+  startDeepSummary: () => invoke<string>("start_deep_summary"),
+  /** Start a Studio artifact (flashcards / mindmap / podcast) as a background
+   *  job; returns its id. The finished HTML opens itself via the terminal
+   *  job-progress event's fileId. `scope` = a file id (else whole room);
+   *  `refs` = @-mentioned file ids. */
+  startStudioJob: (
+    kind: "flashcards" | "mindmap" | "podcast",
+    scope?: string,
+    instructions?: string,
+    refs?: string[],
+  ) => invoke<string>("start_studio_job", { kind, scope, instructions, refs }),
+  /** ADD-32: start a whole-file pass — reads the ENTIRE file window by window
+   *  in a durable background job and saves the result as a new room file.
+   *  mode "merge" folds notes into one document; "stitch" joins transformed
+   *  parts in order. Returns the job id; progress → job-progress. */
+  startFilePass: (file: string, instruction: string, mode?: "merge" | "stitch") =>
+    invoke<string>("start_file_pass", { file, instruction, mode }),
+  /** Pause a running job — it checkpoints and parks as 'paused'. */
+  cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
+  /** Continue a paused/errored job from its checkpoint. */
+  resumeJob: (id: string) => invoke<void>("resume_job", { id }),
+  deleteJob: (id: string) => invoke<void>("delete_job", { id }),
+  // ---- Wave 4a (Idea 2): LLM graph workflows ----
+  listWorkflows: () => invoke<Workflow[]>("list_workflows"),
+  getWorkflow: (id: string) => invoke<Workflow>("get_workflow", { id }),
+  getWorkflowSchedule: (id: string) =>
+    invoke<Schedule | null>("get_workflow_schedule", { id }),
+  workflowTemplates: () => invoke<WorkflowTemplate[]>("workflow_templates"),
+  saveWorkflow: (w: {
+    name: string;
+    description?: string;
+    emoji?: string;
+    definition: unknown;
+    binding?: unknown;
+    createdBy?: string;
+    schedule?: ScheduleArg;
+  }) => invoke<string>("save_workflow", w),
+  updateWorkflow: (w: {
+    id: string;
+    name?: string;
+    description?: string;
+    emoji?: string;
+    definition?: unknown;
+    binding?: unknown;
+    schedule?: ScheduleArg;
+  }) => invoke<void>("update_workflow", w),
+  deleteWorkflow: (id: string) => invoke<void>("delete_workflow", { id }),
+  setWorkflowStatus: (id: string, status: "active" | "draft") =>
+    invoke<void>("set_workflow_status", { id, status }),
+  setWorkflowPinned: (id: string, pinned: boolean) =>
+    invoke<void>("set_workflow_pinned", { id, pinned }),
+  setWorkflowSchedule: (id: string, schedule: ScheduleArg) =>
+    invoke<void>("set_workflow_schedule", { id, schedule }),
+  /** Validate a definition WITHOUT saving — the canvas round-trips edits here. */
+  validateWorkflow: (definition: unknown, binding?: unknown) =>
+    invoke<string[]>("validate_workflow", { definition, binding }),
+  /** Compose a workflow from a plain-language description on any engine (the
+   * model returns JSON as text; the backend validates + saves a draft). Returns
+   * the new workflow's id. */
+  composeWorkflow: (description: string) =>
+    invoke<string>("compose_workflow", { description }),
+  getWorkflowRuns: (id: string) =>
+    invoke<WorkflowRun[]>("get_workflow_runs", { id }),
+  getJobStepArtifact: (jobId: string, stepId: number) =>
+    invoke<string | null>("get_job_step_artifact", { jobId, stepId }),
+  /** Run a workflow now; `fileId` for a file-scoped (Actions-menu) run. */
+  runWorkflow: (id: string, fileId?: string) =>
+    invoke<string>("run_workflow", { id, fileId }),
+  // ---- Wave 5 (Idea 13): runnable & schedulable scripts ----
+  /** Every `.py`/`.js` room file as a script, with status/last-run/schedule. */
+  listScripts: () => invoke<ScriptInfo[]>("list_scripts"),
+  /** The parsed manifest for one script (viewer header / consent card). */
+  getScriptManifest: (fileId: string) =>
+    invoke<ScriptManifest>("get_script_manifest", { fileId }),
+  /** Run a script now. May raise a consent card first; returns the job id.
+   *  Progress arrives via job-progress; the run is a hidden auto-workflow. */
+  runScript: (fileId: string) => invoke<string>("run_script", { fileId }),
+  /** Schedule (or clear, kind="") a script. Requires the script to be approved. */
+  setScriptSchedule: (
+    fileId: string,
+    kind: string,
+    param: string,
+    enabled: boolean,
+  ) => invoke<void>("set_script_schedule", { fileId, kind, param, enabled }),
+  /** Answer a script-run consent card ("once" | "always" | "deny"). */
+  resolveScriptRun: (id: string, decision: "once" | "always" | "deny") =>
+    invoke<void>("resolve_script_run", { id, decision }),
   aiStatus: () => invoke<AiStatus>("ai_status"),
   /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
   modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
+  /** Models available for a detected cloud engine ("claude-cli"/"codex-cli"),
+   *  for the Cloud picker's second level. */
+  listEngineModels: (engine: string) =>
+    invoke<ExternalModelInfo[]>("list_engine_models", { engine }),
   warmModel: () => invoke<void>("warm_model"),
   pullModel: (name: string) => invoke<void>("pull_model", { name }),
   deleteModel: (name: string) => invoke<void>("delete_model", { name }),
@@ -181,6 +319,18 @@ export const api = {
   shapeText: (text: string, translate: boolean, mode: string) =>
     invoke<string>("shape_text", { text, translate, mode }),
 
+  // ---- Idea 3: supernatural voice (on-device AVSpeech synthesis) ----
+  /** Synthesize one sentence-sized chunk (≤1,000 chars) to WAV, base64. */
+  speakText: (
+    text: string,
+    voiceId: string | null,
+    rate: number,
+    pitch: number,
+    volume: number,
+  ) => invoke<string>("speak_text", { text, voiceId, rate, pitch, volume }),
+  /** Installed system voices, for the Settings picker. */
+  listSpeechVoices: () => invoke<VoiceInfo[]>("list_speech_voices"),
+
   // ---- AI actions (per-file / whole-room one-shot Markdown generators) ----
   /** The catalog of AI actions (file- and room-scoped), for the menus. */
   aiActionPrompts: () => invoke<AiActionDef[]>("ai_action_prompts"),
@@ -216,6 +366,10 @@ export const api = {
     listen<[string, string]>("stt-progress", (e) => cb(e.payload)),
   onOpenRoomFile: (cb: (path: string) => void): Promise<UnlistenFn> =>
     listen<string>("open-room-file", (e) => cb(e.payload)),
+  // Idea 9: the room was rolled back to a checkpoint — the whole workspace
+  // remounts against the swapped DB. Payload is the reopened room's info.
+  onRoomRolledBack: (cb: (info: RoomInfo) => void): Promise<UnlistenFn> =>
+    listen<RoomInfo>("room-rolled-back", (e) => cb(e.payload)),
   onAskDelta: (cb: (delta: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-delta", (e) => cb(e.payload)),
   // CHG-5: structured turn events. `ask-step` fires when a tool runs;
@@ -234,9 +388,42 @@ export const api = {
     listen("ask-round", () => cb()),
   onAskNotice: (cb: (text: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-notice", (e) => cb(e.payload)),
-  // ADD-17: progress while the room summary is being built.
-  onSummarizeProgress: (cb: (text: string) => void): Promise<UnlistenFn> =>
-    listen<string>("summarize-progress", (e) => cb(e.payload)),
+  // ADD-31: named stage while a Studio (flashcards/mindmap/podcast) runs.
+  onStudioStep: (cb: (text: string) => void): Promise<UnlistenFn> =>
+    listen<string>("studio-step", (e) => cb(e.payload)),
+  // ADD-30: live progress of a background job, plus its terminal flags.
+  onJobProgress: (cb: (p: JobProgress) => void): Promise<UnlistenFn> =>
+    listen<JobProgress>("job-progress", (e) => cb(e.payload)),
+  // Wave 4a: a workflow node's live status during a run (drives the pipeline
+  // animation) and any workflow save/update/delete (refresh the library).
+  onWorkflowNode: (cb: (e: WorkflowNodeEvent) => void): Promise<UnlistenFn> =>
+    listen<WorkflowNodeEvent>("workflow-node", (e) => cb(e.payload)),
+  onWorkflowsChanged: (cb: () => void): Promise<UnlistenFn> =>
+    listen("workflows-changed", () => cb()),
+  // Wave 5 (Idea 13): the backend is about to run a script from this room and
+  // needs the user's consent (SEC-1 — the card is data-agent-blocked).
+  onScriptApproveRequest: (
+    cb: (req: ScriptApproveRequest) => void,
+  ): Promise<UnlistenFn> =>
+    listen<ScriptApproveRequest>("script-approve-request", (e) => cb(e.payload)),
+  // ADD-31: live import queue — done/total/current name, plus a final receipt
+  // (done === total) carrying imported/failed counts.
+  onImportProgress: (
+    cb: (p: {
+      done: number;
+      total: number;
+      name: string;
+      imported?: number;
+      failed?: number;
+    }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{
+      done: number;
+      total: number;
+      name: string;
+      imported?: number;
+      failed?: number;
+    }>("import-progress", (e) => cb(e.payload)),
   onAgentOpenFile: (
     cb: (payload: AgentOpenFilePayload) => void,
   ): Promise<UnlistenFn> =>
@@ -254,10 +441,105 @@ export const api = {
     cb: (req: McpApproveRequest) => void,
   ): Promise<UnlistenFn> =>
     listen<McpApproveRequest>("mcp-approve-request", (e) => cb(e.payload)),
+  // Wave 2 (Idea 6): the AI is about to change a file and (with the gate on)
+  // needs the user to approve the before/after diff.
+  onEditApproveRequest: (
+    cb: (req: EditApproveRequest) => void,
+  ): Promise<UnlistenFn> =>
+    listen<EditApproveRequest>("edit-approve-request", (e) => cb(e.payload)),
   onMcpStatus: (
     cb: (statuses: McpServerStatus[]) => void,
   ): Promise<UnlistenFn> =>
     listen<McpServerStatus[]>("mcp-status", (e) => cb(e.payload)),
+
+  // ---- ADD-27: live Recording file ----
+  /** Start recording — a fresh file (fileId omitted) or resume an existing
+   *  recording file. Mic PCM is pushed separately via recPushAudio. The
+   *  meeting's speakers are discovered from their voices; nothing to pre-set. */
+  recStart: (opts: {
+    fileId?: string | null;
+    systemAudio: boolean;
+    liveTranslate?: string | null;
+  }) =>
+    invoke<RecStart>("rec_start", {
+      fileId: opts.fileId ?? null,
+      systemAudio: opts.systemAudio,
+      liveTranslate: opts.liveTranslate ?? null,
+    }),
+  /** ~250ms of mic samples: little-endian f32 bytes, base64-packed. */
+  recPushAudio: (rate: number, dataB64: string) =>
+    invoke<void>("rec_push_audio", { rate, dataB64 }),
+  recPause: () => invoke<void>("rec_pause"),
+  recResume: () => invoke<void>("rec_resume"),
+  /** Stop and save; resolves once the tail phrases finished transcribing. */
+  recStop: () => invoke<RecMeta>("rec_stop"),
+  recLiveStatus: () => invoke<RecLive | null>("rec_live_status"),
+  recSetLiveTranslate: (language: string | null) =>
+    invoke<void>("rec_set_live_translate", { language }),
+  /** Live transcription on/off mid-recording. Off: the audio keeps recording
+   *  but no text is written (recoverable later with recRetranscribe). */
+  recSetLiveStt: (on: boolean) => invoke<void>("rec_set_live_stt", { on }),
+  recGet: (id: string) => invoke<RecFile>("rec_get", { id }),
+  /** Studio-style edit: delete a [t0,t1) span from transcript + playback. */
+  recDeleteRange: (id: string, t0: number, t1: number) =>
+    invoke<RecMeta>("rec_delete_range", { id, t0, t1 }),
+  /** Render the cuts into a new "<name> (edited).wav" file. */
+  recExportClean: (id: string) => invoke<FileMeta>("rec_export_clean", { id }),
+  /** Translate the whole transcript on the local model into any language. */
+  recTranslate: (id: string, language: string) =>
+    invoke<FileMeta>("rec_translate", { id, language }),
+  /** Rebuild the whole transcript from the audio with the current pipeline
+   *  (saved recordings only; the audio is untouched, the old transcript goes
+   *  to History). Progress arrives via onRecRetranscribe. */
+  recRetranscribe: (id: string) => invoke<RecMeta>("rec_retranscribe", { id }),
+  onRecPartial: (
+    cb: (p: { fileId: string; source: "mic" | "sys"; t0: number; text: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-partial", (e) => cb(e.payload as never)),
+  onRecSegment: (
+    cb: (p: { fileId: string; segment: RecSegment }) => void,
+  ): Promise<UnlistenFn> => listen("rec-segment", (e) => cb(e.payload as never)),
+  /** A row already on screen was the microphone's echo of meeting audio the
+   *  system lane captured too — remove it. */
+  onRecSegmentDrop: (
+    cb: (p: { fileId: string; id: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-segment-drop", (e) => cb(e.payload as never)),
+  /** The meeting's speakers were re-derived from every voice heard so far —
+   *  labels already on screen may change (that's the point). */
+  onRecRelabel: (
+    cb: (p: { fileId: string; labels: { id: string; speaker: string }[] }) => void,
+  ): Promise<UnlistenFn> => listen("rec-relabel", (e) => cb(e.payload as never)),
+  onRecLevel: (
+    cb: (p: { fileId: string; mic: number; sys: number; durationCs: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-level", (e) => cb(e.payload as never)),
+  onRecState: (
+    cb: (p: { fileId: string; status: string; durationCs: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-state", (e) => cb(e.payload as never)),
+  /** Stop→saved drain progress: the audio is already durable when the first
+   *  event arrives; `remaining` counts phrase decodes still queued. */
+  onRecSaveProgress: (
+    cb: (p: { fileId: string; stage: "transcribing" | "writing"; remaining: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-save-progress", (e) => cb(e.payload as never)),
+  onRecSource: (
+    cb: (p: { fileId: string; source: string; status: string; message: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-source", (e) => cb(e.payload as never)),
+  onRecError: (
+    cb: (p: { fileId: string; message: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-error", (e) => cb(e.payload as never)),
+  onRecLiveTranslation: (
+    cb: (p: { fileId: string; segId: string; text: string }) => void,
+  ): Promise<UnlistenFn> => listen("rec-live-translation", (e) => cb(e.payload as never)),
+  onRecTranslateProgress: (
+    cb: (p: { fileId: string; done: number; total: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-translate-progress", (e) => cb(e.payload as never)),
+  onRecRetranscribe: (
+    cb: (p: { fileId: string; doneCs: number; totalCs: number }) => void,
+  ): Promise<UnlistenFn> => listen("rec-retranscribe", (e) => cb(e.payload as never)),
+
+  // ---- ADD-28: feedback → GitHub issue ----
+  /** Draft an issue title/body from raw feedback on the LOCAL model. */
+  feedbackDraft: (text: string) =>
+    invoke<FeedbackDraft>("feedback_draft", { text }),
+  appDiag: () => invoke<AppDiag>("app_diag"),
 
   // ADD-26: download a YouTube video into the room (yt-dlp on first use).
   importYoutubeVideo: (url: string) =>
@@ -315,21 +597,30 @@ export const studioFlashcards = (
   scope?: string,
   instructions?: string,
   refs?: string[],
-) => invoke<FileMeta>("studio_flashcards", { scope, instructions, refs });
+  opId?: string,
+) => invoke<FileMeta>("studio_flashcards", { scope, instructions, refs, opId });
 
 /** D5: build a self-contained mind map (.html). */
 export const studioMindmap = (
   scope?: string,
   instructions?: string,
   refs?: string[],
-) => invoke<FileMeta>("studio_mindmap", { scope, instructions, refs });
+  opId?: string,
+) => invoke<FileMeta>("studio_mindmap", { scope, instructions, refs, opId });
 
 /** D12: render a two-host podcast script (.html); script only, no audio. */
 export const generatePodcastScript = (
   scope?: string,
   instructions?: string,
   refs?: string[],
-) => invoke<FileMeta>("generate_podcast_script", { scope, instructions, refs });
+  opId?: string,
+) =>
+  invoke<FileMeta>("generate_podcast_script", {
+    scope,
+    instructions,
+    refs,
+    opId,
+  });
 
 /** D6: does this chat's last exchange hold a fact worth remembering? */
 export const memorySuggestion = (chatId: string) =>
@@ -343,9 +634,19 @@ export const suggestFileMeta = (fileId: string) =>
 export const roomServerStatus = () =>
   invoke<RoomServerStatus>("room_server_status");
 
-/** D9: turn the Leash on/off; `allowCloud` gates non-local access. */
-export const setRoomServer = (enabled: boolean, allowCloud: boolean) =>
-  invoke<RoomServerStatus>("set_room_server", { enabled, allowCloud });
+/** D9/Wave 1a: turn the Leash on/off at a trust tier — "files" (read/search/
+ * edit) or "full" (external-agent parity: + background jobs + local AI).
+ * `allowCloud` gates non-local access (files tier only). */
+export const setRoomServer = (
+  enabled: boolean,
+  allowCloud: boolean,
+  scope: "files" | "full",
+) => invoke<RoomServerStatus>("set_room_server", { enabled, allowCloud, scope });
+
+/** Wave 1a: mint a new full-tier bearer token (revokes the old one everywhere,
+ * severing live external-agent connections) and rewrite the discovery file. */
+export const regenerateLeashToken = () =>
+  invoke<RoomServerStatus>("regenerate_leash_token");
 
 /** D10: point the app at a remote Ollama ("the closet"); "" clears the override. */
 export const setOllamaUrl = (url: string) =>
@@ -383,10 +684,13 @@ export type FileKind =
   | "markdown"
   | "web"
   | "text"
+  | "recording"
   | "file";
 
 export function fileKind(f: FileMeta): FileKind {
   if (f.mimeType.startsWith("image/")) return "image";
+  // ADD-27: live recordings carry their own source tag and icon.
+  if (f.source === "recording") return "recording";
   if (f.source === "generated") return "generated";
   const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "pdf") return "pdf";

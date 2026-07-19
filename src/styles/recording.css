@@ -1,0 +1,475 @@
+/* ADD-27: the Recording file view — live transcript, meters, transcript
+ * editing. ADD-28: the feedback modal extras. Follows the app's flat-CSS
+ * conventions (vars from theme, .subtle/.primary buttons come from base). */
+
+.rec-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ---- header ---- */
+.rec-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.rec-head-right {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.rec-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.rec-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #e5484d;
+  display: inline-block;
+  flex: none;
+}
+
+.rec-dot.pulsing {
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+
+.rec-live-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: #e5484d;
+}
+
+.rec-live-chip.paused {
+  color: var(--muted, #888);
+}
+
+/* The stop→saved drain: no longer an alarm (the audio is durable), so it
+   drops the recording red for calm text, with the reassurance line beside
+   it in muted type. */
+.rec-live-chip.saving {
+  color: var(--text, #f1f0f5);
+  flex-wrap: wrap;
+}
+
+.rec-save-note {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--muted, #9597a8);
+}
+
+/* The capture dock: the one unmistakable "microphone is doing something"
+   pill. Fixed above the composer, above everything, never clipped. */
+.capture-dock {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 16px;
+  border-radius: 999px;
+  background: var(--surface-2, #171925);
+  border: 1px solid var(--border, #2a2c3d);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  font-size: 12.5px;
+}
+
+.capture-dock.recording {
+  border-color: color-mix(in srgb, #e5484d 45%, transparent);
+}
+
+.capture-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text, #f1f0f5);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.capture-label.rec {
+  color: #e5484d;
+  font-weight: 600;
+}
+
+.capture-stop {
+  padding: 4px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: #e5484d;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.capture-stop:hover {
+  filter: brightness(1.1);
+}
+
+.rec-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--muted, #888);
+  user-select: none;
+}
+
+.rec-opt input[type="number"] {
+  width: 44px;
+}
+
+/* Mute the mic lane while the Mac's audio keeps recording (live only). */
+.rec-mute {
+  position: relative;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 2px 7px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1.3;
+}
+
+.rec-mute.muted {
+  opacity: 0.6;
+}
+
+.rec-mute.muted::after {
+  content: "";
+  position: absolute;
+  left: 16%;
+  right: 16%;
+  top: 50%;
+  border-top: 2px solid #e5484d;
+  transform: rotate(-45deg);
+}
+
+.rec-meters {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.rec-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 130px;
+}
+
+.rec-meter i {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted, #888);
+  width: 26px;
+}
+
+.rec-meter b {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.15s linear;
+  min-width: 2px;
+}
+
+/* The Mac-audio lane failed while recording (almost always the Screen &
+ * System Audio Recording permission): a banner the user can't miss. */
+.rec-sys-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px 14px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  background: rgba(229, 72, 77, 0.12);
+  color: #c0383d;
+  border-bottom: 1px solid rgba(229, 72, 77, 0.4);
+}
+
+.rec-sys-banner-text {
+  flex: 1 1 260px;
+  font-weight: 600;
+}
+
+.rec-sys-banner button {
+  flex: none;
+  background: #e5484d;
+  color: #fff;
+  border: none;
+  border-radius: 7px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.rec-sys-banner button:hover {
+  background: #c0383d;
+}
+
+.rec-sys-banner-note {
+  flex: 1 1 100%;
+  font-size: 11.5px;
+  opacity: 0.85;
+}
+
+.rec-player {
+  width: calc(100% - 28px);
+  margin: 10px 14px 0;
+}
+
+/* ---- transcript ---- */
+.rec-transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px 20px;
+  min-height: 0;
+}
+
+.rec-empty {
+  max-width: 480px;
+  margin: 40px auto;
+  line-height: 1.55;
+}
+
+/* One turn = one speaker's run of consecutive phrases: timestamp + chip on a
+ * header line once, the phrases' text flowing as one paragraph beneath. */
+.rec-turn {
+  padding: 4px 6px 6px;
+  border-radius: 8px;
+}
+
+.rec-turn + .rec-turn {
+  margin-top: 6px;
+}
+
+.rec-turn.active {
+  background: var(--accent-soft, rgba(120, 120, 255, 0.1));
+}
+
+.rec-turn-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.rec-turn-body {
+  /* Indent under the header past the stamp (40px min-width + 8px gap);
+   * inline-start so an RTL turn indents from the right. */
+  padding-inline-start: 48px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* The phrase playback is inside right now. `clone` keeps the pill shape on
+ * every wrapped line fragment. */
+.rec-seg.active {
+  background: var(--accent-soft, rgba(120, 120, 255, 0.14));
+  border-radius: 4px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.rec-turn.ghost .rec-turn-head {
+  opacity: 0.55;
+}
+
+.rec-seg.ghost {
+  opacity: 0.55;
+}
+
+.rec-seg.ghost::after {
+  content: "▌";
+  animation: rec-pulse 1s infinite;
+  margin-inline-start: 2px;
+}
+
+.rec-stamp {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--muted, #888);
+  background: none;
+  border: none;
+  padding: 0 2px;
+  cursor: pointer;
+  min-width: 40px;
+  text-align: end;
+}
+
+.rec-stamp:hover {
+  color: var(--accent);
+}
+
+.rec-speaker {
+  flex: none;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft, rgba(120, 120, 255, 0.14));
+  color: var(--accent);
+  min-width: 34px;
+  text-align: center;
+}
+
+/* Click a word to jump the player there (drag still selects for delete). */
+.rec-word {
+  cursor: pointer;
+}
+.rec-word:hover {
+  text-decoration: underline dotted;
+}
+
+.rec-word.deleted {
+  text-decoration: line-through;
+  opacity: 0.45;
+}
+
+.rec-translation {
+  display: block;
+  font-size: 12.5px;
+  font-style: italic;
+  color: var(--muted, #888);
+  margin-top: 1px;
+}
+
+/* ---- selection bar + tools ---- */
+.rec-selectbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--panel, rgba(0, 0, 0, 0.03));
+  font-size: 12.5px;
+}
+
+.rec-selectbar .danger {
+  background: #e5484d;
+  color: #fff;
+  border: none;
+  border-radius: 7px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.rec-selectbar .danger:hover {
+  background: #c0383d;
+}
+
+.rec-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.rec-tool {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.rec-tool input {
+  width: 170px;
+}
+
+.rec-hint-inline {
+  font-size: 11.5px;
+  color: var(--muted, #888);
+  margin-left: auto;
+}
+
+/* Replacing a transcript deserves a plain-words confirm, inline. */
+.rec-retrans-confirm {
+  font-size: 12.5px;
+  color: var(--muted, #888);
+}
+
+.rec-retrans-confirm .danger {
+  background: #e5484d;
+  color: #fff;
+  border: none;
+  border-radius: 7px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.rec-retrans-confirm .danger:hover {
+  background: #c0383d;
+}
+
+/* ---- topbar chip ---- */
+.rec-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid rgba(229, 72, 77, 0.4);
+  background: rgba(229, 72, 77, 0.09);
+  color: #c0383d;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.rec-indicator.paused {
+  opacity: 0.75;
+}
+
+/* ---- feedback modal (ADD-28) ---- */
+.feedback-modal {
+  max-width: 560px;
+}
+
+.feedback-raw {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.feedback-raw textarea {
+  flex: 1;
+}
+
+.feedback-body {
+  width: 100%;
+  margin-top: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.feedback-diag {
+  margin-top: 8px;
+  display: flex;
+}

@@ -38,6 +38,9 @@ pub(crate) const STOPWORDS: &[&str] = &[
 
 pub(crate) fn question_terms(question: &str) -> Vec<String> {
     let mut terms = Vec::new();
+    // A pasted pointed-Hebrew query must match the consonantal index: marks
+    // are alphanumeric-adjacent separators that would shred the word here.
+    let question = extraction::strip_hebrew_marks(question);
     for word in question
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -359,6 +362,69 @@ mod tests {
         let content = "Answer.\n\n```boxes\n{\"a\":1}\n```\n\n```annotation\n{\"b\":2}\n```";
         assert_eq!(strip_markup_blocks(content), "Answer.");
         assert_eq!(strip_markup_blocks("plain"), "plain");
+    }
+
+    #[test]
+    fn pointed_hebrew_is_searchable_by_plain_query() {
+        // The Bible bug: nikud'd text indexed under unicode61 shreds into
+        // single-letter fragments, so "קהלת" never matched "קֹהֶלֶת". The
+        // chunk layer now indexes consonantally.
+        let conn = db::open_in_memory_schema();
+        db::insert_file(
+            &conn,
+            "bible.pdf",
+            "application/pdf",
+            b"x",
+            Some("דִּבְרֵי קֹהֶלֶת בֶּן־דָּוִד מֶלֶךְ בִּירוּשָׁלִָם׃"),
+            "upload",
+        )
+        .unwrap();
+        // A plain (unpointed) query finds the chunk…
+        let (chunks, fallback) = retrieve_context(&conn, "קהלת", None).unwrap();
+        assert!(!fallback, "plain Hebrew query must be a real match");
+        assert_eq!(chunks[0].file_name, "bible.pdf");
+        assert!(chunks[0].text.contains("קהלת"), "chunk stores consonantal text");
+        // …and so does a POINTED query (marks stripped from the question too).
+        let (chunks, fallback) = retrieve_context(&conn, "קֹהֶלֶת", None).unwrap();
+        assert!(!fallback);
+        assert_eq!(chunks[0].file_name, "bible.pdf");
+    }
+
+    /// REAL end-to-end search over a real PDF: exact app pipeline — extract →
+    /// import → index → retrieve. Usage:
+    ///   PR_PDF=~/Downloads/hebrew_bible.pdf PR_FIND=קהלת \
+    ///   cargo test --lib real_pdf_search -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual probe on a real PDF; set PR_PDF and PR_FIND"]
+    fn real_pdf_search_probe() {
+        let (Ok(path), Ok(term)) = (std::env::var("PR_PDF"), std::env::var("PR_FIND")) else {
+            eprintln!("SKIP: set PR_PDF and PR_FIND");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("readable file");
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let text = crate::extraction::extract_text(&name, &bytes).expect("extraction");
+        eprintln!("extracted {} chars", text.len());
+        let conn = db::open_in_memory_schema();
+        db::insert_file(&conn, &name, "application/pdf", b"x", Some(&text), "upload").unwrap();
+        let n_chunks: i64 = conn
+            .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        eprintln!("indexed {n_chunks} chunks (cap {})", db::CHUNK_CAP);
+        let (chunks, fallback) = retrieve_context(&conn, &term, None).unwrap();
+        eprintln!("search \"{term}\": fallback={fallback}, {} chunks", chunks.len());
+        for c in chunks.iter().take(3) {
+            eprintln!("  [{}] {}", c.file_name, excerpt(&c.text, &term, 160));
+        }
+        assert!(!fallback, "\"{term}\" must be a real keyword match");
+        assert!(
+            chunks.iter().any(|c| c.text.contains(&term)),
+            "a returned chunk must contain \"{term}\""
+        );
     }
 
     #[test]

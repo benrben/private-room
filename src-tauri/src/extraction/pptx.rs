@@ -1,6 +1,10 @@
 use super::*;
 
 pub(crate) fn extract_pptx(bytes: &[u8]) -> Option<String> {
+    extract_pptx_budgeted(bytes, MAX_ZIP_ENTRY_BYTES)
+}
+
+fn extract_pptx_budgeted(bytes: &[u8], budget: u64) -> Option<String> {
     let cursor = std::io::Cursor::new(bytes);
     let archive = zip::ZipArchive::new(cursor).ok()?;
     let mut slides: Vec<String> = archive
@@ -16,10 +20,16 @@ pub(crate) fn extract_pptx(bytes: &[u8]) -> Option<String> {
     });
     let mut out = String::new();
     for (i, entry) in slides.iter().enumerate() {
-        if let Some(xml) = read_zip_entry(bytes, entry) {
-            let xml = xml.replace("</a:p>", "</a:p>\n");
+        // The per-slide cap alone lets hundreds of near-cap slides balloon
+        // the total, so all slides share one aggregate budget; downstream
+        // truncates extracted text anyway, so stopping early loses nothing.
+        let remaining = budget.saturating_sub(out.len() as u64);
+        if remaining == 0 {
+            break;
+        }
+        if let Some(xml) = read_zip_entry_capped(bytes, entry, remaining) {
             out.push_str(&format!("[slide {}]\n", i + 1));
-            out.push_str(&strip_tags(&xml));
+            out.push_str(&xml_paras_to_text(&xml, "</a:p>"));
             out.push('\n');
         }
     }
@@ -44,5 +54,32 @@ mod tests {
         let text = extract_text("deck.pptx", &bytes).expect("pptx text");
         assert!(text.contains("Quarterly revenue plan"));
         assert!(text.contains("[slide 1]"));
+    }
+
+    #[test]
+    fn stops_appending_slides_once_budget_is_spent() {
+        // Aggregate-budget guard: each slide is within the per-entry cap, but
+        // the total across slides must not exceed the shared budget.
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default();
+            for n in 1..=3 {
+                writer
+                    .start_file(format!("ppt/slides/slide{n}.xml"), options)
+                    .unwrap();
+                writer
+                    .write_all(format!("<a:t>slide {n} body text</a:t>").as_bytes())
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+        let all = extract_pptx_budgeted(&bytes, 10_000).expect("all slides");
+        assert!(all.contains("slide 3 body text"), "got: {all}");
+        let capped = extract_pptx_budgeted(&bytes, 40).expect("first slide");
+        assert!(capped.contains("slide 1 body text"), "got: {capped}");
+        assert!(!capped.contains("slide 3 body text"), "budget ignored: {capped}");
     }
 }

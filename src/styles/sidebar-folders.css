@@ -156,3 +156,22 @@
   cursor: default;
 }
 
+/* ADD-18: "this media file is being transcribed" — a small pulsing dot so
+   readiness scans from the file list without opening anything. */
+.stt-badge {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent, #8b7cf6);
+  animation: rec-pulse 1.4s ease-in-out infinite;
+  cursor: default;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stt-badge {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+

@@ -11,13 +11,12 @@ pub fn get_meta(conn: &Connection, key: &str) -> Option<String> {
 /// CONTRACT-NOTE: `get_meta` above already existed with the exact A2 signature,
 /// so only `set_meta` is new here.
 pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
-    conn.execute(
+    execute_one(
+        conn,
         "INSERT INTO meta(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![key, value],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 #[cfg(test)]

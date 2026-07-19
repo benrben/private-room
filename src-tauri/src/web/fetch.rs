@@ -2,6 +2,53 @@ use super::*;
 
 const MAX_PAGE_CHARS: usize = 12_000;
 
+/// Hard cap on how much of any response body gets buffered. Generous, because
+/// #research pages and YouTube watch pages legitimately run to multiple MB —
+/// but a hostile server can no longer stream gigabytes into memory.
+const MAX_FETCH_BYTES: usize = 8 * 1024 * 1024;
+
+const TOO_LARGE: &str = "The page is too large to fetch.";
+
+/// Read a body into memory without trusting the server about its size: reject
+/// on a declared oversize Content-Length, then stream chunks and stop at
+/// `MAX_FETCH_BYTES`. With `truncate` the first cap bytes are kept (for
+/// callers that window the text anyway); otherwise an oversized body errors.
+async fn body_capped(mut resp: reqwest::Response, truncate: bool) -> Result<Vec<u8>, String> {
+    if !truncate
+        && resp
+            .content_length()
+            .map_or(false, |len| len > MAX_FETCH_BYTES as u64)
+    {
+        return Err(TOO_LARGE.into());
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len() + chunk.len() > MAX_FETCH_BYTES {
+            if !truncate {
+                return Err(TOO_LARGE.into());
+            }
+            buf.extend_from_slice(&chunk[..MAX_FETCH_BYTES - buf.len()]);
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Decode capped body bytes per the Content-Type charset — what `resp.text()`
+/// did before body capping. Legacy pages (old Hebrew sites are commonly
+/// `charset=windows-1255`) would otherwise turn to mojibake; absent/unknown
+/// charsets fall back to lossy UTF-8. `content_type` arrives lowercased.
+fn decode_body(raw: &[u8], content_type: &str) -> String {
+    content_type
+        .split(';')
+        .filter_map(|p| p.trim().strip_prefix("charset="))
+        .next()
+        .and_then(|label| encoding_rs::Encoding::for_label(label.trim_matches('"').as_bytes()))
+        .map(|enc| enc.decode(raw).0.into_owned())
+        .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned())
+}
+
 /// Redirect policy for `fetch_page`: cap the hops and refuse any that lands on
 /// a private/loopback address (search keeps the plain policy in `client()`).
 fn guarded_redirect_policy() -> reqwest::redirect::Policy {
@@ -81,7 +128,8 @@ pub async fn fetch_page(url: &str) -> Result<(String, String), String> {
             "The URL is not a text page (content-type: {content_type})."
         ));
     }
-    let body = resp.text().await.map_err(|e| e.to_string())?;
+    let raw = body_capped(resp, true).await?;
+    let body = decode_body(&raw, &content_type);
     let title = html_title(&body).unwrap_or_else(|| url.to_string());
     let mut text = if content_type.contains("html") || body.trim_start().starts_with('<') {
         extraction::strip_html(&body)
@@ -120,8 +168,8 @@ pub async fn fetch_readable(url: &str) -> Result<(String, String, Vec<u8>), Stri
             "The URL is not a text page (content-type: {content_type})."
         ));
     }
-    let raw = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
-    let body = String::from_utf8_lossy(&raw).into_owned();
+    let raw = body_capped(resp, false).await?;
+    let body = decode_body(&raw, &content_type);
     let title = html_title(&body).unwrap_or_else(|| url.to_string());
     let text = if content_type.contains("html") || body.trim_start().starts_with('<') {
         extraction::strip_html(&body)
@@ -249,11 +297,9 @@ fn timedtext_json3_to_lines(json: &str) -> Option<String> {
 /// no video download, no extra tools. Returns (title, transcript). Manual
 /// captions win over auto-generated ("asr") ones when both exist.
 pub async fn youtube_transcript(url: &str) -> Result<(String, String), String> {
-    let body = guarded_get(url)
-        .await?
-        .text()
-        .await
-        .map_err(|e| e.to_string())?;
+    let raw = body_capped(guarded_get(url).await?, true).await?;
+    // YouTube serves UTF-8 unconditionally; no charset sniffing needed here.
+    let body = String::from_utf8_lossy(&raw).into_owned();
     let title = html_title(&body)
         .map(|t| t.trim_end_matches(" - YouTube").to_string())
         .unwrap_or_else(|| url.to_string());
@@ -269,11 +315,8 @@ pub async fn youtube_transcript(url: &str) -> Result<(String, String), String> {
         .and_then(|u| u.as_str())
         .ok_or("This video's captions could not be read.")?;
     let sep = if base.contains('?') { '&' } else { '?' };
-    let timedtext = guarded_get(&format!("{base}{sep}fmt=json3"))
-        .await?
-        .text()
-        .await
-        .map_err(|e| e.to_string())?;
+    let raw = body_capped(guarded_get(&format!("{base}{sep}fmt=json3")).await?, false).await?;
+    let timedtext = String::from_utf8_lossy(&raw).into_owned();
     let transcript = timedtext_json3_to_lines(&timedtext)
         .ok_or("This video's captions came back empty.")?;
     Ok((title, transcript))
@@ -326,6 +369,17 @@ mod tests {
             "[0:00] Hello world\n[1:15] Second line"
         );
         assert_eq!(timedtext_json3_to_lines(r#"{"events":[]}"#), None);
+    }
+
+    #[test]
+    fn body_decodes_per_content_type_charset() {
+        // "שלום" in windows-1255 — the legacy-Hebrew-page case.
+        let heb = [0xf9, 0xec, 0xe5, 0xed];
+        assert_eq!(decode_body(&heb, "text/html; charset=windows-1255"), "שלום");
+        assert_eq!(decode_body(&heb, "text/html; charset=\"windows-1255\""), "שלום");
+        // Absent or unknown charset falls back to lossy UTF-8.
+        assert_eq!(decode_body("שלום".as_bytes(), "text/html"), "שלום");
+        assert_eq!(decode_body(b"plain", "text/plain; charset=bogus"), "plain");
     }
 
     #[test]

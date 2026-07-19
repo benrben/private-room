@@ -13,8 +13,6 @@ pub struct ChatCommandInfo {
     pub name: &'static str,
     pub summary: &'static str,
     pub usage: &'static str,
-    /// True when the command works on @-pinned files.
-    pub needs_refs: bool,
 }
 
 /// The command catalog. Keep in sync with the `run_command` dispatch below.
@@ -23,67 +21,56 @@ pub const CHAT_COMMANDS: &[ChatCommandInfo] = &[
         name: "add-file",
         summary: "Write a new note or document — or one per item with \"for each\"",
         usage: "#add-file <name>: <topic>   ·   #add-file for each <thing>",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "remember",
         summary: "Save a fact to the room's permanent memory",
         usage: "#remember <fact>",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "find",
         summary: "Search the room's files for content and list what matches",
         usage: "#find <keywords>",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "highlight",
         summary: "Mark an exact passage in a file so you can see it in the viewer",
         usage: "#highlight <thing> in @file",
-        needs_refs: true,
     },
     ChatCommandInfo {
         name: "extract",
         summary: "Pull the same fields out of several files into a spreadsheet",
         usage: "#extract <field, field…> from @a @b",
-        needs_refs: true,
     },
     ChatCommandInfo {
         name: "summarize",
         summary: "Summarize the whole room, or one @file",
         usage: "#summarize   ·   #summarize @file",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "compare",
         summary: "Compare two or more @files side by side",
         usage: "#compare @a @b",
-        needs_refs: true,
     },
     ChatCommandInfo {
         name: "transcribe",
         summary: "Show the transcript of an @recording",
         usage: "#transcribe @recording",
-        needs_refs: true,
     },
     ChatCommandInfo {
         name: "minutes",
         summary: "Turn a meeting transcript or notes into timeline-style HTML minutes",
         usage: "#minutes @recording   ·   #minutes @notes.md",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "to-sheet",
         summary: "Turn the table in the last answer into a spreadsheet",
         usage: "#to-sheet",
-        needs_refs: false,
     },
     ChatCommandInfo {
         name: "translate",
         summary: "Translate an @file into another language",
         usage: "#translate @file to <language>",
-        needs_refs: true,
     },
     // D8 (the Airlock): search the web, pull each source into the room as an
     // owned offline copy, then answer from those files — so the sources stay
@@ -92,7 +79,13 @@ pub const CHAT_COMMANDS: &[ChatCommandInfo] = &[
         name: "research",
         summary: "Search the web, save each source into the room, then answer offline",
         usage: "#research <question>",
-        needs_refs: false,
+    },
+    // Wave 3 (Idea 9): one-click "commit" — a named whole-room checkpoint from
+    // the composer, no model call. Rollback stays gated in Settings.
+    ChatCommandInfo {
+        name: "checkpoint",
+        summary: "Save a named checkpoint of the whole room (roll back later in Settings)",
+        usage: "#checkpoint   ·   #checkpoint before cleanup",
     },
 ];
 
@@ -126,6 +119,12 @@ pub(crate) struct CommandResult {
     effects: ToolEffects,
 }
 
+/// Wall-clock ceiling for a single non-streamed command step (`ask_quiet`).
+/// Well above a normal local generation (seconds) but far below the shared
+/// 10-minute HTTP timeout, so a stalled model fails fast with a clear message
+/// instead of freezing the step chip.
+const COMMAND_STEP_TIMEOUT_SECS: u64 = 180;
+
 impl CmdCtx<'_> {
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
@@ -139,13 +138,19 @@ impl CmdCtx<'_> {
             ollama::ChatMessage::new("user", user),
         ];
         let window = self.window;
-        let (out, _) = ollama::chat_stream_tools(
+        // MIGRATION Phase 2a: streamed through the sidecar `/generate_stream`
+        // (no tools, no `format`); the per-token `ask-delta` events are unchanged.
+        let body = ollama::plain_generate_body(
             self.model,
-            messages,
-            None,
+            &messages,
             self.temperature,
-            Some(self.cancel.clone()),
             KEEP_ALIVE_WARM,
+            ollama::CtxTier::Chat,
+        );
+        let out = crate::sidecar::generate_stream(
+            "/generate_stream",
+            &body,
+            Some(self.cancel.clone()),
             |d| {
                 let _ = window.emit("ask-delta", d);
             },
@@ -161,17 +166,33 @@ impl CmdCtx<'_> {
             ollama::ChatMessage::new("system", system),
             ollama::ChatMessage::new("user", user),
         ];
-        let (out, _) = ollama::chat_stream_tools(
+        // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools); the
+        // Stop flag still abandons a long quiet step promptly.
+        let fut = ollama::generate(
             self.model,
             messages,
-            None,
             temp,
-            Some(self.cancel.clone()),
             KEEP_ALIVE_WARM,
-            |_| {},
+            Some(self.cancel.clone()),
+            ollama::CtxTier::Chat,
+        );
+        // A quiet step streams no tokens, so a stalled model would otherwise
+        // freeze the command's step chip until the shared 10-minute HTTP
+        // timeout. Cap it at a responsive ceiling and surface a clean,
+        // actionable error instead of a silent multi-minute wait (the reported
+        // #translate "hang"). Dropping `fut` on timeout aborts the request, the
+        // same as a Stop.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(COMMAND_STEP_TIMEOUT_SECS),
+            fut,
         )
-        .await?;
-        Ok(out)
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err("The model took too long to respond. Try a shorter \
+                           selection, or switch to a faster model in Settings."
+                .into()),
+        }
     }
 
     /// ADD-22: like `ask_quiet`, but the reply is CONSTRAINED to `schema` via
@@ -188,7 +209,15 @@ impl CmdCtx<'_> {
             ollama::ChatMessage::new("system", system),
             ollama::ChatMessage::new("user", user),
         ];
-        ollama::chat_structured(self.model, messages, temp, KEEP_ALIVE_WARM, schema).await
+        ollama::chat_structured(
+            self.model,
+            messages,
+            temp,
+            KEEP_ALIVE_WARM,
+            schema,
+            Default::default(),
+        )
+        .await
     }
 }
 
@@ -262,14 +291,32 @@ pub async fn run_command(
         (model_setting(conn), history, temperature)
     };
 
+    // Wave 3 (Idea 9): #checkpoint is a one-click "commit" — it never calls the
+    // model, so short-circuit before the Ollama probe (a checkpoint must work
+    // even with the local AI stopped). Rollback stays gated in Settings.
+    if command == "checkpoint" {
+        let meta = create_checkpoint_core(state.inner(), args.trim(), false)?;
+        let content = format!("Saved checkpoint **{}**. Roll back to it in Settings → Checkpoints.", meta.name);
+        return persist_assistant_reply(&state, &chat_id, content, Vec::new(), None);
+    }
+
+    // Engine parity: `#`-commands honor the room's CHOSEN engine, exactly like
+    // chat does — external CLIs route through the sidecar's external backend,
+    // `:cloud` rides the proxy, and both wear the visible "leaves this Mac"
+    // labels the user accepted when picking that engine. Only a room with no
+    // model setting falls back to the best local model. (#extract still
+    // compensates for smaller local models with a direct CSV/TSV column read;
+    // see tabular_field_rows.)
     let models = ollama::list_models().await.unwrap_or_default();
-    if models.is_empty() {
-        return Err("No local AI model is installed yet — download one first.".into());
-    }
-    let mut model = explicit_model.unwrap_or_else(|| best_default(&models));
-    if is_external_engine(&model) {
-        model = best_default(&models);
-    }
+    let model = match explicit_model {
+        Some(m) => m,
+        None => {
+            if models.is_empty() {
+                return Err("No local AI model is installed yet — download one first.".into());
+            }
+            best_local_default(&models)
+        }
+    };
     let history_text = format_history(&history, 8000);
 
     let ctx = CmdCtx {
@@ -316,26 +363,9 @@ pub async fn run_command(
     // ADD-23: viewer effects ride the `effects` column, not fenced markup.
     let effects_value = effects_json(&res.effects);
 
-    // Phase 3 (locked): save the assistant reply (HLT-7: room may have closed).
-    let guard = state.room.lock().unwrap();
-    match guard.as_ref() {
-        Some(room) => db::insert_message(
-            &room.conn,
-            &chat_id,
-            "assistant",
-            &content,
-            &res.sources,
-            effects_value.as_ref(),
-        ),
-        None => Ok(Message {
-            id: String::new(),
-            role: "assistant".into(),
-            content,
-            sources: res.sources,
-            created_at: String::new(),
-            effects: effects_value,
-        }),
-    }
+    // Phase 3 (locked): save the assistant reply (HLT-7: room may have closed) —
+    // same persistence seam as `ask`.
+    persist_assistant_reply(&state, &chat_id, content, res.sources, effects_value)
 }
 
 // ================================================================= moonshot (Section D)

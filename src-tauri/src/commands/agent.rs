@@ -10,9 +10,13 @@ pub(crate) fn normalize_for_match(s: &str) -> String {
         match c {
             '\u{2018}' | '\u{2019}' | '\u{02BC}' => folded.push('\''),
             '\u{201C}' | '\u{201D}' => folded.push('"'),
-            '\u{2013}' | '\u{2014}' => folded.push('-'),
+            // Hebrew maqaf ־ ≡ hyphen: models type בן-דוד for the file's בן־דוד.
+            '\u{2013}' | '\u{2014}' | '\u{05BE}' => folded.push('-'),
             '\u{FB01}' => folded.push_str("fi"),
             '\u{FB02}' => folded.push_str("fl"),
+            // Hebrew nikud/cantillation: search chunks are consonantal, file
+            // text may be pointed — fold both to consonants so quotes meet.
+            c if extraction::is_heb_mark(c) => {}
             _ => folded.push(c),
         }
     }
@@ -33,34 +37,11 @@ pub(crate) fn normalize_for_match(s: &str) -> String {
 /// string is always a real substring of `extracted` (byte-safe spans), and a
 /// strict word-majority is required so we never highlight something unrelated.
 pub(crate) fn closest_snippet(extracted: &str, quote: &str) -> Option<String> {
-    fn norm(w: &str) -> String {
-        w.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
-    }
     let q_words: Vec<String> = quote.split_whitespace().map(norm).filter(|w| !w.is_empty()).collect();
     if q_words.len() < 3 {
         return None; // too short to approximate safely
     }
-    // Haystack words with their original byte spans.
-    let mut h: Vec<(usize, usize, String)> = Vec::new();
-    let mut start: Option<usize> = None;
-    for (i, c) in extracted.char_indices() {
-        if c.is_whitespace() {
-            if let Some(s) = start.take() {
-                let w = norm(&extracted[s..i]);
-                if !w.is_empty() {
-                    h.push((s, i, w));
-                }
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-    }
-    if let Some(s) = start {
-        let w = norm(&extracted[s..]);
-        if !w.is_empty() {
-            h.push((s, extracted.len(), w));
-        }
-    }
+    let h = words_with_byte_spans(extracted);
     if h.is_empty() {
         return None;
     }
@@ -83,6 +64,49 @@ pub(crate) fn closest_snippet(extracted: &str, quote: &str) -> Option<String> {
         return None; // need a strict majority of the quote's words present
     }
     Some(extracted[h[si].0..h[ei - 1].1].to_string())
+}
+
+/// Validate every cell reference up front so a bad one fails before any write.
+fn validate_cell_refs(updates: &[(String, String)]) -> Result<(), String> {
+    for (cell, _) in updates {
+        if parse_a1(cell).is_none() {
+            return Err(format!("\"{cell}\" is not a cell — use A1 notation like B7."));
+        }
+    }
+    Ok(())
+}
+
+/// Collapse a token to its comparison key: lowercase alphanumerics only.
+fn norm(w: &str) -> String {
+    w.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// Each whitespace-delimited word of `text` as (byte start, byte end, key),
+/// where key is the [`norm`]-alized form; words that normalize to empty (pure
+/// punctuation) are dropped. The byte spans land on char boundaries, so slicing
+/// `text` with them is UTF-8-safe.
+fn words_with_byte_spans(text: &str) -> Vec<(usize, usize, String)> {
+    let mut words: Vec<(usize, usize, String)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                let w = norm(&text[s..i]);
+                if !w.is_empty() {
+                    words.push((s, i, w));
+                }
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        let w = norm(&text[s..]);
+        if !w.is_empty() {
+            words.push((s, text.len(), w));
+        }
+    }
+    words
 }
 
 pub(crate) fn build_annotation(
@@ -154,6 +178,12 @@ pub async fn ask(
 ) -> Result<Message, String> {
     use tauri::Emitter;
 
+    // Wave 3 (Idea 9): don't start a turn while a rollback is swapping the DB —
+    // it would save messages that either fail or land against the wrong room.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+
     // ADD-7: register this ask's cancel flag; the guard removes it on return
     // (success, error, or cancel) so `close_room`'s wait can see us finish.
     let cancel = Arc::new(AtomicBool::new(false));
@@ -167,12 +197,20 @@ pub async fn ask(
         ask_id: ask_id.clone(),
     };
 
+    // ADD-31: the audit's worst wait was an anonymous "Thinking locally…" for
+    // 30+ seconds. Name the two hidden phases: waking the daemon (ADD-29 makes
+    // this implicit and slow the first time) and searching the room.
+    if !crate::ollama_lifecycle::is_awake(&ollama::resolved_base_url()).await {
+        let _ = window.emit("ask-step", "Starting the local AI…");
+    }
+    let _ = window.emit("ask-step", "Searching your files…");
+
     // ADD-13: embed the question BEFORE taking the room lock (the Ollama call is
     // async; the lock is not held across it). None on any failure → keyword-only.
     let question_embedding = embed_question(&question).await;
 
     // Phase 1 (locked): gather context, save the user message.
-    let (
+    let QuestionContext {
         explicit_model,
         chat_messages,
         sources,
@@ -182,7 +220,192 @@ pub async fn ask(
         advisors_on,
         advisor_tools_on,
         injected_rowids,
-    ) = {
+    } = gather_context_and_save_question(
+        &window,
+        &state,
+        &chat_id,
+        &question,
+        &attachments,
+        question_embedding.as_deref(),
+    )?;
+
+    let models = ollama::list_models().await.unwrap_or_default();
+    let model = explicit_model
+        .clone()
+        .unwrap_or_else(|| best_default(&models));
+    // ADD-29 parity: the selected engine drives the app itself — no silent
+    // reroute to a local model. Current `:cloud` models emit structured tool
+    // calls and honor the `format` grammar (verified on-device), and the
+    // `chat_core` inline-tool-call net (ADD-29) recovers any engine that leaks
+    // calls as text, so a cloud model runs the same tool loop a local one does.
+    // External CLIs (claude-cli/codex-cli) remain a separate subprocess path
+    // handled below.
+
+    // CHG-19: the "where is X?" grounding pass is deferred to AFTER the answer
+    // (nothing in the reply depends on the boxes), so the warm chat model streams
+    // the first token immediately instead of waiting on a vision-model load.
+    let mut effects = ToolEffects::default();
+    // ADD-25: perception tools attach pixels only when the chat model can
+    // read them; otherwise they fall back to a local vision-model description.
+    effects.vision_chat = is_vision_chat_model(&model);
+
+    // Phase 2 (unlocked): answer — through a cloud CLI if selected, or the
+    // local model with full app-control tools.
+    let answer = stream_answer(
+        &window,
+        &state,
+        &model,
+        &question,
+        chat_messages,
+        temperature,
+        &mut effects,
+        web_enabled,
+        advisors_on,
+        advisor_tools_on,
+        cancel.clone(),
+        &injected_rowids,
+    )
+    .await?;
+    let stopped = cancel.load(Ordering::SeqCst);
+
+    // CHG-19 + CHG-17: run the image-grounding pass now, AFTER the answer, and
+    // ONLY if the model didn't already mark the image via the mark_image tool
+    // (effects.boxes set) and the user didn't stop. This gives fast time-to-
+    // first-token and structurally eliminates the redundant second vision pass
+    // (chat→vision→chat→vision) that the old pre-answer ordering caused on
+    // 16 GB Macs. CHG-18: the trigger now also considers the image's file name.
+    if effects.boxes.is_none() && !stopped {
+        if let Some((img_id, img_name, img_bytes, w, h)) = &first_image {
+            if is_locate_intent(&question, Some(img_name)) {
+                let mut vmodel = vision_model(&models, &model);
+                if is_external_engine(&vmodel) {
+                    vmodel = best_default(&models);
+                }
+                if !models.is_empty() && !is_external_engine(&vmodel) {
+                    if let Ok(boxes) =
+                        ground_prepared_image(&vmodel, &model, img_bytes, &question, *w, *h).await
+                    {
+                        if !boxes.is_empty() {
+                            effects.boxes = Some(serde_json::json!({
+                                "fileId": img_id,
+                                "name": img_name,
+                                "boxes": boxes,
+                            }));
+                            let _ = window.emit("ask-step", "Marked the image");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut content = answer;
+    // CHG-10: deterministic anti-fabrication gate. The prompt asks the model
+    // never to claim a change it didn't make; here the runtime KNOWS whether a
+    // write/highlight actually happened this turn (effects), so append a plain
+    // correction when the local answer claims one that didn't. Local path only
+    // (cloud has no tool effects) and never over a stopped partial.
+    if !is_external_engine(&model) && !stopped {
+        let highlighted = effects.annotation.is_some() || effects.boxes.is_some();
+        if claims_unbacked_action(&content, effects.wrote, highlighted) {
+            content.push_str(
+                "\n\n*(Correction: no file was actually changed this turn — the edit tool did \
+                 not run or failed.)*",
+            );
+        }
+    }
+    // ADD-7: mark the transcript so it matches what the user watched.
+    if stopped {
+        content.push_str(" *(stopped)*");
+    }
+    // ADD-23: viewer effects ride the message's own `effects` column as
+    // structured data — the visible answer stays plain prose. (Fenced
+    // ```boxes/```annotation blocks in old rooms are still parsed by the UI
+    // as a legacy fallback.)
+    let effects_value = effects_json(&effects);
+
+    // Phase 3 (locked): save the assistant reply.
+    persist_assistant_reply(&state, &chat_id, content, sources, effects_value)
+}
+
+/// Everything Phase 1 (the room-locked pass) produces for the rest of `ask`:
+/// resolved settings, the assembled chat messages, the source chips shown to the
+/// user, the first attached image (held back for the deferred grounding pass),
+// ---- Wave 1b (idea 12): response-style presets --------------------------------
+
+/// Canned register paragraphs, tuned for a 4B model: short, imperative, one
+/// anchored example each. These are BYTE-STABLE constants (ADD-22): the system
+/// prompt only changes when the `response_style` setting changes, exactly like
+/// custom instructions, so KV-cache reuse is preserved within a conversation.
+const STYLE_TERSE: &str = "Response style: TERSE. Answer in the fewest words that fully \
+    answer. Use short sentences or bullets. Use precise technical vocabulary; never \
+    simplify terminology. No greetings, no restating the question, no \"Sure\" or \
+    \"Great question\", no closing offers like \"Let me know if you need more\". \
+    Example — Q: \"When does the lease end?\" A: \"March 31, 2027 (lease.pdf, section 2).\"";
+const STYLE_FRIENDLY: &str = "Response style: FRIENDLY. Sound like a helpful colleague: \
+    warm, plain everyday words, address the user as \"you\". At most one short warm \
+    phrase per answer, then get straight to the point — the answer itself must arrive \
+    in the first sentence. After the direct answer, briefly explain the why or the \
+    context. Example — Q: \"When does the lease end?\" A: \"Good news — your lease runs \
+    until March 31, 2027 (it's in lease.pdf, section 2).\"";
+const STYLE_FORMAL: &str = "Response style: FORMAL. Write complete sentences in \
+    professional business language. No slang, no contractions, no exclamation marks, \
+    no emoji. State findings precisely and cite the file. For multi-part answers, use \
+    short headings or numbered points. Example — Q: \"When does the lease end?\" A: \
+    \"The lease terminates on 31 March 2027, as stated in Section 2 of lease.pdf.\"";
+
+/// Map the stored `response_style` setting to its preset paragraph. Anything
+/// else — `None`, `"default"`, an unknown value — maps to `None`, so absent or
+/// unrecognized settings produce a system prompt byte-identical to today's.
+pub(crate) fn style_paragraph(style: Option<&str>) -> Option<&'static str> {
+    match style {
+        Some("terse") => Some(STYLE_TERSE),
+        Some("friendly") => Some(STYLE_FRIENDLY),
+        Some("formal") => Some(STYLE_FORMAL),
+        _ => None,
+    }
+}
+
+/// The injectable style block: the preset paragraph plus — only when the user
+/// ALSO has custom instructions — one precedence sentence (triage rule: free
+/// text always wins over the preset). Pure so tests can pin byte-stability.
+pub(crate) fn style_block(style: Option<&str>, has_custom_instructions: bool) -> Option<String> {
+    let para = style_paragraph(style)?;
+    Some(if has_custom_instructions {
+        format!(
+            "{para} If the user's standing preferences below say otherwise, follow the \
+             user's preferences."
+        )
+    } else {
+        para.to_string()
+    })
+}
+
+/// and the flags/rowids the answer phase needs.
+struct QuestionContext {
+    explicit_model: Option<String>,
+    chat_messages: Vec<ollama::ChatMessage>,
+    sources: Vec<String>,
+    first_image: Option<(String, String, Vec<u8>, f64, f64)>,
+    temperature: Option<f64>,
+    web_enabled: bool,
+    advisors_on: bool,
+    advisor_tools_on: bool,
+    injected_rowids: HashSet<i64>,
+}
+
+/// Phase 1 (locked): gather the room's context and save the user's message.
+/// Runs entirely under the room mutex and performs NO `.await`, so the guard is
+/// never held across a suspension point — the lock discipline `ask` relies on.
+fn gather_context_and_save_question(
+    window: &tauri::Window,
+    state: &State<'_, AppState>,
+    chat_id: &str,
+    question: &str,
+    attachments: &[String],
+    question_embedding: Option<&[f32]>,
+) -> Result<QuestionContext, String> {
+    use tauri::Emitter;
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
         let conn = &room.conn;
@@ -191,6 +414,13 @@ pub async fn ask(
         let temperature: Option<f64> = db::get_setting(conn, "temperature")
             .and_then(|s| s.parse().ok());
         let custom_instructions: Option<String> = db::get_setting(conn, "custom_instructions");
+        // Wave 1b (idea 12): the user's chosen response register for this room.
+        let response_style: Option<String> = db::get_setting(conn, "response_style");
+        // D11: the room's chosen persona (room_role). Written by the Settings
+        // "Role" section; its instructions are injected into the system prompt
+        // below. (Before this it was persisted but never read — the persona had
+        // no effect on answers.)
+        let room_role: Option<String> = db::get_setting(conn, "room_role");
 
         let memories: Vec<String> = db::list_memories(conn)?
             .into_iter()
@@ -198,13 +428,13 @@ pub async fn ask(
             .collect();
 
         let history: Vec<(String, String)> = {
-            let mut rows = db::recent_messages(conn, &chat_id, MAX_HISTORY_MESSAGES as i64)?;
+            let mut rows = db::recent_messages(conn, chat_id, MAX_HISTORY_MESSAGES as i64)?;
             rows.reverse();
             rows
         };
 
         let (context_chunks, context_fallback) =
-            retrieve_context(conn, &question, question_embedding.as_deref())?;
+            retrieve_context(conn, question, question_embedding)?;
         // CHG-16: rowids already injected as context, so a search_room repeat
         // of the same question returns the next-best chunks instead of dupes.
         let injected_rowids: HashSet<i64> = if context_fallback {
@@ -223,7 +453,7 @@ pub async fn ask(
         // context window; images are separately capped at MAX_ATTACHED_IMAGES.
         let mut text_budget = MAX_ATTACHED_TEXT_TOTAL;
         let mut skipped_attachments: Vec<String> = Vec::new();
-        for file_id in &attachments {
+        for file_id in attachments {
             let (name, mime, bytes, text) = match db::get_file_full(conn, file_id) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -257,11 +487,12 @@ pub async fn ask(
                 if truncated {
                     text.push_str("\n… (truncated)");
                     // UX-4: the AI saw only the beginning — say so, by name.
+                    // ADD-32: and point at the tool that DOES cover everything.
                     let _ = window.emit(
                         "ask-notice",
                         format!(
                             "Only the beginning of \"{name}\" was included (file is large). \
-                             For full coverage, ask about it in sections."
+                             For guaranteed full coverage, ask me to run a full pass over it."
                         ),
                     );
                 }
@@ -315,7 +546,9 @@ pub async fn ask(
              page, cell, or text), mark_image (draw boxes on an image), annotate_file \
              (highlight an exact quote or a cell range in a document or spreadsheet so the \
              user sees it), create_file (save a new note/document into the room), edit_file \
-             (replace exact text inside an existing file — text, code, csv, or docx), \
+             (replace exact text in ONE place in an existing file — text, code, csv, or docx), \
+             edit_files (change several places/files, or rename + update references, in ONE \
+             atomic step — all succeed or none do), \
              write_file (rewrite a whole text file), set_cells (change a spreadsheet cell by \
              A1 reference like B7), rename_file (rename a file), move_file (move a file into a \
              folder), add_memory (remember something permanently). Use them \
@@ -334,7 +567,24 @@ pub async fn ask(
              annotate_file (or mark_image) returned success this turn — a guessed quote that \
              fails to match is NOT a highlight.\n\
              - If a tool call fails or you cannot find the exact text, say so plainly and stop; \
-             do not narrate success you did not achieve.",
+             do not narrate success you did not achieve.\n\n\
+             The room keeps one shared working-notes file named \"Scratch pad.md\": when the \
+             user asks to jot, note, write down, or record something temporarily, edit_file or \
+             write_file that file instead of making a new file; read it with open_file when \
+             asked what is on the pad.\n\n\
+             Scripts: a .py or .js file in the room can be Run with one click and scheduled. \
+             When you create or edit a runnable Python script that imports third-party packages, \
+             you MUST declare them inline so they install automatically on Run — the user should \
+             never have to pip install anything. Put a PEP-723 block at the very top:\n    \
+             # /// script\n    # dependencies = [\"pandas\", \"yfinance\"]\n    # ///\n\
+             (a bare `# dependencies = [\"pkg\", ...]` line also works). List every third-party \
+             import; the standard library needs no declaration. Do not tell the user to run pip \
+             or create a venv — declaring the dependencies is how the install happens. \
+             When a script reads or writes room files, refer to each by its EXACT room file name \
+             (e.g. open(\"ETF Tracker.csv\")); you MAY also list them under \
+             `# room-inputs:` / `# room-outputs:` for clarity, but you do not have to — the runner \
+             auto-copies any room file whose name appears in the script and saves back any it \
+             modifies in place (every write is versioned and undoable).",
         );
         if web_enabled {
             system.push_str(
@@ -400,6 +650,30 @@ pub async fn ask(
             );
         }
 
+        // D11: the room's chosen persona (room_role) rides just before the
+        // response-style + custom instructions. Byte-stable (a constant chosen by
+        // a setting), so the ADD-22 KV-cache invariant holds; the plain "default"
+        // role has empty instructions and injects nothing.
+        if let Some(role_id) = &room_role {
+            let instructions = role_instructions(role_id);
+            if !instructions.trim().is_empty() {
+                system.push_str("\n\n");
+                system.push_str(instructions.trim());
+            }
+        }
+
+        // Wave 1b (idea 12): the response-style preset rides immediately before
+        // the custom instructions. Byte-stable (a constant chosen by a setting),
+        // so the ADD-22 KV-cache invariant holds — and when custom text is also
+        // present the block itself states that the free text below wins.
+        let has_custom = custom_instructions
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty());
+        if let Some(block) = style_block(response_style.as_deref(), has_custom) {
+            system.push_str("\n\n");
+            system.push_str(&block);
+        }
+
         if let Some(custom) = &custom_instructions {
             if !custom.trim().is_empty() {
                 system.push_str(
@@ -426,7 +700,7 @@ pub async fn ask(
             // CHG-7 + ADD-22: budget-fitting, question-relevant memories are
             // injected HERE (the always-new user message) rather than the stable
             // system prompt, preserving KV-cache reuse of the system prefix.
-            let chosen = select_memories(&memories, &question, MAX_MEMORY_INJECT_CHARS);
+            let chosen = select_memories(&memories, question, MAX_MEMORY_INJECT_CHARS);
             if !chosen.is_empty() {
                 user_content.push_str("Notes to remember for this room:\n");
                 for m in &chosen {
@@ -460,16 +734,16 @@ pub async fn ask(
             ..Default::default()
         });
 
-        db::insert_message(conn, &chat_id, "user", &question, &[], None)?;
+        db::insert_message(conn, chat_id, "user", question, &[], None)?;
 
         // First question names the session.
         let mut title: String = question.chars().take(48).collect();
         if question.chars().count() > 48 {
             title.push('…');
         }
-        db::set_chat_title_if_new(conn, &chat_id, &title)?;
+        db::set_chat_title_if_new(conn, chat_id, &title)?;
 
-        (
+        Ok(QuestionContext {
             explicit_model,
             chat_messages,
             sources,
@@ -479,169 +753,144 @@ pub async fn ask(
             advisors_on,
             advisor_tools_on,
             injected_rowids,
-        )
-    };
+        })
+}
 
-    let models = ollama::list_models().await.unwrap_or_default();
-    let model = explicit_model
-        .clone()
-        .unwrap_or_else(|| best_default(&models));
-
-    // CHG-19: the "where is X?" grounding pass is deferred to AFTER the answer
-    // (nothing in the reply depends on the boxes), so the warm chat model streams
-    // the first token immediately instead of waiting on a vision-model load.
-    let mut effects = ToolEffects::default();
-    // ADD-25: perception tools attach pixels only when the chat model can
-    // read them; otherwise they fall back to a local vision-model description.
-    effects.vision_chat = is_vision_chat_model(&model);
-
-    // Phase 2 (unlocked): answer — through a cloud CLI if selected, or the
-    // local model with full app-control tools. When the user pressed Stop
-    // mid-answer, a raised error is expected — swallow it and save the partial.
-    let run = if is_external_engine(&model) {
+/// Phase 2 (unlocked): produce the answer. This is deliberately the single place
+/// the answer is generated — a cloud CLI (`claude -p`/`codex`) for an external
+/// engine, otherwise the local Python/LangGraph sidecar (the SOLE local engine;
+/// no native fallback). Everything here awaits, so no room lock may be held
+/// across it.
+///
+/// MIGRATION Phase 2b: `_advisors_on`/`_injected_rowids` were consumed only by
+/// the now-deleted native `agent_loop` path; they are kept in the signature
+/// (caller shape unchanged) pending a later plumbing cleanup.
+/// `advisor_tools_on` is live again: it is the user's "let a cloud AI use this
+/// room's connected tools" switch, so it gates the bridge's MCP pass-through
+/// for external-engine turns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_answer(
+    window: &tauri::Window,
+    state: &State<'_, AppState>,
+    model: &str,
+    question: &str,
+    chat_messages: Vec<ollama::ChatMessage>,
+    temperature: Option<f64>,
+    effects: &mut ToolEffects,
+    web_enabled: bool,
+    _advisors_on: bool,
+    advisor_tools_on: bool,
+    cancel: Arc<AtomicBool>,
+    _injected_rowids: &HashSet<i64>,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    let run = if is_external_engine(model) {
         // CHG-5: a step chip, not fake live text (nothing streams for cloud).
         let _ = window.emit("ask-step", "Asking your cloud AI (content leaves this Mac)");
-        // ADD-20: Claude Code gets the room's tools over a per-ask localhost
-        // MCP bridge — same exec_tool dispatch as the local agent, decryption
-        // stays in-process, and the bridge dies when this ask returns.
-        let bridge = if model == "claude-cli" {
+        // ADD-20 / engine parity: BOTH cloud CLIs (Claude Code and Codex) get
+        // the room's tools over a per-ask localhost MCP bridge — the same
+        // exec_tool dispatch as the local agent, decryption stays in-process,
+        // and the bridge dies when this ask returns. Connected MCP servers ride
+        // along only when the user's advisor-tools switch says so (ADD-21).
+        let bridge = {
             use tauri::Manager;
-            crate::room_mcp::start(window.app_handle().clone(), web_enabled, false)
-                .await
-                .ok()
-        } else {
-            None
+            crate::room_mcp::start(
+                window.app_handle().clone(),
+                web_enabled,
+                crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: advisor_tools_on },
+                None,
+                crate::room_mcp::StartOpts::default(),
+            )
+            .await
+            .ok()
         };
         let res =
-            run_external(&model, &chat_messages, Some(cancel.clone()), bridge.as_ref()).await;
+            run_external(model, &chat_messages, Some(cancel.clone()), bridge.as_ref()).await;
         if let Some(b) = &bridge {
             b.stop();
         }
         res
     } else {
-        // ADD-21: resolve installed advisors only for a local answer with the
-        // setting on — the probe is cached, and it's skipped entirely otherwise.
-        let advisors = if advisors_on {
-            detected_externals(&state).await
-        } else {
-            Vec::new()
-        };
-        // Start the per-ask advisor bridge up front (not inside exec_tool, which
-        // would form an async-recursion cycle) when the sub-option is on and a
-        // Claude advisor exists. It gives that advisor the room's tools and is
-        // torn down when the answer completes, whether or not a consult happens.
-        let advisor_bridge = if advisor_tools_on && advisors.iter().any(|a| a == "claude-cli") {
-            use tauri::Manager;
-            crate::room_mcp::start(window.app_handle().clone(), web_enabled, true)
-                .await
-                .ok()
-        } else {
-            None
-        };
-        let res = agent_loop(
-            &window,
-            &state,
-            &model,
-            &question,
-            chat_messages,
+        // MIGRATION Phase 2b: the Python/LangGraph sidecar is the app's SOLE local
+        // AI engine — EVERY local turn routes through `/run`, including the
+        // app-driving/perception turns (the perception tools now hand their
+        // captured pixels back over the MCP bridge as `image` content, see
+        // `crate::room_mcp`). There is NO native Rust LLM fallback: `Unavailable`
+        // (the sidecar failed before any tool ran) surfaces a clear error rather
+        // than a silent native path; `Failed` (a tool already committed) keeps the
+        // partial so the committed side-effect stays visible. Neither re-runs.
+        use crate::sidecar::SidecarOutcome;
+        match crate::sidecar::run_via_sidecar(
+            window,
+            state,
+            model,
+            question,
+            chat_messages.clone(),
             temperature,
-            &mut effects,
+            effects,
             web_enabled,
-            &advisors,
-            advisor_bridge.as_ref(),
             cancel.clone(),
-            &injected_rowids,
+            false, // visible chat turn — emit the ask-* stream events
         )
-        .await;
-        if let Some(b) = &advisor_bridge {
-            b.stop();
-        }
-        res
-    };
-    let stopped = cancel.load(Ordering::SeqCst);
-    let answer = match run {
-        Ok(text) => text,
-        // ADD-7: the child was killed / stream cut on purpose — keep partial.
-        Err(_) if stopped => String::new(),
-        Err(e) => return Err(e),
-    };
-
-    // CHG-19 + CHG-17: run the image-grounding pass now, AFTER the answer, and
-    // ONLY if the model didn't already mark the image via the mark_image tool
-    // (effects.boxes set) and the user didn't stop. This gives fast time-to-
-    // first-token and structurally eliminates the redundant second vision pass
-    // (chat→vision→chat→vision) that the old pre-answer ordering caused on
-    // 16 GB Macs. CHG-18: the trigger now also considers the image's file name.
-    if effects.boxes.is_none() && !stopped {
-        if let Some((img_id, img_name, img_bytes, w, h)) = &first_image {
-            if is_locate_intent(&question, Some(img_name)) {
-                let mut vmodel = vision_model(&models, &model);
-                if is_external_engine(&vmodel) {
-                    vmodel = best_default(&models);
+        .await
+        {
+            SidecarOutcome::Done(text) => Ok(text),
+            SidecarOutcome::Failed { text, error } => {
+                // A tool already committed a side-effect this turn (the write/
+                // annotation is now in the room and its effects are merged into
+                // `effects`). Returning `Err` here would make `ask`'s `?` discard
+                // BOTH the merged viewer effects and the assistant reply — the
+                // file would change on disk with no transcript entry and no viewer
+                // refresh. Instead return the partial as a normal answer with an
+                // in-transcript failure note, so `ask` persists the reply + effects
+                // and the viewer updates. We must NOT fall back to the native loop
+                // (that would re-run the committed tool and double it).
+                let mut out = text;
+                if !out.trim().is_empty() {
+                    out.push_str("\n\n");
                 }
-                if !models.is_empty() && !is_external_engine(&vmodel) {
-                    let messages = vec![ollama::ChatMessage {
-                        role: "user".into(),
-                        content: grounding_prompt(&question, *w, *h),
-                        images: Some(vec![
-                            base64::engine::general_purpose::STANDARD.encode(img_bytes),
-                        ]),
-                        ..Default::default()
-                    }];
-                    // HLT-5: short keep_alive for this vision pass on low-RAM Macs.
-                    let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &model);
-                    if let Ok(raw) =
-                        ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &boxes_schema())
-                            .await
-                    {
-                        let boxes = parse_boxes(&raw, *w, *h);
-                        if !boxes.is_empty() {
-                            effects.boxes = Some(serde_json::json!({
-                                "fileId": img_id,
-                                "name": img_name,
-                                "boxes": boxes,
-                            }));
-                            let _ = window.emit("ask-step", "Marked the image");
-                        }
-                    }
-                }
+                out.push_str(&format!(
+                    "*(The agent hit an error and stopped mid-run: {error}. Any change \
+                     shown here was already applied.)*"
+                ));
+                Ok(out)
+            }
+            SidecarOutcome::Unavailable(reason) => {
+                // MIGRATION (no fallback): the Python sidecar is the app's SOLE
+                // local AI engine. When it can't start/connect before any tool ran,
+                // we surface a clear error — there is NO native Rust LLM path to
+                // drop to (the native `agent_loop` is deleted). Log the underlying
+                // reason so a broken Python install is debuggable.
+                eprintln!("agent sidecar unavailable: {reason}");
+                Err("AI engine unavailable — the agent sidecar could not start.".to_string())
             }
         }
+    };
+    // When the user pressed Stop mid-answer, a raised error is expected —
+    // swallow it and keep the partial (ADD-7).
+    let stopped = cancel.load(Ordering::SeqCst);
+    match run {
+        Ok(text) => Ok(text),
+        Err(_) if stopped => Ok(String::new()),
+        Err(e) => Err(e),
     }
+}
 
-    let mut content = answer;
-    // CHG-10: deterministic anti-fabrication gate. The prompt asks the model
-    // never to claim a change it didn't make; here the runtime KNOWS whether a
-    // write/highlight actually happened this turn (effects), so append a plain
-    // correction when the local answer claims one that didn't. Local path only
-    // (cloud has no tool effects) and never over a stopped partial.
-    if !is_external_engine(&model) && !stopped {
-        let highlighted = effects.annotation.is_some() || effects.boxes.is_some();
-        if claims_unbacked_action(&content, effects.wrote, highlighted) {
-            content.push_str(
-                "\n\n*(Correction: no file was actually changed this turn — the edit tool did \
-                 not run or failed.)*",
-            );
-        }
-    }
-    // ADD-7: mark the transcript so it matches what the user watched.
-    if stopped {
-        content.push_str(" *(stopped)*");
-    }
-    // ADD-23: viewer effects ride the message's own `effects` column as
-    // structured data — the visible answer stays plain prose. (Fenced
-    // ```boxes/```annotation blocks in old rooms are still parsed by the UI
-    // as a legacy fallback.)
-    let effects_value = effects_json(&effects);
-
-    // Phase 3 (locked): save the assistant reply. HLT-7: if the room was
-    // locked mid-answer it is already closed — return quietly with the
-    // (unsaved) content instead of surfacing "No room is open" to the UI.
+/// Phase 3 (locked): save the assistant reply. HLT-7: if the room was locked
+/// mid-answer it is already closed — return quietly with the (unsaved) content
+/// instead of surfacing "No room is open" to the UI.
+pub(crate) fn persist_assistant_reply(
+    state: &State<'_, AppState>,
+    chat_id: &str,
+    content: String,
+    sources: Vec<String>,
+    effects_value: Option<serde_json::Value>,
+) -> Result<Message, String> {
     let guard = state.room.lock().unwrap();
     match guard.as_ref() {
         Some(room) => db::insert_message(
             &room.conn,
-            &chat_id,
+            chat_id,
             "assistant",
             &content,
             &sources,
@@ -662,7 +911,7 @@ pub async fn ask(
 /// `{"boxes": ..?, "annotation": ..?}` — or None when neither fired, so the
 /// column stays NULL for plain answers.
 pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
-    if effects.boxes.is_none() && effects.annotation.is_none() {
+    if effects.boxes.is_none() && effects.annotation.is_none() && effects.edit_outcomes.is_empty() {
         return None;
     }
     let mut map = serde_json::Map::new();
@@ -671,6 +920,14 @@ pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
     }
     if let Some(a) = &effects.annotation {
         map.insert("annotation".into(), a.clone());
+    }
+    // Wave 2 (Idea 4): content-free edit outcomes for this turn. The frontend
+    // renders nothing from this key — it is telemetry (see edit_match).
+    if !effects.edit_outcomes.is_empty() {
+        map.insert(
+            "edits".into(),
+            serde_json::Value::Array(effects.edit_outcomes.clone()),
+        );
     }
     Some(serde_json::Value::Object(map))
 }
@@ -694,32 +951,35 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "annotate_file",
     "create_file",
     "edit_file",
+    "edit_files",
     "write_file",
     "set_cells",
     "rename_file",
     "move_file",
     "add_memory",
+    "list_memories",
     "web_search",
     "fetch_page",
     "ui_snapshot",
     "ui_act",
     "view_screenshot",
     "view_media_frame",
-];
-
-/// ADD-22: the file-MUTATING built-ins. A small model picks the right tool far
-/// more reliably from a short, relevant list (RAG-MCP / tool-filtering research),
-/// so these are withheld on a plain informational turn and only offered when the
-/// question sounds like it wants a change. Read/show tools (list/search/open/
-/// annotate/mark) are always offered.
-pub(crate) const WRITE_TOOL_NAMES: &[&str] = &[
-    "create_file",
-    "edit_file",
-    "write_file",
-    "set_cells",
-    "rename_file",
-    "move_file",
-    "add_memory",
+    "start_file_pass",
+    "job_status",
+    // Wave 4a (Idea 2): the workflow authoring tools (LocalEngine/ExternalAgent
+    // scopes only, never tools_catalog). Reserved so an MCP route can't shadow
+    // their exec_tool arms.
+    "list_workflows",
+    "save_workflow",
+    "update_workflow",
+    "run_workflow",
+    // Reserved even though they are never in the room bridge's own catalog:
+    // an MCP route sanitizing to one of these names would shadow the built-in
+    // exec_tool arm and skip the SEC-1b consent gate (e.g. server "consult" +
+    // tool "advisor" reaching the cloud-CLI path). Colliding routes rename to
+    // `<name>_2` and stay on the gated fallback.
+    "local_generate",
+    "consult_advisor",
 ];
 
 /// Keyword router deciding whether to offer the write tools this turn. Erring
@@ -738,6 +998,15 @@ pub(crate) fn wants_write_tools(question: &str) -> bool {
     HINTS.iter().any(|h| q.contains(h))
 }
 
+/// "open the Room Map" / "switch to the Detail tab" / "generate flashcards"
+/// matched none of the base UI hints, so ui_act was never offered and the agent
+/// couldn't drive the app at all. App surfaces and navigation verbs:
+const APP_NAVIGATION_VERBS: &[&str] = &[
+    "open ", "show me", "go to", "switch", "close ", "map", "panel", "tab",
+    "studio", "flashcard", "mind map", "mindmap", "podcast", "front page",
+    "dashboard", "play", "pause", "image", "photo", "picture",
+];
+
 /// ADD-25: keyword router for the UI/perception tools (ui_snapshot, ui_act,
 /// view_screenshot, view_media_frame). Same doctrine as wants_write_tools:
 /// deterministic, errs toward YES, and keeps the plain-question catalog short
@@ -750,20 +1019,89 @@ pub(crate) fn wants_ui_tools(question: &str) -> bool {
         "interface", "use the app", "the app", "type in", "toggle", "what do you see",
         "what am i", "on screen",
     ];
+    HINTS.iter().any(|h| q.contains(h)) || APP_NAVIGATION_VERBS.iter().any(|h| q.contains(h))
+}
+
+/// ADD-32: keyword router for the whole-file pass tools (start_file_pass,
+/// job_status). Same doctrine as the other routers: deterministic, errs toward
+/// YES. Fires on whole-file intent ("the entire file", "all of it", "translate
+/// the book") and on job talk ("is it done yet?").
+pub(crate) fn wants_job_tools(question: &str) -> bool {
+    let q = question.to_lowercase();
+    const HINTS: &[&str] = &[
+        "whole", "entire", "entirely", "all of", "every ", "everything", "full",
+        "fully", "complete", "completely", "cover", "thorough", "in depth",
+        "in-depth", "translate", "book", "throughout", "end to end", "cover to cover",
+        "start to finish", "page by page", "chapter", "long file", "large file",
+        "big file", "deep", "job", "progress", "background", "pass", "digest",
+        "no matter", "don't miss", "do not miss", "line by line",
+        // Wave 4a: the workflow authoring tools ride the jobs routing flag.
+        "workflow", "automate", "automat", "every morning", "every day", "every week",
+        "each morning", "each day", "schedule", "recurring", "routine", "pipeline",
+    ];
     HINTS.iter().any(|h| q.contains(h))
 }
 
-/// The lane label shown to the user (transparency: they see how the app framed
-/// their request, so an odd answer is explainable). Purely cosmetic.
-pub(crate) fn lane_label(question: &str, web_enabled: bool) -> &'static str {
-    if wants_ui_tools(question) {
-        "Using the app"
-    } else if wants_write_tools(question) {
-        "Working on your files"
-    } else if web_enabled {
-        "Answering (web available)"
-    } else {
-        "Answering"
+/// ADD-32: the whole-file pass tool specs. Injected by `agent_loop` (never via
+/// `tools_catalog`, so the room MCP bridge can't offer them to a cloud client —
+/// same structural guard as the UI tools; starting hours of local compute stays
+/// a local-agent decision).
+pub(crate) fn job_tools_specs() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type": "function", "function": {"name": "start_file_pass",
+            "description": "Start a durable BACKGROUND pass that reads an ENTIRE file part by part — every character, no matter how large the file is — and saves the result as a new file in the room. Use it whenever the user wants work covering a whole large file (summarize/analyze/translate it all), instead of answering from excerpts. It is slow (minutes to hours) but survives app restarts; the user sees a live progress card. mode \"merge\" (default) folds notes into one final document; mode \"stitch\" transforms each part and joins them in order (translation, rewriting). After starting it, tell the user it is underway — do not wait for it.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "File name or a distinctive part of it"},
+                "instruction": {"type": "string", "description": "What to do across the whole file, e.g. \"summarize thoroughly\", \"translate to French\", \"list every obligation with its section\""},
+                "mode": {"type": "string", "enum": ["merge", "stitch"],
+                    "description": "merge = one final document distilled from the whole file (default); stitch = transform each part and join them in order"}},
+                "required": ["name", "instruction"]}}}),
+        serde_json::json!({"type": "function", "function": {"name": "job_status",
+            "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along.",
+            "parameters": {"type": "object", "properties": {}}}}),
+    ]
+}
+
+/// Wave 1a: tools served ONLY to an external agent on the Leash's full tier
+/// (`ToolScope::ExternalAgent`). Never in `tools_catalog` and never routed to
+/// the in-room engines — the local model IS the thing `local_generate` runs,
+/// and a cloud advisor must not command local compute (same structural guard
+/// as the job tools above).
+pub(crate) fn external_agent_tools_specs() -> Vec<serde_json::Value> {
+    vec![serde_json::json!({"type": "function", "function": {"name": "local_generate",
+        "description": "Run one prompt on the user's LOCAL model on this Mac and return its text (or JSON when a schema is given). Slow but private — use it for steps whose content must not leave this machine. For reading a whole huge file use start_file_pass instead.",
+        "parameters": {"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "The full, self-contained prompt"},
+            "system": {"type": "string", "description": "Optional system instruction"},
+            "schema": {"type": "object", "description": "Optional JSON Schema — the reply is constrained to match it"},
+            "temperature": {"type": "number"},
+            "long": {"type": "boolean", "description": "true to allow a big-context call for large prompts (slower prefill)"}},
+            "required": ["prompt"]}}})]
+}
+
+/// Wave 1a: the CONTENT subset of the UI/perception specs. `view_media_frame`
+/// reads a room video's pixels — room content, like open_file — not the user's
+/// screen, so the external tier serves it while ui_snapshot/ui_act/
+/// view_screenshot stay LocalEngine-only.
+pub(crate) fn media_tools_specs() -> Vec<serde_json::Value> {
+    ui_tools_specs()
+        .into_iter()
+        .filter(|s| s["function"]["name"] == "view_media_frame")
+        .collect()
+}
+
+/// Wave 1a: the model `local_generate` runs on. The tool PROMISES local
+/// execution, so the room's chat model is honored only when it actually runs
+/// on this Mac — an external CLI engine or an Ollama `:cloud` proxy is swapped
+/// for `best_local_default`, which also refuses `:cloud` picks (unlike
+/// `best_default`/`resolve_pass_engine`, whose cloud lane would betray the
+/// promise). With nothing local installed it falls back to the default NAME,
+/// so the surfaced `MODEL_MISSING:<model>` error tells the agent exactly what
+/// to install (open decision 3: error, never a silent cloud fallback).
+pub(crate) fn resolve_local_generate_model(explicit: Option<String>, models: &[String]) -> String {
+    match explicit {
+        Some(m) if !is_external_engine(&m) && !is_cloud_model(&m) => m,
+        _ => best_local_default(models),
     }
 }
 
@@ -776,16 +1114,16 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
             "description": "List every file stored in this room with its type and size.",
             "parameters": {"type": "object", "properties": {}}}},
         {"type": "function", "function": {"name": "search_room",
-            "description": "Search all room files for content the excerpts already provided above do not cover. Use 2-4 keywords, not a full sentence. Results are verbatim file text safe to quote in annotate_file.",
+            "description": "Search all room files for content the excerpts already provided above do not cover. Use 2-4 keywords, not a full sentence. Results are verbatim file text safe to quote in annotate_file. To SHOW the user a passage you found, call open_file with find set to a short quote from these results — you never need a page number.",
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string"}}, "required": ["query"]}}},
         {"type": "function", "function": {"name": "open_file",
-            "description": "Open a file in the app's viewer pane so the user sees it. Optionally jump to a spot.",
+            "description": "Open a file in the app's viewer pane so the user sees it. To jump to a passage, pass find with a short exact quote (copied from search_room results) — the viewer locates the right page itself, in any language; never ask the user for a page number. page/cell also work when known.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "File name or a distinctive part of it"},
                 "page": {"type": "integer", "description": "PDF page number to show"},
                 "cell": {"type": "string", "description": "Spreadsheet cell to show, like B7"},
-                "find": {"type": "string", "description": "Exact text from the file to scroll to"}},
+                "find": {"type": "string", "description": "Short exact text from the file to locate, scroll to, and show — use this to jump to content found with search_room"}},
                 "required": ["name"]}}},
         {"type": "function", "function": {"name": "mark_image",
             "description": "Draw labeled boxes on an image in the room showing where something is.",
@@ -809,12 +1147,24 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                 "name": {"type": "string"}, "content": {"type": "string"}},
                 "required": ["name", "content"]}}},
         {"type": "function", "function": {"name": "edit_file",
-            "description": "Change part of an existing file (text, code, notes, csv, or docx) by replacing exact text. Copy old_text exactly as it appears in the file. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
+            "description": "Change ONE place in ONE file (text, code, notes, csv, or docx) by replacing exact text. Copy old_text exactly as it appears in the file — curly quotes, spacing and dashes are matched tolerantly, but old_text must identify a UNIQUE spot: if it appears more than once you get an error with the count, then either add surrounding text to pick one place or pass all: true to replace every occurrence. To change several places or several files at once, use edit_files. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "File name or part of it"},
                 "old_text": {"type": "string", "description": "Exact text currently in the file"},
-                "new_text": {"type": "string", "description": "Text to replace it with"}},
+                "new_text": {"type": "string", "description": "Text to replace it with"},
+                "all": {"type": "boolean", "description": "Replace EVERY occurrence of old_text (default false → the text must appear exactly once)"}},
                 "required": ["name", "old_text", "new_text"]}}},
+        {"type": "function", "function": {"name": "edit_files",
+            "description": "Change several files (or several places in one file) in ONE atomic step: every edit is checked first, then all are applied together — if any single edit can't match, none are applied. Also renames files as part of the same atomic change, so \"rename X and update every reference\" fully lands or fully doesn't. Prefer this over repeated edit_file calls when a change spans files. Example: {\"edits\": [{\"name\": \"a.md\", \"old_text\": \"foo\", \"new_text\": \"bar\"}, {\"name\": \"old.md\", \"new_name\": \"new.md\"}]}",
+            "parameters": {"type": "object", "properties": {
+                "edits": {"type": "array", "description": "The changes to apply atomically. Each is either an edit {name, old_text, new_text} or a rename {name, new_name}.",
+                    "items": {"type": "object", "properties": {
+                        "name": {"type": "string", "description": "File name or part of it"},
+                        "old_text": {"type": "string", "description": "For an edit: exact text currently in the file"},
+                        "new_text": {"type": "string", "description": "For an edit: text to replace it with"},
+                        "new_name": {"type": "string", "description": "For a rename: the file's new name"}},
+                        "required": ["name"]}}},
+                "required": ["edits"]}}},
         {"type": "function", "function": {"name": "write_file",
             "description": "Replace the entire content of an existing text file. For small changes prefer edit_file.",
             "parameters": {"type": "object", "properties": {
@@ -847,7 +1197,13 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
         {"type": "function", "function": {"name": "add_memory",
             "description": "Save a permanent memory note that the assistant will always see in this room.",
             "parameters": {"type": "object", "properties": {
-                "content": {"type": "string"}}, "required": ["content"]}}}
+                "content": {"type": "string"},
+                "category": {"type": "string", "enum": ["preference", "fact", "project", "instruction"],
+                    "description": "What kind of note this is (optional)"}},
+                "required": ["content"]}}},
+        {"type": "function", "function": {"name": "list_memories",
+            "description": "List every memory note saved in this room. Use it when asked what you remember, or when the notes shown in context look incomplete.",
+            "parameters": {"type": "object", "properties": {}}}}
     ]);
     if web_enabled {
         let arr = tools.as_array_mut().unwrap();
@@ -870,37 +1226,6 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
     tools
 }
 
-/// ADD-21: the `consult_advisor` tool spec, built from the advisors actually
-/// installed on this Mac so the `advisor` enum only ever offers a real choice.
-///
-/// Deliberately NOT part of `tools_catalog`: the room MCP bridge is built from
-/// `tools_catalog`, so keeping this tool out of it means a consulted cloud CLI
-/// can never be handed a tool that spawns another cloud CLI. The recursion
-/// guard is structural, not a runtime filter that could be forgotten.
-pub(crate) fn consult_advisor_spec(advisors: &[String]) -> serde_json::Value {
-    let mut names: Vec<&str> = Vec::new();
-    if advisors.iter().any(|a| a == "claude-cli") {
-        names.push("claude");
-    }
-    if advisors.iter().any(|a| a == "codex-cli") {
-        names.push("codex");
-    }
-    serde_json::json!({"type": "function", "function": {
-        "name": "consult_advisor",
-        "description": "Delegate ONE hard, self-contained subtask to a powerful cloud AI advisor \
-            (Claude or Codex) — deep research, complex reasoning, or difficult code you cannot do \
-            well yourself. It is SLOW (up to a few minutes) and the text you send LEAVES this Mac \
-            via the user's own cloud account, so use it rarely and only as a genuine last resort, \
-            not for things you can answer directly. The advisor sees nothing but your `question` — \
-            not the room, not this conversation — so put the FULL task and ALL needed context into \
-            it. Returns the advisor's written answer for you to use in your reply.",
-        "parameters": {"type": "object", "properties": {
-            "question": {"type": "string", "description": "The complete, self-contained task or question, including every piece of context the advisor needs. It cannot see the room or the chat."},
-            "advisor": {"type": "string", "enum": names, "description": "Which cloud advisor to ask. Use \"codex\" for heavy coding; \"claude\" otherwise."}
-        }, "required": ["question"]}
-    }})
-}
-
 /// ADD-25: the UI/perception tool specs. Deliberately NOT part of
 /// `tools_catalog` — the room MCP bridge is built from `tools_catalog`, so
 /// keeping these out means a cloud client on the Leash can never observe or
@@ -910,7 +1235,7 @@ pub(crate) fn consult_advisor_spec(advisors: &[String]) -> serde_json::Value {
 pub(crate) fn ui_tools_specs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({"type": "function", "function": {"name": "ui_snapshot",
-            "description": "List every clickable/typable control currently visible in the app as numbered marks (role, label, region). Take a fresh snapshot before each ui_act — marks go stale when the screen changes. Consent-sensitive controls (settings, approvals) are never listed.",
+            "description": "List every clickable/typable control currently visible in the app as numbered marks (role, label, region). Call this FIRST when asked to open or use an app surface — the Room Map (the Map toggle), the Memory panel, Studio buttons (Flashcards, Mind map, Podcast script), a viewer tab, or History. Those are app controls, NOT files: never search_room for them. Take a fresh snapshot before each ui_act — marks go stale when the screen changes. Consent-sensitive controls (settings, approvals) are never listed.",
             "parameters": {"type": "object", "properties": {}}}}),
         serde_json::json!({"type": "function", "function": {"name": "ui_act",
             "description": "Operate one control from the latest ui_snapshot by its mark number. The user watches every action. Example: {\"mark\": 12, \"action\": \"click\"}",
@@ -1047,7 +1372,7 @@ pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<Str
 
 /// Viewer payloads produced by tools during a turn; persisted on the saved
 /// assistant message's `effects` column (ADD-23).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ToolEffects {
     pub(crate) boxes: Option<serde_json::Value>,
     pub(crate) annotation: Option<serde_json::Value>,
@@ -1068,315 +1393,21 @@ pub(crate) struct ToolEffects {
     /// caller from `is_vision_chat_model`; when false the perception tools
     /// return a local vision-model description instead of attaching pixels.
     pub(crate) vision_chat: bool,
-}
-
-/// CHG-4/CHG-30: keep the running message list within a char budget so many
-/// tool rounds can't silently overflow num_ctx (Ollama then drops the user's
-/// question and earliest tool results). Stubs the content of older tool-role
-/// messages (oldest first), preserving the system message, the user question,
-/// every assistant tool_calls message (role pairing), and the most recent
-/// results. Pure and testable.
-pub(crate) fn trim_messages_to_budget(messages: &mut [ollama::ChatMessage], tools_chars: usize) {
-    let msg_len = |m: &ollama::ChatMessage| {
-        m.content.len() + m.tool_calls.as_ref().map_or(0, |t| t.to_string().len())
-    };
-    let total: usize = tools_chars + messages.iter().map(msg_len).sum::<usize>();
-    if total <= CTX_CHAR_BUDGET {
-        return;
-    }
-    let mut over = total - CTX_CHAR_BUDGET;
-    // Never stub the most recent 4 messages (≈ the last round or two), nor the
-    // system message at index 0.
-    let keep_from = messages.len().saturating_sub(4);
-    for m in messages.iter_mut().take(keep_from).skip(1) {
-        if over == 0 {
-            break;
-        }
-        if m.role == "tool" && m.content.len() > 80 {
-            let label = m.tool_name.clone().unwrap_or_else(|| "tool".into());
-            let stub = format!("[{label} result trimmed to fit context — already used above]");
-            let saved = m.content.len().saturating_sub(stub.len());
-            m.content = stub;
-            over = over.saturating_sub(saved);
-        }
-    }
-}
-
-/// CHG-5: map a tool name to a short human label shown as a step chip while
-/// the answer streams (replaces the old inline "⚙ name…" text).
-pub(crate) fn tool_step_label(name: &str) -> String {
-    match name {
-        "list_room_files" => "Listed the room's files",
-        "search_room" => "Searched the room",
-        "open_file" => "Opened a file",
-        "mark_image" => "Marked an image",
-        "annotate_file" => "Highlighted a passage",
-        "create_file" => "Created a file",
-        "edit_file" => "Edited a file",
-        "write_file" => "Rewrote a file",
-        "set_cells" => "Updated spreadsheet cells",
-        "rename_file" => "Renamed a file",
-        "move_file" => "Moved a file",
-        "add_memory" => "Saved a memory",
-        "web_search" => "Searched the web",
-        "fetch_page" => "Fetched a page",
-        // ADD-25: the agent is operating the app with the user watching.
-        "ui_snapshot" => "Looked at the app's controls",
-        "ui_act" => "Operated the app",
-        "view_screenshot" => "Looked at the screen",
-        "view_media_frame" => "Looked at a video frame",
-        // ADD-21: name the exfiltration plainly — the local model just chose to
-        // send a subtask to the cloud.
-        "consult_advisor" => "Consulting a cloud advisor (content leaves this Mac)",
-        // Connected MCP tools are namespaced server_tool.
-        _ => return format!("Ran the {name} tool"),
-    }
-    .to_string()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn agent_loop(
-    window: &tauri::Window,
-    state: &State<'_, AppState>,
-    model: &str,
-    // ADD-22: the raw user question, used by the deterministic tool-subset router
-    // (not the model) to decide which built-in tools to offer this turn.
-    question: &str,
-    mut messages: Vec<ollama::ChatMessage>,
-    temperature: Option<f64>,
-    effects: &mut ToolEffects,
-    web_enabled: bool,
-    // ADD-21: cloud CLIs the model may consult as advisors this turn (empty
-    // when the advanced setting is off or none are installed). Injected here,
-    // never into `tools_catalog`, so it never reaches the room bridge.
-    advisors: &[String],
-    // ADD-21: per-ask bridge giving a Claude advisor the room's tools (when the
-    // sub-option is on); None otherwise.
-    advisor_bridge: Option<&crate::room_mcp::Bridge>,
-    cancel: Arc<AtomicBool>,
-    injected_rowids: &HashSet<i64>,
-) -> Result<String, String> {
-    use tauri::Emitter;
-    // ADD-22: let the user see which lane the deterministic router chose, so an
-    // odd answer is explainable ("oh, it thought I wanted an edit").
-    let _ = window.emit("ask-lane", lane_label(question, web_enabled));
-    let mut tools = tools_catalog(web_enabled);
-    // ADD-22: deterministic tool-subset router — withhold the file-mutating
-    // tools on a plain informational turn so the small model chooses from a
-    // short list. MCP + advisor tools are added afterward and never filtered
-    // (the user connected those explicitly).
-    if !wants_write_tools(question) {
-        if let Some(arr) = tools.as_array_mut() {
-            arr.retain(|t| {
-                let name = t["function"]["name"].as_str().unwrap_or("");
-                !WRITE_TOOL_NAMES.contains(&name)
-            });
-        }
-    }
-    let (routes, omitted_mcp) = mcp_routes(state);
-    // ADD-25: UI/perception tools ride the same injection path as the advisor
-    // spec — never `tools_catalog`, so the room bridge can't hand a cloud
-    // client the user's screen. Offered only when the deterministic router
-    // hears an operate-the-app intent, keeping plain-question catalogs short.
-    let ui_enabled = wants_ui_tools(question);
-    if let Some(arr) = tools.as_array_mut() {
-        for r in &routes {
-            arr.push(r.spec.clone());
-        }
-        if !advisors.is_empty() {
-            arr.push(consult_advisor_spec(advisors));
-        }
-        if ui_enabled {
-            arr.extend(ui_tools_specs());
-        }
-    }
-    if ui_enabled {
-        if let Some(sys) = messages.first_mut() {
-            if sys.role == "system" {
-                sys.content.push_str(
-                    "\n\nYou can also OPERATE this app's own interface, with the user watching: \
-                     ui_snapshot lists every visible control as numbered marks; ui_act clicks, \
-                     types into, or scrolls one mark. view_screenshot attaches what the user \
-                     currently sees; view_media_frame grabs a video frame at a timestamp. Take a \
-                     fresh ui_snapshot before each ui_act. Privacy/consent controls (Settings, \
-                     approval dialogs) are excluded and will refuse. Prefer answering directly — \
-                     drive the interface only when the user asked you to do something in the app.",
-                );
-            }
-        }
-    }
-    // ADD-21: tell the model the advisor exists and that it is a last resort —
-    // the tool description says the same, but the system prompt sets the bar.
-    if !advisors.is_empty() {
-        if let Some(sys) = messages.first_mut() {
-            if sys.role == "system" {
-                sys.content.push_str(
-                    "\n\nYou also have consult_advisor: a powerful CLOUD AI (Claude or Codex) you \
-                     can delegate ONE genuinely hard subtask to — deep research or complex \
-                     reasoning/coding beyond your own ability. It is slow and its input leaves this \
-                     Mac, so use it only as a last resort, never for something you can answer \
-                     yourself, and at most once. Put the whole self-contained task in `question`.",
-                );
-            }
-        }
-    }
-    // CHG-29: tell the model which connected tools were dropped for space so it
-    // doesn't try to call them.
-    if !omitted_mcp.is_empty() {
-        if let Some(sys) = messages.first_mut() {
-            if sys.role == "system" {
-                sys.content.push_str(&format!(
-                    "\n\nSome connected tools were omitted to save memory: {}.",
-                    omitted_mcp.join(", ")
-                ));
-            }
-        }
-    }
-    // Web flows chain search → fetch → answer; give them more rounds. A consult
-    // → synthesize path needs the extra room too, and so does a snapshot →
-    // act → re-snapshot UI flow (ADD-25).
-    let max_rounds = if routes.is_empty() && !web_enabled && advisors.is_empty() && !ui_enabled {
-        4
-    } else {
-        8
-    };
-    // CHG-32: an empty catalog keeps num_ctx at 12288 (tools.is_some()) while
-    // forbidding further tool calls — forces a grounded text answer on the
-    // final round instead of letting side-effect tools run unread.
-    let no_tools = serde_json::json!([]);
-    let tools_chars = tools.to_string().len();
-    // CHG-3: remember (name, args) of successful calls to skip exact repeats.
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    // CHG-3/CHG-32: force a tool-less synthesis round after an all-duplicate
-    // round (the model is looping) rather than burning the budget on repeats.
-    let mut force_synthesis = false;
-    let mut final_text = String::new();
-    for round in 0..max_rounds {
-        // ADD-7: stop between rounds too.
-        if cancel.load(Ordering::SeqCst) {
-            break;
-        }
-        // CHG-0/CHG-32: the final round (and any forced synthesis) is tool-less
-        // so the loop always ends with a text answer grounded in prior results.
-        let last = round + 1 == max_rounds || force_synthesis;
-        // CHG-4/CHG-30: keep the running context within budget before sending.
-        trim_messages_to_budget(&mut messages, tools_chars);
-        // CHG-5: a fresh model round begins — frontend clears its live text so
-        // the visible stream always equals only the current round's words.
-        let _ = window.emit("ask-round", ());
-        let offered = if last { &no_tools } else { &tools };
-        let (content, calls) = ollama::chat_stream_tools(
-            model,
-            messages.clone(),
-            Some(offered),
-            temperature,
-            Some(cancel.clone()),
-            // HLT-5: the chat model stays warm throughout the conversation.
-            KEEP_ALIVE_WARM,
-            |d| {
-                let _ = window.emit("ask-delta", d);
-            },
-        )
-        .await?;
-        if calls.is_empty() || cancel.load(Ordering::SeqCst) || last {
-            final_text = content;
-            break;
-        }
-        let raw_calls: Vec<serde_json::Value> = calls.iter().map(|c| c.raw.clone()).collect();
-        messages.push(ollama::ChatMessage {
-            role: "assistant".into(),
-            content: content.clone(),
-            tool_calls: Some(serde_json::json!(raw_calls)),
-            ..Default::default()
-        });
-        // Penultimate round: nudge the small model to wrap up next turn.
-        let near_budget = round + 2 >= max_rounds;
-        let mut all_dup = true;
-        for call in &calls {
-            // ADD-7: stop between tool calls.
-            if cancel.load(Ordering::SeqCst) {
-                break;
-            }
-            let key = (call.name.clone(), call.arguments.to_string());
-            if seen.contains(&key) {
-                // CHG-3: don't re-run an identical call or re-flood context.
-                messages.push(ollama::ChatMessage {
-                    role: "tool".into(),
-                    content: format!(
-                        "Duplicate call: you already ran {} with these exact arguments this \
-                         turn; the result is above. Use it, or call with different arguments.",
-                        call.name
-                    ),
-                    tool_name: Some(call.name.clone()),
-                    ..Default::default()
-                });
-                continue;
-            }
-            all_dup = false;
-            // CHG-5: human step label, not inline "⚙ name…" answer text.
-            let _ = window.emit("ask-step", tool_step_label(&call.name));
-            let outcome = exec_tool(
-                state,
-                window,
-                call,
-                effects,
-                &routes,
-                injected_rowids,
-                Some(cancel.clone()),
-                advisor_bridge,
-            )
-            .await;
-            // ADD-22: tell the UI whether this step succeeded, so a failed tool
-            // chip reads as failed instead of looking identical to a success.
-            let _ = window.emit("ask-step-status", serde_json::json!({ "ok": outcome.is_ok() }));
-            // Only remember successful calls, so a failed one may retry once.
-            let mut result = match outcome {
-                Ok(r) => {
-                    seen.insert(key);
-                    r
-                }
-                Err(e) => format!("Tool error: {e}"),
-            };
-            if near_budget {
-                result.push_str(
-                    "\n[Note: tool budget nearly exhausted — answer the user in your next reply.]",
-                );
-            }
-            messages.push(ollama::ChatMessage {
-                role: "tool".into(),
-                content: result,
-                tool_name: Some(call.name.clone()),
-                ..Default::default()
-            });
-            // ADD-25: a perception tool captured pixels this call — hand them
-            // to the (vision-capable) chat model as a user message right after
-            // the tool result, so it looks at what it just captured. Ollama
-            // reads images from user turns, not tool turns.
-            if !effects.pending_images.is_empty() {
-                let imgs: Vec<String> = effects.pending_images.drain(..).collect();
-                messages.push(ollama::ChatMessage {
-                    role: "user".into(),
-                    content: "[The capture you requested is attached. Look at it, then \
-                              continue — answer the user or take the next action.]"
-                        .into(),
-                    images: Some(imgs),
-                    ..Default::default()
-                });
-            }
-        }
-        // A round of only repeats means the model is stuck; force a tool-less
-        // synthesis next round instead of looping to the budget.
-        if all_dup {
-            force_synthesis = true;
-        }
-        final_text = content;
-    }
-    // Don't invent "Done." over a partial answer the user stopped. After the
-    // tool-less final round this is a genuine dead-path net, not the outcome.
-    if final_text.trim().is_empty() && !cancel.load(Ordering::SeqCst) {
-        final_text = "Done.".into();
-    }
-    Ok(final_text)
+    /// Wave 2 (Idea 4): content-free per-edit outcome records for this turn —
+    /// each `{"tool", "outcome", "n", …}`, never `old_text`/`new_text`. Emitted
+    /// under the `"edits"` key of the message's `effects` column so failure rates
+    /// are measurable per turn. The frontend ignores unknown effects keys.
+    pub(crate) edit_outcomes: Vec<serde_json::Value>,
+    /// Wave 2 (Idea 6): true only on the run-scoped LocalEngine sink (set by the
+    /// bridge's LocalEngine path). The diff-preview "Apply for the rest of this
+    /// answer" cadence is meaningful only here — a sink-less cloud/external scope
+    /// gets a throwaway `ToolEffects` per call, so it always prompts per edit and
+    /// the turn button is hidden (Idea 6 review amendment 2 / second-pass).
+    pub(crate) run_scoped: bool,
+    /// Wave 2 (Idea 6): set true when the user chose "Apply for the rest of this
+    /// answer" on an approval card. Turn-scoped by construction: it rides the
+    /// run-scoped sink, which lives exactly one answer.
+    pub(crate) edit_approved_this_turn: bool,
 }
 
 pub(crate) async fn exec_tool(
@@ -1470,22 +1501,52 @@ pub(crate) async fn exec_tool(
                 let room = guard.as_ref().ok_or("No room is open.")?;
                 db::find_file_like_full(&room.conn, &name)?
             };
+            // Ground `find` in the file's REAL text before the viewer hunts
+            // for it (same ADD-22 net as annotate_file): a model quoting from
+            // memory drifts — "בירושלים" for the file's "בירושלם" — and an
+            // exact-match viewer then silently stays on page 1. Verify the
+            // passage, or swap in the closest real one.
+            let (find, approx) = match (find, &text) {
+                (Some(f), Some(t)) => {
+                    let hay = normalize_for_match(t);
+                    let needle = normalize_for_match(f);
+                    let found = hay.contains(&needle)
+                        || hay.replace(' ', "").contains(&needle.replace(' ', ""));
+                    if found {
+                        (Some(f.to_string()), false)
+                    } else if let Some(snip) = closest_snippet(t, f) {
+                        (Some(snip), true)
+                    } else {
+                        (None, true) // nothing close — open plainly, tell the model
+                    }
+                }
+                (f, _) => (f.map(str::to_string), false),
+            };
             let _ = window.emit(
                 "agent-open-file",
                 serde_json::json!({ "id": id, "page": page, "cell": cell, "find": find }),
             );
-            let target = match (page, cell, find) {
+            let target = match (page, cell, &find) {
                 (Some(p), _, _) => format!(" at page {p}"),
                 (_, Some(c), _) => format!(" at cell {c}"),
                 (_, _, Some(f)) => format!(" at \"{f}\""),
                 _ => String::new(),
+            };
+            let note = if approx && find.is_some() {
+                "\n(The exact text you asked for isn't in the file — jumped to the closest \
+                 real passage instead. Quote text verbatim from search_room next time.)"
+            } else if approx {
+                "\n(That text isn't in this file — opened it from the start. Use search_room \
+                 first and copy the passage exactly.)"
+            } else {
+                ""
             };
             let snippet = text
                 // Char-safe prefix (was a raw byte slice that panicked on
                 // multibyte text).
                 .map(|t| format!("\nIt begins:\n{}", clamp_bytes(t, 1200)))
                 .unwrap_or_default();
-            Ok(format!("Opened \"{real_name}\" in the viewer{target}.{snippet}"))
+            Ok(format!("Opened \"{real_name}\" in the viewer{target}.{note}{snippet}"))
         }
         "annotate_file" => {
             let name = args["name"].as_str().unwrap_or_default();
@@ -1521,90 +1582,112 @@ pub(crate) async fn exec_tool(
             let name = args["name"].as_str().unwrap_or_default();
             let old_text = args["old_text"].as_str().unwrap_or_default();
             let new_text = args["new_text"].as_str().unwrap_or_default();
+            // Idea 4: `all` is the escape hatch for a deliberate multi-occurrence
+            // replace (schema-visible in tools_catalog so the model can discover it).
+            let all = args["all"].as_bool().unwrap_or(false);
             if old_text.is_empty() {
                 return Err("old_text is required — copy the exact text to replace.".into());
             }
-            let guard = state.room.lock().unwrap();
-            let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = db::find_file_like(&room.conn, name)?;
-            let bytes = db::get_file_bytes(&room.conn, &id)?.ok_or("File has no stored content.")?;
-            let ext = extraction::extension_of(&real_name);
-            let (new_bytes, count) = match ext.as_str() {
-                "docx" => extraction::docx_replace_text(&bytes, old_text, new_text)?,
-                "xlsx" | "xls" => {
-                    return Err(
-                        "Spreadsheet cells are edited with set_cells (e.g. cell B7), not edit_file."
-                            .into(),
-                    )
+            // Idea 6: the diff-preview gate wraps this whole edit (compute under the
+            // lock, await approval unlocked, re-lock + staleness-check + apply). When
+            // the cadence setting is off (default) it applies inside the phase-1 lock,
+            // byte-identical to the pre-Wave-2 behavior.
+            let edit = PreviewEdit {
+                name: name.to_string(),
+                old_text: old_text.to_string(),
+                new_text: new_text.to_string(),
+                all,
+            };
+            match gated_write("edit_file", "AI edit", state, window, effects, |conn| {
+                plan_single_edit(conn, &edit)
+            })
+            .await
+            {
+                GateOutcome::Applied(plans) => {
+                    let p = &plans[0];
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_file",
+                        "outcome": p.method.map(EditMethod::outcome).unwrap_or("exact"),
+                        "n": p.count
+                    }));
+                    let base = format!(
+                        "Replaced {} occurrence(s) in \"{}\". The user sees the updated file.",
+                        p.count, p.real_name
+                    );
+                    Ok(if p.method == Some(EditMethod::Fuzzy) {
+                        format!("Matched your text despite quote/spacing differences. {base}")
+                    } else {
+                        base
+                    })
                 }
-                "pdf" => {
-                    return Err(
-                        "PDF text cannot be edited in place. Use annotate_file to highlight, \
-                         or create_file to save a corrected copy of its text."
-                            .into(),
-                    )
+                GateOutcome::Declined(msg) => Ok(msg),
+                GateOutcome::Error(e) => {
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_file", "outcome": e.outcome, "n": 0
+                    }));
+                    Err(e.message)
                 }
-                ext if extraction::is_text_extension(ext) => {
-                    let content = String::from_utf8_lossy(&bytes).into_owned();
-                    let count = content.matches(old_text).count();
-                    if count == 0 {
-                        // ADD-22: show the closest real passage so the model can
-                        // retry with the exact text instead of guessing again.
-                        let hint = closest_snippet(&content, old_text)
-                            .map(|s| format!(" The closest text in the file is: \"{}\".", clamp_bytes(s, 200)))
-                            .unwrap_or_default();
-                        return Err(format!(
-                            "Could not find that exact text in \"{real_name}\". Copy it exactly, \
-                             including spacing and punctuation.{hint}"
-                        ));
-                    }
-                    (content.replace(old_text, new_text).into_bytes(), count)
-                }
-                _ => {
-                    return Err(
-                        "This file type cannot be edited in place. Use create_file to save an \
-                         edited copy of its text instead."
-                            .into(),
-                    )
+            }
+        }
+        "edit_files" => {
+            let ops = match parse_batch_ops(args) {
+                Ok(o) => o,
+                Err(msg) => {
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_files", "outcome": "failed"
+                    }));
+                    return Err(msg);
                 }
             };
-            let text = extraction::extract_text(&real_name, &new_bytes)
-                .or_else(|| String::from_utf8(new_bytes.clone()).ok());
-            store_file_bytes(&room.conn, &id, &new_bytes, text.as_deref(), "AI edit")?;
-            let _ = window.emit("room-files-changed", ());
-            let _ = window.emit("file-updated", &id);
-            effects.wrote = true;
-            Ok(format!(
-                "Replaced {count} occurrence(s) in \"{real_name}\". The user sees the updated file."
-            ))
+            let (n_edits, n_renames) = count_batch_ops(&ops);
+            let batch_id: String = Uuid::new_v4().to_string().chars().take(8).collect();
+            let cause = format!("AI edit (batch {batch_id})");
+            match gated_write("edit_files", &cause, state, window, effects, |conn| {
+                plan_batch(conn, &ops).map_err(|m| EditError::batch_failure(m))
+            })
+            .await
+            {
+                GateOutcome::Applied(plans) => {
+                    let total = n_edits + n_renames;
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_files", "outcome": "applied",
+                        "files": plans.len(), "n": total
+                    }));
+                    Ok(format!(
+                        "Applied {total} change(s) across {} file(s) atomically.",
+                        plans.len()
+                    ))
+                }
+                GateOutcome::Declined(msg) => Ok(msg),
+                GateOutcome::Error(e) => {
+                    effects.edit_outcomes.push(serde_json::json!({
+                        "tool": "edit_files", "outcome": e.outcome
+                    }));
+                    Err(e.message)
+                }
+            }
         }
         "write_file" => {
-            let name = args["name"].as_str().unwrap_or_default();
-            let content = args["content"].as_str().unwrap_or_default();
-            let guard = state.room.lock().unwrap();
-            let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = db::find_file_like(&room.conn, name)?;
-            let ext = extraction::extension_of(&real_name);
-            if !extraction::is_text_extension(&ext) {
-                return Err(format!(
-                    "\"{real_name}\" is not a plain-text file — write_file only rewrites text \
-                     files. Use edit_file (docx), set_cells (spreadsheets), or create_file."
-                ));
+            let name = args["name"].as_str().unwrap_or_default().to_string();
+            let content = args["content"].as_str().unwrap_or_default().to_string();
+            // Idea 6: the diff-preview gate wraps the rewrite (off by default →
+            // byte-identical to before).
+            match gated_write("write_file", "AI rewrite", state, window, effects, |conn| {
+                plan_write_file(conn, &name, &content)
+            })
+            .await
+            {
+                GateOutcome::Applied(plans) => {
+                    let p = &plans[0];
+                    Ok(format!("Rewrote \"{}\" ({} characters).", p.real_name, p.count))
+                }
+                GateOutcome::Declined(msg) => Ok(msg),
+                GateOutcome::Error(e) => Err(e.message),
             }
-            let text = extraction::extract_text(&real_name, content.as_bytes())
-                .unwrap_or_else(|| content.to_string());
-            store_file_bytes(&room.conn, &id, content.as_bytes(), Some(&text), "AI rewrite")?;
-            let _ = window.emit("room-files-changed", ());
-            let _ = window.emit("file-updated", &id);
-            effects.wrote = true;
-            Ok(format!(
-                "Rewrote \"{real_name}\" ({} characters).",
-                content.chars().count()
-            ))
         }
         "set_cells" => {
-            let name = args["name"].as_str().unwrap_or_default();
-            let sheet = args["sheet"].as_str();
+            let name = args["name"].as_str().unwrap_or_default().to_string();
+            let sheet = args["sheet"].as_str().map(str::to_string);
             // CHG-2: accept a batch of {cell, value} in one call so filling a
             // column doesn't burn one inference round per cell. Fall back to the
             // legacy single top-level cell/value for older prompts.
@@ -1632,33 +1715,24 @@ pub(crate) async fn exec_tool(
             if updates.is_empty() {
                 return Err("No cells given — pass updates: [{cell, value}, …].".into());
             }
-            // Validate every cell up front so a bad reference fails before any write.
-            for (cell, _) in &updates {
-                if parse_a1(cell).is_none() {
-                    return Err(format!("\"{cell}\" is not a cell — use A1 notation like B7."));
-                }
-            }
-            let guard = state.room.lock().unwrap();
-            let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = db::find_file_like(&room.conn, name)?;
-            let mut bytes =
-                db::get_file_bytes(&room.conn, &id)?.ok_or("File has no stored content.")?;
-            let mut text = None;
-            for (cell, value) in &updates {
-                let (nb, t) = set_cell_in_bytes(&real_name, &bytes, sheet, cell, value)?;
-                bytes = nb;
-                text = t;
-            }
-            store_file_bytes(&room.conn, &id, &bytes, text.as_deref(), "AI cell change")?;
-            let _ = window.emit("room-files-changed", ());
-            let _ = window.emit("file-updated", &id);
-            effects.wrote = true;
+            validate_cell_refs(&updates)?;
             let summary = updates
                 .iter()
                 .map(|(c, v)| format!("{c}={v}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            Ok(format!("Set {summary} in \"{real_name}\"."))
+            // Idea 6: gate the cell change too.
+            match gated_write("set_cells", "AI cell change", state, window, effects, |conn| {
+                plan_set_cells(conn, &name, sheet.as_deref(), &updates)
+            })
+            .await
+            {
+                GateOutcome::Applied(plans) => {
+                    Ok(format!("Set {summary} in \"{}\".", plans[0].real_name))
+                }
+                GateOutcome::Declined(msg) => Ok(msg),
+                GateOutcome::Error(e) => Err(e.message),
+            }
         }
         // ADD-25: the agent↔UI tools. Each is one round-trip through the
         // AgentUi bridge to the live webview driver; the driver enforces the
@@ -1907,17 +1981,7 @@ pub(crate) async fn exec_tool(
                 let v = vision_model(&models, &chat_model);
                 if is_external_engine(&v) { chat_model.clone() } else { v }
             };
-            let messages = vec![ollama::ChatMessage {
-                role: "user".into(),
-                content: grounding_prompt(find, w, h),
-                images: Some(vec![base64::engine::general_purpose::STANDARD.encode(&prepared)]),
-                ..Default::default()
-            }];
-            // HLT-5: short keep_alive on low-RAM machines when vision != chat.
-            let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &chat_model);
-            let raw =
-                ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &boxes_schema()).await?;
-            let boxes = parse_boxes(&raw, w, h);
+            let boxes = ground_prepared_image(&vmodel, &chat_model, &prepared, find, w, h).await?;
             if boxes.is_empty() {
                 return Ok(format!("Could not locate \"{find}\" in {real_name}."));
             }
@@ -1934,6 +1998,37 @@ pub(crate) async fn exec_tool(
             let content = args["content"].as_str().unwrap_or_default().to_string();
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
+            // Wave 1b (idea 10): the canonical scratch pad is get-or-create.
+            // Every name resolver returns the NEWEST match, so a duplicate
+            // "Scratch pad.md" would silently shadow the real pad (and its
+            // notes) for the chip and every future agent edit — redirect a
+            // create onto the existing pad as a normal versioned overwrite.
+            if is_scratch_pad_name(&name) {
+                if let Some(meta) = db::file_by_exact_name(&room.conn, SCRATCH_PAD_NAME)? {
+                    store_file_bytes(&room.conn, &meta.id, content.as_bytes(), Some(&content), "AI edit")?;
+                    let _ = window.emit("room-files-changed", ());
+                    let _ = window.emit("file-updated", &meta.id);
+                    effects.wrote = true;
+                    return Ok(format!(
+                        "\"{}\" already exists — rewrote it instead of creating a duplicate. \
+                         The previous notes are kept in History.",
+                        meta.name
+                    ));
+                }
+                // No pad yet: create it under the CANONICAL name (never the
+                // HTML-defaulted variant), so the chip and prompt line resolve it.
+                let meta = db::insert_file(
+                    &room.conn,
+                    SCRATCH_PAD_NAME,
+                    &note_mime(SCRATCH_PAD_NAME),
+                    content.as_bytes(),
+                    Some(&content),
+                    "generated",
+                )?;
+                let _ = window.emit("room-files-changed", ());
+                effects.wrote = true;
+                return Ok(format!("Created \"{}\" in the room.", meta.name));
+            }
             // ADD-22 (HTML-first): a document with no explicit extension defaults
             // to HTML; body/plain content is wrapped in a styled standalone page
             // (a no-op when the model already returned a full HTML document).
@@ -2018,14 +2113,128 @@ pub(crate) async fn exec_tool(
                 ));
             }
             let content = raw;
+            // Wave 1b (idea 5): optional category. Normalized leniently — a 4B
+            // model misspelling the enum degrades to uncategorized, never errors.
+            let category = args["category"].as_str().and_then(normalize_category);
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
             // UX-5: don't store an exact duplicate; tell the model so it stops.
             if duplicate_memory(&room.conn, content)?.is_some() {
                 return Ok("Already remembered.".into());
             }
-            db::add_memory(&room.conn, content)?;
+            db::add_memory(&room.conn, content, category)?;
             Ok("Memory saved.".into())
+        }
+        // Wave 1b (idea 5): read the FULL memory set on demand. The per-question
+        // injection is budgeted (MAX_MEMORY_INJECT_CHARS) and can truncate; this
+        // keeps every saved note reachable when the injected slice is partial.
+        "list_memories" => {
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let memories = db::list_memories(&room.conn)?;
+            if memories.is_empty() {
+                return Ok("No memories are saved in this room yet.".into());
+            }
+            let lines: Vec<String> = memories
+                .iter()
+                .map(|m| match m.category.as_deref() {
+                    Some(c) => format!("- [{c}] {}", m.content),
+                    None => format!("- {}", m.content),
+                })
+                .collect();
+            Ok(clamp_tool_result(lines.join("\n")))
+        }
+        // ADD-32: kick off a durable whole-file pass. The heavy lifting is the
+        // deterministic job runner's; the agent only starts it and reports.
+        "start_file_pass" => {
+            let name = args["name"].as_str().unwrap_or_default();
+            let instruction = args["instruction"].as_str().unwrap_or_default();
+            let mode = args["mode"].as_str().unwrap_or("merge");
+            let (_job_id, real_name, parts) =
+                begin_file_pass(window, state.inner(), name, instruction, mode).await?;
+            Ok(format!(
+                "Started a full pass over \"{real_name}\": {parts} part(s) will be read one \
+                 after another in the background, and the finished result will be saved into \
+                 the room as a new file. The user can watch the live progress card in the \
+                 sidebar and stop or resume it any time. Do NOT wait for it or poll job_status \
+                 — tell the user it is underway and answer anything else they asked."
+            ))
+        }
+        // ADD-32: report background-job progress in plain words.
+        "job_status" => {
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let jobs = db::list_jobs(&room.conn)?;
+            if jobs.is_empty() {
+                return Ok("There are no background jobs in this room.".into());
+            }
+            let lines: Vec<String> = jobs
+                .iter()
+                .take(8)
+                .map(|j| {
+                    format!(
+                        "- {} — {} ({} of {} steps done)",
+                        j.title, j.status, j.cursor, j.total
+                    )
+                })
+                .collect();
+            Ok(clamp_tool_result(lines.join("\n")))
+        }
+        // Wave 4a (Idea 2): the workflow authoring tools. All logic lives in
+        // commands::jobs::workflow; these arms just route args + the agent
+        // messages. Drafts require explicit user activation (the review gate).
+        "list_workflows" => {
+            let name = args["name"].as_str();
+            Ok(clamp_tool_result(agent_list_workflows(state.inner(), name)?))
+        }
+        "save_workflow" => agent_save_workflow(state.inner(), window, args, "agent").await,
+        "update_workflow" => agent_update_workflow(state.inner(), window, args).await,
+        "run_workflow" => agent_run_workflow(window, state.inner(), args).await,
+        // Wave 1a: run one prompt on the LOCAL model for an external agent on
+        // the Leash's full tier (only `ToolScope::ExternalAgent` advertises
+        // it). Never touches `effects` — the bridge passes a throwaway sink
+        // for this scope. No `clamp_tool_result`: the output is
+        // generation-bounded and the external client has a big context.
+        "local_generate" => {
+            let prompt = args["prompt"].as_str().unwrap_or_default().trim().to_string();
+            if prompt.is_empty() {
+                return Err("local_generate needs a non-empty `prompt`.".into());
+            }
+            let explicit = {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                model_setting(&room.conn)
+            };
+            let models = ollama::list_models().await.unwrap_or_default();
+            let model = resolve_local_generate_model(explicit, &models);
+            let mut messages = Vec::new();
+            if let Some(sys) = args["system"].as_str().filter(|s| !s.trim().is_empty()) {
+                messages.push(ollama::ChatMessage::new("system", sys));
+            }
+            messages.push(ollama::ChatMessage::new("user", prompt));
+            let temperature = args["temperature"].as_f64();
+            // `long` buys the Job-tier window: an external agent's big prompt
+            // must not be silently truncated at the interactive chat window.
+            let tier = if args["long"].as_bool().unwrap_or(false) {
+                ollama::CtxTier::Job
+            } else {
+                ollama::CtxTier::Chat
+            };
+            if args["schema"].is_object() {
+                ollama::chat_structured(
+                    &model,
+                    messages,
+                    temperature,
+                    KEEP_ALIVE_WARM,
+                    &args["schema"],
+                    ollama::StructuredOpts { tier, cancel: None },
+                )
+                .await
+            } else {
+                let raw = ollama::generate(&model, messages, temperature, KEEP_ALIVE_WARM, None, tier)
+                    .await?;
+                Ok(strip_think_spans(&raw).trim().to_string())
+            }
         }
         // ADD-21: delegate a hard subtask to a cloud CLI. Gated: the tool is
         // only in the catalog when the advanced setting is on and a CLI exists,
@@ -2169,10 +2378,29 @@ pub(crate) async fn perceive_image(
     if models.is_empty() {
         return Err("No local model is available to look at the image.".into());
     }
-    let mut vmodel = vision_model(&models, &models[0]);
-    if is_external_engine(&vmodel) {
-        vmodel = best_default(&models);
-    }
+    // This path only runs when the chat model itself can't read pixels, so we
+    // need a *separate* image-capable LOCAL model to describe them. Prefer a
+    // dedicated grounding VL model; otherwise any local vision-capable chat
+    // model (qwen3.5, gemma3, llava…). Refuse if there's no genuine on-device
+    // vision model: a text-only model just parrots the schema back
+    // (`{"properties":{"description":{}}}`), and an external engine would leak
+    // pixels this path promises never leave the Mac.
+    let vmodel = models
+        .iter()
+        .find(|m| m.contains("qwen2.5vl") || m.contains("qwen2.5-vl") || m.contains("qwen3-vl"))
+        .or_else(|| {
+            models
+                .iter()
+                .find(|m| !is_external_engine(m) && is_vision_chat_model(m))
+        })
+        .cloned();
+    let Some(vmodel) = vmodel else {
+        return Err(
+            "This room's chat model can't see images, and no local vision model is installed to \
+             describe them. Install one — for example `ollama pull qwen2.5vl:3b` — then try again."
+                .into(),
+        );
+    };
     let messages = vec![ollama::ChatMessage {
         role: "user".into(),
         content: format!(
@@ -2191,7 +2419,7 @@ pub(crate) async fn perceive_image(
     // The describe pass may load a second model; release it quickly on
     // low-RAM Macs (chat model unknown here, so "" never matches == warm).
     let keep = vision_keep_alive(total_ram_bytes(), &vmodel, "");
-    let raw = ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &schema).await?;
+    let raw = ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &schema, Default::default()).await?;
     let desc = serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
         .and_then(|v| v["description"].as_str().map(str::to_string))
@@ -2463,18 +2691,15 @@ mod tests {
     }
 
     #[test]
-    fn tool_step_labels_are_human_friendly() {
-        assert_eq!(tool_step_label("search_room"), "Searched the room");
-        assert_eq!(tool_step_label("fetch_page"), "Fetched a page");
-        assert_eq!(tool_step_label("open_file"), "Opened a file");
-        // Unknown / MCP tools fall back to naming the tool, never panic.
-        assert_eq!(tool_step_label("weather_lookup"), "Ran the weather_lookup tool");
-    }
-
-    #[test]
     fn normalizes_for_quote_matching() {
         let doc = normalize_for_match("The  Fee is\n 5%  of total.");
         assert!(doc.contains(&normalize_for_match("fee is 5%")));
+        // A consonantal quote (from search chunks) must match pointed file
+        // text — nikud/cantillation fold away on both sides.
+        let pointed = normalize_for_match("דִּבְרֵי קֹהֶלֶת בֶּן־דָּוִד");
+        assert!(pointed.contains(&normalize_for_match("קהלת")));
+        // Maqaf ≡ hyphen: a model typing בן-דוד must match the file's בן־דוד.
+        assert!(pointed.contains(&normalize_for_match("בן-דוד")));
     }
 
     #[test]
@@ -2518,9 +2743,134 @@ mod tests {
         assert!(wants_ui_tools("scroll down in the sidebar"));
         assert!(wants_ui_tools("what do you see on screen?"));
         assert!(wants_ui_tools("look at the video at 2:15"));
+        // QA regression: these natural phrasings matched no hint, so ui_act was
+        // never offered and the agent couldn't drive the app.
+        assert!(wants_ui_tools("open the Room Map"));
+        assert!(wants_ui_tools("open the Memory panel"));
+        assert!(wants_ui_tools("switch the budget spreadsheet to the Detail tab"));
+        assert!(wants_ui_tools("generate flashcards from the clean code pdf"));
+        assert!(wants_ui_tools("mark the main subject in photo.jpg"));
         // …a plain document question does not.
         assert!(!wants_ui_tools("summarize the contract"));
         assert!(!wants_ui_tools("who signed this agreement"));
+    }
+
+    #[test]
+    fn wants_job_tools_routes_whole_file_intents() {
+        // Whole-file work opens the pass tools…
+        assert!(wants_job_tools("summarize the entire book"));
+        assert!(wants_job_tools("translate the whole contract to French"));
+        assert!(wants_job_tools("go through all of it, don't miss anything"));
+        assert!(wants_job_tools("read it cover to cover"));
+        assert!(wants_job_tools("is the background job done yet?"));
+        // …a pointed question about one clause does not.
+        assert!(!wants_job_tools("what does the lease say about pets?"));
+        assert!(!wants_job_tools("who signed this agreement"));
+    }
+
+    #[test]
+    fn job_tools_never_leak_into_the_room_bridge_catalog() {
+        // ADD-32 structural guard, same as the UI tools: the pass tools must
+        // NOT be in tools_catalog (which builds the room MCP bridge) — only
+        // injected into the local agent loop. A cloud client must not be able
+        // to start hours of local compute.
+        let catalog = tools_catalog(true).to_string();
+        for name in ["start_file_pass", "job_status"] {
+            assert!(!catalog.contains(name), "{name} must not be in tools_catalog");
+        }
+        assert_eq!(job_tools_specs().len(), 2);
+    }
+
+    #[test]
+    fn workflow_tools_never_leak_into_the_room_bridge_catalog() {
+        // Wave 4a structural guard: the four workflow tools are LocalEngine/
+        // ExternalAgent-only (served over the bridge, gated by the jobs router) —
+        // never in tools_catalog, so a cloud client can never reach them. Each is
+        // also reserved in BUILTIN_TOOL_NAMES against MCP shadowing.
+        let catalog = tools_catalog(true).to_string();
+        let specs = workflow_tools_specs();
+        assert_eq!(specs.len(), 4);
+        for name in ["list_workflows", "save_workflow", "update_workflow", "run_workflow"] {
+            assert!(!catalog.contains(name), "{name} must not be in tools_catalog");
+            assert!(BUILTIN_TOOL_NAMES.contains(&name), "{name} must be reserved");
+            assert!(specs.iter().any(|s| s["function"]["name"] == name), "{name} spec missing");
+        }
+    }
+
+    #[test]
+    fn wants_job_tools_routes_workflow_intents() {
+        // Wave 4a: the workflow keywords ride the jobs routing flag.
+        assert!(wants_job_tools("make me a workflow that summarizes new files every morning"));
+        assert!(wants_job_tools("automate a weekly review"));
+        assert!(wants_job_tools("set up a recurring pipeline"));
+        assert!(wants_job_tools("run the morning digest workflow"));
+    }
+
+    #[test]
+    fn exec_tool_arms_are_reserved_against_mcp_shadowing() {
+        // Every exec_tool arm that dispatches to a built-in (not the `other =>`
+        // MCP fallback) must be in BUILTIN_TOOL_NAMES, or a connected MCP server
+        // whose sanitized name collides could shadow the built-in and skip the
+        // SEC-1b consent gate. `consult_advisor` and `local_generate` are never
+        // in any bridge catalog but ARE exec_tool arms, so they are the two that
+        // the plain leak guards above don't already cover.
+        for name in ["consult_advisor", "local_generate"] {
+            assert!(
+                BUILTIN_TOOL_NAMES.contains(&name),
+                "{name} is an exec_tool arm but not reserved — an MCP route could shadow it"
+            );
+        }
+    }
+
+    #[test]
+    fn external_agent_tools_never_leak_into_the_room_bridge_catalog() {
+        // Wave 1a structural guard, same as the job/UI tools: local_generate
+        // is NOT in tools_catalog — only the bridge's ExternalAgent scope
+        // advertises it, so no in-room engine or cloud advisor ever sees it.
+        assert!(!tools_catalog(true).to_string().contains("local_generate"));
+        let specs = external_agent_tools_specs();
+        assert_eq!(specs.len(), 1);
+        let f = &specs[0]["function"];
+        assert_eq!(f["name"], "local_generate");
+        assert_eq!(f["parameters"]["required"], serde_json::json!(["prompt"]));
+        for p in ["prompt", "system", "schema", "temperature", "long"] {
+            assert!(f["parameters"]["properties"][p].is_object(), "missing param {p}");
+        }
+        // The content-perception subset is exactly view_media_frame.
+        let media = media_tools_specs();
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0]["function"]["name"], "view_media_frame");
+    }
+
+    #[test]
+    fn local_generate_never_resolves_to_a_cloud_model() {
+        // Wave 1a amendment: the tool promises LOCAL execution. A :cloud chat
+        // model, an external CLI engine, and a :cloud-first install must all
+        // land on a genuinely local model — resolve_pass_engine's cloud lane
+        // is deliberately NOT the template here.
+        let models = vec![
+            "minimax-m3:cloud".to_string(),
+            "nomic-embed-text:latest".to_string(),
+            "qwen3.5:9b".to_string(),
+        ];
+        assert_eq!(
+            resolve_local_generate_model(Some("minimax-m3:cloud".into()), &models),
+            "qwen3.5:9b"
+        );
+        assert_eq!(
+            resolve_local_generate_model(Some("claude-cli::opus".into()), &models),
+            "qwen3.5:9b"
+        );
+        // An explicit local pick is honored.
+        assert_eq!(
+            resolve_local_generate_model(Some("qwen3.5:9b".into()), &models),
+            "qwen3.5:9b"
+        );
+        assert_eq!(resolve_local_generate_model(None, &models), "qwen3.5:9b");
+        // Nothing local installed → the default NAME, so Ollama surfaces a
+        // clear MODEL_MISSING instead of silently running on the cloud.
+        let no_local = vec!["minimax-m3:cloud".to_string()];
+        assert_eq!(resolve_local_generate_model(None, &no_local), DEFAULT_MODEL);
     }
 
     #[test]
@@ -2539,6 +2889,54 @@ mod tests {
     }
 
     #[test]
+    fn style_paragraph_maps_known_styles() {
+        // Wave 1b (idea 12): each register maps to its constant…
+        assert!(style_paragraph(Some("terse")).unwrap().starts_with("Response style: TERSE."));
+        assert!(style_paragraph(Some("friendly")).unwrap().starts_with("Response style: FRIENDLY."));
+        assert!(style_paragraph(Some("formal")).unwrap().starts_with("Response style: FORMAL."));
+        // …and the audited register halves are present: terse keeps "technical",
+        // friendly keeps "explanatory", formal keeps "structured".
+        assert!(style_paragraph(Some("terse")).unwrap().contains("precise technical vocabulary"));
+        assert!(style_paragraph(Some("friendly")).unwrap().contains("briefly explain the why"));
+        assert!(style_paragraph(Some("formal")).unwrap().contains("short headings or numbered points"));
+    }
+
+    #[test]
+    fn style_paragraph_none_for_default_and_unknown() {
+        // Byte-stability guard: absent/default/unknown values inject NOTHING,
+        // so those rooms' system prompts stay byte-identical to today's.
+        assert!(style_paragraph(None).is_none());
+        assert!(style_paragraph(Some("default")).is_none());
+        assert!(style_paragraph(Some("")).is_none());
+        assert!(style_paragraph(Some("TERSE")).is_none(), "stored values are exact, not folded");
+        assert!(style_paragraph(Some("shakespearean")).is_none());
+    }
+
+    #[test]
+    fn style_block_appends_precedence_sentence_only_with_custom_text() {
+        // Free text wins (triage rule): the sentence appears exactly when
+        // custom instructions ride below the preset.
+        let plain = style_block(Some("terse"), false).unwrap();
+        assert_eq!(plain, STYLE_TERSE);
+        let with_custom = style_block(Some("terse"), true).unwrap();
+        assert!(with_custom.starts_with(STYLE_TERSE));
+        assert!(with_custom.ends_with("follow the user's preferences."));
+        // No preset → nothing, regardless of custom text.
+        assert!(style_block(None, true).is_none());
+    }
+
+    #[test]
+    fn list_memories_rides_the_base_catalog() {
+        // Wave 1b (idea 5): the read-back tool is part of tools_catalog (served
+        // to every scope like list_room_files) and carries no parameters; the
+        // add_memory spec gained the optional category enum.
+        let catalog = tools_catalog(false).to_string();
+        assert!(catalog.contains("\"list_memories\""));
+        assert!(catalog.contains("\"category\""));
+        assert!(BUILTIN_TOOL_NAMES.contains(&"list_memories"));
+    }
+
+    #[test]
     fn effects_json_is_none_until_a_tool_draws() {
         let mut e = ToolEffects::default();
         assert!(effects_json(&e).is_none(), "plain answer → NULL effects column");
@@ -2546,6 +2944,26 @@ mod tests {
         let v = effects_json(&e).expect("annotation should produce effects");
         assert!(v["annotation"].is_object());
         assert!(v.get("boxes").is_none());
+        // Wave 2 (Idea 4): an edit-only turn also flips the column non-null, under
+        // the content-free "edits" key.
+        let mut e2 = ToolEffects::default();
+        e2.edit_outcomes.push(serde_json::json!({"tool": "edit_file", "outcome": "fuzzy", "n": 1}));
+        let v2 = effects_json(&e2).expect("edit outcomes should produce effects");
+        assert!(v2["edits"].is_array());
+        assert_eq!(v2["edits"][0]["outcome"], "fuzzy");
+        assert!(v2.get("boxes").is_none() && v2.get("annotation").is_none());
+    }
+
+    #[test]
+    fn edit_files_is_served_over_the_bridge_catalog() {
+        // Idea 7: unlike the job/UI tools, edit_files MUST be in tools_catalog so
+        // the sidecar and Leash clients can call it — and its name is reserved
+        // against MCP shadowing.
+        let catalog = tools_catalog(false).to_string();
+        assert!(catalog.contains("\"edit_files\""));
+        assert!(BUILTIN_TOOL_NAMES.contains(&"edit_files"));
+        // Idea 4: the `all` escape hatch is schema-visible, not just prose.
+        assert!(catalog.contains("\"all\""));
     }
 
     #[test]

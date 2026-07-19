@@ -47,13 +47,16 @@ const INTERACTIVE_SELECTOR = [
   ".annot-chip",
 ].join(", ");
 
-/** Ordered most-specific-first: the viewer lives inside the layout's main
- * area, so it must win before the broad main/.chat match. */
+/** Ordered most-specific-first: the shell's three panes plus chrome. The
+ * legacy selectors stay as fallbacks so older markup keeps labeling. */
 const REGION_MAP: Array<[selector: string, name: string]> = [
-  [".viewer, .viewer-pane", "viewer"],
-  ["aside, .sidebar", "sidebar"],
-  ["header, .top-bar", "top bar"],
-  ["main, .chat", "chat"],
+  [".viewer, .viewer-pane, .pane-center", "viewer"],
+  [".pane-library, .sidebar", "sidebar"],
+  [".pane-ai, .chat", "chat"],
+  [".activity-rail", "activity rail"],
+  [".pr-statusbar", "status bar"],
+  ["header, .top-bar, .pr-topbar", "top bar"],
+  ["main", "chat"],
 ];
 
 interface SnapshotEntry {
@@ -486,7 +489,6 @@ function viewScreenshot(): Record<string, unknown> {
   };
   const pane =
     document.querySelector(".viewer") ??
-    document.querySelector(".viewer-pane") ??
     document.querySelector('main [class*="viewer"]');
   if (!pane) return noVisual;
 
@@ -607,6 +609,11 @@ async function mediaFrame(
     if (seeked !== "ok" && video.readyState < 2) {
       return { error: `Couldn't seek that video to ${t.toFixed(1)}s.` };
     }
+    // WKWebView fires "seeked" before the decoder has PAINTED the new frame —
+    // drawing immediately captures a black canvas (the model then honestly
+    // reports "a completely black screen"). Wait for a real presented frame,
+    // nudging the paused pipeline with a muted play/pause if it stalls.
+    await presentedFrame(video, 2500);
 
     try {
       return {
@@ -620,6 +627,36 @@ async function mediaFrame(
   } finally {
     video.remove();
   }
+}
+
+/** Resolve once the video has actually PRESENTED a frame (safe to draw).
+ * requestVideoFrameCallback fires per composited frame; on a paused,
+ * just-seeked pipeline it can stall, so after 300ms a muted play/pause forces
+ * a frame through the decoder. Always resolves by timeoutMs — a black frame
+ * beats a hung tool call. */
+function presentedFrame(video: HTMLVideoElement, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (!settled) {
+        settled = true;
+        video.pause();
+        resolve();
+      }
+    };
+    const v = video as HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: () => void) => number;
+    };
+    if (typeof v.requestVideoFrameCallback === "function") {
+      v.requestVideoFrameCallback(() => done());
+      window.setTimeout(() => {
+        if (!settled) void video.play().catch(() => done());
+      }, 300);
+    } else {
+      requestAnimationFrame(() => requestAnimationFrame(done));
+    }
+    window.setTimeout(done, timeoutMs);
+  });
 }
 
 /** Await one media event, racing "error" and a timeout — a bad token or a

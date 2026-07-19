@@ -91,6 +91,18 @@ pub fn list_roles() -> Vec<RoomRole> {
     ]
 }
 
+/// The persona instructions for a saved `room_role` id, or "" for the plain
+/// "default" role or an unknown id. Pure, so the agent's injection is unit-
+/// testable. (D11: the app saves `set_setting('room_role', id)`; the agent reads
+/// it and prepends these instructions to the system prompt.)
+pub(crate) fn role_instructions(id: &str) -> String {
+    list_roles()
+        .into_iter()
+        .find(|r| r.id == id)
+        .map(|r| r.instructions)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +120,13 @@ mod tests {
         assert!(!tutor.instructions.is_empty());
         let def = roles.iter().find(|r| r.id == "default").unwrap();
         assert!(def.instructions.is_empty());
+    }
+
+    #[test]
+    fn role_instructions_looks_up_persona_or_empty() {
+        // A persona id yields its instructions; default / unknown yield "".
+        assert!(role_instructions("tutor").contains("patient tutor"));
+        assert!(role_instructions("default").is_empty());
+        assert!(role_instructions("no-such-role").is_empty());
     }
 }

@@ -137,6 +137,16 @@ pub fn open_html_in_browser(name: Option<String>, html: String) -> Result<String
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Sweep the browser-preview folder `open_html_in_browser` writes into, so the
+/// decrypted HTML it leaves behind doesn't outlive the app. Called at startup
+/// (files from a crashed/force-quit session) and on exit. Best-effort: only our
+/// dedicated directory is touched, and a failure must never block startup/exit.
+/// Not called mid-session — `/usr/bin/open` returns before the browser has read
+/// the file, so an eager sweep could hand the browser a dead path.
+pub fn cleanup_browser_previews() {
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("private-room-preview"));
+}
+
 /// Stage a self-contained HTML page for the isolated in-app preview and return a
 /// token; the frontend loads it via `roomdoc://localhost/<token>`. Old entries
 /// are dropped so the store can't grow without bound.
@@ -206,15 +216,37 @@ Make it a polished, responsive, dark-themed page: near-black background (#0b0b12
 soft violet accent (#8b7cf6), light text, system font. Write correct JavaScript that \
 runs on load with no errors.";
 
+/// ADD-31: create this operation's cancel flag and, when the frontend supplied
+/// an op id, register it in the shared cancel registry — the same one chat's
+/// Stop uses — so `cancel_ask(opId)` stops a Studio run too. The caller keeps a
+/// `CancelGuard` so the entry is removed on every return path.
+pub(crate) fn register_studio_cancel(
+    state: &State<'_, AppState>,
+    op_id: &Option<String>,
+) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Some(id) = op_id {
+        state
+            .cancels
+            .lock()
+            .unwrap()
+            .insert(id.clone(), cancel.clone());
+    }
+    cancel
+}
+
 /// Ask the model to author a complete interactive HTML page for a Studio artifact.
 /// Returns cleaned HTML, or `None` when the output isn't usable HTML — the caller
-/// then falls back to a built-in template so the feature never hard-fails.
+/// then falls back to a built-in template so the caller never hard-fails.
 pub(crate) async fn generate_studio_html(
     model: &str,
     page_role: &str,
     instr: &str,
     label: &str,
     text: &str,
+    // ADD-31: the Studio's Stop flag — authoring a whole page on a local model
+    // runs for minutes and must be abandonable mid-stream.
+    cancel: Arc<AtomicBool>,
 ) -> Result<Option<String>, String> {
     let schema = serde_json::json!({
         "type": "object",
@@ -228,12 +260,16 @@ pub(crate) async fn generate_studio_html(
             format!("{instr}\n\nBuild it only from this material about \"{label}\":\n\n{text}"),
         ),
     ];
-    let raw = ollama::chat_structured(model, messages, Some(0.4), KEEP_ALIVE_WARM, &schema).await?;
-    let html = serde_json::from_str::<serde_json::Value>(raw.trim())
-        .ok()
-        .and_then(|v| v.get("html").and_then(|s| s.as_str()).map(str::to_string))
-        .unwrap_or_default();
-    Ok(clean_studio_html(html))
+    let raw = ollama::chat_structured(
+        model,
+        messages,
+        Some(0.4),
+        KEEP_ALIVE_WARM,
+        &schema,
+        ollama::StructuredOpts::default().with_cancel(cancel),
+    )
+    .await?;
+    Ok(clean_studio_html(json_str_field(&raw, "html").unwrap_or_default()))
 }
 
 /// Normalize model-authored HTML; return `None` if it isn't a real HTML page (so
@@ -266,6 +302,174 @@ pub(crate) fn clean_studio_html(html: String) -> Option<String> {
         );
     }
     Some(h)
+}
+
+// ---- the shared studio pipeline ---------------------------------------------
+
+/// The per-artifact differences between the Studio generators (flashcards, mind
+/// map, podcast script). Everything else — cancel wiring, room-locked text
+/// gathering, model resolution, the HTML-authoring primary path, the JSON
+/// fallback, and save/open — is identical and lives in `run_studio`.
+pub(crate) struct StudioSpec {
+    /// Default editable instruction used when the caller supplies none.
+    pub(crate) default_prompt: &'static str,
+    /// System prompt for the HTML-authoring primary path.
+    pub(crate) page_role: &'static str,
+    /// Leading clause of the "…is writing" step chip (the suffix is shared).
+    pub(crate) working_label: &'static str,
+    /// Optional step chip shown just before the JSON fallback runs.
+    pub(crate) fallback_step: Option<&'static str>,
+    /// JSON-fallback schema.
+    pub(crate) fallback_schema: serde_json::Value,
+    /// JSON-fallback system prompt.
+    pub(crate) fallback_system: &'static str,
+    /// JSON-fallback grounding clause, formatted as `{intro} "{label}"`.
+    pub(crate) fallback_intro: &'static str,
+    /// JSON-fallback sampling temperature.
+    pub(crate) fallback_temp: f64,
+    /// Parse the fallback JSON and render the built-in template, or Err when the
+    /// model returned nothing usable. Args: (raw JSON, scope label).
+    pub(crate) render: fn(&str, &str) -> Result<String, String>,
+    /// Output filename prefix, e.g. "Flashcards".
+    pub(crate) filename_prefix: &'static str,
+}
+
+/// The one Studio pipeline shared by flashcards, mind map and podcast script:
+/// register the Stop flag, gather the scope's text under the room lock, resolve a
+/// structured model, ask it to author a whole interactive HTML page, and — only
+/// if that isn't usable HTML — fall back to a structured extraction rendered by
+/// the artifact's built-in template. `spec` carries the only differences.
+pub(crate) async fn run_studio(
+    window: &tauri::Window,
+    state: &State<'_, AppState>,
+    spec: StudioSpec,
+    scope: Option<String>,
+    instructions: Option<String>,
+    refs: Option<Vec<String>>,
+    op_id: Option<String>,
+) -> Result<FileMeta, String> {
+    // Wave 3 (Idea 9): a Studio run writes a file at the end — don't start one
+    // while a rollback is swapping the DB.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+    // ADD-31: a cancellable operation with visible stages. The flag is
+    // registered under the caller's op id (same registry the chat Stop uses),
+    // so a foreground Stop button works mid-generation.
+    let cancel = register_studio_cancel(state, &op_id);
+    let _cancel_guard = op_id.as_ref().map(|id| CancelGuard {
+        state: state.inner(),
+        ask_id: id.clone(),
+    });
+    run_studio_core(window, state, spec, scope, instructions, refs, cancel, None).await
+}
+
+/// Reconstruct a studio's `StudioSpec` from the durable job plan's `kind` string
+/// (the spec holds fn pointers + `&'static str`, so it can't be serialized into
+/// the plan). Returns None for an unknown kind.
+pub(crate) fn studio_spec_for(kind: &str) -> Option<StudioSpec> {
+    match kind {
+        "flashcards" => Some(flashcards_spec()),
+        "mindmap" => Some(mindmap_spec()),
+        "podcast" => Some(podcast_spec()),
+        _ => None,
+    }
+}
+
+/// Human title for a studio job card (e.g. its background-job label).
+pub(crate) fn studio_title(kind: &str) -> &'static str {
+    match kind {
+        "flashcards" => "Flashcards",
+        "mindmap" => "Mind map",
+        "podcast" => "Podcast script",
+        _ => "Studio",
+    }
+}
+
+/// The shared Studio pipeline, driven by an explicit `cancel` flag so a
+/// background job's own `job_cancels` flag can Stop it (the foreground path
+/// passes its chat-registry flag instead). `room_path`, when set, pins every
+/// room access: a job that runs for minutes must not gather from — or write its
+/// result into — a room the user swapped away from mid-run.
+pub(crate) async fn run_studio_core(
+    window: &tauri::Window,
+    state: &State<'_, AppState>,
+    spec: StudioSpec,
+    scope: Option<String>,
+    instructions: Option<String>,
+    refs: Option<Vec<String>>,
+    cancel: Arc<AtomicBool>,
+    room_path: Option<&str>,
+) -> Result<FileMeta, String> {
+    use tauri::Emitter;
+    let instr = studio_instruction(instructions, spec.default_prompt);
+    let _ = window.emit("studio-step", "Reading the material…");
+    let (label, text) = state.with_room(|room| {
+        if room_path.is_some_and(|rp| room.path != rp) {
+            return Err("the room this job belongs to was closed".to_string());
+        }
+        match refs.as_ref().filter(|r| !r.is_empty()) {
+            Some(ids) => gather_files_text(&room.conn, ids),
+            None => gather_scope_text(&room.conn, scope.as_deref(), &room.name),
+        }
+    })?;
+    let model = resolve_structured_model(state)
+        .await
+        .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
+    let _ = window.emit(
+        "studio-step",
+        if is_cloud_model(&model) || is_external_engine(&model) {
+            format!("{} — your cloud AI is writing (content leaves this Mac)…", spec.working_label)
+        } else {
+            format!("{} — a local model can take a few minutes…", spec.working_label)
+        },
+    );
+    let content = match generate_studio_html(&model, spec.page_role, &instr, &label, &text, cancel.clone())
+        .await?
+    {
+        Some(html) if !cancel.load(Ordering::SeqCst) => html,
+        _ if cancel.load(Ordering::SeqCst) => return Err("Stopped.".into()),
+        _ => {
+            if let Some(step) = spec.fallback_step {
+                let _ = window.emit("studio-step", step);
+            }
+            // Fallback: extract the structured artifact and render the built-in
+            // template (so the caller never hard-fails on unusable HTML).
+            let messages = vec![
+                ollama::ChatMessage::new("system", spec.fallback_system),
+                ollama::ChatMessage::new(
+                    "user",
+                    format!("{instr}\n\n{} \"{label}\":\n\n{text}", spec.fallback_intro),
+                ),
+            ];
+            let raw = ollama::chat_structured(
+                &model,
+                messages,
+                Some(spec.fallback_temp),
+                KEEP_ALIVE_WARM,
+                &spec.fallback_schema,
+                ollama::StructuredOpts::default().with_cancel(cancel.clone()),
+            )
+            .await?;
+            if cancel.load(Ordering::SeqCst) {
+                return Err("Stopped.".into());
+            }
+            (spec.render)(&raw, &label)?
+        }
+    };
+    // Pin the write too: bail if the room was swapped between gather and save,
+    // so the generated file can never land in the wrong room.
+    if let Some(rp) = room_path {
+        let ok = {
+            let guard = state.room.lock().unwrap();
+            guard.as_ref().is_some_and(|r| r.path == rp)
+        };
+        if !ok {
+            return Err("the room this job belongs to was closed".into());
+        }
+    }
+    let name = format!("{} - {}.html", spec.filename_prefix, safe_scope_name(&label));
+    save_and_open(window, state, &name, "text/html", &content, "generated")
 }
 
 // ---- AI actions -------------------------------------------------------------

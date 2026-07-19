@@ -11,6 +11,12 @@ interface Props {
   find?: string;
   /** Save-button label, e.g. "Save copy" when saving creates a new file. */
   saveLabel?: string;
+  /** Wave 1b (idea 10): mirrors the buffer's dirty flag out to the workspace
+   * (s.editorDirtyRef) so an agent write can tell "user has unsaved edits"
+   * from "viewer can safely reload". Called with false again on save AND on
+   * unmount — a stale true would make later agent writes silently skip the
+   * viewer reload for a user who isn't even editing. */
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 export default function CodeEditor({
@@ -20,12 +26,20 @@ export default function CodeEditor({
   onSave,
   find,
   saveLabel,
+  onDirtyChange,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const onSaveRef = useRef(onSave);
   onSaveRef.current = onSave;
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
   const [dirty, setDirty] = useState(false);
+
+  function markDirty(d: boolean) {
+    setDirty(d);
+    onDirtyChangeRef.current?.(d);
+  }
 
   useEffect(() => {
     if (!hostRef.current) return;
@@ -51,16 +65,18 @@ export default function CodeEditor({
         editor.revealRangeInCenter(match.range);
       }
     }
-    const sub = editor.onDidChangeModelContent(() => setDirty(true));
+    const sub = editor.onDidChangeModelContent(() => markDirty(true));
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       if (onSaveRef.current) {
         onSaveRef.current(editor.getValue());
-        setDirty(false);
+        markDirty(false);
       }
     });
     return () => {
       sub.dispose();
       editor.dispose();
+      // The buffer is gone with the editor — never leave dirty=true behind.
+      onDirtyChangeRef.current?.(false);
     };
     // The parent keys this component by file id, so mount-once is correct.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -70,7 +86,7 @@ export default function CodeEditor({
     const editor = editorRef.current;
     if (editor && onSave) {
       onSave(editor.getValue());
-      setDirty(false);
+      markDirty(false);
     }
   }
 

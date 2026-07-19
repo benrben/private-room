@@ -262,6 +262,26 @@
   max-width: 100%;
 }
 
+/* The image viewer proper: the picture centers in its own scroll container
+   (chat thumbnails keep the plain inline .img-wrap above), and a zoomed
+   image scrolls instead of squeezing. */
+.img-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.img-scroll .img-wrap {
+  display: block;
+  width: fit-content;
+  margin: 0 auto;
+}
+
+/* Same zoom pill as the PDF viewer, sat in the image toolbar row. */
+.img-zoombar {
+  position: static;
+  margin-bottom: 0;
+}
+
 .img-wrap img {
   display: block;
   max-width: 100%;

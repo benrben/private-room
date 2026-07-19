@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type React from "react";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
-import { api, ModelCaps, SttStatus } from "../api";
+import { api, ModelCaps, SttStatus, recommendedModels, ensureEmbedModel } from "../api";
 import type { AiStatus } from "../api";
 import { PullProgress, RecommendedModels } from "./types";
 
@@ -59,7 +58,7 @@ export function useModelManagement(
     const unlistenStt = api.onSttDownloadProgress((p) =>
       setSttPercent(p.percent),
     );
-    invoke<RecommendedModels>("recommended_models")
+    recommendedModels()
       .then(setRecommended)
       .catch(() => {});
     return () => {
@@ -153,8 +152,7 @@ export function useModelManagement(
     setPullPercent(null);
     try {
       if (useEnsureEmbed) {
-        // CONTRACT-NOTE: ensure_embed_model emits the same 'pull-progress' events.
-        await invoke("ensure_embed_model");
+        await ensureEmbedModel();
       } else {
         await api.pullModel(name);
       }

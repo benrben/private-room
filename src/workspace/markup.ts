@@ -1,8 +1,42 @@
-import { AnnotationPayload, FileTarget } from "../api";
+import { AiStatus, AnnotationPayload, FileTarget, splitExternalModel } from "../api";
 
-/** Cloud CLI engines send questions off this Mac (SEC-6). */
+/** External CLI engines (Claude Code / Codex): a separate subprocess path —
+ * no in-app tool chips, no Ollama daemon needed. Recognizes both a bare
+ * engine id and a composite "engine::submodel" selection from the Cloud
+ * picker. */
+export function isExternalEngine(model: string): boolean {
+  const [engine] = splitExternalModel(model);
+  return engine === "claude-cli" || engine === "codex-cli";
+}
+
+/** An Ollama `:cloud` model: listed alongside local models and driven through
+ * the same tool loop (ADD-29 parity), but it RUNS REMOTELY — prompts and file
+ * context leave this Mac. Must never be labeled "Local". */
+export function isRemoteModel(model: string): boolean {
+  return model.endsWith(":cloud");
+}
+
+/** Anything that sends room content off this Mac (SEC-6): drives the privacy
+ * strip and the Cloud tier label. */
 export function isCloudEngine(model: string): boolean {
-  return model === "claude-cli" || model === "codex-cli";
+  return isExternalEngine(model) || isRemoteModel(model);
+}
+
+/** Is the room's selected model usable right now (so no "download a model"
+ * card is warranted)? A local/`:cloud` model must be present in Ollama's live
+ * list (matched loosely on the `:tag` boundary). A cloud CLI is ready as soon
+ * as its engine is detected — but the picker hands us a composite
+ * "engine::model::effort" selection, so we split down to the bare engine id
+ * before checking `ai.external` (which only ever holds bare engine ids). */
+export function isModelReady(ai: AiStatus | null | undefined, model: string): boolean {
+  if (!ai) return false;
+  const [engine] = splitExternalModel(model);
+  if (ai.external.includes(engine)) return true;
+  return (
+    ai.running &&
+    (ai.models.includes(model) ||
+      ai.models.some((m) => m.startsWith(model + ":") || model.startsWith(m)))
+  );
 }
 
 export interface BoxesPayload {

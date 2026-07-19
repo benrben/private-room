@@ -5,8 +5,13 @@ pub mod extraction;
 pub mod mcp;
 mod ocr;
 mod ollama;
+mod ollama_lifecycle;
+pub mod recording;
 mod room_mcp;
+mod sidecar;
+mod sidecar_lifecycle;
 pub(crate) mod snapshot;
+pub mod speech;
 pub mod stt;
 pub mod web;
 
@@ -16,6 +21,9 @@ use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Sweep decrypted "Open in browser" previews left behind by a crashed or
+    // force-quit session before anything else runs.
+    commands::cleanup_browser_previews();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -25,6 +33,7 @@ pub fn run() {
         .manage(commands::HtmlPreviews::default())
         .manage(commands::MediaStreams::default())
         .manage(commands::AgentUi::default())
+        .manage(commands::RecState::default())
         // ADD-24: stream staged room media (audio/video) with HTTP Range
         // support — WKWebView's media elements need 206 responses to seek, and
         // large videos must never ride through IPC as base64. Bytes come from
@@ -100,15 +109,20 @@ pub fn run() {
             commands::set_cell,
             commands::delete_file,
             commands::save_generated_file,
+            commands::open_scratch_pad,
             commands::import_link,
-            commands::summarize_room,
             commands::list_file_versions,
             commands::restore_file_version,
+            commands::get_file_version,
             commands::export_file,
             commands::export_all,
             commands::change_password,
             commands::duplicate_room,
             commands::compact_room,
+            commands::create_room_checkpoint,
+            commands::list_room_checkpoints,
+            commands::delete_room_checkpoint,
+            commands::rollback_room_checkpoint,
             commands::list_recent,
             commands::remove_recent,
             commands::clear_recent,
@@ -131,8 +145,10 @@ pub fn run() {
             commands::mcp_status,
             commands::approve_mcp,
             commands::resolve_mcp_call,
+            commands::resolve_edit_approval,
             commands::ai_status,
             commands::model_capabilities,
+            commands::list_engine_models,
             commands::open_ollama,
             commands::warm_model,
             commands::pull_model,
@@ -173,6 +189,7 @@ pub fn run() {
             commands::suggest_file_meta,
             commands::room_server_status,
             commands::set_room_server,
+            commands::regenerate_leash_token,
             commands::set_ollama_url,
             commands::get_ollama_url,
             commands::list_roles,
@@ -180,10 +197,80 @@ pub fn run() {
             // bridge + YouTube video import.
             commands::resolve_agent_ui,
             commands::import_youtube_video,
+            // ADD-27: live Recording file (streaming transcription, editing,
+            // translate). ADD-28: feedback → GitHub issue.
+            commands::rec_start,
+            commands::rec_push_audio,
+            commands::rec_pause,
+            commands::rec_resume,
+            commands::rec_stop,
+            commands::rec_live_status,
+            commands::rec_set_live_translate,
+            commands::rec_set_live_stt,
+            commands::rec_get,
+            commands::rec_delete_range,
+            commands::rec_export_clean,
+            commands::rec_translate,
+            commands::rec_retranscribe,
+            commands::app_diag,
+            commands::feedback_draft,
+            // ADD-30: durable background job runner.
+            commands::list_jobs,
+            commands::cancel_job,
+            commands::delete_job,
+            commands::resume_job,
+            commands::start_deep_summary,
+            commands::start_studio_job,
+            // ADD-32: whole-file pass — exhaustive windowed reading of one file.
+            commands::start_file_pass,
+            // Wave 4a (Idea 2): LLM graph workflows + scheduler + shortcuts.
+            commands::save_workflow,
+            commands::update_workflow,
+            commands::delete_workflow,
+            commands::list_workflows,
+            commands::get_workflow,
+            commands::get_workflow_schedule,
+            commands::workflow_templates,
+            commands::run_workflow,
+            commands::set_workflow_schedule,
+            commands::set_workflow_status,
+            commands::set_workflow_pinned,
+            commands::validate_workflow,
+            commands::compose_workflow,
+            commands::get_workflow_runs,
+            commands::get_job_step_artifact,
+            // Wave 5 (Idea 13): runnable & schedulable scripts.
+            commands::list_scripts,
+            commands::get_script_manifest,
+            commands::run_script,
+            commands::set_script_schedule,
+            commands::resolve_script_run,
+            // Idea 3: supernatural voice — on-device speech synthesis.
+            commands::speak_text,
+            commands::list_speech_voices,
         ])
+        .setup(|app| {
+            // Wave 5 (Idea 13): sweep orphaned script-run workspaces left by a
+            // crash before anything runs (the quiesce_stale_jobs spirit).
+            commands::sweep_script_workspaces(app.handle());
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, _event| {
+            // ADD-29: never leak a background `ollama serve` WE started — stop it
+            // (and only it) as the app exits. A no-op for an external daemon.
+            if let tauri::RunEvent::Exit = _event {
+                ollama_lifecycle::stop_if_ours();
+                // ADD-33: never leak the Python agent sidecar we spawned.
+                sidecar_lifecycle::stop_if_ours();
+                // Decrypted "Open in browser" previews must not outlive the app.
+                commands::cleanup_browser_previews();
+                // Wave 1a: Cmd-Q skips teardown_open_room, so drop the Leash
+                // discovery file here too — it must exist exactly while the
+                // Leash runs, never advertising a dead endpoint.
+                commands::remove_discovery(_app);
+            }
             // Finder double-click on a .roomai file lands here on macOS.
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = _event {

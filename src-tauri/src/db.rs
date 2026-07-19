@@ -16,25 +16,33 @@ mod chats;
 mod embeddings;
 mod files;
 mod folders;
+mod jobs;
 mod memories;
 mod messages;
 mod meta;
+mod recordings;
 mod schema;
 mod settings;
+mod util;
 mod versions;
 mod web_cache;
+mod workflows;
 
 pub use chats::*;
 pub use embeddings::*;
 pub use files::*;
 pub use folders::*;
+pub use jobs::*;
 pub use memories::*;
 pub use messages::*;
 pub use meta::*;
+pub use recordings::*;
 pub use schema::*;
 pub use settings::*;
+pub(crate) use util::*;
 pub use versions::*;
 pub use web_cache::*;
+pub use workflows::*;
 
 // ==================================================================
 // Room-persistence CRUD. Everything below is the only place raw SQL
@@ -47,7 +55,11 @@ const CHUNK_TARGET_CHARS: usize = 1200;
 /// HLT-4: hard cap on chunks indexed per file. A file that hits it is only
 /// partially searchable; `FileMeta.partially_indexed` surfaces that live via a
 /// chunk-count check, so this cap and that flag must agree.
-pub const CHUNK_CAP: usize = 2000;
+/// Was 2000 (~2M chars) — a 1,200-page Hebrew Bible overflowed it and its
+/// last books (קהלת!) silently missed the index. 20,000 chunks ≈ 20M chars
+/// covers any real document; indexing stays seconds, and the flag still
+/// guards the truly pathological.
+pub const CHUNK_CAP: usize = 20_000;
 
 /// Column list shared by every FileMeta query: the base row plus folder_id and
 /// a live chunk count for `partially_indexed` (HLT-4). Kept as one constant so
@@ -72,10 +84,14 @@ pub(crate) fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
     })
 }
 
-/// Chunk `text` (if any) into the search index for `file_id`.
+/// Chunk `text` (if any) into the search index for `file_id`. Hebrew
+/// nikud/cantillation are stripped first: the FTS tokenizer (unicode61)
+/// treats those combining marks as separators, so pointed words would index
+/// as single-letter fragments no plain query can ever match (קהלת vs קֹהֶלֶת).
 pub(crate) fn insert_chunks(conn: &Connection, file_id: &str, text: Option<&str>) -> Result<(), String> {
     if let Some(text) = text {
-        for (seq, chunk) in extraction::chunk_text(text, CHUNK_TARGET_CHARS)
+        let text = extraction::strip_hebrew_marks(text);
+        for (seq, chunk) in extraction::chunk_text(&text, CHUNK_TARGET_CHARS)
             .into_iter()
             .take(CHUNK_CAP)
             .enumerate()

@@ -1,10 +1,28 @@
+import { useEffect } from "react";
 import { tokenAtCaret } from "./composer";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
-/** The "edit the prompt first" modal for Studio actions. Extracted verbatim from
- * renderStudioPromptModal. */
+/** The "edit the prompt first" modal for Studio actions. Run fires a background
+ * job and closes the modal immediately — progress and the finished file live on
+ * the sidebar job card, so there is no in-modal running state. */
 export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
+  // Escape closes the modal (unless the autocomplete's own Escape closes it
+  // first). Capture-phase so the app-level Escape (close file viewer) never
+  // fires underneath the dialog.
+  const open = s.studioPrompt !== null;
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      if (s.studioAc) return; // the autocomplete's own Escape closes it first
+      s.setStudioPrompt(null);
+    }
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, s.studioAc]);
   if (!s.studioPrompt) return null;
   const studioPrompt = s.studioPrompt;
   const label =
@@ -13,15 +31,18 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
       : studioPrompt.kind === "mindmap"
         ? "Mind map"
         : "Podcast script";
-  const running = s.studioBusy !== null;
   return (
     <div
       className="studio-prompt-backdrop"
-      onClick={() => {
-        if (!running) s.setStudioPrompt(null);
-      }}
+      onClick={() => s.setStudioPrompt(null)}
     >
-      <div className="studio-prompt" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="studio-prompt"
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="studio-prompt-title">
           {label} · {studioPrompt.scope ? "this file" : "whole room"}
         </div>
@@ -33,14 +54,21 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
         <div className="studio-prompt-field">
           {s.studioAc && a.studioAcItems().length > 0 && (
             <div className="ac-popover studio-ac-popover">
-              <div className="ac-hint">Add a file or folder as context</div>
+              <div className="ac-hint ac-hint-row">
+                <span>{a.studioAcItems().length} files &amp; folders</span>
+                <span className="ac-keys">↑↓ choose · Enter add · Esc close</span>
+              </div>
               {a.studioAcItems().map((it, i) => (
                 <button
                   key={it.key}
                   className={`ac-item ${i === s.studioAc!.index ? "active" : ""}`}
+                  ref={(el) => {
+                    if (i === s.studioAc!.index)
+                      el?.scrollIntoView({ block: "nearest" });
+                  }}
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    a.acceptStudioMention(it.insert);
+                    a.acceptMention(it.insert, s.studioPrompt, s.setStudioPrompt);
                   }}
                 >
                   <span className="ac-label">{it.label}</span>
@@ -54,7 +82,6 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
             className="studio-prompt-input"
             value={studioPrompt.text}
             autoFocus
-            disabled={running}
             rows={4}
             dir="auto"
             onChange={(e) => {
@@ -90,8 +117,10 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
                 }
                 if (e.key === "Enter" || e.key === "Tab") {
                   e.preventDefault();
-                  a.acceptStudioMention(
+                  a.acceptMention(
                     items[Math.min(s.studioAc.index, items.length - 1)].insert,
+                    s.studioPrompt,
+                    s.setStudioPrompt,
                   );
                   return;
                 }
@@ -109,19 +138,15 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
           />
         </div>
         <div className="studio-prompt-actions">
-          <button
-            className="subtle"
-            disabled={running}
-            onClick={() => s.setStudioPrompt(null)}
-          >
+          <button className="subtle" onClick={() => s.setStudioPrompt(null)}>
             Cancel
           </button>
           <button
             className="primary"
-            disabled={running || !studioPrompt.text.trim()}
+            disabled={!studioPrompt.text.trim()}
             onClick={() => void a.runStudioFromModal()}
           >
-            {running ? "Running…" : "Run"}
+            Run
           </button>
         </div>
       </div>

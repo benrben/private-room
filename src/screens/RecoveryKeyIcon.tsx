@@ -1,6 +1,6 @@
 // A small key glyph for the recovery affordance and sheet (24px grid, 1.6px
-// stroke, currentColor so it inherits accent/slate). Stand-in for the shared
-// icons.RecoveryIcon noted above.
+// stroke, currentColor so it inherits accent/slate). This is the room's
+// recovery-key icon.
 export function RecoveryKeyIcon({ size = 16 }: { size?: number }) {
   return (
     <svg

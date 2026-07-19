@@ -1,40 +1,41 @@
 use super::*;
 
 pub fn list_folders(conn: &Connection) -> Result<Vec<Folder>, String> {
-    let mut stmt = conn
-        .prepare("SELECT id, name FROM folders ORDER BY name COLLATE NOCASE ASC")
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| {
+    query_rows(
+        conn,
+        "SELECT id, name FROM folders ORDER BY name COLLATE NOCASE ASC",
+        [],
+        |r| {
             Ok(Folder {
                 id: r.get(0)?,
                 name: r.get(1)?,
             })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+        },
+    )
 }
 
-/// Create a folder. Names are UNIQUE, so a clash is reported in plain language.
-pub fn create_folder(conn: &Connection, name: &str) -> Result<Folder, String> {
+fn reject_blank_folder_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("Folder name cannot be empty.".into());
     }
+    Ok(name)
+}
+
+fn folder_name_taken(name: &str) -> String {
+    format!("A folder named \"{name}\" already exists.")
+}
+
+/// Create a folder. Names are UNIQUE, so a clash is reported in plain language.
+pub fn create_folder(conn: &Connection, name: &str) -> Result<Folder, String> {
+    let name = reject_blank_folder_name(name)?;
     let id = Uuid::new_v4().to_string();
-    conn.execute(
+    execute_unique(
+        conn,
         "INSERT INTO folders(id, name) VALUES (?1, ?2)",
         params![id, name],
-    )
-    .map_err(|e| {
-        if e.to_string().contains("UNIQUE") {
-            format!("A folder named \"{name}\" already exists.")
-        } else {
-            e.to_string()
-        }
-    })?;
+        || folder_name_taken(name),
+    )?;
     Ok(Folder {
         id,
         name: name.to_string(),
@@ -42,32 +43,24 @@ pub fn create_folder(conn: &Connection, name: &str) -> Result<Folder, String> {
 }
 
 pub fn rename_folder(conn: &Connection, id: &str, name: &str) -> Result<(), String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("Folder name cannot be empty.".into());
-    }
-    conn.execute(
+    let name = reject_blank_folder_name(name)?;
+    execute_unique(
+        conn,
         "UPDATE folders SET name = ?2 WHERE id = ?1",
         params![id, name],
+        || folder_name_taken(name),
     )
-    .map_err(|e| {
-        if e.to_string().contains("UNIQUE") {
-            format!("A folder named \"{name}\" already exists.")
-        } else {
-            e.to_string()
-        }
-    })?;
-    Ok(())
 }
 
 /// Delete a folder. Its files are moved back to the top level (folder_id → NULL)
 /// FIRST — deleting a folder must never delete or hide files (ADD-16).
 pub fn delete_folder(conn: &Connection, id: &str) -> Result<(), String> {
-    conn.execute("UPDATE files SET folder_id = NULL WHERE folder_id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM folders WHERE id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    execute_one(
+        conn,
+        "UPDATE files SET folder_id = NULL WHERE folder_id = ?1",
+        [id],
+    )?;
+    execute_one(conn, "DELETE FROM folders WHERE id = ?1", [id])
 }
 
 /// Move a file into a folder, or to the top level when `folder_id` is None.
@@ -76,12 +69,11 @@ pub fn move_file_to_folder(
     file_id: &str,
     folder_id: Option<&str>,
 ) -> Result<(), String> {
-    conn.execute(
+    execute_one(
+        conn,
         "UPDATE files SET folder_id = ?2 WHERE id = ?1",
         params![file_id, folder_id],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 #[cfg(test)]

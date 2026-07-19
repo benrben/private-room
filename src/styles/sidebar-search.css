@@ -259,3 +259,34 @@
   padding: 7px 9px;
 }
 
+
+/* Wave 1b (idea 5): grouped memory panel — small category headers, a pill on
+   each categorized row, and the category pickers in the add/edit rows. */
+.memory-group-head {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin: 8px 0 2px;
+}
+
+.memory-cat-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--surface-3);
+  background: var(--surface-3);
+  color: var(--text-dim);
+  font-size: 10px;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+
+.memory-cat-select {
+  flex-shrink: 0;
+  max-width: 96px;
+  font-size: 11px;
+  padding: 4px 4px;
+}

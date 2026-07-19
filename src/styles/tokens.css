@@ -1,0 +1,107 @@
+/* ---------- tokens ----------
+   The one place colors, radii and spacing are defined. Two layers:
+
+   1. Canonical tokens (the reference design language): --bg/--top/--rail/
+      --panel/--panel-2/--editor surfaces, --text/--text-strong/--muted/--faint
+      ink, --line/--line-soft hairlines, --hover/--selected states, --accent
+      (+ --accent-2 soft foreground, --accent-ink text-on-accent), and the four
+      semantic hues --green/--amber/--red/--blue. Dark is the default; light
+      lives under [data-theme="light"] on <html>.
+
+   2. Legacy aliases so every pre-redesign rule (surface ramp, --border,
+      --text-dim, --ok/--warn/--danger …) resolves onto the same palette.
+      New CSS should use canonical names only. */
+
+:root {
+  --bg: #121116;
+  --top: #18171d;
+  --rail: #151419;
+  --panel: #1b1a20;
+  --panel-2: #201f26;
+  --editor: #17161b;
+  --text: #eeeaf2;
+  --text-strong: #fbf9fc;
+  --muted: #aaa5b0;
+  --faint: #77727e;
+  --line: #312f38;
+  --line-soft: #27262d;
+  --hover: #28262f;
+  --selected: #302b3d;
+  --selected-strong: #3b3250;
+  --accent: #ae93e7;
+  --accent-2: #d4c3f6;
+  --accent-ink: #1e152e;
+  --green: #83cfaa;
+  --amber: #dfbc72;
+  --red: #e99b9f;
+  --blue: #8fbde7;
+  --shadow: rgba(0, 0, 0, 0.34);
+
+  /* Shape + rhythm. Restrained radii; 4/8px spacing. */
+  --radius-sm: 5px;
+  --radius: 7px;
+  --radius-lg: 10px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* Legacy aliases — old rules keep working, on the new palette. */
+  --surface-1: var(--bg);
+  --surface-2: var(--panel);
+  --surface-3: var(--panel-2);
+  --surface-4: var(--hover);
+  --card-bg: var(--panel-2);
+  --chip-bg: var(--hover);
+  --input-bg: var(--panel-2);
+  --border: var(--line);
+  --border-subtle: var(--line-soft);
+  --border-strong: color-mix(in srgb, var(--text) 24%, var(--line));
+  --text-dim: var(--muted);
+  --text-faint: var(--faint);
+  --slate: var(--muted);
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-ghost: color-mix(in srgb, var(--accent) 8%, transparent);
+  --ok: var(--green);
+  --warn: var(--amber);
+  --danger: var(--red);
+
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    sans-serif;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg: #efedf1;
+  --top: #f9f8fa;
+  --rail: #f2f0f3;
+  --panel: #f8f7f9;
+  --panel-2: #ffffff;
+  --editor: #fdfcfd;
+  --text: #353139;
+  --text-strong: #201d23;
+  --muted: #736d78;
+  --faint: #96909b;
+  --line: #d9d5dc;
+  --line-soft: #e6e2e8;
+  --hover: #ebe8ed;
+  --selected: #e9e2f2;
+  --selected-strong: #dcd0eb;
+  --accent: #65449a;
+  --accent-2: #573882;
+  --accent-ink: #ffffff;
+  --green: #2f7c58;
+  --amber: #876116;
+  --red: #a64c50;
+  --blue: #3d6f9b;
+  --shadow: rgba(45, 36, 52, 0.16);
+  color-scheme: light;
+}
+
+/* Quiet, theme-matched scrollbars everywhere. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}

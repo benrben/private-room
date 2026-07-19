@@ -1,4 +1,4 @@
-use crate::{db, extraction, mcp, ocr, ollama, stt, web};
+use crate::{db, extraction, mcp, ocr, ollama, recording, stt, web};
 use base64::Engine;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ mod external;
 mod rooms;
 mod recent;
 mod safety;
+mod room_checkpoints;
 mod files;
 mod spreadsheet;
 mod stt_cmds;
@@ -25,19 +26,28 @@ mod vision;
 mod chat;
 mod retrieval;
 mod agent;
+mod edit_match;
+mod edit_gate;
 mod chat_commands;
 mod docs_html;
+mod json;
 mod summarize;
 mod studios;
 mod moonshot;
 mod media;
 mod agent_ui;
 mod ytdlp;
+mod recording_cmds;
+mod feedback;
+mod jobs;
+mod scripts;
+mod speech_cmds;
 
 pub use external::*;
 pub use rooms::*;
 pub use recent::*;
 pub use safety::*;
+pub use room_checkpoints::*;
 pub use files::*;
 pub use spreadsheet::*;
 pub use stt_cmds::*;
@@ -49,14 +59,22 @@ pub use vision::*;
 pub use chat::*;
 pub(crate) use retrieval::*;
 pub use agent::*;
+pub(crate) use edit_match::*;
+pub use edit_gate::*;
 pub use chat_commands::*;
 pub(crate) use docs_html::*;
-pub use summarize::*;
+pub(crate) use json::*;
+pub(crate) use summarize::*;
 pub use studios::*;
 pub use moonshot::*;
 pub use media::*;
 pub use agent_ui::*;
 pub use ytdlp::*;
+pub use recording_cmds::*;
+pub use feedback::*;
+pub use jobs::*;
+pub use scripts::*;
+pub use speech_cmds::*;
 
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.5:4b";
 pub(crate) const MAX_CONTEXT_CHUNKS: usize = 6;
@@ -79,9 +97,6 @@ pub(crate) const MAX_MEMORY_CONTENT_CHARS: usize = 500;
 /// External tool results (web pages, search results) can be huge; clamp
 /// them so a few rounds still fit the context window.
 pub(crate) const MAX_TOOL_RESULT_CHARS: usize = 4000;
-/// Cumulative context budget for the agent loop (chars): ~9K tokens of the
-/// 12,288-token num_ctx, leaving room for the tool catalog and generation.
-pub(crate) const CTX_CHAR_BUDGET: usize = 36_000;
 /// Keep the tool catalog small enough for an 8-12K context and a 4B model.
 /// A 4B model cannot reliably choose among more than ~12 tools.
 pub(crate) const MAX_MCP_TOOLS: usize = 12;
@@ -131,12 +146,96 @@ pub struct AppState {
     /// user chose "always allow" for, cleared when the room closes.
     pub mcp_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<McpDecision>>>,
     pub mcp_session_ok: Mutex<HashSet<String>>,
+    /// Wave 2 (Idea 6): per-call diff-preview consent, mirroring `mcp_pending`.
+    /// Holds the reply channel for each in-flight edit-approval request (keyed by
+    /// request id); the frontend answers via `resolve_edit_approval`. Cleared on
+    /// room close next to `mcp_pending` so a pending card can never outlive a room.
+    pub edit_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<EditDecision>>>,
+    /// Wave 5 (Idea 13): per-run script consent, mirroring `mcp_pending`. Holds the
+    /// reply channel for each in-flight script-run approval card (keyed by request
+    /// id); the frontend answers via `resolve_script_run`. Cleared on room close so
+    /// a pending card can never outlive a room.
+    pub script_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<McpDecision>>>,
     /// D9 (the Leash): the room's persistent MCP server, when the user has turned
     /// it on. Unlike the per-`ask` bridge in `run_external`, this one lives for as
     /// long as the room is open so an external CLI/agent can hold a session. It is
     /// stopped and cleared whenever the room locks/closes (see `close_room`) so a
     /// stale endpoint can never outlive a locked room.
     pub room_server: Mutex<Option<crate::room_mcp::Bridge>>,
+    /// ADD-30: one cancel flag per in-flight background job, keyed by job id.
+    /// `cancel_job` flips a flag; the runner sees it between waves, checkpoints,
+    /// and parks the job as 'paused'. The entry is removed when the job ends.
+    pub job_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Wave 4a: the job QUEUE's single running slot. `None` = free; `Some(id)` =
+    /// that job holds the one heavy-work slot (one resident local model makes
+    /// concurrent heavy jobs strictly slower). `queue::submit`/`pump` reserve it;
+    /// each job's terminal epilogue clears it (only when it equals its own id) and
+    /// pumps the next queued row. A start-fresh process is empty (Default), and
+    /// `quiesce_stale_jobs` reconciles the DB — so a crash never strands the slot.
+    pub running_job: Mutex<Option<String>>,
+    /// Wave 4a: generation stamp for the workflow scheduler tick loop (the
+    /// backfill.rs pattern). Every room open bumps it and spawns one loop; a loop
+    /// whose stamp is stale exits, so at most one scheduler is ever live.
+    pub sched_generation: Arc<AtomicU64>,
+    /// Wave 1b (idea 8): generation stamp for the debounced auto-index
+    /// scheduler. Every ingest event bumps it and spawns one waiter carrying
+    /// the new stamp; a waiter whose stamp is stale exits silently, so a
+    /// multi-file drop coalesces into one indexing decision.
+    pub auto_index_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Wave 3 (Idea 9): bumped by `teardown_open_room` on every room close /
+    /// rollback swap. Long-lived background writers that pin only by room path
+    /// (OCR/STT lanes, summary filler, re-extract backfill, room summarize)
+    /// capture this at spawn and re-check it before writing — a rollback leaves
+    /// the path UNCHANGED, so the path pin alone would let a straggler land its
+    /// write against the reopened, rolled-back DB. Generalizes the
+    /// embed_generation pin to every path-pinned writer.
+    pub room_epoch: Arc<AtomicU64>,
+    /// Wave 3 (Idea 9): true while `rollback_room_checkpoint` is between the
+    /// drain and the reopen. New asks/jobs/studios/recordings AND the room
+    /// lifecycle commands (open/close/create) refuse while it is set, turning
+    /// the drain + re-check from best-effort into real mutual exclusion; the
+    /// same flag makes `delete_room_checkpoint` refuse mid-rollback.
+    pub rollback_in_flight: Arc<AtomicBool>,
+}
+
+/// Wave 3 (Idea 9): the message every command entry point returns when a
+/// rollback is in flight — the room is being swapped, so starting new work now
+/// would either fail or land against the wrong DB.
+pub(crate) const ROLLBACK_BUSY: &str = "The room is rolling back — try again in a moment.";
+
+impl AppState {
+    /// Run `f` with the open room held under the room lock, or return the standard
+    /// `"No room is open."` error. Replaces the two-line
+    /// `let guard = state.room.lock().unwrap(); let room = guard.as_ref().ok_or(...)?;`
+    /// prelude that recurs across the command layer.
+    ///
+    /// The closure is SYNCHRONOUS by design: a `MutexGuard` is not `Send`, so it
+    /// must never be held across an `.await`. This signature makes that a compile
+    /// error rather than a latent bug — exactly the locked/unlocked discipline the
+    /// async `ask`/`summarize`/chat paths already follow by hand. A site that needs
+    /// to await must still lock a short sync section, drop it, then await; it keeps
+    /// its explicit lock rather than using this helper.
+    pub(crate) fn with_room<T>(
+        &self,
+        f: impl FnOnce(&Room) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let guard = self.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        f(room)
+    }
+
+    /// Wave 3 (Idea 9): the current room epoch. A background writer captures
+    /// this at spawn and re-checks `self.room_epoch() == captured` before its
+    /// write, alongside the room-path pin.
+    pub(crate) fn room_epoch(&self) -> u64 {
+        self.room_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Wave 3 (Idea 9): true while a checkpoint rollback is between drain and
+    /// reopen. Command entry points return `ROLLBACK_BUSY` when set.
+    pub(crate) fn rolling_back(&self) -> bool {
+        self.rollback_in_flight.load(Ordering::SeqCst)
+    }
 }
 
 /// The user's answer to a per-call MCP approval prompt.
@@ -144,6 +243,15 @@ pub struct AppState {
 pub struct McpDecision {
     pub approved: bool,
     pub remember: bool,
+}
+
+/// Wave 2 (Idea 6): the user's answer to a diff-preview approval card.
+/// `rest_of_turn` maps the "Apply for the rest of this answer" button — honored
+/// only on the run-scoped LocalEngine sink (see `ToolEffects::run_scoped`).
+#[derive(Clone, Copy)]
+pub struct EditDecision {
+    pub approved: bool,
+    pub rest_of_turn: bool,
 }
 
 /// Removes an ask's cancel flag from the registry when the ask returns, on
@@ -208,6 +316,20 @@ pub struct FileVersion {
     pub id: String,
     pub saved_at: String,
     pub cause: String,
+}
+
+/// Idea 11: a saved version's extracted text next to the file's CURRENT text,
+/// for the read-only side-by-side compare view. Text-only — v1 diffs extracted
+/// text, never bytes (per the triage scope guard). Both sides are shaped by the
+/// same `content_text` helper so a code/markdown diff isn't dominated by
+/// representation noise. Either side is `None` when that kind has no comparable
+/// text (image/binary), and the modal shows a "no text" message instead.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionContent {
+    pub file_name: String,
+    pub version_text: Option<String>,
+    pub current_text: Option<String>,
 }
 
 /// Recent rooms live OUTSIDE any room, in the app's own data folder. Rooms are
@@ -316,6 +438,10 @@ pub struct Chat {
 pub struct Memory {
     pub id: String,
     pub content: String,
+    /// Wave 1b (idea 5): preference | fact | project | instruction, or None =
+    /// uncategorized (every pre-category row). Organizational only in v1 —
+    /// prompt injection stays content-only.
+    pub category: Option<String>,
     pub created_at: String,
 }
 
@@ -353,14 +479,12 @@ pub struct AiStatus {
 /// path without the model, so a broken pipeline is visible immediately.
 #[tauri::command]
 pub async fn web_search_test(state: State<'_, AppState>) -> Result<String, String> {
-    let (provider, endpoint) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
-        (
+    let (provider, endpoint) = state.with_room(|room| {
+        Ok((
             db::get_setting(&room.conn, "web_provider").unwrap_or_default(),
             db::get_setting(&room.conn, "web_endpoint").unwrap_or_default(),
-        )
-    };
+        ))
+    })?;
     let hits = match provider.as_str() {
         "duckduckgo" | "brave" => web::search_duckduckgo("duckduckgo").await?,
         "searxng" => web::search_searxng(&endpoint, "searxng").await?,

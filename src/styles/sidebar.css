@@ -9,28 +9,6 @@
   min-height: 0;
 }
 
-.side-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 12px 6px;
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
-}
-
-.side-head.clickable {
-  cursor: pointer;
-  border-top: none;
-}
-
-.side-head-actions {
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
 /* The one violet call-to-action in the sidebar toolbar. */
 .add-btn {
   display: inline-flex;
@@ -54,84 +32,77 @@
   flex-shrink: 0;
 }
 
-/* Client-side file filter. */
-.side-search {
+/* ADD-31: live import queue under the Files header. */
+.import-strip {
   display: flex;
-  align-items: center;
-  gap: 7px;
-  margin: 2px 12px 8px;
-  padding: 0 9px;
-  height: 32px;
-  background: var(--surface-3);
-  border: 1px solid transparent;
-  border-radius: 8px;
-  color: var(--text-dim);
+  align-items: baseline;
+  gap: 8px;
+  margin: 4px 10px 2px;
+  padding: 6px 9px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent, #8b7cf6) 10%, transparent);
+  font-size: 11.5px;
+  overflow: hidden;
 }
-.side-search:focus-within {
-  border-color: var(--accent);
-  color: var(--text);
+.import-strip-count {
+  color: var(--accent, #8b7cf6);
+  font-weight: 600;
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
 }
-.side-search svg {
-  flex-shrink: 0;
-}
-.side-search-input {
-  flex: 1;
-  min-width: 0;
-  background: none;
-  border: none;
-  padding: 0;
-  font-size: 12.5px;
-  color: var(--text);
-}
-.side-search-input:focus {
-  border: none;
-}
-.side-search-clear {
-  display: inline-flex;
-  align-items: center;
-  background: none;
-  border: none;
-  padding: 2px;
-  color: var(--text-dim);
-}
-.side-search-clear:hover {
-  color: var(--text);
-  border-color: transparent;
-}
-
-/* Summarize is a secondary AI tool — a quiet ghost button, not a nav bar. */
-.summarize-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  width: calc(100% - 24px);
-  margin: 0 12px 10px;
-  padding: 7px 10px;
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--accent-2);
-  background: var(--accent-ghost);
-  border: 1px solid rgba(139, 124, 246, 0.18);
-  border-radius: 8px;
-  cursor: pointer;
-  text-align: center;
+.import-strip-name {
+  color: var(--muted, #8b93a7);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.summarize-btn svg {
-  flex-shrink: 0;
+@keyframes job-sweep {
+  0% { margin-left: -40%; }
+  100% { margin-left: 100%; }
 }
-
-.summarize-btn:hover:not(:disabled) {
-  background: rgba(139, 124, 246, 0.14);
-  border-color: rgba(139, 124, 246, 0.28);
+@media (prefers-reduced-motion: reduce) {
+  .job-card-fill.indeterminate { animation-duration: 3s; }
 }
-
-.summarize-btn:disabled {
-  color: var(--text-dim);
-  cursor: default;
+/* ADD-32: the whole-file-pass mosaic. One cell per stretch of the file; each
+   lights up in spectral order as its part is read, so a pass over a huge file
+   is literally watchable — a tapestry filling in, window by window. When every
+   part is read and the notes are being folded ("weaving"), the whole strip
+   breathes gently until the final document lands. */
+.pass-mosaic {
+  display: grid;
+  grid-template-columns: repeat(24, 1fr);
+  gap: 2px;
+  margin: 7px 0 2px;
+}
+.pass-cell {
+  aspect-ratio: 1;
+  border-radius: 2px;
+  background: var(--surface-3);
+  transition: background 0.5s ease, box-shadow 0.5s ease;
+}
+.pass-cell.on {
+  /* --h is set per cell (0→300): the file fills as a quiet rainbow. */
+  background: hsl(calc(var(--h, 0) * 1deg) 55% 55% / 0.85);
+  box-shadow: 0 0 4px hsl(calc(var(--h, 0) * 1deg) 55% 55% / 0.35);
+}
+.pass-cell.now {
+  background: var(--accent);
+  animation: pass-now 1.1s ease-in-out infinite;
+}
+@keyframes pass-now {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+.pass-mosaic.weaving .pass-cell.on {
+  animation: pass-weave 2.6s ease-in-out infinite;
+}
+@keyframes pass-weave {
+  0%, 100% { filter: saturate(0.75) brightness(0.95); }
+  50% { filter: saturate(1.25) brightness(1.12); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pass-cell.now { animation-duration: 3s; }
+  .pass-mosaic.weaving .pass-cell.on { animation: none; }
 }
 
 /* SEC-1: sit above Settings (z-index 30) — it's a security prompt. */
@@ -190,6 +161,49 @@
 .add-link-input {
   width: 100%;
   margin-bottom: 4px;
+}
+
+/* The YouTube import choice as a two-option segmented control — a real
+   either/or, not a checkbox that changes the form's meaning. */
+.yt-mode {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0 4px;
+}
+
+.yt-mode-opt {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--surface-3);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.yt-mode-opt.active {
+  border-color: var(--accent, #8b7cf6);
+  background: color-mix(in srgb, var(--accent, #8b7cf6) 10%, transparent);
+}
+
+.yt-mode-opt:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.yt-mode-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.yt-mode-sub {
+  font-size: 11px;
+  color: var(--text-dim);
 }
 
 .count {

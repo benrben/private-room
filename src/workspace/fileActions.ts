@@ -4,9 +4,11 @@ import {
   FileMeta,
   FileMetaSuggestion,
   FileTarget,
+  FileVersion,
   suggestFileMeta,
 } from "../api";
 import { displayName } from "./composer";
+import { tryToast } from "./guard";
 import { WSState } from "./state";
 
 /** File + folder + open-file state handlers (import/view/edit/versions/folders).
@@ -58,6 +60,29 @@ export function makeFileActions(s: WSState) {
       const vs = await api.listFileVersions(s.openFile.id);
       s.setVersions([...vs].sort((a, b) => b.savedAt.localeCompare(a.savedAt)));
       s.setShowHistory(true);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
+  // ---- Idea 11: open a read-only side-by-side compare of a version ----
+  async function openCompare(v: FileVersion) {
+    if (!s.openFile) return;
+    try {
+      const vc = await api.getFileVersion(v.id);
+      s.setCompare({
+        versionId: v.id,
+        cause: v.cause,
+        savedAt: v.savedAt,
+        // The command shapes BOTH sides identically (same clip + size gates),
+        // so we take the current text from its result, not s.openFile — the
+        // viewer's raw text isn't clipped on the md/csv/code branches.
+        versionText: vc.versionText,
+        currentText: vc.currentText,
+        fileName: vc.fileName,
+      });
+      // Close the popover; the modal takes over (its own Restore re-opens it).
+      s.setShowHistory(false);
     } catch (e) {
       s.pushToast("error", String(e));
     }
@@ -137,6 +162,34 @@ export function makeFileActions(s: WSState) {
     s.setImportSuggestions((cur) => cur.filter((x) => x.fileId !== fileId));
   }
 
+  /** Rename + file one suggestion. Shared by the single-chip Apply and the
+   * batched "Apply all"; the caller owns the receipt toast. */
+  async function applyOneSuggestion(sug: {
+    fileId: string;
+    current: string;
+    suggestion: FileMetaSuggestion;
+  }) {
+    const title = sug.suggestion.title.trim();
+    if (title && title !== sug.current) {
+      const dot = sug.current.lastIndexOf(".");
+      const ext = dot > 0 ? sug.current.slice(dot) : "";
+      const name = /\.[^.]+$/.test(title) ? title : `${title}${ext}`;
+      await api.renameFile(sug.fileId, name);
+      if (s.openFileRef.current?.id === sug.fileId) {
+        s.setOpenFile((o) => (o ? { ...o, name } : o));
+      }
+    }
+    const folderName = sug.suggestion.folder.trim();
+    if (folderName) {
+      let folder = s.folders.find(
+        (f) => f.name.toLowerCase() === folderName.toLowerCase(),
+      );
+      if (!folder) folder = await api.createFolder(folderName);
+      await api.moveFileToFolder(sug.fileId, folder.id);
+      s.setFolders(await api.listFolders());
+    }
+  }
+
   async function applyImportSuggestion(sug: {
     fileId: string;
     current: string;
@@ -144,25 +197,7 @@ export function makeFileActions(s: WSState) {
   }) {
     dismissImportSuggestion(sug.fileId);
     try {
-      const title = sug.suggestion.title.trim();
-      if (title && title !== sug.current) {
-        const dot = sug.current.lastIndexOf(".");
-        const ext = dot > 0 ? sug.current.slice(dot) : "";
-        const name = /\.[^.]+$/.test(title) ? title : `${title}${ext}`;
-        await api.renameFile(sug.fileId, name);
-        if (s.openFileRef.current?.id === sug.fileId) {
-          s.setOpenFile((o) => (o ? { ...o, name } : o));
-        }
-      }
-      const folderName = sug.suggestion.folder.trim();
-      if (folderName) {
-        let folder = s.folders.find(
-          (f) => f.name.toLowerCase() === folderName.toLowerCase(),
-        );
-        if (!folder) folder = await api.createFolder(folderName);
-        await api.moveFileToFolder(sug.fileId, folder.id);
-        s.setFolders(await api.listFolders());
-      }
+      await applyOneSuggestion(sug);
       s.setFiles(await api.listFiles());
       s.pushToast("success", "Tidied up.");
     } catch (e) {
@@ -170,15 +205,48 @@ export function makeFileActions(s: WSState) {
     }
   }
 
-  /** Turn an import report into toasts (shared by the picker and drag-drop). */
-  function reportImport(report: { imported: FileMeta[]; errors: string[] }) {
-    if (report.imported.length > 0) {
+  /** Batched "Apply all" for the collapsed tidy-up card — one receipt at the
+   * end instead of a toast per file. */
+  async function applyAllImportSuggestions() {
+    const pending = s.importSuggestions;
+    s.setImportSuggestions([]);
+    let applied = 0;
+    for (const sug of pending) {
+      try {
+        await applyOneSuggestion(sug);
+        applied += 1;
+      } catch (e) {
+        s.pushToast("error", String(e));
+      }
+    }
+    s.setFiles(await api.listFiles());
+    if (applied > 0) {
       s.pushToast(
         "success",
-        `Added ${report.imported.length} file${report.imported.length === 1 ? "" : "s"} to the room.`,
+        applied === 1 ? "Tidied up 1 file." : `Tidied up ${applied} files.`,
       );
-      suggestImports(report.imported);
     }
+  }
+
+  function dismissAllImportSuggestions() {
+    s.setImportSuggestions([]);
+  }
+
+  /** Turn an import report into the ONE receipt toast (shared by the picker
+   * and drag-drop; the live sidebar strip shows per-file progress). */
+  function reportImport(report: { imported: FileMeta[]; errors: string[] }) {
+    if (report.imported.length === 1) {
+      s.pushToast(
+        "success",
+        `Added "${displayName(report.imported[0].name)}" to the room.`,
+      );
+    } else if (report.imported.length > 1) {
+      s.pushToast(
+        "success",
+        `Added ${report.imported.length} files to the room.`,
+      );
+    }
+    if (report.imported.length > 0) suggestImports(report.imported);
     if (report.errors.length > 3) {
       s.pushToast(
         "error",
@@ -193,21 +261,51 @@ export function makeFileActions(s: WSState) {
     const picked = await api.chooseOpenPath({ title: "Add files to this room", multiple: true });
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
-    const report = await api.importFiles(paths);
-    s.setFiles(await api.listFiles());
-    reportImport(report);
+    // Show the queue strip immediately: a handful of small files can finish
+    // importing before the first backend progress event paints, so the user
+    // otherwise sees nothing until the files just appear.
+    if (paths.length > 1) {
+      s.setImportProgress({ done: 0, total: paths.length, name: "Starting…" });
+    }
+    try {
+      const report = await api.importFiles(paths);
+      s.setFiles(await api.listFiles());
+      reportImport(report);
+    } finally {
+      s.setImportProgress(null);
+    }
   }
 
   async function removeFile(id: string) {
     await api.deleteFile(id);
     s.setFiles(await api.listFiles());
     s.setAttachments((a) => a.filter((f) => f.id !== id));
+    // A viewer left open on the deleted file would keep fetching a row that
+    // no longer exists ("Query returned no rows" toasts).
+    if (s.openFileRef.current?.id === id) s.setOpenFile(null);
+    s.setRecLive((r) => (r?.fileId === id ? null : r));
   }
 
   async function viewFile(id: string, target?: FileTarget) {
     s.setOpenFile({ id, content: await api.getFileContent(id), target });
     s.setEditMode(false);
     s.setShowMap(false);
+  }
+
+  /** "New page": a blank Markdown note via the ordinary generated-file path
+   * (same command chat's "Save to room" uses), opened straight into editing.
+   * A dated name keeps repeat presses from colliding. */
+  async function createNewNote() {
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}.${String(now.getMinutes()).padStart(2, "0")}.${String(now.getSeconds()).padStart(2, "0")}`;
+    try {
+      const meta = await api.saveGeneratedFile(`Note ${stamp}.md`, "");
+      s.setFiles(await api.listFiles());
+      await viewFile(meta.id);
+      s.setEditMode(true);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
   }
 
   async function saveEdit(newText: string) {
@@ -258,12 +356,11 @@ export function makeFileActions(s: WSState) {
     const name = s.creatingFolder.trim();
     s.setCreatingFolder(null);
     if (!name) return;
-    try {
-      await api.createFolder(name);
-      s.setFolders(await api.listFolders());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.createFolder(name),
+      async () => s.setFolders(await api.listFolders()),
+    );
   }
 
   async function commitFolderRename() {
@@ -272,32 +369,27 @@ export function makeFileActions(s: WSState) {
     const trimmed = name.trim();
     s.setRenamingFolder(null);
     if (!trimmed) return;
-    try {
-      await api.renameFolder(id, trimmed);
-      s.setFolders(await api.listFolders());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.renameFolder(id, trimmed),
+      async () => s.setFolders(await api.listFolders()),
+    );
   }
 
   async function deleteFolder(id: string) {
-    try {
-      await api.deleteFolder(id);
+    await tryToast(s, () => api.deleteFolder(id), async () => {
       s.setFolders(await api.listFolders());
       s.setFiles(await api.listFiles());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    });
   }
 
   async function moveFile(fileId: string, folderId: string | null) {
     s.setMoveMenuFor(null);
-    try {
-      await api.moveFileToFolder(fileId, folderId);
-      s.setFiles(await api.listFiles());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.moveFileToFolder(fileId, folderId),
+      async () => s.setFiles(await api.listFiles()),
+    );
   }
 
   async function commitRenameFile() {
@@ -307,15 +399,12 @@ export function makeFileActions(s: WSState) {
     const name = pending.name.trim();
     const original = s.files.find((f) => f.id === pending.id);
     if (!name || name === original?.name) return;
-    try {
-      await api.renameFile(pending.id, name);
+    await tryToast(s, () => api.renameFile(pending.id, name), async () => {
       s.setFiles(await api.listFiles());
       if (s.openFileRef.current?.id === pending.id) {
         s.setOpenFile((o) => (o ? { ...o, name } : o));
       }
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    });
   }
 
   function toggleFolderCollapse(id: string) {
@@ -338,9 +427,10 @@ export function makeFileActions(s: WSState) {
   }
 
   return {
-    noteExportOnce, exportOne, exportAllFiles, openHistory, restoreVersion,
+    noteExportOnce, exportOne, exportAllFiles, openHistory, openCompare, restoreVersion,
     undoEdits, suggestImports, dismissImportSuggestion, applyImportSuggestion,
-    reportImport, importFiles, removeFile, viewFile, saveEdit, saveEditAsCopy,
+    applyAllImportSuggestions, dismissAllImportSuggestions,
+    reportImport, importFiles, removeFile, viewFile, createNewNote, saveEdit, saveEditAsCopy,
     editCell, editModeOf, startCreateFolder, commitCreateFolder,
     commitFolderRename, deleteFolder, moveFile, commitRenameFile,
     toggleFolderCollapse, clampMenu,

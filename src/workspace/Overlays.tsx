@@ -1,20 +1,225 @@
-import { DownloadIcon, GlobeIcon } from "../icons";
+import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { api } from "../api";
+import { DownloadIcon, GlobeIcon, MicIcon, ScriptIcon } from "../icons";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import DiffPreview from "../viewers/DiffPreview";
+import { languageForFile } from "../viewers/monacoSetup";
+import { LayoutApi } from "../shell/useLayout";
+import { toggleTheme } from "../theme";
+
+/** Human name for whoever owns the shared dictation mic right now. */
+const CAPTURE_OWNER_LABEL: Record<string, string> = {
+  note: "Voice note",
+  journal: "Journal entry",
+  composer: "Dictation",
+  memory: "Spoken memory",
+  file: "Dictating to file",
+};
+
+/** The capture dock — the one unmistakable "the microphone is doing
+ * something" surface. Dictation-style capture (voice note, journal,
+ * composer dictation) used to run with no visible state at all: the mic
+ * was LIVE while the screen showed nothing. This pill names every phase —
+ * Preparing → Recording (red dot + timer + Stop) → Transcribing — and is
+ * fixed above the composer so it survives menu closes and view switches. */
+function CaptureDock({ s }: { s: WSState }) {
+  const [elapsed, setElapsed] = useState(0);
+  const recording = s.dictState === "recording";
+  useEffect(() => {
+    if (!recording) {
+      setElapsed(0);
+      return;
+    }
+    const t = window.setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => window.clearInterval(t);
+  }, [recording]);
+  if (s.dictState === "idle") return null;
+  const who = CAPTURE_OWNER_LABEL[s.dictOwner ?? ""] ?? "Recording";
+  const mm = Math.floor(elapsed / 60);
+  const ss = String(elapsed % 60).padStart(2, "0");
+  return (
+    <div className={`capture-dock ${s.dictState}`} role="status">
+      {s.dictState === "preparing" ? (
+        <span className="capture-label">
+          <MicIcon size={13} /> Preparing the microphone…
+        </span>
+      ) : s.dictState === "busy" ? (
+        <span className="capture-label">
+          <MicIcon size={13} /> {who} — transcribing on this Mac…
+        </span>
+      ) : (
+        <>
+          <span className="capture-label rec">
+            <span className="rec-dot pulsing" /> {who} · {mm}:{ss}
+          </span>
+          <button
+            className="capture-stop"
+            onClick={() => s.recorderRef.current?.stop()}
+          >
+            Stop &amp; save
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** One executable palette command (searched alongside room content). */
+type PaletteAction = {
+  id: string;
+  label: string;
+  hint: string;
+  disabled?: boolean;
+  run: () => void;
+};
+
+/** Every palette command is a real handler — the same ones the chrome uses. */
+function buildPaletteActions(
+  s: WSState,
+  a: WSActions,
+  layout: LayoutApi | undefined,
+): PaletteAction[] {
+  const leaveAreas = () => {
+    s.setShowMap(false);
+    s.setShowWorkflows(false);
+    s.setShowScripts(false);
+    s.setOpenFile(null);
+  };
+  const acts: PaletteAction[] = [
+    { id: "new-chat", label: "New chat", hint: "Start a fresh conversation (⌘N)", run: () => a.newChat() },
+    { id: "add-files", label: "Add files…", hint: "Import PDFs, notes, images, audio, sheets", run: () => a.importFiles() },
+    { id: "new-page", label: "New page", hint: "A blank Markdown note, ready to edit", run: () => void a.createNewNote() },
+    { id: "add-link", label: "Import a web link", hint: "A page or a YouTube transcript/video", run: () => { s.setLinkUrl(""); s.setShowAddLink(true); } },
+    { id: "live-rec", label: "Start a live recording", hint: "Mic + Mac audio with a live transcript", disabled: s.recLive != null, run: () => void a.startLiveRecording() },
+    { id: "voice-note", label: "Record a voice note", hint: "Starts the mic — audio saved in this room", disabled: a.micState("note").disabled, run: () => a.recordVoiceNote() },
+    { id: "summarize", label: "Summarize the room", hint: "A cited overview, in the background", disabled: s.files.length === 0, run: () => void a.startDeepSummary() },
+    { id: "go-home", label: "Go to Room home", hint: "Recent work and capabilities", run: () => { leaveAreas(); s.setArea("home"); } },
+    { id: "go-map", label: "Open the Room Map", hint: "How files and notes connect", disabled: s.files.length < 2, run: () => { leaveAreas(); s.setShowMap(true); } },
+    { id: "go-workflows", label: "Open Workflows", hint: "Pipelines, schedules, run history", run: () => a.openWorkflows() },
+    { id: "go-scripts", label: "Open Scripts", hint: "Runnable .py/.js room files", run: () => a.openScripts() },
+    { id: "go-memory", label: "Open Memory & scratch pad", hint: "Durable context, visible and editable", run: () => a.revealMemory() },
+    { id: "focus-editor", label: "Focus the editor", hint: "Hide both side panes", run: () => layout?.toggleFocus("center") },
+    { id: "reset-layout", label: "Reset the three-pane layout", hint: "Restore the balanced default", run: () => layout?.resetLayout() },
+    { id: "theme", label: "Switch theme", hint: "Dark ⇄ light", run: () => toggleTheme() },
+    { id: "checkpoint", label: "Save a checkpoint", hint: "A room-wide recovery point", run: () => { api.createRoomCheckpoint("").then((m) => s.pushToast("success", `Saved checkpoint “${m.name}”.`)).catch((e) => s.pushToast("error", String(e))); } },
+    { id: "export-all", label: "Export all files…", hint: "Plain copies outside the room", disabled: s.files.length === 0, run: () => a.exportAllFiles() },
+    { id: "settings", label: "Room settings", hint: "Models, privacy, voice, connections (⌘,)", run: () => s.setShowSettings(true) },
+    { id: "feedback", label: "Send feedback…", hint: "Draft locally, then open GitHub", run: () => s.setShowFeedback(true) },
+    { id: "lock", label: "Lock this room", hint: "Close and return to the gate (⌘L)", run: () => void a.handleLock() },
+  ];
+  if (!layout) return acts.filter((x) => x.id !== "focus-editor" && x.id !== "reset-layout");
+  return acts;
+}
 
 /** The fixed-position overlays that sit above everything: the MCP tool-call
  * approval card, the file context menu, the "Move to…" menu, the Finder-drop
- * highlight, and the ⌘F search overlay. Extracted verbatim. */
-export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
+ * highlight, and the ⌘K search/command palette. */
+export default function Overlays({
+  s,
+  a,
+  layout,
+}: {
+  s: WSState;
+  a: WSActions;
+  layout?: LayoutApi;
+}) {
   const pendingApproval = s.mcpApprovals[0];
+  const pendingEdit = s.editApprovals[0];
+  const pendingScript = s.scriptApprovals[0];
   const searchResults = s.searchResults;
   const msgOffset = searchResults ? searchResults.files.length : 0;
   const memOffset = searchResults
     ? searchResults.files.length + searchResults.messages.length
     : 0;
   const searchFlat = a.searchFlat();
+  // Commands that match the query (all of them at rest — the palette's
+  // resting state lists what the room can do instead of a blank panel).
+  const q = s.searchQuery.trim().toLowerCase();
+  const actions = buildPaletteActions(s, a, layout).filter(
+    (x) => !q || x.label.toLowerCase().includes(q) || x.hint.toLowerCase().includes(q),
+  );
+  const actOffset = searchFlat.length;
+  const totalItems = searchFlat.length + actions.length;
+  const runSel = (idx: number) => {
+    if (idx < searchFlat.length) {
+      a.activateResult(searchFlat[idx]);
+      return;
+    }
+    const act = actions[idx - actOffset];
+    if (act && !act.disabled) {
+      s.setShowSearch(false);
+      act.run();
+    }
+  };
+  const onPaletteKey = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      s.setSearchSel((sel) => Math.min(sel + 1, Math.max(totalItems - 1, 0)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      s.setSearchSel((sel) => Math.max(sel - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      runSel(s.searchSel);
+    }
+  };
   return (
     <>
+      <CaptureDock s={s} />
+      {pendingScript && (
+        // Wave 5 (Idea 13): the script-run consent card. Same data-agent-blocked
+        // surface as the MCP/edit cards — the UI-driving agent must never approve
+        // its own script. The two honest sentences state the real trust class.
+        <div className="approve-backdrop" data-agent-blocked>
+          <div className="approve-card" role="alertdialog" aria-modal="true">
+            <div className="approve-title">
+              <ScriptIcon size={17} /> Run a script from this room?
+            </div>
+            <p className="approve-body">
+              <strong>{pendingScript.name}</strong> is a real program:{" "}
+              <strong>it can reach the internet.</strong> While it runs, the files it uses are
+              placed in a temporary folder outside the room's encryption.
+            </p>
+            <pre className="approve-args">{pendingScript.interpreterLine}</pre>
+            {pendingScript.deps.length > 0 && (
+              <div className="script-approve-line">
+                <span className="script-approve-key">Installs</span>
+                <pre className="approve-args">{pendingScript.deps.join(", ")}</pre>
+              </div>
+            )}
+            {pendingScript.inputs.length > 0 && (
+              <div className="script-approve-line">
+                <span className="script-approve-key">Reads</span>
+                <pre className="approve-args">{pendingScript.inputs.join(", ")}</pre>
+              </div>
+            )}
+            {pendingScript.outputs.length > 0 && (
+              <div className="script-approve-line">
+                <span className="script-approve-key">Writes back</span>
+                <pre className="approve-args">{pendingScript.outputs.join(", ")}</pre>
+              </div>
+            )}
+            <div className="approve-actions">
+              <button
+                className="primary"
+                onClick={() => a.resolveScriptApproval(pendingScript, "once")}
+              >
+                Run once
+              </button>
+              <button onClick={() => a.resolveScriptApproval(pendingScript, "always")}>
+                Always allow this exact script
+              </button>
+              <button
+                className="danger"
+                onClick={() => a.resolveScriptApproval(pendingScript, "deny")}
+              >
+                Don't run
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {pendingApproval && (
         // ADD-25: consent surface — the agent must never be able to click its
         // own tool-call approval ("Allow"), so the driver can't see it.
@@ -50,6 +255,63 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
                 onClick={() => a.resolveMcpApproval(pendingApproval, "deny")}
               >
                 Don't allow
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {pendingEdit && (
+        // Wave 2 (Idea 6): the diff-preview approval card. Same data-agent-blocked
+        // consent surface as the MCP card — the UI-driving agent must never be
+        // able to approve its own edit.
+        <div className="approve-backdrop" data-agent-blocked>
+          <div className="approve-card approve-card-wide" role="alertdialog" aria-modal="true">
+            <div className="approve-title">
+              Apply {pendingEdit.files.length > 1 ? "these changes" : "this change"} to{" "}
+              {pendingEdit.files.length === 1 ? (
+                <em>{pendingEdit.files[0].name}</em>
+              ) : (
+                <strong>{pendingEdit.files.length} files</strong>
+              )}
+              ?
+            </div>
+            <div className="approve-diffs">
+              {pendingEdit.files.slice(0, 5).map((f, i) => (
+                <div className="approve-diff-file" key={`${f.name}-${i}`}>
+                  {pendingEdit.files.length > 1 && (
+                    <div className="approve-diff-name">{f.name}</div>
+                  )}
+                  <DiffPreview
+                    before={f.before}
+                    after={f.after}
+                    clipped={f.clipped}
+                    language={languageForFile(f.name)}
+                  />
+                </div>
+              ))}
+              {pendingEdit.files.length > 5 && (
+                <div className="approve-diff-more">
+                  …and {pendingEdit.files.length - 5} more file(s) in this change.
+                </div>
+              )}
+            </div>
+            <div className="approve-actions">
+              <button
+                className="primary"
+                onClick={() => a.resolveEditApproval(pendingEdit, "once")}
+              >
+                Apply
+              </button>
+              {pendingEdit.allowTurn && (
+                <button onClick={() => a.resolveEditApproval(pendingEdit, "turn")}>
+                  Apply for the rest of this answer
+                </button>
+              )}
+              <button
+                className="danger"
+                onClick={() => a.resolveEditApproval(pendingEdit, "deny")}
+              >
+                Don't apply
               </button>
             </div>
           </div>
@@ -92,7 +354,9 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
             )}
             <div className="ctx-sep" />
             {s.confirmDelete === `ctx-remove-${s.ctxMenu.file.id}` ? (
-              <div className="ctx-confirm">
+              // ADD-25: the agent driver must not be able to click ✓ on a
+              // removal it didn't earn.
+              <div className="ctx-confirm" data-agent-blocked>
                 <span className="ctx-confirm-q">Remove from room?</span>
                 <button
                   className="ctx-item danger"
@@ -183,16 +447,23 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
               className="search-input"
               autoFocus
               dir="auto"
-              placeholder="Search files, messages and memories…"
+              placeholder="Search this room, or run a command…"
+              aria-label="Search this room or run a command"
               value={s.searchQuery}
-              onChange={(e) => s.setSearchQuery(e.target.value)}
-              onKeyDown={a.onSearchKey}
+              onChange={(e) => {
+                s.setSearchQuery(e.target.value);
+                s.setSearchSel(0);
+              }}
+              onKeyDown={onPaletteKey}
             />
             <div className="search-results">
               {s.searchQuery.trim() &&
                 searchResults &&
-                searchFlat.length === 0 && (
-                  <div className="search-empty">No matches.</div>
+                totalItems === 0 && (
+                  <div className="search-empty">
+                    Nothing matches “{s.searchQuery.trim()}” — not in files,
+                    chats, memories, or commands.
+                  </div>
                 )}
               {s.searchQuery.trim() &&
                 searchResults &&
@@ -290,9 +561,31 @@ export default function Overlays({ s, a }: { s: WSState; a: WSActions }) {
                   })}
                 </div>
               )}
+              {actions.length > 0 && (
+                <div className="search-group">
+                  <div className="search-group-head">
+                    Commands <span className="search-count">{actions.length}</span>
+                  </div>
+                  {actions.map((act, i) => {
+                    const idx = actOffset + i;
+                    return (
+                      <button
+                        key={act.id}
+                        className={`search-result action ${s.searchSel === idx ? "sel" : ""}`}
+                        disabled={act.disabled}
+                        onMouseEnter={() => s.setSearchSel(idx)}
+                        onClick={() => runSel(idx)}
+                      >
+                        <span className="search-result-title">{act.label}</span>
+                        <span className="search-result-snippet">{act.hint}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
             <div className="search-hint">
-              ↑↓ to move · Enter to open · Esc to close
+              ↑↓ to move · Enter to run · Esc to close
             </div>
           </div>
         </div>

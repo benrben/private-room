@@ -1,6 +1,6 @@
 [package]
 name = "private-room"
-version = "0.2.1"
+version = "0.2.3"
 description = "Private Room — an encrypted local AI workspace in a single file"
 authors = ["Ben Reich"]
 edition = "2021"
@@ -32,10 +32,16 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+# Charset-aware decoding of fetched pages (legacy Hebrew sites serve
+# windows-1255); already in the tree via reqwest, so this pins nothing new.
+encoding_rs = "0.8"
 tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt", "net", "macros"] }
 futures-util = "0.3"
 base64 = "0.22"
 sha2 = "0.10"
+# Wave 4a (Idea 2): local-time schedule arithmetic (next daily/weekly run,
+# DST-aware). Already in the lock as a transitive dep, so this builds offline.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # ADD-19: recovery-key sidecar crypto (AES-256-GCM + PBKDF2). base64/sha2
 # above are reused; these three are the only new crypto deps.
 aes-gcm = "0.10"
@@ -52,10 +58,29 @@ umya-spreadsheet = { version = "3.0.0", default-features = false }
 # on Apple Silicon). The engine is built in; the model downloads on first use,
 # same doctrine as Ollama models (never bundled, nothing else to install).
 whisper-rs = "0.16"
+# ADD-27: neural speaker embeddings — TitaNet-small ONNX run by pure-Rust
+# tract (validated bit-exact against onnxruntime; do NOT swap in `ort`, and do
+# not assume tract runs other speaker models correctly — it silently
+# mis-executed CAM++). The 38 MB model ships as a bundled resource.
+tract-onnx = "0.23.4"
 
-# macOS-only native deps: ADD-14 OCR (Apple Vision) + ADD-11 Touch ID (Keychain).
+# macOS-only native deps: ADD-14 OCR (Apple Vision) + ADD-11 Touch ID (Keychain)
+# + ADD-27 system-audio capture (ScreenCaptureKit) for recording meetings.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+dispatch2 = "0.3"
+objc2-core-media = { version = "0.3", features = [
+    "CMSampleBuffer",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+] }
+objc2-screen-capture-kit = { version = "0.3", features = [
+    "SCStream",
+    "SCShareableContent",
+    "block2",
+    "dispatch2",
+    "objc2-core-media",
+] }
 objc2-foundation = { version = "0.3", features = [
     "NSArray",
     "NSData",
@@ -78,6 +103,17 @@ objc2-web-kit = { version = "0.3", features = [
     "WKWebView",
     "block2",
 ] }
+# Idea 3: on-device speech synthesis (AVSpeechSynthesizer write-to-buffer —
+# no temp files, pitchMultiplier only exists in the API, not in `say`).
+# "AVAudioTypes" is required explicitly: AVAudioPCMBuffer::frameLength is
+# gated on it and nothing enables it transitively.
+objc2-avf-audio = { version = "0.3", features = [
+    "AVSpeechSynthesis",
+    "AVAudioBuffer",
+    "AVAudioFormat",
+    "AVAudioTypes",
+    "block2",
+] }
 objc2-vision = { version = "0.3", features = [
     "VNRequest",
     "VNRequestHandler",
@@ -87,6 +123,10 @@ objc2-vision = { version = "0.3", features = [
 objc2-core-foundation = { version = "0.3", features = [
     "CFData",
     "CFCGTypes",
+    # Idea 3: speech synthesis pumps the main run loop when called headless
+    # (tests) — AVSpeech's buffer callback rides the main queue.
+    "CFRunLoop",
+    "CFDate",
 ] }
 objc2-core-graphics = { version = "0.3", features = [
     "CGColorSpace",
@@ -105,3 +145,12 @@ core-foundation-sys = "0.8"
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# ADD-27: mock-app harness for the live-recording engine integration test.
+tauri = { version = "2", features = ["test"] }
+
+# Idea 3: AVSpeechSynthesizer delivers write-to-buffer chunks via the main run
+# loop, so the on-device synthesis smoke test must OWN the real main thread —
+# a harness would run it on a worker and starve the callback queue.
+[[test]]
+name = "tts_smoke"
+harness = false

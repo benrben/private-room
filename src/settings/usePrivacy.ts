@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, hasRecoveryKey } from "../api";
 
 /** Privacy section (Wave 2): auto-lock, change password, Touch ID unlock,
  * duplicate room, and compact. */
@@ -12,6 +12,10 @@ export function usePrivacy() {
   const [pwRepeat, setPwRepeat] = useState("");
   const [pwError, setPwError] = useState("");
   const [pwSaved, setPwSaved] = useState(false);
+  // Changing the password re-issues the recovery key (the old code wrapped
+  // the old password); it is shown once, like the Recovery section's.
+  const [pwRecoveryCode, setPwRecoveryCode] = useState<string | null>(null);
+  const [pwRecoveryCopied, setPwRecoveryCopied] = useState(false);
 
   // ADD-11: Touch ID unlock. Needs the open room's path (from room_info).
   const [roomPath, setRoomPath] = useState("");
@@ -62,11 +66,24 @@ export function usePrivacy() {
       return;
     }
     try {
-      await api.changePassword(pwCurrent, pwNew);
+      // change_password returns null both when the room never had a recovery
+      // sidecar AND when re-wrapping failed (sidecar deleted) — check up
+      // front so a silent revocation gets surfaced.
+      const hadRecovery = roomPath
+        ? await hasRecoveryKey(roomPath).catch(() => false)
+        : false;
+      const freshCode = await api.changePassword(pwCurrent, pwNew);
       setPwCurrent("");
       setPwNew("");
       setPwRepeat("");
       setPwSaved(true);
+      setPwRecoveryCopied(false);
+      setPwRecoveryCode(freshCode);
+      if (hadRecovery && freshCode === null) {
+        setPwError(
+          "Your recovery key could not be re-issued and has been revoked — create a new one in Settings → Recovery key.",
+        );
+      }
       window.setTimeout(() => setPwSaved(false), 2400);
     } catch (e) {
       setPwError(String(e));
@@ -155,6 +172,10 @@ export function usePrivacy() {
     pwError,
     pwSaved,
     changePassword,
+    pwRecoveryCode,
+    setPwRecoveryCode,
+    pwRecoveryCopied,
+    setPwRecoveryCopied,
     touchIdOn,
     toggleTouchId,
     touchIdErr,

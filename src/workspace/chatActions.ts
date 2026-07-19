@@ -3,9 +3,11 @@ import {
   KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { api, FileTarget, memorySuggestion, Message } from "../api";
-import { fileToBase64, isOllamaDown, parseComposer, tokenAtCaret } from "./composer";
+import { fileToBase64, parseComposer, tokenAtCaret } from "./composer";
+import { runGuarded } from "./guard";
 import { splitMarkupBlocks } from "./markup";
 import { HELP_COMMAND } from "./constants";
+import * as voice from "./voice";
 import { WSState } from "./state";
 
 /** Chat sessions + the AI-turn flow + the composer's #/@ autocomplete. Cross-hook
@@ -48,62 +50,109 @@ export function makeChatActions(
     if (!s.activeChatId) return;
     const chatId = s.activeChatId;
     const askId = crypto.randomUUID();
-    s.askIdRef.current = askId;
-    s.setAsking(true);
-    s.setStreamText("");
-    s.setSteps([]);
-    s.setLane("");
-    s.setMemSuggestion(null);
-    s.editedRef.current = new Set();
-    try {
-      await run(askId);
-    } catch (e) {
-      const msg = String(e);
-      if (!/cancel/i.test(msg)) {
-        if (isOllamaDown(msg)) {
-          s.pushToast(
-            "error",
-            "Ollama is not running. Start the Ollama app, then try again.",
-            { label: "Open Ollama", run: openOllamaApp },
-          );
-        } else if (msg.includes("MODEL_MISSING")) {
-          s.pushToast(
-            "error",
-            `Model "${s.model}" is not downloaded yet.`,
-            { label: "Download", run: () => downloadModel(s.model) },
-          );
-        } else {
-          s.pushToast("error", msg);
-        }
+    await runGuarded(s, () => run(askId), {
+      begin: () => {
+        s.askIdRef.current = askId;
+        s.setAsking(true);
+        s.setStreamText("");
+        s.setSteps([]);
+        s.setLane("");
+        s.setMemSuggestion(null);
+        s.editedRef.current = new Set();
+        // Idea 3: a new turn silences the old answer and opens a fresh voice
+        // epoch (stale synthesis/decodes can never schedule audio into it).
+        voice.beginTurn();
+        s.setSpeakingMsgId(null);
+      },
+      // A user-pressed Stop is not a failure: no toast, and the model state is
+      // not worth re-polling.
+      ignore: (msg) => /cancel/i.test(msg),
+      handle: (msg) => {
+        if (!msg.includes("MODEL_MISSING")) return false;
+        s.pushToast(
+          "error",
+          `Model "${s.model}" is not downloaded yet.`,
+          { label: "Download", run: () => downloadModel(s.model) },
+        );
+        return true;
+      },
+      onError: () => {
         refreshAi();
-      }
-    } finally {
-      s.askIdRef.current = null;
-      const msgs = await api.getMessages(chatId);
-      s.setMessages(msgs);
-      const lastMsg = msgs[msgs.length - 1];
-      if (lastMsg?.role === "assistant" && lastMsg.content.trim()) {
-        memorySuggestion(chatId)
-          .then((sug) => {
-            if (sug.worth && sug.fact.trim()) s.setMemSuggestion({ fact: sug.fact.trim() });
-          })
-          .catch(() => {});
-      }
-      const edited = [...s.editedRef.current];
-      if (edited.length) {
-        const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
-        if (lastAssistant) {
-          s.setUndoByMsg((u) => ({ ...u, [lastAssistant.id]: edited }));
+      },
+      openOllamaApp,
+      finish: async () => {
+        s.askIdRef.current = null;
+        const msgs = await api.getMessages(chatId);
+        s.setMessages(msgs);
+        const lastMsg = msgs[msgs.length - 1];
+        // Idea 3: flush the voice's sentence remainder. The fallback text
+        // covers external CLI engines (they emit no ask-delta — the pipeline
+        // was fed nothing, so endOfTurn speaks the persisted answer instead).
+        // runGuarded runs this in `finally`, so a user-pressed Stop reaches
+        // here too — endOfTurn no-ops then (stopAsk killed the turn's epoch).
+        voice.endOfTurn(
+          lastMsg?.role === "assistant"
+            ? (lastMsg.effects ? lastMsg.content : splitMarkupBlocks(lastMsg.content).text)
+            : undefined,
+        );
+        if (lastMsg?.role === "assistant" && lastMsg.content.trim()) {
+          memorySuggestion(chatId)
+            .then(async (sug) => {
+              if (!(sug.worth && sug.fact.trim())) return;
+              const fact = sug.fact.trim();
+              // Wave 1b (idea 5): opt-in auto-save replaces the chip entirely.
+              if (s.memAutoSaveRef.current) {
+                try {
+                  const m = await api.addMemory(fact);
+                  s.setMemories(await api.listMemories());
+                  // addMemory dedups by returning the EXISTING row — only a
+                  // genuinely new memory earns the toast + Forget undo, or the
+                  // undo would delete a memory the user saved long ago.
+                  const isNew =
+                    Math.abs(Date.now() - Date.parse(m.createdAt)) < 10_000;
+                  if (isNew) {
+                    s.pushToast("success", `Remembered: ${fact}`, {
+                      label: "Forget",
+                      run: () => {
+                        void api.deleteMemory(m.id).then(async () => {
+                          s.setMemories(await api.listMemories());
+                        });
+                      },
+                    });
+                  }
+                } catch {
+                  /* auto-save must never disturb the finished answer */
+                }
+              } else {
+                s.setMemSuggestion({ fact });
+              }
+            })
+            .catch(() => {});
         }
-      }
-      s.setChats(await api.listChats());
-      api.listFiles().then(s.setFiles);
-      api.listMemories().then(s.setMemories);
-      s.setAsking(false);
-      s.setStreamText("");
-      s.setSteps([]);
-      s.setLane("");
-    }
+        const edited = [...s.editedRef.current];
+        if (edited.length) {
+          const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+          if (lastAssistant) {
+            s.setUndoByMsg((u) => ({ ...u, [lastAssistant.id]: edited }));
+          }
+        }
+        s.setChats(await api.listChats());
+        api.listFiles().then(s.setFiles);
+        api.listMemories().then(s.setMemories);
+        s.setAsking(false);
+        s.setStreamText("");
+        s.setSteps([]);
+        s.setLane("");
+        // Wave 2 (Idea 6): the run is over (finished OR stopped — this is
+        // runGuarded's `finally`). Decline any diff-preview card still queued: the
+        // tools/call task that awaits it is gone, so applying now would mutate a
+        // turn that no longer exists (second-pass addendum).
+        s.setEditApprovals((q) => {
+          for (const r of q) api.resolveEditApproval(r.id, "deny").catch(() => {});
+          return [];
+        });
+      },
+    });
   }
 
   async function askOnce(q: string, attachmentIds: string[]) {
@@ -112,8 +161,14 @@ export function makeChatActions(
     await runTurn((askId) => api.ask(chatId, q, attachmentIds, askId));
   }
 
-  async function send() {
-    const raw = s.question.trim();
+  /** `text` overrides the composer draft (hands-free dictation sends the
+   * transcript directly — state updates would race a same-tick send). */
+  async function send(text?: string) {
+    // Sending is always a click/Enter/dictation gesture — the one reliable
+    // moment to unlock the AudioContext for this turn's auto-speak (same
+    // "must be first in the gesture" doctrine as acquireMic).
+    voice.ensureUnlocked();
+    const raw = (text ?? s.question).trim();
     if (!raw || s.asking || !s.activeChatId) return;
     if (/^#help(\s|$)/i.test(raw)) {
       s.setQuestion("");
@@ -262,8 +317,17 @@ export function makeChatActions(
         return;
       }
       if (e.key === "Escape") {
+        // The palette swallows Escape completely — nothing else (viewer
+        // close, app-level handlers) may react to the same keypress.
         e.preventDefault();
+        e.stopPropagation();
+        e.nativeEvent.stopImmediatePropagation();
         s.setAc(null);
+        // A bare trigger token was only there to open the palette; closing
+        // the palette takes it with it so the composer is back where it was.
+        if (s.question.trim() === "#" || s.question.trim() === "@")
+          s.setQuestion("");
+        s.composerRef.current?.focus();
         return;
       }
     }
@@ -274,11 +338,20 @@ export function makeChatActions(
   }
 
   function stopAsk() {
+    // Stop must silence speech NOW — and kill the turn's voice epoch so the
+    // cancelled ask's endOfTurn (runGuarded's finally) can't speak the
+    // leftover sentence buffer, and no in-flight speak_text lands late.
+    voice.cancelAll();
+    s.setSpeakingMsgId(null);
     const id = s.askIdRef.current;
     if (id) api.cancelAsk(id).catch(() => {});
   }
 
   async function handleLock() {
+    // The lock gate must never keep speaking decrypted room content. Every
+    // OTHER lock path is covered too: the autolock call site and the
+    // workspace unmount cleanup (effects.ts) both cancel as well.
+    voice.cancelAll();
     if (s.askingRef.current && s.askIdRef.current) {
       try {
         await api.cancelAsk(s.askIdRef.current);
@@ -299,6 +372,7 @@ export function makeChatActions(
 
   async function regenerate(assistantId: string) {
     if (s.asking || !s.activeChatId) return;
+    const chatId = s.activeChatId;
     const idx = s.messages.findIndex((m) => m.id === assistantId);
     if (idx < 0) return;
     let userText = "";
@@ -315,8 +389,19 @@ export function makeChatActions(
       s.pushToast("error", String(e));
       return;
     }
-    s.setMessages(await api.getMessages(s.activeChatId));
-    await askOnce(userText, []);
+    s.setMessages(await api.getMessages(chatId));
+    // Re-run the original turn the SAME way it was first sent: a #command
+    // re-executes as a command (not resent as literal text), and any @-mentioned
+    // files are re-attached (parsed back out of the text). Paperclip-only
+    // attachments aren't stored on the message, so those can't be recovered here.
+    const parsed = parseComposer(userText, s.commands, s.files, s.folders);
+    if (parsed.command) {
+      await runTurn((askId) =>
+        api.runCommand(chatId, parsed.command!, parsed.args, parsed.refIds, userText, askId),
+      );
+    } else {
+      await askOnce(userText, parsed.refIds);
+    }
   }
 
   function copyMessage(m: Message) {

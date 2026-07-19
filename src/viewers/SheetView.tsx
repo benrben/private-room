@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
+// The ESM build of SheetJS 0.20.x ships codepage tables separately; without
+// this, legacy .xls files in non-UTF8 codepages decode to garbled text.
+import * as cptable from "xlsx/dist/cpexcel.full.mjs";
 import { CellRect, parseA1Range } from "./highlight";
+
+XLSX.set_cptable(cptable);
 
 const MAX_ROWS = 1000;
 const MAX_COLS = 60;

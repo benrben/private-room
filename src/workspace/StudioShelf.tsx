@@ -3,7 +3,8 @@ import { WSState } from "./state";
 import { WSActions } from "./actions";
 
 /** The Studio Shelf (D5/D12). `scope` is a file id (this file) or undefined
- * (whole room). Reused by the Front Page. Extracted verbatim. */
+ * (whole room). Rendered inside the right pane's Studio tab and reused by
+ * area views. Flat rows, not cards — outputs are saved back into the room. */
 export default function StudioShelf({
   scope,
   s,
@@ -15,57 +16,53 @@ export default function StudioShelf({
 }) {
   return (
     <div className="studio-shelf">
-      <div className="studio-shelf-title">
-        Studio · {scope ? "this file" : "whole room"}
+      <div className="studio-section-title">
+        {scope ? "From the open file" : "From this room's sources"}
       </div>
       <button
-        className="studio-btn"
-        disabled={s.studioBusy !== null}
+        className="studio-row"
         onClick={() => a.openStudioPrompt("flashcards", scope)}
       >
-        <StudioIcon size={18} />
-        <span className="studio-btn-label">
-          Flashcards
-          <span className="studio-btn-sub">
-            {s.studioBusy === "flashcards"
-              ? "Building…"
-              : "A flip-card deck you can review"}
-          </span>
+        <span className="studio-row-icon">
+          <StudioIcon size={15} />
         </span>
+        <span className="studio-row-text">
+          <span className="studio-row-title">Flashcards</span>
+          <span className="studio-row-copy">A flip-card deck you can review</span>
+        </span>
+        <span className="studio-row-state">Create</span>
       </button>
       <button
-        className="studio-btn"
-        disabled={s.studioBusy !== null}
+        className="studio-row"
         onClick={() => a.openStudioPrompt("mindmap", scope)}
       >
-        <GraphIcon size={18} />
-        <span className="studio-btn-label">
-          Mind map
-          <span className="studio-btn-sub">
-            {s.studioBusy === "mindmap"
-              ? "Building…"
-              : "See how the ideas connect"}
-          </span>
+        <span className="studio-row-icon">
+          <GraphIcon size={15} />
         </span>
+        <span className="studio-row-text">
+          <span className="studio-row-title">Mind map</span>
+          <span className="studio-row-copy">See how the ideas connect</span>
+        </span>
+        <span className="studio-row-state">Create</span>
       </button>
       <button
-        className="studio-btn"
-        disabled={s.studioBusy !== null}
+        className="studio-row"
         onClick={() => a.openStudioPrompt("podcast", scope)}
       >
-        <PodcastIcon size={18} />
-        <span className="studio-btn-label">
-          Podcast script
-          <span className="studio-btn-sub">
-            {s.studioBusy === "podcast"
-              ? "Writing…"
-              : "A two-host transcript (script only)"}
+        <span className="studio-row-icon">
+          <PodcastIcon size={15} />
+        </span>
+        <span className="studio-row-text">
+          <span className="studio-row-title">Podcast script</span>
+          <span className="studio-row-copy">
+            A two-host transcript (script only)
           </span>
         </span>
+        <span className="studio-row-state">Create</span>
       </button>
       {(s.aiActionDefs ?? []).some((x) => x.scope === "room") && (
         <>
-          <div className="studio-shelf-title studio-shelf-subtitle">
+          <div className="studio-section-title">
             AI actions · {scope ? "this folder" : "whole room"}
           </div>
           <div className="ai-action-grid">

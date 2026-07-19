@@ -245,6 +245,15 @@ fn do_export(path: &str, outdir: &str, pw_flag: Option<&str>) -> Result<(), Stri
         .map_err(|e| e.to_string())?;
 
     let mut used: HashSet<String> = HashSet::new();
+    // Never clobber what's already in the output folder: seed the dedupe
+    // set with the names that exist there so unique_name() steps past them.
+    // Keys are lowercased because APFS is case-insensitive by default, so
+    // "Report.pdf" would overwrite an existing "report.pdf".
+    let entries = std::fs::read_dir(outdir).map_err(|e| format!("Could not read {outdir}: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        used.insert(entry.file_name().to_string_lossy().to_lowercase());
+    }
     let mut written = 0usize;
     let mut skipped = 0usize;
 
@@ -324,11 +333,14 @@ fn sanitize(name: &str) -> String {
     }
 }
 
-/// Make `base` unique within this export run so two files that share a name
-/// don't silently clobber each other. Appends ` (2)`, ` (3)`, … before the
-/// extension.
+/// Make `base` unique against `used` — seeded with the destination's
+/// pre-existing filenames and every name handed out earlier in this export
+/// run — so nothing gets silently clobbered. Appends ` (2)`, ` (3)`, … before
+/// the extension. `used` holds lowercased keys (and candidates are tested
+/// lowercased) because APFS is case-insensitive by default; the returned
+/// name keeps the original case.
 fn unique_name(used: &mut HashSet<String>, base: &str) -> String {
-    if used.insert(base.to_string()) {
+    if used.insert(base.to_lowercase()) {
         return base.to_string();
     }
     let (stem, ext) = match base.rsplit_once('.') {
@@ -338,7 +350,7 @@ fn unique_name(used: &mut HashSet<String>, base: &str) -> String {
     let mut n = 2;
     loop {
         let candidate = format!("{stem} ({n}){ext}");
-        if used.insert(candidate.clone()) {
+        if used.insert(candidate.to_lowercase()) {
             return candidate;
         }
         n += 1;
@@ -469,5 +481,26 @@ mod tests {
         assert_eq!(unique_name(&mut used, "a.txt"), "a (3).txt");
         assert_eq!(unique_name(&mut used, "noext"), "noext");
         assert_eq!(unique_name(&mut used, "noext"), "noext (2)");
+    }
+
+    #[test]
+    fn unique_name_steps_past_preexisting_names() {
+        // Names seeded from the destination directory must not be reused.
+        let mut used = HashSet::new();
+        used.insert("report.pdf".to_string());
+        assert_eq!(unique_name(&mut used, "report.pdf"), "report (2).pdf");
+    }
+
+    #[test]
+    fn unique_name_is_case_insensitive() {
+        // APFS is case-insensitive by default: "Report.pdf" would clobber a
+        // pre-existing "report.pdf". Keys are compared lowercased, but the
+        // returned name keeps the caller's case.
+        let mut used = HashSet::new();
+        used.insert("report.pdf".to_string()); // seeded (already lowercased)
+        assert_eq!(unique_name(&mut used, "Report.pdf"), "Report (2).pdf");
+        assert_eq!(unique_name(&mut used, "REPORT.PDF"), "REPORT (3).PDF");
+        assert_eq!(unique_name(&mut used, "Fresh.pdf"), "Fresh.pdf");
+        assert_eq!(unique_name(&mut used, "fresh.pdf"), "fresh (2).pdf");
     }
 }

@@ -1,10 +1,12 @@
-import { ENGINE_LABELS, modelLabel } from "./api";
+import { ENGINE_LABELS } from "./api";
 import { AlertIcon, CloseIcon, DownloadIcon, EyeIcon, TrashIcon } from "./icons";
 import "./settingsA11y.css";
 import { Props } from "./settings/types";
 import ModelSection from "./settings/ModelSection";
 import BehaviorSection from "./settings/BehaviorSection";
+import VoiceSection from "./settings/VoiceSection";
 import PrivacySection from "./settings/PrivacySection";
+import CheckpointsSection from "./settings/CheckpointsSection";
 import OnlineSection from "./settings/OnlineSection";
 import AdvisorsSection from "./settings/AdvisorsSection";
 import McpSection from "./settings/McpSection";
@@ -16,7 +18,9 @@ import RecoverySection from "./settings/RecoverySection";
 import { useFocusTrap } from "./settings/useFocusTrap";
 import { useModelManagement } from "./settings/useModelManagement";
 import { useBehaviorSettings } from "./settings/useBehaviorSettings";
+import { useVoiceSettings } from "./settings/useVoiceSettings";
 import { usePrivacy } from "./settings/usePrivacy";
+import { useCheckpoints } from "./settings/useCheckpoints";
 import { useOnlineSearch } from "./settings/useOnlineSearch";
 import { useAdvisors } from "./settings/useAdvisors";
 import { useMcpConfig } from "./settings/useMcpConfig";
@@ -31,6 +35,7 @@ export default function Settings({
   onModelChange,
   onModelsChanged,
   onClose,
+  busy,
 }: Props) {
   // Each section owns its state + handlers via a per-concern hook. The shell
   // only threads those returns to the presentational section components and
@@ -74,7 +79,17 @@ export default function Settings({
     setInstructions,
     saveTuning,
     saved,
+    responseStyle,
+    changeResponseStyle,
+    autoIndex,
+    changeAutoIndex,
+    memoryAutoSave,
+    changeMemoryAutoSave,
+    editApproval,
+    changeEditApproval,
   } = useBehaviorSettings(() => setError(""));
+
+  const voiceSettings = useVoiceSettings();
 
   const {
     autolock,
@@ -88,6 +103,10 @@ export default function Settings({
     pwError,
     pwSaved,
     changePassword,
+    pwRecoveryCode,
+    setPwRecoveryCode,
+    pwRecoveryCopied,
+    setPwRecoveryCopied,
     touchIdOn,
     toggleTouchId,
     touchIdErr,
@@ -108,6 +127,8 @@ export default function Settings({
     compacting,
     compactErr,
   } = usePrivacy();
+
+  const checkpoints = useCheckpoints();
 
   const {
     webProvider,
@@ -144,11 +165,14 @@ export default function Settings({
   const {
     leash,
     allowCloud,
+    scope,
     leashBusy,
     leashErr,
     leashCopied,
     toggleLeash,
     toggleAllowCloud,
+    changeScope,
+    regenerateToken,
     copyLeashConfig,
   } = useRoomServer();
 
@@ -180,39 +204,59 @@ export default function Settings({
       >
         <div className="settings-head">
           <span id="settings-title">Settings</span>
-          <button className="subtle btn-ic" onClick={onClose}>
+          <button
+            className="subtle btn-ic"
+            aria-label="Close settings"
+            title="Close settings"
+            onClick={onClose}
+          >
             <CloseIcon size={14} />
           </button>
         </div>
         <div className="settings-main">
+          {/* Sections grouped by the question a person is answering; every
+              entry is the same jump target it always was. */}
           <nav className="settings-nav">
             {(
               [
-                ["set-model", "Model"],
-                ["set-behavior", "Behavior"],
-                ["set-privacy", "Privacy"],
-                ["set-online", "Online"],
-                ["set-advisors", "AI advisors"],
-                ["set-mcp", "Connections"],
-                ["set-closet", "Remote AI"],
-                ["set-leash", "Room server"],
-                ["set-role", "Room role"],
-                ["set-helpers", "AI helpers"],
-                ["set-recovery", "Recovery key"],
-              ] as [string, string][]
-            ).map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                className="settings-nav-item"
-                onClick={() =>
-                  document
-                    .getElementById(id)
-                    ?.scrollIntoView({ behavior: "smooth", block: "start" })
-                }
-              >
-                {label}
-              </button>
+                ["AI & behavior", [
+                  ["set-model", "Model"],
+                  ["set-behavior", "Behavior"],
+                  ["set-role", "Room role"],
+                  ["set-helpers", "AI helpers"],
+                  ["set-advisors", "AI advisors"],
+                ]],
+                ["Voice & dictation", [["set-voice", "Spoken voice"]]],
+                ["Privacy & recovery", [
+                  ["set-privacy", "Privacy"],
+                  ["set-recovery", "Recovery key"],
+                ]],
+                ["Connections", [
+                  ["set-online", "Online search"],
+                  ["set-mcp", "Connectors (MCP)"],
+                  ["set-closet", "Remote AI"],
+                  ["set-leash", "Room server"],
+                ]],
+                ["History & storage", [["set-checkpoints", "Checkpoints"]]],
+              ] as [string, [string, string][]][]
+            ).map(([group, items]) => (
+              <div key={group} className="settings-nav-group">
+                <div className="settings-nav-heading">{group}</div>
+                {items.map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className="settings-nav-item"
+                    onClick={() =>
+                      document
+                        .getElementById(id)
+                        ?.scrollIntoView({ behavior: "smooth", block: "start" })
+                    }
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             ))}
           </nav>
           <div className="settings-body">
@@ -221,8 +265,6 @@ export default function Settings({
               model={model}
               onModelChange={onModelChange}
               caps={caps}
-              modelLabel={modelLabel}
-              ENGINE_LABELS={ENGINE_LABELS}
               confirmModel={confirmModel}
               confirmRemoveModel={confirmRemoveModel}
               cancelRemoveModel={cancelRemoveModel}
@@ -255,7 +297,17 @@ export default function Settings({
               setInstructions={setInstructions}
               saveTuning={saveTuning}
               saved={saved}
+              responseStyle={responseStyle}
+              changeResponseStyle={changeResponseStyle}
+              autoIndex={autoIndex}
+              changeAutoIndex={changeAutoIndex}
+              memoryAutoSave={memoryAutoSave}
+              changeMemoryAutoSave={changeMemoryAutoSave}
+              editApproval={editApproval}
+              changeEditApproval={changeEditApproval}
             />
+
+            <VoiceSection {...voiceSettings} />
 
             <PrivacySection
               autolock={autolock}
@@ -268,7 +320,17 @@ export default function Settings({
               setPwRepeat={setPwRepeat}
               pwError={pwError}
               pwSaved={pwSaved}
-              changePassword={changePassword}
+              // Cross-hook wiring: this sheet and the Recovery section's show
+              // one-time codes for the SAME sidecar — starting a re-issue here
+              // dismisses the other sheet so two codes never contradict.
+              changePassword={() => {
+                setRecoveryCode(null);
+                changePassword();
+              }}
+              pwRecoveryCode={pwRecoveryCode}
+              setPwRecoveryCode={setPwRecoveryCode}
+              pwRecoveryCopied={pwRecoveryCopied}
+              setPwRecoveryCopied={setPwRecoveryCopied}
               touchIdOn={touchIdOn}
               toggleTouchId={toggleTouchId}
               touchIdErr={touchIdErr}
@@ -289,6 +351,8 @@ export default function Settings({
               setCompactMsg={setCompactMsg}
               compactErr={compactErr}
             />
+
+            <CheckpointsSection {...checkpoints} busy={busy} />
 
             <OnlineSection
               webProvider={webProvider}
@@ -343,6 +407,9 @@ export default function Settings({
               toggleLeash={toggleLeash}
               allowCloud={allowCloud}
               toggleAllowCloud={toggleAllowCloud}
+              scope={scope}
+              changeScope={changeScope}
+              regenerateToken={regenerateToken}
               copyLeashConfig={copyLeashConfig}
               leashCopied={leashCopied}
               leashErr={leashErr}
@@ -370,7 +437,11 @@ export default function Settings({
               setRecoveryCopied={setRecoveryCopied}
               setRecoveryCode={setRecoveryCode}
               recoveryBusy={recoveryBusy}
-              createRecoveryKey={createRecoveryKey}
+              // Cross-hook wiring: see PrivacySection's changePassword above.
+              createRecoveryKey={() => {
+                setPwRecoveryCode(null);
+                createRecoveryKey();
+              }}
               recoveryErr={recoveryErr}
             />
 

@@ -42,5 +42,4 @@ export const HELP_COMMAND: ChatCommand = {
   name: "help",
   summary: "List every command and how to use it",
   usage: "#help",
-  needsRefs: false,
 };

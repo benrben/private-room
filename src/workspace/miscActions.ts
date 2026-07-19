@@ -1,20 +1,21 @@
-import { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import {
   AnnotationPayload,
   api,
-  ENGINE_LABELS,
+  EditApproveRequest,
+  engineModelLabel,
+  ExternalModelInfo,
   frontPage,
   frontPageSuggestions,
   McpApproveRequest,
   McpServerStatus,
-  modelLabel,
   RoomInfo,
 } from "../api";
+import { tryToast } from "./guard";
 import { FlatResult } from "./types";
 import { WSState } from "./state";
 
 /** Memory, MCP approvals, front page, search, panes, and model-switch handlers.
- * Cross-hook: `viewFile` (files) is threaded in for submitLink/search. */
+ * Cross-hook: `viewFile` (files) is threaded in for search. */
 export function makeMiscActions(
   s: WSState,
   info: RoomInfo,
@@ -27,6 +28,13 @@ export function makeMiscActions(
       .getSetting("web_provider")
       .then((v) => s.setWebOn(v === "duckduckgo" || v === "searxng" || v === "brave"))
       .catch(() => {});
+    // Engine parity: whether connected MCP tools also ride along when a cloud
+    // CLI answers (the advisor-tools switch) — the composer badge tells the
+    // truth per engine with it.
+    api
+      .getSetting("advisor_tools_enabled")
+      .then((v) => s.setAdvisorToolsOn(v === "1" || v === "on"))
+      .catch(() => {});
   }
 
   function refreshAutolock() {
@@ -36,6 +44,27 @@ export function makeMiscActions(
         s.autolockRef.current = v ?? "15";
       })
       .catch(() => {});
+  }
+
+  /** Wave 1b (idea 5): re-read the auto-save switch into the workspace ref.
+   * Called when Settings closes — the BehaviorSection checkbox only writes the
+   * DB setting, and the ref must follow without a room reopen. */
+  function refreshMemAutoSave() {
+    api
+      .getSetting("memory_auto_save")
+      .then((v) => {
+        s.memAutoSaveRef.current = v === "1";
+      })
+      .catch(() => {});
+  }
+
+  /** Wave 1b (idea 10): open (get-or-create) the canonical scratch pad. */
+  async function openScratchPad() {
+    await tryToast(s, async () => {
+      const meta = await api.openScratchPad();
+      s.setFiles(await api.listFiles());
+      await viewFile(meta.id);
+    });
   }
 
   async function dismissSyncWarn() {
@@ -73,24 +102,6 @@ export function makeMiscActions(
     s.setMcpDialogDismissed(true);
   }
 
-  async function submitLink() {
-    const url = s.linkUrl.trim();
-    if (!url || s.importingLink) return;
-    s.setImportingLink(true);
-    try {
-      const meta = await api.importLink(url);
-      s.setFiles(await api.listFiles());
-      s.setShowAddLink(false);
-      s.setLinkUrl("");
-      s.pushToast("success", `Saved "${meta.name}" into the room.`);
-      viewFile(meta.id);
-    } catch (e) {
-      s.pushToast("error", String(e));
-    } finally {
-      s.setImportingLink(false);
-    }
-  }
-
   function loadFrontPage(withSuggestions: boolean) {
     frontPage()
       .then((page) => {
@@ -111,13 +122,34 @@ export function makeMiscActions(
     const fact = s.memSuggestion?.fact;
     if (!fact) return;
     s.setMemSuggestion(null);
-    try {
-      await api.addMemory(fact);
-      s.setMemories(await api.listMemories());
-      s.pushToast("success", "Saved to memory.");
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.addMemory(fact),
+      async () => {
+        s.setMemories(await api.listMemories());
+        s.pushToast("success", "Saved to memory.");
+      },
+    );
+  }
+
+  /** Wave 1b (idea 5): the chip's third button — flip the room to auto-save
+   * mode AND save the current suggestion. The click is the user's explicit
+   * consent (the whole chip stays data-agent-blocked, ADD-25). */
+  async function enableMemoryAutoSave() {
+    const fact = s.memSuggestion?.fact;
+    s.setMemSuggestion(null);
+    s.memAutoSaveRef.current = true;
+    await tryToast(s, async () => {
+      await api.setSetting("memory_auto_save", "1");
+      if (fact) {
+        await api.addMemory(fact);
+        s.setMemories(await api.listMemories());
+      }
+      s.pushToast(
+        "success",
+        "Suggested memories now save automatically — turn this off any time in Settings → Behavior.",
+      );
+    });
   }
 
   function copyReceipt(a: AnnotationPayload) {
@@ -159,23 +191,30 @@ export function makeMiscActions(
   async function addMemory() {
     const content = s.memoryDraft.trim();
     if (!content) return;
-    await api.addMemory(content);
-    s.setMemories(await api.listMemories());
-    s.setMemoryDraft("");
+    // The draft is only cleared once the memory is actually stored, so a failed
+    // save leaves the text where the user can retry it.
+    await tryToast(
+      s,
+      () => api.addMemory(content, s.memoryDraftCat || null),
+      async () => {
+        s.setMemories(await api.listMemories());
+        s.setMemoryDraft("");
+        s.setMemoryDraftCat("");
+      },
+    );
   }
 
   async function saveMemoryEdit() {
     if (!s.editingMemory) return;
-    const { id, content } = s.editingMemory;
+    const { id, content, category } = s.editingMemory;
     const trimmed = content.trim();
     s.setEditingMemory(null);
     if (!trimmed) return;
-    try {
-      await api.updateMemory(id, trimmed);
-      s.setMemories(await api.listMemories());
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    await tryToast(
+      s,
+      () => api.updateMemory(id, trimmed, category),
+      async () => s.setMemories(await api.listMemories()),
+    );
   }
 
   function activateResult(r: FlatResult) {
@@ -190,7 +229,8 @@ export function makeMiscActions(
           ?.scrollIntoView({ block: "center" });
       }, 120);
     } else {
-      s.setShowMemory(true);
+      // A memory hit opens the Memory area, where the row can be edited.
+      revealMemory();
     }
     s.setShowSearch(false);
   }
@@ -203,17 +243,28 @@ export function makeMiscActions(
     s.setMcpApprovals((q) => q.filter((r) => r.id !== req.id));
   }
 
+  // Wave 2 (Idea 6): answer a diff-preview approval card.
+  function resolveEditApproval(
+    req: EditApproveRequest,
+    decision: "once" | "turn" | "deny",
+  ) {
+    api.resolveEditApproval(req.id, decision).catch(() => {});
+    s.setEditApprovals((q) => q.filter((r) => r.id !== req.id));
+  }
+
+  /** Open the Memory & Scratch Pad area (the center-pane manager). */
   function revealMemory() {
-    s.setShowMemory(true);
+    s.setShowMap(false);
+    s.setShowWorkflows(false);
+    s.setShowScripts(false);
+    s.setOpenFile(null);
+    s.setArea("memory");
     s.setShowMemoryIntro(false);
     try {
       localStorage.setItem(`memoryIntroSeen:${info.name}`, "1");
     } catch {
       /* non-fatal */
     }
-    window.setTimeout(() => {
-      s.memoryHeadRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    }, 30);
   }
 
   async function changeModel(value: string) {
@@ -223,7 +274,13 @@ export function makeMiscActions(
   }
 
   function engineLabelOf(m: string): string {
-    return ENGINE_LABELS[m] ?? modelLabel(m) ?? m;
+    return engineModelLabel(m, s.engineModels);
+  }
+
+  /** Cache a cloud engine's fetched model list (Cloud picker second level) so
+   * the model pill/toasts can show friendly names without re-fetching. */
+  function recordEngineModels(engine: string, models: ExternalModelInfo[]) {
+    s.setEngineModels((prev) => ({ ...prev, [engine]: models }));
   }
 
   // ---- ADD-3: two-step delete ----
@@ -239,38 +296,6 @@ export function makeMiscActions(
   function cancelConfirm() {
     window.clearTimeout(s.confirmTimer.current);
     s.setConfirmDelete(null);
-  }
-
-  /** Start dragging a pane divider. `edge` says which pane the divider sizes. */
-  function startPaneResize(edge: "sidebar" | "chat", e: ReactMouseEvent) {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = edge === "sidebar" ? s.sidebarW : s.chatW;
-    document.body.classList.add("resizing-col");
-    function onMove(ev: MouseEvent) {
-      const delta = edge === "sidebar" ? ev.clientX - startX : startX - ev.clientX;
-      const next = Math.max(220, Math.min(560, startW + delta));
-      if (edge === "sidebar") s.setSidebarW(next);
-      else s.setChatW(next);
-    }
-    function onUp() {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      document.body.classList.remove("resizing-col");
-      s.setSidebarW((sw) => {
-        s.setChatW((cw) => {
-          try {
-            localStorage.setItem(s.paneKey, JSON.stringify({ sidebar: sw, chat: cw }));
-          } catch {
-            /* storage full/unavailable — non-fatal */
-          }
-          return cw;
-        });
-        return sw;
-      });
-    }
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
   }
 
   // ADD-6: flatten grouped search results for arrow-key navigation.
@@ -296,26 +321,14 @@ export function makeMiscActions(
     return flat;
   }
 
-  function onSearchKey(e: ReactKeyboardEvent<HTMLInputElement>) {
-    const flat = searchFlat();
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      s.setSearchSel((sel) => Math.min(sel + 1, Math.max(flat.length - 1, 0)));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      s.setSearchSel((sel) => Math.max(sel - 1, 0));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      const r = flat[s.searchSel];
-      if (r) activateResult(r);
-    }
-  }
-
   return {
-    refreshWebAccess, refreshAutolock, dismissSyncWarn, connectedTools,
-    approveMcp, keepMcpOff, submitLink, loadFrontPage, saveSuggestedMemory,
+    refreshWebAccess, refreshAutolock, refreshMemAutoSave, dismissSyncWarn,
+    connectedTools, approveMcp, keepMcpOff, loadFrontPage,
+    saveSuggestedMemory, enableMemoryAutoSave, openScratchPad,
     copyReceipt, playSealSound, addMemory, saveMemoryEdit, activateResult,
-    resolveMcpApproval, revealMemory, changeModel, engineLabelOf,
-    askConfirm, cancelConfirm, startPaneResize, searchFlat, onSearchKey,
+    resolveMcpApproval, resolveEditApproval,
+    revealMemory, changeModel, engineLabelOf,
+    recordEngineModels,
+    askConfirm, cancelConfirm, searchFlat,
   };
 }

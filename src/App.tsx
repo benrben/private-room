@@ -1,7 +1,14 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
-import { api, RoomInfo, RecentRoom } from "./api";
+import {
+  api,
+  RoomInfo,
+  RecentRoom,
+  listRoles,
+  writeRecoveryKey,
+  hasRecoveryKey,
+  openRoomWithRecovery,
+} from "./api";
 import Workspace from "./Workspace";
 import { Logomark } from "./icons";
 import {
@@ -25,20 +32,12 @@ import {
 import "./App.css";
 import "./seal.css";
 
-// CONTRACT-NOTE: the API agent is adding typed api.ts wrappers for
-// write_recovery_key / has_recovery_key / open_room_with_recovery / list_roles
-// (and icons.RecoveryIcon) in parallel. Until they land, this file calls the
-// backend commands directly (names + shapes per BACKEND-ACTUALS) so it builds
-// standalone. Integration can fold these into src/api.ts and swap the icon.
-const writeRecoveryKey = () => invoke<string>("write_recovery_key");
-const hasRecoveryKey = (path: string) =>
-  invoke<boolean>("has_recovery_key", { path });
-const openRoomWithRecovery = (path: string, code: string) =>
-  invoke<RoomInfo>("open_room_with_recovery", { path, code });
-const listRoles = () => invoke<RoomRole[]>("list_roles");
-
 export default function App() {
   const [screen, setScreen] = useState<Screen>({ kind: "start" });
+  // Idea 9: bumped on a checkpoint rollback so the Workspace remounts against
+  // the swapped DB — every pane (files, chats, open file, jobs, front page) is
+  // rebuilt, and the Settings modal closes, which is correct after a rollback.
+  const [roomEpoch, setRoomEpoch] = useState(0);
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
@@ -66,6 +65,14 @@ export default function App() {
   const [recoveryInput, setRecoveryInput] = useState("");
   const [recoveryCopied, setRecoveryCopied] = useState(false);
 
+  // Navigation epoch: bumped on every goTo. In-flight unlock/create
+  // continuations (an awaited openRoom, a pending seal timer) capture it and
+  // abort if it moved — so a gate shown for room B can never be replaced by a
+  // stale "enter room A" continuation mounting a workspace over a closed room.
+  const navEpochRef = useRef(0);
+  // The pending seal-unlock timer, so goTo can cancel a ritual in flight.
+  const sealTimerRef = useRef<number | null>(null);
+
   const loadRecent = useCallback(() => {
     api
       .listRecent()
@@ -74,6 +81,12 @@ export default function App() {
   }, []);
 
   const goTo = useCallback((next: Screen) => {
+    navEpochRef.current += 1;
+    if (sealTimerRef.current !== null) {
+      window.clearTimeout(sealTimerRef.current);
+      sealTimerRef.current = null;
+      setEntering(false);
+    }
     setPassword("");
     setConfirm("");
     setError("");
@@ -89,14 +102,52 @@ export default function App() {
     setScreen(next);
   }, []);
 
+  // Session restore: if the WebKit content process was reloaded (frontend
+  // state lost), the Rust side still holds the unlocked room — landing on the
+  // start screen would read as a scary crash-to-locked. Ask the backend and
+  // jump straight back into the workspace instead. A real quit/lock clears
+  // the backend room, so this never bypasses the password.
+  useEffect(() => {
+    const epoch = navEpochRef.current;
+    api
+      .roomInfo()
+      .then((info) => {
+        // A gate navigation (e.g. a launch-time .roomai open) beat us — the
+        // room this restore saw may already be closed behind that gate.
+        if (info && navEpochRef.current === epoch)
+          goTo({ kind: "workspace", info });
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // A .roomai file double-clicked in Finder lands here, either at launch
   // (pending open) or while the app is already running (event).
   useEffect(() => {
+    // Showing another room's gate must never leave the current room unlocked
+    // behind it — close it first (a safe no-op when none is open).
+    const gateTo = async (path: string) => {
+      await api.closeRoom().catch(() => {});
+      goTo({ kind: "unlock", path });
+    };
     api.takePendingOpen().then((path) => {
-      if (path) goTo({ kind: "unlock", path });
+      if (path) gateTo(path);
     });
     const unlisten = api.onOpenRoomFile((path) => {
-      goTo({ kind: "unlock", path });
+      gateTo(path);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [goTo]);
+
+  // Idea 9: a checkpoint rollback reopened the room against the swapped DB.
+  // Remount the workspace (new key) and land on it — safer than piecemeal
+  // refresh, and it closes any open modal (Settings).
+  useEffect(() => {
+    const unlisten = api.onRoomRolledBack((info) => {
+      setRoomEpoch((e) => e + 1);
+      goTo({ kind: "workspace", info });
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -204,9 +255,14 @@ export default function App() {
       goTo({ kind: "workspace", info });
       return;
     }
+    const epoch = navEpochRef.current;
     setEntering(true);
-    window.setTimeout(() => {
+    sealTimerRef.current = window.setTimeout(() => {
+      sealTimerRef.current = null;
       setEntering(false);
+      // A navigation during the ritual (goTo clears this timer, but belt and
+      // braces) invalidates the entry — the room may no longer be open.
+      if (navEpochRef.current !== epoch) return;
       goTo({ kind: "workspace", info });
     }, SEAL_UNLOCK_MS);
   }
@@ -229,6 +285,11 @@ export default function App() {
       setError("Passwords do not match.");
       return;
     }
+    // If the gate navigates while a step below is in flight (a .roomai
+    // double-clicked in Finder closes the room and shows the other room's
+    // gate), this create flow is stale — it must not create/enter a room
+    // behind the new gate.
+    const epoch = navEpochRef.current;
     // Defer to the native panel only now, to pick where the file is saved.
     const suggested = (roomName.trim() || "My Room").replace(/[/\\:]/g, "-");
     const path = await api.chooseSavePath({
@@ -237,9 +298,11 @@ export default function App() {
       filters: ROOM_FILTER,
     });
     if (!path) return; // cancelled the location picker; stay in the branded flow
+    if (navEpochRef.current !== epoch) return; // gate moved on — create nothing
     setBusy(true);
     try {
       const info = await api.createRoom(path, password);
+      if (navEpochRef.current !== epoch) return; // stale: don't seed or enter
       // The room is now open. Seed the chosen template and role through
       // ordinary APIs before entering. Everything created here is normal,
       // editable content — no special machinery. Blank + default seed nothing.
@@ -284,11 +347,13 @@ export default function App() {
       // additive and optional — if it can't be written, quietly enter anyway.
       try {
         const code = await writeRecoveryKey();
+        if (navEpochRef.current !== epoch) return; // stale: gate moved on
         setPendingInfo(info);
         setRecoveryCopied(false);
         setRecoveryCode(code);
       } catch (e) {
         console.error("Could not create a recovery code", e);
+        if (navEpochRef.current !== epoch) return; // stale: gate moved on
         enterRoom(info);
       }
     } catch (e) {
@@ -299,14 +364,32 @@ export default function App() {
   }
 
   async function handleUnlock(path: string) {
+    // An empty submit never reaches the backend — SQLCipher's PRAGMA-key
+    // error text has no place on the gate.
+    if (!password) {
+      setError("Enter your password to unlock this room.");
+      return;
+    }
     setBusy(true);
+    const epoch = navEpochRef.current;
     try {
       const info = await api.openRoom(path, password);
+      // The gate navigated while the unlock was in flight (another room's
+      // file was double-clicked) — don't mount a workspace the new gate
+      // replaced. The backend tears any leftover room down on the next open.
+      if (navEpochRef.current !== epoch) return;
       enterRoom(info);
     } catch (e) {
       const msg = String(e);
+      // The gate speaks plainly; the raw engine error goes to the console
+      // for debugging, never to the person standing at the door.
+      console.error("unlock failed:", msg);
       setError(
-        msg.includes("WRONG_PASSWORD") ? "Wrong password. Try again." : msg,
+        msg.includes("WRONG_PASSWORD")
+          ? "That password didn't work. Try again."
+          : /PRAGMA|sqlcipher|rekey|ATTACH/i.test(msg)
+            ? "This room couldn't be unlocked. Check the password and try again."
+            : msg,
       );
     } finally {
       setBusy(false);
@@ -320,8 +403,10 @@ export default function App() {
     if (!code) return;
     setError("");
     setBusy(true);
+    const epoch = navEpochRef.current;
     try {
       const info = await openRoomWithRecovery(path, code);
+      if (navEpochRef.current !== epoch) return; // stale: the gate moved on
       enterRoom(info);
     } catch {
       setError("That recovery code didn't work. Check it and try again.");
@@ -335,8 +420,10 @@ export default function App() {
   async function handleTouchId(path: string) {
     setError("");
     setBusy(true);
+    const epoch = navEpochRef.current;
     try {
       const info = await api.touchIdOpen(path);
+      if (navEpochRef.current !== epoch) return; // stale: the gate moved on
       enterRoom(info);
     } catch (e) {
       setError(String(e));
@@ -346,12 +433,15 @@ export default function App() {
   }
 
   async function handleLock() {
+    const epoch = navEpochRef.current;
     // Reduced motion: close and return to the gate instantly, no ritual.
     if (prefersReducedMotion()) {
       await api.closeRoom();
       // Drop the room name from the title bar once locked (CHG-9).
       getCurrentWindow().setTitle("Private Room").catch(() => {});
-      goTo({ kind: "start" });
+      // Another navigation (e.g. a .roomai opened mid-close showed its gate)
+      // wins over the default return to the start screen.
+      if (navEpochRef.current === epoch) goTo({ kind: "start" });
       return;
     }
     // Play the "sealing shut" ritual over the workspace. The room is closed
@@ -369,14 +459,19 @@ export default function App() {
     getCurrentWindow().setTitle("Private Room").catch(() => {});
     window.setTimeout(() => {
       setLocking(false);
-      goTo({ kind: "start" });
+      // As above: a navigation during the ritual (another room's gate) wins.
+      if (navEpochRef.current === epoch) goTo({ kind: "start" });
     }, SEAL_LOCK_MS);
   }
 
   if (screen.kind === "workspace") {
     return (
       <>
-        <Workspace info={screen.info} onLock={handleLock} />
+        <Workspace
+          key={`${screen.info.path}:${roomEpoch}`}
+          info={screen.info}
+          onLock={handleLock}
+        />
         {locking && <SealLockingOverlay />}
       </>
     );

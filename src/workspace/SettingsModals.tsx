@@ -31,10 +31,22 @@ export default function SettingsModals({
           model={s.model}
           onModelChange={a.changeModel}
           onModelsChanged={a.refreshAi}
+          // Idea 9: CheckpointsSection can't reach WSState, so compute the
+          // rollback-disable gate here (same signals as the Summarize button).
+          busy={
+            s.jobs.some(
+              (j) => j.status === "running" || j.status === "queued",
+            ) ||
+            s.recLive !== null ||
+            s.asking
+          }
           onClose={() => {
             s.setShowSettings(false);
             a.refreshWebAccess();
             a.refreshAutolock();
+            // Wave 1b (idea 5): the Behavior checkbox only writes the DB —
+            // re-read it so auto-save flips without reopening the room.
+            a.refreshMemAutoSave();
           }}
         />
       )}
@@ -120,15 +132,18 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
         s.pushToast("error", report.errors.join("\n"));
         return false;
       }
-      const name = report.imported[0]?.name;
+      const first = report.imported[0];
       s.pushToast(
         "success",
-        name
-          ? `Saved "${name}" — it will transcribe itself shortly.`
+        first
+          ? `Saved "${first.name}" — it will transcribe itself shortly.`
           : "Video saved — it will transcribe itself shortly.",
       );
       s.setShowAddLink(false);
       s.setLinkUrl("");
+      // Land the user ON the result — a file appearing silently in the
+      // sidebar makes a finished import look like nothing happened.
+      if (first) a.viewFile(first.id);
       return true;
     } catch (e) {
       s.pushToast("error", String(e));
@@ -207,7 +222,10 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
       <div className="settings add-link-modal">
         <div className="settings-head">
           <span className="badge-label">
-            <LinkIcon size={15} /> Add a web link
+            {/* The sheet renames itself the moment a YouTube URL is
+                recognized — the mental model must never change mid-form. */}
+            <LinkIcon size={15} />{" "}
+            {isYoutube ? "Import YouTube video" : "Add a web link"}
           </span>
           <button
             className="subtle btn-ic"
@@ -220,7 +238,11 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
         </div>
         <div className="settings-body">
           <p className="settings-hint">
-            This fetches one page from the internet.
+            {/* The boundary sentence lives here, in the action surface —
+                what leaves the Mac and what doesn't, before the click. */}
+            {isYoutube
+              ? "This sends the public video link to YouTube to fetch it — your room files stay on this Mac."
+              : "This fetches one page from the internet — your room files stay on this Mac."}
           </p>
           <input
             className="add-link-input"
@@ -235,16 +257,32 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
             }}
           />
           {isYoutube && (
-            <label className="settings-hint" style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              <input
-                type="checkbox"
-                checked={saveVideo}
-                onChange={(e) => setSaveVideo(e.target.checked)}
+            <div
+              className="yt-mode"
+              role="radiogroup"
+              aria-label="What to import"
+            >
+              <button
+                className={`yt-mode-opt${!saveVideo ? " active" : ""}`}
+                role="radio"
+                aria-checked={!saveVideo}
                 disabled={s.importingLink}
-              />
-              Also save the video (downloads via YouTube — larger, stays
-              offline afterward)
-            </label>
+                onClick={() => setSaveVideo(false)}
+              >
+                <span className="yt-mode-name">Transcript only</span>
+                <span className="yt-mode-sub">captions, small and fast</span>
+              </button>
+              <button
+                className={`yt-mode-opt${saveVideo ? " active" : ""}`}
+                role="radio"
+                aria-checked={saveVideo}
+                disabled={s.importingLink}
+                onClick={() => setSaveVideo(true)}
+              >
+                <span className="yt-mode-name">Video + transcript</span>
+                <span className="yt-mode-sub">larger, plays offline forever</span>
+              </button>
+            </div>
           )}
           {downloading && (
             <span className="banner-pull">
@@ -281,7 +319,11 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
                 ? "Downloading…"
                 : s.importingLink
                   ? "Fetching…"
-                  : "Save page"}
+                  : isYoutube
+                    ? saveVideo
+                      ? "Import video"
+                      : "Import transcript"
+                    : "Save page"}
             </button>
           </div>
         </div>

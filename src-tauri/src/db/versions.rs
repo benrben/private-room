@@ -2,61 +2,67 @@ use super::*;
 
 // ---------------------------------------------------------------- file versions (ADD-2)
 
-/// Copy a file's CURRENT bytes into history before it is overwritten, labelled
-/// with `cause`, then keep only the newest 10 versions for that file. A file
-/// with no stored bytes yet (nothing to preserve) is a no-op.
+/// Copy a file's CURRENT state into history before it is overwritten,
+/// labelled with `cause`, then keep only the newest 10 versions for that
+/// file. The snapshot is compound — bytes, extracted text, and any recording
+/// meta — because for a Recording the bytes are the unchanged WAV and what
+/// is being replaced IS the transcript: restoring bytes alone could never
+/// bring the old words, speakers, or cuts back. A file with no stored bytes
+/// yet (nothing to preserve) is a no-op.
 pub fn snapshot_file_version(conn: &Connection, file_id: &str, cause: &str) -> Result<(), String> {
-    let current: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT original_bytes FROM files WHERE id = ?1",
-            [file_id],
-            |r| r.get::<_, Option<Vec<u8>>>(0),
-        )
-        .map_err(|e| e.to_string())?;
-    let Some(bytes) = current else { return Ok(()) };
-    conn.execute(
-        "INSERT INTO file_versions(id, file_id, bytes, cause) VALUES (?1, ?2, ?3, ?4)",
-        params![Uuid::new_v4().to_string(), file_id, bytes, cause],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
+    let current: Option<(Option<Vec<u8>>, Option<String>)> = query_opt(
+        conn,
+        "SELECT original_bytes, extracted_text FROM files WHERE id = ?1",
+        [file_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let Some((Some(bytes), text)) = current else { return Ok(()) };
+    let rec_meta: Option<String> = conn
+        .query_row("SELECT meta FROM recordings WHERE file_id = ?1", [file_id], |r| r.get(0))
+        .ok();
+    execute_one(
+        conn,
+        "INSERT INTO file_versions(id, file_id, bytes, text, rec_meta, cause)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![Uuid::new_v4().to_string(), file_id, bytes, text, rec_meta, cause],
+    )?;
+    execute_one(
+        conn,
         "DELETE FROM file_versions WHERE file_id = ?1 AND id NOT IN (
            SELECT id FROM file_versions WHERE file_id = ?1
            ORDER BY saved_at DESC, rowid DESC LIMIT 10)",
         [file_id],
     )
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// A file's saved versions, newest first.
 pub fn list_file_versions(conn: &Connection, file_id: &str) -> Result<Vec<FileVersion>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, saved_at, cause FROM file_versions WHERE file_id = ?1
-             ORDER BY saved_at DESC, rowid DESC",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([file_id], |r| {
+    query_rows(
+        conn,
+        "SELECT id, saved_at, cause FROM file_versions WHERE file_id = ?1
+         ORDER BY saved_at DESC, rowid DESC",
+        [file_id],
+        |r| {
             Ok(FileVersion {
                 id: r.get(0)?,
                 saved_at: r.get(1)?,
                 cause: r.get(2)?,
             })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+        },
+    )
 }
 
-/// (owning file id, stored bytes) for one saved version.
-pub fn get_version(conn: &Connection, version_id: &str) -> Result<(String, Vec<u8>), String> {
+/// One saved version's full snapshot: (owning file id, bytes, extracted
+/// text, recording meta). Text/meta are None on rows saved before the
+/// compound snapshot existed.
+pub fn get_version(
+    conn: &Connection,
+    version_id: &str,
+) -> Result<(String, Vec<u8>, Option<String>, Option<String>), String> {
     conn.query_row(
-        "SELECT file_id, bytes FROM file_versions WHERE id = ?1",
+        "SELECT file_id, bytes, text, rec_meta FROM file_versions WHERE id = ?1",
         [version_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )
     .map_err(|_| "That version is no longer available.".to_string())
 }
@@ -198,6 +204,13 @@ pub fn has_recovery(room_path: &str) -> bool {
     std::path::Path::new(&recovery_sidecar_path(room_path)).exists()
 }
 
+/// Delete a room's recovery sidecar. Used when re-wrapping after a password
+/// change fails: a sidecar wrapping the OLD password must not stay behind, or
+/// the unlock gate would keep offering a recovery code that can never work.
+pub fn remove_recovery(room_path: &str) -> Result<(), String> {
+    std::fs::remove_file(recovery_sidecar_path(room_path)).map_err(|e| e.to_string())
+}
+
 /// Recover the ROOM PASSWORD from its recovery sidecar + code, WITHOUT opening
 /// the room. The app's recovery-unlock command needs the plaintext password to
 /// hold in memory (for rekey / change-password / duplicate), so this is split
@@ -314,5 +327,21 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(recovery_sidecar_path(&path));
+    }
+
+    #[test]
+    fn rewrite_and_remove_recovery() {
+        // F4: after a password change the sidecar is re-wrapped — the old code
+        // stops working, the new one recovers the NEW password. And
+        // remove_recovery deletes the sidecar (errors, not panics, when gone).
+        let path = temp_room_path();
+        let old_code = write_recovery(&path, "old-password").unwrap();
+        let new_code = write_recovery(&path, "new-password").unwrap();
+        assert_eq!(recover_password(&path, &new_code).unwrap(), "new-password");
+        assert!(recover_password(&path, &old_code).is_err());
+
+        remove_recovery(&path).unwrap();
+        assert!(!has_recovery(&path));
+        assert!(remove_recovery(&path).is_err());
     }
 }

@@ -83,7 +83,7 @@ pub(crate) fn boxes_schema() -> serde_json::Value {
     })
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageBox {
     pub label: String,
@@ -121,23 +121,10 @@ pub(crate) fn parse_boxes(raw: &str, img_w: f64, img_h: f64) -> Vec<ImageBox> {
     vec![]
 }
 
-/// Remove `<think>…</think>` spans (some non-grounding models leak them).
-pub(crate) fn strip_think_spans(raw: &str) -> String {
-    let mut out = raw.to_string();
-    while let Some(start) = out.find("<think>") {
-        match out[start..].find("</think>") {
-            Some(rel) => {
-                let end = start + rel + "</think>".len();
-                out.replace_range(start..end, "");
-            }
-            None => {
-                out.truncate(start);
-                break;
-            }
-        }
-    }
-    out
-}
+/// Removing `<think>…</think>` spans (some non-grounding models leak them) is
+/// the same job the LLM client does when salvaging structured output, so it
+/// lives there. Re-exported so the command modules keep reaching it unqualified.
+pub(crate) use crate::ollama::strip_think_spans;
 
 pub(crate) fn boxes_from_items(items: Vec<serde_json::Value>, img_w: f64, img_h: f64) -> Vec<ImageBox> {
     let mut boxes = Vec::new();
@@ -210,6 +197,39 @@ pub(crate) fn boxes_from_items(items: Vec<serde_json::Value>, img_w: f64, img_h:
     boxes
 }
 
+/// Shared inline image-grounding used by the agent's `mark_image` tool and its
+/// post-answer auto-ground pass: run the vision model on a PREPARED (square-
+/// stretched) image and parse the boxes. (The `locate_in_image` command grounds
+/// via the sidecar's `/vision_locate` instead; unifying all three on the sidecar
+/// is a follow-up that needs on-device vision QA.)
+pub(crate) async fn ground_prepared_image(
+    vmodel: &str,
+    chat_model: &str,
+    prepared: &[u8],
+    query: &str,
+    w: f64,
+    h: f64,
+) -> Result<Vec<ImageBox>, String> {
+    let messages = vec![ollama::ChatMessage {
+        role: "user".into(),
+        content: grounding_prompt(query, w, h),
+        images: Some(vec![base64::engine::general_purpose::STANDARD.encode(prepared)]),
+        ..Default::default()
+    }];
+    // HLT-5: short keep_alive for this vision pass on low-RAM Macs.
+    let keep = vision_keep_alive(total_ram_bytes(), vmodel, chat_model);
+    let raw = ollama::chat_structured(
+        vmodel,
+        messages,
+        Some(0.0),
+        keep,
+        &boxes_schema(),
+        Default::default(),
+    )
+    .await?;
+    Ok(parse_boxes(&raw, w, h))
+}
+
 #[tauri::command]
 pub async fn locate_in_image(
     state: State<'_, AppState>,
@@ -218,14 +238,15 @@ pub async fn locate_in_image(
     #[allow(unused_variables)] img_width: f64,
     #[allow(unused_variables)] img_height: f64,
 ) -> Result<Vec<ImageBox>, String> {
-    let (explicit, prepared, w, h) = {
-        let guard = state.room.lock().unwrap();
-        let room = guard.as_ref().ok_or("No room is open.")?;
+    // Rust keeps: the DB read (original file bytes) and the vision-model pick. The
+    // prepare_image (transcode + 1000×1000 stretch), grounding prompt, boxes schema,
+    // structured call and coordinate parse all now live in the sidecar's
+    // /vision_locate — so we send the ORIGINAL bytes and it does the canvas work.
+    let (explicit, bytes) = state.with_room(|room| {
         let bytes = db::get_file_bytes(&room.conn, &file_id)?;
         let bytes = bytes.ok_or("File has no stored content.")?;
-        let (prepared, w, h) = prepare_image(&bytes);
-        (model_setting(&room.conn), prepared, w, h)
-    };
+        Ok((model_setting(&room.conn), bytes))
+    })?;
 
     let models = ollama::list_models().await.unwrap_or_default();
     let chat_model = explicit.unwrap_or_else(|| best_default(&models));
@@ -237,18 +258,23 @@ pub async fn locate_in_image(
         vmodel = best_default(&models);
     }
 
-    let messages = vec![ollama::ChatMessage {
-        role: "user".into(),
-        content: grounding_prompt(&query, w, h),
-        images: Some(vec![
-            base64::engine::general_purpose::STANDARD.encode(&prepared),
-        ]),
-        ..Default::default()
-    }];
-    // HLT-5: release the vision model quickly on low-RAM machines.
+    // HLT-5: release the vision model quickly on low-RAM machines. num_ctx is left
+    // unset so the sidecar sizes it to its chat-notools window — identical to the
+    // old `StructuredOpts::default()` (Chat tier) this call used.
     let keep = vision_keep_alive(total_ram_bytes(), &vmodel, &chat_model);
-    let raw = ollama::chat_structured(&vmodel, messages, Some(0.0), keep, &boxes_schema()).await?;
-    Ok(parse_boxes(&raw, w, h))
+    let body = serde_json::json!({
+        "model": vmodel,
+        "image_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        "query": query,
+        "base_url": ollama::resolved_base_url(),
+        "temperature": 0.0,
+        "keep_alive": keep,
+    });
+    let v = crate::sidecar::sidecar_json("/vision_locate", &body)
+        .await
+        .map_err(|e| e.sentinel(Some(&vmodel)))?;
+    let boxes: Vec<ImageBox> = serde_json::from_value(v["boxes"].clone()).unwrap_or_default();
+    Ok(boxes)
 }
 
 /// CHG-18: does the question want boxes drawn on the ATTACHED IMAGE? The trigger

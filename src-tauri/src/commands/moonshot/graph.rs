@@ -273,7 +273,7 @@ mod tests {
         assert!(!ends.contains(&c), "orthogonal file is not linked");
 
         // A saved memory becomes a node (no edges in v1) without adding file edges.
-        db::add_memory(&conn, "The office is closed on Fridays.").unwrap();
+        db::add_memory(&conn, "The office is closed on Fridays.", None).unwrap();
         let g2 = build_room_graph(&conn).unwrap();
         assert!(g2.nodes.iter().any(|n| n.kind == "memory"));
         assert_eq!(g2.edges.len(), 1);

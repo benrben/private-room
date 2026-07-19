@@ -1,13 +1,12 @@
 import ToolBadgeIcon from "./ToolBadgeIcon";
 import type { AiStatus, IconComponent, ModelCaps, SttStatus } from "./types";
+import EngineModelPicker from "../workspace/EngineModelPicker";
 
 interface Props {
   ai: AiStatus | null;
   model: string;
   onModelChange: (model: string) => void;
   caps: ModelCaps[];
-  modelLabel: (id: string) => string | null;
-  ENGINE_LABELS: Record<string, string>;
   confirmModel: string | null;
   confirmRemoveModel: (name: string) => void;
   cancelRemoveModel: () => void;
@@ -38,8 +37,6 @@ export default function ModelSection({
   model,
   onModelChange,
   caps,
-  modelLabel,
-  ENGINE_LABELS,
   confirmModel,
   confirmRemoveModel,
   cancelRemoveModel,
@@ -68,26 +65,28 @@ export default function ModelSection({
     <section id="set-model">
       <h3>Model</h3>
             <p className="settings-hint">
-              The AI that lives in this room. Everything runs locally through
-              Ollama.
+              The AI that lives in this room. Models run locally through
+              Ollama — except <b>:cloud</b> models, which run on Ollama's
+              servers: your prompts and file context leave this Mac.
             </p>
-            {ai?.running ? (
-              <div className="model-list">
-                {ai.models.map((m) => (
-                  <div key={m} className={`model-row ${m === model ? "active" : ""}`}>
-                    <label>
-                      <input
-                        type="radio"
-                        name="model"
-                        checked={m === model}
-                        onChange={() => onModelChange(m)}
-                      />
-                      {modelLabel(m) ? (
-                        <span className="model-label">
-                          {modelLabel(m)} <span className="model-id">{m}</span>
+            {ai && (
+              <>
+                <EngineModelPicker
+                  ai={ai}
+                  model={model}
+                  onSelect={onModelChange}
+                  localEmptyHint={
+                    ai.running ? undefined : "Ollama is not running — start it to manage local models."
+                  }
+                  renderLocalExtra={(m) => (
+                    <>
+                      {m.endsWith(":cloud") && (
+                        <span
+                          className="model-badge model-badge-cloud"
+                          title="Runs on Ollama's servers — prompts and file context leave this Mac"
+                        >
+                          cloud · leaves this Mac
                         </span>
-                      ) : (
-                        m
                       )}
                       {(() => {
                         const cap = caps.find((c) => c.name === m);
@@ -107,40 +106,37 @@ export default function ModelSection({
                           </span>
                         );
                       })()}
-                    </label>
-                    {confirmModel === m ? (
-                      <span className="model-confirm">
-                        <span className="settings-hint">Delete?</span>
+                      {confirmModel === m ? (
+                        <span className="model-confirm">
+                          <span className="settings-hint">Delete?</span>
+                          <button
+                            className="subtle btn-ic confirm-yes"
+                            title="Confirm delete"
+                            onClick={() => confirmRemoveModel(m)}
+                          >
+                            ✓
+                          </button>
+                          <button
+                            className="subtle btn-ic confirm-no"
+                            title="Keep model"
+                            onClick={cancelRemoveModel}
+                          >
+                            ✕
+                          </button>
+                        </span>
+                      ) : (
                         <button
-                          className="subtle btn-ic confirm-yes"
-                          title="Confirm delete"
-                          onClick={() => confirmRemoveModel(m)}
+                          className="subtle btn-ic"
+                          title={m === model ? "Can't delete the active model" : "Delete model from disk"}
+                          disabled={m === model}
+                          onClick={() => askRemoveModel(m)}
                         >
-                          ✓
+                          <TrashIcon size={13} />
                         </button>
-                        <button
-                          className="subtle btn-ic confirm-no"
-                          title="Keep model"
-                          onClick={cancelRemoveModel}
-                        >
-                          ✕
-                        </button>
-                      </span>
-                    ) : (
-                      <button
-                        className="subtle btn-ic"
-                        title={m === model ? "Can't delete the active model" : "Delete model from disk"}
-                        disabled={m === model}
-                        onClick={() => askRemoveModel(m)}
-                      >
-                        <TrashIcon size={13} />
-                      </button>
-                    )}
-                  </div>
-                ))}
-                {ai.models.length === 0 && (
-                  <div className="settings-hint">No models installed yet.</div>
-                )}
+                      )}
+                    </>
+                  )}
+                />
                 {(() => {
                   const sel = caps.find((c) => c.name === model);
                   if (!sel || sel.tools) return null;
@@ -156,35 +152,13 @@ export default function ModelSection({
                     </p>
                   );
                 })()}
-              </div>
-            ) : (
-              <div className="settings-hint">
-                Ollama is not running — start it to manage models.
-              </div>
-            )}
-            {ai && ai.external.length > 0 && (
-              <>
-                <label className="settings-label">Cloud engines on this Mac</label>
-                <div className="model-list">
-                  {ai.external.map((e) => (
-                    <div key={e} className={`model-row ${e === model ? "active" : ""}`}>
-                      <label>
-                        <input
-                          type="radio"
-                          name="model"
-                          checked={e === model}
-                          onChange={() => onModelChange(e)}
-                        />
-                        {ENGINE_LABELS[e] ?? e}
-                      </label>
-                    </div>
-                  ))}
-                </div>
-                <p className="settings-hint">
-                  <AlertIcon size={13} className="warn-ic" /> Cloud engines send your questions and room context to your
-                  Claude/OpenAI account — content leaves this Mac. Images stay
-                  local (vision and image marking always use the local model).
-                </p>
+                {ai.external.length > 0 && (
+                  <p className="settings-hint">
+                    <AlertIcon size={13} className="warn-ic" /> Cloud engines send your questions and room context to your
+                    Claude/OpenAI account — content leaves this Mac. Images stay
+                    local (vision and image marking always use the local model).
+                  </p>
+                )}
               </>
             )}
             <div className="pull-row">

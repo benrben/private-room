@@ -24,6 +24,26 @@ export interface FileVersion {
   cause: string;
 }
 
+/** Idea 11: a saved version's extracted text next to the file's current text,
+ * for the read-only side-by-side compare view. Either side is null when that
+ * file kind has no comparable text (image/binary). */
+export interface VersionContent {
+  fileName: string;
+  versionText: string | null;
+  currentText: string | null;
+}
+
+/** Idea 9: one whole-room checkpoint — a full encrypted copy of the room file
+ * beside it, with plaintext metadata only (name/date/size). `auto` marks the
+ * pre-rollback safety copies (capped, pruned) apart from user checkpoints. */
+export interface CheckpointMeta {
+  id: string;
+  name: string;
+  createdAt: string;
+  sizeBytes: number;
+  auto: boolean;
+}
+
 /** A recently opened room, listed on the start screen (ADD-5). */
 export interface RecentRoom {
   name: string;
@@ -57,7 +77,6 @@ export interface ChatCommand {
   name: string;
   summary: string;
   usage: string;
-  needsRefs: boolean;
 }
 
 /** Grouped results of a room-wide search (ADD-6). */
@@ -81,6 +100,8 @@ export interface AiActionDef {
   description: string;
   scope: "file" | "room";
   needsQuestion: boolean;
+  /** ADD-27: true only for "translate" — the modal shows a language picker. */
+  needsLanguage: boolean;
   defaultPrompt: string;
 }
 
@@ -110,6 +131,9 @@ export interface MessageEffects {
     boxes: { label: string; x1: number; y1: number; x2: number; y2: number }[];
   };
   annotation?: AnnotationPayload;
+  /** Wave 2 (Idea 4): content-free per-edit outcome records for the turn
+   * (`{tool, outcome, n}`). Telemetry only — the UI renders nothing from it. */
+  edits?: { tool: string; outcome: string; n?: number; files?: number }[];
 }
 
 /** ADD-25: one backend→webview request on the agent↔UI bridge. The driver
@@ -123,6 +147,9 @@ export interface AgentUiRequest {
 export interface Memory {
   id: string;
   content: string;
+  /** Wave 1b (idea 5): preference | fact | project | instruction, or null =
+   * uncategorized (every pre-category row). */
+  category: string | null;
   createdAt: string;
 }
 
@@ -139,6 +166,7 @@ export interface FileContent {
     | "text"
     | "audio"
     | "video"
+    | "recording"
     | "binary";
   name: string;
   mime: string;
@@ -149,6 +177,82 @@ export interface FileContent {
    * protocol (seekable, any size). The viewer plays
    * `roommedia://localhost/<token>` instead of a base64 data URL. */
   mediaToken: string | null;
+}
+
+// ---- ADD-27: the live Recording file ----
+
+/** One transcribed word on the recording's timeline (centiseconds). `del`
+ * marks words removed in the transcript editor — playback skips their span. */
+export interface RecWord {
+  w: string;
+  t0: number;
+  t1: number;
+  del?: boolean;
+}
+
+export interface RecSegment {
+  id: string;
+  /** Which capture lane heard it: your mic, or the Mac's (meeting) audio. */
+  source: "mic" | "sys";
+  /** "You" for the mic; "Speaker N" for clustered meeting voices. */
+  speaker: string;
+  t0: number;
+  t1: number;
+  text: string;
+  words: RecWord[];
+  lang?: string | null;
+}
+
+/** A span deleted from the transcript; playback skips it, export removes it. */
+export interface RecCut {
+  t0: number;
+  t1: number;
+}
+
+export interface RecMeta {
+  version: number;
+  durationCs: number;
+  segments: RecSegment[];
+  cuts: RecCut[];
+  /** 0 = speakers are discovered from their voices (always, from the UI).
+   * A non-zero value pins the participant count for an older room. */
+  maxSpeakers: number;
+}
+
+export interface RecStart {
+  fileId: string;
+  name: string;
+  meta: RecMeta;
+}
+
+export interface RecLive {
+  fileId: string;
+  status: string;
+  durationCs: number;
+  /** Durable per-source health [status, message] — lets a viewer that
+   *  mounted after a fast failure still show the banner. */
+  mic: [string, string];
+  sys: [string, string];
+}
+
+export interface RecFile {
+  name: string;
+  meta: RecMeta;
+}
+
+// ---- ADD-28: feedback → GitHub issue ----
+
+export interface FeedbackDraft {
+  title: string;
+  body: string;
+}
+
+export interface AppDiag {
+  version: string;
+  os: string;
+  arch: string;
+  /** "owner/repo" the issue opens against. */
+  repo: string;
 }
 
 export interface AiStatus {
@@ -163,9 +267,53 @@ export interface AiStatus {
 }
 
 export const ENGINE_LABELS: Record<string, string> = {
-  "claude-cli": "Claude (cloud)",
-  "codex-cli": "OpenAI (cloud)",
+  "claude-cli": "Claude Code",
+  "codex-cli": "Codex",
 };
+
+/** A specific model offered by a cloud engine (the Cloud picker's second
+ * level) — `slug` is what gets sent to the CLI via `--model`, `label` is the
+ * friendly display name, `efforts` are its supported reasoning levels (empty
+ * if the engine has no effort knob), `defaultEffort` the engine-reported
+ * default if any. */
+export interface ExternalModelInfo {
+  slug: string;
+  label: string;
+  efforts: string[];
+  defaultEffort: string | null;
+}
+
+/** A cloud engine selection, most-specific-last:
+ *   "claude-cli"                    bare engine (CLI default model+effort)
+ *   "codex-cli::gpt-5.6-sol"        a specific model
+ *   "codex-cli::gpt-5.6-sol::high"  a specific model AND reasoning effort
+ * Mirrors the Rust-side `split_external_model`. Returns
+ * [engine, model|null, effort|null]. */
+export function splitExternalModel(
+  model: string,
+): [string, string | null, string | null] {
+  const parts = model.split("::");
+  const engine = parts[0];
+  if (engine !== "claude-cli" && engine !== "codex-cli") return [model, null, null];
+  return [engine, parts[1] ?? null, parts[2] ?? null];
+}
+
+/** Friendly label for any model id — local, bare cloud engine, or a composite
+ * cloud-engine + model (+ effort) selection. `engineModels` is an optional
+ * cache of the fetched model list per engine, used to turn a slug into its
+ * display label; the effort (if any) is appended as "· <effort>". */
+export function engineModelLabel(
+  model: string,
+  engineModels?: Record<string, ExternalModelInfo[]>,
+): string {
+  const [engine, submodel, effort] = splitExternalModel(model);
+  const engineLabel = ENGINE_LABELS[engine];
+  if (!engineLabel) return modelLabel(model) ?? model;
+  if (!submodel) return engineLabel;
+  const known = engineModels?.[engine]?.find((m) => m.slug === submodel)?.label;
+  const base = `${engineLabel} — ${known ?? submodel}`;
+  return effort ? `${base} · ${effort}` : base;
+}
 
 /** ADD-22: a local model's declared abilities (from Ollama /api/show), so the
  * picker can badge each model and warn when the chosen one can't drive the app. */
@@ -181,6 +329,13 @@ export interface SttStatus {
   installed: boolean;
   downloading: boolean;
   sizeMb: number;
+}
+
+/** Idea 3: one installed system speech voice (AVSpeechSynthesisVoice). */
+export interface VoiceInfo {
+  id: string;
+  name: string;
+  lang: string;
 }
 
 /** Friendly display names for models we ship guidance for. The stored setting
@@ -241,6 +396,26 @@ export interface McpApproveRequest {
   server: string;
   tool: string;
   args: string;
+}
+
+/** Wave 2 (Idea 6): one file's before/after in a diff-preview approval card. */
+export interface EditPreviewFile {
+  name: string;
+  before: string;
+  after: string;
+  /** True when the preview text was clipped to the size ceiling. */
+  clipped: boolean;
+}
+
+/** Wave 2 (Idea 6): a pending diff-preview approval prompt from the backend.
+ * `allowTurn` is true only when the cadence is "Once per answer" AND the request
+ * came from the run-scoped local engine — so the "rest of this answer" button is
+ * never offered to a sink-less cloud/external client. */
+export interface EditApproveRequest {
+  id: string;
+  tool: string;
+  allowTurn: boolean;
+  files: EditPreviewFile[];
 }
 
 /** Payload of the agent-open-file event: a bare file id, or an id with a
@@ -308,11 +483,17 @@ export interface FileMetaSuggestion {
   tags: string[];
 }
 
-/** D9: state of the persistent Room MCP server (the Leash). */
+/** D9: state of the persistent Room MCP server (the Leash). Wave 1a: `scope`
+ * is the running trust tier; `stable` means the fixed port was bound (the
+ * pasted config survives restarts); `allowCloud` echoes the effective cloud
+ * sub-option so Settings shows the truth after reopening. */
 export interface RoomServerStatus {
   running: boolean;
   url: string;
   config: string;
+  scope: "files" | "full";
+  stable: boolean;
+  allowCloud: boolean;
 }
 
 /** D11: a selectable room persona (tutor, critic, opposing-counsel, …). */
@@ -330,4 +511,180 @@ export interface StudioPrompts {
   flashcards: string;
   mindmap: string;
   podcast: string;
+}
+
+/** ADD-30: a durable background job (deep summary) as the jobs panel sees it.
+ * `status` is queued | running | paused | error | done. */
+export interface Job {
+  id: string;
+  kind: string;
+  title: string;
+  plan: unknown;
+  state: unknown;
+  cursor: number;
+  total: number;
+  status: string;
+  error: string | null;
+  /** Wave 4a: set on a workflow's inline child job (hidden from the sidebar). */
+  parentJobId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** ADD-30: one `job-progress` event — live counts plus terminal flags. */
+export interface JobProgress {
+  jobId: string;
+  label: string;
+  done: number;
+  total: number;
+  finished?: boolean;
+  paused?: boolean;
+  failed?: boolean;
+  fileId?: string | null;
+}
+
+// ------------------------------------------------------------ Wave 4a: workflows
+
+/** Where a workflow surfaces. `general` = library/top bar; `file` = a file's
+ * Actions menu, run on that file. */
+export type WorkflowBinding =
+  | { scope: "general" }
+  | { scope: "file"; kinds?: string[]; exts?: string[]; file_id?: string | null };
+
+/** A saved LLM graph workflow. `definition`/`binding` are opaque JSON here. */
+export interface Workflow {
+  id: string;
+  name: string;
+  description: string;
+  emoji: string;
+  definition: WorkflowDef;
+  status: "draft" | "active";
+  createdBy: "user" | "agent" | "script";
+  binding: WorkflowBinding;
+  pinned: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The node graph. Nodes carry a `kind` discriminant plus its params. */
+export interface WorkflowDef {
+  version: number;
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+}
+
+export interface WorkflowNode {
+  id: string;
+  label?: string;
+  kind:
+    | "generate"
+    | "summarize_file"
+    | "file_pass"
+    | "agent_run"
+    | "save_file"
+    | "condition";
+  // Kind-specific params (flattened): prompt/model/select/instruction/mode/
+  // name_template/format/question/op/value. Kept loose so the param sheet edits
+  // them generically.
+  [key: string]: unknown;
+}
+
+export interface WorkflowEdge {
+  from: string;
+  to: string;
+  branch?: "then" | "else" | null;
+}
+
+export interface Schedule {
+  id: string;
+  workflowId: string;
+  kind: "interval" | "daily" | "weekly";
+  param: string;
+  enabled: boolean;
+  catchUp: boolean;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastJobId: string | null;
+}
+
+export interface ScheduleArg {
+  kind: string; // interval|daily|weekly, or "" to clear
+  param?: string;
+  enabled?: boolean;
+  catchUp?: boolean;
+}
+
+export interface WorkflowRun {
+  id: string;
+  workflowId: string;
+  jobId: string | null;
+  trigger: string;
+  status: string;
+  error: string | null;
+  inputFileId: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+export interface WorkflowTemplate {
+  name: string;
+  description: string;
+  emoji: string;
+  binding: WorkflowBinding;
+  schedule?: ScheduleArg;
+  definition: WorkflowDef;
+}
+
+/** One `workflow-node` event — a node's live status during a run. */
+export interface WorkflowNodeEvent {
+  jobId: string;
+  workflowId: string;
+  nodeId: string;
+  status: "running" | "done" | "skipped" | "error";
+  peek?: string | null;
+}
+
+// ------------------------------------------------------------ Wave 5: scripts
+
+/** A `.py`/`.js` room file as a first-class runnable/schedulable script. Its run
+ * history/schedule come from the same `workflow_runs`/`schedules` rows as
+ * everything else, via a hidden per-script auto-workflow. */
+export interface ScriptInfo {
+  fileId: string;
+  name: string;
+  lang: "py" | "js";
+  deps: string[];
+  inputs: string[];
+  outputs: string[];
+  /** Where it surfaces as a one-click shortcut. */
+  shortcut: "global" | "file" | "none";
+  /** True when this exact content is approved to run on this Mac. */
+  approved: boolean;
+  /** Ran/scheduled before, but the current content isn't approved (edited). */
+  changedSinceApproval: boolean;
+  workflowId: string | null;
+  schedule: Schedule | null;
+  lastRun: WorkflowRun | null;
+}
+
+/** The parsed PEP-723 + room-* manifest for one script. */
+export interface ScriptManifest {
+  interpreter: "py" | "js";
+  deps: string[];
+  inputs: string[];
+  outputs: string[];
+  timeoutSecs: number;
+  shortcut: "global" | "file" | "none";
+}
+
+/** A pending script-run consent prompt from the backend (SEC-1 doctrine). */
+export interface ScriptApproveRequest {
+  id: string;
+  name: string;
+  /** The exact command line that would run, e.g. "uv run --no-project x.py". */
+  interpreterLine: string;
+  deps: string[];
+  inputs: string[];
+  outputs: string[];
+  timeout: number;
 }
