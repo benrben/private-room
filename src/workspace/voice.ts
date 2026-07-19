@@ -27,6 +27,29 @@ export type VoiceArchetype = "off" | "demon" | "ghost" | "wraith" | "ancient" | 
  *  sentence, so speech degrades instead of going silent. */
 export type VoiceEngine = "neural" | "device";
 
+/** The curated neural-voice roster (Edge TTS short names, all verified
+ * against the live catalog). "Multilingual" voices speak dozens of languages
+ * — including Hebrew — with one natural timbre; Avri/Hila are Hebrew-native.
+ * The sidecar accepts any of these ids in TtsRequest.voice; an empty id
+ * means the product default (Andrew). */
+export interface NeuralVoice {
+  id: string;
+  label: string;
+  hint: string;
+}
+
+export const NEURAL_VOICES: NeuralVoice[] = [
+  { id: "en-US-AndrewMultilingualNeural", label: "Andrew", hint: "warm male · multilingual · default" },
+  { id: "en-US-BrianMultilingualNeural", label: "Brian", hint: "calm male · multilingual" },
+  { id: "en-US-AvaMultilingualNeural", label: "Ava", hint: "bright female · multilingual" },
+  { id: "en-US-EmmaMultilingualNeural", label: "Emma", hint: "friendly female · multilingual" },
+  { id: "fr-FR-RemyMultilingualNeural", label: "Rémy", hint: "French male · multilingual" },
+  { id: "fr-FR-VivienneMultilingualNeural", label: "Vivienne", hint: "French female · multilingual" },
+  { id: "de-DE-SeraphinaMultilingualNeural", label: "Seraphina", hint: "German female · multilingual" },
+  { id: "he-IL-AvriNeural", label: "Avri", hint: "Hebrew male" },
+  { id: "he-IL-HilaNeural", label: "Hila", hint: "Hebrew female" },
+];
+
 export interface VoiceParams {
   /** AVSpeech pitchMultiplier, 0.5–2.0. */
   pitch: number;
@@ -57,6 +80,8 @@ interface VoiceConfig {
   voiceId: string | null;
   autoSpeak: boolean;
   engine: VoiceEngine;
+  /** Curated neural voice id; null/"" = the product default (Andrew). */
+  neuralVoiceId: string | null;
 }
 
 // ---- module state ---------------------------------------------------------
@@ -68,6 +93,7 @@ let cfg: VoiceConfig = {
   voiceId: null,
   autoSpeak: false,
   engine: "neural",
+  neuralVoiceId: null,
 };
 
 /** Generation token: any async continuation captured under an older value is
@@ -243,6 +269,7 @@ export function speakText(
     params?: VoiceParams;
     voiceId?: string | null;
     engine?: VoiceEngine;
+    neuralVoiceId?: string | null;
     onState?: (playing: boolean) => void;
   },
 ): void {
@@ -254,13 +281,16 @@ export function speakText(
     opts?.archetype !== undefined ||
     opts?.params ||
     opts?.voiceId !== undefined ||
-    opts?.engine !== undefined
+    opts?.engine !== undefined ||
+    opts?.neuralVoiceId !== undefined
   ) {
     overrides = {
       archetype: opts?.archetype ?? cfg.archetype,
       params: opts?.params ?? cfg.params,
       voiceId: opts?.voiceId === undefined ? cfg.voiceId : opts.voiceId,
       engine: opts?.engine ?? cfg.engine,
+      neuralVoiceId:
+        opts?.neuralVoiceId === undefined ? cfg.neuralVoiceId : opts.neuralVoiceId,
     };
   } else {
     overrides = null;
@@ -279,6 +309,7 @@ let overrides: {
   params: VoiceParams;
   voiceId: string | null;
   engine: VoiceEngine;
+  neuralVoiceId: string | null;
 } | null = null;
 
 export function setTurnAudioDoneListener(cb: (() => void) | null): void {
@@ -299,6 +330,10 @@ function activeVoiceId(): string | null {
 
 function activeEngine(): VoiceEngine {
   return overrides?.engine ?? cfg.engine;
+}
+
+function activeNeuralVoiceId(): string | null {
+  return overrides?.neuralVoiceId ?? cfg.neuralVoiceId;
 }
 
 // ---- sentence chunker ------------------------------------------------------
@@ -401,10 +436,11 @@ async function pump(): Promise<void> {
       try {
         if (activeEngine() === "neural") {
           try {
-            // Default: Edge neural (Andrew, +22%, -2 Hz, ~-16 LUFS) via the
-            // sidecar. Volume shaping for whispery archetypes still applies
-            // in the DSP graph via `master.gain`, not synthesis-side.
-            b64 = await api.speakTextNeural(text);
+            // Edge neural (+22%, -2 Hz, ~-16 LUFS) via the sidecar, with the
+            // room's chosen roster voice (null = Andrew). Volume shaping for
+            // whispery archetypes still applies in the DSP graph via
+            // `master.gain`, not synthesis-side.
+            b64 = await api.speakTextNeural(text, activeNeuralVoiceId());
           } catch {
             // Offline / sidecar down: this sentence falls back to the
             // on-device voice rather than going silent.

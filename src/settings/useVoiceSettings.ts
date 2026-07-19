@@ -13,6 +13,7 @@ import {
  * live voice singleton so the change applies without reopening the room. */
 export function useVoiceSettings() {
   const [engine, setEngine] = useState<VoiceEngine>("neural");
+  const [neuralVoiceId, setNeuralVoiceId] = useState("");
   const [archetype, setArchetype] = useState<VoiceArchetype>("off");
   const [params, setParams] = useState<VoiceParams>({
     ...ARCHETYPE_DEFAULTS.off,
@@ -27,6 +28,9 @@ export function useVoiceSettings() {
     api.getSetting("voice_engine").then((v) => {
       // Neural is the default; "device" is the explicit opt-out.
       if (v === "device") setEngine("device");
+    });
+    api.getSetting("voice_neural_id").then((v) => {
+      if (v) setNeuralVoiceId(v);
     });
     api.getSetting("voice_archetype").then((v) => {
       if (v) setArchetype(v as VoiceArchetype);
@@ -58,10 +62,17 @@ export function useVoiceSettings() {
 
   async function save() {
     await api.setSetting("voice_engine", engine);
+    await api.setSetting("voice_neural_id", neuralVoiceId);
     await api.setSetting("voice_archetype", archetype);
     await api.setSetting("voice_params", JSON.stringify(params));
     await api.setSetting("voice_id", voiceId);
-    voice.configure({ engine, archetype, params, voiceId: voiceId || null });
+    voice.configure({
+      engine,
+      archetype,
+      params,
+      voiceId: voiceId || null,
+      neuralVoiceId: neuralVoiceId || null,
+    });
     setSaved(true);
     window.setTimeout(() => setSaved(false), 1600);
   }
@@ -81,6 +92,7 @@ export function useVoiceSettings() {
       archetype,
       params,
       voiceId: voiceId || null,
+      neuralVoiceId: neuralVoiceId || null,
       onState: (playing) => {
         if (!playing) setPreviewing(false);
       },
@@ -90,6 +102,8 @@ export function useVoiceSettings() {
   return {
     engine,
     setEngine,
+    neuralVoiceId,
+    setNeuralVoiceId,
     archetype,
     pickArchetype,
     params,

@@ -1,9 +1,16 @@
 import { VoiceInfo } from "../api";
-import { VoiceArchetype, VoiceEngine, VoiceParams } from "../workspace/voice";
+import {
+  NEURAL_VOICES,
+  VoiceArchetype,
+  VoiceEngine,
+  VoiceParams,
+} from "../workspace/voice";
 
 interface Props {
   engine: VoiceEngine;
   setEngine: (e: VoiceEngine) => void;
+  neuralVoiceId: string;
+  setNeuralVoiceId: (id: string) => void;
   archetype: VoiceArchetype;
   pickArchetype: (a: VoiceArchetype) => void;
   params: VoiceParams;
@@ -38,6 +45,8 @@ const ENGINES: [VoiceEngine, string][] = [
 export default function VoiceSection({
   engine,
   setEngine,
+  neuralVoiceId,
+  setNeuralVoiceId,
   archetype,
   pickArchetype,
   params,
@@ -96,12 +105,12 @@ export default function VoiceSection({
       <p className="settings-hint">
         {engine === "neural" ? (
           <>
-            <b>Neural</b> speaks with Andrew (en-US, multilingual) — a{" "}
-            <b>neural synthetic voice, not a human recording</b> — via
-            Microsoft's Edge TTS service at +22% rate, −2 Hz pitch, loudness
-            normalized to about −16 LUFS. Only the sentence being spoken
-            leaves this Mac, and only while speaking is on. Offline, answers
-            fall back to the on-device voice.
+            <b>Neural</b> voices are{" "}
+            <b>neural synthetic voices, not human recordings</b> — synthesized
+            by Microsoft's Edge TTS service at +22% rate, −2 Hz pitch,
+            loudness normalized to about −16 LUFS. Only the sentence being
+            spoken leaves this Mac, and only while speaking is on. Offline,
+            answers fall back to the on-device voice.
           </>
         ) : (
           <>
@@ -110,6 +119,27 @@ export default function VoiceSection({
           </>
         )}
       </p>
+      {engine === "neural" && (
+        <>
+          <label className="settings-label">Neural voice</label>
+          <select
+            className="chat-select"
+            value={neuralVoiceId}
+            onChange={(e) => setNeuralVoiceId(e.target.value)}
+          >
+            {NEURAL_VOICES.map((v) => (
+              <option key={v.id} value={v.id === NEURAL_VOICES[0].id ? "" : v.id}>
+                {v.label} — {v.hint}
+              </option>
+            ))}
+          </select>
+          <p className="settings-hint">
+            Multilingual voices read whatever language your answer is in —
+            Hebrew included — with the same natural timbre. Use ▶ Preview to
+            hear the one you picked before saving.
+          </p>
+        </>
+      )}
       <label className="settings-label">Archetype</label>
       <div className="temp-row" role="radiogroup" aria-label="Voice archetype">
         {ARCHETYPES.map(([id, label]) => (

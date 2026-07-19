@@ -28,11 +28,12 @@ pub fn list_speech_voices() -> Result<Vec<crate::speech::VoiceInfo>, String> {
 /// sidecar's `/tts` — Edge neural synthesis, loudness-normalized WAV back as
 /// base64 (the same shape `speak_text` returns, so the webview's decode +
 /// archetype DSP chain is engine-agnostic). Stateless like `speak_text`: no
-/// AppState, no room access — only the sentence travels. The sidecar owns
-/// the voice/prosody defaults; a failure (offline, service down) surfaces as
-/// an Err the webview maps to the on-device fallback for that sentence.
+/// AppState, no room access — only the sentence travels. `voice` selects
+/// from the webview's curated roster; None/empty keeps the sidecar's
+/// default (Andrew). A failure (offline, service down) surfaces as an Err
+/// the webview maps to the on-device fallback for that sentence.
 #[tauri::command]
-pub async fn speak_text_neural(text: String) -> Result<String, String> {
+pub async fn speak_text_neural(text: String, voice: Option<String>) -> Result<String, String> {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return Err("nothing to speak".into());
@@ -40,7 +41,10 @@ pub async fn speak_text_neural(text: String) -> Result<String, String> {
     if trimmed.chars().count() > crate::speech::MAX_SPEAK_CHARS {
         return Err("text too long to speak in one chunk".into());
     }
-    let body = serde_json::json!({ "text": trimmed });
+    let mut body = serde_json::json!({ "text": trimmed });
+    if let Some(v) = voice.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        body["voice"] = serde_json::Value::String(v);
+    }
     let resp = crate::sidecar::sidecar_json("/tts", &body)
         .await
         .map_err(|e| e.error)?;
@@ -67,8 +71,10 @@ mod tests {
     /// sidecar call, so no server is needed.
     #[tokio::test]
     async fn speak_text_neural_rejects_empty_and_oversize() {
-        assert!(speak_text_neural("  ".into()).await.is_err());
+        assert!(speak_text_neural("  ".into(), None).await.is_err());
         let long = "a".repeat(crate::speech::MAX_SPEAK_CHARS + 1);
-        assert!(speak_text_neural(long).await.is_err());
+        assert!(speak_text_neural(long, Some("en-US-AvaMultilingualNeural".into()))
+            .await
+            .is_err());
     }
 }

@@ -361,9 +361,11 @@ export const api = {
     volume: number,
   ) => invoke<string>("speak_text", { text, voiceId, rate, pitch, volume }),
   /** Neural spoken voice (default engine): one chunk via the sidecar's Edge
-   *  TTS seam — normalized WAV, base64. Fails when offline; callers fall back
-   *  to speakText (on-device) per sentence. */
-  speakTextNeural: (text: string) => invoke<string>("speak_text_neural", { text }),
+   *  TTS seam — normalized WAV, base64. `voice` picks from the curated
+   *  roster (null = Andrew, the product default). Fails when offline;
+   *  callers fall back to speakText (on-device) per sentence. */
+  speakTextNeural: (text: string, voice: string | null) =>
+    invoke<string>("speak_text_neural", { text, voice }),
   /** Installed system voices, for the Settings picker. */
   listSpeechVoices: () => invoke<VoiceInfo[]>("list_speech_voices"),
 
