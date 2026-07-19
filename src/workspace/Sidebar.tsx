@@ -1,48 +1,79 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
-import { api, RoomInfo } from "../api";
+import { useEffect } from "react";
 import {
   CloseIcon,
+  CollapseLeftIcon,
   DownloadIcon,
+  FocusIcon,
   FolderIcon,
-  GraphIcon,
-  WorkflowsIcon,
-  ScriptIcon,
   LinkIcon,
   MemoryIcon,
   MicIcon,
   PencilIcon,
   PlusIcon,
+  ScriptIcon,
   SearchIcon,
-  SparkIcon,
   TrashIcon,
+  WorkflowsIcon,
 } from "../icons";
 import { displayName } from "./composer";
 import DeleteControl from "./DeleteControl";
 import FileRow from "./FileRow";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import { WorkArea } from "./types";
+import { LayoutApi } from "../shell/useLayout";
 
-/** Wave 1b (idea 5): fixed display order for the memory groups; null = the
- * uncategorized bucket every legacy memory lives in. */
-const MEMORY_GROUPS: { key: string | null; label: string }[] = [
-  { key: "instruction", label: "Instructions" },
-  { key: "preference", label: "Preferences" },
-  { key: "project", label: "Projects" },
-  { key: "fact", label: "Facts" },
-  { key: null, label: "Other" },
-];
-const CATEGORY_OPTIONS = ["preference", "fact", "project", "instruction"];
+/** True for files that belong to the Recordings lens: engine-made recordings
+ * plus imported audio/video (they transcribe in the background too). */
+function isRecordingFile(f: import("../api").FileMeta): boolean {
+  return (
+    f.source === "recording" ||
+    f.mimeType.startsWith("audio/") ||
+    f.mimeType.startsWith("video/")
+  );
+}
 
-/** Pane 1: file explorer + folders + client filter + Summarize/Memory chips +
- * the Memory panel. Extracted verbatim from the pane-1 block. */
-export default function Sidebar({
+/** A short human word for a file's type, from its metadata. */
+function fileKindLabel(f: import("../api").FileMeta): string {
+  if (f.source === "recording") return "recording";
+  const m = f.mimeType;
+  if (m.startsWith("audio/")) return "audio";
+  if (m.startsWith("video/")) return "video";
+  if (m.startsWith("image/")) return "image";
+  if (m === "application/pdf") return "PDF";
+  const lower = f.name.toLowerCase();
+  if (lower.endsWith(".md")) return "note";
+  if (lower.endsWith(".csv") || lower.endsWith(".xlsx")) return "sheet";
+  if (lower.endsWith(".py") || lower.endsWith(".js")) return "script";
+  if (lower.endsWith(".docx")) return "document";
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "HTML";
+  return "file";
+}
+
+const AREA_HEADINGS: Record<WorkArea, string> = {
+  files: "Library",
+  home: "Library",
+  map: "Library",
+  recordings: "Recordings",
+  workflows: "Workflows",
+  scripts: "Scripts",
+  memory: "Memory",
+};
+
+/** The left pane. In the file-centric areas it unifies browsing (the real
+ * folder tree with every existing row action) with the AI evidence set
+ * (checkboxes = files attached to the next answer). In the Workflows /
+ * Scripts / Recordings / Memory areas it becomes that area's navigator. */
+export default function LibraryPane({
   s,
   a,
-  info,
+  layout,
+  area,
 }: {
   s: WSState;
   a: WSActions;
-  info: RoomInfo;
+  layout: LayoutApi;
+  area: WorkArea;
 }) {
   const filterQ = s.fileFilter.trim().toLowerCase();
   const matchesFilter = (f: import("../api").FileMeta) =>
@@ -51,19 +82,9 @@ export default function Sidebar({
     displayName(f.name).toLowerCase().includes(filterQ);
   const shownFiles = s.files.filter(matchesFilter);
   const looseFiles = shownFiles.filter((f) => f.folderId === null);
+  const attachedIds = new Set(s.attachments.map((f) => f.id));
+  const fileArea = area === "files" || area === "home" || area === "map";
 
-  // A once-a-second tick so the running job card's elapsed time advances. Only
-  // armed while something is actually running, so an idle sidebar never re-renders.
-  const jobActive =
-    s.summaryStarting ||
-    s.recLive?.status === "saving" ||
-    s.jobs.some((j) => j.status === "running" || j.status === "queued");
-  const [nowTick, setNowTick] = useState(() => Date.now());
-  useEffect(() => {
-    if (!jobActive) return;
-    const t = window.setInterval(() => setNowTick(Date.now()), 1000);
-    return () => window.clearInterval(t);
-  }, [jobActive]);
   // Same dismissal grammar as the header popovers: Escape closes the Add menu.
   useEffect(() => {
     if (!s.addMenuOpen) return;
@@ -75,73 +96,130 @@ export default function Sidebar({
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
   }, [s.addMenuOpen, s]);
-  const elapsedOf = useMemo(
-    () => (createdAt: string) => {
-      const start = Date.parse(createdAt);
-      if (Number.isNaN(start)) return "";
-      const s2 = Math.max(0, Math.round((nowTick - start) / 1000));
-      const m = Math.floor(s2 / 60);
-      return `${m}:${String(s2 % 60).padStart(2, "0")}`;
-    },
-    [nowTick],
-  );
+
+  const headerCount = fileArea
+    ? s.files.length
+    : area === "workflows"
+      ? s.workflows.length
+      : area === "scripts"
+        ? s.scripts.length
+        : area === "recordings"
+          ? s.files.filter(isRecordingFile).length
+          : s.memories.length;
+
   return (
-    <aside className="sidebar" aria-label="Files" style={{ width: s.sidebarW }}>
-      <div
-        className={`side-head${s.dragOverFolder === "__root__" ? " drag-over" : ""}`}
-        onDragOver={(e) => {
-          e.preventDefault();
-          e.dataTransfer.dropEffect = "move";
-          if (s.dragOverFolder !== "__root__") s.setDragOverFolder("__root__");
-        }}
-        onDragLeave={() => s.setDragOverFolder(null)}
-        onDrop={(e) => {
-          e.preventDefault();
-          const id = e.dataTransfer.getData("text/plain");
-          s.setDragOverFolder(null);
-          if (id) a.moveFile(id, null);
-        }}
-      >
-        <span>Files</span>
-        <span className="side-head-actions">
-          {s.files.length > 0 && (
-            <button
-              className={`add-btn${s.showMap ? " active" : ""}`}
-              title={
-                s.showMap
-                  ? "Back to the file list"
-                  : "Map — see how these files relate"
+    <>
+      <div className="pane-header">
+        <div className="pane-heading">{AREA_HEADINGS[area]}</div>
+        <span className="count-badge">{headerCount}</span>
+        <div className="pane-actions">
+          <button
+            className="pane-icon-btn"
+            data-tip="Focus this pane"
+            aria-label="Give the Library pane the full width"
+            onClick={() => layout.toggleFocus("library")}
+          >
+            <FocusIcon size={14} />
+          </button>
+          <button
+            className="pane-icon-btn"
+            data-tip="Collapse"
+            aria-label="Collapse the Library pane"
+            onClick={() => layout.collapsePane("library")}
+          >
+            <CollapseLeftIcon size={14} />
+          </button>
+        </div>
+      </div>
+
+      {fileArea && (
+        <div className="pane-tabs" role="tablist" aria-label="Library content">
+          <button
+            className="pane-tab"
+            role="tab"
+            aria-selected={s.libraryTab === "browse"}
+            onClick={() => s.setLibraryTab("browse")}
+          >
+            Browse
+          </button>
+          <button
+            className="pane-tab"
+            role="tab"
+            aria-selected={s.libraryTab === "sources"}
+            onClick={() => s.setLibraryTab("sources")}
+            title="Choose which files the AI answers from"
+          >
+            AI sources
+            {s.attachments.length > 0 && (
+              <span className="count-badge">{s.attachments.length}</span>
+            )}
+          </button>
+        </div>
+      )}
+
+      {/* ADD-31: live import queue — a multi-file import used to be invisible
+          until it was over. Names the current file and counts progress. */}
+      {s.importProgress && (
+        <div className="import-strip" role="status">
+          <span className="import-strip-count">
+            Importing {s.importProgress.done + 1} of {s.importProgress.total}
+          </span>
+          <span className="import-strip-name">{s.importProgress.name}</span>
+        </div>
+      )}
+
+      {(fileArea || area === "recordings") && (
+        <div className="source-tools">
+          <label className="search-field">
+            <SearchIcon size={13} />
+            <input
+              type="search"
+              placeholder={
+                area === "recordings" ? "Filter recordings" : "Filter files and pages"
               }
-              onClick={() => s.setShowMap((m) => !m)}
-            >
-              <GraphIcon size={14} /> Map
-            </button>
-          )}
-          {/* Wave 4a: the flagship Workflows entry, beside Map. */}
-          <button
-            className={`add-btn${s.showWorkflows ? " active" : ""}`}
-            title="Workflows — automate multi-step pipelines"
-            onClick={() =>
-              s.showWorkflows ? a.closeWorkflows() : a.openWorkflows()
-            }
-          >
-            <WorkflowsIcon size={14} /> Workflows
-          </button>
-          {/* Wave 5 (Idea 13): the Scripts entry, beside Workflows. */}
-          <button
-            className={`add-btn${s.showScripts ? " active" : ""}`}
-            title="Scripts — run and schedule .py/.js files in this room"
-            onClick={() => (s.showScripts ? a.closeScripts() : a.openScripts())}
-          >
-            <ScriptIcon size={14} /> Scripts
-          </button>
-          <div className="add-menu-wrap">
+              aria-label="Filter files and pages"
+              value={s.fileFilter}
+              onChange={(e) => s.setFileFilter(e.target.value)}
+            />
+            {s.fileFilter && (
+              <button
+                className="side-search-clear"
+                title="Clear the filter"
+                onClick={() => s.setFileFilter("")}
+              >
+                <CloseIcon size={11} />
+              </button>
+            )}
+          </label>
+        </div>
+      )}
+
+      {fileArea && s.libraryTab === "browse" && (
+        <BrowsePanel
+          s={s}
+          a={a}
+          shownFiles={shownFiles}
+          looseFiles={looseFiles}
+          filterQ={filterQ}
+        />
+      )}
+      {fileArea && s.libraryTab === "sources" && (
+        <SourcesPanel s={s} a={a} shownFiles={shownFiles} attachedIds={attachedIds} />
+      )}
+      {area === "recordings" && <RecordingsNav s={s} a={a} shownFiles={shownFiles} />}
+      {area === "workflows" && <WorkflowsNav s={s} a={a} />}
+      {area === "scripts" && <ScriptsNav s={s} a={a} />}
+      {area === "memory" && <MemoryNav s={s} a={a} />}
+
+      {(fileArea || area === "recordings") && (
+        <div className="source-footer">
+          <div className="add-menu-wrap" style={{ width: "100%" }}>
             <button
-              className="add-btn"
+              className="add-source-button"
               title="Add something to this room"
               onClick={() => s.setAddMenuOpen((o) => !o)}
             >
-              <PlusIcon size={14} /> Add
+              <PlusIcon size={14} /> Add page or source
             </button>
             {s.addMenuOpen && (
               <>
@@ -149,34 +227,65 @@ export default function Sidebar({
                   className="menu-backdrop"
                   onMouseDown={() => s.setAddMenuOpen(false)}
                 />
-                <div className="pop-menu add-menu">
+                <div className="pop-menu add-menu" role="menu">
                   <button
                     className="pop-item"
+                    role="menuitem"
                     onClick={() => {
                       a.importFiles();
                       s.setAddMenuOpen(false);
                     }}
                   >
-                    <DownloadIcon size={14} /> File
+                    <DownloadIcon size={14} />
+                    <span className="pop-item-body">
+                      Upload files
+                      <span className="pop-item-sub">
+                        PDF, DOCX, images, audio, CSV, Markdown — stored encrypted
+                      </span>
+                    </span>
                   </button>
                   <button
                     className="pop-item"
+                    role="menuitem"
+                    onClick={() => {
+                      s.setAddMenuOpen(false);
+                      void a.createNewNote();
+                    }}
+                  >
+                    <PencilIcon size={14} />
+                    <span className="pop-item-body">
+                      New page
+                      <span className="pop-item-sub">
+                        A blank Markdown note, opened ready to edit
+                      </span>
+                    </span>
+                  </button>
+                  <button
+                    className="pop-item"
+                    role="menuitem"
                     onClick={() => {
                       a.startCreateFolder();
                       s.setAddMenuOpen(false);
                     }}
                   >
-                    <FolderIcon size={14} /> Folder
+                    <FolderIcon size={14} /> New folder
                   </button>
                   <button
                     className="pop-item"
+                    role="menuitem"
                     onClick={() => {
                       s.setLinkUrl("");
                       s.setShowAddLink(true);
                       s.setAddMenuOpen(false);
                     }}
                   >
-                    <LinkIcon size={14} /> Web link
+                    <LinkIcon size={14} />
+                    <span className="pop-item-body">
+                      Web link
+                      <span className="pop-item-sub">
+                        Import a page or a YouTube transcript/video
+                      </span>
+                    </span>
                   </button>
                   {/* ADD-27: a Recording file — live transcript while you
                    * (or your meeting) speak. The three mic entries each say
@@ -184,6 +293,7 @@ export default function Sidebar({
                    * microphone must never be a surprise. */}
                   <button
                     className="pop-item"
+                    role="menuitem"
                     disabled={s.recLive != null}
                     title="Record mic + the Mac's audio with a live transcript — works with Meet, Zoom, Teams"
                     onClick={() => {
@@ -201,6 +311,7 @@ export default function Sidebar({
                   </button>
                   <button
                     className="pop-item"
+                    role="menuitem"
                     disabled={a.micState("note").disabled}
                     onClick={() => {
                       a.recordVoiceNote();
@@ -217,6 +328,7 @@ export default function Sidebar({
                   </button>
                   <button
                     className="pop-item"
+                    role="menuitem"
                     disabled={a.micState("journal").disabled}
                     onClick={() => {
                       a.dictateJournal();
@@ -236,543 +348,455 @@ export default function Sidebar({
               </>
             )}
           </div>
-        </span>
-      </div>
-      {/* ADD-31: live import queue — a multi-file import used to be invisible
-          until it was over. Names the current file and counts progress. */}
-      {s.importProgress && (
-        <div className="import-strip" role="status">
-          <span className="import-strip-count">
-            Importing {s.importProgress.done + 1} of {s.importProgress.total}
-          </span>
-          <span className="import-strip-name">{s.importProgress.name}</span>
         </div>
       )}
-      <div className="side-search">
-        <SearchIcon size={14} />
+    </>
+  );
+}
+
+/* ---------- Browse: the real folder tree ---------- */
+
+function BrowsePanel({
+  s,
+  a,
+  shownFiles,
+  looseFiles,
+  filterQ,
+}: {
+  s: WSState;
+  a: WSActions;
+  shownFiles: import("../api").FileMeta[];
+  looseFiles: import("../api").FileMeta[];
+  filterQ: string;
+}) {
+  return (
+    <div
+      className={`library-scroll file-list${s.dragOverFolder === "__root__" ? " drag-over" : ""}`}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        if (s.dragOverFolder !== "__root__") s.setDragOverFolder("__root__");
+      }}
+      onDragLeave={() => s.setDragOverFolder(null)}
+      onDrop={(e) => {
+        e.preventDefault();
+        const id = e.dataTransfer.getData("text/plain");
+        s.setDragOverFolder(null);
+        if (id) a.moveFile(id, null);
+      }}
+    >
+      {s.creatingFolder !== null && (
         <input
-          className="side-search-input"
-          placeholder="Search files…"
-          value={s.fileFilter}
-          onChange={(e) => s.setFileFilter(e.target.value)}
+          className="folder-create-input"
+          autoFocus
+          dir="auto"
+          placeholder="New folder name"
+          value={s.creatingFolder}
+          onChange={(e) => s.setCreatingFolder(e.target.value)}
+          onBlur={a.commitCreateFolder}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") a.commitCreateFolder();
+            if (e.key === "Escape") s.setCreatingFolder(null);
+          }}
         />
-        {s.fileFilter && (
-          <button
-            className="side-search-clear"
-            title="Clear"
-            onClick={() => s.setFileFilter("")}
-          >
-            <CloseIcon size={12} />
-          </button>
-        )}
-      </div>
-      {(() => {
-        const jobRunning = s.jobs.some(
-          (j) => j.status === "running" || j.status === "queued",
-        );
-        const busy = s.summaryStarting || jobRunning;
+      )}
+      {s.files.length === 0 && (
+        <div className="empty-hint">
+          Add PDFs, notes, images, code or spreadsheets — they are stored
+          encrypted inside this room.
+        </div>
+      )}
+      {s.files.length > 0 && shownFiles.length === 0 && (
+        <div className="empty-hint">No files match “{s.fileFilter}”.</div>
+      )}
+      {looseFiles.map((f) => (
+        <FileRow key={f.id} f={f} s={s} a={a} />
+      ))}
+      {s.folders.map((folder) => {
+        const inFolder = shownFiles.filter((f) => f.folderId === folder.id);
+        if (filterQ && inFolder.length === 0) return null;
+        const collapsed = s.collapsedFolders.has(folder.id);
         return (
-          <button
-            className="summarize-btn"
-            title="Write a short overview of this room and what's inside — runs in the background"
-            disabled={busy}
-            onClick={() => void a.startDeepSummary()}
-          >
-            {s.summaryStarting && !jobRunning ? (
-              "Starting…"
-            ) : (
-              <>
-                <SparkIcon size={14} /> Summarize room
-              </>
-            )}
-          </button>
-        );
-      })()}
-      {/* Optimistic "Starting…" card the instant the button is pressed, before
-          the backend resolves — a cold local model can take seconds to answer,
-          and a click must never look like nothing happened. */}
-      {s.summaryStarting &&
-        !s.jobs.some((j) => j.status === "running" || j.status === "queued") && (
-          <div className="job-card running" role="status">
-            <div className="job-card-head">
-              <span className="job-card-title">Room summary</span>
-            </div>
-            <div className="job-card-bar">
-              <div className="job-card-fill indeterminate" />
-            </div>
-            <div className="job-card-foot">
-              <span className="job-card-label">Starting…</span>
-            </div>
-          </div>
-        )}
-      {/* A recording being finalized keeps a visible card here, so leaving
-          the recording view never turns the save into a mystery. The audio
-          is already durable when this card appears — the label says so. */}
-      {s.recLive?.status === "saving" && (
-        <div className="job-card running" role="status">
-          <div className="job-card-head">
-            <span className="job-card-title">Saving recording</span>
-            {s.recSave && (
-              <span className="job-card-elapsed">{elapsedOf(s.recSave.startedAt)}</span>
-            )}
-          </div>
-          <div className="job-card-bar">
-            <div className="job-card-fill indeterminate" />
-          </div>
-          <div className="job-card-foot">
-            <span className="job-card-label">
-              {s.recSave?.stage === "writing"
-                ? "Audio saved — writing into the room…"
-                : s.recSave && s.recSave.remaining > 0
-                  ? `Audio saved — transcribing (${s.recSave.remaining} to go)`
-                  : "Audio saved — finishing the transcript…"}
-            </span>
-            <button
-              className="job-card-resume"
-              title="Open the recording"
-              onClick={() => {
-                const id = s.recLive?.fileId;
-                if (id) void a.viewFile(id);
+          <div key={folder.id} className="folder-group">
+            <div
+              className={`folder-head${s.dragOverFolder === folder.id ? " drag-over" : ""}`}
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                if (s.dragOverFolder !== folder.id) s.setDragOverFolder(folder.id);
+              }}
+              onDragLeave={() => s.setDragOverFolder(null)}
+              onDrop={(e) => {
+                e.preventDefault();
+                const id = e.dataTransfer.getData("text/plain");
+                s.setDragOverFolder(null);
+                if (id) a.moveFile(id, folder.id);
               }}
             >
-              Open
-            </button>
-          </div>
-        </div>
-      )}
-      {/* ADD-30: background-job cards — live progress while running, Resume
-          for a job that was paused or parked by an error. */}
-      {s.jobs.map((j) => {
-        const live = s.jobProgress[j.id];
-        // Wave 4a: a QUEUED job is waiting for the single heavy-work slot — it is
-        // not actually running yet, so it shows "Waiting — Nth in line" with a
-        // "Remove" affordance (Stop on it is a no-op; cancel_job parks the row).
-        const queued = j.status === "queued";
-        const running = j.status === "running" || queued;
-        const queuePos = queued
-          ? s.jobs.filter((o) => o.status === "queued" && o.createdAt <= j.createdAt).length
-          : 0;
-        const done = live?.done ?? j.cursor;
-        const total = Math.max(live?.total ?? j.total, 1);
-        const friendlyError =
-          j.error === "OLLAMA_DOWN"
-            ? "The local AI isn't running."
-            : j.error?.startsWith("MODEL_MISSING")
-              ? "The AI model isn't installed."
-              : j.error;
-        return (
-          <div key={j.id} className={`job-card ${j.status}`} role="status">
-            <div className="job-card-head">
-              <span className="job-card-title">{j.title}</span>
-              {running ? (
-                <span className="job-card-elapsed">{elapsedOf(j.createdAt)}</span>
+              <button
+                className="folder-caret-btn"
+                title={collapsed ? "Expand" : "Collapse"}
+                onClick={() => a.toggleFolderCollapse(folder.id)}
+              >
+                {collapsed ? "▸" : "▾"}
+              </button>
+              {s.renamingFolder?.id === folder.id ? (
+                <input
+                  className="folder-rename"
+                  autoFocus
+                  dir="auto"
+                  value={s.renamingFolder.name}
+                  onChange={(e) =>
+                    s.setRenamingFolder({ id: folder.id, name: e.target.value })
+                  }
+                  onBlur={a.commitFolderRename}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") a.commitFolderRename();
+                    if (e.key === "Escape") s.setRenamingFolder(null);
+                  }}
+                />
               ) : (
+                <button
+                  className="folder-label"
+                  onClick={() => a.toggleFolderCollapse(folder.id)}
+                >
+                  <span className="folder-name" title={folder.name}>
+                    {folder.name}
+                  </span>
+                  <span className="count">{inFolder.length}</span>
+                </button>
+              )}
+              <span className="folder-actions">
                 <button
                   className="chip-btn"
-                  title="Dismiss this job"
-                  onClick={() => void a.dismissJob(j.id)}
+                  title="Rename folder"
+                  onClick={() =>
+                    s.setRenamingFolder({ id: folder.id, name: folder.name })
+                  }
                 >
-                  <CloseIcon size={11} />
+                  <PencilIcon size={13} />
                 </button>
-              )}
-            </div>
-            {/* ADD-32: the pass mosaic — one cell per stretch of the file,
-                lighting up in spectral order as each part is read, so you can
-                watch the whole file being consumed window by window. */}
-            {j.kind === "file_pass" &&
-              (() => {
-                const plan = (j.plan ?? {}) as { windows?: unknown[] };
-                const nWin = Array.isArray(plan.windows) ? plan.windows.length : 0;
-                if (nWin < 2) return null;
-                const cells = Math.min(nWin, 192);
-                const mapsDone = Math.min(done, nWin);
-                const cellsDone = Math.floor((mapsDone * cells) / nWin);
-                const weaving = running && done >= nWin;
-                return (
-                  <div
-                    className={`pass-mosaic${weaving ? " weaving" : ""}`}
-                    title={`${mapsDone} of ${nWin} parts read`}
-                  >
-                    {Array.from({ length: cells }, (_, c) => (
-                      <span
-                        key={c}
-                        className={`pass-cell${c < cellsDone ? " on" : ""}${
-                          c === cellsDone && running && !weaving ? " now" : ""
-                        }`}
-                        style={{ "--h": Math.round((c * 300) / cells) } as CSSProperties}
-                      />
-                    ))}
-                  </div>
-                );
-              })()}
-            <div className="job-card-bar">
-              <div
-                className={`job-card-fill${running && !live ? " indeterminate" : ""}`}
-                style={
-                  running && !live
-                    ? undefined
-                    : { width: `${Math.min(100, Math.round((done / total) * 100))}%` }
-                }
-              />
-            </div>
-            <div className="job-card-foot">
-              <span className="job-card-label">
-                {queued
-                  ? `Waiting — ${queuePos}${queuePos === 1 ? "st" : queuePos === 2 ? "nd" : queuePos === 3 ? "rd" : "th"} in line`
-                  : running
-                    ? (live?.label ?? "Working…")
-                    : j.status === "error"
-                      ? (friendlyError ?? "Stopped.")
-                      : `Paused at ${done} of ${total}`}
+                <DeleteControl
+                  k={`folder:${folder.id}`}
+                  trigger={<TrashIcon size={14} />}
+                  onConfirm={() => a.deleteFolder(folder.id)}
+                  title="Delete folder (its files are kept, just ungrouped)"
+                  confirmDelete={s.confirmDelete}
+                  askConfirm={a.askConfirm}
+                  cancelConfirm={a.cancelConfirm}
+                />
               </span>
-              {queued ? (
-                <button
-                  className="job-card-resume"
-                  title="Remove this job from the queue"
-                  onClick={() => void a.pauseJob(j.id)}
-                >
-                  Remove
-                </button>
-              ) : running ? (
-                <button
-                  className="job-card-resume"
-                  title="Stop — it checkpoints so you can resume later"
-                  onClick={() => void a.pauseJob(j.id)}
-                >
-                  Stop
-                </button>
-              ) : (
-                <button
-                  className="job-card-resume"
-                  onClick={() => void a.resumeJob(j.id)}
-                >
-                  {j.status === "error" ? "Retry" : "Resume"}
-                </button>
-              )}
             </div>
+            {!collapsed && (
+              <div className="folder-files">
+                {inFolder.length === 0 ? (
+                  <div className="folder-empty">
+                    Empty — drag a file here, or use the folder button on a file.
+                  </div>
+                ) : (
+                  inFolder.map((f) => <FileRow key={f.id} f={f} s={s} a={a} />)
+                )}
+              </div>
+            )}
           </div>
         );
       })}
-      <button
-        className={`memory-chip${s.showMemoryIntro ? " glow" : ""}`}
-        title="What the AI remembers about you — visible and editable"
-        onClick={a.revealMemory}
-      >
-        <span className="memory-chip-label">
-          <MemoryIcon size={14} /> Memory
-        </span>
-        <span className="count">{s.memories.length}</span>
-      </button>
-      {/* Wave 1b (idea 10): the canonical shared working-notes file. Always
-          opens exactly ONE pad (get-or-create on the backend). */}
-      <button
-        className="memory-chip"
-        title='Shared working notes — you and the AI both write "Scratch pad.md"'
-        onClick={() => void a.openScratchPad()}
-      >
-        <span className="memory-chip-label">
-          <PencilIcon size={14} /> Scratch pad
-        </span>
-      </button>
-      {s.showMemoryIntro && (
-        <div className="memory-intro">
-          This is your room's memory — everything the AI remembers about
-          you, visible and editable any time.
-          <button
-            className="memory-intro-dismiss"
-            onClick={() => {
-              s.setShowMemoryIntro(false);
-              try {
-                localStorage.setItem(`memoryIntroSeen:${info.name}`, "1");
-              } catch {
-                /* non-fatal */
-              }
-            }}
-          >
-            Got it
-          </button>
-        </div>
-      )}
-      <div className="file-list">
-        {s.creatingFolder !== null && (
-          <input
-            className="folder-create-input"
-            autoFocus
-            dir="auto"
-            placeholder="New folder name"
-            value={s.creatingFolder}
-            onChange={(e) => s.setCreatingFolder(e.target.value)}
-            onBlur={a.commitCreateFolder}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") a.commitCreateFolder();
-              if (e.key === "Escape") s.setCreatingFolder(null);
-            }}
-          />
-        )}
-        {s.files.length === 0 && (
-          <div className="empty-hint">
-            Add PDFs, notes, images, code or spreadsheets — they are stored
-            encrypted inside this room.
-          </div>
-        )}
-        {s.files.length > 0 && shownFiles.length === 0 && (
-          <div className="empty-hint">No files match “{s.fileFilter}”.</div>
-        )}
-        {looseFiles.map((f) => (
-          <FileRow key={f.id} f={f} s={s} a={a} />
-        ))}
-        {s.folders.map((folder) => {
-          const inFolder = shownFiles.filter((f) => f.folderId === folder.id);
-          if (filterQ && inFolder.length === 0) return null;
-          const collapsed = s.collapsedFolders.has(folder.id);
-          return (
-            <div key={folder.id} className="folder-group">
-              <div
-                className={`folder-head${s.dragOverFolder === folder.id ? " drag-over" : ""}`}
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  e.dataTransfer.dropEffect = "move";
-                  if (s.dragOverFolder !== folder.id) s.setDragOverFolder(folder.id);
-                }}
-                onDragLeave={() => s.setDragOverFolder(null)}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  const id = e.dataTransfer.getData("text/plain");
-                  s.setDragOverFolder(null);
-                  if (id) a.moveFile(id, folder.id);
-                }}
-              >
-                <button
-                  className="folder-caret-btn"
-                  title={collapsed ? "Expand" : "Collapse"}
-                  onClick={() => a.toggleFolderCollapse(folder.id)}
-                >
-                  {collapsed ? "▸" : "▾"}
-                </button>
-                {s.renamingFolder?.id === folder.id ? (
-                  <input
-                    className="folder-rename"
-                    autoFocus
-                    dir="auto"
-                    value={s.renamingFolder.name}
-                    onChange={(e) =>
-                      s.setRenamingFolder({ id: folder.id, name: e.target.value })
-                    }
-                    onBlur={a.commitFolderRename}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") a.commitFolderRename();
-                      if (e.key === "Escape") s.setRenamingFolder(null);
-                    }}
-                  />
-                ) : (
-                  <button
-                    className="folder-label"
-                    onClick={() => a.toggleFolderCollapse(folder.id)}
-                  >
-                    <span className="folder-name" title={folder.name}>
-                      {folder.name}
-                    </span>
-                    <span className="count">{inFolder.length}</span>
-                  </button>
-                )}
-                <span className="folder-actions">
-                  <button
-                    className="chip-btn"
-                    title="Rename folder"
-                    onClick={() =>
-                      s.setRenamingFolder({ id: folder.id, name: folder.name })
-                    }
-                  >
-                    <PencilIcon size={13} />
-                  </button>
-                  <DeleteControl
-                    k={`folder:${folder.id}`}
-                    trigger={<TrashIcon size={14} />}
-                    onConfirm={() => a.deleteFolder(folder.id)}
-                    title="Delete folder (its files are kept, just ungrouped)"
-                    confirmDelete={s.confirmDelete}
-                    askConfirm={a.askConfirm}
-                    cancelConfirm={a.cancelConfirm}
-                  />
-                </span>
-              </div>
-              {!collapsed && (
-                <div className="folder-files">
-                  {inFolder.length === 0 ? (
-                    <div className="folder-empty">
-                      Empty — drag a file here, or use the folder button on a file.
-                    </div>
-                  ) : (
-                    inFolder.map((f) => <FileRow key={f.id} f={f} s={s} a={a} />)
-                  )}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
+    </div>
+  );
+}
 
-      <div
-        ref={s.memoryHeadRef}
-        className="side-head clickable"
-        onClick={() => s.setShowMemory(!s.showMemory)}
-      >
-        <span>
-          Memory <span className="count">{s.memories.length}</span>
-        </span>
-        <span>{s.showMemory ? "▾" : "▸"}</span>
-      </div>
-      {s.showMemory && (
-        <div className="memory-panel">
-          {/* Wave 1b (idea 5): grouped under small category headers (fixed
-              order, empty groups hidden). When nothing is categorized the
-              panel keeps its legacy flat look — no lone "Other" header. */}
-          {MEMORY_GROUPS.filter((g) =>
-            s.memories.some((m) => (m.category ?? null) === g.key),
-          ).map((g, _, shown) => (
-            <div key={g.key ?? "other"} className="memory-group">
-              {!(shown.length === 1 && g.key === null) && (
-                <div className="memory-group-head">{g.label}</div>
-              )}
-              {s.memories
-                .filter((m) => (m.category ?? null) === g.key)
-                .map((m) =>
-                  s.editingMemory?.id === m.id ? (
-                    <div key={m.id} className="memory-row editing">
-                      <input
-                        className="memory-edit-input"
-                        autoFocus
-                        dir="auto"
-                        value={s.editingMemory.content}
-                        onChange={(e) =>
-                          s.setEditingMemory({
-                            id: m.id,
-                            content: e.target.value,
-                            category: s.editingMemory?.category ?? null,
-                          })
-                        }
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") a.saveMemoryEdit();
-                          if (e.key === "Escape") s.setEditingMemory(null);
-                        }}
-                      />
-                      <select
-                        className="memory-cat-select"
-                        title="Category"
-                        value={s.editingMemory.category ?? ""}
-                        onChange={(e) =>
-                          s.setEditingMemory({
-                            id: m.id,
-                            content: s.editingMemory?.content ?? m.content,
-                            category: e.target.value || null,
-                          })
-                        }
-                      >
-                        <option value="">no category</option>
-                        {CATEGORY_OPTIONS.map((c) => (
-                          <option key={c} value={c}>
-                            {c}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        className="chip-btn"
-                        title="Save"
-                        onClick={a.saveMemoryEdit}
-                      >
-                        ✓
-                      </button>
-                      <button
-                        className="chip-btn"
-                        title="Cancel"
-                        onClick={() => s.setEditingMemory(null)}
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  ) : (
-                    <div key={m.id} className="memory-row">
-                      <span dir="auto">
-                        {m.content}
-                        {m.category && (
-                          <span className="memory-cat-pill">{m.category}</span>
-                        )}
-                      </span>
-                      <span className="memory-actions">
-                        <button
-                          className="chip-btn"
-                          title="Edit this memory"
-                          onClick={() =>
-                            s.setEditingMemory({
-                              id: m.id,
-                              content: m.content,
-                              category: m.category ?? null,
-                            })
-                          }
-                        >
-                          <PencilIcon size={13} />
-                        </button>
-                        <DeleteControl
-                          k={`mem:${m.id}`}
-                          trigger="×"
-                          onConfirm={async () => {
-                            await api.deleteMemory(m.id);
-                            s.setMemories(await api.listMemories());
-                          }}
-                          title="Forget this"
-                          confirmDelete={s.confirmDelete}
-                          askConfirm={a.askConfirm}
-                          cancelConfirm={a.cancelConfirm}
-                        />
-                      </span>
-                    </div>
-                  ),
-                )}
-            </div>
+/* ---------- AI sources: the evidence set for the next answer ---------- */
+
+function SourcesPanel({
+  s,
+  a,
+  shownFiles,
+  attachedIds,
+}: {
+  s: WSState;
+  a: WSActions;
+  shownFiles: import("../api").FileMeta[];
+  attachedIds: Set<string>;
+}) {
+  const attached = shownFiles.filter((f) => attachedIds.has(f.id));
+  const available = shownFiles.filter((f) => !attachedIds.has(f.id));
+  return (
+    <div className="library-scroll" role="group" aria-label="AI sources">
+      <p className="area-nav-intro">
+        Checked files are attached to your next question.{" "}
+        {s.attachments.length === 0
+          ? "With none checked, the AI searches the whole room for relevant passages."
+          : `Answers will draw on ${s.attachments.length} attached source${s.attachments.length === 1 ? "" : "s"}.`}
+      </p>
+      {attached.length > 0 && (
+        <>
+          <div className="group-heading">Attached to the next question</div>
+          {attached.map((f) => (
+            <SourceRow key={f.id} f={f} s={s} a={a} checked />
           ))}
-          <div className="memory-add">
-            <input
-              placeholder="Something the AI should always remember…"
-              value={s.memoryDraft}
-              dir="auto"
-              onChange={(e) => s.setMemoryDraft(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && a.addMemory()}
-            />
-            <button
-              className={`subtle btn-ic mic-btn ${a.micState("memory").cls}`}
-              title={
-                s.dictOwner === "memory" && s.dictState === "recording"
-                  ? "Stop recording"
-                  : "Speak a memory"
-              }
-              disabled={a.micState("memory").disabled}
-              onClick={() =>
-                a.dictateTo("memory", (text) =>
-                  s.setMemoryDraft((d) => (d.trim() ? `${d.trimEnd()} ${text}` : text)),
-                )
-              }
-            >
-              <MicIcon size={12} />
-            </button>
-            <select
-              className="memory-cat-select"
-              title="Category for the new memory"
-              value={s.memoryDraftCat}
-              onChange={(e) => s.setMemoryDraftCat(e.target.value)}
-            >
-              <option value="">no category</option>
-              {CATEGORY_OPTIONS.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-            <button className="subtle" onClick={a.addMemory}>
-              Add
-            </button>
-          </div>
+        </>
+      )}
+      <div className="group-heading">Available in this room</div>
+      {available.length === 0 && shownFiles.length === 0 && (
+        <div className="empty-hint">
+          {s.files.length === 0
+            ? "No files yet — add one to ground the AI's answers."
+            : `No files match “${s.fileFilter}”.`}
         </div>
       )}
-    </aside>
+      {available.map((f) => (
+        <SourceRow key={f.id} f={f} s={s} a={a} checked={false} />
+      ))}
+    </div>
+  );
+}
+
+function SourceRow({
+  f,
+  s,
+  a,
+  checked,
+}: {
+  f: import("../api").FileMeta;
+  s: WSState;
+  a: WSActions;
+  checked: boolean;
+}) {
+  const current = s.openFile?.id === f.id;
+  return (
+    <div className={`source-row${current ? " is-current" : ""}`}>
+      <input
+        type="checkbox"
+        checked={checked}
+        aria-label={`Use ${displayName(f.name)} in AI answers`}
+        onChange={() => a.toggleAttach(f)}
+      />
+      <button
+        className="source-open"
+        type="button"
+        onClick={() => void a.viewFile(f.id)}
+        title={`Open ${f.name}`}
+      >
+        <div className="source-line">
+          <span className="source-name">{displayName(f.name)}</span>
+        </div>
+        <div className="source-meta">{fileKindLabel(f)}</div>
+      </button>
+    </div>
+  );
+}
+
+/* ---------- Recordings lens ---------- */
+
+function RecordingsNav({
+  s,
+  a,
+  shownFiles,
+}: {
+  s: WSState;
+  a: WSActions;
+  shownFiles: import("../api").FileMeta[];
+}) {
+  const recs = shownFiles.filter(isRecordingFile);
+  return (
+    <div className="library-scroll">
+      <p className="area-nav-intro">
+        Capture, transcribe, edit, and export. Recordings are ordinary room
+        files — everything here is also in Browse.
+      </p>
+      <button
+        className="area-nav-row"
+        disabled={s.recLive != null}
+        title="Record mic + the Mac's audio with a live transcript"
+        onClick={() => void a.startLiveRecording()}
+      >
+        <span className="browse-icon">
+          <MicIcon size={15} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">New live recording</span>
+          <span className="area-nav-copy">Mic + Mac audio, live transcript</span>
+        </span>
+      </button>
+      <button
+        className="area-nav-row"
+        disabled={a.micState("note").disabled}
+        onClick={() => a.recordVoiceNote()}
+      >
+        <span className="browse-icon">
+          <MicIcon size={15} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">Voice note</span>
+          <span className="area-nav-copy">Starts the mic — audio saved here</span>
+        </span>
+      </button>
+      <div className="group-heading">In this room</div>
+      {recs.length === 0 && (
+        <div className="empty-hint">
+          No recordings yet. Start one above, or import audio/video files —
+          they transcribe themselves in the background.
+        </div>
+      )}
+      {recs.map((f) => (
+        <FileRow key={f.id} f={f} s={s} a={a} />
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Workflows lens ---------- */
+
+function WorkflowsNav({ s, a }: { s: WSState; a: WSActions }) {
+  return (
+    <div className="library-scroll">
+      <p className="area-nav-intro">
+        Repeatable pipelines over this room's files — run them now or on a
+        schedule.
+      </p>
+      <button className="area-nav-row" onClick={() => void a.createBlankWorkflow()}>
+        <span className="browse-icon">
+          <PlusIcon size={15} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">New workflow</span>
+          <span className="area-nav-copy">Start blank or pick a template</span>
+        </span>
+      </button>
+      <div className="group-heading">In this room</div>
+      {s.workflows.length === 0 && (
+        <div className="empty-hint">
+          No workflows yet — create one, or start from a template in the
+          center pane.
+        </div>
+      )}
+      {s.workflows.map((w) => (
+        <button
+          key={w.id}
+          className={`area-nav-row${s.wfDetailId === w.id ? " is-current" : ""}`}
+          onClick={() => a.openWorkflowDetail(w.id)}
+        >
+          <span className="browse-icon">
+            {w.emoji ? <span aria-hidden>{w.emoji}</span> : <WorkflowsIcon size={15} />}
+          </span>
+          <span className="area-nav-main">
+            <span className="area-nav-title">{w.name}</span>
+            <span className="area-nav-copy">
+              {w.status === "active" ? "Active" : "Draft"}
+              {w.pinned ? " · Pinned" : ""}
+              {w.createdBy !== "user" ? ` · by ${w.createdBy}` : ""}
+            </span>
+          </span>
+          <span className="area-nav-state">
+            {w.binding.scope === "general" ? "" : "File"}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Scripts lens ---------- */
+
+function ScriptsNav({ s, a }: { s: WSState; a: WSActions }) {
+  return (
+    <div className="library-scroll">
+      <p className="area-nav-intro">
+        Python or JavaScript files in this room, with declared inputs, outputs
+        and consent tied to their exact contents.
+      </p>
+      <div className="group-heading">In this room</div>
+      {s.scripts.length === 0 && (
+        <div className="empty-hint">
+          No scripts yet — add a .py or .js file with a manifest. The center
+          pane shows an example.
+        </div>
+      )}
+      {s.scripts.map((sc) => (
+        <button
+          key={sc.fileId}
+          className={`area-nav-row${s.openFile?.id === sc.fileId ? " is-current" : ""}`}
+          onClick={() => void a.viewFile(sc.fileId)}
+          title={`Open ${sc.name}`}
+        >
+          <span className="browse-icon">
+            <ScriptIcon size={15} />
+          </span>
+          <span className="area-nav-main">
+            <span className="area-nav-title">{sc.name}</span>
+            <span className="area-nav-copy">
+              {sc.approved
+                ? "Approved"
+                : sc.changedSinceApproval
+                  ? "Edited — needs approval again"
+                  : "Needs review"}
+              {sc.shortcut === "global" ? " · Global shortcut" : ""}
+            </span>
+          </span>
+          <span className="area-nav-state">
+            {sc.lang === "py" ? "Python" : "JavaScript"}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Memory lens ---------- */
+
+function MemoryNav({ s, a }: { s: WSState; a: WSActions }) {
+  const counts = new Map<string | null, number>();
+  for (const m of s.memories) {
+    const k = m.category ?? null;
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  const groups: { key: string | null; label: string }[] = [
+    { key: "instruction", label: "Instructions" },
+    { key: "preference", label: "Preferences" },
+    { key: "project", label: "Projects" },
+    { key: "fact", label: "Facts" },
+    { key: null, label: "Uncategorized" },
+  ];
+  return (
+    <div className="library-scroll">
+      <p className="area-nav-intro">
+        Durable context the AI may use when relevant. The scratch pad is an
+        ordinary private file — it never becomes memory on its own.
+      </p>
+      <button
+        className="area-nav-row"
+        onClick={() => void a.openScratchPad()}
+        title='Shared working notes — you and the AI both write "Scratch pad.md"'
+      >
+        <span className="browse-icon">
+          <PencilIcon size={15} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">Scratch pad</span>
+          <span className="area-nav-copy">Temporary shared notes — not memory</span>
+        </span>
+      </button>
+      <div className="group-heading">Saved memory</div>
+      <div className="area-nav-row is-static">
+        <span className="browse-icon">
+          <MemoryIcon size={15} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">All memory</span>
+        </span>
+        <span className="area-nav-state">{s.memories.length}</span>
+      </div>
+      {groups
+        .filter((g) => (counts.get(g.key) ?? 0) > 0)
+        .map((g) => (
+          <div key={g.key ?? "other"} className="area-nav-row is-static">
+            <span className="browse-icon" />
+            <span className="area-nav-main">
+              <span className="area-nav-title">{g.label}</span>
+            </span>
+            <span className="area-nav-state">{counts.get(g.key)}</span>
+          </div>
+        ))}
+    </div>
   );
 }

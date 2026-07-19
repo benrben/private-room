@@ -15,3 +15,4 @@ export * from "./icons/status";
 export * from "./icons/files";
 export * from "./icons/features";
 export * from "./icons/empty";
+export * from "./icons/shell";

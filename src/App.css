@@ -1,7 +1,8 @@
 /* App.css — barrel of section stylesheets.
-   Split out of the original monolith; imported in the same order the
-   sections appeared so the cascade is unchanged. Edit the section files
-   under ./styles/ rather than adding rules here. */
+   tokens.css loads first (the palette + legacy aliases both themes swap on);
+   shell.css loads last (the new full-window frame wins migration ties).
+   Edit the section files under ./styles/ rather than adding rules here. */
+@import "./styles/tokens.css";
 @import "./styles/base.css";
 @import "./styles/gate.css";
 @import "./styles/workspace.css";
@@ -21,3 +22,4 @@
 @import "./styles/recording.css";
 @import "./styles/workflows.css";
 @import "./styles/scripts.css";
+@import "./styles/shell.css";

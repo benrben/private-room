@@ -292,6 +292,22 @@ export function makeFileActions(s: WSState) {
     s.setShowMap(false);
   }
 
+  /** "New page": a blank Markdown note via the ordinary generated-file path
+   * (same command chat's "Save to room" uses), opened straight into editing.
+   * A dated name keeps repeat presses from colliding. */
+  async function createNewNote() {
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}.${String(now.getMinutes()).padStart(2, "0")}.${String(now.getSeconds()).padStart(2, "0")}`;
+    try {
+      const meta = await api.saveGeneratedFile(`Note ${stamp}.md`, "");
+      s.setFiles(await api.listFiles());
+      await viewFile(meta.id);
+      s.setEditMode(true);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
   async function saveEdit(newText: string) {
     if (!s.openFile) return;
     await api.updateFileContent(s.openFile.id, newText);
@@ -414,7 +430,7 @@ export function makeFileActions(s: WSState) {
     noteExportOnce, exportOne, exportAllFiles, openHistory, openCompare, restoreVersion,
     undoEdits, suggestImports, dismissImportSuggestion, applyImportSuggestion,
     applyAllImportSuggestions, dismissAllImportSuggestions,
-    reportImport, importFiles, removeFile, viewFile, saveEdit, saveEditAsCopy,
+    reportImport, importFiles, removeFile, viewFile, createNewNote, saveEdit, saveEditAsCopy,
     editCell, editModeOf, startCreateFolder, commitCreateFolder,
     commitFolderRename, deleteFolder, moveFile, commitRenameFile,
     toggleFolderCollapse, clampMenu,

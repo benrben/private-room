@@ -11,7 +11,6 @@ import {
 } from "../icons";
 import { displayName } from "./composer";
 import { isCloudEngine, isExternalEngine } from "./markup";
-import Toasts from "./Toasts";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
@@ -40,7 +39,6 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
   }, [s.showHelp, s]);
   return (
     <div className="composer">
-      <Toasts toasts={s.toasts} dismissToast={s.dismissToast} />
       {batchTidy ? (
         <div className="import-suggestion batch">
           <SparkIcon size={13} />
@@ -110,25 +108,34 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
           </button>
         </div>
       )}
-      {/* ADD-29 parity: a `:cloud` model drives the same tool loop as a local
-          one, so its tools chip stays; only external CLIs hide it. */}
-      {!isExternalEngine(s.model) && (s.webOn || s.mcpTools.length > 0) && (
-        <div
-          className="mcp-badge"
-          title={[
-            s.webOn ? "Web search: on" : null,
-            s.mcpTools.length > 0
-              ? `Connected tools: ${s.mcpTools.join(", ")}`
-              : null,
-          ]
-            .filter(Boolean)
-            .join("\n")}
-        >
-          <span className="badge-label">
-            <GlobeIcon size={13} /> This room can reach the internet
-          </span>
-        </div>
-      )}
+      {/* Engine parity: every engine can reach these tools now — local and
+          `:cloud` through the sidecar loop, external CLIs through the room
+          bridge (web always when enabled; connected MCP tools only when the
+          advisor-tools switch says so). The badge states the truth per engine. */}
+      {(() => {
+        const external = isExternalEngine(s.model);
+        const webReach = s.webOn;
+        const mcpReach =
+          s.mcpTools.length > 0 && (!external || s.advisorToolsOn);
+        if (!webReach && !mcpReach) return null;
+        return (
+          <div
+            className="mcp-badge"
+            title={[
+              webReach ? "Web search: on" : null,
+              mcpReach
+                ? `Connected tools: ${s.mcpTools.join(", ")}`
+                : null,
+            ]
+              .filter(Boolean)
+              .join("\n")}
+          >
+            <span className="badge-label">
+              <GlobeIcon size={13} /> This room can reach the internet
+            </span>
+          </div>
+        );
+      })()}
       {(() => {
         const q = s.question.trim().toLowerCase();
         if (!q) return null;

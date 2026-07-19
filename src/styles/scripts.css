@@ -51,8 +51,8 @@
 }
 
 .script-row.needs-review {
-  border-color: #d9a441;
-  box-shadow: 0 0 0 1px rgba(217, 164, 65, 0.35);
+  border-color: var(--amber);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--amber) 35%, transparent);
 }
 
 .script-row-main {
@@ -82,17 +82,10 @@
 .script-ribbon {
   font-size: 0.72rem;
   font-weight: 600;
-  color: #7a5300;
-  background: #f6e0aa;
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 16%, transparent);
   padding: 0.1rem 0.45rem;
   border-radius: 6px;
-}
-
-@media (prefers-color-scheme: dark) {
-  .script-ribbon {
-    color: #f6e0aa;
-    background: rgba(217, 164, 65, 0.18);
-  }
 }
 
 .script-row-status {

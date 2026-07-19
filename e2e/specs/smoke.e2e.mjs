@@ -57,11 +57,13 @@ describe("Private Room — demo happy path", () => {
     await (await $("button=Create & Enter")).click();
 
     // 3. Workspace is open once the composer exists.
-    const composer = await $('textarea[placeholder="Ask this room anything…"]');
+    const composer = await $('textarea[placeholder="Ask anything about this room…"]');
     await composer.waitForExist({ timeout: 30_000 });
 
-    // 4. Import the two fixtures via the "+ Add" button (dialog stubbed).
-    await (await $("button.subtle=+ Add")).click();
+    // 4. Import the two fixtures via "Add page or source" → "Upload files"
+    //    (dialog stubbed).
+    await (await $(".add-source-button")).click();
+    await (await $("button*=Upload files")).click();
     const notesRow = await $(".file-name=notes.txt");
     await notesRow.waitForExist({ timeout: 20_000 });
     await expect(await $(".file-name=data.csv")).toExist();
@@ -69,7 +71,7 @@ describe("Private Room — demo happy path", () => {
     // 5. Ask a question. The mock replies with an annotate_file tool call
     //    (round 1) then a final answer (round 2).
     await composer.setValue("What did the Apollo program achieve?");
-    await (await $(".composer button.primary")).click();
+    await (await $(".composer .send-btn")).click();
 
     // 6. Assert: an assistant answer bubble AND the 📍 annotation chip appear.
     const chip = await $(".annot-chip");

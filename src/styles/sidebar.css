@@ -9,28 +9,6 @@
   min-height: 0;
 }
 
-.side-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 12px 6px;
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
-}
-
-.side-head.clickable {
-  cursor: pointer;
-  border-top: none;
-}
-
-.side-head-actions {
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
 /* The one violet call-to-action in the sidebar toolbar. */
 .add-btn {
   display: inline-flex;
@@ -77,140 +55,6 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-/* Client-side file filter. */
-.side-search {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin: 2px 12px 8px;
-  padding: 0 9px;
-  height: 32px;
-  background: var(--surface-3);
-  border: 1px solid transparent;
-  border-radius: 8px;
-  color: var(--text-dim);
-}
-.side-search:focus-within {
-  border-color: var(--accent);
-  color: var(--text);
-}
-.side-search svg {
-  flex-shrink: 0;
-}
-.side-search-input {
-  flex: 1;
-  min-width: 0;
-  background: none;
-  border: none;
-  padding: 0;
-  font-size: 12.5px;
-  color: var(--text);
-}
-.side-search-input:focus {
-  border: none;
-}
-.side-search-clear {
-  display: inline-flex;
-  align-items: center;
-  background: none;
-  border: none;
-  padding: 2px;
-  color: var(--text-dim);
-}
-.side-search-clear:hover {
-  color: var(--text);
-  border-color: transparent;
-}
-
-/* Summarize is a secondary AI tool — a quiet ghost button, not a nav bar. */
-.summarize-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  width: calc(100% - 24px);
-  margin: 0 12px 10px;
-  padding: 7px 10px;
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--accent-2);
-  background: var(--accent-ghost);
-  border: 1px solid rgba(139, 124, 246, 0.18);
-  border-radius: 8px;
-  cursor: pointer;
-  text-align: center;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.summarize-btn svg {
-  flex-shrink: 0;
-}
-
-.summarize-btn:hover:not(:disabled) {
-  background: rgba(139, 124, 246, 0.14);
-  border-color: rgba(139, 124, 246, 0.28);
-}
-
-.summarize-btn:disabled {
-  color: var(--text-dim);
-  cursor: default;
-}
-
-/* ADD-30: background-job progress card (deep summary). Sits under the
-   Summarize button; running shows a live bar, parked shows Resume. */
-.job-card {
-  margin: 0 12px 10px;
-  padding: 9px 11px;
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  font-size: 12px;
-}
-.job-card.error {
-  border-color: color-mix(in srgb, var(--danger, #e5484d) 40%, transparent);
-}
-.job-card-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.job-card-title {
-  font-weight: 600;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.job-card-elapsed {
-  flex: 0 0 auto;
-  font-size: 11px;
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-}
-.job-card-bar {
-  height: 4px;
-  margin: 7px 0 6px;
-  border-radius: 999px;
-  background: var(--surface-3);
-  overflow: hidden;
-}
-.job-card-fill {
-  height: 100%;
-  border-radius: inherit;
-  background: var(--accent);
-  transition: width 0.4s ease;
-}
-.job-card.error .job-card-fill {
-  background: var(--danger, #e5484d);
-}
-/* Before the first real count arrives, an indeterminate sweep says "alive". */
-.job-card-fill.indeterminate {
-  width: 40%;
-  animation: job-sweep 1.3s ease-in-out infinite;
 }
 @keyframes job-sweep {
   0% { margin-left: -40%; }
@@ -259,33 +103,6 @@
 @media (prefers-reduced-motion: reduce) {
   .pass-cell.now { animation-duration: 3s; }
   .pass-mosaic.weaving .pass-cell.on { animation: none; }
-}
-
-.job-card-foot {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-.job-card-label {
-  color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-.job-card-resume {
-  flex: 0 0 auto;
-  padding: 2px 10px;
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--accent);
-  background: var(--accent-ghost);
-  border: 1px solid rgba(139, 124, 246, 0.25);
-  border-radius: 999px;
-}
-.job-card-resume:hover {
-  background: var(--accent-soft);
 }
 
 /* SEC-1: sit above Settings (z-index 30) — it's a security prompt. */

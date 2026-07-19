@@ -124,7 +124,11 @@ export function configure(next: Partial<VoiceConfig>): void {
 }
 
 export function autoSpeakOn(): boolean {
-  return cfg.autoSpeak && cfg.archetype !== "off";
+  // The chat toggle alone decides — the archetype only picks the sound
+  // ("off" = the plain system voice, same clean chain per-message Play uses).
+  // Gating on archetype here made the toggle a silent no-op until the user
+  // discovered Settings → Spoken voice.
+  return cfg.autoSpeak;
 }
 
 /** Audio is scheduled or audibly playing. The autolock tick treats this as
@@ -189,13 +193,13 @@ export function feedStreamDelta(delta: string): void {
 export function endOfTurn(finalText?: string): void {
   if (!streamedTurn || turnEpoch !== epoch || turnEnded) return;
   turnEnded = true;
-  if (!autoSpeakOn()) return;
-  if (!deltasFed && finalText) {
-    pending = finalText;
-    extractSentences(true);
-  } else {
+  if (autoSpeakOn()) {
+    if (!deltasFed && finalText) pending = finalText;
     extractSentences(true);
   }
+  // Always close the turn: with auto-speak off nothing was scheduled, and
+  // hands-free still needs the done signal to re-arm the mic (silent mode —
+  // the user reads the answer instead of hearing it).
   maybeFireTurnDone();
 }
 

@@ -1,9 +1,11 @@
 import { RoomInfo } from "../api";
 import {
   CloseIcon,
+  CollapseLeftIcon,
   DownloadIcon,
   EmptyViewerArt,
   EyeIcon,
+  FocusIcon,
   LockIcon,
   MicIcon,
   PencilIcon,
@@ -15,11 +17,14 @@ import {
   TimeMachineIcon,
 } from "../icons";
 import RoomMap from "../viewers/RoomMap";
-import { formatWhen } from "./composer";
+import { displayName, formatWhen } from "./composer";
 import ViewerRouter from "./ViewerRouter";
 import FrontPage from "./FrontPage";
+import MemoryView from "./MemoryView";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import { WorkArea } from "./types";
+import { LayoutApi } from "../shell/useLayout";
 import { WorkflowsPage } from "./workflows/WorkflowsPage";
 import { ScriptsPage } from "./scripts/ScriptsPage";
 import { QuickActionsMenu, bindingMatches, QuickAction } from "./QuickActions";
@@ -42,46 +47,81 @@ function transcriptHasSpeech(text: string | null | undefined): boolean {
   });
 }
 
-/** Pane 2: the Room Map host, the open-file viewer + head actions, the Front
- * Page dashboard, and the sealed-room empty state. Extracted verbatim. */
+/** The center pane: a stable content header (breadcrumb + pane controls)
+ * over the active surface — open file (any viewer), Workflows, Scripts,
+ * Room Map, Memory, Recordings, the Front Page, or the sealed-room empty
+ * state. An open file always wins, so citations and agent opens are never
+ * swallowed by an area page; Escape returns to the area underneath. */
 export default function ViewerPane({
   s,
   a,
   info,
+  layout,
+  area,
 }: {
   s: WSState;
   a: WSActions;
   info: RoomInfo;
+  layout: LayoutApi;
+  area: WorkArea;
 }) {
   const { openFile } = s;
   const frontPageView =
     s.fp && (s.fp.fileCount > 0 || s.fp.chatCount > 0 || s.fp.memories.length > 0)
       ? s.fp
       : null;
+  const AREA_CRUMBS: Record<WorkArea, string> = {
+    files: "Files",
+    home: "Home",
+    map: "Room Map",
+    recordings: "Recordings",
+    workflows: "Workflows",
+    scripts: "Scripts",
+    memory: "Memory & scratch pad",
+  };
+  const folderName = openFile
+    ? s.folders.find(
+        (fo) => fo.id === s.files.find((f) => f.id === openFile.id)?.folderId,
+      )?.name
+    : undefined;
   return (
     <section className="viewer" aria-label="Workspace">
-      {s.showWorkflows ? (
-        <WorkflowsPage s={s} a={a} />
-      ) : s.showScripts ? (
-        <ScriptsPage s={s} a={a} />
-      ) : s.showMap ? (
-        <>
-          <div className="viewer-head">
-            <span className="viewer-title">Room map</span>
-            <span className="viewer-actions">
-              <button
-                className="subtle btn-ic"
-                onClick={() => s.setShowMap(false)}
-              >
-                <CloseIcon size={12} /> Close
-              </button>
-            </span>
-          </div>
-          <div className="room-map-canvas">
-            <RoomMap onOpenFile={(id) => a.viewFile(id)} />
-          </div>
-        </>
-      ) : openFile ? (
+      <div className="editor-breadcrumb-bar">
+        <div className="editor-breadcrumb" title={openFile?.content.name}>
+          <strong>{info.name}</strong>
+          {" / "}
+          {openFile ? (
+            <>
+              {AREA_CRUMBS[area] !== "Files" ? `${AREA_CRUMBS[area]} / ` : ""}
+              {folderName ? `${folderName} / ` : ""}
+              <span className="crumb-title">
+                {displayName(openFile.content.name)}
+              </span>
+            </>
+          ) : (
+            <span className="crumb-title">{AREA_CRUMBS[area]}</span>
+          )}
+        </div>
+        <div className="pane-actions">
+          <button
+            className="pane-icon-btn"
+            data-tip="Focus this pane"
+            aria-label="Give the workspace pane the full width"
+            onClick={() => layout.toggleFocus("center")}
+          >
+            <FocusIcon size={14} />
+          </button>
+          <button
+            className="pane-icon-btn"
+            data-tip="Collapse"
+            aria-label="Collapse the workspace pane"
+            onClick={() => layout.collapsePane("center")}
+          >
+            <CollapseLeftIcon size={14} />
+          </button>
+        </div>
+      </div>
+      {openFile ? (
         <>
           <div className="viewer-head">
             <span className="viewer-title">{openFile.content.name}</span>
@@ -379,6 +419,43 @@ export default function ViewerPane({
             />
           </div>
         </>
+      ) : s.showWorkflows ? (
+        <WorkflowsPage s={s} a={a} />
+      ) : s.showScripts ? (
+        <ScriptsPage s={s} a={a} />
+      ) : s.showMap ? (
+        <div className="room-map-canvas">
+          <RoomMap onOpenFile={(id) => a.viewFile(id)} />
+        </div>
+      ) : area === "memory" ? (
+        <MemoryView s={s} a={a} info={info} />
+      ) : area === "recordings" ? (
+        <div className="viewer-empty">
+          <div className="viewer-empty-icon">
+            <MicIcon size={40} />
+          </div>
+          <h1 className="viewer-empty-title">Recordings</h1>
+          <p className="viewer-empty-sub">
+            Pick a recording on the left, or capture something new. Audio
+            stays inside this room and transcribes on this Mac.
+          </p>
+          <div className="viewer-empty-actions">
+            <button
+              className="qa-btn primary"
+              disabled={s.recLive != null}
+              onClick={() => void a.startLiveRecording()}
+            >
+              <MicIcon size={15} /> Start a live recording
+            </button>
+            <button
+              className="qa-btn"
+              disabled={a.micState("note").disabled}
+              onClick={() => a.recordVoiceNote()}
+            >
+              <MicIcon size={15} /> Voice note
+            </button>
+          </div>
+        </div>
       ) : frontPageView ? (
         <FrontPage page={frontPageView} s={s} a={a} />
       ) : (

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
@@ -20,6 +20,13 @@ export function useWorkspaceEffects(
   info: RoomInfo,
   onLock: () => void | Promise<void>,
 ) {
+  // The mount-once wiring below closes over the FIRST render's `a`/`s` —
+  // fine for handlers built on refs and stable setters, wrong for anything
+  // that must read current state (the hands-free auto-send needs the live
+  // activeChatId, which is still null on the first render). Callbacks that
+  // fire long after mount go through this ref to reach the latest actions.
+  const aRef = useRef(a);
+  aRef.current = a;
   useEffect(() => {
     if (s.initRef.current) return;
     s.initRef.current = true;
@@ -228,9 +235,22 @@ export function useWorkspaceEffects(
     // Hands-free: when a streamed turn's audio has fully finished playing,
     // re-arm the composer mic through the ordinary dictation path — never
     // earlier, so the microphone can't capture the speaker's own voice.
+    // The done signal can fire synchronously inside the turn's finish()
+    // (nothing was spoken, or playback outran the stream) while `asking` is
+    // still true — so instead of dropping the re-arm there, wait for the ask
+    // to close. Single-flight: one pending arm attempt at a time.
     voice.setTurnAudioDoneListener(() => {
-      if (!s.handsFreeRef.current || s.askingRef.current) return;
-      a.dictateTo("composer", (text) => void a.send(text));
+      if (s.armTimerRef.current !== null) return;
+      const arm = () => {
+        s.armTimerRef.current = null;
+        if (!s.handsFreeRef.current) return;
+        if (s.askingRef.current) {
+          s.armTimerRef.current = window.setTimeout(arm, 150);
+          return;
+        }
+        aRef.current.dictateTo("composer", (text) => void aRef.current.send(text));
+      };
+      arm();
     });
     if (info.synced) {
       api
@@ -360,6 +380,10 @@ export function useWorkspaceEffects(
       // this cleanup never runs for the second, real mount).
       voice.cancelAll();
       voice.setTurnAudioDoneListener(null);
+      if (s.armTimerRef.current !== null) {
+        window.clearTimeout(s.armTimerRef.current);
+        s.armTimerRef.current = null;
+      }
       unlisten.then((fn) => fn());
       unlistenStep.then((fn) => fn());
       unlistenLane.then((fn) => fn());
@@ -589,20 +613,6 @@ export function useWorkspaceEffects(
     if (s.moveMenuFor) a.clampMenu(s.moveMenuElRef.current, s.moveMenuFor.x, s.moveMenuFor.y);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.moveMenuFor]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(s.paneKey);
-      if (raw) {
-        const w = JSON.parse(raw);
-        if (typeof w.sidebar === "number") s.setSidebarW(w.sidebar);
-        if (typeof w.chat === "number") s.setChatW(w.chat);
-      }
-    } catch {
-      /* ignore malformed saved widths */
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.paneKey]);
 
   useEffect(() => {
     try {

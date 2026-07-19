@@ -24,12 +24,12 @@ import {
   WorkflowNodeEvent,
 } from "../api";
 import { AutocompleteState } from "./composer";
-import { OpenFile, Toast } from "./types";
+import { OpenFile, Toast, WorkArea } from "./types";
 
 /** All of Workspace's state + refs, plus the toast primitives that nearly every
  * handler needs. Split out of Workspace.tsx verbatim; the shell threads this to
  * the action factories, the effects hook, and the pane components. */
-export function useWorkspaceState(info: RoomInfo) {
+export function useWorkspaceState(_info: RoomInfo) {
   const [files, setFiles] = useState<FileMeta[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
@@ -80,7 +80,6 @@ export function useWorkspaceState(info: RoomInfo) {
   const [memoryDraft, setMemoryDraft] = useState("");
   // Wave 1b (idea 5): category picked in the memory-panel add row ("" = none).
   const [memoryDraftCat, setMemoryDraftCat] = useState("");
-  const [showMemory, setShowMemory] = useState(false);
   const [saveDraft, setSaveDraft] = useState<{ id: string; name: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [mcpTools, setMcpTools] = useState<string[]>([]);
@@ -90,6 +89,9 @@ export function useWorkspaceState(info: RoomInfo) {
   const [linkUrl, setLinkUrl] = useState("");
   const [importingLink, setImportingLink] = useState(false);
   const [webOn, setWebOn] = useState(false);
+  // Engine parity: mirrors the "let a cloud AI use this room's tools" switch,
+  // so the composer badge can tell the truth for external engines.
+  const [advisorToolsOn, setAdvisorToolsOn] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [versions, setVersions] = useState<FileVersion[]>([]);
   const [confirmRestore, setConfirmRestore] = useState<string | null>(null);
@@ -127,9 +129,6 @@ export function useWorkspaceState(info: RoomInfo) {
   const [editApprovals, setEditApprovals] = useState<EditApproveRequest[]>([]);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
   const internalDragRef = useRef(false);
-  const paneKey = `paneWidths:${info.name}`;
-  const [sidebarW, setSidebarW] = useState(300);
-  const [chatW, setChatW] = useState(400);
   const [renamingFolder, setRenamingFolder] = useState<{ id: string; name: string } | null>(null);
   const [creatingFolder, setCreatingFolder] = useState<string | null>(null);
   const [editingMemory, setEditingMemory] = useState<{
@@ -171,11 +170,19 @@ export function useWorkspaceState(info: RoomInfo) {
   const recheckTimer = useRef<number | undefined>(undefined);
   const prevModelRef = useRef<string>("");
   const userPickedModelRef = useRef(false);
-  const memoryHeadRef = useRef<HTMLDivElement>(null);
   const [showMemoryIntro, setShowMemoryIntro] = useState(false);
   const [showMap, setShowMap] = useState(false);
   const showMapRef = useRef(false);
   showMapRef.current = showMap;
+  // Shell redesign: the activity-rail area. map/workflows/scripts still key
+  // off their show* flags (which many actions clear against each other);
+  // this adds home/recordings/memory, and "files" as the default lens.
+  const [area, setArea] = useState<WorkArea>("files");
+  // Right-pane tab: chat is the resting state; studio and activity are the
+  // contextual tools. Approvals/jobs pull attention to "activity".
+  const [aiTab, setAiTab] = useState<"chat" | "studio" | "activity">("chat");
+  // Library-pane tab: browse the room vs. manage the AI's evidence set.
+  const [libraryTab, setLibraryTab] = useState<"browse" | "sources">("browse");
   // Wave 4a (Idea 2): the full-pane Workflows view, mirroring showMap (+ ref for
   // the mount-once Escape handler). `wfDetailId` selects a workflow inside it.
   const [showWorkflows, setShowWorkflows] = useState(false);
@@ -275,6 +282,9 @@ export function useWorkspaceState(info: RoomInfo) {
   // mount; it must see the current toggle without re-subscribing.
   const handsFreeRef = useRef(false);
   handsFreeRef.current = handsFree;
+  // Pending hands-free arm attempt (the done signal can fire while `asking`
+  // is still closing — the listener defers via this single-flight timer).
+  const armTimerRef = useRef<number | null>(null);
 
   // Stable identity: several mount-time event subscriptions (the rec-* set
   // among them) list pushToast as an effect dependency — a per-render
@@ -311,11 +321,12 @@ export function useWorkspaceState(info: RoomInfo) {
     openFile, setOpenFile, viewerRev, setViewerRev, editMode, setEditMode,
     staleFile, setStaleFile, editModeRef, editorDirtyRef, memAutoSaveRef,
     memoryDraft, setMemoryDraft, memoryDraftCat, setMemoryDraftCat,
-    showMemory, setShowMemory, saveDraft, setSaveDraft,
+    saveDraft, setSaveDraft,
     showSettings, setShowSettings, mcpTools, setMcpTools,
     mcpDialogDismissed, setMcpDialogDismissed, approvingMcp, setApprovingMcp,
     showAddLink, setShowAddLink, linkUrl, setLinkUrl, importingLink, setImportingLink,
-    webOn, setWebOn, showHistory, setShowHistory, versions, setVersions,
+    webOn, setWebOn, advisorToolsOn, setAdvisorToolsOn,
+    showHistory, setShowHistory, versions, setVersions,
     confirmRestore, setConfirmRestore, compare, setCompare,
     confirmDelete, setConfirmDelete,
     showSyncWarn, setShowSyncWarn, folders, setFolders,
@@ -325,16 +336,17 @@ export function useWorkspaceState(info: RoomInfo) {
     addMenuOpen, setAddMenuOpen, roomMenuOpen, setRoomMenuOpen,
     modelMenuOpen, setModelMenuOpen, mcpApprovals, setMcpApprovals,
     editApprovals, setEditApprovals,
-    dragOverFolder, setDragOverFolder, internalDragRef, paneKey,
-    sidebarW, setSidebarW, chatW, setChatW, renamingFolder, setRenamingFolder,
+    dragOverFolder, setDragOverFolder, internalDragRef,
+    renamingFolder, setRenamingFolder,
     creatingFolder, setCreatingFolder, editingMemory, setEditingMemory,
     showSearch, setShowSearch, searchQuery, setSearchQuery,
     searchResults, setSearchResults, searchSel, setSearchSel,
     chatRef, initRef, toastSeq, openFileRef, showSearchRef, showSettingsRef,
     exportWarnedRef, confirmTimer, autolockRef, lastActivityRef,
     askingRef, prevAskingRef, askIdRef, recheckTimer, prevModelRef,
-    userPickedModelRef, memoryHeadRef, showMemoryIntro, setShowMemoryIntro,
+    userPickedModelRef, showMemoryIntro, setShowMemoryIntro,
     showMap, setShowMap, showMapRef, showHelp, setShowHelp,
+    area, setArea, aiTab, setAiTab, libraryTab, setLibraryTab,
     showWorkflows, setShowWorkflows, showWorkflowsRef, wfDetailId, setWfDetailId,
     workflows, setWorkflows, wfNodeStatus, setWfNodeStatus,
     showScripts, setShowScripts, showScriptsRef, scripts, setScripts,
@@ -352,7 +364,7 @@ export function useWorkspaceState(info: RoomInfo) {
     recLive, setRecLive, recLiveRef, recSave, setRecSave,
     sttStatus, setSttStatus, showFeedback, setShowFeedback,
     autoSpeak, setAutoSpeak, handsFree, setHandsFree, handsFreeRef,
-    speakingMsgId, setSpeakingMsgId,
+    armTimerRef, speakingMsgId, setSpeakingMsgId,
   };
 }
 

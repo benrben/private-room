@@ -3,28 +3,36 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { api, ENGINE_LABELS, RoomInfo, splitExternalModel } from "../api";
 import {
   ChevronDownIcon,
+  CloudIcon,
   DotsIcon,
+  LayoutResetIcon,
   LockIcon,
   Logomark,
   ScriptIcon,
   SearchIcon,
+  ThemeIcon,
 } from "../icons";
 import { isCloudEngine, isExternalEngine, isModelReady } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import EngineModelPicker from "./EngineModelPicker";
 import { QuickActionsMenu, QuickAction } from "./QuickActions";
+import { LayoutApi } from "../shell/useLayout";
+import { toggleTheme } from "../theme";
 
-/** The top bar: room identity, the engine pill/menu, search, room menu, lock.
- * Extracted verbatim from the <header className="topbar"> block. */
+/** The 46px room toolbar: brand seal, room identity, the ⌘K command entry,
+ * pinned workflow/script shortcuts, the engine pill with its truthful
+ * local/cloud route badge, theme, layout reset, the room menu, and Lock. */
 export default function TopBar({
   s,
   a,
   info,
+  layout,
 }: {
   s: WSState;
   a: WSActions;
   info: RoomInfo;
+  layout: LayoutApi;
 }) {
   const { ai, model } = s;
   // Wave 5 (Idea 13): the global-scripts shortcut menu open flag (local — it
@@ -66,18 +74,33 @@ export default function TopBar({
       onRun: () => void a.runScript(sc.fileId),
     }));
   const modelReady = isModelReady(ai, model);
+  const cloud = isCloudEngine(model);
   return (
-    <header className="topbar">
-      <div className="room-id" title={info.path}>
-        <span className="room-lock">
-          <Logomark size={26} />
-        </span>
-        <div className="room-id-text">
+    <header className="pr-topbar">
+      <div className="pr-brandmark" aria-label="Private Room" title={info.path}>
+        <Logomark size={26} />
+      </div>
+      <div className="room-identity" title={info.path}>
+        <div className="room-identity-text">
+          <div className="room-kicker">Private Room</div>
           <div className="room-name">{info.name}</div>
-          <div className="room-sub">Private Room</div>
         </div>
       </div>
-      <div className="topbar-right">
+      <div className="command-wrap">
+        <button
+          className="command-button"
+          type="button"
+          onClick={() => {
+            s.setSearchSel(0);
+            s.setShowSearch(true);
+          }}
+        >
+          <SearchIcon size={14} />
+          <span>Search room or run a command…</span>
+          <kbd>⌘ K</kbd>
+        </button>
+      </div>
+      <div className="top-actions">
         {/* ADD-27: a recording keeps running while you work elsewhere — this
          * chip is the always-visible way back to it. */}
         {s.recLive && (
@@ -128,15 +151,17 @@ export default function TopBar({
         {ai && (ai.models.length > 0 || ai.external.length > 0) ? (
           <div className="model-pill-wrap">
             <button
-              className={`model-pill${isCloudEngine(model) ? " cloud" : ""}`}
+              className="model-pill"
               onClick={() => {
                 // One popover at a time — never a menu stacked over a menu.
                 s.setRoomMenuOpen(false);
                 s.setModelMenuOpen((o) => !o);
               }}
+              aria-haspopup="menu"
+              aria-expanded={s.modelMenuOpen}
               title={
                 ai?.running
-                  ? modelReady || isCloudEngine(model)
+                  ? modelReady || cloud
                     ? "AI ready — click to switch engine"
                     : "Model not downloaded"
                   : "Ollama not running"
@@ -156,17 +181,7 @@ export default function TopBar({
                 }`}
               />
               <span className="model-pill-name">{a.engineLabelOf(model)}</span>
-              <span
-                className={`model-pill-tier ${isCloudEngine(model) ? "cloud" : "local"}`}
-                title={
-                  isCloudEngine(model)
-                    ? "This engine runs in the cloud — your prompts and context leave this Mac."
-                    : "This model runs entirely on this Mac — nothing leaves the device."
-                }
-              >
-                {isCloudEngine(model) ? "Cloud" : "On this Mac"}
-              </span>
-              <ChevronDownIcon size={13} className="model-pill-caret" />
+              <ChevronDownIcon size={12} className="model-pill-caret" />
             </button>
             {s.modelMenuOpen && (
               <>
@@ -203,20 +218,45 @@ export default function TopBar({
             Check AI
           </button>
         )}
+        {/* The truthful route badge: green only when processing stays local. */}
+        <div
+          className={`privacy-badge${cloud ? " cloud" : ""}`}
+          title={
+            cloud
+              ? "This engine runs in the cloud — prompts and attached context leave this Mac."
+              : "Files and AI processing stay on this Mac."
+          }
+        >
+          {cloud ? (
+            <CloudIcon size={12} />
+          ) : (
+            <span className="status-dot" aria-hidden />
+          )}
+          <span>{cloud ? "Cloud model" : "Local & private"}</span>
+        </div>
         <button
           className="icon-btn"
-          title="Search ⌘F"
-          onClick={() => {
-            s.setSearchSel(0);
-            s.setShowSearch(true);
-          }}
+          data-tip="Switch theme"
+          aria-label="Switch between dark and light theme"
+          onClick={() => toggleTheme()}
         >
-          <SearchIcon size={16} />
+          <ThemeIcon size={16} />
+        </button>
+        <button
+          className="icon-btn"
+          data-tip="Reset layout"
+          aria-label="Reset the three-pane layout"
+          onClick={layout.resetLayout}
+        >
+          <LayoutResetIcon size={16} />
         </button>
         <div className="room-menu-wrap">
           <button
             className="icon-btn"
-            title="Room menu"
+            data-tip="Room actions"
+            aria-label="Open the room actions menu"
+            aria-haspopup="menu"
+            aria-expanded={s.roomMenuOpen}
             onClick={() => {
               s.setModelMenuOpen(false);
               s.setRoomMenuOpen((o) => !o);
@@ -230,9 +270,10 @@ export default function TopBar({
                 className="menu-backdrop"
                 onMouseDown={() => s.setRoomMenuOpen(false)}
               />
-              <div className="pop-menu room-menu">
+              <div className="pop-menu room-menu" role="menu">
                 <button
                   className="pop-item"
+                  role="menuitem"
                   onClick={() => {
                     s.setShowSettings(true);
                     s.setRoomMenuOpen(false);
@@ -245,6 +286,7 @@ export default function TopBar({
                     Rolling back stays gated in Settings → Checkpoints. */}
                 <button
                   className="pop-item"
+                  role="menuitem"
                   onClick={() => {
                     s.setRoomMenuOpen(false);
                     api
@@ -263,6 +305,7 @@ export default function TopBar({
                 {s.files.length > 0 && (
                   <button
                     className="pop-item"
+                    role="menuitem"
                     onClick={() => {
                       a.exportAllFiles();
                       s.setRoomMenuOpen(false);
@@ -273,6 +316,7 @@ export default function TopBar({
                 )}
                 <button
                   className="pop-item"
+                  role="menuitem"
                   onClick={() => {
                     revealItemInDir(info.path).catch(() => {});
                     s.setRoomMenuOpen(false);
@@ -283,6 +327,7 @@ export default function TopBar({
                 {/* ADD-28: feedback → GitHub issue (opens in YOUR browser). */}
                 <button
                   className="pop-item"
+                  role="menuitem"
                   onClick={() => {
                     s.setShowFeedback(true);
                     s.setRoomMenuOpen(false);
@@ -297,11 +342,11 @@ export default function TopBar({
         {/* ADD-25: locking the room is the user's call, never the agent's. */}
         <button
           className="lock-btn btn-ic"
-          title="Lock ⌘L"
+          title="Lock this room (⌘L)"
           data-agent-blocked
           onClick={a.handleLock}
         >
-          <LockIcon size={14} /> Lock
+          <LockIcon size={13} /> Lock
         </button>
       </div>
     </header>

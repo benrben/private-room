@@ -204,41 +204,59 @@ export default function Settings({
       >
         <div className="settings-head">
           <span id="settings-title">Settings</span>
-          <button className="subtle btn-ic" onClick={onClose}>
+          <button
+            className="subtle btn-ic"
+            aria-label="Close settings"
+            title="Close settings"
+            onClick={onClose}
+          >
             <CloseIcon size={14} />
           </button>
         </div>
         <div className="settings-main">
+          {/* Sections grouped by the question a person is answering; every
+              entry is the same jump target it always was. */}
           <nav className="settings-nav">
             {(
               [
-                ["set-model", "Model"],
-                ["set-behavior", "Behavior"],
-                ["set-voice", "Spoken voice"],
-                ["set-privacy", "Privacy"],
-                ["set-checkpoints", "Checkpoints"],
-                ["set-online", "Online"],
-                ["set-advisors", "AI advisors"],
-                ["set-mcp", "Connections"],
-                ["set-closet", "Remote AI"],
-                ["set-leash", "Room server"],
-                ["set-role", "Room role"],
-                ["set-helpers", "AI helpers"],
-                ["set-recovery", "Recovery key"],
-              ] as [string, string][]
-            ).map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                className="settings-nav-item"
-                onClick={() =>
-                  document
-                    .getElementById(id)
-                    ?.scrollIntoView({ behavior: "smooth", block: "start" })
-                }
-              >
-                {label}
-              </button>
+                ["AI & behavior", [
+                  ["set-model", "Model"],
+                  ["set-behavior", "Behavior"],
+                  ["set-role", "Room role"],
+                  ["set-helpers", "AI helpers"],
+                  ["set-advisors", "AI advisors"],
+                ]],
+                ["Voice & dictation", [["set-voice", "Spoken voice"]]],
+                ["Privacy & recovery", [
+                  ["set-privacy", "Privacy"],
+                  ["set-recovery", "Recovery key"],
+                ]],
+                ["Connections", [
+                  ["set-online", "Online search"],
+                  ["set-mcp", "Connectors (MCP)"],
+                  ["set-closet", "Remote AI"],
+                  ["set-leash", "Room server"],
+                ]],
+                ["History & storage", [["set-checkpoints", "Checkpoints"]]],
+              ] as [string, [string, string][]][]
+            ).map(([group, items]) => (
+              <div key={group} className="settings-nav-group">
+                <div className="settings-nav-heading">{group}</div>
+                {items.map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className="settings-nav-item"
+                    onClick={() =>
+                      document
+                        .getElementById(id)
+                        ?.scrollIntoView({ behavior: "smooth", block: "start" })
+                    }
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             ))}
           </nav>
           <div className="settings-body">

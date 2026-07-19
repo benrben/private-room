@@ -15,8 +15,10 @@ interface Props {
   previewing: boolean;
 }
 
+// "off" is the id of the clean, unshaped voice (it never disables speaking —
+// the chat toggles decide that), so it reads "Plain" here.
 const ARCHETYPES: [VoiceArchetype, string][] = [
-  ["off", "Off"],
+  ["off", "Plain"],
   ["demon", "Demon"],
   ["ghost", "Ghost"],
   ["wraith", "Wraith"],

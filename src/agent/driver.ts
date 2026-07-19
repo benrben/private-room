@@ -47,13 +47,16 @@ const INTERACTIVE_SELECTOR = [
   ".annot-chip",
 ].join(", ");
 
-/** Ordered most-specific-first: the viewer lives inside the layout's main
- * area, so it must win before the broad main/.chat match. */
+/** Ordered most-specific-first: the shell's three panes plus chrome. The
+ * legacy selectors stay as fallbacks so older markup keeps labeling. */
 const REGION_MAP: Array<[selector: string, name: string]> = [
-  [".viewer, .viewer-pane", "viewer"],
-  ["aside, .sidebar", "sidebar"],
-  ["header, .top-bar", "top bar"],
-  ["main, .chat", "chat"],
+  [".viewer, .viewer-pane, .pane-center", "viewer"],
+  [".pane-library, .sidebar", "sidebar"],
+  [".pane-ai, .chat", "chat"],
+  [".activity-rail", "activity rail"],
+  [".pr-statusbar", "status bar"],
+  ["header, .top-bar, .pr-topbar", "top bar"],
+  ["main", "chat"],
 ];
 
 interface SnapshotEntry {

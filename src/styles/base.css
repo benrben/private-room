@@ -1,42 +1,4 @@
-:root {
-  --bg: #0e1014;
-  /* Surface ramp — depth comes from surface contrast, not borders. */
-  --surface-1: #12161d;
-  --surface-2: #161a22;
-  --surface-3: #1c212c;
-  --surface-4: #232a37;
-  /* Legacy aliases kept so existing rules keep working. */
-  --panel: #161a22;
-  --panel-2: #1c212c;
-  /* Component surfaces referenced by workflows.css. These were UNDEFINED, so
-     every `var(--card-bg, #fff)` etc. fell back to white in the dark UI (node
-     boxes, chips, inputs). Define them on the dark ramp. */
-  --card-bg: #161a22;
-  --chip-bg: #1c212c;
-  --input-bg: #1c212c;
-  /* Borders are now the exception — softened, plus a barely-there hairline. */
-  --border: #232a37;
-  --border-subtle: #1a1f28;
-  --text: #e8eaf0;
-  --text-dim: #8b93a7;
-  --text-faint: #626b7d;
-  --accent: #8b7cf6;
-  --accent-2: #a99df8;
-  --accent-soft: rgba(139, 124, 246, 0.16);
-  --accent-ghost: rgba(139, 124, 246, 0.08);
-  --danger: #e5646c;
-  --ok: #4cc38a;
-  --warn: #e3b341;
-  /* Spacing scale (documentation of the values used across the app). */
-  --sp-1: 4px;
-  --sp-2: 8px;
-  --sp-3: 12px;
-  --sp-4: 16px;
-  --sp-6: 24px;
-  --sp-8: 32px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  color-scheme: dark;
-}
+/* Tokens (colors, radii, spacing, both themes) live in tokens.css. */
 
 * {
   box-sizing: border-box;
@@ -45,8 +7,13 @@
 html,
 body,
 #root {
+  width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
   margin: 0;
+  padding: 0;
+  overflow: hidden;
 }
 
 body {
@@ -61,8 +28,8 @@ button {
   color: var(--text);
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 14px;
+  border-radius: var(--radius);
+  padding: 6px 12px;
   cursor: pointer;
 }
 
@@ -75,10 +42,19 @@ button:disabled {
   cursor: default;
 }
 
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--accent-ink);
   font-weight: 600;
 }
 
@@ -109,8 +85,8 @@ select {
   color: var(--text);
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 9px 12px;
+  border-radius: var(--radius);
+  padding: 7px 10px;
   outline: none;
 }
 

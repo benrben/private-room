@@ -7,6 +7,7 @@ import {
   HandsFreeIcon,
   MemoryIcon,
   PencilIcon,
+  SparkIcon,
   SpeakerIcon,
   TrashIcon,
   UndoIcon,
@@ -44,11 +45,7 @@ export default function ChatPane({
     .reverse()
     .find((m) => m.role === "assistant")?.id;
   return (
-    <main
-      className="chat"
-      aria-label="Chat"
-      style={{ width: s.chatW, maxWidth: "none", flex: "0 0 auto" }}
-    >
+    <div className="chat" aria-label="Chat">
       <div className="chat-head">
         {s.renaming ? (
           <input
@@ -104,8 +101,8 @@ export default function ChatPane({
           className={`subtle btn-ic${s.handsFree ? " accent" : ""}`}
           title={
             s.handsFree
-              ? "Hands-free is on — the mic re-arms after each spoken answer"
-              : "Hands-free: re-arm the mic after each spoken answer"
+              ? "Hands-free is on — the mic re-arms after each answer"
+              : "Hands-free: re-arm the mic after each answer to keep talking"
           }
           aria-pressed={s.handsFree}
           onClick={a.toggleHandsFree}
@@ -287,6 +284,12 @@ export default function ChatPane({
           const annotVerified = !!annotation?.quote && !annotation?.approx;
           return (
           <div key={m.id} id={`msg-${m.id}`} className={`msg ${m.role}`}>
+            <div className="msg-label">
+              <span className="msg-avatar" aria-hidden>
+                {m.role === "assistant" ? <SparkIcon size={12} /> : "•"}
+              </span>
+              {m.role === "assistant" ? "Room AI" : "You"}
+            </div>
             <div className="msg-content" dir="auto">
               {m.role === "assistant" ? (
                 <>
@@ -445,6 +448,12 @@ export default function ChatPane({
         })}
         {s.asking && (
           <div className={`msg assistant ${s.streamText ? "" : "thinking"}`}>
+            <div className="msg-label">
+              <span className="msg-avatar" aria-hidden>
+                <SparkIcon size={12} />
+              </span>
+              Room AI
+            </div>
             {(s.lane || s.steps.length > 0) && (
               <div className="step-chips">
                 {s.lane && <span className="lane-chip">{s.lane}</span>}
@@ -510,6 +519,6 @@ export default function ChatPane({
       </div>
 
       <Composer s={s} a={a} />
-    </main>
+    </div>
   );
 }

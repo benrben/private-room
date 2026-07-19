@@ -27,3 +27,16 @@ export interface Props {
   info: RoomInfo;
   onLock: () => void | Promise<void>;
 }
+
+/** The product areas the activity rail navigates between. "files" is the
+ * default document workspace; map/workflows/scripts keep their existing
+ * show* flags as the source of truth, and this value adds the areas that
+ * had no flag before (home, recordings, memory). */
+export type WorkArea =
+  | "files"
+  | "home"
+  | "map"
+  | "recordings"
+  | "workflows"
+  | "scripts"
+  | "memory";

@@ -62,7 +62,7 @@
 .wf-compose-btn {
   flex: 0 0 auto;
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-ink);
   border: none;
   border-radius: 9px;
   padding: 0 1rem;
@@ -267,7 +267,7 @@
 }
 .pipeline-node.selected {
   border-color: var(--accent, #6b6bff);
-  box-shadow: 0 0 0 2px rgba(107, 107, 255, 0.25);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 .pipeline-node-kind {
   font-size: 0.64rem;
@@ -282,14 +282,14 @@
   word-break: break-word;
 }
 .pipeline-node.done {
-  border-color: #37a24a;
+  border-color: var(--green);
 }
 .pipeline-node.skipped {
   border-style: dashed;
   opacity: 0.5;
 }
 .pipeline-node.error {
-  border-color: #d33;
+  border-color: var(--red);
 }
 .pipeline-node.running {
   border-color: var(--accent, #6b6bff);
@@ -298,10 +298,10 @@
 @keyframes wf-pulse {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(107, 107, 255, 0.5);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent);
   }
   50% {
-    box-shadow: 0 0 0 6px rgba(107, 107, 255, 0);
+    box-shadow: 0 0 0 6px transparent;
   }
 }
 .pipeline-node-status {
@@ -413,13 +413,13 @@
   font: inherit;
 }
 .wf-seg button.active {
-  background: var(--accent, #6b6bff);
-  color: #fff;
+  background: var(--accent);
+  color: var(--accent-ink);
 }
 .wf-errors {
-  border: 1px solid #e7b7b7;
-  background: #fdeeee;
-  color: #8a2b2b;
+  border: 1px solid color-mix(in srgb, var(--red) 45%, var(--line));
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  color: var(--red);
   border-radius: 8px;
   padding: 0.5rem 0.7rem;
   font-size: 0.8rem;
@@ -485,7 +485,7 @@
   letter-spacing: 0.04em;
 }
 .script-stream.err > strong {
-  color: #b33;
+  color: var(--red);
 }
 
 /* ---------------- schedule popover ---------------- */

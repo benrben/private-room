@@ -1,4 +1,3 @@
-import { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import {
   AnnotationPayload,
   api,
@@ -28,6 +27,13 @@ export function makeMiscActions(
     api
       .getSetting("web_provider")
       .then((v) => s.setWebOn(v === "duckduckgo" || v === "searxng" || v === "brave"))
+      .catch(() => {});
+    // Engine parity: whether connected MCP tools also ride along when a cloud
+    // CLI answers (the advisor-tools switch) — the composer badge tells the
+    // truth per engine with it.
+    api
+      .getSetting("advisor_tools_enabled")
+      .then((v) => s.setAdvisorToolsOn(v === "1" || v === "on"))
       .catch(() => {});
   }
 
@@ -223,7 +229,8 @@ export function makeMiscActions(
           ?.scrollIntoView({ block: "center" });
       }, 120);
     } else {
-      s.setShowMemory(true);
+      // A memory hit opens the Memory area, where the row can be edited.
+      revealMemory();
     }
     s.setShowSearch(false);
   }
@@ -245,17 +252,19 @@ export function makeMiscActions(
     s.setEditApprovals((q) => q.filter((r) => r.id !== req.id));
   }
 
+  /** Open the Memory & Scratch Pad area (the center-pane manager). */
   function revealMemory() {
-    s.setShowMemory(true);
+    s.setShowMap(false);
+    s.setShowWorkflows(false);
+    s.setShowScripts(false);
+    s.setOpenFile(null);
+    s.setArea("memory");
     s.setShowMemoryIntro(false);
     try {
       localStorage.setItem(`memoryIntroSeen:${info.name}`, "1");
     } catch {
       /* non-fatal */
     }
-    window.setTimeout(() => {
-      s.memoryHeadRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    }, 30);
   }
 
   async function changeModel(value: string) {
@@ -289,38 +298,6 @@ export function makeMiscActions(
     s.setConfirmDelete(null);
   }
 
-  /** Start dragging a pane divider. `edge` says which pane the divider sizes. */
-  function startPaneResize(edge: "sidebar" | "chat", e: ReactMouseEvent) {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = edge === "sidebar" ? s.sidebarW : s.chatW;
-    document.body.classList.add("resizing-col");
-    function onMove(ev: MouseEvent) {
-      const delta = edge === "sidebar" ? ev.clientX - startX : startX - ev.clientX;
-      const next = Math.max(220, Math.min(560, startW + delta));
-      if (edge === "sidebar") s.setSidebarW(next);
-      else s.setChatW(next);
-    }
-    function onUp() {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      document.body.classList.remove("resizing-col");
-      s.setSidebarW((sw) => {
-        s.setChatW((cw) => {
-          try {
-            localStorage.setItem(s.paneKey, JSON.stringify({ sidebar: sw, chat: cw }));
-          } catch {
-            /* storage full/unavailable — non-fatal */
-          }
-          return cw;
-        });
-        return sw;
-      });
-    }
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  }
-
   // ADD-6: flatten grouped search results for arrow-key navigation.
   function searchFlat(): FlatResult[] {
     const flat: FlatResult[] = [];
@@ -344,21 +321,6 @@ export function makeMiscActions(
     return flat;
   }
 
-  function onSearchKey(e: ReactKeyboardEvent<HTMLInputElement>) {
-    const flat = searchFlat();
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      s.setSearchSel((sel) => Math.min(sel + 1, Math.max(flat.length - 1, 0)));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      s.setSearchSel((sel) => Math.max(sel - 1, 0));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      const r = flat[s.searchSel];
-      if (r) activateResult(r);
-    }
-  }
-
   return {
     refreshWebAccess, refreshAutolock, refreshMemAutoSave, dismissSyncWarn,
     connectedTools, approveMcp, keepMcpOff, loadFrontPage,
@@ -367,6 +329,6 @@ export function makeMiscActions(
     resolveMcpApproval, resolveEditApproval,
     revealMemory, changeModel, engineLabelOf,
     recordEngineModels,
-    askConfirm, cancelConfirm, startPaneResize, searchFlat, onSearchKey,
+    askConfirm, cancelConfirm, searchFlat,
   };
 }

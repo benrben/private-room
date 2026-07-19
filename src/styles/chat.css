@@ -1,62 +1,71 @@
-/* ---------- chat (right pane) ---------- */
+/* ---------- chat (right pane, Chat tab) ---------- */
 
 .chat {
   flex: 1;
-  max-width: 480px;
-  min-width: 360px;
   display: flex;
   flex-direction: column;
   min-height: 0;
-  background: var(--surface-2);
-  border-left: 1px solid var(--border-subtle);
+  min-width: 0;
+  background: transparent;
   position: relative;
 }
 
+/* Compact conversation row: chat picker + rename/new/voice/delete. */
 .chat-head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border-subtle);
+  gap: 3px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  flex: 0 0 auto;
+  min-width: 0;
 }
 
 .chat-select {
   flex: 1;
   min-width: 0;
-  font-size: 13px;
-  padding: 6px 9px;
+  font-size: 12px;
+  padding: 4px 6px;
+  color: var(--text);
   background: none;
   border: 1px solid transparent;
+  border-radius: 5px;
 }
 .chat-select:hover {
-  background: var(--surface-3);
+  background: var(--hover);
+  border-color: var(--line);
 }
 
 .banner {
-  padding: 9px 16px;
-  background: var(--accent-soft);
-  border-bottom: 1px solid var(--border);
-  font-size: 13px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.5;
 }
 
 .banner.notice {
-  background: rgba(227, 179, 65, 0.12);
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
 }
 
 .messages {
   flex: 1;
   overflow-y: auto;
-  padding: 20px 24px;
+  /* A readable conversation column even when the AI pane is focused to the
+     full window: content centers once the pane passes ~62rem. */
+  padding: 16px max(14px, calc((100% - 720px) / 2)) 24px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 20px;
+  min-height: 0;
 }
 
 .chat-hero {
   margin: auto;
   text-align: center;
   max-width: 340px;
-  color: var(--text-dim);
+  color: var(--muted);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -74,74 +83,93 @@
   inset: -25%;
   background: radial-gradient(
     closest-side,
-    rgba(139, 124, 246, 0.14),
+    color-mix(in srgb, var(--accent) 14%, transparent),
     transparent 70%
   );
   z-index: -1;
 }
 
 .chat-hero h2 {
-  color: var(--text);
-  font-size: 18px;
-  font-weight: 600;
-  margin: 14px 0 8px;
+  color: var(--text-strong);
+  font-size: 16px;
+  font-weight: 500;
+  margin: 14px 0 7px;
 }
 
 .chat-hero p {
-  font-size: 13px;
+  font-size: 12.5px;
   line-height: 1.6;
   max-width: 300px;
-  margin: 0 0 18px;
+  margin: 0 0 16px;
 }
 
 /* Example prompt chips in the empty chat. */
 .prompt-chips {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   width: 100%;
 }
 .prompt-chip {
   text-align: left;
-  padding: 10px 13px;
-  font-size: 12.5px;
+  padding: 8px 11px;
+  font-size: 12px;
   color: var(--text);
-  background: var(--surface-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
 }
 .prompt-chip:hover {
-  border-color: rgba(139, 124, 246, 0.35);
-  background: var(--accent-ghost);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: var(--hover);
 }
 
+/* Flat, label-led messages (the reference language): a small uppercase
+   speaker line, then the text — no bubbles competing with the document. */
 .msg {
-  max-width: 92%;
-  border-radius: 14px;
-  padding: 11px 15px;
-  line-height: 1.55;
+  max-width: 100%;
+  min-width: 0;
+  border-radius: 0;
+  padding: 0;
+  line-height: 1.6;
+  font-size: 13px;
+}
+
+.msg-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 6px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+.msg-label .msg-avatar {
+  width: 19px;
+  height: 19px;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: var(--selected);
+  color: var(--accent-2);
+}
+.msg.user .msg-label .msg-avatar {
+  background: var(--hover);
+  color: var(--muted);
 }
 
 .msg.user {
-  align-self: flex-end;
-  /* Less loud than a full violet fill: a dark panel marked "yours" by a thin
-     violet left edge. */
-  background: var(--surface-2);
   color: var(--text);
-  border: 1px solid var(--border-subtle);
-  border-left: 3px solid var(--accent);
-  border-bottom-right-radius: 4px;
 }
 
 .msg.assistant {
-  align-self: flex-start;
-  background: var(--surface-3);
-  border: 1px solid var(--border-subtle);
-  border-bottom-left-radius: 4px;
+  color: var(--text);
 }
 
 .msg.thinking {
-  color: var(--text-dim);
+  color: var(--muted);
   font-style: italic;
 }
 
@@ -156,24 +184,75 @@
     opacity: 0;
   }
 }
+@media (prefers-reduced-motion: reduce) {
+  .stream-cursor {
+    animation: none;
+  }
+}
 
 .msg-content {
-  white-space: pre-wrap;
   word-wrap: break-word;
+  min-width: 0;
   /* UX-1 — each line/paragraph picks its own direction so mixed
      Hebrew/English content reads correctly. */
   unicode-bidi: plaintext;
+}
+/* User text and streaming placeholders are plain strings — keep their line
+   breaks. Assistant markdown brings its own block layout. */
+.msg.user .msg-content,
+.msg.thinking .msg-content {
+  white-space: pre-wrap;
+}
+.msg-content p {
+  margin: 0 0 8px;
+}
+.msg-content p:last-child {
+  margin-bottom: 0;
+}
+.msg-content :is(ul, ol) {
+  margin: 6px 0 8px;
+  padding-left: 18px;
+}
+.msg-content li {
+  margin: 3px 0;
+}
+.msg-content pre {
+  margin: 8px 0;
+  padding: 9px 11px;
+  overflow-x: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  font-size: 11.5px;
+}
+.msg-content h1,
+.msg-content h2,
+.msg-content h3 {
+  margin: 12px 0 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-strong);
 }
 
 .msg-footer {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 9px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-  font-size: 12px;
+  gap: 5px;
+  margin-top: 8px;
+  font-size: 11px;
+}
+.msg-footer > button.subtle {
+  padding: 2px 7px;
+  font-size: 11px;
+  color: var(--faint);
+  background: transparent;
+  border-color: transparent;
+}
+.msg-footer > button.subtle:hover {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--line);
 }
 
 .msg-sources {
@@ -182,13 +261,23 @@
   gap: 5px;
 }
 
+/* Citations: quiet accent chips that reopen the supporting source. */
 .source-chip {
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  padding: 2px 9px;
-  color: var(--text-dim);
-  font-size: 11px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--accent-2);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-size: 10.5px;
+}
+.source-chip:hover {
+  background: var(--selected);
+  border-color: var(--accent);
 }
 
 .save-form {
@@ -202,4 +291,3 @@
   padding: 4px 8px;
   width: 160px;
 }
-
