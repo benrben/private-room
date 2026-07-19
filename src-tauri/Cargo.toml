@@ -1,6 +1,6 @@
 [package]
 name = "private-room"
-version = "0.2.3"
+version = "0.3.0"
 description = "Private Room — an encrypted local AI workspace in a single file"
 authors = ["Ben Reich"]
 edition = "2021"
