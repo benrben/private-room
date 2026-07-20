@@ -18,8 +18,14 @@
   <!-- wordmark -->
   <g transform="translate(36 30)">
     <rect width="46" height="46" rx="11" fill="#161a22" stroke="#8b7cf6" stroke-opacity="0.35" stroke-width="1.5"/>
-    <g stroke="#ae93e7" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M23 10 L36 37 M23 10 L10 37 M14.5 28 H31.5"/>
+    <g transform="translate(11 8) scale(0.0545)">
+      <g transform="translate(-292 -263)">
+        <path d="M375 623 L654 710 Q668 715 661 730 L635 778 Q628 790 614 784 L345 682 Z" fill="#9d80d8"/>
+        <path d="M507 279 Q523 263 541 274 Q550 279 557 294 L731 739 Q738 757 727 772 L702 800 Q692 812 677 805 L637 785 L470 337 Q463 319 473 304 Z" fill="#7857b0"/>
+        <path d="M494 277 Q507 264 524 269 Q542 275 548 292 Q552 303 546 318 L381 737 Q376 749 387 758 L365 797 Q356 813 339 810 Q331 809 323 801 L304 781 Q292 769 298 750 L479 308 Q484 288 494 277 Z" fill="#c3acf2"/>
+        <path d="M672 781 L707 785" stroke="#dfbc72" stroke-width="11" stroke-linecap="round"/>
+        <circle cx="672" cy="781" r="5" fill="#fff0b5"/>
+      </g>
     </g>
   </g>
   <text x="96" y="52" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif" font-size="26" font-weight="700" fill="#e8eaf0">Arcelle</text>

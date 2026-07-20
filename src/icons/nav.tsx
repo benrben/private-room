@@ -8,19 +8,16 @@ export function Logomark({ size = 24, className }: IconProps) {
     <svg
       width={size}
       height={size}
-      viewBox="0 0 24 24"
+      viewBox="235 258 560 560"
       fill="none"
       className={className}
       aria-hidden
     >
-      <g
-        stroke="var(--accent)"
-        strokeWidth="1.9"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        <path d="M12 3.6 19.4 20.4 M12 3.6 4.6 20.4 M7.8 15 H16.2" />
-      </g>
+      <path d="M375 623 L654 710 Q668 715 661 730 L635 778 Q628 790 614 784 L345 682 Z" fill="#9d80d8" />
+      <path d="M507 279 Q523 263 541 274 Q550 279 557 294 L731 739 Q738 757 727 772 L702 800 Q692 812 677 805 L637 785 L470 337 Q463 319 473 304 Z" fill="#7857b0" />
+      <path d="M494 277 Q507 264 524 269 Q542 275 548 292 Q552 303 546 318 L381 737 Q376 749 387 758 L365 797 Q356 813 339 810 Q331 809 323 801 L304 781 Q292 769 298 750 L479 308 Q484 288 494 277 Z" fill="#c3acf2" />
+      <path d="M672 781 L707 785" stroke="#dfbc72" strokeWidth="8" strokeLinecap="round" />
+      <circle cx="672" cy="781" r="4" fill="#fff0b5" />
     </svg>
   );
 }
