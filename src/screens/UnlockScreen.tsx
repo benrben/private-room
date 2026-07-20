@@ -155,7 +155,12 @@ export function UnlockScreen({
             autoCorrect="off"
             spellCheck={false}
             onChange={(e) => {
-              setRecoveryInput(e.target.value);
+              // The code is all-uppercase (see RECOVERY_ALPHABET). The
+              // `autoCapitalize` attribute only acts on soft keyboards, so a
+              // desktop WKWebView left lowercase typing lowercase — uppercase
+              // it here so the field matches the shown XXXX-XXXX format.
+              // Length-preserving, so the caret doesn't jump.
+              setRecoveryInput(e.target.value.toUpperCase());
               if (error) setError("");
             }}
           />
