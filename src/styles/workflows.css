@@ -43,6 +43,9 @@
 .wf-compose-row {
   display: flex;
   gap: 0.5rem;
+  /* The input is a multi-line textarea that grows with the description; keep the
+     button pinned to its last line rather than stretched to full height. */
+  align-items: flex-end;
 }
 .wf-compose-input {
   flex: 1;
@@ -53,6 +56,13 @@
   padding: 0.55rem 0.7rem;
   color: var(--text);
   font-size: 0.85rem;
+  /* Textarea: wrap long descriptions instead of scrolling them off one line.
+     Auto-grown in JS up to this max, then scrolls. */
+  font-family: inherit;
+  line-height: 1.45;
+  resize: none;
+  overflow-y: auto;
+  max-height: 8.5rem;
 }
 .wf-compose-input::placeholder {
   color: var(--text-faint);
@@ -129,7 +139,10 @@
   position: absolute;
   top: 100%;
   left: 0;
-  z-index: 40;
+  /* Must sit ABOVE the full-screen .menu-backdrop (z-index 45), like .pop-menu
+     (46). At 40 the backdrop covered the grid and swallowed the click's
+     mousedown — the picker closed before an icon could be selected. */
+  z-index: 46;
   margin-top: 5px;
   display: grid;
   grid-template-columns: repeat(3, 1fr);

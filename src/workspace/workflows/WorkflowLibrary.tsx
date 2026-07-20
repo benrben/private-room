@@ -1,4 +1,4 @@
-import { KeyboardEvent, useEffect, useMemo, useState } from "react";
+import { KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api, Schedule, Workflow, WorkflowRun, WorkflowTemplate } from "../../api";
 import { WSState } from "../state";
 import { WSActions } from "../actions";
@@ -29,6 +29,17 @@ function cardButton(activate: () => void) {
 function ComposeBar({ s, a }: Props) {
   const [desc, setDesc] = useState("");
   const [busy, setBusy] = useState(false);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-grow the textarea to fit the description (capped by max-height in CSS,
+  // after which it scrolls) so a long, multi-sentence workflow prompt stays fully
+  // visible instead of scrolling off a single line.
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(ta.scrollHeight, 136)}px`;
+  }, [desc]);
 
   async function compose() {
     const d = desc.trim();
@@ -57,14 +68,20 @@ function ComposeBar({ s, a }: Props) {
         <span>Describe a workflow and let the assistant build it</span>
       </div>
       <div className="wf-compose-row">
-        <input
+        <textarea
+          ref={taRef}
           className="wf-compose-input"
           placeholder="e.g. every morning, summarize any new PDFs and save a digest"
           value={desc}
           disabled={busy}
+          rows={1}
           onChange={(e) => setDesc(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") void compose();
+            // Enter composes; Shift+Enter inserts a newline for a longer prompt.
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void compose();
+            }
           }}
         />
         <button className="wf-compose-btn" onClick={() => void compose()} disabled={busy || !desc.trim()}>
