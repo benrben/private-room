@@ -18,10 +18,9 @@
   <!-- wordmark -->
   <g transform="translate(36 30)">
     <rect width="46" height="46" rx="11" fill="#161a22" stroke="#8b7cf6" stroke-opacity="0.35" stroke-width="1.5"/>
-    <path d="M14 34v-9.8a9 9 0 0 1 18 0V34" stroke="#8b7cf6" stroke-width="2.6" stroke-linecap="round"/>
-    <path d="M11 34h24" stroke="#8b7cf6" stroke-width="2.6" stroke-linecap="round"/>
-    <circle cx="23" cy="24.2" r="3.1" fill="#8b7cf6"/>
-    <path d="M23 26.6l-2.2 7h4.4l-2.2-7z" fill="#8b7cf6"/>
+    <g stroke="#ae93e7" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M23 10 L36 37 M23 10 L10 37 M14.5 28 H31.5"/>
+    </g>
   </g>
   <text x="96" y="52" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif" font-size="26" font-weight="700" fill="#e8eaf0">Arcelle</text>
   <text x="96" y="72" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="13" fill="#8b93a7">A private AI workspace sealed inside a single file.</text>
