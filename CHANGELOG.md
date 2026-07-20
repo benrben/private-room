@@ -3,6 +3,13 @@
 All notable, user-facing changes to Private Room. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.5.1 — 2026-07-20
+
+- **Recovery codes show as you type them.** The recovery-code box on the
+  unlock screen now uppercases each character as you type, matching the
+  `XXXX-XXXX-…` format the code was shown in. (It always accepted lowercase —
+  this is a display fix, so what you type looks like what you were given.)
+
 ## 0.5.0 — 2026-07-20
 
 ### Dictation that keeps up with you
