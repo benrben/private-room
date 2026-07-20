@@ -18,19 +18,15 @@
   <rect width="1280" height="640" fill="url(#bg1)"/>
   <rect width="1280" height="640" fill="url(#bg2)"/>
 
-  <!-- left: mark + wordmark -->
-  <g transform="translate(96 140)">
-    <g filter="url(#bglow)" opacity="0.8">
-      <path d="M18 128V66a46 46 0 0 1 92 0v62" stroke="#8b7cf6" stroke-width="11" stroke-linecap="round"/>
-      <path d="M2 128h124" stroke="#8b7cf6" stroke-width="11" stroke-linecap="round"/>
-      <circle cx="64" cy="66" r="16" fill="#8b7cf6"/>
-      <path d="M64 78l-10.5 39h21L64 78z" fill="#8b7cf6"/>
+  <!-- left: mark (the folded ribbon A, matching the app icon) + wordmark -->
+  <g transform="translate(96 130) scale(0.236)">
+    <g transform="translate(-298 -263)">
+      <path d="M375 623 L654 710 Q668 715 661 730 L635 778 Q628 790 614 784 L345 682 Z" fill="#9d80d8"/>
+      <path d="M507 279 Q523 263 541 274 Q550 279 557 294 L731 739 Q738 757 727 772 L702 800 Q692 812 677 805 L637 785 L470 337 Q463 319 473 304 Z" fill="#7857b0"/>
+      <path d="M494 277 Q507 264 524 269 Q542 275 548 292 Q552 303 546 318 L381 737 Q376 749 387 758 L365 797 Q356 813 339 810 Q331 809 323 801 L304 781 Q292 769 298 750 L479 308 Q484 288 494 277 Z" fill="#c3acf2"/>
+      <path d="M672 781 L707 785" stroke="#dfbc72" stroke-width="11" stroke-linecap="round"/>
+      <circle cx="672" cy="781" r="5.5" fill="#fff0b5"/>
     </g>
-    <path d="M18 128V66a46 46 0 0 1 92 0v62" stroke="#8b7cf6" stroke-width="10" stroke-linecap="round"/>
-    <path d="M2 128h124" stroke="#8b7cf6" stroke-width="10" stroke-linecap="round"/>
-    <circle cx="64" cy="66" r="15.5" fill="#8b7cf6"/>
-    <path d="M64 77l-10 38h20l-10-38z" fill="#8b7cf6"/>
-    <circle cx="64" cy="62" r="4.8" fill="#c9c1fb"/>
   </g>
 
   <text x="96" y="360" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif" font-size="64" font-weight="700" letter-spacing="-1" fill="#e8eaf0">Arcelle</text>

@@ -59,7 +59,28 @@ All notable, user-facing changes to Arcelle. Versions follow
   code and model calls live in the same pipeline.
 - **A friendlier builder.** Parallel-branch authoring, an icon picker per
   workflow, clickable validation errors that jump to the offending step, and
-  richer run history with per-step output and copy buttons.
+  richer run history with per-step output and copy buttons. The "describe a
+  workflow" box grows to fit a long description, and the icon picker's choices
+  are reliably clickable.
+- **The assistant tests as it builds.** Ask the assistant to build a workflow
+  and it can now run it, read what each step actually produced, fix the step
+  that failed, and try again — handing you a working draft instead of a guess.
+  It still leaves the workflow as a draft for you to review and activate, and a
+  step that runs one of your scripts still asks your approval first.
+- **Workflows read your generated files.** Steps that pick files — newest, all,
+  by name, or "needs a summary" — now include the pages and sheets the
+  assistant created, not just files you imported, so a workflow can summarize or
+  cross-check the very reports it made.
+- **Deep-pass handles code and data.** A full pass over a script or a CSV no
+  longer comes back empty when the on-device model can't summarize a dense
+  window — the content is kept and covered instead of dropped.
+- **Running a workflow's script asks once.** A workflow step that runs one of
+  your room scripts now shows the same one-time approval card as the Scripts
+  page, instead of silently refusing with a confusing "changed since approved."
+- **Dashboards the assistant builds render in place.** HTML pages the assistant
+  writes are now self-contained — charts drawn inline, data embedded — so they
+  display in the app's private, offline viewer instead of arriving blank because
+  they reached for a chart library or live data on the internet.
 
 ### A calmer, more professional look
 
