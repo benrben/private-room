@@ -887,7 +887,15 @@ pub(crate) async fn run_script_process<R: tauri::Runtime>(
     let current_sha = script_fingerprint(&script_bytes);
     if current_sha != consented_sha256 {
         // Aligns with the approval-gates policy: park, never silently run new code.
-        return Err("Script changed since it was approved — review it on the Scripts page.".into());
+        // Distinguish the two cases so the message is actionable: an EMPTY consent
+        // means this script was never approved for this run (e.g. a scheduled or
+        // agent-triggered workflow embedding a script that isn't pre-approved),
+        // whereas a non-empty mismatch means it was approved but has since changed.
+        return Err(if consented_sha256.is_empty() {
+            "This workflow runs a script that isn't approved on this Mac yet. Open it on the Scripts page and run it once to approve it.".into()
+        } else {
+            "Script changed since it was approved — review it on the Scripts page.".into()
+        });
     }
 
     // (b) Parse the manifest + resolve the interpreter.

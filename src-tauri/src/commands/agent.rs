@@ -1027,6 +1027,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "save_workflow",
     "update_workflow",
     "run_workflow",
+    "test_workflow",
     // Reserved even though they are never in the room bridge's own catalog:
     // an MCP route sanitizing to one of these names would shadow the built-in
     // exec_tool arm and skip the SEC-1b consent gate (e.g. server "consult" +
@@ -1197,7 +1198,7 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                 "note": {"type": "string", "description": "Short label explaining the highlight"}},
                 "required": ["name"]}}},
         {"type": "function", "function": {"name": "create_file",
-            "description": "Create a new note/document file saved into the room. For a document without a specific format, write the content as simple HTML body markup (<h2>, <p>, <ul>, <table>) and the app saves it as an .html page. Only use another extension (.md, .csv, .txt) if the user asked for it.",
+            "description": "Create a new note/document file saved into the room. For a document without a specific format, write the content as simple HTML body markup (<h2>, <p>, <ul>, <table>) and the app saves it as an .html page. Only use another extension (.md, .csv, .txt) if the user asked for it. HTML opens in a network-blocked sandbox, so any page you write — especially a dashboard or anything with charts — MUST be fully self-contained: inline ALL CSS and JavaScript, embed the data as literals in the page (never fetch()/XHR at view time — it is blocked), and draw charts as inline SVG (preferred) or with a charting library whose full source you paste inline. NEVER reference a CDN or any external <script src>/<link href>/remote image — it silently won't load and the chart renders blank. If the data is 'live', snapshot the current numbers into the page.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string"}, "content": {"type": "string"}},
                 "required": ["name", "content"]}}},
@@ -2292,6 +2293,9 @@ pub(crate) async fn exec_tool(
         "save_workflow" => agent_save_workflow(state.inner(), window, args, "agent").await,
         "update_workflow" => agent_update_workflow(state.inner(), window, args).await,
         "run_workflow" => agent_run_workflow(window, state.inner(), args).await,
+        "test_workflow" => {
+            Ok(clamp_tool_result(agent_test_workflow(window, state.inner(), args).await?))
+        }
         // Wave 1a: run one prompt on the LOCAL model for an external agent on
         // the Leash's full tier (only `ToolScope::ExternalAgent` advertises
         // it). Never touches `effects` — the bridge passes a throwaway sink
@@ -2929,14 +2933,14 @@ mod tests {
 
     #[test]
     fn workflow_tools_never_leak_into_the_room_bridge_catalog() {
-        // Wave 4a structural guard: the four workflow tools are LocalEngine/
+        // Wave 4a structural guard: the workflow tools are LocalEngine/
         // ExternalAgent-only (served over the bridge, gated by the jobs router) —
         // never in tools_catalog, so a cloud client can never reach them. Each is
         // also reserved in BUILTIN_TOOL_NAMES against MCP shadowing.
         let catalog = tools_catalog(true).to_string();
         let specs = workflow_tools_specs();
-        assert_eq!(specs.len(), 4);
-        for name in ["list_workflows", "save_workflow", "update_workflow", "run_workflow"] {
+        assert_eq!(specs.len(), 5);
+        for name in ["list_workflows", "save_workflow", "update_workflow", "run_workflow", "test_workflow"] {
             assert!(!catalog.contains(name), "{name} must not be in tools_catalog");
             assert!(BUILTIN_TOOL_NAMES.contains(&name), "{name} must be reserved");
             assert!(specs.iter().any(|s| s["function"]["name"] == name), "{name} spec missing");

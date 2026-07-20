@@ -963,10 +963,17 @@ fn resolve_files<R: tauri::Runtime>(
                 .map_err(|_| "the file this run was invoked on is no longer in the room")?;
             vec![(id.clone(), name, mime)]
         }
+        // newest / all / name_like INCLUDE generated files: in a room whose useful
+        // content is AI-authored (dashboards, sheets, research memos), excluding
+        // `source='generated'` here matched nothing, so every file-read node returned
+        // "No file matched — nothing to read." Only the INCREMENTAL selectors below
+        // (since_last_run / missing_summary) still exclude generated, because those
+        // drive scheduled runs where a workflow could otherwise re-ingest its own
+        // just-saved output in a feedback loop.
         "newest" => query_files(
             conn,
             "SELECT id, name, coalesce(mime_type,'') FROM files \
-             WHERE source != 'generated' ORDER BY created_at DESC LIMIT 1",
+             ORDER BY created_at DESC LIMIT 1",
             [],
         )?,
         // Same 50-file cap as the other bulk selectors; a file_pass node still
@@ -974,7 +981,7 @@ fn resolve_files<R: tauri::Runtime>(
         "all" => query_files(
             conn,
             "SELECT id, name, coalesce(mime_type,'') FROM files \
-             WHERE source != 'generated' ORDER BY created_at DESC LIMIT 50",
+             ORDER BY created_at DESC LIMIT 50",
             [],
         )?,
         "name_like" => {
@@ -982,15 +989,20 @@ fn resolve_files<R: tauri::Runtime>(
             query_files(
                 conn,
                 "SELECT id, name, coalesce(mime_type,'') FROM files \
-                 WHERE source != 'generated' AND lower(name) LIKE ?1 \
+                 WHERE lower(name) LIKE ?1 \
                  ORDER BY created_at DESC LIMIT 20",
                 [pat],
             )?
         }
+        // missing_summary INCLUDES generated files: summarizing only caches a
+        // one-liner into the file's `ai_summary` metadata (never a new file), so
+        // there is no feedback loop — and an AI-authored file needs its one-line
+        // description just like any other. Excluding generated here meant a room of
+        // generated files reported "nothing to summarize" while none got a summary.
         "missing_summary" => query_files(
             conn,
             "SELECT id, name, coalesce(mime_type,'') FROM files \
-             WHERE source != 'generated' AND ai_summary IS NULL \
+             WHERE ai_summary IS NULL \
                AND extracted_text IS NOT NULL AND trim(extracted_text) != '' \
              ORDER BY created_at DESC LIMIT 50",
             [],
@@ -2487,7 +2499,19 @@ pub async fn run_workflow(
                 .ok_or_else(|| "That file is no longer in this room.".to_string())
         })?;
     }
-    start_workflow_run(&window, state.inner(), &id, "manual", file_id, &std::collections::HashSet::new()).await
+    // A user-driven run may embed script_run nodes. Surface the consent card for
+    // any script not yet approved on this Mac (reusing the Scripts-page machinery)
+    // and fold the grants into this run — so an embedded script is runnable without
+    // a separate trip to the Scripts page, while still gated by explicit per-Mac
+    // consent. Without this the run parked with "Script changed since it was
+    // approved" even though the script was never approved.
+    let def: WorkflowDef = state.with_room(|room| {
+        let wf = db::get_workflow(&room.conn, &id)?;
+        serde_json::from_value(wf.definition)
+            .map_err(|_| "this workflow's definition is unreadable".to_string())
+    })?;
+    let extra = crate::commands::approve_workflow_scripts(&window, state.inner(), &def).await?;
+    start_workflow_run(&window, state.inner(), &id, "manual", file_id, &extra).await
 }
 
 /// The prebuilt template gallery (empty-state) — also the agent's few-shot set.
@@ -2838,6 +2862,154 @@ pub(crate) async fn agent_run_workflow(
     ))
 }
 
+/// Agent tool `test_workflow`: the build→test→fix loop's inspection half. RUN a
+/// workflow (draft OR active) to completion right now and report the outcome —
+/// overall status plus EACH step's label, kind, skip and a preview of its result —
+/// so the agent can see what actually failed and fix it with `update_workflow`.
+///
+/// Unlike `run_workflow` (fire-and-forget, active-only), this waits for the run and
+/// returns its results. It leaves the workflow's status untouched — a tested draft
+/// stays a DRAFT, so the user remains the activation gate (never auto-activated).
+/// Script steps still need the user's approval (the agent can't self-approve code),
+/// so a `script_run` node PARKS during a test — reported honestly in the result.
+pub(crate) async fn agent_test_workflow(
+    window: &tauri::Window,
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<String, String> {
+    let key = args["name_or_id"].as_str().or_else(|| args["name"].as_str()).unwrap_or_default();
+    let wf = state.with_room(|room| db::find_workflow(&room.conn, key))?;
+    let def: WorkflowDef = serde_json::from_value(wf.definition.clone())
+        .map_err(|_| "this workflow's definition is unreadable".to_string())?;
+    let binding = parse_binding(Some(&wf.binding));
+
+    // Validate first — a compile error needs no run and names each fix.
+    if let Err(errs) = validate_with_binding(&def, &binding) {
+        return Ok(format!(
+            "Test of \"{}\": it doesn't validate yet, so it can't run. Fix these with update_workflow, then test again:\n- {}",
+            wf.name,
+            errs.join("\n- ")
+        ));
+    }
+
+    // Deadlock-safe: only test when the single job slot is free. A test queued
+    // behind a running job that is ITSELF waiting on this call (a parent workflow's
+    // agent_run node) would hang — so refuse rather than queue.
+    if state.running_job.lock().unwrap().is_some() {
+        return Err(
+            "Another job is running right now — ask the user to wait for it to finish, then test the workflow again."
+                .into(),
+        );
+    }
+
+    // A file-scoped (run_input) workflow needs a file to run on.
+    let file = args["file"].as_str().or_else(|| args["file_id"].as_str());
+    let file_id = match file {
+        Some(f) => Some(state.with_room(|room| db::find_source_file_like(&room.conn, f).map(|(id, _)| id))?),
+        None => None,
+    };
+    if def_uses_run_input(&def) && file_id.is_none() {
+        return Err(format!(
+            "\"{}\" runs on a chosen file — pass `file` (a file name) so the test has something to run on.",
+            wf.name
+        ));
+    }
+
+    // Enqueue a real run with the "agent" trigger — NOT "manual", so a successful
+    // test doesn't auto-open its output file in the viewer on every iteration (only
+    // a manual run yanks the viewer). No script grants — the agent can't self-
+    // approve, so any script step parks (surfaced below). The slot was free, so this
+    // starts immediately rather than queuing.
+    let job_id =
+        start_workflow_run(window, state, &wf.id, "agent", file_id, &std::collections::HashSet::new()).await?;
+    if job_id.is_empty() {
+        return Err("Couldn't start a test run just now — try again in a moment.".into());
+    }
+
+    // Poll the job to a terminal status, bounded. On timeout, cancel the run.
+    const TEST_TIMEOUT_SECS: u64 = 240;
+    let start = std::time::Instant::now();
+    let (status, err): (String, Option<String>) = loop {
+        let job = state.with_room(|room| db::get_job(&room.conn, &job_id));
+        if let Ok(j) = job {
+            match j.status.as_str() {
+                "done" => break ("done".into(), None),
+                "error" => break ("error".into(), j.error.clone()),
+                "paused" => break ("paused".into(), j.error.clone()),
+                _ => {}
+            }
+        }
+        if start.elapsed().as_secs() >= TEST_TIMEOUT_SECS {
+            if let Some(c) = state.job_cancels.lock().unwrap().get(&job_id) {
+                c.store(true, Ordering::SeqCst);
+            }
+            break ("timeout".into(), None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    };
+
+    // Read each step's stored artifact for a per-step report.
+    let total = def.nodes.len();
+    let mut lines: Vec<String> = Vec::new();
+    for i in 0..total {
+        let raw = state
+            .with_room(|room| Ok(db::get_job_artifact(&room.conn, &job_id, i)))
+            .ok()
+            .flatten();
+        let Some(raw) = raw else {
+            lines.push(format!("{}. (did not run)", i + 1));
+            continue;
+        };
+        let art: WfArtifact = serde_json::from_str(&raw).unwrap_or_default();
+        let label = art.node_label.clone().unwrap_or_else(|| format!("Step {}", i + 1));
+        let kind = art.node_kind.clone().unwrap_or_default();
+        let state_str = if art.skipped { "skipped" } else { "done" };
+        let preview: String = art.result.trim().chars().take(240).collect();
+        let preview = if preview.is_empty() {
+            "(no output)".to_string()
+        } else {
+            preview.replace('\n', " ")
+        };
+        let kind_tag = if kind.is_empty() { String::new() } else { format!(" [{kind}]") };
+        lines.push(format!("{}. {label}{kind_tag} — {state_str}: {preview}", i + 1));
+    }
+
+    let header = match status.as_str() {
+        "done" => format!("Test of \"{}\": SUCCESS — every step ran.", wf.name),
+        "error" => format!(
+            "Test of \"{}\": FAILED — {}",
+            wf.name,
+            err.as_deref().unwrap_or("a step errored (see steps below)")
+        ),
+        "paused" => format!(
+            "Test of \"{}\": PAUSED — {}. A script step needs the user's approval on the Scripts page (the agent can't approve code).",
+            wf.name,
+            err.as_deref().unwrap_or("stopped before finishing")
+        ),
+        _ => format!(
+            "Test of \"{}\": still running after {TEST_TIMEOUT_SECS}s — stopped waiting (it may be a heavy model step). The partial results so far:",
+            wf.name
+        ),
+    };
+    Ok(clamp_test_report(format!(
+        "{header}\nSteps:\n{}\n\nThe workflow is still a DRAFT — fix any failing step with update_workflow and test again, or tell the user it's ready to activate.",
+        lines.join("\n")
+    )))
+}
+
+/// Bound the test report so a chatty run can't blow the tool-result budget.
+fn clamp_test_report(s: String) -> String {
+    const MAX: usize = 6000;
+    if s.len() <= MAX {
+        return s;
+    }
+    let mut cut = s.char_indices().map(|(i, _)| i).take_while(|&i| i <= MAX).last().unwrap_or(0);
+    if cut == 0 {
+        cut = s.len();
+    }
+    format!("{}…\n(report truncated)", &s[..cut])
+}
+
 /// Wave 4a: the workflow agent tools. Like the job tools, NEVER in `tools_catalog`
 /// (so a cloud client can't reach them) — served only over the bridge for the
 /// LocalEngine/ExternalAgent scopes and gated by the jobs routing flag.
@@ -2848,7 +3020,7 @@ pub fn workflow_tools_specs() -> Vec<serde_json::Value> {
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Optional: a workflow name to fetch its full definition"}}}}}),
         serde_json::json!({"type": "function", "function": {"name": "save_workflow",
-            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph of nodes + edges [{from, to, branch?}]. Model nodes: generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, for_each_file {select, instruction} (runs on EACH selected file), agent_run {question}, extract {fields:[...]} (structured JSON out of {{input}}), route {prompt, labels:[...]} (tags input with one label → edges use branch:<label>, an N-way condition), vote {prompt, samples, mode:concat|majority}, refine {prompt, rubric, max_rounds} (generate→critique→revise loop), plan_and_map {objective, max_workers} (decompose→work→synthesize). Deterministic nodes (no model): transform {op:append|prepend|replace|upper|lower|trim|truncate|strip_html, find?, value?}, merge {mode:concat|dedupe_lines|numbered} (join parallel branches), http_fetch {url}, script_run {file, mode:import|transform} (run a room .py/.js; transform pipes {{input}}→stdin→stdout), save_file {name_template, format, mode}, condition {op, value}. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Parallelism = several edges out of one node re-joined by a merge. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix.",
+            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph of nodes + edges [{from, to, branch?}]. Model nodes: generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, for_each_file {select, instruction} (runs on EACH selected file), agent_run {question}, extract {fields:[...]} (structured JSON out of {{input}}), route {prompt, labels:[...]} (tags input with one label → edges use branch:<label>, an N-way condition), vote {prompt, samples, mode:concat|majority}, refine {prompt, rubric, max_rounds} (generate→critique→revise loop), plan_and_map {objective, max_workers} (decompose→work→synthesize). Deterministic nodes (no model): transform {op:append|prepend|replace|upper|lower|trim|truncate|strip_html, find?, value?}, merge {mode:concat|dedupe_lines|numbered} (join parallel branches), http_fetch {url}, script_run {file, mode:import|transform} (run a room .py/.js; transform pipes {{input}}→stdin→stdout), save_file {name_template, format, mode}, condition {op, value}. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Parallelism = several edges out of one node re-joined by a merge. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix. After saving, don't stop there: call test_workflow to actually RUN it, read which step failed, fix it with update_workflow, and test again until it works — then tell the user the draft is ready to activate.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string"},
                 "description": {"type": "string"},
@@ -2870,6 +3042,12 @@ pub fn workflow_tools_specs() -> Vec<serde_json::Value> {
                 "required": ["name_or_id"]}}}),
         serde_json::json!({"type": "function", "function": {"name": "run_workflow",
             "description": "Run an ACTIVE workflow now, in the background. Optionally pass `file` (a file name) for a file-scoped workflow. After starting it, tell the user it is underway — do not wait for it or poll.",
+            "parameters": {"type": "object", "properties": {
+                "name_or_id": {"type": "string"},
+                "file": {"type": "string", "description": "Optional file name for a file-scoped workflow"}},
+                "required": ["name_or_id"]}}}),
+        serde_json::json!({"type": "function", "function": {"name": "test_workflow",
+            "description": "TEST a workflow you're building: run it (draft or active) to completion RIGHT NOW and get the result of every step back, so you can see what failed and fix it. This is how you iterate — save_workflow (draft) → test_workflow → read the failing step → update_workflow to fix it → test_workflow again → repeat until it succeeds, then tell the user it's ready to activate. Unlike run_workflow this WAITS and returns the outcome (each step's label, kind, whether it was skipped, and a preview of its output). It never changes the workflow's status — a tested workflow stays a DRAFT for the user to review and activate. A script_run step needs the user's approval (you can't approve code), so it parks in a test — that's expected, just tell the user. Only runs when no other job is busy; if it says another job is running, ask the user to wait and try again. Pass `file` (a file name) for a file-scoped workflow.",
             "parameters": {"type": "object", "properties": {
                 "name_or_id": {"type": "string"},
                 "file": {"type": "string", "description": "Optional file name for a file-scoped workflow"}},

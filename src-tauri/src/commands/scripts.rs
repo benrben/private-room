@@ -121,6 +121,80 @@ pub fn resolve_script_run(state: State<'_, AppState>, id: String, decision: Stri
     Ok(())
 }
 
+/// For a MANUAL workflow run: make every `script_run` node the workflow embeds
+/// runnable by obtaining consent for any whose current content isn't already
+/// approved on this Mac — surfacing the SAME consent card as the Scripts page
+/// (`script-approve-request`), which the global frontend listener renders. Returns
+/// the freshly-granted fingerprints to fold into the run's `extra_consents`, so
+/// `stamp_script_consents` then stamps them into the plan snapshot.
+///
+/// This closes the gap where a workflow embedding a script (e.g. one the agent
+/// drafted) parked every run with "Script changed since it was approved" even
+/// though the script was never approved — the workflow runner had no consent path.
+/// Scheduled/agent/catch-up triggers deliberately never call this (a cron tick
+/// must not prompt, and the UI-driving agent must not approve its own code — the
+/// SEC-1 doctrine); an embedded script they haven't been pre-approved for still
+/// parks. A decline aborts the run with an actionable, script-named error.
+pub(crate) async fn approve_workflow_scripts(
+    window: &tauri::Window,
+    state: &AppState,
+    def: &WorkflowDef,
+) -> Result<HashSet<String>, String> {
+    use tauri::Manager as _;
+    let app = window.app_handle().clone();
+    let approved: HashSet<String> = read_script_approvals(&app).into_iter().collect();
+    let mut grants: HashSet<String> = HashSet::new();
+    // Dedupe by fingerprint so a workflow running the same script twice prompts once.
+    let mut seen: HashSet<String> = HashSet::new();
+    for node in &def.nodes {
+        let NodeKind::ScriptRun { file, .. } = &node.kind else {
+            continue;
+        };
+        // Resolve `file` (a stored id, or a name) to (name, bytes) — the same
+        // resolution the consent-stamping + executor use.
+        let resolved: Option<(String, Vec<u8>)> = state.with_room(|room| {
+            if let Ok((name, bytes)) = db::get_file_bytes_named(&room.conn, file) {
+                Ok(Some((name, bytes.unwrap_or_default())))
+            } else if let Ok((id, _)) = db::find_file_like(&room.conn, file) {
+                match db::get_file_bytes_named(&room.conn, &id) {
+                    Ok((name, bytes)) => Ok(Some((name, bytes.unwrap_or_default()))),
+                    Err(_) => Ok(None),
+                }
+            } else {
+                Ok(None)
+            }
+        })?;
+        // An unresolvable script (or a non-.py/.js file) is left to the executor to
+        // surface honestly — no consent card for a file we can't run.
+        let Some((name, bytes)) = resolved else { continue };
+        if script_lang_of(&name).is_none() {
+            continue;
+        }
+        let sha = script_fingerprint(&bytes);
+        if approved.contains(&sha) || !seen.insert(sha.clone()) {
+            continue;
+        }
+        // Resolve the runtime first — an actionable "install uv/python" error is
+        // better raised before the consent card than after (mirrors `run_script`).
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let manifest = parse_script_manifest(&name, &text);
+        let runner = resolve_interpreter(&manifest)?;
+        let brief = ScriptBrief {
+            name: name.clone(),
+            sha: sha.clone(),
+            interpreter_line: interpreter_line(&runner, &name),
+            manifest,
+        };
+        if !script_run_approved(&app, state, window, &brief).await {
+            return Err(format!(
+                "The script “{name}” wasn't approved, so this workflow can't run."
+            ));
+        }
+        grants.insert(sha);
+    }
+    Ok(grants)
+}
+
 // ------------------------------------------------------------ auto-workflow
 
 /// True when `wf` is the auto-created single-node workflow for `file_id`.
