@@ -3,7 +3,20 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
-## 0.6.0 — 2026-07-20
+## 0.7.0 — 2026-07-20
+
+### Private Room is now Arcelle
+
+- **New name, same sealed room.** Private Room is now **Arcelle** — "a little
+  ark." Same app, same encrypted file, same local AI inside; only the name and
+  the icon changed. This update renames the app in place, so your rooms,
+  memories, Touch ID, and granted permissions carry over untouched.
+- **New vaults are `.arcelle` files.** Rooms you create from now on save with
+  the `.arcelle` extension; every existing `.roomai` file still opens exactly as
+  before — nothing to convert, nothing left behind.
+- **A new mark.** The app icon is a single unbroken ribbon folded into an "A" —
+  one continuous ribbon for the one file that holds everything, with a small
+  amber seam for the one key that opens it.
 
 ### A marketplace for tool connectors
 
