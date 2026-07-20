@@ -18,8 +18,8 @@ import pytest
 from ollama import ResponseError
 from PIL import Image
 
-from privateroom_sidecar import llm, vision
-from privateroom_sidecar.server import create_app
+from arcelle_sidecar import llm, vision
+from arcelle_sidecar.server import create_app
 
 
 # --- fakes (mirrors test_llm.FakeAsyncClient) -------------------------------

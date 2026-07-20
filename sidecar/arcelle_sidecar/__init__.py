@@ -1,4 +1,4 @@
-"""Private Room — local LangGraph agent sidecar.
+"""Arcelle — local LangGraph agent sidecar.
 
 The sidecar is the *agent brain* only. All tools, all DB access, all decryption
 and all streaming to the UI stay in the Rust host (see SPEC.md §1).

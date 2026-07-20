@@ -25,7 +25,7 @@ export default function FeedbackModal({ s }: { s: WSState }) {
   if (!s.showFeedback) return null;
 
   const diagLine = diag
-    ? `Private Room ${diag.version} · ${diag.os} (${diag.arch})`
+    ? `Arcelle ${diag.version} · ${diag.os} (${diag.arch})`
     : "";
   const finalBody = includeDiag && diagLine ? `${body.trim()}\n\n---\n${diagLine}` : body.trim();
   const ready = title.trim().length > 0 && body.trim().length > 0;

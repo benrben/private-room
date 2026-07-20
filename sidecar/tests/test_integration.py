@@ -1,7 +1,7 @@
 """REAL end-to-end integration test for the Rust<->Python agent seam (ADD-33).
 
 Unlike the rest of the suite, this test does NOT mock the sidecar. It stands up
-the *real* FastAPI app (``privateroom_sidecar.server.create_app`` with its default
+the *real* FastAPI app (``arcelle_sidecar.server.create_app`` with its default
 factories) so the run drives the real graph -> real ``chat.OllamaChatModel`` ->
 real ``langchain_ollama.ChatOllama`` -> real ``ollama.AsyncClient`` HTTP, and the
 real ``mcp_client.McpClient`` HTTP. The only things mocked are the two things the
@@ -34,8 +34,8 @@ from typing import Any
 import httpx
 import pytest
 
-from privateroom_sidecar.mcp_client import McpClient, McpError
-from privateroom_sidecar.server import create_app
+from arcelle_sidecar.mcp_client import McpClient, McpError
+from arcelle_sidecar.server import create_app
 
 # --------------------------------------------------------------------------- #
 # Mock Ollama — the /api/chat streaming NDJSON protocol chat.py/langchain expect
@@ -190,7 +190,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             result: Any = {
                 "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "private-room", "version": "test"},
+                "serverInfo": {"name": "arcelle", "version": "test"},
             }
         elif method == "ping":
             result = {}
@@ -512,7 +512,7 @@ async def test_mcp_client_wire_auth_and_notifications():
         # initialized notification -> 202) then tools/list then a tool call.
         async with McpClient(mcp_url, token) as client:
             info = await client.initialize()
-            assert info["serverInfo"]["name"] == "private-room"
+            assert info["serverInfo"]["name"] == "arcelle"
             await client.ping()
             tools = await client.list_tools()
             names = {t.name for t in tools}

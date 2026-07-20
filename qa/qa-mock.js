@@ -7,7 +7,7 @@
   const iso = (minAgo) => new Date(now.getTime() - minAgo * 60000).toISOString();
 
   const files = [
-    { id: "f-direction", name: "Private Room UX direction.md", mimeType: "text/markdown", sizeBytes: 4210, source: "generated", hasText: true, createdAt: iso(2), folderId: "fo-product", partiallyIndexed: false },
+    { id: "f-direction", name: "Arcelle UX direction.md", mimeType: "text/markdown", sizeBytes: 4210, source: "generated", hasText: true, createdAt: iso(2), folderId: "fo-product", partiallyIndexed: false },
     { id: "f-ideas", name: "Ideas.md", mimeType: "text/markdown", sizeBytes: 2130, source: "upload", hasText: true, createdAt: iso(300), folderId: "fo-product", partiallyIndexed: false },
     { id: "f-issues", name: "Issues.md", mimeType: "text/markdown", sizeBytes: 1830, source: "upload", hasText: true, createdAt: iso(14), folderId: "fo-product", partiallyIndexed: false },
     { id: "f-clean", name: "clean-code.pdf", mimeType: "application/pdf", sizeBytes: 3_980_000, source: "upload", hasText: true, createdAt: iso(900), folderId: "fo-research", partiallyIndexed: true },
@@ -24,7 +24,7 @@
 
   const memories = [
     { id: "m1", content: "Prefers concise product documents", category: "preference", createdAt: iso(4000) },
-    { id: "m2", content: "Private Room is a local-first research workspace", category: "project", createdAt: iso(3000) },
+    { id: "m2", content: "Arcelle is a local-first research workspace", category: "project", createdAt: iso(3000) },
     { id: "m3", content: "Ben reads Hebrew sources; keep RTL rendering intact", category: "fact", createdAt: iso(2000) },
   ];
 
@@ -34,7 +34,7 @@
   ];
 
   const messages = [
-    { id: "msg1", role: "user", content: "What should be the core interaction model for Private Room?", sources: [], createdAt: iso(16), effects: null },
+    { id: "msg1", role: "user", content: "What should be the core interaction model for Arcelle?", sources: [], createdAt: iso(16), effects: null },
     {
       id: "msg2",
       role: "assistant",
@@ -48,10 +48,10 @@
     },
   ];
 
-  const docText = `# Private Room UX direction\n\nA calmer, source-grounded workspace where navigation, writing, and assistance stay visible without competing for attention.\n\n## One workspace, three clear jobs\n\nThe interface should behave like a room rather than a stack of destinations. The library is for orientation, the editor is for the current thought, and AI is for asking or transforming. All three remain available side by side, and each can disappear completely when it is not needed.\n\n- Keep the writing surface stable while sources and AI resize around it.\n- Make AI context explicit with source checkboxes and visible citations.\n- Preserve every user layout and restore it on the next visit.\n\n> **Design rule:** Quiet does not mean hidden. Essential controls remain discoverable; secondary controls appear where the user is already looking.\n\n## Reading and writing should feel effortless\n\nUse a restrained type scale, a comfortable line length, and generous vertical rhythm. The page is the visual center. Toolbars stay compact, while frequently used actions are reachable from the keyboard and the activity rail.\n\n## Trust must be visible\n\nShow what leaves the device, what stays local, which files are informing an answer, and where every citation came from. Privacy language should describe behavior, not merely claim safety.`;
+  const docText = `# Arcelle UX direction\n\nA calmer, source-grounded workspace where navigation, writing, and assistance stay visible without competing for attention.\n\n## One workspace, three clear jobs\n\nThe interface should behave like a room rather than a stack of destinations. The library is for orientation, the editor is for the current thought, and AI is for asking or transforming. All three remain available side by side, and each can disappear completely when it is not needed.\n\n- Keep the writing surface stable while sources and AI resize around it.\n- Make AI context explicit with source checkboxes and visible citations.\n- Preserve every user layout and restore it on the next visit.\n\n> **Design rule:** Quiet does not mean hidden. Essential controls remain discoverable; secondary controls appear where the user is already looking.\n\n## Reading and writing should feel effortless\n\nUse a restrained type scale, a comfortable line length, and generous vertical rhythm. The page is the visual center. Toolbars stay compact, while frequently used actions are reachable from the keyboard and the activity rail.\n\n## Trust must be visible\n\nShow what leaves the device, what stays local, which files are informing an answer, and where every citation came from. Privacy language should describe behavior, not merely claim safety.`;
 
   const contents = {
-    "f-direction": { kind: "markdown", name: "Private Room UX direction.md", mime: "text/markdown", editable: true, text: docText, dataB64: null },
+    "f-direction": { kind: "markdown", name: "Arcelle UX direction.md", mime: "text/markdown", editable: true, text: docText, dataB64: null },
     "f-ideas": { kind: "markdown", name: "Ideas.md", mime: "text/markdown", editable: true, text: "# Workspace model\n\nKeep sources, the active page, and AI in one view. Make the page the visual anchor.", dataB64: null },
     "f-issues": { kind: "markdown", name: "Issues.md", mime: "text/markdown", editable: true, text: "# High priority\n\n- Navigation changes meaning between workspace and chat.\n- Source scope is invisible before sending.", dataB64: null },
     "f-apollo": { kind: "csv", name: "Apollo missions.csv", mime: "text/csv", editable: true, text: "mission,year,crew\nApollo 7,1968,3\nApollo 8,1968,3\nApollo 11,1969,3\nApollo 13,1970,3\nApollo 17,1972,3", dataB64: null },

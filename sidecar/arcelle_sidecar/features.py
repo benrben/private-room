@@ -98,7 +98,7 @@ async def front_page_labels(
 # --- feedback: GitHub issue draft (feedback.rs) -----------------------------
 
 _FEEDBACK_SYSTEM = (
-    "You turn a user's raw feedback about the Private Room desktop app into a clear "
+    "You turn a user's raw feedback about the Arcelle desktop app into a clear "
     "GitHub issue. Title: one short, specific English summary line (under 70 "
     "characters, no trailing period). Body: GitHub Markdown with '## What happened' "
     "and, only when the feedback implies them, '## Expected' and '## Steps to "

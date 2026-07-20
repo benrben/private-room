@@ -108,7 +108,7 @@ pub(crate) fn safe_scope_name(label: &str) -> String {
 #[tauri::command]
 pub fn open_html_in_browser(name: Option<String>, html: String) -> Result<String, String> {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("private-room-preview");
+    let dir = std::env::temp_dir().join("arcelle-preview");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Couldn't create the preview folder: {e}"))?;
     let base = name
@@ -144,7 +144,7 @@ pub fn open_html_in_browser(name: Option<String>, html: String) -> Result<String
 /// Not called mid-session — `/usr/bin/open` returns before the browser has read
 /// the file, so an eager sweep could hand the browser a dead path.
 pub fn cleanup_browser_previews() {
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("private-room-preview"));
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("arcelle-preview"));
 }
 
 /// Stage a self-contained HTML page for the isolated in-app preview and return a

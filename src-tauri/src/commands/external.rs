@@ -238,7 +238,7 @@ pub(crate) async fn run_external(
     };
 
     let tmp_dir =
-        std::env::temp_dir().join(format!("private-room-cli-{}", Uuid::new_v4()));
+        std::env::temp_dir().join(format!("arcelle-cli-{}", Uuid::new_v4()));
     let mut image_paths: Vec<String> = Vec::new();
     for m in messages {
         if let Some(images) = &m.images {
@@ -274,7 +274,7 @@ pub(crate) async fn run_external(
     }
     if bridge.is_some() {
         prompt.push_str(
-            "You are connected to the user's Private Room through the MCP \
+            "You are connected to the user's Arcelle through the MCP \
              server named \"room\". Use its tools to list, search, open, edit, \
              create, or annotate the room's files whenever the question \
              involves files — do not guess file contents from memory.\n\n",

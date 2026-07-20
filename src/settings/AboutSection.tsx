@@ -82,7 +82,7 @@ export default function AboutSection() {
     <section id="set-about">
       <h3>Updates &amp; version</h3>
       <p className="settings-hint">
-        Private Room updates itself from its signed GitHub releases. It checks
+        Arcelle updates itself from its signed GitHub releases. It checks
         quietly on launch; use the button below to check right now and install
         the latest release in one click.
       </p>

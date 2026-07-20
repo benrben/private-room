@@ -214,7 +214,7 @@ fn http() -> Result<reqwest::Client, String> {
     // negotiate h2 via ALPN (see mcp_registry). Identify ourselves too.
     reqwest::Client::builder()
         .use_rustls_tls()
-        .user_agent(concat!("PrivateRoom/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Arcelle/", env!("CARGO_PKG_VERSION")))
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())
@@ -255,7 +255,7 @@ pub(crate) async fn discover(prm_url: &str) -> Result<AuthServerMeta, String> {
 /// RFC 7591 dynamic client registration for a public + PKCE client.
 async fn register_client(endpoint: &str, redirect_uri: &str) -> Result<String, String> {
     let body = serde_json::json!({
-        "client_name": "Private Room",
+        "client_name": "Arcelle",
         "redirect_uris": [redirect_uri],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
@@ -362,7 +362,7 @@ pub(crate) async fn probe_www_authenticate(url: &str) -> Option<String> {
         .json(&serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                       "clientInfo": {"name": "Private Room", "version": "probe"}}
+                       "clientInfo": {"name": "Arcelle", "version": "probe"}}
         }))
         .send()
         .await
@@ -406,9 +406,9 @@ async fn await_callback(listener: TcpListener, expected_state: &str) -> Result<S
     let (code, state) = parse_callback_query(target);
     let ok = !code.is_empty() && state == expected_state;
     let page = if ok {
-        "<h2>Signed in.</h2><p>You can close this tab and return to Private Room.</p>"
+        "<h2>Signed in.</h2><p>You can close this tab and return to Arcelle.</p>"
     } else {
-        "<h2>Sign-in failed.</h2><p>Return to Private Room and try again.</p>"
+        "<h2>Sign-in failed.</h2><p>Return to Arcelle and try again.</p>"
     };
     let body = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\r\n{page}",

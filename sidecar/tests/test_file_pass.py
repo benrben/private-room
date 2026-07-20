@@ -1,6 +1,6 @@
 """The whole-file PASS step endpoints (MIGRATION Phase 2, file_pass.rs).
 
-No network, no Ollama: :func:`privateroom_sidecar.llm.generate` is monkeypatched
+No network, no Ollama: :func:`arcelle_sidecar.llm.generate` is monkeypatched
 with a scripted fake, so every test asserts the exact prompt built, the parse/
 clamp of the reply into the ``{result, thread, skipped}`` artifact, model_call's
 single-retry, and the fatal-vs-transient error split the Rust host relies on.
@@ -14,8 +14,8 @@ from typing import Any
 import httpx
 import pytest
 
-from privateroom_sidecar import file_pass, llm
-from privateroom_sidecar.server import create_app
+from arcelle_sidecar import file_pass, llm
+from arcelle_sidecar.server import create_app
 
 
 # --- fake generate ----------------------------------------------------------

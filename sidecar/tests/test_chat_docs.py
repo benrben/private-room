@@ -18,9 +18,9 @@ import httpx
 import pytest
 from ollama import ResponseError
 
-from privateroom_sidecar import chat_docs, llm
-from privateroom_sidecar.config import num_ctx_chat_notools
-from privateroom_sidecar.server import create_app
+from arcelle_sidecar import chat_docs, llm
+from arcelle_sidecar.config import num_ctx_chat_notools
+from arcelle_sidecar.server import create_app
 
 
 # --- fakes (shared shape with test_llm.py) ----------------------------------

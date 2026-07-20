@@ -435,7 +435,7 @@ pub async fn mcp_registry_search(
     // request". rustls does. The endpoint is also intermittently flaky, so retry.
     let client = reqwest::Client::builder()
         .use_rustls_tls()
-        .user_agent(concat!("PrivateRoom/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Arcelle/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(8))
         .timeout(REGISTRY_TIMEOUT)
         .build()
@@ -631,7 +631,7 @@ mod tests {
     async fn live_normalization_yields_entries() {
         let client = reqwest::Client::builder()
             .use_rustls_tls()
-            .user_agent("PrivateRoom/test")
+            .user_agent("Arcelle/test")
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap();

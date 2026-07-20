@@ -5,7 +5,7 @@
 #
 # langgraph/langchain load a lot of code by dynamic import + importlib.metadata,
 # which PyInstaller's static analysis misses — hence the --collect-all /
-# --copy-metadata flags below. Output: dist/privateroom-sidecar (one file).
+# --copy-metadata flags below. Output: dist/arcelle-sidecar (one file).
 #
 # Usage:  ./build-sidecar.sh            # build into sidecar/dist/
 #         ./build-sidecar.sh --clean    # wipe build/ dist/ first
@@ -36,7 +36,7 @@ uv pip install --python "$VENV/bin/python" -e . pyinstaller
 # with the app's Developer ID in one pass and library validation passes.
 "$VENV/bin/pyinstaller" \
   --onedir \
-  --name privateroom-sidecar \
+  --name arcelle-sidecar \
   --console \
   --collect-all langgraph \
   --collect-all langgraph_checkpoint \
@@ -56,7 +56,7 @@ uv pip install --python "$VENV/bin/python" -e . pyinstaller
   --copy-metadata langchain-core \
   --copy-metadata langchain-ollama \
   --copy-metadata ollama \
-  --collect-submodules privateroom_sidecar \
+  --collect-submodules arcelle_sidecar \
   launch.py
 
 # Stage the onedir bundle where Tauri bundles resources from (src-tauri/resources/),
@@ -69,7 +69,7 @@ uv pip install --python "$VENV/bin/python" -e . pyinstaller
 STAGE="../src-tauri/resources/sidecar"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp -R dist/privateroom-sidecar "$STAGE/privateroom-sidecar"
+cp -R dist/arcelle-sidecar "$STAGE/arcelle-sidecar"
 
 # Deep-sign the staged bundle so it actually launches under a hardened runtime:
 # PyInstaller's default per-file signing isn't --deep-consistent, so library
@@ -80,13 +80,13 @@ cp -R dist/privateroom-sidecar "$STAGE/privateroom-sidecar"
 # same flags), so what notarizes is what we validated here.
 codesign --force --deep --options runtime \
   --entitlements sidecar-entitlements.plist \
-  --sign - "$STAGE/privateroom-sidecar/privateroom-sidecar" 2>/dev/null || true
+  --sign - "$STAGE/arcelle-sidecar/arcelle-sidecar" 2>/dev/null || true
 
 echo
-echo "Built + staged: $(cd "$STAGE" && pwd)/privateroom-sidecar/privateroom-sidecar"
-echo "Smoke-test it with:  ./dist/privateroom-sidecar/privateroom-sidecar --port 0"
+echo "Built + staged: $(cd "$STAGE" && pwd)/arcelle-sidecar/arcelle-sidecar"
+echo "Smoke-test it with:  ./dist/arcelle-sidecar/arcelle-sidecar --port 0"
 echo "RELEASE: deep-sign the staged dir with the Developer ID + hardened runtime:"
 echo "  codesign --force --deep --options runtime \\"
 echo "    --entitlements sidecar/sidecar-entitlements.plist \\"
 echo "    --sign \"Developer ID Application: …\" \\"
-echo "    src-tauri/resources/sidecar/privateroom-sidecar"
+echo "    src-tauri/resources/sidecar/arcelle-sidecar"

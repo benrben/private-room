@@ -121,7 +121,7 @@ pub async fn import_youtube_video(
     state.with_room(|_room| Ok(()))?;
     let bin = ensure_ytdlp(&app, &window).await?;
 
-    let work_dir = std::env::temp_dir().join(format!("private-room-yt-{}", Uuid::new_v4()));
+    let work_dir = std::env::temp_dir().join(format!("arcelle-yt-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
     emit_progress(&window, "Downloading the video…", Some(0.0));
 

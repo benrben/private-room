@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from privateroom_sidecar.budget import (
+from arcelle_sidecar.budget import (
     CTX_CHAR_BUDGET,
     msg_len,
     total_chars,
     trim_messages_to_budget,
 )
-from privateroom_sidecar.messages import Message
+from arcelle_sidecar.messages import Message
 
 
 def test_budget_matches_the_rust_constant() -> None:

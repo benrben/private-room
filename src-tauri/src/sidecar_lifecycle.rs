@@ -40,13 +40,13 @@ fn lc() -> &'static Lifecycle {
 /// needs no Python on the user's machine.
 fn launch_command() -> Option<Command> {
     // 1) Bundled PyInstaller onedir binary next to the app resources. The extra
-    //    `privateroom-sidecar/` level is the onedir folder; the executable of the
+    //    `arcelle-sidecar/` level is the onedir folder; the executable of the
     //    same name sits inside it beside its _internal/ dylibs.
     if let Ok(exe) = std::env::current_exe() {
-        // .../Private Room.app/Contents/MacOS/private-room  ->  ../Resources/
+        // .../Arcelle.app/Contents/MacOS/arcelle  ->  ../Resources/
         if let Some(macos_dir) = exe.parent() {
             let bundled = macos_dir
-                .join("../Resources/sidecar/privateroom-sidecar/privateroom-sidecar")
+                .join("../Resources/sidecar/arcelle-sidecar/arcelle-sidecar")
                 .canonicalize()
                 .ok();
             if let Some(path) = bundled {
@@ -57,21 +57,21 @@ fn launch_command() -> Option<Command> {
         }
     }
     // 2) Dev fallback: an explicit interpreter + the source package.
-    //    PRIVATE_ROOM_SIDECAR_PYTHON lets a developer point at the venv that has
-    //    langgraph installed; PRIVATE_ROOM_SIDECAR_DIR is the package parent.
-    let python = std::env::var("PRIVATE_ROOM_SIDECAR_PYTHON").ok()?;
-    let dir = std::env::var("PRIVATE_ROOM_SIDECAR_DIR")
+    //    ARCELLE_SIDECAR_PYTHON lets a developer point at the venv that has
+    //    langgraph installed; ARCELLE_SIDECAR_DIR is the package parent.
+    let python = std::env::var("ARCELLE_SIDECAR_PYTHON").ok()?;
+    let dir = std::env::var("ARCELLE_SIDECAR_DIR")
         .unwrap_or_else(|_| default_dev_sidecar_dir());
     if !std::path::Path::new(&python).exists() {
         return None;
     }
     let mut cmd = Command::new(python);
-    cmd.arg("-m").arg("privateroom_sidecar").current_dir(dir);
+    cmd.arg("-m").arg("arcelle_sidecar").current_dir(dir);
     Some(cmd)
 }
 
 /// The in-repo sidecar package dir, relative to the running binary's source tree
-/// — only used in dev when `PRIVATE_ROOM_SIDECAR_DIR` is unset.
+/// — only used in dev when `ARCELLE_SIDECAR_DIR` is unset.
 fn default_dev_sidecar_dir() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/../sidecar").to_string()
 }

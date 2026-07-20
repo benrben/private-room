@@ -22,13 +22,13 @@ fn model() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME not set");
     let downloaded = PathBuf::from(home)
         .join("Library/Application Support/com.benreich.privateroom/models")
-        .join(private_room_lib::stt::MODEL_FILE);
+        .join(arcelle_lib::stt::MODEL_FILE);
     if downloaded.exists() {
         return downloaded;
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources/models")
-        .join(private_room_lib::stt::MODEL_FILE)
+        .join(arcelle_lib::stt::MODEL_FILE)
 }
 
 /// "SPEAKER <file> 1 <beg> <dur> <NA> <NA> <name> …" → (start, end, speaker).
@@ -215,9 +215,9 @@ fn norm_word(w: &str) -> String {
 fn calibrate_embeddings() {
     let wav = std::env::var("PR_CAL_WAV").expect("set PR_CAL_WAV");
     let solo = std::env::var("PR_CAL_SOLO").expect("set PR_CAL_SOLO (spk\\tstart\\tend)");
-    let pcm = private_room_lib::stt::decode_to_pcm(
+    let pcm = arcelle_lib::stt::decode_to_pcm(
         Path::new(&wav),
-        private_room_lib::stt::MediaKind::Audio,
+        arcelle_lib::stt::MediaKind::Audio,
     )
     .expect("decode audio");
 
@@ -225,9 +225,9 @@ fn calibrate_embeddings() {
     // resolution in an integration test).
     let model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources/models")
-        .join(private_room_lib::recording::diarize::MODEL_FILE);
+        .join(arcelle_lib::recording::diarize::MODEL_FILE);
     assert!(model.exists(), "bundled TitaNet missing: {model:?}");
-    private_room_lib::recording::diarize::set_model_path(model);
+    arcelle_lib::recording::diarize::set_model_path(model);
 
     let mut spans: Vec<(String, f64, f64)> = Vec::new();
     for line in std::fs::read_to_string(&solo).unwrap().lines() {
@@ -248,7 +248,7 @@ fn calibrate_embeddings() {
             windows.push(span);
         }
         for w in windows {
-            let p = private_room_lib::recording::diarize::embed(w);
+            let p = arcelle_lib::recording::diarize::embed(w);
             if p.vec.len() > 30 {
                 // neural print only — DSP fallback would poison the stats
                 prints.push((spk.clone(), p.vec));
@@ -321,9 +321,9 @@ fn calibrate_embeddings() {
 #[ignore = "manual real-audio benchmark; set PR_BENCH_WAV"]
 fn bench_real_wav() {
     let wav = std::env::var("PR_BENCH_WAV").expect("set PR_BENCH_WAV=/path/audio");
-    let mut pcm = private_room_lib::stt::decode_to_pcm(
+    let mut pcm = arcelle_lib::stt::decode_to_pcm(
         Path::new(&wav),
-        private_room_lib::stt::MediaKind::Audio,
+        arcelle_lib::stt::MediaKind::Audio,
     )
     .expect("decode audio");
     if let Ok(s) = std::env::var("PR_BENCH_SECONDS") {
@@ -334,7 +334,7 @@ fn bench_real_wav() {
     eprintln!("audio: {:.0}s  ({})", total_s, wav);
 
     let t = std::time::Instant::now();
-    let meta = private_room_lib::recording::retranscribe(&model(), &pcm, Vec::new(), 0, |_, _| {});
+    let meta = arcelle_lib::recording::retranscribe(&model(), &pcm, Vec::new(), 0, |_, _| {});
     eprintln!("pipeline took {:.0}s ({:.1}x realtime)", t.elapsed().as_secs_f64(), total_s / t.elapsed().as_secs_f64());
 
     // ---- what the user sees

@@ -29,7 +29,7 @@ fn smoke() {
 
     // The full command body: validation + synthesis + base64.
     let b64 =
-        private_room_lib::speech::speak_text_b64("Hello from the room", None, 0.5, 1.0, 1.0)
+        arcelle_lib::speech::speak_text_b64("Hello from the room", None, 0.5, 1.0, 1.0)
             .expect("synthesis failed");
     let wav = base64::engine::general_purpose::STANDARD
         .decode(b64)
@@ -60,7 +60,7 @@ fn write_preview_wavs() {
         ("wraith", 0.38, 1.3, 0.8),
         ("ancient", 0.42, 0.8, 1.0),
     ] {
-        let wav = private_room_lib::speech::synthesize_wav(phrase, None, rate, pitch, volume)
+        let wav = arcelle_lib::speech::synthesize_wav(phrase, None, rate, pitch, volume)
             .expect("synthesis failed");
         let path = format!("/tmp/pr-tts-{name}.wav");
         std::fs::write(&path, wav).expect("write failed");

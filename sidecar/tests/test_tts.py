@@ -12,8 +12,8 @@ import httpx
 import pytest
 from conftest import FakeChatModel, FakeMCP, Round
 
-from privateroom_sidecar import tts
-from privateroom_sidecar.server import create_app
+from arcelle_sidecar import tts
+from arcelle_sidecar.server import create_app
 
 
 def app() -> Any:

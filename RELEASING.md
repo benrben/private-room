@@ -1,4 +1,4 @@
-# Releasing Private Room (macOS)
+# Releasing Arcelle (macOS)
 
 One script cuts a release: [`scripts/release.sh`](scripts/release.sh). It
 builds the Python agent sidecar, builds and signs the app, packages the DMG
@@ -94,7 +94,7 @@ export APPLE_NOTARY_PROFILE="private-room"
    - `src-tauri/tauri.conf.json` → `version`
    - `src-tauri/Cargo.toml` → `[package] version`
    - `sidecar/pyproject.toml` → `version` (the sidecar's `/health` reports it)
-   - `sidecar/privateroom_sidecar/__init__.py` → `__version__`
+   - `sidecar/arcelle_sidecar/__init__.py` → `__version__`
 2. **Update `CHANGELOG.md`** — the release notes come from it.
 3. **Merge to `main`, tag, push:**
    ```sh
@@ -153,7 +153,7 @@ afterwards without rebuilding:
 1. `gh release view v<version>` — assets present, release marked **Latest**.
 2. Fresh download on a Mac that has never seen the app: DMG opens, the
    README's Gatekeeper steps work, app launches, sidecar features respond.
-3. `codesign --verify --strict "/Applications/Private Room.app"` — and for a
+3. `codesign --verify --strict "/Applications/Arcelle.app"` — and for a
    notarized build, `spctl -a -vv` → `accepted · source=Notarized Developer ID`.
 4. If the updater manifest shipped: install the *previous* version, launch,
    and confirm **"Update available — Install & relaunch"** appears and

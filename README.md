@@ -1,6 +1,6 @@
-# Private Room
+# Arcelle
 
-![Private Room — a private AI workspace sealed inside a single file](docs/banner.png)
+![Arcelle — a private AI workspace sealed inside a single file](docs/banner.png)
 
 <p align="center">
   <a href="https://github.com/benrben/private-room/releases/latest"><img src="docs/badge-download.svg" alt="Download the latest DMG" height="28"></a>
@@ -16,7 +16,7 @@ Double-click it, unlock it with your password, and everything — your files,
 your chats, the AI's memory — is sealed in <b>one encrypted document</b>.<br>
 Nothing leaves your Mac unless you say so.</p>
 
-![The Private Room workspace: library, document, and AI side by side](docs/screens/workspace.png)
+![The Arcelle workspace: library, document, and AI side by side](docs/screens/workspace.png)
 
 <p align="center">
   <a href="https://github.com/benrben/private-room/raw/main/art/private-room-productivity-witness-protection.mp4"><img src="docs/video-poster.png" alt="Watch the video — the chaos has entered witness protection" width="720"></a><br>
@@ -346,7 +346,7 @@ all bundled locally, no CDN, no network fetch.
   cause and timestamp. Open any version in a side-by-side diff against the
   current text (RTL-aware for Hebrew/Arabic documents) and restore from
   there — byte-exact, even for binary `.xlsx`.
-- **Import a link.** Paste a URL and Private Room fetches the page once, saves
+- **Import a link.** Paste a URL and Arcelle fetches the page once, saves
   a readable offline copy into the room, and the AI can answer from it with
   the web still off.
 - **Export.** Export any file (byte-identical for originals) or the whole
@@ -359,7 +359,7 @@ flowchart LR
     subgraph file [".roomai — one encrypted file"]
         DB[("SQLCipher · AES-256<br/>files · chats · memory<br/>recordings · versions")]
     end
-    subgraph app ["Private Room.app"]
+    subgraph app ["Arcelle.app"]
         UI["React shell<br/>rail · three panes · status bar"]
         CORE["Rust core — Tauri<br/>crypto · extraction · indexing<br/>jobs · schedules · MCP server"]
         AI["AI engine sidecar<br/>Python · LangGraph<br/>agent · summaries · studios"]
@@ -397,7 +397,7 @@ tests across Rust and Python.
 
 ## Engineered for a 4B model
 
-Private Room targets a 4B local model on a 16 GB Mac — small enough to run
+Arcelle targets a 4B local model on a 16 GB Mac — small enough to run
 comfortably, small enough to wander. So judgment lives in deterministic Rust,
 not in the model's good intentions:
 
@@ -421,14 +421,14 @@ not in the model's good intentions:
 
 **[⬇︎ Download the latest DMG](https://github.com/benrben/private-room/releases/latest)** — macOS 12 or later, Apple Silicon.
 
-1. Open the `.dmg` and drag **Private Room** into **Applications**.
+1. Open the `.dmg` and drag **Arcelle** into **Applications**.
 2. This build is ad-hoc signed (**not notarized**), so the first time you open
-   it macOS warns *"Apple could not verify 'Private Room' is free of malware…"*
+   it macOS warns *"Apple could not verify 'Arcelle' is free of malware…"*
    That's expected for an un-notarized app — the full source is in this repo.
    Clear the download quarantine once, then open it normally:
 
    ```sh
-   /usr/bin/xattr -cr "/Applications/Private Room.app"
+   /usr/bin/xattr -cr "/Applications/Arcelle.app"
    ```
 
    (Use the full path `/usr/bin/xattr` — a Python `xattr` on your PATH has no
@@ -441,12 +441,12 @@ not in the model's good intentions:
    ```
 
    That's it — the app starts and stops the Ollama daemon itself. On first
-   launch Private Room shows a **model picker** — choose one (e.g.
+   launch Arcelle shows a **model picker** — choose one (e.g.
    `qwen3.5:4b`, ~3.4 GB) and it downloads with a progress bar, no Terminal
    needed. Dictation, transcription, and OCR need nothing extra — the Whisper
    voice model is **bundled in the app**.
 
-**Staying up to date.** Private Room checks its signed GitHub releases on
+**Staying up to date.** Arcelle checks its signed GitHub releases on
 launch and offers any newer build in one click. You can also check on demand
 from **Settings → App → Updates & version** — it downloads the release,
 verifies its signature, installs it, and relaunches into the new version.
@@ -458,7 +458,7 @@ Prefer to build it yourself? See [Development](#development).
 ```sh
 npm install
 npm run tauri dev            # run the app
-npm run tauri build          # build Private Room.app + DMG (registers .roomai)
+npm run tauri build          # build Arcelle.app + DMG (registers .roomai)
 cd src-tauri && cargo test   # Rust: encryption, extraction, routing (347 tests)
 cd sidecar && pytest tests   # Python: the AI engine sidecar (415 tests)
 npm run e2e                  # headless end-to-end smoke test (mock model)

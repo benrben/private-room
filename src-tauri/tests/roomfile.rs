@@ -1,5 +1,5 @@
-use private_room_lib::db;
-use private_room_lib::extraction;
+use arcelle_lib::db;
+use arcelle_lib::extraction;
 
 #[test]
 fn roomai_lifecycle_and_encryption() {

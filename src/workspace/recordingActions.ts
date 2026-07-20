@@ -48,7 +48,7 @@ export function makeRecordingActions(
           ? "No microphone found — plug one in or check your input device."
           : name === "NotReadableError" || name === "AbortError"
             ? "The microphone is busy in another app — close it and try again."
-            : "Microphone blocked — allow Private Room in System Settings → Privacy & Security → Microphone, then reopen the app.";
+            : "Microphone blocked — allow Arcelle in System Settings → Privacy & Security → Microphone, then reopen the app.";
       s.pushToast("error", msg);
       return;
     }

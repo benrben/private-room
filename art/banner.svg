@@ -33,7 +33,7 @@
     <circle cx="64" cy="62" r="4.8" fill="#c9c1fb"/>
   </g>
 
-  <text x="96" y="360" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif" font-size="64" font-weight="700" letter-spacing="-1" fill="#e8eaf0">Private Room</text>
+  <text x="96" y="360" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif" font-size="64" font-weight="700" letter-spacing="-1" fill="#e8eaf0">Arcelle</text>
   <text x="96" y="410" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="27" fill="#8b93a7">A private AI workspace sealed inside a single file.</text>
 
   <!-- feature chips -->

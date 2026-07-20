@@ -3,7 +3,7 @@
 Deliberately the same dict the Rust ``ollama::ChatMessage`` serialises to —
 ``{role, content, tool_calls?, tool_name?, images?}`` — so the two engines can be
 diffed line for line and the char-budget arithmetic matches byte for byte. The
-LangChain message objects only exist inside :mod:`privateroom_sidecar.chat`,
+LangChain message objects only exist inside :mod:`arcelle_sidecar.chat`,
 where they are built right before the model call and thrown away after.
 """
 

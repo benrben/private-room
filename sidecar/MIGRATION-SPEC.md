@@ -57,7 +57,7 @@ report — but everything else must be sidecar-only.
 
 ## PHASE 1 — LLM gateway (foundation). Sequential. Do first.
 
-### Sidecar endpoints (new `privateroom_sidecar/llm.py` + routes in `server.py`)
+### Sidecar endpoints (new `arcelle_sidecar/llm.py` + routes in `server.py`)
 
 - `POST /embed` → `{model, texts: [str], base_url, keep_alive?}` → `{embeddings: [[f32]]}`.
   Use the `ollama` python client (`AsyncClient(host=base_url).embed(...)`) — it's a dep.

@@ -1,15 +1,15 @@
 [package]
-name = "private-room"
+name = "arcelle"
 version = "0.6.0"
-description = "Private Room — an encrypted local AI workspace in a single file"
+description = "Arcelle — an encrypted local AI workspace in a single file"
 authors = ["Ben Reich"]
 edition = "2021"
 # The package now ships two binaries (the Tauri app + the `roomai` CLI), so the
 # bundler needs to be told which one is the app.
-default-run = "private-room"
+default-run = "arcelle"
 
 [lib]
-name = "private_room_lib"
+name = "arcelle_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 # ADD-20: tiny offline CLI (roomai verify/info/export) built on the lib crate.

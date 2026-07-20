@@ -367,7 +367,7 @@ impl StdioClient {
                 serde_json::json!({
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "Private Room", "version": env!("CARGO_PKG_VERSION")},
+                    "clientInfo": {"name": "Arcelle", "version": env!("CARGO_PKG_VERSION")},
                 }),
                 CONNECT_TIMEOUT,
             )
@@ -505,7 +505,7 @@ impl HttpClient {
         // surfaces as "error sending request". rustls does.
         let http = reqwest::Client::builder()
             .use_rustls_tls()
-            .user_agent(concat!("Private Room/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("Arcelle/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| format!("Could not build HTTP client: {e}"))?;
         let mut client = HttpClient {
@@ -521,7 +521,7 @@ impl HttpClient {
                 serde_json::json!({
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "Private Room", "version": env!("CARGO_PKG_VERSION")},
+                    "clientInfo": {"name": "Arcelle", "version": env!("CARGO_PKG_VERSION")},
                 }),
                 CONNECT_TIMEOUT,
             )
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn bare_url_is_remote_even_without_type() {
-        // A `url` with no `type` is still remote — Private Room's own Leash
+        // A `url` with no `type` is still remote — Arcelle's own Leash
         // config (room_mcp::mcp_config_json) uses `type: http` + url, but many
         // READMEs omit the type.
         let cfg = parse_config(r#"{"mcpServers": {"x": {"url": "https://ex.com/mcp"}}}"#).unwrap();

@@ -10,10 +10,10 @@ import httpx
 import pytest
 from conftest import FakeChatModel, FakeMCP, Round, call
 
-from privateroom_sidecar import __version__
-from privateroom_sidecar.config import MAX_TOOL_ROUNDS, PLAIN_MAX_ROUNDS, RunRequest
-from privateroom_sidecar.messages import Message, ToolCall
-from privateroom_sidecar.server import RunRegistry, create_app
+from arcelle_sidecar import __version__
+from arcelle_sidecar.config import MAX_TOOL_ROUNDS, PLAIN_MAX_ROUNDS, RunRequest
+from arcelle_sidecar.messages import Message, ToolCall
+from arcelle_sidecar.server import RunRegistry, create_app
 
 BODY: dict[str, Any] = {
     "model": "qwen3.5:9b",
@@ -178,7 +178,7 @@ async def test_cancel_stops_a_live_run() -> None:
 
 
 def test_registry_lifecycle() -> None:
-    from privateroom_sidecar.graph import CancelToken
+    from arcelle_sidecar.graph import CancelToken
 
     reg = RunRegistry()
     token = CancelToken()

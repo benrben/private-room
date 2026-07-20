@@ -1,4 +1,4 @@
-# Private Room — Python/LangGraph Agent Sidecar SPEC
+# Arcelle — Python/LangGraph Agent Sidecar SPEC
 
 This is the authoritative behavioural spec for the Python sidecar that replaces the
 native Rust `agent_loop` (`src-tauri/src/commands/agent.rs:1206`). The sidecar is the

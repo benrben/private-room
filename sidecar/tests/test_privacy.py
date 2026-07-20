@@ -1,7 +1,7 @@
 """SPEC §6 — nothing leaves the Mac.
 
 These are not style tests. A single LANGCHAIN_TRACING_V2=true in the user's shell
-profile would POST the contents of their private room to a cloud endpoint, and a
+profile would POST the contents of their workspace to a cloud endpoint, and a
 0.0.0.0 bind would serve their room to the LAN. Both are one line away at all
 times, so both are pinned here.
 """
@@ -13,11 +13,11 @@ import pathlib
 import re
 import socket
 
-import privateroom_sidecar
-from privateroom_sidecar import LOOPBACK_HOST, disable_tracing
-from privateroom_sidecar.__main__ import _bind, _parse_args
+import arcelle_sidecar
+from arcelle_sidecar import LOOPBACK_HOST, disable_tracing
+from arcelle_sidecar.__main__ import _bind, _parse_args
 
-PKG_DIR = pathlib.Path(privateroom_sidecar.__file__).parent
+PKG_DIR = pathlib.Path(arcelle_sidecar.__file__).parent
 
 
 def test_tracing_env_vars_are_cleared_at_import() -> None:
@@ -37,7 +37,7 @@ def test_disable_tracing_strips_a_poisoned_environment() -> None:
         "LANGCHAIN_TRACING_V2": "true",
         "LANGCHAIN_API_KEY": "ls__leak",
         "LANGCHAIN_ENDPOINT": "https://api.smith.langchain.com",
-        "LANGCHAIN_PROJECT": "private-room",
+        "LANGCHAIN_PROJECT": "arcelle",
         "LANGSMITH_TRACING": "true",
         "LANGSMITH_API_KEY": "ls__leak",
         "LANGSMITH_ENDPOINT": "https://api.smith.langchain.com",

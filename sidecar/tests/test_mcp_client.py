@@ -7,7 +7,7 @@ import json
 import httpx
 import pytest
 
-from privateroom_sidecar.mcp_client import McpClient, McpError
+from arcelle_sidecar.mcp_client import McpClient, McpError
 
 TOKEN = "s3cret"
 URL = "http://127.0.0.1:53421/mcp"
@@ -36,7 +36,7 @@ def bridge(handler=None) -> httpx.AsyncClient:
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "private-room", "version": "0.2.3"},
+                        "serverInfo": {"name": "arcelle", "version": "0.2.3"},
                     },
                 },
             )
@@ -136,7 +136,7 @@ async def test_initialize_and_notification_no_id() -> None:
     http = bridge()
     async with McpClient(URL, TOKEN, client=http) as mcp:
         info = await mcp.initialize()
-    assert info["serverInfo"]["name"] == "private-room"
+    assert info["serverInfo"]["name"] == "arcelle"
     bodies = http.seen  # type: ignore[attr-defined]
     # The initialized notification carries no id — and its 202/empty body must
     # not be parsed as JSON.

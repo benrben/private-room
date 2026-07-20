@@ -207,5 +207,5 @@ impl SysAudioTap {
 // signed, so every rebuild invalidates it silently ("Failed to match existing
 // code requirement" in tccd's log). Hence "off and back on".
 const PERMISSION_HINT: &str = "Couldn't hear the Mac's audio — macOS blocked system-audio capture. \
-In System Settings → Privacy & Security → Screen & System Audio Recording, switch Private Room on \
+In System Settings → Privacy & Security → Screen & System Audio Recording, switch Arcelle on \
 (off and back on if it already looks enabled). Your microphone keeps recording either way.";

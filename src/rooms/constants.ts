@@ -15,7 +15,10 @@ export type Screen =
   | { kind: "unlock"; path: string }
   | { kind: "workspace"; info: RoomInfo };
 
-export const ROOM_FILTER = [{ name: "Private Room Project", extensions: ["roomai"] }];
+// New vaults save as `.arcelle`; legacy `.roomai` stays openable.
+export const ROOM_FILTER = [
+  { name: "Arcelle Workspace", extensions: ["arcelle", "roomai"] },
+];
 
 export const MIN_PASSWORD = 8;
 
@@ -177,12 +180,12 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
       "cite the file you used. Keep replies short and warm, and feel free to " +
       "point out features like text highlighting and the #extract command.",
     memories: [
-      "This is a demo room for exploring Private Room.",
+      "This is a demo room for exploring Arcelle.",
       "The sample files describe a small project called Aurora.",
     ],
     welcome:
       "# Welcome to your demo room\n\n" +
-      "A tiny, self-contained tour of Private Room. Everything here is just " +
+      "A tiny, self-contained tour of Arcelle. Everything here is just " +
       "ordinary content — edit or delete any of it. Nothing leaves your Mac.\n\n" +
       "## Try these three things\n\n" +
       "1. Open **Project Brief.md** and select a sentence — a highlight menu " +

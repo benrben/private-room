@@ -434,7 +434,7 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     let answer = ctx
         .ask_streaming(
             "You answer the user's question using ONLY the provided sources, which were just \
-             saved into their private room. Cite the source file names inline where relevant. \
+             saved into their workspace. Cite the source file names inline where relevant. \
              If the sources don't cover it, say so plainly.",
             format!("Question: {question}\n\nSources:\n{context}"),
         )

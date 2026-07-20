@@ -23,7 +23,7 @@
     <circle cx="23" cy="24.2" r="3.1" fill="#8b7cf6"/>
     <path d="M23 26.6l-2.2 7h4.4l-2.2-7z" fill="#8b7cf6"/>
   </g>
-  <text x="96" y="52" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif" font-size="26" font-weight="700" fill="#e8eaf0">Private Room</text>
+  <text x="96" y="52" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif" font-size="26" font-weight="700" fill="#e8eaf0">Arcelle</text>
   <text x="96" y="72" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="13" fill="#8b93a7">A private AI workspace sealed inside a single file.</text>
 
   <!-- drag hint arrow between icon wells -->
@@ -32,5 +32,5 @@
     <path d="M385 218l17 14-17 14" fill="none" stroke-linejoin="round"/>
   </g>
 
-  <text x="330" y="366" text-anchor="middle" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="12" fill="#8b93a7" opacity="0.85">Drag Private Room into Applications to install</text>
+  <text x="330" y="366" text-anchor="middle" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="12" fill="#8b93a7" opacity="0.85">Drag Arcelle into Applications to install</text>
 </svg>

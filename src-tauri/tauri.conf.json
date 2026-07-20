@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Private Room",
+  "productName": "Arcelle",
   "version": "0.6.0",
   "identifier": "com.benreich.privateroom",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Private Room",
+        "title": "Arcelle",
         "width": 1180,
         "height": 780,
         "minWidth": 900,
@@ -29,9 +29,9 @@
     "createUpdaterArtifacts": true,
     "fileAssociations": [
       {
-        "ext": ["roomai"],
-        "name": "Private Room Project",
-        "description": "Private Room encrypted AI workspace",
+        "ext": ["arcelle", "roomai"],
+        "name": "Arcelle Workspace",
+        "description": "Arcelle encrypted AI workspace",
         "role": "Editor"
       }
     ],
@@ -40,7 +40,7 @@
       "resources/models/ggml-large-v3-turbo-q5_0.bin": "models/ggml-large-v3-turbo-q5_0.bin",
       "resources/models/nemo_en_titanet_small.onnx": "models/nemo_en_titanet_small.onnx",
       "resources/models/ggml-silero-v5.1.2.bin": "models/ggml-silero-v5.1.2.bin",
-      "resources/sidecar/privateroom-sidecar": "sidecar/privateroom-sidecar/"
+      "resources/sidecar/arcelle-sidecar": "sidecar/arcelle-sidecar/"
     },
     "macOS": {
       "signingIdentity": "-",

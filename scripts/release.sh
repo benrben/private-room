@@ -57,11 +57,11 @@ echo "▶ Building the app…"
 PATH=/usr/bin:"$PATH" npm run tauri build -- --bundles app
 
 MACOS="src-tauri/target/release/bundle/macos"
-APP="${MACOS}/Private Room.app"
-TAR="${MACOS}/Private Room.app.tar.gz"
+APP="${MACOS}/Arcelle.app"
+TAR="${MACOS}/Arcelle.app.tar.gz"
 SIG="${TAR}.sig"
 DMG_DIR="src-tauri/target/release/bundle/dmg"
-DMG="${DMG_DIR}/Private Room_${VER}_aarch64.dmg"
+DMG="${DMG_DIR}/Arcelle_${VER}_aarch64.dmg"
 ENTITLEMENTS="src-tauri/Entitlements.plist"
 
 DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null \
@@ -84,7 +84,7 @@ if [[ -n "$DEV_ID" ]]; then
   #    intact) so Contents/_CodeSignature reflects the modified sidecar.
   # NOTE: validated locally only with an ad-hoc identity (no Developer ID cert
   # here); confirm on a notarizing machine that the sidecar launches post-staple.
-  SIDECAR="${APP}/Contents/Resources/sidecar/privateroom-sidecar/privateroom-sidecar"
+  SIDECAR="${APP}/Contents/Resources/sidecar/arcelle-sidecar/arcelle-sidecar"
   if [[ -f "$SIDECAR" ]]; then
     echo "▶ Re-signing the agent sidecar with its entitlements…"
     codesign --force --options runtime --timestamp \
@@ -120,7 +120,7 @@ fi
 
 # Both artifacts come from the exact app that was just signed.
 echo "▶ Packaging updater tar + DMG from the final app…"
-tar -czf "$TAR" -C "$MACOS" "Private Room.app"
+tar -czf "$TAR" -C "$MACOS" "Arcelle.app"
 PATH=/usr/bin:"$PATH" npm run tauri signer sign -- \
   --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
   ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+--password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"} \
@@ -131,7 +131,7 @@ DMG_STAGE="$(mktemp -d)"
 cp -R "$APP" "$DMG_STAGE/"
 ln -s /Applications "$DMG_STAGE/Applications"
 rm -f "$DMG"
-/usr/bin/hdiutil create -volname "Private Room" -srcfolder "$DMG_STAGE" \
+/usr/bin/hdiutil create -volname "Arcelle" -srcfolder "$DMG_STAGE" \
   -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$DMG_STAGE"
 
@@ -180,7 +180,7 @@ if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
 else
   echo "▶ Creating GitHub release ${TAG}…"
   gh release create "$TAG" --repo "$REPO" \
-    --title "Private Room ${VER}" --notes "$NOTES" "${ASSETS[@]}"
+    --title "Arcelle ${VER}" --notes "$NOTES" "${ASSETS[@]}"
 fi
 
 echo "✓ Released ${TAG} — https://github.com/${REPO}/releases/tag/${TAG}"

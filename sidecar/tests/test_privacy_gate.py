@@ -12,9 +12,9 @@ from typing import Any
 
 import pytest
 
-from privateroom_sidecar import llm, privacy, privacy_scan
-from privateroom_sidecar.chat import OllamaChatModel
-from privateroom_sidecar.messages import system_message, user_message
+from arcelle_sidecar import llm, privacy, privacy_scan
+from arcelle_sidecar.chat import OllamaChatModel
+from arcelle_sidecar.messages import system_message, user_message
 
 
 def make_policy(active: bool = True) -> privacy.PrivacyPolicy:
@@ -165,7 +165,7 @@ async def test_llm_generate_local_model_untouched(monkeypatch) -> None:
 
 
 async def test_llm_generate_external_cli_redacts_and_restores(monkeypatch) -> None:
-    from privateroom_sidecar import external_llm
+    from arcelle_sidecar import external_llm
 
     seen: dict[str, Any] = {}
 
@@ -203,7 +203,7 @@ async def test_llm_generate_stream_restores_split_placeholder(monkeypatch) -> No
 
 
 async def test_summarize_client_engages_door(monkeypatch) -> None:
-    from privateroom_sidecar import summarize
+    from arcelle_sidecar import summarize
 
     seen: dict[str, Any] = {}
 
@@ -320,7 +320,7 @@ def test_mint_ephemeral_rules_avoids_taken() -> None:
 def test_every_content_request_model_has_privacy_field() -> None:
     """A future endpoint that ships content without a privacy field would be a
     silent hole in the door — fail loudly here instead."""
-    from privateroom_sidecar import ai_actions, config, file_pass, summarize
+    from arcelle_sidecar import ai_actions, config, file_pass, summarize
 
     models = [
         config.RunRequest,

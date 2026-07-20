@@ -429,7 +429,7 @@ async fn dispatch_jsonrpc(
         "initialize" => Ok(serde_json::json!({
             "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "private-room", "version": env!("CARGO_PKG_VERSION") }
+            "serverInfo": { "name": "arcelle", "version": env!("CARGO_PKG_VERSION") }
         })),
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => Ok(serde_json::json!({ "tools": served_tools(app, web_enabled, scope) })),

@@ -14,10 +14,10 @@ from typing import Any
 import httpx
 import pytest
 
-from privateroom_sidecar import summarize
-from privateroom_sidecar.llm import LlmError
-from privateroom_sidecar.messages import ToolCall
-from privateroom_sidecar.server import create_app
+from arcelle_sidecar import summarize
+from arcelle_sidecar.llm import LlmError
+from arcelle_sidecar.messages import ToolCall
+from arcelle_sidecar.server import create_app
 
 
 # --- pure helpers -----------------------------------------------------------

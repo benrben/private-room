@@ -5,19 +5,21 @@
   <!-- ADD-18: dictation records from the microphone; audio is transcribed
        on-device and never leaves this Mac. -->
   <key>NSMicrophoneUsageDescription</key>
-  <string>Private Room uses the microphone for voice messages and dictation. Audio is transcribed on this Mac and never leaves it.</string>
-  <!-- Re-declares the .roomai association from tauri.conf.json so the
-       document icon (bundled via resources) can be attached; user-supplied
-       plist keys take precedence over the generated ones. -->
+  <string>Arcelle uses the microphone for voice messages and dictation. Audio is transcribed on this Mac and never leaves it.</string>
+  <!-- Re-declares the .arcelle / .roomai associations from tauri.conf.json so
+       the document icon (bundled via resources) can be attached; user-supplied
+       plist keys take precedence over the generated ones. The legacy .roomai
+       extension stays registered so existing vaults still open. -->
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
       <key>CFBundleTypeExtensions</key>
       <array>
+        <string>arcelle</string>
         <string>roomai</string>
       </array>
       <key>CFBundleTypeName</key>
-      <string>Private Room Project</string>
+      <string>Arcelle Workspace</string>
       <key>CFBundleTypeRole</key>
       <string>Editor</string>
       <key>CFBundleTypeIconFile</key>

@@ -10,8 +10,8 @@ import asyncio
 
 import pytest
 
-from privateroom_sidecar import external_llm, llm
-from privateroom_sidecar.external_llm import (
+from arcelle_sidecar import external_llm, llm
+from arcelle_sidecar.external_llm import (
     build_cmdline,
     flatten_messages,
     is_external_model,
@@ -236,14 +236,14 @@ async def test_llm_generate_stream_yields_one_final_delta_for_external(
 async def test_summarize_client_returns_text_and_no_tool_calls_for_external(
     monkeypatch,
 ) -> None:
-    from privateroom_sidecar import summarize
+    from arcelle_sidecar import summarize
 
     async def fake_generate_external(model, messages, *, format=None):
         return "a summary"
 
     # summarize's client imports the symbols lazily inside _chat.
     monkeypatch.setattr(
-        "privateroom_sidecar.external_llm.generate_external", fake_generate_external
+        "arcelle_sidecar.external_llm.generate_external", fake_generate_external
     )
     client = summarize.OllamaModelClient("http://127.0.0.1:11434")
     text, calls = await client.chat_tools(

@@ -231,7 +231,7 @@ export default function App() {
 
   async function chooseOpen() {
     const path = await api.chooseOpenPath({
-      title: "Open a Private Room",
+      title: "Open a Arcelle",
       multiple: false,
       filters: ROOM_FILTER,
     });
@@ -294,7 +294,7 @@ export default function App() {
     const suggested = (roomName.trim() || "My Room").replace(/[/\\:]/g, "-");
     const path = await api.chooseSavePath({
       title: "Choose where to save this room",
-      defaultPath: `${suggested}.roomai`,
+      defaultPath: `${suggested}.arcelle`,
       filters: ROOM_FILTER,
     });
     if (!path) return; // cancelled the location picker; stay in the branded flow
@@ -438,7 +438,7 @@ export default function App() {
     if (prefersReducedMotion()) {
       await api.closeRoom();
       // Drop the room name from the title bar once locked (CHG-9).
-      getCurrentWindow().setTitle("Private Room").catch(() => {});
+      getCurrentWindow().setTitle("Arcelle").catch(() => {});
       // Another navigation (e.g. a .roomai opened mid-close showed its gate)
       // wins over the default return to the start screen.
       if (navEpochRef.current === epoch) goTo({ kind: "start" });
@@ -456,7 +456,7 @@ export default function App() {
       throw e;
     }
     // Drop the room name from the title bar once locked (CHG-9).
-    getCurrentWindow().setTitle("Private Room").catch(() => {});
+    getCurrentWindow().setTitle("Arcelle").catch(() => {});
     window.setTimeout(() => {
       setLocking(false);
       // As above: a navigation during the ritual (another room's gate) wins.
@@ -483,7 +483,7 @@ export default function App() {
         <div className="gate-logo">
           <Logomark size={56} />
         </div>
-        <h1>Private Room</h1>
+        <h1>Arcelle</h1>
 
         {screen.kind === "start" && (
           <StartScreen

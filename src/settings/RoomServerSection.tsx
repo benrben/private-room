@@ -156,7 +156,7 @@ export default function RoomServerSection({
                         ? "This address and config survive restarts. "
                         : ""}
                       Agents can also self-configure from
-                      {" ~/.private-room/leash.json"} (written only while the
+                      {" ~/.arcelle/leash.json"} (written only while the
                       room is open). Regenerate the token to revoke every pasted
                       config at once.
                     </p>

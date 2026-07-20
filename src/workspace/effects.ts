@@ -31,7 +31,7 @@ export function useWorkspaceEffects(
     if (s.initRef.current) return;
     s.initRef.current = true;
     getCurrentWindow()
-      .setTitle(`${info.name} — Private Room`)
+      .setTitle(`${info.name} — Arcelle`)
       .catch(() => {});
     api.listFiles().then(s.setFiles);
     api.listFolders().then(s.setFolders).catch(() => {});

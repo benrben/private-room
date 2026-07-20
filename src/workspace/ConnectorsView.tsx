@@ -40,7 +40,7 @@ export default function ConnectorsView() {
         <p className="settings-hint">
           Give this room extra tools with the Model Context Protocol. Local
           connectors run on your Mac; remote ones reach out over the internet —
-          Private Room asks before either starts, and redacts what leaves.
+          Arcelle asks before either starts, and redacts what leaves.
         </p>
       </header>
 

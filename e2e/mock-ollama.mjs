@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// Mock Ollama server for Private Room's HLT-8 end-to-end smoke test.
+// Mock Ollama server for Arcelle's HLT-8 end-to-end smoke test.
 //
 // It replays canned responses for the handful of Ollama endpoints the app
 // touches, so `npm run e2e` runs with NO real model and NO network. The app is
-// pointed at this server via the PRIVATE_ROOM_OLLAMA_URL env var (see
+// pointed at this server via the ARCELLE_OLLAMA_URL env var (see
 // src-tauri/src/ollama.rs :: base_url()).
 //
 // The interesting part is /api/chat: it emulates one round of tool-calling.

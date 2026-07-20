@@ -116,7 +116,7 @@ mod imp {
         let mut opts = PasswordOptions::new_generic_password(SERVICE, path);
         opts.set_access_control(access);
         opts.use_protected_keychain();
-        opts.set_label("Private Room — Touch ID unlock");
+        opts.set_label("Arcelle — Touch ID unlock");
 
         set_generic_password_options(password.as_bytes(), opts).map_err(map_err)
     }

@@ -1,6 +1,6 @@
-// roomai — a tiny, honest, offline CLI for a Private Room file.
+// roomai — a tiny, honest, offline CLI for a Arcelle file.
 //
-// It reuses the desktop app's library crate (`private_room_lib`) so it opens
+// It reuses the desktop app's library crate (`arcelle_lib`) so it opens
 // rooms with the exact same SQLCipher scheme the app uses — no second code
 // path to drift out of sync. Nothing here touches the network or a model; it
 // only decrypts a local file and reads or copies out what is already inside.
@@ -13,11 +13,11 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use private_room_lib::db;
+use arcelle_lib::db;
 use rusqlite::Connection;
 
 const USAGE: &str = "\
-roomai — offline tools for a Private Room file
+roomai — offline tools for a Arcelle file
 
 Usage:
   roomai verify  <path>           Check the file decrypts and is a valid room.
@@ -283,7 +283,7 @@ fn do_export(path: &str, outdir: &str, pw_flag: Option<&str>) -> Result<(), Stri
 
 /// Success banner shared by verify / info / recover.
 fn print_ok(conn: &Connection) {
-    println!("OK: decrypts and is a valid Private Room file.");
+    println!("OK: decrypts and is a valid Arcelle file.");
     println!("  format:         {}", meta_or(conn, "format"));
     println!("  format_version: {}", meta_or(conn, "format_version"));
     println!("  files:          {}", count(conn, "files"));

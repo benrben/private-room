@@ -70,7 +70,7 @@ fn guarded_redirect_policy() -> reqwest::redirect::Policy {
 fn fetch_client(host: &str, addr: SocketAddr) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
-        .user_agent("Mozilla/5.0 (Macintosh) PrivateRoom/0.1")
+        .user_agent("Mozilla/5.0 (Macintosh) Arcelle/0.1")
         .redirect(guarded_redirect_policy())
         .resolve(host, addr)
         .build()

@@ -1,5 +1,5 @@
-/// Wave 1a: `~/.private-room/leash.json` — the discovery record an external
-/// agent self-configures from (`cat ~/.private-room/leash.json`) without the
+/// Wave 1a: `~/.arcelle/leash.json` — the discovery record an external
+/// agent self-configures from (`cat ~/.arcelle/leash.json`) without the
 /// user re-pasting a config. Written 0600 (it carries the bearer token) on
 /// every Leash start, removed on stop, teardown, and app exit. `pid` is the
 /// staleness check: after a crash the file may survive, so a reader should
@@ -25,7 +25,7 @@ fn leash_json(port: u16, token: &str, scope: &str, room: &str) -> serde_json::Va
 fn discovery_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     use tauri::Manager;
     let home = app.path().home_dir().map_err(|e| e.to_string())?;
-    Ok(home.join(".private-room").join("leash.json"))
+    Ok(home.join(".arcelle").join("leash.json"))
 }
 
 pub(crate) fn write_discovery(

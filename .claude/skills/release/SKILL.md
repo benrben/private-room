@@ -1,7 +1,7 @@
 ---
 name: release
 description: >-
-  Cut a signed macOS GitHub release of Private Room: bump the version, write the
+  Cut a signed macOS GitHub release of Arcelle: bump the version, write the
   changelog, build + sign the app, package the DMG and updater payload, publish
   the GitHub release, and install the built app locally. Use whenever the user
   asks to release, ship, cut a release, "build re-install and release", publish a
@@ -9,7 +9,7 @@ description: >-
   and its gotchas, and ALWAYS appends the required Install section to the notes.
 ---
 
-# Releasing Private Room
+# Releasing Arcelle
 
 Cut a release of this project end to end. `scripts/release.sh` does the heavy
 lifting (sidecar build → app build → sign → DMG + updater tar → minisign →
@@ -33,7 +33,7 @@ the app. Show the assembled notes to the user before publishing.
 Download the DMG below — macOS 12+, Apple Silicon. The build is ad-hoc signed (not notarized), so clear quarantine once after installing:
 
 ```sh
-/usr/bin/xattr -cr "/Applications/Private Room.app"
+/usr/bin/xattr -cr "/Applications/Arcelle.app"
 ```
 ```
 
@@ -49,10 +49,10 @@ Download the DMG below — macOS 12+, Apple Silicon. The build is ad-hoc signed 
 - `src-tauri/tauri.conf.json` → `version`
 - `src-tauri/Cargo.toml` → `[package] version`
 - `sidecar/pyproject.toml` → `version` (the sidecar's `/health` reports it)
-- `sidecar/privateroom_sidecar/__init__.py` → `__version__`
+- `sidecar/arcelle_sidecar/__init__.py` → `__version__`
 
 Then refresh the lockfile so the build doesn't rebuild it dirty:
-`(cd src-tauri && cargo update -p private-room --precise <NEW_VERSION>)`
+`(cd src-tauri && cargo update -p arcelle --precise <NEW_VERSION>)`
 (use the repo's cargo, e.g. `/opt/homebrew/bin/cargo` — rustup shims are broken).
 
 ### 3. Write the CHANGELOG
@@ -67,7 +67,7 @@ that carries only the five version bumps + `Cargo.lock` + `CHANGELOG.md`.
 git add <changed source files> && git commit -m "<what changed>"
 git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml \
         src-tauri/Cargo.lock sidecar/pyproject.toml \
-        sidecar/privateroom_sidecar/__init__.py CHANGELOG.md
+        sidecar/arcelle_sidecar/__init__.py CHANGELOG.md
 git commit -m "Release <version>"
 git tag v<version> && git push origin main v<version>
 ```
@@ -84,7 +84,7 @@ RELEASE_NOTES="$BODY
 Download the DMG below — macOS 12+, Apple Silicon. The build is ad-hoc signed (not notarized), so clear quarantine once after installing:
 
 \`\`\`sh
-/usr/bin/xattr -cr \"/Applications/Private Room.app\"
+/usr/bin/xattr -cr \"/Applications/Arcelle.app\"
 \`\`\`"
 ```
 `RELEASE_NOTES` feeds BOTH the GitHub release body and `latest.json`. Show it to
@@ -127,14 +127,14 @@ Expect three assets (`.dmg`, `Private.Room.app.tar.gz`, `latest.json`),
 
 ### 9. Install the built app locally + verify
 ```sh
-osascript -e 'tell application "Private Room" to quit'   # quit the running copy
-APP="src-tauri/target/release/bundle/macos/Private Room.app"
+osascript -e 'tell application "Arcelle" to quit'   # quit the running copy
+APP="src-tauri/target/release/bundle/macos/Arcelle.app"
 codesign --verify --strict "$APP"
-rm -rf "/Applications/Private Room.app" && ditto "$APP" "/Applications/Private Room.app"
-codesign --verify --strict "/Applications/Private Room.app"
+rm -rf "/Applications/Arcelle.app" && ditto "$APP" "/Applications/Arcelle.app"
+codesign --verify --strict "/Applications/Arcelle.app"
 /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
-  "/Applications/Private Room.app/Contents/Info.plist"      # expect the new version
-open -a "Private Room"
+  "/Applications/Arcelle.app/Contents/Info.plist"      # expect the new version
+open -a "Arcelle"
 ```
 `release.sh` already applied the final (ad-hoc, stable-DR) signature, so a
 separate `macsign.sh` run is not needed here — but if you ever rebuild locally

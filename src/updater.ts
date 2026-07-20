@@ -23,7 +23,7 @@ export async function checkForUpdatesQuietly(): Promise<void> {
     console.info(`[updater] version ${update.version} available.`);
 
     const ok = await confirm(
-      `Version ${update.version} is available.\n\nInstall it now and relaunch Private Room?`,
+      `Version ${update.version} is available.\n\nInstall it now and relaunch Arcelle?`,
       { title: "Update available — Install & relaunch", kind: "info" },
     );
     if (!ok) return;

@@ -264,7 +264,7 @@ async fn provision(app: &tauri::AppHandle, kind: RuntimeKind) -> Result<(), Stri
     // reliably negotiate h2 via ALPN (see mcp_registry).
     let client = reqwest::Client::builder()
         .use_rustls_tls()
-        .user_agent(concat!("PrivateRoom/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Arcelle/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client

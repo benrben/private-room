@@ -612,7 +612,7 @@ export default function RecordingView({
             Open System Settings
           </button>
           <span className="rec-sys-banner-note">
-            After granting, quit and reopen Private Room — macOS applies the
+            After granting, quit and reopen Arcelle — macOS applies the
             permission only to a fresh launch.
           </span>
         </div>

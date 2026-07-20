@@ -10,10 +10,10 @@ from typing import Any, Awaitable, Callable
 
 import pytest
 
-from privateroom_sidecar.config import McpConfig, RunRequest
-from privateroom_sidecar.graph import CancelToken, Deps, Event, run_agent
-from privateroom_sidecar.mcp_client import ToolResult, ToolSpec
-from privateroom_sidecar.messages import Message, ToolCall
+from arcelle_sidecar.config import McpConfig, RunRequest
+from arcelle_sidecar.graph import CancelToken, Deps, Event, run_agent
+from arcelle_sidecar.mcp_client import ToolResult, ToolSpec
+from arcelle_sidecar.messages import Message, ToolCall
 
 #: The built-in catalog the room bridge serves in LocalEngine scope (SPEC §2.1).
 BUILTIN_TOOL_NAMES = [

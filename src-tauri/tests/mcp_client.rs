@@ -3,7 +3,7 @@
 //! fake also emits a stray notification and a non-JSON log line, which a
 //! real server may do and the client must skip.
 
-use private_room_lib::mcp;
+use arcelle_lib::mcp;
 
 fn connect_err(result: Result<(mcp::Client, Vec<mcp::Tool>), String>) -> String {
     match result {

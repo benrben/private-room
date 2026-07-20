@@ -1,6 +1,6 @@
 # Changelog
 
-All notable, user-facing changes to Private Room. Versions follow
+All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
 ## 0.6.0 — 2026-07-20
@@ -16,7 +16,7 @@ All notable, user-facing changes to Private Room. Versions follow
 - **Local by default, cloud by choice.** A connector that ships both a local
   package and a hosted endpoint installs the local one (nothing leaves your
   Mac), with a one-tap switch to the cloud version. Remote connectors are
-  badged loudly; before their arguments leave the Mac, Private Room redacts the
+  badged loudly; before their arguments leave the Mac, Arcelle redacts the
   room's sensitive spans and asks first.
 - **Sign in without leaving the app.** Remote connectors that use OAuth get a
   **Connect account** button that runs the whole browser sign-in and stores the

@@ -1,8 +1,8 @@
-// WebdriverIO + tauri-driver config for Private Room's HLT-8 smoke test.
+// WebdriverIO + tauri-driver config for Arcelle's HLT-8 smoke test.
 //
 // Lifecycle:
 //   onPrepare      -> start the mock Ollama server and export
-//                     PRIVATE_ROOM_OLLAMA_URL so the app (spawned later by
+//                     ARCELLE_OLLAMA_URL so the app (spawned later by
 //                     tauri-driver, inheriting this process's env) talks to it.
 //   beforeSession  -> spawn `tauri-driver`, which in turn launches the built
 //                     release binary and speaks WebDriver to it.
@@ -27,7 +27,7 @@ const projectRoot = path.resolve(__dirname, "..");
 // the in-tree target if CARGO_TARGET_DIR is unset.
 const targetDir =
   process.env.CARGO_TARGET_DIR || path.join(projectRoot, "src-tauri", "target");
-const binName = process.platform === "win32" ? "private-room.exe" : "private-room";
+const binName = process.platform === "win32" ? "arcelle.exe" : "arcelle";
 const application = path.join(targetDir, "release", binName);
 
 const MOCK_PORT = process.env.MOCK_OLLAMA_PORT || "11434";
@@ -67,7 +67,7 @@ export const config = {
     }
 
     // Point the app at the mock for every child process spawned after this.
-    process.env.PRIVATE_ROOM_OLLAMA_URL = `http://127.0.0.1:${MOCK_PORT}`;
+    process.env.ARCELLE_OLLAMA_URL = `http://127.0.0.1:${MOCK_PORT}`;
 
     mockServer = spawn(
       process.execPath,

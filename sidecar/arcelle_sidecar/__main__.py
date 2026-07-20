@@ -4,7 +4,7 @@ The Rust host spawns this, reads the port off stdout, and health-checks it. Port
 0 means the OS picks an ephemeral one — same as the room MCP bridge, so two
 rooms (or a stale process) can never fight over a fixed port.
 
-Bind host is :data:`privateroom_sidecar.LOOPBACK_HOST` and is not configurable.
+Bind host is :data:`arcelle_sidecar.LOOPBACK_HOST` and is not configurable.
 An 0.0.0.0 bind would put the user's room contents on their LAN (SPEC §6).
 """
 
@@ -40,7 +40,7 @@ def _watch_parent() -> None:
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="privateroom-sidecar")
+    p = argparse.ArgumentParser(prog="arcelle-sidecar")
     p.add_argument(
         "--port",
         type=int,

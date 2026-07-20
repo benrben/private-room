@@ -4,7 +4,7 @@ fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         // A generic UA, no cookies: pages get fetched, not browsed.
-        .user_agent("Mozilla/5.0 (Macintosh) PrivateRoom/0.1")
+        .user_agent("Mozilla/5.0 (Macintosh) Arcelle/0.1")
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|e| e.to_string())

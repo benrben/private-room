@@ -164,12 +164,12 @@ pub fn rec_start(
             live_translate,
         },
     );
-    // QA hook: PRIVATE_ROOM_QA_SYS_WAV=<16k mono wav> plays that file into
+    // QA hook: ARCELLE_QA_SYS_WAV=<16k mono wav> plays that file into
     // the meeting lane at real-time pace — the whole live loop (VAD →
     // streaming Whisper → events → persistence) runs without needing the
     // Screen Recording permission or a real meeting. Dev/QA only; the env
     // var simply doesn't exist in normal runs.
-    if let Ok(wav_path) = std::env::var("PRIVATE_ROOM_QA_SYS_WAV") {
+    if let Ok(wav_path) = std::env::var("ARCELLE_QA_SYS_WAV") {
         spawn_qa_sys_feeder(handle.tx.clone(), wav_path);
     }
     let awake = std::process::Command::new("/usr/bin/caffeinate")

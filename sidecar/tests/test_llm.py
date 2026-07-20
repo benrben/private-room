@@ -16,8 +16,8 @@ import httpx
 import pytest
 from ollama import ResponseError
 
-from privateroom_sidecar import llm
-from privateroom_sidecar.server import create_app
+from arcelle_sidecar import llm
+from arcelle_sidecar.server import create_app
 
 
 # --- fakes ------------------------------------------------------------------

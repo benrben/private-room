@@ -11,7 +11,7 @@ datas += copy_metadata('langgraph')
 datas += copy_metadata('langchain-core')
 datas += copy_metadata('langchain-ollama')
 datas += copy_metadata('ollama')
-hiddenimports += collect_submodules('privateroom_sidecar')
+hiddenimports += collect_submodules('arcelle_sidecar')
 tmp_ret = collect_all('langgraph')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('langgraph_checkpoint')
@@ -60,7 +60,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='privateroom-sidecar',
+    name='arcelle-sidecar',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -79,5 +79,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='privateroom-sidecar',
+    name='arcelle-sidecar',
 )

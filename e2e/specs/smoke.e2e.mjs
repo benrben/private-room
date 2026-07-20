@@ -1,6 +1,6 @@
 // HLT-8 end-to-end smoke test: create -> import -> view -> ask (mocked) ->
 // annotation chip. Drives the REAL app UI through tauri-driver, with Ollama
-// faked by e2e/mock-ollama.mjs (wired via PRIVATE_ROOM_OLLAMA_URL).
+// faked by e2e/mock-ollama.mjs (wired via ARCELLE_OLLAMA_URL).
 //
 // Native file dialogs cannot be driven by WebDriver, so we stub exactly that
 // one seam inside the webview: we wrap window.__TAURI_INTERNALS__.invoke (the
@@ -38,7 +38,7 @@ function installDialogStub(savePath, openPaths) {
   };
 }
 
-describe("Private Room — demo happy path", () => {
+describe("Arcelle — demo happy path", () => {
   it("create -> import -> ask (mocked) -> annotation chip", async () => {
     // 1. Start screen.
     const createBtn = await $("button=Create New Room");

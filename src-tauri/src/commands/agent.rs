@@ -540,7 +540,7 @@ fn gather_context_and_save_question(
         let advisor_tools_on = advisors_on && advisor_tools_enabled(conn);
 
         let mut system = String::from(
-            "You are the private AI assistant inside \"Private Room\", a local encrypted \
+            "You are the private AI assistant inside \"Arcelle\", a local encrypted \
              workspace. Everything you see stays on this computer. Answer the user's question \
              using the file excerpts provided as context when they are relevant, and mention \
              the file names you drew from. If the room's content does not contain the answer, \

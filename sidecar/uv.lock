@@ -174,6 +174,46 @@ wheels = [
 ]
 
 [[package]]
+name = "arcelle-sidecar"
+version = "0.6.0"
+source = { editable = "." }
+dependencies = [
+    { name = "edge-tts" },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "langchain-core" },
+    { name = "langchain-ollama" },
+    { name = "langgraph" },
+    { name = "pillow" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "uvicorn" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "edge-tts", specifier = ">=7.0" },
+    { name = "fastapi", specifier = ">=0.110" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "langchain-core", specifier = ">=0.3" },
+    { name = "langchain-ollama", specifier = ">=0.2" },
+    { name = "langgraph", specifier = ">=0.2" },
+    { name = "pillow", specifier = ">=10.0" },
+    { name = "pydantic", specifier = ">=2.6" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
+    { name = "starlette", specifier = ">=0.40,<1.0" },
+    { name = "uvicorn", specifier = ">=0.27" },
+]
+provides-extras = ["dev"]
+
+[[package]]
 name = "attrs"
 version = "26.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -984,46 +1024,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
 ]
-
-[[package]]
-name = "privateroom-sidecar"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "edge-tts" },
-    { name = "fastapi" },
-    { name = "httpx" },
-    { name = "langchain-core" },
-    { name = "langchain-ollama" },
-    { name = "langgraph" },
-    { name = "pillow" },
-    { name = "pydantic" },
-    { name = "starlette" },
-    { name = "uvicorn" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "edge-tts", specifier = ">=7.0" },
-    { name = "fastapi", specifier = ">=0.110" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "langchain-core", specifier = ">=0.3" },
-    { name = "langchain-ollama", specifier = ">=0.2" },
-    { name = "langgraph", specifier = ">=0.2" },
-    { name = "pillow", specifier = ">=10.0" },
-    { name = "pydantic", specifier = ">=2.6" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
-    { name = "starlette", specifier = ">=0.40,<1.0" },
-    { name = "uvicorn", specifier = ">=0.27" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "propcache"

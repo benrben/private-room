@@ -80,12 +80,12 @@ export default function TopBar({
   const cloud = isCloudEngine(model);
   return (
     <header className="pr-topbar">
-      <div className="pr-brandmark" aria-label="Private Room" title={info.path}>
+      <div className="pr-brandmark" aria-label="Arcelle" title={info.path}>
         <Logomark size={26} />
       </div>
       <div className="room-identity" title={info.path}>
         <div className="room-identity-text">
-          <div className="room-kicker">Private Room</div>
+          <div className="room-kicker">Arcelle</div>
           <div className="room-name">{info.name}</div>
         </div>
       </div>

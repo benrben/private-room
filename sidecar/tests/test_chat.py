@@ -7,9 +7,9 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 
-from privateroom_sidecar.chat import OllamaChatModel, _chunk_text, _to_langchain
-from privateroom_sidecar.config import KEEP_ALIVE_WARM, NUM_CTX_HIGH, NUM_CTX_LOW, num_ctx_for_chat
-from privateroom_sidecar.messages import Message
+from arcelle_sidecar.chat import OllamaChatModel, _chunk_text, _to_langchain
+from arcelle_sidecar.config import KEEP_ALIVE_WARM, NUM_CTX_HIGH, NUM_CTX_LOW, num_ctx_for_chat
+from arcelle_sidecar.messages import Message
 
 
 def test_roles_convert() -> None:

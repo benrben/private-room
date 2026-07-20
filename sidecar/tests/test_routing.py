@@ -7,8 +7,8 @@ import re
 
 import pytest
 
-import privateroom_sidecar
-from privateroom_sidecar.routing import (
+import arcelle_sidecar
+from arcelle_sidecar.routing import (
     JOB_TOOL_NAMES,
     UI_TOOL_NAMES,
     WRITE_TOOL_NAMES,
@@ -30,7 +30,7 @@ from privateroom_sidecar.routing import (
 # equality, which is the only thing that keeps them from drifting.
 
 _AGENT_RS = (
-    pathlib.Path(privateroom_sidecar.__file__).resolve().parents[2]
+    pathlib.Path(arcelle_sidecar.__file__).resolve().parents[2]
     / "src-tauri"
     / "src"
     / "commands"
@@ -118,7 +118,7 @@ def test_ui_and_job_tool_names() -> None:
 
 
 def test_wants_job_tools_fires_on_workflow_intents() -> None:
-    from privateroom_sidecar.routing import wants_job_tools
+    from arcelle_sidecar.routing import wants_job_tools
 
     assert wants_job_tools("make me a workflow that summarizes new files every morning")
     assert wants_job_tools("automate a weekly review")

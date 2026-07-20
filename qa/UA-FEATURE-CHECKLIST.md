@@ -1,4 +1,4 @@
-# Private Room — Complete UA Feature Checklist
+# Arcelle — Complete UA Feature Checklist
 
 **Purpose:** the exhaustive test surface for a user-acceptance agent. Every button, control, menu entry, keyboard shortcut, passive behavior, and background capability in the app, with the path to reach it, the expected outcome, and preconditions. Standard: *not one single feature missed*.
 
@@ -27,8 +27,8 @@
 - [ ] `.roomai` Finder double-click, app closed → app launches to that file's Unlock gate (`lib.rs:293-307`).
 - [ ] `.roomai` double-click while a *different* room is open → current room closes first, new room's Unlock gate shown (`App.tsx:126-142`).
 - [ ] Checkpoint rollback → full workspace remount (every pane rebuilt, Settings closed) (`App.tsx:147-155`).
-- [ ] Window: title "Private Room", default 1180×780, min 900×600; no tray, no custom menu (`tauri.conf.json:12-21`).
-- [ ] Window title resets to "Private Room" on lock (`App.tsx:441,459`).
+- [ ] Window: title "Arcelle", default 1180×780, min 900×600; no tray, no custom menu (`tauri.conf.json:12-21`).
+- [ ] Window title resets to "Arcelle" on lock (`App.tsx:441,459`).
 - [ ] Seal-unlock animation (~520 ms keyhole bloom) on every successful open; skipped under Reduce Motion (`SealOverlay.tsx`, `App.tsx:254-257`).
 - [ ] Seal-lock animation (~460 ms ink veil) on lock; skipped under Reduce Motion (`App.tsx:438-445`).
 
@@ -490,7 +490,7 @@
 **Room server (the Leash)**
 - [ ] On/off toggle serves the unlocked room as an MCP server (`RoomServerSection.tsx:41-58`).
 - [ ] Access level: Files only vs Full agent (restart severs old connections); full-tier warning; read-only Address + client-config JSON (focus selects all); "Copy config" → "Copied ✓" (`RoomServerSection.tsx:59-132`).
-- [ ] "Regenerate token" (full tier): new bearer token, rewrites `~/.private-room/leash.json`, revokes pasted configs (`RoomServerSection.tsx:133-141`).
+- [ ] "Regenerate token" (full tier): new bearer token, rewrites `~/.arcelle/leash.json`, revokes pasted configs (`RoomServerSection.tsx:133-141`).
 - [ ] Port-17872-taken temporary-port warning; files-tier "dies when you lock" note; files-tier "Allow cloud AI clients" toggle with warning (`RoomServerSection.tsx:143-199`).
 
 **Room role**
@@ -560,7 +560,7 @@ Test each by asking the agent in plain language and observing the stated outcome
 
 **Leash — test from an external MCP client (claude-cli / codex-cli / Claude Desktop)**
 - [ ] Files tier: fresh token + ephemeral port per start, paste-only config, no discovery file; serves file tools (+ web if on, + MCP if allow-cloud) — assert `ui_act`, `start_file_pass`, `local_generate` are ABSENT from `tools/list`.
-- [ ] Full tier: stable port 17872 + persisted token; writes `~/.private-room/leash.json` (mode 0600, `{url, token, scope, room, pid…}`); removed on stop/lock/app-exit; stale-pid self-heals (`discovery.rs`, `lib.rs:290`).
+- [ ] Full tier: stable port 17872 + persisted token; writes `~/.arcelle/leash.json` (mode 0600, `{url, token, scope, room, pid…}`); removed on stop/lock/app-exit; stale-pid self-heals (`discovery.rs`, `lib.rs:290`).
 - [ ] Full tier serves file + job + workflow tools + `local_generate` + `view_media_frame`; NEVER `ui_snapshot`/`ui_act`/`view_screenshot`/`consult_advisor` (`room_mcp.rs:22-30`).
 - [ ] Wrong/missing bearer → 401 (constant-time compare); GET → 405; unadvertised tool name → "unknown tool"; loopback-only bind.
 - [ ] Tier change / Regenerate token restarts the bridge and severs live connections; `change_password` deliberately does NOT rotate the leash token.

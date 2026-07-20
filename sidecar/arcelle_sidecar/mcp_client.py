@@ -147,7 +147,7 @@ class McpClient:
             {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "privateroom-sidecar", "version": "0.1.0"},
+                "clientInfo": {"name": "arcelle-sidecar", "version": "0.1.0"},
             },
         )
         await self.notify("notifications/initialized")

@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Ollama's HTTP base URL from the ENV/DEFAULT layer only. Normally the local
-/// daemon, but overridable via the `PRIVATE_ROOM_OLLAMA_URL` env var so
+/// daemon, but overridable via the `ARCELLE_OLLAMA_URL` env var so
 /// end-to-end tests (HLT-8) can point the app at a mock server with no real
 /// model. Cached on first read; behaviour is identical to the old hardcoded
 /// constant when the env var is unset.
@@ -16,7 +16,7 @@ use std::time::Duration;
 fn base_url() -> &'static str {
     static BASE_URL: OnceLock<String> = OnceLock::new();
     BASE_URL.get_or_init(|| {
-        std::env::var("PRIVATE_ROOM_OLLAMA_URL")
+        std::env::var("ARCELLE_OLLAMA_URL")
             .ok()
             .map(|s| s.trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
@@ -26,7 +26,7 @@ fn base_url() -> &'static str {
 
 /// C1: the runtime base-URL override — the "closet supercomputer" Settings
 /// value that points the app at a remote Ollama box on the LAN. Unlike
-/// `PRIVATE_ROOM_OLLAMA_URL` (read once, cached), this is settable while the app
+/// `ARCELLE_OLLAMA_URL` (read once, cached), this is settable while the app
 /// runs, so flipping the Settings field takes effect on the next request with no
 /// restart. `None` (the default) means "no override — fall back to env, then the
 /// local default".
@@ -49,7 +49,7 @@ pub fn set_base_url_override(url: Option<String>) {
 }
 
 /// C1: the base URL that actual requests use. Precedence:
-/// runtime override (`set_base_url_override`) > `PRIVATE_ROOM_OLLAMA_URL` env >
+/// runtime override (`set_base_url_override`) > `ARCELLE_OLLAMA_URL` env >
 /// default `http://127.0.0.1:11434`. Returns an owned `String` (not the
 /// `&'static str` of `base_url()`) because the override can change at runtime.
 pub fn resolved_base_url() -> String {

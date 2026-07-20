@@ -440,7 +440,7 @@ pub async fn rollback_room_checkpoint(
     // the settings table BYTE-FOR-BYTE, so open_room_impl's
     // spawn_room_server_if_enabled re-reads the RESTORED room_server_*/leash_*
     // settings and starts (or, being disabled, leaves stopped) the Leash on the
-    // checkpoint's own tier/token, rewriting ~/.private-room/leash.json to match.
+    // checkpoint's own tier/token, rewriting ~/.arcelle/leash.json to match.
     // Combined with teardown's stop + remove_discovery above, that IS the
     // restart-or-stop-and-rewrite/remove reconciliation the audit requires — the
     // checkpoint's Leash config is authoritative.

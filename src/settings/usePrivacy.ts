@@ -110,8 +110,8 @@ export function usePrivacy() {
   // ADD-4: pick a destination file for the copy.
   async function chooseDupDest() {
     const p = await api.chooseSavePath({
-      defaultPath: "Copy of room.roomai",
-      filters: [{ name: "Private Room Project", extensions: ["roomai"] }],
+      defaultPath: "Copy of room.arcelle",
+      filters: [{ name: "Arcelle Workspace", extensions: ["arcelle", "roomai"] }],
     });
     if (p) setDupDest(p);
   }

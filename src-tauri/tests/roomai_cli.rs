@@ -2,7 +2,7 @@
 //! with the lib, then drive the built binary the way a user would. Cargo hands
 //! us the binary path via CARGO_BIN_EXE_roomai.
 
-use private_room_lib::db;
+use arcelle_lib::db;
 use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_roomai");

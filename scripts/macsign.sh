@@ -1,5 +1,5 @@
 #!/bin/bash
-# Re-sign a built Private Room.app with a STABLE designated requirement.
+# Re-sign a built Arcelle.app with a STABLE designated requirement.
 #
 # Why this exists: macOS keys every TCC grant (Microphone, Screen & System
 # Audio Recording) to the app's designated requirement. An ad-hoc signature's
@@ -12,10 +12,10 @@
 # anchored, so any locally-run binary claiming this bundle identifier would
 # match it. A Developer ID certificate replaces this properly at release.
 #
-# Usage: scripts/macsign.sh [path/to/Private Room.app]
+# Usage: scripts/macsign.sh [path/to/Arcelle.app]
 set -euo pipefail
 
-APP="${1:-src-tauri/target/release/bundle/macos/Private Room.app}"
+APP="${1:-src-tauri/target/release/bundle/macos/Arcelle.app}"
 IDENT="com.benreich.privateroom"
 ENTITLEMENTS="$(cd "$(dirname "$0")/.." && pwd)/src-tauri/Entitlements.plist"
 

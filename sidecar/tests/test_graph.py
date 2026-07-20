@@ -14,10 +14,10 @@ from conftest import (
     specs,
 )
 
-from privateroom_sidecar.mcp_client import ToolSpec
+from arcelle_sidecar.mcp_client import ToolSpec
 
-from privateroom_sidecar.config import PLAIN_MAX_ROUNDS
-from privateroom_sidecar.graph import (
+from arcelle_sidecar.config import PLAIN_MAX_ROUNDS
+from arcelle_sidecar.graph import (
     AGENT_GRAPH,
     CancelToken,
     Deps,
@@ -25,15 +25,15 @@ from privateroom_sidecar.graph import (
     route_after_model,
     route_after_tools,
 )
-from privateroom_sidecar.mcp_client import ToolResult
-from privateroom_sidecar.messages import Message, ToolCall
-from privateroom_sidecar.prompts import (
+from arcelle_sidecar.mcp_client import ToolResult
+from arcelle_sidecar.messages import Message, ToolCall
+from arcelle_sidecar.prompts import (
     IMAGE_HANDOFF,
     JOBS_PROMPT,
     NEAR_BUDGET_NOTE,
     UI_PROMPT,
 )
-from privateroom_sidecar.routing import WRITE_TOOL_NAMES
+from arcelle_sidecar.routing import WRITE_TOOL_NAMES
 
 WRITE_ON = {"write": True, "ui": False, "jobs": False}
 

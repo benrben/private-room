@@ -114,7 +114,7 @@ pub(crate) fn html_document(title: &str, body: &str) -> String {
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <title>{}</title>\n{}\n</head>\n<body>\n<main class=\"doc\">\n{}\n</main>\n\
-         <footer class=\"doc-foot\">Private Room · generated on this Mac</footer>\n\
+         <footer class=\"doc-foot\">Arcelle · generated on this Mac</footer>\n\
          </body>\n</html>\n",
         html_escape(title),
         DOC_STYLE,

@@ -184,7 +184,7 @@ pub async fn set_room_server(
             if store_bridge_if_current(&state, &room_path, bridge) {
                 // Only the full tier advertises itself on disk — the files-tier
                 // UI promises the token reaches the room by paste only, so we
-                // must not drop its bearer token into ~/.private-room/leash.json.
+                // must not drop its bearer token into ~/.arcelle/leash.json.
                 if matches!(bscope, crate::room_mcp::ToolScope::ExternalAgent) {
                     let _ = write_discovery(&app, port, &token, scope_name(bscope), &room_name);
                 } else {

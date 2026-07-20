@@ -54,7 +54,7 @@ from .graph import CancelToken, Deps, Emit, Event, stream_events
 from .mcp_client import McpClient
 from .messages import compact_json
 
-log = logging.getLogger("privateroom_sidecar")
+log = logging.getLogger("arcelle_sidecar")
 
 #: A factory so tests can inject a scripted model instead of a real Ollama.
 ChatModelFactory = Callable[[RunRequest], ChatModel]
@@ -105,7 +105,7 @@ def create_app(
     chat_factory: ChatModelFactory = _default_chat_model,
     mcp_factory: McpFactory = _default_mcp,
 ) -> FastAPI:
-    app = FastAPI(title="Private Room agent sidecar", version=__version__)
+    app = FastAPI(title="Arcelle agent sidecar", version=__version__)
     registry = RunRegistry()
     app.state.registry = registry
 

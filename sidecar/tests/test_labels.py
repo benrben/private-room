@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from privateroom_sidecar.labels import tool_step_label
+from arcelle_sidecar.labels import tool_step_label
 
 EXPECTED = {
     "list_room_files": "Listed the room's files",

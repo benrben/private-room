@@ -140,7 +140,7 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
         <div>
           <strong>Browse the connector marketplace</strong>
           <p className="settings-hint">
-            To list connectors, Private Room fetches the public MCP registry over
+            To list connectors, Arcelle fetches the public MCP registry over
             the internet — the one time it reaches out on its own. Nothing from
             your room is sent; only the catalog comes back. Installing still asks
             before anything runs.
@@ -439,7 +439,7 @@ function InstallDrawer({
               <div>
                 <b>This connector runs in the cloud.</b> When the assistant calls
                 it, your prompt and the tool's arguments leave your Mac and reach{" "}
-                <b>{host}</b>. Private Room redacts sensitive spans first and asks
+                <b>{host}</b>. Arcelle redacts sensitive spans first and asks
                 again the moment data is about to leave.
               </div>
             </div>
@@ -447,7 +447,7 @@ function InstallDrawer({
             <div className="mkt-wall safe">
               {ICON.shield}
               <div>
-                <b>Runs on your Mac.</b> Private Room starts{" "}
+                <b>Runs on your Mac.</b> Arcelle starts{" "}
                 <b>{spec.kind === "stdio" ? spec.command : ""}</b> as a local
                 program — it only reaches the internet if the tool itself makes a
                 request. You'll be asked before it starts.
