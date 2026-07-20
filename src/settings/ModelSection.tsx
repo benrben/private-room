@@ -1,5 +1,6 @@
 import ToolBadgeIcon from "./ToolBadgeIcon";
 import type { AiStatus, IconComponent, ModelCaps, SttStatus } from "./types";
+import { CheckIcon, CloseIcon, CircleCheckIcon } from "../icons";
 import EngineModelPicker from "../workspace/EngineModelPicker";
 
 interface Props {
@@ -112,16 +113,18 @@ export default function ModelSection({
                           <button
                             className="subtle btn-ic confirm-yes"
                             title="Confirm delete"
+                            aria-label="Confirm delete"
                             onClick={() => confirmRemoveModel(m)}
                           >
-                            ✓
+                            <CheckIcon size={14} />
                           </button>
                           <button
                             className="subtle btn-ic confirm-no"
                             title="Keep model"
+                            aria-label="Keep model"
                             onClick={cancelRemoveModel}
                           >
-                            ✕
+                            <CloseIcon size={14} />
                           </button>
                         </span>
                       ) : (
@@ -200,7 +203,7 @@ export default function ModelSection({
             </p>
             {stt?.installed ? (
               <div className="model-row active">
-                <span>Voice model installed ✓</span>
+                <span className="btn-ic"><CircleCheckIcon size={13} /> Voice model installed</span>
                 <button
                   className="subtle btn-ic"
                   title="Delete the dictation model from disk"

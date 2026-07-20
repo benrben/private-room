@@ -1,6 +1,6 @@
 import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api } from "../api";
-import { DownloadIcon, GlobeIcon, MicIcon, ScriptIcon } from "../icons";
+import { CheckIcon, CloseIcon, DownloadIcon, GlobeIcon, MicIcon, ScriptIcon } from "../icons";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import DiffPreview from "../viewers/DiffPreview";
@@ -213,12 +213,18 @@ export default function Overlays({
                 <pre className="approve-args">{pendingScript.outputs.join(", ")}</pre>
               </div>
             )}
+            <p className="approve-body caption">
+              <strong>Allow once</strong> runs it this one time and keeps it marked “Needs review”.
+              <br />
+              <strong>Always allow this exact script</strong> approves this version — it stops asking
+              and can be scheduled. Any edit to the script asks again.
+            </p>
             <div className="approve-actions">
               <button
                 className="primary"
                 onClick={() => a.resolveScriptApproval(pendingScript, "once")}
               >
-                Run once
+                Allow once
               </button>
               <button onClick={() => a.resolveScriptApproval(pendingScript, "always")}>
                 Always allow this exact script
@@ -372,7 +378,7 @@ export default function Overlays({
               <div className="ctx-confirm" data-agent-blocked>
                 <span className="ctx-confirm-q">Remove from room?</span>
                 <button
-                  className="ctx-item danger"
+                  className="ctx-item danger btn-ic"
                   onClick={() => {
                     const id = s.ctxMenu!.file.id;
                     a.cancelConfirm();
@@ -380,10 +386,10 @@ export default function Overlays({
                     a.removeFile(id);
                   }}
                 >
-                  ✓ Remove
+                  <CheckIcon size={13} /> Remove
                 </button>
-                <button className="ctx-item" onClick={a.cancelConfirm}>
-                  ✕ Keep
+                <button className="ctx-item btn-ic" onClick={a.cancelConfirm}>
+                  <CloseIcon size={13} /> Keep
                 </button>
               </div>
             ) : (

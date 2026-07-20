@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, AppDiag } from "../api";
+import { SparklesIcon } from "../icons";
 import { WSState } from "./state";
 
 /** ADD-28: feedback → GitHub issue.
@@ -92,12 +93,12 @@ export default function FeedbackModal({ s }: { s: WSState }) {
             onChange={(e) => setRaw(e.target.value)}
           />
           <button
-            className="subtle"
+            className="subtle btn-ic"
             disabled={drafting || !raw.trim()}
             title="The local model turns your words into a clear issue title and body — nothing leaves this Mac"
             onClick={() => void draftWithAi()}
           >
-            {drafting ? "Drafting…" : "✦ Draft it for me"}
+            {drafting ? "Drafting…" : (<><SparklesIcon size={13} /> Draft it for me</>)}
           </button>
         </div>
 

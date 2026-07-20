@@ -1,3 +1,5 @@
+import { CircleCheckIcon } from "../icons";
+
 interface Props {
   temperature: number;
   setTemperature: (v: number) => void;
@@ -98,8 +100,8 @@ export default function BehaviorSection({
               }}
             />
             <div className="settings-actions">
-              <button className="primary" onClick={saveTuning}>
-                {saved ? "Saved ✓" : "Save"}
+              <button className="primary btn-ic" onClick={saveTuning}>
+                {saved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
               </button>
             </div>
             <label className="settings-label">

@@ -6,6 +6,8 @@ llm.generate / summarize-client routing seams (subprocess mocked)."""
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from privateroom_sidecar import external_llm, llm
@@ -152,6 +154,46 @@ async def test_generate_external_raises_sentinel_on_failure(monkeypatch) -> None
         )
     assert exc.value.code == "ENGINE_ERROR"
     assert "quota exhausted" in exc.value.message
+
+
+class _HangingProc:
+    """A CLI subprocess that never returns from ``communicate`` — the wedge case
+    the timeout guard exists for. ``kill``/``wait`` are cheap so the reap is fast."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+
+    async def communicate(self, payload: bytes | None = None):
+        await asyncio.sleep(3600)  # hangs until the wait_for timeout cancels it
+        return b"", b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int | None:
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_generate_external_times_out_and_kills_the_process(monkeypatch) -> None:
+    proc = _HangingProc()
+
+    async def fake_exec(*argv, **kwargs):
+        return proc
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    # Shrink the ceiling so a wedged CLI trips the guard fast instead of hanging.
+    monkeypatch.setattr(external_llm, "EXTERNAL_TIMEOUT_SECS", 0.1)
+
+    with pytest.raises(llm.LlmError) as exc:
+        await external_llm.generate_external(
+            "claude-cli", [{"role": "user", "content": "hi"}]
+        )
+    assert exc.value.code == "ENGINE_ERROR"
+    assert "timed out" in exc.value.message
+    assert proc.killed  # the guard stopped the wedged subprocess
 
 
 # ---------------------------------------------------------------- llm seams

@@ -3,6 +3,7 @@ import {
   FocusIcon,
   GraphIcon,
   HomeIcon,
+  LinkIcon,
   MemoryIcon,
   MicIcon,
   PanelCenterIcon,
@@ -37,6 +38,7 @@ const AREAS: {
     label: "Memory & scratch pad",
     icon: (s) => <MemoryIcon size={s} />,
   },
+  { key: "connectors", label: "Connectors", icon: (s) => <LinkIcon size={s} /> },
 ];
 
 /** The 46px activity rail. Two deliberately different groups: pane

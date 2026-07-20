@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, RecMeta, RecSegment, RecWord } from "../api";
+import { PlayIcon, PauseIcon, StopIcon } from "../icons";
 import { liveSttOn, micMuted, noteLiveStt, setMicMuted } from "../workspace/liveRec";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
@@ -507,8 +508,8 @@ export default function RecordingView({
         )}
         {status === "recording" && (
           <>
-            <button className="subtle rec-btn" onClick={() => void onPause()}>⏸ Pause</button>
-            <button className="primary rec-btn" onClick={() => void onStop()}>■ Stop &amp; save</button>
+            <button className="subtle rec-btn" onClick={() => void onPause()}><PauseIcon size={13} /> Pause</button>
+            <button className="primary rec-btn" onClick={() => void onStop()}><StopIcon size={13} /> Stop &amp; save</button>
             <span className="rec-live-chip">
               <span className="rec-dot pulsing" /> REC {formatTimestamp(durationCs)}
             </span>
@@ -543,8 +544,8 @@ export default function RecordingView({
         )}
         {status === "paused" && (
           <>
-            <button className="primary rec-btn" onClick={() => void onResume()}>● Resume</button>
-            <button className="subtle rec-btn" onClick={() => void onStop()}>■ Stop &amp; save</button>
+            <button className="primary rec-btn" onClick={() => void onResume()}><PlayIcon size={13} /> Resume</button>
+            <button className="subtle rec-btn" onClick={() => void onStop()}><StopIcon size={13} /> Stop &amp; save</button>
             <span className="rec-live-chip paused">Paused at {formatTimestamp(durationCs)}</span>
           </>
         )}

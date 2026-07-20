@@ -3,6 +3,68 @@
 All notable, user-facing changes to Private Room. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.6.0 — 2026-07-20
+
+### A marketplace for tool connectors
+
+- **Browse and install MCP connectors from a live registry.** A new
+  **Connectors** area in the sidebar rail lets you search the public Model
+  Context Protocol registry, filter to verified publishers, local-only, or "no
+  API key needed," and install a connector in one click. Browsing the registry
+  is the only time the app reaches out on its own, so it's behind an explicit
+  opt-in — nothing about your room is sent, only the catalog comes back.
+- **Local by default, cloud by choice.** A connector that ships both a local
+  package and a hosted endpoint installs the local one (nothing leaves your
+  Mac), with a one-tap switch to the cloud version. Remote connectors are
+  badged loudly; before their arguments leave the Mac, Private Room redacts the
+  room's sensitive spans and asks first.
+- **Sign in without leaving the app.** Remote connectors that use OAuth get a
+  **Connect account** button that runs the whole browser sign-in and stores the
+  token in the room — with a manual open/copy-link fallback if your browser
+  doesn't open on its own.
+- **Manage every connector and every tool.** Installed connectors can be turned
+  on or off, removed, and expanded to a per-tool list where you switch
+  individual tools on or off — or flip one override to send a connector's whole
+  toolset to the assistant. Cloud models now get a much larger tool budget than
+  the small on-device model, so a big connector's tools all come through.
+
+### Workflows do more — and in parallel
+
+- **Nine new step types** join generate / summarize / deep-pass / agent /
+  save / condition: **HTTP fetch** a URL, **extract** structured fields into a
+  table, **transform** text with no model call at all, **merge** several
+  branches back together, **route** to labeled branches, **vote** across
+  parallel attempts for consensus, **fan out over every matching file**,
+  **refine** an output until it passes its own check, and **plan-then-map** an
+  objective into sub-tasks. Each type gets its own parameter sheet in the
+  builder.
+- **Steps run in parallel.** Independent branches now execute concurrently —
+  lane-gated so the single local model stays serialized while cloud and CPU
+  work fan out — instead of everything running one after another.
+- **Scripts and workflows mix.** A workflow step can run one of your room
+  scripts — importing its output, or piping text through it — so deterministic
+  code and model calls live in the same pipeline.
+- **A friendlier builder.** Parallel-branch authoring, an icon picker per
+  workflow, clickable validation errors that jump to the offending step, and
+  richer run history with per-step output and copy buttons.
+
+### A calmer, more professional look
+
+- **One icon family, no emoji.** Every native emoji in the interface — the
+  workflow template gallery, pins, schedules, run/stop/pause controls, and the
+  "saved / copied / installed" status checks across Settings — is now a line
+  icon from a single system (24px grid, monochrome, with the violet accent
+  reserved for selected and primary actions). The workflow template gallery in
+  particular reads as one professional set instead of seven colorful
+  pictograms.
+
+### Updates
+
+- **Check for updates in-app.** A new **Settings → App → Updates & version**
+  shows your current version and, in one click, checks the signed GitHub
+  release, downloads and verifies it, installs, and relaunches — the visible,
+  on-demand counterpart to the quiet check that already runs on launch.
+
 ## 0.5.1 — 2026-07-20
 
 - **Recovery codes show as you type them.** The recovery-code box on the

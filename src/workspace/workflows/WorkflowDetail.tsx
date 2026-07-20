@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   api,
   Schedule,
@@ -15,6 +16,8 @@ import { PipelineCanvas } from "./PipelineCanvas";
 import { NodeParamSheet } from "./NodeParamSheet";
 import { SchedulePopover } from "./SchedulePopover";
 import { RunHistory } from "./RunHistory";
+import { WorkflowGlyph, WORKFLOW_ICON_CHOICES } from "./workflowGlyph";
+import { PlayIcon, PinIcon, CalendarClockIcon } from "../../icons";
 
 const KIND_UNION = [
   "image", "pdf", "docx", "sheet", "csv", "markdown", "html", "code", "text",
@@ -33,6 +36,21 @@ function parseExts(raw: string): string[] {
     .split(",")
     .map((x) => x.trim().replace(/^\./, "").toLowerCase())
     .filter(Boolean);
+}
+
+/** Turn a backend validation sentence (which names nodes by their internal id,
+ * e.g. `Node 'nmrt1v6mp1' …`) into human text — swapping each quoted id for the
+ * step's label — and surface the first referenced node id so the error can be
+ * clicked to select that step. */
+function humanizeError(msg: string, nodes: WorkflowNode[]): { text: string; nodeId: string | null } {
+  let nodeId: string | null = null;
+  const text = msg.replace(/'([^']+)'/g, (m, id) => {
+    const n = nodes.find((x) => x.id === id);
+    if (!n) return m;
+    if (!nodeId) nodeId = id;
+    return `"${(n.label && String(n.label)) || id}"`;
+  });
+  return { text, nodeId };
 }
 
 function newNode(idx: number): WorkflowNode {
@@ -54,9 +72,19 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   const [extsText, setExtsText] = useState(() => extsOf(workflow.binding));
   const [selected, setSelected] = useState<string | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
-  const [dirty, setDirty] = useState(false);
+  // Dirty = the form actually differs from the saved workflow, so toggling a
+  // value back to its original (e.g. Script mode Import→Pipe→Import) clears Save.
+  const dirty = useMemo(
+    () =>
+      name !== workflow.name ||
+      (emoji || "⚙️") !== (workflow.emoji || "⚙️") ||
+      JSON.stringify(def) !== JSON.stringify(workflow.definition) ||
+      JSON.stringify(binding) !== JSON.stringify(workflow.binding),
+    [name, emoji, def, binding, workflow],
+  );
   const [schedule, setSchedule] = useState<Schedule | null>(null);
   const [showSched, setShowSched] = useState(false);
+  const [showIconPicker, setShowIconPicker] = useState(false);
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
 
   // Re-seed from the store when the selected workflow (or its saved form) changes.
@@ -66,7 +94,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
     setEmoji(workflow.emoji || "⚙️");
     setBinding(workflow.binding);
     setExtsText(extsOf(workflow.binding));
-    setDirty(false);
+    /* dirty is derived from a diff */
   }, [workflow.id, workflow.updatedAt]);
 
   // Load schedule + run history; refresh when the workflows list changes (a run
@@ -99,7 +127,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
 
   function updateNode(n: WorkflowNode) {
     setDef((d) => ({ ...d, nodes: d.nodes.map((x) => (x.id === n.id ? n : x)) }));
-    setDirty(true);
+    /* dirty is derived from a diff */
   }
   function deleteNode(id: string) {
     setDef((d) => ({
@@ -108,11 +136,11 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
       edges: d.edges.filter((e) => e.from !== id && e.to !== id),
     }));
     setSelected(null);
-    setDirty(true);
+    /* dirty is derived from a diff */
   }
   function updateEdges(edges: WorkflowEdge[]) {
     setDef((d) => ({ ...d, edges }));
-    setDirty(true);
+    /* dirty is derived from a diff */
   }
   /** Add a step. With `afterId`, splice it in right after that node — rewiring
    * that node's successors through the new step (branch labels are dropped since
@@ -134,12 +162,22 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
       ];
       return { ...d, nodes: [...d.nodes, n], edges };
     });
-    setDirty(true);
+    /* dirty is derived from a diff */
+  }
+  /** Add a PARALLEL branch: a new step wired from `afterId` WITHOUT rewiring its
+   * existing successors, so `afterId` now fans out to two children (the engine
+   * runs independent branches concurrently on the cloud/CPU lanes). */
+  function addBranchNode(afterId: string) {
+    setDef((d) => {
+      const n = newNode(d.nodes.length);
+      return { ...d, nodes: [...d.nodes, n], edges: [...d.edges, { from: afterId, to: n.id }] };
+    });
+    /* dirty is derived from a diff */
   }
 
   async function save() {
     await a.saveWorkflowEdits(workflow.id, { name, emoji, definition: def, binding });
-    setDirty(false);
+    /* dirty is derived from a diff */
   }
   async function saveAndActivate() {
     await save();
@@ -151,18 +189,18 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
     const kinds = binding.kinds ?? [];
     const next = kinds.includes(k) ? kinds.filter((x) => x !== k) : [...kinds, k];
     setBinding({ ...binding, kinds: next });
-    setDirty(true);
+    /* dirty is derived from a diff */
   }
   function setBindingExts(raw: string) {
     if (binding.scope !== "file") return;
     setExtsText(raw);
     setBinding({ ...binding, exts: parseExts(raw) });
-    setDirty(true);
+    /* dirty is derived from a diff */
   }
   function setBindingFile(fileId: string | null) {
     if (binding.scope !== "file") return;
     setBinding({ ...binding, file_id: fileId });
-    setDirty(true);
+    /* dirty is derived from a diff */
   }
 
   return (
@@ -171,27 +209,56 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
         <button className="subtle btn-ic" onClick={() => s.setWfDetailId(null)}>
           ← Library
         </button>
-        <input
-          className="wf-emoji-input"
-          style={{ width: "2.2rem", textAlign: "center", font: "inherit" }}
-          value={emoji}
-          onChange={(e) => {
-            setEmoji(e.target.value);
-            setDirty(true);
-          }}
-        />
+        <div className="wf-icon-pick" style={{ position: "relative" }}>
+          <button
+            type="button"
+            className="wf-icon-btn"
+            aria-haspopup="menu"
+            aria-expanded={showIconPicker}
+            title="Choose an icon"
+            aria-label="Choose an icon for this workflow"
+            onClick={() => setShowIconPicker((v) => !v)}
+          >
+            <WorkflowGlyph emoji={emoji} size={18} />
+          </button>
+          {showIconPicker && (
+            <>
+              <div className="menu-backdrop" onMouseDown={() => setShowIconPicker(false)} />
+              <div className="wf-icon-grid" role="menu" aria-label="Workflow icon">
+                {WORKFLOW_ICON_CHOICES.map((c) => (
+                  <button
+                    key={c.key}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={(emoji || "⚙️") === c.key}
+                    className={`wf-icon-choice${(emoji || "⚙️") === c.key ? " active" : ""}`}
+                    title={c.label}
+                    aria-label={c.label}
+                    onClick={() => {
+                      setEmoji(c.key);
+                      setShowIconPicker(false);
+                      /* dirty is derived from a diff */
+                    }}
+                  >
+                    <WorkflowGlyph emoji={c.key} size={18} />
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
         <input
           className="viewer-title"
           style={{ font: "inherit", fontWeight: 600, border: "none", background: "transparent", flex: 1 }}
           value={name}
           onChange={(e) => {
             setName(e.target.value);
-            setDirty(true);
+            /* dirty is derived from a diff */
           }}
         />
         <span className="viewer-actions" style={{ position: "relative" }}>
-          <button className="subtle" disabled={workflow.status !== "active"} onClick={() => void a.runWorkflowNow(workflow.id)}>
-            ▶ Run now
+          <button className="subtle btn-ic" disabled={workflow.status !== "active"} onClick={() => void a.runWorkflowNow(workflow.id)}>
+            <PlayIcon size={12} /> Run now
           </button>
           {workflow.status === "active" ? (
             <button className="subtle" onClick={() => void a.setWorkflowStatus(workflow.id, "draft")}>
@@ -207,17 +274,27 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
           </button>
           {!isFileScoped && (
             <button
-              className="subtle"
+              className={`subtle btn-ic${workflow.pinned ? " active" : ""}`}
               title={workflow.pinned ? "Unpin from the top bar" : "Pin to the top bar"}
               onClick={() => void a.setWorkflowPinned(workflow.id, !workflow.pinned)}
             >
-              {workflow.pinned ? "📌 Pinned" : "📌 Pin"}
+              <PinIcon size={12} /> {workflow.pinned ? "Pinned" : "Pin"}
             </button>
           )}
-          <button className="subtle" onClick={() => setShowSched((v) => !v)}>
-            🕒 Schedule
+          <button className="subtle btn-ic" onClick={() => setShowSched((v) => !v)}>
+            <CalendarClockIcon size={12} /> Schedule
           </button>
-          <button className="subtle" data-agent-blocked onClick={() => void a.deleteWorkflow(workflow.id)}>
+          <button
+            className="subtle"
+            data-agent-blocked
+            onClick={async () => {
+              const ok = await confirm(`Delete the workflow “${workflow.name}”? This can't be undone.`, {
+                title: "Delete workflow",
+                kind: "warning",
+              });
+              if (ok) await a.deleteWorkflow(workflow.id);
+            }}
+          >
             Delete
           </button>
           {showSched && (
@@ -245,9 +322,25 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
           <div className="wf-errors">
             Fix these before activating:
             <ul>
-              {errors.map((e, i) => (
-                <li key={i}>{e}</li>
-              ))}
+              {errors.map((e, i) => {
+                const { text, nodeId } = humanizeError(e, def.nodes);
+                return (
+                  <li key={i}>
+                    {nodeId ? (
+                      <button
+                        type="button"
+                        className="wf-error-link"
+                        onClick={() => setSelected(nodeId)}
+                        title="Select this step"
+                      >
+                        {text}
+                      </button>
+                    ) : (
+                      text
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           </div>
         )}
@@ -258,6 +351,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
           selectedId={selected}
           onSelect={setSelected}
           onAddAfter={addNode}
+          onAddBranch={addBranchNode}
           editable
         />
 
@@ -269,6 +363,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
             edges={def.edges}
             allNodes={def.nodes}
             onEdgesChange={updateEdges}
+            files={s.files}
           />
         )}
 
@@ -276,22 +371,28 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
         <div className="node-param-sheet">
           <label>
             Where it appears
-            <div className="wf-seg">
+            <div className="wf-seg" role="radiogroup" aria-label="Where it appears">
               <button
+                type="button"
+                role="radio"
+                aria-checked={binding.scope === "general"}
                 className={binding.scope === "general" ? "active" : ""}
                 onClick={() => {
                   setBinding({ scope: "general" });
-                  setDirty(true);
+                  /* dirty is derived from a diff */
                 }}
               >
                 General
               </button>
               <button
+                type="button"
+                role="radio"
+                aria-checked={binding.scope === "file"}
                 className={binding.scope === "file" ? "active" : ""}
                 onClick={() => {
                   setBinding({ scope: "file", kinds: [], exts: [] });
                   setExtsText("");
-                  setDirty(true);
+                  /* dirty is derived from a diff */
                 }}
               >
                 Specific files
@@ -348,7 +449,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
         </div>
 
         <h3 style={{ marginTop: "1.2rem" }}>Run history</h3>
-        <RunHistory runs={runs} nodeCount={nodeCount} />
+        <RunHistory runs={runs} nodeCount={nodeCount} nodes={def.nodes} />
       </div>
     </div>
   );

@@ -21,6 +21,8 @@ mod stt_cmds;
 mod library;
 mod search;
 mod mcp_cmds;
+mod mcp_oauth;
+mod mcp_registry;
 mod models;
 mod vision;
 mod chat;
@@ -55,6 +57,7 @@ pub use stt_cmds::*;
 pub use library::*;
 pub use search::*;
 pub use mcp_cmds::*;
+pub use mcp_registry::*;
 pub use models::*;
 pub use vision::*;
 pub use chat::*;
@@ -104,12 +107,30 @@ pub(crate) const MAX_TOOL_RESULT_CHARS: usize = 4000;
 pub(crate) const MAX_MCP_TOOLS: usize = 12;
 /// Whole-catalog character budget for connected MCP tool specs.
 pub(crate) const MAX_MCP_CATALOG_CHARS: usize = 8_000;
+/// Cloud/external engines (`:cloud`, claude-cli, codex-cli) have big contexts and
+/// handle many tools fine — the tight 12/8000 budget above is a LOCAL-4B limit,
+/// and applying it to a cloud model silently hides most of a connector's tools
+/// (a 15-tool server showed only ~4). These are the generous caps used when the
+/// chosen engine isn't the small local model. `mcp_routes` picks per engine.
+pub(crate) const MAX_MCP_TOOLS_CLOUD: usize = 64;
+pub(crate) const MAX_MCP_CATALOG_CHARS_CLOUD: usize = 64_000;
 /// ADD-21: at most this many cloud-advisor consults per `ask`. A consult is a
 /// slow, paid cloud call; one per turn keeps the local loop from flailing into
 /// repeated exfiltration when it could just answer.
 pub(crate) const MAX_ADVISOR_CALLS: u8 = 1;
 
 pub(crate) const MCP_CONFIG_KEY: &str = "mcp_config";
+/// Per-connector tool opt-outs: a JSON `{ "<server>": ["<tool>", …] }` of tool
+/// names the user has turned OFF. Default (missing/empty) = every tool on, so
+/// behavior matches pre-whitelist. Kept SEPARATE from `mcp_config` on purpose —
+/// toggling a tool must not change the config fingerprint and re-trigger the
+/// SEC-1 approval dialog.
+pub(crate) const MCP_TOOL_PREFS_KEY: &str = "mcp_tool_prefs";
+/// Connectors the user has opted OUT of the tool-count cap for: a JSON array of
+/// server names. For a server listed here, `mcp_routes` sends EVERY enabled tool
+/// to the assistant, ignoring `MAX_MCP_TOOLS*`/`MAX_MCP_CATALOG_CHARS*` — an
+/// explicit "I know, show them all" override (default off keeps the cap).
+pub(crate) const MCP_TOOL_UNCAPPED_KEY: &str = "mcp_tool_uncapped";
 /// Shown as the starting config. The web-search entry ships disabled so a
 /// room never reaches the internet without the user flipping it on.
 // Ship an empty scaffold, not a search example: web search has one clear home

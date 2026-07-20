@@ -316,9 +316,16 @@ export function useWorkspaceEffects(
       // index (and a script that just ran wrote its outputs here).
       void a.refreshScripts();
     });
-    api.mcpStatus().then((st) => s.setMcpTools(a.connectedTools(st))).catch(() => {});
+    api
+      .mcpStatus()
+      .then((st) => {
+        s.setMcpTools(a.connectedTools(st));
+        s.setMcpStatuses(st);
+      })
+      .catch(() => {});
     const unlistenMcp = api.onMcpStatus((statuses) => {
       s.setMcpTools(a.connectedTools(statuses));
+      s.setMcpStatuses(statuses);
     });
     // ADD-27: keep the workspace-wide live-recording state in sync with the
     // engine (the TopBar chip + RecordingView both read s.recLive), re-attach

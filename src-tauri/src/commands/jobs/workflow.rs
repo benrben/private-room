@@ -63,6 +63,24 @@ fn default_format() -> String {
 fn default_save_mode() -> String {
     "create".into()
 }
+fn default_script_mode() -> String {
+    "import".into()
+}
+fn default_merge_mode() -> String {
+    "concat".into()
+}
+fn default_vote_mode() -> String {
+    "concat".into()
+}
+fn default_samples() -> u32 {
+    3
+}
+fn default_refine_rounds() -> u32 {
+    2
+}
+fn default_max_workers() -> u32 {
+    4
+}
 
 /// The node palette. `kind` is the discriminant; each variant carries its params.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +131,103 @@ pub enum NodeKind {
     /// Wave 5 (Idea 13): run a `.py`/`.js` room script in a throwaway workspace,
     /// importing its declared + new outputs back into the room. `file` is the
     /// script's file id (or a name). The consent hash lives in the plan snapshot.
-    ScriptRun { file: String },
+    ///
+    /// `mode` = "import" (default, the Wave-5 behavior: the artifact is the run
+    /// report JSON) | "transform" (a first-class PIPE STAGE: the upstream
+    /// `{{input}}` is fed to the script's STDIN and its STDOUT becomes the step
+    /// artifact, so a script drops into the dataflow between LLM nodes — the
+    /// "deterministic step" a workflow reaches for). Imported files land either
+    /// way.
+    ScriptRun {
+        file: String,
+        #[serde(default = "default_script_mode")]
+        mode: String,
+    },
+    // ---- richer palette (the pattern nodes) ----
+    /// A deterministic text transform on the joined input — no model call. `op` =
+    /// append | prepend | replace | upper | lower | trim | truncate | strip_html.
+    /// `find`/`value` carry the op's operands. The "more deterministic steps" a
+    /// workflow should prefer over an LLM call for mechanical work.
+    Transform {
+        op: String,
+        #[serde(default)]
+        find: Option<String>,
+        #[serde(default)]
+        value: Option<String>,
+    },
+    /// A fan-in reducer: combine EVERY live incoming branch deterministically.
+    /// `mode` = concat (join by `separator`, default a blank line) | dedupe_lines
+    /// | numbered. The explicit merge point for parallel branches.
+    Merge {
+        #[serde(default = "default_merge_mode")]
+        mode: String,
+        #[serde(default)]
+        separator: Option<String>,
+    },
+    /// Deterministic HTTP GET of `url` (SSRF-guarded, readable-text extracted),
+    /// its text the step artifact. `url` supports `{{input}}`/`{{date}}`.
+    HttpFetch { url: String },
+    /// Structured output: pull named `fields` out of the input as a JSON object
+    /// (schema-constrained `/generate`). The augmented-LLM foundation that lets a
+    /// downstream condition/code gate branch on machine-readable values.
+    Extract {
+        fields: Vec<String>,
+        #[serde(default)]
+        model: String,
+    },
+    /// Routing (fuzzy classifier): the model picks ONE of `labels` for the input;
+    /// the chosen label is the taken branch (edges carry `branch: <label>`), so a
+    /// route fans to N specialized handlers the way `condition` fans to then/else.
+    Route {
+        #[serde(default)]
+        prompt: String,
+        labels: Vec<String>,
+        #[serde(default)]
+        model: String,
+    },
+    /// Parallelization–voting: run the same `prompt` `samples` times and aggregate.
+    /// `mode` = concat (label each sample) | majority (most common trimmed answer).
+    Vote {
+        prompt: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default = "default_samples")]
+        samples: u32,
+        #[serde(default = "default_vote_mode")]
+        mode: String,
+    },
+    /// Parallelization–sectioning over a file set: run `instruction` against EACH
+    /// selected file and join the results (fixes file_pass/`all` taking only the
+    /// first file).
+    ForEachFile {
+        #[serde(default)]
+        select: FileSelector,
+        instruction: String,
+        #[serde(default)]
+        model: String,
+    },
+    /// Evaluator-optimizer: generate → evaluate against `rubric` → revise, looping
+    /// up to `max_rounds` or until the evaluator passes. The one pattern that needs
+    /// a bounded loop, kept a single acyclic step so resume/checkpoint are unchanged.
+    Refine {
+        prompt: String,
+        #[serde(default)]
+        rubric: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default = "default_refine_rounds")]
+        max_rounds: u32,
+    },
+    /// Orchestrator-workers: the model decomposes `objective` into a structured
+    /// subtask list (unknown until runtime), runs a worker per subtask, then
+    /// synthesizes — a dynamic fan-out kept inside one step.
+    PlanAndMap {
+        objective: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default = "default_max_workers")]
+        max_workers: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +294,13 @@ struct WfArtifact {
     /// save_file / file_pass: the written file id (idempotent re-execution).
     #[serde(default)]
     file_id: Option<String>,
+    /// The node's human name + kind, stamped at store time so the run-history
+    /// view can label each step by its node (not just "Step N") — the compiled
+    /// step order isn't the def order, so the frontend can't derive this itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_kind: Option<String>,
 }
 
 // ---------------------------------------------------------------- validation
@@ -192,7 +313,29 @@ const NODE_KINDS: &[&str] = &[
     "save_file",
     "condition",
     "script_run",
+    "transform",
+    "merge",
+    "http_fetch",
+    "extract",
+    "route",
+    "vote",
+    "for_each_file",
+    "refine",
+    "plan_and_map",
 ];
+const TRANSFORM_OPS: &[&str] = &[
+    "append",
+    "prepend",
+    "replace",
+    "upper",
+    "lower",
+    "trim",
+    "truncate",
+    "strip_html",
+];
+const MERGE_MODES: &[&str] = &["concat", "dedupe_lines", "numbered"];
+const SCRIPT_MODES: &[&str] = &["import", "transform"];
+const VOTE_MODES: &[&str] = &["concat", "majority"];
 const FILE_SELECTORS: &[&str] = &[
     "newest",
     "all",
@@ -216,9 +359,9 @@ fn selector_is_run_input(sel: &FileSelector) -> bool {
 
 fn node_uses_run_input(node: &WorkflowNode) -> bool {
     match &node.kind {
-        NodeKind::SummarizeFile { select } | NodeKind::FilePass { select, .. } => {
-            selector_is_run_input(select)
-        }
+        NodeKind::SummarizeFile { select }
+        | NodeKind::FilePass { select, .. }
+        | NodeKind::ForEachFile { select, .. } => selector_is_run_input(select),
         _ => false,
     }
 }
@@ -248,6 +391,9 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
     }
     // Per-kind param checks.
     let mut condition_ids: HashSet<&str> = HashSet::new();
+    // route nodes are branch sources like condition, but their branch labels are
+    // the node's own `labels` (not then/else) — collected here for edge legality.
+    let mut route_labels: HashMap<&str, Vec<String>> = HashMap::new();
     for n in &def.nodes {
         match &n.kind {
             NodeKind::Generate { prompt, .. } => {
@@ -310,7 +456,7 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                     ));
                 }
             }
-            NodeKind::ScriptRun { file } => {
+            NodeKind::ScriptRun { file, mode } => {
                 if file.trim().is_empty() {
                     errs.push(format!("Node '{}' (script_run) has no script file.", n.id));
                 } else if script_lang_of(file).is_none() && extraction::extension_of(file).is_empty()
@@ -322,6 +468,112 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                         "Node '{}' points at '{}' — only .py or .js scripts can run.",
                         n.id, file
                     ));
+                }
+                if !SCRIPT_MODES.contains(&mode.as_str()) {
+                    errs.push(format!(
+                        "Node '{}' has an unknown script mode '{}' — use import or transform.",
+                        n.id, mode
+                    ));
+                }
+            }
+            NodeKind::Transform { op, find, value } => {
+                if !TRANSFORM_OPS.contains(&op.as_str()) {
+                    errs.push(format!(
+                        "Node '{}' has an unknown transform '{}' — use one of: {}.",
+                        n.id,
+                        op,
+                        TRANSFORM_OPS.join(", ")
+                    ));
+                }
+                if op == "replace" && find.as_deref().unwrap_or("").is_empty() {
+                    errs.push(format!("Node '{}' (replace) needs a `find` string.", n.id));
+                }
+                if op == "truncate"
+                    && value.as_deref().unwrap_or("").trim().parse::<usize>().is_err()
+                {
+                    errs.push(format!(
+                        "Node '{}' (truncate) needs `value` to be a character count.",
+                        n.id
+                    ));
+                }
+            }
+            NodeKind::Merge { mode, .. } => {
+                if !MERGE_MODES.contains(&mode.as_str()) {
+                    errs.push(format!(
+                        "Node '{}' has an unknown merge mode '{}' — use one of: {}.",
+                        n.id,
+                        mode,
+                        MERGE_MODES.join(", ")
+                    ));
+                }
+            }
+            NodeKind::HttpFetch { url } => {
+                if url.trim().is_empty() {
+                    errs.push(format!("Node '{}' (http_fetch) has no URL.", n.id));
+                }
+            }
+            NodeKind::Extract { fields, .. } => {
+                if fields.iter().all(|f| f.trim().is_empty()) {
+                    errs.push(format!(
+                        "Node '{}' (extract) lists no fields to pull out.",
+                        n.id
+                    ));
+                }
+            }
+            NodeKind::Route { labels, .. } => {
+                let clean: Vec<String> = labels
+                    .iter()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if clean.len() < 2 {
+                    errs.push(format!(
+                        "Node '{}' (route) needs at least two labels to route between.",
+                        n.id
+                    ));
+                }
+                route_labels.insert(n.id.as_str(), clean);
+            }
+            NodeKind::Vote { prompt, mode, .. } => {
+                if prompt.trim().is_empty() {
+                    errs.push(format!("Node '{}' (vote) has an empty prompt.", n.id));
+                }
+                if !VOTE_MODES.contains(&mode.as_str()) {
+                    errs.push(format!(
+                        "Node '{}' has an unknown vote mode '{}' — use concat or majority.",
+                        n.id, mode
+                    ));
+                }
+            }
+            NodeKind::ForEachFile { select, instruction, .. } => {
+                if !FILE_SELECTORS.contains(&select.kind.as_str()) {
+                    errs.push(format!(
+                        "Node '{}' has an unknown file selector '{}' — use one of: {}.",
+                        n.id,
+                        select.kind,
+                        FILE_SELECTORS.join(", ")
+                    ));
+                }
+                if select.kind == "name_like"
+                    && select.pattern.as_deref().unwrap_or("").trim().is_empty()
+                {
+                    errs.push(format!("Node '{}' selects by name but has no pattern.", n.id));
+                }
+                if instruction.trim().is_empty() {
+                    errs.push(format!(
+                        "Node '{}' (for_each_file) has an empty instruction.",
+                        n.id
+                    ));
+                }
+            }
+            NodeKind::Refine { prompt, .. } => {
+                if prompt.trim().is_empty() {
+                    errs.push(format!("Node '{}' (refine) has an empty prompt.", n.id));
+                }
+            }
+            NodeKind::PlanAndMap { objective, .. } => {
+                if objective.trim().is_empty() {
+                    errs.push(format!("Node '{}' (plan_and_map) has an empty objective.", n.id));
                 }
             }
         }
@@ -345,15 +597,28 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
             errs.push(format!("An edge points to unknown node '{}'.", e.to));
         }
         if let Some(b) = &e.branch {
-            if !["then", "else"].contains(&b.as_str()) {
+            // A branch edge comes off a condition (then|else) OR a route (one of
+            // its own labels). Skip-propagation matches the artifact branch string
+            // to the edge branch either way, so both fan the graph the same.
+            let from_condition = condition_ids.contains(e.from.as_str());
+            let from_route = route_labels.contains_key(e.from.as_str());
+            if from_condition {
+                if !["then", "else"].contains(&b.as_str()) {
+                    errs.push(format!(
+                        "Edge {}→{} has branch '{}' — a condition only branches 'then' or 'else'.",
+                        e.from, e.to, b
+                    ));
+                }
+            } else if from_route {
+                if !route_labels[e.from.as_str()].iter().any(|l| l == b) {
+                    errs.push(format!(
+                        "Edge {}→{} has branch '{}', but route '{}' has no such label.",
+                        e.from, e.to, b, e.from
+                    ));
+                }
+            } else {
                 errs.push(format!(
-                    "Edge {}→{} has branch '{}' — only 'then' or 'else' are allowed.",
-                    e.from, e.to, b
-                ));
-            }
-            if !condition_ids.contains(e.from.as_str()) {
-                errs.push(format!(
-                    "Edge {}→{} has a branch, but '{}' is not a condition node.",
+                    "Edge {}→{} has a branch, but '{}' is not a condition or route node.",
                     e.from, e.to, e.from
                 ));
             }
@@ -400,6 +665,15 @@ fn node_kind_tag(kind: &NodeKind) -> &'static str {
         NodeKind::SaveFile { .. } => "save_file",
         NodeKind::Condition { .. } => "condition",
         NodeKind::ScriptRun { .. } => "script_run",
+        NodeKind::Transform { .. } => "transform",
+        NodeKind::Merge { .. } => "merge",
+        NodeKind::HttpFetch { .. } => "http_fetch",
+        NodeKind::Extract { .. } => "extract",
+        NodeKind::Route { .. } => "route",
+        NodeKind::Vote { .. } => "vote",
+        NodeKind::ForEachFile { .. } => "for_each_file",
+        NodeKind::Refine { .. } => "refine",
+        NodeKind::PlanAndMap { .. } => "plan_and_map",
     }
 }
 
@@ -505,13 +779,23 @@ pub fn compile_workflow(
             .filter_map(|i| i["parent"].as_u64().map(|v| v as usize))
             .collect();
         let (model, lane) = match &node.kind {
-            NodeKind::Generate { model, .. } => resolve_node_model(model, room_model, models),
+            NodeKind::Generate { model, .. }
+            | NodeKind::Extract { model, .. }
+            | NodeKind::Route { model, .. }
+            | NodeKind::Vote { model, .. }
+            | NodeKind::ForEachFile { model, .. }
+            | NodeKind::Refine { model, .. }
+            | NodeKind::PlanAndMap { model, .. } => resolve_node_model(model, room_model, models),
             NodeKind::SummarizeFile { .. }
             | NodeKind::FilePass { .. }
             | NodeKind::AgentRun { .. } => resolve_node_model("auto", room_model, models),
+            // Deterministic, no model call — the CPU lane (fans out to 4).
             NodeKind::SaveFile { .. }
             | NodeKind::Condition { .. }
-            | NodeKind::ScriptRun { .. } => (String::new(), Lane::Cpu),
+            | NodeKind::ScriptRun { .. }
+            | NodeKind::Transform { .. }
+            | NodeKind::Merge { .. }
+            | NodeKind::HttpFetch { .. } => (String::new(), Lane::Cpu),
         };
         steps.push(Step {
             id: idx,
@@ -764,6 +1048,152 @@ fn count_new_files<R: tauri::Runtime>(
         .unwrap_or(0)
 }
 
+// ----------------------------------------------- richer-node helpers
+
+/// Per-file text budget for a for_each_file map — the local model's Job-tier ctx.
+const PER_FILE_CHARS: usize = 12_000;
+
+/// The workflow's single LLM entry point: one cancellable `/generate` call with an
+/// optional structured-output `format` schema. Every model node (extract / route /
+/// vote / for_each_file / refine / plan_and_map) speaks to the same endpoint as
+/// the Generate arm, so engine-parity and Stop behave identically across them.
+async fn wf_generate(
+    model: &str,
+    prompt: &str,
+    format: Option<serde_json::Value>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let mut body = serde_json::json!({
+        "model": model,
+        "base_url": ollama::resolved_base_url(),
+        "messages": [{ "role": "user", "content": prompt }],
+        "keep_alive": KEEP_ALIVE_WARM,
+    });
+    if let Some(f) = format {
+        body["format"] = f;
+    }
+    match crate::sidecar::sidecar_json_cancellable("/generate", &body, cancel).await {
+        Ok(Some(v)) => Ok(v["text"].as_str().unwrap_or_default().to_string()),
+        Ok(None) => Err("STOPPED".into()),
+        Err(e) => Err(e.sentinel(Some(model))),
+    }
+}
+
+/// Pure deterministic text transform (unit-tested).
+fn apply_transform(op: &str, find: &Option<String>, value: &Option<String>, input: &str) -> String {
+    let v = value.clone().unwrap_or_default();
+    match op {
+        "append" => format!("{input}{v}"),
+        "prepend" => format!("{v}{input}"),
+        "replace" => match find {
+            Some(f) if !f.is_empty() => input.replace(f.as_str(), &v),
+            _ => input.to_string(),
+        },
+        "upper" => input.to_uppercase(),
+        "lower" => input.to_lowercase(),
+        "trim" => input.trim().to_string(),
+        "truncate" => input.chars().take(v.trim().parse().unwrap_or(0)).collect(),
+        "strip_html" => extraction::strip_html(input),
+        _ => input.to_string(),
+    }
+}
+
+/// Pure fan-in reducer over the live incoming branch results (unit-tested).
+fn apply_merge(mode: &str, separator: &Option<String>, inputs: &[String]) -> String {
+    let sep = separator.clone().unwrap_or_else(|| "\n\n".into());
+    match mode {
+        "numbered" => inputs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}. {}", i + 1, s))
+            .collect::<Vec<_>>()
+            .join(&sep),
+        "dedupe_lines" => {
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut out: Vec<String> = Vec::new();
+            for block in inputs {
+                for line in block.lines() {
+                    if seen.insert(line.to_string()) {
+                        out.push(line.to_string());
+                    }
+                }
+            }
+            out.join("\n")
+        }
+        _ => inputs.join(&sep), // "concat"
+    }
+}
+
+/// Pure vote aggregation (unit-tested): majority = most common trimmed sample
+/// (ties → the earliest); concat = every sample, labeled.
+fn aggregate_votes(mode: &str, samples: &[String]) -> String {
+    if samples.is_empty() {
+        return String::new();
+    }
+    if mode == "majority" {
+        // key -> (count, first-seen index); pick highest count, tie → lowest index.
+        let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
+        for (i, s) in samples.iter().enumerate() {
+            let e = counts.entry(s.trim()).or_insert((0, i));
+            e.0 += 1;
+        }
+        return counts
+            .iter()
+            .max_by(|(_, (ca, ia)), (_, (cb, ib))| ca.cmp(cb).then(ib.cmp(ia)))
+            .map(|(k, _)| k.to_string())
+            .unwrap_or_default();
+    }
+    samples
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("— sample {} —\n{}", i + 1, s.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// A JSON schema requiring each field as a string — the /generate `format` for an
+/// extract node (structured output).
+fn build_extract_schema(fields: &[String]) -> serde_json::Value {
+    let mut props = serde_json::Map::new();
+    let mut required: Vec<serde_json::Value> = Vec::new();
+    for f in fields.iter().map(|f| f.trim()).filter(|f| !f.is_empty()) {
+        props.insert(f.to_string(), serde_json::json!({ "type": "string" }));
+        required.push(serde_json::Value::String(f.to_string()));
+    }
+    serde_json::json!({ "type": "object", "properties": props, "required": required })
+}
+
+/// A JSON schema constraining a `label` to one of `labels` — the route classifier's
+/// /generate `format`.
+fn route_schema_of(labels: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { "label": { "type": "string", "enum": labels } },
+        "required": ["label"]
+    })
+}
+
+/// Pick the route label the model chose from its (possibly messy) output: an exact
+/// case-insensitive match wins, else the first label whose text appears, else the
+/// first label (a route always takes SOME branch). Pure — unit-tested.
+fn pick_route_label(raw: &str, labels: &[String]) -> String {
+    let hay = raw.to_lowercase();
+    // Prefer a `"label": "x"` structured answer if present.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ollama::recover_json(raw)) {
+        if let Some(l) = v.get("label").and_then(|l| l.as_str()) {
+            if let Some(m) = labels.iter().find(|x| x.eq_ignore_ascii_case(l.trim())) {
+                return m.clone();
+            }
+        }
+    }
+    for l in labels {
+        if hay.contains(&l.to_lowercase()) {
+            return l.clone();
+        }
+    }
+    labels.first().cloned().unwrap_or_default()
+}
+
 /// Execute one workflow step. Generic over the runtime so the mock-app harness
 /// can drive the deterministic nodes; the agent_run arm is injected via
 /// `agent_run` so the executor core stays mock-drivable. Room-pinned throughout.
@@ -826,7 +1256,17 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
         let state = app.state::<AppState>();
         let guard = state.room.lock().unwrap();
         if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
-            store_wf_artifact(&r.conn, job_id, step.id, &WfArtifact { skipped: true, ..Default::default() })?;
+            store_wf_artifact(
+                &r.conn,
+                job_id,
+                step.id,
+                &WfArtifact {
+                    skipped: true,
+                    node_label: Some(node.label.clone()),
+                    node_kind: Some(node_kind_tag(&node.kind).to_string()),
+                    ..Default::default()
+                },
+            )?;
         }
         emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "skipped", None);
         return Ok(());
@@ -937,13 +1377,222 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 ..Default::default()
             })
         }
-        NodeKind::ScriptRun { file } => {
-            run_script_node(app, job_id, room_path, plan, file, cancel, published).await
+        NodeKind::ScriptRun { file, mode } => {
+            // transform mode makes the script a pipe stage: {{input}} → stdin,
+            // stdout → the step artifact (so a downstream node reads the script's
+            // output, not the run report). import mode is the Wave-5 behavior.
+            let stdin = if mode == "transform" {
+                Some(inputs_joined.clone())
+            } else {
+                None
+            };
+            run_script_node(app, job_id, room_path, plan, file, mode, stdin, cancel, published).await
+        }
+        NodeKind::Transform { op, find, value } => Ok(WfArtifact {
+            result: apply_transform(op, find, value, &inputs_joined),
+            ..Default::default()
+        }),
+        NodeKind::Merge { mode, separator } => Ok(WfArtifact {
+            // Merge reduces the live branches individually, so dedupe/numbered can
+            // see each branch (not the pre-joined blob).
+            result: apply_merge(mode, separator, &live_inputs),
+            ..Default::default()
+        }),
+        NodeKind::HttpFetch { url } => {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("STOPPED".into());
+            }
+            let url = interpolate(app, room_path, url, &inputs_joined);
+            match crate::web::fetch_page(&url).await {
+                Ok((title, text)) => Ok(WfArtifact {
+                    result: format!("{title}\n\n{text}"),
+                    ..Default::default()
+                }),
+                Err(e) => Err(e),
+            }
+        }
+        NodeKind::Extract { fields, .. } => {
+            let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
+            let schema = build_extract_schema(fields);
+            let prompt = format!(
+                "Extract these fields from the text and return ONLY a JSON object with \
+                 exactly these keys: {}.\n\nText:\n{}",
+                fields.join(", "),
+                inputs_joined
+            );
+            let raw = wf_generate(&m, &prompt, Some(schema), cancel).await?;
+            let cleaned = ollama::recover_json(&raw);
+            let val: serde_json::Value =
+                serde_json::from_str(&cleaned).unwrap_or_else(|_| serde_json::json!({ "_raw": raw }));
+            Ok(WfArtifact {
+                result: serde_json::to_string_pretty(&val).unwrap_or(cleaned),
+                ..Default::default()
+            })
+        }
+        NodeKind::Route { prompt, labels, .. } => {
+            let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
+            let ask = interpolate(app, room_path, prompt, &inputs_joined);
+            let full = format!(
+                "{}\n\nChoose EXACTLY ONE label for the following, from: {}.\n\n{}",
+                if ask.trim().is_empty() { "Classify the input." } else { ask.trim() },
+                labels.join(", "),
+                inputs_joined
+            );
+            let raw = wf_generate(&m, &full, Some(route_schema_of(labels)), cancel).await?;
+            let label = pick_route_label(&raw, labels);
+            Ok(WfArtifact {
+                result: format!("route: {label}"),
+                branch: Some(label),
+                ..Default::default()
+            })
+        }
+        NodeKind::Vote { prompt, samples, mode, .. } => {
+            let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
+            let p = interpolate(app, room_path, prompt, &inputs_joined);
+            let n = (*samples).clamp(1, 7);
+            let mut outs: Vec<String> = Vec::new();
+            for _ in 0..n {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err("STOPPED".into());
+                }
+                outs.push(wf_generate(&m, &p, None, cancel).await?);
+            }
+            Ok(WfArtifact { result: aggregate_votes(mode, &outs), ..Default::default() })
+        }
+        NodeKind::ForEachFile { select, instruction, .. } => {
+            let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
+            let files = resolve_files(app, room_path, select, &plan.input_file_id, &plan.prev_run_at)?;
+            if files.is_empty() {
+                Ok(WfArtifact { result: "No files matched — nothing to do.".into(), ..Default::default() })
+            } else {
+                let instr = interpolate(app, room_path, instruction, &inputs_joined);
+                let mut sections: Vec<String> = Vec::new();
+                for (id, name, _mime) in &files {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err("STOPPED".into());
+                    }
+                    let full = {
+                        let state = app.state::<AppState>();
+                        let guard = state.room.lock().unwrap();
+                        guard
+                            .as_ref()
+                            .filter(|r| r.path == room_path)
+                            .and_then(|r| db::get_file_extracted_text(&r.conn, id))
+                    };
+                    let Some(full) = full.filter(|t| !t.trim().is_empty()) else { continue };
+                    let clipped: String = full.chars().take(PER_FILE_CHARS).collect();
+                    let prompt = format!("{instr}\n\nFile: {name}\n\n{clipped}");
+                    let r = wf_generate(&m, &prompt, None, cancel).await?;
+                    sections.push(format!("## {name}\n\n{}", r.trim()));
+                }
+                let result = if sections.is_empty() {
+                    "No files had readable text.".into()
+                } else {
+                    sections.join("\n\n")
+                };
+                Ok(WfArtifact { result, ..Default::default() })
+            }
+        }
+        NodeKind::Refine { prompt, rubric, max_rounds, .. } => {
+            let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
+            let base = interpolate(app, room_path, prompt, &inputs_joined);
+            let rounds = (*max_rounds).clamp(1, 4);
+            let mut draft = wf_generate(&m, &base, None, cancel).await?;
+            let rubric = if rubric.trim().is_empty() {
+                "accurate, complete, and clearly written".to_string()
+            } else {
+                rubric.trim().to_string()
+            };
+            let verdict_schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pass": { "type": "boolean" },
+                    "feedback": { "type": "string" }
+                },
+                "required": ["pass", "feedback"]
+            });
+            for _ in 1..rounds {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err("STOPPED".into());
+                }
+                let eval_prompt = format!(
+                    "Judge the draft against this bar: {rubric}.\nReturn ONLY JSON \
+                     {{\"pass\": <bool>, \"feedback\": <what to fix>}}.\n\nDraft:\n{draft}"
+                );
+                let verdict_raw = wf_generate(&m, &eval_prompt, Some(verdict_schema.clone()), cancel).await?;
+                let verdict: serde_json::Value = serde_json::from_str(&ollama::recover_json(&verdict_raw))
+                    .unwrap_or_else(|_| serde_json::json!({ "pass": true, "feedback": "" }));
+                if verdict["pass"].as_bool().unwrap_or(true) {
+                    break;
+                }
+                let feedback = verdict["feedback"].as_str().unwrap_or_default();
+                let improve = format!(
+                    "{base}\n\nYour previous draft:\n{draft}\n\nRevise it to fix this feedback:\n{feedback}"
+                );
+                draft = wf_generate(&m, &improve, None, cancel).await?;
+            }
+            Ok(WfArtifact { result: draft, ..Default::default() })
+        }
+        NodeKind::PlanAndMap { objective, max_workers, .. } => {
+            let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
+            let obj = interpolate(app, room_path, objective, &inputs_joined);
+            let plan_schema = serde_json::json!({
+                "type": "object",
+                "properties": { "subtasks": { "type": "array", "items": { "type": "string" } } },
+                "required": ["subtasks"]
+            });
+            let plan_prompt = format!(
+                "Break this objective into a short list of independent subtasks (no more \
+                 than {}). Return ONLY JSON {{\"subtasks\": [\"…\"]}}.\n\nObjective:\n{}\n\nContext:\n{}",
+                (*max_workers).clamp(1, 8),
+                obj,
+                inputs_joined
+            );
+            let plan_raw = wf_generate(&m, &plan_prompt, Some(plan_schema), cancel).await?;
+            let parsed: serde_json::Value = serde_json::from_str(&ollama::recover_json(&plan_raw))
+                .unwrap_or_else(|_| serde_json::json!({ "subtasks": [] }));
+            let subtasks: Vec<String> = parsed["subtasks"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .take((*max_workers).clamp(1, 8) as usize)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if subtasks.is_empty() {
+                // No decomposition — fall back to answering the objective directly.
+                let direct = wf_generate(&m, &format!("{obj}\n\nContext:\n{inputs_joined}"), None, cancel).await?;
+                Ok(WfArtifact { result: direct, ..Default::default() })
+            } else {
+                let mut worker_results: Vec<String> = Vec::new();
+                for st in &subtasks {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err("STOPPED".into());
+                    }
+                    let wp = format!(
+                        "Overall objective:\n{obj}\n\nDo ONLY this subtask and return its \
+                         result:\n{st}\n\nContext:\n{inputs_joined}"
+                    );
+                    let r = wf_generate(&m, &wp, None, cancel).await?;
+                    worker_results.push(format!("### {st}\n\n{}", r.trim()));
+                }
+                let synth = format!(
+                    "Combine these subtask results into one coherent answer to the \
+                     objective.\n\nObjective:\n{obj}\n\nResults:\n{}",
+                    worker_results.join("\n\n")
+                );
+                let out = wf_generate(&m, &synth, None, cancel).await?;
+                Ok(WfArtifact { result: out, ..Default::default() })
+            }
         }
     };
 
     match result {
-        Ok(artifact) => {
+        Ok(mut artifact) => {
+            artifact.node_label = Some(node.label.clone());
+            artifact.node_kind = Some(node_kind_tag(&node.kind).to_string());
             {
                 let state = app.state::<AppState>();
                 let guard = state.room.lock().unwrap();
@@ -998,12 +1647,15 @@ async fn run_file_pass_node<R: tauri::Runtime>(
 /// never silently runs new code), runs it, records the report JSON as the step
 /// artifact, and publishes the first imported output (the terminal auto-open is
 /// gated to MANUAL runs in `spawn_workflow_job`).
+#[allow(clippy::too_many_arguments)]
 async fn run_script_node<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     job_id: &str,
     room_path: &str,
     plan: &WorkflowPlan,
     file: &str,
+    mode: &str,
+    stdin: Option<String>,
     cancel: &Arc<AtomicBool>,
     published: &std::sync::Mutex<Option<FileMeta>>,
 ) -> Result<WfArtifact, String> {
@@ -1030,15 +1682,27 @@ async fn run_script_node<R: tauri::Runtime>(
     };
     let consent = plan.script_consents.get(&file_id).cloned().unwrap_or_default();
     let report =
-        run_script_process(app, job_id, room_path, &file_id, &consent, cancel).await?;
+        run_script_process(app, job_id, room_path, &file_id, &consent, stdin, cancel).await?;
     // Publish the first imported output so a MANUAL run can auto-open it.
     if let Some(first) = report.imported.first() {
         *published.lock().unwrap() = Some(first.clone());
     }
     let n = report.imported.len();
-    let result = serde_json::to_string(&report).unwrap_or_else(|_| {
-        format!("Script finished (exit {}), {n} file(s) imported.", report.exit_code)
-    });
+    // transform mode is a pipe stage: the artifact is the script's STDOUT, so a
+    // downstream {{input}} reads the script's output. import mode records the run
+    // report JSON (the Wave-5 behavior the run-history view renders specially).
+    let result = if mode == "transform" {
+        let out = report.stdout_tail.trim();
+        if out.is_empty() {
+            format!("(the script produced no output; {n} file(s) imported)")
+        } else {
+            out.to_string()
+        }
+    } else {
+        serde_json::to_string(&report).unwrap_or_else(|_| {
+            format!("Script finished (exit {}), {n} file(s) imported.", report.exit_code)
+        })
+    };
     let file_id = report.imported.first().map(|m| m.id.clone());
     Ok(WfArtifact { result, file_id, ..Default::default() })
 }
@@ -1292,13 +1956,16 @@ pub(crate) fn spawn_workflow_job(
                 }
             },
             |done, total| {
-                emit_progress(
-                    &window,
-                    &job_id,
-                    &format!("Running step {done} of {total}…"),
-                    done,
-                    total,
-                );
+                // `done` = steps completed so far; at 0 nothing has run yet, so
+                // "step 0 of N" reads wrong — show "Preparing…" then 1-based.
+                let label = if done == 0 {
+                    "Preparing…".to_string()
+                } else if done >= total {
+                    "Finishing…".to_string()
+                } else {
+                    format!("Running step {} of {}…", done + 1, total)
+                };
+                emit_progress(&window, &job_id, &label, done, total);
             },
         )
         .await;
@@ -1368,7 +2035,7 @@ pub(crate) fn stamp_script_consents(
 ) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     for node in &def.nodes {
-        if let NodeKind::ScriptRun { file } = &node.kind {
+        if let NodeKind::ScriptRun { file, .. } = &node.kind {
             // Resolve `file` (a stored id, or a name) to a file id + bytes.
             let resolved: Option<(String, Vec<u8>)> = if let Ok((name, bytes)) =
                 db::get_file_bytes_named(conn, file)
@@ -1954,7 +2621,20 @@ fn compose_prompt(description: &str) -> String {
          - generate {{prompt, model:\"auto\"}}\n\
          - summarize_file {{select}}\n\
          - file_pass {{select, instruction, mode}}\n\
+         - for_each_file {{select, instruction, model}} — runs the instruction on EACH \
+           selected file and joins the results (use instead of file_pass to cover many files)\n\
          - agent_run {{question}}\n\
+         - extract {{fields:[\"name\",...]}} — pulls named fields out of {{{{input}}}} as JSON\n\
+         - route {{prompt, labels:[\"a\",\"b\",...]}} — the model tags {{{{input}}}} with ONE label; \
+           edges off it use branch:<label> (like condition's then/else, but N-way)\n\
+         - vote {{prompt, samples:3, mode:\"concat\"|\"majority\"}} — runs the prompt N times, aggregates\n\
+         - refine {{prompt, rubric, max_rounds:2}} — generate→critique→revise until it passes\n\
+         - plan_and_map {{objective, max_workers:4}} — splits the objective into subtasks, runs each, synthesizes\n\
+         - transform {{op, find?, value?}} — deterministic text op (append|prepend|replace|upper|lower|trim|truncate|strip_html)\n\
+         - merge {{mode:\"concat\"|\"dedupe_lines\"|\"numbered\", separator?}} — joins parallel branches\n\
+         - http_fetch {{url}} — fetches a web page's text (url may use {{{{input}}}})\n\
+         - script_run {{file, mode:\"import\"|\"transform\"}} — runs a .py/.js room script; transform feeds \
+           {{{{input}}}} on stdin and returns its stdout as a pipe stage\n\
          - save_file {{name_template, format:\"html\"|\"md\", mode:\"create\"}}\n\
          - condition {{op, value}}\n\
          `select` is {{\"type\":...,\"pattern\"?}}. The ONLY valid types: \"newest\" (latest \
@@ -1964,7 +2644,9 @@ fn compose_prompt(description: &str) -> String {
          `op` must be one of: contains, not_contains, is_empty, not_empty, \
          new_files_since_last_run.\n\
          Each node needs a unique \"id\" and \"kind\". edges are [{{\"from\",\"to\",\"branch\"?}}] \
-         (branch \"then\"/\"else\" only from a condition). Prompts may use {{{{input}}}} \
+         (branch \"then\"/\"else\" off a condition, or one of a route's labels off a route; \
+         omit branch otherwise). Parallel branches are just several edges out of one node, \
+         re-joined by a later node (e.g. a merge). Prompts may use {{{{input}}}} \
          (upstream results), {{{{files}}}} (the room's file list), {{{{date}}}}.\n\
          For a workflow that runs on the file the user is viewing, set \
          \"binding\":{{\"scope\":\"file\",\"kinds\":[\"pdf\"]}} and give input-taking nodes \
@@ -2166,7 +2848,7 @@ pub fn workflow_tools_specs() -> Vec<serde_json::Value> {
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Optional: a workflow name to fetch its full definition"}}}}}),
         serde_json::json!({"type": "function", "function": {"name": "save_workflow",
-            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph: nodes from the palette (generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, agent_run {question}, save_file {name_template, format, mode}, condition {op, value}) plus edges [{from, to, branch?}]. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix.",
+            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph of nodes + edges [{from, to, branch?}]. Model nodes: generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, for_each_file {select, instruction} (runs on EACH selected file), agent_run {question}, extract {fields:[...]} (structured JSON out of {{input}}), route {prompt, labels:[...]} (tags input with one label → edges use branch:<label>, an N-way condition), vote {prompt, samples, mode:concat|majority}, refine {prompt, rubric, max_rounds} (generate→critique→revise loop), plan_and_map {objective, max_workers} (decompose→work→synthesize). Deterministic nodes (no model): transform {op:append|prepend|replace|upper|lower|trim|truncate|strip_html, find?, value?}, merge {mode:concat|dedupe_lines|numbered} (join parallel branches), http_fetch {url}, script_run {file, mode:import|transform} (run a room .py/.js; transform pipes {{input}}→stdin→stdout), save_file {name_template, format, mode}, condition {op, value}. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Parallelism = several edges out of one node re-joined by a merge. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string"},
                 "description": {"type": "string"},
@@ -2275,6 +2957,88 @@ pub fn builtin_templates() -> Vec<serde_json::Value> {
                       "mode": "merge" }
                 ],
                 "edges": []
+            }
+        }),
+        // Compare perspectives — a DIAMOND: one brief fans out to two parallel
+        // reads, which a merge re-joins (fan-out + fan-in, the sectioning pattern).
+        serde_json::json!({
+            "name": "Compare perspectives",
+            "description": "Look at the room from two angles at once, then combine them.",
+            "emoji": "⚖️",
+            "binding": { "scope": "general" },
+            "definition": {
+                "version": 1,
+                "nodes": [
+                    { "id": "brief", "label": "Gather the material", "kind": "generate",
+                      "model": "auto", "prompt": "Briefly summarize what's in this room:\n{{files}}" },
+                    { "id": "pro", "label": "The optimistic read", "kind": "generate",
+                      "model": "auto", "prompt": "Argue the OPTIMISTIC case about this:\n{{input}}" },
+                    { "id": "con", "label": "The skeptical read", "kind": "generate",
+                      "model": "auto", "prompt": "Argue the SKEPTICAL case about this:\n{{input}}" },
+                    { "id": "merge", "label": "Combine both", "kind": "merge", "mode": "numbered" },
+                    { "id": "save", "label": "Save the memo", "kind": "save_file",
+                      "name_template": "Two views {{date}}", "format": "html", "mode": "create" }
+                ],
+                "edges": [
+                    { "from": "brief", "to": "pro" },
+                    { "from": "brief", "to": "con" },
+                    { "from": "pro", "to": "merge" },
+                    { "from": "con", "to": "merge" },
+                    { "from": "merge", "to": "save" }
+                ]
+            }
+        }),
+        // Summarize every file — for_each_file sectioning over the whole room.
+        serde_json::json!({
+            "name": "Summarize every file",
+            "description": "Write a short summary of every file, then save one page.",
+            "emoji": "🗂️",
+            "binding": { "scope": "general" },
+            "definition": {
+                "version": 1,
+                "nodes": [
+                    { "id": "each", "label": "Read each file", "kind": "for_each_file",
+                      "model": "auto", "select": { "type": "all" },
+                      "instruction": "Summarize this file in a short paragraph." },
+                    { "id": "save", "label": "Save the digest", "kind": "save_file",
+                      "name_template": "File digest {{date}}", "format": "md", "mode": "create" }
+                ],
+                "edges": [ { "from": "each", "to": "save" } ]
+            }
+        }),
+        // Triage the newest note — a ROUTE fans to three specialized handlers that
+        // re-converge on a save (N-way routing pattern).
+        serde_json::json!({
+            "name": "Triage the newest note",
+            "description": "Sort the newest file into a bucket and act on it.",
+            "emoji": "🧭",
+            "binding": { "scope": "general" },
+            "definition": {
+                "version": 1,
+                "nodes": [
+                    { "id": "read", "label": "Read newest", "kind": "summarize_file",
+                      "select": { "type": "newest" } },
+                    { "id": "route", "label": "Which bucket?", "kind": "route",
+                      "prompt": "Which bucket does this belong in?",
+                      "labels": ["action", "reference", "idea"] },
+                    { "id": "act", "label": "Make a checklist", "kind": "generate",
+                      "model": "auto", "prompt": "Turn this into a short action checklist:\n{{input}}" },
+                    { "id": "ref", "label": "Note the reference", "kind": "generate",
+                      "model": "auto", "prompt": "Write a one-line reference note for this:\n{{input}}" },
+                    { "id": "idea", "label": "Expand the idea", "kind": "generate",
+                      "model": "auto", "prompt": "Expand this idea into a paragraph:\n{{input}}" },
+                    { "id": "save", "label": "Save it", "kind": "save_file",
+                      "name_template": "Triage {{date}}", "format": "html", "mode": "create" }
+                ],
+                "edges": [
+                    { "from": "read", "to": "route" },
+                    { "from": "route", "to": "act", "branch": "action" },
+                    { "from": "route", "to": "ref", "branch": "reference" },
+                    { "from": "route", "to": "idea", "branch": "idea" },
+                    { "from": "act", "to": "save" },
+                    { "from": "ref", "to": "save" },
+                    { "from": "idea", "to": "save" }
+                ]
             }
         }),
     ]
@@ -2480,6 +3244,129 @@ mod tests {
         assert!(eval_condition("not_empty", "x", &None, 0));
         assert!(eval_condition("new_files_since_last_run", "", &None, 3));
         assert!(!eval_condition("new_files_since_last_run", "", &None, 0));
+    }
+
+    // ---- richer palette: pure helpers + validation ----
+
+    #[test]
+    fn transform_ops_are_deterministic() {
+        assert_eq!(apply_transform("append", &None, &Some(" world".into()), "hi"), "hi world");
+        assert_eq!(apply_transform("prepend", &None, &Some(">> ".into()), "hi"), ">> hi");
+        assert_eq!(
+            apply_transform("replace", &Some("a".into()), &Some("b".into()), "banana"),
+            "bbnbnb"
+        );
+        assert_eq!(apply_transform("upper", &None, &None, "hi"), "HI");
+        assert_eq!(apply_transform("lower", &None, &None, "HI"), "hi");
+        assert_eq!(apply_transform("trim", &None, &None, "  hi \n"), "hi");
+        assert_eq!(apply_transform("truncate", &None, &Some("3".into()), "abcdef"), "abc");
+        assert_eq!(apply_transform("strip_html", &None, &None, "<b>hi</b>").trim(), "hi");
+        // Unknown op is a passthrough (validation catches it earlier).
+        assert_eq!(apply_transform("bogus", &None, &None, "hi"), "hi");
+    }
+
+    #[test]
+    fn merge_modes_combine_branches() {
+        let inputs = vec!["a\nb".to_string(), "b\nc".to_string()];
+        assert_eq!(apply_merge("concat", &Some("|".into()), &inputs), "a\nb|b\nc");
+        assert_eq!(apply_merge("numbered", &Some("\n".into()), &inputs), "1. a\nb\n2. b\nc");
+        // dedupe_lines keeps first occurrence order, drops the repeat 'b'.
+        assert_eq!(apply_merge("dedupe_lines", &None, &inputs), "a\nb\nc");
+    }
+
+    #[test]
+    fn vote_aggregation_picks_majority_and_concats() {
+        let s = vec!["yes".to_string(), "no".to_string(), "yes".to_string()];
+        assert_eq!(aggregate_votes("majority", &s), "yes");
+        // A tie resolves to the earliest sample.
+        let tie = vec!["b".to_string(), "a".to_string()];
+        assert_eq!(aggregate_votes("majority", &tie), "b");
+        assert!(aggregate_votes("concat", &s).contains("sample 1"));
+        assert_eq!(aggregate_votes("majority", &[]), "");
+    }
+
+    #[test]
+    fn route_label_pick_is_robust() {
+        let labels = vec!["action".to_string(), "reference".to_string(), "idea".to_string()];
+        // Structured answer wins.
+        assert_eq!(pick_route_label("{\"label\":\"idea\"}", &labels), "idea");
+        // Fuzzy: the label appears in prose.
+        assert_eq!(pick_route_label("This is clearly a reference note.", &labels), "reference");
+        // Nothing matches → the first label (a route always takes SOME branch).
+        assert_eq!(pick_route_label("uh, dunno", &labels), "action");
+    }
+
+    #[test]
+    fn extract_schema_requires_each_field() {
+        let s = build_extract_schema(&["name".into(), "date".into(), "  ".into()]);
+        assert_eq!(s["type"], "object");
+        assert!(s["properties"]["name"].is_object());
+        // Blank field names are dropped.
+        let req = s["required"].as_array().unwrap();
+        assert_eq!(req.len(), 2);
+    }
+
+    #[test]
+    fn validate_route_needs_labels_and_legal_branches() {
+        // Fewer than two labels is rejected.
+        let bad = parse(serde_json::json!({
+            "nodes": [ { "id": "r", "kind": "route", "labels": ["only"] } ],
+            "edges": []
+        }));
+        assert!(validate_definition(&bad).unwrap_err().iter().any(|e| e.contains("two labels")));
+        // A branch label the route doesn't declare is rejected.
+        let bad2 = parse(serde_json::json!({
+            "nodes": [
+                { "id": "r", "kind": "route", "labels": ["a", "b"] },
+                { "id": "g", "kind": "generate", "prompt": "x" }
+            ],
+            "edges": [ { "from": "r", "to": "g", "branch": "c" } ]
+        }));
+        assert!(validate_definition(&bad2).unwrap_err().iter().any(|e| e.contains("no such label")));
+        // A legal route graph validates.
+        let ok = parse(serde_json::json!({
+            "nodes": [
+                { "id": "r", "kind": "route", "labels": ["a", "b"] },
+                { "id": "g", "kind": "generate", "prompt": "x" },
+                { "id": "h", "kind": "generate", "prompt": "y" }
+            ],
+            "edges": [
+                { "from": "r", "to": "g", "branch": "a" },
+                { "from": "r", "to": "h", "branch": "b" }
+            ]
+        }));
+        assert!(validate_definition(&ok).is_ok());
+    }
+
+    #[test]
+    fn validate_flags_bad_transform_and_script_mode() {
+        let def = parse(serde_json::json!({
+            "nodes": [
+                { "id": "t", "kind": "transform", "op": "explode" },
+                { "id": "s", "kind": "script_run", "file": "x.py", "mode": "sideways" }
+            ],
+            "edges": []
+        }));
+        let errs = validate_definition(&def).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("unknown transform")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("unknown script mode")), "{errs:?}");
+    }
+
+    #[test]
+    fn compile_assigns_cpu_lane_to_deterministic_nodes() {
+        let def = parse(serde_json::json!({
+            "nodes": [
+                { "id": "m", "kind": "merge", "mode": "concat" },
+                { "id": "e", "kind": "extract", "fields": ["name"] }
+            ],
+            "edges": [ { "from": "m", "to": "e" } ]
+        }));
+        let models = vec!["qwen3.5:4b".to_string()];
+        let steps = compile_workflow(&def, &None, &models).unwrap();
+        let merge = steps.iter().find(|s| s.params["node"]["id"] == "m").unwrap();
+        assert_eq!(merge.lane, Lane::Cpu, "merge is deterministic → CPU lane");
+        let extract = steps.iter().find(|s| s.params["node"]["id"] == "e").unwrap();
+        assert_eq!(extract.lane, Lane::LocalLlm, "extract calls the model");
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "private-room"
-version = "0.5.1"
+version = "0.6.0"
 description = "Private Room — an encrypted local AI workspace in a single file"
 authors = ["Ben Reich"]
 edition = "2021"
@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 # Charset-aware decoding of fetched pages (legacy Hebrew sites serve
 # windows-1255); already in the tree via reqwest, so this pins nothing new.
 encoding_rs = "0.8"

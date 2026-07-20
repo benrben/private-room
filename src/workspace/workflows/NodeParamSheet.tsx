@@ -4,13 +4,15 @@ type Props = {
   node: WorkflowNode;
   onChange: (n: WorkflowNode) => void;
   onDelete: () => void;
-  /** The def's full edge list — passed so a condition step can author its
-   * then/else branches in-place. */
+  /** The def's full edge list — passed so a condition/route step can author its
+   * outgoing branches in-place. */
   edges?: WorkflowEdge[];
   /** All nodes in the def — the branch target picker. */
   allNodes?: WorkflowNode[];
-  /** Replace the def's edge list (condition branch editor). */
+  /** Replace the def's edge list (branch editor). */
   onEdgesChange?: (edges: WorkflowEdge[]) => void;
+  /** Room files — so a script_run node can pick a .py/.js script. */
+  files?: { id: string; name: string }[];
 };
 
 const FILE_SELECTORS = [
@@ -28,35 +30,83 @@ const CONDITION_OPS = [
   ["not_contains", "Input does not contain…"],
   ["new_files_since_last_run", "New files since last run"],
 ];
+const TRANSFORM_OPS = [
+  ["trim", "Trim whitespace"],
+  ["upper", "UPPERCASE"],
+  ["lower", "lowercase"],
+  ["append", "Append text…"],
+  ["prepend", "Prepend text…"],
+  ["replace", "Find & replace…"],
+  ["truncate", "Truncate to N chars…"],
+  ["strip_html", "Strip HTML tags"],
+];
 
-/** The six engine-supported step kinds and their human labels. */
+/** Every engine-supported step kind and its human label. */
 const NODE_KINDS: [string, string][] = [
   ["generate", "Generate text"],
   ["summarize_file", "Summarize a file"],
   ["file_pass", "Full-file pass"],
+  ["for_each_file", "For each file…"],
   ["agent_run", "Ask the agent"],
+  ["extract", "Extract fields"],
+  ["route", "Route by content"],
+  ["vote", "Vote / consensus"],
+  ["refine", "Refine (critique loop)"],
+  ["plan_and_map", "Plan & map"],
+  ["transform", "Transform text"],
+  ["merge", "Merge branches"],
+  ["http_fetch", "Fetch a URL"],
+  ["script_run", "Run a script"],
   ["save_file", "Save a file"],
   ["condition", "Condition"],
 ];
 
-/** Fields each kind needs seeded on a kind switch. serde requires
- * prompt/question/op/name_template to even parse the def, so seeding them (to
- * "" or a sensible default) keeps validation showing actionable field errors
- * instead of an opaque parse failure. `mode` differs per kind, so it is reset. */
+/** Fields each kind needs seeded on a kind switch. serde requires the required
+ * fields to even parse the def, so seeding them keeps validation showing
+ * actionable field errors instead of an opaque parse failure. */
 const KIND_DEFAULTS: Record<string, Record<string, unknown>> = {
   generate: { prompt: "", model: "auto" },
   summarize_file: { select: { type: "newest" } },
   file_pass: { select: { type: "newest" }, instruction: "", mode: "merge" },
+  for_each_file: { select: { type: "all" }, instruction: "", model: "auto" },
   agent_run: { question: "" },
+  extract: { fields: [], model: "auto" },
+  route: { prompt: "", labels: ["a", "b"], model: "auto" },
+  vote: { prompt: "", samples: 3, mode: "concat", model: "auto" },
+  refine: { prompt: "", rubric: "", max_rounds: 2, model: "auto" },
+  plan_and_map: { objective: "", max_workers: 4, model: "auto" },
+  transform: { op: "trim" },
+  merge: { mode: "concat" },
+  http_fetch: { url: "" },
+  script_run: { file: "", mode: "import" },
   save_file: { name_template: "", format: "html", mode: "create" },
   condition: { op: "not_empty", input: "", value: "" },
 };
+
+/** Kinds that call a model — they get the auto/local/cloud picker. */
+const MODEL_KINDS = new Set([
+  "generate",
+  "for_each_file",
+  "extract",
+  "route",
+  "vote",
+  "refine",
+  "plan_and_map",
+]);
 
 function nodeName(n: WorkflowNode): string {
   return (n.label && String(n.label)) || n.kind;
 }
 
-export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEdgesChange }: Props) {
+/** Parse/format a comma-separated string ⇄ string[] (fields, labels). */
+function csv(v: unknown): string {
+  return Array.isArray(v) ? (v as string[]).join(", ") : "";
+}
+function parseCsv(raw: string): string[] {
+  return raw.split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEdgesChange, files }: Props) {
   const set = (k: string, v: unknown) => onChange({ ...node, [k]: v });
   const sel = (node.select as { type?: string; pattern?: string } | undefined) ?? {};
   const setSel = (patch: Record<string, unknown>) =>
@@ -68,7 +118,18 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
     onChange({ id: node.id, label: node.label, kind, ...KIND_DEFAULTS[kind] } as WorkflowNode);
   }
 
-  // ---- condition branch editing (then/else outgoing edges) ----
+  const scripts = (files ?? []).filter((f) => /\.(py|js)$/i.test(f.name));
+
+  // ---- branch editing (condition then/else, or a route's labels) ----
+  const isBranchSource = node.kind === "condition" || node.kind === "route";
+  const routeLabels = Array.isArray(node.labels) ? (node.labels as string[]) : [];
+  const branchOptions: [string, string][] =
+    node.kind === "route"
+      ? routeLabels.map((l) => [l, l] as [string, string])
+      : [
+          ["then", "then →"],
+          ["else", "else →"],
+        ];
   const otherNodes = (allNodes ?? []).filter((n) => n.id !== node.id);
   function editEdge(globalIdx: number, patch: Partial<WorkflowEdge>) {
     onEdgesChange?.((edges ?? []).map((e, i) => (i === globalIdx ? { ...e, ...patch } : e)));
@@ -77,29 +138,54 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
     onEdgesChange?.((edges ?? []).filter((_, i) => i !== globalIdx));
   }
   function addBranch() {
-    // Default the new branch FORWARD — to the node right after this condition in
-    // pipeline order (nodes are appended in order) — so a fresh branch never
-    // wires back into an earlier node and forms a cycle. When the condition is
-    // the last node, leave the target unset ("") so validation prompts for a
-    // real forward pick instead of silently emitting a back-edge into the root.
+    // Target the node right after this one (forward → never a back-edge cycle),
+    // else the first other node — NEVER "" (which validated as `unknown node ''`).
     const nodes = allNodes ?? [];
     const idx = nodes.findIndex((n) => n.id === node.id);
-    // idx >= 0 in practice (the edited node is one of allNodes); guard the -1
-    // case explicitly so a not-found node never falls back to nodes[0] (the
-    // root) and re-creates the very back-edge cycle this fix removes.
-    const target = idx >= 0 ? (nodes[idx + 1]?.id ?? "") : "";
-    onEdgesChange?.([...(edges ?? []), { from: node.id, to: target, branch: "then" }]);
+    const target = (idx >= 0 ? nodes[idx + 1]?.id : undefined) ?? otherNodes[0]?.id;
+    if (!target) return; // no possible target (button is disabled anyway)
+    // Assign the first UNUSED branch label so route branches don't all reuse "a"
+    // and condition auto-fills then → else.
+    const used = new Set((edges ?? []).filter((e) => e.from === node.id).map((e) => e.branch ?? ""));
+    const branch = branchOptions.find(([v]) => !used.has(v))?.[0] ?? branchOptions[0]?.[0] ?? "then";
+    onEdgesChange?.([...(edges ?? []), { from: node.id, to: target, branch }]);
   }
+
+  // ---- fan-in: which steps feed INTO this node (plain, non-branch edges) ----
+  function toggleInput(fromId: string) {
+    const cur = edges ?? [];
+    const has = cur.some((e) => e.from === fromId && e.to === node.id && e.branch == null);
+    onEdgesChange?.(
+      has
+        ? cur.filter((e) => !(e.from === fromId && e.to === node.id && e.branch == null))
+        : [...cur, { from: fromId, to: node.id }],
+    );
+  }
+
+  const ModelSeg = (
+    <label>
+      Model
+      <div className="wf-seg">
+        {["auto", "local", "cloud"].map((m) => (
+          <button
+            key={m}
+            type="button"
+            aria-pressed={(node.model ?? "auto") === m}
+            className={(node.model ?? "auto") === m ? "active" : ""}
+            onClick={() => set("model", m)}
+          >
+            {m[0].toUpperCase() + m.slice(1)}
+          </button>
+        ))}
+      </div>
+    </label>
+  );
 
   return (
     <div className="node-param-sheet">
       <label>
         Step name
-        <input
-          type="text"
-          value={String(node.label ?? "")}
-          onChange={(e) => set("label", e.target.value)}
-        />
+        <input type="text" value={String(node.label ?? "")} onChange={(e) => set("label", e.target.value)} />
       </label>
 
       <label>
@@ -114,32 +200,13 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
       </label>
 
       {node.kind === "generate" && (
-        <>
-          <label>
-            Prompt <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}} {{files}} {{date}}"})</span>
-            <textarea
-              value={String(node.prompt ?? "")}
-              onChange={(e) => set("prompt", e.target.value)}
-            />
-          </label>
-          <label>
-            Model
-            <div className="wf-seg">
-              {["auto", "local", "cloud"].map((m) => (
-                <button
-                  key={m}
-                  className={(node.model ?? "auto") === m ? "active" : ""}
-                  onClick={() => set("model", m)}
-                >
-                  {m[0].toUpperCase() + m.slice(1)}
-                </button>
-              ))}
-            </div>
-          </label>
-        </>
+        <label>
+          Prompt <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}} {{files}} {{date}}"})</span>
+          <textarea value={String(node.prompt ?? "")} onChange={(e) => set("prompt", e.target.value)} />
+        </label>
       )}
 
-      {(node.kind === "summarize_file" || node.kind === "file_pass") && (
+      {(node.kind === "summarize_file" || node.kind === "file_pass" || node.kind === "for_each_file") && (
         <>
           <label>
             Which file(s)
@@ -154,11 +221,7 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
           {sel.type === "name_like" && (
             <label>
               Name pattern
-              <input
-                type="text"
-                value={String(sel.pattern ?? "")}
-                onChange={(e) => setSel({ pattern: e.target.value })}
-              />
+              <input type="text" value={String(sel.pattern ?? "")} onChange={(e) => setSel({ pattern: e.target.value })} />
             </label>
           )}
         </>
@@ -168,20 +231,13 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
         <>
           <label>
             Instruction
-            <textarea
-              value={String(node.instruction ?? "")}
-              onChange={(e) => set("instruction", e.target.value)}
-            />
+            <textarea value={String(node.instruction ?? "")} onChange={(e) => set("instruction", e.target.value)} />
           </label>
           <label>
             Mode
             <div className="wf-seg">
               {["merge", "stitch"].map((m) => (
-                <button
-                  key={m}
-                  className={(node.mode ?? "merge") === m ? "active" : ""}
-                  onClick={() => set("mode", m)}
-                >
+                <button key={m} type="button" aria-pressed={(node.mode ?? "merge") === m} className={(node.mode ?? "merge") === m ? "active" : ""} onClick={() => set("mode", m)}>
                   {m}
                 </button>
               ))}
@@ -190,35 +246,233 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
         </>
       )}
 
+      {node.kind === "for_each_file" && (
+        <label>
+          Instruction <span style={{ opacity: 0.6, fontWeight: 400 }}>(run on EACH file)</span>
+          <textarea value={String(node.instruction ?? "")} onChange={(e) => set("instruction", e.target.value)} />
+        </label>
+      )}
+
       {node.kind === "agent_run" && (
         <label>
           Question for the agent
-          <textarea
-            value={String(node.question ?? "")}
-            onChange={(e) => set("question", e.target.value)}
+          <textarea value={String(node.question ?? "")} onChange={(e) => set("question", e.target.value)} />
+        </label>
+      )}
+
+      {node.kind === "extract" && (
+        <label>
+          Fields to pull out <span style={{ opacity: 0.6, fontWeight: 400 }}>(comma-separated)</span>
+          <input
+            type="text"
+            placeholder="title, author, date"
+            value={csv(node.fields)}
+            onChange={(e) => set("fields", parseCsv(e.target.value))}
           />
         </label>
+      )}
+
+      {node.kind === "route" && (
+        <>
+          <label>
+            Question <span style={{ opacity: 0.6, fontWeight: 400 }}>(how to classify {"{{input}}"})</span>
+            <textarea value={String(node.prompt ?? "")} onChange={(e) => set("prompt", e.target.value)} />
+          </label>
+          <label>
+            Labels <span style={{ opacity: 0.6, fontWeight: 400 }}>(comma-separated — each becomes a branch)</span>
+            <input
+              type="text"
+              placeholder="urgent, normal, ignore"
+              value={csv(node.labels)}
+              onChange={(e) => set("labels", parseCsv(e.target.value))}
+            />
+          </label>
+        </>
+      )}
+
+      {node.kind === "vote" && (
+        <>
+          <label>
+            Prompt <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}}"})</span>
+            <textarea value={String(node.prompt ?? "")} onChange={(e) => set("prompt", e.target.value)} />
+          </label>
+          <label>
+            Samples
+            <input
+              type="number"
+              min={1}
+              max={7}
+              value={Number(node.samples ?? 3)}
+              onChange={(e) => set("samples", Math.max(1, Math.min(7, Number(e.target.value) || 1)))}
+            />
+          </label>
+          <label>
+            Combine
+            <div className="wf-seg">
+              {[
+                ["concat", "All samples"],
+                ["majority", "Majority"],
+              ].map(([v, l]) => (
+                <button key={v} type="button" aria-pressed={(node.mode ?? "concat") === v} className={(node.mode ?? "concat") === v ? "active" : ""} onClick={() => set("mode", v)}>
+                  {l}
+                </button>
+              ))}
+            </div>
+          </label>
+        </>
+      )}
+
+      {node.kind === "refine" && (
+        <>
+          <label>
+            Prompt <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}} {{files}}"})</span>
+            <textarea value={String(node.prompt ?? "")} onChange={(e) => set("prompt", e.target.value)} />
+          </label>
+          <label>
+            Quality bar <span style={{ opacity: 0.6, fontWeight: 400 }}>(what a good result must be)</span>
+            <textarea value={String(node.rubric ?? "")} onChange={(e) => set("rubric", e.target.value)} />
+          </label>
+          <label>
+            Max rounds
+            <input
+              type="number"
+              min={1}
+              max={4}
+              value={Number(node.max_rounds ?? 2)}
+              onChange={(e) => set("max_rounds", Math.max(1, Math.min(4, Number(e.target.value) || 1)))}
+            />
+          </label>
+        </>
+      )}
+
+      {node.kind === "plan_and_map" && (
+        <>
+          <label>
+            Objective <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}} {{files}}"})</span>
+            <textarea value={String(node.objective ?? "")} onChange={(e) => set("objective", e.target.value)} />
+          </label>
+          <label>
+            Max subtasks
+            <input
+              type="number"
+              min={1}
+              max={8}
+              value={Number(node.max_workers ?? 4)}
+              onChange={(e) => set("max_workers", Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
+            />
+          </label>
+        </>
+      )}
+
+      {node.kind === "transform" && (
+        <>
+          <label>
+            Operation
+            <select value={String(node.op ?? "trim")} onChange={(e) => set("op", e.target.value)}>
+              {TRANSFORM_OPS.map(([v, l]) => (
+                <option key={v} value={v}>
+                  {l}
+                </option>
+              ))}
+            </select>
+          </label>
+          {node.op === "replace" && (
+            <label>
+              Find
+              <input type="text" value={String(node.find ?? "")} onChange={(e) => set("find", e.target.value)} />
+            </label>
+          )}
+          {(node.op === "replace" || node.op === "append" || node.op === "prepend" || node.op === "truncate") && (
+            <label>
+              {node.op === "truncate" ? "Character count" : node.op === "replace" ? "Replace with" : "Text"}
+              <input type="text" value={String(node.value ?? "")} onChange={(e) => set("value", e.target.value)} />
+            </label>
+          )}
+        </>
+      )}
+
+      {node.kind === "merge" && (
+        <label>
+          How to combine branches
+          <select value={String(node.mode ?? "concat")} onChange={(e) => set("mode", e.target.value)}>
+            <option value="concat">Concatenate</option>
+            <option value="numbered">Numbered list</option>
+            <option value="dedupe_lines">Dedupe lines</option>
+          </select>
+        </label>
+      )}
+
+      {node.kind === "http_fetch" && (
+        <label>
+          URL <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}} {{date}}"})</span>
+          <input type="text" placeholder="https://…" value={String(node.url ?? "")} onChange={(e) => set("url", e.target.value)} />
+        </label>
+      )}
+
+      {node.kind === "script_run" && (
+        <>
+          <label>
+            Script
+            {scripts.length > 0 ? (
+              <select value={String(node.file ?? "")} onChange={(e) => set("file", e.target.value)}>
+                <option value="">Choose a .py / .js file…</option>
+                {Boolean(node.file) && !scripts.some((f) => f.id === node.file || f.name === node.file) && (
+                  <option value={String(node.file)}>{String(node.file)} (not in this room)</option>
+                )}
+                {scripts.map((f) => (
+                  <option key={f.id} value={f.name}>
+                    {f.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                placeholder="script.py"
+                value={String(node.file ?? "")}
+                onChange={(e) => set("file", e.target.value)}
+              />
+            )}
+          </label>
+          <div className="field" role="radiogroup" aria-label="Script mode">
+            <span className="field-head">Mode</span>
+            <div className="wf-seg">
+              {[
+                ["import", "Import files"],
+                ["transform", "Pipe (in→out)"],
+              ].map(([v, l]) => (
+                <button
+                  key={v}
+                  type="button"
+                  role="radio"
+                  aria-checked={(node.mode ?? "import") === v}
+                  className={(node.mode ?? "import") === v ? "active" : ""}
+                  onClick={() => set("mode", v)}
+                >
+                  {l}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="caption">
+            {(node.mode ?? "import") === "transform"
+              ? "Pipe mode: the upstream {{input}} is sent to the script's stdin, and its stdout becomes this step's output. Any files the script writes are still imported into the room."
+              : "Import mode: the script runs and its output files are imported back into the room; this step's result is the run report (exit code, stdout/stderr)."}
+          </div>
+        </>
       )}
 
       {node.kind === "save_file" && (
         <>
           <label>
             File name <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{date}}"})</span>
-            <input
-              type="text"
-              value={String(node.name_template ?? "")}
-              onChange={(e) => set("name_template", e.target.value)}
-            />
+            <input type="text" value={String(node.name_template ?? "")} onChange={(e) => set("name_template", e.target.value)} />
           </label>
           <label>
             Format
             <div className="wf-seg">
               {["html", "md"].map((m) => (
-                <button
-                  key={m}
-                  className={(node.format ?? "html") === m ? "active" : ""}
-                  onClick={() => set("format", m)}
-                >
+                <button key={m} type="button" aria-pressed={(node.format ?? "html") === m} className={(node.format ?? "html") === m ? "active" : ""} onClick={() => set("format", m)}>
                   {m}
                 </button>
               ))}
@@ -250,48 +504,80 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
           {(node.op === "contains" || node.op === "not_contains") && (
             <label>
               Text
-              <input
-                type="text"
-                value={String(node.value ?? "")}
-                onChange={(e) => set("value", e.target.value)}
-              />
+              <input type="text" value={String(node.value ?? "")} onChange={(e) => set("value", e.target.value)} />
             </label>
           )}
-          {onEdgesChange && (
-            <div className="wf-branches">
-              <div className="wf-branch-label">Branches (where each outcome goes)</div>
-              {!(edges ?? []).some((e) => e.from === node.id) && (
-                <div className="caption">No branches yet — add one to route the then / else outcomes.</div>
-              )}
-              {(edges ?? []).map((e, i) =>
-                e.from === node.id ? (
-                  <div key={i} className="wf-branch-row">
-                    <select
-                      value={e.branch ?? "then"}
-                      onChange={(ev) => editEdge(i, { branch: ev.target.value as "then" | "else" })}
-                    >
-                      <option value="then">then →</option>
-                      <option value="else">else →</option>
-                    </select>
-                    <select value={e.to} onChange={(ev) => editEdge(i, { to: ev.target.value })}>
-                      {otherNodes.map((n) => (
-                        <option key={n.id} value={n.id}>
-                          {nodeName(n)}
-                        </option>
-                      ))}
-                    </select>
-                    <button className="subtle" title="Remove branch" onClick={() => removeEdge(i)}>
-                      ×
-                    </button>
-                  </div>
-                ) : null,
-              )}
-              <button className="subtle" onClick={addBranch} disabled={otherNodes.length === 0}>
-                + Add branch
-              </button>
-            </div>
-          )}
         </>
+      )}
+
+      {node.kind === "generate" && ModelSeg}
+      {MODEL_KINDS.has(node.kind) && node.kind !== "generate" && ModelSeg}
+
+      {/* Fan-in: pick which steps feed into this one (check several to merge
+          parallel branches here). Branch edges from a condition/route are shown
+          read-only so they aren't clobbered. */}
+      {onEdgesChange && otherNodes.length > 0 && (
+        <div className="wf-branches">
+          <div className="wf-branch-label">Runs after (inputs)</div>
+          <div className="caption">Check several to merge parallel branches into this step.</div>
+          {otherNodes.map((n) => {
+            const plain = (edges ?? []).some((e) => e.from === n.id && e.to === node.id && e.branch == null);
+            const viaBranch = (edges ?? []).some((e) => e.from === n.id && e.to === node.id && e.branch != null);
+            return (
+              <label key={n.id} className="wf-input-row">
+                <input
+                  type="checkbox"
+                  checked={plain || viaBranch}
+                  disabled={viaBranch}
+                  onChange={() => toggleInput(n.id)}
+                />
+                <span>
+                  {nodeName(n)}
+                  {viaBranch ? " (via branch)" : ""}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Branch editor — condition (then/else) or route (its labels) */}
+      {isBranchSource && onEdgesChange && (
+        <div className="wf-branches">
+          <div className="wf-branch-label">Branches (where each outcome goes)</div>
+          {node.kind === "route" && routeLabels.length < 2 && (
+            <div className="caption">Add at least two labels above to route between.</div>
+          )}
+          {!(edges ?? []).some((e) => e.from === node.id) && (
+            <div className="caption">No branches yet — add one to route each outcome.</div>
+          )}
+          {(edges ?? []).map((e, i) =>
+            e.from === node.id ? (
+              <div key={i} className="wf-branch-row">
+                <select value={e.branch ?? branchOptions[0]?.[0] ?? ""} onChange={(ev) => editEdge(i, { branch: ev.target.value })}>
+                  {branchOptions.map(([v, l]) => (
+                    <option key={v} value={v}>
+                      {l}
+                    </option>
+                  ))}
+                </select>
+                <select value={e.to} onChange={(ev) => editEdge(i, { to: ev.target.value })}>
+                  {otherNodes.map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {nodeName(n)}
+                    </option>
+                  ))}
+                </select>
+                <button className="subtle" title="Remove branch" onClick={() => removeEdge(i)}>
+                  ×
+                </button>
+              </div>
+            ) : null,
+          )}
+          <button className="subtle" onClick={addBranch} disabled={otherNodes.length === 0}>
+            + Add branch
+          </button>
+        </div>
       )}
 
       <button className="subtle" data-agent-blocked onClick={onDelete} style={{ alignSelf: "flex-start" }}>

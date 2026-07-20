@@ -39,4 +39,5 @@ export type WorkArea =
   | "recordings"
   | "workflows"
   | "scripts"
-  | "memory";
+  | "memory"
+  | "connectors";

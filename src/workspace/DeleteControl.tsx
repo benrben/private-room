@@ -1,4 +1,5 @@
 import { ReactNode } from "react";
+import { CheckIcon, CloseIcon } from "../icons";
 
 interface DeleteControlProps {
   k: string;
@@ -30,15 +31,16 @@ export default function DeleteControl({
         <button
           className="chip-btn confirm-yes"
           title="Confirm delete"
+          aria-label="Confirm delete"
           onClick={() => {
             cancelConfirm();
             onConfirm();
           }}
         >
-          ✓
+          <CheckIcon size={13} />
         </button>
-        <button className="chip-btn confirm-no" title="Keep" onClick={cancelConfirm}>
-          ✕
+        <button className="chip-btn confirm-no" title="Keep" aria-label="Keep" onClick={cancelConfirm}>
+          <CloseIcon size={13} />
         </button>
       </span>
     );

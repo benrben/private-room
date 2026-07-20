@@ -1,4 +1,5 @@
 import type { IconComponent, RoomServerStatus } from "./types";
+import { CircleCheckIcon } from "../icons";
 
 interface Props {
   leash: RoomServerStatus;
@@ -128,7 +129,7 @@ export default function RoomServerSection({
                 />
                 <div className="settings-actions">
                   <button className="btn-ic" onClick={copyLeashConfig}>
-                    {leashCopied ? "Copied ✓" : "Copy config"}
+                    {leashCopied ? (<><CircleCheckIcon size={13} /> Copied</>) : "Copy config"}
                   </button>
                   {scope === "full" && (
                     <button

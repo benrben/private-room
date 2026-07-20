@@ -125,6 +125,26 @@ impl Redactor {
         }
     }
 
+    /// Redact real strings anywhere in a JSON value (real → placeholder). The
+    /// mirror of `restore_value`, used to mask a tool call's arguments before
+    /// they leave the Mac to a REMOTE connector.
+    pub(crate) fn redact_value(
+        &self,
+        v: &serde_json::Value,
+        report: &mut PrivacyReport,
+    ) -> serde_json::Value {
+        match v {
+            serde_json::Value::String(s) => serde_json::Value::String(self.redact(s, report)),
+            serde_json::Value::Array(a) => serde_json::Value::Array(
+                a.iter().map(|x| self.redact_value(x, report)).collect(),
+            ),
+            serde_json::Value::Object(o) => serde_json::Value::Object(
+                o.iter().map(|(k, x)| (k.clone(), self.redact_value(x, report))).collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
@@ -180,6 +200,21 @@ pub(crate) fn active_policy() -> Option<Arc<PolicyState>> {
         .unwrap()
         .clone()
         .filter(|p| p.active && !p.redactor.is_empty())
+}
+
+/// The room's redactor for the OUTBOUND remote-connector seam. Unlike
+/// [`active_policy`], this IGNORES the on/off switch: a remote connector is a
+/// hard non-local destination, so the room's known entities are masked before a
+/// tool call's arguments leave, even when the chat-model door is off. `None`
+/// when the entity map is empty — there is then nothing to mask mechanically,
+/// and the SEC-1b per-call consent (which shows the user the exact args) is the
+/// floor. Whatever the local scanner has found for this room is enforced here.
+pub(crate) fn remote_seam_redactor() -> Option<Arc<PolicyState>> {
+    policy_cell()
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|p| !p.redactor.is_empty())
 }
 
 /// Room closed: no policy may outlive the room (teardown invariant).
@@ -765,6 +800,32 @@ mod tests {
         assert_eq!(restored["q"], "Ben Reich");
         assert_eq!(restored["list"][0], "12 Herzl St");
         assert_eq!(restored["n"], 3);
+    }
+
+    #[test]
+    fn redact_value_masks_outbound_connector_args() {
+        // PRIV: the outbound remote-connector seam masks real entities in a tool
+        // call's args (real → placeholder) before they leave, walking nested
+        // JSON and leaving non-strings untouched. Round-trips with restore_value.
+        let r = redactor();
+        let args = serde_json::json!({
+            "query": "email from Ben Reich about 12 Herzl St",
+            "limit": 5,
+            "tags": ["Ben", "urgent"],
+        });
+        let mut report = PrivacyReport::default();
+        let sent = r.redact_value(&args, &mut report);
+        assert_eq!(sent["query"], "email from [Person A] about [Address A]");
+        assert_eq!(sent["tags"][0], "[Person B]");
+        assert_eq!(sent["tags"][1], "urgent");
+        assert_eq!(sent["limit"], 5);
+        assert!(report.replacements >= 3);
+        // What leaves carries no real name/address.
+        let leaving = sent.to_string();
+        assert!(!leaving.contains("Ben Reich"));
+        assert!(!leaving.contains("12 Herzl St"));
+        // And the placeholders restore on the way back.
+        assert_eq!(r.restore_value(&sent)["query"], "email from Ben Reich about 12 Herzl St");
     }
 
     #[test]

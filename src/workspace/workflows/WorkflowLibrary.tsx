@@ -1,9 +1,26 @@
-import { useEffect, useMemo, useState } from "react";
+import { KeyboardEvent, useEffect, useMemo, useState } from "react";
 import { api, Schedule, Workflow, WorkflowRun, WorkflowTemplate } from "../../api";
 import { WSState } from "../state";
 import { WSActions } from "../actions";
+import { PlusIcon, SparklesIcon, PinIcon } from "../../icons";
+import { WorkflowGlyph } from "./workflowGlyph";
 
 type Props = { s: WSState; a: WSActions };
+
+/** Make a clickable card behave as a real button for keyboard/AT users. */
+function cardButton(activate: () => void) {
+  return {
+    role: "button" as const,
+    tabIndex: 0,
+    onClick: activate,
+    onKeyDown: (e: KeyboardEvent) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        activate();
+      }
+    },
+  };
+}
 
 /** The AI-authoring bar: describe a workflow in plain language and the backend
  * composes it on whatever engine the room uses (the model returns the definition
@@ -34,7 +51,9 @@ function ComposeBar({ s, a }: Props) {
   return (
     <div className="wf-compose">
       <div className="wf-compose-head">
-        <span className="wf-compose-spark">✨</span>
+        <span className="wf-compose-spark">
+          <SparklesIcon size={16} />
+        </span>
         <span>Describe a workflow and let the assistant build it</span>
       </div>
       <div className="wf-compose-row">
@@ -90,6 +109,9 @@ export function WorkflowLibrary({ s, a }: Props) {
   const [schedules, setSchedules] = useState<Record<string, Schedule | null>>({});
   const [lastRuns, setLastRuns] = useState<Record<string, WorkflowRun | null>>({});
   const [now, setNow] = useState(() => Date.now());
+  // Templates stay reachable AFTER the first workflow exists (the empty-state
+  // gallery used to be the only way in — this toggle restores access).
+  const [showTemplates, setShowTemplates] = useState(false);
 
   // Wave 5 (Idea 13): the per-script auto-workflows (created_by='script') have
   // their own home on the Scripts page — hide them from the workflow library.
@@ -98,11 +120,11 @@ export function WorkflowLibrary({ s, a }: Props) {
     [s.workflows],
   );
 
+  // Always load templates (empty-state shows them; the toolbar toggle reopens
+  // the gallery once you already have workflows).
   useEffect(() => {
-    if (visible.length === 0) {
-      api.workflowTemplates().then(setTemplates).catch(() => {});
-    }
-  }, [visible.length]);
+    api.workflowTemplates().then(setTemplates).catch(() => {});
+  }, []);
 
   // Fetch each workflow's schedule for its badge/countdown.
   useEffect(() => {
@@ -149,6 +171,33 @@ export function WorkflowLibrary({ s, a }: Props) {
     return () => window.clearInterval(t);
   }, [anyScheduled]);
 
+  const templateGrid = (
+    <div className="wf-grid">
+      {templates.map((t) => (
+        <div key={t.name} className="wf-card tmpl" {...cardButton(() => void a.instantiateTemplate(t))}>
+          <div className="wf-card-top">
+            <span className="wf-card-emoji">
+              <WorkflowGlyph emoji={t.emoji} size={18} />
+            </span>
+            <span className="wf-card-name">{t.name}</span>
+            {t.schedule && <span className="wf-badge">{t.schedule.kind}</span>}
+          </div>
+          <div className="wf-card-desc">{t.description}</div>
+          <div className="wf-card-cta">Use template →</div>
+        </div>
+      ))}
+      <div className="wf-card wf-card-blank" {...cardButton(() => void a.createBlankWorkflow())}>
+        <div className="wf-card-top">
+          <span className="wf-card-emoji">
+            <PlusIcon size={17} />
+          </span>
+          <span className="wf-card-name">Blank workflow</span>
+        </div>
+        <div className="wf-card-desc">Start from an empty pipeline and add steps yourself.</div>
+      </div>
+    </div>
+  );
+
   if (visible.length === 0) {
     return (
       <div className="wf-body">
@@ -161,26 +210,7 @@ export function WorkflowLibrary({ s, a }: Props) {
         </div>
         <ComposeBar s={s} a={a} />
         <div className="wf-section-label">Start from a template</div>
-        <div className="wf-grid">
-          {templates.map((t) => (
-            <div key={t.name} className="wf-card tmpl" onClick={() => void a.instantiateTemplate(t)}>
-              <div className="wf-card-top">
-                <span className="wf-card-emoji">{t.emoji}</span>
-                <span className="wf-card-name">{t.name}</span>
-                {t.schedule && <span className="wf-badge">{t.schedule.kind}</span>}
-              </div>
-              <div className="wf-card-desc">{t.description}</div>
-              <div className="wf-card-cta">Use template →</div>
-            </div>
-          ))}
-          <div className="wf-card wf-card-blank" onClick={() => void a.createBlankWorkflow()}>
-            <div className="wf-card-top">
-              <span className="wf-card-emoji">＋</span>
-              <span className="wf-card-name">Blank workflow</span>
-            </div>
-            <div className="wf-card-desc">Start from an empty pipeline and add steps yourself.</div>
-          </div>
-        </div>
+        {templateGrid}
       </div>
     );
   }
@@ -190,20 +220,42 @@ export function WorkflowLibrary({ s, a }: Props) {
       <ComposeBar s={s} a={a} />
       <div className="wf-toolbar">
         <div className="wf-section-label">Your workflows</div>
-        <button className="wf-new-btn" onClick={() => void a.createBlankWorkflow()}>
-          ＋ New workflow
+        <button
+          className="wf-new-btn btn-ic"
+          aria-pressed={showTemplates}
+          onClick={() => setShowTemplates((v) => !v)}
+        >
+          <SparklesIcon size={13} /> {showTemplates ? "Hide templates" : "From template"}
+        </button>
+        <button className="wf-new-btn btn-ic" onClick={() => void a.createBlankWorkflow()}>
+          <PlusIcon size={13} /> New workflow
         </button>
       </div>
+      {showTemplates && (
+        <>
+          <div className="wf-section-label">Start from a template</div>
+          {templateGrid}
+          <div className="wf-section-label" style={{ marginTop: "1rem" }}>
+            Your workflows
+          </div>
+        </>
+      )}
       <div className="wf-grid">
         {visible.map((w) => {
           const sc = schedules[w.id];
           const bb = bindingBadge(w);
           return (
-            <div key={w.id} className="wf-card" onClick={() => a.openWorkflowDetail(w.id)}>
+            <div key={w.id} className="wf-card" {...cardButton(() => a.openWorkflowDetail(w.id))}>
               <div className="wf-card-top">
-                <span className="wf-card-emoji">{w.emoji || "⚙️"}</span>
+                <span className="wf-card-emoji">
+                  <WorkflowGlyph emoji={w.emoji} size={18} />
+                </span>
                 <span className="wf-card-name">{w.name}</span>
-                {w.pinned && <span title="Pinned to the top bar">📌</span>}
+                {w.pinned && (
+                  <span className="wf-card-pin" title="Pinned to the top bar" aria-label="Pinned to the top bar">
+                    <PinIcon size={13} />
+                  </span>
+                )}
               </div>
               {w.description && <div className="wf-card-desc">{w.description}</div>}
               <div className="wf-badges">

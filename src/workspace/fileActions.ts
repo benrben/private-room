@@ -176,7 +176,12 @@ export function makeFileActions(s: WSState) {
       const name = /\.[^.]+$/.test(title) ? title : `${title}${ext}`;
       await api.renameFile(sug.fileId, name);
       if (s.openFileRef.current?.id === sug.fileId) {
-        s.setOpenFile((o) => (o ? { ...o, name } : o));
+        // Update BOTH the top-level name and content.name — the viewer header
+        // reads `openFile.content.name`, so touching only the outer name left it
+        // showing the old filename until a reopen.
+        s.setOpenFile((o) =>
+          o ? { ...o, name, content: o.content ? { ...o.content, name } : o.content } : o,
+        );
       }
     }
     const folderName = sug.suggestion.folder.trim();
@@ -308,6 +313,33 @@ export function makeFileActions(s: WSState) {
     }
   }
 
+  /** Create a starter `.py` script and open it in the editor (the Scripts page's
+   * "New script" action — a room .py/.js file IS a script). */
+  async function createNewScript() {
+    const starter = `# /// script
+# dependencies = []
+# ///
+# A room script. To read/write room files, declare them above, e.g.:
+#   # room-inputs: data.csv
+#   # room-outputs: result.csv
+# In a workflow's "Pipe" mode, stdin is the previous step's text and whatever you
+# print to stdout becomes this step's output.
+import sys
+
+data = sys.stdin.read()
+print(data.upper())
+`;
+    try {
+      const meta = await api.saveGeneratedFile("New script.py", starter);
+      s.setFiles(await api.listFiles());
+      await viewFile(meta.id);
+      s.setEditMode(true);
+      s.pushToast("info", "New script created — edit it, then run it from the Scripts page.");
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
   async function saveEdit(newText: string) {
     if (!s.openFile) return;
     await api.updateFileContent(s.openFile.id, newText);
@@ -402,7 +434,12 @@ export function makeFileActions(s: WSState) {
     await tryToast(s, () => api.renameFile(pending.id, name), async () => {
       s.setFiles(await api.listFiles());
       if (s.openFileRef.current?.id === pending.id) {
-        s.setOpenFile((o) => (o ? { ...o, name } : o));
+        // Update BOTH the top-level name and content.name — the viewer header
+        // reads `openFile.content.name`, so touching only the outer name left it
+        // showing the old filename until a reopen.
+        s.setOpenFile((o) =>
+          o ? { ...o, name, content: o.content ? { ...o.content, name } : o.content } : o,
+        );
       }
     });
   }
@@ -430,7 +467,7 @@ export function makeFileActions(s: WSState) {
     noteExportOnce, exportOne, exportAllFiles, openHistory, openCompare, restoreVersion,
     undoEdits, suggestImports, dismissImportSuggestion, applyImportSuggestion,
     applyAllImportSuggestions, dismissAllImportSuggestions,
-    reportImport, importFiles, removeFile, viewFile, createNewNote, saveEdit, saveEditAsCopy,
+    reportImport, importFiles, removeFile, viewFile, createNewNote, createNewScript, saveEdit, saveEditAsCopy,
     editCell, editModeOf, startCreateFolder, commitCreateFolder,
     commitFolderRename, deleteFolder, moveFile, commitRenameFile,
     toggleFolderCollapse, clampMenu,

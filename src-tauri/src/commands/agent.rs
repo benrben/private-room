@@ -1096,7 +1096,8 @@ pub(crate) fn wants_job_tools(question: &str) -> bool {
     HINTS.iter().any(|h| q.contains(h))
 }
 
-/// ADD-32: the whole-file pass tool specs. Injected by `agent_loop` (never via
+/// ADD-32: the whole-file pass tool specs. Injected by the sidecar `/run` loop
+/// via the room MCP bridge's LocalEngine scope (never via
 /// `tools_catalog`, so the room MCP bridge can't offer them to a cloud client —
 /// same structural guard as the UI tools; starting hours of local compute stays
 /// a local-agent decision).
@@ -1284,8 +1285,8 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
 /// `tools_catalog` — the room MCP bridge is built from `tools_catalog`, so
 /// keeping these out means a cloud client on the Leash can never observe or
 /// drive this Mac's screen. The guard is structural, exactly like
-/// `consult_advisor_spec`. Injected by `agent_loop` only when the
-/// deterministic router (`wants_ui_tools`) fires.
+/// `consult_advisor_spec`. Injected by the sidecar `/run` loop (via the room MCP
+/// bridge) only when the deterministic router (`wants_ui_tools`) fires.
 pub(crate) fn ui_tools_specs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({"type": "function", "function": {"name": "ui_snapshot",
@@ -1319,6 +1320,9 @@ pub(crate) struct McpRoute {
     /// The connector this tool belongs to — shown in the approval prompt and
     /// used as the "always allow" key.
     pub(crate) server_name: String,
+    /// True when this connector is reached over the network — the outbound
+    /// redaction seam masks the room's entities in this tool's args.
+    pub(crate) remote: bool,
     /// pub(crate) so the room bridge can advertise the same specs to a
     /// consulted advisor (ADD-21).
     pub(crate) spec: serde_json::Value,
@@ -1371,16 +1375,58 @@ pub(crate) fn slim_schema(v: &mut serde_json::Value) {
 /// server can't silently overflow the 4B model's context. Returns the routes
 /// plus the names of any tools omitted for budget so the caller can tell the
 /// model.
+/// The connected-tool budget `(max_tools, max_catalog_chars)` for an engine:
+/// generous for a cloud/external engine, tight for the small local model (whose
+/// 4B reasoning can't juggle many tools). Pure — unit-tested.
+pub(crate) fn mcp_budget(model: Option<&str>) -> (usize, usize) {
+    let cloud = model
+        .map(|m| is_cloud_model(m) || is_external_engine(m))
+        .unwrap_or(false);
+    if cloud {
+        (MAX_MCP_TOOLS_CLOUD, MAX_MCP_CATALOG_CHARS_CLOUD)
+    } else {
+        (MAX_MCP_TOOLS, MAX_MCP_CATALOG_CHARS)
+    }
+}
+
 pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<String>) {
     let mut taken: HashSet<String> = BUILTIN_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+    // Per-connector tool opt-outs + the chosen engine, read before locking `mcp`
+    // so we never hold both locks. A disabled tool is skipped entirely (the user
+    // curates the budget); the engine decides how big that budget is.
+    let (disabled, uncapped, model) = state
+        .with_room(|room| {
+            Ok((
+                parse_tool_prefs(
+                    &db::get_setting(&room.conn, MCP_TOOL_PREFS_KEY).unwrap_or_default(),
+                ),
+                parse_uncapped(
+                    &db::get_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY).unwrap_or_default(),
+                ),
+                model_setting(&room.conn),
+            ))
+        })
+        .unwrap_or_default();
+    // The 12/8000 cap is a small-local-4B limit. Cloud/external engines have the
+    // context and reasoning to use many tools, so give them a generous budget —
+    // otherwise a 15-tool connector shows a cloud model only ~4 tools.
+    let (max_tools, max_chars) = mcp_budget(model.as_deref());
     let mgr = state.mcp.lock().unwrap();
     let mut routes = Vec::new();
     let mut omitted: Vec<String> = Vec::new();
     let mut catalog_chars = 0usize;
     for server in &mgr.servers {
         let Some(client) = &server.client else { continue };
+        let off = disabled.get(&server.name);
+        // User override: send EVERY enabled tool for this connector, ignoring the
+        // count/char caps ("show them all, I know what I'm doing").
+        let no_cap = uncapped.contains(&server.name);
         for tool in &server.tools {
-            if routes.len() >= MAX_MCP_TOOLS {
+            // User turned this tool off for this room — it's not offered at all.
+            if off.is_some_and(|s| s.contains(&tool.name)) {
+                continue;
+            }
+            if !no_cap && routes.len() >= max_tools {
                 omitted.push(tool.name.clone());
                 continue;
             }
@@ -1404,9 +1450,10 @@ pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<Str
                 "description": description,
                 "parameters": schema,
             }});
-            // Whole-catalog budget: stop admitting once the specs get too large.
+            // Whole-catalog budget: stop admitting once the specs get too large
+            // (unless the user overrode the cap for this connector).
             let cost = spec.to_string().len();
-            if catalog_chars + cost > MAX_MCP_CATALOG_CHARS && !routes.is_empty() {
+            if !no_cap && catalog_chars + cost > max_chars && !routes.is_empty() {
                 omitted.push(tool.name.clone());
                 continue;
             }
@@ -1416,6 +1463,7 @@ pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<Str
                 catalog_name,
                 tool_name: tool.name.clone(),
                 server_name: server.name.clone(),
+                remote: server.remote,
                 spec,
                 client: client.clone(),
             });
@@ -1440,7 +1488,7 @@ pub(crate) struct ToolEffects {
     /// `MAX_ADVISOR_CALLS`.
     pub(crate) advisor_calls: u8,
     /// ADD-25: base64 PNGs captured this round (view_screenshot /
-    /// view_media_frame). agent_loop drains them into a vision user-message
+    /// view_media_frame). The room bridge drains them into a vision user-message
     /// right after the tool result, so the model looks at what it captured.
     pub(crate) pending_images: Vec<String>,
     /// ADD-25: whether the CHAT model can read attached images. Set by the
@@ -2342,12 +2390,36 @@ pub(crate) async fn exec_tool(
                         route.tool_name, route.server_name
                     ));
                 }
+                // PRIV: extend the mechanical redaction door to the OUTBOUND
+                // remote seam. A remote connector is a non-local destination, so
+                // mask the room's known entities in the args before they leave,
+                // and restore them in the result so the model's view stays
+                // consistent. Local connectors run on this Mac and are exempt.
+                // `remote_seam_redactor` ignores the on/off switch on purpose:
+                // a remote call is a hard leak point. None when the entity map
+                // is empty (nothing to mask) — SEC-1b consent above is the floor.
+                let seam = if route.remote {
+                    crate::commands::remote_seam_redactor()
+                } else {
+                    None
+                };
+                let sent = match &seam {
+                    Some(p) => {
+                        let mut report = crate::commands::PrivacyReport::default();
+                        p.redactor.redact_value(args, &mut report)
+                    }
+                    None => args.clone(),
+                };
                 let result = route
                     .client
                     .lock()
                     .await
-                    .call_tool(&route.tool_name, args)
+                    .call_tool(&route.tool_name, &sent)
                     .await?;
+                let result = match &seam {
+                    Some(p) => p.redactor.restore(&result),
+                    None => result,
+                };
                 Ok(clamp_tool_result(result))
             }
             None => Err(format!("Unknown tool: {other}")),
@@ -2412,7 +2484,7 @@ pub(crate) fn clamp_bytes(mut s: String, max: usize) -> String {
 }
 
 /// ADD-25: hand a captured image (screenshot / video frame) to the model.
-/// Vision-capable chat model → queue the pixels; agent_loop attaches them as
+/// Vision-capable chat model → queue the pixels; the room bridge attaches them as
 /// a user message right after this tool result. Text-only chat model → a
 /// LOCAL vision model describes the image and the description IS the result,
 /// so every model tier gets perception without any pixels leaving the Mac.
@@ -2714,6 +2786,26 @@ pub(crate) fn claims_unbacked_action(text: &str, wrote: bool, highlighted: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_budget_is_generous_for_cloud_tight_for_local() {
+        // A small local model keeps the tight 4B-safe budget.
+        assert_eq!(mcp_budget(Some("qwen3.5:4b")), (MAX_MCP_TOOLS, MAX_MCP_CATALOG_CHARS));
+        assert_eq!(mcp_budget(None), (MAX_MCP_TOOLS, MAX_MCP_CATALOG_CHARS));
+        // A :cloud model and an external CLI engine both get the generous budget,
+        // so a 15-tool connector isn't silently trimmed to ~4.
+        assert_eq!(
+            mcp_budget(Some("minimax-m3:cloud")),
+            (MAX_MCP_TOOLS_CLOUD, MAX_MCP_CATALOG_CHARS_CLOUD)
+        );
+        assert_eq!(
+            mcp_budget(Some("claude-cli")),
+            (MAX_MCP_TOOLS_CLOUD, MAX_MCP_CATALOG_CHARS_CLOUD)
+        );
+        // The generous budget really is bigger.
+        assert!(MAX_MCP_TOOLS_CLOUD > MAX_MCP_TOOLS);
+        assert!(MAX_MCP_CATALOG_CHARS_CLOUD > MAX_MCP_CATALOG_CHARS);
+    }
 
     #[test]
     fn fabrication_gate_flags_only_unbacked_claims() {

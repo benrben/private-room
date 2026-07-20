@@ -8,10 +8,13 @@ import {
   LayoutResetIcon,
   LockIcon,
   Logomark,
+  PlayIcon,
   ScriptIcon,
   SearchIcon,
   ThemeIcon,
+  WorkflowsIcon,
 } from "../icons";
+import { WorkflowGlyph } from "./workflows/workflowGlyph";
 import { isCloudEngine, isExternalEngine, isModelReady } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -59,7 +62,7 @@ export default function TopBar({
     .map((w) => ({
       id: w.id,
       label: w.name,
-      icon: w.emoji || "⚙️",
+      icon: <WorkflowGlyph emoji={w.emoji} size={15} />,
       hint: w.name,
       onRun: () => void a.runWorkflowNow(w.id),
     }));
@@ -69,7 +72,7 @@ export default function TopBar({
     .map((sc) => ({
       id: sc.fileId,
       label: sc.name,
-      icon: "▶",
+      icon: <PlayIcon size={13} />,
       hint: `Run ${sc.name}`,
       onRun: () => void a.runScript(sc.fileId),
     }));
@@ -129,7 +132,7 @@ export default function TopBar({
             s.setQaMenuOpen(o);
           }}
           buttonLabel="Workflows"
-          buttonIcon="⚡"
+          buttonIcon={<WorkflowsIcon size={15} />}
           inlineMax={3}
           pill
           footer={{ label: "All workflows…", onClick: a.openWorkflows }}

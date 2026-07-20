@@ -33,6 +33,57 @@ export function useMcpConfig() {
     }
   }
 
+  // Marketplace install: merge one server entry into the mcpServers JSON and
+  // apply it. Goes through mcp_apply_config exactly like a hand-typed config, so
+  // the SEC-1 fingerprint approval still covers anything a click would start.
+  // Returns the fresh statuses; throws (with a readable message) on a bad config
+  // or a connect failure so the caller can surface it.
+  async function installServer(
+    name: string,
+    entry: Record<string, unknown>,
+  ): Promise<McpServerStatus[]> {
+    let root: { mcpServers?: Record<string, unknown> } = {};
+    if (mcpConfig.trim()) {
+      try {
+        root = JSON.parse(mcpConfig);
+      } catch {
+        throw new Error(
+          "The current config isn't valid JSON — fix or clear it under Advanced before installing.",
+        );
+      }
+    }
+    const servers = (root.mcpServers ?? {}) as Record<string, unknown>;
+    servers[name] = entry;
+    root.mcpServers = servers;
+    const json = JSON.stringify(root, null, 2);
+    setMcpConfig(json);
+    const statuses = await api.mcpApplyConfig(json);
+    setMcpStatuses(statuses);
+    return statuses;
+  }
+
+  // Turn a connector on/off (keeps it in the config) — the disable path.
+  async function setServerEnabled(name: string, enabled: boolean) {
+    setMcpError("");
+    try {
+      setMcpStatuses(await api.mcpSetServerEnabled(name, enabled));
+      setMcpConfig(await api.mcpGetConfig());
+    } catch (e) {
+      setMcpError(String(e));
+    }
+  }
+
+  // Remove a connector from the room entirely.
+  async function removeServer(name: string) {
+    setMcpError("");
+    try {
+      setMcpStatuses(await api.mcpRemoveServer(name));
+      setMcpConfig(await api.mcpGetConfig());
+    } catch (e) {
+      setMcpError(String(e));
+    }
+  }
+
   // Merge the guided form's fields into the mcpServers JSON so non-technical
   // users never have to hand-write it. The raw editor below stays available
   // for anyone pasting a config from elsewhere.
@@ -78,5 +129,9 @@ export function useMcpConfig() {
     setConnArgs,
     applyMcp,
     addConnector,
+    installServer,
+    setServerEnabled,
+    removeServer,
+    installedNames: mcpStatuses.map((s) => s.name),
   };
 }

@@ -1,4 +1,5 @@
 import type { IconComponent } from "./types";
+import { CircleCheckIcon } from "../icons";
 
 interface Props {
   webProvider: string;
@@ -76,8 +77,8 @@ export default function OnlineSection({
               >
                 {webTesting ? "Testing…" : "Test search"}
               </button>
-              <button className="primary" onClick={saveWebAccess}>
-                {webSaved ? "Saved ✓" : "Save"}
+              <button className="primary btn-ic" onClick={saveWebAccess}>
+                {webSaved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
               </button>
             </div>
             {webTestResult && (

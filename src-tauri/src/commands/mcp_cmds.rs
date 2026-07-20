@@ -31,13 +31,20 @@ pub(crate) fn mcp_fingerprint(config_json: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// SEC-1: the full command line a server would run, e.g. "uvx duckduckgo-mcp-server".
-/// Shown in the approval dialog so the user sees exactly what would execute.
+/// SEC-1: what a server would do, shown in the approval dialog so the user sees
+/// exactly what they're allowing. Local: the full command line, e.g.
+/// "uvx duckduckgo-mcp-server". Remote: the endpoint it would reach, flagged so
+/// the dialog can distinguish "start a program" from "reach a service".
 pub(crate) fn render_command_line(cfg: &mcp::ServerConfig) -> String {
-    let mut parts = Vec::with_capacity(1 + cfg.args.len());
-    parts.push(cfg.command.clone());
-    parts.extend(cfg.args.iter().cloned());
-    parts.join(" ")
+    match &cfg.transport {
+        mcp::Transport::Stdio { command, args, .. } => {
+            let mut parts = Vec::with_capacity(1 + args.len());
+            parts.push(command.clone());
+            parts.extend(args.iter().cloned());
+            parts.join(" ")
+        }
+        mcp::Transport::Http { url, .. } => format!("{url}  (remote — reaches the internet)"),
+    }
 }
 
 /// Approved MCP fingerprints live OUTSIDE any room, in the app's own data
@@ -201,6 +208,7 @@ pub(crate) fn start_mcp_connections(app: tauri::AppHandle, servers: Vec<(String,
                 },
                 error: None,
                 tools: Vec::new(),
+                remote: cfg.transport.is_remote(),
                 client: None,
             })
             .collect();
@@ -287,6 +295,314 @@ pub(crate) async fn mcp_call_approved(
             .insert(route.server_name.clone());
     }
     decision.approved
+}
+
+// ---------------------------------------------------------------- OAuth
+
+/// Merge an `Authorization: Bearer <token>` header into one server's entry in an
+/// mcpServers config JSON, preserving everything else. Pure — unit-tested.
+pub(crate) fn merge_bearer(config: &str, server: &str, token: &str) -> Result<String, String> {
+    let mut root: serde_json::Value = serde_json::from_str(config)
+        .map_err(|_| "the room's connector config isn't valid JSON".to_string())?;
+    let entry = root
+        .get_mut("mcpServers")
+        .and_then(|m| m.get_mut(server))
+        .and_then(|e| e.as_object_mut())
+        .ok_or_else(|| format!("\"{server}\" is not in the connector config"))?;
+    let headers = entry
+        .entry("headers")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(obj) = headers.as_object_mut() {
+        obj.insert(
+            "Authorization".to_string(),
+            serde_json::Value::String(format!("Bearer {token}")),
+        );
+    }
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// Run the OAuth sign-in for one remote connector: discover, register, PKCE
+/// browser flow, store the token, merge the bearer into the room config, and
+/// reconnect. The interactive step opens the system browser.
+#[tauri::command]
+pub async fn mcp_oauth_authorize(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+) -> Result<Vec<mcp::ServerStatus>, String> {
+    let config = state.with_room(|room| {
+        Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default())
+    })?;
+    let url = mcp::parse_config(&config)?
+        .into_iter()
+        .find(|(n, _)| n == &server)
+        .and_then(|(_, c)| match c.transport {
+            mcp::Transport::Http { url, .. } => Some(url),
+            _ => None,
+        })
+        .ok_or_else(|| format!("\"{server}\" is not a remote connector in this room."))?;
+
+    // Interactive authorization — opens the browser via the opener plugin. We
+    // also emit the URL first so the UI can offer a manual "open / copy the
+    // sign-in link" fallback when the system browser doesn't come up on its own.
+    let app_open = app.clone();
+    let server_ev = server.clone();
+    let open = move |u: &str| -> Result<(), String> {
+        use tauri::Emitter;
+        let _ = app_open.emit(
+            "mcp-oauth-url",
+            serde_json::json!({ "server": server_ev, "url": u }),
+        );
+        use tauri_plugin_opener::OpenerExt;
+        app_open
+            .opener()
+            .open_url(u.to_string(), None::<&str>)
+            .map_err(|e| e.to_string())
+    };
+    let www = super::mcp_oauth::probe_www_authenticate(&url).await;
+    let token = super::mcp_oauth::authorize(&url, www.as_deref(), open).await?;
+
+    // Persist the token + merge the bearer into the config, then reconnect. The
+    // config change is a deliberate user action (they just signed in), so its
+    // new fingerprint is approved like a saved config (SEC-1).
+    let merged = state.with_room(|room| {
+        super::mcp_oauth::save_tokens(&room.conn, &server, &token)?;
+        let json = merge_bearer(&config, &server, &token.access_token)?;
+        db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
+        Ok(json)
+    })?;
+    add_mcp_approval(&app, &mcp_fingerprint(&merged));
+    start_mcp_connections(app, mcp::parse_config(&merged)?);
+    Ok(state.mcp.lock().unwrap().statuses())
+}
+
+/// Whether a remote connector has a stored, non-expired OAuth token — drives
+/// the "Signed in" vs "Connect account" state in the marketplace drawer.
+#[tauri::command]
+pub fn mcp_oauth_status(state: State<'_, AppState>, server: String) -> Result<bool, String> {
+    state.with_room(|room| {
+        Ok(super::mcp_oauth::load_tokens(&room.conn, &server)
+            .map(|t| !super::mcp_oauth::needs_refresh(&t))
+            .unwrap_or(false))
+    })
+}
+
+/// Forget a remote connector's OAuth token and strip its bearer header.
+#[tauri::command]
+pub fn mcp_oauth_sign_out(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+) -> Result<Vec<mcp::ServerStatus>, String> {
+    let merged = state.with_room(|room| {
+        super::mcp_oauth::clear_tokens(&room.conn, &server)?;
+        let config = db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default();
+        // Drop the Authorization header if present, leaving the rest intact.
+        let json = strip_bearer(&config, &server).unwrap_or(config);
+        db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
+        Ok(json)
+    })?;
+    add_mcp_approval(&app, &mcp_fingerprint(&merged));
+    start_mcp_connections(app, mcp::parse_config(&merged).unwrap_or_default());
+    Ok(state.mcp.lock().unwrap().statuses())
+}
+
+// ------------------------------------------------------------ enable/remove
+
+/// Set or clear `"disabled"` on one server in an mcpServers config. Pure —
+/// unit-tested. Disabling keeps the connector in the config but stops it.
+pub(crate) fn set_server_disabled(
+    config: &str,
+    server: &str,
+    disabled: bool,
+) -> Result<String, String> {
+    let mut root: serde_json::Value = serde_json::from_str(config)
+        .map_err(|_| "the room's connector config isn't valid JSON".to_string())?;
+    let entry = root
+        .get_mut("mcpServers")
+        .and_then(|m| m.get_mut(server))
+        .and_then(|e| e.as_object_mut())
+        .ok_or_else(|| format!("\"{server}\" is not in the connector config"))?;
+    if disabled {
+        entry.insert("disabled".to_string(), serde_json::Value::Bool(true));
+    } else {
+        entry.remove("disabled");
+    }
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// Remove one server from an mcpServers config entirely. Pure — unit-tested.
+pub(crate) fn remove_server_from_config(config: &str, server: &str) -> Result<String, String> {
+    let mut root: serde_json::Value = serde_json::from_str(config)
+        .map_err(|_| "the room's connector config isn't valid JSON".to_string())?;
+    if let Some(map) = root.get_mut("mcpServers").and_then(|m| m.as_object_mut()) {
+        map.remove(server);
+    }
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// Persist an edited config, re-approve it (the edit is a deliberate user
+/// action so its new fingerprint counts as approved — SEC-1), and reconnect.
+fn apply_edited_config(
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
+    json: String,
+) -> Result<Vec<mcp::ServerStatus>, String> {
+    add_mcp_approval(app, &mcp_fingerprint(&json));
+    start_mcp_connections(app.clone(), mcp::parse_config(&json).unwrap_or_default());
+    Ok(state.mcp.lock().unwrap().statuses())
+}
+
+/// Turn one connector on or off without removing it (writes `"disabled"`).
+#[tauri::command]
+pub fn mcp_set_server_enabled(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+    enabled: bool,
+) -> Result<Vec<mcp::ServerStatus>, String> {
+    let json = state.with_room(|room| {
+        let config = db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default();
+        let json = set_server_disabled(&config, &server, !enabled)?;
+        db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
+        Ok(json)
+    })?;
+    apply_edited_config(&app, &state, json)
+}
+
+/// Remove one connector from the room entirely (also forgets its OAuth token).
+#[tauri::command]
+pub fn mcp_remove_server(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+) -> Result<Vec<mcp::ServerStatus>, String> {
+    let json = state.with_room(|room| {
+        let _ = super::mcp_oauth::clear_tokens(&room.conn, &server);
+        let config = db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default();
+        let json = remove_server_from_config(&config, &server)?;
+        db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
+        Ok(json)
+    })?;
+    apply_edited_config(&app, &state, json)
+}
+
+/// Remove the Authorization header from one server's config entry. Pure.
+fn strip_bearer(config: &str, server: &str) -> Result<String, String> {
+    let mut root: serde_json::Value =
+        serde_json::from_str(config).map_err(|e| e.to_string())?;
+    if let Some(h) = root
+        .get_mut("mcpServers")
+        .and_then(|m| m.get_mut(server))
+        .and_then(|e| e.get_mut("headers"))
+        .and_then(|h| h.as_object_mut())
+    {
+        h.remove("Authorization");
+    }
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+// ------------------------------------------------------- per-tool whitelist
+
+/// Read the per-connector tool opt-outs (`{server: [disabled tool names]}`).
+/// Missing/invalid → empty (everything on). Pure over the stored string.
+pub(crate) fn parse_tool_prefs(
+    raw: &str,
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(raw)
+        .map(|m| m.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect())
+        .unwrap_or_default()
+}
+
+/// Update one server's disabled-tools list and return the new prefs JSON. Pure —
+/// unit-tested. `enabled=false` adds the tool to the off-list; `true` removes it.
+pub(crate) fn set_tool_pref(
+    raw: &str,
+    server: &str,
+    tool: &str,
+    enabled: bool,
+) -> Result<String, String> {
+    let mut map: std::collections::BTreeMap<String, Vec<String>> =
+        serde_json::from_str(raw).unwrap_or_default();
+    let list = map.entry(server.to_string()).or_default();
+    list.retain(|t| t != tool);
+    if !enabled {
+        list.push(tool.to_string());
+    }
+    if list.is_empty() {
+        map.remove(server);
+    }
+    serde_json::to_string(&map).map_err(|e| e.to_string())
+}
+
+/// The room's tool opt-outs as `{server: [disabled tools]}` — drives the per-tool
+/// toggles in the Connectors page. Empty object when nothing is turned off.
+#[tauri::command]
+pub fn mcp_get_tool_prefs(state: State<'_, AppState>) -> Result<String, String> {
+    state.with_room(|room| {
+        Ok(db::get_setting(&room.conn, MCP_TOOL_PREFS_KEY).unwrap_or_else(|| "{}".to_string()))
+    })
+}
+
+/// Turn one connector tool on or off for this room. No reconnect needed — the
+/// change takes effect on the next turn, when `mcp_routes` re-reads the prefs.
+#[tauri::command]
+pub fn mcp_set_tool_enabled(
+    state: State<'_, AppState>,
+    server: String,
+    tool: String,
+    enabled: bool,
+) -> Result<String, String> {
+    state.with_room(|room| {
+        let raw = db::get_setting(&room.conn, MCP_TOOL_PREFS_KEY).unwrap_or_else(|| "{}".to_string());
+        let next = set_tool_pref(&raw, &server, &tool, enabled)?;
+        db::set_setting(&room.conn, MCP_TOOL_PREFS_KEY, &next)?;
+        Ok(next)
+    })
+}
+
+/// Parse the "ignore the tool cap" server list. Missing/invalid → empty.
+pub(crate) fn parse_uncapped(raw: &str) -> std::collections::HashSet<String> {
+    serde_json::from_str::<Vec<String>>(raw)
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Add/remove a server from the uncapped list, returning the new JSON. Pure —
+/// unit-tested.
+pub(crate) fn set_uncapped(raw: &str, server: &str, uncapped: bool) -> Result<String, String> {
+    let mut set: std::collections::BTreeSet<String> =
+        serde_json::from_str::<Vec<String>>(raw).unwrap_or_default().into_iter().collect();
+    if uncapped {
+        set.insert(server.to_string());
+    } else {
+        set.remove(server);
+    }
+    serde_json::to_string(&set.into_iter().collect::<Vec<_>>()).map_err(|e| e.to_string())
+}
+
+/// The connectors the user has exempted from the tool-count cap (JSON array).
+#[tauri::command]
+pub fn mcp_get_uncapped(state: State<'_, AppState>) -> Result<String, String> {
+    state.with_room(|room| {
+        Ok(db::get_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY).unwrap_or_else(|| "[]".to_string()))
+    })
+}
+
+/// Turn the "send every tool, ignore the limit" override on/off for one
+/// connector. Takes effect next turn (mcp_routes re-reads it); no reconnect.
+#[tauri::command]
+pub fn mcp_set_server_uncapped(
+    state: State<'_, AppState>,
+    server: String,
+    uncapped: bool,
+) -> Result<String, String> {
+    state.with_room(|room| {
+        let raw = db::get_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY).unwrap_or_else(|| "[]".to_string());
+        let next = set_uncapped(&raw, &server, uncapped)?;
+        db::set_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY, &next)?;
+        Ok(next)
+    })
 }
 
 /// The frontend's answer to an `mcp-approve-request` — "once", "always", or
@@ -396,19 +712,116 @@ mod tests {
     #[test]
     fn renders_full_command_line() {
         let cfg = mcp::ServerConfig {
-            command: "uvx".into(),
-            args: vec!["duckduckgo-mcp-server".into(), "--verbose".into()],
-            env: std::collections::HashMap::new(),
+            transport: mcp::Transport::Stdio {
+                command: "uvx".into(),
+                args: vec!["duckduckgo-mcp-server".into(), "--verbose".into()],
+                env: std::collections::HashMap::new(),
+            },
             disabled: false,
         };
         assert_eq!(render_command_line(&cfg), "uvx duckduckgo-mcp-server --verbose");
         let bare = mcp::ServerConfig {
-            command: "node".into(),
-            args: vec![],
-            env: std::collections::HashMap::new(),
+            transport: mcp::Transport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+            },
             disabled: false,
         };
         assert_eq!(render_command_line(&bare), "node");
+    }
+
+    #[test]
+    fn set_disabled_and_remove_edit_the_right_server() {
+        let cfg = r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"]},"gh":{"type":"http","url":"https://x"}}}"#;
+        // Disable adds "disabled":true, leaving the other server alone.
+        let off = set_server_disabled(cfg, "web", true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&off).unwrap();
+        assert_eq!(v["mcpServers"]["web"]["disabled"], true);
+        assert_eq!(v["mcpServers"]["web"]["command"], "uvx");
+        assert!(v["mcpServers"]["gh"]["url"].is_string());
+        // Re-enable removes the flag entirely (not "disabled":false).
+        let on = set_server_disabled(&off, "web", false).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&on).unwrap();
+        assert!(v2["mcpServers"]["web"].get("disabled").is_none());
+        // Remove drops just that server.
+        let rm = remove_server_from_config(cfg, "web").unwrap();
+        let v3: serde_json::Value = serde_json::from_str(&rm).unwrap();
+        assert!(v3["mcpServers"].get("web").is_none());
+        assert!(v3["mcpServers"]["gh"].is_object());
+        // Unknown server → error for disable, no-op for remove.
+        assert!(set_server_disabled(cfg, "nope", true).is_err());
+        assert!(remove_server_from_config(cfg, "nope").is_ok());
+    }
+
+    #[test]
+    fn merge_and_strip_bearer_are_inverse() {
+        let cfg = r#"{"mcpServers":{"gh":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#;
+        let merged = merge_bearer(cfg, "gh", "tok123").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["mcpServers"]["gh"]["headers"]["Authorization"], "Bearer tok123");
+        // url is preserved.
+        assert_eq!(v["mcpServers"]["gh"]["url"], "https://api.githubcopilot.com/mcp/");
+        // Stripping removes just the Authorization header.
+        let stripped = strip_bearer(&merged, "gh").unwrap();
+        let sv: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert!(sv["mcpServers"]["gh"]["headers"].get("Authorization").is_none());
+        assert_eq!(sv["mcpServers"]["gh"]["url"], "https://api.githubcopilot.com/mcp/");
+        // Unknown server → error, not a panic.
+        assert!(merge_bearer(cfg, "nope", "t").is_err());
+    }
+
+    #[test]
+    fn tool_prefs_toggle_off_and_back_on() {
+        // Default: nothing disabled.
+        assert!(parse_tool_prefs("{}").is_empty());
+        // Turn a tool OFF → it lands in the server's off-list.
+        let a = set_tool_pref("{}", "fetch-mcp", "http_head", false).unwrap();
+        let m = parse_tool_prefs(&a);
+        assert!(m["fetch-mcp"].contains("http_head"));
+        // A second tool OFF joins it; no duplicates on repeat.
+        let b = set_tool_pref(&a, "fetch-mcp", "http_put", false).unwrap();
+        let b = set_tool_pref(&b, "fetch-mcp", "http_put", false).unwrap();
+        assert_eq!(parse_tool_prefs(&b)["fetch-mcp"].len(), 2);
+        // Turning the last one back ON removes it; emptying a server drops the key.
+        let c = set_tool_pref(&b, "fetch-mcp", "http_head", true).unwrap();
+        let c = set_tool_pref(&c, "fetch-mcp", "http_put", true).unwrap();
+        assert!(parse_tool_prefs(&c).get("fetch-mcp").is_none());
+        // Garbage stored value degrades to "all on", never an error.
+        assert!(parse_tool_prefs("not json").is_empty());
+    }
+
+    #[test]
+    fn uncapped_override_toggles_per_server() {
+        assert!(parse_uncapped("[]").is_empty());
+        // Turn the override ON for one server; idempotent on repeat.
+        let a = set_uncapped("[]", "fetch-mcp", true).unwrap();
+        let a = set_uncapped(&a, "fetch-mcp", true).unwrap();
+        assert!(parse_uncapped(&a).contains("fetch-mcp"));
+        assert_eq!(parse_uncapped(&a).len(), 1);
+        // A second server joins; turning the first OFF leaves the second.
+        let b = set_uncapped(&a, "github", true).unwrap();
+        let c = set_uncapped(&b, "fetch-mcp", false).unwrap();
+        let m = parse_uncapped(&c);
+        assert!(m.contains("github") && !m.contains("fetch-mcp"));
+        // Garbage → empty, never an error.
+        assert!(parse_uncapped("nope").is_empty());
+    }
+
+    #[test]
+    fn renders_remote_endpoint_for_dialog() {
+        // SEC-1: a remote connector's approval line names the endpoint and flags
+        // that it reaches the internet — not a fake command line.
+        let cfg = mcp::ServerConfig {
+            transport: mcp::Transport::Http {
+                url: "https://mcp.notion.com/mcp".into(),
+                headers: std::collections::HashMap::new(),
+            },
+            disabled: false,
+        };
+        let line = render_command_line(&cfg);
+        assert!(line.contains("https://mcp.notion.com/mcp"));
+        assert!(line.contains("remote"));
     }
 
 }

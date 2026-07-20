@@ -35,6 +35,11 @@ from .messages import Message
 #: Engine ids that name a cloud coding CLI (mirror external.rs).
 EXTERNAL_ENGINES = ("claude-cli", "codex-cli")
 
+#: Hard ceiling on one external-CLI generation call. A wedged ``claude`` /
+#: ``codex`` process would otherwise hang the await forever with no way to stop
+#: it; on expiry we kill the subprocess and raise the ``ENGINE_ERROR`` sentinel.
+EXTERNAL_TIMEOUT_SECS: int = 300
+
 #: The engine/model/effort separator — a double colon, written as a regex so
 #: the privacy suite's IPv6-wildcard-bind scan (which forbids a literal
 #: double-colon STRING anywhere in this package) stays meaningful.
@@ -129,7 +134,23 @@ async def generate_external(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate(prompt.encode("utf-8"))
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(prompt.encode("utf-8")),
+            timeout=EXTERNAL_TIMEOUT_SECS,
+        )
+    except asyncio.TimeoutError as exc:
+        # Wedged CLI: stop it rather than hang the call forever. This raise is
+        # NOT caught by the generic `except Exception` below — an exception
+        # raised inside one except clause bypasses its sibling clauses.
+        proc.kill()
+        try:  # best-effort reap of the killed child; failure here is ignorable
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:  # noqa: BLE001 - already killed; reaping is best-effort
+            pass
+        raise LlmError(
+            "ENGINE_ERROR",
+            f"{engine} timed out after {EXTERNAL_TIMEOUT_SECS}s and was stopped.",
+        ) from exc
     except FileNotFoundError as exc:  # zsh itself missing — effectively impossible
         raise LlmError("ENGINE_ERROR", f"Could not start {engine}: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract

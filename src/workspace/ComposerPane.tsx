@@ -8,6 +8,7 @@ import {
   PaperclipIcon,
   SendIcon,
   SparkIcon,
+  StopIcon,
 } from "../icons";
 import { displayName } from "./composer";
 import { isCloudEngine, isExternalEngine } from "./markup";
@@ -304,7 +305,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
                 title="Stop this answer"
                 onClick={a.stopAsk}
               >
-                <span className="stop-glyph">◼</span>
+                <StopIcon size={14} />
               </button>
             ) : (
               <button

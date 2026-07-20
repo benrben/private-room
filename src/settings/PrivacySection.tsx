@@ -1,3 +1,5 @@
+import { CircleCheckIcon } from "../icons";
+
 interface Props {
   autolock: string;
   changeAutolock: (value: string) => void;
@@ -120,8 +122,8 @@ export default function PrivacySection({
             </p>
             {pwError && <div className="gate-error">{pwError}</div>}
             <div className="settings-actions">
-              <button className="primary" onClick={changePassword}>
-                {pwSaved ? "Password changed ✓" : "Change password"}
+              <button className="primary btn-ic" onClick={changePassword}>
+                {pwSaved ? (<><CircleCheckIcon size={13} /> Password changed</>) : "Change password"}
               </button>
             </div>
             {pwRecoveryCode && (
@@ -140,7 +142,7 @@ export default function PrivacySection({
                 </div>
                 <div className="recovery-sheet-actions">
                   <button
-                    className="primary"
+                    className="primary btn-ic"
                     onClick={() => {
                       setPwRecoveryCopied(true);
                       try {
@@ -150,7 +152,7 @@ export default function PrivacySection({
                       }
                     }}
                   >
-                    {pwRecoveryCopied ? "Copied ✓" : "Copy code"}
+                    {pwRecoveryCopied ? (<><CircleCheckIcon size={13} /> Copied</>) : "Copy code"}
                   </button>
                   <button className="subtle" onClick={() => window.print()}>
                     Print
@@ -220,8 +222,8 @@ export default function PrivacySection({
             </div>
             {dupError && <div className="gate-error">{dupError}</div>}
             <div className="settings-actions">
-              <button className="primary" onClick={duplicate}>
-                {dupDone ? "Duplicated ✓" : "Duplicate"}
+              <button className="primary btn-ic" onClick={duplicate}>
+                {dupDone ? (<><CircleCheckIcon size={13} /> Duplicated</>) : "Duplicate"}
               </button>
             </div>
 

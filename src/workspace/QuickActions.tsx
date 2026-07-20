@@ -5,7 +5,7 @@ import type { WorkflowBinding } from "../api";
 export type QuickAction = {
   id: string;
   label: string;
-  icon?: string; // emoji
+  icon?: ReactNode; // a line icon (or any node)
   hint?: string;
   disabled?: boolean;
   onRun: () => void;

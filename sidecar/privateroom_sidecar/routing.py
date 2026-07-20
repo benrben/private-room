@@ -1,11 +1,15 @@
 """Deterministic tool routing — ported VERBATIM from the Rust.
 
-Source of truth: ``src-tauri/src/commands/agent.rs``
-  - ``WRITE_TOOL_NAMES``  (agent.rs:737)
-  - ``wants_write_tools`` (agent.rs:751)
-  - ``wants_ui_tools``    (agent.rs:767)
-  - ``wants_job_tools``   (agent.rs:788)
-  - ``lane_label``        (agent.rs:823)
+Source of truth: the routing predicates in ``src-tauri/src/commands/agent.rs``,
+referenced by name (line numbers rot) so they stay findable:
+  - ``wants_write_tools`` — offer the file-mutating built-ins this turn?
+  - ``wants_ui_tools``    — offer the UI/perception tools?
+  - ``wants_job_tools``   — offer the whole-file pass + workflow tools?
+
+``WRITE_TOOL_NAMES`` and ``lane_label`` below have no agent.rs counterpart: the
+Rust inlines its hint lists inside each predicate and computes no lane label, so
+only those three predicates — plus the tool-name reservations in agent.rs
+``BUILTIN_TOOL_NAMES`` — need to stay in sync.
 
 These are NOT model-driven: they are case-insensitive substring matches on the
 raw user question. A small model picks the right tool far more reliably from a
@@ -19,8 +23,10 @@ the same commit or the two engines drift.
 
 from __future__ import annotations
 
-#: The file-MUTATING built-ins (agent.rs:737). Withheld on a plain informational
-#: turn. Note `annotate_file` / `mark_image` are deliberately NOT in this list —
+#: The file-MUTATING built-ins, withheld on a plain informational turn (the Rust
+#: withholds the same set via `wants_write_tools`; the names are reserved in
+#: agent.rs `BUILTIN_TOOL_NAMES`). Note `annotate_file` / `mark_image` are
+#: deliberately NOT in this list —
 #: they show the user something, they don't change a file.
 WRITE_TOOL_NAMES: tuple[str, ...] = (
     "create_file",
@@ -101,22 +107,23 @@ def _any_hint(question: str, hints: tuple[str, ...]) -> bool:
 
 
 def wants_write_tools(question: str) -> bool:
-    """Offer the file-mutating built-ins this turn? (agent.rs:751)"""
+    """Offer the file-mutating built-ins this turn? (agent.rs `wants_write_tools`)"""
     return _any_hint(question, _WRITE_HINTS)
 
 
 def wants_ui_tools(question: str) -> bool:
-    """Offer the UI/perception tools (and their system-prompt paragraph)? (agent.rs:767)"""
+    """Offer the UI/perception tools (and their system-prompt paragraph)? (agent.rs `wants_ui_tools`)"""
     return _any_hint(question, _UI_HINTS)
 
 
 def wants_job_tools(question: str) -> bool:
-    """Offer the whole-file pass tools (and their paragraph)? (agent.rs:788)"""
+    """Offer the whole-file pass tools (and their paragraph)? (agent.rs `wants_job_tools`)"""
     return _any_hint(question, _JOB_HINTS)
 
 
 def lane_label(*, ui: bool, write: bool, web_enabled: bool) -> str:
-    """The lane shown to the user, so an odd answer is explainable (agent.rs:823).
+    """The lane shown to the user, so an odd answer is explainable (Python-only —
+    no agent.rs counterpart).
 
     Purely cosmetic. Order matters: UI wins over write, write over web.
 

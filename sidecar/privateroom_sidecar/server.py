@@ -1,11 +1,15 @@
 """The sidecar's HTTP surface (SPEC §5).
 
-Loopback only, three endpoints, no state that outlives a run:
+Loopback only, no state that outlives a run. The core of it:
 
   GET  /health -> {"ok": true, "version": "..."}   (the Rust lifecycle manager)
-  POST /run    -> application/x-ndjson, one SPEC §4 event per line
+  POST /run    -> application/x-ndjson, one SPEC §4 event per line (the agent loop)
   POST /cancel -> {"run_id": "..."}; the loop checks between rounds and between
                   tool calls, so Stop stops within one tool call, not one round.
+
+Around those sit a set of one-shot gateway endpoints — generation/summarize,
+whole-file pass, knowledge extract, vision, TTS, embeddings, privacy scan, and
+the rest — that reuse the same engine plumbing without the streaming loop.
 
 Nothing here logs message content: the sidecar handles the user's private files
 and a log line is a copy of them that outlives the run (SPEC §6).

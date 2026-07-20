@@ -50,13 +50,21 @@ for line in sys.stdin:
                 "content": [{"type": "text", "text": "it broke"}]}})
 "#;
 
-fn fake_config() -> mcp::ServerConfig {
+/// A local (stdio) server config for the tests — the marketplace's remote
+/// transport is exercised by the unit tests in `mcp.rs` (no network here).
+fn stdio_config(command: &str, args: Vec<String>) -> mcp::ServerConfig {
     mcp::ServerConfig {
-        command: "python3".into(),
-        args: vec!["-c".into(), FAKE_SERVER.into()],
-        env: Default::default(),
+        transport: mcp::Transport::Stdio {
+            command: command.into(),
+            args,
+            env: Default::default(),
+        },
         disabled: false,
     }
+}
+
+fn fake_config() -> mcp::ServerConfig {
+    stdio_config("python3", vec!["-c".into(), FAKE_SERVER.into()])
 }
 
 #[tokio::test]
@@ -87,12 +95,7 @@ async fn initialize_list_and_call() {
 #[tokio::test]
 #[ignore]
 async fn real_duckduckgo_server() {
-    let config = mcp::ServerConfig {
-        command: "uvx".into(),
-        args: vec!["duckduckgo-mcp-server".into()],
-        env: Default::default(),
-        disabled: false,
-    };
+    let config = stdio_config("uvx", vec!["duckduckgo-mcp-server".into()]);
     let (mut client, tools) = mcp::Client::connect(&config)
         .await
         .expect("connect to duckduckgo-mcp-server");
@@ -114,27 +117,20 @@ async fn real_duckduckgo_server() {
 
 #[tokio::test]
 async fn missing_command_fails_cleanly() {
-    let config = mcp::ServerConfig {
-        command: "definitely-not-a-real-command-xyz".into(),
-        args: vec![],
-        env: Default::default(),
-        disabled: false,
-    };
+    let config = stdio_config("definitely-not-a-real-command-xyz", vec![]);
     let err = connect_err(mcp::Client::connect(&config).await);
     assert!(err.contains("Could not start"), "got: {err}");
 }
 
 #[tokio::test]
 async fn server_that_exits_immediately_reports_stderr() {
-    let config = mcp::ServerConfig {
-        command: "python3".into(),
-        args: vec![
+    let config = stdio_config(
+        "python3",
+        vec![
             "-c".into(),
             "import sys; print('boom: missing dependency', file=sys.stderr); sys.exit(1)".into(),
         ],
-        env: Default::default(),
-        disabled: false,
-    };
+    );
     let err = connect_err(mcp::Client::connect(&config).await);
     assert!(err.contains("boom: missing dependency"), "got: {err}");
 }

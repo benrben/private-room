@@ -437,6 +437,41 @@ export interface McpServerStatus {
   status: "connecting" | "connected" | "failed" | "disabled";
   error: string | null;
   tools: string[];
+  /** True when reached over the network (a remote HTTP server) — the UI badges
+   * it "reaches the internet" vs a local "runs on your Mac" connector. */
+  remote: boolean;
+}
+
+/** What "Install" would write into the room's mcpServers config, from the
+ * marketplace. Tagged union on `kind` (mirrors Rust's InstallSpec). */
+export type InstallSpec =
+  | { kind: "stdio"; command: string; args: string[]; envKeys: string[] }
+  | { kind: "http"; url: string; headerKeys: string[] };
+
+/** One normalized marketplace listing from the MCP registry (mcp_registry.rs
+ * CatalogEntry). */
+export interface CatalogEntry {
+  id: string;
+  name: string;
+  /** The registry's human title when present; the UI shows this, falling back
+   * to `name`. */
+  title: string | null;
+  /** The server's icon as an inlined `data:` URI (backend-proxied — the CSP
+   * blocks remote images), or null → show a monogram. */
+  icon: string | null;
+  description: string;
+  publisher: string;
+  /** The publisher demonstrably owns the namespace (registry trust signal). */
+  verified: boolean;
+  /** Installs a remote endpoint — data leaves the Mac when the tool is called. */
+  remote: boolean;
+  transport: "stdio" | "http" | "sse" | string;
+  repository: string | null;
+  install: InstallSpec;
+  /** The other transport when the record offers both a local package and a
+   * remote endpoint — `install` is the (privacy-first) local default, this is
+   * the cloud alternative the drawer can switch to. null when only one exists. */
+  altInstall: InstallSpec | null;
 }
 
 /** SEC-1b: a pending per-call MCP approval prompt from the backend. */
@@ -629,11 +664,22 @@ export interface WorkflowNode {
     | "generate"
     | "summarize_file"
     | "file_pass"
+    | "for_each_file"
     | "agent_run"
+    | "extract"
+    | "route"
+    | "vote"
+    | "refine"
+    | "plan_and_map"
+    | "transform"
+    | "merge"
+    | "http_fetch"
+    | "script_run"
     | "save_file"
     | "condition";
   // Kind-specific params (flattened): prompt/model/select/instruction/mode/
-  // name_template/format/question/op/value. Kept loose so the param sheet edits
+  // name_template/format/question/op/value/fields/labels/samples/rubric/
+  // objective/url/file/find/separator. Kept loose so the param sheet edits
   // them generically.
   [key: string]: unknown;
 }
@@ -641,7 +687,9 @@ export interface WorkflowNode {
 export interface WorkflowEdge {
   from: string;
   to: string;
-  branch?: "then" | "else" | null;
+  /** "then"/"else" off a condition, or one of a route node's labels; absent
+   * otherwise. */
+  branch?: string | null;
 }
 
 export interface Schedule {

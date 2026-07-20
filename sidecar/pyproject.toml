@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "privateroom-sidecar"
-version = "0.5.1"
+version = "0.6.0"
 description = "Private Room — local LangGraph agent sidecar (the agent brain only; no DB, no keys, no files)"
 readme = "SPEC.md"
 requires-python = ">=3.11"

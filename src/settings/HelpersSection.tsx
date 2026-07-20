@@ -1,4 +1,5 @@
 import type { AiStatus, IconComponent, RecommendedModels } from "./types";
+import { CircleCheckIcon } from "../icons";
 
 interface Props {
   ai: AiStatus | null;
@@ -38,7 +39,7 @@ export default function HelpersSection({
                 <label className="settings-label">Vision helper</label>
                 {visionInstalled ? (
                   <div className="model-row active">
-                    <span>Installed ✓ — the AI can see and mark images.</span>
+                    <span className="btn-ic"><CircleCheckIcon size={13} /> Installed — the AI can see and mark images.</span>
                   </div>
                 ) : (
                   <>
@@ -64,7 +65,7 @@ export default function HelpersSection({
                 </label>
                 {embedInstalled ? (
                   <div className="model-row active">
-                    <span>On ✓ — search understands meaning, not just words.</span>
+                    <span className="btn-ic"><CircleCheckIcon size={13} /> On — search understands meaning, not just words.</span>
                   </div>
                 ) : (
                   <>

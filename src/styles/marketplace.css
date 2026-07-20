@@ -1,0 +1,666 @@
+/* ---------- Connector marketplace ----------
+   The browse/search/install surface inside Settings → Connections. Styled
+   entirely through the canonical tokens (tokens.css), so it tracks the theme.
+   Local connectors read green ("on your Mac"); remote read amber ("reaches the
+   internet"). */
+
+.mkt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+/* ---- Connectors page (activity-rail area) ---- */
+.connectors-page {
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--sp-6) var(--sp-8) var(--sp-8);
+  max-width: 1100px;
+  margin: 0 auto;
+  width: 100%;
+}
+.connectors-head h1 {
+  margin: 0 0 var(--sp-1);
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text-strong);
+}
+.connectors-head .settings-hint {
+  max-width: 68ch;
+}
+.connectors-h2 {
+  font-size: 13px;
+  font-weight: 620;
+  color: var(--text);
+  margin: var(--sp-6) 0 var(--sp-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.connectors-installed .mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.connector-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+.connector-status {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* One connector = its row plus an optional expandable per-tool list. */
+.connector-item {
+  display: flex;
+  flex-direction: column;
+}
+.connector-tools {
+  margin: calc(var(--sp-1) * -1) 0 0;
+  padding: 0 var(--sp-3) var(--sp-2);
+  border: 1px solid var(--line);
+  border-top: none;
+  border-radius: 0 0 var(--radius) var(--radius);
+  background: var(--panel-2);
+}
+.connector-tools > summary {
+  cursor: pointer;
+  padding: var(--sp-2) 0;
+  font-size: 12px;
+  color: var(--faint);
+  user-select: none;
+}
+.connector-tools-hint {
+  margin: 0 0 var(--sp-2);
+  font-size: 11px;
+}
+.connector-uncap {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  cursor: pointer;
+  margin: 0 0 var(--sp-2);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 12px;
+  color: var(--text);
+}
+.connector-tool-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--sp-1) var(--sp-3);
+}
+.connector-tool {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  cursor: pointer;
+  min-width: 0;
+}
+.connector-tool code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.connector-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-left: auto;
+}
+.connector-remove {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+.connector-remove:hover {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 45%, transparent);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+.connectors-advanced {
+  margin-top: var(--sp-6);
+}
+
+/* Opt-in gate — shown until the user turns registry browsing on. */
+.mkt-gate {
+  display: flex;
+  gap: var(--sp-4);
+  align-items: flex-start;
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--panel-2);
+  margin-bottom: var(--sp-4);
+}
+.mkt-gate-icon {
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  color: var(--accent-2);
+  background: var(--accent-soft);
+}
+.mkt-gate-icon svg {
+  width: 20px;
+  height: 20px;
+}
+.mkt-gate strong {
+  color: var(--text-strong);
+}
+.mkt-gate .primary {
+  margin-top: var(--sp-2);
+}
+
+/* Controls row: search + toggles. */
+.mkt-controls {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.mkt-search {
+  position: relative;
+  flex: 1;
+  min-width: 220px;
+}
+.mkt-search svg {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 15px;
+  height: 15px;
+  color: var(--faint);
+}
+.mkt-search input {
+  width: 100%;
+  padding: 8px 12px 8px 33px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+}
+.mkt-search input:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.mkt-toggles {
+  display: flex;
+  gap: var(--sp-3);
+}
+.mkt-tgl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.mkt-tgl input {
+  display: none;
+}
+.mkt-sw {
+  width: 30px;
+  height: 17px;
+  border-radius: 99px;
+  background: var(--line);
+  position: relative;
+  transition: background 0.15s;
+  flex: none;
+}
+.mkt-sw::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 99px;
+  background: var(--panel-2);
+  transition: transform 0.15s;
+  box-shadow: 0 1px 2px var(--shadow);
+}
+.mkt-tgl input:checked + .mkt-sw {
+  background: var(--accent);
+}
+.mkt-tgl input:checked + .mkt-sw::after {
+  transform: translateX(13px);
+}
+
+.mkt-status {
+  padding: var(--sp-3) 0;
+}
+.mkt-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.mkt-error button {
+  flex: none;
+}
+
+/* Card grid. */
+.mkt-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--sp-3);
+}
+.mkt-card {
+  text-align: left;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-3) var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  cursor: pointer;
+  transition: border-color 0.12s, transform 0.12s;
+  color: var(--text);
+  font: inherit;
+}
+.mkt-card:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+.mkt-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mkt-card-head {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: center;
+}
+.mkt-mono {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: -0.02em;
+}
+.mkt-mono.lg {
+  width: 42px;
+  height: 42px;
+  font-size: 16px;
+}
+/* Real logo (a backend-inlined data URI) fills the same tile. */
+img.mkt-mono {
+  object-fit: cover;
+  overflow: hidden;
+  background: var(--hover);
+}
+.mkt-id {
+  min-width: 0;
+}
+.mkt-name {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  font-size: 13.5px;
+}
+.mkt-verified {
+  color: var(--blue);
+  display: inline-flex;
+}
+.mkt-verified svg {
+  width: 13px;
+  height: 13px;
+}
+.mkt-pub {
+  color: var(--muted);
+  font-size: 11.5px;
+  margin-top: 1px;
+}
+.mkt-desc {
+  color: var(--muted);
+  font-size: 12.25px;
+  line-height: 1.45;
+  margin: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.mkt-badges {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-top: auto;
+}
+.mkt-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 3px 7px;
+  border-radius: 99px;
+  white-space: nowrap;
+}
+.mkt-badge svg {
+  width: 10px;
+  height: 10px;
+}
+.mkt-badge.local {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 15%, transparent);
+}
+.mkt-badge.remote {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 16%, transparent);
+}
+.mkt-badge.plain {
+  color: var(--muted);
+  background: var(--hover);
+  font-weight: 500;
+}
+.mkt-badge.installed {
+  color: var(--accent-2);
+  background: var(--accent-soft);
+}
+
+/* Install drawer. */
+.mkt-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 7, 11, 0.5);
+  z-index: 60;
+  display: flex;
+  justify-content: flex-end;
+}
+.mkt-drawer {
+  width: min(460px, 96vw);
+  height: 100%;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  box-shadow: -24px 0 60px -30px var(--shadow);
+  display: flex;
+  flex-direction: column;
+  animation: mkt-slide 0.18s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+@keyframes mkt-slide {
+  from {
+    transform: translateX(100%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mkt-drawer {
+    animation: none;
+  }
+}
+.mkt-dr-head {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: flex-start;
+  padding: var(--sp-4) var(--sp-4) var(--sp-3);
+  border-bottom: 1px solid var(--line-soft);
+}
+.mkt-dr-id {
+  flex: 1;
+  min-width: 0;
+}
+.mkt-dr-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text-strong);
+}
+.mkt-dr-x {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  width: 29px;
+  height: 29px;
+  border-radius: var(--radius);
+  display: grid;
+  place-items: center;
+  flex: none;
+  cursor: pointer;
+}
+.mkt-dr-x:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.mkt-dr-x svg {
+  width: 15px;
+  height: 15px;
+}
+.mkt-dr-body {
+  flex: 1;
+  overflow: auto;
+  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+.mkt-dr-desc {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 0;
+}
+.mkt-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  font-weight: 650;
+  margin-bottom: var(--sp-2);
+}
+.mkt-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 9px 11px;
+  overflow-x: auto;
+  white-space: pre;
+  word-break: break-all;
+}
+.mkt-fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.mkt-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mkt-field span {
+  font-size: 12px;
+  color: var(--muted);
+}
+.mkt-field input {
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.mkt-field input:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.mkt-wall {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border-radius: var(--radius);
+  padding: var(--sp-3);
+  font-size: 12.25px;
+  line-height: 1.5;
+}
+.mkt-wall svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-top: 1px;
+}
+.mkt-wall.warn {
+  background: color-mix(in srgb, var(--amber) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent);
+}
+.mkt-wall.warn svg,
+.mkt-wall.warn b {
+  color: var(--amber);
+}
+.mkt-wall.safe {
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--green) 32%, transparent);
+}
+.mkt-wall.safe svg,
+.mkt-wall.safe b {
+  color: var(--green);
+}
+.mkt-repo {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 12.5px;
+}
+.mkt-repo:hover {
+  text-decoration: underline;
+}
+
+.mkt-dr-foot {
+  padding: var(--sp-3) var(--sp-4);
+  border-top: 1px solid var(--line-soft);
+}
+.mkt-install {
+  width: 100%;
+  justify-content: center;
+}
+.mkt-install.remote {
+  background: var(--amber);
+  color: #241a06;
+  border-color: var(--amber);
+}
+:root[data-theme="light"] .mkt-install.remote {
+  color: #fff;
+}
+.mkt-install:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+.mkt-dr-note {
+  color: var(--faint);
+  font-size: 11px;
+  text-align: center;
+  margin-top: 6px;
+}
+
+/* Remote sign-in: the button plus, while waiting, a hint and an escape hatch so
+ * a stuck browser round-trip never traps the user on the spinner. */
+.mkt-oauth {
+  margin-top: var(--sp-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mkt-oauth-wait {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+}
+.mkt-oauth-wait .settings-hint {
+  flex: 1;
+  margin: 0;
+  font-size: 11.5px;
+}
+.mkt-oauth-cancel {
+  flex: none;
+  align-self: center;
+}
+/* Local-vs-cloud switch, shown when a connector offers both transports. */
+.mkt-transport {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+}
+.mkt-tp-opt {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  text-align: left;
+}
+.mkt-tp-opt svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+.mkt-tp-opt span {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+.mkt-tp-opt b {
+  color: var(--text);
+  font-size: 12.5px;
+}
+.mkt-tp-opt small {
+  font-size: 10.5px;
+}
+.mkt-tp-opt.on {
+  border-color: var(--accent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.mkt-oauth-manual {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.mkt-oauth-manual .settings-hint {
+  margin: 0;
+}
+.mkt-oauth-manual .mkt-repo {
+  margin: 0;
+}

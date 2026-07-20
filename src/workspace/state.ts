@@ -14,6 +14,7 @@ import {
   FrontPage,
   Job,
   McpApproveRequest,
+  McpServerStatus,
   Memory,
   Message,
   RoomInfo,
@@ -89,6 +90,8 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [saveDraft, setSaveDraft] = useState<{ id: string; name: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [mcpTools, setMcpTools] = useState<string[]>([]);
+  // Full per-server statuses (drives the Connectors area's count badge).
+  const [mcpStatuses, setMcpStatuses] = useState<McpServerStatus[]>([]);
   const [mcpDialogDismissed, setMcpDialogDismissed] = useState(false);
   const [approvingMcp, setApprovingMcp] = useState(false);
   const [showAddLink, setShowAddLink] = useState(false);
@@ -336,6 +339,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     memoryDraft, setMemoryDraft, memoryDraftCat, setMemoryDraftCat,
     saveDraft, setSaveDraft,
     showSettings, setShowSettings, mcpTools, setMcpTools,
+    mcpStatuses, setMcpStatuses,
     mcpDialogDismissed, setMcpDialogDismissed, approvingMcp, setApprovingMcp,
     showAddLink, setShowAddLink, linkUrl, setLinkUrl, importingLink, setImportingLink,
     webOn, setWebOn, advisorToolsOn, setAdvisorToolsOn,

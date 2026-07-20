@@ -96,7 +96,7 @@ flows through one token system so both are first-class.
 | **Scripts** | Runnable Python/JavaScript files with declared inputs and outputs, schedulable like workflows |
 | **Memory** | Everything the AI remembers about you — a full area with categories, approval flow, and a shared scratch pad |
 | **Studio** | Flashcards, mind maps, podcast scripts, and a living room summary, generated as background jobs |
-| **Settings** | Per-room engine and model, creativity, custom instructions, role, Touch ID, dictation, and online features |
+| **Settings** | Per-room engine and model, creativity, custom instructions, role, Touch ID, dictation, online features, and one-click app updates |
 
 **Start from a template.** A new room can begin **Blank**, or as **Legal**,
 **Medical**, **Research**, or **Journal** — each pre-fills tuned instructions, a
@@ -233,12 +233,20 @@ severed on the spot. Lock the room and their access dies with it.
 
 ![Workflows: describe a pipeline and let the assistant build it](docs/screens/workflows.png)
 
-- **Workflows** chain six kinds of steps — generate, summarize, deep
-  full-file pass, run the agent, save a file, and condition branches — on an
-  animated canvas that lights up node by node as a run executes. Start from a
-  template (Morning digest, New-file summarizer, Weekly review, Deep read),
-  build by hand, or **describe the workflow in plain language and let the
-  room's model draft it**. Runs keep step-by-step history and artifacts.
+- **Workflows** chain steps into a pipeline on an animated canvas that lights
+  up node by node as a run executes. Beyond the basics — generate, summarize,
+  deep full-file pass, run the agent, save a file, condition branch — a step
+  can run one of your **room scripts**, fetch a URL, extract structured fields
+  into a table, transform text with **no model call at all**, **route** to
+  different branches, **vote** across parallel attempts for consensus, **fan
+  out over every matching file**, or loop to **refine an output until it
+  passes** and **plan-then-map** an objective into sub-tasks. Independent
+  branches run **in parallel** (lane-gated so the local model stays
+  serialized). Start from a template (Morning digest, New-file summarizer,
+  Weekly review, Deep read, Compare perspectives, Summarize every file, Triage
+  the newest note), build by hand, or **describe the workflow in plain language
+  and let the room's model draft it**. Runs keep step-by-step history and
+  artifacts.
 - **Schedules that survive a locked room.** Interval, daily, or weekly
   (DST-safe), with an optional catch-up run at unlock for triggers missed
   while the room was locked. Consent is collected once at activation, and a
@@ -438,6 +446,11 @@ not in the model's good intentions:
    needed. Dictation, transcription, and OCR need nothing extra — the Whisper
    voice model is **bundled in the app**.
 
+**Staying up to date.** Private Room checks its signed GitHub releases on
+launch and offers any newer build in one click. You can also check on demand
+from **Settings → App → Updates & version** — it downloads the release,
+verifies its signature, installs it, and relaunches into the new version.
+
 Prefer to build it yourself? See [Development](#development).
 
 ## Development
@@ -483,8 +496,11 @@ light palettes; the dark accents:
 | Green / Amber / Red | `#4cc38a` / `#e3b341` / `#e5646c` | Status only |
 
 In-app icons are React components in [`src/icons.tsx`](src/icons.tsx) and
-[`src/icons/shell.tsx`](src/icons/shell.tsx); master artwork and the
-asset-generation pipeline live in [`art/`](art/README.md).
+[`src/icons/shell.tsx`](src/icons/shell.tsx) — one line-icon family (24px grid,
+1.6px strokes, `currentColor`) used throughout, with **no native emoji**, so
+the interface stays monochrome and consistent and the violet accent is reserved
+for selected and primary actions. Master artwork and the asset-generation
+pipeline live in [`art/`](art/README.md).
 
 ## Roadmap
 

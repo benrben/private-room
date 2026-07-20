@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { api, RoomInfo } from "../api";
-import { MemoryIcon, MicIcon, PencilIcon } from "../icons";
+import { CheckIcon, CloseIcon, MemoryIcon, MicIcon, PencilIcon } from "../icons";
 import DeleteControl from "./DeleteControl";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -154,15 +154,16 @@ export default function MemoryView({
                         </option>
                       ))}
                     </select>
-                    <button className="chip-btn" title="Save" onClick={a.saveMemoryEdit}>
-                      ✓
+                    <button className="chip-btn" title="Save" aria-label="Save" onClick={a.saveMemoryEdit}>
+                      <CheckIcon size={13} />
                     </button>
                     <button
                       className="chip-btn"
                       title="Cancel"
+                      aria-label="Cancel"
                       onClick={() => s.setEditingMemory(null)}
                     >
-                      ✕
+                      <CloseIcon size={13} />
                     </button>
                   </div>
                 ) : (

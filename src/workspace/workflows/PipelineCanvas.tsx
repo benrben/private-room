@@ -15,6 +15,7 @@ type Props = {
   selectedId?: string | null;
   onSelect?: (id: string) => void;
   onAddAfter?: (id: string | null) => void; // null = add a first/tail node
+  onAddBranch?: (id: string) => void; // add a PARALLEL sibling child (fan-out)
   editable?: boolean;
 };
 
@@ -84,6 +85,7 @@ export function PipelineCanvas({
   selectedId,
   onSelect,
   onAddAfter,
+  onAddBranch,
   editable,
 }: Props) {
   const { pos, width, height } = useMemo(() => layout(def), [def]);
@@ -123,15 +125,26 @@ export function PipelineCanvas({
           const cls = ["pipeline-node", st ?? "", selectedId === n.id ? "selected" : ""]
             .filter(Boolean)
             .join(" ");
+          const kindLabel = n.kind.replace(/_/g, " ");
           return (
             <div
               key={n.id}
               className={cls}
               style={{ left: p.x, top: p.y, height: NODE_H }}
+              role="button"
+              tabIndex={0}
+              aria-pressed={selectedId === n.id}
+              aria-label={`${kindLabel} step: ${nodeTitle(n)}${st ? `, ${st}` : ""}`}
               onClick={() => onSelect?.(n.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onSelect?.(n.id);
+                }
+              }}
               title={status?.[n.id]?.peek ?? undefined}
             >
-              <div className="pipeline-node-kind">{n.kind.replace("_", " ")}</div>
+              <div className="pipeline-node-kind">{kindLabel}</div>
               <div className="pipeline-node-label">{nodeTitle(n)}</div>
               {st && <div className="pipeline-node-status">{st}</div>}
             </div>
@@ -141,18 +154,32 @@ export function PipelineCanvas({
           def.nodes.map((n) => {
             const p = pos.get(n.id)!;
             return (
-              <button
-                key={`add-${n.id}`}
-                className="pipeline-add"
-                title="Add a step after this one"
-                style={{ left: p.x + NODE_W - 9, top: p.y + NODE_H / 2 - 11, zIndex: 3 }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onAddAfter?.(n.id);
-                }}
-              >
-                +
-              </button>
+              <span key={`add-${n.id}`}>
+                <button
+                  className="pipeline-add"
+                  title="Add a step after this one"
+                  style={{ left: p.x + NODE_W - 9, top: p.y + NODE_H / 2 - 11, zIndex: 3 }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onAddAfter?.(n.id);
+                  }}
+                >
+                  +
+                </button>
+                {onAddBranch && (
+                  <button
+                    className="pipeline-add pipeline-branch"
+                    title="Add a parallel branch from this step"
+                    style={{ left: p.x + NODE_W - 9, top: p.y + NODE_H - 9, zIndex: 3 }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onAddBranch(n.id);
+                    }}
+                  >
+                    ⑂
+                  </button>
+                )}
+              </span>
             );
           })}
         {editable && def.nodes.length === 0 && (

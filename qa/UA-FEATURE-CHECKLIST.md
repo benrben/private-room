@@ -6,6 +6,8 @@
 
 **How to use each item:** exercise the control via the stated path, observe the stated outcome, and only then check it off. If a precondition can't be met in the test environment, mark the item *blocked-precondition* rather than skipping silently. File references (`file.tsx:12`) are for debugging failures, not part of the test.
 
+**Icons, not glyphs (uncommitted):** the UI no longer uses native emoji or typographic symbols. Where an item below writes a trailing `✓` (e.g. "Saved ✓", "Copied ✓", "Installed ✓"), an inline `✓/✕` confirm pair, or a playback `▶`/`◼`/`●`, the app now renders a monochrome **line icon** (check / close / play / stop / pause) beside the word — verify the icon, not the character. Likewise workflow/template "emoji" are line icons from one family.
+
 **Global preconditions to arrange before starting:**
 - macOS with the app installed (after a local build, run `scripts/macsign.sh` or TCC permission grants die).
 - Ollama installed with `qwen3.5:4b` (chat), a vision model, and the embed model for semantic search; some items need Ollama deliberately *stopped* to test degraded states.
@@ -375,25 +377,35 @@
 
 **Library (`WorkflowLibrary.tsx`)**
 - [ ] AI-compose bar: description input (Enter or "Compose with AI"; disabled while busy/empty) → "Composing a workflow…" toast → draft opens with "Draft ready — review and activate it."; failure → error toast (`WorkflowLibrary.tsx:16-56`).
-- [ ] Empty state: heading, template cards (emoji, name, schedule badge, description, "Use template →") → instantiates a draft and opens it; "Blank workflow" ＋ card (`WorkflowLibrary.tsx:152-186`).
-- [ ] Populated: "＋ New workflow" button; cards with emoji/name, 📌 pin indicator, description, Draft badge, last-run dot (Ran OK / Failed / Running), "Drafted by the agent" badge, schedule badge with live countdown ("· in 5m / due now", 30 s auto-tick), file-binding badge "On: …" (`WorkflowLibrary.tsx:188-225`).
+- [ ] Empty state: heading, template cards (a line icon in a muted square, name, schedule badge, description, "Use template →") → instantiates a draft and opens it; "Blank workflow" card with a Plus icon (`WorkflowLibrary.tsx`).
+- [ ] Populated: "New workflow" (Plus icon) + "From template" (Sparkles icon, `aria-pressed` toggle) buttons; cards with a line-icon glyph + name, a pin-icon indicator, description, Draft badge, last-run dot (Ran OK / Failed / Running), "Drafted by the agent" badge, schedule badge with live countdown ("· in 5m / due now", 30 s auto-tick), file-binding badge "On: …" (`WorkflowLibrary.tsx`).
 - [ ] Script-created workflows are hidden here (they live on the Scripts page) (`WorkflowLibrary.tsx:96-99`).
 
 **Detail (`WorkflowDetail.tsx`)**
-- [ ] Header: ← Library · emoji input · name input (edits mark dirty) · ▶ Run now (active only) · Activate (disabled while invalid) / Deactivate · Save (dirty && valid) · 📌 Pin/Unpin (general-scope only) · 🕒 Schedule · Delete (`data-agent-blocked`) (`WorkflowDetail.tsx:170-222`).
+- [ ] Header: ← Library · icon picker (popover of curated line icons — no free-text emoji field) · name input (edits mark dirty) · Run now (play icon; active only) · Activate (disabled while invalid) / Deactivate · Save (enabled only when dirty && valid — dirty is a live diff, so restoring a value to its original clears Save) · Pin/Unpin (pin icon; general-scope only) · Schedule (calendar-clock icon) · Delete (`data-agent-blocked`; confirm dialog names the workflow) (`WorkflowDetail.tsx`).
 - [ ] Draft banner + "Drafted by the agent" badge; validation panel "Fix these before activating:" recomputed on every edit (`WorkflowDetail.tsx:237-253`).
-- [ ] Canvas: auto-layout DAG (no free drag — by design), bezier edges with then/else branch labels, live edge highlight when source node is done, node cards with kind + label + live status (tooltip = peek), click selects; per-node "+" adds a step after; empty-canvas "+" (`PipelineCanvas.tsx:24-167`).
-- [ ] Param sheet per node: Step name; Step type select (Generate text / Summarize a file / Full-file pass / Ask the agent / Save a file / Condition) seeding defaults on switch (`NodeParamSheet.tsx:96-114`).
+- [ ] Canvas: auto-layout DAG (no free drag — by design), bezier edges with branch labels, live edge highlight when source node is done, node cards with kind + label + live status (keyboard-focusable `role=button` with `aria-pressed`, tooltip = peek), click/Enter selects; per-node "+" adds a step after; per-node "⑂" adds a **parallel branch** (fans out); empty-canvas "+" (`PipelineCanvas.tsx`).
+- [ ] Param sheet per node: Step name; Step type select seeding defaults on switch — **16 kinds**: Generate text, Summarize a file, Full-file pass, For each file…, Ask the agent, Extract fields, Route by content, Vote / consensus, Refine (critique loop), Plan &amp; map, Transform text, Merge branches, Fetch a URL, Run a script, Save a file, Condition (`NodeParamSheet.tsx`).
   - [ ] generate: prompt textarea (`{{input}} {{files}} {{date}}` hint) + model segmented Auto/Local/Cloud.
-  - [ ] summarize_file & file_pass: "Which file(s)" select — Newest file / **All files (uncommitted)** / Name contains… (+ pattern input) / Files missing a summary / Added since last run / The file this runs on.
+  - [ ] summarize_file, file_pass & for_each_file: "Which file(s)" select — Newest file / All files / Name contains… (+ pattern input) / Files missing a summary / Added since last run / The file this runs on.
   - [ ] file_pass: instruction textarea + merge/stitch segmented control.
+  - [ ] for_each_file: per-file instruction textarea — fans out over every matching file (branches run in parallel).
   - [ ] agent_run: "Question for the agent" textarea.
+  - [ ] extract: comma-separated field list (e.g. "title, author, date") + "Which file(s)" selector → structured rows.
+  - [ ] route: comma-separated label list (e.g. "urgent, normal, ignore"); the branch editor maps each label to a target node.
+  - [ ] vote: prompt; attempts run in parallel and are aggregated by the chosen mode (consensus).
+  - [ ] refine: prompt; generate→critique loop until the output passes or the round cap.
+  - [ ] plan_and_map: objective textarea — plans sub-tasks, then maps them (orchestrator-workers).
+  - [ ] transform: op select (trim default; replace → find + "Replace with"; append/prepend → "Text"; truncate → "Character count") — runs with **no model call**.
+  - [ ] merge: join-mode select (Concatenate…) — fan-in of several upstream branches.
+  - [ ] http_fetch: URL input ("https://…"; fetched in Rust behind the private-network guard).
+  - [ ] script_run: script picker (room `.py`/`.js`, e.g. "script.py") + Mode radiogroup — "Import files" (script's output files re-imported; result = run report) vs "Pipe (in→out)" (upstream `{{input}}` → stdin, stdout → this step's output); caption explains each.
   - [ ] save_file: file name (`{{date}}` hint), html/md segmented, "When it exists" Create new/Overwrite/Append.
-  - [ ] condition: op select (not empty / empty / contains… / does not contain… / new files since last run) + text input for contains ops; branch editor — per-branch then/else select, target-node select, × remove, "+ Add branch" (forward-target default, disabled with no other nodes) (`NodeParamSheet.tsx:238-293`).
-  - [ ] "Delete step" (`data-agent-blocked`) removes node + its edges (`NodeParamSheet.tsx:297-299`).
+  - [ ] condition: op select (not empty / empty / contains… / does not contain… / new files since last run) + text input for contains ops; branch editor — per-branch then/else select, target-node select, × remove, "+ Add branch" (forward-target default, disabled with no other nodes).
+  - [ ] "Delete step" (`data-agent-blocked`) removes node + its edges (`NodeParamSheet.tsx`).
 - [ ] Binding editor "Where it appears": General / Specific files; file scope → 13 kind badges (image…binary), comma-separated extensions input, "Only this specific file" select (incl. "(bound file — not in this room)" fallback) (`WorkflowDetail.tsx:276-348`).
 - [ ] Schedule popover: Off / Every N minutes / Daily HH:MM / Weekly day+time; Enabled + "Catch up at unlock" checkboxes; caption "Runs while this room is open and unlocked…"; Save with blank kind clears; file-scoped workflows get the disabled variant (`SchedulePopover.tsx:26-118`).
-- [ ] Run history: rows (status dot, trigger, localized start time, error text, ▾ expand) → lazy-loaded per-step artifacts; skipped steps say "Step skipped."; "No runs yet." (`RunHistory.tsx:95-146`).
+- [ ] Run history: expandable rows (`aria-expanded` disclosure button: status dot, trigger, localized start time, error text) → lazy-loaded per-step artifacts with node-named headers, a scrollable body, and a Copy button (flips to a check icon + "Copied"); skipped steps say "Step skipped."; older runs fall back to node names; "No runs yet." (`RunHistory.tsx`).
 - [ ] Live per-node status during a run (canvas updates while running) (`WorkflowDetail.tsx:92-94`).
 - [ ] File-scoped runs: matching workflow appears in the open file's "Actions" menu and runs on that file with toast "<name> started on <file>" + View action (`workflowActions.ts:51-61`).
 - [ ] Pinned workflows run one-click from the TopBar ⌘J menu (`TopBar.tsx:57-65`).
@@ -489,6 +501,13 @@
 
 **Recovery key**
 - [ ] "Create a recovery key" → one-time sheet (Copy / Print / Done); invalidates nothing until created; unlock screen gains the recovery path (`RecoverySection.tsx:29-77`).
+
+**Updates & version (App)** *(uncommitted)*
+- [ ] Nav group "App" → "Updates & version" jumps to the section; shows "Current version v0.5.1" from `getVersion()` (`AboutSection.tsx:28-36`).
+- [ ] "Check for updates" (up-to-date case): button → "Checking…" → green "You're on the latest version." with a check icon; no relaunch (`AboutSection.tsx:38-52`).
+- [ ] "Check for updates" (newer release exists): status "Version vX is available." + a replace/relaunch warning; button becomes primary "Download & install vX" (`AboutSection.tsx:99-118`).
+- [ ] "Download & install" → progress bar "Downloading… N%" → "Installing… the app will relaunch." → signature-verified install + relaunch into the new version (`AboutSection.tsx:54-77`).
+- [ ] Offline / no release: inline error, not a silent no-op ("Couldn't reach the release server…") (`AboutSection.tsx:79-84,151-157`).
 
 ## 28. In-room agent capabilities (chat-invocable tools)
 

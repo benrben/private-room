@@ -133,3 +133,35 @@ export function ClockIcon(p: IconProps) {
     </Stroke>
   );
 }
+
+/** AI authoring / "let the assistant build it" — a four-point sparkle. */
+export function SparklesIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M11 4.5 12.4 8.6 16.5 10 12.4 11.4 11 15.5 9.6 11.4 5.5 10 9.6 8.6z" />
+      <path d="M18 4v3.2M19.6 5.6h-3.2M18.5 15.5v2.4M19.7 16.7h-2.4" />
+    </Stroke>
+  );
+}
+
+/** Pin a workflow to the top bar. */
+export function PinIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M12 16v5" />
+      <path d="M9 4.5h6l-.8 4.2 2.3 2.6a1 1 0 0 1-.75 1.66H7.05a1 1 0 0 1-.76-1.65l2.3-2.61z" />
+    </Stroke>
+  );
+}
+
+/** A clock overlaid on a calendar — the "schedule" affordance. */
+export function CalendarClockIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M20 9.5V6a1.5 1.5 0 0 0-1.5-1.5h-13A1.5 1.5 0 0 0 4 6v12a1.5 1.5 0 0 0 1.5 1.5H10" />
+      <path d="M4 9.5h9M8 3v3M16 3v3" />
+      <circle cx="17" cy="16.5" r="4.5" />
+      <path d="M17 14.3v2.2l1.5 1" />
+    </Stroke>
+  );
+}

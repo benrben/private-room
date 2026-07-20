@@ -10,12 +10,12 @@ import PrivacySection from "./settings/PrivacySection";
 import CheckpointsSection from "./settings/CheckpointsSection";
 import OnlineSection from "./settings/OnlineSection";
 import AdvisorsSection from "./settings/AdvisorsSection";
-import McpSection from "./settings/McpSection";
 import RemoteAiSection from "./settings/RemoteAiSection";
 import RoomServerSection from "./settings/RoomServerSection";
 import RoleSection from "./settings/RoleSection";
 import HelpersSection from "./settings/HelpersSection";
 import RecoverySection from "./settings/RecoverySection";
+import AboutSection from "./settings/AboutSection";
 import { useFocusTrap } from "./settings/useFocusTrap";
 import { useModelManagement } from "./settings/useModelManagement";
 import { useBehaviorSettings } from "./settings/useBehaviorSettings";
@@ -24,7 +24,6 @@ import { usePrivacy } from "./settings/usePrivacy";
 import { useCheckpoints } from "./settings/useCheckpoints";
 import { useOnlineSearch } from "./settings/useOnlineSearch";
 import { useAdvisors } from "./settings/useAdvisors";
-import { useMcpConfig } from "./settings/useMcpConfig";
 import { useRemoteAi } from "./settings/useRemoteAi";
 import { useRoomServer } from "./settings/useRoomServer";
 import { useRoles } from "./settings/useRoles";
@@ -146,21 +145,6 @@ export default function Settings({
   const { advisorsOn, advisorToolsOn, onAdvisorsToggle, onAdvisorToolsToggle } =
     useAdvisors();
 
-  const {
-    mcpConfig,
-    setMcpConfig,
-    mcpStatuses,
-    mcpError,
-    connName,
-    setConnName,
-    connCmd,
-    setConnCmd,
-    connArgs,
-    setConnArgs,
-    applyMcp,
-    addConnector,
-  } = useMcpConfig();
-
   const { closetUrl, setClosetUrl, saveOllamaUrl, closetSaved } = useRemoteAi();
 
   const {
@@ -235,11 +219,11 @@ export default function Settings({
                 ]],
                 ["Connections", [
                   ["set-online", "Online search"],
-                  ["set-mcp", "Connectors (MCP)"],
                   ["set-closet", "Remote AI"],
                   ["set-leash", "Room server"],
                 ]],
                 ["History & storage", [["set-checkpoints", "Checkpoints"]]],
+                ["App", [["set-about", "Updates & version"]]],
               ] as [string, [string, string][]][]
             ).map(([group, items]) => (
               <div key={group} className="settings-nav-group">
@@ -381,21 +365,6 @@ export default function Settings({
               AlertIcon={AlertIcon}
             />
 
-            <McpSection
-              connName={connName}
-              setConnName={setConnName}
-              connCmd={connCmd}
-              setConnCmd={setConnCmd}
-              connArgs={connArgs}
-              setConnArgs={setConnArgs}
-              addConnector={addConnector}
-              mcpConfig={mcpConfig}
-              setMcpConfig={setMcpConfig}
-              applyMcp={applyMcp}
-              mcpStatuses={mcpStatuses}
-              mcpError={mcpError}
-              AlertIcon={AlertIcon}
-            />
 
             <RemoteAiSection
               closetUrl={closetUrl}
@@ -448,6 +417,8 @@ export default function Settings({
               }}
               recoveryErr={recoveryErr}
             />
+
+            <AboutSection />
 
           {error && <div className="gate-error">{error}</div>}
           </div>

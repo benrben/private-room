@@ -23,11 +23,13 @@ import ViewerRouter from "./ViewerRouter";
 import CloudView from "../viewers/CloudView";
 import FrontPage from "./FrontPage";
 import MemoryView from "./MemoryView";
+import ConnectorsView from "./ConnectorsView";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkArea } from "./types";
 import { LayoutApi } from "../shell/useLayout";
 import { WorkflowsPage } from "./workflows/WorkflowsPage";
+import { WorkflowGlyph } from "./workflows/workflowGlyph";
 import { ScriptsPage } from "./scripts/ScriptsPage";
 import { QuickActionsMenu, bindingMatches, QuickAction } from "./QuickActions";
 
@@ -88,6 +90,7 @@ export default function ViewerPane({
     workflows: "Workflows",
     scripts: "Scripts",
     memory: "Memory & scratch pad",
+    connectors: "Connectors",
   };
   const folderName = openFile
     ? s.folders.find(
@@ -204,7 +207,7 @@ export default function ViewerPane({
                   .map((sc) => ({
                     id: sc.fileId,
                     label: sc.name,
-                    icon: "▶",
+                    icon: <PlayIcon size={13} />,
                     hint: `Run ${sc.name}`,
                     onRun: () => void a.runScript(sc.fileId),
                   }));
@@ -349,7 +352,7 @@ export default function ViewerPane({
                   .map((w) => ({
                     id: w.id,
                     label: w.name,
-                    icon: w.emoji || "⚙️",
+                    icon: <WorkflowGlyph emoji={w.emoji} size={15} />,
                     onRun: () =>
                       void a.runWorkflowOn(w.id, openFile.id, openFile.content.name),
                   }));
@@ -454,6 +457,8 @@ export default function ViewerPane({
         <div className="room-map-canvas">
           <RoomMap onOpenFile={(id) => a.viewFile(id)} />
         </div>
+      ) : area === "connectors" ? (
+        <ConnectorsView />
       ) : area === "memory" ? (
         <MemoryView s={s} a={a} info={info} />
       ) : area === "recordings" ? (

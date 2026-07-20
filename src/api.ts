@@ -39,6 +39,7 @@ import type {
   Folder,
   SearchResults,
   McpServerStatus,
+  CatalogEntry,
   AiStatus,
   ModelCaps,
   Chat,
@@ -181,6 +182,74 @@ export const api = {
   // SEC-1b: answer a per-call MCP approval prompt ("once" | "always" | "deny").
   resolveMcpCall: (id: string, decision: "once" | "always" | "deny") =>
     invoke<void>("resolve_mcp_call", { id, decision }),
+  // Marketplace: search the live MCP registry (opt-in gated). Errors when
+  // browsing is off so the UI can show the opt-in gate.
+  mcpRegistrySearch: (query?: string, limit?: number) =>
+    invoke<CatalogEntry[]>("mcp_registry_search", { query, limit }),
+  mcpRegistryOptinStatus: () =>
+    invoke<boolean>("mcp_registry_optin_status"),
+  setMcpRegistryOptin: (enabled: boolean) =>
+    invoke<void>("set_mcp_registry_optin", { enabled }),
+  // OAuth for a remote connector (opens the system browser). Returns the fresh
+  // statuses once the token is stored and the connector reconnects.
+  mcpOauthAuthorize: (server: string) =>
+    invoke<McpServerStatus[]>("mcp_oauth_authorize", { server }),
+  mcpOauthStatus: (server: string) =>
+    invoke<boolean>("mcp_oauth_status", { server }),
+  mcpOauthSignOut: (server: string) =>
+    invoke<McpServerStatus[]>("mcp_oauth_sign_out", { server }),
+  // Fires when an OAuth sign-in reaches the browser step, carrying the authorize
+  // URL — the UI shows it as a manual "open / copy" fallback if the system
+  // browser doesn't open on its own.
+  onMcpOauthUrl: (
+    cb: (p: { server: string; url: string }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ server: string; url: string }>("mcp-oauth-url", (e) => cb(e.payload)),
+  // Turn a connector on/off (keeps it in the config) or remove it entirely.
+  mcpSetServerEnabled: (server: string, enabled: boolean) =>
+    invoke<McpServerStatus[]>("mcp_set_server_enabled", { server, enabled }),
+  mcpRemoveServer: (server: string) =>
+    invoke<McpServerStatus[]>("mcp_remove_server", { server }),
+  // Per-connector tool opt-outs: `{ server: [disabled tool names] }`. Toggling a
+  // tool off keeps the connector but hides that tool from the assistant.
+  mcpGetToolPrefs: async (): Promise<Record<string, string[]>> => {
+    try {
+      return JSON.parse(await invoke<string>("mcp_get_tool_prefs")) as Record<string, string[]>;
+    } catch {
+      return {};
+    }
+  },
+  mcpSetToolEnabled: async (
+    server: string,
+    tool: string,
+    enabled: boolean,
+  ): Promise<Record<string, string[]>> => {
+    try {
+      return JSON.parse(
+        await invoke<string>("mcp_set_tool_enabled", { server, tool, enabled }),
+      ) as Record<string, string[]>;
+    } catch {
+      return {};
+    }
+  },
+  // Connectors exempted from the tool-count cap (all their enabled tools reach
+  // the assistant). A list of server names.
+  mcpGetUncapped: async (): Promise<string[]> => {
+    try {
+      return JSON.parse(await invoke<string>("mcp_get_uncapped")) as string[];
+    } catch {
+      return [];
+    }
+  },
+  mcpSetServerUncapped: async (server: string, uncapped: boolean): Promise<string[]> => {
+    try {
+      return JSON.parse(
+        await invoke<string>("mcp_set_server_uncapped", { server, uncapped }),
+      ) as string[];
+    } catch {
+      return [];
+    }
+  },
   // Wave 2 (Idea 6): answer a diff-preview approval ("once" | "turn" | "deny").
   resolveEditApproval: (id: string, decision: "once" | "turn" | "deny") =>
     invoke<void>("resolve_edit_approval", { id, decision }),

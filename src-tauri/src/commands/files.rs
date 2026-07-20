@@ -438,11 +438,12 @@ pub fn delete_file(
 
 #[tauri::command]
 pub fn save_generated_file(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     name: String,
     content: String,
 ) -> Result<FileMeta, String> {
-    state.with_room(|room| {
+    let meta = state.with_room(|room| {
         let name = if extraction::extension_of(&name).is_empty() {
             format!("{name}.md")
         } else {
@@ -460,7 +461,11 @@ pub fn save_generated_file(
             Some(&content),
             "generated",
         )
-    })
+    })?;
+    // A new file (e.g. a New script .py) must re-index the Scripts page etc.
+    use tauri::Emitter;
+    let _ = app.emit("room-files-changed", ());
+    Ok(meta)
 }
 
 // ---------------------------------------------------------------- import link (ADD-12)
@@ -541,8 +546,19 @@ pub async fn import_link(state: State<'_, AppState>, url: String) -> Result<File
 // ---------------------------------------------------------------- summarize room (ADD-17)
 
 #[tauri::command]
-pub fn rename_file(state: State<'_, AppState>, id: String, name: String) -> Result<(), String> {
-    state.with_room(|room| db::rename_file(&room.conn, &id, &name))
+pub fn rename_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    state.with_room(|room| db::rename_file(&room.conn, &id, &name))?;
+    // A rename can turn a note into a script (.md → .py) or back, and several
+    // views cache file names — signal a room-files change so the Library, the
+    // Scripts index and the front page all re-read.
+    use tauri::Emitter;
+    let _ = app.emit("room-files-changed", ());
+    Ok(())
 }
 
 

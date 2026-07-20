@@ -215,7 +215,12 @@ pub fn list_scripts(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
             let Some(lang) = script_lang_of(&f.name) else {
                 continue;
             };
-            let bytes = db::get_file_bytes(&room.conn, &f.id)?.unwrap_or_default();
+            // A single unreadable blob must not error the WHOLE list (which would
+            // hide every other script) — treat it as empty and keep discovering.
+            let bytes = db::get_file_bytes(&room.conn, &f.id)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             let text = String::from_utf8_lossy(&bytes).into_owned();
             let manifest = parse_script_manifest(&f.name, &text);
             let sha = script_fingerprint(&bytes);

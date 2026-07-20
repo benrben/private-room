@@ -1,4 +1,5 @@
 import { RecoveryKeyIcon } from "./RecoveryKeyIcon";
+import { CircleCheckIcon } from "../icons";
 
 // Recovery-code reveal after create — shown once, then we enter.
 export function RecoveryModal({
@@ -47,7 +48,7 @@ export function RecoveryModal({
           <div className="recovery-sheet-actions">
             <button
               type="button"
-              className={recoveryCopied ? "primary" : undefined}
+              className={recoveryCopied ? "primary btn-ic" : undefined}
               onClick={() => {
                 if (!recoveryCode) return;
                 setRecoveryCopied(true);
@@ -58,7 +59,7 @@ export function RecoveryModal({
                 }
               }}
             >
-              {recoveryCopied ? "Copied ✓" : "Copy code"}
+              {recoveryCopied ? (<><CircleCheckIcon size={13} /> Copied</>) : "Copy code"}
             </button>
             <button type="button" onClick={() => window.print()}>
               Print

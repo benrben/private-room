@@ -1,4 +1,5 @@
 import type { IconComponent, McpServerStatus } from "./types";
+import McpMarketplace from "./McpMarketplace";
 
 interface Props {
   connName: string;
@@ -13,6 +14,11 @@ interface Props {
   applyMcp: () => void;
   mcpStatuses: McpServerStatus[];
   mcpError: string;
+  installServer: (
+    name: string,
+    entry: Record<string, unknown>,
+  ) => Promise<McpServerStatus[]>;
+  installedNames: string[];
   AlertIcon: IconComponent;
 }
 
@@ -29,18 +35,31 @@ export default function McpSection({
   applyMcp,
   mcpStatuses,
   mcpError,
+  installServer,
+  installedNames,
   AlertIcon,
 }: Props) {
   return (
     <section id="set-mcp">
       <h3>Connections (MCP)</h3>
             <p className="settings-hint">
-              Advanced: connect external tool programs with the Model Context
-              Protocol — paste the same <code>mcpServers</code> config used by
-              Claude Desktop or Cursor. For web search you don't need this — use{" "}
-              <strong>Online features</strong> above, the one built-in search
-              path. A "Could not start …" error means that server's program
-              isn't installed on this Mac.
+              Give this room extra tools. Browse the marketplace below, or paste
+              the same <code>mcpServers</code> config used by Claude Desktop or
+              Cursor under <strong>Add manually</strong>. For web search you don't
+              need this — use <strong>Online features</strong> above, the one
+              built-in search path.
+            </p>
+
+            <McpMarketplace
+              installServer={installServer}
+              installedNames={installedNames}
+            />
+
+            <details className="mcp-advanced">
+              <summary>Add manually / paste a config</summary>
+            <p className="settings-hint">
+              A "Could not start …" error means that server's program isn't
+              installed on this Mac.
             </p>
             <p className="settings-hint">
               <AlertIcon size={13} className="warn-ic" /> Connected tools are separate programs and can reach the
@@ -92,12 +111,23 @@ export default function McpSection({
                 Save & Connect
               </button>
             </div>
+            </details>
             {mcpStatuses.length > 0 && (
               <div className="mcp-list">
                 {mcpStatuses.map((s) => (
                   <div key={s.name} className="mcp-row">
                     <span className={`mcp-dot ${s.status}`} />
                     <strong>{s.name}</strong>
+                    <span
+                      className={`mkt-badge ${s.remote ? "remote" : "local"}`}
+                      title={
+                        s.remote
+                          ? "Remote — reaches the internet"
+                          : "Local — runs on your Mac"
+                      }
+                    >
+                      {s.remote ? "Remote" : "Local"}
+                    </span>
                     <span className="settings-hint">
                       {s.status === "connected" &&
                         `${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}: ${s.tools.join(", ")}`}

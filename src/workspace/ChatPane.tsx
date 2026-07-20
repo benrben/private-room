@@ -8,8 +8,10 @@ import {
   HandsFreeIcon,
   MemoryIcon,
   PencilIcon,
+  PlayIcon,
   SparkIcon,
   SpeakerIcon,
+  StopIcon,
   TrashIcon,
   UndoIcon,
 } from "../icons";
@@ -388,7 +390,7 @@ export default function ChatPane({
                   </span>
                 )}
                 <button
-                  className="subtle"
+                  className="subtle btn-ic"
                   title={
                     s.speakingMsgId === m.id
                       ? "Stop speaking"
@@ -396,7 +398,11 @@ export default function ChatPane({
                   }
                   onClick={() => a.speakMessage(m)}
                 >
-                  {s.speakingMsgId === m.id ? "◼ Stop" : "▶ Play"}
+                  {s.speakingMsgId === m.id ? (
+                    <><StopIcon size={12} /> Stop</>
+                  ) : (
+                    <><PlayIcon size={12} /> Play</>
+                  )}
                 </button>
                 <button
                   className="subtle"

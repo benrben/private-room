@@ -1,6 +1,6 @@
 import { WSState } from "../state";
 import { WSActions } from "../actions";
-import { ScriptIcon, CloseIcon } from "../../icons";
+import { ScriptIcon, CloseIcon, PlusIcon } from "../../icons";
 import { ScriptRow } from "./ScriptRow";
 
 type Props = { s: WSState; a: WSActions };
@@ -15,6 +15,9 @@ export function ScriptsPage({ s, a }: Props) {
           <ScriptIcon size={15} /> Scripts
         </span>
         <span className="viewer-actions">
+          <button className="subtle btn-ic" onClick={() => void a.createNewScript()}>
+            <PlusIcon size={13} /> New script
+          </button>
           <button className="subtle btn-ic" onClick={() => a.closeScripts()}>
             <CloseIcon size={12} /> Close
           </button>
@@ -25,10 +28,13 @@ export function ScriptsPage({ s, a }: Props) {
           <div className="scripts-empty">
             <h3>No scripts yet</h3>
             <p className="caption">
-              Add a <code>.py</code> or <code>.js</code> file to this room and it becomes a
-              first-class script — run it with one click or on a schedule. Declare its inputs,
-              outputs and dependencies in a short header:
+              Create one below, or add a <code>.py</code> / <code>.js</code> file to this room — it
+              becomes a first-class script you can run with one click or on a schedule. Declare its
+              inputs, outputs and dependencies in a short header:
             </p>
+            <button className="primary" style={{ margin: "0.4rem 0" }} onClick={() => void a.createNewScript()}>
+              <PlusIcon size={13} /> New script
+            </button>
             <pre className="scripts-manifest-example">{`# /// script
 # dependencies = ["yfinance", "pandas"]
 # ///

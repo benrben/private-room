@@ -566,12 +566,15 @@ pub async fn execute_script_in_workspace(
     script_name: &str,
     timeout_secs: u64,
     cancel: &Arc<AtomicBool>,
+    stdin: Option<&[u8]>,
 ) -> Result<ExecOut, String> {
     let mut cmd = Command::new(&runner.program);
     cmd.args(&runner.argv_prefix)
         .arg(script_name)
         .current_dir(ws)
-        .stdin(Stdio::null())
+        // A `transform`-mode workflow node feeds the upstream {{input}} on stdin;
+        // otherwise stdin is /dev/null (a script never blocks reading a tty).
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Minimal env — NEVER the room path or key. A workspace-local TMPDIR
@@ -587,6 +590,18 @@ pub async fn execute_script_in_workspace(
         .spawn()
         .map_err(|e| format!("Could not start the script: {e}"))?;
     let pgid = child.id();
+
+    // Feed stdin on a thread so a large input can't deadlock against an unread
+    // pipe while we drain stdout/stderr; dropping the handle closes it (EOF).
+    if let Some(bytes) = stdin {
+        if let Some(mut si) = child.stdin.take() {
+            let data = bytes.to_vec();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = si.write_all(&data);
+            });
+        }
+    }
 
     // Drain stdout/stderr on blocking threads into 32 KB ring tails (the
     // sidecar_lifecycle BufReader-on-a-thread pattern).
@@ -846,12 +861,14 @@ pub struct ScriptRunReport {
 /// `consented_sha256` is the hash approved when this run was enqueued (the
 /// immutable snapshot). If the script's CURRENT bytes don't match, the run
 /// PARKS — a mid-run edit never silently runs new code.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_script_process<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     job_id: &str,
     room_path: &str,
     script_file_id: &str,
     consented_sha256: &str,
+    stdin: Option<String>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<ScriptRunReport, String> {
     use tauri::{Emitter, Manager};
@@ -923,6 +940,7 @@ pub(crate) async fn run_script_process<R: tauri::Runtime>(
         &manifest,
         &materialized,
         &script_name,
+        stdin.as_deref().map(str::as_bytes),
         cancel,
     )
     .await;
@@ -950,12 +968,14 @@ async fn run_and_import<R: tauri::Runtime>(
     manifest: &ScriptManifest,
     materialized: &[Materialized],
     script_name: &str,
+    stdin: Option<&[u8]>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<ScriptRunReport, String> {
     use tauri::Manager;
     // uv is detected by its `run` argv prefix; only it can install on the fly.
     let is_uv = runner.argv_prefix.first().map(|s| s == "run").unwrap_or(false);
-    let mut out = execute_script_in_workspace(ws, runner, safe_script, manifest.timeout_secs, cancel).await?;
+    let mut out =
+        execute_script_in_workspace(ws, runner, safe_script, manifest.timeout_secs, cancel, stdin).await?;
 
     // Auto-heal: if the script imports a package it never declared, install it and
     // retry — the user should never have to pip install or declare anything for a
@@ -982,7 +1002,7 @@ async fn run_and_import<R: tauri::Runtime>(
                 program: runner.program.clone(),
                 argv_prefix: argv,
             };
-            out = execute_script_in_workspace(ws, &healed_runner, safe_script, manifest.timeout_secs, cancel).await?;
+            out = execute_script_in_workspace(ws, &healed_runner, safe_script, manifest.timeout_secs, cancel, stdin).await?;
         }
     }
 
@@ -1367,7 +1387,7 @@ mod tests {
             c2.store(true, Ordering::SeqCst);
         });
         let start = Instant::now();
-        let res = execute_script_in_workspace(&ws, &runner, "sleep.sh", 60, &cancel).await;
+        let res = execute_script_in_workspace(&ws, &runner, "sleep.sh", 60, &cancel, None).await;
         assert_eq!(res.unwrap_err(), "STOPPED");
         assert!(start.elapsed() < Duration::from_secs(20), "cancel returned promptly, not after the 30s sleep");
         let _ = std::fs::remove_dir_all(&ws);
@@ -1379,8 +1399,30 @@ mod tests {
         std::fs::write(ws.join("sleep.sh"), b"#!/bin/sh\nsleep 30\n").unwrap();
         let runner = Runner { program: "/bin/sh".into(), argv_prefix: vec![] };
         let cancel = Arc::new(AtomicBool::new(false));
-        let res = execute_script_in_workspace(&ws, &runner, "sleep.sh", MIN_TIMEOUT_SECS, &cancel).await;
+        let res = execute_script_in_workspace(&ws, &runner, "sleep.sh", MIN_TIMEOUT_SECS, &cancel, None).await;
         assert!(res.unwrap_err().contains("timed out"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn stdin_is_piped_to_the_script_and_stdout_captured() {
+        // transform mode feeds {{input}} on stdin; a `cat` echoes it to stdout.
+        let ws = tmp_ws();
+        std::fs::write(ws.join("echo.sh"), b"#!/bin/sh\ncat\n").unwrap();
+        let runner = Runner { program: "/bin/sh".into(), argv_prefix: vec![] };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = execute_script_in_workspace(
+            &ws,
+            &runner,
+            "echo.sh",
+            30,
+            &cancel,
+            Some(b"piped-in payload"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr_tail);
+        assert!(out.stdout_tail.contains("piped-in payload"), "got: {:?}", out.stdout_tail);
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -1390,7 +1432,7 @@ mod tests {
         std::fs::write(ws.join("fail.sh"), b"#!/bin/sh\necho boom 1>&2\nexit 3\n").unwrap();
         let runner = Runner { program: "/bin/sh".into(), argv_prefix: vec![] };
         let cancel = Arc::new(AtomicBool::new(false));
-        let out = execute_script_in_workspace(&ws, &runner, "fail.sh", 30, &cancel).await.unwrap();
+        let out = execute_script_in_workspace(&ws, &runner, "fail.sh", 30, &cancel, None).await.unwrap();
         assert_eq!(out.exit_code, 3);
         assert!(out.stderr_tail.contains("boom"));
         let _ = std::fs::remove_dir_all(&ws);
@@ -1417,7 +1459,7 @@ mod tests {
         let materialized = vec![Materialized { name: "a.txt".into(), sha: script_fingerprint(b"hello") }];
         let runner = Runner { program: py, argv_prefix: vec![] };
         let cancel = Arc::new(AtomicBool::new(false));
-        let out = execute_script_in_workspace(&ws, &runner, "gen.py", 60, &cancel).await.unwrap();
+        let out = execute_script_in_workspace(&ws, &runner, "gen.py", 60, &cancel, None).await.unwrap();
         assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr_tail);
         let manifest = manifest_out(&["b.csv"]);
         let (imported, _skipped) =

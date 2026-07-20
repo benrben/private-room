@@ -58,6 +58,7 @@ const AREA_HEADINGS: Record<WorkArea, string> = {
   workflows: "Workflows",
   scripts: "Scripts",
   memory: "Memory",
+  connectors: "Connectors",
 };
 
 /** The left pane. In the file-centric areas it unifies browsing (the real
@@ -105,7 +106,11 @@ export default function LibraryPane({
         ? s.scripts.length
         : area === "recordings"
           ? s.files.filter(isRecordingFile).length
-          : s.memories.length;
+          : area === "memory"
+            ? s.memories.length
+            : area === "connectors"
+              ? s.mcpStatuses.length
+              : 0;
 
   return (
     <>
@@ -210,6 +215,7 @@ export default function LibraryPane({
       {area === "workflows" && <WorkflowsNav s={s} a={a} />}
       {area === "scripts" && <ScriptsNav s={s} a={a} />}
       {area === "memory" && <MemoryNav s={s} a={a} />}
+      {area === "connectors" && <ConnectorsNav s={s} />}
 
       {(fileArea || area === "recordings") && (
         <div className="source-footer">
@@ -648,13 +654,16 @@ function RecordingsNav({
 /* ---------- Workflows lens ---------- */
 
 function WorkflowsNav({ s, a }: { s: WSState; a: WSActions }) {
+  // Per-script auto-workflows (created_by='script') live on the Scripts page —
+  // keep them out of the workflow list so a script isn't shown as "· by script".
+  const workflows = s.workflows.filter((w) => w.createdBy !== "script");
   return (
     <div className="library-scroll">
       <p className="area-nav-intro">
         Repeatable pipelines over this room's files — run them now or on a
         schedule.
       </p>
-      <button className="area-nav-row" onClick={() => void a.createBlankWorkflow()}>
+      <button className="area-nav-row" onClick={() => a.openWorkflows()}>
         <span className="browse-icon">
           <PlusIcon size={15} />
         </span>
@@ -664,13 +673,13 @@ function WorkflowsNav({ s, a }: { s: WSState; a: WSActions }) {
         </span>
       </button>
       <div className="group-heading">In this room</div>
-      {s.workflows.length === 0 && (
+      {workflows.length === 0 && (
         <div className="empty-hint">
           No workflows yet — create one, or start from a template in the
           center pane.
         </div>
       )}
-      {s.workflows.map((w) => (
+      {workflows.map((w) => (
         <button
           key={w.id}
           className={`area-nav-row${s.wfDetailId === w.id ? " is-current" : ""}`}
@@ -737,6 +746,46 @@ function ScriptsNav({ s, a }: { s: WSState; a: WSActions }) {
             {sc.lang === "py" ? "Python" : "JavaScript"}
           </span>
         </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Connectors lens ---------- */
+
+function ConnectorsNav({ s }: { s: WSState }) {
+  return (
+    <div className="library-scroll">
+      <p className="area-nav-intro">
+        Tool connectors in this room. Manage them and add more in the center
+        pane.
+      </p>
+      <div className="group-heading">Installed</div>
+      {s.mcpStatuses.length === 0 && (
+        <div className="empty-hint">
+          No connectors yet — browse the marketplace in the center pane to add
+          one.
+        </div>
+      )}
+      {s.mcpStatuses.map((m) => (
+        <div key={m.name} className="area-nav-row" title={m.name}>
+          <span className="browse-icon">
+            <span className={`mcp-dot ${m.status}`} />
+          </span>
+          <span className="area-nav-main">
+            <span className="area-nav-title">{m.name}</span>
+            <span className="area-nav-copy">
+              {m.status === "connected"
+                ? `${m.tools.length} tool${m.tools.length === 1 ? "" : "s"}`
+                : m.status === "disabled"
+                  ? "Off"
+                  : m.status === "connecting"
+                    ? "Connecting…"
+                    : (m.error ?? "Failed")}
+            </span>
+          </span>
+          <span className="area-nav-state">{m.remote ? "Remote" : "Local"}</span>
+        </div>
       ))}
     </div>
   );

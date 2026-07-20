@@ -55,3 +55,31 @@ export function AlertIcon(p: IconProps) {
     </Stroke>
   );
 }
+
+/** A checkmark inside a circle — a "succeeded / saved" confirmation. */
+export function CircleCheckIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="m8.5 12 2.4 2.4 4.6-4.8" />
+    </Stroke>
+  );
+}
+
+/** A square stop glyph — the counterpart to PlayIcon for playback controls. */
+export function StopIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <rect x="6.5" y="6.5" width="11" height="11" rx="1.6" />
+    </Stroke>
+  );
+}
+
+/** Two vertical bars — pause a recording/playback. */
+export function PauseIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M9 5v14M15 5v14" />
+    </Stroke>
+  );
+}

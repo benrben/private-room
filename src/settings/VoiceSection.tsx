@@ -1,4 +1,5 @@
 import { VoiceInfo } from "../api";
+import { PlayIcon, StopIcon, CircleCheckIcon } from "../icons";
 import {
   NEURAL_VOICES,
   VoiceArchetype,
@@ -176,11 +177,15 @@ export default function VoiceSection({
       {slider("Reverb", "reverb", 0, 1, 0.05)}
       {slider("Distortion", "distortion", 0, 1, 0.05)}
       <div className="settings-actions">
-        <button className="subtle" onClick={preview}>
-          {previewing ? "◼ Stop preview" : "▶ Preview"}
+        <button className="subtle btn-ic" onClick={preview}>
+          {previewing ? (
+            <><StopIcon size={12} /> Stop preview</>
+          ) : (
+            <><PlayIcon size={12} /> Preview</>
+          )}
         </button>
-        <button className="primary" onClick={save}>
-          {saved ? "Saved ✓" : "Save"}
+        <button className="primary btn-ic" onClick={save}>
+          {saved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
         </button>
       </div>
     </section>

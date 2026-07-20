@@ -1,3 +1,5 @@
+import { CircleCheckIcon } from "../icons";
+
 interface Props {
   recoveryCode: string | null;
   recoveryCopied: boolean;
@@ -40,7 +42,7 @@ export default function RecoverySection({
                 </div>
                 <div className="recovery-sheet-actions">
                   <button
-                    className="primary"
+                    className="primary btn-ic"
                     onClick={() => {
                       setRecoveryCopied(true);
                       try {
@@ -50,7 +52,7 @@ export default function RecoverySection({
                       }
                     }}
                   >
-                    {recoveryCopied ? "Copied ✓" : "Copy code"}
+                    {recoveryCopied ? (<><CircleCheckIcon size={13} /> Copied</>) : "Copy code"}
                   </button>
                   <button className="subtle" onClick={() => window.print()}>
                     Print

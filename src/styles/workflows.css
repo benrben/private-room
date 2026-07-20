@@ -35,7 +35,9 @@
   margin-bottom: 0.6rem;
 }
 .wf-compose-spark {
-  font-size: 1rem;
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent);
   line-height: 1;
 }
 .wf-compose-row {
@@ -107,6 +109,57 @@
   border-color: var(--accent);
 }
 
+/* ---------------- workflow icon picker (detail header) ---------------- */
+.wf-icon-btn {
+  width: 30px;
+  height: 30px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--muted);
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.wf-icon-btn:hover {
+  color: var(--text);
+  border-color: var(--line);
+}
+.wf-icon-grid {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 40;
+  margin-top: 5px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding: 6px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+}
+.wf-icon-choice {
+  width: 34px;
+  height: 34px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.wf-icon-choice:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.wf-icon-choice.active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 /* ---------------- library grid ---------------- */
 .wf-grid {
   display: grid;
@@ -142,9 +195,28 @@
   align-items: center;
   gap: 0.55rem;
 }
+/* One quiet, uniform icon container for every card (templates + workflows):
+   a muted 28px rounded square holding a line icon, never a colorful pictogram. */
 .wf-card-emoji {
-  font-size: 1.4rem;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--muted);
   line-height: 1;
+}
+.wf-card:hover .wf-card-emoji,
+.wf-card:focus-visible .wf-card-emoji {
+  color: var(--text);
+}
+.wf-card-pin {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent);
 }
 .wf-card-name {
   font-weight: 600;
@@ -328,6 +400,21 @@
   border-style: solid;
   border-color: var(--accent, #6b6bff);
 }
+/* The parallel-branch (fan-out) affordance, sitting below a node's tail "+" . */
+.pipeline-branch {
+  color: var(--accent-2, #12a594);
+  font-size: 0.8rem;
+}
+/* Fan-in checkbox rows in the param sheet. */
+.wf-input-row {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 400;
+}
+.wf-input-row input {
+  width: auto;
+}
 
 /* ---------------- param sheet ---------------- */
 .node-param-sheet {
@@ -339,12 +426,24 @@
   flex-direction: column;
   gap: 0.6rem;
 }
-.node-param-sheet label {
+.node-param-sheet label,
+.node-param-sheet .field {
   font-size: 0.78rem;
   font-weight: 600;
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
+}
+/* A radiogroup field heading (used instead of a <label>, which must not wrap a
+ * multi-button group). */
+.node-param-sheet .field-head {
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+/* Clickable cards are role=button — show a keyboard focus ring. */
+.wf-card:focus-visible {
+  outline: 2px solid var(--accent, #6b6bff);
+  outline-offset: 2px;
 }
 .node-param-sheet textarea,
 .node-param-sheet input[type="text"],
@@ -445,6 +544,58 @@
   align-items: center;
   cursor: pointer;
   font-size: 0.82rem;
+  /* now a real <button> for disclosure semantics — strip the default chrome */
+  width: 100%;
+  background: none;
+  border: none;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  padding: 0.15rem 0;
+}
+.run-step-head {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.2rem;
+}
+.run-step-kind {
+  font-size: 0.66rem;
+  opacity: 0.6;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.run-step-copy {
+  font-size: 0.68rem;
+  padding: 0.05rem 0.4rem;
+}
+.run-step-body {
+  max-height: 260px;
+  overflow: auto;
+  border-radius: 6px;
+}
+/* Keyboard focus rings for the now-focusable canvas nodes + disclosure rows. */
+.pipeline-node:focus-visible,
+.run-row-head:focus-visible {
+  outline: 2px solid var(--accent, #6b6bff);
+  outline-offset: 2px;
+}
+/* A validation error that maps to a node — click to select it. */
+.wf-error-link {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+.wf-error-link:hover {
+  text-decoration: underline;
 }
 .run-row-trigger {
   font-size: 0.68rem;

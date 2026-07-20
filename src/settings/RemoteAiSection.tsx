@@ -1,4 +1,5 @@
 import type { IconComponent } from "./types";
+import { CircleCheckIcon } from "../icons";
 
 interface Props {
   closetUrl: string;
@@ -36,8 +37,8 @@ export default function RemoteAiSection({
               never leave this Mac.
             </p>
             <div className="settings-actions">
-              <button className="primary" onClick={saveOllamaUrl}>
-                {closetSaved ? "Saved ✓" : "Save"}
+              <button className="primary btn-ic" onClick={saveOllamaUrl}>
+                {closetSaved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
               </button>
             </div>
     </section>
