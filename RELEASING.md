@@ -129,19 +129,19 @@ afterwards without rebuilding:
 
 1. Build everything the same way (`release.sh` steps, skipping the minisign
    sign + `latest.json`), and publish the release with **both** the DMG and
-   the **unsigned** `Private.Room.app.tar.gz`.
+   the **unsigned** `Arcelle.app.tar.gz`.
 2. `releases/latest/download/latest.json` now 404s, so existing installs'
    update checks quietly no-op — nobody sees an error; downloads work.
 3. Later, on a machine with the key: download that exact `app.tar.gz` asset,
    sign it, write `latest.json`, upload both:
    ```sh
-   gh release download v<version> -p "Private.Room.app.tar.gz"
+   gh release download v<version> -p "Arcelle.app.tar.gz"
    npm run tauri signer sign -- --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
      ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+--password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"} \
-     Private.Room.app.tar.gz
+     Arcelle.app.tar.gz
    # build latest.json from the .sig (version, notes, pub_date, url — see
    # the template block in scripts/release.sh), then:
-   gh release upload v<version> --clobber Private.Room.app.tar.gz latest.json
+   gh release upload v<version> --clobber Arcelle.app.tar.gz latest.json
    ```
    Auto-update is live the moment `latest.json` lands on the release marked
    **Latest**.

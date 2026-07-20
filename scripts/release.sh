@@ -143,8 +143,8 @@ done
 # updater URL in latest.json is deterministic and matches the uploaded asset.
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
-cp "$DMG" "${STAGE}/Private.Room_${VER}_aarch64.dmg"
-cp "$TAR" "${STAGE}/Private.Room.app.tar.gz"
+cp "$DMG" "${STAGE}/Arcelle_${VER}_aarch64.dmg"
+cp "$TAR" "${STAGE}/Arcelle.app.tar.gz"
 
 SIGNATURE="$(cat "$SIG")"
 PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -161,14 +161,14 @@ node -e 'const e = process.env; process.stdout.write(JSON.stringify({
   platforms: {
     "darwin-aarch64": {
       signature: e.SIGNATURE,
-      url: `https://github.com/${e.REPO}/releases/download/${e.TAG}/Private.Room.app.tar.gz`
+      url: `https://github.com/${e.REPO}/releases/download/${e.TAG}/Arcelle.app.tar.gz`
     }
   }
 }, null, 2) + "\n")' > "${STAGE}/latest.json"
 
 ASSETS=(
-  "${STAGE}/Private.Room_${VER}_aarch64.dmg"
-  "${STAGE}/Private.Room.app.tar.gz"
+  "${STAGE}/Arcelle_${VER}_aarch64.dmg"
+  "${STAGE}/Arcelle.app.tar.gz"
   "${STAGE}/latest.json"
 )
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then

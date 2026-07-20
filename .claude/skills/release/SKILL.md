@@ -121,7 +121,7 @@ gh release view v<version> --repo benrben/private-room \
 curl -sL https://github.com/benrben/private-room/releases/latest/download/latest.json \
   | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['version'])"
 ```
-Expect three assets (`.dmg`, `Private.Room.app.tar.gz`, `latest.json`),
+Expect three assets (`.dmg`, `Arcelle.app.tar.gz`, `latest.json`),
 `prerelease:false`, and `latest.json` → the new version. Marking the release
 **Latest** (the default, non-prerelease) is what makes auto-update go live.
 
