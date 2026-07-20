@@ -1,7 +1,7 @@
 import { IconProps } from "./types";
 import { Stroke } from "./base";
 
-/* ---------- logomark: arched doorway with keyhole ---------- */
+/* ---------- logomark: the folded Arcelle "A" ---------- */
 
 export function Logomark({ size = 24, className }: IconProps) {
   return (
@@ -13,20 +13,14 @@ export function Logomark({ size = 24, className }: IconProps) {
       className={className}
       aria-hidden
     >
-      <path
-        d="M6 20.5V10.8a6 6 0 0 1 12 0v9.7"
+      <g
         stroke="var(--accent)"
-        strokeWidth="1.8"
+        strokeWidth="1.9"
         strokeLinecap="round"
-      />
-      <path
-        d="M4 20.5h16"
-        stroke="var(--accent)"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-      />
-      <circle cx="12" cy="10.8" r="2.1" fill="var(--accent)" />
-      <path d="M12 12.4l-1.5 4.8h3l-1.5-4.8z" fill="var(--accent)" />
+        strokeLinejoin="round"
+      >
+        <path d="M12 3.6 19.4 20.4 M12 3.6 4.6 20.4 M7.8 15 H16.2" />
+      </g>
     </svg>
   );
 }

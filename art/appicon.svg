@@ -1,49 +1,46 @@
-<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Arcelle folded A app icon</title>
+  <desc id="desc">A sculptural lavender ribbon folded into an interlocking capital A over a dark technical grid, with a small amber encryption seam.</desc>
   <defs>
-    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#1a1f2a"/>
-      <stop offset="55%" stop-color="#10131a"/>
-      <stop offset="100%" stop-color="#0a0c10"/>
-    </linearGradient>
-    <radialGradient id="halo" cx="50%" cy="38%" r="55%">
-      <stop offset="0%" stop-color="#8b7cf6" stop-opacity="0.32"/>
-      <stop offset="60%" stop-color="#8b7cf6" stop-opacity="0.08"/>
-      <stop offset="100%" stop-color="#8b7cf6" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="doorlight" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#8b7cf6" stop-opacity="0.16"/>
-      <stop offset="100%" stop-color="#8b7cf6" stop-opacity="0.02"/>
-    </linearGradient>
-    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
-      <feGaussianBlur stdDeviation="26"/>
-    </filter>
-    <clipPath id="squircle">
-      <rect x="100" y="100" width="824" height="824" rx="185"/>
-    </clipPath>
+    <clipPath id="squircle-clip"><rect x="43" y="43" width="938" height="938" rx="226"/></clipPath>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#17151c"/><stop offset="0.48" stop-color="#121116"/><stop offset="1" stop-color="#0d0c10"/></linearGradient>
+    <radialGradient id="ink-glow" cx="50%" cy="48%" r="62%"><stop offset="0" stop-color="#24202d" stop-opacity="0.58"/><stop offset="0.58" stop-color="#121116" stop-opacity="0"/><stop offset="1" stop-color="#050407" stop-opacity="0.35"/></radialGradient>
+    <pattern id="minor-grid" width="48" height="48" patternUnits="userSpaceOnUse"><path d="M48 0H0V48" fill="none" stroke="#65449a" stroke-width="1.5" opacity="0.24"/></pattern>
+    <pattern id="major-grid" width="192" height="192" patternUnits="userSpaceOnUse"><path d="M192 0H0V192" fill="none" stroke="#65449a" stroke-width="5" opacity="0.47"/></pattern>
+    <linearGradient id="ribbon-front" x1="0.18" y1="0.05" x2="0.85" y2="0.96"><stop offset="0" stop-color="#dbcafb"/><stop offset="0.20" stop-color="#c3acf2"/><stop offset="0.52" stop-color="#ae93e7"/><stop offset="0.82" stop-color="#8a68c3"/><stop offset="1" stop-color="#65449a"/></linearGradient>
+    <linearGradient id="ribbon-right" x1="0.08" y1="0" x2="0.92" y2="1"><stop offset="0" stop-color="#a987df"/><stop offset="0.36" stop-color="#8967c1"/><stop offset="0.72" stop-color="#6f4fa6"/><stop offset="1" stop-color="#513478"/></linearGradient>
+    <linearGradient id="ribbon-cross" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8060b8"/><stop offset="0.48" stop-color="#ae93e7"/><stop offset="1" stop-color="#54377d"/></linearGradient>
+    <linearGradient id="inner-face" x1="0" y1="0" x2="0.9" y2="1"><stop offset="0" stop-color="#211b2b"/><stop offset="0.55" stop-color="#15121b"/><stop offset="1" stop-color="#08070b"/></linearGradient>
+    <linearGradient id="edge-light" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f0e8ff" stop-opacity="0.95"/><stop offset="0.48" stop-color="#d4c3f6" stop-opacity="0.38"/><stop offset="1" stop-color="#ae93e7" stop-opacity="0"/></linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff0b5"/><stop offset="0.38" stop-color="#dfbc72"/><stop offset="1" stop-color="#876116"/></linearGradient>
+    <filter id="paper" x="-10%" y="-10%" width="120%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.82" numOctaves="3" seed="17" result="noise"/><feColorMatrix in="noise" type="saturate" values="0" result="gray"/><feComponentTransfer in="gray" result="faint-noise"><feFuncA type="table" tableValues="0 0.06"/></feComponentTransfer><feBlend in="SourceGraphic" in2="faint-noise" mode="soft-light"/></filter>
+    <filter id="mark-shadow" x="-40%" y="-40%" width="180%" height="190%"><feDropShadow dx="0" dy="26" stdDeviation="22" flood-color="#000000" flood-opacity="0.72"/><feDropShadow dx="0" dy="9" stdDeviation="12" flood-color="#65449a" flood-opacity="0.30"/></filter>
+    <filter id="amber-glow" x="-200%" y="-200%" width="500%" height="500%"><feGaussianBlur stdDeviation="5" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
   </defs>
-
-  <!-- tile -->
-  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)"/>
-  <g clip-path="url(#squircle)">
-    <rect x="100" y="100" width="824" height="824" fill="url(#halo)"/>
+  <g clip-path="url(#squircle-clip)">
+    <rect x="43" y="43" width="938" height="938" rx="226" fill="url(#ink)"/>
+    <rect x="43" y="43" width="938" height="938" fill="url(#minor-grid)"/>
+    <rect x="43" y="43" width="938" height="938" fill="url(#major-grid)"/>
+    <rect x="43" y="43" width="938" height="938" fill="url(#ink-glow)"/>
+    <rect x="43" y="43" width="938" height="938" rx="226" fill="transparent" filter="url(#paper)"/>
   </g>
-  <rect x="106" y="106" width="812" height="812" rx="179" stroke="#8b7cf6" stroke-opacity="0.22" stroke-width="6"/>
-
-  <!-- light inside the doorway -->
-  <path d="M362 700V470a150 150 0 0 1 300 0v230H362z" fill="url(#doorlight)"/>
-
-  <!-- glow pass of the mark -->
-  <g filter="url(#glow)" opacity="0.85">
-    <path d="M362 700V470a150 150 0 0 1 300 0v230" stroke="#8b7cf6" stroke-width="36" stroke-linecap="round"/>
-    <path d="M312 700h400" stroke="#8b7cf6" stroke-width="36" stroke-linecap="round"/>
-    <circle cx="512" cy="470" r="54" fill="#8b7cf6"/>
-    <path d="M512 512l-36 128h72l-36-128z" fill="#8b7cf6"/>
+  <rect x="45" y="45" width="934" height="934" rx="224" fill="none" stroke="#40334f" stroke-width="4" opacity="0.56"/>
+  <g id="arcelle-mark" filter="url(#mark-shadow)">
+    <path d="M375 623 L654 710 Q668 715 661 730 L635 778 Q628 790 614 784 L345 682 Z" fill="url(#ribbon-cross)"/>
+    <path d="M380 624 L651 713" fill="none" stroke="#d4c3f6" stroke-width="4" opacity="0.46"/>
+    <path d="M346 682 L615 784 Q628 789 635 778 L648 754 L377 650 Z" fill="url(#inner-face)" opacity="0.74"/>
+    <path d="M507 279 Q523 263 541 274 Q550 279 557 294 L731 739 Q738 757 727 772 L702 800 Q692 812 677 805 L637 785 L470 337 Q463 319 473 304 Z" fill="url(#ribbon-right)"/>
+    <path d="M540 276 Q551 281 558 296 L731 739" fill="none" stroke="#d4c3f6" stroke-width="5" opacity="0.64"/>
+    <path d="M637 785 L677 805 Q692 812 702 800 L727 772 Q735 761 731 744 L692 779 Q684 786 673 781 L650 769 Z" fill="url(#inner-face)"/>
+    <path d="M494 277 Q507 264 524 269 Q542 275 548 292 Q552 303 546 318 L381 737 Q376 749 387 758 L365 797 Q356 813 339 810 Q331 809 323 801 L304 781 Q292 769 298 750 L479 308 Q484 288 494 277 Z" fill="url(#ribbon-front)"/>
+    <path d="M496 279 Q509 266 525 271 Q541 276 547 292" fill="none" stroke="url(#edge-light)" stroke-width="7" stroke-linecap="round"/>
+    <path d="M302 750 L479 308" fill="none" stroke="#eadfff" stroke-width="4" opacity="0.43"/>
+    <path d="M304 781 Q292 769 298 750 L307 729 Q304 756 322 768 L353 786 Q363 792 371 782 L365 797 Q356 813 339 810 Q331 809 323 801 Z" fill="url(#inner-face)"/>
+    <path d="M304 781 Q293 770 298 750" fill="none" stroke="#9b7bd2" stroke-width="3" opacity="0.72"/>
+    <path d="M381 737 L546 318" fill="none" stroke="#65449a" stroke-width="4" opacity="0.65"/>
+    <path d="M470 337 L637 785" fill="none" stroke="#cdb9f3" stroke-width="3" opacity="0.30"/>
+    <path d="M672 781 L707 785" fill="none" stroke="url(#amber)" stroke-width="7" stroke-linecap="round" filter="url(#amber-glow)"/>
+    <circle cx="672" cy="781" r="3.4" fill="#fff0b5"/>
   </g>
-
-  <!-- crisp mark -->
-  <path d="M362 700V470a150 150 0 0 1 300 0v230" stroke="#8b7cf6" stroke-width="34" stroke-linecap="round"/>
-  <path d="M312 700h400" stroke="#8b7cf6" stroke-width="34" stroke-linecap="round"/>
-  <circle cx="512" cy="470" r="52" fill="#8b7cf6"/>
-  <path d="M512 510l-34 126h68l-34-126z" fill="#8b7cf6"/>
-  <circle cx="512" cy="458" r="16" fill="#c9c1fb" opacity="0.9"/>
 </svg>
