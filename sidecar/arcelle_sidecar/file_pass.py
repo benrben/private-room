@@ -314,10 +314,18 @@ async def run_map(
     )
     result = "" if parsed is _SKIP else _field(parsed, result_key).strip()
     if not result:
-        # A double-failure (_SKIP) OR a valid-but-EMPTY reply (a small model can
-        # return {"notes": ""} on a hard window): either way there is nothing to
-        # carry. Mark the window skipped and keep the INCOMING thread flowing so
-        # the next window still reads in context; coverage counts it honestly.
+        # The structured reply was a double-failure (_SKIP) or a valid-but-EMPTY
+        # reply. A small model often can't wrap CODE / CSV / tabular content — full
+        # of braces and quotes — in the forced {notes, thread} JSON, so it returns
+        # nothing usable even for a window that clearly HAS text. Rather than drop
+        # the window (which reads to the user as "0 of N parts could not be
+        # processed" for a file we can plainly see), fall back to the raw window
+        # text so this content is still COVERED: the section step then composes a
+        # summary from it (or, failing that, publishes it raw). Coverage stays
+        # honest — only a genuinely empty window is marked skipped.
+        fallback = clamp_bytes(window_text.strip(), result_cap)
+        if fallback:
+            return {"result": fallback, "thread": thread, "skipped": False}
         return {"result": "", "thread": thread, "skipped": True}
     return {
         "result": clamp_bytes(result, result_cap),

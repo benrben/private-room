@@ -183,15 +183,29 @@ async def test_map_thread_is_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(art["thread"].encode("utf-8")) == file_pass.PASS_THREAD_MAX
 
 
-async def test_map_double_parse_failure_skips_and_keeps_incoming_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_map_double_parse_failure_falls_back_to_raw_window_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A double parse failure (e.g. a small model can't wrap code/CSV in the forced
+    # JSON) no longer drops the window: the raw window text is used so the content
+    # is still COVERED, and the incoming thread flows on for the next window.
     fake = set_replies(monkeypatch, "not json", "still not json")
     art = await file_pass.run_map(
         model="m", base_url="http://h:1", mode="merge", file_name="f", instruction="i",
-        part=2, total=5, start=0, end=10, text_len=100, thread="carried context", window_text="w",
+        part=2, total=5, start=0, end=10, text_len=100, thread="carried context",
+        window_text="the real content of this part",
     )
-    # skipped, but the incoming thread flows on so the NEXT window still reads in context
-    assert art == {"result": "", "thread": "carried context", "skipped": True}
+    assert art == {"result": "the real content of this part", "thread": "carried context", "skipped": False}
     assert len(fake.calls) == 2  # one retry
+
+
+async def test_map_empty_window_with_failed_reply_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only a GENUINELY empty window (no text to fall back to) is marked skipped.
+    fake = set_replies(monkeypatch, "not json", "still not json")
+    art = await file_pass.run_map(
+        model="m", base_url="http://h:1", mode="merge", file_name="f", instruction="i",
+        part=2, total=5, start=0, end=10, text_len=100, thread="carried context", window_text="   ",
+    )
+    assert art == {"result": "", "thread": "carried context", "skipped": True}
+    assert len(fake.calls) == 2
 
 
 async def test_map_retries_once_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -230,15 +244,16 @@ async def test_map_transient_engine_error_retries(monkeypatch: pytest.MonkeyPatc
     assert len(fake.calls) == 2
 
 
-async def test_map_empty_reply_skips_and_keeps_incoming_thread(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A valid-but-empty map reply marks the window skipped (honest coverage) and
-    # keeps the INCOMING thread flowing, exactly like a double parse failure.
+async def test_map_empty_reply_falls_back_to_raw_window_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A valid-but-empty map reply (a small model returning {"notes": ""} on a hard
+    # window) falls back to the raw window text so the content is still covered,
+    # keeping the INCOMING thread flowing for the next window.
     fake = set_replies(monkeypatch, json.dumps({"notes": "  ", "thread": "ignored"}))
     art = await file_pass.run_map(
         model="m", base_url="http://h:1", mode="merge", file_name="f", instruction="i",
-        part=3, total=6, start=0, end=10, text_len=100, thread="carried", window_text="w",
+        part=3, total=6, start=0, end=10, text_len=100, thread="carried", window_text="raw part text",
     )
-    assert art == {"result": "", "thread": "carried", "skipped": True}
+    assert art == {"result": "raw part text", "thread": "carried", "skipped": False}
     assert len(fake.calls) == 1  # parsed fine, no retry
 
 
