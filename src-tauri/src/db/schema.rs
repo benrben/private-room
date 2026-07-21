@@ -209,6 +209,30 @@ CREATE TABLE IF NOT EXISTS schedules (
   last_job_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_wf ON schedules(workflow_id);
+-- Agent Skills are a separate library, not room files.  The two-table shape is
+-- an encrypted representation of the portable folder contract: one metadata +
+-- instruction row (SKILL.md) and any number of relative resource paths below it.
+CREATE TABLE IF NOT EXISTS skills (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL,
+  instructions TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_by TEXT NOT NULL DEFAULT 'user',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE TABLE IF NOT EXISTS skill_resources (
+  id TEXT PRIMARY KEY,
+  skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'reference',
+  content BLOB NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  UNIQUE(skill_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_skill_resources_skill ON skill_resources(skill_id);
 "#;
 
 pub(crate) fn apply_key(conn: &Connection, password: &str) -> Result<(), String> {
@@ -651,6 +675,33 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
            rules_sha256 TEXT NOT NULL,
            scanned_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
          );",
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Skills mirror the portable SKILL.md folder format while remaining inside
+    // the encrypted room and outside the ordinary `files` library.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS skills (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL UNIQUE,
+           description TEXT NOT NULL,
+           instructions TEXT NOT NULL DEFAULT '',
+           enabled INTEGER NOT NULL DEFAULT 1,
+           created_by TEXT NOT NULL DEFAULT 'user',
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );
+         CREATE TABLE IF NOT EXISTS skill_resources (
+           id TEXT PRIMARY KEY,
+           skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+           path TEXT NOT NULL,
+           kind TEXT NOT NULL DEFAULT 'reference',
+           content BLOB NOT NULL,
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           UNIQUE(skill_id, path)
+         );
+         CREATE INDEX IF NOT EXISTS idx_skill_resources_skill ON skill_resources(skill_id);",
     )
     .map_err(|e| e.to_string())?;
     Ok(())

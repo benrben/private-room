@@ -31,6 +31,7 @@ import { LayoutApi } from "../shell/useLayout";
 import { WorkflowsPage } from "./workflows/WorkflowsPage";
 import { WorkflowGlyph } from "./workflows/workflowGlyph";
 import { ScriptsPage } from "./scripts/ScriptsPage";
+import SkillsView from "./skills/SkillsView";
 import { QuickActionsMenu, bindingMatches, QuickAction } from "./QuickActions";
 
 /** True when a file name is a runnable script (.py/.js). */
@@ -89,6 +90,7 @@ export default function ViewerPane({
     recordings: "Recordings",
     workflows: "Workflows",
     scripts: "Scripts",
+    skills: "Skills",
     memory: "Memory & scratch pad",
     connectors: "Connectors",
   };
@@ -459,6 +461,8 @@ export default function ViewerPane({
         </div>
       ) : area === "connectors" ? (
         <ConnectorsView />
+      ) : area === "skills" ? (
+        <SkillsView s={s} a={a} />
       ) : area === "memory" ? (
         <MemoryView s={s} a={a} info={info} />
       ) : area === "recordings" ? (

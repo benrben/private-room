@@ -23,6 +23,12 @@ _LABELS: dict[str, str] = {
     "add_memory": "Saved a memory",
     # Wave 1b (idea 5): read-back for the budget-truncated injection.
     "list_memories": "Listed the saved memories",
+    "list_skills": "Listed the room's skills",
+    "read_skill": "Loaded a skill",
+    "read_skill_resource": "Read a skill resource",
+    "save_skill": "Drafted a skill",
+    "write_skill_resource": "Saved a skill resource",
+    "run_skill_script": "Ran a skill script",
     "web_search": "Searched the web",
     "fetch_page": "Fetched a page",
     # ADD-25: the agent is operating the app with the user watching.

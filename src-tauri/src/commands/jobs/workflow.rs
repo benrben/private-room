@@ -2744,7 +2744,7 @@ fn compose_prompt(description: &str) -> String {
 /// Generate text from whatever engine the room is set to — a local/cloud Ollama
 /// model or an external CLI (Codex/Claude). Used by `compose_workflow` so it works
 /// on ANY engine, including a plain-text external CLI that has no room tools.
-async fn generate_text_any_engine(model: &str, prompt: &str) -> Result<String, String> {
+pub(crate) async fn generate_text_any_engine(model: &str, prompt: &str) -> Result<String, String> {
     let msgs = vec![ollama::ChatMessage::new("user", prompt)];
     if is_external_engine(model) {
         crate::commands::run_external(model, &msgs, None, None, false).await
@@ -3612,4 +3612,3 @@ mod tests {
         assert_eq!(extract.lane, Lane::LocalLlm, "extract calls the model");
     }
 }
-

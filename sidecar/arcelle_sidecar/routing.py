@@ -37,6 +37,8 @@ WRITE_TOOL_NAMES: tuple[str, ...] = (
     "rename_file",
     "move_file",
     "add_memory",
+    "save_skill",
+    "write_skill_resource",
 )
 
 #: The UI/perception tools (ADD-25). Never in the bridge's cloud scope.

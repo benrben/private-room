@@ -21,6 +21,7 @@ import {
   SearchResults,
   ScriptInfo,
   ScriptApproveRequest,
+  SkillSummary,
   StudioPrompts,
   Workflow,
   WorkflowNodeEvent,
@@ -218,6 +219,10 @@ export function useWorkspaceState(_info: RoomInfo) {
   const showScriptsRef = useRef(false);
   showScriptsRef.current = showScripts;
   const [scripts, setScripts] = useState<ScriptInfo[]>([]);
+  // Skills are their own encrypted library (not files/folders). Only metadata
+  // lives here; the selected SKILL.md + resource tree is loaded on demand.
+  const [skills, setSkills] = useState<SkillSummary[]>([]);
+  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
   // Queued script-run consent cards, mirroring mcpApprovals.
   const [scriptApprovals, setScriptApprovals] = useState<ScriptApproveRequest[]>([]);
   // Per-job map of node id → live status, driving the pipeline animation.
@@ -371,6 +376,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     showWorkflows, setShowWorkflows, showWorkflowsRef, wfDetailId, setWfDetailId,
     workflows, setWorkflows, wfNodeStatus, setWfNodeStatus,
     showScripts, setShowScripts, showScriptsRef, scripts, setScripts,
+    skills, setSkills, selectedSkillId, setSelectedSkillId,
     scriptApprovals, setScriptApprovals,
     qaMenuOpen, setQaMenuOpen, qaFileMenuOpen, setQaFileMenuOpen,
     qaScriptMenuOpen, setQaScriptMenuOpen,

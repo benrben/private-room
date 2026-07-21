@@ -31,6 +31,9 @@ import type {
   ScriptInfo,
   ScriptManifest,
   ScriptApproveRequest,
+  SkillSummary,
+  SkillBundle,
+  SkillResourceContent,
   FileVersion,
   VersionContent,
   CheckpointMeta,
@@ -345,6 +348,37 @@ export const api = {
   /** Answer a script-run consent card ("once" | "always" | "deny"). */
   resolveScriptRun: (id: string, decision: "once" | "always" | "deny") =>
     invoke<void>("resolve_script_run", { id, decision }),
+  // ---- Portable Agent Skills (separate from ordinary room files) ----
+  listSkills: () => invoke<SkillSummary[]>("list_skills"),
+  getSkill: (id: string) => invoke<SkillBundle>("get_skill", { id }),
+  createSkill: (name: string, description: string, instructions: string) =>
+    invoke<string>("create_skill", { name, description, instructions }),
+  updateSkill: (id: string, name: string, description: string, instructions: string) =>
+    invoke<void>("update_skill", { id, name, description, instructions }),
+  setSkillEnabled: (id: string, enabled: boolean) =>
+    invoke<void>("set_skill_enabled", { id, enabled }),
+  deleteSkill: (id: string) => invoke<void>("delete_skill", { id }),
+  getSkillResource: (skillId: string, path: string) =>
+    invoke<SkillResourceContent>("get_skill_resource", { skillId, path }),
+  saveSkillResource: (
+    skillId: string,
+    path: string,
+    content: { text?: string; dataB64?: string },
+  ) =>
+    invoke<void>("save_skill_resource", {
+      skillId,
+      path,
+      text: content.text ?? null,
+      dataB64: content.dataB64 ?? null,
+    }),
+  deleteSkillResource: (skillId: string, path: string) =>
+    invoke<void>("delete_skill_resource", { skillId, path }),
+  importSkillFolder: (path: string) =>
+    invoke<string>("import_skill_folder", { path }),
+  exportSkillFolder: (id: string, destination: string) =>
+    invoke<string>("export_skill_folder", { id, destination }),
+  composeSkill: (description: string) =>
+    invoke<string>("compose_skill", { description }),
   aiStatus: () => invoke<AiStatus>("ai_status"),
   /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
   modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
@@ -533,6 +567,8 @@ export const api = {
     listen<WorkflowNodeEvent>("workflow-node", (e) => cb(e.payload)),
   onWorkflowsChanged: (cb: () => void): Promise<UnlistenFn> =>
     listen("workflows-changed", () => cb()),
+  onSkillsChanged: (cb: () => void): Promise<UnlistenFn> =>
+    listen("skills-changed", () => cb()),
   // Wave 5 (Idea 13): the backend is about to run a script from this room and
   // needs the user's consent (SEC-1 — the card is data-agent-blocked).
   onScriptApproveRequest: (

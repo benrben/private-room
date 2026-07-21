@@ -106,6 +106,43 @@ async fn script_run_approved(
     decision.approved
 }
 
+/// Reuse the exact content-addressed consent gate for a script bundled in an
+/// Agent Skill. The caller supplies the bytes and then runs the returned
+/// interpreter in an isolated, materialized skill workspace.
+pub(crate) async fn approve_script_bytes(
+    window: &tauri::Window,
+    state: &AppState,
+    display_name: &str,
+    bytes: &[u8],
+) -> Result<(Runner, ScriptManifest), String> {
+    use tauri::Manager as _;
+    if script_lang_of(display_name).is_none() {
+        return Err("Only .py or .js skill scripts can be run.".into());
+    }
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    let manifest = parse_script_manifest(display_name, &text);
+    let runner = resolve_interpreter(&manifest)?;
+    let sha = script_fingerprint(bytes);
+    let app = window.app_handle().clone();
+    if !read_script_approvals(&app).iter().any(|f| f == &sha) {
+        // Skill scripts do not receive room-file inputs/outputs. Keep the card
+        // honest even if a copied room-script header happens to declare them.
+        let mut shown_manifest = manifest.clone();
+        shown_manifest.inputs.clear();
+        shown_manifest.outputs.clear();
+        let brief = ScriptBrief {
+            name: display_name.to_string(),
+            sha,
+            interpreter_line: interpreter_line(&runner, display_name),
+            manifest: shown_manifest,
+        };
+        if !script_run_approved(&app, state, window, &brief).await {
+            return Err("This skill script was not approved to run.".into());
+        }
+    }
+    Ok((runner, manifest))
+}
+
 /// The frontend's answer to a `script-approve-request` — "once" | "always" |
 /// anything else (declined). Clone of `resolve_mcp_call`.
 #[tauri::command]

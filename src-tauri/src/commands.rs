@@ -44,6 +44,7 @@ mod feedback;
 mod jobs;
 mod privacy;
 mod scripts;
+mod skills;
 mod speech_cmds;
 
 pub use external::*;
@@ -79,6 +80,7 @@ pub use feedback::*;
 pub use jobs::*;
 pub use privacy::*;
 pub use scripts::*;
+pub use skills::*;
 pub use speech_cmds::*;
 
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.5:4b";

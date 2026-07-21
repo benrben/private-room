@@ -39,5 +39,6 @@ export type WorkArea =
   | "recordings"
   | "workflows"
   | "scripts"
+  | "skills"
   | "memory"
   | "connectors";

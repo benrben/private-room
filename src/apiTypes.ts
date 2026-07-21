@@ -790,3 +790,42 @@ export interface ScriptApproveRequest {
   outputs: string[];
   timeout: number;
 }
+
+// ------------------------------------------------------------ Agent Skills
+
+/** Level-1 progressive-disclosure metadata. This is the only part of every
+ * enabled skill placed in an ordinary model turn. */
+export interface SkillSummary {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  createdBy: "user" | "agent" | "import";
+  resourceCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Skill extends Omit<SkillSummary, "resourceCount"> {
+  instructions: string;
+}
+
+export interface SkillResourceMeta {
+  path: string;
+  kind: "script" | "reference" | "asset" | "agent" | "resource";
+  sizeBytes: number;
+  text: boolean;
+  updatedAt: string;
+}
+
+export interface SkillBundle {
+  skill: Skill;
+  resources: SkillResourceMeta[];
+}
+
+export interface SkillResourceContent {
+  path: string;
+  kind: string;
+  text: string | null;
+  dataB64: string | null;
+}

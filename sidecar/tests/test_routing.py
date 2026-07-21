@@ -84,6 +84,8 @@ def test_write_tool_names_match_the_rust_list() -> None:
         "rename_file",
         "move_file",
         "add_memory",
+        "save_skill",
+        "write_skill_resource",
     )
 
 

@@ -431,6 +431,13 @@ fn gather_context_and_save_question(
             .map(|m| m.content)
             .collect();
 
+        // Agent Skills progressive disclosure, level 1: only the enabled
+        // name+description metadata enters every turn. The model calls
+        // read_skill for full instructions, then read_skill_resource as needed.
+        // Keeping this in the per-turn user message preserves the stable system
+        // prefix (and therefore Ollama's KV cache) when skills change.
+        let available_skills = db::list_skills(conn, true)?;
+
         let history: Vec<(String, String)> = {
             let mut rows = db::recent_messages(conn, chat_id, MAX_HISTORY_MESSAGES as i64)?;
             rows.reverse();
@@ -700,6 +707,15 @@ fn gather_context_and_save_question(
         }
 
         let mut user_content = String::new();
+        if !available_skills.is_empty() {
+            user_content.push_str(
+                "Available Agent Skills (specialized instructions). If one clearly matches the question, call read_skill before doing the work:\n",
+            );
+            for skill in &available_skills {
+                user_content.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            }
+            user_content.push('\n');
+        }
         if !memories.is_empty() {
             // CHG-7 + ADD-22: budget-fitting, question-relevant memories are
             // injected HERE (the always-new user message) rather than the stable
@@ -1012,6 +1028,12 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "move_file",
     "add_memory",
     "list_memories",
+    "list_skills",
+    "read_skill",
+    "read_skill_resource",
+    "save_skill",
+    "write_skill_resource",
+    "run_skill_script",
     "web_search",
     "fetch_page",
     "ui_snapshot",
@@ -1260,6 +1282,41 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
         {"type": "function", "function": {"name": "list_memories",
             "description": "List every memory note saved in this room. Use it when asked what you remember, or when the notes shown in context look incomplete.",
             "parameters": {"type": "object", "properties": {}}}}
+        ,{"type": "function", "function": {"name": "list_skills",
+            "description": "List the Agent Skills stored in this room, including disabled drafts. Enabled skill metadata is already shown in the question; use this for inventory or authoring.",
+            "parameters": {"type": "object", "properties": {}}}}
+        ,{"type": "function", "function": {"name": "read_skill",
+            "description": "Load a skill's full SKILL.md instructions and resource tree. Call this when an available skill's description matches the user's task, before doing the work.",
+            "parameters": {"type": "object", "properties": {
+                "skill": {"type": "string", "description": "Skill name or id"}},
+                "required": ["skill"]}}}
+        ,{"type": "function", "function": {"name": "read_skill_resource",
+            "description": "Read one text file from a loaded skill, such as references/policy.md or scripts/process.py. Use the relative path listed by read_skill.",
+            "parameters": {"type": "object", "properties": {
+                "skill": {"type": "string", "description": "Skill name or id"},
+                "path": {"type": "string", "description": "Relative resource path"}},
+                "required": ["skill", "path"]}}}
+        ,{"type": "function", "function": {"name": "save_skill",
+            "description": "Create or update a portable Agent Skill. Saves it DISABLED as a draft for human review. Put all trigger conditions in description and concise imperative Markdown in instructions; add reusable resources separately with write_skill_resource.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "Lowercase hyphenated name, at most 64 characters"},
+                "description": {"type": "string", "description": "What the skill does and exactly when to use it"},
+                "instructions": {"type": "string", "description": "The SKILL.md Markdown body"}},
+                "required": ["name", "description", "instructions"]}}}
+        ,{"type": "function", "function": {"name": "write_skill_resource",
+            "description": "Add or replace a text resource in a skill draft under scripts/, references/, assets/, agents/, or another relative folder. The skill is disabled again for review.",
+            "parameters": {"type": "object", "properties": {
+                "skill": {"type": "string", "description": "Skill name or id"},
+                "path": {"type": "string", "description": "Relative path, e.g. references/schema.md"},
+                "content": {"type": "string"}},
+                "required": ["skill", "path", "content"]}}}
+        ,{"type": "function", "function": {"name": "run_skill_script",
+            "description": "Run an enabled skill's bundled Python or JavaScript helper from scripts/ in an isolated temporary copy of the skill folder. The user must approve the exact script contents first. Optional input is sent on stdin; stdout is returned.",
+            "parameters": {"type": "object", "properties": {
+                "skill": {"type": "string", "description": "Enabled skill name or id"},
+                "path": {"type": "string", "description": "Relative scripts/... .py or .js path"},
+                "input": {"type": "string", "description": "Optional text sent to the script on stdin"}},
+                "required": ["skill", "path"]}}}
     ]);
     if web_enabled {
         let arr = tools.as_array_mut().unwrap();
@@ -2247,6 +2304,49 @@ pub(crate) async fn exec_tool(
                 .collect();
             Ok(clamp_tool_result(lines.join("\n")))
         }
+        "list_skills" => {
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let skills = db::list_skills(&room.conn, false)?;
+            if skills.is_empty() {
+                return Ok("No skills are stored in this room yet.".into());
+            }
+            let lines = skills
+                .iter()
+                .map(|s| format!("- {} [{}] — {} ({} resources)", s.name, if s.enabled { "enabled" } else { "disabled draft" }, s.description, s.resource_count))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(clamp_bytes(lines, 12_000))
+        }
+        "read_skill" => {
+            let key = args["skill"].as_str().unwrap_or_default();
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let skill = db::find_skill(&room.conn, key)?.ok_or_else(|| format!("No skill named \"{key}\" exists."))?;
+            let resources = db::list_skill_resources(&room.conn, &skill.id)?;
+            let tree = if resources.is_empty() {
+                "(no bundled resources)".to_string()
+            } else {
+                resources.iter().map(|r| format!("- {} ({})", r.path, r.kind)).collect::<Vec<_>>().join("\n")
+            };
+            Ok(clamp_bytes(
+                format!("# Skill: {}\nStatus: {}\nDescription: {}\n\n{}\n\nBundled resources:\n{}", skill.name, if skill.enabled { "enabled" } else { "disabled draft" }, skill.description, skill.instructions, tree),
+                20_000,
+            ))
+        }
+        "read_skill_resource" => {
+            let key = args["skill"].as_str().unwrap_or_default();
+            let path = normalize_skill_path(args["path"].as_str().unwrap_or_default())?;
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let skill = db::find_skill(&room.conn, key)?.ok_or_else(|| format!("No skill named \"{key}\" exists."))?;
+            let resource = db::get_skill_resource(&room.conn, &skill.id, &path)?;
+            let text = String::from_utf8(resource.content).map_err(|_| format!("{path} is binary and cannot be loaded as text."))?;
+            Ok(clamp_bytes(text, 20_000))
+        }
+        "save_skill" => agent_save_skill(window, state.inner(), args),
+        "write_skill_resource" => agent_write_skill_resource(window, state.inner(), args),
+        "run_skill_script" => agent_run_skill_script(window, state.inner(), args).await,
         // ADD-32: kick off a durable whole-file pass. The heavy lifting is the
         // deterministic job runner's; the agent only starts it and reports.
         "start_file_pass" => {

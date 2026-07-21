@@ -52,6 +52,7 @@ export function useWorkspaceEffects(
     // Wave 5 (Idea 13): load the room's scripts once — one source of truth for
     // the Scripts page, the file-header Run button, and the shortcut bars.
     void a.refreshScripts();
+    void a.refreshSkills();
     a.refreshAi();
     a.loadFrontPage(true);
     api.warmModel().catch(() => {});
@@ -155,6 +156,9 @@ export function useWorkspaceEffects(
     // Wave 5 (Idea 13): queue a script-run consent card (data-agent-blocked).
     const unlistenScriptApprove = api.onScriptApproveRequest((req) => {
       s.setScriptApprovals((q) => [...q, req]);
+    });
+    const unlistenSkillsChanged = api.onSkillsChanged(() => {
+      void a.refreshSkills();
     });
     const unlistenPull = listen<{ status: string; percent: number | null }>(
       "pull-progress",
@@ -413,6 +417,7 @@ export function useWorkspaceEffects(
       unlistenWfNode.then((fn) => fn());
       unlistenWfChanged.then((fn) => fn());
       unlistenScriptApprove.then((fn) => fn());
+      unlistenSkillsChanged.then((fn) => fn());
       unlistenPull.then((fn) => fn());
       unlistenDrop.then((fn) => fn());
       unlistenOpen.then((fn) => fn());

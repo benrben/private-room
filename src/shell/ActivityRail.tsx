@@ -10,6 +10,7 @@ import {
   PanelLeftIcon,
   PanelRightIcon,
   ScriptIcon,
+  BookOpenIcon,
   SearchIcon,
   SettingsIcon,
   WorkflowsIcon,
@@ -36,6 +37,7 @@ const AREAS: {
     icon: (s) => <WorkflowsIcon size={s} />,
   },
   { key: "scripts", label: "Scripts", short: "Scripts", icon: (s) => <ScriptIcon size={s} /> },
+  { key: "skills", label: "Skills", short: "Skills", icon: (s) => <BookOpenIcon size={s} /> },
   {
     key: "memory",
     label: "Memory & scratch pad",

@@ -8,6 +8,7 @@ import { makeChatActions } from "./chatActions";
 import { makeVoiceActions } from "./voiceActions";
 import { makeWorkflowActions } from "./workflowActions";
 import { makeScriptActions } from "./scriptActions";
+import { makeSkillActions } from "./skillActions";
 
 /** Build every Workspace handler, threading the cross-hook dependencies in the
  * one place that owns the wiring (files → misc → recording → studio → chat). */
@@ -36,7 +37,8 @@ export function useWorkspaceActions(
   const voice = makeVoiceActions(s);
   const workflows = makeWorkflowActions(s, { viewFile: files.viewFile });
   const scripts = makeScriptActions(s);
-  return { ...files, ...misc, ...recording, ...studio, ...chat, ...voice, ...workflows, ...scripts };
+  const skills = makeSkillActions(s);
+  return { ...files, ...misc, ...recording, ...studio, ...chat, ...voice, ...workflows, ...scripts, ...skills };
 }
 
 export type WSActions = ReturnType<typeof useWorkspaceActions>;

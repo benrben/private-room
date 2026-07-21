@@ -11,6 +11,7 @@ import {
   PencilIcon,
   PlusIcon,
   ScriptIcon,
+  BookOpenIcon,
   SearchIcon,
   TrashIcon,
   WorkflowsIcon,
@@ -32,6 +33,7 @@ const AREA_HEADINGS: Record<WorkArea, string> = {
   recordings: "Recordings",
   workflows: "Workflows",
   scripts: "Scripts",
+  skills: "Skills",
   memory: "Memory",
   connectors: "Connectors",
 };
@@ -79,6 +81,8 @@ export default function LibraryPane({
       ? visibleWorkflows(s.workflows).length
       : area === "scripts"
         ? s.scripts.length
+        : area === "skills"
+          ? s.skills.length
         : area === "recordings"
           ? s.files.filter(isRecordingFile).length
           : area === "memory"
@@ -189,6 +193,7 @@ export default function LibraryPane({
       {area === "recordings" && <RecordingsNav s={s} a={a} shownFiles={shownFiles} />}
       {area === "workflows" && <WorkflowsNav s={s} a={a} />}
       {area === "scripts" && <ScriptsNav s={s} a={a} />}
+      {area === "skills" && <SkillsNav s={s} a={a} />}
       {area === "memory" && <MemoryNav s={s} a={a} />}
       {area === "connectors" && <ConnectorsNav s={s} />}
 
@@ -728,6 +733,43 @@ function ScriptsNav({ s, a }: { s: WSState; a: WSActions }) {
           <span className="area-nav-state">
             {sc.lang === "py" ? "Python" : "JavaScript"}
           </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Skills lens ---------- */
+
+function SkillsNav({ s, a }: { s: WSState; a: WSActions }) {
+  return (
+    <div className="library-scroll">
+      <p className="area-nav-intro">
+        Portable instructions and bundled resources the assistant loads only
+        when a task matches.
+      </p>
+      <div className="group-heading">In this room</div>
+      {s.skills.length === 0 && (
+        <div className="empty-hint">
+          No skills yet — build one with AI, create it manually, or import a
+          folder from Claude Code or another Agent Skills client.
+        </div>
+      )}
+      {s.skills.map((skill) => (
+        <button
+          key={skill.id}
+          className={`area-nav-row${s.selectedSkillId === skill.id ? " is-current" : ""}`}
+          onClick={() => a.openSkill(skill.id)}
+          title={skill.description}
+        >
+          <span className="browse-icon"><BookOpenIcon size={15} /></span>
+          <span className="area-nav-main">
+            <span className="area-nav-title">{skill.name}</span>
+            <span className="area-nav-copy">
+              {skill.enabled ? "Enabled" : "Disabled draft"} · {skill.resourceCount} resource{skill.resourceCount === 1 ? "" : "s"}
+            </span>
+          </span>
+          <span className="area-nav-state">{skill.createdBy === "agent" ? "AI" : skill.createdBy}</span>
         </button>
       ))}
     </div>
