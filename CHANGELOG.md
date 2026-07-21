@@ -3,6 +3,35 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.9.0 — 2026-07-21
+
+### Skills turn repeatable work into a reusable capability
+
+- **A dedicated Skills workspace.** Skills now live in their own encrypted
+  area instead of masquerading as ordinary room files. Create them manually or
+  describe what you need and let the room's current AI engine draft one for
+  review.
+- **Portable, folder-shaped skills.** Import and export the familiar
+  `SKILL.md` structure with optional `scripts/`, `references/`, and `assets/`
+  folders, so a skill can move between Arcelle and other agent-skill systems
+  without being flattened or rewritten.
+- **Everything needed stays together.** Browse the skill tree, edit its
+  instructions and text resources, add supporting files, and maintain many
+  independent skills from one place.
+
+### The assistant loads only the expertise it needs
+
+- **Progressive disclosure keeps context focused.** The assistant initially
+  sees only enabled skill names and trigger descriptions, then reads the full
+  instructions or a specific resource when the task actually calls for it.
+- **Skills work across every engine.** Local models, cloud models, Codex, and
+  Claude share the same room skill catalog and can list, read, draft, and
+  extend skills through the agent tool bridge.
+- **Review before activation.** Imported and AI-generated skills begin as
+  disabled drafts. Script helpers run only from reviewed, enabled skills,
+  require approval for their exact content, and execute from an isolated
+  temporary skill tree without access to the encrypted room key.
+
 ## 0.8.0 — 2026-07-21
 
 ### Always know where your content is going
