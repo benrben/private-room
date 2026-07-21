@@ -3,6 +3,25 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.11.0 — 2026-07-21
+
+### Bring your own cloud models
+
+- **OpenRouter is now a first-class AI provider.** Connect an API key from
+  Settings; it is validated and stored in macOS Keychain, never in a room file.
+- **A live catalog instead of a hardcoded list.** Arcelle loads the models
+  available to the connected OpenRouter account, with search, context windows,
+  and live input/output pricing.
+- **Choose by capability.** Filter models for tool calling, vision, reasoning,
+  and structured JSON output, then use the selection anywhere Arcelle uses the
+  room's AI engine.
+- **Cloud models keep Arcelle's agent workflow.** OpenRouter models stream
+  answers, use room and MCP tools when supported, work across background
+  actions and workflows, and pass through the same cloud-privacy door.
+- **Failures say what actually happened.** Provider validation and upstream
+  errors are no longer mislabeled as a sidecar startup failure; incompatible
+  tool catalogs recover to ordinary chat without exposing credentials.
+
 ## 0.10.0 — 2026-07-21
 
 ### See — and reclaim — your context budget
