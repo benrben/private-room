@@ -45,9 +45,14 @@ const AREAS: {
   { key: "connectors", label: "Connectors", short: "Connect", icon: (s) => <LinkIcon size={s} /> },
 ];
 
-/** The 46px activity rail. Two deliberately different groups: pane
- * visibility (neutral pressed state) and product-area navigation (accent
- * current state), plus Focus editor and Settings at the bottom. */
+/** The activity rail. Two deliberately different groups: pane visibility
+ * (neutral pressed state) and product-area navigation (accent current
+ * state), plus Focus editor and Settings at the bottom. Every button carries
+ * a persistent visible label (`.rail-label`) rather than relying on a hover
+ * tooltip — the rail is a scroll container (`overflow-x: hidden`, needed for
+ * its vertical auto-scroll), so a popover tooltip anchored to a narrow button
+ * gets silently clipped to a couple of characters. The aria-label carries the
+ * keyboard shortcut for screen readers instead. */
 export default function ActivityRail({
   layout,
   area,
@@ -74,8 +79,7 @@ export default function ActivityRail({
         type="button"
         data-pane-toggle="library"
         aria-pressed={paneVisible("library")}
-        data-tip="Library (⌘1)"
-        aria-label="Toggle the Library pane"
+        aria-label="Toggle the Library pane (⌘1)"
         onClick={() => layout.togglePane("library")}
       >
         <PanelLeftIcon size={17} />
@@ -86,8 +90,7 @@ export default function ActivityRail({
         type="button"
         data-pane-toggle="center"
         aria-pressed={paneVisible("center")}
-        data-tip="Workspace (⌘2)"
-        aria-label="Toggle the workspace pane"
+        aria-label="Toggle the workspace pane (⌘2)"
         onClick={() => layout.togglePane("center")}
       >
         <PanelCenterIcon size={17} />
@@ -98,8 +101,7 @@ export default function ActivityRail({
         type="button"
         data-pane-toggle="ai"
         aria-pressed={paneVisible("ai")}
-        data-tip="AI & Studio (⌘3)"
-        aria-label="Toggle the AI and Studio pane"
+        aria-label="Toggle the AI and Studio pane (⌘3)"
         onClick={() => layout.togglePane("ai")}
       >
         <PanelRightIcon size={17} />
@@ -115,8 +117,7 @@ export default function ActivityRail({
       <button
         className="rail-button"
         type="button"
-        data-tip="Search room (⌘K)"
-        aria-label="Search this room or run a command"
+        aria-label="Search this room or run a command (⌘K)"
         onClick={onSearch}
       >
         <SearchIcon size={17} />
@@ -132,7 +133,6 @@ export default function ActivityRail({
         className={`rail-button zen`}
         type="button"
         aria-pressed={layout.focusPane === "center"}
-        data-tip="Focus the editor"
         aria-label="Focus the editor — hide both side panes"
         onClick={() => layout.toggleFocus("center")}
       >
@@ -144,8 +144,7 @@ export default function ActivityRail({
       <button
         className="rail-button"
         type="button"
-        data-tip="Room settings (⌘,)"
-        aria-label="Open room settings"
+        aria-label="Open room settings (⌘,)"
         onClick={onSettings}
       >
         <SettingsIcon size={17} />
@@ -171,7 +170,6 @@ function RailAreaButton({
       type="button"
       data-area={def.key}
       aria-current={current ? "true" : undefined}
-      data-tip={def.label}
       aria-label={`Open ${def.label}`}
       onClick={() => onArea(def.key)}
     >

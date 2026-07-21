@@ -291,7 +291,7 @@
   min-height: 0;
   min-width: 0;
   display: grid;
-  grid-template-columns: 68px minmax(0, 1fr);
+  grid-template-columns: 74px minmax(0, 1fr);
 }
 
 .activity-rail {
@@ -318,8 +318,8 @@
   flex: 0 0 auto;
 }
 .rail-button {
-  width: 58px;
-  min-height: 44px;
+  width: 64px;
+  min-height: 46px;
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
@@ -330,21 +330,28 @@
   background: transparent;
   border: 0;
   border-radius: var(--radius);
-  padding: 6px 2px;
+  padding: 6px 3px;
   position: relative;
 }
 /* The persistent text label under each rail icon — so a naïve user can tell
    Map / Scripts / Memory / Connectors apart without hovering. Inherits the
-   button colour, so it brightens with the active/pressed state. */
+   button colour, so it brightens with the active/pressed state. Wraps onto a
+   2nd line rather than ellipsis-truncating: a silently clipped word ("Connec…")
+   is worse than a 2-line label, and `.rail-button`'s min-height (not a fixed
+   height) lets the button grow to fit it. */
 .rail-label {
   font-size: 9.5px;
-  line-height: 1.05;
+  line-height: 1.15;
   letter-spacing: 0.01em;
   max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   color: inherit;
+  text-align: center;
+  white-space: normal;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
 }
 .rail-button:hover {
   color: var(--text);
@@ -417,10 +424,6 @@
   line-height: 1;
   box-shadow: 0 5px 18px rgba(0, 0, 0, 0.3);
   transition: opacity 0.12s ease;
-}
-.rail-button[data-tip]::after {
-  left: 42px;
-  top: 8px;
 }
 .icon-btn[data-tip]::after,
 .pane-icon-btn[data-tip]::after,
