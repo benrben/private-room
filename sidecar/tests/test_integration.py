@@ -359,14 +359,23 @@ async def test_live_seam_single_tool_run():
     assert status == 200, f"/run rejected the Rust-shaped body: {status} {events}"
 
     # (b) The EXACT event sequence sidecar.rs::stream_run parses:
-    #     lane -> round -> (delta*) -> step -> step_status -> round -> (delta*) -> final
+    #     lane -> round -> usage -> (delta*) -> step -> step_status -> round ->
+    #     usage -> (delta*) -> final. `usage` (the token-budget bar's snapshot)
+    #     fires once per round, right after that round's model call returns.
     kinds = _kinds(events)
     assert kinds[0] == "lane"
     # squeeze out delta runs to compare the structural skeleton
     skeleton = [k for i, k in enumerate(kinds) if k != "delta"]
-    assert skeleton == ["lane", "round", "step", "step_status", "round", "final"], (
-        f"unexpected event skeleton: {kinds}"
-    )
+    assert skeleton == [
+        "lane",
+        "round",
+        "usage",
+        "step",
+        "step_status",
+        "round",
+        "usage",
+        "final",
+    ], f"unexpected event skeleton: {kinds}"
 
     # (c) Every event matches the {"t":..,"v":..}/{"t":"step_status","ok":..} shape
     #     the Rust side reads (str_v() reads "v"; step_status reads "ok").

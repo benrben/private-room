@@ -19,7 +19,8 @@ JOBS_PROMPT = (
     "\n\nFor RECURRING or multi-step automation — 'every morning', 'summarize new "
     "files daily', a saved pipeline — use the workflow tools: list_workflows to "
     "see or fetch one, save_workflow to draft a new multi-step pipeline (nodes + "
-    "edges), update_workflow to change one, run_workflow to run an active one now. "
+    "edges), update_workflow to change one, delete_workflow only when explicitly "
+    "asked, test_workflow to validate a draft, and run_workflow to run an active one now. "
     "save_workflow always creates a DRAFT the user reviews and activates on the "
     "Workflows page; if a definition is invalid it comes back with a numbered list "
     "to fix and retry."
@@ -40,6 +41,17 @@ UI_PROMPT = (
     "buttons (Flashcards, Mind map, Podcast script) and AI actions; file viewers "
     "have their own tabs and a History button. When the user names one of these, "
     "do not ask what they mean — ui_snapshot to find the control, then ui_act it."
+)
+
+#: Appended only when the user explicitly asks about Skills or MCP connectors.
+#: These tools are deliberately absent from ordinary document chat.
+MANAGEMENT_PROMPT = (
+    "\n\nYou have on-demand management tools for Skills and/or MCP connectors. "
+    "Inspect first with the relevant list/read tool before changing or deleting "
+    "anything. Skill edits remain disabled drafts for human review. Connector "
+    "edits are saved disabled and credentials are never available to you; tell "
+    "the user to review, add credentials, and explicitly enable/approve a "
+    "connector in Connectors before it can run or reach the network."
 )
 
 
@@ -69,6 +81,7 @@ DONE_TEXT = "Done."
 __all__ = [
     "JOBS_PROMPT",
     "UI_PROMPT",
+    "MANAGEMENT_PROMPT",
     "NEAR_BUDGET_NOTE",
     "IMAGE_HANDOFF",
     "DONE_TEXT",

@@ -448,6 +448,10 @@ pub struct Message {
     /// stays plain prose — the UI renders these from data, never by parsing
     /// fenced blocks back out of the text.
     pub effects: Option<serde_json::Value>,
+    /// Marks a non-ordinary row without repurposing `role` — today only
+    /// `Some("handoff")` (a context-compaction summary marker). `None` for
+    /// every ordinary user/assistant message.
+    pub kind: Option<String>,
 }
 
 #[derive(Serialize, Clone)]

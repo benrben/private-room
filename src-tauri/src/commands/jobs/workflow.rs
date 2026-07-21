@@ -386,7 +386,10 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
         if n.id.trim().is_empty() {
             errs.push("A node has an empty id — every node needs a unique id.".into());
         } else if !ids.insert(n.id.as_str()) {
-            errs.push(format!("Duplicate node id '{}' — ids must be unique.", n.id));
+            errs.push(format!(
+                "Duplicate node id '{}' — ids must be unique.",
+                n.id
+            ));
         }
     }
     // Per-kind param checks.
@@ -421,7 +424,10 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
             }
             NodeKind::AgentRun { question } => {
                 if question.trim().is_empty() {
-                    errs.push(format!("Node '{}' (agent_run) has an empty question.", n.id));
+                    errs.push(format!(
+                        "Node '{}' (agent_run) has an empty question.",
+                        n.id
+                    ));
                 }
             }
             NodeKind::SaveFile {
@@ -459,7 +465,8 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
             NodeKind::ScriptRun { file, mode } => {
                 if file.trim().is_empty() {
                     errs.push(format!("Node '{}' (script_run) has no script file.", n.id));
-                } else if script_lang_of(file).is_none() && extraction::extension_of(file).is_empty()
+                } else if script_lang_of(file).is_none()
+                    && extraction::extension_of(file).is_empty()
                 {
                     // A bare id (no extension) is fine — it's resolved at run
                     // time; a name WITH an extension must be .py/.js.
@@ -489,7 +496,12 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                     errs.push(format!("Node '{}' (replace) needs a `find` string.", n.id));
                 }
                 if op == "truncate"
-                    && value.as_deref().unwrap_or("").trim().parse::<usize>().is_err()
+                    && value
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .parse::<usize>()
+                        .is_err()
                 {
                     errs.push(format!(
                         "Node '{}' (truncate) needs `value` to be a character count.",
@@ -545,7 +557,11 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                     ));
                 }
             }
-            NodeKind::ForEachFile { select, instruction, .. } => {
+            NodeKind::ForEachFile {
+                select,
+                instruction,
+                ..
+            } => {
                 if !FILE_SELECTORS.contains(&select.kind.as_str()) {
                     errs.push(format!(
                         "Node '{}' has an unknown file selector '{}' — use one of: {}.",
@@ -557,7 +573,10 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                 if select.kind == "name_like"
                     && select.pattern.as_deref().unwrap_or("").trim().is_empty()
                 {
-                    errs.push(format!("Node '{}' selects by name but has no pattern.", n.id));
+                    errs.push(format!(
+                        "Node '{}' selects by name but has no pattern.",
+                        n.id
+                    ));
                 }
                 if instruction.trim().is_empty() {
                     errs.push(format!(
@@ -573,7 +592,10 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
             }
             NodeKind::PlanAndMap { objective, .. } => {
                 if objective.trim().is_empty() {
-                    errs.push(format!("Node '{}' (plan_and_map) has an empty objective.", n.id));
+                    errs.push(format!(
+                        "Node '{}' (plan_and_map) has an empty objective.",
+                        n.id
+                    ));
                 }
             }
         }
@@ -641,7 +663,10 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
 }
 
 /// Cross-check the def against its binding (a run_input node needs file scope).
-pub fn validate_with_binding(def: &WorkflowDef, binding: &WorkflowBinding) -> Result<(), Vec<String>> {
+pub fn validate_with_binding(
+    def: &WorkflowDef,
+    binding: &WorkflowBinding,
+) -> Result<(), Vec<String>> {
     validate_definition(def)?;
     if def_uses_run_input(def) && !matches!(binding, WorkflowBinding::File { .. }) {
         for n in &def.nodes {
@@ -724,7 +749,11 @@ fn topo_order(def: &WorkflowDef) -> Result<Vec<String>, Vec<String>> {
 /// honor whatever the user chose, INCLUDING external CLIs (the sidecar's
 /// external backend runs them); "local" stays a hard local pick; "cloud"
 /// prefers an installed `:cloud` proxy. Lane = remote engines → Cloud.
-fn resolve_node_model(choice: &str, room_model: &Option<String>, models: &[String]) -> (String, Lane) {
+fn resolve_node_model(
+    choice: &str,
+    room_model: &Option<String>,
+    models: &[String],
+) -> (String, Lane) {
     let name = match choice.trim() {
         "" | "auto" => room_model.clone().unwrap_or_else(|| best_default(models)),
         "local" => best_local_default(models),
@@ -769,9 +798,9 @@ pub fn compile_workflow(
             .iter()
             .filter(|e| &e.to == nid)
             .filter_map(|e| {
-                step_of.get(e.from.as_str()).map(|&p| {
-                    serde_json::json!({ "parent": p, "branch": e.branch })
-                })
+                step_of
+                    .get(e.from.as_str())
+                    .map(|&p| serde_json::json!({ "parent": p, "branch": e.branch }))
             })
             .collect();
         let depends_on: Vec<usize> = incoming
@@ -822,8 +851,9 @@ pub fn default_resolved_model(room_model: &Option<String>, models: &[String]) ->
 /// A headless agent-turn runner, injected by the concrete spawner so the
 /// generic executor stays mock-drivable (the agent_run arm needs concrete
 /// window/state types the mock harness can't produce; the planned e2e avoids it).
-pub type AgentRunFn =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync>;
+pub type AgentRunFn = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync,
+>;
 
 fn load_wf_artifact(conn: &Connection, job_id: &str, step_id: usize) -> Option<WfArtifact> {
     db::get_job_artifact(conn, job_id, step_id).and_then(|s| serde_json::from_str(&s).ok())
@@ -862,7 +892,12 @@ fn store_wf_artifact(
     step_id: usize,
     a: &WfArtifact,
 ) -> Result<(), String> {
-    db::put_job_artifact(conn, job_id, step_id, &serde_json::to_string(a).map_err(|e| e.to_string())?)
+    db::put_job_artifact(
+        conn,
+        job_id,
+        step_id,
+        &serde_json::to_string(a).map_err(|e| e.to_string())?,
+    )
 }
 
 fn emit_workflow_node<R: tauri::Runtime>(
@@ -985,7 +1020,10 @@ fn resolve_files<R: tauri::Runtime>(
             [],
         )?,
         "name_like" => {
-            let pat = format!("%{}%", sel.pattern.clone().unwrap_or_default().to_lowercase());
+            let pat = format!(
+                "%{}%",
+                sel.pattern.clone().unwrap_or_default().to_lowercase()
+            );
             query_files(
                 conn,
                 "SELECT id, name, coalesce(mime_type,'') FROM files \
@@ -1031,7 +1069,8 @@ fn query_files<P: rusqlite::Params>(
     let rows = stmt
         .query_map(params, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 /// Count source files created after `since` — the `new_files_since_last_run`
@@ -1229,9 +1268,9 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
         .map(|a| {
             a.iter()
                 .filter_map(|i| {
-                    i["parent"].as_u64().map(|p| {
-                        (p as usize, i["branch"].as_str().map(|s| s.to_string()))
-                    })
+                    i["parent"]
+                        .as_u64()
+                        .map(|p| (p as usize, i["branch"].as_str().map(|s| s.to_string())))
                 })
                 .collect()
         })
@@ -1319,9 +1358,18 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
         }
         NodeKind::SummarizeFile { select } => {
             let model = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
-            let files = resolve_files(app, room_path, select, &plan.input_file_id, &plan.prev_run_at)?;
+            let files = resolve_files(
+                app,
+                room_path,
+                select,
+                &plan.input_file_id,
+                &plan.prev_run_at,
+            )?;
             if files.is_empty() {
-                Ok(WfArtifact { result: "No files matched — nothing to summarize.".into(), ..Default::default() })
+                Ok(WfArtifact {
+                    result: "No files matched — nothing to summarize.".into(),
+                    ..Default::default()
+                })
             } else {
                 let mut lines: Vec<String> = Vec::new();
                 for (id, name, mime) in &files {
@@ -1336,7 +1384,9 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                             .filter(|r| r.path == room_path)
                             .and_then(|r| db::get_file_extracted_text(&r.conn, id))
                     };
-                    let Some(full) = full.filter(|t| !t.trim().is_empty()) else { continue };
+                    let Some(full) = full.filter(|t| !t.trim().is_empty()) else {
+                        continue;
+                    };
                     match summarize_one_file(&model, name, mime, &full, KEEP_ALIVE_WARM).await {
                         Ok(liner) if !liner.is_empty() => {
                             let state = app.state::<AppState>();
@@ -1350,31 +1400,83 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                         Err(e) => return Err(e),
                     }
                 }
-                Ok(WfArtifact { result: lines.join("\n"), ..Default::default() })
+                Ok(WfArtifact {
+                    result: lines.join("\n"),
+                    ..Default::default()
+                })
             }
         }
-        NodeKind::FilePass { select, instruction, mode } => {
+        NodeKind::FilePass {
+            select,
+            instruction,
+            mode,
+        } => {
             // Reuse a prior publish if this node already ran (idempotency).
             if let Some(a) = &existing {
                 if a.file_id.is_some() && !a.skipped {
-                    Ok(WfArtifact { result: a.result.clone(), file_id: a.file_id.clone(), ..Default::default() })
+                    Ok(WfArtifact {
+                        result: a.result.clone(),
+                        file_id: a.file_id.clone(),
+                        ..Default::default()
+                    })
                 } else {
-                    run_file_pass_node(app, job_id, room_path, plan, select, instruction, mode, cancel, published).await
+                    run_file_pass_node(
+                        app,
+                        job_id,
+                        room_path,
+                        plan,
+                        select,
+                        instruction,
+                        mode,
+                        cancel,
+                        published,
+                    )
+                    .await
                 }
             } else {
-                run_file_pass_node(app, job_id, room_path, plan, select, instruction, mode, cancel, published).await
+                run_file_pass_node(
+                    app,
+                    job_id,
+                    room_path,
+                    plan,
+                    select,
+                    instruction,
+                    mode,
+                    cancel,
+                    published,
+                )
+                .await
             }
         }
         NodeKind::AgentRun { question } => {
             let q = interpolate(app, room_path, question, &inputs_joined);
             match agent_run(q).await {
-                Ok(text) => Ok(WfArtifact { result: text, ..Default::default() }),
+                Ok(text) => Ok(WfArtifact {
+                    result: text,
+                    ..Default::default()
+                }),
                 Err(e) => Err(e),
             }
         }
-        NodeKind::SaveFile { name_template, format, mode } => {
-            save_file_node(app, room_path, name_template, format, mode, &inputs_joined, existing.as_ref(), published).map(|(result, file_id)| WfArtifact { result, file_id: Some(file_id), ..Default::default() })
-        }
+        NodeKind::SaveFile {
+            name_template,
+            format,
+            mode,
+        } => save_file_node(
+            app,
+            room_path,
+            name_template,
+            format,
+            mode,
+            &inputs_joined,
+            existing.as_ref(),
+            published,
+        )
+        .map(|(result, file_id)| WfArtifact {
+            result,
+            file_id: Some(file_id),
+            ..Default::default()
+        }),
         NodeKind::Condition { op, value, .. } => {
             let new_files = if op == "new_files_since_last_run" {
                 count_new_files(app, room_path, &plan.prev_run_at)
@@ -1398,7 +1500,10 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
             } else {
                 None
             };
-            run_script_node(app, job_id, room_path, plan, file, mode, stdin, cancel, published).await
+            run_script_node(
+                app, job_id, room_path, plan, file, mode, stdin, cancel, published,
+            )
+            .await
         }
         NodeKind::Transform { op, find, value } => Ok(WfArtifact {
             result: apply_transform(op, find, value, &inputs_joined),
@@ -1434,8 +1539,8 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
             );
             let raw = wf_generate(&m, &prompt, Some(schema), cancel).await?;
             let cleaned = ollama::recover_json(&raw);
-            let val: serde_json::Value =
-                serde_json::from_str(&cleaned).unwrap_or_else(|_| serde_json::json!({ "_raw": raw }));
+            let val: serde_json::Value = serde_json::from_str(&cleaned)
+                .unwrap_or_else(|_| serde_json::json!({ "_raw": raw }));
             Ok(WfArtifact {
                 result: serde_json::to_string_pretty(&val).unwrap_or(cleaned),
                 ..Default::default()
@@ -1446,7 +1551,11 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
             let ask = interpolate(app, room_path, prompt, &inputs_joined);
             let full = format!(
                 "{}\n\nChoose EXACTLY ONE label for the following, from: {}.\n\n{}",
-                if ask.trim().is_empty() { "Classify the input." } else { ask.trim() },
+                if ask.trim().is_empty() {
+                    "Classify the input."
+                } else {
+                    ask.trim()
+                },
                 labels.join(", "),
                 inputs_joined
             );
@@ -1458,7 +1567,12 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 ..Default::default()
             })
         }
-        NodeKind::Vote { prompt, samples, mode, .. } => {
+        NodeKind::Vote {
+            prompt,
+            samples,
+            mode,
+            ..
+        } => {
             let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
             let p = interpolate(app, room_path, prompt, &inputs_joined);
             let n = (*samples).clamp(1, 7);
@@ -1469,13 +1583,29 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 }
                 outs.push(wf_generate(&m, &p, None, cancel).await?);
             }
-            Ok(WfArtifact { result: aggregate_votes(mode, &outs), ..Default::default() })
+            Ok(WfArtifact {
+                result: aggregate_votes(mode, &outs),
+                ..Default::default()
+            })
         }
-        NodeKind::ForEachFile { select, instruction, .. } => {
+        NodeKind::ForEachFile {
+            select,
+            instruction,
+            ..
+        } => {
             let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
-            let files = resolve_files(app, room_path, select, &plan.input_file_id, &plan.prev_run_at)?;
+            let files = resolve_files(
+                app,
+                room_path,
+                select,
+                &plan.input_file_id,
+                &plan.prev_run_at,
+            )?;
             if files.is_empty() {
-                Ok(WfArtifact { result: "No files matched — nothing to do.".into(), ..Default::default() })
+                Ok(WfArtifact {
+                    result: "No files matched — nothing to do.".into(),
+                    ..Default::default()
+                })
             } else {
                 let instr = interpolate(app, room_path, instruction, &inputs_joined);
                 let mut sections: Vec<String> = Vec::new();
@@ -1491,7 +1621,9 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                             .filter(|r| r.path == room_path)
                             .and_then(|r| db::get_file_extracted_text(&r.conn, id))
                     };
-                    let Some(full) = full.filter(|t| !t.trim().is_empty()) else { continue };
+                    let Some(full) = full.filter(|t| !t.trim().is_empty()) else {
+                        continue;
+                    };
                     let clipped: String = full.chars().take(PER_FILE_CHARS).collect();
                     let prompt = format!("{instr}\n\nFile: {name}\n\n{clipped}");
                     let r = wf_generate(&m, &prompt, None, cancel).await?;
@@ -1502,10 +1634,18 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 } else {
                     sections.join("\n\n")
                 };
-                Ok(WfArtifact { result, ..Default::default() })
+                Ok(WfArtifact {
+                    result,
+                    ..Default::default()
+                })
             }
         }
-        NodeKind::Refine { prompt, rubric, max_rounds, .. } => {
+        NodeKind::Refine {
+            prompt,
+            rubric,
+            max_rounds,
+            ..
+        } => {
             let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
             let base = interpolate(app, room_path, prompt, &inputs_joined);
             let rounds = (*max_rounds).clamp(1, 4);
@@ -1531,9 +1671,11 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                     "Judge the draft against this bar: {rubric}.\nReturn ONLY JSON \
                      {{\"pass\": <bool>, \"feedback\": <what to fix>}}.\n\nDraft:\n{draft}"
                 );
-                let verdict_raw = wf_generate(&m, &eval_prompt, Some(verdict_schema.clone()), cancel).await?;
-                let verdict: serde_json::Value = serde_json::from_str(&ollama::recover_json(&verdict_raw))
-                    .unwrap_or_else(|_| serde_json::json!({ "pass": true, "feedback": "" }));
+                let verdict_raw =
+                    wf_generate(&m, &eval_prompt, Some(verdict_schema.clone()), cancel).await?;
+                let verdict: serde_json::Value =
+                    serde_json::from_str(&ollama::recover_json(&verdict_raw))
+                        .unwrap_or_else(|_| serde_json::json!({ "pass": true, "feedback": "" }));
                 if verdict["pass"].as_bool().unwrap_or(true) {
                     break;
                 }
@@ -1543,9 +1685,16 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 );
                 draft = wf_generate(&m, &improve, None, cancel).await?;
             }
-            Ok(WfArtifact { result: draft, ..Default::default() })
+            Ok(WfArtifact {
+                result: draft,
+                ..Default::default()
+            })
         }
-        NodeKind::PlanAndMap { objective, max_workers, .. } => {
+        NodeKind::PlanAndMap {
+            objective,
+            max_workers,
+            ..
+        } => {
             let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
             let obj = interpolate(app, room_path, objective, &inputs_joined);
             let plan_schema = serde_json::json!({
@@ -1575,8 +1724,17 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 .unwrap_or_default();
             if subtasks.is_empty() {
                 // No decomposition — fall back to answering the objective directly.
-                let direct = wf_generate(&m, &format!("{obj}\n\nContext:\n{inputs_joined}"), None, cancel).await?;
-                Ok(WfArtifact { result: direct, ..Default::default() })
+                let direct = wf_generate(
+                    &m,
+                    &format!("{obj}\n\nContext:\n{inputs_joined}"),
+                    None,
+                    cancel,
+                )
+                .await?;
+                Ok(WfArtifact {
+                    result: direct,
+                    ..Default::default()
+                })
             } else {
                 let mut worker_results: Vec<String> = Vec::new();
                 for st in &subtasks {
@@ -1596,7 +1754,10 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                     worker_results.join("\n\n")
                 );
                 let out = wf_generate(&m, &synth, None, cancel).await?;
-                Ok(WfArtifact { result: out, ..Default::default() })
+                Ok(WfArtifact {
+                    result: out,
+                    ..Default::default()
+                })
             }
         }
     };
@@ -1614,7 +1775,11 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                     .ok_or("The room this job belongs to is no longer open.")?;
                 store_wf_artifact(&room.conn, job_id, step.id, &artifact)?;
             }
-            let peek = if artifact.result.is_empty() { None } else { Some(artifact.result.as_str()) };
+            let peek = if artifact.result.is_empty() {
+                None
+            } else {
+                Some(artifact.result.as_str())
+            };
             emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "done", peek);
             Ok(())
         }
@@ -1641,17 +1806,40 @@ async fn run_file_pass_node<R: tauri::Runtime>(
     cancel: &Arc<AtomicBool>,
     published: &std::sync::Mutex<Option<FileMeta>>,
 ) -> Result<WfArtifact, String> {
-    let files = resolve_files(app, room_path, select, &plan.input_file_id, &plan.prev_run_at)?;
+    let files = resolve_files(
+        app,
+        room_path,
+        select,
+        &plan.input_file_id,
+        &plan.prev_run_at,
+    )?;
     let Some((id, name, _mime)) = files.into_iter().next() else {
-        return Ok(WfArtifact { result: "No file matched — nothing to read.".into(), skipped: false, ..Default::default() });
+        return Ok(WfArtifact {
+            result: "No file matched — nothing to read.".into(),
+            skipped: false,
+            ..Default::default()
+        });
     };
-    let (summary, meta) =
-        drive_file_pass(app, job_id, room_path, &id, &name, instruction, mode, cancel).await?;
+    let (summary, meta) = drive_file_pass(
+        app,
+        job_id,
+        room_path,
+        &id,
+        &name,
+        instruction,
+        mode,
+        cancel,
+    )
+    .await?;
     let file_id = meta.as_ref().map(|m| m.id.clone());
     if let Some(m) = meta {
         *published.lock().unwrap() = Some(m);
     }
-    Ok(WfArtifact { result: summary, file_id, ..Default::default() })
+    Ok(WfArtifact {
+        result: summary,
+        file_id,
+        ..Default::default()
+    })
 }
 
 /// Wave 5 (Idea 13): the `script_run` node arm. Resolves the script file id, reads
@@ -1692,7 +1880,11 @@ async fn run_script_node<R: tauri::Runtime>(
             db::find_file_like(&room.conn, file)?.0
         }
     };
-    let consent = plan.script_consents.get(&file_id).cloned().unwrap_or_default();
+    let consent = plan
+        .script_consents
+        .get(&file_id)
+        .cloned()
+        .unwrap_or_default();
     let report =
         run_script_process(app, job_id, room_path, &file_id, &consent, stdin, cancel).await?;
     // Publish the first imported output so a MANUAL run can auto-open it.
@@ -1712,11 +1904,18 @@ async fn run_script_node<R: tauri::Runtime>(
         }
     } else {
         serde_json::to_string(&report).unwrap_or_else(|_| {
-            format!("Script finished (exit {}), {n} file(s) imported.", report.exit_code)
+            format!(
+                "Script finished (exit {}), {n} file(s) imported.",
+                report.exit_code
+            )
         })
     };
     let file_id = report.imported.first().map(|m| m.id.clone());
-    Ok(WfArtifact { result, file_id, ..Default::default() })
+    Ok(WfArtifact {
+        result,
+        file_id,
+        ..Default::default()
+    })
 }
 
 /// Write the workflow's output as a room file. Idempotent: if this node already
@@ -1757,7 +1956,14 @@ fn save_file_node<R: tauri::Runtime>(
                 db::update_file_content(&room.conn, &prev, content.as_bytes(), Some(&content))?;
                 db::get_file_meta(&room.conn, &prev)?
             } else {
-                db::insert_file(&room.conn, &name, &mime, content.as_bytes(), Some(&content), "generated")?
+                db::insert_file(
+                    &room.conn,
+                    &name,
+                    &mime,
+                    content.as_bytes(),
+                    Some(&content),
+                    "generated",
+                )?
             }
         } else if mode == "overwrite" || mode == "append" {
             // Find an existing generated file of this name.
@@ -1784,10 +1990,24 @@ fn save_file_node<R: tauri::Runtime>(
                     db::update_file_content(&room.conn, &fid, content.as_bytes(), Some(&content))?;
                     db::get_file_meta(&room.conn, &fid)?
                 }
-                None => db::insert_file(&room.conn, &name, &mime, content.as_bytes(), Some(&content), "generated")?,
+                None => db::insert_file(
+                    &room.conn,
+                    &name,
+                    &mime,
+                    content.as_bytes(),
+                    Some(&content),
+                    "generated",
+                )?,
             }
         } else {
-            db::insert_file(&room.conn, &name, &mime, content.as_bytes(), Some(&content), "generated")?
+            db::insert_file(
+                &room.conn,
+                &name,
+                &mime,
+                content.as_bytes(),
+                Some(&content),
+                "generated",
+            )?
         }
     };
     if let Some(w) = app.get_webview_window("main") {
@@ -1812,7 +2032,9 @@ pub(crate) async fn run_agent_headless(
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
     use tauri::Manager;
-    let webview = app.get_webview_window("main").ok_or("main window is gone")?;
+    let webview = app
+        .get_webview_window("main")
+        .ok_or("main window is gone")?;
     let window = webview.as_ref().window();
     let state = app.state::<AppState>();
     let (model, web_enabled) = {
@@ -1846,7 +2068,9 @@ pub(crate) async fn run_agent_headless(
         if let Some(b) = &bridge {
             b.stop();
         }
-        return res;
+        // Usage discarded — workflow-node usage reporting is out of scope for
+        // the chat token-budget bar (this text-only path never touches it).
+        return res.map(|(text, _usage)| text);
     }
     let mut effects = ToolEffects::default();
     let outcome = crate::sidecar::run_via_sidecar(
@@ -1901,11 +2125,19 @@ pub(crate) fn spawn_workflow_job(
         }
         let steps = plan.steps.clone();
         let total = steps.len();
-        emit_progress(&window, &job_id, "Starting the workflow…", start_done.len(), total);
+        emit_progress(
+            &window,
+            &job_id,
+            "Starting the workflow…",
+            start_done.len(),
+            total,
+        );
 
         let published: Arc<std::sync::Mutex<Option<FileMeta>>> =
             Arc::new(std::sync::Mutex::new(None));
-        let last_prefix = Arc::new(std::sync::atomic::AtomicUsize::new(dense_prefix(&start_done)));
+        let last_prefix = Arc::new(std::sync::atomic::AtomicUsize::new(dense_prefix(
+            &start_done,
+        )));
 
         // The injected headless agent-turn runner (concrete window/state captured
         // here so the executor core stays runtime-generic + mock-drivable).
@@ -1917,7 +2149,9 @@ pub(crate) fn spawn_workflow_job(
                 let app = app.clone();
                 let room_path = room_path.clone();
                 let cancel = cancel.clone();
-                Box::pin(async move { run_agent_headless(&app, &room_path, &question, cancel).await })
+                Box::pin(
+                    async move { run_agent_headless(&app, &room_path, &question, cancel).await },
+                )
             })
         };
 
@@ -1999,7 +2233,11 @@ pub(crate) fn spawn_workflow_job(
                 let _ = db::set_job_status(&r.conn, &job_id, status, err);
                 // Close the workflow_runs row for a terminal outcome.
                 if !matches!(outcome, RunOutcome::Paused) {
-                    let run_status = if matches!(outcome, RunOutcome::Done) { "done" } else { "error" };
+                    let run_status = if matches!(outcome, RunOutcome::Done) {
+                        "done"
+                    } else {
+                        "error"
+                    };
                     let _ = db::finish_workflow_run_by_job(&r.conn, &job_id, run_status, err);
                 }
             }
@@ -2049,17 +2287,19 @@ pub(crate) fn stamp_script_consents(
     for node in &def.nodes {
         if let NodeKind::ScriptRun { file, .. } = &node.kind {
             // Resolve `file` (a stored id, or a name) to a file id + bytes.
-            let resolved: Option<(String, Vec<u8>)> = if let Ok((name, bytes)) =
-                db::get_file_bytes_named(conn, file)
-            {
-                let _ = name;
-                Some((file.clone(), bytes.unwrap_or_default()))
-            } else if let Ok((id, _)) = db::find_file_like(conn, file) {
-                let bytes = db::get_file_bytes(conn, &id).ok().flatten().unwrap_or_default();
-                Some((id, bytes))
-            } else {
-                None
-            };
+            let resolved: Option<(String, Vec<u8>)> =
+                if let Ok((name, bytes)) = db::get_file_bytes_named(conn, file) {
+                    let _ = name;
+                    Some((file.clone(), bytes.unwrap_or_default()))
+                } else if let Ok((id, _)) = db::find_file_like(conn, file) {
+                    let bytes = db::get_file_bytes(conn, &id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    Some((id, bytes))
+                } else {
+                    None
+                };
             if let Some((id, bytes)) = resolved {
                 let sha = script_fingerprint(&bytes);
                 if approved.contains(&sha) {
@@ -2114,7 +2354,9 @@ pub(crate) async fn start_workflow_run(
         .map_err(|_| "this workflow's definition is unreadable")?;
     // run_input defs need a file to run on.
     if def_uses_run_input(&def) && input_file_id.is_none() {
-        return Err("This workflow runs on a chosen file — start it from a file's Actions menu.".into());
+        return Err(
+            "This workflow runs on a chosen file — start it from a file's Actions menu.".into(),
+        );
     }
     // Engine-review #1: never pile up runs of the SAME workflow. Without this a
     // scheduled workflow whose runtime exceeds its interval accumulates duplicate
@@ -2123,7 +2365,10 @@ pub(crate) async fn start_workflow_run(
     // manual trigger tells the user why. Also honor the shared queue cap, which
     // the scheduler path previously bypassed.
     let (has_inflight, full) = state.with_room(|room| {
-        Ok((has_inflight_run(&room.conn, workflow_id), queue::at_capacity(&room.conn)))
+        Ok((
+            has_inflight_run(&room.conn, workflow_id),
+            queue::at_capacity(&room.conn),
+        ))
     })?;
     if has_inflight {
         return if trigger == "manual" {
@@ -2144,16 +2389,16 @@ pub(crate) async fn start_workflow_run(
     let app = window.app_handle().clone();
     let approved: std::collections::HashSet<String> = {
         let mut set: std::collections::HashSet<String> =
-            crate::commands::read_script_approvals(&app).into_iter().collect();
+            crate::commands::read_script_approvals(&app)
+                .into_iter()
+                .collect();
         set.extend(extra_consents.iter().cloned());
         set
     };
-    let script_consents = state.with_room(|room| {
-        Ok(stamp_script_consents(&room.conn, &def, &approved))
-    })?;
+    let script_consents =
+        state.with_room(|room| Ok(stamp_script_consents(&room.conn, &def, &approved)))?;
     let models = ollama::list_models().await.unwrap_or_default();
-    let steps = compile_workflow(&def, &room_model, &models)
-        .map_err(|errs| errs.join(" "))?;
+    let steps = compile_workflow(&def, &room_model, &models).map_err(|errs| errs.join(" "))?;
     let resolved_model = default_resolved_model(&room_model, &models);
     let plan = WorkflowPlan {
         workflow_id: workflow_id.to_string(),
@@ -2175,7 +2420,13 @@ pub(crate) async fn start_workflow_run(
             return Err("The room changed while starting this workflow.".into());
         }
         let id = db::create_job(&room.conn, "workflow", &title, &plan_json, total)?;
-        db::create_workflow_run(&room.conn, workflow_id, &id, trigger, input_file_id.as_deref())?;
+        db::create_workflow_run(
+            &room.conn,
+            workflow_id,
+            &id,
+            trigger,
+            input_file_id.as_deref(),
+        )?;
         Ok(id)
     })?;
     super::queue::submit(window, state, job_id.clone()).await?;
@@ -2232,15 +2483,24 @@ fn backfill_node_labels(def_val: &mut serde_json::Value) {
         return;
     };
     for node in nodes {
-        let Some(obj) = node.as_object_mut() else { continue };
+        let Some(obj) = node.as_object_mut() else {
+            continue;
+        };
         let blank = obj
             .get("label")
             .and_then(|l| l.as_str())
             .map(|s| s.trim().is_empty())
             .unwrap_or(true);
         if blank {
-            let kind = obj.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
-            obj.insert("label".into(), serde_json::Value::String(human_kind_label(&kind)));
+            let kind = obj
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or("")
+                .to_string();
+            obj.insert(
+                "label".into(),
+                serde_json::Value::String(human_kind_label(&kind)),
+            );
         }
     }
 }
@@ -2261,7 +2521,10 @@ async fn validate_workflow_inner(
     if let Err(errs) = validate_with_binding(def, binding) {
         return errs;
     }
-    let room_model = state.with_room(|room| Ok(model_setting(&room.conn))).ok().flatten();
+    let room_model = state
+        .with_room(|room| Ok(model_setting(&room.conn)))
+        .ok()
+        .flatten();
     let models = ollama::list_models().await.unwrap_or_default();
     match compile_workflow(def, &room_model, &models) {
         Ok(_) => Vec::new(),
@@ -2299,7 +2562,9 @@ async fn apply_schedule(
     catch_up: bool,
 ) -> Result<(), String> {
     if kind.is_empty() {
-        return state.with_room(|room| db::upsert_schedule(&room.conn, workflow_id, "", "", true, true, None));
+        return state.with_room(|room| {
+            db::upsert_schedule(&room.conn, workflow_id, "", "", true, true, None)
+        });
     }
     if def_uses_run_input(def) {
         return Err("This workflow runs on a chosen file — it can't be scheduled.".into());
@@ -2313,7 +2578,15 @@ async fn apply_schedule(
         None
     };
     state.with_room(|room| {
-        db::upsert_schedule(&room.conn, workflow_id, kind, param, enabled, catch_up, next.as_deref())
+        db::upsert_schedule(
+            &room.conn,
+            workflow_id,
+            kind,
+            param,
+            enabled,
+            catch_up,
+            next.as_deref(),
+        )
     })
 }
 
@@ -2353,7 +2626,8 @@ pub async fn save_workflow(
     if !errs.is_empty() {
         return Err(errs.join(" "));
     }
-    let binding_json = serde_json::to_value(&binding).unwrap_or(serde_json::json!({"scope": "general"}));
+    let binding_json =
+        serde_json::to_value(&binding).unwrap_or(serde_json::json!({"scope": "general"}));
     let id = state.with_room(|room| {
         db::create_workflow(
             &room.conn,
@@ -2369,7 +2643,16 @@ pub async fn save_workflow(
         )
     })?;
     if let Some(s) = schedule {
-        apply_schedule(state.inner(), &id, &def, &s.kind, &s.param, s.enabled, s.catch_up).await?;
+        apply_schedule(
+            state.inner(),
+            &id,
+            &def,
+            &s.kind,
+            &s.param,
+            s.enabled,
+            s.catch_up,
+        )
+        .await?;
     }
     Ok(id)
 }
@@ -2389,7 +2672,9 @@ pub async fn update_workflow(
     schedule: Option<ScheduleArg>,
 ) -> Result<(), String> {
     let current = state.with_room(|room| db::get_workflow(&room.conn, &id))?;
-    let mut def_val = definition.clone().unwrap_or_else(|| current.definition.clone());
+    let mut def_val = definition
+        .clone()
+        .unwrap_or_else(|| current.definition.clone());
     backfill_node_labels(&mut def_val);
     let def = parse_def(&def_val)?;
     let binding_val = binding.clone().unwrap_or_else(|| current.binding.clone());
@@ -2403,7 +2688,10 @@ pub async fn update_workflow(
             &room.conn,
             &id,
             name.as_deref().unwrap_or(&current.name).trim(),
-            description.as_deref().unwrap_or(&current.description).trim(),
+            description
+                .as_deref()
+                .unwrap_or(&current.description)
+                .trim(),
             emoji.as_deref().unwrap_or(&current.emoji).trim(),
             &def_val,
             &binding_val,
@@ -2415,7 +2703,16 @@ pub async fn update_workflow(
         Ok(())
     })?;
     if let Some(s) = schedule {
-        apply_schedule(state.inner(), &id, &def, &s.kind, &s.param, s.enabled, s.catch_up).await?;
+        apply_schedule(
+            state.inner(),
+            &id,
+            &def,
+            &s.kind,
+            &s.param,
+            s.enabled,
+            s.catch_up,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2423,7 +2720,11 @@ pub async fn update_workflow(
 /// Flip a workflow active/draft. Activating is the explicit user consent that
 /// also pre-consents any scheduled/headless runs (no 180s prompt at cron time).
 #[tauri::command]
-pub fn set_workflow_status(state: State<'_, AppState>, id: String, status: String) -> Result<(), String> {
+pub fn set_workflow_status(
+    state: State<'_, AppState>,
+    id: String,
+    status: String,
+) -> Result<(), String> {
     let status = match status.as_str() {
         "active" => "active",
         _ => "draft",
@@ -2433,7 +2734,11 @@ pub fn set_workflow_status(state: State<'_, AppState>, id: String, status: Strin
 }
 
 #[tauri::command]
-pub fn set_workflow_pinned(state: State<'_, AppState>, id: String, pinned: bool) -> Result<(), String> {
+pub fn set_workflow_pinned(
+    state: State<'_, AppState>,
+    id: String,
+    pinned: bool,
+) -> Result<(), String> {
     let wf = state.with_room(|room| db::get_workflow(&room.conn, &id))?;
     let binding = parse_binding(Some(&wf.binding));
     if pinned && matches!(binding, WorkflowBinding::File { .. }) {
@@ -2454,7 +2759,16 @@ pub async fn set_workflow_schedule(
 ) -> Result<(), String> {
     let wf = state.with_room(|room| db::get_workflow(&room.conn, &id))?;
     let def = parse_def(&wf.definition)?;
-    apply_schedule(state.inner(), &id, &def, &schedule.kind, &schedule.param, schedule.enabled, schedule.catch_up).await?;
+    apply_schedule(
+        state.inner(),
+        &id,
+        &def,
+        &schedule.kind,
+        &schedule.param,
+        schedule.enabled,
+        schedule.catch_up,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2511,12 +2825,18 @@ pub fn get_workflow(state: State<'_, AppState>, id: String) -> Result<db::Workfl
 }
 
 #[tauri::command]
-pub fn get_workflow_schedule(state: State<'_, AppState>, id: String) -> Result<Option<db::Schedule>, String> {
+pub fn get_workflow_schedule(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<db::Schedule>, String> {
     state.with_room(|room| db::get_schedule(&room.conn, &id))
 }
 
 #[tauri::command]
-pub fn get_workflow_runs(state: State<'_, AppState>, id: String) -> Result<Vec<db::WorkflowRun>, String> {
+pub fn get_workflow_runs(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<db::WorkflowRun>, String> {
     state.with_room(|room| db::list_workflow_runs(&room.conn, &id))
 }
 
@@ -2587,52 +2907,58 @@ fn schedule_from_args(args: &serde_json::Value) -> Option<ScheduleArg> {
     let kind = s.get("kind").and_then(|v| v.as_str())?.to_string();
     Some(ScheduleArg {
         kind,
-        param: s.get("param").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        param: s
+            .get("param")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         enabled: s.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
-        catch_up: s.get("catchUp").or_else(|| s.get("catch_up")).and_then(|v| v.as_bool()).unwrap_or(true),
+        catch_up: s
+            .get("catchUp")
+            .or_else(|| s.get("catch_up"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
     })
 }
 
 /// Agent tool `list_workflows`: no name → id/name/status/schedule summary lines;
 /// with a name → that workflow's full definition JSON (needed for update flows).
 pub(crate) fn agent_list_workflows(state: &AppState, name: Option<&str>) -> Result<String, String> {
-    state.with_room(|room| {
-        match name.filter(|n| !n.trim().is_empty()) {
-            Some(n) => {
-                let wf = db::find_workflow(&room.conn, n)?;
-                let sched = db::get_schedule(&room.conn, &wf.id)?;
-                let sched_line = sched
-                    .map(|s| format!(" schedule: {} {}", s.kind, s.param))
-                    .unwrap_or_default();
-                Ok(format!(
-                    "{} (id {}, {}){}\n\nDefinition:\n{}",
-                    wf.name,
-                    wf.id,
-                    wf.status,
-                    sched_line,
-                    serde_json::to_string_pretty(&wf.definition).unwrap_or_default()
-                ))
+    state.with_room(|room| match name.filter(|n| !n.trim().is_empty()) {
+        Some(n) => {
+            let wf = db::find_workflow(&room.conn, n)?;
+            let sched = db::get_schedule(&room.conn, &wf.id)?;
+            let sched_line = sched
+                .map(|s| format!(" schedule: {} {}", s.kind, s.param))
+                .unwrap_or_default();
+            Ok(format!(
+                "{} (id {}, {}){}\n\nDefinition:\n{}",
+                wf.name,
+                wf.id,
+                wf.status,
+                sched_line,
+                serde_json::to_string_pretty(&wf.definition).unwrap_or_default()
+            ))
+        }
+        None => {
+            let wfs = db::list_workflows(&room.conn)?;
+            if wfs.is_empty() {
+                return Ok("No workflows are saved in this room yet.".into());
             }
-            None => {
-                let wfs = db::list_workflows(&room.conn)?;
-                if wfs.is_empty() {
-                    return Ok("No workflows are saved in this room yet.".into());
-                }
-                let lines: Vec<String> = wfs
-                    .iter()
-                    .map(|w| {
-                        format!(
-                            "- {} {} (id {}, {}, by {})",
-                            if w.emoji.is_empty() { "•" } else { &w.emoji },
-                            w.name,
-                            w.id,
-                            w.status,
-                            w.created_by
-                        )
-                    })
-                    .collect();
-                Ok(lines.join("\n"))
-            }
+            let lines: Vec<String> = wfs
+                .iter()
+                .map(|w| {
+                    format!(
+                        "- {} {} (id {}, {}, by {})",
+                        if w.emoji.is_empty() { "•" } else { &w.emoji },
+                        w.name,
+                        w.id,
+                        w.status,
+                        w.created_by
+                    )
+                })
+                .collect();
+            Ok(lines.join("\n"))
         }
     })
 }
@@ -2663,7 +2989,8 @@ pub(crate) async fn agent_save_workflow(
             errs.join("\n- ")
         ));
     }
-    let binding_json = serde_json::to_value(&binding).unwrap_or(serde_json::json!({"scope": "general"}));
+    let binding_json =
+        serde_json::to_value(&binding).unwrap_or(serde_json::json!({"scope": "general"}));
     let id = state.with_room(|room| {
         db::create_workflow(
             &room.conn,
@@ -2747,11 +3074,22 @@ fn compose_prompt(description: &str) -> String {
 pub(crate) async fn generate_text_any_engine(model: &str, prompt: &str) -> Result<String, String> {
     let msgs = vec![ollama::ChatMessage::new("user", prompt)];
     if is_external_engine(model) {
-        crate::commands::run_external(model, &msgs, None, None, false).await
-    } else {
-        ollama::generate(model, msgs, Some(0.2), KEEP_ALIVE_WARM, None, ollama::CtxTier::Job)
+        // Usage discarded — this one-shot text gateway (workflow generate
+        // nodes) is out of scope for the chat token-budget bar.
+        crate::commands::run_external(model, &msgs, None, None, false)
             .await
-            .map(|t| ollama::strip_think_spans(&t))
+            .map(|(text, _usage)| text)
+    } else {
+        ollama::generate(
+            model,
+            msgs,
+            Some(0.2),
+            KEEP_ALIVE_WARM,
+            None,
+            ollama::CtxTier::Job,
+        )
+        .await
+        .map(|t| ollama::strip_think_spans(&t))
     }
 }
 
@@ -2815,8 +3153,16 @@ pub async fn compose_workflow(
             last_err = errs.join("; ");
             continue;
         }
-        let name = val["name"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("New workflow");
-        let emoji = val["emoji"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("✨");
+        let name = val["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("New workflow");
+        let emoji = val["emoji"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("✨");
         let binding_json =
             serde_json::to_value(&binding).unwrap_or(serde_json::json!({"scope": "general"}));
         let id = state.with_room(|room| {
@@ -2853,10 +3199,16 @@ pub(crate) async fn agent_update_workflow(
         .or_else(|| args["name"].as_str())
         .unwrap_or_default();
     let current = state.with_room(|room| db::find_workflow(&room.conn, key))?;
-    let mut def_val = args.get("definition").cloned().unwrap_or_else(|| current.definition.clone());
+    let mut def_val = args
+        .get("definition")
+        .cloned()
+        .unwrap_or_else(|| current.definition.clone());
     backfill_node_labels(&mut def_val);
     let def = parse_def(&def_val)?;
-    let binding_val = args.get("binding").cloned().unwrap_or_else(|| current.binding.clone());
+    let binding_val = args
+        .get("binding")
+        .cloned()
+        .unwrap_or_else(|| current.binding.clone());
     let binding = parse_binding(Some(&binding_val));
     let errs = validate_workflow_inner(state, &def, &binding).await;
     if !errs.is_empty() {
@@ -2870,7 +3222,10 @@ pub(crate) async fn agent_update_workflow(
             &room.conn,
             &current.id,
             args["name"].as_str().unwrap_or(&current.name).trim(),
-            args["description"].as_str().unwrap_or(&current.description).trim(),
+            args["description"]
+                .as_str()
+                .unwrap_or(&current.description)
+                .trim(),
             args["emoji"].as_str().unwrap_or(&current.emoji).trim(),
             &def_val,
             &binding_val,
@@ -2881,13 +3236,62 @@ pub(crate) async fn agent_update_workflow(
         Ok(())
     })?;
     if let Some(s) = schedule_from_args(args) {
-        apply_schedule(state, &current.id, &def, &s.kind, &s.param, s.enabled, s.catch_up).await?;
+        apply_schedule(
+            state,
+            &current.id,
+            &def,
+            &s.kind,
+            &s.param,
+            s.enabled,
+            s.catch_up,
+        )
+        .await?;
     }
     emit_workflows_changed(window);
     Ok(format!(
         "Updated \"{}\" and set it back to DRAFT — tell the user to review and re-activate it.",
         current.name
     ))
+}
+
+/// Agent-side workflow deletion mirrors the UI command: unfinished runs are
+/// cancelled before their workflow row (and cascading schedule/history rows) is
+/// removed. It is intentionally a separate tool so delete is never inferred
+/// from an update payload.
+pub(crate) fn agent_delete_workflow(
+    state: &AppState,
+    window: &tauri::Window,
+    args: &serde_json::Value,
+) -> Result<String, String> {
+    let key = args["name_or_id"]
+        .as_str()
+        .or_else(|| args["name"].as_str())
+        .unwrap_or_default()
+        .trim();
+    if key.is_empty() {
+        return Err("delete_workflow needs a workflow name or id.".into());
+    }
+    let workflow = state.with_room(|room| db::find_workflow(&room.conn, key))?;
+    state.with_room(|room| {
+        let runs = db::list_workflow_runs(&room.conn, &workflow.id)?;
+        for run in runs {
+            if let Some(job_id) = run.job_id {
+                let unfinished = db::get_job(&room.conn, &job_id)
+                    .ok()
+                    .map(|job| matches!(job.status.as_str(), "running" | "queued" | "paused"))
+                    .unwrap_or(false);
+                if unfinished {
+                    if let Some(flag) = state.job_cancels.lock().unwrap().get(&job_id) {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let _ = db::delete_job(&room.conn, &job_id);
+                }
+            }
+        }
+        db::delete_workflow(&room.conn, &workflow.id)
+    })?;
+    emit_workflows_changed(window);
+    Ok(format!("Deleted workflow \"{}\".", workflow.name))
 }
 
 /// Agent tool `run_workflow`: enqueue a manual run (same trust class as
@@ -2897,7 +3301,10 @@ pub(crate) async fn agent_run_workflow(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<String, String> {
-    let key = args["name_or_id"].as_str().or_else(|| args["name"].as_str()).unwrap_or_default();
+    let key = args["name_or_id"]
+        .as_str()
+        .or_else(|| args["name"].as_str())
+        .unwrap_or_default();
     let wf = state.with_room(|room| db::find_workflow(&room.conn, key))?;
     if wf.status != "active" {
         return Err(format!(
@@ -2907,12 +3314,20 @@ pub(crate) async fn agent_run_workflow(
     }
     let file = args["file"].as_str().or_else(|| args["file_id"].as_str());
     let file_id = match file {
-        Some(f) => Some(state.with_room(|room| {
-            db::find_source_file_like(&room.conn, f).map(|(id, _)| id)
-        })?),
+        Some(f) => Some(
+            state.with_room(|room| db::find_source_file_like(&room.conn, f).map(|(id, _)| id))?,
+        ),
         None => None,
     };
-    start_workflow_run(window, state, &wf.id, "manual", file_id, &std::collections::HashSet::new()).await?;
+    start_workflow_run(
+        window,
+        state,
+        &wf.id,
+        "manual",
+        file_id,
+        &std::collections::HashSet::new(),
+    )
+    .await?;
     Ok(format!(
         "Started \"{}\" in the background — the user can watch it on the Workflows page. Do not wait for it.",
         wf.name
@@ -2934,7 +3349,10 @@ pub(crate) async fn agent_test_workflow(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<String, String> {
-    let key = args["name_or_id"].as_str().or_else(|| args["name"].as_str()).unwrap_or_default();
+    let key = args["name_or_id"]
+        .as_str()
+        .or_else(|| args["name"].as_str())
+        .unwrap_or_default();
     let wf = state.with_room(|room| db::find_workflow(&room.conn, key))?;
     let def: WorkflowDef = serde_json::from_value(wf.definition.clone())
         .map_err(|_| "this workflow's definition is unreadable".to_string())?;
@@ -2962,7 +3380,9 @@ pub(crate) async fn agent_test_workflow(
     // A file-scoped (run_input) workflow needs a file to run on.
     let file = args["file"].as_str().or_else(|| args["file_id"].as_str());
     let file_id = match file {
-        Some(f) => Some(state.with_room(|room| db::find_source_file_like(&room.conn, f).map(|(id, _)| id))?),
+        Some(f) => Some(
+            state.with_room(|room| db::find_source_file_like(&room.conn, f).map(|(id, _)| id))?,
+        ),
         None => None,
     };
     if def_uses_run_input(&def) && file_id.is_none() {
@@ -2977,8 +3397,15 @@ pub(crate) async fn agent_test_workflow(
     // a manual run yanks the viewer). No script grants — the agent can't self-
     // approve, so any script step parks (surfaced below). The slot was free, so this
     // starts immediately rather than queuing.
-    let job_id =
-        start_workflow_run(window, state, &wf.id, "agent", file_id, &std::collections::HashSet::new()).await?;
+    let job_id = start_workflow_run(
+        window,
+        state,
+        &wf.id,
+        "agent",
+        file_id,
+        &std::collections::HashSet::new(),
+    )
+    .await?;
     if job_id.is_empty() {
         return Err("Couldn't start a test run just now — try again in a moment.".into());
     }
@@ -3018,7 +3445,10 @@ pub(crate) async fn agent_test_workflow(
             continue;
         };
         let art: WfArtifact = serde_json::from_str(&raw).unwrap_or_default();
-        let label = art.node_label.clone().unwrap_or_else(|| format!("Step {}", i + 1));
+        let label = art
+            .node_label
+            .clone()
+            .unwrap_or_else(|| format!("Step {}", i + 1));
         let kind = art.node_kind.clone().unwrap_or_default();
         let state_str = if art.skipped { "skipped" } else { "done" };
         let preview: String = art.result.trim().chars().take(240).collect();
@@ -3027,8 +3457,15 @@ pub(crate) async fn agent_test_workflow(
         } else {
             preview.replace('\n', " ")
         };
-        let kind_tag = if kind.is_empty() { String::new() } else { format!(" [{kind}]") };
-        lines.push(format!("{}. {label}{kind_tag} — {state_str}: {preview}", i + 1));
+        let kind_tag = if kind.is_empty() {
+            String::new()
+        } else {
+            format!(" [{kind}]")
+        };
+        lines.push(format!(
+            "{}. {label}{kind_tag} — {state_str}: {preview}",
+            i + 1
+        ));
     }
 
     let header = match status.as_str() {
@@ -3068,7 +3505,12 @@ fn clamp_test_report(s: String) -> String {
     if s.len() <= MAX {
         return s;
     }
-    let mut cut = s.char_indices().map(|(i, _)| i).take_while(|&i| i <= MAX).last().unwrap_or(0);
+    let mut cut = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= MAX)
+        .last()
+        .unwrap_or(0);
     if cut == 0 {
         cut = s.len();
     }
@@ -3104,6 +3546,11 @@ pub fn workflow_tools_specs() -> Vec<serde_json::Value> {
                 "definition": {"type": "object"},
                 "binding": {"type": "object"},
                 "schedule": {"type": "object"}},
+                "required": ["name_or_id"]}}}),
+        serde_json::json!({"type": "function", "function": {"name": "delete_workflow",
+            "description": "Delete a workflow and its schedule/run history. Any unfinished run is cancelled first. Use only when the user explicitly asks to delete that workflow.",
+            "parameters": {"type": "object", "properties": {
+                "name_or_id": {"type": "string", "description": "Workflow name or id"}},
                 "required": ["name_or_id"]}}}),
         serde_json::json!({"type": "function", "function": {"name": "run_workflow",
             "description": "Run an ACTIVE workflow now, in the background. Optionally pass `file` (a file name) for a file-scoped workflow. After starting it, tell the user it is underway — do not wait for it or poll.",
@@ -3299,8 +3746,7 @@ mod tests {
     fn resolve_node_model_honors_external_engines_on_the_cloud_lane() {
         let models = vec!["qwen3.5:4b".to_string(), "minimax-m3:cloud".to_string()];
         // Engine parity: "auto" keeps the room's external CLI choice.
-        let (m, lane) =
-            resolve_node_model("auto", &Some("claude-cli::opus".into()), &models);
+        let (m, lane) = resolve_node_model("auto", &Some("claude-cli::opus".into()), &models);
         assert_eq!(m, "claude-cli::opus");
         assert!(matches!(lane, Lane::Cloud));
         // A literal external engine is honored too.
@@ -3308,8 +3754,7 @@ mod tests {
         assert_eq!(m, "codex-cli");
         assert!(matches!(lane, Lane::Cloud));
         // "local" stays a hard local pick whatever the room engine is.
-        let (m, lane) =
-            resolve_node_model("local", &Some("codex-cli".into()), &models);
+        let (m, lane) = resolve_node_model("local", &Some("codex-cli".into()), &models);
         assert_eq!(m, "qwen3.5:4b");
         assert!(matches!(lane, Lane::LocalLlm));
         // `:cloud` proxies keep riding the cloud lane.
@@ -3333,7 +3778,11 @@ mod tests {
         assert!(validate_definition(&linear_def()).is_ok());
         for t in builtin_templates() {
             let def: WorkflowDef = serde_json::from_value(t["definition"].clone()).unwrap();
-            assert!(validate_definition(&def).is_ok(), "template {} invalid", t["name"]);
+            assert!(
+                validate_definition(&def).is_ok(),
+                "template {} invalid",
+                t["name"]
+            );
         }
     }
 
@@ -3347,8 +3796,11 @@ mod tests {
             "edges": [ { "from": "a", "to": "b" }, { "from": "b", "to": "a" } ]
         }));
         let errs = validate_definition(&def).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("cycle") && e.contains("a") && e.contains("b")),
-            "cycle must be named: {errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("cycle") && e.contains("a") && e.contains("b")),
+            "cycle must be named: {errs:?}"
+        );
     }
 
     #[test]
@@ -3362,8 +3814,14 @@ mod tests {
             "edges": [ { "from": "a", "to": "ghost" }, { "from": "a", "to": "b", "branch": "then" } ]
         }));
         let errs = validate_definition(&def).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("ghost")), "dangling edge: {errs:?}");
-        assert!(errs.iter().any(|e| e.contains("not a condition")), "bad branch: {errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("ghost")),
+            "dangling edge: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("not a condition")),
+            "bad branch: {errs:?}"
+        );
     }
 
     #[test]
@@ -3395,10 +3853,16 @@ mod tests {
     fn compose_prompt_teaches_the_full_palette() {
         let prompt = compose_prompt("x");
         for sel in FILE_SELECTORS {
-            assert!(prompt.contains(sel), "selector '{sel}' missing from compose prompt");
+            assert!(
+                prompt.contains(sel),
+                "selector '{sel}' missing from compose prompt"
+            );
         }
         for op in CONDITION_OPS {
-            assert!(prompt.contains(op), "condition op '{op}' missing from compose prompt");
+            assert!(
+                prompt.contains(op),
+                "condition op '{op}' missing from compose prompt"
+            );
         }
     }
 
@@ -3416,7 +3880,11 @@ mod tests {
         // …file binding is accepted.
         assert!(validate_with_binding(
             &def,
-            &WorkflowBinding::File { kinds: vec!["pdf".into()], exts: vec![], file_id: None }
+            &WorkflowBinding::File {
+                kinds: vec!["pdf".into()],
+                exts: vec![],
+                file_id: None
+            }
         )
         .is_ok());
     }
@@ -3443,10 +3911,16 @@ mod tests {
             }
         }
         // cond is a root (no deps) and on the Cpu lane; the generate is LocalLlm.
-        let cond = steps.iter().find(|s| s.params["node"]["id"] == "cond").unwrap();
+        let cond = steps
+            .iter()
+            .find(|s| s.params["node"]["id"] == "cond")
+            .unwrap();
         assert!(cond.depends_on.is_empty());
         assert_eq!(cond.lane, Lane::Cpu);
-        let gen = steps.iter().find(|s| s.params["node"]["id"] == "gen").unwrap();
+        let gen = steps
+            .iter()
+            .find(|s| s.params["node"]["id"] == "gen")
+            .unwrap();
         assert_eq!(gen.lane, Lane::LocalLlm);
         // The generate's incoming edge carries the 'then' branch of the condition.
         let inc = gen.params["incoming"].as_array().unwrap();
@@ -3466,9 +3940,18 @@ mod tests {
 
     #[test]
     fn edge_liveness_rule() {
-        let done = WfArtifact { result: "hi".into(), ..Default::default() };
-        let skipped = WfArtifact { skipped: true, ..Default::default() };
-        let then_branch = WfArtifact { branch: Some("then".into()), ..Default::default() };
+        let done = WfArtifact {
+            result: "hi".into(),
+            ..Default::default()
+        };
+        let skipped = WfArtifact {
+            skipped: true,
+            ..Default::default()
+        };
+        let then_branch = WfArtifact {
+            branch: Some("then".into()),
+            ..Default::default()
+        };
         // No branch: live iff not skipped, missing = dead.
         assert!(edge_is_live(Some(&done), &None));
         assert!(!edge_is_live(Some(&skipped), &None));
@@ -3480,9 +3963,19 @@ mod tests {
 
     #[test]
     fn condition_ops_evaluate() {
-        assert!(eval_condition("contains", "hello world", &Some("world".into()), 0));
+        assert!(eval_condition(
+            "contains",
+            "hello world",
+            &Some("world".into()),
+            0
+        ));
         assert!(!eval_condition("contains", "hello", &Some("bye".into()), 0));
-        assert!(eval_condition("not_contains", "hello", &Some("bye".into()), 0));
+        assert!(eval_condition(
+            "not_contains",
+            "hello",
+            &Some("bye".into()),
+            0
+        ));
         assert!(eval_condition("is_empty", "   ", &None, 0));
         assert!(eval_condition("not_empty", "x", &None, 0));
         assert!(eval_condition("new_files_since_last_run", "", &None, 3));
@@ -3493,8 +3986,14 @@ mod tests {
 
     #[test]
     fn transform_ops_are_deterministic() {
-        assert_eq!(apply_transform("append", &None, &Some(" world".into()), "hi"), "hi world");
-        assert_eq!(apply_transform("prepend", &None, &Some(">> ".into()), "hi"), ">> hi");
+        assert_eq!(
+            apply_transform("append", &None, &Some(" world".into()), "hi"),
+            "hi world"
+        );
+        assert_eq!(
+            apply_transform("prepend", &None, &Some(">> ".into()), "hi"),
+            ">> hi"
+        );
         assert_eq!(
             apply_transform("replace", &Some("a".into()), &Some("b".into()), "banana"),
             "bbnbnb"
@@ -3502,8 +4001,14 @@ mod tests {
         assert_eq!(apply_transform("upper", &None, &None, "hi"), "HI");
         assert_eq!(apply_transform("lower", &None, &None, "HI"), "hi");
         assert_eq!(apply_transform("trim", &None, &None, "  hi \n"), "hi");
-        assert_eq!(apply_transform("truncate", &None, &Some("3".into()), "abcdef"), "abc");
-        assert_eq!(apply_transform("strip_html", &None, &None, "<b>hi</b>").trim(), "hi");
+        assert_eq!(
+            apply_transform("truncate", &None, &Some("3".into()), "abcdef"),
+            "abc"
+        );
+        assert_eq!(
+            apply_transform("strip_html", &None, &None, "<b>hi</b>").trim(),
+            "hi"
+        );
         // Unknown op is a passthrough (validation catches it earlier).
         assert_eq!(apply_transform("bogus", &None, &None, "hi"), "hi");
     }
@@ -3511,8 +4016,14 @@ mod tests {
     #[test]
     fn merge_modes_combine_branches() {
         let inputs = vec!["a\nb".to_string(), "b\nc".to_string()];
-        assert_eq!(apply_merge("concat", &Some("|".into()), &inputs), "a\nb|b\nc");
-        assert_eq!(apply_merge("numbered", &Some("\n".into()), &inputs), "1. a\nb\n2. b\nc");
+        assert_eq!(
+            apply_merge("concat", &Some("|".into()), &inputs),
+            "a\nb|b\nc"
+        );
+        assert_eq!(
+            apply_merge("numbered", &Some("\n".into()), &inputs),
+            "1. a\nb\n2. b\nc"
+        );
         // dedupe_lines keeps first occurrence order, drops the repeat 'b'.
         assert_eq!(apply_merge("dedupe_lines", &None, &inputs), "a\nb\nc");
     }
@@ -3530,11 +4041,18 @@ mod tests {
 
     #[test]
     fn route_label_pick_is_robust() {
-        let labels = vec!["action".to_string(), "reference".to_string(), "idea".to_string()];
+        let labels = vec![
+            "action".to_string(),
+            "reference".to_string(),
+            "idea".to_string(),
+        ];
         // Structured answer wins.
         assert_eq!(pick_route_label("{\"label\":\"idea\"}", &labels), "idea");
         // Fuzzy: the label appears in prose.
-        assert_eq!(pick_route_label("This is clearly a reference note.", &labels), "reference");
+        assert_eq!(
+            pick_route_label("This is clearly a reference note.", &labels),
+            "reference"
+        );
         // Nothing matches → the first label (a route always takes SOME branch).
         assert_eq!(pick_route_label("uh, dunno", &labels), "action");
     }
@@ -3556,7 +4074,10 @@ mod tests {
             "nodes": [ { "id": "r", "kind": "route", "labels": ["only"] } ],
             "edges": []
         }));
-        assert!(validate_definition(&bad).unwrap_err().iter().any(|e| e.contains("two labels")));
+        assert!(validate_definition(&bad)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("two labels")));
         // A branch label the route doesn't declare is rejected.
         let bad2 = parse(serde_json::json!({
             "nodes": [
@@ -3565,7 +4086,10 @@ mod tests {
             ],
             "edges": [ { "from": "r", "to": "g", "branch": "c" } ]
         }));
-        assert!(validate_definition(&bad2).unwrap_err().iter().any(|e| e.contains("no such label")));
+        assert!(validate_definition(&bad2)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("no such label")));
         // A legal route graph validates.
         let ok = parse(serde_json::json!({
             "nodes": [
@@ -3591,8 +4115,14 @@ mod tests {
             "edges": []
         }));
         let errs = validate_definition(&def).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("unknown transform")), "{errs:?}");
-        assert!(errs.iter().any(|e| e.contains("unknown script mode")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("unknown transform")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("unknown script mode")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -3606,9 +4136,15 @@ mod tests {
         }));
         let models = vec!["qwen3.5:4b".to_string()];
         let steps = compile_workflow(&def, &None, &models).unwrap();
-        let merge = steps.iter().find(|s| s.params["node"]["id"] == "m").unwrap();
+        let merge = steps
+            .iter()
+            .find(|s| s.params["node"]["id"] == "m")
+            .unwrap();
         assert_eq!(merge.lane, Lane::Cpu, "merge is deterministic → CPU lane");
-        let extract = steps.iter().find(|s| s.params["node"]["id"] == "e").unwrap();
+        let extract = steps
+            .iter()
+            .find(|s| s.params["node"]["id"] == "e")
+            .unwrap();
         assert_eq!(extract.lane, Lane::LocalLlm, "extract calls the model");
     }
 }

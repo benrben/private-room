@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 import pytest
 
+from arcelle_sidecar.chat import RoundUsage
 from arcelle_sidecar.config import McpConfig, RunRequest
 from arcelle_sidecar.graph import CancelToken, Deps, Event, run_agent
 from arcelle_sidecar.mcp_client import ToolResult, ToolSpec
@@ -92,7 +93,7 @@ class FakeChatModel:
         tools: list[dict[str, Any]],
         on_delta: Callable[[str], Awaitable[None]],
         cancel: Any = None,
-    ) -> tuple[str, list[ToolCall]]:
+    ) -> tuple[str, list[ToolCall], RoundUsage]:
         self.offered.append(list(tools))
         self.seen_messages.append([dict(m) for m in messages])
         self.cancels.append(cancel)
@@ -104,7 +105,10 @@ class FakeChatModel:
             await on_delta(rnd.content)
         # A round offering zero tools must not be able to produce a tool call.
         calls = list(rnd.calls) if tools else []
-        return rnd.content, calls
+        # No real engine behind this fake — every test exercises the
+        # char-estimate fallback path unless a test overrides `stream` itself.
+        usage = RoundUsage(input_tokens=None, output_tokens=None, max_context=8192, is_real=False)
+        return rnd.content, calls, usage
 
 
 class FakeMCP:

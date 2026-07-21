@@ -86,6 +86,13 @@ impl ToolScope {
     fn include_external_tools(self) -> bool {
         matches!(self, ToolScope::ExternalAgent)
     }
+    /// Connector configuration can start local programs or reach remote
+    /// services, so its CRUD tools belong only to Arcelle's local main agent.
+    /// The save operation still writes disabled drafts; explicit user approval
+    /// remains required before a connector can run.
+    fn include_mcp_management_tools(self) -> bool {
+        matches!(self, ToolScope::LocalEngine)
+    }
 }
 
 /// ADD-33: a run-scoped accumulator for tool side-effects (`wrote`, `annotation`,
@@ -254,7 +261,15 @@ pub async fn start(
             }
         }
     });
-    Ok(Bridge { port, token, scope, stable, shutdown: tx, task, tool_ran })
+    Ok(Bridge {
+        port,
+        token,
+        scope,
+        stable,
+        shutdown: tx,
+        task,
+        tool_ran,
+    })
 }
 
 /// One bridge connection: `serve_conn` with the real JSON-RPC dispatcher.
@@ -276,7 +291,13 @@ async fn handle_conn(
         let tool_ran = tool_ran.clone();
         async move {
             dispatch_jsonrpc(
-                &app, &body, web_enabled, scope, effects.as_ref(), &tool_ran, privacy_bypass,
+                &app,
+                &body,
+                web_enabled,
+                scope,
+                effects.as_ref(),
+                &tool_ran,
+                privacy_bypass,
             )
             .await
         }
@@ -434,8 +455,16 @@ async fn dispatch_jsonrpc(
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => Ok(serde_json::json!({ "tools": served_tools(app, web_enabled, scope) })),
         "tools/call" => {
-            tool_call(app, &req["params"], web_enabled, scope, effects, tool_ran, privacy_bypass)
-                .await
+            tool_call(
+                app,
+                &req["params"],
+                web_enabled,
+                scope,
+                effects,
+                tool_ran,
+                privacy_bypass,
+            )
+            .await
         }
         _ => Err(format!("method not found: {method}")),
     };
@@ -449,15 +478,111 @@ async fn dispatch_jsonrpc(
     (200, reply.to_string().into_bytes())
 }
 
-/// Translate one Ollama-shaped `{"function": {...}}` spec to an MCP tool record.
-fn to_mcp_tool(t: &serde_json::Value) -> Option<serde_json::Value> {
-    let f = t.get("function")?;
+/// Safety metadata for Arcelle-owned tools. Codex `exec` is deliberately
+/// non-interactive (`approval_policy=never`); without MCP annotations it treats
+/// every server tool as approval-requiring and returns "user cancelled MCP
+/// tool call" before the request reaches Arcelle. These hints let reads and
+/// recoverable/non-destructive writes run while keeping genuinely unknown
+/// third-party tools fail-closed.
+fn arcelle_tool_annotations(name: &str) -> Option<serde_json::Value> {
+    let (read_only, destructive, idempotent, open_world) = match name {
+        // Room/content reads and viewer-only effects.
+        "list_room_files"
+        | "search_room"
+        | "open_file"
+        | "mark_image"
+        | "annotate_file"
+        | "list_memories"
+        | "list_skills"
+        | "read_skill"
+        | "read_skill_resource"
+        | "job_status"
+        | "list_workflows"
+        | "ui_snapshot"
+        | "view_screenshot"
+        | "view_media_frame"
+        | "local_generate"
+        | "list_mcps"
+        | "read_mcp" => (true, false, true, false),
+        // Reads that may contact the public web. Arcelle only advertises them
+        // when the room's Online features setting is enabled.
+        "web_search" | "fetch_page" => (true, false, true, true),
+        // Recoverable room mutations. File writes are versioned, workflow and
+        // skill writes produce reviewable drafts, and script execution has its
+        // own explicit Arcelle approval gate.
+        "create_file"
+        | "edit_file"
+        | "edit_files"
+        | "write_file"
+        | "set_cells"
+        | "rename_file"
+        | "move_file"
+        | "add_memory"
+        | "save_skill"
+        | "write_skill_resource"
+        | "run_skill_script"
+        | "start_file_pass"
+        | "save_workflow"
+        | "update_workflow"
+        | "run_workflow"
+        | "test_workflow"
+        | "ui_act"
+        | "save_mcp" => (false, false, false, false),
+        // Deletion is intentionally marked honestly. A non-interactive Codex
+        // subprocess cannot confirm it, while the local main agent reaches it
+        // only through the on-demand management lane.
+        "delete_skill" | "delete_skill_resource" | "delete_workflow" | "delete_mcp" => {
+            (false, true, false, false)
+        }
+        _ => return None,
+    };
     Some(serde_json::json!({
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": idempotent,
+        "openWorldHint": open_world,
+    }))
+}
+
+/// Keep only the standard boolean MCP hints from a connected third-party
+/// server. Arcelle's own connector approval gate remains authoritative; this
+/// metadata merely prevents Codex from adding an impossible second prompt in
+/// its non-interactive subprocess.
+fn sanitized_tool_annotations(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let source = value.as_object()?;
+    let mut out = serde_json::Map::new();
+    for key in [
+        "readOnlyHint",
+        "destructiveHint",
+        "idempotentHint",
+        "openWorldHint",
+    ] {
+        if let Some(value) = source.get(key).and_then(|v| v.as_bool()) {
+            out.insert(key.to_string(), serde_json::Value::Bool(value));
+        }
+    }
+    (!out.is_empty()).then_some(serde_json::Value::Object(out))
+}
+
+/// Translate one Ollama-shaped `{"function": {...}}` spec to an MCP tool record.
+fn to_mcp_tool(t: &serde_json::Value, arcelle_owned: bool) -> Option<serde_json::Value> {
+    let f = t.get("function")?;
+    let name = f.get("name")?.as_str()?;
+    let mut tool = serde_json::json!({
         "name": f.get("name")?,
         "description": f.get("description").cloned().unwrap_or_default(),
         "inputSchema": f.get("parameters").cloned()
             .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
-    }))
+    });
+    let annotations = if arcelle_owned {
+        arcelle_tool_annotations(name)
+    } else {
+        f.get("annotations").and_then(sanitized_tool_annotations)
+    };
+    if let Some(annotations) = annotations {
+        tool["annotations"] = annotations;
+    }
+    Some(tool)
 }
 
 /// The built-in room catalog translated to MCP tool records. Same source of
@@ -468,7 +593,7 @@ fn builtin_mcp_tools(web_enabled: bool) -> Vec<serde_json::Value> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(to_mcp_tool)
+        .filter_map(|tool| to_mcp_tool(tool, true))
         .collect()
 }
 
@@ -497,11 +622,14 @@ fn scoped_specs(web_enabled: bool, scope: ToolScope) -> Vec<serde_json::Value> {
         // start_file_pass, which the external tier already grants.
         extras.extend(commands::workflow_tools_specs());
     }
+    if scope.include_mcp_management_tools() {
+        extras.extend(commands::mcp_management_tools_specs());
+    }
     if scope.include_external_tools() {
         extras.extend(commands::external_agent_tools_specs());
         extras.extend(commands::media_tools_specs());
     }
-    list.extend(extras.iter().filter_map(to_mcp_tool));
+    list.extend(extras.iter().filter_map(|tool| to_mcp_tool(tool, true)));
     list
 }
 
@@ -519,7 +647,7 @@ fn served_tools(
         let state = app.state::<commands::AppState>();
         let (routes, _omitted) = commands::mcp_routes(&state);
         for r in &routes {
-            if let Some(rec) = to_mcp_tool(&r.spec) {
+            if let Some(rec) = to_mcp_tool(&r.spec, false) {
                 list.push(rec);
             }
         }
@@ -612,7 +740,14 @@ async fn tool_call(
             // here (and hidden for the sink-less cloud/external scopes below).
             effects.run_scoped = true;
             let outcome = commands::exec_tool(
-                &state, &window, &call, &mut effects, &routes, &HashSet::new(), None, None,
+                &state,
+                &window,
+                &call,
+                &mut effects,
+                &routes,
+                &HashSet::new(),
+                None,
+                None,
             )
             .await;
             // MIGRATION Phase 2b (perception bridge): a UI/perception tool
@@ -643,7 +778,14 @@ async fn tool_call(
             // description.
             effects.vision_chat = matches!(scope, ToolScope::ExternalAgent);
             let outcome = commands::exec_tool(
-                &state, &window, &call, &mut effects, &routes, &HashSet::new(), None, None,
+                &state,
+                &window,
+                &call,
+                &mut effects,
+                &routes,
+                &HashSet::new(),
+                None,
+                None,
             )
             .await;
             let images: Vec<String> = effects.pending_images.drain(..).collect();
@@ -712,7 +854,10 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> Res
         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
         body.len()
     );
-    stream.write_all(head.as_bytes()).await.map_err(|e| e.to_string())?;
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
     stream.write_all(body).await.map_err(|e| e.to_string())?;
     stream.flush().await.map_err(|e| e.to_string())
 }
@@ -761,7 +906,9 @@ mod tests {
         assert!(open["inputSchema"]["properties"]["name"].is_object());
         // web tools appear only when web access is on
         assert!(!tools.iter().any(|t| t["name"] == "web_search"));
-        assert!(builtin_mcp_tools(true).iter().any(|t| t["name"] == "web_search"));
+        assert!(builtin_mcp_tools(true)
+            .iter()
+            .any(|t| t["name"] == "web_search"));
         // ADD-21: the advisor tool is NOT in the bridge catalog — a consulted
         // cloud CLI must never be handed a tool that spawns another one.
         assert!(!tools.iter().any(|t| t["name"] == "consult_advisor"));
@@ -773,9 +920,84 @@ mod tests {
         assert!(!tools.iter().any(|t| t["name"] == "start_file_pass"));
         // Wave 1a: the external tier's tools never reach a cloud scope either.
         let cloud = scoped_specs(false, ToolScope::CloudAdvisor { include_mcp: true });
-        for name in ["local_generate", "start_file_pass", "job_status", "view_media_frame"] {
-            assert!(!cloud.iter().any(|t| t["name"] == name), "{name} leaked to cloud");
+        for name in [
+            "local_generate",
+            "start_file_pass",
+            "job_status",
+            "view_media_frame",
+        ] {
+            assert!(
+                !cloud.iter().any(|t| t["name"] == name),
+                "{name} leaked to cloud"
+            );
         }
+    }
+
+    #[test]
+    fn arcelle_tools_publish_codex_approval_hints() {
+        let tools = builtin_mcp_tools(true);
+        let read = tools
+            .iter()
+            .find(|t| t["name"] == "list_room_files")
+            .unwrap();
+        assert_eq!(read["annotations"]["readOnlyHint"], true);
+        assert_eq!(read["annotations"]["idempotentHint"], true);
+        assert_eq!(read["annotations"]["destructiveHint"], false);
+        assert_eq!(read["annotations"]["openWorldHint"], false);
+
+        let write = tools.iter().find(|t| t["name"] == "create_file").unwrap();
+        assert_eq!(write["annotations"]["readOnlyHint"], false);
+        assert_eq!(write["annotations"]["destructiveHint"], false);
+        assert_eq!(write["annotations"]["openWorldHint"], false);
+
+        let web = tools.iter().find(|t| t["name"] == "web_search").unwrap();
+        assert_eq!(web["annotations"]["readOnlyHint"], true);
+        assert_eq!(web["annotations"]["openWorldHint"], true);
+
+        // Every Arcelle-owned tool exposed to any bridge tier must be classified.
+        // An unclassified future tool deliberately has no annotations and will
+        // fail closed in non-interactive Codex until its safety is reviewed.
+        for scope in [
+            ToolScope::CloudAdvisor { include_mcp: false },
+            ToolScope::LocalEngine,
+            ToolScope::ExternalAgent,
+        ] {
+            for tool in scoped_specs(true, scope) {
+                assert!(
+                    tool["annotations"].is_object(),
+                    "{} is missing MCP safety annotations",
+                    tool["name"].as_str().unwrap_or("<unnamed>")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn connected_tool_annotations_are_preserved_but_sanitized() {
+        let spec = serde_json::json!({"type": "function", "function": {
+            "name": "connector_lookup",
+            "description": "Look something up",
+            "parameters": {"type": "object", "properties": {}},
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": true,
+                "vendorSecret": "must not be forwarded"
+            }
+        }});
+        let tool = to_mcp_tool(&spec, false).unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["annotations"]["destructiveHint"], false);
+        assert_eq!(tool["annotations"]["openWorldHint"], true);
+        assert!(tool["annotations"].get("vendorSecret").is_none());
+
+        let unknown = serde_json::json!({"type": "function", "function": {
+            "name": "unknown_tool", "parameters": {"type": "object"}
+        }});
+        assert!(to_mcp_tool(&unknown, false)
+            .unwrap()
+            .get("annotations")
+            .is_none());
     }
 
     #[test]
@@ -783,34 +1005,82 @@ mod tests {
         // Wave 1a: the ExternalAgent tier = file tools + job tools +
         // local_generate + the content-perception view_media_frame…
         let ext = scoped_specs(false, ToolScope::ExternalAgent);
-        for name in ["list_room_files", "start_file_pass", "job_status", "local_generate",
-                     "view_media_frame"] {
-            assert!(ext.iter().any(|t| t["name"] == name), "{name} missing from external tier");
+        for name in [
+            "list_room_files",
+            "start_file_pass",
+            "job_status",
+            "local_generate",
+            "view_media_frame",
+        ] {
+            assert!(
+                ext.iter().any(|t| t["name"] == name),
+                "{name} missing from external tier"
+            );
         }
         // …and NEVER the UI-driving/screen tools or consult_advisor (the two
         // intentional gaps from in-room parity — see the module doc).
-        for name in ["ui_act", "ui_snapshot", "view_screenshot", "consult_advisor"] {
-            assert!(!ext.iter().any(|t| t["name"] == name), "{name} leaked to external tier");
+        for name in [
+            "ui_act",
+            "ui_snapshot",
+            "view_screenshot",
+            "consult_advisor",
+            "list_mcps",
+            "save_mcp",
+            "delete_mcp",
+        ] {
+            assert!(
+                !ext.iter().any(|t| t["name"] == name),
+                "{name} leaked to external tier"
+            );
         }
         // The local engine keeps its full set but has no local_generate — it
         // IS the local model already.
         let local = scoped_specs(false, ToolScope::LocalEngine);
-        for name in ["ui_act", "ui_snapshot", "view_screenshot", "view_media_frame",
-                     "start_file_pass", "job_status"] {
-            assert!(local.iter().any(|t| t["name"] == name), "{name} missing from local tier");
+        for name in [
+            "ui_act",
+            "ui_snapshot",
+            "view_screenshot",
+            "view_media_frame",
+            "start_file_pass",
+            "job_status",
+            "list_mcps",
+            "read_mcp",
+            "save_mcp",
+            "delete_mcp",
+        ] {
+            assert!(
+                local.iter().any(|t| t["name"] == name),
+                "{name} missing from local tier"
+            );
         }
         assert!(!local.iter().any(|t| t["name"] == "local_generate"));
 
         // Wave 4a: the workflow authoring tools ride the job-tools trust class —
         // served to LocalEngine and ExternalAgent, NEVER to a cloud advisor.
-        let wf_names = ["list_workflows", "save_workflow", "update_workflow", "run_workflow"];
+        let wf_names = [
+            "list_workflows",
+            "save_workflow",
+            "update_workflow",
+            "delete_workflow",
+            "run_workflow",
+            "test_workflow",
+        ];
         for name in wf_names {
-            assert!(local.iter().any(|t| t["name"] == name), "{name} missing from local tier");
-            assert!(ext.iter().any(|t| t["name"] == name), "{name} missing from external tier");
+            assert!(
+                local.iter().any(|t| t["name"] == name),
+                "{name} missing from local tier"
+            );
+            assert!(
+                ext.iter().any(|t| t["name"] == name),
+                "{name} missing from external tier"
+            );
         }
         let cloud = scoped_specs(false, ToolScope::CloudAdvisor { include_mcp: true });
         for name in wf_names {
-            assert!(!cloud.iter().any(|t| t["name"] == name), "{name} leaked to cloud");
+            assert!(
+                !cloud.iter().any(|t| t["name"] == name),
+                "{name} leaked to cloud"
+            );
         }
     }
 
@@ -843,7 +1113,9 @@ mod tests {
         let mut buf = [0u8; 1024];
         let n = conn.read(&mut buf).await.unwrap();
         assert!(
-            std::str::from_utf8(&buf[..n]).unwrap().starts_with("HTTP/1.1 200"),
+            std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .starts_with("HTTP/1.1 200"),
             "first request on the live connection must be served"
         );
         // Stop. The SAME socket: the write may land in the OS buffer, but no
@@ -853,10 +1125,12 @@ mod tests {
         let _ = conn.write_all(head.as_bytes()).await;
         let _ = conn.write_all(body).await;
         let mut rest = Vec::new();
-        let read =
-            tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_to_end(&mut rest))
-                .await
-                .expect("severed connection must not hang");
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_to_end(&mut rest),
+        )
+        .await
+        .expect("severed connection must not hang");
         match read {
             Ok(_) => assert!(
                 !String::from_utf8_lossy(&rest).contains("HTTP/1.1 200"),

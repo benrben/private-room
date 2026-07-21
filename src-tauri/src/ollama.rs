@@ -244,7 +244,7 @@ pub enum CtxTier {
 /// 7.7 GB · 128k → 9.9 GB, all 100% GPU. Chat sizes stay small because the
 /// user waits for prefill (~210 tok/s on that machine); Job sizes go big
 /// because a background step can afford minutes. Read once.
-fn num_ctx_for(has_tools: bool, tier: CtxTier) -> u32 {
+pub(crate) fn num_ctx_for(has_tools: bool, tier: CtxTier) -> u32 {
     static HIGH_RAM: OnceLock<bool> = OnceLock::new();
     let high = *HIGH_RAM.get_or_init(|| {
         let mut sys = sysinfo::System::new();
@@ -410,6 +410,33 @@ pub async fn generate(
     let body = plain_generate_body(model, &messages, temperature, keep_alive, tier);
     let value = post_generate_cancellable(&body, model, cancel).await?;
     Ok(value["text"].as_str().unwrap_or_default().to_string())
+}
+
+/// Context handoff: one summarization call through the sidecar's
+/// `/handoff_summary` gateway (`sidecar/arcelle_sidecar/handoff.py`) — the
+/// same engine-agnostic `llm.generate` dispatch every other one-shot gateway
+/// call gets (Ollama or an external CLI, whichever the room is set to).
+/// PRIV-1: the room's privacy policy rides along, same as every other gateway
+/// call that touches real chat content (see `sidecar.rs`'s `/run` body).
+pub(crate) async fn handoff_summary(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    temperature: Option<f64>,
+) -> Result<String, String> {
+    let _daemon = if crate::commands::is_external_engine(model) {
+        None
+    } else {
+        Some(wake_daemon().await?)
+    };
+    let body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "base_url": resolved_base_url(),
+        "temperature": temperature,
+    });
+    let body = crate::commands::inject_policy(&body).unwrap_or(body);
+    let value = sidecar_post("/handoff_summary", &body, Some(model)).await?;
+    Ok(value["summary"].as_str().unwrap_or_default().to_string())
 }
 
 /// Remove the `<think>…</think>` reasoning spans a model leaks into its visible
@@ -589,6 +616,36 @@ pub async fn list_models() -> Result<Vec<String>, String> {
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// The model's real advertised context length, straight from Ollama's own
+/// `/api/tags` catalog — NOT the RAM-adaptive `num_ctx` window this app
+/// throttles Ollama to for speed/memory (reported live 2026-07-21: a user's
+/// qwen3.5 model natively supports ~256k, but the bar showed the throttled
+/// 12288 working window instead). This is the Rust-side twin of the
+/// sidecar's `model_limits.native_context_length` — needed here because
+/// `handoff_chat` builds its post-handoff usage snapshot without going
+/// through the sidecar at all. `None` on any failure (daemon unreachable,
+/// model not listed) — the caller falls back to the RAM-adaptive window.
+pub(crate) async fn native_context_length(model: &str) -> Option<u32> {
+    let base = resolved_base_url();
+    let resp = client()
+        .ok()?
+        .get(format!("{base}/api/tags"))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    v["models"].as_array()?.iter().find_map(|m| {
+        let matches = m["model"].as_str() == Some(model) || m["name"].as_str() == Some(model);
+        if !matches {
+            return None;
+        }
+        m["details"]["context_length"].as_u64().map(|n| n as u32)
+    })
 }
 
 /// ADD-22: a model's declared capabilities via the sidecar `/capabilities`

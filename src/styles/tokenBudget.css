@@ -1,0 +1,238 @@
+/* Token-budget bar: a segmented composition meter (colored by category) plus
+   a click-to-expand exact breakdown. Extends the .pw-meter track/fill idiom
+   (gate.css) to N colored sub-segments; the overall near/at/over-budget
+   signal is a color-only ring (never a width change — the fill width is
+   always the real ratio). Categorical colors: --tok-* (tokens.css). */
+
+.token-bar-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+.token-bar-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+.token-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: 3px 4px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+}
+.token-bar:hover {
+  background: var(--hover);
+}
+.token-bar-track {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+.token-bar-fill {
+  display: flex;
+  height: 100%;
+  gap: 2px;
+  transition: width 0.3s ease;
+}
+.token-bar-seg {
+  flex: 0 0 auto;
+  height: 100%;
+  position: relative;
+}
+.token-bar-seg:first-child {
+  border-radius: 3px 0 0 3px;
+}
+.token-bar-seg:last-child {
+  border-radius: 0 3px 3px 0;
+}
+.tok-system {
+  background: var(--tok-system);
+}
+.tok-history {
+  background: var(--tok-history);
+}
+.tok-tools {
+  background: var(--tok-tools);
+}
+.tok-skills {
+  background: var(--tok-skills);
+}
+.tok-files {
+  background: var(--tok-files);
+}
+.token-bar-label {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.token-bar-est {
+  margin-left: 3px;
+  color: var(--faint);
+  cursor: help;
+}
+/* Threshold ring — a glow, never a width jump. Reuses the app's own
+   --ok/--warn/--danger (green/amber/red), same triad as .pw-meter. */
+.token-bar.ok {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 22%, transparent);
+}
+.token-bar.warn {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 30%, transparent);
+}
+.token-bar.danger {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--danger) 36%, transparent);
+  animation: token-bar-pulse 1.6s ease-in-out infinite;
+}
+@keyframes token-bar-pulse {
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 20%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-bar.danger {
+    animation: none;
+  }
+}
+/* Per-segment hover tooltip — the shared [data-tip] mechanism (shell.css),
+   anchored above the thin mark instead of the icon-btn's corner offset. */
+.token-bar-seg[data-tip]::after {
+  bottom: calc(100% + 6px);
+  top: auto;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+/* Click-to-expand breakdown — the shared .pop-menu shell (workspace.css),
+   anchored UPWARD: the bar sits near the bottom of the viewport, above the
+   composer, unlike the top-bar's model-pill popover it's otherwise modeled on. */
+.token-breakdown-pop {
+  left: 0;
+  right: auto;
+  bottom: calc(100% + 8px);
+  top: auto;
+  width: min(320px, calc(100vw - 40px));
+}
+.token-breakdown-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 5px 6px;
+  font-size: 12px;
+}
+.token-breakdown-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+.token-breakdown-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+}
+.token-breakdown-count {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.token-breakdown-pct {
+  width: 3.2em;
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.token-breakdown-total {
+  display: flex;
+  justify-content: space-between;
+  margin: 6px 0 2px;
+  padding: 6px 6px 0;
+  border-top: 1px solid var(--line-soft);
+  font-size: 12px;
+  color: var(--text);
+}
+.token-breakdown-note {
+  margin-top: 6px;
+  padding: 0 6px;
+  font-size: 10.5px;
+  color: var(--faint);
+  line-height: 1.4;
+}
+
+/* Hand-off (context compaction) button — sits beside the bar in the same
+   row, a chat-wide action rather than a per-draft input tool. */
+.token-handoff-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.token-handoff-btn.busy {
+  opacity: 0.75;
+  cursor: default;
+}
+.token-handoff-spin {
+  animation: token-handoff-spin 1s linear infinite;
+}
+@keyframes token-handoff-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-handoff-spin {
+    animation: none;
+  }
+}
+
+/* Handoff marker — a divider in the message list, not a .msg bubble. */
+.handoff-marker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  margin: var(--sp-1) 0;
+}
+.handoff-marker-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  color: var(--faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.handoff-marker-line::before,
+.handoff-marker-line::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line-soft);
+}
+.handoff-marker-details {
+  max-width: 560px;
+  width: 100%;
+}
+.handoff-marker-details > summary {
+  cursor: pointer;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--faint);
+  user-select: none;
+}
+.handoff-marker-details > summary:hover {
+  color: var(--text);
+}
+.handoff-marker-body {
+  margin-top: 6px;
+  padding: var(--sp-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  font-size: 12.5px;
+  color: var(--muted);
+}

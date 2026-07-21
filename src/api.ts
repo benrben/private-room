@@ -67,6 +67,7 @@ import type {
   ExternalModelInfo,
   VoiceInfo,
   AskPrivacy,
+  AskTokenUsage,
   PrivacyEntity,
   PrivacyPreview,
   PrivacyScanProgress,
@@ -377,8 +378,8 @@ export const api = {
     invoke<string>("import_skill_folder", { path }),
   exportSkillFolder: (id: string, destination: string) =>
     invoke<string>("export_skill_folder", { id, destination }),
-  composeSkill: (description: string) =>
-    invoke<string>("compose_skill", { description }),
+  composeSkill: (description: string, fileIds: string[] = []) =>
+    invoke<string>("compose_skill", { description, fileIds }),
   aiStatus: () => invoke<AiStatus>("ai_status"),
   /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
   modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
@@ -414,6 +415,9 @@ export const api = {
       privacyBypass: privacyBypass ?? null,
     }),
   cancelAsk: (askId: string) => invoke<void>("cancel_ask", { askId }),
+  // Context handoff: summarize the chat so far and insert a marker message —
+  // every future turn's history then starts from that marker.
+  handoffContext: (chatId: string) => invoke<Message>("handoff_chat", { chatId }),
   /** Run a prebuilt "#name" workflow. `refs` are @-pinned file ids; `raw` is
    *  the full line the user typed (saved verbatim as the user message). Streams
    *  the same ask-delta/ask-step/ask-notice events as `ask`. */
@@ -552,6 +556,9 @@ export const api = {
   // { bypassed: true } when the user shared real details this once.
   onAskPrivacy: (cb: (p: AskPrivacy) => void): Promise<UnlistenFn> =>
     listen<AskPrivacy>("ask-privacy", (e) => cb(e.payload)),
+  // Token-budget bar: one live usage snapshot per completed model round.
+  onAskTokenUsage: (cb: (p: AskTokenUsage) => void): Promise<UnlistenFn> =>
+    listen<AskTokenUsage>("ask-token-usage", (e) => cb(e.payload)),
   // PRIV-2: background privacy-scan progress for the Settings section.
   onPrivacyScan: (cb: (p: PrivacyScanProgress) => void): Promise<UnlistenFn> =>
     listen<PrivacyScanProgress>("privacy-scan", (e) => cb(e.payload)),

@@ -101,6 +101,10 @@ export function useWorkspaceEffects(
     const unlistenPrivacy = api.onAskPrivacy((p) => {
       s.setAskPrivacy(p);
     });
+    // Token-budget bar: one live snapshot per completed model round.
+    const unlistenTokenUsage = api.onAskTokenUsage((p) => {
+      s.setTokenUsage(p);
+    });
     // ADD-31: live import queue. The receipt toast comes from reportImport
     // (which knows names and errors) — this event only drives the strip.
     const unlistenImport = api.onImportProgress((p) => {
@@ -412,6 +416,7 @@ export function useWorkspaceEffects(
       unlistenRound.then((fn) => fn());
       unlistenNotice.then((fn) => fn());
       unlistenPrivacy.then((fn) => fn());
+      unlistenTokenUsage.then((fn) => fn());
       unlistenImport.then((fn) => fn());
       unlistenJobs.then((fn) => fn());
       unlistenWfNode.then((fn) => fn());

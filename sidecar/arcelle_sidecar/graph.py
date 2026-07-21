@@ -38,6 +38,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .budget import json_chars, trim_messages_to_budget
 from .chat import ChatModel
+from .usage import build_usage_event, categorize_messages
 from .config import MAX_TOOL_ROUNDS, RunRequest
 from .labels import tool_step_label
 from .mcp_client import McpClient, ToolResult
@@ -52,6 +53,7 @@ from .prompts import (
     DONE_TEXT,
     IMAGE_HANDOFF,
     JOBS_PROMPT,
+    MANAGEMENT_PROMPT,
     NEAR_BUDGET_NOTE,
     UI_PROMPT,
     duplicate_call_note,
@@ -59,6 +61,8 @@ from .prompts import (
 from .routing import (
     FORBIDDEN_TOOL_NAMES,
     JOB_TOOL_NAMES,
+    MCP_MANAGEMENT_TOOL_NAMES,
+    SKILL_TOOL_NAMES,
     UI_TOOL_NAMES,
     WRITE_TOOL_NAMES,
     lane_label,
@@ -109,6 +113,8 @@ class AgentState(TypedDict, total=False):
     write: bool
     ui: bool
     jobs: bool
+    skills: bool
+    connectors: bool
     max_rounds: int
 
     # --- derived once, in `prepare`
@@ -142,7 +148,7 @@ def _deps(config: RunnableConfig) -> Deps:
 
 
 def _filter_catalog(
-    specs: list[dict[str, Any]], *, write: bool, ui: bool, jobs: bool
+    specs: list[dict[str, Any]], *, write: bool, ui: bool, jobs: bool, skills: bool, connectors: bool
 ) -> list[dict[str, Any]]:
     """Apply the deterministic routers to whatever the bridge served us.
 
@@ -161,6 +167,10 @@ def _filter_catalog(
         drop |= set(UI_TOOL_NAMES)
     if not jobs:
         drop |= set(JOB_TOOL_NAMES)
+    if not skills:
+        drop |= set(SKILL_TOOL_NAMES)
+    if not connectors:
+        drop |= set(MCP_MANAGEMENT_TOOL_NAMES)
     return [s for s in specs if s.get("function", {}).get("name") not in drop]
 
 
@@ -171,6 +181,8 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     write = bool(state.get("write", False))
     ui = bool(state.get("ui", False))
     jobs = bool(state.get("jobs", False))
+    skills = bool(state.get("skills", False))
+    connectors = bool(state.get("connectors", False))
 
     # ADD-22: let the user see which lane the deterministic router chose, so an
     # odd answer is explainable ("oh, it thought I wanted an edit"). Use the
@@ -182,7 +194,12 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     # Never hardcode the catalog — the host decides our trust scope (SPEC §2.1).
     served = await deps.mcp.list_tools() if deps.mcp is not None else []
     tools = _filter_catalog(
-        [s.to_ollama() for s in served], write=write, ui=ui, jobs=jobs
+        [s.to_ollama() for s in served],
+        write=write,
+        ui=ui,
+        jobs=jobs,
+        skills=skills,
+        connectors=connectors,
     )
 
     messages: list[Message] = [dict(m) for m in state.get("messages", [])]  # type: ignore[misc]
@@ -194,6 +211,10 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             messages[0]["content"] = (messages[0].get("content") or "") + JOBS_PROMPT
         if ui and offered & set(UI_TOOL_NAMES):
             messages[0]["content"] = (messages[0].get("content") or "") + UI_PROMPT
+        if (skills and offered & set(SKILL_TOOL_NAMES)) or (
+            connectors and offered & set(MCP_MANAGEMENT_TOOL_NAMES)
+        ):
+            messages[0]["content"] = (messages[0].get("content") or "") + MANAGEMENT_PROMPT
 
     return {
         "tools": tools,
@@ -238,7 +259,13 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
     async def on_delta(d: str) -> None:
         await deps.emit({"t": "delta", "v": d})
 
-    content, calls = await deps.chat.stream(messages, offered, on_delta, deps.cancel)
+    content, calls, usage = await deps.chat.stream(messages, offered, on_delta, deps.cancel)
+
+    # Token-budget bar: categorize what was actually SENT this round (the tool
+    # catalog offered this round, not the cached full-catalog `tools_chars` —
+    # the tool-less final round offers none, and the breakdown must reflect that).
+    breakdown_chars = categorize_messages(messages, json_chars(offered))
+    await deps.emit({"t": "usage", **build_usage_event(rnd, usage, breakdown_chars)})
 
     cancelled = deps.cancel.cancelled
     stop = last or cancelled or not calls
@@ -401,8 +428,8 @@ AGENT_GRAPH = build_graph()
 
 async def run_agent(req: RunRequest, deps: Deps) -> str:
     """Run one ask to completion. Emits SPEC §4 events through ``deps.emit``."""
-    write, ui, jobs = req.resolved_routing()
-    max_rounds = req.resolved_max_rounds(ui, jobs)
+    write, ui, jobs, skills, connectors = req.resolved_routing()
+    max_rounds = req.resolved_max_rounds(ui, jobs, skills, connectors)
 
     # The ask lives in `question` (a REQUIRED field); `messages` is optional
     # history. Chat callers ALSO append the ask as the final user turn, but
@@ -421,6 +448,8 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
         "write": write,
         "ui": ui,
         "jobs": jobs,
+        "skills": skills,
+        "connectors": connectors,
         "max_rounds": max_rounds,
         "messages": messages,
         "seen": set(),

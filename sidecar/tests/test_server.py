@@ -11,6 +11,7 @@ import pytest
 from conftest import FakeChatModel, FakeMCP, Round, call
 
 from arcelle_sidecar import __version__
+from arcelle_sidecar.chat import RoundUsage
 from arcelle_sidecar.config import MAX_TOOL_ROUNDS, PLAIN_MAX_ROUNDS, RunRequest
 from arcelle_sidecar.messages import Message, ToolCall
 from arcelle_sidecar.server import RunRegistry, create_app
@@ -74,15 +75,17 @@ async def test_run_streams_ndjson_in_order() -> None:
         "lane",
         "round",
         "delta",
+        "usage",  # token-budget bar snapshot for this round
         "step",
         "step_status",
         "round",
         "delta",
+        "usage",
         "final",
     ]
     assert events[0]["v"] == "Working on your files"
-    assert events[3]["v"] == "Searched the room"
-    assert events[4]["ok"] is True
+    assert events[4]["v"] == "Searched the room"
+    assert events[5]["ok"] is True
     assert events[-1] == {"t": "final", "v": "The rent is 1200."}
     assert mcp.closed is True  # the bridge client is released with the run
 
@@ -110,7 +113,7 @@ async def test_a_failure_becomes_an_error_event_not_a_500() -> None:
             tools: list[dict[str, Any]],
             on_delta: Callable[[str], Awaitable[None]],
             cancel: Any = None,
-        ) -> tuple[str, list[ToolCall]]:
+        ) -> tuple[str, list[ToolCall], RoundUsage]:
             raise RuntimeError("ollama is not running")
 
     app = app_with(Exploding(), FakeMCP())
@@ -144,12 +147,13 @@ async def test_cancel_stops_a_live_run() -> None:
             tools: list[dict[str, Any]],
             on_delta: Callable[[str], Awaitable[None]],
             cancel: Any = None,
-        ) -> tuple[str, list[ToolCall]]:
+        ) -> tuple[str, list[ToolCall], RoundUsage]:
             self.n += 1
             await on_delta("partial")
             started.set()
             await release.wait()  # the user presses Stop right about here
-            return "partial", [ToolCall(name="write_file", arguments={"name": "x"}, id="c1")]
+            usage = RoundUsage(input_tokens=None, output_tokens=None, max_context=8192, is_real=False)
+            return "partial", [ToolCall(name="write_file", arguments={"name": "x"}, id="c1")], usage
 
     chat = BlockingChat()
     app = app_with(chat, mcp)
@@ -194,7 +198,7 @@ def test_run_request_defaults_and_routing_fallback() -> None:
     req = RunRequest(model="m", question="edit the lease")
     assert req.ollama_base_url == "http://127.0.0.1:11434"
     # No routing block from the host -> the sidecar runs the routers itself.
-    assert req.resolved_routing() == (True, False, False)
+    assert req.resolved_routing() == (True, False, False, False, False)
     assert req.resolved_max_rounds(ui=False, jobs=False) == 4  # a plain turn
 
     req2 = RunRequest(model="m", question="what is the rent", web_enabled=True, max_rounds=24)
@@ -225,7 +229,7 @@ def test_resolved_max_rounds_over_the_plain_predicate(
     kwargs: dict, ui: bool, jobs: bool, expected: int
 ) -> None:
     # SPEC §3.2: max_rounds = 4 iff (no mcp routes AND not web AND no advisors AND
-    # not ui AND not jobs), else the backstop. All five inputs must matter.
+    # not ui/jobs/skills/connectors), else the backstop. Each input matters.
     req = RunRequest(model="m", question="q", **kwargs)
     assert req.resolved_max_rounds(ui=ui, jobs=jobs) == expected
 

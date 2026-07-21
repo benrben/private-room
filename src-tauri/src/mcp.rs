@@ -99,12 +99,22 @@ pub fn parse_config(json: &str) -> Result<Vec<(String, ServerConfig)>, String> {
                 .to_string();
             let args = s["args"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let env = string_map(&s["env"]);
             Transport::Stdio { command, args, env }
         };
-        out.push((name.clone(), ServerConfig { transport, disabled }));
+        out.push((
+            name.clone(),
+            ServerConfig {
+                transport,
+                disabled,
+            },
+        ));
     }
     Ok(out)
 }
@@ -125,7 +135,13 @@ fn string_map(v: &serde_json::Value) -> HashMap<String, String> {
 /// `[a-zA-Z0-9_]`, replace the rest.
 pub fn sanitize_tool_name(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -145,6 +161,10 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub schema: serde_json::Value,
+    /// Standard MCP safety hints supplied by the connector. The room bridge
+    /// preserves these when it re-exports connected tools to an external
+    /// agent; without them non-interactive Codex rejects even read-only calls.
+    pub annotations: Option<serde_json::Value>,
 }
 
 pub struct Server {
@@ -255,9 +275,17 @@ fn flatten_call_result(result: &serde_json::Value) -> Result<String, String> {
     }
     let text = parts.join("\n");
     if result["isError"].as_bool().unwrap_or(false) {
-        return Err(if text.is_empty() { "Tool failed.".into() } else { text });
+        return Err(if text.is_empty() {
+            "Tool failed.".into()
+        } else {
+            text
+        });
     }
-    Ok(if text.is_empty() { "(no output)".into() } else { text })
+    Ok(if text.is_empty() {
+        "(no output)".into()
+    } else {
+        text
+    })
 }
 
 /// Collect `tools/list` records (one page) into `Tool`s. Shared by both
@@ -273,6 +301,7 @@ fn collect_tools(result: &serde_json::Value, into: &mut Vec<Tool>) -> Option<Str
                 } else {
                     serde_json::json!({"type": "object", "properties": {}})
                 },
+                annotations: t.get("annotations").filter(|v| v.is_object()).cloned(),
             });
         }
     }
@@ -383,7 +412,9 @@ impl StdioClient {
                 Some(c) => serde_json::json!({"cursor": c}),
                 None => serde_json::json!({}),
             };
-            let result = client.request("tools/list", params, CONNECT_TIMEOUT).await?;
+            let result = client
+                .request("tools/list", params, CONNECT_TIMEOUT)
+                .await?;
             cursor = collect_tools(&result, &mut tools);
             if cursor.is_none() {
                 break;
@@ -537,7 +568,9 @@ impl HttpClient {
                 Some(c) => serde_json::json!({"cursor": c}),
                 None => serde_json::json!({}),
             };
-            let result = client.request("tools/list", params, CONNECT_TIMEOUT).await?;
+            let result = client
+                .request("tools/list", params, CONNECT_TIMEOUT)
+                .await?;
             cursor = collect_tools(&result, &mut tools);
             if cursor.is_none() {
                 break;
@@ -653,7 +686,10 @@ impl HttpClient {
         }
         if !status.is_success() {
             let snippet: String = text.chars().take(200).collect();
-            return Err(format!("{method}: remote server returned HTTP {} {snippet}", status.as_u16()));
+            return Err(format!(
+                "{method}: remote server returned HTTP {} {snippet}",
+                status.as_u16()
+            ));
         }
         let msg = parse_http_message(&ctype, &text, id)
             .ok_or_else(|| format!("{method}: no JSON-RPC response in the reply"))?;
@@ -693,7 +729,9 @@ fn parse_http_message(ctype: &str, body: &str, id: u64) -> Option<serde_json::Va
         // SSE: scan `data:` payloads for the response that carries our id.
         for line in body.lines() {
             let line = line.trim_start();
-            let Some(data) = line.strip_prefix("data:") else { continue };
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
             let data = data.trim();
             if data.is_empty() {
                 continue;
@@ -789,12 +827,37 @@ mod tests {
     }
 
     #[test]
+    fn preserves_tool_annotations_from_connector_catalogs() {
+        let page = serde_json::json!({
+            "tools": [{
+                "name": "lookup",
+                "description": "Look something up",
+                "inputSchema": {"type": "object", "properties": {}},
+                "annotations": {
+                    "readOnlyHint": true,
+                    "destructiveHint": false
+                }
+            }]
+        });
+        let mut tools = Vec::new();
+        assert!(collect_tools(&page, &mut tools).is_none());
+        assert_eq!(tools.len(), 1);
+        let annotations = tools[0].annotations.as_ref().unwrap();
+        assert_eq!(annotations["readOnlyHint"], true);
+        assert_eq!(annotations["destructiveHint"], false);
+    }
+
+    #[test]
     fn flattens_tool_result_variants() {
         // text blocks joined; non-text noted; isError → Err; empty → (no output).
         let ok = serde_json::json!({"content": [{"type": "text", "text": "hello"},
             {"type": "image", "data": "…"}]});
-        assert_eq!(flatten_call_result(&ok).unwrap(), "hello\n[image content omitted]");
-        let err = serde_json::json!({"content": [{"type": "text", "text": "boom"}], "isError": true});
+        assert_eq!(
+            flatten_call_result(&ok).unwrap(),
+            "hello\n[image content omitted]"
+        );
+        let err =
+            serde_json::json!({"content": [{"type": "text", "text": "boom"}], "isError": true});
         assert_eq!(flatten_call_result(&err).unwrap_err(), "boom");
         let empty = serde_json::json!({"content": []});
         assert_eq!(flatten_call_result(&empty).unwrap(), "(no output)");

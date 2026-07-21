@@ -17,6 +17,7 @@ import {
 } from "../icons";
 import ChatAnnotatedImage from "../viewers/ChatAnnotatedImage";
 import MarkdownView from "../viewers/MarkdownView";
+import { HandoffMarker } from "./TokenBudgetBar";
 import {
   annotationTarget,
   isCloudEngine,
@@ -276,6 +277,13 @@ export default function ChatPane({
           </div>
         )}
         {messages.map((m) => {
+          // Context handoff: a divider, not a participant turn — render it
+          // before any of the ordinary assistant/user branches below (`role`
+          // stays `"assistant"` on a marker row, so those checks alone would
+          // render it as a normal reply).
+          if (m.kind === "handoff") {
+            return <HandoffMarker key={m.id} message={m} />;
+          }
           // ADD-23: structured effects ride on the message row; the content is
           // plain prose. Legacy rooms (effects: null) still carry fenced
           // ```boxes/```annotation blocks inside the text — split those out.

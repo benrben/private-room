@@ -32,12 +32,28 @@ pub struct ExternalModelInfo {
     /// The model's own default effort, if the engine reports one (Codex does;
     /// Claude Code's flag has no per-model default we can read).
     pub default_effort: Option<String>,
+    /// Codex only (`context_window` in `codex debug models`'s catalog JSON,
+    /// confirmed present live 2026-07-21) — the real per-slug context window,
+    /// for a future model-picker display. Claude Code has no catalog to read
+    /// this from; the token-budget bar's own max-context sizing does NOT read
+    /// this field (see `model_limits.rs` for why: re-fetching the catalog on
+    /// every chat turn just for this number isn't worth the subprocess cost).
+    pub context_window: Option<u32>,
 }
 
 /// Claude Code's `--effort` flag accepts this fixed set (from `claude --help`),
 /// the same for every Claude model — like the model aliases, it's the CLI's own
 /// documented values, not a catalog we invented.
 const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Arcelle owns the workspace and tool boundary for an embedded Codex turn.
+/// Keep the one-shot CLI ephemeral and read-only, ignore unrelated personal
+/// plugins/MCP servers, and disable Codex's own web/shell tools so room access
+/// can happen only through the scoped `room` bridge below. Standard MCP safety
+/// annotations let Arcelle's non-destructive tools run with approvals disabled.
+const CODEX_ARCELLE_FLAGS: &str = " --ignore-user-config --ephemeral --skip-git-repo-check \
+    --sandbox read-only -c 'approval_policy=\"never\"' --disable shell_tool \
+    --disable unified_exec -c 'web_search=\"disabled\"'";
 
 /// Codex ships a real, live model catalog — no hardcoding needed. `codex debug
 /// models` (read-only, no git-repo-trust requirement, confirmed to work from
@@ -54,10 +70,43 @@ async fn list_codex_models() -> Result<Vec<ExternalModelInfo>, String> {
     .await
     .map_err(|e| e.to_string())??;
     if !out.status.success() {
-        let err: String = String::from_utf8_lossy(&out.stderr).chars().take(400).collect();
+        let err: String = String::from_utf8_lossy(&out.stderr)
+            .chars()
+            .take(400)
+            .collect();
         return Err(format!("codex debug models failed: {err}"));
     }
     parse_codex_catalog(&out.stdout)
+}
+
+/// Cached for the process lifetime — the catalog rarely changes, and
+/// re-spawning `codex debug models` on every chat turn just to read one
+/// model's context window isn't worth the subprocess cost. Retries the fetch
+/// (rather than caching a failure) if it hasn't succeeded yet.
+static CODEX_CATALOG: tokio::sync::Mutex<Option<Vec<ExternalModelInfo>>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// The real per-slug context window for a Codex model, read from the CLI's
+/// own catalog — bare "codex-cli" (no explicit model chosen) has no slug to
+/// look up, and a model missing from the catalog also falls through, both as
+/// `None`: the caller falls back to `model_limits::CODEX_MAX_CONTEXT`.
+/// Confirmed live 2026-07-21 that different Codex models have WILDLY
+/// different real windows (e.g. one model's catalog entry reported
+/// 1,050,000 vs another's 272,000) — a single hardcoded constant for every
+/// Codex model materially misrepresents the token-budget bar.
+pub(crate) async fn codex_context_window(submodel: Option<&str>) -> Option<u32> {
+    let slug = submodel?;
+    let mut guard = CODEX_CATALOG.lock().await;
+    if guard.is_none() {
+        if let Ok(models) = list_codex_models().await {
+            *guard = Some(models);
+        }
+    }
+    guard
+        .as_ref()?
+        .iter()
+        .find(|m| m.slug == slug)
+        .and_then(|m| m.context_window)
 }
 
 /// Pure JSON→list mapping, split out from `list_codex_models` so it's testable
@@ -94,7 +143,17 @@ fn parse_codex_catalog(json: &[u8]) -> Result<Vec<ExternalModelInfo>, String> {
                 .get("default_reasoning_level")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            Some(ExternalModelInfo { slug, label, efforts, default_effort })
+            let context_window = m
+                .get("context_window")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            Some(ExternalModelInfo {
+                slug,
+                label,
+                efforts,
+                default_effort,
+                context_window,
+            })
         })
         .collect())
 }
@@ -113,6 +172,7 @@ fn claude_known_models() -> Vec<ExternalModelInfo> {
         label: label.into(),
         efforts: efforts.clone(),
         default_effort: None,
+        context_window: None,
     };
     vec![
         mk("opus", "Opus 4.8"),
@@ -194,11 +254,11 @@ pub(crate) async fn run_external(
     messages: &[ollama::ChatMessage],
     cancel: Option<Arc<AtomicBool>>,
     // ADD-20: when present, the CLI is given the room's tools over a scoped
-    // localhost MCP bridge (claude-cli only for now).
+    // localhost MCP bridge.
     bridge: Option<&crate::room_mcp::Bridge>,
     // PRIV-1: "send real details this once" — skip the door for this one turn.
     privacy_bypass: bool,
-) -> Result<String, String> {
+) -> Result<(String, Option<ExternalUsage>), String> {
     use std::io::Write;
 
     // The caller passes either a bare engine id ("claude-cli"/"codex-cli") or
@@ -237,8 +297,7 @@ pub(crate) async fn run_external(
         None => messages,
     };
 
-    let tmp_dir =
-        std::env::temp_dir().join(format!("arcelle-cli-{}", Uuid::new_v4()));
+    let tmp_dir = std::env::temp_dir().join(format!("arcelle-cli-{}", Uuid::new_v4()));
     let mut image_paths: Vec<String> = Vec::new();
     for m in messages {
         if let Some(images) = &m.images {
@@ -322,14 +381,21 @@ pub(crate) async fn run_external(
         ("codex-cli", Some(e)) => format!(" -c 'model_reasoning_effort={e}'"),
         _ => String::new(),
     };
+    // Token-budget bar: `--output-format json`/`--json` swap plain-text stdout
+    // for a machine-readable envelope carrying real usage alongside the
+    // answer — confirmed live 2026-07-21 (see parse_claude_json_result /
+    // parse_codex_json_stream below), including with the MCP-bridge flags
+    // active. Both parsers fall back to raw stdout as plain text if the
+    // envelope doesn't parse, so a future CLI change can't turn a successful
+    // answer into a hard failure — only into a plain-text, usage-less one.
     let cmdline = match (engine, &mcp_config_path) {
         ("claude-cli", Some(p)) => format!(
-            "claude -p --mcp-config '{}' --strict-mcp-config --allowedTools 'mcp__room__*'{model_flag}{effort_flag}",
+            "claude -p --output-format json --mcp-config '{}' --strict-mcp-config --allowedTools 'mcp__room__*'{model_flag}{effort_flag}",
             p.to_string_lossy()
         ),
-        ("claude-cli", None) => format!("claude -p{model_flag}{effort_flag}"),
+        ("claude-cli", None) => format!("claude -p --output-format json{model_flag}{effort_flag}"),
         ("codex-cli", _) => format!(
-            "codex exec --skip-git-repo-check{codex_mcp_flags}{model_flag}{effort_flag} -"
+            "codex exec --json{CODEX_ARCELLE_FLAGS}{codex_mcp_flags}{model_flag}{effort_flag} -"
         ),
         _ => return Err("Unknown engine".into()),
     };
@@ -387,10 +453,23 @@ pub(crate) async fn run_external(
         done.store(true, Ordering::SeqCst);
         let _ = watcher.join();
         if !out.status.success() {
-            let err: String = String::from_utf8_lossy(&out.stderr).chars().take(400).collect();
+            let err: String = String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(400)
+                .collect();
             return Err(format!("{engine_name} failed: {err}"));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        Ok(match engine_name.as_str() {
+            "claude-cli" => {
+                let (text, usage) = parse_claude_json_result(&out.stdout);
+                (text, Some(usage))
+            }
+            "codex-cli" => {
+                let (text, usage) = parse_codex_json_stream(&out.stdout);
+                (text, Some(usage))
+            }
+            _ => (String::from_utf8_lossy(&out.stdout).trim().to_string(), None),
+        })
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -398,11 +477,134 @@ pub(crate) async fn run_external(
     // Decrypted content must not linger on disk.
     let _ = std::fs::remove_dir_all(&tmp_dir);
     // PRIV-1: put the real values back into the reply — the cloud only ever
-    // saw the placeholders; the user reads a normal answer.
+    // saw the placeholders; the user reads a normal answer. Usage numbers
+    // carry no room content, so they ride through untouched.
     match (&policy, result) {
-        (Some(p), Ok(text)) => Ok(p.redactor.restore(&text)),
+        (Some(p), Ok((text, usage))) => Ok((p.redactor.restore(&text), usage)),
         (_, r) => r,
     }
+}
+
+/// Real usage for one external-CLI turn, when the CLI's own JSON envelope
+/// parsed. `input_tokens` is the round's real PROMPT/context token count
+/// (Claude: `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`,
+/// all three count toward context; Codex: `input_tokens`, already inclusive
+/// of any cached subset) — the same thing the char-based breakdown describes,
+/// so the token-budget bar can scale its estimate to it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExternalUsage {
+    pub(crate) input_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
+    /// Claude only: the real context window read live off `modelUsage` in the
+    /// CLI's own response. `None` → caller falls back to
+    /// `model_limits::external_max_context`.
+    pub(crate) max_context_hint: Option<u32>,
+}
+
+/// `claude -p --output-format json`'s single JSON result object. Confirmed
+/// live 2026-07-21: `{"result": "<answer>", "usage": {"input_tokens",
+/// "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+/// ...}, "modelUsage": {"<model>": {"inputTokens", "outputTokens",
+/// "cacheCreationInputTokens", "cacheReadInputTokens", "contextWindow", ...}}}`.
+/// Falls back to treating the whole stdout as plain answer text (no usage) if
+/// the envelope doesn't parse as expected — a future CLI change degrades this
+/// to a plain-text, usage-less answer, never a hard failure.
+fn parse_claude_json_result(stdout: &[u8]) -> (String, ExternalUsage) {
+    let fallback_text = || String::from_utf8_lossy(stdout).trim().to_string();
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(stdout) else {
+        return (fallback_text(), ExternalUsage::default());
+    };
+    let text = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(fallback_text);
+
+    let u64_field = |obj: &serde_json::Value, k: &str| obj.get(k).and_then(|x| x.as_u64());
+    let usage_obj = v.get("usage");
+    let input_tokens = usage_obj.map(|u| {
+        u64_field(u, "input_tokens").unwrap_or(0)
+            + u64_field(u, "cache_creation_input_tokens").unwrap_or(0)
+            + u64_field(u, "cache_read_input_tokens").unwrap_or(0)
+    });
+    let output_tokens = usage_obj.and_then(|u| u64_field(u, "output_tokens"));
+    // Pick whichever model did the most work this turn — a turn can span more
+    // than one model (haiku + sonnet observed in one call during a live smoke
+    // test), and its context window is the one that actually matters.
+    let max_context_hint = v.get("modelUsage").and_then(|m| m.as_object()).and_then(|obj| {
+        obj.values()
+            .filter_map(|entry| {
+                let w = |k: &str| entry.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                let weight = w("inputTokens")
+                    + w("outputTokens")
+                    + w("cacheCreationInputTokens")
+                    + w("cacheReadInputTokens");
+                entry
+                    .get("contextWindow")
+                    .and_then(|x| x.as_u64())
+                    .map(|c| (weight, c as u32))
+            })
+            .max_by_key(|(weight, _)| *weight)
+            .map(|(_, c)| c)
+    });
+
+    (
+        text,
+        ExternalUsage {
+            input_tokens,
+            output_tokens,
+            max_context_hint,
+        },
+    )
+}
+
+/// `codex exec --json`'s JSONL event stream. Confirmed live 2026-07-21: the
+/// answer rides an `{"type":"item.completed","item":{"type":"agent_message",
+/// "text":"..."}}` event (last one wins), and usage rides a final
+/// `{"type":"turn.completed","usage":{"input_tokens","cached_input_tokens",
+/// "output_tokens","reasoning_output_tokens"}}` event. No context-window
+/// field is reported here at all (see `model_limits.rs`). Falls back to the
+/// raw stdout as plain text only if NOT ONE line parsed as JSON (a genuine
+/// schema-drift case) — an answer that's merely empty is trusted as-is.
+fn parse_codex_json_stream(stdout: &[u8]) -> (String, ExternalUsage) {
+    let mut text = String::new();
+    let mut usage = ExternalUsage::default();
+    let mut parsed_any = false;
+    for line in stdout.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        parsed_any = true;
+        match ev.get("type").and_then(|t| t.as_str()) {
+            Some("item.completed") => {
+                let is_agent_message = ev
+                    .get("item")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("agent_message");
+                if is_agent_message {
+                    if let Some(t) = ev.get("item").and_then(|i| i.get("text")).and_then(|t| t.as_str())
+                    {
+                        text = t.to_string();
+                    }
+                }
+            }
+            Some("turn.completed") => {
+                if let Some(u) = ev.get("usage") {
+                    usage.input_tokens = u.get("input_tokens").and_then(|x| x.as_u64());
+                    usage.output_tokens = u.get("output_tokens").and_then(|x| x.as_u64());
+                }
+            }
+            _ => {}
+        }
+    }
+    if !parsed_any {
+        text = String::from_utf8_lossy(stdout).trim().to_string();
+    }
+    (text, usage)
 }
 
 #[cfg(test)]
@@ -412,7 +614,10 @@ mod tests {
     #[test]
     fn split_external_model_handles_bare_model_and_effort() {
         assert_eq!(split_external_model("codex-cli"), ("codex-cli", None, None));
-        assert_eq!(split_external_model("claude-cli"), ("claude-cli", None, None));
+        assert_eq!(
+            split_external_model("claude-cli"),
+            ("claude-cli", None, None)
+        );
         assert_eq!(
             split_external_model("codex-cli::gpt-5.6-sol"),
             ("codex-cli", Some("gpt-5.6-sol"), None)
@@ -427,7 +632,10 @@ mod tests {
         );
         // A local Ollama model name is never split, even though it contains a
         // ":" (not "::") — the engine-id guard is what matters.
-        assert_eq!(split_external_model("qwen3.5:4b"), ("qwen3.5:4b", None, None));
+        assert_eq!(
+            split_external_model("qwen3.5:4b"),
+            ("qwen3.5:4b", None, None)
+        );
     }
 
     #[test]
@@ -438,6 +646,21 @@ mod tests {
         assert!(is_external_engine("claude-cli::opus::high"));
         assert!(!is_external_engine("qwen3.5:4b"));
         assert!(!is_external_engine("minimax-m3:cloud"));
+    }
+
+    #[test]
+    fn embedded_codex_is_ephemeral_read_only_and_room_scoped() {
+        for required in [
+            "--ignore-user-config",
+            "--ephemeral",
+            "--sandbox read-only",
+            "approval_policy=\"never\"",
+            "--disable shell_tool",
+            "--disable unified_exec",
+            "web_search=\"disabled\"",
+        ] {
+            assert!(CODEX_ARCELLE_FLAGS.contains(required), "missing {required}");
+        }
     }
 
     #[test]
@@ -474,6 +697,66 @@ mod tests {
         let slugs: Vec<&str> = models.iter().map(|m| m.slug.as_str()).collect();
         assert_eq!(slugs, vec!["opus", "sonnet", "haiku", "fable"]);
         // Every Claude model offers the CLI's fixed --effort set.
-        assert_eq!(models[0].efforts, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(
+            models[0].efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    // --- token-budget bar: real fixtures captured from live smoke calls, --
+    // --- 2026-07-21 (see model_limits.rs / token_usage.rs doc comments)   --
+
+    #[test]
+    fn parse_claude_json_result_reads_text_usage_and_dominant_context_window() {
+        // Captured verbatim from `claude -p --output-format json` (trimmed of
+        // fields this parser doesn't read).
+        let stdout = br#"{"type":"result","subtype":"success","is_error":false,"result":"pong","usage":{"input_tokens":1,"cache_creation_input_tokens":39383,"cache_read_input_tokens":0,"output_tokens":18},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":522,"outputTokens":14,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"contextWindow":200000},"claude-sonnet-5":{"inputTokens":1,"outputTokens":18,"cacheReadInputTokens":0,"cacheCreationInputTokens":39383,"contextWindow":1000000}}}"#;
+        let (text, usage) = parse_claude_json_result(stdout);
+        assert_eq!(text, "pong");
+        // 1 + 39383 + 0 — all three count toward context.
+        assert_eq!(usage.input_tokens, Some(39384));
+        assert_eq!(usage.output_tokens, Some(18));
+        // claude-sonnet-5 did the most work (39384 vs haiku's 536) — its
+        // window wins, not the first entry or the smallest.
+        assert_eq!(usage.max_context_hint, Some(1_000_000));
+    }
+
+    #[test]
+    fn parse_claude_json_result_falls_back_to_plain_text_on_bad_json() {
+        let (text, usage) = parse_claude_json_result(b"not json at all");
+        assert_eq!(text, "not json at all");
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.max_context_hint, None);
+    }
+
+    #[test]
+    fn parse_codex_json_stream_reads_last_agent_message_and_turn_usage() {
+        // Captured verbatim from `codex exec --json`.
+        let stdout = b"{\"type\":\"thread.started\",\"thread_id\":\"x\"}\n\
+{\"type\":\"turn.started\"}\n\
+{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"pong\"}}\n\
+{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":14365,\"cached_input_tokens\":9984,\"output_tokens\":5,\"reasoning_output_tokens\":0}}\n";
+        let (text, usage) = parse_codex_json_stream(stdout);
+        assert_eq!(text, "pong");
+        assert_eq!(usage.input_tokens, Some(14365));
+        assert_eq!(usage.output_tokens, Some(5));
+        // Codex reports no context-window field anywhere in the stream.
+        assert_eq!(usage.max_context_hint, None);
+    }
+
+    #[test]
+    fn parse_codex_json_stream_falls_back_to_raw_text_when_nothing_parses() {
+        let (text, usage) = parse_codex_json_stream(b"garbage, not jsonl");
+        assert_eq!(text, "garbage, not jsonl");
+        assert_eq!(usage.input_tokens, None);
+    }
+
+    #[test]
+    fn parse_codex_json_stream_keeps_last_agent_message_when_several_appear() {
+        let stdout = b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"first\"}}\n\
+{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\",\"text\":\"thinking...\"}}\n\
+{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"final answer\"}}\n";
+        let (text, _usage) = parse_codex_json_stream(stdout);
+        assert_eq!(text, "final answer");
     }
 }

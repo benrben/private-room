@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS messages (
   content TEXT NOT NULL,
   sources TEXT,
   effects TEXT,
+  kind TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
@@ -581,6 +582,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     // blocks inside old messages are still parsed by the UI as a fallback.
     if table_exists(conn, "messages")? && !column_exists(conn, "messages", "effects")? {
         conn.execute("ALTER TABLE messages ADD COLUMN effects TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Token-budget bar / context handoff: a flag on the existing row, not a new
+    // `role` — `role` is pattern-matched throughout the LLM-facing plumbing
+    // (chat.py's `_to_langchain`, `ollama::ChatMessage` construction), where an
+    // unrecognized value would need auditing everywhere. `kind` is purely
+    // additive metadata, same shape as `effects` above. NULL for every
+    // ordinary row; `'handoff'` marks a context-compaction summary message —
+    // `db::recent_messages` starts a turn's history from the latest one.
+    if table_exists(conn, "messages")? && !column_exists(conn, "messages", "kind")? {
+        conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT", [])
             .map_err(|e| e.to_string())?;
     }
 

@@ -40,6 +40,18 @@
   --blue: #8fbde7;
   --shadow: rgba(0, 0, 0, 0.34);
 
+  /* Token-budget bar: 5 fixed categorical hues (system/history/tools/skills/
+     files), distinct from the green/amber/red status triad above (which stay
+     reserved for the bar's own near/at/over-budget signal, never category
+     identity). Validated with the dataviz skill's validate_palette.js against
+     this surface (--panel-2): CVD worst-adjacent ΔE 17.9, well over the 12
+     target. Fixed order — never reordered, never cycled. */
+  --tok-system: #008eb1;
+  --tok-history: #2d74ca;
+  --tok-tools: #b559a3;
+  --tok-skills: #00997c;
+  --tok-files: #8d73ce;
+
   /* Shape + rhythm. Restrained radii; 4/8px spacing. */
   --radius-sm: 5px;
   --radius: 7px;
@@ -104,6 +116,14 @@
   --blue: #3d6f9b;
   --shadow: rgba(45, 36, 52, 0.16);
   color-scheme: light;
+
+  /* Token-budget bar categorical hues — re-derived (not just darkened) for
+     this surface (--panel-2: #ffffff), separately validated. */
+  --tok-system: #00648c;
+  --tok-history: #0053a5;
+  --tok-tools: #872e78;
+  --tok-skills: #007456;
+  --tok-files: #5f439c;
 }
 
 /* Quiet, theme-matched scrollbars everywhere. */

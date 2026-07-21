@@ -187,6 +187,38 @@
     },
     recommended_models: () => ({ vision: "qwen2.5vl:3b", embed: "nomic-embed-text" }),
     get_ollama_url: () => "",
+    // Token-budget bar QA: a context-compaction marker, appended so the next
+    // get_messages reflects it in place (ChatPane renders it as a divider).
+    handoff_chat: () => {
+      const marker = {
+        id: "msg-handoff-" + Math.random().toString(36).slice(2),
+        role: "assistant",
+        content:
+          "**Recap:** The user asked about the core interaction model for Arcelle. " +
+          "The assistant recommended a persistent three-part workspace — source " +
+          "library, focused editor, and contextual AI — with visible citations and " +
+          "reversible layout.",
+        sources: [],
+        createdAt: new Date().toISOString(),
+        effects: {
+          usage: {
+            total_tokens: 340,
+            max_context: 24576,
+            estimated: true,
+            breakdown: {
+              system: { tokens: 120, estimated: true },
+              history: { tokens: 180, estimated: true },
+              tools: { tokens: 20, estimated: true },
+              skills: { tokens: 10, estimated: true },
+              files: { tokens: 10, estimated: true },
+            },
+          },
+        },
+        kind: "handoff",
+      };
+      messages.push(marker);
+      return marker;
+    },
   };
 
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
@@ -231,6 +263,27 @@
         // Pretend a short streamed answer, so Send visibly works in QA.
         setTimeout(() => window.__qaEmit("ask-delta", "Thinking about your sources… "), 150);
         setTimeout(() => window.__qaEmit("ask-delta", "here is a grounded answer."), 450);
+        // Token-budget bar QA: a live per-turn snapshot, growing a bit each ask
+        // so repeated sends visibly fill the bar.
+        window.__qaTurns = (window.__qaTurns || 0) + 1;
+        const base = 4200 + window.__qaTurns * 900;
+        setTimeout(
+          () =>
+            window.__qaEmit("ask-token-usage", {
+              round: 0,
+              total_tokens: base,
+              max_context: 24576,
+              estimated: window.__qaTurns % 3 === 0,
+              breakdown: {
+                system: { tokens: 620, estimated: true },
+                history: { tokens: Math.round(base * 0.62), estimated: true },
+                tools: { tokens: Math.round(base * 0.18), estimated: true },
+                skills: { tokens: Math.round(base * 0.06), estimated: true },
+                files: { tokens: Math.round(base * 0.06), estimated: true },
+              },
+            }),
+          650,
+        );
         return new Promise((resolve) =>
           setTimeout(() => resolve({ id: "msg-live", role: "assistant", content: "Thinking about your sources… here is a grounded answer.", sources: ["Ideas.md"], createdAt: new Date().toISOString(), effects: null }), 800),
         );

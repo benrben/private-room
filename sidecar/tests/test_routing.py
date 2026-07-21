@@ -10,13 +10,19 @@ import pytest
 import arcelle_sidecar
 from arcelle_sidecar.routing import (
     JOB_TOOL_NAMES,
+    MCP_MANAGEMENT_TOOL_NAMES,
+    SKILL_TOOL_NAMES,
     UI_TOOL_NAMES,
     WRITE_TOOL_NAMES,
     _JOB_HINTS,
+    _MCP_MANAGEMENT_HINTS,
+    _SKILL_HINTS,
     _UI_HINTS,
     _WRITE_HINTS,
     lane_label,
     wants_job_tools,
+    wants_mcp_management_tools,
+    wants_skill_tools,
     wants_ui_tools,
     wants_write_tools,
 )
@@ -64,6 +70,8 @@ def test_hint_lists_are_verbatim_ports_of_the_rust_arrays() -> None:
     # by APP_NAVIGATION_VERBS (agent.rs:807 `HINTS || APP_NAVIGATION_VERBS`).
     assert _rust_str_list(src, "fn wants_write_tools") == _WRITE_HINTS
     assert _rust_str_list(src, "fn wants_job_tools") == _JOB_HINTS
+    assert _rust_str_list(src, "fn wants_skill_tools") == _SKILL_HINTS
+    assert _rust_str_list(src, "fn wants_mcp_management_tools") == _MCP_MANAGEMENT_HINTS
     ui_expected = _rust_str_list(src, "fn wants_ui_tools") + _rust_str_list(
         src, "APP_NAVIGATION_VERBS: &[&str]"
     )
@@ -72,9 +80,7 @@ def test_hint_lists_are_verbatim_ports_of_the_rust_arrays() -> None:
 # --- the lists themselves ---------------------------------------------------
 
 
-def test_write_tool_names_match_the_rust_list() -> None:
-    # agent.rs BUILTIN_TOOL_NAMES — the file-mutating built-ins, in this order.
-    # Wave 2 (Idea 7) added `edit_files` right after `edit_file`.
+def test_management_tool_names_are_gated_in_their_own_lanes() -> None:
     assert WRITE_TOOL_NAMES == (
         "create_file",
         "edit_file",
@@ -84,9 +90,12 @@ def test_write_tool_names_match_the_rust_list() -> None:
         "rename_file",
         "move_file",
         "add_memory",
-        "save_skill",
-        "write_skill_resource",
     )
+    assert SKILL_TOOL_NAMES == (
+        "list_skills", "read_skill", "read_skill_resource", "save_skill",
+        "write_skill_resource", "delete_skill_resource", "delete_skill", "run_skill_script",
+    )
+    assert MCP_MANAGEMENT_TOOL_NAMES == ("list_mcps", "read_mcp", "save_mcp", "delete_mcp")
 
 
 def test_edit_files_is_a_write_tool() -> None:
@@ -107,7 +116,7 @@ def test_show_tools_are_not_write_tools() -> None:
 
 def test_ui_and_job_tool_names() -> None:
     assert UI_TOOL_NAMES == ("ui_snapshot", "ui_act", "view_screenshot", "view_media_frame")
-    # Wave 4a: the four workflow authoring tools join the job tools so
+    # Workflow CRUD/run tools join the job tools so
     # _filter_catalog drops them off a plain turn (kept in sync with agent.rs).
     assert JOB_TOOL_NAMES == (
         "start_file_pass",
@@ -115,7 +124,9 @@ def test_ui_and_job_tool_names() -> None:
         "list_workflows",
         "save_workflow",
         "update_workflow",
+        "delete_workflow",
         "run_workflow",
+        "test_workflow",
     )
 
 
@@ -126,6 +137,15 @@ def test_wants_job_tools_fires_on_workflow_intents() -> None:
     assert wants_job_tools("automate a weekly review")
     assert wants_job_tools("set up a recurring pipeline")
     assert not wants_job_tools("what does the lease say about pets?")
+
+
+def test_skill_and_connector_tools_are_only_requested_on_demand() -> None:
+    assert wants_skill_tools("list my skills")
+    assert wants_skill_tools("turn this policy into an agent instruction")
+    assert not wants_skill_tools("what does the lease say")
+    assert wants_mcp_management_tools("show my MCP connectors")
+    assert wants_mcp_management_tools("remove that integration")
+    assert not wants_mcp_management_tools("summarize the contract")
 
 
 # --- wants_write_tools ------------------------------------------------------
@@ -175,6 +195,11 @@ def test_wants_job_tools_fires_on_workflow_intents() -> None:
 )
 def test_wants_write_tools_fires(question: str) -> None:
     assert wants_write_tools(question) is True
+
+
+def test_skill_authoring_uses_the_skill_lane_not_the_file_write_lane() -> None:
+    assert wants_skill_tools("turn the attached policy into a skill")
+    assert wants_write_tools("turn the attached policy into a skill") is False
 
 
 @pytest.mark.parametrize(

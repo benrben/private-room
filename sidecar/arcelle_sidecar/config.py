@@ -106,6 +106,8 @@ class Routing(BaseModel):
     write: bool | None = None
     ui: bool | None = None
     jobs: bool | None = None
+    skills: bool | None = None
+    connectors: bool | None = None
 
 
 class RunRequest(BaseModel):
@@ -134,17 +136,31 @@ class RunRequest(BaseModel):
     mcp_routes: int = 0
     advisors: list[str] = Field(default_factory=list)
 
-    def resolved_routing(self) -> tuple[bool, bool, bool]:
-        """(write, ui, jobs) — the host's decision, else our own routers."""
-        from .routing import wants_job_tools, wants_ui_tools, wants_write_tools
+    def resolved_routing(self) -> tuple[bool, bool, bool, bool, bool]:
+        """(write, ui, jobs, skills, connectors) — host decision else router."""
+        from .routing import (
+            wants_job_tools,
+            wants_mcp_management_tools,
+            wants_skill_tools,
+            wants_ui_tools,
+            wants_write_tools,
+        )
 
         r = self.routing
         write = r.write if r and r.write is not None else wants_write_tools(self.question)
         ui = r.ui if r and r.ui is not None else wants_ui_tools(self.question)
         jobs = r.jobs if r and r.jobs is not None else wants_job_tools(self.question)
-        return write, ui, jobs
+        skills = r.skills if r and r.skills is not None else wants_skill_tools(self.question)
+        connectors = (
+            r.connectors
+            if r and r.connectors is not None
+            else wants_mcp_management_tools(self.question)
+        )
+        return write, ui, jobs, skills, connectors
 
-    def resolved_max_rounds(self, ui: bool, jobs: bool) -> int:
+    def resolved_max_rounds(
+        self, ui: bool, jobs: bool, skills: bool = False, connectors: bool = False
+    ) -> int:
         """agent.rs:1337 — 4 rounds for a plain turn, the backstop otherwise."""
         plain = (
             self.mcp_routes == 0
@@ -152,6 +168,8 @@ class RunRequest(BaseModel):
             and not self.advisors
             and not ui
             and not jobs
+            and not skills
+            and not connectors
         )
         if plain:
             return PLAIN_MAX_ROUNDS

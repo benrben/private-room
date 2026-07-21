@@ -5,15 +5,17 @@ referenced by name (line numbers rot) so they stay findable:
   - ``wants_write_tools`` — offer the file-mutating built-ins this turn?
   - ``wants_ui_tools``    — offer the UI/perception tools?
   - ``wants_job_tools``   — offer the whole-file pass + workflow tools?
+  - ``wants_skill_tools`` — offer Agent Skill CRUD/resource tools?
+  - ``wants_mcp_management_tools`` — offer connector CRUD tools?
 
 ``WRITE_TOOL_NAMES`` and ``lane_label`` below have no agent.rs counterpart: the
 Rust inlines its hint lists inside each predicate and computes no lane label, so
-only those three predicates — plus the tool-name reservations in agent.rs
+only those five predicates — plus the tool-name reservations in agent.rs
 ``BUILTIN_TOOL_NAMES`` — need to stay in sync.
 
 These are NOT model-driven: they are case-insensitive substring matches on the
 raw user question. A small model picks the right tool far more reliably from a
-short, relevant list, so the mutating / UI / job tools are withheld unless the
+short, relevant list, so the mutating / UI / job / management tools are withheld unless the
 question sounds like it wants them. Erring toward YES is safe — it just restores
 the fuller catalog.
 
@@ -37,8 +39,30 @@ WRITE_TOOL_NAMES: tuple[str, ...] = (
     "rename_file",
     "move_file",
     "add_memory",
+)
+
+#: Agent Skills are a distinct administrative surface. They are withheld until
+#: the user asks about a skill, so ordinary chat does not carry their CRUD,
+#: resource, or script schemas.
+SKILL_TOOL_NAMES: tuple[str, ...] = (
+    "list_skills",
+    "read_skill",
+    "read_skill_resource",
     "save_skill",
     "write_skill_resource",
+    "delete_skill_resource",
+    "delete_skill",
+    "run_skill_script",
+)
+
+#: Connector CRUD is local-agent-only at the bridge layer and also withheld
+#: from normal chat. `save_mcp` produces a disabled draft; it cannot start a
+#: local command or contact a new remote endpoint.
+MCP_MANAGEMENT_TOOL_NAMES: tuple[str, ...] = (
+    "list_mcps",
+    "read_mcp",
+    "save_mcp",
+    "delete_mcp",
 )
 
 #: The UI/perception tools (ADD-25). Never in the bridge's cloud scope.
@@ -49,7 +73,7 @@ UI_TOOL_NAMES: tuple[str, ...] = (
     "view_media_frame",
 )
 
-#: The whole-file pass tools (ADD-32) plus the Wave 4a workflow authoring tools.
+#: The whole-file pass tools (ADD-32) plus the workflow CRUD/run tools.
 #: These MUST be dropped when the jobs router does not fire (graph._filter_catalog
 #: is a drop-list) — else they'd bloat every turn's catalog and defeat the
 #: short-catalog doctrine. Kept in sync with agent.rs BUILTIN_TOOL_NAMES.
@@ -59,7 +83,9 @@ JOB_TOOL_NAMES: tuple[str, ...] = (
     "list_workflows",
     "save_workflow",
     "update_workflow",
+    "delete_workflow",
     "run_workflow",
+    "test_workflow",
 )
 
 #: Never offered to anyone but the top-level local agent — closes the recursion
@@ -102,6 +128,12 @@ _JOB_HINTS: tuple[str, ...] = (
     "each morning", "each day", "schedule", "recurring", "routine", "pipeline",
 )
 
+_SKILL_HINTS: tuple[str, ...] = ("skill", "agent instruction")
+
+_MCP_MANAGEMENT_HINTS: tuple[str, ...] = (
+    "mcp", "connector", "connectors", "integration", "integrations",
+)
+
 
 def _any_hint(question: str, hints: tuple[str, ...]) -> bool:
     q = question.lower()
@@ -121,6 +153,16 @@ def wants_ui_tools(question: str) -> bool:
 def wants_job_tools(question: str) -> bool:
     """Offer the whole-file pass tools (and their paragraph)? (agent.rs `wants_job_tools`)"""
     return _any_hint(question, _JOB_HINTS)
+
+
+def wants_skill_tools(question: str) -> bool:
+    """Offer Agent Skill CRUD/resource tools only for a skill request."""
+    return _any_hint(question, _SKILL_HINTS)
+
+
+def wants_mcp_management_tools(question: str) -> bool:
+    """Offer connector CRUD only when the user asks about MCP/connectors."""
+    return _any_hint(question, _MCP_MANAGEMENT_HINTS)
 
 
 def lane_label(*, ui: bool, write: bool, web_enabled: bool) -> str:
@@ -146,11 +188,15 @@ def lane_label(*, ui: bool, write: bool, web_enabled: bool) -> str:
 
 __all__ = [
     "WRITE_TOOL_NAMES",
+    "SKILL_TOOL_NAMES",
+    "MCP_MANAGEMENT_TOOL_NAMES",
     "UI_TOOL_NAMES",
     "JOB_TOOL_NAMES",
     "FORBIDDEN_TOOL_NAMES",
     "wants_write_tools",
     "wants_ui_tools",
     "wants_job_tools",
+    "wants_skill_tools",
+    "wants_mcp_management_tools",
     "lane_label",
 ]

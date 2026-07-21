@@ -3,7 +3,8 @@ use super::*;
 #[tauri::command]
 pub fn mcp_get_config(state: State<'_, AppState>) -> Result<String, String> {
     state.with_room(|room| {
-        Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string()))
+        Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY)
+            .unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string()))
     })
 }
 
@@ -121,8 +122,7 @@ pub(crate) fn mcp_gate(config_json: &str, approved: &std::collections::HashSet<S
 /// (no enabled servers, or already approved).
 pub(crate) fn pending_mcp_for(app: &tauri::AppHandle, conn: &Connection) -> Option<McpApproval> {
     let config = db::get_setting(conn, MCP_CONFIG_KEY)?;
-    let approved: std::collections::HashSet<String> =
-        read_mcp_approvals(app).into_iter().collect();
+    let approved: std::collections::HashSet<String> = read_mcp_approvals(app).into_iter().collect();
     match mcp_gate(&config, &approved) {
         McpGate::NeedsApproval {
             fingerprint,
@@ -175,8 +175,7 @@ pub(crate) fn refresh_mcp(app: &tauri::AppHandle) {
     // this exact config. If the gate says NeedsApproval, start NOTHING — the UI
     // surfaces the approval dialog via RoomInfo.pendingMcp and calls approve_mcp
     // on "Allow". This is the SAME decision pending_mcp_for shows the user.
-    let approved: std::collections::HashSet<String> =
-        read_mcp_approvals(app).into_iter().collect();
+    let approved: std::collections::HashSet<String> = read_mcp_approvals(app).into_iter().collect();
     if let Some(McpGate::NeedsApproval { .. }) =
         config_json.as_deref().map(|j| mcp_gate(j, &approved))
     {
@@ -191,7 +190,10 @@ pub(crate) fn refresh_mcp(app: &tauri::AppHandle) {
     start_mcp_connections(app.clone(), servers);
 }
 
-pub(crate) fn start_mcp_connections(app: tauri::AppHandle, servers: Vec<(String, mcp::ServerConfig)>) {
+pub(crate) fn start_mcp_connections(
+    app: tauri::AppHandle,
+    servers: Vec<(String, mcp::ServerConfig)>,
+) {
     use tauri::{Emitter, Manager as _};
     let generation = {
         let state = app.state::<AppState>();
@@ -214,7 +216,10 @@ pub(crate) fn start_mcp_connections(app: tauri::AppHandle, servers: Vec<(String,
             .collect();
         mgr.generation
     };
-    let _ = app.emit("mcp-status", app.state::<AppState>().mcp.lock().unwrap().statuses());
+    let _ = app.emit(
+        "mcp-status",
+        app.state::<AppState>().mcp.lock().unwrap().statuses(),
+    );
     for (name, cfg) in servers.into_iter().filter(|(_, c)| !c.disabled) {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -240,7 +245,10 @@ pub(crate) fn start_mcp_connections(app: tauri::AppHandle, servers: Vec<(String,
                     }
                 }
             }
-            let _ = app.emit("mcp-status", app.state::<AppState>().mcp.lock().unwrap().statuses());
+            let _ = app.emit(
+                "mcp-status",
+                app.state::<AppState>().mcp.lock().unwrap().statuses(),
+            );
         });
     }
 }
@@ -284,7 +292,10 @@ pub(crate) async fn mcp_call_approved(
         Ok(Ok(d)) => d,
         _ => {
             state.mcp_pending.lock().unwrap().remove(&id);
-            McpDecision { approved: false, remember: false }
+            McpDecision {
+                approved: false,
+                remember: false,
+            }
         }
     };
     if decision.approved && decision.remember {
@@ -330,9 +341,8 @@ pub async fn mcp_oauth_authorize(
     state: State<'_, AppState>,
     server: String,
 ) -> Result<Vec<mcp::ServerStatus>, String> {
-    let config = state.with_room(|room| {
-        Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default())
-    })?;
+    let config = state
+        .with_room(|room| Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default()))?;
     let url = mcp::parse_config(&config)?
         .into_iter()
         .find(|(n, _)| n == &server)
@@ -405,6 +415,212 @@ pub fn mcp_oauth_sign_out(
     add_mcp_approval(&app, &mcp_fingerprint(&merged));
     start_mcp_connections(app, mcp::parse_config(&merged).unwrap_or_default());
     Ok(state.mcp.lock().unwrap().statuses())
+}
+
+// ------------------------------------------------ agent CRUD (local-only)
+
+const AGENT_SECRET_KEYS: &[&str] = &[
+    "headers",
+    "env",
+    "bearer_token_env_var",
+    "authorization",
+    "token",
+    "oauth",
+];
+
+fn agent_mcp_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(
+            "Connector names use 1-64 letters, numbers, dots, dashes, or underscores.".into(),
+        );
+    }
+    Ok(name)
+}
+
+fn agent_mcp_root(raw: &str) -> Result<serde_json::Value, String> {
+    let mut root: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| "the room's connector config isn't valid JSON".to_string())?;
+    if !root.is_object() {
+        return Err("the room's connector config must be a JSON object".into());
+    }
+    if root.get("mcpServers").is_none() {
+        root["mcpServers"] = serde_json::json!({});
+    }
+    if !root["mcpServers"].is_object() {
+        return Err("the room's mcpServers value must be an object".into());
+    }
+    Ok(root)
+}
+
+fn redact_agent_mcp_config(config: &serde_json::Value) -> serde_json::Value {
+    let mut safe = config.clone();
+    if let Some(map) = safe.as_object_mut() {
+        for key in AGENT_SECRET_KEYS {
+            if map.remove(*key).is_some() {
+                map.insert(
+                    (*key).to_string(),
+                    serde_json::Value::String("[redacted]".into()),
+                );
+            }
+        }
+    }
+    safe
+}
+
+fn remove_agent_mcp_secrets(config: &mut serde_json::Value) {
+    if let Some(map) = config.as_object_mut() {
+        for key in AGENT_SECRET_KEYS {
+            map.remove(*key);
+        }
+    }
+}
+
+/// Inventory available to the local main agent. It deliberately describes
+/// transports/statuses, never credential values.
+pub(crate) fn agent_list_mcps(state: &AppState) -> Result<String, String> {
+    let config = state.with_room(|room| {
+        Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY)
+            .unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string()))
+    })?;
+    let servers = mcp::parse_config(&config)?;
+    if servers.is_empty() {
+        return Ok("No MCP connectors are configured in this room.".into());
+    }
+    let statuses: std::collections::HashMap<String, String> = state
+        .mcp
+        .lock()
+        .unwrap()
+        .statuses()
+        .into_iter()
+        .map(|status| (status.name, format!("{:?}", status.status).to_lowercase()))
+        .collect();
+    let lines = servers
+        .iter()
+        .map(|(name, cfg)| {
+            let transport = match &cfg.transport {
+                mcp::Transport::Stdio { command, args, .. } => {
+                    let args = if args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", args.join(" "))
+                    };
+                    format!("local: {command}{args}")
+                }
+                mcp::Transport::Http { url, .. } => format!("remote: {url}"),
+            };
+            let state = if cfg.disabled {
+                "disabled".to_string()
+            } else {
+                statuses
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| "configured".into())
+            };
+            format!("- {name} [{state}] — {transport}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(lines)
+}
+
+/// Read one server's editable, secret-free configuration.
+pub(crate) fn agent_read_mcp(state: &AppState, name: &str) -> Result<String, String> {
+    let name = agent_mcp_name(name)?;
+    let config = state.with_room(|room| {
+        Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY)
+            .unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string()))
+    })?;
+    let root = agent_mcp_root(&config)?;
+    let server = root["mcpServers"]
+        .get(name)
+        .ok_or_else(|| format!("No connector named \"{name}\" exists."))?;
+    let safe = redact_agent_mcp_config(server);
+    Ok(format!(
+        "Connector {name} (credentials redacted):\n{}",
+        serde_json::to_string_pretty(&safe).map_err(|e| e.to_string())?
+    ))
+}
+
+/// Create/update a connector without ever accepting, exposing, approving, or
+/// starting credentials/programs. A changed connector remains disabled until a
+/// human reviews it in Connectors and completes the existing SEC-1 approval.
+pub(crate) fn agent_save_mcp(
+    window: &tauri::Window,
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<String, String> {
+    use tauri::Manager as _;
+
+    let name = agent_mcp_name(args["name"].as_str().unwrap_or_default())?.to_string();
+    let mut incoming = args
+        .get("config")
+        .cloned()
+        .filter(serde_json::Value::is_object)
+        .ok_or("save_mcp needs a `config` object.")?;
+    remove_agent_mcp_secrets(&mut incoming);
+    let json = state.with_room(|room| {
+        let raw = db::get_setting(&room.conn, MCP_CONFIG_KEY)
+            .unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string());
+        let mut root = agent_mcp_root(&raw)?;
+        let servers = root["mcpServers"].as_object_mut().expect("checked above");
+        let existed = servers.get(&name).is_some();
+        // Preserve already-stored credentials while refusing new secret values
+        // from model context. A connector edit must never erase a user's token.
+        if let Some(old) = servers.get(&name).and_then(serde_json::Value::as_object) {
+            if let Some(new) = incoming.as_object_mut() {
+                for key in ["headers", "env", "bearer_token_env_var"] {
+                    if let Some(value) = old.get(key) {
+                        new.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
+        }
+        incoming["disabled"] = serde_json::Value::Bool(true);
+        servers.insert(name.clone(), incoming);
+        let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+        mcp::parse_config(&json)?;
+        db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
+        Ok((json, existed))
+    })?;
+    let servers = mcp::parse_config(&json.0)?;
+    start_mcp_connections(window.app_handle().clone(), servers);
+    Ok(format!(
+        "{} connector \"{}\" as disabled. Review it in Connectors, add any credentials there, then explicitly enable and approve it before it can run or reach the network.",
+        if json.1 { "Updated" } else { "Saved" },
+        name
+    ))
+}
+
+pub(crate) fn agent_delete_mcp(
+    window: &tauri::Window,
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<String, String> {
+    use tauri::Manager as _;
+
+    let name = agent_mcp_name(args["name"].as_str().unwrap_or_default())?.to_string();
+    let json = state.with_room(|room| {
+        let raw = db::get_setting(&room.conn, MCP_CONFIG_KEY)
+            .unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string());
+        let root = agent_mcp_root(&raw)?;
+        if root["mcpServers"].get(&name).is_none() {
+            return Err(format!("No connector named \"{name}\" exists."));
+        }
+        super::mcp_oauth::clear_tokens(&room.conn, &name)?;
+        let json = remove_server_from_config(&raw, &name)?;
+        db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
+        Ok(json)
+    })?;
+    start_mcp_connections(window.app_handle().clone(), mcp::parse_config(&json)?);
+    Ok(format!(
+        "Deleted connector \"{name}\" and its saved OAuth token."
+    ))
 }
 
 // ------------------------------------------------------------ enable/remove
@@ -489,8 +705,7 @@ pub fn mcp_remove_server(
 
 /// Remove the Authorization header from one server's config entry. Pure.
 fn strip_bearer(config: &str, server: &str) -> Result<String, String> {
-    let mut root: serde_json::Value =
-        serde_json::from_str(config).map_err(|e| e.to_string())?;
+    let mut root: serde_json::Value = serde_json::from_str(config).map_err(|e| e.to_string())?;
     if let Some(h) = root
         .get_mut("mcpServers")
         .and_then(|m| m.get_mut(server))
@@ -510,7 +725,11 @@ pub(crate) fn parse_tool_prefs(
     raw: &str,
 ) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
     serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(raw)
-        .map(|m| m.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect())
+        .map(|m| {
+            m.into_iter()
+                .map(|(k, v)| (k, v.into_iter().collect()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -554,7 +773,8 @@ pub fn mcp_set_tool_enabled(
     enabled: bool,
 ) -> Result<String, String> {
     state.with_room(|room| {
-        let raw = db::get_setting(&room.conn, MCP_TOOL_PREFS_KEY).unwrap_or_else(|| "{}".to_string());
+        let raw =
+            db::get_setting(&room.conn, MCP_TOOL_PREFS_KEY).unwrap_or_else(|| "{}".to_string());
         let next = set_tool_pref(&raw, &server, &tool, enabled)?;
         db::set_setting(&room.conn, MCP_TOOL_PREFS_KEY, &next)?;
         Ok(next)
@@ -571,8 +791,10 @@ pub(crate) fn parse_uncapped(raw: &str) -> std::collections::HashSet<String> {
 /// Add/remove a server from the uncapped list, returning the new JSON. Pure —
 /// unit-tested.
 pub(crate) fn set_uncapped(raw: &str, server: &str, uncapped: bool) -> Result<String, String> {
-    let mut set: std::collections::BTreeSet<String> =
-        serde_json::from_str::<Vec<String>>(raw).unwrap_or_default().into_iter().collect();
+    let mut set: std::collections::BTreeSet<String> = serde_json::from_str::<Vec<String>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     if uncapped {
         set.insert(server.to_string());
     } else {
@@ -598,7 +820,8 @@ pub fn mcp_set_server_uncapped(
     uncapped: bool,
 ) -> Result<String, String> {
     state.with_room(|room| {
-        let raw = db::get_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY).unwrap_or_else(|| "[]".to_string());
+        let raw =
+            db::get_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY).unwrap_or_else(|| "[]".to_string());
         let next = set_uncapped(&raw, &server, uncapped)?;
         db::set_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY, &next)?;
         Ok(next)
@@ -614,16 +837,24 @@ pub fn resolve_mcp_call(
     decision: String,
 ) -> Result<(), String> {
     let d = match decision.as_str() {
-        "once" => McpDecision { approved: true, remember: false },
-        "always" => McpDecision { approved: true, remember: true },
-        _ => McpDecision { approved: false, remember: false },
+        "once" => McpDecision {
+            approved: true,
+            remember: false,
+        },
+        "always" => McpDecision {
+            approved: true,
+            remember: true,
+        },
+        _ => McpDecision {
+            approved: false,
+            remember: false,
+        },
     };
     if let Some(tx) = state.mcp_pending.lock().unwrap().remove(&id) {
         let _ = tx.send(d);
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -719,7 +950,10 @@ mod tests {
             },
             disabled: false,
         };
-        assert_eq!(render_command_line(&cfg), "uvx duckduckgo-mcp-server --verbose");
+        assert_eq!(
+            render_command_line(&cfg),
+            "uvx duckduckgo-mcp-server --verbose"
+        );
         let bare = mcp::ServerConfig {
             transport: mcp::Transport::Stdio {
                 command: "node".into(),
@@ -756,17 +990,29 @@ mod tests {
 
     #[test]
     fn merge_and_strip_bearer_are_inverse() {
-        let cfg = r#"{"mcpServers":{"gh":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#;
+        let cfg =
+            r#"{"mcpServers":{"gh":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#;
         let merged = merge_bearer(cfg, "gh", "tok123").unwrap();
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(v["mcpServers"]["gh"]["headers"]["Authorization"], "Bearer tok123");
+        assert_eq!(
+            v["mcpServers"]["gh"]["headers"]["Authorization"],
+            "Bearer tok123"
+        );
         // url is preserved.
-        assert_eq!(v["mcpServers"]["gh"]["url"], "https://api.githubcopilot.com/mcp/");
+        assert_eq!(
+            v["mcpServers"]["gh"]["url"],
+            "https://api.githubcopilot.com/mcp/"
+        );
         // Stripping removes just the Authorization header.
         let stripped = strip_bearer(&merged, "gh").unwrap();
         let sv: serde_json::Value = serde_json::from_str(&stripped).unwrap();
-        assert!(sv["mcpServers"]["gh"]["headers"].get("Authorization").is_none());
-        assert_eq!(sv["mcpServers"]["gh"]["url"], "https://api.githubcopilot.com/mcp/");
+        assert!(sv["mcpServers"]["gh"]["headers"]
+            .get("Authorization")
+            .is_none());
+        assert_eq!(
+            sv["mcpServers"]["gh"]["url"],
+            "https://api.githubcopilot.com/mcp/"
+        );
         // Unknown server → error, not a panic.
         assert!(merge_bearer(cfg, "nope", "t").is_err());
     }
@@ -824,4 +1070,39 @@ mod tests {
         assert!(line.contains("remote"));
     }
 
+    #[test]
+    fn agent_connector_views_never_expose_secret_fields() {
+        let raw = serde_json::json!({
+            "command": "npx",
+            "headers": {"Authorization": "Bearer secret"},
+            "env": {"API_KEY": "secret"},
+            "bearer_token_env_var": "TOKEN_ENV",
+            "token": "secret"
+        });
+        let safe = redact_agent_mcp_config(&raw);
+        assert_eq!(safe["headers"], "[redacted]");
+        assert_eq!(safe["env"], "[redacted]");
+        assert_eq!(safe["bearer_token_env_var"], "[redacted]");
+        assert_eq!(safe["token"], "[redacted]");
+        assert!(!safe.to_string().contains("secret"));
+
+        let mut incoming = raw;
+        remove_agent_mcp_secrets(&mut incoming);
+        for key in AGENT_SECRET_KEYS {
+            assert!(
+                incoming.get(*key).is_none(),
+                "{key} leaked into an agent save"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_connector_names_and_roots_are_strict() {
+        assert_eq!(agent_mcp_name("github.v2").unwrap(), "github.v2");
+        assert!(agent_mcp_name("has space").is_err());
+        assert!(agent_mcp_name("../escape").is_err());
+        let root = agent_mcp_root(r#"{"mcpServers":{}}"#).unwrap();
+        assert!(root["mcpServers"].is_object());
+        assert!(agent_mcp_root(r#"{"mcpServers":[]}"#).is_err());
+    }
 }

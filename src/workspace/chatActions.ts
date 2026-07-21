@@ -10,7 +10,7 @@ import { HELP_COMMAND } from "./constants";
 import * as voice from "./voice";
 import { WSState } from "./state";
 
-/** Chat sessions + the AI-turn flow + the composer's #/@ autocomplete. Cross-hook
+/** Chat sessions + the AI-turn flow + the composer's #, @, and / autocomplete. Cross-hook
  * deps threaded from the shell: files' viewFile (openSource), recording's
  * openOllamaApp/downloadModel/refreshAi (turn error remediation), misc's
  * playSealSound (lock ritual). onLock is the App-level lock. */
@@ -196,12 +196,19 @@ export function makeChatActions(
       s.setShowHelp(true);
       return;
     }
-    const parsed = parseComposer(raw, s.commands, s.files, s.folders);
+    const parsed = parseComposer(raw, s.commands, s.skills, s.files, s.folders);
     if (parsed.commandError) {
       const names = s.commands.map((c) => `#${c.name}`).join(", ");
       s.pushToast(
         "error",
         `#${parsed.commandError} isn't a command. Try: ${names || "(none available)"}`,
+      );
+      return;
+    }
+    if (parsed.skillError) {
+      s.pushToast(
+        "error",
+        `/${parsed.skillError} isn't an enabled skill. Type / to choose from enabled skills.`,
       );
       return;
     }
@@ -231,7 +238,7 @@ export function makeChatActions(
     }
   }
 
-  // ---- "#"/"@" autocomplete ----
+  // ---- "#"/"@"/"/" autocomplete ----
 
   function autocompleteItems(): {
     key: string;
@@ -250,6 +257,18 @@ export function makeChatActions(
           hint: c.summary,
           insert: `#${c.name} `,
           usage: c.usage,
+        }));
+    }
+    if (s.ac.kind === "skill") {
+      return s.skills
+        .filter((skill) => skill.enabled && skill.name.startsWith(s.ac!.query))
+        .slice(0, 10)
+        .map((skill) => ({
+          key: `skill-${skill.id}`,
+          label: `/${skill.name}`,
+          hint: skill.description,
+          insert: `/${skill.name} `,
+          usage: "Skill",
         }));
     }
     const q = s.ac.query;
@@ -278,13 +297,13 @@ export function makeChatActions(
     s.setAc(tok ? { kind: tok.kind, query: tok.query, start: tok.start, index: 0 } : null);
   }
 
-  function insertComposerToken(token: "@" | "#") {
+  function insertComposerToken(token: "@" | "#" | "/") {
     const cur = s.question;
     let next: string;
     let caret: number;
-    if (token === "#") {
+    if (token === "#" || token === "/") {
       const body = cur.replace(/^\s+/, "");
-      next = `#${body}`;
+      next = `${token}${body}`;
       caret = 1;
     } else {
       const needsSpace = cur.length > 0 && !/\s$/.test(cur);
@@ -345,7 +364,7 @@ export function makeChatActions(
         s.setAc(null);
         // A bare trigger token was only there to open the palette; closing
         // the palette takes it with it so the composer is back where it was.
-        if (s.question.trim() === "#" || s.question.trim() === "@")
+        if (["#", "@", "/"].includes(s.question.trim()))
           s.setQuestion("");
         s.composerRef.current?.focus();
         return;
@@ -390,6 +409,26 @@ export function makeChatActions(
     }
   }
 
+  // Context handoff: summarize the chat so far and insert a marker message —
+  // `db::recent_messages` then starts every future turn's history from it, so
+  // the token-budget bar's next reading reflects the much smaller context.
+  async function handoffContext() {
+    if (!s.activeChatId || s.asking || s.handoffStarting) return;
+    const chatId = s.activeChatId;
+    await runGuarded(
+      s,
+      async () => {
+        const marker = await api.handoffContext(chatId);
+        s.setMessages(await api.getMessages(chatId));
+        if (marker.effects?.usage) s.setTokenUsage(marker.effects.usage);
+      },
+      {
+        begin: () => s.setHandoffStarting(true),
+        finish: () => s.setHandoffStarting(false),
+      },
+    );
+  }
+
   async function regenerate(assistantId: string) {
     if (s.asking || !s.activeChatId) return;
     const chatId = s.activeChatId;
@@ -414,7 +453,7 @@ export function makeChatActions(
     // re-executes as a command (not resent as literal text), and any @-mentioned
     // files are re-attached (parsed back out of the text). Paperclip-only
     // attachments aren't stored on the message, so those can't be recovered here.
-    const parsed = parseComposer(userText, s.commands, s.files, s.folders);
+    const parsed = parseComposer(userText, s.commands, s.skills, s.files, s.folders);
     if (parsed.command) {
       await runTurn((askId) =>
         api.runCommand(chatId, parsed.command!, parsed.args, parsed.refIds, userText, askId),
@@ -527,6 +566,6 @@ export function makeChatActions(
     refreshAutocomplete, insertComposerToken, acceptAutocomplete,
     onComposerKeyDown, stopAsk, handleLock, regenerate, copyMessage,
     copyAllText, openSource, startRename, commitRename, onComposerPaste,
-    makeMinutes, saveToRoom, toggleAttach,
+    makeMinutes, saveToRoom, toggleAttach, handoffContext,
   };
 }

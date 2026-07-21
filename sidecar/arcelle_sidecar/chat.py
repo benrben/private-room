@@ -9,14 +9,37 @@ network, no Ollama and no weights.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
 
 from .config import KEEP_ALIVE_WARM, num_ctx_for_chat
 from .messages import Message, ToolCall, attach_images
+from .model_limits import native_context_length
 from .privacy import PrivacyPolicy, guard_outbound
 
 #: Called with each streamed text delta.
 DeltaSink = Callable[[str], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class RoundUsage:
+    """One round's token accounting, for the chat token-budget bar.
+
+    ``input_tokens``/``output_tokens`` are the engine's own report (Ollama's
+    ``prompt_eval_count``/``eval_count``, surfaced by ``langchain_ollama`` as
+    ``usage_metadata``) when available; ``None`` when the engine reported
+    nothing, in which case the caller falls back to a char-length estimate.
+    ``max_context`` is the model's real advertised context length (from
+    Ollama's own catalog — see ``model_limits.native_context_length``), not
+    the smaller RAM-adaptive ``num_ctx`` window we actually throttle Ollama to
+    for this session (CHG-32 pins that stable for the whole turn, but users
+    expect the bar to show what the model itself is capable of).
+    """
+
+    input_tokens: int | None
+    output_tokens: int | None
+    max_context: int
+    is_real: bool
 
 
 class Cancellable(Protocol):
@@ -39,14 +62,17 @@ class ChatModel(Protocol):
         tools: list[dict[str, Any]],
         on_delta: DeltaSink,
         cancel: Optional[Cancellable] = None,
-    ) -> tuple[str, list[ToolCall]]:
+    ) -> tuple[str, list[ToolCall], RoundUsage]:
         """Stream one assistant turn. ``tools`` may be empty — that is the
         tool-less final round, and it must NOT be treated as "no tools argument".
 
         ``cancel`` is the Stop button: Stop must break the token stream mid-flight
         (agent.rs:1361 threads the cancel token into ``chat_stream_tools``, honoured
         at ollama.rs:521), not merely between rounds — otherwise a plain single-
-        stream answer keeps typing after the user pressed Stop."""
+        stream answer keeps typing after the user pressed Stop.
+
+        Returns ``(content, tool_calls, usage)`` — ``usage`` feeds the chat
+        token-budget bar (see :class:`RoundUsage`)."""
         ...
 
 
@@ -251,7 +277,7 @@ class OllamaChatModel:
         tools: list[dict[str, Any]],
         on_delta: DeltaSink,
         cancel: Optional[Cancellable] = None,
-    ) -> tuple[str, list[ToolCall]]:
+    ) -> tuple[str, list[ToolCall], RoundUsage]:
         from langchain_core.messages import AIMessageChunk
 
         # PRIV-1: every round of the agent loop passes the door — the composed
@@ -317,7 +343,29 @@ class OllamaChatModel:
                         },
                     )
                 )
-        return content, calls
+        return content, calls, await self._round_usage(merged)
+
+    async def _round_usage(self, merged: Any) -> RoundUsage:
+        """Real usage when Ollama reported it, else the char-estimate fallback
+        signal (``is_real=False`` — the caller substitutes its own estimate).
+
+        ``max_context`` is the model's real advertised context length (Ollama's
+        own catalog, confirmed live 2026-07-21 to work for both local and
+        ``:cloud`` models) — NOT ``self.num_ctx``, which is only the smaller
+        RAM-adaptive WORKING window we throttle Ollama to for speed. Falls
+        back to that working window if the catalog lookup fails."""
+        max_context = await native_context_length(self.model, self.base_url) or self.num_ctx
+        meta = getattr(merged, "usage_metadata", None) if merged is not None else None
+        if meta:
+            return RoundUsage(
+                input_tokens=meta.get("input_tokens"),
+                output_tokens=meta.get("output_tokens"),
+                max_context=max_context,
+                is_real=True,
+            )
+        return RoundUsage(
+            input_tokens=None, output_tokens=None, max_context=max_context, is_real=False
+        )
 
 
-__all__ = ["ChatModel", "OllamaChatModel", "DeltaSink", "Cancellable"]
+__all__ = ["ChatModel", "OllamaChatModel", "DeltaSink", "Cancellable", "RoundUsage"]

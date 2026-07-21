@@ -3,6 +3,7 @@ import {
   AiActionDef,
   AiStatus,
   AskPrivacy,
+  AskTokenUsage,
   Chat,
   ChatCommand,
   ExternalModelInfo,
@@ -108,6 +109,11 @@ export function useWorkspaceState(_info: RoomInfo) {
   // PRIV-1: what the door did on the latest finished turn (the chat chip);
   // cleared when the next turn starts.
   const [askPrivacy, setAskPrivacy] = useState<AskPrivacy | null>(null);
+  // Token-budget bar: the latest turn's live usage snapshot (null = nothing
+  // asked yet this session, or the active model reports nothing at all).
+  const [tokenUsage, setTokenUsage] = useState<AskTokenUsage | null>(null);
+  // True while a "hand off" (context-compaction) summary call is in flight.
+  const [handoffStarting, setHandoffStarting] = useState(false);
   // Engine parity: mirrors the "let a cloud AI use this room's tools" switch,
   // so the composer badge can tell the truth for external engines.
   const [advisorToolsOn, setAdvisorToolsOn] = useState(false);
@@ -352,6 +358,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     showAddLink, setShowAddLink, linkUrl, setLinkUrl, importingLink, setImportingLink,
     webOn, setWebOn, advisorToolsOn, setAdvisorToolsOn,
     privacyOn, setPrivacyOn, askPrivacy, setAskPrivacy,
+    tokenUsage, setTokenUsage, handoffStarting, setHandoffStarting,
     showHistory, setShowHistory, versions, setVersions,
     confirmRestore, setConfirmRestore, compare, setCompare,
     confirmDelete, setConfirmDelete,

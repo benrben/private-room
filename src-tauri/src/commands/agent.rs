@@ -210,7 +210,10 @@ pub async fn ask(
 
     // ADD-13: embed the question BEFORE taking the room lock (the Ollama call is
     // async; the lock is not held across it). None on any failure → keyword-only.
-    let question_embedding = embed_question(&question).await;
+    let embedding_question = explicit_skill_request(&question)
+        .map(|(_, request)| request)
+        .unwrap_or(question.trim());
+    let question_embedding = embed_question(embedding_question).await;
 
     // Phase 1 (locked): gather context, save the user message.
     let QuestionContext {
@@ -401,6 +404,22 @@ struct QuestionContext {
 /// Phase 1 (locked): gather the room's context and save the user's message.
 /// Runs entirely under the room mutex and performs NO `.await`, so the guard is
 /// never held across a suspension point — the lock discipline `ask` relies on.
+fn explicit_skill_request(question: &str) -> Option<(&str, &str)> {
+    let question = question.trim_start();
+    let rest = question.strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..end];
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return None;
+    }
+    Some((name, rest[end..].trim()))
+}
+
 fn gather_context_and_save_question(
     window: &tauri::Window,
     state: &State<'_, AppState>,
@@ -413,6 +432,10 @@ fn gather_context_and_save_question(
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
         let conn = &room.conn;
+        let (explicit_skill_name, effective_question) = match explicit_skill_request(question) {
+            Some((name, request)) => (Some(name), request),
+            None => (None, question.trim()),
+        };
 
         let explicit_model = model_setting(conn);
         let temperature: Option<f64> = db::get_setting(conn, "temperature")
@@ -437,6 +460,20 @@ fn gather_context_and_save_question(
         // Keeping this in the per-turn user message preserves the stable system
         // prefix (and therefore Ollama's KV cache) when skills change.
         let available_skills = db::list_skills(conn, true)?;
+        let explicit_skill = match explicit_skill_name {
+            Some(name) => {
+                let skill = db::find_skill(conn, name)?
+                    .ok_or_else(|| format!("No skill named \"{name}\" exists."))?;
+                if !skill.enabled {
+                    return Err(format!(
+                        "The skill \"{name}\" is still a disabled draft. Review and enable it in Skills before using /{name}."
+                    ));
+                }
+                let resources = db::list_skill_resources(conn, &skill.id)?;
+                Some((skill, resources))
+            }
+            None => None,
+        };
 
         let history: Vec<(String, String)> = {
             let mut rows = db::recent_messages(conn, chat_id, MAX_HISTORY_MESSAGES as i64)?;
@@ -445,7 +482,7 @@ fn gather_context_and_save_question(
         };
 
         let (context_chunks, context_fallback) =
-            retrieve_context(conn, question, question_embedding)?;
+            retrieve_context(conn, effective_question, question_embedding)?;
         // CHG-16: rowids already injected as context, so a search_room repeat
         // of the same question returns the next-best chunks instead of dupes.
         let injected_rowids: HashSet<i64> = if context_fallback {
@@ -716,11 +753,29 @@ fn gather_context_and_save_question(
             }
             user_content.push('\n');
         }
+        if let Some((skill, resources)) = &explicit_skill {
+            let tree = if resources.is_empty() {
+                "(no bundled resources)".to_string()
+            } else {
+                resources
+                    .iter()
+                    .map(|resource| format!("- {} ({})", resource.path, resource.kind))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let instructions = clamp_bytes(skill.instructions.clone(), 20_000);
+            user_content.push_str(&format!(
+                "Explicitly selected Agent Skill: /{}\n\
+                 Follow this skill for the current request. The slash selection overrides automatic skill choice, but never the user's request or safety/privacy rules. Read listed resources with read_skill_resource when the instructions call for them.\n\
+                 Description: {}\n\nSkill instructions:\n{}\n\nBundled resources:\n{}\n\n",
+                skill.name, skill.description, instructions, tree
+            ));
+        }
         if !memories.is_empty() {
             // CHG-7 + ADD-22: budget-fitting, question-relevant memories are
             // injected HERE (the always-new user message) rather than the stable
             // system prompt, preserving KV-cache reuse of the system prefix.
-            let chosen = select_memories(&memories, question, MAX_MEMORY_INJECT_CHARS);
+            let chosen = select_memories(&memories, effective_question, MAX_MEMORY_INJECT_CHARS);
             if !chosen.is_empty() {
                 user_content.push_str("Notes to remember for this room:\n");
                 for m in &chosen {
@@ -745,7 +800,7 @@ fn gather_context_and_save_question(
             }
             user_content.push_str("---\n\n");
         }
-        user_content.push_str(&format!("Question: {question}"));
+        user_content.push_str(&format!("Question: {effective_question}"));
 
         chat_messages.push(ollama::ChatMessage {
             role: "user".into(),
@@ -757,8 +812,9 @@ fn gather_context_and_save_question(
         db::insert_message(conn, chat_id, "user", question, &[], None)?;
 
         // First question names the session.
-        let mut title: String = question.chars().take(48).collect();
-        if question.chars().count() > 48 {
+        let title_source = if effective_question.is_empty() { question } else { effective_question };
+        let mut title: String = title_source.chars().take(48).collect();
+        if title_source.chars().count() > 48 {
             title.push('…');
         }
         db::set_chat_title_if_new(conn, chat_id, &title)?;
@@ -862,6 +918,13 @@ pub(crate) async fn stream_answer(
         if let Some(b) = &bridge {
             b.stop();
         }
+        // Token-budget bar wants a snapshot regardless of what happens to the
+        // text below (redaction/Stop-swallowing), so split it out now.
+        let (res, ext_usage): (Result<String, String>, Option<crate::commands::external::ExternalUsage>) =
+            match res {
+                Ok((text, usage)) => (Ok(text), usage),
+                Err(e) => (Err(e), None),
+            };
         // Restore is idempotent: run_external already put real values back for
         // its own guard's rules; this covers the pre-redacted copy's rules.
         let res = match &policy {
@@ -877,6 +940,36 @@ pub(crate) async fn stream_answer(
                     "images_blocked": privacy_report.images_blocked,
                 }),
             );
+        }
+        // Token-budget bar: whatever the CLI reported (even on error — it may
+        // have reported partial usage), categorized against the guarded
+        // message list actually sent. `guarded` has no per-round "tools
+        // offered" figure the way the sidecar path does, and — more
+        // importantly — no role:"tool" messages at all (run_external hides
+        // its own internal tool-calling rounds from Rust entirely), so the
+        // "opaque gap" breakdown (not the generic proportional one) is what
+        // keeps real tool/file activity from being silently misattributed to
+        // system/history (reported live 2026-07-21).
+        {
+            let (engine, submodel, _effort) = split_external_model(model);
+            let max_context = match ext_usage.as_ref().and_then(|u| u.max_context_hint) {
+                Some(hint) => hint,
+                None => match engine {
+                    "codex-cli" => crate::commands::external::codex_context_window(submodel)
+                        .await
+                        .unwrap_or_else(|| crate::model_limits::external_max_context(engine)),
+                    _ => crate::model_limits::external_max_context(engine),
+                },
+            };
+            let breakdown = crate::token_usage::categorize_messages(&guarded);
+            let value = crate::token_usage::build_usage_value_opaque_gap(
+                ext_usage.as_ref().and_then(|u| u.input_tokens),
+                max_context,
+                &breakdown,
+                "tools",
+            );
+            effects.token_usage = Some(value.clone());
+            let _ = window.emit("ask-token-usage", value);
         }
         res
     } else {
@@ -973,6 +1066,7 @@ pub(crate) fn persist_assistant_reply(
             sources,
             created_at: String::new(),
             effects: effects_value,
+            kind: None,
         }),
     }
 }
@@ -981,7 +1075,11 @@ pub(crate) fn persist_assistant_reply(
 /// `{"boxes": ..?, "annotation": ..?}` — or None when neither fired, so the
 /// column stays NULL for plain answers.
 pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
-    if effects.boxes.is_none() && effects.annotation.is_none() && effects.edit_outcomes.is_empty() {
+    if effects.boxes.is_none()
+        && effects.annotation.is_none()
+        && effects.edit_outcomes.is_empty()
+        && effects.token_usage.is_none()
+    {
         return None;
     }
     let mut map = serde_json::Map::new();
@@ -999,6 +1097,11 @@ pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
             serde_json::Value::Array(effects.edit_outcomes.clone()),
         );
     }
+    // Token-budget bar: this turn's snapshot, same shape as the live
+    // `ask-token-usage` event (see sidecar.rs / token_usage.rs).
+    if let Some(u) = &effects.token_usage {
+        map.insert("usage".into(), u.clone());
+    }
     Some(serde_json::Value::Object(map))
 }
 
@@ -1009,6 +1112,68 @@ pub fn cancel_ask(state: State<'_, AppState>, ask_id: String) {
     if let Some(flag) = state.cancels.lock().unwrap().get(&ask_id) {
         flag.store(true, Ordering::SeqCst);
     }
+}
+
+/// Token-budget bar / context handoff: summarize the conversation the model
+/// currently sees (already truncated at any earlier handoff marker, per
+/// `db::recent_messages`) and insert a fresh marker with the recap. Every
+/// future turn in this chat then starts its context from that recap — the
+/// entire mechanism is `db::recent_messages`'s truncation point, not any
+/// separate "compacted" state.
+#[tauri::command]
+pub async fn handoff_chat(state: State<'_, AppState>, chat_id: String) -> Result<Message, String> {
+    // Phase 1 (locked): read what the model would currently see.
+    let (explicit_model, temperature, mut history) = {
+        let guard = state.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open")?;
+        let explicit_model = model_setting(&room.conn);
+        let temperature: Option<f64> = db::get_setting(&room.conn, "temperature")
+            .and_then(|s| s.parse().ok());
+        let history = db::recent_messages(&room.conn, &chat_id, MAX_HISTORY_MESSAGES as i64)?;
+        (explicit_model, temperature, history)
+    };
+    if history.is_empty() {
+        return Err("Nothing to summarize yet.".into());
+    }
+    // `recent_messages` is newest-first; the summarizer wants chronological
+    // order, same as `ask`'s own history read.
+    history.reverse();
+
+    let models = ollama::list_models().await.unwrap_or_default();
+    let model = explicit_model.unwrap_or_else(|| best_default(&models));
+    let messages: Vec<ollama::ChatMessage> = history
+        .into_iter()
+        .map(|(role, content)| ollama::ChatMessage::new(&role, content))
+        .collect();
+
+    // Phase 2 (unlocked): the summarization call — any engine, same as `ask`.
+    let summary = ollama::handoff_summary(&model, messages, temperature).await?;
+
+    // Token-budget bar: no LLM "ask" turn happens as part of a handoff, so no
+    // `ask-token-usage` event fires on its own — build a snapshot for the new,
+    // much smaller post-handoff context now, so the bar can update
+    // immediately rather than waiting for a turn that hasn't happened yet.
+    // Necessarily an estimate (no real usage exists until the next real turn).
+    let (engine, submodel, _effort) = split_external_model(&model);
+    let max_context = if engine == "codex-cli" {
+        crate::commands::external::codex_context_window(submodel)
+            .await
+            .unwrap_or_else(|| crate::model_limits::external_max_context(engine))
+    } else if is_external_engine(&model) {
+        crate::model_limits::external_max_context(engine)
+    } else {
+        ollama::native_context_length(&model)
+            .await
+            .unwrap_or_else(|| ollama::num_ctx_for(false, ollama::CtxTier::Chat))
+    };
+    let marker_msg = ollama::ChatMessage::new("assistant", summary.clone());
+    let breakdown = crate::token_usage::categorize_messages(std::slice::from_ref(&marker_msg));
+    let usage_value = crate::token_usage::build_usage_value(None, max_context, &breakdown);
+
+    // Phase 3 (locked): persist the marker, with that snapshot as its effects.
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("The room closed while summarizing.")?;
+    db::insert_handoff_message(&room.conn, &chat_id, &summary, Some(&usage_value))
 }
 
 /// Every built-in agent tool name — also the reserved set MCP tools may not
@@ -1033,7 +1198,13 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read_skill_resource",
     "save_skill",
     "write_skill_resource",
+    "delete_skill",
+    "delete_skill_resource",
     "run_skill_script",
+    "list_mcps",
+    "read_mcp",
+    "save_mcp",
+    "delete_mcp",
     "web_search",
     "fetch_page",
     "ui_snapshot",
@@ -1048,6 +1219,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "list_workflows",
     "save_workflow",
     "update_workflow",
+    "delete_workflow",
     "run_workflow",
     "test_workflow",
     // Reserved even though they are never in the room bridge's own catalog:
@@ -1073,6 +1245,31 @@ pub(crate) fn wants_write_tools(question: &str) -> bool {
         "move ", "rename", "organize", "organise", "put ", "folder", "sort ", "tidy",
     ];
     HINTS.iter().any(|h| q.contains(h))
+}
+
+/// Skill management is a separate, on-demand lane. Reading or changing a skill
+/// is uncommon enough that its six CRUD/resource tools should not burden a
+/// normal document question, but the word itself is an unambiguous request to
+/// expose them.
+pub(crate) fn wants_skill_tools(question: &str) -> bool {
+    let q = question.to_lowercase();
+    const HINTS: &[&str] = &["skill", "agent instruction"];
+    HINTS.iter().any(|hint| q.contains(hint))
+}
+
+/// Connector management is deliberately local-agent-only and on demand. A
+/// normal question about a document must never spend context on the schemas
+/// that can configure programs or remote services.
+pub(crate) fn wants_mcp_management_tools(question: &str) -> bool {
+    let q = question.to_lowercase();
+    const HINTS: &[&str] = &[
+        "mcp",
+        "connector",
+        "connectors",
+        "integration",
+        "integrations",
+    ];
+    HINTS.iter().any(|hint| q.contains(hint))
 }
 
 /// "open the Room Map" / "switch to the Detail tab" / "generate flashcards"
@@ -1137,6 +1334,34 @@ pub(crate) fn job_tools_specs() -> Vec<serde_json::Value> {
         serde_json::json!({"type": "function", "function": {"name": "job_status",
             "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along.",
             "parameters": {"type": "object", "properties": {}}}}),
+    ]
+}
+
+/// Local-only connector administration. The agent can inspect/create/update/
+/// remove connector records, but `save_mcp` always leaves a changed connector
+/// disabled. Starting a program or reaching a new remote endpoint remains an
+/// explicit human approval on the Connectors page.
+pub(crate) fn mcp_management_tools_specs() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type": "function", "function": {"name": "list_mcps",
+            "description": "List the room's MCP connectors with their enabled state, transport, and live status. Use this to inspect or manage connectors.",
+            "parameters": {"type": "object", "properties": {}}}}),
+        serde_json::json!({"type": "function", "function": {"name": "read_mcp",
+            "description": "Read one connector's configuration for editing. Secret header, environment, and OAuth values are redacted and never shown to the agent.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "Connector name"}},
+                "required": ["name"]}}}),
+        serde_json::json!({"type": "function", "function": {"name": "save_mcp",
+            "description": "Create or update one MCP connector configuration. Supply a name plus a standard MCP server config object (command/args for local, or type:url for remote). Do not include headers, env, tokens, or credentials: those stay in Connectors. Every changed connector is saved DISABLED, so the user reviews it and explicitly enables/approves it before anything runs or reaches the network.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "Unique connector name (letters, digits, dot, dash, underscore)"},
+                "config": {"type": "object", "description": "MCP server configuration, without secrets"}},
+                "required": ["name", "config"]}}}),
+        serde_json::json!({"type": "function", "function": {"name": "delete_mcp",
+            "description": "Remove one MCP connector from this room, including its saved OAuth token. Use only when the user explicitly asks to remove that connector.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "Connector name"}},
+                "required": ["name"]}}}),
     ]
 }
 
@@ -1297,11 +1522,12 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                 "path": {"type": "string", "description": "Relative resource path"}},
                 "required": ["skill", "path"]}}}
         ,{"type": "function", "function": {"name": "save_skill",
-            "description": "Create or update a portable Agent Skill. Saves it DISABLED as a draft for human review. Put all trigger conditions in description and concise imperative Markdown in instructions; add reusable resources separately with write_skill_resource.",
+            "description": "Create or update a portable Agent Skill. Saves it DISABLED as a draft for human review. Put all trigger conditions in description and concise imperative Markdown in instructions; add reusable resources separately with write_skill_resource. When the user wants a skill based on attached room files, pass their file names in source_files: Arcelle snapshots their readable content under references/source-files/ without making the model repeat the documents.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Lowercase hyphenated name, at most 64 characters"},
                 "description": {"type": "string", "description": "What the skill does and exactly when to use it"},
-                "instructions": {"type": "string", "description": "The SKILL.md Markdown body"}},
+                "instructions": {"type": "string", "description": "The SKILL.md Markdown body"},
+                "source_files": {"type": "array", "items": {"type": "string"}, "description": "Optional names of attached/readable room files to bundle as portable reference snapshots (maximum 12)"}},
                 "required": ["name", "description", "instructions"]}}}
         ,{"type": "function", "function": {"name": "write_skill_resource",
             "description": "Add or replace a text resource in a skill draft under scripts/, references/, assets/, agents/, or another relative folder. The skill is disabled again for review.",
@@ -1310,6 +1536,17 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                 "path": {"type": "string", "description": "Relative path, e.g. references/schema.md"},
                 "content": {"type": "string"}},
                 "required": ["skill", "path", "content"]}}}
+        ,{"type": "function", "function": {"name": "delete_skill_resource",
+            "description": "Delete one bundled resource from a skill. Use only when the user explicitly asks to remove that resource.",
+            "parameters": {"type": "object", "properties": {
+                "skill": {"type": "string", "description": "Skill name or id"},
+                "path": {"type": "string", "description": "Relative resource path"}},
+                "required": ["skill", "path"]}}}
+        ,{"type": "function", "function": {"name": "delete_skill",
+            "description": "Delete an entire Agent Skill and all of its bundled resources. Use only when the user explicitly asks to delete that skill.",
+            "parameters": {"type": "object", "properties": {
+                "skill": {"type": "string", "description": "Skill name or id"}},
+                "required": ["skill"]}}}
         ,{"type": "function", "function": {"name": "run_skill_script",
             "description": "Run an enabled skill's bundled Python or JavaScript helper from scripts/ in an isolated temporary copy of the skill folder. The user must approve the exact script contents first. Optional input is sent on stdin; stdout is returned.",
             "parameters": {"type": "object", "properties": {
@@ -1503,11 +1740,14 @@ pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<Str
             let description: String = tool.description.chars().take(300).collect();
             let mut schema = tool.schema.clone();
             slim_schema(&mut schema);
-            let spec = serde_json::json!({"type": "function", "function": {
+            let mut spec = serde_json::json!({"type": "function", "function": {
                 "name": catalog_name,
                 "description": description,
                 "parameters": schema,
             }});
+            if let Some(annotations) = &tool.annotations {
+                spec["function"]["annotations"] = annotations.clone();
+            }
             // Whole-catalog budget: stop admitting once the specs get too large
             // (unless the user overrode the cap for this connector).
             let cost = spec.to_string().len();
@@ -1568,6 +1808,12 @@ pub(crate) struct ToolEffects {
     /// answer" on an approval card. Turn-scoped by construction: it rides the
     /// run-scoped sink, which lives exactly one answer.
     pub(crate) edit_approved_this_turn: bool,
+    /// Token-budget bar: this turn's `AskTokenUsage` snapshot (last round wins —
+    /// only the latest round's numbers matter, same "last-write-wins" shape as
+    /// `boxes`/`annotation` above, not accumulated like `edit_outcomes`). `None`
+    /// when no engine on this turn reported anything (sidecar-backed turns
+    /// always set it; see external-CLI turns for the exception).
+    pub(crate) token_usage: Option<serde_json::Value>,
 }
 
 pub(crate) async fn exec_tool(
@@ -2346,7 +2592,16 @@ pub(crate) async fn exec_tool(
         }
         "save_skill" => agent_save_skill(window, state.inner(), args),
         "write_skill_resource" => agent_write_skill_resource(window, state.inner(), args),
+        "delete_skill" => agent_delete_skill(window, state.inner(), args),
+        "delete_skill_resource" => agent_delete_skill_resource(window, state.inner(), args),
         "run_skill_script" => agent_run_skill_script(window, state.inner(), args).await,
+        "list_mcps" => Ok(clamp_tool_result(agent_list_mcps(state.inner())?)),
+        "read_mcp" => {
+            let name = args["name"].as_str().unwrap_or_default();
+            Ok(clamp_tool_result(agent_read_mcp(state.inner(), name)?))
+        }
+        "save_mcp" => agent_save_mcp(window, state.inner(), args),
+        "delete_mcp" => agent_delete_mcp(window, state.inner(), args),
         // ADD-32: kick off a durable whole-file pass. The heavy lifting is the
         // deterministic job runner's; the agent only starts it and reports.
         "start_file_pass" => {
@@ -2392,6 +2647,7 @@ pub(crate) async fn exec_tool(
         }
         "save_workflow" => agent_save_workflow(state.inner(), window, args, "agent").await,
         "update_workflow" => agent_update_workflow(state.inner(), window, args).await,
+        "delete_workflow" => agent_delete_workflow(state.inner(), window, args),
         "run_workflow" => agent_run_workflow(window, state.inner(), args).await,
         "test_workflow" => {
             Ok(clamp_tool_result(agent_test_workflow(window, state.inner(), args).await?))
@@ -2469,7 +2725,11 @@ pub(crate) async fn exec_tool(
             let msgs = vec![ollama::ChatMessage::new("user", question)];
             let res = run_external(engine, &msgs, cancel.clone(), bridge, false).await;
             match res {
-                Ok(answer) => Ok(format!(
+                // Usage discarded: a nested sub-call inside one turn, already
+                // captured as ordinary tool-result char length under the
+                // outer turn's "tools" category — not worth a second
+                // CLI-invocation's own usage-capture complexity.
+                Ok((answer, _usage)) => Ok(format!(
                     "Advisor ({want}) replied:\n\n{}",
                     clamp_tool_result(answer)
                 )),
@@ -2980,9 +3240,28 @@ mod tests {
         assert!(wants_write_tools("Create a summary note"));
         assert!(wants_write_tools("highlight the pet clause"));
         assert!(wants_write_tools("translate this to French"));
+        assert!(wants_skill_tools("turn the attached policy into a skill"));
+        assert!(wants_mcp_management_tools("show my MCP connectors"));
+        assert!(!wants_skill_tools("what does the lease say about pets?"));
+        assert!(!wants_mcp_management_tools("what does the lease say about pets?"));
         // …plain informational questions keep the short read-only catalog.
         assert!(!wants_write_tools("what does the lease say about pets?"));
         assert!(!wants_write_tools("who are the parties in this agreement"));
+    }
+
+    #[test]
+    fn slash_skill_invocation_extracts_the_selected_skill_and_request() {
+        assert_eq!(
+            explicit_skill_request("/lease-review check the termination clause"),
+            Some(("lease-review", "check the termination clause"))
+        );
+        assert_eq!(
+            explicit_skill_request("  /lease-review   check this  "),
+            Some(("lease-review", "check this"))
+        );
+        assert_eq!(explicit_skill_request("/lease-review"), Some(("lease-review", "")));
+        assert_eq!(explicit_skill_request("summarize /lease-review"), None);
+        assert_eq!(explicit_skill_request("/not_valid do it"), None);
     }
 
     #[test]
@@ -3039,11 +3318,21 @@ mod tests {
         // also reserved in BUILTIN_TOOL_NAMES against MCP shadowing.
         let catalog = tools_catalog(true).to_string();
         let specs = workflow_tools_specs();
-        assert_eq!(specs.len(), 5);
-        for name in ["list_workflows", "save_workflow", "update_workflow", "run_workflow", "test_workflow"] {
+        assert_eq!(specs.len(), 6);
+        for name in ["list_workflows", "save_workflow", "update_workflow", "delete_workflow", "run_workflow", "test_workflow"] {
             assert!(!catalog.contains(name), "{name} must not be in tools_catalog");
             assert!(BUILTIN_TOOL_NAMES.contains(&name), "{name} must be reserved");
             assert!(specs.iter().any(|s| s["function"]["name"] == name), "{name} spec missing");
+        }
+    }
+
+    #[test]
+    fn connector_management_tools_are_local_only_and_reserved() {
+        let specs = mcp_management_tools_specs();
+        for name in ["list_mcps", "read_mcp", "save_mcp", "delete_mcp"] {
+            assert!(BUILTIN_TOOL_NAMES.contains(&name), "{name} must be reserved");
+            assert!(specs.iter().any(|s| s["function"]["name"] == name), "{name} spec missing");
+            assert!(!tools_catalog(true).to_string().contains(name), "{name} leaked to base catalog");
         }
     }
 
@@ -3202,6 +3491,12 @@ mod tests {
         assert!(v2["edits"].is_array());
         assert_eq!(v2["edits"][0]["outcome"], "fuzzy");
         assert!(v2.get("boxes").is_none() && v2.get("annotation").is_none());
+        // Token-budget bar: a usage-only turn also flips the column non-null.
+        let mut e3 = ToolEffects::default();
+        e3.token_usage = Some(serde_json::json!({"total_tokens": 100, "max_context": 8192}));
+        let v3 = effects_json(&e3).expect("token usage should produce effects");
+        assert_eq!(v3["usage"]["total_tokens"], 100);
+        assert!(v3.get("boxes").is_none() && v3.get("edits").is_none());
     }
 
     #[test]

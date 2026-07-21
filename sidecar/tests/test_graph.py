@@ -14,6 +14,7 @@ from conftest import (
     specs,
 )
 
+from arcelle_sidecar.chat import RoundUsage
 from arcelle_sidecar.mcp_client import ToolSpec
 
 from arcelle_sidecar.config import PLAIN_MAX_ROUNDS
@@ -30,10 +31,11 @@ from arcelle_sidecar.messages import Message, ToolCall
 from arcelle_sidecar.prompts import (
     IMAGE_HANDOFF,
     JOBS_PROMPT,
+    MANAGEMENT_PROMPT,
     NEAR_BUDGET_NOTE,
     UI_PROMPT,
 )
-from arcelle_sidecar.routing import WRITE_TOOL_NAMES
+from arcelle_sidecar.routing import MCP_MANAGEMENT_TOOL_NAMES, SKILL_TOOL_NAMES, WRITE_TOOL_NAMES
 
 WRITE_ON = {"write": True, "ui": False, "jobs": False}
 
@@ -170,6 +172,28 @@ async def test_workflow_tools_are_dropped_off_a_plain_turn() -> None:
     assert {"save_workflow", "run_workflow"} <= set(out2.chat.offered_names[0])
 
 
+async def test_skill_and_connector_management_tools_are_search_gated() -> None:
+    mcp = FakeMCP(
+        tools=specs([
+            "search_room", "list_skills", "save_skill", "delete_skill",
+            "list_mcps", "save_mcp", "delete_mcp",
+        ])
+    )
+    chat = FakeChatModel([Round(content="ok")])
+    out = await drive(make_request("what does the lease say"), chat, mcp)
+    offered = set(out.chat.offered_names[0])
+    assert not offered & set(SKILL_TOOL_NAMES)
+    assert not offered & set(MCP_MANAGEMENT_TOOL_NAMES)
+
+    skill_chat = FakeChatModel([Round(content="ok")])
+    skill_out = await drive(make_request("list my skills"), skill_chat, mcp)
+    assert {"list_skills", "save_skill", "delete_skill"} <= set(skill_out.chat.offered_names[0])
+
+    mcp_chat = FakeChatModel([Round(content="ok")])
+    mcp_out = await drive(make_request("show my MCP connectors"), mcp_chat, mcp)
+    assert {"list_mcps", "save_mcp", "delete_mcp"} <= set(mcp_out.chat.offered_names[0])
+
+
 # --------------------------------------------------------------------------- #
 # system-prompt appends
 # --------------------------------------------------------------------------- #
@@ -184,6 +208,17 @@ async def test_ui_prompt_is_appended_only_when_the_ui_router_fires() -> None:
     chat2 = FakeChatModel([Round(content="ok")])
     out2 = await drive(make_request("what is the rent"), chat2)
     assert UI_PROMPT not in out2.messages[0]["content"]
+
+
+async def test_management_prompt_is_appended_only_when_management_tools_are_offered() -> None:
+    mcp = FakeMCP(tools=specs(["search_room", "list_skills", "list_mcps"]))
+    chat = FakeChatModel([Round(content="ok")])
+    out = await drive(make_request("what does the lease say"), chat, mcp)
+    assert MANAGEMENT_PROMPT not in out.messages[0]["content"]
+
+    chat2 = FakeChatModel([Round(content="ok")])
+    out2 = await drive(make_request("show my MCP connectors"), chat2, mcp)
+    assert MANAGEMENT_PROMPT in out2.messages[0]["content"]
 
 
 async def test_job_prompt_is_appended_only_when_the_job_router_fires() -> None:
@@ -258,11 +293,12 @@ async def test_a_rogue_call_on_the_tool_less_round_is_never_executed() -> None:
             tools: list[dict[str, Any]],
             on_delta: Callable[[str], Awaitable[None]],
             cancel: Any = None,
-        ) -> tuple[str, list[ToolCall]]:
+        ) -> tuple[str, list[ToolCall], RoundUsage]:
             self.offered.append(list(tools))
             self.seen_messages.append([dict(m) for m in messages])
             self.n += 1
-            return "text", [ToolCall(name="write_file", arguments={"name": "x"}, id="rogue")]
+            usage = RoundUsage(input_tokens=None, output_tokens=None, max_context=8192, is_real=False)
+            return "text", [ToolCall(name="write_file", arguments={"name": "x"}, id="rogue")], usage
 
     mcp = FakeMCP()
     chat = RogueChatModel()
@@ -644,10 +680,12 @@ async def test_event_sequence() -> None:
         "lane",
         "round",
         "delta",  # "looking"
+        "usage",  # token-budget bar snapshot for this round
         "step",
         "step_status",
         "round",  # the frontend clears its live text here
         "delta",  # "The rent is 1200."
+        "usage",
         "final",
     ]
     assert out.events[0] == {"t": "lane", "v": "Working on your files"}

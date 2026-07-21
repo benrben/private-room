@@ -3,6 +3,7 @@ mod commands;
 pub mod db;
 pub mod extraction;
 pub mod mcp;
+mod model_limits;
 mod ocr;
 mod ollama;
 mod ollama_lifecycle;
@@ -13,6 +14,7 @@ mod sidecar_lifecycle;
 pub(crate) mod snapshot;
 pub mod speech;
 pub mod stt;
+mod token_usage;
 pub mod web;
 
 use commands::AppState;
@@ -184,6 +186,7 @@ pub fn run() {
             commands::import_audio_bytes,
             commands::ask,
             commands::cancel_ask,
+            commands::handoff_chat,
             commands::run_command,
             commands::list_chat_commands,
             commands::locate_in_image,

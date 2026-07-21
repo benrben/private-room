@@ -295,8 +295,14 @@ pub async fn generate_stream(
                 // Clean end: exactly one `done` after the last delta.
                 Some("done") => return Ok(full),
                 Some("error") => {
-                    let code = ev.get("code").and_then(|c| c.as_str()).unwrap_or("ENGINE_ERROR");
-                    let error = ev.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+                    let code = ev
+                        .get("code")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("ENGINE_ERROR");
+                    let error = ev
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("unknown error");
                     return Err(sentinel(code, error));
                 }
                 _ => {}
@@ -429,6 +435,8 @@ pub async fn run_via_sidecar(
             "write": crate::commands::wants_write_tools(question),
             "ui": crate::commands::wants_ui_tools(question),
             "jobs": crate::commands::wants_job_tools(question),
+            "skills": crate::commands::wants_skill_tools(question),
+            "connectors": crate::commands::wants_mcp_management_tools(question),
         },
         "web_enabled": web_enabled,
         "mcp_routes": mcp_route_count,
@@ -461,11 +469,23 @@ pub async fn run_via_sidecar(
     *effects = sink.lock().await.clone();
 
     match streamed {
-        StreamResult::Done(text) => SidecarOutcome::Done(text),
+        StreamResult::Done(text, usage) => {
+            effects.token_usage = usage;
+            SidecarOutcome::Done(text)
+        }
         // Stop mid-answer is expected — keep whatever streamed (the caller adds
         // the "(stopped)" marker).
-        StreamResult::Cancelled(text) => SidecarOutcome::Done(text),
-        StreamResult::Failed { text, error, tool_ran } => {
+        StreamResult::Cancelled(text, usage) => {
+            effects.token_usage = usage;
+            SidecarOutcome::Done(text)
+        }
+        StreamResult::Failed {
+            text,
+            error,
+            tool_ran,
+            usage,
+        } => {
+            effects.token_usage = usage;
             // Distinguish the two no-fallback surfaces. If a tool already ran —
             // per the in-stream `step` line OR the bridge's own dispatch flag —
             // its side-effect is committed, so we surface `Failed` (the caller
@@ -483,12 +503,13 @@ pub async fn run_via_sidecar(
 }
 
 enum StreamResult {
-    Done(String),
-    Cancelled(String),
+    Done(String, Option<serde_json::Value>),
+    Cancelled(String, Option<serde_json::Value>),
     Failed {
         text: String,
         error: String,
         tool_ran: bool,
+        usage: Option<serde_json::Value>,
     },
 }
 
@@ -510,6 +531,7 @@ async fn stream_run(
                 text: String::new(),
                 error: e.to_string(),
                 tool_ran: false,
+                usage: None,
             }
         }
     };
@@ -520,6 +542,7 @@ async fn stream_run(
                 text: String::new(),
                 error: format!("sidecar /run failed: {e}"),
                 tool_ran: false,
+                usage: None,
             }
         }
     };
@@ -528,6 +551,7 @@ async fn stream_run(
             text: String::new(),
             error: format!("sidecar /run status {}", resp.status()),
             tool_ran: false,
+            usage: None,
         };
     }
 
@@ -535,6 +559,9 @@ async fn stream_run(
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut final_text = String::new();
+    // Token-budget bar: the latest round's usage snapshot seen so far — last
+    // one wins, mirroring `final_text`'s own "whatever streamed so far" shape.
+    let mut last_usage: Option<serde_json::Value> = None;
     // A `step` event means a tool is being executed over the bridge — once seen,
     // a side-effect has (or is about to have) happened, so no native fallback.
     let mut tool_ran = false;
@@ -556,13 +583,14 @@ async fn stream_run(
                         text: final_text,
                         error: e.to_string(),
                         tool_ran,
+                        usage: last_usage,
                     }
                 }
                 None => break, // stream ended
             },
             _ = wait_for_cancel(cancel) => {
                 let _ = cancel_run(base, &run_id).await; // best-effort
-                return StreamResult::Cancelled(final_text);
+                return StreamResult::Cancelled(final_text, last_usage);
             }
         };
         buf.extend_from_slice(&chunk);
@@ -575,7 +603,7 @@ async fn stream_run(
             }
             if cancel.load(Ordering::SeqCst) {
                 let _ = cancel_run(base, &run_id).await; // best-effort
-                return StreamResult::Cancelled(final_text);
+                return StreamResult::Cancelled(final_text, last_usage);
             }
             let ev: serde_json::Value = match serde_json::from_slice(line) {
                 Ok(v) => v,
@@ -624,18 +652,32 @@ async fn stream_run(
                         );
                     }
                 }
+                // Token-budget bar: one snapshot per round. Strip the NDJSON
+                // discriminator before emitting/persisting — the payload shape
+                // is `AskTokenUsage` (apiTypes.ts), which carries no `"t"` key.
+                Some("usage") => {
+                    let mut usage = ev.clone();
+                    if let serde_json::Value::Object(map) = &mut usage {
+                        map.remove("t");
+                    }
+                    if !headless {
+                        let _ = window.emit("ask-token-usage", usage.clone());
+                    }
+                    last_usage = Some(usage);
+                }
                 Some("error") => {
                     return StreamResult::Failed {
                         text: final_text,
                         error: str_v(&ev).to_string(),
                         tool_ran,
+                        usage: last_usage,
                     };
                 }
                 _ => {}
             }
         }
     }
-    StreamResult::Done(final_text)
+    StreamResult::Done(final_text, last_usage)
 }
 
 fn str_v(ev: &serde_json::Value) -> &str {
@@ -671,12 +713,30 @@ mod tests {
     #[test]
     fn error_sentinels_survive_the_migration() {
         // The `{code}` → legacy-sentinel mapping the callers still match on.
-        let down = SidecarError { code: "OLLAMA_DOWN".into(), error: "x".into(), status: 503 };
+        let down = SidecarError {
+            code: "OLLAMA_DOWN".into(),
+            error: "x".into(),
+            status: 503,
+        };
         assert_eq!(down.sentinel(Some("gemma3:4b")), "OLLAMA_DOWN");
-        let missing = SidecarError { code: "MODEL_MISSING".into(), error: "x".into(), status: 404 };
-        assert_eq!(missing.sentinel(Some("gemma3:4b")), "MODEL_MISSING:gemma3:4b");
+        let missing = SidecarError {
+            code: "MODEL_MISSING".into(),
+            error: "x".into(),
+            status: 404,
+        };
+        assert_eq!(
+            missing.sentinel(Some("gemma3:4b")),
+            "MODEL_MISSING:gemma3:4b"
+        );
         assert_eq!(missing.sentinel(None), "MODEL_MISSING");
-        let other = SidecarError { code: "ENGINE_ERROR".into(), error: "boom".into(), status: 500 };
-        assert_eq!(other.sentinel(Some("gemma3:4b")), "Local AI error (500): boom");
+        let other = SidecarError {
+            code: "ENGINE_ERROR".into(),
+            error: "boom".into(),
+            status: 500,
+        };
+        assert_eq!(
+            other.sentinel(Some("gemma3:4b")),
+            "Local AI error (500): boom"
+        );
     }
 }

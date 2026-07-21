@@ -14,6 +14,7 @@ import { displayName } from "./composer";
 import { isCloudEngine, isExternalEngine } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import TokenBudgetBar from "./TokenBudgetBar";
 
 /** The composer block: toasts, import-tidy chips, cloud/tools strips, the
  * attach nudge, attachment chips, the textarea + #/@ autocomplete popover, the
@@ -171,6 +172,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
           ))}
         </div>
       )}
+      <TokenBudgetBar s={s} a={a} />
       <div className={`composer-card${s.asking ? " busy" : ""}`}>
         {s.ac && a.autocompleteItems().length > 0 && (
           <div className="ac-popover">
@@ -180,7 +182,9 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               <span>
                 {s.ac.kind === "cmd"
                   ? `${a.autocompleteItems().length} commands`
-                  : `${a.autocompleteItems().length} files & folders`}
+                  : s.ac.kind === "skill"
+                    ? `${a.autocompleteItems().length} enabled skills`
+                    : `${a.autocompleteItems().length} files & folders`}
               </span>
               <span className="ac-keys">↑↓ choose · Enter run · Esc close</span>
             </div>
@@ -278,6 +282,18 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               onClick={() => a.insertComposerToken("#")}
             >
               <span className="tool-hash">#</span> Action
+            </button>
+            <button
+              className="tool-chip"
+              title={
+                s.skills.some((skill) => skill.enabled)
+                  ? "Use a specific enabled skill for this answer"
+                  : "Enable a skill in Skills before invoking it"
+              }
+              disabled={!s.skills.some((skill) => skill.enabled)}
+              onClick={() => a.insertComposerToken("/")}
+            >
+              <span className="tool-hash">/</span> Skill
             </button>
           </div>
           <div className="composer-tools-right">

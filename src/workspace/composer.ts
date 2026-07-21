@@ -1,29 +1,35 @@
-import { ChatCommand, FileMeta, Folder } from "../api";
+import { ChatCommand, FileMeta, Folder, SkillSummary } from "../api";
 
-// ---- "#command" / "@reference" parsing (makes the small model deterministic) ----
+// ---- "#command" / "/skill" / "@reference" parsing ----------------------
 
 /** Live autocomplete popover state for the composer. */
 export interface AutocompleteState {
-  kind: "cmd" | "ref";
-  /** The partial token being typed (after # or @), lowercased for matching. */
+  kind: "cmd" | "ref" | "skill";
+  /** The partial token being typed (after #, @, or /), lowercased for matching. */
   query: string;
-  /** Byte offset of the '#'/'@' that opened this token. */
+  /** Byte offset of the '#', '@', or '/' that opened this token. */
   start: number;
   /** Highlighted item index. */
   index: number;
 }
 
-/** The token immediately left of the caret, if it's a "#…" or "@…" being typed
+/** The token immediately left of the caret, if it's a "#…", "/…", or "@…" being typed
  *  (i.e. no whitespace since the sigil). Returns null otherwise. */
 export function tokenAtCaret(
   value: string,
   caret: number,
-): { kind: "cmd" | "ref"; start: number; query: string } | null {
+): { kind: "cmd" | "ref" | "skill"; start: number; query: string } | null {
   const before = value.slice(0, caret);
   // A '#' command only makes sense as the first token of the message.
   const cmd = /^#([a-z-]*)$/.exec(before);
   if (cmd) {
     return { kind: "cmd", start: 0, query: cmd[1].toLowerCase() };
+  }
+  // An explicit skill invocation is also the first token. Enabled skills are
+  // presented as /skill-name and the backend loads that SKILL.md for the turn.
+  const skill = /^\/([a-z0-9-]*)$/.exec(before);
+  if (skill) {
+    return { kind: "skill", start: 0, query: skill[1].toLowerCase() };
   }
   // '@' references can appear anywhere; match back to the sigil (allows spaces
   // in the query so multi-word filenames can be typed/filtered).
@@ -79,15 +85,26 @@ export function resolveRefs(
 export function parseComposer(
   text: string,
   commands: ChatCommand[],
+  skills: SkillSummary[],
   files: FileMeta[],
   folders: Folder[],
 ): {
   command?: string;
+  skill?: string;
   args: string;
   refIds: string[];
   commandError?: string;
+  skillError?: string;
 } {
   const { refIds, cleaned } = resolveRefs(text, files, folders);
+  const skill = /^\/([a-z0-9-]+)\b\s*([\s\S]*)$/.exec(cleaned);
+  if (skill) {
+    const name = skill[1].toLowerCase();
+    if (!skills.some((candidate) => candidate.enabled && candidate.name === name)) {
+      return { args: cleaned, refIds, skillError: name };
+    }
+    return { skill: name, args: skill[2].trim(), refIds };
+  }
   const m = /^#([a-z-]+)\b\s*([\s\S]*)$/.exec(cleaned);
   if (!m) return { args: cleaned, refIds };
   const name = m[1];

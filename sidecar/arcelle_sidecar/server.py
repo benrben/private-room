@@ -25,7 +25,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import __version__, ai_actions, chat_docs, features, file_pass, llm, vision
+from . import __version__, ai_actions, chat_docs, features, file_pass, handoff, llm, vision
 from . import privacy as privacy_mod
 from . import privacy_scan as privacy_scan_mod
 from . import summarize as summarize_feature
@@ -593,6 +593,14 @@ def create_app(
         except llm.LlmError as exc:
             return exc.response()
         return {"purpose": purpose, "questions": questions}
+
+    @app.post("/handoff_summary")
+    async def handoff_summary(req: handoff.HandoffSummaryRequest) -> Any:
+        try:
+            summary = await handoff.summarize_for_handoff(req)
+        except llm.LlmError as exc:
+            return exc.response()
+        return {"summary": summary}
 
     return app
 

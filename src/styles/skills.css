@@ -15,6 +15,25 @@
 .skill-compose-title svg { color: var(--accent); }
 .skill-compose-row { display: flex; gap: .55rem; align-items: flex-end; }
 .skill-compose-row textarea { flex: 1; min-width: 0; resize: none; max-height: 8.5rem; padding: .6rem .7rem; border: 1px solid var(--border); border-radius: 9px; color: var(--text); background: var(--surface-1); font: inherit; line-height: 1.45; }
+.skill-compose-source-chips { display: flex; flex-wrap: wrap; gap: .35rem; margin: 0 0 .55rem; }
+.skill-source-chip { min-width: 0; max-width: 15rem; display: inline-flex; align-items: center; gap: .3rem; padding: .28rem .38rem; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-1); color: var(--muted); font-size: .72rem; }
+.skill-source-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-source-chip button { border: 0; padding: 0 .1rem; background: transparent; color: var(--text-faint); cursor: pointer; font-size: .9rem; }
+.skill-source-chip button:hover { color: var(--text); }
+.skill-compose-source-bar { display: flex; align-items: center; gap: .55rem; margin-top: .55rem; color: var(--text-faint); font-size: .7rem; }
+.skill-source-picker-wrap { position: relative; flex: 0 0 auto; }
+.skill-source-picker-wrap > button.active { color: var(--accent); background: var(--accent-ghost); }
+.skill-source-picker { position: absolute; z-index: 8; left: 0; top: calc(100% + .35rem); width: min(25rem, calc(100vw - 5rem)); padding: .65rem; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-1); box-shadow: 0 14px 40px color-mix(in srgb, #000 28%, transparent); }
+.skill-source-picker-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .45rem; font-size: .78rem; }
+.skill-source-picker > input { width: 100%; box-sizing: border-box; margin-bottom: .4rem; padding: .48rem .55rem; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); color: var(--text); font: inherit; }
+.skill-source-list { max-height: 16rem; overflow-y: auto; }
+.skill-source-option { display: flex; align-items: center; gap: .5rem; padding: .48rem .35rem; border-radius: 7px; cursor: pointer; }
+.skill-source-option:hover { background: var(--hover); }
+.skill-source-option.disabled { cursor: not-allowed; opacity: .5; }
+.skill-source-option > span { min-width: 0; display: flex; flex: 1; flex-direction: column; }
+.skill-source-option strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .76rem; }
+.skill-source-option small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-faint); font-size: .66rem; }
+.skill-source-empty { padding: 1rem; text-align: center; color: var(--text-faint); font-size: .74rem; }
 .skills-toolbar { display: flex; align-items: center; gap: .45rem; margin: 1rem 0 .65rem; max-width: 64rem; }
 .skills-toolbar > span:first-child { margin-right: auto; color: var(--muted); font-size: .8rem; }
 .skills-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: .75rem; max-width: 64rem; }

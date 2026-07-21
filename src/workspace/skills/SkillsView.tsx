@@ -1,14 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, SkillBundle, SkillResourceContent } from "../../api";
+import { api, formatSize, SkillBundle, SkillResourceContent } from "../../api";
 import {
   BookOpenIcon,
   DownloadIcon,
+  FileTypeIcon,
   FolderIcon,
+  PaperclipIcon,
   PlusIcon,
   SaveIcon,
   SparklesIcon,
   TrashIcon,
 } from "../../icons";
+import { displayName } from "../composer";
 import { WSState } from "../state";
 import { WSActions } from "../actions";
 
@@ -38,6 +41,9 @@ export default function SkillsView({ s, a }: Props) {
   const [busy, setBusy] = useState(false);
   const [composeText, setComposeText] = useState("");
   const [composeBusy, setComposeBusy] = useState(false);
+  const [composeSourceIds, setComposeSourceIds] = useState<string[]>([]);
+  const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
+  const [sourceFilter, setSourceFilter] = useState("");
   const [resource, setResource] = useState<SkillResourceContent | null>(null);
   const [resourceText, setResourceText] = useState("");
   const [resourceDirty, setResourceDirty] = useState(false);
@@ -88,6 +94,25 @@ export default function SkillsView({ s, a }: Props) {
     () => s.skills.find((x) => x.id === selected) ?? null,
     [s.skills, selected],
   );
+  const composeSourceFiles = useMemo(
+    () => composeSourceIds.flatMap((id) => s.files.find((file) => file.id === id) ?? []),
+    [composeSourceIds, s.files],
+  );
+  const filteredSourceFiles = useMemo(() => {
+    const query = sourceFilter.trim().toLowerCase();
+    return s.files.filter((file) => !query || file.name.toLowerCase().includes(query));
+  }, [s.files, sourceFilter]);
+
+  function toggleComposeSource(id: string) {
+    setComposeSourceIds((current) => {
+      if (current.includes(id)) return current.filter((sourceId) => sourceId !== id);
+      if (current.length >= 12) {
+        s.pushToast("error", "Choose at most 12 source files for one skill.");
+        return current;
+      }
+      return [...current, id];
+    });
+  }
 
   function startNew() {
     s.setSelectedSkillId(null);
@@ -133,8 +158,11 @@ export default function SkillsView({ s, a }: Props) {
     setComposeBusy(true);
     s.pushToast("info", "Designing the skill folder…");
     try {
-      const id = await api.composeSkill(text);
+      const id = await api.composeSkill(text, composeSourceIds);
       setComposeText("");
+      setComposeSourceIds([]);
+      setSourcePickerOpen(false);
+      setSourceFilter("");
       await a.refreshSkills();
       s.setSelectedSkillId(id);
       s.pushToast("success", "Skill draft ready — review its trigger, instructions, and resources.");
@@ -257,13 +285,29 @@ export default function SkillsView({ s, a }: Props) {
             <p>
               Teach the assistant repeatable ways of working. Each skill is a portable folder:
               <code> SKILL.md</code>, plus optional <code>scripts/</code>, <code>references/</code>,
-              <code>assets/</code>, and <code>agents/</code>.
+              <code>assets/</code>, and <code>agents/</code>. Enabled skills appear in chat when
+              you type <code>/</code>.
             </p>
           </div>
         </div>
 
         <div className="skill-compose">
-          <div className="skill-compose-title"><SparklesIcon size={16} /> Describe a skill and let the assistant build the folder</div>
+          <div className="skill-compose-title"><SparklesIcon size={16} /> Ask the skill builder</div>
+          {composeSourceFiles.length > 0 && (
+            <div className="skill-compose-source-chips" aria-label="Skill source files">
+              {composeSourceFiles.map((file) => (
+                <span key={file.id} className="skill-source-chip">
+                  <FileTypeIcon file={file} size={13} />
+                  <span title={file.name}>{displayName(file.name)}</span>
+                  <button
+                    type="button"
+                    aria-label={`Remove ${file.name}`}
+                    onClick={() => toggleComposeSource(file.id)}
+                  >×</button>
+                </span>
+              ))}
+            </div>
+          )}
           <div className="skill-compose-row">
             <textarea
               ref={composeRef}
@@ -281,6 +325,64 @@ export default function SkillsView({ s, a }: Props) {
             <button className="primary" disabled={composeBusy || !composeText.trim()} onClick={() => void compose()}>
               {composeBusy ? "Building…" : "Build with AI"}
             </button>
+          </div>
+          <div className="skill-compose-source-bar">
+            <div className="skill-source-picker-wrap">
+              <button
+                type="button"
+                className={`subtle btn-ic${sourcePickerOpen ? " active" : ""}`}
+                onClick={() => setSourcePickerOpen((open) => !open)}
+              >
+                <PaperclipIcon size={13} />
+                {composeSourceIds.length > 0
+                  ? `${composeSourceIds.length} source${composeSourceIds.length === 1 ? "" : "s"}`
+                  : "Add room files"}
+              </button>
+              {sourcePickerOpen && (
+                <div className="skill-source-picker" role="dialog" aria-label="Choose source files">
+                  <div className="skill-source-picker-head">
+                    <strong>Build from room files</strong>
+                    <button className="subtle" onClick={() => setSourcePickerOpen(false)}>Done</button>
+                  </div>
+                  <input
+                    autoFocus
+                    value={sourceFilter}
+                    placeholder="Find a file…"
+                    onChange={(event) => setSourceFilter(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") setSourcePickerOpen(false);
+                    }}
+                  />
+                  <div className="skill-source-list">
+                    {filteredSourceFiles.length === 0 && (
+                      <div className="skill-source-empty">
+                        {s.files.length === 0 ? "No files in this room yet." : "No files match that search."}
+                      </div>
+                    )}
+                    {filteredSourceFiles.map((file) => {
+                      const checked = composeSourceIds.includes(file.id);
+                      const disabled = !file.hasText || (!checked && composeSourceIds.length >= 12);
+                      return (
+                        <label key={file.id} className={`skill-source-option${disabled ? " disabled" : ""}`}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={disabled}
+                            onChange={() => toggleComposeSource(file.id)}
+                          />
+                          <FileTypeIcon file={file} size={15} />
+                          <span>
+                            <strong title={file.name}>{displayName(file.name)}</strong>
+                            <small>{file.hasText ? `${file.mimeType || "file"} · ${formatSize(file.sizeBytes)}` : "No readable text yet"}</small>
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+            <span>Selected files are copied into the draft as portable reference snapshots.</span>
           </div>
         </div>
 

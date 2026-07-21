@@ -121,6 +121,10 @@ export interface Message {
    * Rendered from data — the message content itself stays plain prose.
    * Null for plain answers and for user messages. */
   effects: MessageEffects | null;
+  /** Marks a non-ordinary row without repurposing `role` — today only
+   * `"handoff"` (a context-compaction summary marker). Null/absent for every
+   * ordinary user/assistant message. */
+  kind?: string | null;
 }
 
 /** PRIV-1: one protected entity in the room's map. */
@@ -162,6 +166,26 @@ export interface AskPrivacy {
   bypassed?: boolean;
 }
 
+/** The token-budget bar's 5 fixed breakdown categories, in legend/stacking
+ * order (tokens.css --tok-* vars). Never reordered. */
+export type TokenCategory = "system" | "history" | "tools" | "skills" | "files";
+
+/** The ask-token-usage event — one live per-turn snapshot, pushed once per
+ * completed assistant turn. Snake_case throughout, matching `AskPrivacy`:
+ * this is a raw pass-through of the sidecar/Rust-constructed JSON value, not
+ * a camelCase-derived struct. `breakdown` is always a char-length estimate
+ * (proportional split, scaled to `total_tokens` when a real engine aggregate
+ * is known); `estimated` flags when `total_tokens` itself is also estimated
+ * (no exact usage obtainable from this engine at all). The same shape is
+ * reused for the persisted `MessageEffects.usage` blob. */
+export interface AskTokenUsage {
+  round?: number;
+  total_tokens: number;
+  max_context: number;
+  estimated: boolean;
+  breakdown: Record<TokenCategory, { tokens: number; estimated: boolean }>;
+}
+
 /** PRIV-2: privacy-scan progress events. */
 export interface PrivacyScanProgress {
   running: boolean;
@@ -183,6 +207,8 @@ export interface MessageEffects {
   /** Wave 2 (Idea 4): content-free per-edit outcome records for the turn
    * (`{tool, outcome, n}`). Telemetry only — the UI renders nothing from it. */
   edits?: { tool: string; outcome: string; n?: number; files?: number }[];
+  /** This turn's token-usage snapshot for the budget bar (see AskTokenUsage). */
+  usage?: AskTokenUsage;
 }
 
 /** ADD-25: one backend→webview request on the agent↔UI bridge. The driver
