@@ -3,6 +3,69 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.8.0 — 2026-07-21
+
+### Always know where your content is going
+
+- **One trust indicator, everywhere.** The room now states its privacy state
+  in one consistent way — **Local only**, **Protected cloud**, or **Raw
+  cloud** — with the same words and the same color in the status bar, the top
+  bar's engine badge, and the chat pane, instead of "Cloud model" in one place
+  and "nothing leaves on its own" in another. Click it to jump straight to
+  Cloud privacy in Settings.
+- **See exactly what a cloud model would receive.** "Cloud view" is now
+  **Preview cloud payload** — it shows the estimated size, states plainly
+  whether the door is protecting you or off, and if it's off, marks the
+  details that would otherwise be hidden.
+- **The AI's source scope is explicit.** The sidebar now says outright whether
+  the assistant is drawing on the **whole room** or only your **selected
+  files** — no more guessing what an empty checkbox means.
+- **Spoken answers default to on-device.** Voice replies now default to the
+  on-device synthesizer, which never sends anything off this Mac; the cloud
+  neural voice is an explicit opt-in, and the Voice settings page states which
+  one is active before you touch anything.
+
+### Home leads with what needs you
+
+- **A new "Needs your attention" section.** Home now opens with the things
+  that actually need a decision — a raw-cloud model in use, files still
+  waiting on a privacy scan, scripts that need review, workflows stuck as
+  drafts — each with a one-click fix, instead of only a list of recent files.
+
+### Workflows and scripts you can trust
+
+- **Steps have real names.** A workflow step no longer opens to a blank "Step
+  name" while the canvas shows `file_pass` — every step gets a short,
+  human-language name, backfilled automatically for existing workflows and
+  requested up front when the assistant builds a new one.
+- **One incident, not five identical errors.** A script that fails the same
+  way repeatedly now shows as a single incident — the cause, how many times,
+  and one recovery action — instead of five raw error rows.
+- **The assistant won't say "fixed" until it's actually fixed.** Testing a
+  workflow now returns an explicit validated/not-validated result, and the
+  assistant is instructed never to claim a script or workflow works until a
+  real test confirms it — a script step that only *parked* for your approval
+  is no longer reported as working.
+
+### A calmer, clearer shell
+
+- **Settings is six focused pages**, not one long scroll — AI & behavior,
+  Voice, Privacy & recovery, Connections, History & storage, and App.
+- **Every rail icon has a label.** The left rail is no longer icon-only —
+  Library, Workspace, AI, Home, Map, Recordings, Workflows, Scripts, Memory,
+  Connect, Focus, and Settings are all named, and the Focus button now reads
+  "Focus" / "Unfocus" instead of relying on a tooltip.
+- **The workspace is the star.** New rooms open with a wider, more dominant
+  center pane; the AI pane eases open and closed instead of snapping.
+- **Room Map handles outlier files.** A file unrelated to everything else in
+  the room no longer drifts off-screen and breaks the map's auto-fit.
+
+### Re-transcribe on demand
+
+- **A Re-transcribe button on every recording and video.** If a transcript
+  came out wrong, or you've since installed the voice model, one click reruns
+  on-device transcription and replaces it — no need to delete and re-import.
+
 ## 0.7.0 — 2026-07-20
 
 ### Private Room is now Arcelle
