@@ -868,7 +868,7 @@ pub(crate) async fn stream_answer(
     if privacy_bypass && crate::commands::active_policy().is_some() {
         let _ = window.emit("ask-privacy", serde_json::json!({ "bypassed": true }));
     }
-    let run = if is_external_engine(model) {
+    let run = if is_cli_engine(model) {
         // CHG-5: a step chip, not fake live text (nothing streams for cloud).
         let _ = window.emit("ask-step", "Asking your cloud AI (content leaves this Mac)");
         // PRIV-1: redact HERE (counted, for the indicator) and hand the CLI the
@@ -1026,6 +1026,10 @@ pub(crate) async fn stream_answer(
                 // reason so a broken Python install is debuggable.
                 eprintln!("agent sidecar unavailable: {reason}");
                 Err("AI engine unavailable — the agent sidecar could not start.".to_string())
+            }
+            SidecarOutcome::EngineError(error) => {
+                eprintln!("agent model/provider failed: {error}");
+                Err(format!("AI provider error — {error}"))
             }
         }
     };

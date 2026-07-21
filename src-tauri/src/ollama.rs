@@ -128,9 +128,13 @@ async fn sidecar_post(
     model: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let base = crate::sidecar_lifecycle::ensure_up().await?;
+    let body = match model {
+        Some(model) => crate::commands::inject_provider_runtime(body, model)?,
+        None => body.clone(),
+    };
     let resp = client()?
         .post(format!("{base}{path}"))
-        .json(body)
+        .json(&body)
         .send()
         .await
         .map_err(map_send_err)?;

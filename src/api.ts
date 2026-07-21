@@ -67,6 +67,7 @@ import type {
   ExternalModelInfo,
   VoiceInfo,
   AskPrivacy,
+  AiProviderStatus,
   AskTokenUsage,
   PrivacyEntity,
   PrivacyPreview,
@@ -387,6 +388,11 @@ export const api = {
    *  for the Cloud picker's second level. */
   listEngineModels: (engine: string) =>
     invoke<ExternalModelInfo[]>("list_engine_models", { engine }),
+  listAiProviders: () => invoke<AiProviderStatus[]>("list_ai_providers"),
+  connectAiProvider: (provider: string, apiKey: string) =>
+    invoke<number>("connect_ai_provider", { provider, apiKey }),
+  disconnectAiProvider: (provider: string) =>
+    invoke<void>("disconnect_ai_provider", { provider }),
   warmModel: () => invoke<void>("warm_model"),
   pullModel: (name: string) => invoke<void>("pull_model", { name }),
   deleteModel: (name: string) => invoke<void>("delete_model", { name }),

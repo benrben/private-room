@@ -94,6 +94,19 @@ class McpConfig(BaseModel):
     token: str
 
 
+class ProviderConfig(BaseModel):
+    """One call's API-provider credentials, supplied from native Keychain."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    api_key: str
+    base_url: str
+    model: str
+    context_window: int | None = None
+    supports_tools: bool = True
+
+
 class Routing(BaseModel):
     """Routing decisions the Rust host already computed.
 
@@ -128,6 +141,7 @@ class RunRequest(BaseModel):
     #: PRIV-1: the room's resolved privacy policy (:func:`.privacy.policy_from_payload`
     #: shape). Engages only when ``model`` is non-local; None/absent = door open.
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
     #: How many connected (third-party) MCP tools the host routed this turn, and
     #: which cloud advisors are available. Both only feed the max_rounds choice
@@ -217,6 +231,7 @@ class GenerateRequest(BaseModel):
     images: list[str] | None = None
     #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class ModelsRequest(BaseModel):
@@ -296,6 +311,7 @@ class LabelRequest(BaseModel):
     files: list[str] = Field(default_factory=list)
     #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class FeedbackDraftRequest(BaseModel):
@@ -311,6 +327,7 @@ class FeedbackDraftRequest(BaseModel):
     text: str = ""
     #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class VisionLocateRequest(BaseModel):
@@ -342,6 +359,7 @@ class VisionLocateRequest(BaseModel):
     keep_alive: str | None = None
     #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class KnowledgeExtractRequest(BaseModel):
@@ -377,6 +395,7 @@ class KnowledgeExtractRequest(BaseModel):
     keep_alive: str = KEEP_ALIVE_WARM
     #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class GenerateDocRequest(BaseModel):
@@ -406,6 +425,7 @@ class GenerateDocRequest(BaseModel):
     keep_alive: str = KEEP_ALIVE_WARM
     #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class PrivacyScanRequest(BaseModel):
@@ -443,6 +463,7 @@ __all__ = [
     "num_ctx_for_chat",
     "num_ctx_chat_notools",
     "McpConfig",
+    "ProviderConfig",
     "Routing",
     "RunRequest",
     "CancelRequest",

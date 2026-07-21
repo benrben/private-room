@@ -11,6 +11,7 @@ use uuid::Uuid;
 // Split into submodules (behavior-preserving relocation). Each submodule is
 // re-exported below so existing paths (commands::foo) keep resolving unchanged.
 mod external;
+mod providers;
 mod rooms;
 mod recent;
 mod safety;
@@ -48,6 +49,7 @@ mod skills;
 mod speech_cmds;
 
 pub use external::*;
+pub use providers::*;
 pub use rooms::*;
 pub use recent::*;
 pub use safety::*;

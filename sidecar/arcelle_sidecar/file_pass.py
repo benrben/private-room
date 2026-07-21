@@ -33,7 +33,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import llm
-from .config import KEEP_ALIVE_WARM, _HIGH_RAM_BYTES, _total_ram_bytes
+from .config import KEEP_ALIVE_WARM, ProviderConfig, _HIGH_RAM_BYTES, _total_ram_bytes
 from .messages import Message, compact_json, system_message, user_message
 
 # --- Job-tier num_ctx (ollama.rs:307-308 num_ctx_for(_, Job)) ---------------
@@ -211,6 +211,7 @@ async def _structured_call(
     keep_alive: str,
     num_predict: int = PASS_DOC_PREDICT,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> Any:
     """One structured model call with a single retry (file_pass.rs ``model_call``).
 
@@ -239,6 +240,7 @@ async def _structured_call(
                 keep_alive=keep_alive,
                 format=schema,
                 privacy=privacy,
+                provider=provider,
             )
         except llm.LlmError as exc:
             if _is_fatal(exc.code):
@@ -274,6 +276,7 @@ async def run_map(
     window_text: str,
     keep_alive: str = KEEP_ALIVE_WARM,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> dict[str, Any]:
     """One map window: dense notes (merge) or transformed text (stitch) + a thread.
 
@@ -311,6 +314,7 @@ async def run_map(
         keep_alive=keep_alive,
         num_predict=PASS_MAP_PREDICT,
         privacy=privacy,
+        provider=provider,
     )
     result = "" if parsed is _SKIP else _field(parsed, result_key).strip()
     if not result:
@@ -346,6 +350,7 @@ async def run_section(
     missing: int = 0,
     keep_alive: str = KEEP_ALIVE_WARM,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> dict[str, Any]:
     """Compose ONE ordered section of the deliverable from a small group of
     consecutive windows' notes (the sectioned path).
@@ -385,7 +390,8 @@ async def run_section(
     }
     messages = [system_message(SECTION_SYSTEM), user_message(user)]
     parsed = await _structured_call(
-        model, messages, schema, base_url, keep_alive=keep_alive, privacy=privacy
+        model, messages, schema, base_url, keep_alive=keep_alive,
+        privacy=privacy, provider=provider
     )
     html = "" if parsed is _SKIP else _field(parsed, "html").strip()
     if not html:
@@ -426,6 +432,7 @@ class FilePassMapRequest(BaseModel):
     keep_alive: str = KEEP_ALIVE_WARM
     #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class FilePassSectionRequest(BaseModel):
@@ -445,6 +452,7 @@ class FilePassSectionRequest(BaseModel):
     keep_alive: str = KEEP_ALIVE_WARM
     #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 __all__ = [

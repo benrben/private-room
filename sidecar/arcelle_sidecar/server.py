@@ -31,6 +31,7 @@ from . import privacy_scan as privacy_scan_mod
 from . import summarize as summarize_feature
 from . import tts as tts_mod
 from .chat import ChatModel, OllamaChatModel
+from .provider_api import OpenAICompatibleChatModel
 from .config import (
     CancelRequest,
     CapabilitiesRequest,
@@ -62,6 +63,12 @@ McpFactory = Callable[[RunRequest], McpClient | None]
 
 
 def _default_chat_model(req: RunRequest) -> ChatModel:
+    if req.provider is not None:
+        return OpenAICompatibleChatModel(
+            model=req.model,
+            provider=req.provider,
+            temperature=req.temperature,
+        )
     return OllamaChatModel(
         model=req.model,
         base_url=req.ollama_base_url,
@@ -224,6 +231,7 @@ def create_app(
                 format=req.format,
                 images=req.images,
                 privacy=req.privacy,
+                provider=req.provider,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -249,6 +257,7 @@ def create_app(
                     format=req.format,
                     images=req.images,
                     privacy=req.privacy,
+                    provider=req.provider,
                 ):
                     yield (compact_json({"t": "delta", "v": delta}) + "\n").encode("utf-8")
                 yield (compact_json({"t": "done"}) + "\n").encode("utf-8")
@@ -349,7 +358,8 @@ def create_app(
         # here — graph.rs build_room_graph is model-free by design.
         try:
             questions = await features.front_page_labels(
-                req.model, req.room_name, req.files, req.base_url, privacy=req.privacy
+                req.model, req.room_name, req.files, req.base_url,
+                privacy=req.privacy, provider=req.provider
             )
         except llm.LlmError:
             # Front page is resilient: any engine failure yields no suggestions,
@@ -361,7 +371,8 @@ def create_app(
     async def feedback_draft(req: FeedbackDraftRequest) -> Any:
         try:
             draft = await features.feedback_draft(
-                req.model, req.text, req.base_url, privacy=req.privacy
+                req.model, req.text, req.base_url,
+                privacy=req.privacy, provider=req.provider
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -383,6 +394,7 @@ def create_app(
                 num_ctx=req.num_ctx,
                 keep_alive=req.keep_alive,
                 privacy=req.privacy,
+                provider=req.provider,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -408,6 +420,7 @@ def create_app(
                     temperature=req.temperature,
                     keep_alive=req.keep_alive,
                     privacy=req.privacy,
+                    provider=req.provider,
                 )
                 return {"items": items}
             values = await chat_docs.extract_fields(
@@ -418,6 +431,7 @@ def create_app(
                 temperature=req.temperature,
                 keep_alive=req.keep_alive,
                 privacy=req.privacy,
+                provider=req.provider,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -440,6 +454,7 @@ def create_app(
                 temperature=req.temperature,
                 keep_alive=req.keep_alive,
                 privacy=req.privacy,
+                provider=req.provider,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -475,6 +490,7 @@ def create_app(
                 window_text=req.window_text,
                 keep_alive=req.keep_alive,
                 privacy=req.privacy,
+                provider=req.provider,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -495,6 +511,7 @@ def create_app(
                 missing=req.missing,
                 keep_alive=req.keep_alive,
                 privacy=req.privacy,
+                provider=req.provider,
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -518,6 +535,7 @@ def create_app(
                 instructions=req.instructions,
                 question=req.question,
                 privacy=req.privacy,
+                provider=req.provider,
             )
         except (ai_actions.ActionError, llm.LlmError) as exc:
             return exc.response()
@@ -526,13 +544,15 @@ def create_app(
     @app.post("/memory_suggestion")
     async def memory_suggestion(req: ai_actions.MemorySuggestionRequest) -> Any:
         return await ai_actions.memory_suggestion(
-            req.model, req.user_text, req.assistant_text, req.base_url, privacy=req.privacy
+            req.model, req.user_text, req.assistant_text, req.base_url,
+            privacy=req.privacy, provider=req.provider
         )
 
     @app.post("/suggest_file_meta")
     async def suggest_file_meta(req: ai_actions.FileMetaRequest) -> Any:
         return await ai_actions.suggest_file_meta(
-            req.model, req.current_name, req.text, req.base_url, privacy=req.privacy
+            req.model, req.current_name, req.text, req.base_url,
+            privacy=req.privacy, provider=req.provider
         )
 
     # --- privacy scanner (PRIV-2) -------------------------------------------
@@ -574,7 +594,11 @@ def create_app(
 
     @app.post("/summarize_file")
     async def summarize_file(req: summarize_feature.SummarizeFileRequest) -> Any:
-        client = summarize_feature.OllamaModelClient(req.base_url, req.privacy)
+        client = (
+            summarize_feature.OllamaModelClient(req.base_url, req.privacy, req.provider)
+            if req.provider is not None
+            else summarize_feature.OllamaModelClient(req.base_url, req.privacy)
+        )
         try:
             summary = await summarize_feature.summarize_one_file(
                 client, req.model, req.name, req.mime, req.text, req.keep_alive
@@ -585,7 +609,11 @@ def create_app(
 
     @app.post("/combine_summary")
     async def combine_summary(req: summarize_feature.CombineSummaryRequest) -> Any:
-        client = summarize_feature.OllamaModelClient(req.base_url, req.privacy)
+        client = (
+            summarize_feature.OllamaModelClient(req.base_url, req.privacy, req.provider)
+            if req.provider is not None
+            else summarize_feature.OllamaModelClient(req.base_url, req.privacy)
+        )
         try:
             purpose, questions = await summarize_feature.combine_summary(
                 client, req.model, req.room_name, req.memories, req.file_lines

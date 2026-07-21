@@ -43,7 +43,11 @@ def is_nonlocal_model(model: str) -> bool:
     Two ways out exist: the Ollama daemon relaying a ``:cloud`` model, and the
     cloud coding CLIs (claude-cli / codex-cli). Everything else is loopback.
     """
-    return is_cloud_model(model) or is_external_model(model)
+    return (
+        is_cloud_model(model)
+        or is_external_model(model)
+        or model.split(":" * 2, 1)[0] == "openrouter"
+    )
 
 
 @dataclass(slots=True)

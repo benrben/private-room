@@ -112,8 +112,17 @@ pub async fn sidecar_json(
     // non-local and the room's door is on, the privacy policy rides along so
     // the sidecar's mechanical seam engages. Bodies without a model (or with a
     // local one) pass through untouched.
-    let injected = crate::commands::inject_policy(body);
-    let body = injected.as_ref().unwrap_or(body);
+    let mut request_body = crate::commands::inject_policy(body).unwrap_or_else(|| body.clone());
+    if let Some(model) = request_body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    {
+        request_body = crate::commands::inject_provider_runtime(&request_body, &model).map_err(|e| {
+            SidecarError { code: "ENGINE_ERROR".into(), error: e, status: 400 }
+        })?;
+    }
+    let body = &request_body;
     // A dead sidecar is the no-fallback OLLAMA_DOWN surface (see module note).
     let base = match sidecar_lifecycle::ensure_up().await {
         Ok(b) => b,
@@ -195,8 +204,21 @@ pub async fn generate_stream(
     use futures_util::StreamExt;
 
     // PRIV-1: same single injection as `sidecar_json` — the streaming twin.
-    let injected = crate::commands::inject_policy(body);
-    let body = injected.as_ref().unwrap_or(body);
+    let mut request_body = crate::commands::inject_policy(body).unwrap_or_else(|| body.clone());
+    if let Some(model) = request_body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    {
+        request_body = crate::commands::inject_provider_runtime(&request_body, &model)
+            .map_err(|e| SidecarError {
+                code: "ENGINE_ERROR".into(),
+                error: e,
+                status: 400,
+            })
+            .map_err(|e| e.sentinel(Some(&model)))?;
+    }
+    let body = &request_body;
 
     // The sidecar doesn't echo the model back on the error line, so rebuild the
     // `MODEL_MISSING:<model>` sentinel from the body's model (Copy `Option<&str>`).
@@ -352,6 +374,10 @@ pub enum SidecarOutcome {
     /// this as an error ("AI engine unavailable …"); the carried string is the
     /// underlying reason, logged for debugging a broken sidecar/Python install.
     Unavailable(String),
+    /// The sidecar started and accepted the run, but the selected model/provider
+    /// rejected or failed the request before any tool executed. This is not a
+    /// sidecar startup failure and must retain its actionable upstream message.
+    EngineError(String),
     /// Failed after a tool already executed — do NOT fall back (re-running would
     /// double the side-effect). Carries whatever text had streamed plus the error,
     /// so the caller can still persist the partial reply + committed effects: a
@@ -391,9 +417,13 @@ pub async fn run_via_sidecar(
     // The sidecar reaches Ollama but can't START it: ensure the local daemon is up
     // and hold the guard for the run's duration. No tool has run yet, so a down or
     // unstartable daemon is the safe `Unavailable` surface.
-    let _daemon = match ollama::wake_daemon().await {
-        Ok(g) => g,
-        Err(e) => return SidecarOutcome::Unavailable(e),
+    let _daemon = if crate::commands::is_api_provider_model(model) {
+        None
+    } else {
+        match ollama::wake_daemon().await {
+            Ok(g) => Some(g),
+            Err(e) => return SidecarOutcome::Unavailable(e),
+        }
     };
 
     // The run-scoped effects sink the bridge accumulates into, seeded with the
@@ -452,6 +482,10 @@ pub async fn run_via_sidecar(
     } else {
         crate::commands::inject_policy(&body).unwrap_or(body)
     };
+    let body = match crate::commands::inject_provider_runtime(&body, model) {
+        Ok(body) => body,
+        Err(e) => return SidecarOutcome::Unavailable(e),
+    };
 
     let streamed = stream_run(&base, &body, window, &cancel, headless).await;
     // The bridge's own record of whether a tool was dispatched to `exec_tool`.
@@ -492,11 +526,11 @@ pub async fn run_via_sidecar(
             // keeps the partial reply + merged effects; re-running would double
             // the write). If NO tool ran, the sidecar failed before doing
             // anything, so it's `Unavailable` → the caller shows the
-            // "AI engine unavailable" error. Neither path re-runs anything.
+            // provider/model error. Neither path re-runs anything.
             if tool_ran || bridge_tool_ran {
                 SidecarOutcome::Failed { text, error }
             } else {
-                SidecarOutcome::Unavailable(error)
+                SidecarOutcome::EngineError(error)
             }
         }
     }
@@ -547,9 +581,18 @@ async fn stream_run(
         }
     };
     if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|value| safe_validation_detail(&value));
         return StreamResult::Failed {
             text: String::new(),
-            error: format!("sidecar /run status {}", resp.status()),
+            error: match detail {
+                Some(detail) => format!("sidecar /run status {status}: {detail}"),
+                None => format!("sidecar /run status {status}"),
+            },
             tool_ran: false,
             usage: None,
         };
@@ -684,6 +727,37 @@ fn str_v(ev: &serde_json::Value) -> &str {
     ev.get("v").and_then(|v| v.as_str()).unwrap_or("")
 }
 
+/// Extract only Pydantic's safe location/message pairs. FastAPI validation
+/// bodies can also contain the rejected input value, which for provider
+/// requests includes the API key and must never reach logs or the UI.
+fn safe_validation_detail(value: &serde_json::Value) -> Option<String> {
+    let errors = value.get("detail")?.as_array()?;
+    let parts: Vec<String> = errors
+        .iter()
+        .filter_map(|error| {
+            let message = error.get("msg")?.as_str()?;
+            let location = error
+                .get("loc")
+                .and_then(|loc| loc.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .filter(|item| *item != "body")
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
+                .unwrap_or_default();
+            Some(if location.is_empty() {
+                message.to_string()
+            } else {
+                format!("{location}: {message}")
+            })
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 /// Resolve as soon as `cancel` is set. Polled every 100ms so Stop is observed
 /// even while a silent, long-running tool holds the `/run` stream idle.
 async fn wait_for_cancel(cancel: &Arc<AtomicBool>) {
@@ -738,5 +812,20 @@ mod tests {
             other.sentinel(Some("gemma3:4b")),
             "Local AI error (500): boom"
         );
+    }
+
+    #[test]
+    fn validation_detail_never_includes_rejected_secret_input() {
+        let body = serde_json::json!({
+            "detail": [{
+                "loc": ["body", "provider", "api_key"],
+                "msg": "Field required",
+                "type": "missing",
+                "input": {"apiKey": "do-not-leak"}
+            }]
+        });
+        let detail = safe_validation_detail(&body).unwrap();
+        assert_eq!(detail, "provider.api_key: Field required");
+        assert!(!detail.contains("do-not-leak"));
     }
 }

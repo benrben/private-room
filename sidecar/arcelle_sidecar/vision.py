@@ -282,6 +282,7 @@ async def vision_locate(
     num_ctx: int | None = None,
     keep_alive: str | None = None,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Ground ``query`` in the image and return normalized boxes.
 
@@ -310,6 +311,7 @@ async def vision_locate(
         format=schema,
         images=[prepared_b64],
         privacy=privacy,
+        provider=provider,
     )
     return parse_boxes(recover_json(text), w, h)
 

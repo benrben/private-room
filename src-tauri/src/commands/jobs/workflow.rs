@@ -2053,7 +2053,7 @@ pub(crate) async fn run_agent_headless(
     // agent, so it gets the same per-run room bridge as a chat ask
     // (CloudAdvisor scope: file + web tools, never UI/job tools, no MCP
     // connectors in a headless run) and the same cancel watcher.
-    if is_external_engine(&chat_model) {
+    if is_cli_engine(&chat_model) {
         let bridge = crate::room_mcp::start(
             app.clone(),
             web_enabled,
@@ -2090,6 +2090,7 @@ pub(crate) async fn run_agent_headless(
     match outcome {
         crate::sidecar::SidecarOutcome::Done(text) => Ok(text),
         crate::sidecar::SidecarOutcome::Unavailable(e) => Err(e),
+        crate::sidecar::SidecarOutcome::EngineError(e) => Err(e),
         crate::sidecar::SidecarOutcome::Failed { text, error } => {
             if text.trim().is_empty() {
                 Err(error)
@@ -3073,7 +3074,7 @@ fn compose_prompt(description: &str) -> String {
 /// on ANY engine, including a plain-text external CLI that has no room tools.
 pub(crate) async fn generate_text_any_engine(model: &str, prompt: &str) -> Result<String, String> {
     let msgs = vec![ollama::ChatMessage::new("user", prompt)];
-    if is_external_engine(model) {
+    if is_cli_engine(model) {
         // Usage discarded — this one-shot text gateway (workflow generate
         // nodes) is out of scope for the chat token-budget bar.
         crate::commands::run_external(model, &msgs, None, None, false)

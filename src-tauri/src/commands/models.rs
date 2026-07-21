@@ -116,8 +116,13 @@ pub async fn ai_status(state: State<'_, AppState>) -> Result<AiStatus, String> {
     let external = tauri::async_runtime::spawn_blocking(detect_external_blocking)
         .await
         .unwrap_or_default();
-    // ADD-21: keep the advisor gate's cache current with what Settings shows.
+    // Advisors are CLI subprocesses today. Keep this cache CLI-only while the
+    // user-facing engine list below also includes connected API providers.
     *state.external_cache.lock().unwrap() = Some(external.clone());
+    let mut external = external;
+    if provider_connected("openrouter") {
+        external.push("openrouter".into());
+    }
     let installed = tauri::async_runtime::spawn_blocking(ollama_installed_blocking)
         .await
         .unwrap_or(false);

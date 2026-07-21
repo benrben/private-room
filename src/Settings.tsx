@@ -17,6 +17,7 @@ import RoleSection from "./settings/RoleSection";
 import HelpersSection from "./settings/HelpersSection";
 import RecoverySection from "./settings/RecoverySection";
 import AboutSection from "./settings/AboutSection";
+import AiProvidersSection from "./settings/AiProvidersSection";
 import { useFocusTrap } from "./settings/useFocusTrap";
 import { useModelManagement } from "./settings/useModelManagement";
 import { useBehaviorSettings } from "./settings/useBehaviorSettings";
@@ -59,6 +60,7 @@ const SETTINGS_GROUPS: { key: string; label: string; sections: [string, string][
     key: "connections",
     label: "Connections",
     sections: [
+      ["set-ai-providers", "AI providers"],
       ["set-online", "Online search"],
       ["set-closet", "Remote AI"],
       ["set-leash", "Room server"],
@@ -416,6 +418,16 @@ export default function Settings({
             </div>
 
             <div className="settings-page" hidden={activeGroup !== "connections"}>
+              <AiProvidersSection
+                model={model}
+                fallbackModel={
+                  ai?.models.find((candidate) => !candidate.endsWith(":cloud")) ??
+                  ai?.defaultModel ??
+                  "qwen3.5:4b"
+                }
+                onModelChange={onModelChange}
+                onChanged={onModelsChanged}
+              />
               <OnlineSection
                 webProvider={webProvider}
                 setWebProvider={setWebProvider}

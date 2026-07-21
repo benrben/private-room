@@ -73,6 +73,12 @@ export default function EngineModelPicker({
   );
   const [loadingEngine, setLoadingEngine] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [needsTools, setNeedsTools] = useState(false);
+  const [needsVision, setNeedsVision] = useState(false);
+  const [needsReasoning, setNeedsReasoning] = useState(false);
+  const [needsStructured, setNeedsStructured] = useState(false);
+  const externalCatalogVersion = ai.external.join("|");
 
   // Fetch an engine's model list whenever it becomes the expanded one and
   // isn't cached yet. Keyed on `expanded` (not only on a click) so a menu that
@@ -80,7 +86,11 @@ export default function EngineModelPicker({
   // engine — still fetches, instead of showing only its default row.
   useEffect(() => {
     const engine = expanded;
-    if (!engine || engineModels[engine]) return;
+    if (
+      !engine ||
+      !ai.external.includes(engine) ||
+      (engine !== "openrouter" && engineModels[engine])
+    ) return;
     let cancelled = false;
     setLoadingEngine(engine);
     setLoadError(null);
@@ -99,9 +109,16 @@ export default function EngineModelPicker({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded]);
+  }, [expanded, externalCatalogVersion]);
 
   function toggleExpand(engine: string) {
+    if (expanded !== engine) {
+      setQuery("");
+      setNeedsTools(false);
+      setNeedsVision(false);
+      setNeedsReasoning(false);
+      setNeedsStructured(false);
+    }
     setExpanded((cur) => (cur === engine ? null : engine));
   }
 
@@ -183,6 +200,18 @@ export default function EngineModelPicker({
           ))}
           {ai.external.map((engine) => {
             const models = engineModels[engine] ?? [];
+            const hasRichCatalog = models.some(
+              (item) => item.contextWindow || item.description || item.inputPrice,
+            );
+            const needle = query.trim().toLowerCase();
+            const visibleModels = hasRichCatalog ? models.filter((item) => {
+              if (needle && !`${item.label} ${item.slug}`.toLowerCase().includes(needle)) return false;
+              if (needsTools && !item.tools) return false;
+              if (needsVision && !item.vision) return false;
+              if (needsReasoning && !item.reasoning) return false;
+              if (needsStructured && !item.structuredOutputs) return false;
+              return true;
+            }) : models;
             return (
               <div key={engine} className="engine-cloud-group">
                 <button
@@ -206,23 +235,100 @@ export default function EngineModelPicker({
                     )}
                     {loadError === engine && (
                       <div className="settings-hint engine-submodel-loading">
-                        Couldn't list models — using {ENGINE_LABELS[engine] ?? engine}'s default.
+                        {engine === "openrouter"
+                          ? "Couldn't refresh the model catalog. Check the connection in Settings."
+                          : `Couldn't list models — using ${ENGINE_LABELS[engine] ?? engine}'s default.`}
+                      </div>
+                    )}
+                    {!loadingEngine && hasRichCatalog && (
+                      <div className="model-catalog-controls">
+                        <input
+                          type="search"
+                          value={query}
+                          onChange={(event) => setQuery(event.target.value)}
+                          placeholder={`Search ${models.length.toLocaleString()} models…`}
+                          aria-label={`Search ${ENGINE_LABELS[engine] ?? engine} models`}
+                        />
+                        <div className="model-filter-chips" role="group" aria-label="Model capabilities">
+                          <button
+                            type="button"
+                            className={needsTools ? "active" : ""}
+                            aria-pressed={needsTools}
+                            onClick={() => setNeedsTools((value) => !value)}
+                          >
+                            Tools
+                          </button>
+                          <button
+                            type="button"
+                            className={needsVision ? "active" : ""}
+                            aria-pressed={needsVision}
+                            onClick={() => setNeedsVision((value) => !value)}
+                          >
+                            Vision
+                          </button>
+                          <button
+                            type="button"
+                            className={needsReasoning ? "active" : ""}
+                            aria-pressed={needsReasoning}
+                            onClick={() => setNeedsReasoning((value) => !value)}
+                          >
+                            Reasoning
+                          </button>
+                          <button
+                            type="button"
+                            className={needsStructured ? "active" : ""}
+                            aria-pressed={needsStructured}
+                            onClick={() => setNeedsStructured((value) => !value)}
+                          >
+                            JSON
+                          </button>
+                          <span>{visibleModels.length.toLocaleString()} shown</span>
+                        </div>
                       </div>
                     )}
                     {!loadingEngine &&
-                      models.map((mi) => {
+                      visibleModels.map((mi) => {
                         const base = `${engine}::${mi.slug}`;
                         const picked = selEngine === engine && selModel === mi.slug;
+                        const perMillion = (raw: string | null) => {
+                          if (!raw) return null;
+                          const value = Number(raw) * 1_000_000;
+                          if (!Number.isFinite(value)) return null;
+                          return value === 0 ? "free" : `$${value < 0.01 ? value.toFixed(3) : value.toFixed(2)}/M`;
+                        };
+                        const context = mi.contextWindow
+                          ? `${mi.contextWindow >= 1_000_000
+                              ? `${(mi.contextWindow / 1_000_000).toFixed(1)}M`
+                              : `${Math.round(mi.contextWindow / 1000)}K`} ctx`
+                          : null;
                         return (
                           <div key={mi.slug} className="engine-submodel">
                             <button
                               type="button"
                               className={`model-menu-item${model === base ? " sel" : ""}`}
                               aria-pressed={model === base}
+                              title={mi.description ?? mi.label}
                               onClick={() => onSelect(base)}
                             >
                               <span className="model-dot cloud" />
-                              <span className="model-menu-name">{mi.label}</span>
+                              <span className="model-menu-name model-catalog-name">
+                                <span>{mi.label}</span>
+                                {hasRichCatalog && (
+                                  <span className="model-catalog-meta">
+                                    {context && <span>{context}</span>}
+                                    {mi.tools && <span>tools</span>}
+                                    {mi.vision && <span>vision</span>}
+                                    {mi.reasoning && <span>reasoning</span>}
+                                    {mi.structuredOutputs && <span>structured</span>}
+                                    {perMillion(mi.inputPrice) && (
+                                      <span>{perMillion(mi.inputPrice)} in</span>
+                                    )}
+                                    {perMillion(mi.outputPrice) && (
+                                      <span>{perMillion(mi.outputPrice)} out</span>
+                                    )}
+                                  </span>
+                                )}
+                              </span>
                               {model === base && <CheckIcon size={14} />}
                             </button>
                             {/* Effort chips: shown once this model is the picked
@@ -260,7 +366,17 @@ export default function EngineModelPicker({
                           </div>
                         );
                       })}
-                    <button
+                    {!loadingEngine && hasRichCatalog && visibleModels.length === 0 && (
+                      <div className="settings-hint engine-submodel-loading">
+                        No models match these filters.
+                      </div>
+                    )}
+                    {!loadingEngine && !loadError && engine === "openrouter" && models.length === 0 && (
+                      <div className="settings-hint engine-submodel-loading">
+                        No models are available for this OpenRouter account.
+                      </div>
+                    )}
+                    {engine !== "openrouter" && <button
                       type="button"
                       className={`model-menu-item engine-submodel-default${
                         model === engine ? " sel" : ""
@@ -273,7 +389,7 @@ export default function EngineModelPicker({
                         {ENGINE_LABELS[engine] ?? engine}'s default
                       </span>
                       {model === engine && <CheckIcon size={14} />}
-                    </button>
+                    </button>}
                   </div>
                 )}
               </div>

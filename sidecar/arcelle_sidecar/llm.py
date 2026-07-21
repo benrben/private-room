@@ -30,6 +30,7 @@ from . import external_llm
 from . import privacy as privacy_mod
 from .chat import OllamaChatModel
 from .messages import Message
+from .provider_api import OpenAICompatibleChatModel, ProviderApiError
 
 #: HTTP status the gateway routes use for a classified engine failure. Any non-2xx
 #: makes the Rust side read the ``code``; 502 (bad upstream) is the honest one —
@@ -68,6 +69,8 @@ def _classify(exc: Exception) -> LlmError:
     """
     if isinstance(exc, LlmError):
         return exc
+    if isinstance(exc, ProviderApiError):
+        return LlmError("ENGINE_ERROR", str(exc))
     if isinstance(exc, ResponseError):
         status = getattr(exc, "status_code", -1)
         msg = getattr(exc, "error", None) or str(exc)
@@ -120,6 +123,7 @@ async def generate(
     format: dict[str, Any] | None = None,  # noqa: A002 - matches the Ollama arg name
     images: list[str] | None = None,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> str:
     """One non-streaming assistant turn (ollama.rs ``chat_structured`` gateway).
 
@@ -144,6 +148,13 @@ async def generate(
     messages, images, engaged = privacy_mod.guard_outbound(model, messages, policy, images)
     if external_llm.is_external_model(model):
         text = await external_llm.generate_external(model, messages, format=format)
+        return engaged.restore_text(text) if engaged else text
+    if provider is not None:
+        chat = OpenAICompatibleChatModel(model, provider, temperature)
+        try:
+            text = await chat.generate(messages, format=format, images=images)
+        except Exception as exc:  # noqa: BLE001
+            raise _classify(exc) from exc
         return engaged.restore_text(text) if engaged else text
     kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
     if temperature is not None:
@@ -173,6 +184,7 @@ async def generate_stream(
     format: dict[str, Any] | None = None,  # noqa: A002 - matches the Ollama arg name
     images: list[str] | None = None,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> AsyncIterator[str]:
     """Streaming twin of :func:`generate` (ollama.rs ``chat_core`` streaming text).
 
@@ -194,6 +206,23 @@ async def generate_stream(
     if external_llm.is_external_model(model):
         text = await external_llm.generate_external(model, messages, format=format)
         yield engaged.restore_text(text) if engaged else text
+        return
+    if provider is not None:
+        chat = OpenAICompatibleChatModel(model, provider, temperature)
+        restorer = engaged.restorer() if engaged else None
+        try:
+            async for delta in chat.generate_stream(messages, format=format, images=images):
+                if restorer is not None:
+                    delta = restorer.feed(delta)
+                    if not delta:
+                        continue
+                yield delta
+        except Exception as exc:  # noqa: BLE001
+            raise _classify(exc) from exc
+        if restorer is not None:
+            tail = restorer.flush()
+            if tail:
+                yield tail
         return
     kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
     if temperature is not None:

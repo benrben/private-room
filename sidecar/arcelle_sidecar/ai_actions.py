@@ -44,7 +44,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from . import llm
-from .config import KEEP_ALIVE_WARM, num_ctx_chat_notools
+from .config import KEEP_ALIVE_WARM, ProviderConfig, num_ctx_chat_notools
 from .messages import Message, compact_json, system_message, user_message
 
 #: chat_structured (ollama.rs) primes the schema onto the last user turn because
@@ -81,6 +81,7 @@ class AiActionRequest(BaseModel):
     base_url: str = "http://127.0.0.1:11434"
     #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class MemorySuggestionRequest(BaseModel):
@@ -98,6 +99,7 @@ class MemorySuggestionRequest(BaseModel):
     base_url: str = "http://127.0.0.1:11434"
     #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class FileMetaRequest(BaseModel):
@@ -113,6 +115,7 @@ class FileMetaRequest(BaseModel):
     base_url: str = "http://127.0.0.1:11434"
     #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 # --- the 14 AI actions ------------------------------------------------------
 #
@@ -451,6 +454,7 @@ async def run_ai_action(
     instructions: str | None = None,
     question: str | None = None,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> str:
     """Run one AI action over the gathered ``text`` and return its markdown.
 
@@ -490,6 +494,7 @@ async def run_ai_action(
         keep_alive=KEEP_ALIVE_WARM,
         format=_MARKDOWN_SCHEMA,
         privacy=privacy,
+        provider=provider,
     )
     markdown = _str_field(_load_obj(raw), "markdown")
     if not markdown:
@@ -508,6 +513,7 @@ async def run_ai_action(
             num_ctx=num_ctx_chat_notools(),
             keep_alive=KEEP_ALIVE_WARM,
             privacy=privacy,
+            provider=provider,
         )
         obj = _load_obj(plain)
         markdown = (
@@ -547,6 +553,7 @@ async def memory_suggestion(
     assistant_text: str,
     base_url: str,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> dict[str, Any]:
     """Judge whether one durable fact from the exchange is worth remembering (D6).
 
@@ -576,6 +583,7 @@ async def memory_suggestion(
             keep_alive=KEEP_ALIVE_WARM,
             format=_MEMORY_SCHEMA,
             privacy=privacy,
+            provider=provider,
         )
     except llm.LlmError:
         # Model down: not worth (Rust unwrap_or_default -> empty raw -> false).
@@ -612,6 +620,7 @@ async def suggest_file_meta(
     text: str,
     base_url: str,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> dict[str, Any]:
     """Propose a title, one folder, and up to five tags for a file (D7).
 
@@ -646,6 +655,7 @@ async def suggest_file_meta(
             keep_alive=KEEP_ALIVE_WARM,
             format=_FILE_META_SCHEMA,
             privacy=privacy,
+            provider=provider,
         )
     except llm.LlmError:
         return echo()

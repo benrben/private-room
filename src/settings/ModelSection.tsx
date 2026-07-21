@@ -158,7 +158,7 @@ export default function ModelSection({
                 {ai.external.length > 0 && (
                   <p className="settings-hint">
                     <AlertIcon size={13} className="warn-ic" /> Cloud engines send your questions and room context to your
-                    Claude/OpenAI account — content leaves this Mac. Images stay
+                    connected AI provider or account — content leaves this Mac. Images stay
                     local (vision and image marking always use the local model).
                   </p>
                 )}

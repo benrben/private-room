@@ -404,13 +404,19 @@ class OllamaModelClient:
     :class:`.llm.LlmError` contract.
     """
 
-    def __init__(self, base_url: str, privacy: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        privacy: dict[str, Any] | None = None,
+        provider: Any | None = None,
+    ) -> None:
         from .privacy import policy_from_payload
 
         self.base_url = base_url
         # PRIV-1: the room's policy rides the request body; the door engages in
         # _chat only when the model is non-local.
         self.privacy = policy_from_payload(privacy)
+        self.provider = provider
 
     async def _chat(
         self,
@@ -438,6 +444,27 @@ class OllamaModelClient:
         if is_external_model(model):
             text = await generate_external(model, messages, format=format)
             return (engaged.restore_text(text) if engaged else text), []
+        if self.provider is not None:
+            from .provider_api import OpenAICompatibleChatModel
+
+            api = OpenAICompatibleChatModel(model, self.provider, temperature)
+
+            async def ignore_delta(_value: str) -> None:
+                return None
+
+            try:
+                if tools:
+                    content, calls, _usage = await api.stream(messages, tools, ignore_delta)
+                else:
+                    content = await api.generate(messages, format=format)
+                    calls = []
+            except Exception as exc:  # noqa: BLE001
+                raise _classify(exc) from exc
+            if engaged is not None:
+                content = engaged.restore_text(content)
+                for call in calls:
+                    call.arguments = engaged.restore_value(call.arguments)
+            return content, calls
 
         options: dict[str, Any] = {"num_ctx": num_ctx}
         if temperature is not None:
@@ -794,6 +821,7 @@ class SummarizeFileRequest(BaseModel):
     keep_alive: str = "30m"
     #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
     privacy: dict[str, Any] | None = None
+    provider: config.ProviderConfig | None = None
 
 
 class CombineSummaryRequest(BaseModel):
@@ -809,6 +837,7 @@ class CombineSummaryRequest(BaseModel):
     keep_alive: str = "30m"
     #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
     privacy: dict[str, Any] | None = None
+    provider: config.ProviderConfig | None = None
 
 
 __all__ = [

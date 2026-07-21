@@ -10,7 +10,7 @@ use super::*;
 pub fn split_external_model(model: &str) -> (&str, Option<&str>, Option<&str>) {
     let mut parts = model.splitn(3, "::");
     let engine = parts.next().unwrap_or(model);
-    if engine != "claude-cli" && engine != "codex-cli" {
+    if engine != "claude-cli" && engine != "codex-cli" && engine != "openrouter" {
         return (model, None, None);
     }
     (engine, parts.next(), parts.next())
@@ -18,7 +18,13 @@ pub fn split_external_model(model: &str) -> (&str, Option<&str>, Option<&str>) {
 
 pub fn is_external_engine(model: &str) -> bool {
     let base = split_external_model(model).0;
-    base == "claude-cli" || base == "codex-cli"
+    base == "claude-cli" || base == "codex-cli" || base == "openrouter"
+}
+
+/// CLI-backed engines are executed directly by Rust. API-backed providers are
+/// external/non-local too, but run through the provider-aware Python sidecar.
+pub fn is_cli_engine(model: &str) -> bool {
+    matches!(split_external_model(model).0, "claude-cli" | "codex-cli")
 }
 
 #[derive(Serialize, Clone)]
@@ -39,6 +45,14 @@ pub struct ExternalModelInfo {
     /// this field (see `model_limits.rs` for why: re-fetching the catalog on
     /// every chat turn just for this number isn't worth the subprocess cost).
     pub context_window: Option<u32>,
+    pub description: Option<String>,
+    pub input_price: Option<String>,
+    pub output_price: Option<String>,
+    pub input_modalities: Vec<String>,
+    pub tools: bool,
+    pub vision: bool,
+    pub reasoning: bool,
+    pub structured_outputs: bool,
 }
 
 /// Claude Code's `--effort` flag accepts this fixed set (from `claude --help`),
@@ -130,7 +144,7 @@ fn parse_codex_catalog(json: &[u8]) -> Result<Vec<ExternalModelInfo>, String> {
                 .unwrap_or(&slug)
                 .to_string();
             // Each model carries its own supported reasoning levels + default.
-            let efforts = m
+            let efforts: Vec<String> = m
                 .get("supported_reasoning_levels")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
@@ -147,12 +161,21 @@ fn parse_codex_catalog(json: &[u8]) -> Result<Vec<ExternalModelInfo>, String> {
                 .get("context_window")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
+            let reasoning = !efforts.is_empty();
             Some(ExternalModelInfo {
                 slug,
                 label,
                 efforts,
                 default_effort,
                 context_window,
+                description: None,
+                input_price: None,
+                output_price: None,
+                input_modalities: vec!["text".into()],
+                tools: true,
+                vision: false,
+                reasoning,
+                structured_outputs: true,
             })
         })
         .collect())
@@ -173,6 +196,14 @@ fn claude_known_models() -> Vec<ExternalModelInfo> {
         efforts: efforts.clone(),
         default_effort: None,
         context_window: None,
+        description: None,
+        input_price: None,
+        output_price: None,
+        input_modalities: vec!["text".into()],
+        tools: true,
+        vision: false,
+        reasoning: true,
+        structured_outputs: true,
     };
     vec![
         mk("opus", "Opus 4.8"),
@@ -189,6 +220,7 @@ pub async fn list_engine_models(engine: String) -> Result<Vec<ExternalModelInfo>
     match engine.as_str() {
         "codex-cli" => list_codex_models().await,
         "claude-cli" => Ok(claude_known_models()),
+        "openrouter" => super::list_provider_models("openrouter").await,
         other => Err(format!("Unknown engine: {other}")),
     }
 }

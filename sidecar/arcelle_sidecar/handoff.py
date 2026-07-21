@@ -19,6 +19,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .config import ProviderConfig
 from .llm import generate
 from .messages import Message, system_message, user_message
 
@@ -41,6 +42,7 @@ class HandoffSummaryRequest(BaseModel):
     messages: list[Message]
     temperature: float | None = None
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 def _transcript(messages: list[Message]) -> str:
@@ -67,13 +69,13 @@ async def summarize_for_handoff(req: HandoffSummaryRequest) -> str:
         system_message(HANDOFF_SYSTEM_PROMPT),
         user_message(_transcript(req.messages) or "(nothing said yet)"),
     ]
-    return await generate(
-        req.model,
-        prompt,
-        req.base_url,
-        temperature=req.temperature,
-        privacy=req.privacy,
-    )
+    kwargs: dict[str, Any] = {
+        "temperature": req.temperature,
+        "privacy": req.privacy,
+    }
+    if req.provider is not None:
+        kwargs["provider"] = req.provider
+    return await generate(req.model, prompt, req.base_url, **kwargs)
 
 
 __all__ = ["HandoffSummaryRequest", "summarize_for_handoff"]

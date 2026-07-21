@@ -72,6 +72,7 @@ async def front_page_labels(
     files: list[str],
     base_url: str,
     privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> list[str]:
     """Up to three starter questions for the room's front page (D4).
 
@@ -91,6 +92,7 @@ async def front_page_labels(
         keep_alive=KEEP_ALIVE_WARM,
         format=_SUGGESTIONS_SCHEMA,
         privacy=privacy,
+        provider=provider,
     )
     return _parse_questions(raw)
 
@@ -137,7 +139,11 @@ def _parse_or_fallback(raw: str, text: str) -> tuple[str, str]:
 
 
 async def feedback_draft(
-    model: str, text: str, base_url: str, privacy: dict[str, Any] | None = None
+    model: str,
+    text: str,
+    base_url: str,
+    privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
 ) -> dict[str, str]:
     """Shape raw feedback into a GitHub-ready ``{title, body}`` (ADD-28).
 
@@ -154,6 +160,7 @@ async def feedback_draft(
         keep_alive=KEEP_ALIVE_SHORT,
         format=_FEEDBACK_SCHEMA,
         privacy=privacy,
+        provider=provider,
     )
     title, body = _parse_or_fallback(raw, text)
     return {"title": title[:120], "body": body}

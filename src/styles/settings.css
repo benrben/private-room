@@ -152,6 +152,53 @@
   font-size: 13px;
 }
 
+.provider-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.provider-card.connected {
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--border));
+}
+.provider-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.provider-card-head .settings-hint {
+  margin: 3px 0 0;
+}
+.provider-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.provider-state.connected,
+.provider-message.good {
+  color: var(--ok);
+}
+.provider-key-row {
+  display: flex;
+  gap: 8px;
+}
+.provider-key-row input {
+  flex: 1;
+  min-width: 0;
+}
+.provider-message {
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .pull-progress {
   margin-top: 8px;
   font-size: 12px;

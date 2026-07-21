@@ -344,6 +344,7 @@ export interface AiStatus {
 export const ENGINE_LABELS: Record<string, string> = {
   "claude-cli": "Claude Code",
   "codex-cli": "Codex",
+  openrouter: "OpenRouter",
 };
 
 /** A specific model offered by a cloud engine (the Cloud picker's second
@@ -356,6 +357,22 @@ export interface ExternalModelInfo {
   label: string;
   efforts: string[];
   defaultEffort: string | null;
+  contextWindow: number | null;
+  description: string | null;
+  /** OpenRouter prices in USD per token, exactly as returned by its live API. */
+  inputPrice: string | null;
+  outputPrice: string | null;
+  inputModalities: string[];
+  tools: boolean;
+  vision: boolean;
+  reasoning: boolean;
+  structuredOutputs: boolean;
+}
+
+export interface AiProviderStatus {
+  id: string;
+  label: string;
+  connected: boolean;
 }
 
 /** A cloud engine selection, most-specific-last:
@@ -369,7 +386,9 @@ export function splitExternalModel(
 ): [string, string | null, string | null] {
   const parts = model.split("::");
   const engine = parts[0];
-  if (engine !== "claude-cli" && engine !== "codex-cli") return [model, null, null];
+  if (engine !== "claude-cli" && engine !== "codex-cli" && engine !== "openrouter") {
+    return [model, null, null];
+  }
   return [engine, parts[1] ?? null, parts[2] ?? null];
 }
 
