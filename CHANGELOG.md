@@ -3,6 +3,23 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.10.0 — 2026-07-21
+
+### See — and reclaim — your context budget
+
+- **A live token-budget bar.** The composer now shows how full the model's
+  context window is, right where you're typing — a segmented bar colored by
+  what's actually taking up the space.
+- **Click for the exact breakdown.** See precisely how many tokens come from
+  the system prompt, conversation history, tool results, skills, and file
+  reads, each with an exact count and percentage.
+- **Hand off when you're running low.** One click summarizes the conversation
+  so far and continues the same chat with a fresh, much smaller context — no
+  need to start a new chat just to keep going.
+- **Real counts wherever the engine reports them.** Local models, Ollama cloud
+  models, Claude Code, and Codex all report their actual token usage now;
+  anywhere else, the bar says plainly that it's estimating.
+
 ## 0.9.0 — 2026-07-21
 
 ### Skills turn repeatable work into a reusable capability
