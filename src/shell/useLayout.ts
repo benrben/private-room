@@ -14,20 +14,23 @@ export type PaneKey = "library" | "center" | "ai";
 
 export const PANE_ORDER: PaneKey[] = ["library", "center", "ai"];
 
-/** Reference default proportions (21 / 50 / 29). Ratios, not widths. */
+/** Default proportions (18 / 58 / 24): ONE dominant workspace, with the library
+ * a navigable strip and the AI pane a slim contextual column you widen or
+ * collapse to a drawer as needed. Ratios, not widths. New rooms (and Reset
+ * layout) get this; rooms with a saved custom layout keep theirs. */
 const DEFAULT_RATIOS: Record<PaneKey, number> = {
-  library: 0.21,
-  center: 0.5,
-  ai: 0.29,
+  library: 0.18,
+  center: 0.58,
+  ai: 0.24,
 };
 
 /** Drag/keyboard clamps, matching the reference feel: the library stays a
  * navigable strip, the AI pane stays wide enough for its composer, and the
- * center never shrinks below a readable column while others are visible. */
+ * center stays the dominant, readable column while others are visible. */
 const CLAMP = {
-  library: { min: 0.13, max: 0.34 },
-  ai: { min: 0.2, max: 0.45 },
-  centerMin: 0.3,
+  library: { min: 0.13, max: 0.32 },
+  ai: { min: 0.2, max: 0.42 },
+  centerMin: 0.4,
 };
 
 /** Below this the three-pane grid stops being readable; the shell shows ONE

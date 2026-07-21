@@ -5,15 +5,18 @@ import {
   ShieldIcon,
 } from "../icons";
 import { LayoutApi } from "./useLayout";
+import { trustState } from "../workspace/markup";
 
-/** The 23px status strip. Every item reflects real state: the data route
- * (local vs the chosen cloud engine), indexed file count, connected tools,
+/** The 23px status strip. Every item reflects real state: the trust route
+ * (local / protected cloud / raw cloud), indexed file count, connected tools,
  * background work, and the current pane layout. */
 export default function StatusBar({
   layout,
   fileCount,
   cloud,
   engineLabel,
+  protectedOn,
+  onOpenPrivacy,
   webOn,
   mcpToolCount,
   runningJobs,
@@ -24,33 +27,30 @@ export default function StatusBar({
   fileCount: number;
   cloud: boolean;
   engineLabel: string;
+  /** The cloud-privacy door's effective state; null while still loading. */
+  protectedOn: boolean | null;
+  /** Open the trust control (Settings → Cloud privacy). */
+  onOpenPrivacy: () => void;
   webOn: boolean;
   mcpToolCount: number;
   runningJobs: number;
   pendingApprovals: number;
   onShowActivity: () => void;
 }) {
+  const trust = trustState(cloud, protectedOn);
   return (
     <footer className="pr-statusbar" aria-label="Workspace status">
       <div className="status-seal" title="This room is an encrypted file on this Mac">
         <ShieldIcon size={12} />
       </div>
       <div className="status-left">
-        {cloud ? (
-          <span
-            className="status-item warn"
-            title={`${engineLabel} runs in the cloud — prompts and attached context leave this Mac`}
-          >
-            <CloudIcon size={11} /> Cloud · {engineLabel}
-          </span>
-        ) : (
-          <span
-            className="status-item good"
-            title="AI runs on this Mac — nothing leaves the device"
-          >
-            <span className="status-dot" /> Local · {engineLabel}
-          </span>
-        )}
+        <button
+          className={`status-item status-trust ${trust.tone}`}
+          title={`${trust.title} (${engineLabel})${cloud ? " Click to review." : ""}`}
+          onClick={onOpenPrivacy}
+        >
+          {cloud ? <CloudIcon size={11} /> : <ShieldIcon size={11} />} {trust.label}
+        </button>
         <span className="status-item" title="Files stored in this room">
           <DatabaseIcon size={11} /> {fileCount} file{fileCount === 1 ? "" : "s"}
         </span>

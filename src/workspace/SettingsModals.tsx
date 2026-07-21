@@ -40,8 +40,10 @@ export default function SettingsModals({
             s.recLive !== null ||
             s.asking
           }
+          initialSection={s.settingsSection}
           onClose={() => {
             s.setShowSettings(false);
+            s.setSettingsSection(null);
             a.refreshWebAccess();
             a.refreshAutolock();
             a.refreshPrivacy();

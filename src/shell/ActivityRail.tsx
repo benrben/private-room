@@ -22,23 +22,27 @@ export type { WorkArea };
 const AREAS: {
   key: Exclude<WorkArea, "files">;
   label: string;
+  /** Short label shown under the icon in the rail (≤9 chars). */
+  short: string;
   icon: (size: number) => ReactElement;
 }[] = [
-  { key: "home", label: "Room home", icon: (s) => <HomeIcon size={s} /> },
-  { key: "map", label: "Room Map", icon: (s) => <GraphIcon size={s} /> },
-  { key: "recordings", label: "Recordings", icon: (s) => <MicIcon size={s} /> },
+  { key: "home", label: "Room home", short: "Home", icon: (s) => <HomeIcon size={s} /> },
+  { key: "map", label: "Room Map", short: "Map", icon: (s) => <GraphIcon size={s} /> },
+  { key: "recordings", label: "Recordings", short: "Record", icon: (s) => <MicIcon size={s} /> },
   {
     key: "workflows",
     label: "Workflows",
+    short: "Workflows",
     icon: (s) => <WorkflowsIcon size={s} />,
   },
-  { key: "scripts", label: "Scripts", icon: (s) => <ScriptIcon size={s} /> },
+  { key: "scripts", label: "Scripts", short: "Scripts", icon: (s) => <ScriptIcon size={s} /> },
   {
     key: "memory",
     label: "Memory & scratch pad",
+    short: "Memory",
     icon: (s) => <MemoryIcon size={s} />,
   },
-  { key: "connectors", label: "Connectors", icon: (s) => <LinkIcon size={s} /> },
+  { key: "connectors", label: "Connectors", short: "Connect", icon: (s) => <LinkIcon size={s} /> },
 ];
 
 /** The 46px activity rail. Two deliberately different groups: pane
@@ -75,6 +79,7 @@ export default function ActivityRail({
         onClick={() => layout.togglePane("library")}
       >
         <PanelLeftIcon size={17} />
+        <span className="rail-label">Library</span>
       </button>
       <button
         className="rail-button"
@@ -86,6 +91,7 @@ export default function ActivityRail({
         onClick={() => layout.togglePane("center")}
       >
         <PanelCenterIcon size={17} />
+        <span className="rail-label">Workspace</span>
       </button>
       <button
         className="rail-button"
@@ -97,6 +103,7 @@ export default function ActivityRail({
         onClick={() => layout.togglePane("ai")}
       >
         <PanelRightIcon size={17} />
+        <span className="rail-label">AI</span>
         {aiAttention && <span className="rail-badge" aria-hidden />}
       </button>
 
@@ -113,6 +120,7 @@ export default function ActivityRail({
         onClick={onSearch}
       >
         <SearchIcon size={17} />
+        <span className="rail-label">Search</span>
       </button>
       {AREAS.slice(1).map((a) => (
         <RailAreaButton key={a.key} def={a} area={area} onArea={onArea} />
@@ -129,6 +137,9 @@ export default function ActivityRail({
         onClick={() => layout.toggleFocus("center")}
       >
         <FocusIcon size={17} />
+        <span className="rail-label">
+          {layout.focusPane === "center" ? "Unfocus" : "Focus"}
+        </span>
       </button>
       <button
         className="rail-button"
@@ -138,6 +149,7 @@ export default function ActivityRail({
         onClick={onSettings}
       >
         <SettingsIcon size={17} />
+        <span className="rail-label">Settings</span>
       </button>
     </nav>
   );
@@ -164,6 +176,7 @@ function RailAreaButton({
       onClick={() => onArea(def.key)}
     >
       {def.icon(17)}
+      <span className="rail-label">{def.short}</span>
     </button>
   );
 }

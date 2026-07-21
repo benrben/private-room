@@ -10,6 +10,16 @@ export function DownloadIcon({ size, className }: IconProps) {
   );
 }
 
+/** Re-run / redo a background pass (e.g. re-transcribe). */
+export function RefreshIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M19 5.5v5h-5" />
+      <path d="M19.3 10a7.3 7.3 0 1 0-1.5 7.9" />
+    </Stroke>
+  );
+}
+
 /** ADD-18: dictation (voice input). */
 export function MicIcon(p: IconProps) {
   return (

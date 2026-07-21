@@ -422,12 +422,53 @@
   height: 100%;
   min-height: 0;
 }
+.cloudview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px 0;
+}
+.cloudview-badge {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.cloudview-badge.protected {
+  color: var(--amber);
+  background: rgba(223, 188, 114, 0.16);
+}
+.cloudview-badge.danger {
+  color: var(--danger);
+  background: rgba(233, 155, 159, 0.18);
+}
+.cloudview-size {
+  font-size: 11.5px;
+  color: var(--muted);
+}
 .cloudview-ribbon {
   padding: 8px 14px;
   font-size: 12.5px;
   color: var(--muted);
   border-bottom: 1px solid var(--line);
   background: var(--panel-2);
+}
+.cloudview-raw .cloudview-ribbon {
+  color: var(--danger);
+  background: rgba(233, 155, 159, 0.1);
+}
+/* Door OFF: the sensitive spans aren't blacked out — they're exposed. Show
+   them as a red-underlined warning instead of a solid blackout chip. */
+.cloudview-mark.exposed {
+  background: transparent;
+  color: var(--danger);
+  border-radius: 0;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+  text-decoration: underline wavy var(--danger);
 }
 .cloudview-text {
   flex: 1;

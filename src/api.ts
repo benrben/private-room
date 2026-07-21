@@ -414,6 +414,11 @@ export const api = {
    *  when the dictation model hasn't been downloaded yet (Settings → AI). */
   transcribeAudio: (dataB64: string, ext: string, timestamps: boolean) =>
     invoke<string>("transcribe_audio", { dataB64, ext, timestamps }),
+  /** Re-run on-device transcription for a stored audio/video file, replacing its
+   *  transcript. Queues on the same STT lane as import; progress arrives via the
+   *  usual `stt-progress` events. Rejects for non-media files. */
+  retranscribeFile: (fileId: string) =>
+    invoke<void>("retranscribe_file", { fileId }),
   /** Post-process dictated text on the LOCAL model (alfred's pipeline):
    *  optional translate-to-English + an intent rewrite (raw/email/message/
    *  commit/notes/prompt). mode="off" && !translate returns text unchanged. */
@@ -815,10 +820,40 @@ export type FileKind =
   | "recording"
   | "file";
 
+/** True for files that belong to the Recordings lens: engine-made recordings
+ * plus imported audio/video (they transcribe in the background too). This is the
+ * ONE definition of "is this a recording" — the Recordings list/count, the file
+ * icon (via fileKind), and Home's labels all derive from it, so an imported
+ * audio file reads as a recording everywhere, not just in the Recordings pane. */
+export function isRecordingFile(f: FileMeta): boolean {
+  return (
+    f.source === "recording" ||
+    f.mimeType.startsWith("audio/") ||
+    f.mimeType.startsWith("video/")
+  );
+}
+
+/** A short human word for a file's type, from its metadata. Shared by the
+ * Library rows and the Home "Continue" list so a note isn't mislabeled "File"
+ * and a recording always reads as a recording. */
+export function fileKindLabel(f: FileMeta): string {
+  if (isRecordingFile(f)) return "recording";
+  const m = f.mimeType;
+  if (m.startsWith("image/")) return "image";
+  if (m === "application/pdf") return "PDF";
+  const lower = f.name.toLowerCase();
+  if (lower.endsWith(".md")) return "note";
+  if (lower.endsWith(".csv") || lower.endsWith(".xlsx")) return "sheet";
+  if (lower.endsWith(".py") || lower.endsWith(".js")) return "script";
+  if (lower.endsWith(".docx")) return "document";
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "HTML";
+  return "file";
+}
+
 export function fileKind(f: FileMeta): FileKind {
   if (f.mimeType.startsWith("image/")) return "image";
-  // ADD-27: live recordings carry their own source tag and icon.
-  if (f.source === "recording") return "recording";
+  // Live recordings AND imported audio/video share the recording icon.
+  if (isRecordingFile(f)) return "recording";
   if (f.source === "generated") return "generated";
   const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "pdf") return "pdf";

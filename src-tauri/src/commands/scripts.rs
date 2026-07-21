@@ -258,6 +258,13 @@ pub struct ScriptInfo {
     pub workflow_id: Option<String>,
     pub schedule: Option<db::Schedule>,
     pub last_run: Option<db::WorkflowRun>,
+    /// How many of the most-recent runs failed with the SAME error text,
+    /// counting newest-first (0 = the latest run didn't fail). Lets the UI show
+    /// ONE incident card instead of N identical error rows.
+    pub consecutive_failures: u32,
+    /// The shared error text of that identical-failure streak (None when the
+    /// script isn't currently failing).
+    pub last_error: Option<String>,
 }
 
 fn lang_str(lang: ScriptLang) -> String {
@@ -302,9 +309,29 @@ pub fn list_scripts(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
             let wf = workflows.iter().find(|w| wf_is_for_script(w, &f.id));
             let workflow_id = wf.map(|w| w.id.clone());
             let schedule = wf.and_then(|w| db::get_schedule(&room.conn, &w.id).ok().flatten());
-            let last_run = wf
+            let runs = wf
                 .and_then(|w| db::list_workflow_runs(&room.conn, &w.id).ok())
-                .and_then(|runs| runs.into_iter().next());
+                .unwrap_or_default();
+            let last_run = runs.first().cloned();
+            // Walk the leading run streak (newest-first) and collapse repeated
+            // identical failures into a single incident: how many times, and the
+            // shared error. A non-failure — or a *different* error — ends it.
+            let mut consecutive_failures = 0u32;
+            let mut last_error: Option<String> = None;
+            for r in &runs {
+                if r.status != "error" && r.status != "failed" {
+                    break;
+                }
+                let this_err = r.error.clone().unwrap_or_default();
+                match &last_error {
+                    None => {
+                        last_error = Some(this_err);
+                        consecutive_failures = 1;
+                    }
+                    Some(e) if *e == this_err => consecutive_failures += 1,
+                    Some(_) => break,
+                }
+            }
             out.push(ScriptInfo {
                 file_id: f.id,
                 name: f.name,
@@ -318,6 +345,8 @@ pub fn list_scripts(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
                 workflow_id,
                 schedule,
                 last_run,
+                consecutive_failures,
+                last_error,
             });
         }
         Ok(out)

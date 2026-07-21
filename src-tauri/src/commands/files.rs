@@ -171,6 +171,36 @@ pub(crate) fn enqueue_stt(app: &tauri::AppHandle, job: JobMeta) {
     let _ = tx.send(job);
 }
 
+/// Re-run on-device transcription for one audio/video file, replacing its
+/// transcript with a fresh pass. Routes through the SAME STT lane as import-time
+/// transcription, so it queues behind any in-flight job instead of spawning a
+/// competing decode, and emits the usual `stt-progress` events the viewer reads.
+#[tauri::command]
+pub fn retranscribe_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    file_id: String,
+) -> Result<(), String> {
+    let epoch = state.room_epoch();
+    let (name, mime, room_path) = state.with_room(|room| {
+        let meta = db::get_file_meta(&room.conn, &file_id)?;
+        Ok((meta.name, meta.mime_type, room.path.clone()))
+    })?;
+    let ext = std::path::Path::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if stt::media_kind(&mime, &ext).is_none() {
+        return Err("This file isn't audio or video, so there's nothing to transcribe.".into());
+    }
+    enqueue_stt(
+        &app,
+        JobMeta { id: file_id, name, mime, ext, room_path, epoch },
+    );
+    Ok(())
+}
+
 /// Read a job's stored bytes iff its room is still the open one. None → the room
 /// was closed/switched while the job was queued; the worker drops the job.
 pub(crate) fn read_job_bytes(app: &tauri::AppHandle, job: &JobMeta) -> Option<Vec<u8>> {

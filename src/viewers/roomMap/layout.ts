@@ -73,6 +73,13 @@ export function runTick(nodes: SimNode[], edges: SimEdge[], temp: number, k: num
     dx[e.bi] += ux * att;
     dy[e.bi] += uy * att;
   }
+  // A disconnected node feels only repulsion (pushing out) and gravity (pulling
+  // in); it settles at r ≈ k·√(n/GRAVITY) — with GRAVITY=0.015 that's ~8× the
+  // connected cluster's radius, so a single unlinked file "floats far above" and
+  // wrecks the auto-fit (the cluster shrinks to a dot). Contain every node
+  // inside a frame sized to the connected layout so nothing escapes; the fit
+  // then frames the real room instead of one outlier.
+  const maxR = 1.15 * k * Math.sqrt(n) + 2 * k;
   for (let i = 0; i < n; i++) {
     dx[i] -= nodes[i].x * GRAVITY;
     dy[i] -= nodes[i].y * GRAVITY;
@@ -80,6 +87,11 @@ export function runTick(nodes: SimNode[], edges: SimEdge[], temp: number, k: num
     const move = Math.min(dl, temp);
     nodes[i].x += (dx[i] / dl) * move;
     nodes[i].y += (dy[i] / dl) * move;
+    const r = Math.hypot(nodes[i].x, nodes[i].y);
+    if (r > maxR) {
+      nodes[i].x *= maxR / r;
+      nodes[i].y *= maxR / r;
+    }
   }
 }
 

@@ -212,6 +212,43 @@ video.audio-view-media {
   font-size: 11.5px;
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+/* A real button, not a ghost text link — QA flagged the original treatment as
+   too subdued to notice at the edge of the metadata row. */
+.audio-retranscribe {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 10px;
+}
+.audio-retranscribe:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text-strong);
+}
+.audio-retranscribe:disabled {
+  opacity: 0.75;
+  cursor: default;
+}
+.audio-retranscribe .spin {
+  animation: audio-retranscribe-spin 1s linear infinite;
+}
+@keyframes audio-retranscribe-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .audio-retranscribe .spin {
+    animation: none;
+  }
 }
 .audio-transcript {
   flex: 1;

@@ -15,7 +15,7 @@ import {
   WorkflowsIcon,
 } from "../icons";
 import { WorkflowGlyph } from "./workflows/workflowGlyph";
-import { isCloudEngine, isExternalEngine, isModelReady } from "./markup";
+import { isCloudEngine, isExternalEngine, isModelReady, trustState } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import EngineModelPicker from "./EngineModelPicker";
@@ -221,22 +221,25 @@ export default function TopBar({
             Check AI
           </button>
         )}
-        {/* The truthful route badge: green only when processing stays local. */}
-        <div
-          className={`privacy-badge${cloud ? " cloud" : ""}`}
-          title={
-            cloud
-              ? "This engine runs in the cloud — prompts and attached context leave this Mac."
-              : "Files and AI processing stay on this Mac."
-          }
-        >
-          {cloud ? (
-            <CloudIcon size={12} />
-          ) : (
-            <span className="status-dot" aria-hidden />
-          )}
-          <span>{cloud ? "Cloud model" : "Local & private"}</span>
-        </div>
+        {/* The truthful route badge — same vocabulary and colour as the
+            status-bar trust chip (workspace/markup.ts trustState), so this room
+            can never say two different things about where its content goes. */}
+        {(() => {
+          const trust = trustState(cloud, s.privacyOn);
+          return (
+            <div
+              className={`privacy-badge ${trust.tone}`}
+              title={trust.title}
+            >
+              {cloud ? (
+                <CloudIcon size={12} />
+              ) : (
+                <span className="status-dot" aria-hidden />
+              )}
+              <span>{trust.label}</span>
+            </div>
+          );
+        })()}
         <button
           className="icon-btn"
           data-tip="Switch theme"

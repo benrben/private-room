@@ -16,39 +16,14 @@ import {
   WorkflowsIcon,
 } from "../icons";
 import { displayName } from "./composer";
+import { isRecordingFile, fileKindLabel } from "../api";
 import DeleteControl from "./DeleteControl";
 import FileRow from "./FileRow";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkArea } from "./types";
 import { LayoutApi } from "../shell/useLayout";
-
-/** True for files that belong to the Recordings lens: engine-made recordings
- * plus imported audio/video (they transcribe in the background too). */
-function isRecordingFile(f: import("../api").FileMeta): boolean {
-  return (
-    f.source === "recording" ||
-    f.mimeType.startsWith("audio/") ||
-    f.mimeType.startsWith("video/")
-  );
-}
-
-/** A short human word for a file's type, from its metadata. */
-function fileKindLabel(f: import("../api").FileMeta): string {
-  if (f.source === "recording") return "recording";
-  const m = f.mimeType;
-  if (m.startsWith("audio/")) return "audio";
-  if (m.startsWith("video/")) return "video";
-  if (m.startsWith("image/")) return "image";
-  if (m === "application/pdf") return "PDF";
-  const lower = f.name.toLowerCase();
-  if (lower.endsWith(".md")) return "note";
-  if (lower.endsWith(".csv") || lower.endsWith(".xlsx")) return "sheet";
-  if (lower.endsWith(".py") || lower.endsWith(".js")) return "script";
-  if (lower.endsWith(".docx")) return "document";
-  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "HTML";
-  return "file";
-}
+import { visibleWorkflows } from "./workflows/selectors";
 
 const AREA_HEADINGS: Record<WorkArea, string> = {
   files: "Library",
@@ -101,7 +76,7 @@ export default function LibraryPane({
   const headerCount = fileArea
     ? s.files.length
     : area === "workflows"
-      ? s.workflows.length
+      ? visibleWorkflows(s.workflows).length
       : area === "scripts"
         ? s.scripts.length
         : area === "recordings"
@@ -528,12 +503,20 @@ function SourcesPanel({
   const available = shownFiles.filter((f) => !attachedIds.has(f.id));
   return (
     <div className="library-scroll" role="group" aria-label="AI sources">
-      <p className="area-nav-intro">
-        Checked files are attached to your next question.{" "}
-        {s.attachments.length === 0
-          ? "With none checked, the AI searches the whole room for relevant passages."
-          : `Answers will draw on ${s.attachments.length} attached source${s.attachments.length === 1 ? "" : "s"}.`}
-      </p>
+      <div className="sources-scope" role="status">
+        <span
+          className={`scope-tag ${s.attachments.length === 0 ? "auto" : "selected"}`}
+        >
+          {s.attachments.length === 0
+            ? "Scope: Whole room"
+            : `Scope: ${s.attachments.length} selected file${s.attachments.length === 1 ? "" : "s"}`}
+        </span>
+        <p className="area-nav-intro">
+          {s.attachments.length === 0
+            ? "With nothing checked, the AI automatically pulls the most relevant passages from every file in this room. Check files below to answer from only those."
+            : "Answers draw only on the checked files — nothing else in the room. Uncheck all to search the whole room again."}
+        </p>
+      </div>
       {attached.length > 0 && (
         <>
           <div className="group-heading">Attached to the next question</div>
@@ -656,7 +639,7 @@ function RecordingsNav({
 function WorkflowsNav({ s, a }: { s: WSState; a: WSActions }) {
   // Per-script auto-workflows (created_by='script') live on the Scripts page —
   // keep them out of the workflow list so a script isn't shown as "· by script".
-  const workflows = s.workflows.filter((w) => w.createdBy !== "script");
+  const workflows = visibleWorkflows(s.workflows);
   return (
     <div className="library-scroll">
       <p className="area-nav-intro">

@@ -93,6 +93,41 @@
   font-size: 0.8rem;
 }
 
+/* One grouped incident instead of N identical error rows. */
+.script-incident {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 1px solid rgba(233, 155, 159, 0.4);
+  background: rgba(233, 155, 159, 0.08);
+  border-radius: 8px;
+}
+.script-incident-body {
+  flex: 1;
+  min-width: 0;
+}
+.script-incident-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--danger);
+}
+.script-incident-cause {
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-family: var(--mono, ui-monospace, monospace);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.script-incident-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
 .script-running {
   display: inline-flex;
   align-items: center;

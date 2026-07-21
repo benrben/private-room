@@ -2,12 +2,22 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import type { PrivacyPreview } from "../apiTypes";
 
+/** Estimated wire size of the text a cloud model would receive. */
+function fmtSize(chars: number): string {
+  const kb = chars / 1024;
+  if (kb < 1) return `${chars} characters`;
+  if (kb < 1024) return `~${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
+  return `~${(kb / 1024).toFixed(1)} MB`;
+}
+
 /** PRIV-1 — the reader's "blocked version": this file's text exactly as a
  * non-local model receives it, placeholders and all. Seeing the door's output
  * with your own eyes is the trust mechanism — no AI judgment to believe, just
- * text to read. */
+ * text to read. It also states the door state (protected vs raw) and the
+ * estimated size, so the preview never *looks* protected when the door is off. */
 export default function CloudView({ fileId }: { fileId: string }) {
   const [preview, setPreview] = useState<PrivacyPreview | null>(null);
+  const [doorOn, setDoorOn] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -21,6 +31,14 @@ export default function CloudView({ fileId }: { fileId: string }) {
       })
       .catch((e) => {
         if (live) setError(String(e));
+      });
+    api
+      .privacyStatus()
+      .then((s) => {
+        if (live) setDoorOn(s.effectiveOn);
+      })
+      .catch(() => {
+        if (live) setDoorOn(null);
       });
     return () => {
       live = false;
@@ -49,10 +67,35 @@ export default function CloudView({ fileId }: { fileId: string }) {
   if (!preview) {
     return <div className="cloudview-empty">Preparing the cloud view…</div>;
   }
+  const size = fmtSize(preview.text.length);
+  const raw = doorOn === false;
   return (
-    <div className="cloudview">
+    <div className={`cloudview${raw ? " cloudview-raw" : ""}`}>
+      <div className="cloudview-head">
+        <span className={`cloudview-badge ${raw ? "danger" : "protected"}`}>
+          {raw ? "Raw cloud payload" : "Protected cloud payload"}
+        </span>
+        <span className="cloudview-size">{size}</span>
+      </div>
       <div className="cloudview-ribbon" role="status">
-        {preview.replacements > 0 ? (
+        {raw ? (
+          <>
+            The privacy door is <b>OFF</b> for this room, so a cloud model
+            receives this file's <b>real content</b> — full names and details.
+            {preview.replacements > 0 ? (
+              <>
+                {" "}
+                The {preview.entitiesHidden} highlighted item
+                {preview.entitiesHidden === 1 ? "" : "s"} below (shown as
+                placeholders) would be hidden if you turned protection on in
+                Settings → Cloud privacy; right now their real values leave
+                instead.
+              </>
+            ) : (
+              ""
+            )}
+          </>
+        ) : preview.replacements > 0 ? (
           <>
             This is exactly what a cloud model receives —{" "}
             <b>
@@ -70,7 +113,7 @@ export default function CloudView({ fileId }: { fileId: string }) {
       <pre className="cloudview-text">
         {parts.map((p, i) =>
           p.mark ? (
-            <mark key={i} className="cloudview-mark">
+            <mark key={i} className={`cloudview-mark${raw ? " exposed" : ""}`}>
               {p.text}
             </mark>
           ) : (

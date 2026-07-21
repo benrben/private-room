@@ -22,6 +22,45 @@ export function isCloudEngine(model: string): boolean {
   return isExternalEngine(model) || isRemoteModel(model);
 }
 
+export type TrustTone = "good" | "warn" | "danger";
+export interface TrustState {
+  tone: TrustTone;
+  label: string;
+  title: string;
+}
+
+/** The room's ONE trust state, derived from the engine (local vs cloud) and the
+ * privacy door (protected vs raw). Every surface that tells the user whether
+ * their content leaves this Mac — the status-bar chip, the top-bar engine
+ * badge — reads from this single function, so they can never say different
+ * things about the same room at the same time.
+ *   • Local only      — the model runs on this Mac; nothing leaves.       (good)
+ *   • Protected cloud — a cloud model, but private details are redacted. (warn)
+ *   • Raw cloud       — a cloud model with the door OPEN; real content leaves. (danger) */
+export function trustState(cloud: boolean, protectedOn: boolean | null): TrustState {
+  if (!cloud) {
+    return {
+      tone: "good",
+      label: "Local only",
+      title: "The AI runs on this Mac — nothing leaves the device.",
+    };
+  }
+  if (protectedOn === false) {
+    return {
+      tone: "danger",
+      label: "Raw cloud",
+      title:
+        "Cloud model with privacy OFF — questions, documents and tool results leave this Mac with real names and details.",
+    };
+  }
+  return {
+    tone: "warn",
+    label: "Protected cloud",
+    title:
+      "Cloud model with the privacy door on — private details are replaced with neutral tags before anything leaves this Mac.",
+  };
+}
+
 /** Is the room's selected model usable right now (so no "download a model"
  * card is warranted)? A local/`:cloud` model must be present in Ollama's live
  * list (matched loosely on the `:tag` boundary). A cloud CLI is ready as soon

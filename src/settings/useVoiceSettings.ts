@@ -12,7 +12,10 @@ import {
  * voice, persisted per room (settings K/V). Saving also reconfigures the
  * live voice singleton so the change applies without reopening the room. */
 export function useVoiceSettings() {
-  const [engine, setEngine] = useState<VoiceEngine>("neural");
+  // Privacy-safe default: on-device voice keeps every spoken sentence on this
+  // Mac. Neural (cloud Edge TTS, which sends the sentence text off-device) is an
+  // explicit opt-in — see the getSetting below.
+  const [engine, setEngine] = useState<VoiceEngine>("device");
   const [neuralVoiceId, setNeuralVoiceId] = useState("");
   const [archetype, setArchetype] = useState<VoiceArchetype>("off");
   const [params, setParams] = useState<VoiceParams>({
@@ -26,8 +29,9 @@ export function useVoiceSettings() {
   useEffect(() => {
     api.listSpeechVoices().then(setVoices).catch(() => {});
     api.getSetting("voice_engine").then((v) => {
-      // Neural is the default; "device" is the explicit opt-out.
-      if (v === "device") setEngine("device");
+      // On-device is the privacy-safe default; "neural" (cloud Edge TTS) is the
+      // explicit opt-in that sends spoken sentence text off this Mac.
+      if (v === "neural") setEngine("neural");
     });
     api.getSetting("voice_neural_id").then((v) => {
       if (v) setNeuralVoiceId(v);

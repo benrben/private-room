@@ -4,6 +4,7 @@ import { WSState } from "../state";
 import { WSActions } from "../actions";
 import { PlusIcon, SparklesIcon, PinIcon } from "../../icons";
 import { WorkflowGlyph } from "./workflowGlyph";
+import { visibleWorkflows } from "./selectors";
 
 type Props = { s: WSState; a: WSActions };
 
@@ -132,10 +133,7 @@ export function WorkflowLibrary({ s, a }: Props) {
 
   // Wave 5 (Idea 13): the per-script auto-workflows (created_by='script') have
   // their own home on the Scripts page — hide them from the workflow library.
-  const visible = useMemo(
-    () => s.workflows.filter((w) => w.createdBy !== "script"),
-    [s.workflows],
-  );
+  const visible = useMemo(() => visibleWorkflows(s.workflows), [s.workflows]);
 
   // Always load templates (empty-state shows them; the toolbar toggle reopens
   // the gallery once you already have workflows).

@@ -1,5 +1,6 @@
 import { useMemo } from "react";
-import type { WorkflowDef, WorkflowNode, WorkflowNodeEvent } from "../../api";
+import type { WorkflowDef, WorkflowNodeEvent } from "../../api";
+import { kindLabel, nodeTitle } from "./kinds";
 
 const NODE_W = 150;
 const NODE_H = 62;
@@ -75,10 +76,6 @@ function layout(def: WorkflowDef) {
   };
 }
 
-function nodeTitle(n: WorkflowNode): string {
-  return (n.label && String(n.label)) || n.kind;
-}
-
 export function PipelineCanvas({
   def,
   status,
@@ -125,7 +122,7 @@ export function PipelineCanvas({
           const cls = ["pipeline-node", st ?? "", selectedId === n.id ? "selected" : ""]
             .filter(Boolean)
             .join(" ");
-          const kindLabel = n.kind.replace(/_/g, " ");
+          const kindText = kindLabel(n.kind);
           return (
             <div
               key={n.id}
@@ -134,7 +131,7 @@ export function PipelineCanvas({
               role="button"
               tabIndex={0}
               aria-pressed={selectedId === n.id}
-              aria-label={`${kindLabel} step: ${nodeTitle(n)}${st ? `, ${st}` : ""}`}
+              aria-label={`${kindText} step: ${nodeTitle(n)}${st ? `, ${st}` : ""}`}
               onClick={() => onSelect?.(n.id)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
@@ -144,7 +141,7 @@ export function PipelineCanvas({
               }}
               title={status?.[n.id]?.peek ?? undefined}
             >
-              <div className="pipeline-node-kind">{kindLabel}</div>
+              <div className="pipeline-node-kind">{kindText}</div>
               <div className="pipeline-node-label">{nodeTitle(n)}</div>
               {st && <div className="pipeline-node-status">{st}</div>}
             </div>

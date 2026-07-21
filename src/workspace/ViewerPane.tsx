@@ -145,11 +145,11 @@ export default function ViewerPane({
                   title={
                     cloudView
                       ? "Back to the normal view"
-                      : "See this file exactly as a cloud model would receive it"
+                      : "Preview this file exactly as a cloud model would receive it — nothing is sent"
                   }
                   onClick={() => setCloudView(!cloudView)}
                 >
-                  {cloudView ? "Normal view" : "Cloud view"}
+                  {cloudView ? "Close preview" : "Preview cloud payload"}
                 </button>
               )}
               {!cloudView && a.editModeOf(openFile.content) && (

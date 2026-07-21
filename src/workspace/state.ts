@@ -89,6 +89,9 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [memoryDraftCat, setMemoryDraftCat] = useState("");
   const [saveDraft, setSaveDraft] = useState<{ id: string; name: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  // Deep-link target when Settings opens (a section id like "set-cloud-privacy",
+  // e.g. from the status-bar trust chip); null = open at the top.
+  const [settingsSection, setSettingsSection] = useState<string | null>(null);
   const [mcpTools, setMcpTools] = useState<string[]>([]);
   // Full per-server statuses (drives the Connectors area's count badge).
   const [mcpStatuses, setMcpStatuses] = useState<McpServerStatus[]>([]);
@@ -338,7 +341,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     staleFile, setStaleFile, editModeRef, editorDirtyRef, memAutoSaveRef,
     memoryDraft, setMemoryDraft, memoryDraftCat, setMemoryDraftCat,
     saveDraft, setSaveDraft,
-    showSettings, setShowSettings, mcpTools, setMcpTools,
+    showSettings, setShowSettings, settingsSection, setSettingsSection, mcpTools, setMcpTools,
     mcpStatuses, setMcpStatuses,
     mcpDialogDismissed, setMcpDialogDismissed, approvingMcp, setApprovingMcp,
     showAddLink, setShowAddLink, linkUrl, setLinkUrl, importingLink, setImportingLink,

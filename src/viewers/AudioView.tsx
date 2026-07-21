@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../api";
+import { RefreshIcon } from "../icons";
 import { base64ToBytes } from "./util";
 import { normalizeForMatch } from "./highlight";
 
@@ -12,6 +14,8 @@ import { normalizeForMatch } from "./highlight";
 
 interface Props {
   kind: "audio" | "video";
+  /** The room file id — lets the viewer re-run transcription on demand. */
+  fileId: string;
   mime: string;
   dataB64: string;
   /** ADD-24: token for the roommedia:// streaming protocol (seekable, any
@@ -74,10 +78,37 @@ function parseRows(text: string | null): Row[] {
     });
 }
 
-export default function AudioView({ kind, mime, dataB64, mediaToken, text, target, transcribing }: Props) {
+export default function AudioView({
+  kind,
+  fileId,
+  mime,
+  dataB64,
+  mediaToken,
+  text,
+  target,
+  transcribing,
+}: Props) {
   const mediaRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [activeIdx, setActiveIdx] = useState(-1);
+  // Local "just kicked off a re-transcribe" flag: gives instant feedback in the
+  // window before the backend's stt-progress "started" event flips `transcribing`
+  // true, and self-clears so a same-text result can't leave it stuck.
+  const [kicked, setKicked] = useState(false);
+  const [retranscribeErr, setRetranscribeErr] = useState<string | null>(null);
+  const busy = transcribing || kicked;
+  async function retranscribe() {
+    setRetranscribeErr(null);
+    setKicked(true);
+    try {
+      await api.retranscribeFile(fileId);
+    } catch (e) {
+      setKicked(false);
+      setRetranscribeErr(String(e));
+      return;
+    }
+    window.setTimeout(() => setKicked(false), 6000);
+  }
   // A file the decoder rejects (empty, truncated, unsupported codec) must say
   // so — "No transcript yet" on a 0-duration recording reads as "keep waiting"
   // for audio that will never play or transcribe.
@@ -226,17 +257,35 @@ export default function AudioView({ kind, mime, dataB64, mediaToken, text, targe
         // Transcript readiness is a first-class state, named right under the
         // player — scanning it must never require reading the empty-hint prose.
         <div className="audio-meta">
-          Length {fmtDur(dur)}
-          {" · "}
-          {hasSpeech
-            ? "Transcript ready"
-            : transcribing
+          <span>
+            Length {fmtDur(dur)}
+            {" · "}
+            {busy
               ? "Transcribing on this Mac…"
-              : rows.length > 0
-                ? "No speech detected"
-                : "No transcript yet"}
+              : hasSpeech
+                ? "Transcript ready"
+                : rows.length > 0
+                  ? "No speech detected"
+                  : "No transcript yet"}
+          </span>
+          {!mediaDead && (
+            <button
+              className="btn-ic audio-retranscribe"
+              disabled={busy}
+              onClick={() => void retranscribe()}
+              title={
+                hasSpeech
+                  ? "Run the on-device transcriber again, replacing this transcript"
+                  : "Run the on-device transcriber on this file"
+              }
+            >
+              <RefreshIcon size={12} className={busy ? "spin" : undefined} />
+              {busy ? "Transcribing…" : hasSpeech ? "Re-transcribe" : "Transcribe"}
+            </button>
+          )}
         </div>
       )}
+      {retranscribeErr && <div className="gate-error">{retranscribeErr}</div>}
       {hasSpeech ? (
         <div className="audio-transcript" ref={listRef}>
           {rows.map((r, i) =>
@@ -270,7 +319,7 @@ export default function AudioView({ kind, mime, dataB64, mediaToken, text, targe
           No speech detected — this {kind === "video" ? "video" : "recording"}{" "}
           appears to be silent or contains no recognizable speech.
         </div>
-      ) : transcribing ? (
+      ) : busy ? (
         <div className="empty-hint">
           Transcribing on this Mac… the transcript will appear here on its
           own — you can keep working meanwhile.

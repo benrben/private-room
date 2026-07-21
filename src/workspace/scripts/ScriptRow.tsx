@@ -12,6 +12,16 @@ function fmtWhen(ts: string | null | undefined): string {
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
 }
 
+/** The human cause line from a script's error text — the executor prefixes
+ * "The script failed (exit N):" then the stderr tail; show the most telling
+ * line rather than the whole dump. */
+function causeLine(err: string): string {
+  const lines = err.split("\n").map((l) => l.trim()).filter(Boolean);
+  // Prefer the last non-empty stderr line (usually the actual exception);
+  // fall back to the first line.
+  return lines[lines.length - 1] || lines[0] || err;
+}
+
 /** One script's row on the Scripts page: identity + deps/inputs/outputs chips,
  * approval state, last-run status, and Run / Schedule / History actions. */
 export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActions }) {
@@ -56,6 +66,10 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
             <span className="script-running">
               <span className="rec-dot pulsing" /> {live.label}
             </span>
+          ) : sc.consecutiveFailures >= 1 ? (
+            <span className="wf-badge dot-err">
+              Failed {sc.consecutiveFailures}×
+            </span>
           ) : lastStatus ? (
             <span className={`wf-badge ${lastStatus === "error" ? "dot-err" : "dot-ok"}`}>
               {lastStatus}
@@ -66,6 +80,44 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
           )}
         </span>
       </div>
+
+      {/* ONE incident instead of N identical error rows: cause + a single
+          recovery path. The old raw-error-times-5 spam lived here. */}
+      {!live && sc.consecutiveFailures >= 1 && sc.lastError && (
+        <div className="script-incident">
+          <div className="script-incident-body">
+            <div className="script-incident-title">
+              This script failed {sc.consecutiveFailures}
+              {sc.consecutiveFailures === 1 ? " time" : " times in a row — same error"}
+            </div>
+            <div className="script-incident-cause" title={sc.lastError}>
+              {causeLine(sc.lastError)}
+            </div>
+          </div>
+          <div className="script-incident-actions">
+            <button
+              className="subtle btn-ic"
+              title="Open the script to fix the cause above"
+              onClick={() => void a.viewFile(sc.fileId)}
+            >
+              Open to fix
+            </button>
+            <button
+              className="subtle btn-ic"
+              disabled={!!live}
+              title={
+                sc.changedSinceApproval
+                  ? "You edited the script — run the fixed version"
+                  : "Run again"
+              }
+              onClick={() => void a.runScript(sc.fileId)}
+            >
+              <PlayIcon size={12} />{" "}
+              {sc.changedSinceApproval ? "Run fixed version" : "Run again"}
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="script-chips">
         {sc.deps.length > 0 && (

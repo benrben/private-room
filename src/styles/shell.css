@@ -123,8 +123,10 @@
   gap: 3px;
 }
 
-/* Truthful data-route badge: green when everything stays on this Mac, amber
-   when the chosen engine sends content to the cloud. */
+/* Truthful data-route badge — the same three trust tones as the status-bar
+   trust chip (workspace/markup.ts trustState): good (local) / warn (protected
+   cloud) / danger (raw cloud). One vocabulary, one colour system, everywhere
+   this room states whether content leaves the Mac. */
 .privacy-badge {
   display: flex;
   align-items: center;
@@ -140,10 +142,15 @@
   font-size: 11.5px;
   white-space: nowrap;
 }
-.privacy-badge.cloud {
+.privacy-badge.warn {
   border-color: color-mix(in srgb, var(--amber) 32%, var(--line));
   color: var(--amber);
   background: color-mix(in srgb, var(--amber) 8%, transparent);
+}
+.privacy-badge.danger {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
 }
 .status-dot {
   width: 6px;
@@ -153,9 +160,13 @@
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 12%, transparent);
   flex: 0 0 auto;
 }
-.privacy-badge.cloud .status-dot {
+.privacy-badge.warn .status-dot {
   background: var(--amber);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber) 12%, transparent);
+}
+.privacy-badge.danger .status-dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 12%, transparent);
 }
 
 /* Compact engine pill in the top bar (popover unchanged). */
@@ -280,7 +291,7 @@
   min-height: 0;
   min-width: 0;
   display: grid;
-  grid-template-columns: 46px minmax(0, 1fr);
+  grid-template-columns: 68px minmax(0, 1fr);
 }
 
 .activity-rail {
@@ -307,17 +318,33 @@
   flex: 0 0 auto;
 }
 .rail-button {
-  width: 35px;
-  height: 35px;
+  width: 58px;
+  min-height: 44px;
   flex: 0 0 auto;
-  display: grid;
-  place-items: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
   color: var(--faint);
   background: transparent;
   border: 0;
   border-radius: var(--radius);
-  padding: 0;
+  padding: 6px 2px;
   position: relative;
+}
+/* The persistent text label under each rail icon — so a naïve user can tell
+   Map / Scripts / Memory / Connectors apart without hovering. Inherits the
+   button colour, so it brightens with the active/pressed state. */
+.rail-label {
+  font-size: 9.5px;
+  line-height: 1.05;
+  letter-spacing: 0.01em;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: inherit;
 }
 .rail-button:hover {
   color: var(--text);
@@ -415,9 +442,9 @@
 /* ----- the three-pane grid ----- */
 
 .pane-grid {
-  --left-track: 21fr;
-  --center-track: 50fr;
-  --right-track: 29fr;
+  --left-track: 18fr;
+  --center-track: 58fr;
+  --right-track: 24fr;
   --split-a: 5px;
   --split-b: 5px;
   min-width: 0;
@@ -427,6 +454,17 @@
     minmax(0, var(--left-track)) var(--split-a) minmax(0, var(--center-track))
     var(--split-b) minmax(0, var(--right-track));
   background: var(--bg);
+  /* Drawer feel: collapsing/expanding the AI pane eases the tracks. Suppressed
+     mid-drag so the splitter tracks the cursor 1:1, and for reduced-motion. */
+  transition: grid-template-columns 0.16s ease;
+}
+.pane-grid.is-dragging {
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-grid {
+    transition: none;
+  }
 }
 .pane {
   min-width: 0;
@@ -648,8 +686,11 @@ body.resizing-col * {
   white-space: nowrap;
   flex: 0 0 auto;
 }
-.local-mini.cloud {
+.local-mini.warn {
   color: var(--amber);
+}
+.local-mini.danger {
+  color: var(--danger);
 }
 
 /* ----- status bar ----- */
@@ -701,9 +742,26 @@ body.resizing-col * {
 .status-item.warn {
   color: var(--amber);
 }
+.status-item.danger {
+  color: var(--danger);
+}
+/* The trust chip is the room's primary safety readout — give it a touch more
+   weight than the neutral status items, and let "Raw cloud" carry a faint fill
+   so the one dangerous state actually catches the eye. */
+.status-trust {
+  font-weight: 600;
+  cursor: pointer;
+}
+.status-trust.danger {
+  background: rgba(233, 155, 159, 0.16);
+}
 button.status-item:hover {
   color: var(--text);
   background: var(--hover);
+}
+button.status-trust.danger:hover {
+  color: var(--danger);
+  background: rgba(233, 155, 159, 0.26);
 }
 
 /* ----- library pane internals ----- */
@@ -914,6 +972,29 @@ button.status-item:hover {
   color: var(--muted);
   font-size: 11px;
   line-height: 1.5;
+}
+/* Name the AI's source scope explicitly, so "nothing checked" reads as a chosen
+   mode ("Whole room") rather than an accidental empty selection. */
+.sources-scope {
+  margin: 6px 7px 10px;
+}
+.sources-scope .area-nav-intro {
+  margin: 6px 0 0;
+}
+.scope-tag {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.scope-tag.auto {
+  color: var(--amber);
+  background: rgba(223, 188, 114, 0.16);
+}
+.scope-tag.selected {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
 }
 .area-nav-row {
   width: 100%;
@@ -1508,6 +1589,69 @@ button.status-item:hover {
 .home-list {
   border-top: 1px solid var(--line-soft);
 }
+
+/* Room Brief: the action-first band at the top of Home. Each row states an
+   issue and resolves it in one click; the left dot carries the severity. */
+.room-brief .brief-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.brief-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel-2);
+  font-size: 12.5px;
+  color: var(--text);
+}
+.brief-row.danger {
+  border-color: rgba(233, 155, 159, 0.4);
+  background: rgba(233, 155, 159, 0.08);
+}
+.brief-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.brief-row.danger .brief-dot {
+  background: var(--danger);
+}
+.brief-row.warn .brief-dot {
+  background: var(--amber);
+}
+.brief-row.info .brief-dot {
+  background: var(--accent);
+}
+.brief-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.45;
+}
+.brief-cta {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 11px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.brief-cta:hover {
+  border-color: var(--accent);
+  color: var(--text-strong);
+}
+.brief-row.danger .brief-cta {
+  border-color: var(--danger);
+  color: var(--danger);
+}
 .home-row {
   width: 100%;
   min-height: 50px;
@@ -1608,6 +1752,17 @@ button.status-item:hover {
   font-size: 12.5px;
   color: var(--text);
   line-height: 1.5;
+}
+.memory-view .memory-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.memory-view .memory-row-when {
+  font-size: 11px;
+  color: var(--faint);
 }
 .memory-view .memory-row.editing {
   align-items: center;

@@ -22,7 +22,10 @@
   --text: #eeeaf2;
   --text-strong: #fbf9fc;
   --muted: #aaa5b0;
-  --faint: #77727e;
+  /* --faint is the smallest secondary text (timestamps, hints, meta). The old
+     #77727e sat ~3.7:1 on the panels — below the WCAG 1.4.3 minimum of 4.5:1
+     for normal text. Lifted to clear it on --bg/--panel/--panel-2. */
+  --faint: #928d9a;
   --line: #312f38;
   --line-soft: #27262d;
   --hover: #28262f;
@@ -83,7 +86,10 @@
   --text: #353139;
   --text-strong: #201d23;
   --muted: #736d78;
-  --faint: #96909b;
+  /* Light-mode --faint was #96909b (~2.9:1 on white) — well under WCAG 4.5:1.
+     Darkened to clear the minimum on --panel/--panel-2 (converges toward
+     --muted, which legibility here is worth). */
+  --faint: #6f6974;
   --line: #d9d5dc;
   --line-soft: #e6e2e8;
   --hover: #ebe8ed;

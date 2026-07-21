@@ -1,4 +1,5 @@
 import type { WorkflowNode, WorkflowEdge } from "../../api";
+import { KIND_LABELS, kindLabel } from "./kinds";
 
 type Props = {
   node: WorkflowNode;
@@ -41,25 +42,9 @@ const TRANSFORM_OPS = [
   ["strip_html", "Strip HTML tags"],
 ];
 
-/** Every engine-supported step kind and its human label. */
-const NODE_KINDS: [string, string][] = [
-  ["generate", "Generate text"],
-  ["summarize_file", "Summarize a file"],
-  ["file_pass", "Full-file pass"],
-  ["for_each_file", "For each file…"],
-  ["agent_run", "Ask the agent"],
-  ["extract", "Extract fields"],
-  ["route", "Route by content"],
-  ["vote", "Vote / consensus"],
-  ["refine", "Refine (critique loop)"],
-  ["plan_and_map", "Plan & map"],
-  ["transform", "Transform text"],
-  ["merge", "Merge branches"],
-  ["http_fetch", "Fetch a URL"],
-  ["script_run", "Run a script"],
-  ["save_file", "Save a file"],
-  ["condition", "Condition"],
-];
+/** Every engine-supported step kind and its human label — from the shared
+ * kinds map so the dropdown, the canvas, and the backend backfill never drift. */
+const NODE_KINDS: [string, string][] = Object.entries(KIND_LABELS);
 
 /** Fields each kind needs seeded on a kind switch. serde requires the required
  * fields to even parse the def, so seeding them keeps validation showing
@@ -95,7 +80,7 @@ const MODEL_KINDS = new Set([
 ]);
 
 function nodeName(n: WorkflowNode): string {
-  return (n.label && String(n.label)) || n.kind;
+  return (n.label && String(n.label).trim()) || kindLabel(n.kind);
 }
 
 /** Parse/format a comma-separated string ⇄ string[] (fields, labels). */
@@ -185,7 +170,12 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
     <div className="node-param-sheet">
       <label>
         Step name
-        <input type="text" value={String(node.label ?? "")} onChange={(e) => set("label", e.target.value)} />
+        <input
+          type="text"
+          value={String(node.label ?? "")}
+          placeholder={kindLabel(node.kind)}
+          onChange={(e) => set("label", e.target.value)}
+        />
       </label>
 
       <label>

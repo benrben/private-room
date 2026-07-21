@@ -92,7 +92,9 @@ let cfg: VoiceConfig = {
   params: { ...ARCHETYPE_DEFAULTS.off },
   voiceId: null,
   autoSpeak: false,
-  engine: "neural",
+  // Privacy-safe default: on-device until the user explicitly opts into neural
+  // (cloud Edge TTS). Matches useVoiceSettings' default.
+  engine: "device",
   neuralVoiceId: null,
 };
 

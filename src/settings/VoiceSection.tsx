@@ -37,8 +37,8 @@ const ARCHETYPES: [VoiceArchetype, string][] = [
 ];
 
 const ENGINES: [VoiceEngine, string][] = [
-  ["neural", "Neural (default)"],
-  ["device", "On-device"],
+  ["device", "On-device (default)"],
+  ["neural", "Neural · cloud"],
 ];
 
 /** Idea 3: "Spoken voice" — labeled to avoid colliding with the writing-style
@@ -89,6 +89,22 @@ export default function VoiceSection({
         Give answers a voice. Turn it on per answer with ▶ Play, or for every
         answer with the speaker toggle above the chat.
       </p>
+      {/* The active data boundary, stated plainly and first — the engine picker
+          below changes it, but a naïve user shouldn't have to infer the current
+          state from which radio button is highlighted. */}
+      <div className={`voice-boundary${engine === "neural" ? " danger" : " good"}`}>
+        {engine === "neural" ? (
+          <>
+            <b>Current voice: Neural · cloud</b> — the text of each spoken
+            sentence leaves this Mac, sent to Microsoft's Edge TTS service.
+          </>
+        ) : (
+          <>
+            <b>Current voice: On-device</b> — nothing about your answers
+            leaves this Mac.
+          </>
+        )}
+      </div>
       <label className="settings-label">Voice engine</label>
       <div className="temp-row" role="radiogroup" aria-label="Voice engine">
         {ENGINES.map(([id, label]) => (

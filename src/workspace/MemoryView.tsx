@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { api, RoomInfo } from "../api";
 import { CheckIcon, CloseIcon, MemoryIcon, MicIcon, PencilIcon } from "../icons";
+import { formatWhen } from "./composer";
 import DeleteControl from "./DeleteControl";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -15,6 +16,14 @@ const MEMORY_GROUPS: { key: string | null; label: string }[] = [
   { key: null, label: "Other" },
 ];
 const CATEGORY_OPTIONS = ["preference", "fact", "project", "instruction"];
+const KNOWN_CATS = new Set(CATEGORY_OPTIONS);
+
+/** Which display group a memory belongs to: its category when it is one of the
+ * known buckets, otherwise the catch-all "Other" (null) group. This keeps the
+ * grouping EXHAUSTIVE — a memory with a null OR an unrecognized category still
+ * renders, so the count can never disagree with what's on screen. */
+const groupKey = (m: { category: string | null }): string | null =>
+  m.category && KNOWN_CATS.has(m.category) ? m.category : null;
 
 /** The Memory & Scratch Pad area: durable, user-visible AI context with
  * add/edit/delete/categories (moved intact from the old sidebar panel),
@@ -107,14 +116,14 @@ export default function MemoryView({
         )}
 
         {MEMORY_GROUPS.filter((g) =>
-          s.memories.some((m) => (m.category ?? null) === g.key),
+          s.memories.some((m) => groupKey(m) === g.key),
         ).map((g, _, shown) => (
           <section key={g.key ?? "other"} className="memory-group">
             {!(shown.length === 1 && g.key === null) && (
               <div className="group-heading">{g.label}</div>
             )}
             {s.memories
-              .filter((m) => (m.category ?? null) === g.key)
+              .filter((m) => groupKey(m) === g.key)
               .map((m) =>
                 s.editingMemory?.id === m.id ? (
                   <div key={m.id} className="memory-row editing">
@@ -168,11 +177,16 @@ export default function MemoryView({
                   </div>
                 ) : (
                   <div key={m.id} className="memory-row">
-                    <span dir="auto">
-                      {m.content}
-                      {m.category && (
-                        <span className="memory-cat-pill">{m.category}</span>
-                      )}
+                    <span className="memory-row-body" dir="auto">
+                      <span className="memory-row-text">
+                        {m.content}
+                        {m.category && (
+                          <span className="memory-cat-pill">{m.category}</span>
+                        )}
+                      </span>
+                      <span className="memory-row-when">
+                        Added {formatWhen(m.createdAt)}
+                      </span>
                     </span>
                     <span className="memory-actions">
                       <button

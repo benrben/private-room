@@ -9,7 +9,7 @@ import {
   FocusIcon,
   SparkIcon,
 } from "../icons";
-import { isCloudEngine } from "./markup";
+import { isCloudEngine, trustState } from "./markup";
 import ChatPane from "./ChatPane";
 import StudioShelf from "./StudioShelf";
 import { WSState } from "./state";
@@ -52,6 +52,8 @@ export default function AiPane({
           className="assistant-tab"
           role="tab"
           aria-selected={s.aiTab === "chat"}
+          aria-label="Chat"
+          data-tip="Chat"
           onClick={() => s.setAiTab("chat")}
         >
           <ChatBubbleIcon size={14} />
@@ -61,6 +63,8 @@ export default function AiPane({
           className="assistant-tab"
           role="tab"
           aria-selected={s.aiTab === "studio"}
+          aria-label="Studio"
+          data-tip="Studio"
           onClick={() => s.setAiTab("studio")}
         >
           <SparkIcon size={14} />
@@ -70,6 +74,14 @@ export default function AiPane({
           className="assistant-tab"
           role="tab"
           aria-selected={s.aiTab === "activity"}
+          aria-label={
+            pendingApprovals > 0
+              ? "Activity — something needs your approval"
+              : jobsRunning > 0
+                ? "Activity — background work is running"
+                : "Activity"
+          }
+          data-tip="Activity"
           onClick={() => s.setAiTab("activity")}
         >
           <ActivityIcon size={14} />
@@ -77,6 +89,7 @@ export default function AiPane({
           {(pendingApprovals > 0 || jobsRunning > 0) && (
             <span
               className={`tab-dot${pendingApprovals === 0 ? " busy" : ""}`}
+              aria-hidden="true"
               title={
                 pendingApprovals > 0
                   ? "Something needs your approval"
@@ -135,14 +148,22 @@ export default function AiPane({
                 </button>
               )}
             </span>
-            <span className={`local-mini${cloud ? " cloud" : ""}`}>
-              {cloud ? (
-                <CloudIcon size={11} />
-              ) : (
-                <span className="status-dot" aria-hidden />
-              )}
-              <span>{cloud ? "Cloud" : "On device"}</span>
-            </span>
+            {(() => {
+              // Same vocabulary as the top-bar badge and status-bar trust chip
+              // (workspace/markup.ts trustState) — this pill must never say
+              // something different about the same room's data route.
+              const trust = trustState(cloud, s.privacyOn);
+              return (
+                <span className={`local-mini ${trust.tone}`} title={trust.title}>
+                  {cloud ? (
+                    <CloudIcon size={11} />
+                  ) : (
+                    <span className="status-dot" aria-hidden />
+                  )}
+                  <span>{trust.label}</span>
+                </span>
+              );
+            })()}
           </div>
           <ChatPane s={s} a={a} info={info} />
         </>

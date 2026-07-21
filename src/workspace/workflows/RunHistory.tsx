@@ -173,9 +173,22 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
     return <div className="caption">No runs yet.</div>;
   }
 
+  // Collapse a LEADING streak of identical failures (newest-first) into one
+  // representative row + a count, so a script that failed 5× the same way reads
+  // as a single incident here too — not five identical rows.
+  const firstErr = runs[0]?.error ?? "";
+  let lead = 0;
+  for (const r of runs) {
+    const failed = r.status === "error" || r.status === "failed";
+    if (!failed || (r.error ?? "") !== firstErr) break;
+    lead++;
+  }
+  const collapsed = lead >= 2 ? lead : 0;
+  const shown = collapsed ? [runs[0], ...runs.slice(lead)] : runs;
+
   return (
     <div className="run-history">
-      {runs.map((r) => {
+      {shown.map((r, idx) => {
         const expanded = openRun === r.id;
         return (
           <div key={r.id} className="run-row">
@@ -191,6 +204,12 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
               {r.error && <span style={{ color: "#b33" }}>{r.error}</span>}
               <span aria-hidden style={{ opacity: 0.5 }}>{expanded ? "▾" : "▸"}</span>
             </button>
+            {idx === 0 && collapsed > 0 && (
+              <div className="run-step caption">
+                + {collapsed - 1} earlier run{collapsed - 1 === 1 ? "" : "s"} failed
+                the same way
+              </div>
+            )}
             {expanded && (
               <div>
                 {(artifacts[r.id] ?? []).map((a, i) =>

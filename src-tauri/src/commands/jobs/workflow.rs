@@ -2195,6 +2195,56 @@ fn parse_def(v: &serde_json::Value) -> Result<WorkflowDef, String> {
     })
 }
 
+/// Human label for a step kind — mirrors `KIND_LABELS` in
+/// `src/workspace/workflows/kinds.ts`. Kept in sync so the stored name and the
+/// UI never diverge.
+fn human_kind_label(kind: &str) -> String {
+    match kind {
+        "generate" => "Generate text",
+        "summarize_file" => "Summarize a file",
+        "file_pass" => "Full-file pass",
+        "for_each_file" => "For each file",
+        "agent_run" => "Ask the agent",
+        "extract" => "Extract fields",
+        "route" => "Route by content",
+        "vote" => "Vote / consensus",
+        "refine" => "Refine (critique loop)",
+        "plan_and_map" => "Plan & map",
+        "transform" => "Transform text",
+        "merge" => "Merge branches",
+        "http_fetch" => "Fetch a URL",
+        "script_run" => "Run a script",
+        "save_file" => "Save a file",
+        "condition" => "Condition",
+        other => return other.replace('_', " "),
+    }
+    .to_string()
+}
+
+/// Ensure every node in a definition JSON carries a non-empty human `label`.
+/// AI-composed definitions (and the agent's `save_workflow` tool) emit only
+/// `id` + `kind`, so their steps would open with a blank "Step name" field even
+/// though the canvas shows the kind. Backfilling the raw JSON at persist time —
+/// rather than the parsed struct, which isn't what we store — makes the saved
+/// name real and consistent across the canvas, the inspector, and validation.
+fn backfill_node_labels(def_val: &mut serde_json::Value) {
+    let Some(nodes) = def_val.get_mut("nodes").and_then(|n| n.as_array_mut()) else {
+        return;
+    };
+    for node in nodes {
+        let Some(obj) = node.as_object_mut() else { continue };
+        let blank = obj
+            .get("label")
+            .and_then(|l| l.as_str())
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+        if blank {
+            let kind = obj.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+            obj.insert("label".into(), serde_json::Value::String(human_kind_label(&kind)));
+        }
+    }
+}
+
 /// Parse a binding Value, defaulting to general on absence/malformed input.
 fn parse_binding(v: Option<&serde_json::Value>) -> WorkflowBinding {
     v.and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -2291,11 +2341,12 @@ pub async fn save_workflow(
     name: String,
     description: Option<String>,
     emoji: Option<String>,
-    definition: serde_json::Value,
+    mut definition: serde_json::Value,
     binding: Option<serde_json::Value>,
     created_by: Option<String>,
     schedule: Option<ScheduleArg>,
 ) -> Result<String, String> {
+    backfill_node_labels(&mut definition);
     let def = parse_def(&definition)?;
     let binding = parse_binding(binding.as_ref());
     let errs = validate_workflow_inner(state.inner(), &def, &binding).await;
@@ -2338,7 +2389,8 @@ pub async fn update_workflow(
     schedule: Option<ScheduleArg>,
 ) -> Result<(), String> {
     let current = state.with_room(|room| db::get_workflow(&room.conn, &id))?;
-    let def_val = definition.clone().unwrap_or_else(|| current.definition.clone());
+    let mut def_val = definition.clone().unwrap_or_else(|| current.definition.clone());
+    backfill_node_labels(&mut def_val);
     let def = parse_def(&def_val)?;
     let binding_val = binding.clone().unwrap_or_else(|| current.binding.clone());
     let binding_obj = parse_binding(Some(&binding_val));
@@ -2596,10 +2648,11 @@ pub(crate) async fn agent_save_workflow(
     if name.is_empty() {
         return Err("save_workflow needs a `name`.".into());
     }
-    let definition = args
+    let mut definition = args
         .get("definition")
         .cloned()
         .ok_or("save_workflow needs a `definition` object.")?;
+    backfill_node_labels(&mut definition);
     let def = parse_def(&definition)?;
     let binding = parse_binding(args.get("binding"));
     let errs = validate_workflow_inner(state, &def, &binding).await;
@@ -2667,7 +2720,9 @@ fn compose_prompt(description: &str) -> String {
          run), \"run_input\" (the file the workflow is invoked on — file binding only). \
          `op` must be one of: contains, not_contains, is_empty, not_empty, \
          new_files_since_last_run.\n\
-         Each node needs a unique \"id\" and \"kind\". edges are [{{\"from\",\"to\",\"branch\"?}}] \
+         Each node needs a unique \"id\", a \"kind\", and a short \"label\" — 2-4 words \
+         in the USER'S language describing what THIS step does for them (e.g. \
+         \"Find new tickers\", \"Append to dashboard\"), NOT the kind name. edges are [{{\"from\",\"to\",\"branch\"?}}] \
          (branch \"then\"/\"else\" off a condition, or one of a route's labels off a route; \
          omit branch otherwise). Parallel branches are just several edges out of one node, \
          re-joined by a later node (e.g. a merge). Prompts may use {{{{input}}}} \
@@ -2678,8 +2733,8 @@ fn compose_prompt(description: &str) -> String {
          For a schedule use \"schedule\":{{\"kind\":\"daily\",\"param\":\"08:00\"}} \
          (kind interval|daily|weekly).\n\n\
          Example: {{\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"description\":\"Digest new files each morning.\",\
-         \"definition\":{{\"version\":1,\"nodes\":[{{\"id\":\"gen\",\"kind\":\"generate\",\"model\":\"auto\",\
-         \"prompt\":\"Digest the files:\\n{{{{files}}}}\"}},{{\"id\":\"save\",\"kind\":\"save_file\",\
+         \"definition\":{{\"version\":1,\"nodes\":[{{\"id\":\"gen\",\"kind\":\"generate\",\"label\":\"Write the digest\",\"model\":\"auto\",\
+         \"prompt\":\"Digest the files:\\n{{{{files}}}}\"}},{{\"id\":\"save\",\"kind\":\"save_file\",\"label\":\"Save today's digest\",\
          \"name_template\":\"Digest {{{{date}}}}\",\"format\":\"html\",\"mode\":\"create\"}}],\
          \"edges\":[{{\"from\":\"gen\",\"to\":\"save\"}}]}},\"schedule\":{{\"kind\":\"daily\",\"param\":\"08:00\"}}}}\n\n\
          The workflow the user wants: {description}"
@@ -2742,10 +2797,11 @@ pub async fn compose_workflow(
                 continue;
             }
         };
-        let Some(definition) = val.get("definition").cloned() else {
+        let Some(mut definition) = val.get("definition").cloned() else {
             last_err = "the JSON had no `definition` object".into();
             continue;
         };
+        backfill_node_labels(&mut definition);
         let def = match parse_def(&definition) {
             Ok(d) => d,
             Err(e) => {
@@ -2797,7 +2853,8 @@ pub(crate) async fn agent_update_workflow(
         .or_else(|| args["name"].as_str())
         .unwrap_or_default();
     let current = state.with_room(|room| db::find_workflow(&room.conn, key))?;
-    let def_val = args.get("definition").cloned().unwrap_or_else(|| current.definition.clone());
+    let mut def_val = args.get("definition").cloned().unwrap_or_else(|| current.definition.clone());
+    backfill_node_labels(&mut def_val);
     let def = parse_def(&def_val)?;
     let binding_val = args.get("binding").cloned().unwrap_or_else(|| current.binding.clone());
     let binding = parse_binding(Some(&binding_val));
@@ -2991,8 +3048,16 @@ pub(crate) async fn agent_test_workflow(
             wf.name
         ),
     };
+    // A machine-checkable gate so the model can't paraphrase a failing run into
+    // "Fixed". Only a real terminal `done` counts as validated; a parked script
+    // (needs the user's approval) did NOT validate anything.
+    let trailer = match status.as_str() {
+        "done" => "VALIDATED: yes — every step ran to completion. You may now tell the user this works and the draft is ready to review & activate.",
+        "paused" => "VALIDATED: no — a script step parked for the user's approval, so this run did NOT validate the workflow. Do NOT say it's fixed or works. Tell the user to review and run/approve it on the Scripts page; a script can only be confirmed by an approved run.",
+        _ => "VALIDATED: no — this run did not succeed. Fix the failing step with update_workflow and test again. Do NOT tell the user it's fixed or ready until a test_workflow returns VALIDATED: yes.",
+    };
     Ok(clamp_test_report(format!(
-        "{header}\nSteps:\n{}\n\nThe workflow is still a DRAFT — fix any failing step with update_workflow and test again, or tell the user it's ready to activate.",
+        "{header}\nSteps:\n{}\n\n{trailer}\n\nThe workflow stays a DRAFT for the user to review and activate.",
         lines.join("\n")
     )))
 }
@@ -3020,7 +3085,7 @@ pub fn workflow_tools_specs() -> Vec<serde_json::Value> {
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Optional: a workflow name to fetch its full definition"}}}}}),
         serde_json::json!({"type": "function", "function": {"name": "save_workflow",
-            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph of nodes + edges [{from, to, branch?}]. Model nodes: generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, for_each_file {select, instruction} (runs on EACH selected file), agent_run {question}, extract {fields:[...]} (structured JSON out of {{input}}), route {prompt, labels:[...]} (tags input with one label → edges use branch:<label>, an N-way condition), vote {prompt, samples, mode:concat|majority}, refine {prompt, rubric, max_rounds} (generate→critique→revise loop), plan_and_map {objective, max_workers} (decompose→work→synthesize). Deterministic nodes (no model): transform {op:append|prepend|replace|upper|lower|trim|truncate|strip_html, find?, value?}, merge {mode:concat|dedupe_lines|numbered} (join parallel branches), http_fetch {url}, script_run {file, mode:import|transform} (run a room .py/.js; transform pipes {{input}}→stdin→stdout), save_file {name_template, format, mode}, condition {op, value}. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Parallelism = several edges out of one node re-joined by a merge. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix. After saving, don't stop there: call test_workflow to actually RUN it, read which step failed, fix it with update_workflow, and test again until it works — then tell the user the draft is ready to activate.",
+            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph of nodes + edges [{from, to, branch?}]. Model nodes: generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, for_each_file {select, instruction} (runs on EACH selected file), agent_run {question}, extract {fields:[...]} (structured JSON out of {{input}}), route {prompt, labels:[...]} (tags input with one label → edges use branch:<label>, an N-way condition), vote {prompt, samples, mode:concat|majority}, refine {prompt, rubric, max_rounds} (generate→critique→revise loop), plan_and_map {objective, max_workers} (decompose→work→synthesize). Deterministic nodes (no model): transform {op:append|prepend|replace|upper|lower|trim|truncate|strip_html, find?, value?}, merge {mode:concat|dedupe_lines|numbered} (join parallel branches), http_fetch {url}, script_run {file, mode:import|transform} (run a room .py/.js; transform pipes {{input}}→stdin→stdout), save_file {name_template, format, mode}, condition {op, value}. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Parallelism = several edges out of one node re-joined by a merge. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Give every node a short `label` (2-4 words in the user's language for what that step does, e.g. \"Write the digest\") so the canvas and inspector read as plain steps, not kind names. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"label\":\"Write the digest\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"label\":\"Save today's digest\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix. After saving, don't stop there: call test_workflow to actually RUN it, read which step failed, fix it with update_workflow, and test again until test_workflow returns `VALIDATED: yes` — only then tell the user the draft is ready to activate. NEVER tell the user it's fixed or works before a test returns `VALIDATED: yes`; a script_run step can only be confirmed by an approved run on the Scripts page.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string"},
                 "description": {"type": "string"},
@@ -3047,7 +3112,7 @@ pub fn workflow_tools_specs() -> Vec<serde_json::Value> {
                 "file": {"type": "string", "description": "Optional file name for a file-scoped workflow"}},
                 "required": ["name_or_id"]}}}),
         serde_json::json!({"type": "function", "function": {"name": "test_workflow",
-            "description": "TEST a workflow you're building: run it (draft or active) to completion RIGHT NOW and get the result of every step back, so you can see what failed and fix it. This is how you iterate — save_workflow (draft) → test_workflow → read the failing step → update_workflow to fix it → test_workflow again → repeat until it succeeds, then tell the user it's ready to activate. Unlike run_workflow this WAITS and returns the outcome (each step's label, kind, whether it was skipped, and a preview of its output). It never changes the workflow's status — a tested workflow stays a DRAFT for the user to review and activate. A script_run step needs the user's approval (you can't approve code), so it parks in a test — that's expected, just tell the user. Only runs when no other job is busy; if it says another job is running, ask the user to wait and try again. Pass `file` (a file name) for a file-scoped workflow.",
+            "description": "TEST a workflow you're building: run it (draft or active) to completion RIGHT NOW and get the result of every step back, so you can see what failed and fix it. This is how you iterate — save_workflow (draft) → test_workflow → read the failing step → update_workflow to fix it → test_workflow again → repeat until the result says `VALIDATED: yes`, then tell the user it's ready to activate. The result ends with `VALIDATED: yes` only when every step actually ran; treat `VALIDATED: no` as not-yet-working and never report success on it. Unlike run_workflow this WAITS and returns the outcome (each step's label, kind, whether it was skipped, and a preview of its output). It never changes the workflow's status — a tested workflow stays a DRAFT for the user to review and activate. A script_run step needs the user's approval (you can't approve code), so it PARKS in a test and comes back `VALIDATED: no` — that does NOT mean the script works; tell the user to approve and run it on the Scripts page, don't claim it's fixed. Only runs when no other job is busy; if it says another job is running, ask the user to wait and try again. Pass `file` (a file name) for a file-scoped workflow.",
             "parameters": {"type": "object", "properties": {
                 "name_or_id": {"type": "string"},
                 "file": {"type": "string", "description": "Optional file name for a file-scoped workflow"}},

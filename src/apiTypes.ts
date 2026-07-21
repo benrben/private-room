@@ -762,6 +762,11 @@ export interface ScriptInfo {
   workflowId: string | null;
   schedule: Schedule | null;
   lastRun: WorkflowRun | null;
+  /** How many of the most-recent runs failed with the SAME error (newest-first;
+   * 0 = latest run didn't fail). Drives the single "incident" card. */
+  consecutiveFailures: number;
+  /** The shared error text of that failure streak, or null when not failing. */
+  lastError: string | null;
 }
 
 /** The parsed PEP-723 + room-* manifest for one script. */

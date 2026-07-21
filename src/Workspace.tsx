@@ -107,7 +107,7 @@ export default function Workspace({ info, onLock }: Props) {
           aiAttention={pendingApprovals > 0 || runningJobs > 0}
         />
         <div
-          className="pane-grid"
+          className={`pane-grid${layout.dragging ? " is-dragging" : ""}`}
           ref={layout.gridRef}
           style={layout.gridStyle}
         >
@@ -142,6 +142,11 @@ export default function Workspace({ info, onLock }: Props) {
         fileCount={s.files.length}
         cloud={isCloudEngine(s.model)}
         engineLabel={a.engineLabelOf(s.model)}
+        protectedOn={s.privacyOn}
+        onOpenPrivacy={() => {
+          s.setSettingsSection("set-cloud-privacy");
+          s.setShowSettings(true);
+        }}
         webOn={s.webOn}
         mcpToolCount={s.mcpTools.length}
         runningJobs={runningJobs}

@@ -316,6 +316,7 @@ function ViewerBody({
         <AudioView
           key={`${openFile.id}-${viewerRev}`}
           kind={c.kind}
+          fileId={openFile.id}
           mime={c.mime}
           dataB64={c.dataB64 ?? ""}
           mediaToken={c.mediaToken}

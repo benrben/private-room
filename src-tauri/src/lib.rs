@@ -191,6 +191,7 @@ pub fn run() {
             commands::stt_download_model,
             commands::stt_delete_model,
             commands::transcribe_audio,
+            commands::retranscribe_file,
             commands::shape_text,
             commands::dict_start,
             commands::dict_push_audio,

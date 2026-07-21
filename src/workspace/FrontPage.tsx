@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { FrontPage as FrontPageData } from "../api";
+import { useEffect, useState } from "react";
+import { api, FrontPage as FrontPageData, fileKindLabel } from "../api";
 import {
   ChatBubbleIcon,
   FileTypeIcon,
@@ -11,8 +11,123 @@ import {
   WorkflowsIcon,
 } from "../icons";
 import { displayName, formatWhen } from "./composer";
+import { isCloudEngine } from "./markup";
+import { visibleWorkflows } from "./workflows/selectors";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+
+type BriefTone = "danger" | "warn" | "info";
+interface BriefItem {
+  key: string;
+  tone: BriefTone;
+  text: string;
+  cta: string;
+  run: () => void;
+}
+const TONE_RANK: Record<BriefTone, number> = { danger: 0, warn: 1, info: 2 };
+
+/** Room Brief: the one place Home leads with what NEEDS ATTENTION rather than
+ * what's merely recent — raw-cloud exposure, unscanned files, scripts to
+ * review, failed runs, drafts to activate. Every row resolves its own issue in
+ * one click. Renders nothing when the room is clear, so Home stays calm. */
+function RoomBrief({ s, a }: { s: WSState; a: WSActions }) {
+  const [pendingScan, setPendingScan] = useState(0);
+  useEffect(() => {
+    let live = true;
+    api
+      .privacyStatus()
+      .then((st) => live && setPendingScan(st.pendingFiles))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [s.files.length]);
+
+  const openPrivacy = () => {
+    s.setSettingsSection("set-cloud-privacy");
+    s.setShowSettings(true);
+  };
+
+  const items: BriefItem[] = [];
+  if (isCloudEngine(s.model) && s.privacyOn === false) {
+    items.push({
+      key: "raw-cloud",
+      tone: "danger",
+      text: "This room is answering with a raw cloud model — real names and content leave this Mac.",
+      cta: "Review privacy",
+      run: openPrivacy,
+    });
+  }
+  if (pendingScan > 0) {
+    items.push({
+      key: "scan",
+      tone: "warn",
+      text: `${pendingScan} file${pendingScan === 1 ? "" : "s"} haven't been scanned for private details yet.`,
+      cta: "Scan now",
+      run: () => {
+        api.startPrivacyScan().catch(() => {});
+        openPrivacy();
+      },
+    });
+  }
+  const needReview = s.scripts.filter((sc) => !sc.approved || sc.changedSinceApproval).length;
+  if (needReview > 0) {
+    items.push({
+      key: "script-review",
+      tone: "warn",
+      text: `${needReview} script${needReview === 1 ? "" : "s"} need review before ${needReview === 1 ? "it" : "they"} can run.`,
+      cta: "Review scripts",
+      run: () => a.openScripts(),
+    });
+  }
+  const failed = s.scripts.filter(
+    (sc) => sc.lastRun && (sc.lastRun.status === "failed" || sc.lastRun.status === "error"),
+  ).length;
+  if (failed > 0) {
+    items.push({
+      key: "script-failed",
+      tone: "warn",
+      text: `${failed} script${failed === 1 ? "" : "s"} failed on ${failed === 1 ? "its" : "their"} last run.`,
+      cta: "Open scripts",
+      run: () => a.openScripts(),
+    });
+  }
+  const drafts = visibleWorkflows(s.workflows).filter((w) => w.status === "draft").length;
+  if (drafts > 0) {
+    items.push({
+      key: "wf-draft",
+      tone: "info",
+      text: `${drafts} workflow${drafts === 1 ? "" : "s"} ${drafts === 1 ? "is a draft" : "are drafts"} waiting to be activated.`,
+      cta: "Review workflows",
+      run: () => a.openWorkflows(),
+    });
+  }
+
+  if (items.length === 0) return null;
+  items.sort((x, y) => TONE_RANK[x.tone] - TONE_RANK[y.tone]);
+
+  return (
+    <section className="home-section room-brief">
+      <div className="home-section-head">
+        <h2>Needs your attention</h2>
+        <span>
+          {items.length} item{items.length === 1 ? "" : "s"}
+        </span>
+      </div>
+      <div className="brief-list">
+        {items.map((it) => (
+          <div key={it.key} className={`brief-row ${it.tone}`}>
+            <span className="brief-dot" aria-hidden="true" />
+            <span className="brief-text">{it.text}</span>
+            <button className="brief-cta" onClick={it.run}>
+              {it.cta}
+            </button>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
 
 /** Room home: continue recent work, then reach every capability — quiet
  * lists, not a card gallery. Shown in the center pane on unlock. */
@@ -44,6 +159,8 @@ export default function FrontPage({
           </p>
         </header>
 
+        <RoomBrief s={s} a={a} />
+
         <section className="home-section">
           <div className="home-section-head">
             <h2>Continue</h2>
@@ -67,7 +184,9 @@ export default function FrontPage({
                 </span>
                 <span className="home-row-main">
                   <span className="home-row-title">{displayName(f.name)}</span>
-                  <span className="home-row-copy">File</span>
+                  <span className="home-row-copy">
+                    {fileKindLabel(f).replace(/^./, (c) => c.toUpperCase())}
+                  </span>
                 </span>
                 <span className="home-row-meta">{formatWhen(f.createdAt)}</span>
               </button>
