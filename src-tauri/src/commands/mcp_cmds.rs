@@ -79,6 +79,68 @@ pub(crate) fn add_mcp_approval(app: &tauri::AppHandle, fingerprint: &str) {
     }
 }
 
+/// "Auto mode" for connector tool calls lives per-Mac next to the fingerprint
+/// approvals — a single JSON bool, outside any room (the room's author is the
+/// attacker; a blanket-consent flag must never travel inside a `.roomai`).
+pub(crate) fn mcp_auto_approve_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager as _;
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("mcp_auto_approve.json"))
+}
+
+/// The persisted auto-approve preference. **Absent file = OFF.**
+///
+/// Auto mode is not only "skip the card": since 2026-07-24 it also sends a
+/// remote connector its REAL arguments (`agent::masks_outbound_args`), because
+/// masking the values a connector is asked ABOUT made the lookup fail with no
+/// visible reason. That is a defensible trade for a user who asks for it — but
+/// it is two gates at once, so it cannot be the state a room arrives in. A
+/// fresh install therefore keeps the per-call card AND the outbound mask, and
+/// the toggle turns both off together, saying so.
+///
+/// Reading is resilient — any parse failure falls back to the default rather
+/// than erroring.
+pub(crate) fn read_mcp_auto_approve(app: &tauri::AppHandle) -> bool {
+    let raw = mcp_auto_approve_file(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    parse_auto_approve(raw.as_deref())
+}
+
+/// The pure half of [`read_mcp_auto_approve`], so the DEFAULT is unit-testable
+/// without an `AppHandle`. Only an explicit `true` on disk turns auto mode on;
+/// a missing, empty or corrupt file fails closed.
+pub(crate) fn parse_auto_approve(raw: Option<&str>) -> bool {
+    raw.and_then(|s| serde_json::from_str::<bool>(s.trim()).ok())
+        .unwrap_or(false)
+}
+
+fn write_mcp_auto_approve(app: &tauri::AppHandle, on: bool) {
+    if let Ok(path) = mcp_auto_approve_file(app) {
+        let _ = std::fs::write(path, if on { "true" } else { "false" });
+    }
+}
+
+/// Connectors → Auto-approve: read the current "auto mode" state for the UI toggle.
+#[tauri::command]
+pub fn get_mcp_auto_approve(state: State<'_, AppState>) -> bool {
+    state
+        .mcp_auto_approve
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Connectors → Auto-approve: flip "auto mode" and persist it per-Mac. Takes
+/// effect immediately for the next connector call (the flag is read live in
+/// `mcp_call_approved`); the file makes it survive a restart.
+#[tauri::command]
+pub fn set_mcp_auto_approve(app: tauri::AppHandle, state: State<'_, AppState>, on: bool) {
+    state
+        .mcp_auto_approve
+        .store(on, std::sync::atomic::Ordering::SeqCst);
+    write_mcp_auto_approve(&app, on);
+}
+
 /// SEC-1: the spawn/approval decision for a room's MCP config, decided PURELY
 /// from the config text and the set of already-approved fingerprints — no I/O,
 /// so it is unit-testable. `refresh_mcp` (the spawner) and `pending_mcp_for`
@@ -267,6 +329,20 @@ pub(crate) async fn mcp_call_approved(
     args: &serde_json::Value,
 ) -> bool {
     use tauri::Emitter;
+    // "Auto mode" (Connectors → Auto-approve): the user granted blanket consent
+    // to RUN connector tools, so the agent's calls never stall on a card nobody
+    // is watching. Since 2026-07-24 it also means the call carries REAL
+    // arguments: `exec_tool` skips the outbound remote-arg masking under auto
+    // mode, because masking the values a connector is asked about made the call
+    // fail with no visible reason. Auto mode is therefore full approval —
+    // consent AND real args — which is exactly why it is OFF until the user
+    // turns it on (`read_mcp_auto_approve`). Turning it off restores both gates.
+    if state
+        .mcp_auto_approve
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return true;
+    }
     if state
         .mcp_session_ok
         .lock()
@@ -781,53 +857,6 @@ pub fn mcp_set_tool_enabled(
     })
 }
 
-/// Parse the "ignore the tool cap" server list. Missing/invalid → empty.
-pub(crate) fn parse_uncapped(raw: &str) -> std::collections::HashSet<String> {
-    serde_json::from_str::<Vec<String>>(raw)
-        .map(|v| v.into_iter().collect())
-        .unwrap_or_default()
-}
-
-/// Add/remove a server from the uncapped list, returning the new JSON. Pure —
-/// unit-tested.
-pub(crate) fn set_uncapped(raw: &str, server: &str, uncapped: bool) -> Result<String, String> {
-    let mut set: std::collections::BTreeSet<String> = serde_json::from_str::<Vec<String>>(raw)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    if uncapped {
-        set.insert(server.to_string());
-    } else {
-        set.remove(server);
-    }
-    serde_json::to_string(&set.into_iter().collect::<Vec<_>>()).map_err(|e| e.to_string())
-}
-
-/// The connectors the user has exempted from the tool-count cap (JSON array).
-#[tauri::command]
-pub fn mcp_get_uncapped(state: State<'_, AppState>) -> Result<String, String> {
-    state.with_room(|room| {
-        Ok(db::get_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY).unwrap_or_else(|| "[]".to_string()))
-    })
-}
-
-/// Turn the "send every tool, ignore the limit" override on/off for one
-/// connector. Takes effect next turn (mcp_routes re-reads it); no reconnect.
-#[tauri::command]
-pub fn mcp_set_server_uncapped(
-    state: State<'_, AppState>,
-    server: String,
-    uncapped: bool,
-) -> Result<String, String> {
-    state.with_room(|room| {
-        let raw =
-            db::get_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY).unwrap_or_else(|| "[]".to_string());
-        let next = set_uncapped(&raw, &server, uncapped)?;
-        db::set_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY, &next)?;
-        Ok(next)
-    })
-}
-
 /// The frontend's answer to an `mcp-approve-request` — "once", "always", or
 /// anything else (declined).
 #[tauri::command]
@@ -859,6 +888,21 @@ pub fn resolve_mcp_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_mode_is_off_until_the_user_turns_it_on() {
+        // Auto mode opens TWO gates — no consent card AND real (unmasked)
+        // arguments to a remote connector (`agent::masks_outbound_args`). A
+        // fresh install must not arrive with both already open, so anything
+        // other than an explicit `true` on disk fails closed.
+        assert!(!parse_auto_approve(None), "a fresh install must default OFF");
+        assert!(!parse_auto_approve(Some("")));
+        assert!(!parse_auto_approve(Some("garbage")));
+        assert!(!parse_auto_approve(Some("false")));
+        // Only the user's own explicit choice turns it on, whitespace and all.
+        assert!(parse_auto_approve(Some("true")));
+        assert!(parse_auto_approve(Some(" true\n")));
+    }
 
     #[test]
     fn mcp_fingerprint_is_stable_and_config_sensitive() {
@@ -1035,23 +1079,6 @@ mod tests {
         assert!(parse_tool_prefs(&c).get("fetch-mcp").is_none());
         // Garbage stored value degrades to "all on", never an error.
         assert!(parse_tool_prefs("not json").is_empty());
-    }
-
-    #[test]
-    fn uncapped_override_toggles_per_server() {
-        assert!(parse_uncapped("[]").is_empty());
-        // Turn the override ON for one server; idempotent on repeat.
-        let a = set_uncapped("[]", "fetch-mcp", true).unwrap();
-        let a = set_uncapped(&a, "fetch-mcp", true).unwrap();
-        assert!(parse_uncapped(&a).contains("fetch-mcp"));
-        assert_eq!(parse_uncapped(&a).len(), 1);
-        // A second server joins; turning the first OFF leaves the second.
-        let b = set_uncapped(&a, "github", true).unwrap();
-        let c = set_uncapped(&b, "fetch-mcp", false).unwrap();
-        let m = parse_uncapped(&c);
-        assert!(m.contains("github") && !m.contains("fetch-mcp"));
-        // Garbage → empty, never an error.
-        assert!(parse_uncapped("nope").is_empty());
     }
 
     #[test]

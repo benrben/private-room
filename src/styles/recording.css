@@ -348,6 +348,30 @@
   text-align: center;
 }
 
+/* GH #5: the chip is a button — click it to say who this voice was. It must
+   still READ as a chip at rest (the transcript is the content here, not a form),
+   so the affordance is a hover underline plus the cursor, not a border. */
+.rec-speaker-btn {
+  border: 0;
+  font-family: inherit;
+  cursor: text;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rec-speaker-btn:hover,
+.rec-speaker-btn:focus-visible {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.rec-speaker-input {
+  border: 1px solid var(--accent);
+  font-family: inherit;
+  width: 12ch;
+  outline: none;
+}
+
 /* Click a word to jump the player there (drag still selects for delete). */
 .rec-word {
   cursor: pointer;

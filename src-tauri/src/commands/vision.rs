@@ -250,13 +250,25 @@ pub async fn locate_in_image(
 
     let models = ollama::list_models().await.unwrap_or_default();
     let chat_model = explicit.unwrap_or_else(|| best_default(&models));
-    let mut vmodel = vision_model(&models, &chat_model);
-    if is_external_engine(&vmodel) {
-        if models.is_empty() {
-            return Err("Marking images needs a local Ollama vision model.".into());
+    // Grounding needs a model that can actually AIM, not just read. Asking for
+    // one and silently accepting the chat model instead is how "no VL model
+    // installed" reached the user as "The AI could not locate that in this
+    // image" — a false statement about their picture rather than a true one
+    // about their setup. `NO_VISION_MODEL` is a sentinel the viewer maps to the
+    // one-click pull it already implements for exactly this case.
+    let vmodel = match grounding_model(&models) {
+        Some(m) => m,
+        None => {
+            // The room's own chat model may still be able to ground if it is a
+            // VL build the name patterns above do not know; only give up when
+            // it cannot even read an image.
+            if !is_external_engine(&chat_model) && is_vision_chat_model(&chat_model) {
+                chat_model.clone()
+            } else {
+                return Err("NO_VISION_MODEL".into());
+            }
         }
-        vmodel = best_default(&models);
-    }
+    };
 
     // HLT-5: release the vision model quickly on low-RAM machines. num_ctx is left
     // unset so the sidecar sizes it to its chat-notools window — identical to the
@@ -273,7 +285,12 @@ pub async fn locate_in_image(
     let v = crate::sidecar::sidecar_json("/vision_locate", &body)
         .await
         .map_err(|e| e.sentinel(Some(&vmodel)))?;
-    let boxes: Vec<ImageBox> = serde_json::from_value(v["boxes"].clone()).unwrap_or_default();
+    // NOT unwrap_or_default: a shape drift across the language boundary would
+    // land in the UI as "could not locate that in this image", i.e. as a claim
+    // about the user's picture instead of a bug report. An empty ARRAY is a
+    // real answer; a failure to decode is not.
+    let boxes: Vec<ImageBox> = serde_json::from_value(v["boxes"].clone())
+        .map_err(|e| format!("The vision pass returned an unreadable result: {e}"))?;
     Ok(boxes)
 }
 

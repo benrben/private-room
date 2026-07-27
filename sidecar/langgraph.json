@@ -1,0 +1,39 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "python_version": "3.11",
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "agent": "devtools.studio:AGENT",
+    "agent.chat.answer": "devtools.studio:CHAT_ANSWER",
+    "agent.files.read": "devtools.studio:FILES_READ",
+    "agent.chat.web": "devtools.studio:CHAT_WEB",
+    "agent.app.ui": "devtools.studio:APP_UI",
+    "agent.jobs.run": "devtools.studio:JOBS_RUN",
+    "agent.jobs.workflows": "devtools.studio:JOBS_WORKFLOWS",
+    "agent.scripts.run": "devtools.studio:SCRIPTS_RUN",
+    "agent.skills.use": "devtools.studio:SKILLS_USE",
+    "agent.skills.author": "devtools.studio:SKILLS_AUTHOR",
+    "agent.connectors.use": "devtools.studio:CONNECTORS_USE",
+    "agent.connectors.admin": "devtools.studio:CONNECTORS_ADMIN",
+    "agent.media.transcribe": "devtools.studio:MEDIA_TRANSCRIBE",
+    "agent.media.video": "devtools.studio:MEDIA_VIDEO",
+    "agent.creator.studio": "devtools.studio:CREATOR_STUDIO",
+    "template.react": "devtools.studio:TEMPLATE_REACT",
+    "template.supervisor": "devtools.studio:TEMPLATE_SUPERVISOR",
+    "template.react_verify": "devtools.studio:TEMPLATE_REACT_VERIFY",
+    "template.route_act": "devtools.studio:TEMPLATE_ROUTE_ACT",
+    "template.probe_gate_act": "devtools.studio:TEMPLATE_PROBE_GATE_ACT",
+    "template.perceive_act": "devtools.studio:TEMPLATE_PERCEIVE_ACT",
+    "template.chain_stage": "devtools.studio:TEMPLATE_CHAIN_STAGE",
+    "template.recall_act_check": "devtools.studio:TEMPLATE_RECALL_ACT_CHECK",
+    "workflow.refine": "devtools.studio:WORKFLOW_REFINE",
+    "workflow.plan_and_map": "devtools.studio:WORKFLOW_PLAN_AND_MAP"
+  },
+  "http": {
+    "disable_mcp": true,
+    "disable_a2a": true,
+    "disable_webhooks": true
+  }
+}

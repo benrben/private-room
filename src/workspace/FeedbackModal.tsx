@@ -9,7 +9,12 @@ import { WSState } from "./state";
  * Write it yourself, or let the LOCAL model shape your words into a title +
  * body (feedback never goes to a cloud engine). Nothing is ever sent by the
  * app: "Open GitHub issue" opens the user's own browser on a prefilled
- * new-issue page, and posting stays their explicit action there. */
+ * new-issue page, and posting stays their explicit action there.
+ *
+ * MOUNTED ONLY WHILE OPEN (see Workspace.tsx). The draft lives in local state,
+ * so unmounting is what empties it — rendering `null` while open would keep the
+ * previous issue's text around for the next one (GH #3). Don't reintroduce an
+ * internal "if (!showFeedback) return null" guard: it silently restores the bug. */
 export default function FeedbackModal({ s }: { s: WSState }) {
   const [raw, setRaw] = useState("");
   const [title, setTitle] = useState("");
@@ -19,10 +24,8 @@ export default function FeedbackModal({ s }: { s: WSState }) {
   const [includeDiag, setIncludeDiag] = useState(true);
 
   useEffect(() => {
-    if (s.showFeedback) void api.appDiag().then(setDiag).catch(() => {});
-  }, [s.showFeedback]);
-
-  if (!s.showFeedback) return null;
+    void api.appDiag().then(setDiag).catch(() => {});
+  }, []);
 
   const diagLine = diag
     ? `Arcelle ${diag.version} · ${diag.os} (${diag.arch})`
@@ -74,7 +77,11 @@ export default function FeedbackModal({ s }: { s: WSState }) {
 
   return (
     <div className="studio-prompt-backdrop" data-agent-blocked onClick={close}>
-      <div className="studio-prompt feedback-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="studio-prompt feedback-modal"
+        data-testid="feedback-modal"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="studio-prompt-title">Send feedback</div>
         <p className="studio-prompt-hint">
           Found a bug, missing something? It becomes a GitHub issue — drafted here,

@@ -2,6 +2,8 @@ import { useCallback, useRef, useState } from "react";
 import {
   AiActionDef,
   AiStatus,
+  AskActiveAgent,
+  AskPlanStep,
   AskPrivacy,
   AskTokenUsage,
   Chat,
@@ -56,6 +58,19 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [streamText, setStreamText] = useState("");
   const [steps, setSteps] = useState<{ label: string; ok: boolean }[]>([]);
   const [lane, setLane] = useState("");
+  // Dispatch-first agent visibility: the roster of domain agents handling the
+  // current ask (ask-plan, one entry per step) and which one is active
+  // (ask-agent). Both live only while `asking` — like `steps` and `lane`.
+  const [agentPlan, setAgentPlan] = useState<AskPlanStep[] | null>(null);
+  const [activeAgent, setActiveAgent] = useState<AskActiveAgent | null>(null);
+  // The same tool steps as `steps`, but filed under the agent that ran them
+  // (`AskPlanStep.key`) so the graph's inspector can show one node's work
+  // alone. Kept ALONGSIDE the flat list rather than replacing it: `steps` is
+  // still what the flat chip row renders, and the many non-sidecar `ask-step`
+  // emitters carry no node at all.
+  const [agentSteps, setAgentSteps] = useState<
+    Record<string, { label: string; ok: boolean }[]>
+  >({});
   const [undoByMsg, setUndoByMsg] = useState<Record<string, string[]>>({});
   const editedRef = useRef<Set<string>>(new Set());
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -342,7 +357,9 @@ export function useWorkspaceState(_info: RoomInfo) {
     engineModels, setEngineModels,
     attachments, setAttachments, question, setQuestion, commands, setCommands,
     ac, setAc, composerRef, asking, setAsking, streamText, setStreamText,
-    steps, setSteps, lane, setLane, undoByMsg, setUndoByMsg, editedRef,
+    steps, setSteps, lane, setLane, agentPlan, setAgentPlan,
+    activeAgent, setActiveAgent, agentSteps, setAgentSteps,
+    undoByMsg, setUndoByMsg, editedRef,
     toasts, setToasts, dictState, setDictState, dictOwner, setDictOwner,
     recorderRef, dictChunksRef, dictStreamRef, dictPartial, setDictPartial,
     dragOver, setDragOver, renaming, setRenaming,

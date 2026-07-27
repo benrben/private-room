@@ -128,7 +128,7 @@ async def generate(
     """One non-streaming assistant turn (ollama.rs ``chat_structured`` gateway).
 
     Reuses :class:`.chat.OllamaChatModel` for the pinned config (base_url, temp,
-    keep_alive, RAM-adaptive num_ctx) and its non-streaming ``generate``. ``format``
+    keep_alive, and an optional explicit num_ctx) and its non-streaming ``generate``. ``format``
     is Ollama's structured-output grammar (a JSON schema); ``images`` ride on the
     last user turn for vision. ``num_predict`` caps output tokens (None = uncapped);
     background jobs set it so a runaway loop can't fill the whole window. Rust keeps
@@ -189,7 +189,7 @@ async def generate_stream(
     """Streaming twin of :func:`generate` (ollama.rs ``chat_core`` streaming text).
 
     Reuses :class:`.chat.OllamaChatModel` for the pinned config (base_url, temp,
-    keep_alive, RAM-adaptive num_ctx) and its streaming ``generate_stream``. Yields
+    keep_alive, and an optional explicit num_ctx) and its streaming ``generate_stream``. Yields
     each text delta in order; the route wraps them into the NDJSON token envelope.
     A classified engine failure is re-raised as :class:`LlmError` so the route can
     emit the terminal ``{"t":"error","code":...}`` line — the SAME sentinels

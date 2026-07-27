@@ -52,9 +52,18 @@ class ToolCall:
     #: The provider-shaped call, echoed back verbatim in the assistant message.
     raw: dict[str, Any] = field(default_factory=dict)
 
-    def key(self) -> tuple[str, str]:
-        """The duplicate-suppression key: (name, canonical args)."""
-        return (self.name, canonical_json(self.arguments))
+    def key(self) -> str:
+        """The duplicate-suppression key: ``name|canonical args``.
+
+        A STRING, not a tuple, and that matters beyond taste: the memo set lives
+        in ``AgentState``, and LangGraph's ``JsonPlusSerializer`` round-trips a
+        ``set[tuple]`` to ``None`` — silently, with no exception — so a
+        checkpointed turn would resume with its duplicate suppression wiped and
+        crash on the next ``set`` operation. ``set[str]`` survives intact.
+        ``|`` is safe as the separator: the right side is always canonical JSON,
+        so any literal pipe inside it is quoted.
+        """
+        return f"{self.name}|{canonical_json(self.arguments)}"
 
     def to_raw(self) -> dict[str, Any]:
         if self.raw:

@@ -282,10 +282,19 @@ fn is_text_path(path: &str, bytes: &[u8]) -> bool {
 pub(crate) fn render_skill_md(skill: &db::Skill) -> String {
     let description = skill.description.replace('\n', " ").replace('\r', " ");
     let description = description.replace('\\', "\\\\").replace('"', "\\\"");
+    // The owning sub-agent travels with the skill, so exporting and re-importing
+    // a folder keeps the binding. Omitted entirely when GENERAL, which keeps the
+    // rendered file byte-identical to a pre-2026-07-24 export.
+    let agent = if skill.agent.trim().is_empty() {
+        String::new()
+    } else {
+        format!("agent: {}\n", skill.agent.trim())
+    };
     format!(
-        "---\nname: {}\ndescription: \"{}\"\n---\n\n{}\n",
+        "---\nname: {}\ndescription: \"{}\"\n{}---\n\n{}\n",
         skill.name,
         description,
+        agent,
         skill.instructions.trim_end()
     )
 }
@@ -306,13 +315,18 @@ fn unquote_yaml(s: &str) -> String {
     }
 }
 
-fn parse_skill_md(text: &str) -> Result<(String, String, String), String> {
+/// Returns `(name, description, agent, instructions)`. `agent:` (2026-07-24)
+/// binds a skill to ONE sub-agent, so a domain agent's `list_skills` shows
+/// only its own procedures; absent/empty means GENERAL — every agent sees it,
+/// which is what every skill authored before this key stays.
+fn parse_skill_md(text: &str) -> Result<(String, String, String, String), String> {
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
         return Err("SKILL.md must begin with YAML frontmatter between --- lines.".into());
     }
     let mut name = String::new();
     let mut description = String::new();
+    let mut agent = String::new();
     let mut in_description_block = false;
     let mut body_start = None;
     let all: Vec<&str> = text.lines().collect();
@@ -331,6 +345,8 @@ fn parse_skill_md(text: &str) -> Result<(String, String, String), String> {
         in_description_block = false;
         if let Some(v) = raw.strip_prefix("name:") {
             name = unquote_yaml(v);
+        } else if let Some(v) = raw.strip_prefix("agent:") {
+            agent = unquote_yaml(v);
         } else if let Some(v) = raw.strip_prefix("description:") {
             let v = v.trim();
             if v == ">" || v == "|" || v == ">-" || v == "|-" {
@@ -343,7 +359,12 @@ fn parse_skill_md(text: &str) -> Result<(String, String, String), String> {
     let at = body_start.ok_or("SKILL.md frontmatter has no closing --- line.")?;
     let instructions = all[at..].join("\n").trim().to_string();
     let name = validate_skill_fields(&name, &description, &instructions)?;
-    Ok((name, description.trim().to_string(), instructions))
+    Ok((
+        name,
+        description.trim().to_string(),
+        agent.trim().to_string(),
+        instructions,
+    ))
 }
 
 fn emit_skills_changed(window: &tauri::Window) {
@@ -361,6 +382,8 @@ pub(crate) fn agent_save_skill(
     let raw_name = args["name"].as_str().unwrap_or_default();
     let description = args["description"].as_str().unwrap_or_default();
     let instructions = args["instructions"].as_str().unwrap_or_default();
+    // Which sub-agent this procedure belongs to; omitted = GENERAL.
+    let agent_owner = args["agent"].as_str().unwrap_or_default();
     let name = validate_skill_fields(raw_name, description, instructions)?;
     let source_names: Vec<String> = args["source_files"]
         .as_array()
@@ -392,6 +415,7 @@ pub(crate) fn agent_save_skill(
                 &name,
                 description.trim(),
                 &instructions,
+                &existing.agent,
             )?;
             db::set_skill_enabled(&room.conn, &existing.id, false)?;
             for source in &sources {
@@ -412,6 +436,7 @@ pub(crate) fn agent_save_skill(
                 &instructions,
                 false,
                 "agent",
+                agent_owner.trim(),
             )?;
             for source in &sources {
                 if let Err(e) = db::upsert_skill_resource(
@@ -636,8 +661,10 @@ pub fn create_skill(
     name: String,
     description: String,
     instructions: String,
+    agent: Option<String>,
 ) -> Result<String, String> {
     let name = validate_skill_fields(&name, &description, &instructions)?;
+    let owner = agent.unwrap_or_default();
     let id = state.with_room(|room| {
         db::create_skill(
             &room.conn,
@@ -646,6 +673,7 @@ pub fn create_skill(
             instructions.trim(),
             false,
             "user",
+            owner.trim(),
         )
     })?;
     emit_skills_changed(&window);
@@ -660,15 +688,22 @@ pub fn update_skill(
     name: String,
     description: String,
     instructions: String,
+    agent: Option<String>,
 ) -> Result<(), String> {
     let name = validate_skill_fields(&name, &description, &instructions)?;
     state.with_room(|room| {
+        // None = "leave the binding alone" (the editor form may not send it).
+        let owner = match &agent {
+            Some(a) => a.trim().to_string(),
+            None => db::get_skill(&room.conn, &id).map(|s| s.agent).unwrap_or_default(),
+        };
         db::update_skill(
             &room.conn,
             &id,
             &name,
             description.trim(),
             instructions.trim(),
+            &owner,
         )
     })?;
     emit_skills_changed(&window);
@@ -822,7 +857,7 @@ pub fn import_skill_folder(
     }
     let skill_md = std::fs::read_to_string(root.join("SKILL.md"))
         .map_err(|_| "That folder has no readable SKILL.md.".to_string())?;
-    let (name, description, instructions) = parse_skill_md(&skill_md)?;
+    let (name, description, agent, instructions) = parse_skill_md(&skill_md)?;
     let mut files = Vec::new();
     let mut total = 0usize;
     collect_folder_files(&root, &root, &mut files, &mut total)?;
@@ -834,6 +869,7 @@ pub fn import_skill_folder(
             &instructions,
             false,
             "import",
+            &agent,
         )?;
         for (path, bytes) in &files {
             if let Err(e) =
@@ -1017,6 +1053,7 @@ pub async fn compose_skill(
                 instructions.trim(),
                 false,
                 "agent",
+                "",
             )?;
             for (path, content) in &resources {
                 if let Err(e) = db::upsert_skill_resource(
@@ -1053,13 +1090,16 @@ mod tests {
             instructions: "# Review\n\nRead `references/policy.md`.".into(),
             enabled: true,
             created_by: "user".into(),
+            agent: "files.read".into(),
             created_at: "".into(),
             updated_at: "".into(),
         };
         let text = render_skill_md(&skill);
-        let (name, desc, body) = parse_skill_md(&text).unwrap();
+        let (name, desc, agent, body) = parse_skill_md(&text).unwrap();
         assert_eq!(name, skill.name);
         assert_eq!(desc, skill.description);
+        // The owning agent survives an export/import round trip.
+        assert_eq!(agent, "files.read");
         assert_eq!(body, skill.instructions);
     }
 

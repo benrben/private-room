@@ -12,10 +12,18 @@ export function useMcpConfig() {
   const [connName, setConnName] = useState("");
   const [connCmd, setConnCmd] = useState("");
   const [connArgs, setConnArgs] = useState("");
+  // "Auto mode": blanket consent for connector tool calls AND real (unmasked)
+  // arguments to a remote connector — default OFF, so the initial value here
+  // must be `false` or the switch reads ON for a frame before Rust answers and
+  // the user is briefly told their details are already leaving. The real state
+  // lives in Rust; mirror it here. Optimistic set so the switch never lags the
+  // click.
+  const [autoApprove, setAutoApproveState] = useState(false);
 
   useEffect(() => {
     api.mcpGetConfig().then(setMcpConfig).catch(() => {});
     api.mcpStatus().then(setMcpStatuses).catch(() => {});
+    api.getMcpAutoApprove().then(setAutoApproveState).catch(() => {});
     const unlistenMcp = listen<McpServerStatus[]>("mcp-status", (e) => {
       setMcpStatuses(e.payload);
     });
@@ -60,6 +68,17 @@ export function useMcpConfig() {
     const statuses = await api.mcpApplyConfig(json);
     setMcpStatuses(statuses);
     return statuses;
+  }
+
+  // Flip "auto mode" — optimistic, then persist. On failure, reload the true
+  // value so the switch never lies about what the backend will do.
+  async function setAutoApprove(on: boolean) {
+    setAutoApproveState(on);
+    try {
+      await api.setMcpAutoApprove(on);
+    } catch {
+      api.getMcpAutoApprove().then(setAutoApproveState).catch(() => {});
+    }
   }
 
   // Turn a connector on/off (keeps it in the config) — the disable path.
@@ -132,6 +151,8 @@ export function useMcpConfig() {
     installServer,
     setServerEnabled,
     removeServer,
+    autoApprove,
+    setAutoApprove,
     installedNames: mcpStatuses.map((s) => s.name),
   };
 }

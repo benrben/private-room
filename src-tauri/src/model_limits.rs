@@ -1,9 +1,8 @@
 //! Max-context sizing for the external-CLI engines (claude-cli / codex-cli).
 //!
-//! Ollama (local + `:cloud`) needs no registry here — the sidecar self-reports
-//! its own configured `num_ctx` as `max_context` on every usage event (see
-//! `sidecar/arcelle_sidecar/chat.py`/`model_limits.py`), since only it knows
-//! the RAM-adaptive window it actually requested.
+//! Ollama (local + `:cloud`) needs no registry here — the sidecar reads each
+//! model's advertised context length from Ollama's catalog (see
+//! `sidecar/arcelle_sidecar/chat.py`/`model_limits.py`).
 //!
 //! Confirmed live 2026-07-21 (smoke calls, not just `--help`):
 //! `claude -p --output-format json` carries a real `modelUsage.<model>.

@@ -38,8 +38,10 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import config
+from .budget import json_chars, msg_len, window_budget_bytes
 from .llm import LlmError, _classify
 from .messages import Message, ToolCall, canonical_json, compact_json
+from .model_limits import max_num_ctx, native_context_length, pick_num_ctx
 
 # --- constants (verbatim from summarize.rs / extraction/window.rs) ----------
 
@@ -49,34 +51,7 @@ MAX_READS: int = 4
 #: extraction/window.rs — the default/min/max for ONE read window (bytes).
 READ_WINDOW_DEFAULT: int = 4_000
 READ_WINDOW_MIN: int = 200
-READ_WINDOW_MAX: int = 32_000
-
-
-# --- num_ctx sizing (ollama.rs num_ctx_for / job_context_chars) -------------
-#
-# Kept here rather than in the (parallel-contended) config module. Uses only the
-# stable RAM primitives; mirrors ollama.rs:306 exactly.
-
-
-def _num_ctx_for(has_tools: bool, tier: str) -> int:
-    """ollama.rs ``num_ctx_for(has_tools, CtxTier)``. tier ∈ {"job","chat"}.
-
-    The Job tier ignores ``has_tools`` (a background job always gets the big
-    window); the no-tools Chat tier is the smaller 16384/8192. 32 GB+ RAM picks
-    the high column, unknown RAM (0) falls to low — same as Rust.
-    """
-    high = config._total_ram_bytes() >= config._HIGH_RAM_BYTES
-    if tier == "job":
-        return 131_072 if high else 65_536
-    if has_tools:
-        return 24_576 if high else 12_288
-    return 16_384 if high else 8_192
-
-
-def _job_context_chars() -> int:
-    """ollama.rs ``job_context_chars`` — the Job window in chars (≈3 chars/token,
-    a safe floor across English and Hebrew)."""
-    return _num_ctx_for(True, "job") * 3
+READ_WINDOW_MAX: int = 64_000
 
 
 # --- text windowing (ported from extraction/window.rs, BYTE-exact) ----------
@@ -376,7 +351,7 @@ class ModelClient(Protocol):
         tools: list[dict[str, Any]],
         *,
         temperature: float | None,
-        num_ctx: int,
+        num_ctx: int | None,
         keep_alive: str,
     ) -> tuple[str, list[ToolCall]]:
         ...
@@ -387,7 +362,7 @@ class ModelClient(Protocol):
         messages: list[Message],
         *,
         temperature: float | None,
-        num_ctx: int,
+        num_ctx: int | None,
         keep_alive: str,
         format: dict[str, Any] | None = None,  # noqa: A002 - Ollama arg name
     ) -> str:
@@ -426,7 +401,7 @@ class OllamaModelClient:
         tools: list[dict[str, Any]] | None,
         format: dict[str, Any] | None,  # noqa: A002
         temperature: float | None,
-        num_ctx: int,
+        num_ctx: int | None,
         keep_alive: str,
         think_on: bool,
     ) -> tuple[str, list[ToolCall]]:
@@ -466,7 +441,25 @@ class OllamaModelClient:
                     call.arguments = engaged.restore_value(call.arguments)
             return content, calls
 
-        options: dict[str, Any] = {"num_ctx": num_ctx}
+        # A LOCAL call MUST carry an explicit num_ctx. This client talks to
+        # `ollama.AsyncClient` directly rather than through `llm.generate`, so
+        # it does not inherit `chat.OllamaChatModel`'s payload-fitted window —
+        # and with none sent, the daemon loads its own ~4k default and silently
+        # context-shifts the FRONT of the prompt away (see model_limits.py).
+        # That is fatal here of all places: this path deliberately gathers whole
+        # read windows, so the system prompt and the instruction were the first
+        # things to vanish.
+        options: dict[str, Any] = {}
+        window = num_ctx
+        if window is None:
+            native = await native_context_length(model, self.base_url)
+            window = pick_num_ctx(
+                sum(msg_len(m) for m in messages)
+                + (json_chars(tools) if tools else 0)
+                + (json_chars(format) if format else 0),
+                native,
+            )
+        options["num_ctx"] = window
         if temperature is not None:
             options["temperature"] = temperature
         # ollama.rs:603 — only qwen3 non-instruct models accept (and need) the flag.
@@ -513,7 +506,7 @@ class OllamaModelClient:
         tools: list[dict[str, Any]],
         *,
         temperature: float | None,
-        num_ctx: int,
+        num_ctx: int | None,
         keep_alive: str,
     ) -> tuple[str, list[ToolCall]]:
         # summarize.rs uses chat_stream_tools_thinking here: thinking ON.
@@ -534,7 +527,7 @@ class OllamaModelClient:
         messages: list[Message],
         *,
         temperature: float | None,
-        num_ctx: int,
+        num_ctx: int | None,
         keep_alive: str,
         format: dict[str, Any] | None = None,  # noqa: A002
     ) -> str:
@@ -562,7 +555,6 @@ async def _chat_structured(
     temperature: float | None,
     keep_alive: str,
     schema: dict[str, Any],
-    tier: str,
 ) -> str:
     """ollama.rs ``chat_structured``: a one-shot call CONSTRAINED to ``schema`` via
     Ollama ``format`` (grammar token masking), plus the schema appended to the last
@@ -577,12 +569,11 @@ async def _chat_structured(
                 f"with real content:\n{compact_json(schema)}"
             )
             break
-    num_ctx = _num_ctx_for(False, tier)
     raw = await client.generate(
         model,
         primed,
         temperature=temperature,
-        num_ctx=num_ctx,
+        num_ctx=None,
         keep_alive=keep_alive,
         format=schema,
     )
@@ -610,12 +601,20 @@ async def summarize_one_file(
     data = filtered.encode("utf-8")
     head = read_window(data, 0, READ_WINDOW_DEFAULT, None)
     whole = head.end >= len(data)
-    # Deterministic baseline samples for a long file, and a cumulative read budget
-    # derived from the engine's REAL context (spend it on file text, not a fixed
-    # snippet). All arithmetic is in BYTES to match Rust exactly.
+    # Deterministic baseline samples for a long file, and a cumulative read
+    # budget derived from the largest window this Mac can actually ask a local
+    # model for. `MAX_READS` alone is NOT a bound: four reads of up to
+    # READ_WINDOW_MAX plus the samples is ~264 KB, far past any window, and the
+    # daemon's answer to an oversized prompt is to drop the FRONT of it — the
+    # system prompt and the instruction. Spend the window on file text, but
+    # spend only what there is. All arithmetic is in BYTES.
     mid = read_window(data, len(data) // 2, 2_000, None)
     tail = read_window(data, max(0, len(data) - 2_000), 2_000, None)
-    remaining = max(0, _job_context_chars() - (head.nbytes + mid.nbytes + tail.nbytes + 8_000))
+    remaining = max(
+        0,
+        window_budget_bytes(max_num_ctx())
+        - (head.nbytes + mid.nbytes + tail.nbytes + 8_000),
+    )
 
     if whole:
         system = (
@@ -655,13 +654,12 @@ async def summarize_one_file(
         tools = read_text_tool()
         seen: set[str] = set()
         reads = 0
-        num_ctx = _num_ctx_for(True, "job")
         while reads < MAX_READS and remaining >= READ_WINDOW_MIN:
             # ADD-27: thinking ON — without it, qwen3-family models answer straight
             # from the samples and never touch the tool.
             try:
                 _content, calls = await client.chat_tools(
-                    model, list(messages), tools, temperature=0.2, num_ctx=num_ctx, keep_alive=keep_alive
+                    model, list(messages), tools, temperature=0.2, num_ctx=None, keep_alive=keep_alive
                 )
             except LlmError as exc:
                 # Ollama down / model missing: every remaining call would fail too.
@@ -713,14 +711,13 @@ async def summarize_one_file(
         )
 
     # ADD-22: a single guaranteed string field, so a chatty model can't wrap the
-    # sentence in preamble/markup. Job tier: the gathered windows can far exceed
-    # the small chat num_ctx.
+    # sentence in preamble/markup. The engine owns the context window.
     schema = {
         "type": "object",
         "properties": {"summary": {"type": "string"}},
         "required": ["summary"],
     }
-    raw = await _chat_structured(client, model, messages, 0.2, keep_alive, schema, "job")
+    raw = await _chat_structured(client, model, messages, 0.2, keep_alive, schema)
     # A reply that isn't the JSON envelope still usually contains the sentence, so
     # fall back to the raw text rather than losing the summary.
     summary = json_str_field(raw, "summary")
@@ -771,7 +768,7 @@ async def combine_summary(
         model,
         purpose_messages,
         temperature=0.4,
-        num_ctx=_num_ctx_for(False, "chat"),
+        num_ctx=None,
         keep_alive=config.KEEP_ALIVE_WARM,
     )
     purpose = strip_think_spans(purpose_raw).strip()
@@ -792,7 +789,7 @@ async def combine_summary(
     schema = {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 3}
     try:
         questions_raw = await _chat_structured(
-            client, model, questions_messages, 0.4, config.KEEP_ALIVE_WARM, schema, "chat"
+            client, model, questions_messages, 0.4, config.KEEP_ALIVE_WARM, schema
         )
     except LlmError:
         questions_raw = ""

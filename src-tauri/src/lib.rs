@@ -166,8 +166,8 @@ pub fn run() {
             commands::mcp_remove_server,
             commands::mcp_get_tool_prefs,
             commands::mcp_set_tool_enabled,
-            commands::mcp_get_uncapped,
-            commands::mcp_set_server_uncapped,
+            commands::get_mcp_auto_approve,
+            commands::set_mcp_auto_approve,
             commands::resolve_edit_approval,
             commands::ai_status,
             commands::model_capabilities,
@@ -241,6 +241,7 @@ pub fn run() {
             commands::rec_set_live_stt,
             commands::rec_get,
             commands::rec_delete_range,
+            commands::rec_set_speaker_name,
             commands::rec_export_clean,
             commands::rec_translate,
             commands::rec_retranscribe,
@@ -299,6 +300,14 @@ pub fn run() {
             // Wave 5 (Idea 13): sweep orphaned script-run workspaces left by a
             // crash before anything runs (the quiesce_stale_jobs spirit).
             commands::sweep_script_workspaces(app.handle());
+            // Connectors → Auto-approve: hydrate the in-memory "auto mode" flag
+            // from its per-Mac file so the choice survives a restart (default ON).
+            {
+                let auto = commands::read_mcp_auto_approve(app.handle());
+                app.state::<AppState>()
+                    .mcp_auto_approve
+                    .store(auto, std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -23,7 +23,7 @@ export default function AdvisorsSection({
     <section id="set-advisors">
       <h3>AI advisors (advanced)</h3>
             <p className="settings-hint">
-              Let your <strong>local</strong> AI hand off one genuinely hard
+              Let your selected AI model hand off one genuinely hard
               subtask — deep research, complex reasoning, difficult code — to a
               powerful cloud AI (<code>consult_advisor</code>), using the cloud
               CLIs already installed on this Mac. Off by default. While off, the
@@ -31,7 +31,7 @@ export default function AdvisorsSection({
               Mac on the model's own initiative.
             </p>
             <p className="settings-hint">
-              <AlertIcon size={13} className="warn-ic" /> When on, the local AI may decide — on its own, mid-answer — to
+              <AlertIcon size={13} className="warn-ic" /> When on, the selected model may decide — on its own, mid-answer — to
               send the subtask it writes to Claude or Codex through your cloud
               account. That text leaves this Mac. Each consult is shown as a
               step while it happens, and it's capped at one per question.

@@ -473,6 +473,18 @@ pub fn save_generated_file(
     name: String,
     content: String,
 ) -> Result<FileMeta, String> {
+    save_generated_impl(&app, state.inner(), name, content)
+}
+
+/// The command's body, callable from inside another command (the chat ask
+/// path's deterministic "save that" bypass reuses the exact Save-to-room
+/// logic instead of asking the model to reproduce it).
+pub(crate) fn save_generated_impl(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    name: String,
+    content: String,
+) -> Result<FileMeta, String> {
     let meta = state.with_room(|room| {
         let name = if extraction::extension_of(&name).is_empty() {
             format!("{name}.md")

@@ -18,6 +18,7 @@ import {
 import ChatAnnotatedImage from "../viewers/ChatAnnotatedImage";
 import MarkdownView from "../viewers/MarkdownView";
 import { HandoffMarker } from "./TokenBudgetBar";
+import { AgentGraph } from "./AgentGraph";
 import {
   annotationTarget,
   isCloudEngine,
@@ -311,6 +312,25 @@ export default function ChatPane({
               </span>
               {m.role === "assistant" ? "Room AI" : "You"}
             </div>
+            {m.role === "assistant" &&
+              !!m.effects?.agents?.length && (
+                <div
+                  className="agent-strip past"
+                  aria-label="Agents that handled this request"
+                >
+                  <span className="agent-strip-caption">
+                    {m.effects.agents.length > 1 ? "Agents" : "Agent"}
+                  </span>
+                  {m.effects.agents.map((p, i) => (
+                    <span key={i} className="agent-pipe">
+                      {i > 0 && <span className="agent-arrow" aria-hidden>→</span>}
+                      <span className="agent-chip past" title={p.instruction}>
+                        {p.label}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              )}
             <div className="msg-content" dir="auto">
               {m.role === "assistant" ? (
                 <>
@@ -479,6 +499,18 @@ export default function ChatPane({
               </span>
               Room AI
             </div>
+            {/* The live roster as a hub-and-spoke graph. A turn where nothing
+                was delegated has no graph to draw, and AgentGraph falls back to
+                the single flat chip this used to be. */}
+            {s.agentPlan && s.agentPlan.length > 0 && (
+              <AgentGraph
+                plan={s.agentPlan}
+                active={s.activeAgent}
+                agentSteps={s.agentSteps}
+                steps={s.steps}
+                lane={s.lane}
+              />
+            )}
             {(s.lane || s.steps.length > 0) && (
               <div className="step-chips">
                 {s.lane && <span className="lane-chip">{s.lane}</span>}

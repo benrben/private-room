@@ -99,7 +99,21 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
           : `Found ${found.length} match${found.length === 1 ? "" : "es"}.`,
       );
     } catch (err) {
-      setStatus(String(err));
+      // NO_VISION_MODEL is not a failure to find anything — it means nothing
+      // installed can aim at all. Saying "could not locate that" here would be
+      // a claim about the user's picture; this is a claim about their setup,
+      // and it comes with the one-click fix already wired below.
+      const msg = String(err);
+      if (msg.includes("NO_VISION_MODEL")) {
+        setStatus(
+          "Marking needs a vision model, and none is installed yet — " +
+            "download one below and try again.",
+        );
+        const rec = await recommendedModels().catch(() => null);
+        if (rec?.vision?.trim()) setVisionModel(rec.vision.trim());
+      } else {
+        setStatus(msg);
+      }
     } finally {
       setBusy(false);
     }

@@ -17,9 +17,16 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::time::Duration;
 
-/// The official Model Context Protocol registry. Returns `{ "servers": [...] }`.
-const REGISTRY_URL: &str = "https://registry.modelcontextprotocol.io/v0/servers";
-const REGISTRY_TIMEOUT: Duration = Duration::from_secs(15);
+/// The official Model Context Protocol registry's frozen, versioned API.
+/// Returns `{ "servers": [...] }`.
+const REGISTRY_URL: &str = "https://registry.modelcontextprotocol.io/v0.1/servers";
+// Production reads occasionally take 20–30 seconds (and have reached roughly
+// 45 seconds during load spikes). Fifteen seconds made every retry fail before
+// a healthy-but-slow response could arrive.
+const REGISTRY_TIMEOUT: Duration = Duration::from_secs(45);
+// Two long attempts cover a transient connection failure without making an
+// actual outage hold the marketplace open for three minutes.
+const REGISTRY_ATTEMPTS: u32 = 2;
 
 /// Send a request with a few retries + backoff — the registry endpoint is
 /// intermittently slow to establish a connection (the first attempt often
@@ -27,7 +34,7 @@ const REGISTRY_TIMEOUT: Duration = Duration::from_secs(15);
 /// re-cloned each attempt.
 async fn send_with_retries(req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
     let mut last = String::from("no attempt made");
-    for attempt in 0..4u32 {
+    for attempt in 0..REGISTRY_ATTEMPTS {
         let Some(attempt_req) = req.try_clone() else {
             return Err("could not build the registry request".into());
         };
@@ -432,7 +439,8 @@ pub async fn mcp_registry_search(
     }
     // rustls, not macOS native-tls: the registry is HTTP/2-only and native-tls's
     // ALPN doesn't reliably negotiate h2, which surfaces as "error sending
-    // request". rustls does. The endpoint is also intermittently flaky, so retry.
+    // request". rustls does. The endpoint is also intermittently slow/flaky, so
+    // allow its documented latency window and retry once.
     let client = reqwest::Client::builder()
         .use_rustls_tls()
         .user_agent(concat!("Arcelle/", env!("CARGO_PKG_VERSION")))
@@ -455,8 +463,9 @@ pub async fn mcp_registry_search(
         .query(&params);
     let resp = send_with_retries(req).await.map_err(|e| {
         format!(
-            "Couldn't reach the connector registry after several tries ({e}). \
-             Check your internet connection and try again."
+            "The connector registry did not respond after two attempts ({e}). \
+             The official registry may be busy; check your internet connection \
+             or try again shortly."
         )
     })?;
     if !resp.status().is_success() {
@@ -474,6 +483,19 @@ pub async fn mcp_registry_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_client_uses_stable_api_and_allows_slow_reads() {
+        assert!(
+            REGISTRY_URL.ends_with("/v0.1/servers"),
+            "use the registry's frozen API, not the changing preview route"
+        );
+        assert!(
+            REGISTRY_TIMEOUT >= Duration::from_secs(30),
+            "production registry reads have a documented 20–30 second latency window"
+        );
+        assert_eq!(REGISTRY_ATTEMPTS, 2);
+    }
 
     /// A representative slice of the LIVE registry payload: entries wrapped in
     /// `server`, current camelCase package fields (`registryType`/`identifier`/
@@ -632,7 +654,7 @@ mod tests {
         let client = reqwest::Client::builder()
             .use_rustls_tls()
             .user_agent("Arcelle/test")
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(REGISTRY_TIMEOUT)
             .build()
             .unwrap();
         let mut payload = None;

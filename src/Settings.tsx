@@ -6,6 +6,7 @@ import { Props } from "./settings/types";
 import ModelSection from "./settings/ModelSection";
 import BehaviorSection from "./settings/BehaviorSection";
 import VoiceSection from "./settings/VoiceSection";
+import MicSection from "./settings/MicSection";
 import CloudPrivacySection from "./settings/CloudPrivacySection";
 import PrivacySection from "./settings/PrivacySection";
 import CheckpointsSection from "./settings/CheckpointsSection";
@@ -46,7 +47,14 @@ const SETTINGS_GROUPS: { key: string; label: string; sections: [string, string][
       ["set-advisors", "AI advisors"],
     ],
   },
-  { key: "voice", label: "Voice", sections: [["set-voice", "Spoken voice"]] },
+  {
+    key: "voice",
+    label: "Voice",
+    sections: [
+      ["set-voice", "Spoken voice"],
+      ["set-mic", "Microphone"],
+    ],
+  },
   {
     key: "privacy",
     label: "Privacy & recovery",
@@ -356,6 +364,7 @@ export default function Settings({
 
             <div className="settings-page" hidden={activeGroup !== "voice"}>
               <VoiceSection {...voiceSettings} />
+              <MicSection />
             </div>
 
             <div className="settings-page" hidden={activeGroup !== "privacy"}>

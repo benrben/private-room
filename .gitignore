@@ -46,6 +46,17 @@ __pycache__/
 # Local virtualenvs, if a dev creates one inside the repo tree.
 .venv/
 venv/
+# Never commit a dotenv. `langgraph dev` and the LangGraph Studio docs both
+# suggest a local .env; this repo's privacy guarantee (SPEC §6) means such a
+# file must never reach the tree — and disable_tracing() strips LANGSMITH_*/
+# LANGCHAIN_* at import anyway, so nothing here is meant to carry one.
+.env
+.env.*
+!.env.example
+# `langgraph dev` cloudpickles threads, checkpoints and the store into the CWD
+# in PLAINTEXT. Never let that land in the tree next to the SQLCipher DB — and
+# always run it with LANGGRAPH_DISABLE_FILE_PERSISTENCE=true (see sidecar/STUDIO.md).
+.langgraph_api/
 # PyInstaller packaging: the one-file binary bundle for a release build.
 # (dist/ is already covered by the bare `dist` rule above.)
 sidecar/build/

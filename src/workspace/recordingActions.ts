@@ -1,7 +1,14 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, FileTarget } from "../api";
 import { fileToBase64 } from "./composer";
-import { acquireMic, attachMicTap, createPcmTap, noteLiveStt, stopMicTap } from "./liveRec";
+import {
+  acquireMic,
+  attachMicTap,
+  createPcmTap,
+  micConstraints,
+  noteLiveStt,
+  stopMicTap,
+} from "./liveRec";
 import { WSState } from "./state";
 
 /** Dictation (one shared mic, several sinks) + model onboarding/status.
@@ -38,7 +45,12 @@ export function makeRecordingActions(
     s.setDictState("preparing");
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Same constraints as a recording: `audio: true` lets WebKit turn on
+      // voice processing (and its gain riding) by default, which other apps on
+      // the same microphone hear as their volume dropping (GH #4).
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: micConstraints(),
+      });
     } catch (e) {
       s.setDictState("idle");
       s.setDictOwner(null);

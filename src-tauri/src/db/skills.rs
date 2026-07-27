@@ -15,6 +15,10 @@ pub struct SkillSummary {
     pub description: String,
     pub enabled: bool,
     pub created_by: String,
+    /// Which sub-agent owns this skill (`agent:` in SKILL.md frontmatter).
+    /// Empty = GENERAL: offered to every agent, which is what every skill
+    /// authored before 2026-07-24 stays.
+    pub agent: String,
     pub resource_count: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -29,6 +33,8 @@ pub struct Skill {
     pub instructions: String,
     pub enabled: bool,
     pub created_by: String,
+    /// See `SkillSummary::agent`.
+    pub agent: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -47,7 +53,7 @@ pub struct SkillResource {
 
 const SUMMARY_COLS: &str = "s.id, s.name, s.description, s.enabled, s.created_by, \
     (SELECT count(*) FROM skill_resources r WHERE r.skill_id = s.id), \
-    s.created_at, s.updated_at";
+    s.created_at, s.updated_at, s.agent";
 
 fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SkillSummary> {
     Ok(SkillSummary {
@@ -59,6 +65,7 @@ fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SkillSummary> {
         resource_count: r.get(5)?,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+        agent: r.get(8)?,
     })
 }
 
@@ -72,6 +79,7 @@ fn skill_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Skill> {
         created_by: r.get(5)?,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+        agent: r.get(8)?,
     })
 }
 
@@ -106,8 +114,8 @@ pub fn list_skills(conn: &Connection, enabled_only: bool) -> Result<Vec<SkillSum
 pub fn get_skill(conn: &Connection, id: &str) -> Result<Skill, String> {
     query_one(
         conn,
-        "SELECT id, name, description, instructions, enabled, created_by, created_at, updated_at \
-         FROM skills WHERE id = ?1",
+        "SELECT id, name, description, instructions, enabled, created_by, created_at, updated_at, \
+         agent FROM skills WHERE id = ?1",
         [id],
         skill_row,
     )
@@ -116,8 +124,8 @@ pub fn get_skill(conn: &Connection, id: &str) -> Result<Skill, String> {
 pub fn find_skill(conn: &Connection, name_or_id: &str) -> Result<Option<Skill>, String> {
     query_opt(
         conn,
-        "SELECT id, name, description, instructions, enabled, created_by, created_at, updated_at \
-         FROM skills WHERE id = ?1 OR lower(name) = lower(?1) LIMIT 1",
+        "SELECT id, name, description, instructions, enabled, created_by, created_at, updated_at, \
+         agent FROM skills WHERE id = ?1 OR lower(name) = lower(?1) LIMIT 1",
         [name_or_id],
         skill_row,
     )
@@ -130,18 +138,20 @@ pub fn create_skill(
     instructions: &str,
     enabled: bool,
     created_by: &str,
+    agent: &str,
 ) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO skills(id, name, description, instructions, enabled, created_by) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO skills(id, name, description, instructions, enabled, created_by, agent) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             id,
             name,
             description,
             instructions,
             enabled as i64,
-            created_by
+            created_by,
+            agent
         ],
     )
     .map_err(|e| {
@@ -160,11 +170,12 @@ pub fn update_skill(
     name: &str,
     description: &str,
     instructions: &str,
+    agent: &str,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE skills SET name=?2, description=?3, instructions=?4, \
+        "UPDATE skills SET name=?2, description=?3, instructions=?4, agent=?5, \
          updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?1",
-        params![id, name, description, instructions],
+        params![id, name, description, instructions, agent],
     )
     .map_err(|e| {
         if e.to_string().contains("UNIQUE") {
@@ -263,6 +274,7 @@ mod tests {
             "Do the work.",
             true,
             "user",
+            "files.read",
         )
         .unwrap();
         upsert_skill_resource(&conn, &id, "references/policy.md", "reference", b"policy").unwrap();

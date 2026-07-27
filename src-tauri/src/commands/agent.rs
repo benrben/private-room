@@ -235,6 +235,39 @@ pub async fn ask(
         question_embedding.as_deref(),
     )?;
 
+    // Live-QA 2026-07-23: a PURE "save that as a file" turn is deterministic —
+    // content = the previous assistant reply, name = whatever the user said.
+    // The 4B model failed this twice (asked for content, then fabricated a
+    // different document without calling create_file), so code does it and the
+    // model gets no vote — the exact Save-to-room button path. Attachments or
+    // transform verbs ("save that translated…") fall through to the engine.
+    if attachments.is_empty() && is_pure_save_reference(&question) {
+        let prev = state.with_room(|room| db::list_messages(&room.conn, &chat_id))?;
+        let prev = prev
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && m.kind.is_none() && !m.content.trim().is_empty());
+        if let Some(prev) = prev {
+            use tauri::Manager;
+            let name =
+                requested_file_name(&question).unwrap_or_else(|| "Saved answer".to_string());
+            let content = prev.content.trim_end_matches(" *(stopped)*").to_string();
+            let meta = super::files::save_generated_impl(
+                &window.app_handle().clone(),
+                state.inner(),
+                name,
+                content,
+            )?;
+            let _ = window.emit("ask-step", "Saved to the room");
+            let text = format!("Saved your previous answer to the room as \"{}\".", meta.name);
+            let _ = window.emit("ask-delta", text.clone());
+            let mut fx = ToolEffects::default();
+            fx.wrote = true;
+            let fx = effects_json(&fx);
+            return persist_assistant_reply(&state, &chat_id, text, vec![meta.name.clone()], fx);
+        }
+    }
+
     let models = ollama::list_models().await.unwrap_or_default();
     let model = explicit_model
         .clone()
@@ -310,9 +343,12 @@ pub async fn ask(
     // CHG-10: deterministic anti-fabrication gate. The prompt asks the model
     // never to claim a change it didn't make; here the runtime KNOWS whether a
     // write/highlight actually happened this turn (effects), so append a plain
-    // correction when the local answer claims one that didn't. Local path only
-    // (cloud has no tool effects) and never over a stopped partial.
-    if !is_external_engine(&model) && !stopped {
+    // correction when the answer claims one that didn't. Every engine now runs
+    // through the hub and its tools go through our bridge, so every engine has
+    // real effects to check against (the old "cloud has no tool effects" carve-
+    // out described the CLI's opaque direct path, which no longer exists).
+    // Never over a stopped partial.
+    if !stopped {
         let highlighted = effects.annotation.is_some() || effects.boxes.is_some();
         if claims_unbacked_action(&content, effects.wrote, highlighted) {
             content.push_str(
@@ -421,14 +457,13 @@ fn explicit_skill_request(question: &str) -> Option<(&str, &str)> {
 }
 
 fn gather_context_and_save_question(
-    window: &tauri::Window,
+    _window: &tauri::Window,
     state: &State<'_, AppState>,
     chat_id: &str,
     question: &str,
     attachments: &[String],
     question_embedding: Option<&[f32]>,
 ) -> Result<QuestionContext, String> {
-    use tauri::Emitter;
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
         let conn = &room.conn;
@@ -497,10 +532,6 @@ fn gather_context_and_save_question(
         let mut attached_notes: Vec<String> = Vec::new();
         let mut sources: Vec<String> = Vec::new();
         let mut first_image: Option<(String, String, Vec<u8>, f64, f64)> = None;
-        // Shared first-come budget so many text attachments can't blow the
-        // context window; images are separately capped at MAX_ATTACHED_IMAGES.
-        let mut text_budget = MAX_ATTACHED_TEXT_TOTAL;
-        let mut skipped_attachments: Vec<String> = Vec::new();
         for file_id in attachments {
             let (name, mime, bytes, text) = match db::get_file_full(conn, file_id) {
                 Ok(v) => v,
@@ -521,48 +552,9 @@ fn gather_context_and_save_question(
                     }
                 }
             } else if let Some(text) = text {
-                // Per-file cap of 6000, further limited by the remaining shared
-                // budget. A file that gets too small a slice to be useful is
-                // skipped entirely so its source chip stays honest.
-                let allow = text_budget.min(6000);
-                if allow < 200 && text.len() > allow {
-                    skipped_attachments.push(name);
-                    continue;
-                }
-                let truncated = text.len() > allow;
-                let mut text = clamp_bytes(text, allow);
-                text_budget = text_budget.saturating_sub(text.len());
-                if truncated {
-                    text.push_str("\n… (truncated)");
-                    // UX-4: the AI saw only the beginning — say so, by name.
-                    // ADD-32: and point at the tool that DOES cover everything.
-                    let _ = window.emit(
-                        "ask-notice",
-                        format!(
-                            "Only the beginning of \"{name}\" was included (file is large). \
-                             For guaranteed full coverage, ask me to run a full pass over it."
-                        ),
-                    );
-                }
                 attached_notes.push(format!("[attached file: {name}]\n{text}"));
                 sources.push(name);
             }
-        }
-        if !skipped_attachments.is_empty() {
-            let first = skipped_attachments[0].clone();
-            let more = skipped_attachments.len() - 1;
-            let tail = if more > 0 {
-                format!(" and {more} more attachment(s)")
-            } else {
-                String::new()
-            };
-            let _ = window.emit(
-                "ask-notice",
-                format!(
-                    "\"{first}\"{tail} were skipped — too much attached text for one \
-                     question; ask about them separately."
-                ),
-            );
         }
 
         // Only credit files that genuinely matched the question. On the
@@ -656,11 +648,13 @@ fn gather_context_and_save_question(
         if !connected_mcp.is_empty() {
             system.push_str(&format!(
                 "\n\nThe user has also connected external tool servers to this room: {}. \
-                 Their tools appear alongside the built-in ones and can reach the internet \
-                 or other apps. IMPORTANT: when a question needs current or outside \
-                 information (weather, news, prices, events) and no built-in tool covers \
-                 it, you MUST use one of these tools instead of answering that you lack \
-                 real-time data. Mention when you did.",
+                 Their tools are available dynamically through search_mcp_tools and \
+                 run_mcp_tool and can reach the internet or other apps. Search before \
+                 choosing a connector tool, then pass the returned exact tool id and \
+                 arguments to run_mcp_tool. IMPORTANT: when a question needs current or \
+                 outside information (weather, news, prices, events) and no built-in tool \
+                 covers it, you MUST search and use a connected tool instead of answering \
+                 that you lack real-time data. Mention when you did.",
                 connected_mcp.join(", ")
             ));
         }
@@ -739,6 +733,7 @@ fn gather_context_and_save_question(
         // Recency-weighted history: keep whole recent turns under one global
         // budget, dropping the oldest wholesale rather than cutting each turn
         // to a silently-unterminated 4000-char head (char-safe throughout).
+        let has_history = !history.is_empty();
         for (role, content) in compact_history(history, MAX_HISTORY_CHARS) {
             chat_messages.push(ollama::ChatMessage::new(&role, content));
         }
@@ -800,6 +795,18 @@ fn gather_context_and_save_question(
             }
             user_content.push_str("---\n\n");
         }
+        // Deterministic anaphora hint (see `is_bare_save_reference`): a 4B model
+        // sees its own previous reply in the history yet still asks the user to
+        // re-provide it. Conditional wording keeps a rare false positive
+        // harmless — the model just double-checks what "that" means.
+        if has_history && is_bare_save_reference(question) {
+            user_content.push_str(
+                "(Note: the user's \"that\"/\"this\" refers to earlier content in this \
+                 conversation — usually your own previous reply. Save THAT full text \
+                 with create_file or write_file now; do not ask the user to re-provide \
+                 content that is already above.)\n\n",
+            );
+        }
         user_content.push_str(&format!("Question: {effective_question}"));
 
         chat_messages.push(ollama::ChatMessage {
@@ -832,18 +839,55 @@ fn gather_context_and_save_question(
         })
 }
 
+/// A selected external engine is the room's primary agent, so its per-turn
+/// bridge always includes the room's enabled MCP connectors. The separate
+/// advisor-tools setting applies only to a secondary consulted advisor.
+/// Whether one connector call's arguments get masked on the way out.
+///
+/// Two conditions, both required. A LOCAL connector runs on this Mac, so
+/// nothing leaves and there is nothing to mask. AUTO MODE is the user's
+/// explicit "full approval" for connector tools — approving the call but
+/// rewriting the values it asks about is the worst of both: the call fails,
+/// and the restore on the way back erases the evidence, so the agent can only
+/// report that the connector "would not answer". Auto mode therefore sends
+/// real arguments; turning it off restores masking and the per-call card.
+pub(crate) fn masks_outbound_args(remote: bool, auto_mode: bool) -> bool {
+    remote && !auto_mode
+}
+
+/// The bridge tier for a cloud CLI selected as the ROOM'S OWN engine.
+///
+/// Owner decision 2026-07-25 ("claude and codex should be able to do same as
+/// local"). Before it, this returned `CloudAdvisor { include_mcp: true }`, so a
+/// cloud-CLI room was served no job, workflow, script, studio or transcription
+/// tools at all — the Main agent's catalog lost `ask_jobs_agent` entirely and
+/// live QA saw it substitute a disabled draft SKILL for a requested workflow.
+/// The engine-parity doctrine named only four gaps (dictation, `local_generate`,
+/// vision boxes, UI tools); jobs were never one of them.
+pub(crate) fn primary_cli_scope() -> crate::room_mcp::ToolScope {
+    crate::room_mcp::ToolScope::CloudEngine
+}
+
+/// Resolve the cloud CLIs that can act as advisors. `ai_status` normally keeps
+/// this cache warm; the fallback probe covers headless/background turns that
+/// begin before Settings or the model picker has requested status.
+pub(crate) async fn detected_advisors(state: &State<'_, AppState>) -> Vec<String> {
+    if let Some(cached) = state.external_cache.lock().unwrap().clone() {
+        return cached;
+    }
+    let found = tauri::async_runtime::spawn_blocking(detect_external_blocking)
+        .await
+        .unwrap_or_default();
+    *state.external_cache.lock().unwrap() = Some(found.clone());
+    found
+}
+
 /// Phase 2 (unlocked): produce the answer. This is deliberately the single place
 /// the answer is generated — a cloud CLI (`claude -p`/`codex`) for an external
 /// engine, otherwise the local Python/LangGraph sidecar (the SOLE local engine;
 /// no native fallback). Everything here awaits, so no room lock may be held
 /// across it.
 ///
-/// MIGRATION Phase 2b: `_advisors_on`/`_injected_rowids` were consumed only by
-/// the now-deleted native `agent_loop` path; they are kept in the signature
-/// (caller shape unchanged) pending a later plumbing cleanup.
-/// `advisor_tools_on` is live again: it is the user's "let a cloud AI use this
-/// room's connected tools" switch, so it gates the bridge's MCP pass-through
-/// for external-engine turns.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_answer(
     window: &tauri::Window,
@@ -854,7 +898,7 @@ pub(crate) async fn stream_answer(
     temperature: Option<f64>,
     effects: &mut ToolEffects,
     web_enabled: bool,
-    _advisors_on: bool,
+    advisors_on: bool,
     advisor_tools_on: bool,
     cancel: Arc<AtomicBool>,
     _injected_rowids: &HashSet<i64>,
@@ -864,115 +908,32 @@ pub(crate) async fn stream_answer(
 ) -> Result<String, String> {
     use tauri::Emitter;
     // PRIV-1: an explicit bypass is loud — the transcript records that real
-    // details were shared this once (both engine branches).
+    // details were shared this once, whichever engine answers.
     if privacy_bypass && crate::commands::active_policy().is_some() {
         let _ = window.emit("ask-privacy", serde_json::json!({ "bypassed": true }));
     }
-    let run = if is_cli_engine(model) {
-        // CHG-5: a step chip, not fake live text (nothing streams for cloud).
-        let _ = window.emit("ask-step", "Asking your cloud AI (content leaves this Mac)");
-        // PRIV-1: redact HERE (counted, for the indicator) and hand the CLI the
-        // guarded copy. `run_external`'s own internal guard then finds nothing
-        // left to hide — it exists for the callers that don't count.
-        let policy = if privacy_bypass {
-            None
-        } else {
-            crate::commands::active_policy()
-        };
-        let mut privacy_report = crate::commands::PrivacyReport::default();
-        let guarded: Vec<ollama::ChatMessage> = match &policy {
-            Some(p) => chat_messages
-                .iter()
-                .map(|m| {
-                    let mut mm = m.clone();
-                    mm.content = p.redactor.redact(&m.content, &mut privacy_report);
-                    if let Some(images) = &mm.images {
-                        privacy_report.images_blocked += images.len();
-                        mm.images = None;
-                    }
-                    mm
-                })
-                .collect(),
-            None => chat_messages.clone(),
-        };
-        // ADD-20 / engine parity: BOTH cloud CLIs (Claude Code and Codex) get
-        // the room's tools over a per-ask localhost MCP bridge — the same
-        // exec_tool dispatch as the local agent, decryption stays in-process,
-        // and the bridge dies when this ask returns. Connected MCP servers ride
-        // along only when the user's advisor-tools switch says so (ADD-21).
-        let bridge = {
-            use tauri::Manager;
-            crate::room_mcp::start(
-                window.app_handle().clone(),
-                web_enabled,
-                crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: advisor_tools_on },
-                None,
-                crate::room_mcp::StartOpts { privacy_bypass, ..Default::default() },
-            )
-            .await
-            .ok()
-        };
-        let res =
-            run_external(model, &guarded, Some(cancel.clone()), bridge.as_ref(), privacy_bypass)
-                .await;
-        if let Some(b) = &bridge {
-            b.stop();
-        }
-        // Token-budget bar wants a snapshot regardless of what happens to the
-        // text below (redaction/Stop-swallowing), so split it out now.
-        let (res, ext_usage): (Result<String, String>, Option<crate::commands::external::ExternalUsage>) =
-            match res {
-                Ok((text, usage)) => (Ok(text), usage),
-                Err(e) => (Err(e), None),
-            };
-        // Restore is idempotent: run_external already put real values back for
-        // its own guard's rules; this covers the pre-redacted copy's rules.
-        let res = match &policy {
-            Some(p) => res.map(|t| p.redactor.restore(&t)),
-            None => res,
-        };
-        if policy.is_some() {
-            let _ = window.emit(
-                "ask-privacy",
-                serde_json::json!({
-                    "entities_hidden": privacy_report.entities_hidden,
-                    "replacements": privacy_report.replacements,
-                    "images_blocked": privacy_report.images_blocked,
-                }),
-            );
-        }
-        // Token-budget bar: whatever the CLI reported (even on error — it may
-        // have reported partial usage), categorized against the guarded
-        // message list actually sent. `guarded` has no per-round "tools
-        // offered" figure the way the sidecar path does, and — more
-        // importantly — no role:"tool" messages at all (run_external hides
-        // its own internal tool-calling rounds from Rust entirely), so the
-        // "opaque gap" breakdown (not the generic proportional one) is what
-        // keeps real tool/file activity from being silently misattributed to
-        // system/history (reported live 2026-07-21).
-        {
-            let (engine, submodel, _effort) = split_external_model(model);
-            let max_context = match ext_usage.as_ref().and_then(|u| u.max_context_hint) {
-                Some(hint) => hint,
-                None => match engine {
-                    "codex-cli" => crate::commands::external::codex_context_window(submodel)
-                        .await
-                        .unwrap_or_else(|| crate::model_limits::external_max_context(engine)),
-                    _ => crate::model_limits::external_max_context(engine),
-                },
-            };
-            let breakdown = crate::token_usage::categorize_messages(&guarded);
-            let value = crate::token_usage::build_usage_value_opaque_gap(
-                ext_usage.as_ref().and_then(|u| u.input_tokens),
-                max_context,
-                &breakdown,
-                "tools",
-            );
-            effects.token_usage = Some(value.clone());
-            let _ = window.emit("ask-token-usage", value);
-        }
-        res
+    let advisors = if advisors_on {
+        detected_advisors(state).await
     } else {
+        Vec::new()
+    };
+    // ENGINE PARITY (2026-07-24): there is ONE chat path. Every engine —
+    // local Ollama, `:cloud`, an API provider, and the cloud CLIs (Claude
+    // Code / Codex) — answers through the Python agent hub, so the main
+    // agent, the domain agents and their roster events are the same code for
+    // all of them. A CLI engine used to short-circuit to `run_external` here
+    // and drive the room itself as one opaque agent: no plan, no sub-agents,
+    // nothing for the agent strip to show. The CLI is now a ChatModel behind
+    // that hub (`external_llm.ExternalChatModel`), and `run_via_sidecar`
+    // narrows the bridge scope for it so a cloud engine still never receives
+    // the UI/screen-driving tools.
+    let run = {
+        // CHG-5: the cloud engines say so out loud, before anything is sent.
+        // The old direct CLI path emitted this; the transparency belongs to the
+        // engine choice, not to which code path answers.
+        if is_cli_engine(model) {
+            let _ = window.emit("ask-step", "Asking your cloud AI (content leaves this Mac)");
+        }
         // MIGRATION Phase 2b: the Python/LangGraph sidecar is the app's SOLE local
         // AI engine — EVERY local turn routes through `/run`, including the
         // app-driving/perception turns (the perception tools now hand their
@@ -994,6 +955,8 @@ pub(crate) async fn stream_answer(
             cancel.clone(),
             false, // visible chat turn — emit the ask-* stream events
             privacy_bypass,
+            advisors,
+            advisor_tools_on,
         )
         .await
         {
@@ -1083,6 +1046,7 @@ pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
         && effects.annotation.is_none()
         && effects.edit_outcomes.is_empty()
         && effects.token_usage.is_none()
+        && effects.agent_plan.is_none()
     {
         return None;
     }
@@ -1105,6 +1069,11 @@ pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
     // `ask-token-usage` event (see sidecar.rs / token_usage.rs).
     if let Some(u) = &effects.token_usage {
         map.insert("usage".into(), u.clone());
+    }
+    // Agent visibility: the roster that handled this turn, so the transcript
+    // keeps showing WHO after the live strip is gone.
+    if let Some(p) = &effects.agent_plan {
+        map.insert("agents".into(), p.clone());
     }
     Some(serde_json::Value::Object(map))
 }
@@ -1168,7 +1137,7 @@ pub async fn handoff_chat(state: State<'_, AppState>, chat_id: String) -> Result
     } else {
         ollama::native_context_length(&model)
             .await
-            .unwrap_or_else(|| ollama::num_ctx_for(false, ollama::CtxTier::Chat))
+            .unwrap_or(128_000)
     };
     let marker_msg = ollama::ChatMessage::new("assistant", summary.clone());
     let breakdown = crate::token_usage::categorize_messages(std::slice::from_ref(&marker_msg));
@@ -1197,6 +1166,8 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "move_file",
     "add_memory",
     "list_memories",
+    "update_memory",
+    "delete_memory",
     "list_skills",
     "read_skill",
     "read_skill_resource",
@@ -1209,6 +1180,8 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read_mcp",
     "save_mcp",
     "delete_mcp",
+    "search_mcp_tools",
+    "run_mcp_tool",
     "web_search",
     "fetch_page",
     "ui_snapshot",
@@ -1217,6 +1190,13 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "view_media_frame",
     "start_file_pass",
     "job_status",
+    "list_scripts",
+    "run_script",
+    "studio_flashcards",
+    "studio_mindmap",
+    "generate_podcast_script",
+    "retranscribe_file",
+    "stt_status",
     // Wave 4a (Idea 2): the workflow authoring tools (LocalEngine/ExternalAgent
     // scopes only, never tools_catalog). Reserved so an MCP route can't shadow
     // their exec_tool arms.
@@ -1235,10 +1215,78 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "consult_advisor",
 ];
 
-/// Keyword router deciding whether to offer the write tools this turn. Erring
-/// toward YES is safe (it just restores the fuller catalog); the win is the
-/// large class of pure questions ("what does the contract say about X") that
-/// contain none of these and get a 5-tool catalog instead of 11.
+/// The Scripts lane (2026-07-24). Same trust class as the job tools: running a
+/// script is local compute the user already reaches with one click, and
+/// `run_script` keeps its own fingerprint consent gate underneath — a script
+/// the agent just wrote is an unapproved fingerprint, so it cannot self-execute
+/// new code without the user seeing the card.
+pub(crate) fn script_tools_specs() -> Vec<serde_json::Value> {
+    serde_json::json!([
+        {"type": "function", "function": {"name": "list_scripts",
+            "description": "List the runnable .py/.js scripts in this room, with their declared dependencies and whether the user has already approved each one to run.",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "run_script",
+            "description": "Run one of this room's scripts now. The user is asked to approve any script whose exact contents they have not approved before — including one you just wrote. Output and any files it writes appear in the Scripts view.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "The script's file name, e.g. etf-report.py"}},
+                "required": ["name"]}}}
+    ])
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+}
+
+/// The Studio + transcription lanes (2026-07-24). Both product areas had an
+/// AgentSpec declared with `available=False` — the tree documented the target
+/// shape while the bridge served nothing, so the Main agent could not reach
+/// either. These are the tools that are actually AGENT-shaped.
+///
+/// Deliberately NOT exposed: `transcribe_audio` takes base64 audio bytes from
+/// the recorder UI, which an agent has no way to supply, and `rec_retranscribe`
+/// drives a live recording session. Re-running transcription on a room FILE is
+/// the operation an agent can meaningfully perform, so that is the one offered.
+pub(crate) fn studio_tools_specs() -> Vec<serde_json::Value> {
+    serde_json::json!([
+        {"type": "function", "function": {"name": "studio_flashcards",
+            "description": "Build question/answer flashcards from this room's material and save them as a new file. Say what to focus on in instructions.",
+            "parameters": {"type": "object", "properties": {
+                "instructions": {"type": "string", "description": "What to cover, in the user's words"},
+                "refs": {"type": "array", "items": {"type": "string"}, "description": "Optional file names to build from; omit to use the whole room"}}}}},
+        {"type": "function", "function": {"name": "studio_mindmap",
+            "description": "Build a structured mind map from this room's material and save it as a new file.",
+            "parameters": {"type": "object", "properties": {
+                "instructions": {"type": "string", "description": "What to map, in the user's words"},
+                "refs": {"type": "array", "items": {"type": "string"}, "description": "Optional file names to build from; omit to use the whole room"}}}}},
+        {"type": "function", "function": {"name": "generate_podcast_script",
+            "description": "Write a two-voice podcast script from this room's material and save it as a new file.",
+            "parameters": {"type": "object", "properties": {
+                "instructions": {"type": "string", "description": "What the episode should cover"},
+                "refs": {"type": "array", "items": {"type": "string"}, "description": "Optional file names to build from; omit to use the whole room"}}}}}
+    ])
+    .as_array().cloned().unwrap_or_default()
+}
+
+/// On-device transcription, for a room file that already exists.
+pub(crate) fn transcribe_tools_specs() -> Vec<serde_json::Value> {
+    serde_json::json!([
+        {"type": "function", "function": {"name": "stt_status",
+            "description": "Whether the on-device speech-to-text model is installed and ready. Check this before promising a transcription.",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "retranscribe_file",
+            "description": "Transcribe a room audio/video file again on this computer — use when a transcript is missing, in the wrong language, or poor. Nothing is uploaded.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "The file's name in this room"}},
+                "required": ["name"]}}}
+    ])
+    .as_array().cloned().unwrap_or_default()
+}
+
+/// Keyword router for WRITE intent. Since 2026-07-23 the write tools are
+/// ALWAYS in the catalog (the base system prompt teaches them by name every
+/// turn, so withholding the schemas made the prompt and the catalog contradict
+/// each other — "I can't save files"); this predicate now feeds only the
+/// cosmetic lane label ("Working on your files"). Hebrew hints included: the
+/// matchers are plain substring tests, so a Hebrew ask must find Hebrew stems.
 pub(crate) fn wants_write_tools(question: &str) -> bool {
     let q = question.to_lowercase();
     const HINTS: &[&str] = &[
@@ -1247,8 +1295,145 @@ pub(crate) fn wants_write_tools(question: &str) -> bool {
         "insert", "append", "rename", "correct", "remember", "note ", "jot", "record",
         "translate", "highlight", "mark ", "annotate", "draft", "generate",
         "move ", "rename", "organize", "organise", "put ", "folder", "sort ", "tidy",
+        // Hebrew (substring matchers see no word boundaries, so stems suffice):
+        "ערוך", "עריכה", "שנה", "תקן", "עדכן", "כתוב", "צור ", "שמור", "שמרי",
+        "מחק", "הוסף", "תרגם", "סמן", "זכור", "תזכור", "רשום", "העבר", "תיקיה",
+        "תיקייה", "טיוטה", "קובץ חדש",
     ];
     HINTS.iter().any(|h| q.contains(h))
+}
+
+/// 2026-07-23 live QA: a small model WITH the write tools in hand still fumbled
+/// "save that as a new file called Summary" — it asked the user for content
+/// instead of resolving "that" to its own previous reply (the #1 measured
+/// small-model multi-turn failure: misassuming conversation state; see
+/// pm-request/small-model-agent-reliability-2026-07-23.md). Detects a short
+/// save/record turn whose object is a bare reference ("that", "this", "it",
+/// "זה") rather than inline content, so the ask path can inject a
+/// deterministic anaphora hint into the always-new user message (NEVER the
+/// byte-stable system prompt — ADD-22 KV-cache).
+pub(crate) fn is_bare_save_reference(question: &str) -> bool {
+    let q = question.to_lowercase();
+    // Long turns carry their own content — the reference is not bare.
+    if q.chars().count() > 160 {
+        return false;
+    }
+    const VERBS: &[&str] = &[
+        "save", "keep ", "record", "write that", "write this", "write it",
+        "note that", "note this", "jot", "שמור", "שמרי", "תשמור", "רשום", "רשמי",
+    ];
+    const REFERENTS: &[&str] = &[
+        "that", "this", "it ", " it", "the above", "your answer", "your reply",
+        "your summary", "זה", "זאת", "את זה", "התשובה",
+    ];
+    VERBS.iter().any(|v| q.contains(v)) && REFERENTS.iter().any(|r| q.contains(r))
+}
+
+/// The markers that introduce an explicit file name in a save turn.
+const NAME_MARKERS: &[&str] = &["called ", "named ", "titled ", "as file ", "בשם "];
+
+/// Case-insensitive substring search returning `(start, end)` BYTE offsets into
+/// the ORIGINAL `haystack`.
+///
+/// `haystack.to_lowercase().find(needle)` is the obvious version and it is
+/// subtly wrong: lowercasing is not length-preserving (`İ` is one char and two
+/// after `to_lowercase`), so an index found in the lowered copy can point at a
+/// different — or invalid — place in the original. Comparing slice by slice
+/// keeps every offset native to the string we will actually cut.
+fn find_ci(haystack: &str, needle_lower: &str) -> Option<(usize, usize)> {
+    let n = needle_lower.chars().count();
+    if n == 0 {
+        return None;
+    }
+    let bounds: Vec<usize> = haystack
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(haystack.len()))
+        .collect();
+    for k in 0..bounds.len().saturating_sub(n) {
+        let (start, end) = (bounds[k], bounds[k + n]);
+        if haystack[start..end].to_lowercase() == needle_lower {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+/// Live-QA round 2 (2026-07-23): the anaphora HINT was not enough — the 4B
+/// "saved" by fabricating a fresh document in chat and never calling
+/// create_file. For a deterministic intent the model gets no vote: a PURE
+/// save-that turn is executed by code — the same path as the Save-to-room
+/// button.
+///
+/// "Pure" is decided by an ALLOW-LIST, not by a list of transform verbs. A
+/// blacklist has to enumerate every way a turn could ask for more than a
+/// verbatim copy, and it cannot: "save this as a PDF", "save this in a table",
+/// "save that with the headings fixed" all named no transform verb, so the
+/// bypass fired, wrote the previous reply unchanged, and reported success while
+/// silently dropping what the user actually asked for.
+///
+/// So: strip an explicit "…called X" name, then require every remaining word to
+/// be plain save vocabulary. One unrecognised word means the turn is asking for
+/// something, and it goes to the model — the pre-existing behaviour, and the
+/// safe direction to fail in.
+pub(crate) fn is_pure_save_reference(question: &str) -> bool {
+    if !is_bare_save_reference(question) {
+        return false;
+    }
+    // The requested NAME is arbitrary user text ("called Q3 revenue notes") and
+    // must not be scanned for vocabulary.
+    let mut body = question.trim();
+    for marker in NAME_MARKERS {
+        if let Some((start, _)) = find_ci(body, marker) {
+            body = &body[..start];
+        }
+    }
+    // Save verbs, referents, and the filler that legitimately joins them.
+    // Deliberately small: growing it is a product decision, and each addition
+    // is one more turn the model never sees.
+    const ALLOWED: &[&str] = &[
+        // verbs
+        "save", "saves", "saved", "keep", "store", "record", "write", "jot",
+        "note", "put", "add",
+        // referents
+        "that", "this", "it", "above", "answer", "reply", "response", "message",
+        "text", "output", "last", "previous", "your",
+        // filler
+        "a", "an", "the", "as", "to", "in", "into", "on", "of", "for", "my",
+        "our", "please", "down", "here", "just", "new", "file", "files",
+        "document", "doc", "note's", "notes", "room", "library", "somewhere",
+        // Hebrew equivalents
+        "שמור", "שמרי", "תשמור", "רשום", "רשמי", "זה", "זאת", "את", "קובץ",
+        "כקובץ", "חדש", "בחדר", "התשובה", "בבקשה", "לקובץ", "אותו",
+    ];
+    body.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':'))
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .all(|w| ALLOWED.contains(&w.as_str()))
+}
+
+/// "…called Summary" / "…named Q3 notes" / "…בשם סיכום" → the requested file
+/// name, if the save turn carries one.
+pub(crate) fn requested_file_name(question: &str) -> Option<String> {
+    let q = question.trim();
+    for marker in NAME_MARKERS {
+        // `find_ci` returns offsets into `q` itself, so the name keeps its own
+        // casing and the cut is always on a real char boundary.
+        if let Some((_, end)) = find_ci(q, marker) {
+            let name = q[end..]
+                .trim()
+                .trim_matches(|c| matches!(c, '"' | '\'' | '“' | '”' | '„'))
+                .trim_end_matches(['.', '!', '?'])
+                .trim();
+            if !name.is_empty() && name.chars().count() <= 80 {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Skill management is a separate, on-demand lane. Reading or changing a skill
@@ -1257,7 +1442,7 @@ pub(crate) fn wants_write_tools(question: &str) -> bool {
 /// expose them.
 pub(crate) fn wants_skill_tools(question: &str) -> bool {
     let q = question.to_lowercase();
-    const HINTS: &[&str] = &["skill", "agent instruction"];
+    const HINTS: &[&str] = &["skill", "agent instruction", "מיומנות", "סקיל"];
     HINTS.iter().any(|hint| q.contains(hint))
 }
 
@@ -1272,6 +1457,9 @@ pub(crate) fn wants_mcp_management_tools(question: &str) -> bool {
         "connectors",
         "integration",
         "integrations",
+        "מחבר",
+        "מחברים",
+        "אינטגרצ",
     ];
     HINTS.iter().any(|hint| q.contains(hint))
 }
@@ -1283,6 +1471,9 @@ const APP_NAVIGATION_VERBS: &[&str] = &[
     "open ", "show me", "go to", "switch", "close ", "map", "panel", "tab",
     "studio", "flashcard", "mind map", "mindmap", "podcast", "front page",
     "dashboard", "play", "pause", "image", "photo", "picture",
+    // Hebrew navigation/operation verbs and surfaces:
+    "לחץ", "לחצי", "פתח", "פתחי", "הצג", "הציגי", "מסך", "צילום מסך", "גלול",
+    "כפתור", "סרטון", "וידאו", "תמונה", "סגור", "עבור אל", "תפריט", "לוח",
 ];
 
 /// ADD-25: keyword router for the UI/perception tools (ui_snapshot, ui_act,
@@ -1316,6 +1507,10 @@ pub(crate) fn wants_job_tools(question: &str) -> bool {
         // Wave 4a: the workflow authoring tools ride the jobs routing flag.
         "workflow", "automate", "automat", "every morning", "every day", "every week",
         "each morning", "each day", "schedule", "recurring", "routine", "pipeline",
+        // Hebrew whole-file / automation intents:
+        "כל הקובץ", "הקובץ כולו", "כולו", "את כל", "הכל", "הספר", "יסודי", "מקיף",
+        "לעומק", "ברקע", "משימת רקע", "תהליך", "אוטומצ", "אוטומט", "תזמן", "מתוזמן",
+        "כל בוקר", "כל יום", "כל שבוע", "פרק אחר פרק", "שורה אחר שורה",
     ];
     HINTS.iter().any(|h| q.contains(h))
 }
@@ -1367,6 +1562,28 @@ pub(crate) fn mcp_management_tools_specs() -> Vec<serde_json::Value> {
                 "name": {"type": "string", "description": "Connector name"}},
                 "required": ["name"]}}}),
     ]
+}
+
+/// The top-level model's optional cloud-advisor tool. The enum is constructed
+/// from CLIs actually installed on this Mac, so the model cannot select a
+/// provider that cannot run. This spec is attached to a per-turn bridge only;
+/// a consulted advisor's own bridge never receives it.
+pub(crate) fn consult_advisor_spec(advisors: &[String]) -> serde_json::Value {
+    let mut names: Vec<&str> = Vec::new();
+    if advisors.iter().any(|item| item == "claude-cli") {
+        names.push("claude");
+    }
+    if advisors.iter().any(|item| item == "codex-cli") {
+        names.push("codex");
+    }
+    serde_json::json!({"type": "function", "function": {
+        "name": "consult_advisor",
+        "description": "Delegate ONE hard, self-contained subtask to an installed cloud AI advisor (Claude or Codex). It is slow, may cost money, and the question leaves this Mac through the user's cloud account, so use it only when a second model would materially improve the answer. Put the full task and all necessary context in `question`. When advisor room tools are enabled, Claude may also inspect the room through its restricted bridge. Returns the advisor's written answer for use in the final response.",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "Complete, self-contained task with all context the advisor needs."},
+            "advisor": {"type": "string", "enum": names, "description": "Use codex for coding-heavy work; use claude otherwise."}
+        }, "required": ["question"]}
+    }})
 }
 
 /// Wave 1a: tools served ONLY to an external agent on the Leash's full tier
@@ -1511,9 +1728,21 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
         {"type": "function", "function": {"name": "list_memories",
             "description": "List every memory note saved in this room. Use it when asked what you remember, or when the notes shown in context look incomplete.",
             "parameters": {"type": "object", "properties": {}}}}
+        ,{"type": "function", "function": {"name": "update_memory",
+            "description": "Correct a memory note that is now wrong or out of date. Identify it by a distinctive phrase from the note itself, not by an id.",
+            "parameters": {"type": "object", "properties": {
+                "find": {"type": "string", "description": "A distinctive phrase from the note to correct"},
+                "content": {"type": "string", "description": "The corrected note, in full"}},
+                "required": ["find", "content"]}}}
+        ,{"type": "function", "function": {"name": "delete_memory",
+            "description": "Forget a memory note the user no longer wants remembered. Identify it by a distinctive phrase from the note itself, not by an id.",
+            "parameters": {"type": "object", "properties": {
+                "find": {"type": "string", "description": "A distinctive phrase from the note to forget"}},
+                "required": ["find"]}}}
         ,{"type": "function", "function": {"name": "list_skills",
-            "description": "List the Agent Skills stored in this room, including disabled drafts. Enabled skill metadata is already shown in the question; use this for inventory or authoring.",
-            "parameters": {"type": "object", "properties": {}}}}
+            "description": "List the Agent Skills available to you, including disabled drafts. Call this to see which procedures exist for your domain, then read_skill to load one.",
+            "parameters": {"type": "object", "properties": {
+                "agent": {"type": "string", "description": "Internal: the calling sub-agent's id. The sidecar fills this; leave it out."}}}}}
         ,{"type": "function", "function": {"name": "read_skill",
             "description": "Load a skill's full SKILL.md instructions and resource tree. Call this when an available skill's description matches the user's task, before doing the work.",
             "parameters": {"type": "object", "properties": {
@@ -1531,7 +1760,8 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                 "name": {"type": "string", "description": "Lowercase hyphenated name, at most 64 characters"},
                 "description": {"type": "string", "description": "What the skill does and exactly when to use it"},
                 "instructions": {"type": "string", "description": "The SKILL.md Markdown body"},
-                "source_files": {"type": "array", "items": {"type": "string"}, "description": "Optional names of attached/readable room files to bundle as portable reference snapshots (maximum 12)"}},
+                "source_files": {"type": "array", "items": {"type": "string"}, "description": "Optional names of attached/readable room files to bundle as portable reference snapshots (maximum 12)"},
+                "agent": {"type": "string", "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts). Omit for a skill any agent may use."}},
                 "required": ["name", "description", "instructions"]}}}
         ,{"type": "function", "function": {"name": "write_skill_resource",
             "description": "Add or replace a text resource in a skill draft under scripts/, references/, assets/, agents/, or another relative folder. The skill is disabled again for review.",
@@ -1669,64 +1899,27 @@ pub(crate) fn slim_schema(v: &mut serde_json::Value) {
 }
 
 /// Snapshot the connected MCP tools, namespaced `server_tool` and deduped
-/// against the built-in tool names and each other. CHG-29: schemas are slimmed
-/// and the whole catalog is held under a char budget so a large third-party
-/// server can't silently overflow the 4B model's context. Returns the routes
-/// plus the names of any tools omitted for budget so the caller can tell the
-/// model.
-/// The connected-tool budget `(max_tools, max_catalog_chars)` for an engine:
-/// generous for a cloud/external engine, tight for the small local model (whose
-/// 4B reasoning can't juggle many tools). Pure — unit-tested.
-pub(crate) fn mcp_budget(model: Option<&str>) -> (usize, usize) {
-    let cloud = model
-        .map(|m| is_cloud_model(m) || is_external_engine(m))
-        .unwrap_or(false);
-    if cloud {
-        (MAX_MCP_TOOLS_CLOUD, MAX_MCP_CATALOG_CHARS_CLOUD)
-    } else {
-        (MAX_MCP_TOOLS, MAX_MCP_CATALOG_CHARS)
-    }
-}
-
-pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<String>) {
+/// against the built-in tool names and each other. Schemas are still slimmed
+/// to remove vendor-only noise, but every enabled connected tool is offered.
+pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> Vec<McpRoute> {
     let mut taken: HashSet<String> = BUILTIN_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
-    // Per-connector tool opt-outs + the chosen engine, read before locking `mcp`
-    // so we never hold both locks. A disabled tool is skipped entirely (the user
-    // curates the budget); the engine decides how big that budget is.
-    let (disabled, uncapped, model) = state
+    // Per-connector tool opt-outs, read before locking `mcp` so we never hold
+    // both locks. A disabled tool is skipped entirely.
+    let disabled = state
         .with_room(|room| {
-            Ok((
-                parse_tool_prefs(
-                    &db::get_setting(&room.conn, MCP_TOOL_PREFS_KEY).unwrap_or_default(),
-                ),
-                parse_uncapped(
-                    &db::get_setting(&room.conn, MCP_TOOL_UNCAPPED_KEY).unwrap_or_default(),
-                ),
-                model_setting(&room.conn),
+            Ok(parse_tool_prefs(
+                &db::get_setting(&room.conn, MCP_TOOL_PREFS_KEY).unwrap_or_default(),
             ))
         })
         .unwrap_or_default();
-    // The 12/8000 cap is a small-local-4B limit. Cloud/external engines have the
-    // context and reasoning to use many tools, so give them a generous budget —
-    // otherwise a 15-tool connector shows a cloud model only ~4 tools.
-    let (max_tools, max_chars) = mcp_budget(model.as_deref());
     let mgr = state.mcp.lock().unwrap();
     let mut routes = Vec::new();
-    let mut omitted: Vec<String> = Vec::new();
-    let mut catalog_chars = 0usize;
     for server in &mgr.servers {
         let Some(client) = &server.client else { continue };
         let off = disabled.get(&server.name);
-        // User override: send EVERY enabled tool for this connector, ignoring the
-        // count/char caps ("show them all, I know what I'm doing").
-        let no_cap = uncapped.contains(&server.name);
         for tool in &server.tools {
             // User turned this tool off for this room — it's not offered at all.
             if off.is_some_and(|s| s.contains(&tool.name)) {
-                continue;
-            }
-            if !no_cap && routes.len() >= max_tools {
-                omitted.push(tool.name.clone());
                 continue;
             }
             let base = format!(
@@ -1752,14 +1945,6 @@ pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<Str
             if let Some(annotations) = &tool.annotations {
                 spec["function"]["annotations"] = annotations.clone();
             }
-            // Whole-catalog budget: stop admitting once the specs get too large
-            // (unless the user overrode the cap for this connector).
-            let cost = spec.to_string().len();
-            if !no_cap && catalog_chars + cost > max_chars && !routes.is_empty() {
-                omitted.push(tool.name.clone());
-                continue;
-            }
-            catalog_chars += cost;
             taken.insert(catalog_name.clone());
             routes.push(McpRoute {
                 catalog_name,
@@ -1771,7 +1956,7 @@ pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> (Vec<McpRoute>, Vec<Str
             });
         }
     }
-    (routes, omitted)
+    routes
 }
 
 /// Viewer payloads produced by tools during a turn; persisted on the saved
@@ -1818,6 +2003,12 @@ pub(crate) struct ToolEffects {
     /// when no engine on this turn reported anything (sidecar-backed turns
     /// always set it; see external-CLI turns for the exception).
     pub(crate) token_usage: Option<serde_json::Value>,
+    /// Dispatch-first agent visibility: the turn's agent roster (the sidecar's
+    /// `plan` event body — `[{agent,label,instruction}]`). Persisted under the
+    /// `"agents"` effects key so a finished message still shows WHO handled it
+    /// (the live strip only exists while the turn streams — live QA 2026-07-23:
+    /// a fast local answer flashes it too quickly to read).
+    pub(crate) agent_plan: Option<serde_json::Value>,
 }
 
 pub(crate) async fn exec_tool(
@@ -2554,16 +2745,139 @@ pub(crate) async fn exec_tool(
                 .collect();
             Ok(clamp_tool_result(lines.join("\n")))
         }
+        // 2026-07-24: the agent could add a memory but never correct or drop
+        // one, so a wrong note it saved was permanent. Both verbs match on the
+        // note's TEXT — list_memories never shows ids, and asking a 4B to carry
+        // a UUID between two calls is exactly the multi-turn state it fails at.
+        "update_memory" | "delete_memory" => {
+            let find = args["find"].as_str().unwrap_or_default().trim();
+            if find.is_empty() {
+                return Ok("Say which note to change, using a phrase from it.".into());
+            }
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let hits = db::memories_like(&room.conn, &find.to_lowercase())?;
+            match hits.len() {
+                0 => Ok(format!("No memory contains \"{find}\". Call list_memories to see them.")),
+                1 => {
+                    let (id, old) = &hits[0];
+                    if call.name == "delete_memory" {
+                        db::delete_memory(&room.conn, id)?;
+                        Ok(format!("Forgot: {old}"))
+                    } else {
+                        let content = args["content"].as_str().unwrap_or_default().trim();
+                        if content.is_empty() {
+                            return Ok("Give the corrected note in `content`.".into());
+                        }
+                        if content.chars().count() > MAX_MEMORY_CONTENT_CHARS {
+                            return Ok(format!(
+                                "Memory too long ({} chars); keep it under {}.",
+                                content.chars().count(),
+                                MAX_MEMORY_CONTENT_CHARS
+                            ));
+                        }
+                        // update_memory SETs category, so a text-only fix
+                        // would silently clear it — carry the existing one.
+                        let keep = db::list_memories(&room.conn)?
+                            .into_iter()
+                            .find(|m| &m.id == id)
+                            .and_then(|m| m.category);
+                        db::update_memory(&room.conn, id, content, keep.as_deref())?;
+                        Ok(format!("Updated. Was: {old}"))
+                    }
+                }
+                // Never guess which note the user meant — name them and stop.
+                _ => Ok(format!(
+                    "\"{find}\" matches {} notes; be more specific:\n{}",
+                    hits.len(),
+                    hits.iter().map(|(_, c)| format!("- {c}")).collect::<Vec<_>>().join("\n")
+                )),
+            }
+        }
+        "list_scripts" => {
+            use tauri::Manager;
+            super::agent_list_scripts(window.app_handle(), state)
+        }
+        "run_script" => super::agent_run_script(window, state, args, cancel.as_ref()).await,
+        "studio_flashcards" | "studio_mindmap" | "generate_podcast_script" => {
+            use tauri::Manager;
+            let app = window.app_handle().clone();
+            let st = app.state::<AppState>();
+            let spec = match call.name.as_str() {
+                "studio_flashcards" => super::flashcards_spec(),
+                "studio_mindmap" => super::mindmap_spec(),
+                _ => super::podcast_spec(),
+            };
+            let refs: Option<Vec<String>> = args["refs"].as_array().map(|a| {
+                a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+            });
+            let instructions = args["instructions"].as_str().map(str::to_string);
+            let meta = super::run_studio(window, &st, spec, None, instructions, refs, None).await?;
+            Ok(format!("Saved \"{}\" into the room.", meta.name))
+        }
+        "stt_status" => {
+            use tauri::Manager;
+            let s = super::stt_status(window.app_handle().clone())?;
+            Ok(if s.installed {
+                "The on-device speech model is installed and ready.".to_string()
+            } else if s.downloading {
+                "The on-device speech model is still downloading.".to_string()
+            } else {
+                format!(
+                    "The on-device speech model is not installed ({} MB). The user installs it in Settings.",
+                    s.size_mb
+                )
+            })
+        }
+        "retranscribe_file" => {
+            use tauri::Manager;
+            let wanted = args["name"].as_str().unwrap_or_default().trim().to_string();
+            if wanted.is_empty() {
+                return Err("Say which file to transcribe, by name.".into());
+            }
+            let (file_id, name) = {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                db::find_file_like(&room.conn, &wanted)?
+            };
+            let app = window.app_handle().clone();
+            let st = app.state::<AppState>();
+            super::retranscribe_file(app.clone(), st, file_id)?;
+            Ok(format!("Re-transcribing {name} on this computer; nothing is uploaded."))
+        }
         "list_skills" => {
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            let skills = db::list_skills(&room.conn, false)?;
+            let all = db::list_skills(&room.conn, false)?;
+            // 2026-07-24: a skill may belong to ONE sub-agent. The bridge is
+            // scoped per RUN, not per worker, so the caller's id arrives as an
+            // argument the sidecar injects. A skill with no owner is GENERAL
+            // and stays visible to everyone (every pre-existing skill).
+            let caller = args["agent"].as_str().unwrap_or_default().trim();
+            let skills: Vec<_> = all
+                .iter()
+                .filter(|s| {
+                    let owner = s.agent.trim();
+                    owner.is_empty() || caller.is_empty() || owner == caller
+                })
+                .collect();
             if skills.is_empty() {
-                return Ok("No skills are stored in this room yet.".into());
+                return Ok(if all.is_empty() {
+                    "No skills are stored in this room yet.".into()
+                } else {
+                    "No skills are assigned to you yet.".into()
+                });
             }
             let lines = skills
                 .iter()
-                .map(|s| format!("- {} [{}] — {} ({} resources)", s.name, if s.enabled { "enabled" } else { "disabled draft" }, s.description, s.resource_count))
+                .map(|s| format!(
+                    "- {} [{}]{} — {} ({} resources)",
+                    s.name,
+                    if s.enabled { "enabled" } else { "disabled draft" },
+                    if !s.agent.trim().is_empty() && s.agent.trim() == caller { " (yours)" } else { "" },
+                    s.description,
+                    s.resource_count,
+                ))
                 .collect::<Vec<_>>()
                 .join("\n");
             Ok(clamp_bytes(lines, 12_000))
@@ -2693,7 +3007,7 @@ pub(crate) async fn exec_tool(
                     temperature,
                     KEEP_ALIVE_WARM,
                     &args["schema"],
-                    ollama::StructuredOpts { tier, cancel: None },
+                    ollama::StructuredOpts::default(),
                 )
                 .await
             } else {
@@ -2763,10 +3077,21 @@ pub(crate) async fn exec_tool(
                 // mask the room's known entities in the args before they leave,
                 // and restore them in the result so the model's view stays
                 // consistent. Local connectors run on this Mac and are exempt.
-                // `remote_seam_redactor` ignores the on/off switch on purpose:
-                // a remote call is a hard leak point. None when the entity map
-                // is empty (nothing to mask) — SEC-1b consent above is the floor.
-                let seam = if route.remote {
+                //
+                // AUTO MODE (owner's call, 2026-07-24) is the one exception, and
+                // it is deliberate: masking rewrites the VALUES a connector is
+                // asked about, so a room whose entity map holds the very things
+                // the user wants looked up ("NVDA", "#eng") sent the server
+                // `[Person A]` and got nothing back — the call failed, and the
+                // restore on the way home hid WHY, so the agent could only
+                // report that the connector "would not answer". Auto mode means
+                // the agent has full approval to act, so it also sends real
+                // arguments. Turning auto mode OFF restores masking along with
+                // the per-call consent card. None when the entity map is empty.
+                let auto_mode = state
+                    .mcp_auto_approve
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let seam = if masks_outbound_args(route.remote, auto_mode) {
                     crate::commands::remote_seam_redactor()
                 } else {
                     None
@@ -2795,37 +3120,20 @@ pub(crate) async fn exec_tool(
     }
 }
 
-/// CHG-5/CHG-28: format one window of a fetched page's readable text starting at
-/// char offset `start`. When more text remains, the truncation notice tells the
-/// model the exact `start` to pass to keep reading (served from cache — no new
-/// network). Char-safe throughout.
+/// Format a fetched page's remaining readable text starting at char offset
+/// `start`. Tool-result pagination is no longer app-capped.
 pub(crate) fn fetch_page_window(title: &str, url: &str, text: &str, start: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
     let start = start.min(total);
     let header = format!("[{title}] {url}\n\n");
-    // Leave room for the header within the per-result char budget.
-    let window = MAX_TOOL_RESULT_CHARS.saturating_sub(header.chars().count() + 120);
-    let end = (start + window).min(total);
-    let body: String = chars[start..end].iter().collect();
-    let mut out = format!("{header}{body}");
-    if end < total {
-        out.push_str(&format!(
-            "\n… truncated at char {end} of {total}. To keep reading, call fetch_page again \
-             with the same url and start={end} (instant, served from cache)."
-        ));
-    }
-    out
+    let body: String = chars[start..].iter().collect();
+    format!("{header}{body}")
 }
 
-/// Clamp at a char boundary — external tool output can be multibyte.
+/// Tool results are passed through without an app-level character cap.
 pub(crate) fn clamp_tool_result(s: String) -> String {
-    if s.chars().count() <= MAX_TOOL_RESULT_CHARS {
-        return s;
-    }
-    let mut cut: String = s.chars().take(MAX_TOOL_RESULT_CHARS).collect();
-    cut.push_str("\n… (truncated)");
-    cut
+    s
 }
 
 /// Largest byte index <= `max` that is a char boundary. Stable-Rust stand-in
@@ -3156,23 +3464,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mcp_budget_is_generous_for_cloud_tight_for_local() {
-        // A small local model keeps the tight 4B-safe budget.
-        assert_eq!(mcp_budget(Some("qwen3.5:4b")), (MAX_MCP_TOOLS, MAX_MCP_CATALOG_CHARS));
-        assert_eq!(mcp_budget(None), (MAX_MCP_TOOLS, MAX_MCP_CATALOG_CHARS));
-        // A :cloud model and an external CLI engine both get the generous budget,
-        // so a 15-tool connector isn't silently trimmed to ~4.
-        assert_eq!(
-            mcp_budget(Some("minimax-m3:cloud")),
-            (MAX_MCP_TOOLS_CLOUD, MAX_MCP_CATALOG_CHARS_CLOUD)
-        );
-        assert_eq!(
-            mcp_budget(Some("claude-cli")),
-            (MAX_MCP_TOOLS_CLOUD, MAX_MCP_CATALOG_CHARS_CLOUD)
-        );
-        // The generous budget really is bigger.
-        assert!(MAX_MCP_TOOLS_CLOUD > MAX_MCP_TOOLS);
-        assert!(MAX_MCP_CATALOG_CHARS_CLOUD > MAX_MCP_CATALOG_CHARS);
+    fn auto_mode_sends_real_connector_args() {
+        // The reported failure: a remote connector asked about values the room's
+        // entity map also knows ("NVDA", "#eng") received placeholders and
+        // returned nothing, and the restore hid why. Auto mode = full approval,
+        // so the args go out real.
+        assert!(!masks_outbound_args(true, true));
+        // Auto mode off: the per-call card is back, and so is the mask.
+        assert!(masks_outbound_args(true, false));
+        // A local connector never leaves this Mac, either way.
+        assert!(!masks_outbound_args(false, false));
+        assert!(!masks_outbound_args(false, true));
+    }
+
+    #[test]
+    fn primary_cli_scope_is_the_engine_tier_not_the_advisor_tier() {
+        // Owner decision 2026-07-25: the room's own cloud CLI is the main
+        // agent, so it gets the local tier minus the screen. Sharing the
+        // consulted-advisor tier cost it jobs, workflows, scripts, studio and
+        // transcription — `ask_jobs_agent` never entered its catalog at all.
+        assert_eq!(primary_cli_scope(), crate::room_mcp::ToolScope::CloudEngine);
+        // The property the old name pinned — connected MCP always advertised
+        // to the room's own engine — is asserted with the rest of the tier in
+        // `room_mcp::tests::cloud_engine_matches_the_local_tier_except_the_screen`.
     }
 
     #[test]
@@ -3269,6 +3583,113 @@ mod tests {
     }
 
     #[test]
+    fn pure_save_references_bypass_the_model() {
+        // Live-QA round 2: these must be handled by CODE (Save-to-room path).
+        assert!(is_pure_save_reference("save that as a new file called Summary"));
+        assert!(is_pure_save_reference("save this to the room"));
+        assert!(is_pure_save_reference("שמור את זה כקובץ בשם סיכום"));
+        assert!(is_pure_save_reference("keep it as a note"));
+        assert!(is_pure_save_reference("Save this, please."));
+        // Transform saves still go to the model — real work is required.
+        assert!(!is_pure_save_reference("save that translated to Hebrew"));
+        assert!(!is_pure_save_reference("save this but shorten it first"));
+        assert!(!is_pure_save_reference("save it without the code blocks"));
+        // A file NAME must not read as a transform verb — and arbitrary user
+        // text in the name must not be scanned for vocabulary at all.
+        assert!(is_pure_save_reference("save that as a file called Summary"));
+        assert!(is_pure_save_reference(
+            "save this as a file called translate the shorter version"
+        ));
+    }
+
+    #[test]
+    fn a_qualified_save_is_the_models_job_not_the_bypasss() {
+        // The blacklist's blind spot, and why the predicate is an allow-list
+        // now: none of these names a "transform verb", so the bypass fired,
+        // wrote the previous reply UNCHANGED, and told the user it had saved
+        // what they asked for. Every one must reach the model instead.
+        for q in [
+            "save this as a PDF",
+            "save this in a table format",
+            "save that with the headings fixed",
+            "save that as bullet points",
+            "save it in Hebrew",
+            "save this and email it to Dana",
+            "save that minus the intro",
+        ] {
+            assert!(is_bare_save_reference(q), "fixture must be a save turn: {q}");
+            assert!(!is_pure_save_reference(q), "silently dropped a qualifier: {q}");
+        }
+    }
+
+    #[test]
+    fn case_insensitive_search_returns_offsets_into_the_original() {
+        // `to_lowercase().find()` is the obvious version and it is subtly
+        // wrong: lowercasing is not length-preserving, so an index found in the
+        // lowered copy can point somewhere else in the original.
+        let (start, end) = find_ci("Save that CALLED Summary", "called ").unwrap();
+        assert_eq!(&"Save that CALLED Summary"[start..end], "CALLED ");
+        assert_eq!(&"Save that CALLED Summary"[end..], "Summary");
+        assert_eq!(find_ci("nothing here", "called "), None);
+        // A string whose lowercase is LONGER than itself must not shift the cut.
+        let tricky = "save that İcalled Report";
+        assert!(tricky.to_lowercase().len() > tricky.len());
+        if let Some((_, end)) = find_ci(tricky, "called ") {
+            assert_eq!(&tricky[end..], "Report");
+        }
+        assert_eq!(requested_file_name(tricky).as_deref(), Some("Report"));
+    }
+
+    #[test]
+    fn requested_file_names_are_extracted() {
+        assert_eq!(
+            requested_file_name("save that as a new file called Summary").as_deref(),
+            Some("Summary")
+        );
+        assert_eq!(
+            requested_file_name("keep it, named \"Q3 notes\"").as_deref(),
+            Some("Q3 notes")
+        );
+        assert_eq!(
+            requested_file_name("שמור את זה בשם סיכום הפרויקט").as_deref(),
+            Some("סיכום הפרויקט")
+        );
+        assert_eq!(requested_file_name("save that to the room"), None);
+    }
+
+    #[test]
+    fn bare_save_references_are_detected() {
+        // The live-QA failure, verbatim:
+        assert!(is_bare_save_reference("save that as a new file called Summary"));
+        assert!(is_bare_save_reference("Save this to the room"));
+        assert!(is_bare_save_reference("keep it as a note"));
+        assert!(is_bare_save_reference("record your answer in a file"));
+        assert!(is_bare_save_reference("שמור את זה כקובץ חדש"));
+        // Content-carrying or unrelated turns must NOT trigger the hint:
+        assert!(!is_bare_save_reference("save the quarterly report file"));
+        assert!(!is_bare_save_reference("what does the contract say about rent"));
+        let long = format!("save this: {}", "x".repeat(200));
+        assert!(!is_bare_save_reference(&long)); // carries its own content
+    }
+
+    #[test]
+    fn hebrew_questions_fire_the_routers() {
+        // 2026-07-23 live QA: the hint lists were English-only substrings, so
+        // a Hebrew speaker could never open a lane. (to_lowercase is identity
+        // for Hebrew; plain substring matching.)
+        assert!(wants_write_tools("שמור את זה כקובץ"));
+        assert!(wants_write_tools("ערוך את החוזה"));
+        assert!(wants_ui_tools("פתח את הקובץ"));
+        assert!(wants_ui_tools("צלם צילום מסך"));
+        assert!(wants_job_tools("סכם את כל הספר"));
+        assert!(wants_skill_tools("צור מיומנות חדשה"));
+        assert!(wants_mcp_management_tools("הצג את המחברים שלי"));
+        // A plain Hebrew question opens nothing (the short-catalog win case).
+        assert!(!wants_ui_tools("מה שכר הדירה בחוזה?"));
+        assert!(!wants_job_tools("מה שכר הדירה בחוזה?"));
+    }
+
+    #[test]
     fn wants_ui_tools_routes_operate_intents() {
         // Operate-the-app intents open the UI/perception tools…
         assert!(wants_ui_tools("click the Save button"));
@@ -3354,9 +3775,9 @@ mod tests {
         // Every exec_tool arm that dispatches to a built-in (not the `other =>`
         // MCP fallback) must be in BUILTIN_TOOL_NAMES, or a connected MCP server
         // whose sanitized name collides could shadow the built-in and skip the
-        // SEC-1b consent gate. `consult_advisor` and `local_generate` are never
-        // in any bridge catalog but ARE exec_tool arms, so they are the two that
-        // the plain leak guards above don't already cover.
+        // SEC-1b consent gate. `consult_advisor` is added only by a per-turn
+        // runtime and `local_generate` only by the external scope, but both ARE
+        // exec_tool arms and must remain reserved against MCP shadowing.
         for name in ["consult_advisor", "local_generate"] {
             assert!(
                 BUILTIN_TOOL_NAMES.contains(&name),

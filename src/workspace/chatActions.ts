@@ -58,6 +58,9 @@ export function makeChatActions(
         s.setStreamText("");
         s.setSteps([]);
         s.setLane("");
+        s.setAgentPlan(null);
+        s.setActiveAgent(null);
+        s.setAgentSteps({});
         s.setMemSuggestion(null);
         s.editedRef.current = new Set();
         // Idea 3: a new turn silences the old answer and opens a fresh voice
@@ -144,6 +147,9 @@ export function makeChatActions(
         s.setStreamText("");
         s.setSteps([]);
         s.setLane("");
+        s.setAgentPlan(null);
+        s.setActiveAgent(null);
+        s.setAgentSteps({});
         // Wave 2 (Idea 6): the run is over (finished OR stopped — this is
         // runGuarded's `finally`). Decline any diff-preview card still queued: the
         // tools/call task that awaits it is gone, so applying now would mutate a

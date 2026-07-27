@@ -1130,6 +1130,103 @@ async fn wf_generate(
     }
 }
 
+/// Run one workflow CHAIN node in the sidecar's LangGraph (MIGRATION slice 1,
+/// owner decision 2026-07-25: "Rust drives, Python thinks").
+///
+/// `refine` and `plan_and_map` are the only two node kinds that are multi-call
+/// model chains needing NOTHING from the room while they run: `interpolate`
+/// resolves `{{files}}`/`{{date}}` against the encrypted DB once, BEFORE the
+/// call, and everything after was just `wf_generate`. So they move whole, and
+/// Rust keeps what it already owns — the plan, the lane, the interpolation, the
+/// wave scheduler and every checkpoint.
+///
+/// The step boundary does not move, which is why this needs no checkpointer.
+/// In-process, a failure at call 6 of 7 aborted the arm, `run_plan` returned
+/// `Error` BEFORE `checkpoint(&done)` ran, and resume replayed the step from
+/// scratch — calls 1-5 were already thrown away. Bundling the chain behind one
+/// POST therefore costs exactly zero durability: the granularity was never
+/// finer than the step. `run_plan_discards_a_failed_waves_completed_siblings`
+/// pins that contract and this change cannot reach it.
+async fn wf_node_value(
+    kind: &str,
+    model: &str,
+    job_id: &str,
+    step_id: usize,
+    lane: Lane,
+    body: serde_json::Value,
+    cancel: &Arc<AtomicBool>,
+) -> Result<serde_json::Value, String> {
+    let run_id = format!("{job_id}:{step_id}");
+    let mut payload = serde_json::json!({
+        "kind": kind,
+        // TOP-LEVEL, deliberately: `sidecar_json` keys `inject_policy` and
+        // `inject_provider_runtime` off `body["model"]`, so nesting it would
+        // silently drop the privacy door and the Keychain-backed provider
+        // credentials on a cloud engine.
+        "model": model,
+        "base_url": ollama::resolved_base_url(),
+        "keep_alive": KEEP_ALIVE_WARM,
+        "run_id": run_id,
+        // The lane budget, re-imposed INSIDE the step. `plan_dispatch` enforces
+        // Lane::LocalLlm => 1 ACROSS steps because "Local model and Whisper are
+        // serial (RAM and a single resident model)"; a fan-out inside ONE step
+        // would bypass it entirely and let several generations hit a local 4B
+        // at once, multiplying resident context.
+        "parallel": lane.slots(),
+    });
+    // Merge the node's own fields UNDER the reserved keys above, never over
+    // them. The comment on "model" says exactly why it must stay top-level —
+    // `sidecar_json` keys the privacy door and the Keychain-backed provider
+    // credentials off `body["model"]` — and a blind `payload[k] = v` would let
+    // a future node body named `model` (or `run_id`, or `parallel`) overwrite
+    // it silently, which is the failure that comment exists to prevent.
+    const RESERVED: &[&str] = &["kind", "model", "base_url", "keep_alive", "run_id", "parallel"];
+    if let Some(map) = body.as_object() {
+        for (k, v) in map {
+            debug_assert!(
+                !RESERVED.contains(&k.as_str()),
+                "wf_node body key {k:?} would shadow a reserved payload field"
+            );
+            if !RESERVED.contains(&k.as_str()) {
+                payload[k] = v.clone();
+            }
+        }
+    }
+    match crate::sidecar::sidecar_json_cancellable_run(
+        "/wf_node",
+        &payload,
+        cancel,
+        &run_id,
+        crate::sidecar::SIDECAR_CHAIN_TIMEOUT,
+    )
+    .await
+    {
+        // The sidecar's own Stop answer, and the host-side one, map to the same
+        // sentinel `wf_generate` produced — `spawn_workflow_job` normalises it
+        // to Paused, so Stop still parks the job rather than failing it.
+        Ok(Some(v)) if v.get("stopped").and_then(|s| s.as_bool()) == Some(true) => {
+            Err("STOPPED".into())
+        }
+        Ok(Some(v)) => Ok(v),
+        Ok(None) => Err("STOPPED".into()),
+        Err(e) => Err(e.sentinel(Some(model))),
+    }
+}
+
+/// The common case: a chain node whose whole artifact is its text.
+async fn wf_node(
+    kind: &str,
+    model: &str,
+    job_id: &str,
+    step_id: usize,
+    lane: Lane,
+    body: serde_json::Value,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let v = wf_node_value(kind, model, job_id, step_id, lane, body, cancel).await?;
+    Ok(v["result"].as_str().unwrap_or_default().to_string())
+}
+
 /// Pure deterministic text transform (unit-tested).
 fn apply_transform(op: &str, find: &Option<String>, value: &Option<String>, input: &str) -> String {
     let v = value.clone().unwrap_or_default();
@@ -1177,74 +1274,18 @@ fn apply_merge(mode: &str, separator: &Option<String>, inputs: &[String]) -> Str
 
 /// Pure vote aggregation (unit-tested): majority = most common trimmed sample
 /// (ties → the earliest); concat = every sample, labeled.
-fn aggregate_votes(mode: &str, samples: &[String]) -> String {
-    if samples.is_empty() {
-        return String::new();
-    }
-    if mode == "majority" {
-        // key -> (count, first-seen index); pick highest count, tie → lowest index.
-        let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
-        for (i, s) in samples.iter().enumerate() {
-            let e = counts.entry(s.trim()).or_insert((0, i));
-            e.0 += 1;
-        }
-        return counts
-            .iter()
-            .max_by(|(_, (ca, ia)), (_, (cb, ib))| ca.cmp(cb).then(ib.cmp(ia)))
-            .map(|(k, _)| k.to_string())
-            .unwrap_or_default();
-    }
-    samples
-        .iter()
-        .enumerate()
-        .map(|(i, s)| format!("— sample {} —\n{}", i + 1, s.trim()))
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// A JSON schema requiring each field as a string — the /generate `format` for an
-/// extract node (structured output).
-fn build_extract_schema(fields: &[String]) -> serde_json::Value {
-    let mut props = serde_json::Map::new();
-    let mut required: Vec<serde_json::Value> = Vec::new();
-    for f in fields.iter().map(|f| f.trim()).filter(|f| !f.is_empty()) {
-        props.insert(f.to_string(), serde_json::json!({ "type": "string" }));
-        required.push(serde_json::Value::String(f.to_string()));
-    }
-    serde_json::json!({ "type": "object", "properties": props, "required": required })
-}
-
-/// A JSON schema constraining a `label` to one of `labels` — the route classifier's
-/// /generate `format`.
-fn route_schema_of(labels: &[String]) -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": { "label": { "type": "string", "enum": labels } },
-        "required": ["label"]
-    })
-}
-
-/// Pick the route label the model chose from its (possibly messy) output: an exact
-/// case-insensitive match wins, else the first label whose text appears, else the
-/// first label (a route always takes SOME branch). Pure — unit-tested.
-fn pick_route_label(raw: &str, labels: &[String]) -> String {
-    let hay = raw.to_lowercase();
-    // Prefer a `"label": "x"` structured answer if present.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ollama::recover_json(raw)) {
-        if let Some(l) = v.get("label").and_then(|l| l.as_str()) {
-            if let Some(m) = labels.iter().find(|x| x.eq_ignore_ascii_case(l.trim())) {
-                return m.clone();
-            }
-        }
-    }
-    for l in labels {
-        if hay.contains(&l.to_lowercase()) {
-            return l.clone();
-        }
-    }
-    labels.first().cloned().unwrap_or_default()
-}
-
+// `aggregate_votes` lived here and is DELETED (2026-07-25, MIGRATION slice 2).
+// The vote arm now runs in the sidecar, so this was a second implementation of
+// something Python already owns — exactly the "written twice" case. Its four
+// assertions (majority wins, a TIE goes to the earliest sample, concat labels
+// samples from 1, empty in -> empty out) moved verbatim into
+// `sidecar/tests/test_wf_nodes.py::test_aggregate_votes_matches_the_rust_rules`.
+// `build_extract_schema`, `route_schema_of` and `pick_route_label` lived here
+// and are DELETED (2026-07-25, MIGRATION slice 3). The extract and route arms
+// run in the sidecar now, so these were second implementations of things Python
+// owns. Their assertions moved verbatim into
+// `sidecar/tests/test_wf_nodes.py::test_route_label_pick_is_robust` and
+// `::test_extract_schema_requires_each_field`.
 /// Execute one workflow step. Generic over the runtime so the mock-app harness
 /// can drive the deterministic nodes; the agent_run arm is injected via
 /// `agent_run` so the executor core stays mock-drivable. Room-pinned throughout.
@@ -1529,62 +1570,86 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
             }
         }
         NodeKind::Extract { fields, .. } => {
+            // MIGRATION slice 3: one structured call, run in the sidecar.
+            // `build_extract_schema` moved WITH it (and took its Rust
+            // assertions along) so the schema is not built in two places.
             let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
-            let schema = build_extract_schema(fields);
-            let prompt = format!(
-                "Extract these fields from the text and return ONLY a JSON object with \
-                 exactly these keys: {}.\n\nText:\n{}",
-                fields.join(", "),
-                inputs_joined
-            );
-            let raw = wf_generate(&m, &prompt, Some(schema), cancel).await?;
-            let cleaned = ollama::recover_json(&raw);
-            let val: serde_json::Value = serde_json::from_str(&cleaned)
-                .unwrap_or_else(|_| serde_json::json!({ "_raw": raw }));
+            let result = wf_node(
+                "extract",
+                &m,
+                job_id,
+                step.id,
+                step.lane,
+                serde_json::json!({ "fields": fields, "context": inputs_joined }),
+                cancel,
+            )
+            .await?;
             Ok(WfArtifact {
-                result: serde_json::to_string_pretty(&val).unwrap_or(cleaned),
+                result,
                 ..Default::default()
             })
         }
+
         NodeKind::Route { prompt, labels, .. } => {
+            // MIGRATION slice 3. This arm returns a BRANCH as well as text —
+            // `compile_workflow` prunes the dead edges from it — so `wf_node`
+            // alone is not enough here and the branch is read explicitly.
             let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
             let ask = interpolate(app, room_path, prompt, &inputs_joined);
-            let full = format!(
-                "{}\n\nChoose EXACTLY ONE label for the following, from: {}.\n\n{}",
-                if ask.trim().is_empty() {
-                    "Classify the input."
-                } else {
-                    ask.trim()
-                },
-                labels.join(", "),
-                inputs_joined
-            );
-            let raw = wf_generate(&m, &full, Some(route_schema_of(labels)), cancel).await?;
-            let label = pick_route_label(&raw, labels);
+            let v = wf_node_value(
+                "route",
+                &m,
+                job_id,
+                step.id,
+                step.lane,
+                serde_json::json!({
+                    "prompt": ask,
+                    "labels": labels,
+                    "context": inputs_joined,
+                }),
+                cancel,
+            )
+            .await?;
+            let branch = v["branch"].as_str().map(|s| s.to_string());
             Ok(WfArtifact {
-                result: format!("route: {label}"),
-                branch: Some(label),
+                result: v["result"].as_str().unwrap_or_default().to_string(),
+                branch,
                 ..Default::default()
             })
         }
+
         NodeKind::Vote {
             prompt,
             samples,
             mode,
             ..
         } => {
+            // MIGRATION slice 2: self-consistency sampling runs as a LangGraph
+            // fan-out in the sidecar. Same profile as refine/plan_and_map —
+            // `interpolate` once against the encrypted DB HERE, then N model
+            // calls that touch nothing. The blocker the analysis named for this
+            // arm (majority ties resolve by FIRST-SEEN index, so completion
+            // order must not leak in) is closed by the same index-carrying
+            // reducer `plan_and_map` uses; `aggregate_votes` is ported verbatim
+            // and its Rust unit test stays as the parity anchor.
             let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
             let p = interpolate(app, room_path, prompt, &inputs_joined);
-            let n = (*samples).clamp(1, 7);
-            let mut outs: Vec<String> = Vec::new();
-            for _ in 0..n {
-                if cancel.load(Ordering::SeqCst) {
-                    return Err("STOPPED".into());
-                }
-                outs.push(wf_generate(&m, &p, None, cancel).await?);
-            }
+            let result = wf_node(
+                "vote",
+                &m,
+                job_id,
+                step.id,
+                step.lane,
+                serde_json::json!({
+                    "prompt": p,
+                    "mode": mode,
+                    "samples": *samples,
+                }),
+                cancel,
+            )
+            .await?;
             Ok(WfArtifact {
-                result: aggregate_votes(mode, &outs),
+                result,
                 ..Default::default()
             })
         }
@@ -1646,47 +1711,29 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
             max_rounds,
             ..
         } => {
+            // MIGRATION slice 1 (owner decision 2026-07-25, "Rust drives,
+            // Python thinks"): the evaluator-optimizer loop now runs as a
+            // LangGraph graph in the sidecar. Rust still interpolates against
+            // the encrypted DB HERE, before the call — the sidecar never sees a
+            // room handle, only finished text.
             let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
             let base = interpolate(app, room_path, prompt, &inputs_joined);
-            let rounds = (*max_rounds).clamp(1, 4);
-            let mut draft = wf_generate(&m, &base, None, cancel).await?;
-            let rubric = if rubric.trim().is_empty() {
-                "accurate, complete, and clearly written".to_string()
-            } else {
-                rubric.trim().to_string()
-            };
-            let verdict_schema = serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pass": { "type": "boolean" },
-                    "feedback": { "type": "string" }
-                },
-                "required": ["pass", "feedback"]
-            });
-            for _ in 1..rounds {
-                if cancel.load(Ordering::SeqCst) {
-                    return Err("STOPPED".into());
-                }
-                let eval_prompt = format!(
-                    "Judge the draft against this bar: {rubric}.\nReturn ONLY JSON \
-                     {{\"pass\": <bool>, \"feedback\": <what to fix>}}.\n\nDraft:\n{draft}"
-                );
-                let verdict_raw =
-                    wf_generate(&m, &eval_prompt, Some(verdict_schema.clone()), cancel).await?;
-                let verdict: serde_json::Value =
-                    serde_json::from_str(&ollama::recover_json(&verdict_raw))
-                        .unwrap_or_else(|_| serde_json::json!({ "pass": true, "feedback": "" }));
-                if verdict["pass"].as_bool().unwrap_or(true) {
-                    break;
-                }
-                let feedback = verdict["feedback"].as_str().unwrap_or_default();
-                let improve = format!(
-                    "{base}\n\nYour previous draft:\n{draft}\n\nRevise it to fix this feedback:\n{feedback}"
-                );
-                draft = wf_generate(&m, &improve, None, cancel).await?;
-            }
+            let result = wf_node(
+                "refine",
+                &m,
+                job_id,
+                step.id,
+                step.lane,
+                serde_json::json!({
+                    "prompt": base,
+                    "rubric": rubric,
+                    "max_rounds": *max_rounds,
+                }),
+                cancel,
+            )
+            .await?;
             Ok(WfArtifact {
-                result: draft,
+                result,
                 ..Default::default()
             })
         }
@@ -1695,70 +1742,31 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
             max_workers,
             ..
         } => {
+            // MIGRATION slice 1: the orchestrator-worker fan-out now runs as a
+            // LangGraph graph. A `Lane::Cloud` step gets its workers overlapped
+            // 4-wide for free; a local one still serializes exactly as the
+            // sequential `for st in &subtasks` loop did, because the lane's slot
+            // count rides along in the payload and becomes a semaphore there.
             let m = model.clone().unwrap_or_else(|| plan.resolved_model.clone());
             let obj = interpolate(app, room_path, objective, &inputs_joined);
-            let plan_schema = serde_json::json!({
-                "type": "object",
-                "properties": { "subtasks": { "type": "array", "items": { "type": "string" } } },
-                "required": ["subtasks"]
-            });
-            let plan_prompt = format!(
-                "Break this objective into a short list of independent subtasks (no more \
-                 than {}). Return ONLY JSON {{\"subtasks\": [\"…\"]}}.\n\nObjective:\n{}\n\nContext:\n{}",
-                (*max_workers).clamp(1, 8),
-                obj,
-                inputs_joined
-            );
-            let plan_raw = wf_generate(&m, &plan_prompt, Some(plan_schema), cancel).await?;
-            let parsed: serde_json::Value = serde_json::from_str(&ollama::recover_json(&plan_raw))
-                .unwrap_or_else(|_| serde_json::json!({ "subtasks": [] }));
-            let subtasks: Vec<String> = parsed["subtasks"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s.as_str().map(|s| s.trim().to_string()))
-                        .filter(|s| !s.is_empty())
-                        .take((*max_workers).clamp(1, 8) as usize)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if subtasks.is_empty() {
-                // No decomposition — fall back to answering the objective directly.
-                let direct = wf_generate(
-                    &m,
-                    &format!("{obj}\n\nContext:\n{inputs_joined}"),
-                    None,
-                    cancel,
-                )
-                .await?;
-                Ok(WfArtifact {
-                    result: direct,
-                    ..Default::default()
-                })
-            } else {
-                let mut worker_results: Vec<String> = Vec::new();
-                for st in &subtasks {
-                    if cancel.load(Ordering::SeqCst) {
-                        return Err("STOPPED".into());
-                    }
-                    let wp = format!(
-                        "Overall objective:\n{obj}\n\nDo ONLY this subtask and return its \
-                         result:\n{st}\n\nContext:\n{inputs_joined}"
-                    );
-                    let r = wf_generate(&m, &wp, None, cancel).await?;
-                    worker_results.push(format!("### {st}\n\n{}", r.trim()));
-                }
-                let synth = format!(
-                    "Combine these subtask results into one coherent answer to the \
-                     objective.\n\nObjective:\n{obj}\n\nResults:\n{}",
-                    worker_results.join("\n\n")
-                );
-                let out = wf_generate(&m, &synth, None, cancel).await?;
-                Ok(WfArtifact {
-                    result: out,
-                    ..Default::default()
-                })
-            }
+            let result = wf_node(
+                "plan_and_map",
+                &m,
+                job_id,
+                step.id,
+                step.lane,
+                serde_json::json!({
+                    "prompt": obj,
+                    "context": inputs_joined,
+                    "max_workers": *max_workers,
+                }),
+                cancel,
+            )
+            .await?;
+            Ok(WfArtifact {
+                result,
+                ..Default::default()
+            })
         }
     };
 
@@ -2037,7 +2045,7 @@ pub(crate) async fn run_agent_headless(
         .ok_or("main window is gone")?;
     let window = webview.as_ref().window();
     let state = app.state::<AppState>();
-    let (model, web_enabled) = {
+    let (model, web_enabled, advisors_on, advisor_tools_on) = {
         let guard = state.room.lock().unwrap();
         let room = guard
             .as_ref()
@@ -2045,21 +2053,45 @@ pub(crate) async fn run_agent_headless(
             .ok_or("the room this workflow belongs to is no longer open")?;
         let m = model_setting(&room.conn);
         let models_room = m.clone();
-        (models_room, web_access_enabled(&room.conn))
+        let advisors_on = advisors_enabled(&room.conn);
+        (
+            models_room,
+            web_access_enabled(&room.conn),
+            advisors_on,
+            advisors_on && advisor_tools_enabled(&room.conn),
+        )
     };
     let models = ollama::list_models().await.unwrap_or_default();
     let chat_model = model.unwrap_or_else(|| best_default(&models));
+    let advisors = if advisors_on {
+        detected_advisors(&state).await
+    } else {
+        Vec::new()
+    };
     // Engine parity: an external CLI runs the grounded turn ITSELF — it is an
     // agent, so it gets the same per-run room bridge as a chat ask
     // (CloudAdvisor scope: file + web tools, never UI/job tools, no MCP
     // connectors in a headless run) and the same cancel watcher.
     if is_cli_engine(&chat_model) {
+        let (advisor_runtime, consulted_room_bridge) =
+            crate::room_mcp::prepare_advisor_runtime(
+                app.clone(),
+                web_enabled,
+                advisors,
+                advisor_tools_on,
+                cancel.clone(),
+                false,
+            )
+            .await;
         let bridge = crate::room_mcp::start(
             app.clone(),
             web_enabled,
             crate::room_mcp::ToolScope::CloudAdvisor { include_mcp: false },
             None,
-            crate::room_mcp::StartOpts::default(),
+            crate::room_mcp::StartOpts {
+                advisor: advisor_runtime,
+                ..Default::default()
+            },
         )
         .await
         .ok();
@@ -2067,6 +2099,9 @@ pub(crate) async fn run_agent_headless(
         let res = run_external(&chat_model, &messages, Some(cancel), bridge.as_ref(), false).await;
         if let Some(b) = &bridge {
             b.stop();
+        }
+        if let Some(nested) = consulted_room_bridge {
+            nested.stop();
         }
         // Usage discarded — workflow-node usage reporting is out of scope for
         // the chat token-budget bar (this text-only path never touches it).
@@ -2085,6 +2120,8 @@ pub(crate) async fn run_agent_headless(
         cancel,
         true,  // headless — no ask-* events into the chat UI
         false, // background turns never bypass the privacy door
+        advisors,
+        advisor_tools_on,
     )
     .await;
     match outcome {
@@ -3428,7 +3465,20 @@ pub(crate) async fn agent_test_workflow(
             if let Some(c) = state.job_cancels.lock().unwrap().get(&job_id) {
                 c.store(true, Ordering::SeqCst);
             }
-            break ("timeout".into(), None);
+            // Live QA 2026-07-25: the agent reported "the test run timed out so
+            // it never got validated" while the workflow card showed a green
+            // "Ran OK" — the run finished in the gap between the last poll and
+            // the cancel taking effect. Read the truth one final time before
+            // reporting a failure that did not happen.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let settled = state
+                .with_room(|room| db::get_job(&room.conn, &job_id))
+                .ok()
+                .map(|j| (j.status.clone(), j.error.clone()));
+            break match settled {
+                Some((s, e)) if s == "done" || s == "error" || s == "paused" => (s, e),
+                _ => ("timeout".into(), None),
+            };
         }
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     };
@@ -3489,15 +3539,25 @@ pub(crate) async fn agent_test_workflow(
     // A machine-checkable gate so the model can't paraphrase a failing run into
     // "Fixed". Only a real terminal `done` counts as validated; a parked script
     // (needs the user's approval) did NOT validate anything.
-    let trailer = match status.as_str() {
-        "done" => "VALIDATED: yes — every step ran to completion. You may now tell the user this works and the draft is ready to review & activate.",
-        "paused" => "VALIDATED: no — a script step parked for the user's approval, so this run did NOT validate the workflow. Do NOT say it's fixed or works. Tell the user to review and run/approve it on the Scripts page; a script can only be confirmed by an approved run.",
-        _ => "VALIDATED: no — this run did not succeed. Fix the failing step with update_workflow and test again. Do NOT tell the user it's fixed or ready until a test_workflow returns VALIDATED: yes.",
-    };
+    let trailer = test_run_trailer(&status);
     Ok(clamp_test_report(format!(
         "{header}\nSteps:\n{}\n\n{trailer}\n\nThe workflow stays a DRAFT for the user to review and activate.",
         lines.join("\n")
     )))
+}
+
+/// The machine-checkable verdict line, so the model cannot paraphrase a failing
+/// run into "Fixed" — nor, since 2026-07-25, a still-running one into "broken".
+fn test_run_trailer(status: &str) -> &'static str {
+    match status {
+        "done" => "VALIDATED: yes — every step ran to completion. You may now tell the user this works and the draft is ready to review & activate.",
+        "paused" => "VALIDATED: no — a script step parked for the user's approval, so this run did NOT validate the workflow. Do NOT say it's fixed or works. Tell the user to review and run/approve it on the Scripts page; a script can only be confirmed by an approved run.",
+        // A timeout is UNKNOWN, not failed: nothing errored, we simply stopped
+        // waiting. Telling the model to "fix the failing step" made it report a
+        // failure to the user for a run that went on to finish green.
+        "timeout" => "VALIDATED: unknown — nothing failed; the run was still going when the wait ended. Do NOT call it broken and do NOT start fixing steps. Tell the user it is still running and they can watch it finish on the Workflows page.",
+        _ => "VALIDATED: no — this run did not succeed. Fix the failing step with update_workflow and test again. Do NOT tell the user it's fixed or ready until a test_workflow returns VALIDATED: yes.",
+    }
 }
 
 /// Bound the test report so a chatty run can't blow the tool-result budget.
@@ -3741,6 +3801,24 @@ mod tests {
 
     fn parse(v: serde_json::Value) -> WorkflowDef {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_timed_out_test_run_is_unknown_not_failed() {
+        // Live QA 2026-07-25: the agent told the user "the test run timed out so
+        // it never got validated" while the workflow card showed a green
+        // "Ran OK". Nothing failed — we stopped waiting — but the trailer said
+        // "this run did not succeed. Fix the failing step", so the model
+        // reported a failure that never happened.
+        let timeout = test_run_trailer("timeout");
+        assert!(timeout.starts_with("VALIDATED: unknown"));
+        assert!(timeout.contains("nothing failed"));
+        assert!(!timeout.contains("did not succeed"));
+        assert!(!timeout.contains("Fix the failing step"));
+        // The verdicts that DO mean something still say so plainly.
+        assert!(test_run_trailer("done").starts_with("VALIDATED: yes"));
+        assert!(test_run_trailer("error").starts_with("VALIDATED: no"));
+        assert!(test_run_trailer("paused").starts_with("VALIDATED: no"));
     }
 
     #[test]
@@ -4029,44 +4107,8 @@ mod tests {
         assert_eq!(apply_merge("dedupe_lines", &None, &inputs), "a\nb\nc");
     }
 
-    #[test]
-    fn vote_aggregation_picks_majority_and_concats() {
-        let s = vec!["yes".to_string(), "no".to_string(), "yes".to_string()];
-        assert_eq!(aggregate_votes("majority", &s), "yes");
-        // A tie resolves to the earliest sample.
-        let tie = vec!["b".to_string(), "a".to_string()];
-        assert_eq!(aggregate_votes("majority", &tie), "b");
-        assert!(aggregate_votes("concat", &s).contains("sample 1"));
-        assert_eq!(aggregate_votes("majority", &[]), "");
-    }
 
-    #[test]
-    fn route_label_pick_is_robust() {
-        let labels = vec![
-            "action".to_string(),
-            "reference".to_string(),
-            "idea".to_string(),
-        ];
-        // Structured answer wins.
-        assert_eq!(pick_route_label("{\"label\":\"idea\"}", &labels), "idea");
-        // Fuzzy: the label appears in prose.
-        assert_eq!(
-            pick_route_label("This is clearly a reference note.", &labels),
-            "reference"
-        );
-        // Nothing matches → the first label (a route always takes SOME branch).
-        assert_eq!(pick_route_label("uh, dunno", &labels), "action");
-    }
 
-    #[test]
-    fn extract_schema_requires_each_field() {
-        let s = build_extract_schema(&["name".into(), "date".into(), "  ".into()]);
-        assert_eq!(s["type"], "object");
-        assert!(s["properties"]["name"].is_object());
-        // Blank field names are dropped.
-        let req = s["required"].as_array().unwrap();
-        assert_eq!(req.len(), 2);
-    }
 
     #[test]
     fn validate_route_needs_labels_and_legal_branches() {
@@ -4147,5 +4189,431 @@ mod tests {
             .find(|s| s.params["node"]["id"] == "e")
             .unwrap();
         assert_eq!(extract.lane, Lane::LocalLlm, "extract calls the model");
+    }
+
+    // ------------------------------------------------------------------
+    // Resume characterization: the REAL executor on a REAL room.
+    //
+    // Everything above this line is a pure-function test — not one of them
+    // executes a workflow. These three drive `compile_workflow` →
+    // `execute_workflow_step` → `run_plan` → `db::checkpoint_job` → reload →
+    // resume, over the node kinds that need no sidecar (transform / condition /
+    // merge / save_file, plus a summarize_file whose selector matches nothing).
+    // They are the behavioural baseline the LangGraph port must reproduce.
+    // Harness style follows `file_pass_end_to_end_with_real_model`; the
+    // checkpoint closure is copied VERBATIM from `spawn_workflow_job` and the
+    // resume seed VERBATIM from `queue::start_workflow_row`, so the two halves
+    // of the resume contract are exercised against each other.
+    // ------------------------------------------------------------------
+
+    /// A mock Tauri app managing an in-memory room — the file_pass e2e harness
+    /// minus the encrypted temp file (no node in these fixtures touches disk).
+    fn wf_app(room_path: &str) -> tauri::App<tauri::test::MockRuntime> {
+        use tauri::Manager;
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = AppState::default();
+        *state.room.lock().unwrap() = Some(Room {
+            conn: db::mem(),
+            path: room_path.to_string(),
+            name: "wf-test".into(),
+            password: "pw".into(),
+        });
+        app.manage(state);
+        app
+    }
+
+    /// Compile a fixture def into the immutable plan snapshot a job row carries.
+    fn wf_plan(def: WorkflowDef) -> WorkflowPlan {
+        let steps = compile_workflow(&def, &None, &[]).expect("fixture def must compile");
+        WorkflowPlan {
+            workflow_id: "wf-1".into(),
+            workflow_name: "Fixture".into(),
+            trigger: "manual".into(),
+            def,
+            resolved_model: "qwen3.5:4b".into(),
+            input_file_id: None,
+            prev_run_at: None,
+            script_consents: Default::default(),
+            steps,
+        }
+    }
+
+    fn create_wf_job(
+        handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        plan: &WorkflowPlan,
+    ) -> String {
+        use tauri::Manager;
+        let state = handle.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        db::create_job(
+            &guard.as_ref().unwrap().conn,
+            "workflow",
+            "Fixture",
+            &serde_json::to_value(plan).unwrap(),
+            plan.steps.len() as i64,
+        )
+        .unwrap()
+    }
+
+    fn wf_job_row(handle: &tauri::AppHandle<tauri::test::MockRuntime>, job_id: &str) -> db::Job {
+        use tauri::Manager;
+        let state = handle.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        db::get_job(&guard.as_ref().unwrap().conn, job_id).unwrap()
+    }
+
+    fn wf_step_artifact(
+        handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        job_id: &str,
+        step: usize,
+    ) -> WfArtifact {
+        use tauri::Manager;
+        let state = handle.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        load_wf_artifact(&guard.as_ref().unwrap().conn, job_id, step)
+            .unwrap_or_else(|| panic!("step {step} has no artifact"))
+    }
+
+    /// EXACTLY how `queue::start_workflow_row` seeds a resume from the job row.
+    fn persisted_done(job: &db::Job) -> HashSet<usize> {
+        job.state
+            .get("done")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `spawn_workflow_job`'s wiring minus the tauri Window: the real `run_plan`
+    /// driving the real `execute_workflow_step`, with the spawner's checkpoint
+    /// closure verbatim. `stop_after` trips Stop the moment that step id
+    /// finishes (the user pressing Stop mid-plan). Returns the outcome and the
+    /// step ids that actually EXECUTED in this leg.
+    async fn drive_workflow(
+        handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        job_id: &str,
+        room_path: &str,
+        plan: &WorkflowPlan,
+        start_done: HashSet<usize>,
+        stop_after: Option<usize>,
+    ) -> (RunOutcome, Vec<usize>) {
+        use tauri::Manager;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ran: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let published: Arc<std::sync::Mutex<Option<FileMeta>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let agent_run: AgentRunFn = Arc::new(|_q: String| {
+            Box::pin(async { Err::<String, String>("no agent node in this fixture".into()) })
+        });
+        let steps = plan.steps.clone();
+
+        let outcome = run_plan(
+            &steps,
+            start_done,
+            cancel.clone(),
+            |s| {
+                let app = handle.clone();
+                let job_id = job_id.to_string();
+                let room_path = room_path.to_string();
+                let plan = plan.clone();
+                let cancel = cancel.clone();
+                let published = published.clone();
+                let agent_run = agent_run.clone();
+                let ran = ran.clone();
+                async move {
+                    let r = execute_workflow_step(
+                        &app, &job_id, &room_path, &plan, &s, &cancel, &published, &agent_run,
+                    )
+                    .await;
+                    ran.lock().unwrap().push(s.id);
+                    if stop_after == Some(s.id) {
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                    r
+                }
+            },
+            |done| {
+                // Verbatim from spawn_workflow_job: the cursor is the dense
+                // prefix, the state blob is the whole sorted done-set.
+                let cursor = dense_prefix(done);
+                let done_vec: Vec<usize> = {
+                    let mut v: Vec<usize> = done.iter().copied().collect();
+                    v.sort_unstable();
+                    v
+                };
+                let state = handle.state::<AppState>();
+                let guard = state.room.lock().unwrap();
+                if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+                    db::checkpoint_job(
+                        &r.conn,
+                        &job_id.to_string(),
+                        cursor as i64,
+                        &serde_json::json!({ "done": done_vec }),
+                    )
+                    .unwrap();
+                }
+            },
+            |_, _| {},
+        )
+        .await;
+        let ids = ran.lock().unwrap().clone();
+        (outcome, ids)
+    }
+
+    /// seed → gate(condition) →then hot, →else cold → cold2; hot + cold2 → join
+    /// (merge) → out (save_file). The `else` arm is dead, so cold AND its child
+    /// cold2 must both be skipped.
+    fn branching_def() -> WorkflowDef {
+        parse(serde_json::json!({
+            "nodes": [
+                { "id": "seed", "kind": "transform", "op": "append", "value": "alpha" },
+                { "id": "gate", "kind": "condition", "op": "contains", "value": "alpha" },
+                { "id": "hot",  "kind": "transform", "op": "append", "value": " HOT" },
+                { "id": "cold", "kind": "transform", "op": "append", "value": " COLD" },
+                { "id": "cold2","kind": "transform", "op": "append", "value": " COLD2" },
+                { "id": "join", "kind": "merge", "mode": "concat", "separator": "||" },
+                { "id": "out",  "kind": "save_file", "name_template": "wf-out",
+                  "format": "md", "mode": "create" }
+            ],
+            "edges": [
+                { "from": "seed",  "to": "gate" },
+                { "from": "gate",  "to": "hot",  "branch": "then" },
+                { "from": "gate",  "to": "cold", "branch": "else" },
+                { "from": "cold",  "to": "cold2" },
+                { "from": "hot",   "to": "join" },
+                { "from": "cold2", "to": "join" },
+                { "from": "join",  "to": "out" }
+            ]
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workflow_runs_to_completion_and_skips_the_dead_branch_transitively() {
+        use tauri::Manager;
+        let room_path = "mem://wf-complete";
+        let app = wf_app(room_path);
+        let handle = app.handle().clone();
+        let plan = wf_plan(branching_def());
+        // Compiled ids are the topo order of the def above.
+        assert_eq!(plan.steps.len(), 7);
+        for (i, s) in plan.steps.iter().enumerate() {
+            assert_eq!(s.id, i);
+        }
+        let job_id = create_wf_job(&handle, &plan);
+
+        let (outcome, ran) =
+            drive_workflow(&handle, &job_id, room_path, &plan, HashSet::new(), None).await;
+        assert_eq!(outcome, RunOutcome::Done);
+        let mut ran_sorted = ran.clone();
+        ran_sorted.sort_unstable();
+        assert_eq!(ran_sorted, (0..7).collect::<Vec<_>>(), "every step runs once");
+
+        // The condition took `then`, and it is the ARTIFACT that records it.
+        let gate = wf_step_artifact(&handle, &job_id, 1);
+        assert_eq!(gate.branch.as_deref(), Some("then"));
+        assert_eq!(gate.node_kind.as_deref(), Some("condition"));
+
+        // The live arm ran on the gate's own artifact text (the condition's
+        // `result` IS the downstream input — pin it, a port must not "pass
+        // through" the condition's upstream value instead).
+        let hot = wf_step_artifact(&handle, &job_id, 2);
+        assert!(!hot.skipped);
+        assert_eq!(hot.result, "branch: then HOT");
+
+        // Skip propagates transitively: cold is dead by branch mismatch, cold2 is
+        // dead because its only parent is skipped. Both still carry node labels
+        // so the run-history view can name them.
+        let cold = wf_step_artifact(&handle, &job_id, 3);
+        let cold2 = wf_step_artifact(&handle, &job_id, 4);
+        assert!(cold.skipped, "the else arm must be skipped");
+        assert!(cold2.skipped, "skip must propagate to the arm's child");
+        assert_eq!(cold2.node_kind.as_deref(), Some("transform"));
+        assert!(cold.result.is_empty() && cold2.result.is_empty());
+
+        // The merge saw ONLY the live branch — no empty slot, no separator.
+        let join = wf_step_artifact(&handle, &job_id, 5);
+        assert_eq!(join.result, "branch: then HOT");
+
+        // save_file wrote the merged text into the room and recorded the file id.
+        let out = wf_step_artifact(&handle, &job_id, 6);
+        let file_id = out.file_id.clone().expect("save_file records its file id");
+        {
+            let state = handle.state::<AppState>();
+            let guard = state.room.lock().unwrap();
+            let conn = &guard.as_ref().unwrap().conn;
+            let meta = db::get_file_meta(conn, &file_id).unwrap();
+            assert_eq!(meta.name, "wf-out.md");
+            assert_eq!(meta.source, "generated");
+            assert_eq!(
+                db::get_file_extracted_text(conn, &file_id).unwrap(),
+                "branch: then HOT"
+            );
+        }
+
+        // The job row ends fully checkpointed: cursor == total and the state
+        // blob names every step.
+        let job = wf_job_row(&handle, &job_id);
+        assert_eq!(job.cursor, 7);
+        assert_eq!(job.state, serde_json::json!({ "done": [0, 1, 2, 3, 4, 5, 6] }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workflow_resume_seeds_from_the_persisted_done_set_not_the_cursor() {
+        // The NON-DENSE resume. Two same-lane siblings (LocalLlm, 1 slot) plus a
+        // Cpu sibling means a wave finishes {0,1,3} with step 2 still pending:
+        // the cursor is 2 but three steps are done. Storing a scalar count (3)
+        // would mark step 2 done though it never ran — its artifact would never
+        // exist, so the merge below it would see a MISSING (= dead) parent and
+        // silently drop a live branch. This is the exact trap a reimplementation
+        // falls into by persisting "how many finished" instead of "which".
+        let room_path = "mem://wf-resume";
+        let app = wf_app(room_path);
+        let handle = app.handle().clone();
+        let def = parse(serde_json::json!({
+            "nodes": [
+                { "id": "seed", "kind": "transform", "op": "append", "value": "seed-value" },
+                // Selector matches nothing, so these return their empty-set line
+                // without ever calling a model — but they still ride LocalLlm.
+                { "id": "s1", "kind": "summarize_file",
+                  "select": { "type": "name_like", "pattern": "zzz-no-such-file" } },
+                { "id": "s2", "kind": "summarize_file",
+                  "select": { "type": "name_like", "pattern": "zzz-no-such-file" } },
+                { "id": "t3", "kind": "transform", "op": "append", "value": " +t3" },
+                { "id": "join", "kind": "merge", "mode": "concat", "separator": "||" }
+            ],
+            "edges": [
+                { "from": "seed", "to": "s1" },
+                { "from": "seed", "to": "s2" },
+                { "from": "seed", "to": "t3" },
+                { "from": "s1", "to": "join" },
+                { "from": "s2", "to": "join" },
+                { "from": "t3", "to": "join" }
+            ]
+        }));
+        let plan = wf_plan(def);
+        assert_eq!(plan.steps[1].lane, Lane::LocalLlm);
+        assert_eq!(plan.steps[2].lane, Lane::LocalLlm);
+        assert_eq!(plan.steps[3].lane, Lane::Cpu);
+        let job_id = create_wf_job(&handle, &plan);
+
+        // Leg 1: Stop the moment step 3 finishes — the wave that completes {0,1,3}.
+        let (outcome, ran) =
+            drive_workflow(&handle, &job_id, room_path, &plan, HashSet::new(), Some(3)).await;
+        assert_eq!(outcome, RunOutcome::Paused, "Stop pauses, never errors");
+        let mut ran1 = ran.clone();
+        ran1.sort_unstable();
+        assert_eq!(ran1, vec![0, 1, 3], "step 2 lost the serial lane slot");
+
+        // The checkpoint is non-dense: cursor 2, done-set {0,1,3}.
+        let job = wf_job_row(&handle, &job_id);
+        assert_eq!(job.cursor, 2, "cursor is the dense prefix, not the count");
+        assert_eq!(job.state, serde_json::json!({ "done": [0, 1, 3] }));
+        assert!(
+            (job.cursor as usize) < job.state["done"].as_array().unwrap().len(),
+            "this fixture must produce a non-dense checkpoint"
+        );
+
+        // Leg 2: resume exactly the way queue::start_workflow_row does.
+        let seed = persisted_done(&job);
+        assert_eq!(seed, [0usize, 1, 3].into_iter().collect::<HashSet<_>>());
+        let (outcome, ran) = drive_workflow(&handle, &job_id, room_path, &plan, seed, None).await;
+        assert_eq!(outcome, RunOutcome::Done);
+        let mut ran2 = ran.clone();
+        ran2.sort_unstable();
+        assert_eq!(
+            ran2,
+            vec![2, 4],
+            "resume runs the hole and the tail — never a completed node again"
+        );
+
+        // The artifact channel carried leg 1's values across the boundary: the
+        // merge's input for steps 1 and 3 can only have come from the DB.
+        let join = wf_step_artifact(&handle, &job_id, 4);
+        let empty_line = "No files matched — nothing to summarize.";
+        assert_eq!(
+            join.result,
+            format!("{empty_line}||{empty_line}||seed-value +t3"),
+            "live inputs arrive in incoming-edge order, from persisted artifacts"
+        );
+
+        let job = wf_job_row(&handle, &job_id);
+        assert_eq!(job.cursor, 5);
+        assert_eq!(job.state, serde_json::json!({ "done": [0, 1, 2, 3, 4] }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_branch_decided_before_the_pause_still_steers_the_resumed_run() {
+        // The branch a condition took lives ONLY in its artifact. Resume after
+        // the condition and before its children: the dead arm must still skip,
+        // and the run must still publish the live arm's text. A port that keeps
+        // branch state in memory (or re-evaluates the condition on resume with a
+        // different input) passes leg 1 and fails here.
+        use tauri::Manager;
+        let room_path = "mem://wf-branch-resume";
+        let app = wf_app(room_path);
+        let handle = app.handle().clone();
+        let plan = wf_plan(branching_def());
+        let job_id = create_wf_job(&handle, &plan);
+
+        // Leg 1: Stop right after the condition (step 1).
+        let (outcome, ran) =
+            drive_workflow(&handle, &job_id, room_path, &plan, HashSet::new(), Some(1)).await;
+        assert_eq!(outcome, RunOutcome::Paused);
+        assert_eq!(ran, vec![0, 1], "paused with the branch decided, nothing more");
+        let job = wf_job_row(&handle, &job_id);
+        assert_eq!(job.cursor, 2);
+        assert_eq!(job.state, serde_json::json!({ "done": [0, 1] }));
+        // Nothing downstream exists yet — no artifact, no file.
+        {
+            let state = handle.state::<AppState>();
+            let guard = state.room.lock().unwrap();
+            let conn = &guard.as_ref().unwrap().conn;
+            assert!(load_wf_artifact(conn, &job_id, 2).is_none());
+            let files: i64 = conn
+                .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(files, 0, "save_file must not have run yet");
+        }
+
+        // Leg 2: resume from the persisted set.
+        let (outcome, ran) = drive_workflow(
+            &handle,
+            &job_id,
+            room_path,
+            &plan,
+            persisted_done(&job),
+            None,
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Done);
+        assert_eq!(
+            ran,
+            vec![2, 3, 4, 5, 6],
+            "the resumed leg re-runs neither the seed nor the condition"
+        );
+
+        // The branch read back off disk still kills the else arm transitively…
+        assert!(wf_step_artifact(&handle, &job_id, 3).skipped);
+        assert!(wf_step_artifact(&handle, &job_id, 4).skipped);
+        // …and the published file carries the pre-pause value, proving the
+        // artifact channel — not process memory — is the workflow's dataflow.
+        let out = wf_step_artifact(&handle, &job_id, 6);
+        let file_id = out.file_id.clone().unwrap();
+        let state = handle.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        let conn = &guard.as_ref().unwrap().conn;
+        assert_eq!(
+            db::get_file_extracted_text(conn, &file_id).unwrap(),
+            "branch: then HOT"
+        );
+        let files: i64 = conn
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(files, 1, "resume must not publish a second copy");
     }
 }

@@ -59,12 +59,26 @@ pub(crate) fn is_vision_chat_model(model: &str) -> bool {
 /// target, gemma3 puts boxes in the wrong place while qwen2.5vl is accurate
 /// without qwen3's slow thinking pass.
 pub(crate) fn vision_model(models: &[String], chat_model: &str) -> String {
+    grounding_model(models).unwrap_or_else(|| chat_model.to_string())
+}
+
+/// The installed Qwen-VL grounding model, or None when there isn't one.
+///
+/// Split out from `vision_model` because the fallback is a LIE at the grounding
+/// call site: `vision_model` hands back the chat model, and a text-only chat
+/// model asked to outline a region answers `[]` — which the image viewer renders
+/// as "The AI could not locate that in this image." So a machine with no VL
+/// model installed was told, over and over, that its image did not contain the
+/// thing it plainly contained. Callers that need real grounding must ask THIS
+/// and say something true when it returns None; callers that only need to READ
+/// an image (describe/attach) can keep using `vision_model`, because
+/// `is_vision_chat_model` covers that case.
+pub(crate) fn grounding_model(models: &[String]) -> Option<String> {
     models
         .iter()
         .find(|m| m.contains("qwen2.5vl") || m.contains("qwen2.5-vl"))
         .or_else(|| models.iter().find(|m| m.contains("qwen3-vl")))
         .cloned()
-        .unwrap_or_else(|| chat_model.to_string())
 }
 
 /// HLT-5: keep the chat model resident this long so follow-up questions are
@@ -237,6 +251,29 @@ mod tests {
         // 32 GB Mac keeps a distinct vision model warm too.
         assert_eq!(vision_keep_alive(32 * gb, "qwen2.5vl", "qwen3.5:4b"), "30m");
         assert_eq!(vision_keep_alive(64 * gb, "qwen2.5vl", "qwen3.5:4b"), "30m");
+    }
+
+    #[test]
+    fn grounding_model_admits_when_nothing_can_aim() {
+        // Live bug 2026-07-27: `vision_model` falls back to the CHAT model, so a
+        // machine with no VL model installed grounded with a text-only model,
+        // got `[]`, and the viewer told the user "The AI could not locate that
+        // in this image" — a false claim about their picture. `grounding_model`
+        // returns None instead, and locate_in_image turns that into the
+        // NO_VISION_MODEL sentinel + the one-click pull.
+        let none_installed = vec!["qwen3.5:4b".to_string(), "llama3:8b".to_string()];
+        assert_eq!(grounding_model(&none_installed), None);
+        // ...while `vision_model` still (correctly, for READING an image) hands
+        // back the chat model — the two call sites want different answers.
+        assert_eq!(vision_model(&none_installed, "qwen3.5:4b"), "qwen3.5:4b");
+
+        // A real VL model is picked, and qwen2.5vl wins over qwen3-vl (measured:
+        // qwen3 aims no better and pays for a thinking pass).
+        let both = vec!["qwen3-vl:8b".to_string(), "qwen2.5vl:7b".to_string()];
+        assert_eq!(grounding_model(&both), Some("qwen2.5vl:7b".to_string()));
+        let only_q3 = vec!["qwen3-vl:8b".to_string()];
+        assert_eq!(grounding_model(&only_q3), Some("qwen3-vl:8b".to_string()));
+        assert_eq!(grounding_model(&[]), None);
     }
 
     #[test]

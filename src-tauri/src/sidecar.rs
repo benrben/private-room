@@ -19,8 +19,9 @@
 //! `image` content blocks ([`crate::room_mcp`] `tool_call` drains
 //! `effects.pending_images`), which the sidecar graph feeds into the next model
 //! turn as a user image message — so the perception handoff the in-process
-//! `ToolEffects` used to carry natively now rides the bridge. `consult_advisor`
-//! remains served over no scope's catalog (the cloud-recursion guard stays shut).
+//! `ToolEffects` used to carry natively now rides the bridge. A top-level turn
+//! may also receive `consult_advisor`; the consulted advisor's restricted nested
+//! bridge omits that runtime capability, keeping recursion structurally closed.
 //!
 //! No-fallback rule (MIGRATION): the sidecar is the app's SOLE local AI engine.
 //! `Unavailable` (the sidecar failed BEFORE running any tool) surfaces an error to
@@ -99,6 +100,18 @@ pub(crate) fn humanize_empty_generation(msg: &str) -> Option<String> {
     }
 }
 
+/// The per-request budget for a single gateway POST. Every endpoint here is
+/// ONE model generation, and 600s is generous for one.
+const SIDECAR_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// A CHAIN endpoint's budget. `/wf_node` runs up to seven generations (refine)
+/// or ten (plan_and_map) behind a single POST, so it cannot share the
+/// one-generation budget: a local 4B at 15 tok/s would trip 600s mid-chain and
+/// the whole step would replay. Sized as the one-call budget times the longest
+/// chain, rather than removed — an unbounded request would hang the lane
+/// forever if the sidecar wedged.
+pub const SIDECAR_CHAIN_TIMEOUT: Duration = Duration::from_secs(600 * 10);
+
 /// POST a JSON body to a sidecar FEATURE endpoint and return the parsed JSON.
 /// Ensures the sidecar is up first (no native fallback — a dead sidecar surfaces
 /// as `OLLAMA_DOWN` so callers map it the same way a dead Ollama used to map). A
@@ -107,6 +120,14 @@ pub(crate) fn humanize_empty_generation(msg: &str) -> Option<String> {
 pub async fn sidecar_json(
     path: &str,
     body: &serde_json::Value,
+) -> Result<serde_json::Value, SidecarError> {
+    sidecar_json_timeout(path, body, SIDECAR_TIMEOUT).await
+}
+
+pub async fn sidecar_json_timeout(
+    path: &str,
+    body: &serde_json::Value,
+    timeout: Duration,
 ) -> Result<serde_json::Value, SidecarError> {
     // PRIV-1: THE Rust-side injection point — when the body's model is
     // non-local and the room's door is on, the privacy policy rides along so
@@ -135,7 +156,7 @@ pub async fn sidecar_json(
         }
     };
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(timeout)
         .build()
         .map_err(|e| SidecarError {
             code: "ENGINE_ERROR".to_string(),
@@ -366,6 +387,84 @@ pub async fn sidecar_json_cancellable(
     }
 }
 
+/// Like [`sidecar_json_cancellable`], but for a CHAIN endpoint that runs many
+/// generations behind one POST, and therefore cannot be stopped by hanging up.
+///
+/// Dropping the request closes the connection, and the docstring above assumes
+/// that stops the work. Measured against the sidecar's pinned uvicorn/starlette,
+/// it does not: a non-streaming handler kept running three seconds past a hard
+/// disconnect. For `/generate` that wastes at most one generation. For
+/// `/wf_node` it would waste up to six more — on `Lane::LocalLlm`'s single slot,
+/// holding the GPU and the resident model while the next job queues behind.
+///
+/// So Stop is DELIVERED, not implied: POST `/cancel` with the same `run_id` the
+/// body carried, then drop. The sidecar registers `/wf_node` in the very same
+/// `RunRegistry` `/run` uses, so this is the path that already works for chat.
+pub async fn sidecar_json_cancellable_run(
+    path: &str,
+    body: &serde_json::Value,
+    cancel: &Arc<AtomicBool>,
+    run_id: &str,
+    timeout: Duration,
+) -> Result<Option<serde_json::Value>, SidecarError> {
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let fut = sidecar_json_timeout(path, body, timeout);
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            res = &mut fut => return res.map(Some),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    // Tell the sidecar BEFORE dropping: the drop alone does not
+                    // stop it. Best-effort — if the POST fails the chain
+                    // finishes, which is the pre-existing behaviour, not worse.
+                    if let Ok(base) = sidecar_lifecycle::ensure_up().await {
+                        let _ = cancel_run(&base, run_id).await;
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// Lane routing for one ask, with per-conversation LATCHING (2026-07-23).
+///
+/// The keyword routers used to see only the CURRENT question, so "research X"
+/// → "now save that" lost the very tools the follow-up needed whenever the
+/// follow-up's phrasing missed the hint list (live QA: the agent told the user
+/// it could not save files). Lanes now latch monotonically over the chat: a
+/// lane fires if the current question OR any PRIOR user turn wanted it.
+///
+/// Two deliberate exclusions:
+/// * The LAST message is skipped — it is the composed user turn carrying
+///   injected file context, the skills preamble ("Available Agent Skills…"),
+///   and memories, any of which would false-fire lanes on every ask.
+/// * `write` stays question-only: the write tools are always in the catalog
+///   now, so the boolean only colors the "Working on your files" lane label,
+///   which should reflect THIS turn's intent.
+pub(crate) fn sticky_lanes(
+    question: &str,
+    chat_messages: &[ollama::ChatMessage],
+) -> serde_json::Value {
+    let prior: Vec<&str> = chat_messages
+        .iter()
+        .take(chat_messages.len().saturating_sub(1))
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .collect();
+    let fires = |f: fn(&str) -> bool| f(question) || prior.iter().any(|q| f(q));
+    serde_json::json!({
+        "write": crate::commands::wants_write_tools(question),
+        "ui": fires(crate::commands::wants_ui_tools),
+        "jobs": fires(crate::commands::wants_job_tools),
+        "skills": fires(crate::commands::wants_skill_tools),
+        "connectors": fires(crate::commands::wants_mcp_management_tools),
+    })
+}
+
 /// The result of attempting an answer through the sidecar.
 pub enum SidecarOutcome {
     /// Completed (or was cleanly stopped) — use this text.
@@ -406,6 +505,10 @@ pub async fn run_via_sidecar(
     // PRIV-1: "send real details this once" — the user explicitly confirmed
     // sharing real values for THIS turn, so the policy is not attached.
     privacy_bypass: bool,
+    // Installed advisors available to this top-level model. Empty when the
+    // room setting is off; never forwarded to a consulted advisor.
+    advisors: Vec<String>,
+    advisor_tools_enabled: bool,
 ) -> SidecarOutcome {
     use tauri::Manager;
 
@@ -417,7 +520,12 @@ pub async fn run_via_sidecar(
     // The sidecar reaches Ollama but can't START it: ensure the local daemon is up
     // and hold the guard for the run's duration. No tool has run yet, so a down or
     // unstartable daemon is the safe `Unavailable` surface.
-    let _daemon = if crate::commands::is_api_provider_model(model) {
+    // Only an Ollama-served model needs the local daemon. An API provider and a
+    // cloud CLI engine both generate elsewhere, so requiring Ollama would make
+    // chat fail on a Mac that never runs it.
+    let _daemon = if crate::commands::is_api_provider_model(model)
+        || crate::commands::is_cli_engine(model)
+    {
         None
     } else {
         match ollama::wake_daemon().await {
@@ -430,28 +538,75 @@ pub async fn run_via_sidecar(
     // caller's current effects (esp. `vision_chat`) so nothing is lost.
     let sink: EffectsSink = Arc::new(tokio::sync::Mutex::new(std::mem::take(effects)));
 
+    let advisor_names = advisors.clone();
+    let (advisor_runtime, consulted_room_bridge) = room_mcp::prepare_advisor_runtime(
+        window.app_handle().clone(),
+        web_enabled,
+        advisors,
+        advisor_tools_enabled,
+        cancel.clone(),
+        privacy_bypass,
+    )
+    .await;
+
     // The LOCAL-engine bridge: the sidecar is trusted like the native loop, so it
     // gets the app-driving + job tools too (ADD-33). Torn down when we return.
+    //
+    // ENGINE PARITY: the agent hub now runs on a cloud CLI too (its rounds are
+    // `claude -p`/`codex exec` behind the same ChatModel seam), and the tools
+    // the sidecar can serve are decided HERE, not by who is asking. So the
+    // scope follows the ENGINE: a CLI engine gets `CloudEngine` — everything
+    // the local engine gets EXCEPT the UI/screen-driving tools. "Any model
+    // drives the screen" stays forbidden; everything else is parity (owner
+    // decision 2026-07-25, see `primary_cli_scope`).
+    let scope = if crate::commands::is_cli_engine(model) {
+        crate::commands::primary_cli_scope()
+    } else {
+        ToolScope::LocalEngine
+    };
     let bridge = match room_mcp::start(
         window.app_handle().clone(),
         web_enabled,
-        ToolScope::LocalEngine,
+        scope,
         Some(sink.clone()),
-        room_mcp::StartOpts::default(),
+        room_mcp::StartOpts {
+            privacy_bypass,
+            advisor: advisor_runtime,
+            ..Default::default()
+        },
     )
     .await
     {
         Ok(b) => b,
         Err(e) => {
+            if let Some(nested) = consulted_room_bridge {
+                nested.stop();
+            }
             // Restore effects before bailing (nothing ran).
             *effects = sink.lock().await.clone();
             return SidecarOutcome::Unavailable(format!("sidecar bridge failed: {e}"));
         }
     };
 
-    let mcp_route_count = crate::commands::mcp_routes(state).0.len();
+    let mcp_route_count = crate::commands::mcp_routes(state).len();
+    // Token-bar denominator for an engine that reports no usage of its own. The
+    // app imposes no context limit on a cloud CLI — this is display only, and
+    // it is resolved HERE because only the host can read the live Codex
+    // catalog. Ollama/provider models report their own window; they send none.
+    let max_context: Option<u32> = if crate::commands::is_cli_engine(model) {
+        let (engine, submodel, _effort) = crate::commands::split_external_model(model);
+        Some(match engine {
+            "codex-cli" => crate::commands::codex_context_window(submodel)
+                .await
+                .unwrap_or_else(|| crate::model_limits::external_max_context(engine)),
+            _ => crate::model_limits::external_max_context(engine),
+        })
+    } else {
+        None
+    };
     let body = serde_json::json!({
         "model": model,
+        "max_context": max_context,
         "question": question,
         "messages": chat_messages,
         "temperature": temperature,
@@ -461,17 +616,15 @@ pub async fn run_via_sidecar(
         // router. MIGRATION Phase 2b: ui turns now route here too, so `ui` reflects
         // the same deterministic router the native loop used — the LocalEngine
         // bridge scope serves the ui/perception + job tools when they fire.
-        "routing": {
-            "write": crate::commands::wants_write_tools(question),
-            "ui": crate::commands::wants_ui_tools(question),
-            "jobs": crate::commands::wants_job_tools(question),
-            "skills": crate::commands::wants_skill_tools(question),
-            "connectors": crate::commands::wants_mcp_management_tools(question),
-        },
+        // 2026-07-23: lanes LATCH per conversation (sticky_lanes) — once a prior
+        // turn opened a lane, a follow-up phrased without a keyword ("now do
+        // that for the rest") must not silently lose the tools. `write` stays
+        // question-only: it feeds only the cosmetic lane label now (the write
+        // tools themselves are always in the catalog).
+        "routing": sticky_lanes(question, &chat_messages),
         "web_enabled": web_enabled,
         "mcp_routes": mcp_route_count,
-        // The sidecar never runs consult_advisor (recursion guard) — no advisors.
-        "advisors": Vec::<String>::new(),
+        "advisors": advisor_names,
         "run_id": bridge.token,
     });
     // PRIV-1: attach the room policy for a non-local model (the sidecar's chat
@@ -496,6 +649,9 @@ pub async fn run_via_sidecar(
     // while the bridge is still alive, then tear the bridge down.
     let bridge_tool_ran = bridge.tool_ran();
     bridge.stop();
+    if let Some(nested) = consulted_room_bridge {
+        nested.stop();
+    }
 
     // Merge whatever the bridge accumulated back into the caller's effects,
     // regardless of outcome — a write that DID happen must be visible to the
@@ -503,14 +659,16 @@ pub async fn run_via_sidecar(
     *effects = sink.lock().await.clone();
 
     match streamed {
-        StreamResult::Done(text, usage) => {
+        StreamResult::Done(text, usage, plan) => {
             effects.token_usage = usage;
+            effects.agent_plan = plan;
             SidecarOutcome::Done(text)
         }
         // Stop mid-answer is expected — keep whatever streamed (the caller adds
         // the "(stopped)" marker).
-        StreamResult::Cancelled(text, usage) => {
+        StreamResult::Cancelled(text, usage, plan) => {
             effects.token_usage = usage;
+            effects.agent_plan = plan;
             SidecarOutcome::Done(text)
         }
         StreamResult::Failed {
@@ -518,8 +676,10 @@ pub async fn run_via_sidecar(
             error,
             tool_ran,
             usage,
+            plan,
         } => {
             effects.token_usage = usage;
+            effects.agent_plan = plan;
             // Distinguish the two no-fallback surfaces. If a tool already ran —
             // per the in-stream `step` line OR the bridge's own dispatch flag —
             // its side-effect is committed, so we surface `Failed` (the caller
@@ -537,13 +697,14 @@ pub async fn run_via_sidecar(
 }
 
 enum StreamResult {
-    Done(String, Option<serde_json::Value>),
-    Cancelled(String, Option<serde_json::Value>),
+    Done(String, Option<serde_json::Value>, Option<serde_json::Value>),
+    Cancelled(String, Option<serde_json::Value>, Option<serde_json::Value>),
     Failed {
         text: String,
         error: String,
         tool_ran: bool,
         usage: Option<serde_json::Value>,
+        plan: Option<serde_json::Value>,
     },
 }
 
@@ -566,6 +727,7 @@ async fn stream_run(
                 error: e.to_string(),
                 tool_ran: false,
                 usage: None,
+                plan: None,
             }
         }
     };
@@ -577,6 +739,7 @@ async fn stream_run(
                 error: format!("sidecar /run failed: {e}"),
                 tool_ran: false,
                 usage: None,
+                plan: None,
             }
         }
     };
@@ -595,6 +758,7 @@ async fn stream_run(
             },
             tool_ran: false,
             usage: None,
+            plan: None,
         };
     }
 
@@ -605,6 +769,9 @@ async fn stream_run(
     // Token-budget bar: the latest round's usage snapshot seen so far — last
     // one wins, mirroring `final_text`'s own "whatever streamed so far" shape.
     let mut last_usage: Option<serde_json::Value> = None;
+    // Agent visibility: the turn's roster (the `plan` event body). Captured
+    // regardless of `headless` — it also persists into the message effects.
+    let mut last_plan: Option<serde_json::Value> = None;
     // A `step` event means a tool is being executed over the bridge — once seen,
     // a side-effect has (or is about to have) happened, so no native fallback.
     let mut tool_ran = false;
@@ -627,13 +794,14 @@ async fn stream_run(
                         error: e.to_string(),
                         tool_ran,
                         usage: last_usage,
+                        plan: last_plan,
                     }
                 }
                 None => break, // stream ended
             },
             _ = wait_for_cancel(cancel) => {
                 let _ = cancel_run(base, &run_id).await; // best-effort
-                return StreamResult::Cancelled(final_text, last_usage);
+                return StreamResult::Cancelled(final_text, last_usage, last_plan);
             }
         };
         buf.extend_from_slice(&chunk);
@@ -646,7 +814,7 @@ async fn stream_run(
             }
             if cancel.load(Ordering::SeqCst) {
                 let _ = cancel_run(base, &run_id).await; // best-effort
-                return StreamResult::Cancelled(final_text, last_usage);
+                return StreamResult::Cancelled(final_text, last_usage, last_plan);
             }
             let ev: serde_json::Value = match serde_json::from_slice(line) {
                 Ok(v) => v,
@@ -655,6 +823,28 @@ async fn stream_run(
             match ev.get("t").and_then(|t| t.as_str()) {
                 // Wave 4a: headless runs (a workflow agent_run node) suppress every
                 // ask-* emit so a background turn never streams into the chat UI.
+                // Dispatch-first agent visibility: `plan` is the full roster of
+                // domain agents handling this ask (emitted once, before work
+                // starts); `agent` marks which one is active as steps advance.
+                // Payloads are forwarded as-is (JSON) — the shapes are the
+                // sidecar's plan/agent event bodies (graph.py run_agent).
+                Some("plan") => {
+                    last_plan = ev.get("v").cloned();
+                    if !headless {
+                        let _ = window.emit(
+                            "ask-plan",
+                            last_plan.clone().unwrap_or(serde_json::Value::Null),
+                        );
+                    }
+                }
+                Some("agent") => {
+                    if !headless {
+                        let _ = window.emit(
+                            "ask-agent",
+                            ev.get("v").cloned().unwrap_or(serde_json::Value::Null),
+                        );
+                    }
+                }
                 Some("lane") => {
                     if !headless {
                         let _ = window.emit("ask-lane", str_v(&ev));
@@ -670,16 +860,35 @@ async fn stream_run(
                         let _ = window.emit("ask-delta", str_v(&ev));
                     }
                 }
+                // Both carry `node`: the agent-graph slot of the loop that
+                // emitted them ("main", or "<agent id>#<slot>"). Parallel
+                // children interleave their events, so arrival order attributes
+                // nothing — the stamp is the only way the UI files a step under
+                // the right node. Absent on an older sidecar; forwarded as null,
+                // which the frontend reads as "the active agent" (the old
+                // behaviour).
                 Some("step") => {
                     tool_ran = true;
                     if !headless {
-                        let _ = window.emit("ask-step", str_v(&ev));
+                        let _ = window.emit(
+                            "ask-step",
+                            serde_json::json!({
+                                "label": str_v(&ev),
+                                "node": ev.get("node").and_then(|n| n.as_str()),
+                            }),
+                        );
                     }
                 }
                 Some("step_status") => {
                     if !headless {
                         let ok = ev.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
-                        let _ = window.emit("ask-step-status", serde_json::json!({ "ok": ok }));
+                        let _ = window.emit(
+                            "ask-step-status",
+                            serde_json::json!({
+                                "ok": ok,
+                                "node": ev.get("node").and_then(|n| n.as_str()),
+                            }),
+                        );
                     }
                 }
                 Some("final") => {
@@ -714,13 +923,14 @@ async fn stream_run(
                         error: str_v(&ev).to_string(),
                         tool_ran,
                         usage: last_usage,
+                        plan: last_plan,
                     };
                 }
                 _ => {}
             }
         }
     }
-    StreamResult::Done(final_text, last_usage)
+    StreamResult::Done(final_text, last_usage, last_plan)
 }
 
 fn str_v(ev: &serde_json::Value) -> &str {
@@ -827,5 +1037,54 @@ mod tests {
         let detail = safe_validation_detail(&body).unwrap();
         assert_eq!(detail, "provider.api_key: Field required");
         assert!(!detail.contains("do-not-leak"));
+    }
+
+    fn msg(role: &str, content: &str) -> ollama::ChatMessage {
+        ollama::ChatMessage::new(role, content)
+    }
+
+    #[test]
+    fn lanes_latch_over_prior_user_turns() {
+        // Turn 1 opened the jobs lane; turn 2's phrasing has no jobs keyword —
+        // the lane must stay open ("now save that" must not lose the tools).
+        let history = vec![
+            msg("system", "You are the room assistant."),
+            msg("user", "summarize the entire book"),
+            msg("assistant", "Working on it."),
+            msg("user", "now give me the three main points"), // composed final turn
+        ];
+        let r = sticky_lanes("now give me the three main points", &history);
+        assert_eq!(r["jobs"], true);
+        // A lane no prior turn wanted stays closed.
+        assert_eq!(r["connectors"], false);
+    }
+
+    #[test]
+    fn the_composed_final_turn_and_system_prompt_never_fire_lanes() {
+        // The final user message carries injected context ("Available Agent
+        // Skills…", file excerpts mentioning workflows) and the system prompt
+        // names every tool — neither may open a lane by itself.
+        let history = vec![
+            msg("system", "tools: save_workflow, skills, connectors, screenshot"),
+            msg(
+                "user",
+                "Available Agent Skills (specialized instructions)…\nQuestion: what is the rent",
+            ),
+        ];
+        let r = sticky_lanes("what is the rent", &history);
+        assert_eq!(r["jobs"], false);
+        assert_eq!(r["skills"], false);
+        assert_eq!(r["connectors"], false);
+        assert_eq!(r["ui"], false);
+    }
+
+    #[test]
+    fn hebrew_questions_route_lanes() {
+        // Substring hints must cover Hebrew or a Hebrew-speaking user can NEVER
+        // open a lane (to_lowercase is identity for Hebrew — plain contains()).
+        assert_eq!(sticky_lanes("תרגם את כל הספר", &[])["jobs"], true);
+        assert_eq!(sticky_lanes("פתח את המסמך על המסך", &[])["ui"], true);
+        let write = sticky_lanes("שמור את זה כקובץ", &[]);
+        assert_eq!(write["write"], true);
     }
 }

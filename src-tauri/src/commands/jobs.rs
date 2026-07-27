@@ -1120,6 +1120,35 @@ mod tests {
         }
     }
 
+    /// The EXACT plan shape `deep_summary_plan` builds (jobs.rs:335-345): one
+    /// independent step per file, all on the engine's lane, `kind` fixed to the
+    /// live dispatch discriminant "summarize_file", no params, no deps.
+    fn summarize_steps(n: usize, lane: Lane) -> Vec<Step> {
+        (0..n)
+            .map(|i| Step {
+                id: i,
+                lane,
+                kind: "summarize_file".into(),
+                params: serde_json::Value::Null,
+                depends_on: vec![],
+            })
+            .collect()
+    }
+
+    /// A `db::SummaryFile` as `deep_summary_plan` reads it, with an optional
+    /// cached one-liner (`None` = never summarized, `Some("")` = auto sentinel).
+    fn summary_file(name: &str, liner: Option<&str>) -> db::SummaryFile {
+        db::SummaryFile {
+            id: format!("id-{name}"),
+            name: name.into(),
+            mime: "text/plain".into(),
+            source: "upload".into(),
+            folder: None,
+            text: Some("body".into()),
+            ai_summary: liner.map(str::to_string),
+        }
+    }
+
     #[test]
     fn local_lane_is_serial() {
         // Three independent local-model steps: only ONE may start at a time.
@@ -1367,6 +1396,208 @@ mod tests {
         assert!(cancel.load(Ordering::SeqCst));
     }
 
+    // ------------------------------------------------------------------
+    // MIGRATION BASELINE: file_pass's resume contract at the run_plan level.
+    // The step bodies are stubbed; what is pinned is which steps re-run for a
+    // given persisted cursor, and that the scalar cursor is lossless for THIS
+    // job kind (unlike a branched workflow).
+    // ------------------------------------------------------------------
+
+    /// Drive a file_pass DAG with stubbed steps, returning every checkpoint as
+    /// (dense_prefix, done_count) — the value that would be persisted to
+    /// `jobs.cursor` vs the work actually finished.
+    async fn pass_checkpoints(n: usize, mode: &str, lane: Lane) -> Vec<(usize, usize)> {
+        let steps = build_pass_steps(n, mode, lane);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
+        let s2 = seen.clone();
+        let outcome = run_plan(
+            &steps,
+            HashSet::new(),
+            Arc::new(AtomicBool::new(false)),
+            move |_s| async move { Ok(()) },
+            move |done| s2.lock().unwrap().push((dense_prefix(done), done.len())),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Done);
+        let cps = seen.lock().unwrap().clone();
+        assert_eq!(cps.last().unwrap().0, steps.len(), "a finished run must end fully dense");
+        cps
+    }
+
+    #[tokio::test]
+    async fn file_pass_cursor_is_exact_on_the_local_lane_and_lossy_on_the_cloud_lane() {
+        // `jobs.cursor` is a dense prefix, so it can only express a CONTIGUOUS
+        // done-set. Whether that loses finished work depends entirely on the
+        // LANE — which file_pass re-resolves from the room's CURRENT model when
+        // it resumes (queue.rs::start_file_pass_row), so one stored plan can run
+        // either way across a pause.
+        //
+        // LocalLlm (1 slot): one step per wave, so done is always contiguous and
+        // the cursor is exact.
+        for (n, mode) in [(30usize, "merge"), (13, "merge"), (1, "merge"), (5, "stitch")] {
+            let cps = pass_checkpoints(n, mode, Lane::LocalLlm).await;
+            assert!(
+                cps.iter().all(|&(prefix, count)| prefix == count),
+                "local n={n} {mode} went non-dense: {cps:?}"
+            );
+        }
+        // Cloud (4 slots): section 0 becomes ready the moment ITS six windows
+        // are done, so it runs ALONGSIDE map 6 — done = {0..=6, 30} while maps
+        // 7.. are still pending. dense_prefix caps at 7, so a Stop there
+        // persists cursor=7 and SILENTLY FORGETS the finished compose, which
+        // re-runs on resume (another billed cloud call, overwriting its
+        // artifact). This is why dense_prefix is load-bearing for file_pass and
+        // not just for workflows — and the exact behaviour a port must keep.
+        let cps = pass_checkpoints(30, "merge", Lane::Cloud).await;
+        let lossy: Vec<(usize, usize)> = cps.iter().copied().filter(|&(p, c)| p < c).collect();
+        assert!(!lossy.is_empty(), "expected cloud-lane under-reporting, got {cps:?}");
+        assert!(cps.contains(&(7, 8)), "expected the map-6/section-0 overlap in {cps:?}");
+        // The prefix is still MONOTONIC and never claims unfinished work — the
+        // invariant that keeps a lossy cursor SAFE rather than corrupting.
+        assert!(cps.windows(2).all(|w| w[0].0 <= w[1].0), "cursor went backwards: {cps:?}");
+        assert!(cps.iter().all(|&(p, c)| p <= c));
+    }
+
+    #[test]
+    fn the_resume_gate_hashes_the_smart_filtered_text_not_the_file() {
+        // queue.rs::start_file_pass_row refuses to resume unless the file's
+        // re-filtered text still matches the plan on BOTH length and sha256.
+        // The hashed value is `smart_filter(extracted_text)`, NOT the stored
+        // bytes — so smart_filter is part of the durable format: any change to
+        // its output (a port that normalizes newlines differently, drops a
+        // different "noise" line, or trims differently) makes EVERY paused pass
+        // in every existing room unresumable with "The file changed since this
+        // pass started". Pin the composition and the digest shape.
+        let raw = "Header\nHeader\n\n\n  body line  \n\nHeader\n";
+        let filtered = extraction::smart_filter(raw);
+        // Dedupe of CONSECUTIVE repeated lines, blank-run collapse, and
+        // trailing-space trim (leading space is KEPT) are all inside the hash.
+        assert_eq!(filtered, "Header\n\n  body line\n\nHeader\n");
+        assert_ne!(filtered.len(), raw.len(), "the gate compares FILTERED lengths");
+        let d = text_digest(&filtered);
+        assert_eq!(d.len(), 64);
+        assert!(d.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        // Plain lowercase-hex SHA-256 of the UTF-8 bytes — nothing app-specific.
+        assert_eq!(
+            text_digest(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // A same-LENGTH content swap is exactly what the digest exists to catch
+        // (older plans without one keep only the length check).
+        assert_eq!("alpha".len(), "alphb".len());
+        assert_ne!(text_digest("alpha"), text_digest("alphb"));
+    }
+
+    #[tokio::test]
+    async fn file_pass_resume_from_the_stored_cursor_replays_exactly_the_tail() {
+        // 7 windows, merge: maps 0..7, sections 7 and 8, publish 9.
+        let steps = build_pass_steps(7, "merge", Lane::LocalLlm);
+        assert_eq!(steps.len(), 10);
+        // Leg 1: Stop trips after the third map finishes, exactly like a user
+        // pressing Stop between waves.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let (c2, r2, cu2) = (cancel.clone(), ran.clone(), cursor.clone());
+        let outcome = run_plan(
+            &steps,
+            HashSet::new(),
+            cancel.clone(),
+            move |s| {
+                let (c, r) = (c2.clone(), r2.clone());
+                async move {
+                    r.lock().unwrap().push(s.id);
+                    if s.id == 2 {
+                        c.store(true, Ordering::SeqCst);
+                    }
+                    Ok(())
+                }
+            },
+            move |done| cu2.store(dense_prefix(done), Ordering::SeqCst),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Paused);
+        assert_eq!(*ran.lock().unwrap(), vec![0, 1, 2]);
+        let stored = cursor.load(Ordering::SeqCst);
+        assert_eq!(stored, 3, "the jobs row persists cursor=3");
+
+        // Leg 2: `start_file_pass_row` seeds (0..cursor) — the three finished
+        // maps are NOT re-run (their artifacts stand), and everything from the
+        // cursor up runs, in id order, ending with publish.
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let r2 = ran.clone();
+        let outcome = run_plan(
+            &steps,
+            (0..stored).collect(),
+            Arc::new(AtomicBool::new(false)),
+            move |s| {
+                let r = r2.clone();
+                async move {
+                    r.lock().unwrap().push(s.id);
+                    Ok(())
+                }
+            },
+            |_| {},
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Done);
+        assert_eq!(*ran.lock().unwrap(), (3..10).collect::<Vec<usize>>());
+
+        // A cursor already at the end is a legal resume: nothing runs at all —
+        // which is ALSO how a pass whose publish committed but whose final
+        // checkpoint landed finishes without writing a second file.
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let r2 = ran.clone();
+        let outcome = run_plan(
+            &steps,
+            (0..steps.len()).collect(),
+            Arc::new(AtomicBool::new(false)),
+            move |s| {
+                let r = r2.clone();
+                async move {
+                    r.lock().unwrap().push(s.id);
+                    Ok(())
+                }
+            },
+            |_| {},
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Done);
+        assert!(ran.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_step_never_checkpoints_its_wave_so_it_replays() {
+        // A Stop landing INSIDE a model call surfaces as the step error
+        // "STOPPED", not a clean pause: run_plan returns Error and the wave's
+        // checkpoint never fires, so the cursor stays at the previous wave and
+        // the interrupted step re-runs on resume. spawn_file_pass then rewrites
+        // that Error to Paused (jobs.rs: `RunOutcome::Error(_) if cancel` →
+        // Paused) so the card reads Paused, not Stopped. A migration that
+        // checkpoints per-STEP instead of per-WAVE, or that lets STOPPED reach
+        // the status writer, breaks both halves.
+        let steps = build_pass_steps(4, "stitch", Lane::LocalLlm); // 4 maps + publish
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let cu2 = cursor.clone();
+        let outcome = run_plan(
+            &steps,
+            HashSet::new(),
+            Arc::new(AtomicBool::new(false)),
+            move |s| async move {
+                if s.id == 2 { Err("STOPPED".to_string()) } else { Ok(()) }
+            },
+            move |done| cu2.store(dense_prefix(done), Ordering::SeqCst),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Error("STOPPED".into()));
+        assert_eq!(cursor.load(Ordering::SeqCst), 2, "the interrupted step must replay");
+    }
+
     #[tokio::test]
     async fn run_plan_parks_on_step_error() {
         let steps = vec![step(0, Lane::LocalLlm, &[]), step(1, Lane::LocalLlm, &[0])];
@@ -1386,5 +1617,349 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, RunOutcome::Error("OLLAMA_DOWN".into()));
+    }
+
+    // ---------------------------------------------------------------------
+    // MIGRATION BASELINE (deep_summary). The four production `run_plan`
+    // callers — spawn_deep_summary (jobs.rs:395), spawn_file_pass
+    // (jobs.rs:1013), the inline child pass (file_pass.rs:517) and
+    // spawn_workflow_job (workflow.rs:2196) — all inherit the semantics below.
+    // deep_summary is the simplest of them, so these pin the SHARED contract
+    // any replacement engine must reproduce byte-for-byte.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_plan_checkpoints_once_per_wave_not_once_per_step() {
+        // THE wave contract. The unit of durability is a WAVE, not a step: six
+        // independent cloud-lane files (4 slots) run as [0,1,2,3] then [4,5] and
+        // produce exactly TWO checkpoints. A per-node checkpoint would record
+        // 1,2,3,4,5,6 — a different (finer) resume granularity and a different
+        // crash-replay cost, so this is the assertion a migration must satisfy.
+        let steps = summarize_steps(6, Lane::Cloud);
+        let cps = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let ticks = Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
+        let c2 = cps.clone();
+        let t2 = ticks.clone();
+        let outcome = run_plan(
+            &steps,
+            HashSet::new(),
+            Arc::new(AtomicBool::new(false)),
+            move |_s| async move { Ok(()) },
+            move |done| c2.lock().unwrap().push(dense_prefix(done)),
+            move |done, total| t2.lock().unwrap().push((done, total)),
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Done);
+        assert_eq!(*cps.lock().unwrap(), vec![4, 6]);
+        // Progress ticks once up front (the resume seed) and once per wave.
+        assert_eq!(*ticks.lock().unwrap(), vec![(0, 6), (4, 6), (6, 6)]);
+    }
+
+    #[tokio::test]
+    async fn run_plan_discards_a_failed_waves_completed_siblings() {
+        // A wave is atomic for checkpointing: `join_all` drives every future in
+        // it, but the first Err returns before `checkpoint` is ever called — so
+        // the SUCCEEDED siblings of a failed step are NOT persisted and re-run
+        // on resume. This is what makes "done stays a valid prefix" hold even
+        // on a fan-out lane, and why every step must be idempotent.
+        let steps = summarize_steps(4, Lane::Cloud);
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let cps = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let r2 = ran.clone();
+        let c2 = cps.clone();
+        let outcome = run_plan(
+            &steps,
+            HashSet::new(),
+            Arc::new(AtomicBool::new(false)),
+            move |s| {
+                let r = r2.clone();
+                async move {
+                    r.lock().unwrap().push(s.id);
+                    if s.id == 2 {
+                        Err("OLLAMA_DOWN".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            move |done| c2.lock().unwrap().push(dense_prefix(done)),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Error("OLLAMA_DOWN".into()));
+        // All four ran — the whole wave is awaited before the error surfaces…
+        let mut ran = ran.lock().unwrap().clone();
+        ran.sort_unstable();
+        assert_eq!(ran, vec![0, 1, 2, 3]);
+        // …yet NOTHING was checkpointed, so the durable cursor stays 0.
+        assert!(cps.lock().unwrap().is_empty(), "a failed wave must not checkpoint");
+    }
+
+    #[tokio::test]
+    async fn run_plan_honors_a_real_done_set_but_a_prefix_seed_replays() {
+        // Two resume shapes ride the same entry point:
+        //  - a workflow seeds the REAL done-set (from jobs.state) — an
+        //    above-prefix id is honored and never re-runs;
+        //  - deep_summary/file_pass seed `0..dense_prefix` — the same
+        //    above-prefix step REPLAYS, which is only safe because every step
+        //    is idempotent (deep_summary's one-liner cache, file_pass's
+        //    INSERT OR REPLACE artifacts).
+        let steps = summarize_steps(4, Lane::LocalLlm);
+        let real: HashSet<usize> = [0, 1, 3].into_iter().collect();
+        assert_eq!(dense_prefix(&real), 2);
+
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let ticks = Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
+        let r2 = ran.clone();
+        let t2 = ticks.clone();
+        let outcome = run_plan(
+            &steps,
+            real.clone(),
+            Arc::new(AtomicBool::new(false)),
+            move |s| {
+                let r = r2.clone();
+                async move {
+                    r.lock().unwrap().push(s.id);
+                    Ok(())
+                }
+            },
+            |_| {},
+            move |done, total| t2.lock().unwrap().push((done, total)),
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Done);
+        assert_eq!(*ran.lock().unwrap(), vec![2]);
+        // The progress bar seeds from the COUNT (3 of 4) while the durable
+        // cursor a spawner stores is the PREFIX (2) — a deliberate asymmetry.
+        assert_eq!(ticks.lock().unwrap()[0], (3, 4));
+
+        // Same plan, prefix seed: step 3 runs a second time.
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let r2 = ran.clone();
+        let outcome = run_plan(
+            &steps,
+            (0..dense_prefix(&real)).collect(),
+            Arc::new(AtomicBool::new(false)),
+            move |s| {
+                let r = r2.clone();
+                async move {
+                    r.lock().unwrap().push(s.id);
+                    Ok(())
+                }
+            },
+            |_| {},
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Done);
+        assert_eq!(*ran.lock().unwrap(), vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn run_plan_cancelled_before_the_first_wave_is_a_no_op() {
+        // Stop pressed while the job sat queued (or right at spawn): the flag is
+        // checked at the TOP of the loop, so nothing executes and — crucially —
+        // nothing is checkpointed, so the resume seed is exactly what it was.
+        let steps = summarize_steps(3, Lane::LocalLlm);
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let cps = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let ticks = Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
+        let r2 = ran.clone();
+        let c2 = cps.clone();
+        let t2 = ticks.clone();
+        let outcome = run_plan(
+            &steps,
+            (0..1).collect(),
+            Arc::new(AtomicBool::new(true)),
+            move |s| {
+                let r = r2.clone();
+                async move {
+                    r.lock().unwrap().push(s.id);
+                    Ok(())
+                }
+            },
+            move |done| c2.lock().unwrap().push(dense_prefix(done)),
+            move |done, total| t2.lock().unwrap().push((done, total)),
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Paused);
+        assert!(ran.lock().unwrap().is_empty());
+        assert!(cps.lock().unwrap().is_empty());
+        // The seed tick still fires, so the Paused card reports real progress.
+        assert_eq!(*ticks.lock().unwrap(), vec![(1, 3)]);
+    }
+
+    #[tokio::test]
+    async fn a_fully_cached_resume_is_done_with_no_work_and_no_checkpoint() {
+        // The deep_summary reduce-retry path: the map phase finished, the
+        // "Room summary.html" write failed, the job parked 'error'. Resume
+        // re-derives the cursor from the one-liner cache, finds every file
+        // cached, and seeds a COMPLETE done-set — run_plan then returns Done
+        // having executed nothing and checkpointed nothing, so the retry costs
+        // only the two reduce calls (jobs.rs:484 "cheap, cache-fed write").
+        let steps = summarize_steps(3, Lane::LocalLlm);
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let cps = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let ticks = Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
+        let r2 = ran.clone();
+        let c2 = cps.clone();
+        let t2 = ticks.clone();
+        let outcome = run_plan(
+            &steps,
+            (0..3).collect(),
+            Arc::new(AtomicBool::new(false)),
+            move |s| {
+                let r = r2.clone();
+                async move {
+                    r.lock().unwrap().push(s.id);
+                    Ok(())
+                }
+            },
+            move |done| c2.lock().unwrap().push(dense_prefix(done)),
+            move |done, total| t2.lock().unwrap().push((done, total)),
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Done);
+        assert!(ran.lock().unwrap().is_empty());
+        assert!(cps.lock().unwrap().is_empty());
+        assert_eq!(*ticks.lock().unwrap(), vec![(3, 3)]);
+    }
+
+    #[test]
+    fn deep_summary_lane_choice_sets_the_checkpoint_granularity() {
+        // The rule at jobs.rs:330 — the room's chosen ENGINE picks the lane, and
+        // the lane's slot count is what makes the durable cursor advance 1 step
+        // at a time (local) or 4 at a time (cloud / external CLI). A crash on a
+        // cloud engine therefore replays up to 3 already-summarized files.
+        let lane_for = |m: &str| {
+            if is_cloud_model(m) || is_external_engine(m) {
+                Lane::Cloud
+            } else {
+                Lane::LocalLlm
+            }
+        };
+        assert_eq!(lane_for("qwen3.5:4b"), Lane::LocalLlm);
+        assert_eq!(lane_for("minimax-m3:cloud"), Lane::Cloud);
+        assert_eq!(lane_for("claude-cli::opus::high"), Lane::Cloud);
+        assert_eq!(lane_for("openrouter::x-ai/grok-4"), Lane::Cloud);
+
+        let local = summarize_steps(6, Lane::LocalLlm);
+        assert_eq!(local[0].kind, "summarize_file");
+        assert!(local.iter().all(|s| s.depends_on.is_empty()));
+        assert_eq!(
+            plan_dispatch(&local, &HashSet::new(), &HashSet::new()),
+            vec![0]
+        );
+        let cloud = summarize_steps(6, Lane::Cloud);
+        assert_eq!(
+            plan_dispatch(&cloud, &HashSet::new(), &HashSet::new()),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn the_manual_resume_cursor_stops_at_the_first_uncached_file() {
+        // `has_liner` is the primitive the deep_summary resume point is derived
+        // from (queue.rs:start_deep_summary_row uses
+        // `files.take_while(has_liner).count()`), so it must stop at the FIRST
+        // gap — counting cached files instead would skip the gap forever.
+        let files = vec![
+            summary_file("a.pdf", Some("about a")),
+            summary_file("b.pdf", None),
+            summary_file("c.pdf", Some("about c")),
+        ];
+        assert!(has_liner(&files[0]));
+        assert!(!has_liner(&files[1]));
+        // The auto '' sentinel (and whitespace) counts as MISSING, so a manual
+        // run retries a stuck file while the auto scheduler leaves it alone.
+        assert!(!has_liner(&summary_file("stuck.pdf", Some(""))));
+        assert!(!has_liner(&summary_file("blank.pdf", Some("   "))));
+
+        assert_eq!(files.iter().take_while(|f| has_liner(f)).count(), 1);
+        assert_eq!(files.iter().filter(|f| has_liner(f)).count(), 2);
+    }
+
+    #[test]
+    fn deep_summary_stored_cursor_is_write_only_and_can_disagree_with_the_cache() {
+        // What deep_summary actually persists: the job row + an immutable-ish
+        // plan snapshot, a per-wave cursor, and an ALWAYS-EMPTY state blob (it
+        // accumulates nothing and writes no job_artifacts — its per-step output
+        // channel is `files.ai_summary`). The cursor is written but never read
+        // back for this kind: it is positional over a file list that may have
+        // changed, so resume re-derives from the cache instead.
+        let conn = db::mem();
+        let plan = serde_json::json!({
+            "steps": summarize_steps(3, Lane::LocalLlm),
+            "auto": false,
+            "reduce": true,
+        });
+        let id = db::create_job(&conn, "deep_summary", "Room summary", &plan, 3).unwrap();
+        db::set_job_status(&conn, &id, "running", None).unwrap();
+        db::checkpoint_job(&conn, &id, 2, &serde_json::json!({})).unwrap();
+
+        let job = db::get_job(&conn, &id).unwrap();
+        assert_eq!(job.cursor, 2);
+        assert_eq!(job.state, serde_json::json!({}));
+        assert_eq!(job.plan["steps"][0]["kind"], "summarize_file");
+        assert_eq!(job.plan["steps"][0]["lane"], "local_llm");
+        assert_eq!(job.plan["auto"], serde_json::json!(false));
+        assert_eq!(job.plan["reduce"], serde_json::json!(true));
+        assert!(db::get_job_artifact(&conn, &id, 0).is_none());
+
+        // A file was inserted ahead of the unsummarized one while the job was
+        // parked: the cache-derived cursor is 1, the stored cursor still 2.
+        // Trusting the stored cursor would silently skip an unsummarized file.
+        let files = vec![
+            summary_file("a.pdf", Some("about a")),
+            summary_file("new.pdf", None),
+            summary_file("b.pdf", Some("about b")),
+        ];
+        let derived = files.iter().take_while(|f| has_liner(f)).count();
+        assert_eq!(derived, 1);
+        assert_ne!(derived as i64, job.cursor);
+    }
+
+    #[test]
+    fn quiesce_parks_running_jobs_keeps_queued_and_preserves_the_checkpoint() {
+        // Room open after a crash/restart. A 'running' row belongs to a process
+        // that is gone → park it 'paused' (Resume offered); a 'queued' row never
+        // started → LEAVE it queued so `pump_on_open` auto-starts it; terminal
+        // rows are untouched; a workflow's inline CHILD is untouched (its parent
+        // re-drives it). The checkpoint (cursor/state/plan) must survive intact.
+        let conn = db::mem();
+        let plan = serde_json::json!({ "steps": summarize_steps(4, Lane::LocalLlm) });
+        let running = db::create_job(&conn, "deep_summary", "Room summary", &plan, 4).unwrap();
+        db::set_job_status(&conn, &running, "running", None).unwrap();
+        db::checkpoint_job(&conn, &running, 2, &serde_json::json!({})).unwrap();
+        let queued = db::create_job(&conn, "deep_summary", "Indexing new files",
+            &serde_json::json!({ "auto": true }), 2).unwrap();
+        let paused = db::create_job(&conn, "file_pass", "Full pass", &plan, 4).unwrap();
+        db::set_job_status(&conn, &paused, "paused", None).unwrap();
+        let finished = db::create_job(&conn, "deep_summary", "old", &plan, 1).unwrap();
+        db::set_job_status(&conn, &finished, "done", None).unwrap();
+        let failed = db::create_job(&conn, "deep_summary", "bad", &plan, 1).unwrap();
+        db::set_job_status(&conn, &failed, "error", Some("OLLAMA_DOWN")).unwrap();
+        let parent = db::create_job(&conn, "workflow", "Digest", &plan, 2).unwrap();
+        let child = db::create_child_job(&conn, "file_pass", "Full pass — book.pdf",
+            &plan, 3, &parent).unwrap();
+        db::set_job_status(&conn, &child, "running", None).unwrap();
+
+        quiesce_stale_jobs(&conn);
+
+        let st = |id: &str| db::get_job(&conn, id).unwrap().status;
+        assert_eq!(st(&running), "paused");
+        assert_eq!(st(&queued), "queued");
+        assert_eq!(st(&paused), "paused");
+        assert_eq!(st(&finished), "done");
+        assert_eq!(st(&failed), "error");
+        // The child keeps 'running': unfinished_jobs hides it, so quiesce can't
+        // park it out from under the workflow that owns it.
+        assert_eq!(st(&child), "running");
+
+        let j = db::get_job(&conn, &running).unwrap();
+        assert_eq!(j.cursor, 2, "quiesce must not reset the checkpoint");
+        assert_eq!(j.total, 4);
+        assert_eq!(j.plan["steps"][0]["kind"], "summarize_file");
+        assert_eq!(db::get_job(&conn, &failed).unwrap().error.as_deref(), Some("OLLAMA_DOWN"));
     }
 }

@@ -85,10 +85,12 @@
 - [ ] "Search room (⌘K)" button opens the search/command palette (`ActivityRail.tsx:106-114`).
 - [ ] "Focus the editor" (zen) hides both side panes; click again restores (`ActivityRail.tsx:121-130`).
 - [ ] "Room settings (⌘,)" opens Settings (`ActivityRail.tsx:131-139`).
+- [ ] **GH #2** Expand/Collapse toggle at the top widens the rail to ~184 px with FULL labels ("Connectors", not "Connect"); collapses back; persists per room (`ActivityRail.tsx`, `useLayout.ts` railExpanded). *e2e: `gh2-sidebar-expand.e2e.mjs`*
 
 ## 7. Three-pane layout
 
-- [ ] Default 21/50/29 split; Splitter A (Library|rest) and B (Center|AI) drag-resize with clamps (library 13–34 %, AI 20–45 %, center ≥ 30 %) (`useLayout.ts:18-31`).
+- [ ] Default 18/58/24 split; Splitter A (Library|rest) and B (Center|AI) drag-resize with clamps (library 13–50 %, AI 20–42 %, center ≥ 40 %) (`useLayout.ts:21-38`).
+- [ ] **GH #2** The splitter grip is visible WITHOUT hovering, and the two panes either side of it trade — the ratios stay summed to 1 and the center floor holds at both extremes. *e2e: `gh2-sidebar-expand.e2e.mjs`*
 - [ ] Splitter keyboard: focus + ArrowLeft/Right (Shift = bigger steps); `aria-valuenow` updates (`useLayout.ts:258-286`).
 - [ ] Double-click (or Enter) a splitter → reset layout, unhide all, exit focus (`Splitter.tsx:34-43`).
 - [ ] ⌘1/⌘2/⌘3 toggle panes; hiding all auto-restores center; Escape exits focus mode (ignored while typing) (`useLayout.ts:290-306`).
@@ -207,6 +209,9 @@
 
 **Recording (`RecordingView.tsx`)** — see §22 for capture; viewer-side:
 - [ ] Speaker-grouped transcript with colored speaker chips ("You" = accent); per-turn RTL/LTR (`RecordingView.tsx:290-315,660-721`).
+- [ ] **GH #5** Click a speaker chip → inline input → naming them renames EVERY line that voice said (one map entry, not a per-line edit); Enter commits, Escape abandons, an empty name restores the engine's label (`RecordingView.tsx` SpeakerChip, `rec_set_speaker_name`). *e2e: `gh5-speaker-names.e2e.mjs`*
+- [ ] **GH #5** Names survive closing and reopening the recording, are carried into "Export edited copy", appear in the translated file and in the searchable transcript text; the chip's COLOUR stays keyed to the machine label (`recording.rs` display_speaker). *cargo: `recording::tests::speaker_names_*`*
+- [ ] **GH #5** Re-transcribe warns that voices are re-numbered when names exist, so the user re-checks them afterwards (`RecordingView.tsx` retranscribe confirm).
 - [ ] Turn timestamp "Jump to this moment" and word click-to-seek (drag-select ≠ seek) (`RecordingView.tsx:671-707`).
 - [ ] Select words → action bar "N words · t0–t1": Delete from recording (soft cut; playback skips; toast notes Export makes it permanent) / Keep (`RecordingView.tsx:346-380,737-747`).
 - [ ] Translate-into input + button → whole transcript translated into a NEW file, progress "done/total" (`RecordingView.tsx:754-772`).
@@ -313,6 +318,13 @@
 - [ ] Citation chips: quote/note/range + file name; verified quotes get check + "Verified" badge, approximate get "· ≈ closest match"; click opens the file at the highlight; "Copy as receipt" on verified quotes (`ChatPane.tsx:314-366`).
 - [ ] Assistant footer: source chips (open newest matching file; info toast if gone) · ▶ Play/◼ Stop TTS · Copy · "Undo edit"/"Undo N edits" (when the answer edited files) · Regenerate (last answer only; re-runs the turn, paperclip attachments intentionally dropped) · "Save to room" inline form (name default "AI note.md", Enter saves) (`ChatPane.tsx:374-454`).
 - [ ] Streaming: pulsing placeholder ("Thinking locally…" vs "Asking your cloud AI — content leaves this Mac…"), lane + step chips (failed steps ⚠ with tooltip), live Markdown + ▍ cursor (`ChatPane.tsx:460-494`).
+- [ ] Agent graph (2026-07-27): a turn that DELEGATES shows a hub-and-spoke graph above the step chips — "Main agent" rooted left, one node per dispatched specialist to its right, curved spokes between them; each node reads label + truncated instruction + elapsed, with its state carried by glyph AND outline, never colour alone (○ dashed = queued, spinner + accent = running, ✓ = done, ⚠ + heavy red = failed); the header counts "N running" / "N/M done" (`AgentGraph.tsx`, `ask-plan` entries' `status`).
+- [ ] Parallel batch grouping: specialists dispatched in the SAME round sit inside one dashed "N IN PARALLEL" band, all lit at once, and go done/failed INDEPENDENTLY (a fast child must stop pulsing while a slow sibling still runs — not all at the end); a later round's specialist appears in its own band below (`ask-plan` entries' `batch`).
+- [ ] Node inspection: clicking a specialist opens a panel with its registry id, label, description, FULL instruction, "round N, alongside K other agents", elapsed, report status, and only ITS OWN tool steps (a sibling's steps must not appear); clicking "Main agent" shows the whole turn instead — specialists dispatched, lane, and a chip per delegation; ✕ closes it (`ask-step`/`ask-step-status` `node` attribution).
+- [ ] Agent graph — Expand: the "Expand" button opens a centred overlay with a roomier graph where each instruction rides its own edge; Escape and a backdrop click both close it; light and dark both correct; with `prefers-reduced-motion: reduce` every animation (node entry, spinner, flowing edges) is off and the graph is still fully readable.
+- [ ] Agent strip fallback (2026-07-23): a turn that delegates NOTHING (a greeting, general knowledge) shows no graph at all — just the single quiet "AGENT · Main agent" chip it always did; this is the common turn and must never grow a diagram. Historic behaviour: the roster above the step chips — one chip per plan step (label from the registry, instruction as tooltip); active chip pulses a dot, finished chips show ✓, later chips read "· queued"; compound asks ("translate the book and then send it to Slack", Hebrew "ואז") show 2-3 chips advancing as steps run; strip clears when the turn ends (`ChatPane.tsx` agent-strip, `ask-plan`/`ask-agent` events).
+- [ ] Persisted agent roster: every FINISHED assistant message keeps a quiet chip line under "Room AI" naming the pipeline that handled it with arrows (e.g. "AGENTS · File agent → Main agent"; instruction as tooltip) — survives app restart (stored in the message's `effects.agents`; sidecar-engine turns only, external-CLI turns have none) (`ChatPane.tsx` agent-strip past, `effects_json` agents key).
+- [ ] Agentic hub (2026-07-23 v3): the Main agent DECIDES delegation — a greeting shows only the "Main agent" chip (no worker wakes); a room question GROWS the strip live as it delegates (Main agent → File agent appears mid-turn → back to Main agent); compound asks chain specialists (Jobs agent → Connector agent → Main agent); step chips read "Asked the File agent"; the persisted answer is always the Main agent's own words and the saved roster is the full pipeline with arrows.
 - [ ] Privacy receipt after cloud turns: "N private detail(s) hidden…" / "Shielded — nothing private needed hiding" / "Real details were shared this once" (+ "N image(s) kept on this Mac") (`ChatPane.tsx:497-515`).
 - [ ] "Ask again with real details (this once)" valve (`data-agent-blocked`): two-step with "Yes, this once" (danger) / Cancel (`ChatPane.tsx:516-545`).
 - [ ] Memory-suggestion card (`data-agent-blocked`): "Worth remembering?" — Save to memory / Ignore / Always save (turns on auto-save; auto-saved turns show a "Forget" undo toast) (`ChatPane.tsx:548-580`).
@@ -358,6 +370,8 @@
 - [ ] Start: guards a second session (info toast + opens the live one); mic acquired first; mic denied → Mac-audio-only continues with explanatory error toast (`recordingActions.ts:269-314`).
 - [ ] Pause / Resume (mute state survives) / Stop & save → "Recording saved — transcript included." toast with Open action (`recordingActions.ts:316-362`).
 - [ ] Mic mute is track-level (Mac audio keeps recording) (`liveRec.ts:47-55`).
+- [ ] **GH #4** Arcelle never requests `autoGainControl` on ANY mic path (recording or dictation), so a Teams/Zoom/Meet call sharing the microphone does not hear its own volume drop. Echo cancellation stays ON by default (it keeps meeting audio out of the "You" lane) (`liveRec.ts` micConstraints). *e2e: `gh4-mic-volume.e2e.mjs`*
+- [ ] **GH #4** Settings → Voice → Microphone: "Clean up microphone audio" toggle releases voice processing for headphone users; takes effect on the next mic acquisition; persists as `mic_voice_processing` (`MicSection.tsx`). *e2e: `gh4-mic-volume.e2e.mjs`*
 - [ ] Live transcription toggle per session (starts ON); live translate into 16 languages pre-start or mid-session (`RecordingView.tsx:574-594`).
 - [ ] System-audio permission failure → banner + "Open System Settings" deep link (Screen & System Audio Recording) (`RecordingView.tsx:601-618`).
 - [ ] AudioWorklet tap with ScriptProcessor fallback; ~250 ms PCM batches; teardown flush so the closing word isn't clipped (`liveRec.ts:175-279`).
@@ -404,7 +418,7 @@
   - [ ] condition: op select (not empty / empty / contains… / does not contain… / new files since last run) + text input for contains ops; branch editor — per-branch then/else select, target-node select, × remove, "+ Add branch" (forward-target default, disabled with no other nodes).
   - [ ] "Delete step" (`data-agent-blocked`) removes node + its edges (`NodeParamSheet.tsx`).
 - [ ] Binding editor "Where it appears": General / Specific files; file scope → 13 kind badges (image…binary), comma-separated extensions input, "Only this specific file" select (incl. "(bound file — not in this room)" fallback) (`WorkflowDetail.tsx:276-348`).
-- [ ] Schedule popover: Off / Every N minutes / Daily HH:MM / Weekly day+time; Enabled + "Catch up at unlock" checkboxes; caption "Runs while this room is open and unlocked…"; Save with blank kind clears; file-scoped workflows get the disabled variant (`SchedulePopover.tsx:26-118`).
+- [ ] Schedule popover: Off / Every N minutes / Daily HH:MM / Weekly day+time; Enabled + "Catch up at unlock" checkboxes; caption "Runs while this room is open and unlocked…"; Save with blank kind clears; file-scoped workflows get the disabled variant (`SchedulePopover.tsx:26-118`). MUST be fully visible/clickable — it renders in a body portal anchored under the Schedule button (2026-07-23 fix: it used to be clipped to a sliver by the pane's `overflow: hidden` + `container-type`, i.e. invisible).
 - [ ] Run history: expandable rows (`aria-expanded` disclosure button: status dot, trigger, localized start time, error text) → lazy-loaded per-step artifacts with node-named headers, a scrollable body, and a Copy button (flips to a check icon + "Copied"); skipped steps say "Step skipped."; older runs fall back to node names; "No runs yet." (`RunHistory.tsx`).
 - [ ] Live per-node status during a run (canvas updates while running) (`WorkflowDetail.tsx:92-94`).
 - [ ] File-scoped runs: matching workflow appears in the open file's "Actions" menu and runs on that file with toast "<name> started on <file>" + View action (`workflowActions.ts:51-61`).
@@ -562,6 +576,7 @@ Test each by asking the agent in plain language and observing the stated outcome
 - [ ] Files tier: fresh token + ephemeral port per start, paste-only config, no discovery file; serves file tools (+ web if on, + MCP if allow-cloud) — assert `ui_act`, `start_file_pass`, `local_generate` are ABSENT from `tools/list`.
 - [ ] Full tier: stable port 17872 + persisted token; writes `~/.arcelle/leash.json` (mode 0600, `{url, token, scope, room, pid…}`); removed on stop/lock/app-exit; stale-pid self-heals (`discovery.rs`, `lib.rs:290`).
 - [ ] Full tier serves file + job + workflow tools + `local_generate` + `view_media_frame`; NEVER `ui_snapshot`/`ui_act`/`view_screenshot`/`consult_advisor` (`room_mcp.rs:22-30`).
+- [ ] **Cloud-engine tier (2026-07-25, `ToolScope::CloudEngine`)** — set the room engine to `claude-cli`/`codex-cli`, then confirm the agent hub reaches every domain the local engine does: "schedule a summary every morning" builds a real WORKFLOW (not a skill), "run the X script" runs it, flashcards/mindmap/podcast work, "redo the transcript" retranscribes, connectors can be listed/drafted. NEVER `ui_snapshot`/`ui_act`/`view_screenshot` — a click request must be refused, not faked (`room_mcp.rs`, `agent.rs::primary_cli_scope`).
 - [ ] Wrong/missing bearer → 401 (constant-time compare); GET → 405; unadvertised tool name → "unknown tool"; loopback-only bind.
 - [ ] Tier change / Regenerate token restarts the bridge and severs live connections; `change_password` deliberately does NOT rotate the leash token.
 - [ ] `local_generate` over full tier refuses `:cloud`/external model picks (`agent.rs:1155`).

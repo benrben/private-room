@@ -14,6 +14,7 @@ let stream: MediaStream | null = null;
 let teardown: (() => void) | null = null;
 let muted = false;
 let liveStt = true;
+let voiceProcessing = true;
 
 /** Same-origin asset, never a blob: URL — the app's CSP allows `script-src
  * 'self'` only, and an AudioWorklet module is fetched as a script. */
@@ -53,6 +54,41 @@ export function setMicMuted(m: boolean): void {
 
 export function micMuted(): boolean {
   return muted;
+}
+
+/** GH #4 — what we ask macOS to do to the microphone signal.
+ *
+ * `autoGainControl` is deliberately ALWAYS false. It is not a filter: on macOS
+ * it rides the shared input device's actual gain, so any other app on the same
+ * microphone (Teams, Zoom, Meet) hears our level changes as its own volume
+ * dropping. Whisper does its own normalization, so we lose nothing by leaving
+ * the hardware level exactly where the user set it.
+ *
+ * `echoCancellation` IS load-bearing and stays on by default: it stops meeting
+ * audio played through the speakers from re-entering the mic lane and being
+ * attributed to "You" (see recording_cmds::rec_start). Users on headphones have
+ * no acoustic echo to cancel, and turning the whole voice-processing path off
+ * is what fully releases the device — hence the setting.
+ *
+ * Read SYNCHRONOUSLY (module state, not an await): `acquireMic` has to be the
+ * first thing awaited in the click handler or WebKit revokes the capture
+ * gesture, so there is no room for an IPC round-trip here. */
+export function micConstraints(): MediaTrackConstraints {
+  return {
+    echoCancellation: voiceProcessing,
+    noiseSuppression: voiceProcessing,
+    autoGainControl: false,
+  };
+}
+
+/** Apply the persisted `mic_voice_processing` room setting. Called at startup
+ * (effects.ts) and whenever Settings saves it. */
+export function configureMic(processing: boolean): void {
+  voiceProcessing = processing;
+}
+
+export function micVoiceProcessing(): boolean {
+  return voiceProcessing;
 }
 
 /** UI mirror of the engine's live-transcription gate (rec_set_live_stt).
@@ -157,7 +193,7 @@ function scriptProcessorTap(
 export async function acquireMic(): Promise<MediaStream> {
   try {
     return await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: micConstraints(),
     });
   } catch (e) {
     const name = (e as { name?: string })?.name || "";

@@ -220,6 +220,7 @@ CREATE TABLE IF NOT EXISTS skills (
   instructions TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
   created_by TEXT NOT NULL DEFAULT 'user',
+  agent TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
@@ -485,18 +486,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     // Compound snapshots (see the base schema): older rooms lack the columns.
-    // SQLite has no ADD COLUMN IF NOT EXISTS, so the duplicate-column error
-    // is the idempotence check.
     for stmt in [
         "ALTER TABLE file_versions ADD COLUMN text TEXT",
         "ALTER TABLE file_versions ADD COLUMN rec_meta TEXT",
     ] {
-        if let Err(e) = conn.execute(stmt, []) {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column") {
-                return Err(msg);
-            }
-        }
+        add_column_if_missing(conn, stmt)?;
     }
 
     // RM-2: the web_pages cache must be keyed by URL so save_web_page can upsert.
@@ -701,6 +695,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
            instructions TEXT NOT NULL DEFAULT '',
            enabled INTEGER NOT NULL DEFAULT 1,
            created_by TEXT NOT NULL DEFAULT 'user',
+           agent TEXT NOT NULL DEFAULT '',
            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
          );
@@ -717,6 +712,35 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS idx_skill_resources_skill ON skill_resources(skill_id);",
     )
     .map_err(|e| e.to_string())?;
+    // 2026-07-24: which sub-agent owns this skill (an `agent:` key in SKILL.md
+    // frontmatter). Empty = GENERAL, offered to every agent — which is what
+    // every pre-existing skill stays. Placed AFTER the CREATE above, not with
+    // the file_versions ALTERs near the top: a room written before the skills
+    // table existed has nothing to alter until this block has run, and the
+    // ALTER's "no such table" error is fatal to `migrate`, so an old room could
+    // not be opened at all (regression caught by
+    // `roomfile::migrates_old_rooms_into_sessions`).
+    add_column_if_missing(conn, "ALTER TABLE skills ADD COLUMN agent TEXT NOT NULL DEFAULT ''")?;
+    Ok(())
+}
+
+/// `ALTER TABLE … ADD COLUMN`, idempotent. SQLite has no `ADD COLUMN IF NOT
+/// EXISTS`, so the two "already fine" outcomes are recognised by their error
+/// text and swallowed:
+///
+/// * `duplicate column` — the room already has it (the ordinary re-open path);
+/// * `no such table` — the room predates the table entirely, so a later
+///   `CREATE TABLE IF NOT EXISTS` in this same `migrate` will mint it WITH the
+///   column. Treating this as fatal is what broke opening old rooms.
+///
+/// Anything else is a real schema failure and still aborts the migration.
+fn add_column_if_missing(conn: &Connection, stmt: &str) -> Result<(), String> {
+    if let Err(e) = conn.execute(stmt, []) {
+        let msg = e.to_string();
+        if !(msg.contains("duplicate column") || msg.contains("no such table")) {
+            return Err(msg);
+        }
+    }
     Ok(())
 }
 

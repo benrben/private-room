@@ -128,9 +128,17 @@ async fn sidecar_post(
     model: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let base = crate::sidecar_lifecycle::ensure_up().await?;
+    // PRIV-1: the room's redaction rules must ride along for a cloud/CLI model,
+    // exactly as they do on the other gateway (`sidecar.rs::sidecar_json`). Without
+    // this, `privacy.guard_outbound` sidecar-side sees `policy is None` and returns
+    // the messages UNTOUCHED — so studio HTML, meeting transcripts and grounding
+    // images reached cloud engines as raw room content. Idempotent: `inject_policy`
+    // returns None when a `privacy` key is already present, so `handoff_summary`'s
+    // own injection below is unaffected.
+    let body = crate::commands::inject_policy(body).unwrap_or_else(|| body.clone());
     let body = match model {
-        Some(model) => crate::commands::inject_provider_runtime(body, model)?,
-        None => body.clone(),
+        Some(model) => crate::commands::inject_provider_runtime(&body, model)?,
+        None => body,
     };
     let resp = client()?
         .post(format!("{base}{path}"))
@@ -231,10 +239,9 @@ async fn post_generate_cancellable(
 /// `keep_alive` (HLT-5) is how long Ollama holds the model resident after this
 /// call (e.g. "30m" to stay warm, "2m"/"0" to release a vision model on
 /// low-RAM machines). The caller decides per model — see `vision_keep_alive`.
-/// ADD-27: which latency class a call belongs to, which decides how big a
-/// `num_ctx` it may allocate. `Chat` is the interactive path — prefill time is
-/// user-visible, so its window stays small. `Job` is background work (deep
-/// summaries, digests): prefill minutes are fine, so it gets the big window.
+/// Compatibility classification retained for existing callers. Context-window
+/// sizing is now owned by Ollama/the selected model, so both variants use the
+/// same uncapped request body.
 #[derive(Clone, Copy, Default)]
 pub enum CtxTier {
     #[default]
@@ -242,51 +249,16 @@ pub enum CtxTier {
     Job,
 }
 
-/// ADD-22: the working-memory window (`num_ctx`) handed to Ollama, sized so a
-/// 16 GB Mac never OOMs. Measured 2026-07 on qwen3.5:9b (Q4_K_M, GQA cache
-/// ≈34 KB/token, 16 GB M-series): 12k ctx → 5.9 GB · 32k → 6.6 GB · 64k →
-/// 7.7 GB · 128k → 9.9 GB, all 100% GPU. Chat sizes stay small because the
-/// user waits for prefill (~210 tok/s on that machine); Job sizes go big
-/// because a background step can afford minutes. Read once.
-pub(crate) fn num_ctx_for(has_tools: bool, tier: CtxTier) -> u32 {
-    static HIGH_RAM: OnceLock<bool> = OnceLock::new();
-    let high = *HIGH_RAM.get_or_init(|| {
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        sys.total_memory() >= 32 * 1024 * 1024 * 1024
-    });
-    match (tier, has_tools, high) {
-        (CtxTier::Job, _, true) => 131072,
-        (CtxTier::Job, _, false) => 65536,
-        (CtxTier::Chat, true, true) => 24576,
-        (CtxTier::Chat, true, false) => 12288,
-        (CtxTier::Chat, false, true) => 16384,
-        (CtxTier::Chat, false, false) => 8192,
-    }
-}
-
-/// ADD-27: rough character budget for a background-job call (≈3 chars/token —
-/// a safe floor across English and Hebrew), so read-loop callers can size
-/// their windows to what the engine will actually see instead of a hardcoded
-/// snippet. 16 GB Mac → ~196k chars; 32 GB+ → ~393k.
-///
-/// MIGRATION: the read-loop callers that used this (the summarizer's paging) now
-/// gather their text inside the sidecar, so nothing in Rust calls this today. Kept
-/// per the migration spec as a pure sizing helper the engine config still describes.
-#[allow(dead_code)]
-pub fn job_context_chars() -> usize {
-    num_ctx_for(true, CtxTier::Job) as usize * 3
-}
-
 /// The knobs a `chat_structured` caller may vary. `Default` is the interactive
 /// case: Chat context tier, no cancellation.
 #[derive(Default, Clone)]
 pub struct StructuredOpts {
-    /// ADD-27: which `num_ctx` the call may allocate. `Job` is for the final
-    /// call of a background job whose messages carry big gathered windows (a
-    /// deep summary's reads would overflow the small chat `num_ctx` and
-    /// silently drop the user's question).
-    pub tier: CtxTier,
+    // `tier: CtxTier` lived here and is DELETED (2026-07-25). Its own doc said
+    // "no longer changes the context window", so it was a field callers set and
+    // nothing read — kept alive only by `#[allow(dead_code)]`. The same dead
+    // `tier` argument was removed from the Python twin (`summarize.py`
+    // `_chat_structured`) in the same pass; the context window is now decided
+    // by payload-fitted `num_ctx`, not by a caller's classification.
     /// ADD-31/ADD-32: a caller-owned flag for long structured generations the
     /// user must be able to stop — a Studio writing a whole HTML page on a
     /// local model runs for minutes, and a whole-file pass runs one Job-tier
@@ -327,11 +299,6 @@ pub async fn chat_structured(
             serde_json::to_string(schema).unwrap_or_default()
         ));
     }
-    // The no-tools window at the caller's tier — the old `chat_core` sized this
-    // from `num_ctx_for(tools.is_some()==false, tier)`. Compute it HERE and pass
-    // it explicitly so a Job-tier deep summary still gets the big window (the
-    // sidecar's own chat default is the smaller tool tier and would truncate it).
-    let num_ctx = num_ctx_for(false, opts.tier);
     let body = serde_json::json!({
         "model": model,
         // Images (vision grounding) ride inline on the user messages; the sidecar
@@ -340,7 +307,6 @@ pub async fn chat_structured(
         "base_url": resolved_base_url(),
         // `null` when unset — the sidecar treats a null temperature as "omit".
         "temperature": temperature,
-        "num_ctx": num_ctx,
         "keep_alive": keep_alive,
         // ADD-22: the structured-output grammar (token masking) — the sidecar
         // passes it to Ollama as `format`.
@@ -357,23 +323,21 @@ pub async fn chat_structured(
 // shaping (non-streaming, `generate`) and the interactive #command answers
 // streamed into the chat (streaming, `sidecar::generate_stream`). Both POST the
 // SAME `/generate` request schema (`plain_generate_body`), so the streamed and
-// non-streamed variants size `num_ctx`, think-disable, and pass the base URL
-// identically to how the old native chat did for a no-tools Chat call.
+// non-streamed variants omit `num_ctx`, think-disable, and pass the base URL
+// identically.
 
 /// Build the `/generate`(`_stream`) request body for a tool-less, plain-text
 /// chat — the shared schema the streaming ([`crate::sidecar::generate_stream`])
-/// and non-streaming ([`generate`]) plain paths both POST. Sizes `num_ctx` for
-/// the caller's `tier` exactly as the old native chat did for a no-tools call
-/// (the streaming caller stays `Chat`, so streamed tokens match byte-for-byte;
-/// Wave 1a's `local_generate long=true` is the `Job`-tier caller) and passes
-/// the runtime-overridable Ollama base URL the sidecar should talk to. No
-/// `format` (that is `chat_structured`'s grammar path) and no `tools`.
+/// and non-streaming ([`generate`]) plain paths both POST. The legacy `tier`
+/// argument is accepted for caller compatibility, but the request omits
+/// `num_ctx` so Ollama/the model owns the context window. No `format` (that is
+/// `chat_structured`'s grammar path) and no `tools`.
 pub fn plain_generate_body(
     model: &str,
     messages: &[ChatMessage],
     temperature: Option<f64>,
     keep_alive: &str,
-    tier: CtxTier,
+    _tier: CtxTier,
 ) -> serde_json::Value {
     serde_json::json!({
         "model": model,
@@ -381,7 +345,6 @@ pub fn plain_generate_body(
         "base_url": resolved_base_url(),
         // `null` when unset — the sidecar treats a null temperature as "omit".
         "temperature": temperature,
-        "num_ctx": num_ctx_for(false, tier),
         "keep_alive": keep_alive,
     })
 }
@@ -389,8 +352,8 @@ pub fn plain_generate_body(
 /// Non-streaming plain-text generation through the sidecar `/generate`. The
 /// drop-in for the tool-less streaming calls whose output was NOT
 /// streamed (a #command's quiet step, dictation shaping, recording/segment
-/// naming + translation): same messages/temperature/keep_alive and Chat-tier
-/// `num_ctx` the old native chat used, returning the model's RAW text (no
+/// naming + translation): same messages/temperature/keep_alive, returning the
+/// model's RAW text (no
 /// `recover_json` — these are prose, not JSON; callers `strip_think_spans`
 /// themselves as before). Engine failures come back as the same `OLLAMA_DOWN` /
 /// `MODEL_MISSING:<model>` sentinels.
@@ -400,9 +363,8 @@ pub fn plain_generate_body(
 /// the caller treats as stopped (same "partial == stopped" contract the old
 /// streamed path had). Callers with no Stop affordance pass `None`.
 ///
-/// `tier` (Wave 1a): the `num_ctx` class. Every interactive caller passes
-/// `Chat`; `local_generate` with `long=true` passes `Job` so a big external
-/// prompt is not silently truncated at the small chat window.
+/// `tier` remains part of this API for existing callers but no longer changes
+/// the generated request.
 pub async fn generate(
     model: &str,
     messages: Vec<ChatMessage>,
@@ -622,34 +584,20 @@ pub async fn list_models() -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
-/// The model's real advertised context length, straight from Ollama's own
-/// `/api/tags` catalog — NOT the RAM-adaptive `num_ctx` window this app
-/// throttles Ollama to for speed/memory (reported live 2026-07-21: a user's
-/// qwen3.5 model natively supports ~256k, but the bar showed the throttled
-/// 12288 working window instead). This is the Rust-side twin of the
-/// sidecar's `model_limits.native_context_length` — needed here because
-/// `handoff_chat` builds its post-handoff usage snapshot without going
-/// through the sidecar at all. `None` on any failure (daemon unreachable,
-/// model not listed) — the caller falls back to the RAM-adaptive window.
+/// The model's real advertised context length, from Ollama's own `/api/tags`
+/// catalog — read by the SIDECAR, not here. Until 2026-07-25 this was the last
+/// raw `GET {base}/api/tags` left in Rust, which contradicted the module note
+/// above ("the sidecar is the app's SOLE AI service"); it now goes through
+/// `/context_length`, whose body is `model_limits.native_context_length`.
+/// `None` on any failure (sidecar or daemon unreachable, model not listed) —
+/// the caller uses a display fallback, so a dead sidecar degrades rather than
+/// erroring. Used by `handoff_chat`'s post-handoff usage snapshot.
 pub(crate) async fn native_context_length(model: &str) -> Option<u32> {
-    let base = resolved_base_url();
-    let resp = client()
-        .ok()?
-        .get(format!("{base}/api/tags"))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: serde_json::Value = resp.json().await.ok()?;
-    v["models"].as_array()?.iter().find_map(|m| {
-        let matches = m["model"].as_str() == Some(model) || m["name"].as_str() == Some(model);
-        if !matches {
-            return None;
-        }
-        m["details"]["context_length"].as_u64().map(|n| n as u32)
-    })
+    let body = serde_json::json!({ "model": model, "base_url": resolved_base_url() });
+    let v = sidecar_post("/context_length", &body, Some(model)).await.ok()?;
+    v.get("context_length")
+        .and_then(|n| n.as_u64())
+        .map(|n| n as u32)
 }
 
 /// ADD-22: a model's declared capabilities via the sidecar `/capabilities`
@@ -710,19 +658,13 @@ mod tests {
         assert_eq!(resolved_base_url(), base_url());
     }
 
-    // Wave 1a: the plain-generation body honors the caller's context tier —
-    // a `local_generate long=true` call gets the Job window instead of being
-    // silently truncated at the small interactive Chat window.
     #[test]
-    fn plain_generate_body_sizes_num_ctx_by_tier() {
+    fn plain_generate_body_leaves_context_to_the_engine() {
         let messages = vec![ChatMessage::new("user", "hi")];
         let chat = plain_generate_body("m", &messages, None, "30m", CtxTier::Chat);
         let job = plain_generate_body("m", &messages, None, "30m", CtxTier::Job);
-        let (chat_ctx, job_ctx) = (chat["num_ctx"].as_u64().unwrap(), job["num_ctx"].as_u64().unwrap());
-        assert!(job_ctx > chat_ctx, "Job tier must widen the window ({job_ctx} vs {chat_ctx})");
-        // Whatever the machine's RAM, these are the two no-tools tiers.
-        assert_eq!(chat_ctx as u32, num_ctx_for(false, CtxTier::Chat));
-        assert_eq!(job_ctx as u32, num_ctx_for(false, CtxTier::Job));
+        assert!(chat.get("num_ctx").is_none());
+        assert!(job.get("num_ctx").is_none());
     }
 
     // A structured-output response must parse whether the model returns bare

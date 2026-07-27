@@ -19,7 +19,6 @@ import pytest
 from ollama import ResponseError
 
 from arcelle_sidecar import chat_docs, llm
-from arcelle_sidecar.config import num_ctx_chat_notools
 from arcelle_sidecar.server import create_app
 
 
@@ -103,8 +102,9 @@ async def test_extract_fields_prompt_schema_and_priming(fake_client: type[FakeAs
         "properties": {"revenue": {"type": "string"}, "CEO": {"type": "string"}},
         "required": ["revenue", "CEO"],
     }
-    # no-tools Chat window, deterministic temperature.
-    assert call["options"]["num_ctx"] == num_ctx_chat_notools()
+    # 2026-07-23: local calls always request a payload-fitted window — the
+    # daemon's own ~4k default context-shifts big documents into garbage.
+    assert call["options"]["num_ctx"] == 8_192
     assert call["options"]["temperature"] == 0.0
     assert call["keep_alive"] == "30m"
 
@@ -242,7 +242,8 @@ async def test_generate_doc_single_prompt(fake_client: type[FakeAsyncClient]) ->
     assert call["format"] is None
     assert "Reply with ONLY JSON matching this schema" not in sent[1]["content"]
     assert call["options"]["temperature"] == 0.4
-    assert call["options"]["num_ctx"] == num_ctx_chat_notools()
+    # 2026-07-23: payload-fitted window on every local call (see test above).
+    assert call["options"]["num_ctx"] == 8_192
 
 
 async def test_generate_doc_each_prompt(fake_client: type[FakeAsyncClient]) -> None:

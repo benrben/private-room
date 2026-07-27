@@ -23,8 +23,6 @@ from typing import Any
 
 import httpx
 
-from .routing import FORBIDDEN_TOOL_NAMES
-
 #: The MCP revision the bridge speaks (room_mcp.rs:156).
 PROTOCOL_VERSION = "2024-11-05"
 
@@ -181,8 +179,8 @@ class McpClient:
         """The tools the host chose to serve us.
 
         Never hardcode the catalog: the host decides our trust scope (SPEC §2.1).
-        ``consult_advisor`` must never appear — if it ever does, drop it, so the
-        recursion path stays closed even if the host regresses.
+        A top-level bridge may include ``consult_advisor``; nested advisor
+        bridges omit it at the host boundary.
         """
         await self.ensure_ready()
         result = await self._rpc("tools/list")
@@ -193,8 +191,6 @@ class McpClient:
                 continue
             name = t.get("name")
             if not isinstance(name, str) or not name:
-                continue
-            if name in FORBIDDEN_TOOL_NAMES:
                 continue
             schema = t.get("inputSchema")
             if not isinstance(schema, dict):

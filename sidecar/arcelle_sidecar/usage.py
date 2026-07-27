@@ -7,10 +7,8 @@ char-length estimate: bucket every message's byte length by what it is
 (system prompt / conversation history / tool result / skill content / file
 read), then — when a real aggregate is known for the round — scale the
 estimated shares proportionally so they sum to the real number instead of the
-rougher char-based one. `CHARS_PER_TOKEN` mirrors the ratio already
-documented at `ollama.rs:273` (`job_context_chars`, "≈3 chars/token — a safe
-floor across English and Hebrew"); this module deliberately does not invent a
-different one.
+rougher char-based one. `CHARS_PER_TOKEN` is a conservative display estimate
+shared with the Rust-side accounting.
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ from .chat import RoundUsage
 from .messages import Message
 from .routing import SKILL_TOOL_NAMES
 
-#: chars/token — kept identical to ollama.rs's `job_context_chars` ratio.
+#: chars/token — kept identical to token_usage.rs.
 CHARS_PER_TOKEN: int = 3
 
 #: The built-in tools whose results are literal file text/excerpts

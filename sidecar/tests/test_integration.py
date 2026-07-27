@@ -324,11 +324,16 @@ async def test_live_seam_single_tool_run():
     bridge_srv, bridge_base = _spawn(_BridgeHandler, bridge_state)
     mcp_url = bridge_base + "/mcp"
 
-    # Round 1: ask for search_room. Round 2 (after the tool result): stream the
-    # final answer in two pieces, no tool calls.
+    # Hub v3: main round 1 delegates to the File agent; the worker's round 1
+    # asks for search_room; its round 2 reports; main round 2 streams the
+    # user-facing answer in two pieces.
     answer_pieces = ["The lease ", "prohibits pets (clause 7)."]
     final_answer = "".join(answer_pieces)
+    ollama_state.script.append(
+        [_tool_chunk("ask_file_agent", {"instruction": "find what the lease says about pets"}), _done_chunk()]
+    )
     ollama_state.script.append([_tool_chunk("search_room", {"query": "pets"}), _done_chunk()])
+    ollama_state.script.append([_text_chunk("Clause 7 forbids pets."), _done_chunk()])
     ollama_state.script.append(
         [_text_chunk(answer_pieces[0]), _text_chunk(answer_pieces[1]), _done_chunk()]
     )
@@ -358,20 +363,40 @@ async def test_live_seam_single_tool_run():
     #     ChatMessage wire shapes are compatible across the language boundary).
     assert status == 200, f"/run rejected the Rust-shaped body: {status} {events}"
 
-    # (b) The EXACT event sequence sidecar.rs::stream_run parses:
-    #     lane -> round -> usage -> (delta*) -> step -> step_status -> round ->
-    #     usage -> (delta*) -> final. `usage` (the token-budget bar's snapshot)
-    #     fires once per round, right after that round's model call returns.
+    # (b) The EXACT event skeleton sidecar.rs::stream_run parses (hub v3):
+    #     the Main agent thinks, delegates (roster grows), the File agent
+    #     works in its own lane, the Main agent resumes and streams the
+    #     user-facing answer. `usage` fires once per model round.
     kinds = _kinds(events)
-    assert kinds[0] == "lane"
+    assert kinds[0] == "plan"
     # squeeze out delta runs to compare the structural skeleton
     skeleton = [k for i, k in enumerate(kinds) if k != "delta"]
     assert skeleton == [
-        "lane",
+        "plan",  # the Main agent, thinking
+        "agent",
         "round",
         "usage",
-        "step",
+        # The roster is emitted at DISPATCH, before the step chip: children are
+        # launched as one batch, so the UI learns the whole roster at once.
+        "plan",  # roster grew: File agent -> Main agent
+        "agent",
+        "step",  # Asked the File agent
+        "lane",  # the worker's lane
+        "round",
+        "usage",
+        "step",  # Searched the room
         "step_status",
+        "round",
+        "usage",
+        # A child FINISHED: its own roster slot flips to done the moment its
+        # sub-loop ends — not when the parent gets round to collecting it, or a
+        # fast sibling would keep pulsing until the slowest one returned.
+        "plan",
+        "agent",
+        "step_status",  # the delegation call completed
+        # The Main agent is marked active once the whole batch is collected.
+        "plan",  # the Main agent resumes
+        "agent",
         "round",
         "usage",
         "final",
@@ -379,19 +404,22 @@ async def test_live_seam_single_tool_run():
 
     # (c) Every event matches the {"t":..,"v":..}/{"t":"step_status","ok":..} shape
     #     the Rust side reads (str_v() reads "v"; step_status reads "ok").
-    lane = events[0]
+    lane = next(e for e in events if e["t"] == "lane")
     assert lane == {"t": "lane", "v": "Answering"}  # ui=False,write=False,web=False
-    step = next(e for e in events if e["t"] == "step")
-    assert step == {"t": "step", "v": "Searched the room"}  # labels.py tool_step_label
+    steps = [e["v"] for e in events if e["t"] == "step"]
+    assert steps == ["Asked the File agent", "Searched the room"]
     step_status = next(e for e in events if e["t"] == "step_status")
-    assert step_status == {"t": "step_status", "ok": True}
+    # `node` names the emitting agent's graph slot — the ONLY way to attribute a
+    # step once siblings run concurrently and their events interleave.
+    assert step_status == {"t": "step_status", "ok": True, "node": "files.read#0"}
     for d in [e for e in events if e["t"] == "delta"]:
         assert set(d.keys()) == {"t", "v"} and isinstance(d["v"], str)
 
-    # (d) The deltas belong to the SECOND round and reconstruct the answer, and the
-    #     final event is exactly what the mock model returned.
+    # (d) The worker's report streams, then the Main agent's answer streams —
+    #     the frontend clears live text on each "round", so the user sees only
+    #     the current stage's words. The final IS the Main agent's answer.
     delta_text = "".join(e["v"] for e in events if e["t"] == "delta")
-    assert delta_text == final_answer
+    assert delta_text.endswith(final_answer)
     final = events[-1]
     assert final == {"t": "final", "v": final_answer}
 
@@ -411,16 +439,25 @@ async def test_live_seam_single_tool_run():
     assert methods == [
         "initialize",
         "notifications/initialized",
-        "tools/list",
-        "tools/call",
+        "tools/list",  # the Main agent's prepare (agent-tools are local)
+        "tools/list",  # the File agent's prepare
+        "tools/call",  # the File agent's search_room
     ], methods
     assert all(r["auth"] == f"Bearer {token}" for r in bridge_state.rpc)
 
-    # (g) The model was called exactly twice (two rounds) and its second request
-    #     carried the tool result the graph fed back.
-    assert len(ollama_state.requests) == 2, ollama_state.requests
-    round2_roles = [m.get("role") for m in ollama_state.requests[1]["messages"]]
-    assert "tool" in round2_roles, round2_roles
+    # (g) Four model calls: main delegates, worker searches, worker reports,
+    #     main answers. The worker's 2nd request carries the tool result; the
+    #     worker's 1st request ends on the delegation note (user role); the
+    #     main's 2nd request carries the File agent's report as a tool msg.
+    assert len(ollama_state.requests) == 4, ollama_state.requests
+    worker_kickoff = ollama_state.requests[1]["messages"][-1]
+    assert worker_kickoff["role"] == "user"
+    assert "The Main agent delegated this task" in worker_kickoff["content"]
+    worker_r2_roles = [m.get("role") for m in ollama_state.requests[2]["messages"]]
+    assert "tool" in worker_r2_roles, worker_r2_roles
+    main_r2 = ollama_state.requests[3]["messages"]
+    report_msgs = [m for m in main_r2 if m.get("role") == "tool"]
+    assert report_msgs and "Report from the File agent" in report_msgs[-1]["content"]
 
 
 # --------------------------------------------------------------------------- #
@@ -438,12 +475,17 @@ async def test_duplicate_tool_call_suppressed():
     bridge_srv, bridge_base = _spawn(_BridgeHandler, bridge_state)
     mcp_url = bridge_base + "/mcp"
 
-    # Round 1 and round 2 ask for the SAME tool with IDENTICAL args. The second
-    # must be suppressed (no bridge call); the all-duplicate round forces a
-    # tool-less synthesis in round 3.
+    # Inside the WORKER: rounds 1 and 2 ask for the SAME tool with IDENTICAL
+    # args. The second must be suppressed (no bridge call); the all-duplicate
+    # round forces a tool-less synthesis in worker round 3. The main agent
+    # then answers (round 5 overall).
     final_answer = "Based on the search, pets are not allowed."
+    ollama_state.script.append(
+        [_tool_chunk("ask_file_agent", {"instruction": "check the lease for pets"}), _done_chunk()]
+    )
     ollama_state.script.append([_tool_chunk("search_room", {"query": "pets"}), _done_chunk()])
     ollama_state.script.append([_tool_chunk("search_room", {"query": "pets"}), _done_chunk()])
+    ollama_state.script.append([_text_chunk("Clause 7: no pets."), _done_chunk()])
     ollama_state.script.append([_text_chunk(final_answer), _done_chunk()])
 
     app = create_app()
@@ -473,16 +515,16 @@ async def test_duplicate_tool_call_suppressed():
     assert len(bridge_state.tool_calls) == 1, bridge_state.tool_calls
     assert bridge_state.tool_calls[0]["name"] == "search_room"
 
-    # Exactly one "step" was emitted (the duplicate round emits its round marker
-    # but no step, because the call was suppressed before exec).
+    # Two "step" events: the delegation itself + the one executed search (the
+    # duplicate round emits its round marker but no step — suppressed pre-exec).
     kinds = _kinds(events)
-    assert kinds.count("step") == 1, kinds
-    assert kinds.count("step_status") == 1, kinds
-    # Three model rounds ran (round marker per round: 3), ending in a final.
-    assert kinds.count("round") == 3, kinds
+    assert kinds.count("step") == 2, kinds
+    assert kinds.count("step_status") == 2, kinds  # search ok + delegation ok
+    # Main delegates (1) + three worker rounds + main answers = 5 rounds.
+    assert kinds.count("round") == 5, kinds
     assert kinds[-1] == "final"
     assert events[-1] == {"t": "final", "v": final_answer}
-    assert len(ollama_state.requests) == 3, ollama_state.requests
+    assert len(ollama_state.requests) == 5, ollama_state.requests
 
 
 # --------------------------------------------------------------------------- #

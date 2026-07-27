@@ -404,6 +404,54 @@ pub fn rec_get(state: State<'_, AppState>, id: String) -> Result<RecFile, String
     })
 }
 
+/// GH #5: name a speaker after the fact ("Speaker 2" → "Dana").
+///
+/// Stores an OVERLAY keyed by the machine label rather than rewriting the
+/// segments, so re-clustering — which renames labels as a meeting grows — can't
+/// destroy the name, and one write renames every line that speaker said. An
+/// empty (or whitespace-only) `name` clears it back to the machine label.
+///
+/// Safe to call while a recording is live: only the name map is touched, and
+/// the engine never reads it. The stored transcript text is refreshed so search
+/// and the AI see the same names the screen does.
+#[tauri::command]
+pub fn rec_set_speaker_name(
+    state: State<'_, AppState>,
+    id: String,
+    speaker: String,
+    name: String,
+) -> Result<RecMeta, String> {
+    let speaker = speaker.trim().to_string();
+    if speaker.is_empty() {
+        return Err("No speaker selected.".into());
+    }
+    // A name long enough to blow out the transcript prefix is a paste accident.
+    let name = name.trim().chars().take(60).collect::<String>();
+    state.with_room(|room| {
+        let mut meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+        if meta.segments.is_empty() {
+            return Err("That recording has no transcript yet.".into());
+        }
+        if !meta.segments.iter().any(|s| s.speaker == speaker) {
+            return Err(format!("Nobody in this recording is labelled \"{speaker}\"."));
+        }
+        // Naming someone back to their machine label is a removal, not an
+        // entry that shadows itself.
+        if name.is_empty() || name == speaker {
+            meta.speaker_names.remove(&speaker);
+        } else {
+            meta.speaker_names.insert(speaker, name);
+        }
+        let text = recording::transcript_text(&meta);
+        // Rewrite the searchable transcript in place. The audio is untouched,
+        // so this is not a new file version — renaming is not an edit to the
+        // recording, and versioning every rename would bury the real edits.
+        db::set_file_extracted_text(&room.conn, &id, &text)?;
+        db::set_rec_meta(&room.conn, &id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
+        Ok(meta)
+    })
+}
+
 /// Studio-style transcript editing: delete a time span. The words inside it
 /// disappear from the transcript, playback skips it, and "export edited copy"
 /// cuts it from the audio for real. Non-destructive (a cut list + word marks);
@@ -475,6 +523,9 @@ pub fn rec_export_clean(
     let mut new_meta = RecMeta {
         max_speakers: meta.max_speakers,
         duration_cs: recording::cs_of_samples(spliced.len()),
+        // The edited copy keeps the same speaker labels, so it keeps their
+        // names too (GH #5) — otherwise "Dana" silently reverts to "Speaker 2".
+        speaker_names: meta.speaker_names.clone(),
         ..Default::default()
     };
     for seg in &meta.segments {
@@ -555,7 +606,9 @@ pub async fn rec_translate(
             .filter_map(|seg| {
                 let text = recording::segment_visible_text(seg);
                 (!text.is_empty()).then(|| {
-                    format!("{} {}: {}", recording::format_stamp(seg.t0), seg.speaker, text)
+                    // The user's name for them, when set (GH #5).
+                    let who = meta.display_speaker(&seg.speaker);
+                    format!("{} {}: {}", recording::format_stamp(seg.t0), who, text)
                 })
             })
             .collect();

@@ -23,9 +23,8 @@ Faithfulness (SPEC "same output, same error surfaces"):
     json.rs byte for byte.
   * The doc-body call reproduces ``ask_quiet`` — a PLAIN chat turn (no ``format``,
     no priming, no JSON recovery), temperature 0.4, returned verbatim.
-  * ``num_ctx`` is the no-tools Chat tier (ollama.rs ``num_ctx_for(false, Chat)``
-    = 16384 on 32 GB+, else 8192) the Rust ``ask_structured`` / ``ask_quiet``
-    calls actually allocated — NOT the larger tools-tier chat window.
+  * ``num_ctx`` is omitted, so Ollama/the selected model owns its context
+    window instead of an app-level chat tier constraining it.
 
 The model I/O (and the OLLAMA_DOWN / MODEL_MISSING error classification the Rust
 gateway branches on) is delegated to :func:`llm.generate`, so these endpoints
@@ -38,7 +37,7 @@ import json
 from typing import Any
 
 from . import llm
-from .config import KEEP_ALIVE_WARM, num_ctx_chat_notools
+from .config import KEEP_ALIVE_WARM
 from .messages import Message, compact_json, system_message, user_message
 
 # --- verbatim prompts (from the Rust) ---------------------------------------
@@ -197,7 +196,6 @@ async def _structured(
         primed,
         base_url,
         temperature=temperature,
-        num_ctx=num_ctx_chat_notools(),
         keep_alive=keep_alive,
         format=schema,
         privacy=privacy,
@@ -222,7 +220,6 @@ async def _plain(
         messages,
         base_url,
         temperature=temperature,
-        num_ctx=num_ctx_chat_notools(),
         keep_alive=keep_alive,
         privacy=privacy,
         provider=provider,

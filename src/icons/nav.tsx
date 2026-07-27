@@ -65,6 +65,22 @@ export function ChevronDownIcon(p: IconProps) {
   );
 }
 
+export function ChevronLeftIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M14.5 6l-6 6 6 6" />
+    </Stroke>
+  );
+}
+
+export function ChevronRightIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M9.5 6l6 6-6 6" />
+    </Stroke>
+  );
+}
+
 export function SearchIcon(p: IconProps) {
   return (
     <Stroke {...p}>

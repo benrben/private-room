@@ -22,7 +22,7 @@ pub mod diarize;
 pub mod sck;
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -137,11 +137,42 @@ pub struct RecMeta {
     /// stored one keep it.
     #[serde(default)]
     pub max_speakers: u32,
+    /// GH #5: the human names, machine label -> what the user calls them
+    /// ("Speaker 2" -> "Dana").
+    ///
+    /// An OVERLAY, deliberately not baked into `segments`. Diarization owns the
+    /// labels and rewrites them freely — re-clustering as the meeting grows,
+    /// and wholesale on re-transcribe — so a name written into every segment
+    /// would be destroyed by the next pass. Keyed by the machine label, it
+    /// survives all of that, and renaming a speaker is one map write instead of
+    /// a walk over the transcript.
+    ///
+    /// BTreeMap, not HashMap: the metadata is serialized to JSON and diffed by
+    /// the room's file-version history, so key order has to be stable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub speaker_names: BTreeMap<String, String>,
 }
 
 impl Default for RecMeta {
     fn default() -> Self {
-        Self { version: 1, duration_cs: 0, segments: Vec::new(), cuts: Vec::new(), max_speakers: 0 }
+        Self {
+            version: 1,
+            duration_cs: 0,
+            segments: Vec::new(),
+            cuts: Vec::new(),
+            max_speakers: 0,
+            speaker_names: BTreeMap::new(),
+        }
+    }
+}
+
+impl RecMeta {
+    /// What a speaker should be CALLED — the user's name if they set one, else
+    /// the machine label. Every user-visible rendering of a speaker (the
+    /// transcript, exports, translations) goes through here so the screen and
+    /// the file can't drift apart.
+    pub fn display_speaker<'a>(&'a self, label: &'a str) -> &'a str {
+        self.speaker_names.get(label).map_or(label, |s| s.as_str())
     }
 }
 
@@ -203,7 +234,10 @@ pub fn transcript_text(meta: &RecMeta) -> String {
         if text.is_empty() {
             continue;
         }
-        out.push_str(&format!("{} {}: {}\n", format_stamp(seg.t0), seg.speaker, text));
+        // The user's name for the speaker, when they set one (GH #5) — this
+        // text is what search and the AI read, so it has to match the screen.
+        let who = meta.display_speaker(&seg.speaker);
+        out.push_str(&format!("{} {}: {}\n", format_stamp(seg.t0), who, text));
     }
     out
 }
@@ -3543,6 +3577,7 @@ mod tests {
             }],
             cuts: vec![RecCut { t0: 10, t1: 20 }],
             max_speakers: 0,
+            speaker_names: BTreeMap::new(),
         };
 
         let mut ticks: Vec<(i64, i64)> = Vec::new();
@@ -3606,5 +3641,66 @@ mod tests {
         let text = transcript_text(&meta);
         assert!(text.contains("[0:00] You: hello world"), "{text}");
         assert!(!text.contains("cruel"));
+    }
+
+    /// GH #5. The names are an OVERLAY: the segments keep their machine labels,
+    /// so renaming survives the engine rewriting them, and every line the
+    /// speaker said is renamed by the one map entry.
+    #[test]
+    fn speaker_names_rename_every_line_without_touching_segments() {
+        fn seg(id: &str, speaker: &str, t0: i64, text: &str) -> RecSegment {
+            RecSegment {
+                id: id.into(),
+                source: if speaker == "You" { "mic".into() } else { "sys".into() },
+                speaker: speaker.into(),
+                t0,
+                t1: t0 + 100,
+                text: text.into(),
+                words: vec![RecWord { w: text.into(), t0, t1: t0 + 100, del: false }],
+                lang: None,
+                voice: None,
+            }
+        }
+        let mut meta = RecMeta {
+            segments: vec![
+                seg("a", "Speaker 1", 0, "hello"),
+                seg("b", "Speaker 2", 100, "hi"),
+                seg("c", "Speaker 1", 200, "again"),
+            ],
+            ..Default::default()
+        };
+
+        // Before naming anyone, the machine labels are what shows.
+        let plain = transcript_text(&meta);
+        assert!(plain.contains("[0:00] Speaker 1: hello"), "{plain}");
+        assert!(plain.contains("[0:02] Speaker 1: again"), "{plain}");
+
+        meta.speaker_names.insert("Speaker 1".into(), "Dana".into());
+        let named = transcript_text(&meta);
+        // BOTH of Speaker 1's lines, from the single map entry...
+        assert!(named.contains("[0:00] Dana: hello"), "{named}");
+        assert!(named.contains("[0:02] Dana: again"), "{named}");
+        // ...and nobody else is touched.
+        assert!(named.contains("[0:01] Speaker 2: hi"), "{named}");
+        // The segments still carry the label, so the next re-clustering pass
+        // has something to key on and the name is not lost.
+        assert!(meta.segments.iter().all(|s| s.speaker.starts_with("Speaker")));
+        assert_eq!(meta.display_speaker("Speaker 1"), "Dana");
+        assert_eq!(meta.display_speaker("Speaker 2"), "Speaker 2");
+
+        // Clearing a name falls back to the label.
+        meta.speaker_names.remove("Speaker 1");
+        assert!(transcript_text(&meta).contains("[0:00] Speaker 1: hello"));
+    }
+
+    /// Recordings saved before GH #5 have no `speakerNames` key at all; they
+    /// must still load, and must not grow an empty one when saved back.
+    #[test]
+    fn speaker_names_absent_in_older_recordings() {
+        let older = r#"{"version":1,"durationCs":500,"segments":[],"cuts":[],"maxSpeakers":0}"#;
+        let meta: RecMeta = serde_json::from_str(older).expect("legacy meta must still parse");
+        assert!(meta.speaker_names.is_empty());
+        let round = serde_json::to_string(&meta).unwrap();
+        assert!(!round.contains("speakerNames"), "{round}");
     }
 }

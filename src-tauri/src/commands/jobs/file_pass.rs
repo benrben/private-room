@@ -686,6 +686,544 @@ mod tests {
         assert!(plan.text_sha256.is_none());
     }
 
+    // ---------------------------------------------------------------------
+    // MIGRATION BASELINE (Rust → Python/LangGraph). Everything below pins
+    // behaviour the pure-plan tests above never touch: the `Step.kind`
+    // dispatch, the publish side effect, the coverage arithmetic, and the
+    // resume contract. These must pass IDENTICALLY before and after the move.
+    // They are hermetic — no sidecar, no model, no room file on disk.
+    // ---------------------------------------------------------------------
+
+    /// A mock Tauri app whose managed `AppState` holds ONE in-memory room —
+    /// the same shape `file_pass_end_to_end_with_real_model` builds, minus the
+    /// encrypted file on disk (these tests never call the model, so the plain
+    /// in-memory schema is enough and keeps them fast and hermetic).
+    fn mock_room(path: &str) -> tauri::AppHandle<tauri::test::MockRuntime> {
+        use tauri::Manager;
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = AppState::default();
+        *state.room.lock().unwrap() = Some(Room {
+            conn: db::mem(),
+            path: path.to_string(),
+            name: "t".into(),
+            password: "pw".into(),
+        });
+        app.manage(state);
+        app.handle().clone()
+    }
+
+    /// Borrow the room's connection. NEVER hold this across an `execute_pass_step`
+    /// await — the step takes the same lock.
+    fn with_conn<T>(
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+        f: impl FnOnce(&Connection) -> T,
+    ) -> T {
+        use tauri::Manager;
+        let state = app.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        f(&guard.as_ref().unwrap().conn)
+    }
+
+    fn plan_for(mode: &str, windows: Vec<(usize, usize)>, text_len: usize) -> PassPlan {
+        PassPlan {
+            file_id: "file-1".into(),
+            file_name: "book.txt".into(),
+            instruction: "summarize".into(),
+            mode: mode.into(),
+            text_len,
+            text_sha256: None,
+            windows,
+        }
+    }
+
+    fn art(result: &str, skipped: bool) -> PassArtifact {
+        PassArtifact { result: result.into(), thread: String::new(), skipped }
+    }
+
+    /// Drive one step against the mock room, returning its result and whatever
+    /// it recorded in the `published` slot.
+    async fn run_step(
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+        job_id: &str,
+        room_path: &str,
+        plan: &PassPlan,
+        filtered: &str,
+        step: &Step,
+        cancel: &Arc<AtomicBool>,
+    ) -> (Result<(), String>, Option<FileMeta>) {
+        let published: std::sync::Mutex<Option<FileMeta>> = std::sync::Mutex::new(None);
+        let r = execute_pass_step(
+            app, job_id, room_path, plan, "test-model", filtered, step, cancel, &published,
+        )
+        .await;
+        let meta = published.lock().unwrap().take();
+        (r, meta)
+    }
+
+    #[test]
+    fn step_kind_is_a_live_dispatch_discriminant_not_a_constant() {
+        // file_pass is the ONLY job kind whose steps carry three different
+        // `kind` values; the workflow compiler emits the constant
+        // "workflow_node" and deep_summary the constant "summarize_file". A
+        // migration that models `kind` as a per-job constant silently breaks
+        // this kind, so pin the exact strings and their positions.
+        let merge = build_pass_steps(13, "merge", Lane::LocalLlm);
+        let kinds: Vec<&str> = merge.iter().map(|s| s.kind.as_str()).collect();
+        assert_eq!(&kinds[..13], &["map"; 13]);
+        assert_eq!(&kinds[13..], &["compose", "compose", "compose", "publish"]);
+        let stitch = build_pass_steps(3, "stitch", Lane::LocalLlm);
+        assert_eq!(
+            stitch.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>(),
+            vec!["map", "map", "map", "publish"]
+        );
+        // Stitch has NO compose step at all — its deliverable is the ordered
+        // concatenation of the map outputs.
+        assert!(stitch.iter().all(|s| s.kind != "compose"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_step_kind_is_a_hard_error() {
+        // The `other =>` arm. This is what a migration that stamped every step
+        // with a constant kind (or renamed "map" → "node") would hit — and it
+        // is a step ERROR, so the job parks instead of skipping the step.
+        let app = mock_room("/tmp/r1.roomai");
+        let plan = plan_for("merge", vec![(0, 4)], 4);
+        let step = Step {
+            id: 0,
+            lane: Lane::Cpu,
+            kind: "workflow_node".into(),
+            params: serde_json::Value::Null,
+            depends_on: vec![],
+        };
+        let (r, _) = run_step(
+            &app, "job", "/tmp/r1.roomai", &plan, "text", &step,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert_eq!(r, Err("unknown pass step kind: workflow_node".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_inserts_a_brand_new_file_on_every_replay() {
+        // THE non-idempotent side effect. `db::insert_file` mints a fresh uuid
+        // and INSERTs — there is no upsert-by-name — so re-running the publish
+        // step (a cursor reset, or a crash between insert_file and
+        // checkpoint_job) leaves the room with a SECOND "Full pass — …" file
+        // plus a second copy of its search chunks. Any migration that resets a
+        // paused job to cursor=0 duplicates the deliverable once per resume.
+        let room = "/tmp/r2.roomai";
+        let app = mock_room(room);
+        let plan = plan_for("merge", vec![(0, 4)], 4);
+        let steps = build_pass_steps(1, "merge", Lane::LocalLlm);
+        let job = with_conn(&app, |c| {
+            let id = db::create_job(c, "file_pass", "Full pass — book.txt",
+                &serde_json::to_value(&plan).unwrap(), steps.len() as i64).unwrap();
+            store_artifact(c, &id, 0, &art("notes", false)).unwrap();
+            store_artifact(c, &id, 1, &art("<h2>Section</h2>", false)).unwrap();
+            id
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let publish = steps.last().unwrap();
+
+        let (r1, m1) = run_step(&app, &job, room, &plan, "text", publish, &cancel).await;
+        assert!(r1.is_ok());
+        let (r2, m2) = run_step(&app, &job, room, &plan, "text", publish, &cancel).await;
+        assert!(r2.is_ok());
+
+        let m1 = m1.expect("publish records the file it wrote");
+        let m2 = m2.expect("the replay records ANOTHER file");
+        assert_eq!(m1.name, "Full pass — book.txt.html");
+        assert_eq!(m2.name, m1.name);
+        assert_ne!(m1.id, m2.id, "publish must be pinned as NON-idempotent");
+        let same_name = with_conn(&app, |c| {
+            db::list_files(c).unwrap().into_iter().filter(|f| f.name == m1.name).count()
+        });
+        assert_eq!(same_name, 2, "two runs of publish leave two files in the room");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stitch_publish_body_is_byte_exact() {
+        // The stitch deliverable is pure string assembly — no model — so it is
+        // fully pinnable: markdown, the missing-part placeholder (1-BASED), the
+        // "---" rule and the italicised coverage line, and the .md name/mime.
+        let room = "/tmp/r3.roomai";
+        let app = mock_room(room);
+        let plan = plan_for("stitch", vec![(0, 10), (9, 20), (19, 30)], 30);
+        let steps = build_pass_steps(3, "stitch", Lane::LocalLlm);
+        let job = with_conn(&app, |c| {
+            let id = db::create_job(c, "file_pass", "t",
+                &serde_json::to_value(&plan).unwrap(), steps.len() as i64).unwrap();
+            store_artifact(c, &id, 0, &art("  part one  ", false)).unwrap();
+            store_artifact(c, &id, 1, &art("", true)).unwrap(); // the model gave up here
+            store_artifact(c, &id, 2, &art("part three", false)).unwrap();
+            id
+        });
+        let (r, meta) = run_step(&app, &job, room, &plan, "text", steps.last().unwrap(),
+            &Arc::new(AtomicBool::new(false))).await;
+        assert!(r.is_ok());
+        let meta = meta.unwrap();
+        assert_eq!(meta.name, "Full pass — book.txt.md");
+        assert_eq!(meta.mime_type, "text/markdown");
+        assert_eq!(meta.source, "generated");
+        let body = with_conn(&app, |c| db::get_file_extracted_text(c, &meta.id).unwrap());
+        assert_eq!(
+            body,
+            "part one\n\n[part 2 could not be processed]\n\npart three\n\n---\n\n\
+             _Read 2 of 3 parts of “book.txt” (30 characters); 1 part(s) could not be \
+             processed and are marked in place._\n"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_publish_coverage_counts_map_rows_and_over_claims_empty_windows() {
+        // Coverage is computed from the MAP artifacts (0..n), never from the
+        // sections. Two rules that differ and must both survive the migration:
+        //   * a MISSING map row counts as skipped (is_none_or);
+        //   * an artifact with skipped=false but an EMPTY result counts as
+        //     COVERED here, while `compose` counts that same row as `missing`.
+        // So a malformed sidecar reply (deserialized via unwrap_or_default →
+        // skipped=false, result="") makes the published coverage line
+        // OVER-CLAIM. Pinned as-is: it is today's behaviour, and a migration
+        // that "fixes" it changes user-visible output.
+        let room = "/tmp/r4.roomai";
+        let app = mock_room(room);
+        let plan = plan_for("merge", vec![(0, 10), (9, 20), (19, 30)], 30);
+        let steps = build_pass_steps(3, "merge", Lane::LocalLlm); // 3 maps, 1 compose, publish
+        let job = with_conn(&app, |c| {
+            let id = db::create_job(c, "file_pass", "t",
+                &serde_json::to_value(&plan).unwrap(), steps.len() as i64).unwrap();
+            store_artifact(c, &id, 0, &art("real notes", false)).unwrap();
+            store_artifact(c, &id, 1, &art("", false)).unwrap(); // empty, NOT flagged
+            // window 2 has NO row at all
+            store_artifact(c, &id, 3, &art("<h2>S</h2>", false)).unwrap();
+            id
+        });
+        let (r, meta) = run_step(&app, &job, room, &plan, "text", steps.last().unwrap(),
+            &Arc::new(AtomicBool::new(false))).await;
+        assert!(r.is_ok());
+        let doc = with_conn(&app, |c| {
+            db::get_file_extracted_text(c, &meta.unwrap().id).unwrap()
+        });
+        // 1 skipped (the missing row) — the empty-but-unflagged window 1 is
+        // counted as READ even though compose treated it as missing.
+        assert!(
+            doc.contains(
+                "Read 2 of 3 parts of “book.txt” (30 characters); 1 part(s) could not be \
+                 processed and are marked in place."
+            ),
+            "coverage line changed: {doc}"
+        );
+        assert!(doc.starts_with("<!doctype html>"));
+        assert!(doc.contains("<hr/>"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_publish_full_coverage_line_and_missing_section_placeholder() {
+        let room = "/tmp/r5.roomai";
+        let app = mock_room(room);
+        let plan = plan_for("merge", vec![(0, 10), (9, 20)], 20);
+        // Force TWO sections by hand (the real grouping needs >6 windows).
+        let publish = Step {
+            id: 4,
+            lane: Lane::Cpu,
+            kind: "publish".into(),
+            params: serde_json::json!({ "sections": [2, 3] }),
+            depends_on: vec![2, 3],
+        };
+        let job = with_conn(&app, |c| {
+            let id = db::create_job(c, "file_pass", "t",
+                &serde_json::to_value(&plan).unwrap(), 5).unwrap();
+            store_artifact(c, &id, 0, &art("a", false)).unwrap();
+            store_artifact(c, &id, 1, &art("b", false)).unwrap();
+            store_artifact(c, &id, 2, &art("<h2>One</h2>", false)).unwrap();
+            store_artifact(c, &id, 3, &art("", true)).unwrap(); // section 2 collapsed
+            id
+        });
+        let (r, meta) = run_step(&app, &job, room, &plan, "text", &publish,
+            &Arc::new(AtomicBool::new(false))).await;
+        assert!(r.is_ok());
+        let doc = with_conn(&app, |c| {
+            db::get_file_extracted_text(c, &meta.unwrap().id).unwrap()
+        });
+        // Every map row is present and unflagged → the "complete coverage" line.
+        assert!(
+            doc.contains("Read all 2 parts of “book.txt” — 20 characters, complete coverage."),
+            "coverage line changed: {doc}"
+        );
+        // A collapsed section is marked IN PLACE, keeping the document ordered.
+        assert!(doc.contains("<h2>One</h2>"));
+        assert!(doc.contains("<p><em>[a section could not be composed]</em></p>"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wholly_collapsed_merge_pass_still_publishes_a_placeholder_document() {
+        // The "no readable sections" guard is all but DEAD: an unusable section
+        // pushes a placeholder into html_body, so html_body is never blank once
+        // the step has at least one section id — a pass whose every section
+        // collapsed still writes a file containing nothing but placeholders and
+        // a coverage line. Pinned because it is the behaviour a resumed/replayed
+        // pass produces, and because a migration "tidying" the empty check would
+        // change whether the job ends done or error.
+        let room = "/tmp/r6.roomai";
+        let app = mock_room(room);
+        let plan = plan_for("merge", vec![(0, 10)], 10);
+        let steps = build_pass_steps(1, "merge", Lane::LocalLlm);
+        let job = with_conn(&app, |c| {
+            let id = db::create_job(c, "file_pass", "t",
+                &serde_json::to_value(&plan).unwrap(), steps.len() as i64).unwrap();
+            store_artifact(c, &id, 0, &art("notes", false)).unwrap();
+            store_artifact(c, &id, 1, &art("   ", false)).unwrap(); // whitespace only
+            id
+        });
+        let (r, meta) = run_step(&app, &job, room, &plan, "text", steps.last().unwrap(),
+            &Arc::new(AtomicBool::new(false))).await;
+        assert!(r.is_ok(), "a collapsed section publishes anyway: {r:?}");
+        let doc = with_conn(&app, |c| {
+            db::get_file_extracted_text(c, &meta.unwrap().id).unwrap()
+        });
+        assert!(doc.contains("<p><em>[a section could not be composed]</em></p>"));
+        // …and the coverage line still calls it COMPLETE, because coverage reads
+        // the MAP rows and map 0 succeeded. Empty document, "complete coverage".
+        assert!(doc.contains("Read all 1 parts of “book.txt” — 10 characters, complete coverage."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_only_errors_when_the_step_carries_no_sections_at_all() {
+        // The reachable half of that guard: a publish step whose `sections`
+        // param is missing/misshapen (the exact failure a re-derived or ported
+        // plan would produce). Nothing is written, so THIS error is safely
+        // replayable — unlike a successful publish.
+        let room = "/tmp/r6b.roomai";
+        let app = mock_room(room);
+        let plan = plan_for("merge", vec![(0, 10)], 10);
+        let job = with_conn(&app, |c| {
+            db::create_job(c, "file_pass", "t",
+                &serde_json::to_value(&plan).unwrap(), 3).unwrap()
+        });
+        let publish = Step {
+            id: 2,
+            lane: Lane::Cpu,
+            kind: "publish".into(),
+            params: serde_json::json!({ "inputs": [0] }), // stitch-shaped params
+            depends_on: vec![1],
+        };
+        let before = with_conn(&app, |c| db::list_files(c).unwrap().len());
+        let (r, meta) = run_step(&app, &job, room, &plan, "text", &publish,
+            &Arc::new(AtomicBool::new(false))).await;
+        assert_eq!(r, Err("the pass produced no readable sections to publish".into()));
+        assert!(meta.is_none());
+        assert_eq!(with_conn(&app, |c| db::list_files(c).unwrap().len()), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compose_stores_a_skipped_section_without_calling_the_model() {
+        // The early return at the top of the compose arm: when NO window in the
+        // group yields usable notes, compose writes a skipped artifact and
+        // never touches the sidecar. Note the "usable" test — `skipped=false`
+        // AND a non-blank result — is STRICTER than publish's skip count.
+        let room = "/tmp/r7.roomai";
+        let app = mock_room(room);
+        let plan = plan_for("merge", vec![(0, 10), (9, 20)], 20);
+        let steps = build_pass_steps(2, "merge", Lane::LocalLlm);
+        let job = with_conn(&app, |c| {
+            let id = db::create_job(c, "file_pass", "t",
+                &serde_json::to_value(&plan).unwrap(), steps.len() as i64).unwrap();
+            store_artifact(c, &id, 0, &art("", false)).unwrap();  // empty, unflagged
+            store_artifact(c, &id, 1, &art("x", true)).unwrap();  // flagged skipped
+            id
+        });
+        let compose = &steps[2];
+        assert_eq!(compose.kind, "compose");
+        let (r, _) = run_step(&app, &job, room, &plan, "text", compose,
+            &Arc::new(AtomicBool::new(false))).await;
+        assert!(r.is_ok(), "compose must degrade, not fail: {r:?}");
+        let stored = with_conn(&app, |c| load_artifact(c, &job, compose.id).unwrap());
+        assert!(stored.skipped);
+        assert_eq!(stored.result, "");
+        assert_eq!(stored.thread, "");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_map_step_stops_before_the_model_and_leaves_no_artifact() {
+        // Stop is checked INSIDE `sidecar_json_cancellable` before the request,
+        // so a cancelled map returns the STOPPED sentinel and writes nothing.
+        // `spawn_file_pass` normalizes that step error to Paused; the wave
+        // never checkpoints, so this step re-runs on resume.
+        let room = "/tmp/r8.roomai";
+        let app = mock_room(room);
+        let plan = plan_for("merge", vec![(0, 4), (3, 8)], 8);
+        let steps = build_pass_steps(2, "merge", Lane::LocalLlm);
+        let job = with_conn(&app, |c| {
+            let id = db::create_job(c, "file_pass", "t",
+                &serde_json::to_value(&plan).unwrap(), steps.len() as i64).unwrap();
+            store_artifact(c, &id, 0, &art("prior notes", false)).unwrap();
+            id
+        });
+        let cancel = Arc::new(AtomicBool::new(true));
+        let (r, _) = run_step(&app, &job, room, &plan, "abcdefgh", &steps[1], &cancel).await;
+        assert_eq!(r, Err("STOPPED".into()));
+        assert!(with_conn(&app, |c| load_artifact(c, &job, 1)).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn map_guards_reject_a_stale_plan_before_any_model_call() {
+        let room = "/tmp/r9.roomai";
+        let app = mock_room(room);
+        let plan = plan_for("merge", vec![(0, 4)], 4);
+        let cancel = Arc::new(AtomicBool::new(false));
+        // A window id the plan doesn't have (a re-derived plan that shrank).
+        let bad_id = Step {
+            id: 0, lane: Lane::LocalLlm, kind: "map".into(),
+            params: serde_json::json!({ "window": 7 }), depends_on: vec![],
+        };
+        let (r, _) = run_step(&app, "j", room, &plan, "abcd", &bad_id, &cancel).await;
+        assert_eq!(r, Err("window 7 is not in the plan".into()));
+        // A span the CURRENT text can't satisfy — the second line of defence
+        // behind the resume-time text_len/text_sha256 check.
+        let ok_id = Step {
+            id: 0, lane: Lane::LocalLlm, kind: "map".into(),
+            params: serde_json::json!({ "window": 0 }), depends_on: vec![],
+        };
+        let (r, _) = run_step(&app, "j", room, &plan, "ab", &ok_id, &cancel).await;
+        assert_eq!(
+            r,
+            Err("the file's text no longer matches this pass — start a new pass".into())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_room_touching_step_parks_when_the_room_swapped() {
+        // room_path pins each step to the room the pass started in.
+        let app = mock_room("/tmp/open.roomai");
+        let gone = "/tmp/closed.roomai";
+        let plan = plan_for("merge", vec![(0, 4), (3, 8)], 8);
+        let steps = build_pass_steps(2, "merge", Lane::LocalLlm);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let msg = Err::<(), String>("The room this job belongs to is no longer open.".into());
+        // map 1 reads the previous window's thread from the room first.
+        assert_eq!(run_step(&app, "j", gone, &plan, "abcdefgh", &steps[1], &cancel).await.0, msg);
+        // compose gathers its group's notes from the room.
+        assert_eq!(run_step(&app, "j", gone, &plan, "abcdefgh", &steps[2], &cancel).await.0, msg);
+        // publish writes into the room.
+        assert_eq!(run_step(&app, "j", gone, &plan, "abcdefgh", &steps[3], &cancel).await.0, msg);
+    }
+
+    #[test]
+    fn pass_artifact_wire_format_is_the_migration_contract() {
+        // A Python step writing job_artifacts must emit exactly these three
+        // keys. All are `#[serde(default)]`, so partial rows load, and the
+        // `unwrap_or_default()` in the map/compose arms turns a MALFORMED
+        // sidecar reply into an empty artifact with skipped = FALSE — which
+        // publish then counts as covered (see the over-claim test above).
+        let a: PassArtifact = serde_json::from_value(
+            serde_json::json!({ "result": "r", "thread": "t", "skipped": true }),
+        )
+        .unwrap();
+        assert_eq!((a.result.as_str(), a.thread.as_str(), a.skipped), ("r", "t", true));
+        let json = serde_json::to_value(&art("r", false)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "result": "r", "thread": "", "skipped": false })
+        );
+        // Partial + unknown-field tolerance.
+        let p: PassArtifact =
+            serde_json::from_value(serde_json::json!({ "result": "only" })).unwrap();
+        assert!(!p.skipped && p.thread.is_empty());
+        // The malformed-reply fallback the map arm actually uses.
+        let fallback: PassArtifact =
+            serde_json::from_value(serde_json::json!({ "skipped": "yes" })).unwrap_or_default();
+        assert!(!fallback.skipped);
+        assert_eq!(fallback.result, "");
+    }
+
+    #[test]
+    fn only_engine_death_parks_the_pass() {
+        // is_fatal decides durability: fatal → the job parks resumable; anything
+        // else degrades THIS window to skipped and the pass keeps going with an
+        // honest coverage line. Getting this wrong in either direction either
+        // burns a whole book on a dead engine or parks on a hiccup.
+        assert!(is_fatal("OLLAMA_DOWN"));
+        assert!(is_fatal("MODEL_MISSING"));
+        assert!(is_fatal("MODEL_MISSING:qwen3:4b"));
+        assert!(!is_fatal("STOPPED"));
+        assert!(!is_fatal("Local AI error (500): boom"));
+        assert!(!is_fatal("ollama_down")); // exact match only
+        assert!(!is_fatal("The AI model returned nothing. If this room uses a cloud model…"));
+    }
+
+    #[test]
+    fn resume_rederives_the_steps_and_the_lane_follows_the_current_engine() {
+        // What "file_pass re-derives its plan on resume" actually means
+        // (queue.rs::start_file_pass_row): the jobs row stores a PassPlan, NOT
+        // a step DAG, so the steps are rebuilt with `build_pass_steps` from the
+        // plan's (windows.len(), mode) — stable — plus a lane resolved from the
+        // room's CURRENT model setting — NOT stable. Ids/kinds/deps/params must
+        // be identical across engines (artifacts align with step ids), and ONLY
+        // the lane may differ.
+        let n = 20;
+        let local = build_pass_steps(n, "merge", Lane::LocalLlm);
+        let cloud = build_pass_steps(n, "merge", Lane::Cloud);
+        assert_eq!(local.len(), cloud.len());
+        for (l, c) in local.iter().zip(&cloud) {
+            assert_eq!(l.id, c.id);
+            assert_eq!(l.kind, c.kind);
+            assert_eq!(l.params, c.params);
+            assert_eq!(l.depends_on, c.depends_on);
+        }
+        // Only the model steps move lane; publish stays CPU either way.
+        assert_eq!(local[0].lane, Lane::LocalLlm);
+        assert_eq!(cloud[0].lane, Lane::Cloud);
+        assert_eq!(local.last().unwrap().lane, Lane::Cpu);
+        assert_eq!(cloud.last().unwrap().lane, Lane::Cpu);
+        // And that lane change is OBSERVABLE: with every map done, the local
+        // lane composes one section at a time while the cloud lane fans out.
+        let done: std::collections::HashSet<usize> = (0..n).collect();
+        let empty = std::collections::HashSet::new();
+        assert_eq!(plan_dispatch(&local, &done, &empty).len(), 1);
+        assert_eq!(plan_dispatch(&cloud, &done, &empty).len(), 4);
+    }
+
+    #[test]
+    fn the_section_constant_is_an_unstored_part_of_the_plan() {
+        // TRIPWIRE. `windows` and `mode` are persisted; PASS_SECTION_WINDOWS is
+        // NOT — yet it decides how many compose steps exist and therefore every
+        // step id above the maps. Changing it re-derives a DIFFERENT DAG for an
+        // already-paused pass: the stored `total` stops matching, and the stored
+        // cursor seeds `0..cursor` as done over steps that are no longer the
+        // same steps, so artifacts misalign silently. Bumping this constant (or
+        // porting it to Python with a different value) requires a plan version
+        // + migration, not just an edit.
+        assert_eq!(PASS_SECTION_WINDOWS, 6);
+        for n in [1usize, 5, 6, 7, 12, 13, 50] {
+            let steps = build_pass_steps(n, "merge", Lane::LocalLlm);
+            assert_eq!(steps.len(), n + n.div_ceil(PASS_SECTION_WINDOWS) + 1);
+        }
+        for n in [1usize, 4, 50] {
+            assert_eq!(build_pass_steps(n, "stitch", Lane::LocalLlm).len(), n + 1);
+        }
+        // Window geometry is persisted, so these only pin what a FRESH plan gets.
+        assert_eq!(PASS_WINDOW_CHARS, 32_000);
+        assert_eq!(PASS_WINDOW_OVERLAP, 400);
+    }
+
+    #[test]
+    fn progress_labels_cover_the_stitch_publish_arm() {
+        // The second `Step.kind` match (`pass_progress_label`): anything that is
+        // not "compose" falls into the save label — including stitch, which has
+        // no compose step at all.
+        let plan = plan_for("stitch", vec![(0, 10), (9, 20)], 20);
+        let steps = build_pass_steps(2, "stitch", Lane::LocalLlm);
+        assert_eq!(
+            pass_progress_label(&plan, &steps, 0),
+            "Reading part 1 of 2 — characters 0–10"
+        );
+        assert_eq!(pass_progress_label(&plan, &steps, 2), "Saving the result into the room…");
+        // Past the end of the plan (a resumed job whose cursor is already total).
+        assert_eq!(pass_progress_label(&plan, &steps, 3), "Finishing…");
+    }
+
     /// REAL end-to-end: a temp encrypted room, a multi-window document, and the
     /// actual local Ollama model running the full map → section-compose →
     /// publish pipeline — including a mid-run Stop and a resume from the

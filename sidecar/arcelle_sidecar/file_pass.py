@@ -33,27 +33,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import llm
-from .config import KEEP_ALIVE_WARM, ProviderConfig, _HIGH_RAM_BYTES, _total_ram_bytes
+from .config import KEEP_ALIVE_WARM, ProviderConfig
 from .messages import Message, compact_json, system_message, user_message
-
-# --- Job-tier num_ctx (ollama.rs:307-308 num_ctx_for(_, Job)) ---------------
-#: The background-job window a whole-file PASS runs each map/merge/compose call
-#: at (chat_structured with ``StructuredOpts::job()``). Job ignores has_tools —
-#: it is the big window a deep read's gathered text needs so nothing truncates.
-NUM_CTX_JOB_LOW: int = 65536
-NUM_CTX_JOB_HIGH: int = 131072
-
-_num_ctx_job_cache: int | None = None
-
-
-def num_ctx_for_job() -> int:
-    """131072 on a 32 GB+ Mac, 65536 below. Cached — RAM does not change."""
-    global _num_ctx_job_cache
-    if _num_ctx_job_cache is None:
-        _num_ctx_job_cache = (
-            NUM_CTX_JOB_HIGH if _total_ram_bytes() >= _HIGH_RAM_BYTES else NUM_CTX_JOB_LOW
-        )
-    return _num_ctx_job_cache
 
 # --- caps (file_pass.rs constants) -----------------------------------------
 #: Per-window notes cap (merge mode). This is the FIRST and harshest fold — a
@@ -78,13 +59,18 @@ PASS_SECTION_MAX: int = 40_000
 #: file_pass.rs ``model_call`` passes ``Some(0.2)`` — steady, low-variance reads.
 PASS_TEMPERATURE: float = 0.2
 
-#: Output-token caps (num_predict). Without a cap, a degenerate repetition loop
-#: generates until it fills the whole num_ctx window — ~72 min on a 4B (65,536
-#: tokens ÷ ~15 tok/s), which a multi-doc sweep hit on ~4 % of section composes.
-#: These caps stop a runaway in minutes while sitting well above real output
-#: (map notes ≈ 1.4 K tokens; a section ≈ 0.4–2 K tokens), and the byte-clamps
-#: still trim the result. Sized generously so legitimate output is never cut.
-PASS_MAP_PREDICT: int = 2_048
+#: Output-token ceilings (``num_predict``). Not a quality limit — both sit far
+#: above real output (map notes ≈1.4k tokens, a section ≈0.4–2k) — but a
+#: runaway guard. Without one a degenerate repetition loop generates until it
+#: fills the whole window, which a multi-doc sweep hit on ~4 % of section
+#: composes and which now costs MORE than it used to: the window is
+#: payload-fitted and can reach 128k, so an uncapped 4B could grind for hours
+#: on one window while holding `Lane::LocalLlm`'s single slot.
+#:
+#: The map ceiling is deliberately generous — well past `PASS_NOTES_MAX`, which
+#: is the byte clamp that actually shapes the artifact — so it can only ever
+#: stop a loop, never truncate a real read.
+PASS_MAP_PREDICT: int = 4_096
 PASS_DOC_PREDICT: int = 8_192
 
 
@@ -209,7 +195,7 @@ async def _structured_call(
     base_url: str,
     *,
     keep_alive: str,
-    num_predict: int = PASS_DOC_PREDICT,
+    num_predict: int | None = PASS_DOC_PREDICT,
     privacy: dict[str, Any] | None = None,
     provider: Any | None = None,
 ) -> Any:
@@ -227,7 +213,6 @@ async def _structured_call(
     * otherwise the parsed JSON value (any JSON — the caller reads fields safely).
     """
     primed = _prime_schema(messages, schema)
-    num_ctx = num_ctx_for_job()
     for attempt in range(2):
         try:
             raw = await llm.generate(
@@ -235,7 +220,6 @@ async def _structured_call(
                 primed,
                 base_url,
                 temperature=PASS_TEMPERATURE,
-                num_ctx=num_ctx,
                 num_predict=num_predict,
                 keep_alive=keep_alive,
                 format=schema,
@@ -473,7 +457,6 @@ __all__ = [
     "recover_json",
     "run_map",
     "run_section",
-    "num_ctx_for_job",
     "FilePassMapRequest",
     "FilePassSectionRequest",
 ]

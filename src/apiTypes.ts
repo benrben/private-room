@@ -186,6 +186,61 @@ export interface AskTokenUsage {
   breakdown: Record<TokenCategory, { tokens: number; estimated: boolean }>;
 }
 
+/** Dispatch-first agent visibility: one roster entry per plan step — which
+ * domain agent will handle it. The whole array arrives once per ask via
+ * `ask-plan`, before any work starts (single-step turns get a 1-item roster).
+ * Snake-free pass-through of the sidecar's plan event body. */
+export interface AskPlanStep {
+  /** Registry id, e.g. "jobs.run". */
+  agent: string;
+  /** Human-readable agent name, e.g. "Jobs & long passes". */
+  label: string;
+  /** The clause of the user's ask this step will execute. */
+  instruction: string;
+  /** This entry's own state. Every `ask-plan` is a COMPLETE snapshot, so the
+   * latest one is the whole truth — no diffing, no dependence on event order
+   * (children emit concurrently, so their order guarantees nothing).
+   * Optional: an older sidecar omits it, and the graph falls back to deriving
+   * state from the single `step` marker. */
+  status?: AgentNodeStatus;
+  /** Which dispatch round sent this specialist. Entries sharing a batch were
+   * launched TOGETHER and run in parallel — the one fact that makes the
+   * fan-out legible, and the one thing roster growth alone cannot express.
+   * `null` on the Main agent, which is the hub rather than a dispatched child. */
+  batch?: number | null;
+  /** Uniquely addresses this node ("main", or "<agent id>#<slot>"). The
+   * registry id will NOT do: one round can dispatch two `files.read` children,
+   * and each needs its own tool-step bucket. */
+  key?: string;
+}
+
+/** A node's state in the turn's agent graph. Rendered so it never depends on
+ * colour alone — each state also carries its own glyph and outline. */
+export type AgentNodeStatus = "pending" | "running" | "done" | "failed";
+
+/** The `ask-agent` event — which roster entry is active right now. */
+export interface AskActiveAgent {
+  id: string;
+  label: string;
+  /** 1-based position in the roster. With a parallel batch in flight this
+   * points at the FIRST running child; read `active_steps` for the real set. */
+  step: number;
+  total: number;
+  /** Every 1-based slot running right now. A batch lights several at once,
+   * which `step` alone cannot say. Optional — older sidecars omit it. */
+  active_steps?: number[];
+}
+
+/** The `ask-step` event. Payload is a bare string from the many non-sidecar
+ * emitters (chat commands, ai_actions, the native agent paths) and an object
+ * from the sidecar, which stamps the emitting agent's graph slot. `api.ts`
+ * normalises both to this shape. */
+export interface AskStep {
+  label: string;
+  /** The `AskPlanStep.key` of the agent that ran this tool, when known. */
+  node?: string | null;
+}
+
 /** PRIV-2: privacy-scan progress events. */
 export interface PrivacyScanProgress {
   running: boolean;
@@ -209,6 +264,10 @@ export interface MessageEffects {
   edits?: { tool: string; outcome: string; n?: number; files?: number }[];
   /** This turn's token-usage snapshot for the budget bar (see AskTokenUsage). */
   usage?: AskTokenUsage;
+  /** Dispatch-first agent visibility: the roster of domain agents that handled
+   * this turn (the sidecar's plan event body). Rendered as a compact line on
+   * the finished message — the live strip only exists while streaming. */
+  agents?: AskPlanStep[];
 }
 
 /** ADD-25: one backend→webview request on the agent↔UI bridge. The driver
@@ -292,6 +351,10 @@ export interface RecMeta {
   /** 0 = speakers are discovered from their voices (always, from the UI).
    * A non-zero value pins the participant count for an older room. */
   maxSpeakers: number;
+  /** GH #5: machine label → the name the user gave them ("Speaker 2" → "Dana").
+   * An overlay on top of `segments`, so re-clustering and re-transcribe (which
+   * both rewrite the labels) can't destroy it. Absent until someone renames. */
+  speakerNames?: Record<string, string>;
 }
 
 export interface RecStart {

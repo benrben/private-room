@@ -113,11 +113,8 @@ def test_read_args_tolerates_model_typing() -> None:
     assert summarize.read_args({"find": "  "}) == (0, summarize.READ_WINDOW_DEFAULT, None)
 
 
-def test_num_ctx_tiers_and_job_chars() -> None:
-    # Job ignores has_tools and is much larger than the no-tools Chat window.
-    assert summarize._num_ctx_for(True, "job") == summarize._num_ctx_for(False, "job")
-    assert summarize._num_ctx_for(False, "job") > summarize._num_ctx_for(False, "chat")
-    assert summarize._job_context_chars() == summarize._num_ctx_for(True, "job") * 3
+def test_read_window_max_is_64k() -> None:
+    assert summarize.READ_WINDOW_MAX == 64_000
 
 
 # --- a scripted fake model --------------------------------------------------
@@ -176,9 +173,9 @@ async def test_summarize_short_file_one_call_no_reads() -> None:
     # No gather loop for a whole file; exactly one (final, schema) generate.
     assert fake.tool_calls_seen == []
     assert len(fake.generate_seen) == 1
-    # The final call is schema-constrained at the Job tier.
+    # The final call is schema-constrained without an app-imposed context tier.
     assert fake.generate_seen[0]["format"]["properties"]["summary"] == {"type": "string"}
-    assert fake.generate_seen[0]["num_ctx"] == summarize._num_ctx_for(False, "job")
+    assert fake.generate_seen[0]["num_ctx"] is None
 
 
 async def test_summarize_short_file_falls_back_to_raw_when_not_json() -> None:
@@ -217,8 +214,7 @@ async def test_summarize_long_file_reads_past_first_window() -> None:
     round2_msgs = fake.tool_calls_seen[1]["messages"]
     tool_msgs = [m for m in round2_msgs if m.get("role") == "tool"]
     assert tool_msgs and "MANIFEST" in tool_msgs[0]["content"]
-    # Gather rounds run at the big Job window.
-    assert fake.tool_calls_seen[0]["num_ctx"] == summarize._num_ctx_for(True, "job")
+    assert fake.tool_calls_seen[0]["num_ctx"] is None
 
 
 async def test_summarize_long_file_dedupes_identical_reads() -> None:

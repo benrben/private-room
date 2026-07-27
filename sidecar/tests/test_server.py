@@ -12,7 +12,7 @@ from conftest import FakeChatModel, FakeMCP, Round, call
 
 from arcelle_sidecar import __version__
 from arcelle_sidecar.chat import RoundUsage
-from arcelle_sidecar.config import MAX_TOOL_ROUNDS, PLAIN_MAX_ROUNDS, RunRequest
+from arcelle_sidecar.config import AGENT_ROUND_BACKSTOP, RunRequest
 from arcelle_sidecar.messages import Message, ToolCall
 from arcelle_sidecar.server import RunRegistry, create_app
 
@@ -54,7 +54,9 @@ async def test_health() -> None:
 async def test_run_streams_ndjson_in_order() -> None:
     chat = FakeChatModel(
         [
+            Round(content="", calls=[call("ask_file_agent", instruction="find the rent")]),
             Round(content="looking", calls=[call("search_room", query="rent")]),
+            Round(content="Found it; rent is 1200."),
             Round(content="The rent is 1200."),
         ]
     )
@@ -72,26 +74,49 @@ async def test_run_streams_ndjson_in_order() -> None:
 
     events = [json.loads(line) for line in lines]
     assert [e["t"] for e in events] == [
+        "plan",  # the Main agent, thinking
+        "agent",
+        "round",
+        "usage",
+        # The roster is emitted at DISPATCH — the whole batch of children is
+        # launched as a unit, before any step chip.
+        "plan",  # roster grew
+        "agent",
+        "step",  # Asked the File agent
         "lane",
         "round",
         "delta",
-        "usage",  # token-budget bar snapshot for this round
+        "usage",
         "step",
         "step_status",
         "round",
         "delta",
         "usage",
+        # A child FINISHED: its own roster slot flips to done the moment its
+        # sub-loop ends — not when the parent gets round to collecting it, or a
+        # fast sibling would keep pulsing until the slowest one returned.
+        "plan",
+        "agent",
+        "step_status",
+        # The Main agent is marked active once the whole batch is collected.
+        "plan",  # the Main agent resumes
+        "agent",
+        "round",
+        "delta",
+        "usage",
         "final",
     ]
-    assert events[0]["v"] == "Working on your files"
-    assert events[4]["v"] == "Searched the room"
-    assert events[5]["ok"] is True
+    lanes = [e for e in events if e["t"] == "lane"]
+    assert lanes[0]["v"] == "Working on your files"
+    steps = [e["v"] for e in events if e["t"] == "step"]
+    assert steps == ["Asked the File agent", "Searched the room"]
     assert events[-1] == {"t": "final", "v": "The rent is 1200."}
     assert mcp.closed is True  # the bridge client is released with the run
 
-
 async def test_every_line_is_one_json_object() -> None:
-    chat = FakeChatModel([Round(content="multi\nline\nanswer")])
+    chat = FakeChatModel(
+        [Round(content="multi\nline\nanswer"), Round(content="multi\nline\nanswer")]
+    )
     app = app_with(chat, FakeMCP())
     async with client_for(app) as c:
         resp = await c.post("/run", json=BODY)
@@ -199,7 +224,7 @@ def test_run_request_defaults_and_routing_fallback() -> None:
     assert req.ollama_base_url == "http://127.0.0.1:11434"
     # No routing block from the host -> the sidecar runs the routers itself.
     assert req.resolved_routing() == (True, False, False, False, False)
-    assert req.resolved_max_rounds(ui=False, jobs=False) == 4  # a plain turn
+    assert req.resolved_max_rounds(ui=False, jobs=False) == AGENT_ROUND_BACKSTOP
 
     req2 = RunRequest(model="m", question="what is the rent", web_enabled=True, max_rounds=24)
     assert req2.resolved_max_rounds(ui=False, jobs=False) == 24
@@ -208,28 +233,21 @@ def test_run_request_defaults_and_routing_fallback() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "ui", "jobs", "expected"),
     [
-        # Plain: no mcp routes, no web, no advisors, no ui, no jobs -> 4 rounds.
-        (dict(), False, False, PLAIN_MAX_ROUNDS),
-        # Each capability ALONE flips the turn off the plain path -> the backstop.
-        (dict(mcp_routes=1), False, False, MAX_TOOL_ROUNDS),  # M13: mcp_routes counts
-        (dict(advisors=["cloud"]), False, False, MAX_TOOL_ROUNDS),  # M13: advisors count
-        (dict(web_enabled=True), False, False, MAX_TOOL_ROUNDS),
-        (dict(), True, False, MAX_TOOL_ROUNDS),  # M12: ui counts
-        (dict(), False, True, MAX_TOOL_ROUNDS),  # M12: jobs counts
-        # Non-plain with NO explicit max_rounds -> the backstop, not PLAIN (M36).
-        (dict(web_enabled=True), False, False, MAX_TOOL_ROUNDS),
-        # An explicit host-supplied backstop is honoured on a capable turn (the
-        # host's lever; SPEC §5 carries max_rounds precisely for this).
+        (dict(), False, False, AGENT_ROUND_BACKSTOP),
+        (dict(mcp_routes=1), False, False, AGENT_ROUND_BACKSTOP),
+        (dict(advisors=["cloud"]), False, False, AGENT_ROUND_BACKSTOP),
+        (dict(web_enabled=True), False, False, AGENT_ROUND_BACKSTOP),
+        (dict(), True, False, AGENT_ROUND_BACKSTOP),
+        (dict(), False, True, AGENT_ROUND_BACKSTOP),
+        (dict(web_enabled=True), False, False, AGENT_ROUND_BACKSTOP),
         (dict(web_enabled=True, max_rounds=8), False, False, 8),
-        # ...but never on the plain path, which is always 4.
-        (dict(max_rounds=8), False, False, PLAIN_MAX_ROUNDS),
+        (dict(max_rounds=8), False, False, 8),
     ],
 )
 def test_resolved_max_rounds_over_the_plain_predicate(
     kwargs: dict, ui: bool, jobs: bool, expected: int
 ) -> None:
-    # SPEC §3.2: max_rounds = 4 iff (no mcp routes AND not web AND no advisors AND
-    # not ui/jobs/skills/connectors), else the backstop. Each input matters.
+    # Every lane uses the same high backstop; an explicit test override still wins.
     req = RunRequest(model="m", question="q", **kwargs)
     assert req.resolved_max_rounds(ui=ui, jobs=jobs) == expected
 

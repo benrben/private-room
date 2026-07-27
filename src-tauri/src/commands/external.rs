@@ -181,14 +181,317 @@ fn parse_codex_catalog(json: &[u8]) -> Result<Vec<ExternalModelInfo>, String> {
         .collect())
 }
 
-/// Claude Code's CLI has no equivalent listing command (checked --help,
-/// config, doctor, and the invalid-model error message — confirmed none
-/// enumerate). These are the CLI's own documented, self-updating `--model`
-/// ALIASES (see `claude --help`), not dated model ids, so they track whichever
-/// model Anthropic currently maps each tier to — only the display label below
-/// is maintained text, the smallest hardcoding surface available given the CLI
-/// exposes nothing enumerable.
-fn claude_known_models() -> Vec<ExternalModelInfo> {
+/// Claude Code's CLI still has no listing command — re-verified 2026-07-24
+/// against CLI 2.1.201 and 2.1.219: no `models` subcommand, `--help` names
+/// only three aliases as examples (it omits `haiku`), `auto-mode` prints
+/// classifier rules only, and an invalid `--model` reports a generic error
+/// with no valid-value list. But the CLI's own `/model` picker data IS
+/// embedded in the installed executable's JavaScriptCore string table, so read
+/// the catalog out of whichever CLI version the user actually has rather than
+/// maintaining one here. Nothing about the tiers or their versions is
+/// hardcoded below; only the display ORDER is, and unknown tiers still appear
+/// (see `CLAUDE_TIER_ORDER`).
+///
+/// Scrape the executable that will be RUN — `run_external` invokes plain
+/// `claude` through `zsh -ilc`, so the catalog must come from what is on PATH.
+/// Resist reading a newer copy found elsewhere (a VSCode extension bundles
+/// one): the picker would advertise models the CLI we actually execute cannot
+/// run. A stale PATH install showing older tiers is the honest outcome, and
+/// `claude update` is the fix.
+///
+/// Verified across a real upgrade: on 2.1.201 this yielded `opus -> Opus 4.8`
+/// and on 2.1.219 `opus -> Opus 5`, with no code change — and in each case
+/// `claude --model opus -p … --output-format json` reported that exact model
+/// id back in `modelUsage`, so the label matches what the CLI really runs.
+///
+/// The string table has no record structure tying an alias to its label, so
+/// parsing is content-based rather than positional: picker entries read
+/// "<Family> <version> - <description>" and each is trusted only if its own
+/// model id (`Opus 4.8` -> `claude-opus-4-8`) also appears in the executable.
+/// That cross-check is what separates catalog entries from unrelated strings
+/// that happen to read the same way (a live scan turned up exactly one such
+/// impostor, "Phase 2 - …", and the check rejects it).
+#[derive(Default)]
+struct ClaudeCatalogScan {
+    /// ("Opus", "4.8") -> "best for everyday, complex tasks"
+    labels: HashMap<(String, String), String>,
+    /// Every `claude-…` id seen, for the cross-check above.
+    ids: HashSet<String>,
+}
+
+/// Display order for the Claude tiers in the picker. Presentation only — a
+/// tier missing from this list still appears (appended, then alphabetical), so
+/// a newly launched family shows up without a code change here.
+const CLAUDE_TIER_ORDER: &[&str] = &["opus", "sonnet", "haiku", "fable"];
+
+/// Refuse to believe a scan that found almost nothing: a garbled or partial
+/// read should leave the fallback in place rather than empty the picker.
+const CLAUDE_MIN_TIERS: usize = 2;
+
+/// Bound on a picker description, and on how many distinct label candidates a
+/// scan will hold — a live executable yields a handful, so anything near these
+/// means we are reading noise, not a catalog.
+const CLAUDE_DESC_MAX: usize = 240;
+const CLAUDE_LABEL_MAX: usize = 256;
+
+fn claude_version_parts(version: &str) -> Option<Vec<u32>> {
+    if !version.starts_with(|c: char| c.is_ascii_digit())
+        || !version.ends_with(|c: char| c.is_ascii_digit())
+    {
+        return None;
+    }
+    version.split('.').map(|p| p.parse().ok()).collect()
+}
+
+fn claude_model_id(family: &str, version: &str) -> String {
+    format!("claude-{}-{}", family.to_lowercase(), version.replace('.', "-"))
+}
+
+/// True when the executable carries this exact model id, or a dated form of it
+/// (`claude-opus-4-8-20260501`). Deliberately not a bare substring test, which
+/// would also accept an unrelated `claude-opus-4-80`.
+fn claude_catalog_has_id(ids: &HashSet<String>, expected: &str) -> bool {
+    ids.iter().any(|id| {
+        id == expected || id.strip_prefix(expected).is_some_and(|r| r.starts_with('-'))
+    })
+}
+
+/// Parse backwards from the byte before a " - " separator to recover the
+/// "<Family> <version>" head of a picker label. Returns None for anything that
+/// isn't shaped like one, which is the overwhelming majority of hits.
+fn claude_label_head(before: &[u8]) -> Option<(String, String)> {
+    let mut v = before.len();
+    while v > 0 && (before[v - 1].is_ascii_digit() || before[v - 1] == b'.') {
+        v -= 1;
+    }
+    let version = std::str::from_utf8(&before[v..]).ok()?;
+    claude_version_parts(version)?;
+    if v == 0 || before[v - 1] != b' ' {
+        return None;
+    }
+    let mut f = v - 1;
+    while f > 0 && before[f - 1].is_ascii_alphabetic() {
+        f -= 1;
+    }
+    let family = std::str::from_utf8(&before[f..v - 1]).ok()?;
+    if family.len() < 2
+        || family.len() > 16
+        || !family.starts_with(|c: char| c.is_ascii_uppercase())
+        || !family.chars().skip(1).all(|c| c.is_ascii_lowercase())
+    {
+        return None;
+    }
+    Some((family.to_string(), version.to_string()))
+}
+
+/// The description following " - ". The executable carries the picker text
+/// twice: once in the length-prefixed bytecode string table (where the string
+/// ends at the first non-printable byte) and once in the plain JS source it was
+/// compiled from (where it ends at the closing quote). Stop at either, or the
+/// prose runs on into the surrounding code — quotes and backslashes never
+/// appear inside a picker description.
+fn claude_label_desc(after: &[u8]) -> String {
+    let end = after
+        .iter()
+        .take(CLAUDE_DESC_MAX)
+        .position(|b| !(0x20..=0x7e).contains(b) || matches!(b, b'"' | b'`' | b'\\'))
+        .unwrap_or(after.len().min(CLAUDE_DESC_MAX));
+    String::from_utf8_lossy(&after[..end]).trim().to_string()
+}
+
+fn scan_claude_chunk(buf: &[u8], scan: &mut ClaudeCatalogScan) {
+    // Anchor on the '-' of " - ": one byte compare per position, short-circuited
+    // to its neighbours only on a hit, instead of a bounds-checked 3-byte slice
+    // compare at every offset. This walks a ~230 MB executable on the first
+    // model-picker open, so the inner test is the whole cost of the scan.
+    //
+    // `i` is bounded to `1..len-1`, so `buf[i - 1]`, `buf[i + 1]` and the
+    // `sep + 3` slice below (at worst `&buf[len..]`, an empty slice) are all in
+    // range; a buffer shorter than 2 bytes yields an empty range.
+    for i in 1..buf.len().saturating_sub(1) {
+        if buf[i] != b'-' || buf[i - 1] != b' ' || buf[i + 1] != b' ' {
+            continue;
+        }
+        let sep = i - 1; // index of the leading space, as before
+        let Some(head) = claude_label_head(&buf[..sep]) else {
+            continue;
+        };
+        let desc = claude_label_desc(&buf[sep + 3..]);
+        // A chunk boundary can cut a description short; the overlap re-reads it
+        // intact, so keep whichever copy is longer.
+        if desc.is_empty() || scan.labels.len() >= CLAUDE_LABEL_MAX {
+            continue;
+        }
+        let slot = scan.labels.entry(head).or_default();
+        if desc.len() > slot.len() {
+            *slot = desc;
+        }
+    }
+
+    let mut i = 0usize;
+    while i + 7 <= buf.len() {
+        if &buf[i..i + 7] != b"claude-" {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 7;
+        while j < buf.len()
+            && j - i < 48
+            && (buf[j].is_ascii_lowercase() || buf[j].is_ascii_digit() || buf[j] == b'-')
+        {
+            j += 1;
+        }
+        if let Ok(id) = std::str::from_utf8(&buf[i..j]) {
+            scan.ids.insert(id.to_string());
+        }
+        i = j.max(i + 1);
+    }
+}
+
+fn claude_models_from_scan(scan: &ClaudeCatalogScan) -> Vec<ExternalModelInfo> {
+    let efforts: Vec<String> = CLAUDE_EFFORTS.iter().map(|s| s.to_string()).collect();
+    // Newest version wins per family — that is what the CLI's bare alias
+    // resolves to, and it needs no dependence on the English wording the
+    // picker uses to mark older entries ("legacy", "previous … version").
+    let mut newest: HashMap<&str, (Vec<u32>, &str, &str)> = HashMap::new();
+    for ((family, version), description) in &scan.labels {
+        let Some(parts) = claude_version_parts(version) else {
+            continue;
+        };
+        if !claude_catalog_has_id(&scan.ids, &claude_model_id(family, version)) {
+            continue;
+        }
+        match newest.get(family.as_str()) {
+            Some((best, _, _)) if *best >= parts => {}
+            _ => {
+                newest.insert(family, (parts, version, description));
+            }
+        }
+    }
+
+    let mut models: Vec<(usize, ExternalModelInfo)> = newest
+        .into_iter()
+        .map(|(family, (_, version, description))| {
+            let slug = family.to_lowercase();
+            let rank = CLAUDE_TIER_ORDER
+                .iter()
+                .position(|t| *t == slug)
+                .unwrap_or(CLAUDE_TIER_ORDER.len());
+            (
+                rank,
+                ExternalModelInfo {
+                    slug,
+                    label: format!("{family} {version}"),
+                    efforts: efforts.clone(),
+                    default_effort: None,
+                    context_window: None,
+                    description: Some(description.to_string()),
+                    input_price: None,
+                    output_price: None,
+                    // Claude Code takes image input — `run_external` writes
+                    // attached images out for the CLI to open. This field is
+                    // load-bearing now: a scraped catalog is a "rich" one to
+                    // the picker, so its Vision filter chip acts on it.
+                    input_modalities: vec!["text".into(), "image".into()],
+                    tools: true,
+                    vision: true,
+                    reasoning: true,
+                    structured_outputs: true,
+                },
+            )
+        })
+        .collect();
+    models.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.label.cmp(&b.1.label)));
+    models.into_iter().map(|(_, m)| m).collect()
+}
+
+/// The installed executable is ~230 MB, so stream it instead of loading it
+/// whole. Successive chunks overlap so a label straddling a boundary is still
+/// seen intact.
+const CLAUDE_SCAN_CHUNK: usize = 8 << 20;
+const CLAUDE_SCAN_OVERLAP: usize = 1 << 10;
+
+fn read_fully(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    let mut n = 0;
+    while n < buf.len() {
+        match file.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
+fn scan_claude_executable(path: &std::path::Path) -> std::io::Result<ClaudeCatalogScan> {
+    let mut file = std::fs::File::open(path)?;
+    let mut scan = ClaudeCatalogScan::default();
+    let mut buf = vec![0u8; CLAUDE_SCAN_CHUNK + CLAUDE_SCAN_OVERLAP];
+    let mut carry = 0usize;
+    loop {
+        let read = read_fully(&mut file, &mut buf[carry..])?;
+        if read == 0 {
+            break;
+        }
+        let filled = carry + read;
+        scan_claude_chunk(&buf[..filled], &mut scan);
+        if filled <= CLAUDE_SCAN_OVERLAP {
+            break;
+        }
+        buf.copy_within(filled - CLAUDE_SCAN_OVERLAP..filled, 0);
+        carry = CLAUDE_SCAN_OVERLAP;
+    }
+    Ok(scan)
+}
+
+/// Where the `claude` binary actually lives. What is on PATH is a symlink into
+/// the versioned install (`~/.local/share/claude/versions/<v>`), so canonicalize
+/// first — the catalog is in the real executable, not the link. Same
+/// interactive-login-shell trick as `detect_external_blocking`.
+fn claude_executable_path() -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("zsh")
+        .args(["-ilc", "command -v claude"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    std::fs::canonicalize(line).ok()
+}
+
+/// Cached for the process lifetime, like `CODEX_CATALOG` — the installed CLI
+/// can't change under us without a restart of it. Unlike Codex's, this cache
+/// also holds onto a FAILED scan: Codex retries a cheap subprocess, whereas
+/// retrying here would re-read 230 MB on every picker open. A pinned fallback
+/// only costs the version numbers and descriptions — its aliases still select
+/// the right model — so that is the better trade than a repeated scan, and the
+/// next app launch tries again.
+static CLAUDE_CATALOG: tokio::sync::Mutex<Option<Vec<ExternalModelInfo>>> =
+    tokio::sync::Mutex::const_new(None);
+
+async fn list_claude_models() -> Vec<ExternalModelInfo> {
+    let mut guard = CLAUDE_CATALOG.lock().await;
+    if guard.is_none() {
+        let scanned = tauri::async_runtime::spawn_blocking(|| {
+            let path = claude_executable_path()?;
+            let scan = scan_claude_executable(&path).ok()?;
+            let models = claude_models_from_scan(&scan);
+            (models.len() >= CLAUDE_MIN_TIERS).then_some(models)
+        })
+        .await
+        .ok()
+        .flatten();
+        *guard = Some(scanned.unwrap_or_else(claude_fallback_models));
+    }
+    guard.clone().unwrap_or_else(claude_fallback_models)
+}
+
+/// Used only when the installed executable can't be read or its catalog does
+/// not parse. The slugs are the CLI's own self-updating `--model` aliases, and
+/// the labels deliberately carry NO version number — an unversioned fallback
+/// cannot go stale the way a maintained "Opus 4.8" does.
+fn claude_fallback_models() -> Vec<ExternalModelInfo> {
     let efforts: Vec<String> = CLAUDE_EFFORTS.iter().map(|s| s.to_string()).collect();
     let mk = |slug: &str, label: &str| ExternalModelInfo {
         slug: slug.into(),
@@ -199,18 +502,20 @@ fn claude_known_models() -> Vec<ExternalModelInfo> {
         description: None,
         input_price: None,
         output_price: None,
-        input_modalities: vec!["text".into()],
+        input_modalities: vec!["text".into(), "image".into()],
         tools: true,
-        vision: false,
+        vision: true,
         reasoning: true,
         structured_outputs: true,
     };
-    vec![
-        mk("opus", "Opus 4.8"),
-        mk("sonnet", "Sonnet 5"),
-        mk("haiku", "Haiku 4.5"),
-        mk("fable", "Fable 5"),
-    ]
+    CLAUDE_TIER_ORDER
+        .iter()
+        .map(|slug| {
+            let mut label = slug.to_string();
+            label[..1].make_ascii_uppercase();
+            mk(slug, &label)
+        })
+        .collect()
 }
 
 /// List the models available for a detected cloud engine, for the Cloud
@@ -219,7 +524,7 @@ fn claude_known_models() -> Vec<ExternalModelInfo> {
 pub async fn list_engine_models(engine: String) -> Result<Vec<ExternalModelInfo>, String> {
     match engine.as_str() {
         "codex-cli" => list_codex_models().await,
-        "claude-cli" => Ok(claude_known_models()),
+        "claude-cli" => Ok(list_claude_models().await),
         "openrouter" => super::list_provider_models("openrouter").await,
         other => Err(format!("Unknown engine: {other}")),
     }
@@ -403,7 +708,11 @@ pub(crate) async fn run_external(
     // Single-quoted, matching the mcp_config_path quoting just above — safe
     // here because submodel/effort are always our own known slugs (a Codex
     // catalog slug + level, or a Claude Code alias + --effort value), never
-    // arbitrary user text. Effort is only meaningful with a chosen model.
+    // arbitrary user text. The Claude alias is scraped from the installed CLI
+    // rather than hardcoded, so what upholds that is `claude_label_head`'s
+    // charset: a slug can only ever be 2-16 lowercase ASCII letters, and no
+    // quote or metacharacter can reach one. Effort is only meaningful with a
+    // chosen model.
     let model_flag = submodel
         .map(|m| format!(" --model '{m}'"))
         .unwrap_or_default();
@@ -527,10 +836,6 @@ pub(crate) async fn run_external(
 pub(crate) struct ExternalUsage {
     pub(crate) input_tokens: Option<u64>,
     pub(crate) output_tokens: Option<u64>,
-    /// Claude only: the real context window read live off `modelUsage` in the
-    /// CLI's own response. `None` → caller falls back to
-    /// `model_limits::external_max_context`.
-    pub(crate) max_context_hint: Option<u32>,
 }
 
 /// `claude -p --output-format json`'s single JSON result object. Confirmed
@@ -560,34 +865,11 @@ fn parse_claude_json_result(stdout: &[u8]) -> (String, ExternalUsage) {
             + u64_field(u, "cache_read_input_tokens").unwrap_or(0)
     });
     let output_tokens = usage_obj.and_then(|u| u64_field(u, "output_tokens"));
-    // Pick whichever model did the most work this turn — a turn can span more
-    // than one model (haiku + sonnet observed in one call during a live smoke
-    // test), and its context window is the one that actually matters.
-    let max_context_hint = v.get("modelUsage").and_then(|m| m.as_object()).and_then(|obj| {
-        obj.values()
-            .filter_map(|entry| {
-                let w = |k: &str| entry.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-                let weight = w("inputTokens")
-                    + w("outputTokens")
-                    + w("cacheCreationInputTokens")
-                    + w("cacheReadInputTokens");
-                entry
-                    .get("contextWindow")
-                    .and_then(|x| x.as_u64())
-                    .map(|c| (weight, c as u32))
-            })
-            .max_by_key(|(weight, _)| *weight)
-            .map(|(_, c)| c)
-    });
-
-    (
-        text,
-        ExternalUsage {
-            input_tokens,
-            output_tokens,
-            max_context_hint,
-        },
-    )
+    // NOTE: `modelUsage[*].contextWindow` also rides this envelope — the real
+    // window, per model. The CHAT path reads it in the sidecar's twin of this
+    // parser (`external_llm.parse_claude_json_result`), which is where the
+    // token bar's denominator is now decided; nothing here consumes it.
+    (text, ExternalUsage { input_tokens, output_tokens })
 }
 
 /// `codex exec --json`'s JSONL event stream. Confirmed live 2026-07-21: the
@@ -723,12 +1005,201 @@ mod tests {
         assert_eq!(models[0].label, "gpt-5.4-mini");
     }
 
+    // --- Claude catalog scraped from the installed CLI executable ---------
+    // The fixtures below are NUL-joined strings in the shape the real
+    // JavaScriptCore string table stores them, copied from a live scan of
+    // Claude Code 2.1.201 (including the "Phase 2" impostor it really
+    // contains). See `ClaudeCatalogScan` for why parsing is content-based.
+
+    fn string_table(strings: &[&str]) -> Vec<u8> {
+        strings.join("\0").into_bytes()
+    }
+
+    fn scan_fixture(strings: &[&str]) -> Vec<ExternalModelInfo> {
+        let mut scan = ClaudeCatalogScan::default();
+        scan_claude_chunk(&string_table(strings), &mut scan);
+        claude_models_from_scan(&scan)
+    }
+
+    const CLAUDE_FIXTURE: &[&str] = &[
+        "sonnet",
+        "Custom Sonnet model",
+        " (1M context)",
+        "Sonnet 5 - efficient for routine tasks. Generally recommended for most coding tasks",
+        "claude-sonnet-5",
+        "Sonnet 4.6 - previous Sonnet version",
+        "claude-sonnet-4-6",
+        "Opus 4.8 - best for everyday, complex tasks",
+        "claude-opus-4-8",
+        "Opus 4.7 - previous Opus version",
+        "claude-opus-4-7",
+        "Opus 4.8 with 1M context window - for long sessions with large codebases",
+        // Haiku appears only in its dated form here — the id cross-check has
+        // to accept that, since the picker label carries no date.
+        "Haiku 4.5 - fastest for quick answers. Lower cost but less capable",
+        "claude-haiku-4-5-20251001",
+        "Fable 5 - most capable for your hardest and longest-running tasks",
+        "claude-fable-5",
+        // Reads exactly like a picker label but has no `claude-phase-2` id.
+        "Phase 2 - rollout begins next week",
+    ];
+
     #[test]
-    fn claude_known_models_are_cli_documented_aliases_with_fixed_efforts() {
-        let models = claude_known_models();
+    fn claude_catalog_scrapes_current_tier_per_family_from_the_executable() {
+        let models = scan_fixture(CLAUDE_FIXTURE);
+        let seen: Vec<(&str, &str)> = models
+            .iter()
+            .map(|m| (m.slug.as_str(), m.label.as_str()))
+            .collect();
+        // Newest version per family wins; display order is CLAUDE_TIER_ORDER.
+        assert_eq!(
+            seen,
+            vec![
+                ("opus", "Opus 4.8"),
+                ("sonnet", "Sonnet 5"),
+                ("haiku", "Haiku 4.5"),
+                ("fable", "Fable 5"),
+            ]
+        );
+        assert_eq!(
+            models[0].description.as_deref(),
+            Some("best for everyday, complex tasks")
+        );
+        // The " with 1M context window - " variant is not a second tier entry.
+        assert_eq!(models.iter().filter(|m| m.slug == "opus").count(), 1);
+        // A scraped catalog is "rich" to the picker, so these drive its
+        // capability filter chips — Claude Code takes images and tools.
+        assert!(models.iter().all(|m| m.vision && m.tools));
+        // Every Claude model offers the CLI's fixed --effort set.
+        assert_eq!(
+            models[0].efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn claude_catalog_rejects_labels_with_no_matching_model_id() {
+        // "Phase 2 - …" parses as a label but owns no `claude-phase-2` id.
+        assert!(scan_fixture(CLAUDE_FIXTURE)
+            .iter()
+            .all(|m| m.slug != "phase"));
+    }
+
+    #[test]
+    fn claude_catalog_description_stops_at_the_end_of_the_js_string_literal() {
+        // The native install embeds the plain JS source next to the compiled
+        // string table, so a printable run does not end at the description —
+        // it continues into the surrounding code. Verbatim shape from a live
+        // scan of 2.1.201.
+        let js = br#"descriptionForModel:"Opus 4.8 - best for everyday, complex tasks"}}function WBa(){let e=process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;"claude-opus-4-8""#;
+        let mut scan = ClaudeCatalogScan::default();
+        scan_claude_chunk(js, &mut scan);
+        let models = claude_models_from_scan(&scan);
+        assert_eq!(
+            models[0].description.as_deref(),
+            Some("best for everyday, complex tasks")
+        );
+    }
+
+    #[test]
+    fn claude_catalog_slugs_are_shell_safe_lowercase_aliases() {
+        // Both command builders interpolate the slug into a single-quoted
+        // `--model '<slug>'` on the stated assumption that it is one of "our
+        // own known slugs". It is scraped now, so the parser's charset is what
+        // upholds that assumption — pin it here.
+        let models = scan_fixture(&[
+            "Opus 4.8 - best for everyday, complex tasks",
+            "claude-opus-4-8",
+            // Metacharacters butted against a real label must not reach a slug.
+            "'; rm -rf ~; echo 'Sonnet 5 - efficient for routine tasks",
+            "claude-sonnet-5",
+        ]);
+        assert_eq!(models.len(), 2);
+        for m in &models {
+            assert!(
+                (2..=16).contains(&m.slug.len())
+                    && m.slug.chars().all(|c| c.is_ascii_lowercase()),
+                "unsafe slug reached the CLI command: {:?}",
+                m.slug
+            );
+        }
+    }
+
+    #[test]
+    fn claude_catalog_orders_versions_numerically_not_lexically() {
+        let models = scan_fixture(&[
+            "Opus 4.9 - previous Opus version",
+            "claude-opus-4-9",
+            "Opus 4.10 - best for everyday, complex tasks",
+            "claude-opus-4-10",
+        ]);
+        // Lexically "4.10" < "4.9"; numerically 4.10 is the newer tier.
+        assert_eq!(models[0].label, "Opus 4.10");
+    }
+
+    #[test]
+    fn claude_catalog_id_check_accepts_dated_ids_but_not_longer_versions() {
+        let ids: HashSet<String> = ["claude-opus-4-8-20260501", "claude-opus-4-80"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(claude_catalog_has_id(&ids, "claude-opus-4-8"));
+        assert!(!claude_catalog_has_id(&ids, "claude-opus-4-7"));
+        // `claude-opus-4-80` must not vouch for a "Opus 4.8" label.
+        let only_longer: HashSet<String> =
+            std::iter::once("claude-opus-4-80".to_string()).collect();
+        assert!(!claude_catalog_has_id(&only_longer, "claude-opus-4-8"));
+    }
+
+    #[test]
+    fn claude_catalog_survives_a_label_split_across_scan_chunks() {
+        let table = string_table(CLAUDE_FIXTURE);
+        // Cut mid-description of the Opus entry, then rescan with the same
+        // overlap the streaming reader uses.
+        let cut = table
+            .windows(9)
+            .position(|w| w == b"best for ")
+            .expect("fixture contains the Opus description")
+            + 4;
+        let overlap = cut.saturating_sub(CLAUDE_SCAN_OVERLAP);
+        let mut scan = ClaudeCatalogScan::default();
+        scan_claude_chunk(&table[..cut], &mut scan);
+        scan_claude_chunk(&table[overlap..], &mut scan);
+        let models = claude_models_from_scan(&scan);
+        // The truncated copy must not win over the intact one.
+        assert_eq!(
+            models[0].description.as_deref(),
+            Some("best for everyday, complex tasks")
+        );
+    }
+
+    /// Live check against whatever Claude Code is installed on this machine.
+    /// Ignored by default so the suite never depends on a local CLI — run with
+    /// `cargo test -- --ignored claude_catalog_scan_of_the_installed_cli` after
+    /// a CLI upgrade to confirm the string table still parses.
+    #[test]
+    #[ignore]
+    fn claude_catalog_scan_of_the_installed_cli() {
+        let path = claude_executable_path().expect("claude is installed");
+        let scan = scan_claude_executable(&path).expect("executable is readable");
+        let models = claude_models_from_scan(&scan);
+        eprintln!("scanned {}:", path.display());
+        for m in &models {
+            eprintln!("  {:8} {:12} {:?}", m.slug, m.label, m.description);
+        }
+        assert!(models.len() >= CLAUDE_MIN_TIERS, "catalog looks empty");
+        assert!(models.iter().any(|m| m.slug == "opus"));
+        assert!(models.iter().all(|m| m.label.contains(char::is_numeric)));
+    }
+
+    #[test]
+    fn claude_fallback_is_unversioned_cli_aliases_with_fixed_efforts() {
+        let models = claude_fallback_models();
         let slugs: Vec<&str> = models.iter().map(|m| m.slug.as_str()).collect();
         assert_eq!(slugs, vec!["opus", "sonnet", "haiku", "fable"]);
-        // Every Claude model offers the CLI's fixed --effort set.
+        // No version number in a fallback label — nothing here can go stale.
+        assert_eq!(models[0].label, "Opus");
+        assert!(models.iter().all(|m| !m.label.contains(char::is_numeric)));
         assert_eq!(
             models[0].efforts,
             vec!["low", "medium", "high", "xhigh", "max"]
@@ -748,9 +1219,6 @@ mod tests {
         // 1 + 39383 + 0 — all three count toward context.
         assert_eq!(usage.input_tokens, Some(39384));
         assert_eq!(usage.output_tokens, Some(18));
-        // claude-sonnet-5 did the most work (39384 vs haiku's 536) — its
-        // window wins, not the first entry or the smallest.
-        assert_eq!(usage.max_context_hint, Some(1_000_000));
     }
 
     #[test]
@@ -758,7 +1226,6 @@ mod tests {
         let (text, usage) = parse_claude_json_result(b"not json at all");
         assert_eq!(text, "not json at all");
         assert_eq!(usage.input_tokens, None);
-        assert_eq!(usage.max_context_hint, None);
     }
 
     #[test]
@@ -772,8 +1239,6 @@ mod tests {
         assert_eq!(text, "pong");
         assert_eq!(usage.input_tokens, Some(14365));
         assert_eq!(usage.output_tokens, Some(5));
-        // Codex reports no context-window field anywhere in the stream.
-        assert_eq!(usage.max_context_hint, None);
     }
 
     #[test]

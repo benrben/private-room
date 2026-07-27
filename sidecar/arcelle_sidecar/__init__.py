@@ -48,12 +48,27 @@ _TRACING_ENV_VARS: tuple[str, ...] = (
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    # Neither of these matches the LANGSMITH_ prefix rule below, so both survived
+    # the strip until now. Extensions to the guard, never a weakening:
+    #   * a stray LANGGRAPH_CLOUD_LICENSE_KEY starts langgraph-api's metadata loop,
+    #     which POSTs to beacon.langchain.com every 300s;
+    #   * LANGGRAPH_AES_KEY would hand this process an encryption key, which SPEC §1
+    #     forbids outright ("no DB, no keys, no files").
+    "LANGGRAPH_CLOUD_LICENSE_KEY",
+    "LANGGRAPH_AES_KEY",
 )
 
 #: Forced to these values (belt and braces: even if something re-reads a default).
 _TRACING_ENV_FORCED: dict[str, str] = {
     "LANGCHAIN_TRACING_V2": "false",
     "LANGSMITH_TRACING": "false",
+    # Checkpoint payloads round-trip out of this process and back (the write-through
+    # checkpointer design). Without strict mode, langgraph's msgpack decoder imports
+    # and executes any Python callable stored in checkpoint data on load. Set here so
+    # it holds the day a checkpointer first appears, rather than being remembered then.
+    "LANGGRAPH_STRICT_MSGPACK": "true",
+    # No PyPI version probe on start (SPEC §6: no outbound beyond Ollama + the bridge).
+    "LANGGRAPH_NO_VERSION_CHECK": "true",
 }
 
 

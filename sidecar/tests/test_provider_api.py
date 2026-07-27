@@ -86,11 +86,11 @@ def test_message_conversion_preserves_images_and_stringifies_tool_arguments() ->
 
 
 @pytest.mark.asyncio
-async def test_stream_retries_without_rejected_tool_catalog(monkeypatch) -> None:
+async def test_stream_retries_with_arcelle_write_tools_when_connector_schema_is_rejected(monkeypatch) -> None:
     requests: list[dict] = []
     success = "\n".join(
         [
-            'data: {"choices":[{"delta":{"content":"fallback worked"}}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_write","function":{"name":"write_file","arguments":"{\\"name\\":\\"note.md\\",\\"content\\":\\"done\\"}"}}]}}]}',
             'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2}}',
             "data: [DONE]",
             "",
@@ -124,12 +124,35 @@ async def test_stream_retries_without_rejected_tool_catalog(monkeypatch) -> None
     model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
     text, calls, usage = await model.stream(
         [{"role": "user", "content": "hello"}],
-        [{"type": "function", "function": {"name": "bad", "parameters": {}}}],
+        [
+            {"type": "function", "function": {"name": "write_file", "parameters": {}}},
+            {"type": "function", "function": {"name": "connector_bad", "parameters": {}}},
+        ],
         on_delta,
     )
 
     assert "tools" in requests[0]
-    assert "tools" not in requests[1]
-    assert text == "fallback worked"
-    assert calls == []
+    assert [t["function"]["name"] for t in requests[1]["tools"]] == ["write_file"]
+    assert text == ""
+    assert calls[0].name == "write_file"
+    assert calls[0].arguments == {"name": "note.md", "content": "done"}
     assert usage.is_real is True
+
+
+def test_write_request_fails_clearly_when_selected_model_has_no_tools() -> None:
+    model = provider_api.OpenAICompatibleChatModel(
+        "openrouter::vendor/model", config(tools=False)
+    )
+    with pytest.raises(provider_api.ProviderApiError, match="Tools capability"):
+        model._payload(
+            [{"role": "user", "content": "write it"}],
+            tools=[
+                {"type": "function", "function": {"name": "write_file", "parameters": {}}}
+            ],
+        )
+
+
+def test_repeated_streamed_tool_name_is_not_duplicated() -> None:
+    current = provider_api._merge_stream_piece("", "write_file")
+    current = provider_api._merge_stream_piece(current, "write_file")
+    assert current == "write_file"

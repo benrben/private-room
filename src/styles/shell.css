@@ -291,7 +291,17 @@
   min-height: 0;
   min-width: 0;
   display: grid;
-  grid-template-columns: 74px minmax(0, 1fr);
+  /* GH #2: the rail width is a variable so it can expand to full labels. */
+  grid-template-columns: var(--rail-w, 74px) minmax(0, 1fr);
+  transition: grid-template-columns 0.16s ease;
+}
+.pr-main:has(.activity-rail.is-expanded) {
+  --rail-w: 184px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pr-main {
+    transition: none;
+  }
 }
 
 .activity-rail {
@@ -357,6 +367,42 @@
   color: var(--text);
   background: var(--hover);
   border-color: transparent;
+}
+
+/* ----- GH #2: expanded rail — icon and full label on one row ----- */
+.activity-rail.is-expanded {
+  align-items: stretch;
+  padding: 7px 8px;
+}
+.activity-rail.is-expanded .rail-button {
+  width: 100%;
+  min-height: 34px;
+  flex-direction: row;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 6px 9px;
+}
+.activity-rail.is-expanded .rail-label {
+  font-size: 12px;
+  text-align: left;
+  -webkit-line-clamp: 1;
+  white-space: nowrap;
+  word-break: normal;
+}
+.activity-rail.is-expanded .rail-divider {
+  width: 100%;
+}
+/* The pressed/current spine sits just inside the wider padding. */
+.activity-rail.is-expanded .rail-button::before {
+  left: -3px;
+}
+/* The expander itself reads as chrome, not as another destination. */
+.rail-expander {
+  color: var(--faint);
+  opacity: 0.75;
+}
+.rail-expander:hover {
+  opacity: 1;
 }
 /* Pane-visibility toggles: restrained neutral pressed state. */
 .rail-button[data-pane-toggle][aria-pressed="true"] {
@@ -510,25 +556,56 @@
   pointer-events: none;
   border: 0;
 }
+/* GH #2: the grip is always visible. A 5px line with a hover-only grip reads as
+   a border, so the panes looked fixed-width to anyone who never happened to
+   drag exactly on it — the resize has always been here, it just wasn't
+   advertised. Quiet at rest, obvious on hover. */
 .splitter::after {
   content: "";
   position: absolute;
   width: 2px;
-  height: 36px;
+  height: 26px;
   border-radius: 4px;
   background: var(--faint);
-  opacity: 0;
+  opacity: 0.45;
   left: 1px;
-  top: calc(50% - 18px);
+  top: calc(50% - 13px);
+  transition: opacity 0.12s ease, height 0.12s ease;
+}
+/* Grab area much wider than the visible line, overflowing into both neighbours
+   without spending any layout width. 5px of drawn splitter is a ~5px target,
+   and QA on the real app still could not land a drag on it — the pointer-down
+   fell through to the transcript behind and selected text instead. 15px is the
+   difference between "there is no resize" and "there is". */
+.splitter::before {
+  content: "";
+  position: absolute;
+  inset: 0 -5px;
+  cursor: col-resize;
+  /* Own the gesture outright: without this a drag that starts here can be
+     claimed by the scroll container underneath. */
+  touch-action: none;
 }
 .splitter:hover,
 .splitter.is-dragging {
   background: color-mix(in srgb, var(--accent) 18%, var(--bg));
   border-color: var(--accent);
 }
+.splitter:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
 .splitter:hover::after,
-.splitter.is-dragging::after {
-  opacity: 0.8;
+.splitter.is-dragging::after,
+.splitter:focus-visible::after {
+  opacity: 0.9;
+  height: 36px;
+  top: calc(50% - 18px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .splitter::after {
+    transition: none;
+  }
 }
 body.resizing-col,
 body.resizing-col * {

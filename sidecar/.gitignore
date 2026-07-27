@@ -1,0 +1,4 @@
+
+# Dev-time dataset generation: teacher credentials and run logs.
+data/
+.env.local

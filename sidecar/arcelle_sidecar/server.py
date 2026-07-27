@@ -25,12 +25,13 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import __version__, ai_actions, chat_docs, features, file_pass, handoff, llm, vision
+from . import __version__, ai_actions, chat_docs, features, file_pass, handoff, llm, model_limits, vision, wf_nodes
 from . import privacy as privacy_mod
 from . import privacy_scan as privacy_scan_mod
 from . import summarize as summarize_feature
 from . import tts as tts_mod
 from .chat import ChatModel, OllamaChatModel
+from .external_llm import ExternalChatModel, is_external_model
 from .provider_api import OpenAICompatibleChatModel
 from .config import (
     CancelRequest,
@@ -68,6 +69,20 @@ def _default_chat_model(req: RunRequest) -> ChatModel:
             model=req.model,
             provider=req.provider,
             temperature=req.temperature,
+        )
+    # Engine parity: a cloud CLI is just a third implementation of the same
+    # one-method seam, so the agent hub (main agent + domain agents) runs on
+    # `claude -p` / `codex exec` through exactly the code the local engine uses.
+    if is_external_model(req.model):
+        return ExternalChatModel(
+            model=req.model,
+            temperature=req.temperature,
+            max_context=req.max_context,
+            # Room tools are handed to Claude as a REAL MCP server scoped to
+            # each agent's box — the CLI drives its own tool loop over the same
+            # bridge the sidecar uses.
+            mcp_url=req.mcp.url if req.mcp else "",
+            mcp_token=req.mcp.token if req.mcp else "",
         )
     return OllamaChatModel(
         model=req.model,
@@ -166,8 +181,26 @@ def create_app(
                     log.warning("privacy live guard unavailable; exact rules still apply")
             chat.privacy = policy  # type: ignore[attr-defined]
 
+        # How many delegated children may hold a model round at once. A LOCAL
+        # room has one resident model, so concurrent children are contention
+        # rather than throughput — and each of them inflates the payload the
+        # others fit their window to. `wf_nodes.NodeDeps.parallel` already makes
+        # exactly this call for the workflow lanes. A cloud engine has no
+        # resident model, so it fans out unbounded.
+        worker_parallel = (
+            None
+            if (req.provider is not None or privacy_mod.is_nonlocal_model(req.model))
+            else 1
+        )
+
         def deps_factory(emit: Emit) -> Deps:
-            return Deps(chat=chat, emit=emit, cancel=token, mcp=mcp)
+            return Deps(
+                chat=chat,
+                emit=emit,
+                cancel=token,
+                mcp=mcp,
+                worker_parallel=worker_parallel,
+            )
 
         async def body() -> AsyncIterator[bytes]:
             try:
@@ -301,6 +334,15 @@ def create_app(
         # Never fails: unknown capabilities == none (ollama.rs contract).
         caps = await llm.capabilities(req.model, req.base_url)
         return {"capabilities": caps}
+
+    @app.post("/context_length")
+    async def context_length(req: CapabilitiesRequest) -> Any:
+        # The sidecar is the SOLE AI service: this is the last Ollama read the
+        # host used to do itself (`ollama.rs::native_context_length`'s raw
+        # GET /api/tags). Never fails — `None` means "unknown", and the caller
+        # falls back to its explicit override or a display default.
+        length = await model_limits.native_context_length(req.model, req.base_url)
+        return {"context_length": length}
 
     @app.post("/pull")
     async def pull(req: PullRequest) -> StreamingResponse:
@@ -515,6 +557,83 @@ def create_app(
             )
         except llm.LlmError as exc:
             return exc.response()
+
+    @app.post("/wf_node")
+    async def wf_node(req: wf_nodes.WfNodeRequest) -> Any:
+        """One workflow CHAIN node, as a compiled LangGraph graph.
+
+        MIGRATION slice 1 (owner decision 2026-07-25, "Rust drives, Python
+        thinks"): the two workflow arms that are multi-call model chains and
+        touch nothing else — ``refine`` and ``plan_and_map`` — run here instead
+        of in ``workflow.rs``. Rust keeps the plan, the lane, the interpolation
+        against the encrypted DB, ``run_plan``'s wave scheduler and every
+        checkpoint. One Rust ``Step`` is still exactly one POST, so the per-wave
+        checkpoint contract is untouched and the 33 resume characterization
+        tests are structurally unreachable by this change.
+
+        Registered in the SAME ``RunRegistry`` ``/run`` uses, because Stop does
+        NOT arrive by the client hanging up: measured against the pinned
+        uvicorn 0.51 / starlette 0.52, a non-streaming handler kept running
+        three seconds past a hard disconnect. A one-call route tolerates that;
+        a seven-call refine would burn six more generations on the GPU after
+        the user pressed Stop, holding ``Lane::LocalLlm``'s single slot.
+        """
+        token = CancelToken()
+        registry.register(req.run_id, token)
+        try:
+            deps = wf_nodes.NodeDeps(
+                model=req.model,
+                base_url=req.base_url,
+                keep_alive=req.keep_alive,
+                privacy=req.privacy,
+                provider=req.provider,
+                cancel=token,
+                parallel=req.parallel,
+            )
+            if req.kind == "refine":
+                return await wf_nodes.run_refine(
+                    deps=deps,
+                    prompt=req.prompt,
+                    rubric=req.rubric,
+                    max_rounds=req.max_rounds,
+                )
+            if req.kind == "plan_and_map":
+                return await wf_nodes.run_plan_and_map(
+                    deps=deps,
+                    objective=req.prompt,
+                    context=req.context,
+                    max_workers=req.max_workers,
+                )
+            if req.kind == "extract":
+                return await wf_nodes.run_extract(
+                    deps=deps, fields=req.fields, context=req.context
+                )
+            if req.kind == "route":
+                return await wf_nodes.run_route(
+                    deps=deps,
+                    prompt=req.prompt,
+                    labels=req.labels,
+                    context=req.context,
+                )
+            if req.kind == "vote":
+                return await wf_nodes.run_vote(
+                    deps=deps,
+                    prompt=req.prompt,
+                    mode=req.mode,
+                    samples=req.samples,
+                )
+            return JSONResponse(
+                {"error": f"unknown workflow node kind: {req.kind}", "code": "BAD_KIND"},
+                status_code=400,
+            )
+        except wf_nodes.Stopped:
+            # Rust's contract for a stopped node is `Ok(None)` -> Err("STOPPED"),
+            # which spawn_workflow_job normalises to Paused. Mirror it exactly.
+            return JSONResponse({"stopped": True})
+        except llm.LlmError as exc:
+            return exc.response()
+        finally:
+            registry.release(req.run_id)
 
     # --- AI actions / memory / file-meta (moonshot/ai_actions.rs) -----------
     #

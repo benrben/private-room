@@ -12,10 +12,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
 
-from .config import KEEP_ALIVE_WARM, num_ctx_for_chat
+from .budget import json_chars, msg_len, trim_messages_to_window
+from .config import KEEP_ALIVE_WARM
 from .messages import Message, ToolCall, attach_images
-from .model_limits import native_context_length
-from .privacy import PrivacyPolicy, guard_outbound
+from .model_limits import native_context_length, pick_num_ctx
+from .privacy import PrivacyPolicy, guard_outbound, is_nonlocal_model
 
 #: Called with each streamed text delta.
 DeltaSink = Callable[[str], Awaitable[None]]
@@ -29,11 +30,10 @@ class RoundUsage:
     ``prompt_eval_count``/``eval_count``, surfaced by ``langchain_ollama`` as
     ``usage_metadata``) when available; ``None`` when the engine reported
     nothing, in which case the caller falls back to a char-length estimate.
-    ``max_context`` is the model's real advertised context length (from
-    Ollama's own catalog — see ``model_limits.native_context_length``), not
-    the smaller RAM-adaptive ``num_ctx`` window we actually throttle Ollama to
-    for this session (CHG-32 pins that stable for the whole turn, but users
-    expect the bar to show what the model itself is capable of).
+    ``max_context`` is the window the call actually ran in: the payload-fitted
+    ``num_ctx`` the app requested for a local model (see
+    ``model_limits.pick_num_ctx``), or the model's advertised native length
+    for non-local models, whose window lives on the remote side.
     """
 
     input_tokens: int | None
@@ -160,29 +160,64 @@ class OllamaChatModel:
         self.model = model
         self.base_url = base_url
         self.temperature = temperature
-        # RAM-adaptive by default (ollama.rs:224): 24576 on 32 GB+, 12288 below.
-        self.num_ctx = num_ctx if num_ctx is not None else num_ctx_for_chat()
-        # Optional output-token cap. None = no cap (chat's default). A background
-        # job sets this so a degenerate repetition loop can't generate until it
-        # fills the whole num_ctx window (~72 min on a 4B) — it stops at the cap.
+        # Explicit caller override. When None, each LOCAL call computes a
+        # payload-fitted window instead (``_resolve_num_ctx``): the daemon's
+        # own default is ~4k tokens and it silently context-shifts the front
+        # of an oversized prompt away — the "Done." live regression. `:cloud`
+        # models keep None (their window is remote and already the native one).
+        self.num_ctx = num_ctx
+        # Optional output-token cap. None = no app-level cap.
         self.num_predict = num_predict
         self.keep_alive = keep_alive
+        # The window the LAST call actually requested — the truthful
+        # ``max_context`` for the token bar (the native length is a capability
+        # ceiling, not what the running request can actually hold).
+        self._last_num_ctx: int | None = num_ctx
         # PRIV-1: the /run handler attaches the room's resolved policy here; the
         # agent loop then talks to a ``:cloud`` model only through the door.
         self.privacy: PrivacyPolicy | None = None
 
-    def _llm(self) -> Any:
+    @staticmethod
+    def _payload_bytes(
+        messages: list[Message],
+        format: dict[str, Any] | None = None,  # noqa: A002 - matches the Ollama arg
+        images: list[str] | None = None,
+    ) -> int:
+        """Estimated prompt cost of a one-shot call, in bytes of text.
+
+        Images don't ride the text context as base64 — each costs roughly a
+        vision-encoder budget (~1.5k tokens for the models this app ships),
+        counted here at the byte equivalent.
+        """
+        return (
+            sum(msg_len(m) for m in messages)
+            + (json_chars(format) if format else 0)
+            + 4_500 * len(images or [])
+        )
+
+    async def _resolve_num_ctx(self, payload_bytes: int) -> int | None:
+        """The ``num_ctx`` this call sends: override > payload-fitted > None.
+
+        None only for non-local (``:cloud``) models, whose window lives on the
+        remote side. Remembers the choice for :meth:`_round_usage`.
+        """
+        num_ctx = self.num_ctx
+        if num_ctx is None and not is_nonlocal_model(self.model):
+            native = await native_context_length(self.model, self.base_url)
+            num_ctx = pick_num_ctx(payload_bytes, native)
+        self._last_num_ctx = num_ctx
+        return num_ctx
+
+    def _llm(self, num_ctx: int | None) -> Any:
         from langchain_ollama import ChatOllama
 
         kwargs: dict[str, Any] = {
             "model": self.model,
             "base_url": self.base_url,
-            # CHG-32: pin the window so the tool-less final round doesn't shrink
-            # it mid-answer.
-            "num_ctx": self.num_ctx,
-            # HLT-5: the chat model stays warm throughout the conversation.
             "keep_alive": self.keep_alive,
         }
+        if num_ctx is not None:
+            kwargs["num_ctx"] = num_ctx
         if self.num_predict is not None:
             kwargs["num_predict"] = self.num_predict
         if self.temperature is not None:
@@ -209,7 +244,10 @@ class OllamaChatModel:
         """
         from ollama import AsyncClient
 
-        options: dict[str, Any] = {"num_ctx": self.num_ctx}
+        options: dict[str, Any] = {}
+        num_ctx = await self._resolve_num_ctx(self._payload_bytes(messages, format, images))
+        if num_ctx is not None:
+            options["num_ctx"] = num_ctx
         if self.num_predict is not None:
             options["num_predict"] = self.num_predict
         if self.temperature is not None:
@@ -249,7 +287,10 @@ class OllamaChatModel:
         """
         from ollama import AsyncClient
 
-        options: dict[str, Any] = {"num_ctx": self.num_ctx}
+        options: dict[str, Any] = {}
+        num_ctx = await self._resolve_num_ctx(self._payload_bytes(messages, format, images))
+        if num_ctx is not None:
+            options["num_ctx"] = num_ctx
         if self.num_predict is not None:
             options["num_predict"] = self.num_predict
         if self.temperature is not None:
@@ -287,7 +328,24 @@ class OllamaChatModel:
         send, _, engaged = guard_outbound(self.model, messages, self.privacy)
         restorer = engaged.restorer() if engaged else None
 
-        llm: Any = self._llm()
+        reserved = json_chars(tools) if tools else 0
+        num_ctx = await self._resolve_num_ctx(
+            sum(msg_len(m) for m in send) + reserved
+        )
+        # Last resort: the round loop can outgrow even the largest window this
+        # Mac may ask for (a big attachment, a whole fetched page, a chatty
+        # connector result). Shrink it deliberately here rather than letting the
+        # daemon context-shift the system prompt and the question away.
+        #
+        # Mutates in place, and that is the contract (it was the deleted Rust
+        # `trim_messages_to_budget`'s too): for a LOCAL model `guard_outbound`
+        # returns the caller's own list, so a stubbed tool result stays stubbed
+        # for the rest of the turn instead of re-growing and being re-trimmed
+        # every round. A non-local model takes the other branch — `num_ctx` is
+        # None there, so this returns immediately and a cloud model never loses
+        # a byte to us.
+        trim_messages_to_window(send, reserved, num_ctx)
+        llm: Any = self._llm(num_ctx)
         if tools:
             llm = llm.bind_tools(tools)
 
@@ -343,18 +401,33 @@ class OllamaChatModel:
                         },
                     )
                 )
-        return content, calls, await self._round_usage(merged)
+        return content, calls, await self._round_usage(merged, num_ctx)
 
-    async def _round_usage(self, merged: Any) -> RoundUsage:
+    async def _round_usage(self, merged: Any, num_ctx: int | None = None) -> RoundUsage:
         """Real usage when Ollama reported it, else the char-estimate fallback
         signal (``is_real=False`` — the caller substitutes its own estimate).
 
-        ``max_context`` is the model's real advertised context length (Ollama's
-        own catalog, confirmed live 2026-07-21 to work for both local and
-        ``:cloud`` models) — NOT ``self.num_ctx``, which is only the smaller
-        RAM-adaptive WORKING window we throttle Ollama to for speed. Falls
-        back to that working window if the catalog lookup fails."""
-        max_context = await native_context_length(self.model, self.base_url) or self.num_ctx
+        ``max_context`` is the window the last call ACTUALLY requested
+        (payload-fitted ``num_ctx``) — the pre-fix bar divided real usage by
+        the 262k native length while the running window was 4k, showing "1%
+        used" on a turn that had already overflowed. Non-local models have no
+        local window, so they keep the native advertised length (Ollama's own
+        catalog, confirmed live 2026-07-21 for ``:cloud`` models too)."""
+        # THIS call's window, passed in from the frame that chose it — not
+        # `self._last_num_ctx`. One ChatModel instance is shared by every
+        # concurrent delegation child (graph.Deps holds a single `chat`), so
+        # instance state here is last-writer-wins: two local siblings whose
+        # payloads land in different NUM_CTX_BUCKETS published each other's
+        # denominator and the token bar told the user the wrong thing. That is
+        # the same class of untruthful bar the 2026-07-21 live QA already fixed
+        # once. `_last_num_ctx` stays as the fallback for any caller that has
+        # not threaded the value through.
+        max_context = (
+            num_ctx
+            or self._last_num_ctx
+            or await native_context_length(self.model, self.base_url)
+            or 128_000
+        )
         meta = getattr(merged, "usage_metadata", None) if merged is not None else None
         if meta:
             return RoundUsage(

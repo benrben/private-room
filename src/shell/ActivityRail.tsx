@@ -1,5 +1,7 @@
 import type { ReactElement } from "react";
 import {
+  ChevronLeftIcon,
+  ChevronRightIcon,
   FocusIcon,
   GraphIcon,
   HomeIcon,
@@ -54,7 +56,11 @@ const AREAS: {
  * tooltip — the rail is a scroll container (`overflow-x: hidden`, needed for
  * its vertical auto-scroll), so a popover tooltip anchored to a narrow button
  * gets silently clipped to a couple of characters. The aria-label carries the
- * keyboard shortcut for screen readers instead. */
+ * keyboard shortcut for screen readers instead.
+ *
+ * GH #2: the rail expands. Collapsed it is a 74px icon strip whose labels have
+ * to be abbreviated ("Connect", "Record"); expanded it is a 184px column with
+ * the icon and the FULL label side by side. The choice persists per room. */
 export default function ActivityRail({
   layout,
   area,
@@ -74,8 +80,26 @@ export default function ActivityRail({
 }) {
   const paneVisible = (k: "library" | "center" | "ai") =>
     layout.visible.includes(k);
+  const wide = layout.railExpanded;
   return (
-    <nav className="activity-rail" aria-label="Workspace panes and areas">
+    <nav
+      className={`activity-rail${wide ? " is-expanded" : ""}`}
+      aria-label="Workspace panes and areas"
+    >
+      <button
+        className="rail-button rail-expander"
+        type="button"
+        data-testid="rail-expander"
+        aria-expanded={wide}
+        aria-label={wide ? "Collapse the sidebar to icons" : "Expand the sidebar to show full labels"}
+        onClick={layout.toggleRail}
+      >
+        {wide ? <ChevronLeftIcon size={17} /> : <ChevronRightIcon size={17} />}
+        <span className="rail-label">{wide ? "Collapse" : "Expand"}</span>
+      </button>
+
+      <div className="rail-divider" aria-hidden />
+
       <button
         className="rail-button"
         type="button"
@@ -114,7 +138,7 @@ export default function ActivityRail({
       <div className="rail-divider" aria-hidden />
 
       {AREAS.slice(0, 1).map((a) => (
-        <RailAreaButton key={a.key} def={a} area={area} onArea={onArea} />
+        <RailAreaButton key={a.key} def={a} area={area} onArea={onArea} wide={wide} />
       ))}
       <button
         className="rail-button"
@@ -126,7 +150,7 @@ export default function ActivityRail({
         <span className="rail-label">Search</span>
       </button>
       {AREAS.slice(1).map((a) => (
-        <RailAreaButton key={a.key} def={a} area={area} onArea={onArea} />
+        <RailAreaButton key={a.key} def={a} area={area} onArea={onArea} wide={wide} />
       ))}
 
       <div className="rail-spacer" />
@@ -160,10 +184,14 @@ function RailAreaButton({
   def,
   area,
   onArea,
+  wide,
 }: {
   def: (typeof AREAS)[number];
   area: WorkArea;
   onArea: (area: Exclude<WorkArea, "files">) => void;
+  /** Expanded rail: room for the real name, so drop the ≤9-char abbreviation
+   * ("Connect" → "Connectors"). */
+  wide: boolean;
 }) {
   const current = area === def.key;
   return (
@@ -176,7 +204,7 @@ function RailAreaButton({
       onClick={() => onArea(def.key)}
     >
       {def.icon(17)}
-      <span className="rail-label">{def.short}</span>
+      <span className="rail-label">{wide ? def.label : def.short}</span>
     </button>
   );
 }

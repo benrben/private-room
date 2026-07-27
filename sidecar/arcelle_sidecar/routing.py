@@ -15,9 +15,25 @@ only those five predicates — plus the tool-name reservations in agent.rs
 
 These are NOT model-driven: they are case-insensitive substring matches on the
 raw user question. A small model picks the right tool far more reliably from a
-short, relevant list, so the mutating / UI / job / management tools are withheld unless the
+short, relevant list, so the UI / job / management tools are withheld unless the
 question sounds like it wants them. Erring toward YES is safe — it just restores
-the fuller catalog.
+the fuller catalog. Three deliberate softenings of that doctrine (2026-07-23,
+after live QA showed the agent "not knowing" it could save files):
+
+* **The write tools are ALWAYS offered.** The Rust base system prompt teaches
+  create_file/edit_file/… by name on every turn, so withholding the schemas made
+  the prompt and the catalog contradict each other — the model claimed it could
+  not save, or hallucinated calls. ``wants_write_tools`` now feeds only the
+  cosmetic lane label.
+* **Lanes latch per conversation** (Rust ``sidecar.rs`` ORs the routers over the
+  chat's prior user turns) — "now save that as a workflow" keeps the jobs tools
+  even when THIS phrasing has no keyword.
+* **``request_tools`` is the escape hatch** (graph.py): a always-on mini-tool the
+  model can call to unlock a lane the keywords missed entirely.
+
+The hint lists include Hebrew equivalents: the matchers are plain substring
+tests, so a Hebrew question ("שמור את זה כקובץ") must find Hebrew hints or a
+lane can never fire for a Hebrew-speaking user.
 
 The hint lists are product behaviour. If you change one here, change the Rust in
 the same commit or the two engines drift.
@@ -25,10 +41,11 @@ the same commit or the two engines drift.
 
 from __future__ import annotations
 
-#: The file-MUTATING built-ins, withheld on a plain informational turn (the Rust
-#: withholds the same set via `wants_write_tools`; the names are reserved in
-#: agent.rs `BUILTIN_TOOL_NAMES`). Note `annotate_file` / `mark_image` are
-#: deliberately NOT in this list —
+#: The file-MUTATING built-ins. Since 2026-07-23 they are ALWAYS offered (the
+#: base system prompt teaches them by name every turn, so the catalog must
+#: agree); the list is kept for the lane label, tests, and the name
+#: reservations in agent.rs `BUILTIN_TOOL_NAMES`. Note `annotate_file` /
+#: `mark_image` are deliberately NOT in this list —
 #: they show the user something, they don't change a file.
 WRITE_TOOL_NAMES: tuple[str, ...] = (
     "create_file",
@@ -88,10 +105,10 @@ JOB_TOOL_NAMES: tuple[str, ...] = (
     "test_workflow",
 )
 
-#: Never offered to anyone but the top-level local agent — closes the recursion
-#: path (a consulted cloud CLI must not be able to spawn another one). The
-#: sidecar ignores it if the bridge ever serves it (SPEC §2.1).
-FORBIDDEN_TOOL_NAMES: tuple[str, ...] = ("consult_advisor",)
+#: Offered only when the host marks this run as a top-level turn with an
+#: installed advisor. Consulted advisors receive a separate bridge without this
+#: capability, so they cannot recursively consult another advisor.
+ADVISOR_TOOL_NAMES: tuple[str, ...] = ("consult_advisor",)
 
 # --- hint lists, verbatim from the Rust -------------------------------------
 
@@ -101,6 +118,10 @@ _WRITE_HINTS: tuple[str, ...] = (
     "insert", "append", "rename", "correct", "remember", "note ", "jot", "record",
     "translate", "highlight", "mark ", "annotate", "draft", "generate",
     "move ", "rename", "organize", "organise", "put ", "folder", "sort ", "tidy",
+    # Hebrew (substring matchers see no word boundaries, so stems suffice):
+    "ערוך", "עריכה", "שנה", "תקן", "עדכן", "כתוב", "צור ", "שמור", "שמרי",
+    "מחק", "הוסף", "תרגם", "סמן", "זכור", "תזכור", "רשום", "העבר", "תיקיה",
+    "תיקייה", "טיוטה", "קובץ חדש",
 )
 
 _UI_HINTS: tuple[str, ...] = (
@@ -114,6 +135,9 @@ _UI_HINTS: tuple[str, ...] = (
     "open ", "show me", "go to", "switch", "close ", "map", "panel", "tab",
     "studio", "flashcard", "mind map", "mindmap", "podcast", "front page",
     "dashboard", "play", "pause", "image", "photo", "picture",
+    # Hebrew navigation/operation verbs and surfaces:
+    "לחץ", "לחצי", "פתח", "פתחי", "הצג", "הציגי", "מסך", "צילום מסך", "גלול",
+    "כפתור", "סרטון", "וידאו", "תמונה", "סגור", "עבור אל", "תפריט", "לוח",
 )
 
 _JOB_HINTS: tuple[str, ...] = (
@@ -126,12 +150,17 @@ _JOB_HINTS: tuple[str, ...] = (
     # Wave 4a: the workflow authoring tools ride the jobs routing flag.
     "workflow", "automate", "automat", "every morning", "every day", "every week",
     "each morning", "each day", "schedule", "recurring", "routine", "pipeline",
+    # Hebrew whole-file / automation intents:
+    "כל הקובץ", "הקובץ כולו", "כולו", "את כל", "הכל", "הספר", "יסודי", "מקיף",
+    "לעומק", "ברקע", "משימת רקע", "תהליך", "אוטומצ", "אוטומט", "תזמן", "מתוזמן",
+    "כל בוקר", "כל יום", "כל שבוע", "פרק אחר פרק", "שורה אחר שורה",
 )
 
-_SKILL_HINTS: tuple[str, ...] = ("skill", "agent instruction")
+_SKILL_HINTS: tuple[str, ...] = ("skill", "agent instruction", "מיומנות", "סקיל")
 
 _MCP_MANAGEMENT_HINTS: tuple[str, ...] = (
     "mcp", "connector", "connectors", "integration", "integrations",
+    "מחבר", "מחברים", "אינטגרצ",
 )
 
 
@@ -192,7 +221,7 @@ __all__ = [
     "MCP_MANAGEMENT_TOOL_NAMES",
     "UI_TOOL_NAMES",
     "JOB_TOOL_NAMES",
-    "FORBIDDEN_TOOL_NAMES",
+    "ADVISOR_TOOL_NAMES",
     "wants_write_tools",
     "wants_ui_tools",
     "wants_job_tools",

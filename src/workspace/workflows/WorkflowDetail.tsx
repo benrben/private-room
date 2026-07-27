@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   api,
@@ -84,6 +85,14 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   );
   const [schedule, setSchedule] = useState<Schedule | null>(null);
   const [showSched, setShowSched] = useState(false);
+  // Where to place the schedule popover: the Schedule button's rect at open
+  // time. The popover renders in a body-level portal because every `.pane`
+  // is `overflow: hidden` + `container-type: inline-size` — the latter makes
+  // the pane the containing block even for `position: fixed` descendants, so
+  // an in-tree popover gets clipped to a sliver at the pane edge (live QA
+  // 2026-07-23: "can't see the scheduler popup").
+  const schedBtnRef = useRef<HTMLButtonElement>(null);
+  const [schedAnchor, setSchedAnchor] = useState<{ top: number; right: number } | null>(null);
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
 
@@ -281,7 +290,17 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
               <PinIcon size={12} /> {workflow.pinned ? "Pinned" : "Pin"}
             </button>
           )}
-          <button className="subtle btn-ic" onClick={() => setShowSched((v) => !v)}>
+          <button
+            ref={schedBtnRef}
+            className="subtle btn-ic"
+            onClick={() => {
+              const r = schedBtnRef.current?.getBoundingClientRect();
+              setSchedAnchor(
+                r ? { top: r.bottom + 6, right: window.innerWidth - r.right } : null,
+              );
+              setShowSched((v) => !v);
+            }}
+          >
             <CalendarClockIcon size={12} /> Schedule
           </button>
           <button
@@ -297,16 +316,25 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
           >
             Delete
           </button>
-          {showSched && (
-            <div style={{ position: "absolute", top: "100%", right: 0, zIndex: 30 }}>
-              <SchedulePopover
-                schedule={schedule}
-                disabled={isFileScoped}
-                onClose={() => setShowSched(false)}
-                onSave={(sc) => void a.setWorkflowSchedule(workflow.id, sc)}
-              />
-            </div>
-          )}
+          {showSched &&
+            createPortal(
+              <div
+                style={{
+                  position: "fixed",
+                  top: schedAnchor?.top ?? 90,
+                  right: Math.max(schedAnchor?.right ?? 16, 8),
+                  zIndex: 1000,
+                }}
+              >
+                <SchedulePopover
+                  schedule={schedule}
+                  disabled={isFileScoped}
+                  onClose={() => setShowSched(false)}
+                  onSave={(sc) => void a.setWorkflowSchedule(workflow.id, sc)}
+                />
+              </div>,
+              document.body,
+            )}
         </span>
       </div>
 

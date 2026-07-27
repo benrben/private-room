@@ -91,7 +91,9 @@ export default function Workspace({ info, onLock }: Props) {
       <StudioModal s={s} a={a} />
       <CompareModal s={s} a={a} />
       <AiActionModal s={s} a={a} />
-      <FeedbackModal s={s} />
+      {/* Mounted only while open: the draft fields are local state, so
+          unmounting is what clears them between issues (GH #3). */}
+      {s.showFeedback && <FeedbackModal s={s} />}
       <SettingsModals s={s} a={a} info={info} />
 
       <main className="pr-main">

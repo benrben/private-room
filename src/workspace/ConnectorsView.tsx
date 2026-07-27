@@ -17,21 +17,18 @@ export default function ConnectorsView() {
     installServer,
     setServerEnabled,
     removeServer,
+    autoApprove,
+    setAutoApprove,
     installedNames,
   } = useMcpConfig();
 
   // Per-connector tool opt-outs: { server: [disabled tool names] }.
   const [toolPrefs, setToolPrefs] = useState<Record<string, string[]>>({});
-  // Connectors the user exempted from the tool-count cap.
-  const [uncapped, setUncapped] = useState<string[]>([]);
   useEffect(() => {
     api.mcpGetToolPrefs().then(setToolPrefs).catch(() => {});
-    api.mcpGetUncapped().then(setUncapped).catch(() => {});
   }, []);
   const toggleTool = (server: string, tool: string, enabled: boolean) =>
     void api.mcpSetToolEnabled(server, tool, enabled).then(setToolPrefs).catch(() => {});
-  const toggleUncapped = (server: string, on: boolean) =>
-    void api.mcpSetServerUncapped(server, on).then(setUncapped).catch(() => {});
 
   return (
     <div className="connectors-page">
@@ -40,8 +37,29 @@ export default function ConnectorsView() {
         <p className="settings-hint">
           Give this room extra tools with the Model Context Protocol. Local
           connectors run on your Mac; remote ones reach out over the internet —
-          Arcelle asks before either starts, and redacts what leaves.
+          Arcelle asks before either starts, and hides this room's private
+          details in what it sends to a remote one.
         </p>
+        <label
+          className="connector-switch connectors-autoapprove"
+          title="Let the assistant run connector tools without asking, and send remote connectors your real values"
+        >
+          <input
+            type="checkbox"
+            checked={autoApprove}
+            onChange={(e) => void setAutoApprove(e.target.checked)}
+          />
+          <span className="mkt-sw" />
+          <span>
+            <b>Auto-approve connector tools</b> — the assistant runs them
+            without stopping to ask, <b>and remote connectors receive your real
+            values instead of placeholders</b>. That is what makes lookups work
+            (a connector can't answer about “[Person A]”), but it means this
+            room's private details do leave for a remote connector. Off by
+            default; while off you approve each call and remote connectors see
+            placeholders.
+          </span>
+        </label>
       </header>
 
       {mcpStatuses.length > 0 && (
@@ -102,21 +120,11 @@ export default function ConnectorsView() {
                     <details className="connector-tools">
                       <summary>Tools ({onCount}/{s.tools.length})</summary>
                       <p className="settings-hint connector-tools-hint">
-                        Turn off tools you don't need — fewer, sharper tools work
-                        better. A small local model can only juggle about a dozen at
-                        once; cloud models handle many more.
+                        Every tool you leave on is available to the assistant —
+                        it searches them by name when it needs one, so a large
+                        connector costs nothing until it's used. Turn off any
+                        you'd rather it never reach.
                       </p>
-                      <label className="connector-uncap" title="Send every tool below to the assistant, ignoring the tool limit">
-                        <input
-                          type="checkbox"
-                          checked={uncapped.includes(s.name)}
-                          onChange={(e) => toggleUncapped(s.name, e.target.checked)}
-                        />
-                        <span className="mkt-sw" />
-                        <span>
-                          Send <b>all</b> enabled tools to the assistant (ignore the limit)
-                        </span>
-                      </label>
                       <div className="connector-tool-list">
                         {s.tools.map((t) => {
                           const on = !offList.includes(t);

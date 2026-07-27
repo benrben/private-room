@@ -13,8 +13,7 @@
 use crate::ollama;
 use std::collections::BTreeMap;
 
-//: chars/token — identical to ollama.rs's `job_context_chars` ratio and
-//: usage.py's `CHARS_PER_TOKEN`.
+//: chars/token — identical to usage.py's `CHARS_PER_TOKEN`.
 pub(crate) const CHARS_PER_TOKEN: u64 = 3;
 
 //: The built-in tools whose results are literal file text/excerpts
@@ -128,63 +127,6 @@ pub(crate) fn build_usage_value(
     })
 }
 
-/// Same contract as `build_usage_value`, for a turn where `breakdown_chars`
-/// is structurally blind to some of the categories — an external-CLI turn's
-/// `categorize_messages` never sees a `role: "tool"` message at all (Claude
-/// Code/Codex run their own tool-calling loop inside the subprocess, entirely
-/// invisible to Rust), so its estimate only ever has `system`/`history`
-/// populated. Naively scaling every category proportionally to a real total
-/// (as `build_usage_value` does) would then smear ALL of that invisible
-/// tool/file activity onto `system`/`history` instead — reported live
-/// 2026-07-21 as "shows all system prompt and history, no tools, no
-/// anything." Any real total beyond the visible estimate is attributed
-/// entirely to `gap_bucket` instead — for these engines that's overwhelmingly
-/// the CLI's own tool-calling/file-reading overhead, so `"tools"` is the
-/// closest honest label, not a proportional guess across categories that
-/// were never actually measured.
-pub(crate) fn build_usage_value_opaque_gap(
-    real_total: Option<u64>,
-    max_context: u32,
-    breakdown_chars: &BTreeMap<&'static str, u64>,
-    gap_bucket: &'static str,
-) -> serde_json::Value {
-    let mut est_breakdown: BTreeMap<&str, u64> = breakdown_chars
-        .iter()
-        .map(|(k, v)| (*k, v / CHARS_PER_TOKEN))
-        .collect();
-    let est_total: u64 = est_breakdown.values().sum();
-
-    let (total_tokens, estimated) = match real_total {
-        Some(real) if real > est_total => {
-            *est_breakdown.entry(gap_bucket).or_insert(0) += real - est_total;
-            (real, false)
-        }
-        Some(real) if est_total > 0 => {
-            // Real total known but doesn't exceed the visible estimate (rare
-            // for an external CLI, but not impossible) — proportional scaling
-            // is fine here since there's no gap to misattribute.
-            for v in est_breakdown.values_mut() {
-                *v = ((*v as f64) * (real as f64) / (est_total as f64)).round() as u64;
-            }
-            (real, false)
-        }
-        Some(real) => (real, false),
-        None => (est_total, true),
-    };
-
-    let breakdown_map: serde_json::Map<String, serde_json::Value> = est_breakdown
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), serde_json::json!({ "tokens": v, "estimated": true })))
-        .collect();
-
-    serde_json::json!({
-        "total_tokens": total_tokens,
-        "max_context": max_context,
-        "estimated": estimated,
-        "breakdown": breakdown_map,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,62 +190,6 @@ mod tests {
             chars.insert(k, 0);
         }
         let v = build_usage_value(None, 8192, &chars);
-        assert_eq!(v["estimated"], true);
-        assert_eq!(v["total_tokens"], 3);
-        assert_eq!(v["breakdown"]["system"]["tokens"], 3);
-    }
-
-    #[test]
-    fn opaque_gap_attributes_the_surplus_to_the_gap_bucket_not_proportionally() {
-        // An external-CLI turn: categorize_messages never sees a role:"tool"
-        // message, so only system/history are ever nonzero here.
-        let mut chars: BTreeMap<&'static str, u64> = BTreeMap::new();
-        chars.insert("system", 300); // -> 100 est tokens
-        chars.insert("history", 600); // -> 200 est tokens
-        chars.insert("tools", 0);
-        chars.insert("skills", 0);
-        chars.insert("files", 0);
-        // Real total is far larger than the visible estimate (300 tokens) —
-        // the CLI did a lot of invisible tool/file work this turn.
-        let v = build_usage_value_opaque_gap(Some(5_300), 1_050_000, &chars, "tools");
-        assert_eq!(v["total_tokens"], 5300);
-        assert_eq!(v["max_context"], 1_050_000);
-        assert_eq!(v["estimated"], false);
-        // system/history keep their OWN estimated values — not scaled up.
-        assert_eq!(v["breakdown"]["system"]["tokens"], 100);
-        assert_eq!(v["breakdown"]["history"]["tokens"], 200);
-        // The entire gap (5300 - 300 = 5000) lands on the gap bucket, not
-        // smeared across every category.
-        assert_eq!(v["breakdown"]["tools"]["tokens"], 5000);
-        assert_eq!(v["breakdown"]["skills"]["tokens"], 0);
-        assert_eq!(v["breakdown"]["files"]["tokens"], 0);
-    }
-
-    #[test]
-    fn opaque_gap_scales_proportionally_when_real_total_is_not_a_surplus() {
-        let mut chars: BTreeMap<&'static str, u64> = BTreeMap::new();
-        chars.insert("system", 30); // -> 10 est tokens
-        chars.insert("history", 60); // -> 20 est tokens
-        chars.insert("tools", 0);
-        chars.insert("skills", 0);
-        chars.insert("files", 0);
-        // Real total (20) is LESS than the visible estimate (30) — no gap to
-        // misattribute, so this falls back to proportional scaling.
-        let v = build_usage_value_opaque_gap(Some(20), 8192, &chars, "tools");
-        assert_eq!(v["total_tokens"], 20);
-        assert_eq!(v["breakdown"]["system"]["tokens"], 7); // round(10 * 20/30)
-        assert_eq!(v["breakdown"]["history"]["tokens"], 13); // round(20 * 20/30)
-        assert_eq!(v["breakdown"]["tools"]["tokens"], 0);
-    }
-
-    #[test]
-    fn opaque_gap_falls_back_to_the_raw_estimate_with_no_real_total() {
-        let mut chars: BTreeMap<&'static str, u64> = BTreeMap::new();
-        chars.insert("system", 9); // -> 3 est tokens
-        for k in ["history", "tools", "skills", "files"] {
-            chars.insert(k, 0);
-        }
-        let v = build_usage_value_opaque_gap(None, 8192, &chars, "tools");
         assert_eq!(v["estimated"], true);
         assert_eq!(v["total_tokens"], 3);
         assert_eq!(v["breakdown"]["system"]["tokens"], 3);

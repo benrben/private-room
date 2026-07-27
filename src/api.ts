@@ -69,6 +69,9 @@ import type {
   AskPrivacy,
   AiProviderStatus,
   AskTokenUsage,
+  AskPlanStep,
+  AskActiveAgent,
+  AskStep,
   PrivacyEntity,
   PrivacyPreview,
   PrivacyScanProgress,
@@ -187,6 +190,11 @@ export const api = {
   // SEC-1b: answer a per-call MCP approval prompt ("once" | "always" | "deny").
   resolveMcpCall: (id: string, decision: "once" | "always" | "deny") =>
     invoke<void>("resolve_mcp_call", { id, decision }),
+  // Connectors → Auto-approve ("auto mode"): read/flip blanket consent for
+  // connector tool calls so the agent's run_mcp_tool never stalls on a card.
+  getMcpAutoApprove: () => invoke<boolean>("get_mcp_auto_approve"),
+  setMcpAutoApprove: (on: boolean) =>
+    invoke<void>("set_mcp_auto_approve", { on }),
   // Marketplace: search the live MCP registry (opt-in gated). Errors when
   // browsing is off so the UI can show the opt-in gate.
   mcpRegistrySearch: (query?: string, limit?: number) =>
@@ -235,24 +243,6 @@ export const api = {
       ) as Record<string, string[]>;
     } catch {
       return {};
-    }
-  },
-  // Connectors exempted from the tool-count cap (all their enabled tools reach
-  // the assistant). A list of server names.
-  mcpGetUncapped: async (): Promise<string[]> => {
-    try {
-      return JSON.parse(await invoke<string>("mcp_get_uncapped")) as string[];
-    } catch {
-      return [];
-    }
-  },
-  mcpSetServerUncapped: async (server: string, uncapped: boolean): Promise<string[]> => {
-    try {
-      return JSON.parse(
-        await invoke<string>("mcp_set_server_uncapped", { server, uncapped }),
-      ) as string[];
-    } catch {
-      return [];
     }
   },
   // Wave 2 (Idea 6): answer a diff-preview approval ("once" | "turn" | "deny").
@@ -545,15 +535,37 @@ export const api = {
   // CHG-5: structured turn events. `ask-step` fires when a tool runs;
   // `ask-round` fires when a new model round starts (clear the live text);
   // `ask-notice` carries a user-facing warning (e.g. UX-4 truncation).
-  onAskStep: (cb: (label: string) => void): Promise<UnlistenFn> =>
-    listen<string>("ask-step", (e) => cb(e.payload)),
+  // Two payload shapes reach this event: the sidecar sends {label, node} so a
+  // step can be attributed to the agent that ran it, while the many other
+  // emitters (chat commands, ai_actions, the native agent paths) send a bare
+  // string. Normalised here so no consumer has to know which one fired.
+  onAskStep: (cb: (step: AskStep) => void): Promise<UnlistenFn> =>
+    listen<string | AskStep>("ask-step", (e) =>
+      cb(
+        typeof e.payload === "string"
+          ? { label: e.payload, node: null }
+          : { label: e.payload.label, node: e.payload.node ?? null },
+      ),
+    ),
   // ADD-22: the deterministic router's chosen lane ("Answering", "Working on
   // your files", …), shown as a subtle label so an odd answer is explainable.
   onAskLane: (cb: (label: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-lane", (e) => cb(e.payload)),
+  // Dispatch-first agent visibility: the roster of domain agents handling
+  // this ask (once, before work starts) and the currently active one.
+  onAskPlan: (cb: (plan: AskPlanStep[]) => void): Promise<UnlistenFn> =>
+    listen<AskPlanStep[]>("ask-plan", (e) => cb(e.payload)),
+  onAskAgent: (cb: (agent: AskActiveAgent) => void): Promise<UnlistenFn> =>
+    listen<AskActiveAgent>("ask-agent", (e) => cb(e.payload)),
   // ADD-22: outcome of the most recent tool step, so a failed chip reads failed.
-  onAskStepStatus: (cb: (p: { ok: boolean }) => void): Promise<UnlistenFn> =>
-    listen<{ ok: boolean }>("ask-step-status", (e) => cb(e.payload)),
+  // `node` (when present) says WHOSE most-recent step this resolves — with
+  // parallel children "the most recent step" is ambiguous without it.
+  onAskStepStatus: (
+    cb: (p: { ok: boolean; node?: string | null }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ ok: boolean; node?: string | null }>("ask-step-status", (e) =>
+      cb(e.payload),
+    ),
   onAskRound: (cb: () => void): Promise<UnlistenFn> =>
     listen("ask-round", () => cb()),
   onAskNotice: (cb: (text: string) => void): Promise<UnlistenFn> =>
@@ -665,6 +677,10 @@ export const api = {
   /** Studio-style edit: delete a [t0,t1) span from transcript + playback. */
   recDeleteRange: (id: string, t0: number, t1: number) =>
     invoke<RecMeta>("rec_delete_range", { id, t0, t1 }),
+  /** GH #5: name a speaker after transcribing ("Speaker 2" → "Dana"). Renames
+   * every line they said at once; an empty name restores the machine label. */
+  recSetSpeakerName: (id: string, speaker: string, name: string) =>
+    invoke<RecMeta>("rec_set_speaker_name", { id, speaker, name }),
   /** Render the cuts into a new "<name> (edited).wav" file. */
   recExportClean: (id: string) => invoke<FileMeta>("rec_export_clean", { id }),
   /** Translate the whole transcript on the local model into any language. */

@@ -1,0 +1,503 @@
+/* ---------- the live agent graph ----------
+   Hub-and-spoke picture of one chat turn: the Main agent roots the left, every
+   dispatched specialist sits in a column to its right, and children dispatched
+   in the same round share a "N in parallel" band. Sits inline in the streaming
+   assistant bubble, so it stays quiet: small type, hairline rules, no fill
+   heavier than a token colour-mix.
+
+   Everything below resolves through tokens.css, so light and dark are both
+   correct without a second palette. Status is NEVER carried by colour alone —
+   each state also has its own glyph (○ ◐ ✓ ⚠), border weight and dash. */
+
+.agraph {
+  margin-bottom: 7px;
+  max-width: 100%;
+}
+
+.agraph-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: 5px;
+}
+.agraph-summary {
+  font-size: 10px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.agraph-expand {
+  margin-inline-start: auto;
+  font-size: 10px;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  padding: 1px 7px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.agraph-expand:hover {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+}
+
+/* Screen-reader-only running summary. One live region for the whole graph:
+   eight nodes each announcing themselves would be unusable. */
+.agraph-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  margin: 0;
+}
+
+/* ---- canvas: hub | (measured edge layer) | children ---- */
+.agraph-canvas {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 46px;
+  padding: 2px 0;
+  /* Tall enough that a realistic roster (up to ~7 specialists) never needs a
+     nested scrollbar — a scroll region inside a scrolling chat is a trap. The
+     cap only catches pathological turns, and the fade says so. */
+  max-height: 320px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+}
+/* No fade when nothing is clipped — the mask would dim the last row for free. */
+.agraph-canvas:not(.scrolls) {
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+/* The overlay copy: real width, so the instruction can ride its own edge the
+   way a graph should show it. Never used inline — at the chat pane's typical
+   ~290px these labels overlap each other and the nodes. */
+.agraph-canvas.roomy {
+  gap: clamp(120px, 26vw, 300px);
+  max-height: none;
+  padding: var(--sp-4) 0;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+.agraph-canvas.roomy .agraph-node {
+  padding: 7px 12px;
+}
+.agraph-canvas.roomy .agraph-node-label {
+  font-size: 12.5px;
+}
+
+/* ---- expanded overlay ---- */
+.agraph-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+  padding: var(--sp-6);
+}
+.agraph-modal {
+  width: min(880px, 92vw);
+  max-height: 86vh;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 24px 60px var(--shadow);
+}
+.agraph-modal-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+.agraph-modal-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-strong);
+}
+.agraph-modal-head .agraph-expand {
+  margin-inline-start: auto;
+}
+.agraph-modal-body {
+  overflow-y: auto;
+  padding: var(--sp-2) var(--sp-4) var(--sp-4);
+}
+
+.agraph-edges {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.agraph-edge {
+  fill: none;
+  stroke: var(--line);
+  stroke-width: 1.5;
+}
+.agraph-edge.pending {
+  stroke-dasharray: 3 4;
+  opacity: 0.7;
+}
+.agraph-edge.running {
+  stroke: var(--accent);
+  stroke-dasharray: 5 5;
+  animation: agraph-flow 0.9s linear infinite;
+}
+.agraph-edge.done {
+  stroke: color-mix(in srgb, var(--green) 55%, var(--line));
+}
+.agraph-edge.failed {
+  stroke: color-mix(in srgb, var(--red) 60%, var(--line));
+  stroke-dasharray: 2 3;
+}
+@keyframes agraph-flow {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
+
+/* Haloed in the panel colour so the spokes it rides never cut through the
+   words. `paint-order` draws the stroke first, under the fill. */
+.agraph-edge-label {
+  fill: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.01em;
+  stroke: var(--panel);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+  paint-order: stroke fill;
+}
+
+.agraph-hub {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.agraph-children {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ---- a parallel band: the whole point of the feature ----
+   A group of children dispatched in ONE round. The rail + tag say "these are
+   simultaneous" structurally, so the concurrency survives a greyscale print,
+   a colour-blind reader, and the reduced-motion path where nothing pulses. */
+.agraph-band {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+}
+.agraph-band.parallel {
+  padding: 5px 6px 6px;
+  border: 1px dashed var(--line-soft);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+}
+.agraph-band-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.agraph-band-rail {
+  width: 12px;
+  height: 1px;
+  background: var(--accent);
+  opacity: 0.6;
+}
+
+/* ---- nodes ---- */
+.agraph-node {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  text-align: start;
+  font: inherit;
+  padding: 4px 9px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  position: relative;
+  z-index: 1;
+  transition: border-color 0.18s ease, background 0.18s ease,
+    box-shadow 0.18s ease, opacity 0.18s ease;
+  /* New spokes fade+slide in as the roster grows. Subtle on purpose: this sits
+     inside a chat the user is reading. */
+  animation: agraph-node-in 0.26s ease both;
+}
+.agraph-node.hub {
+  background: var(--panel-2);
+  border-color: var(--border-strong);
+}
+.agraph-node:hover {
+  border-color: var(--accent);
+  background: var(--hover);
+}
+.agraph-node:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.agraph-node.selected {
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.agraph-node.pending {
+  border-style: dashed;
+  opacity: 0.72;
+}
+.agraph-node.running {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 9%, var(--panel));
+}
+.agraph-node.done {
+  border-color: color-mix(in srgb, var(--green) 42%, var(--line));
+}
+.agraph-node.failed {
+  border-color: color-mix(in srgb, var(--red) 55%, var(--line));
+  border-width: 1.5px;
+}
+@keyframes agraph-node-in {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+}
+
+.agraph-glyph {
+  flex: 0 0 auto;
+  width: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: var(--muted);
+}
+.agraph-node.done .agraph-glyph {
+  color: var(--green);
+}
+.agraph-node.failed .agraph-glyph {
+  color: var(--red);
+}
+.agraph-node.running .agraph-glyph {
+  color: var(--accent);
+}
+
+/* The running mark: a rotating arc, so "busy" is legible as motion AND as a
+   distinct shape when motion is off (it falls back to a static ring). */
+.agraph-spin {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  animation: agraph-spin 0.75s linear infinite;
+}
+@keyframes agraph-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.agraph-node-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 1px;
+}
+.agraph-node-label {
+  font-size: 11px;
+  font-weight: 550;
+  color: var(--text-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agraph-node.pending .agraph-node-label {
+  font-weight: 500;
+  color: var(--text);
+}
+/* The instruction the hub handed this child. Lives in the card rather than on
+   the 46px spoke, where it would be unreadable; the expanded view puts it back
+   on the edge, where there is room for it. */
+.agraph-node-sub {
+  font-size: 10px;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agraph-canvas.roomy .agraph-node-sub {
+  display: none;
+}
+.agraph-elapsed {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- inspector ---- */
+.agraph-inspect {
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  padding: var(--sp-2) var(--sp-3);
+  animation: agraph-node-in 0.2s ease both;
+}
+.agraph-inspect-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.agraph-inspect-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.agraph-inspect-id {
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--hover);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+}
+.agraph-inspect-status {
+  font-size: 10px;
+  color: var(--muted);
+}
+.agraph-inspect-status.done {
+  color: var(--green);
+}
+.agraph-inspect-status.failed {
+  color: var(--red);
+}
+.agraph-inspect-status.running {
+  color: var(--accent);
+}
+.agraph-inspect-close {
+  margin-inline-start: auto;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+}
+.agraph-inspect-close:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.agraph-inspect-desc {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.agraph-inspect-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px var(--sp-3);
+  margin: var(--sp-2) 0 0;
+  font-size: 11px;
+}
+.agraph-inspect-facts dt {
+  color: var(--faint);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding-top: 1px;
+}
+.agraph-inspect-facts dd {
+  margin: 0;
+  color: var(--text);
+  min-width: 0;
+}
+.agraph-inspect-instruction {
+  line-height: 1.45;
+}
+.agraph-mini-chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+  border-radius: 20px;
+  padding: 0 7px;
+  margin: 0 4px 3px 0;
+}
+.agraph-mini-chip.done {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 35%, transparent);
+}
+.agraph-mini-chip.failed {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 40%, transparent);
+}
+.agraph-mini-chip.running {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.agraph-inspect-steps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--line-soft);
+}
+.agraph-inspect-steps-cap {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+}
+.agraph-inspect-empty {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+/* Motion is decoration here — every state is already carried by glyph, border
+   and text, so removing it loses nothing. */
+@media (prefers-reduced-motion: reduce) {
+  .agraph-node,
+  .agraph-inspect {
+    animation: none;
+  }
+  .agraph-edge.running {
+    animation: none;
+  }
+  .agraph-spin {
+    animation: none;
+    border-top-color: var(--accent);
+  }
+}

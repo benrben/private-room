@@ -85,6 +85,68 @@ fn migrates_old_rooms_into_sessions() {
         })
         .unwrap();
     assert!(chat_id.is_some(), "old message was not adopted into a chat");
+    // The skills table did not exist in this room at all. `migrate` must mint
+    // it (already carrying `agent`), not abort on the ADD COLUMN — that error
+    // is fatal, so the whole room became unopenable.
+    let agent: String = conn
+        .query_row(
+            "SELECT ifnull(group_concat(name), '') FROM pragma_table_info('skills') \
+             WHERE name = 'agent'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(agent, "agent", "the skills table was not created with `agent`");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The other half of the same migration: a room whose `skills` table PREDATES
+/// the `agent` column. Here the ALTER is the thing that must actually run, and
+/// existing rows must survive it as GENERAL skills (empty owner).
+#[test]
+fn adds_the_agent_column_to_a_legacy_skills_table() {
+    let dir = std::env::temp_dir().join(format!("roomai-skills-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("legacy-skills.roomai");
+    let path_str = path.to_string_lossy().to_string();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "key", "pw").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES('format','roomai'),('name','legacy');
+             CREATE TABLE messages(
+               id TEXT PRIMARY KEY, role TEXT NOT NULL, content TEXT NOT NULL,
+               sources TEXT,
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+             CREATE TABLE skills(
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL UNIQUE,
+               description TEXT NOT NULL,
+               instructions TEXT NOT NULL DEFAULT '',
+               enabled INTEGER NOT NULL DEFAULT 1,
+               created_by TEXT NOT NULL DEFAULT 'user',
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+               updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+             INSERT INTO skills(id, name, description) VALUES('s1','review','Review a doc');",
+        )
+        .unwrap();
+    }
+
+    let conn = db::open_room(&path_str, "pw").unwrap();
+    let owner: String = conn
+        .query_row("SELECT agent FROM skills WHERE id = 's1'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(owner, "", "a pre-existing skill must stay GENERAL");
+    // Re-opening is a no-op: the duplicate-column error is the idempotence check.
+    drop(conn);
+    let conn = db::open_room(&path_str, "pw").unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM skills", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

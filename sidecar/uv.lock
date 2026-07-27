@@ -175,7 +175,7 @@ wheels = [
 
 [[package]]
 name = "arcelle-sidecar"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "." }
 dependencies = [
     { name = "edge-tts" },
@@ -184,6 +184,7 @@ dependencies = [
     { name = "langchain-core" },
     { name = "langchain-ollama" },
     { name = "langgraph" },
+    { name = "langgraph-checkpoint" },
     { name = "pillow" },
     { name = "pydantic" },
     { name = "starlette" },
@@ -201,9 +202,10 @@ requires-dist = [
     { name = "edge-tts", specifier = ">=7.0" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "langchain-core", specifier = ">=0.3" },
+    { name = "langchain-core", specifier = ">=1.4,<2" },
     { name = "langchain-ollama", specifier = ">=0.2" },
-    { name = "langgraph", specifier = ">=0.2" },
+    { name = "langgraph", specifier = ">=1.2,<2" },
+    { name = "langgraph-checkpoint", specifier = ">=4.1,<5" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },

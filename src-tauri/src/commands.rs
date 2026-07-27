@@ -93,9 +93,6 @@ pub(crate) const MAX_CONTEXT_CHUNKS: usize = 6;
 /// vector-only (synonym) chunk can surface above weak keyword hits.
 pub(crate) const RETRIEVE_CANDIDATES: usize = MAX_CONTEXT_CHUNKS * 4;
 pub(crate) const MAX_ATTACHED_IMAGES: usize = 4;
-/// Shared character budget for all text attachments in one question — a
-/// first-come cap so N attached files can never blow the 8K window.
-pub(crate) const MAX_ATTACHED_TEXT_TOTAL: usize = 12_000;
 pub(crate) const MAX_HISTORY_MESSAGES: usize = 12;
 /// Whole-conversation history budget (chars), applied newest-first so recent
 /// turns survive and ancient ones drop wholesale instead of each being cut.
@@ -103,21 +100,6 @@ pub(crate) const MAX_HISTORY_CHARS: usize = 12_000;
 /// Injected persistent-memory budget (chars) and per-memory write cap.
 pub(crate) const MAX_MEMORY_INJECT_CHARS: usize = 1_500;
 pub(crate) const MAX_MEMORY_CONTENT_CHARS: usize = 500;
-/// External tool results (web pages, search results) can be huge; clamp
-/// them so a few rounds still fit the context window.
-pub(crate) const MAX_TOOL_RESULT_CHARS: usize = 4000;
-/// Keep the tool catalog small enough for an 8-12K context and a 4B model.
-/// A 4B model cannot reliably choose among more than ~12 tools.
-pub(crate) const MAX_MCP_TOOLS: usize = 12;
-/// Whole-catalog character budget for connected MCP tool specs.
-pub(crate) const MAX_MCP_CATALOG_CHARS: usize = 8_000;
-/// Cloud/external engines (`:cloud`, claude-cli, codex-cli) have big contexts and
-/// handle many tools fine — the tight 12/8000 budget above is a LOCAL-4B limit,
-/// and applying it to a cloud model silently hides most of a connector's tools
-/// (a 15-tool server showed only ~4). These are the generous caps used when the
-/// chosen engine isn't the small local model. `mcp_routes` picks per engine.
-pub(crate) const MAX_MCP_TOOLS_CLOUD: usize = 64;
-pub(crate) const MAX_MCP_CATALOG_CHARS_CLOUD: usize = 64_000;
 /// ADD-21: at most this many cloud-advisor consults per `ask`. A consult is a
 /// slow, paid cloud call; one per turn keeps the local loop from flailing into
 /// repeated exfiltration when it could just answer.
@@ -130,11 +112,6 @@ pub(crate) const MCP_CONFIG_KEY: &str = "mcp_config";
 /// toggling a tool must not change the config fingerprint and re-trigger the
 /// SEC-1 approval dialog.
 pub(crate) const MCP_TOOL_PREFS_KEY: &str = "mcp_tool_prefs";
-/// Connectors the user has opted OUT of the tool-count cap for: a JSON array of
-/// server names. For a server listed here, `mcp_routes` sends EVERY enabled tool
-/// to the assistant, ignoring `MAX_MCP_TOOLS*`/`MAX_MCP_CATALOG_CHARS*` — an
-/// explicit "I know, show them all" override (default off keeps the cap).
-pub(crate) const MCP_TOOL_UNCAPPED_KEY: &str = "mcp_tool_uncapped";
 /// Shown as the starting config. The web-search entry ships disabled so a
 /// room never reaches the internet without the user flipping it on.
 // Ship an empty scaffold, not a search example: web search has one clear home
@@ -173,6 +150,26 @@ pub struct AppState {
     /// user chose "always allow" for, cleared when the room closes.
     pub mcp_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<McpDecision>>>,
     pub mcp_session_ok: Mutex<HashSet<String>>,
+    /// "Auto mode" for connector tool calls (Connectors → Auto-approve).
+    ///
+    /// It opens TWO gates, and both belong in this doc because the pair is what
+    /// makes it a real choice rather than a convenience:
+    ///
+    /// 1. `mcp_call_approved` returns true without emitting a consent card, so
+    ///    an agent's `run_mcp_tool` calls never stall on a prompt nobody is
+    ///    watching (a card left unanswered for 180s counts as a decline, which
+    ///    read to the model — and the user — as "the connector tool fails every
+    ///    time").
+    /// 2. `exec_tool` skips the outbound remote-seam redaction, so a REMOTE
+    ///    connector receives the room's real values (`masks_outbound_args`).
+    ///    Masking rewrites the values the connector is asked ABOUT, which broke
+    ///    the lookups outright; full approval means real arguments.
+    ///
+    /// Because (2) genuinely weakens what leaves the Mac, this defaults to OFF
+    /// (`read_mcp_auto_approve`) and the Connectors copy states both effects.
+    /// Loaded from disk at startup (`setup`) and persisted per-Mac like
+    /// `mcp_approvals.json`, outside any room.
+    pub mcp_auto_approve: Arc<AtomicBool>,
     /// Wave 2 (Idea 6): per-call diff-preview consent, mirroring `mcp_pending`.
     /// Holds the reply channel for each in-flight edit-approval request (keyed by
     /// request id); the frontend answers via `resolve_edit_approval`. Cleared on

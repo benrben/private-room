@@ -121,10 +121,12 @@ async def test_map_merge_mode_builds_notes_prompt_and_artifact(monkeypatch: pyte
     assert fake.calls[0]["temperature"] == file_pass.PASS_TEMPERATURE
 
 
-async def test_calls_pass_an_output_cap_to_stop_runaway_generation(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Every pass model call sets num_predict so a degenerate loop can't fill the
-    # whole num_ctx window (~72 min on a 4B). Map uses the small notes cap; the
-    # doc-level step (section) uses the larger one.
+async def test_both_pass_steps_carry_a_runaway_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `num_predict` is a runaway guard, not a quality limit. Uncapped, a
+    # degenerate repetition loop generates until it fills the whole window —
+    # hit on ~4 % of section composes in a multi-doc sweep — and the window is
+    # payload-fitted now, so it can be 128k and grind for hours on one part
+    # while holding the serial local-model lane.
     fake = set_replies(monkeypatch,
                        json.dumps({"notes": "n", "thread": "t"}),   # map
                        json.dumps({"html": "<p>s</p>"}))             # section
@@ -135,7 +137,10 @@ async def test_calls_pass_an_output_cap_to_stop_runaway_generation(monkeypatch: 
     await file_pass.run_section(model="m", base_url="http://h:1", instruction="g", file_name="f",
                                 section=0, total=1, sections=["s"])
     assert fake.calls[-1]["num_predict"] == file_pass.PASS_DOC_PREDICT
-    assert file_pass.PASS_MAP_PREDICT < file_pass.PASS_DOC_PREDICT
+    # Both ceilings sit well above the BYTE clamp that actually shapes each
+    # artifact, so neither can ever truncate real output.
+    assert file_pass.PASS_MAP_PREDICT * 3 > file_pass.PASS_NOTES_MAX
+    assert file_pass.PASS_DOC_PREDICT * 3 > file_pass.PASS_SECTION_MAX // 2
 
 
 async def test_map_stitch_mode_uses_result_key_and_byte_cap(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,0 +1,1375 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Save a permanent memory note that the assistant will always see in this room.",
+    "inputSchema": {
+      "properties": {
+        "category": {
+          "description": "What kind of note this is (optional)",
+          "enum": [
+            "preference",
+            "fact",
+            "project",
+            "instruction"
+          ],
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "add_memory"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Highlight a spot in a document or spreadsheet so the user sees it marked in the viewer. Quote exact text from the file, or give a cell range for spreadsheets. For images use mark_image instead. Example: {\"name\": \"lease.pdf\", \"text\": \"no pets are allowed\", \"note\": \"pet clause\"}",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "File name or part of it",
+          "type": "string"
+        },
+        "note": {
+          "description": "Short label explaining the highlight",
+          "type": "string"
+        },
+        "page": {
+          "description": "PDF page the text is on, if known",
+          "type": "integer"
+        },
+        "range": {
+          "description": "Cell or range to highlight, like B7 or B2:D5",
+          "type": "string"
+        },
+        "sheet": {
+          "description": "Sheet name, for spreadsheets",
+          "type": "string"
+        },
+        "text": {
+          "description": "Short exact quote copied from the file (max ~200 chars)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "annotate_file"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create a new note/document file saved into the room. For a document without a specific format, write the content as simple HTML body markup (<h2>, <p>, <ul>, <table>) and the app saves it as an .html page. Only use another extension (.md, .csv, .txt) if the user asked for it. HTML opens in a network-blocked sandbox, so any page you write — especially a dashboard or anything with charts — MUST be fully self-contained: inline ALL CSS and JavaScript, embed the data as literals in the page (never fetch()/XHR at view time — it is blocked), and draw charts as inline SVG (preferred) or with a charting library whose full source you paste inline. NEVER reference a CDN or any external <script src>/<link href>/remote image — it silently won't load and the chart renders blank. If the data is 'live', snapshot the current numbers into the page.",
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "create_file"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Remove one MCP connector from this room, including its saved OAuth token. Use only when the user explicitly asks to remove that connector.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Connector name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "delete_mcp"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Forget a memory note the user no longer wants remembered. Identify it by a distinctive phrase from the note itself, not by an id.",
+    "inputSchema": {
+      "properties": {
+        "find": {
+          "description": "A distinctive phrase from the note to forget",
+          "type": "string"
+        }
+      },
+      "required": [
+        "find"
+      ],
+      "type": "object"
+    },
+    "name": "delete_memory"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Delete an entire Agent Skill and all of its bundled resources. Use only when the user explicitly asks to delete that skill.",
+    "inputSchema": {
+      "properties": {
+        "skill": {
+          "description": "Skill name or id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill"
+      ],
+      "type": "object"
+    },
+    "name": "delete_skill"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Delete one bundled resource from a skill. Use only when the user explicitly asks to remove that resource.",
+    "inputSchema": {
+      "properties": {
+        "path": {
+          "description": "Relative resource path",
+          "type": "string"
+        },
+        "skill": {
+          "description": "Skill name or id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "delete_skill_resource"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Delete a workflow and its schedule/run history. Any unfinished run is cancelled first. Use only when the user explicitly asks to delete that workflow.",
+    "inputSchema": {
+      "properties": {
+        "name_or_id": {
+          "description": "Workflow name or id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name_or_id"
+      ],
+      "type": "object"
+    },
+    "name": "delete_workflow"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Change ONE place in ONE file (text, code, notes, csv, or docx) by replacing exact text. Copy old_text exactly as it appears in the file — curly quotes, spacing and dashes are matched tolerantly, but old_text must identify a UNIQUE spot: if it appears more than once you get an error with the count, then either add surrounding text to pick one place or pass all: true to replace every occurrence. To change several places or several files at once, use edit_files. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
+    "inputSchema": {
+      "properties": {
+        "all": {
+          "description": "Replace EVERY occurrence of old_text (default false → the text must appear exactly once)",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "File name or part of it",
+          "type": "string"
+        },
+        "new_text": {
+          "description": "Text to replace it with",
+          "type": "string"
+        },
+        "old_text": {
+          "description": "Exact text currently in the file",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "old_text",
+        "new_text"
+      ],
+      "type": "object"
+    },
+    "name": "edit_file"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Change several files (or several places in one file) in ONE atomic step: every edit is checked first, then all are applied together — if any single edit can't match, none are applied. Also renames files as part of the same atomic change, so \"rename X and update every reference\" fully lands or fully doesn't. Prefer this over repeated edit_file calls when a change spans files. Example: {\"edits\": [{\"name\": \"a.md\", \"old_text\": \"foo\", \"new_text\": \"bar\"}, {\"name\": \"old.md\", \"new_name\": \"new.md\"}]}",
+    "inputSchema": {
+      "properties": {
+        "edits": {
+          "description": "The changes to apply atomically. Each is either an edit {name, old_text, new_text} or a rename {name, new_name}.",
+          "items": {
+            "properties": {
+              "name": {
+                "description": "File name or part of it",
+                "type": "string"
+              },
+              "new_name": {
+                "description": "For a rename: the file's new name",
+                "type": "string"
+              },
+              "new_text": {
+                "description": "For an edit: text to replace it with",
+                "type": "string"
+              },
+              "old_text": {
+                "description": "For an edit: exact text currently in the file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "edits"
+      ],
+      "type": "object"
+    },
+    "name": "edit_files"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Fetch one web page by URL and return its readable text. If the result is truncated, call again with the same url and the start value from the truncation notice to read further.",
+    "inputSchema": {
+      "properties": {
+        "start": {
+          "description": "Character offset to continue reading a long page; use the value from the truncation notice.",
+          "type": "integer"
+        },
+        "url": {
+          "description": "Full http(s) URL",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "name": "fetch_page"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Write a two-voice podcast script from this room's material and save it as a new file.",
+    "inputSchema": {
+      "properties": {
+        "instructions": {
+          "description": "What the episode should cover",
+          "type": "string"
+        },
+        "refs": {
+          "description": "Optional file names to build from; omit to use the whole room",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "generate_podcast_script"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "job_status"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List the room's MCP connectors with their enabled state, transport, and live status. Use this to inspect or manage connectors.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_mcps"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List every memory note saved in this room. Use it when asked what you remember, or when the notes shown in context look incomplete.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_memories"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List every file stored in this room with its type and size.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_room_files"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List the runnable .py/.js scripts in this room, with their declared dependencies and whether the user has already approved each one to run.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_scripts"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List the Agent Skills available to you, including disabled drafts. Call this to see which procedures exist for your domain, then read_skill to load one.",
+    "inputSchema": {
+      "properties": {
+        "agent": {
+          "description": "Internal: the calling sub-agent's id. The sidecar fills this; leave it out.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_skills"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List the saved workflows in this room (name, id, status, schedule). Pass `name` to get one workflow's full definition JSON — needed before update_workflow.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Optional: a workflow name to fetch its full definition",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_workflows"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Run one prompt on the user's LOCAL model on this Mac and return its text (or JSON when a schema is given). Slow but private — use it for steps whose content must not leave this machine. For reading a whole huge file use start_file_pass instead.",
+    "inputSchema": {
+      "properties": {
+        "long": {
+          "description": "true to allow a big-context call for large prompts (slower prefill)",
+          "type": "boolean"
+        },
+        "prompt": {
+          "description": "The full, self-contained prompt",
+          "type": "string"
+        },
+        "schema": {
+          "description": "Optional JSON Schema — the reply is constrained to match it",
+          "type": "object"
+        },
+        "system": {
+          "description": "Optional system instruction",
+          "type": "string"
+        },
+        "temperature": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "name": "local_generate"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Draw labeled boxes on an image in the room showing where something is.",
+    "inputSchema": {
+      "properties": {
+        "find": {
+          "description": "What to locate in the image",
+          "type": "string"
+        },
+        "image_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "image_name",
+        "find"
+      ],
+      "type": "object"
+    },
+    "name": "mark_image"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Move a file into a folder (created if it doesn't exist), or to the top level with an empty folder. Example: {\"name\": \"NVDA_Stock_Info.md\", \"folder\": \"stocks\"}",
+    "inputSchema": {
+      "properties": {
+        "folder": {
+          "description": "Destination folder name; empty string for the top level",
+          "type": "string"
+        },
+        "name": {
+          "description": "File name or part of it",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "folder"
+      ],
+      "type": "object"
+    },
+    "name": "move_file"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Open a file in the app's viewer pane so the user sees it. To jump to a passage, pass find with a short exact quote (copied from search_room results) — the viewer locates the right page itself, in any language; never ask the user for a page number. page/cell also work when known.",
+    "inputSchema": {
+      "properties": {
+        "cell": {
+          "description": "Spreadsheet cell to show, like B7",
+          "type": "string"
+        },
+        "find": {
+          "description": "Short exact text from the file to locate, scroll to, and show — use this to jump to content found with search_room",
+          "type": "string"
+        },
+        "name": {
+          "description": "File name or a distinctive part of it",
+          "type": "string"
+        },
+        "page": {
+          "description": "PDF page number to show",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "open_file"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read one connector's configuration for editing. Secret header, environment, and OAuth values are redacted and never shown to the agent.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Connector name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "read_mcp"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Load a skill's full SKILL.md instructions and resource tree. Call this when an available skill's description matches the user's task, before doing the work.",
+    "inputSchema": {
+      "properties": {
+        "skill": {
+          "description": "Skill name or id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill"
+      ],
+      "type": "object"
+    },
+    "name": "read_skill"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read one text file from a loaded skill, such as references/policy.md or scripts/process.py. Use the relative path listed by read_skill.",
+    "inputSchema": {
+      "properties": {
+        "path": {
+          "description": "Relative resource path",
+          "type": "string"
+        },
+        "skill": {
+          "description": "Skill name or id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "read_skill_resource"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Rename a file in the room. The extension is kept if you omit it. Example: {\"name\": \"draft.md\", \"new_name\": \"Q3 plan\"}",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Current file name or part of it",
+          "type": "string"
+        },
+        "new_name": {
+          "description": "The new name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "new_name"
+      ],
+      "type": "object"
+    },
+    "name": "rename_file"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Transcribe a room audio/video file again on this computer — use when a transcript is missing, in the wrong language, or poor. Nothing is uploaded.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "The file's name in this room",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "retranscribe_file"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Run one connected room MCP tool returned by search_mcp_tools. Pass its exact tool id and arguments matching the returned input schema.",
+    "inputSchema": {
+      "properties": {
+        "arguments": {
+          "description": "Arguments matching that tool's input schema.",
+          "type": "object"
+        },
+        "tool": {
+          "description": "Exact tool id returned by search_mcp_tools.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "name": "run_mcp_tool"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Run one of this room's scripts now. The user is asked to approve any script whose exact contents they have not approved before — including one you just wrote. Output and any files it writes appear in the Scripts view.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "The script's file name, e.g. etf-report.py",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "run_script"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Run an enabled skill's bundled Python or JavaScript helper from scripts/ in an isolated temporary copy of the skill folder. The user must approve the exact script contents first. Optional input is sent on stdin; stdout is returned.",
+    "inputSchema": {
+      "properties": {
+        "input": {
+          "description": "Optional text sent to the script on stdin",
+          "type": "string"
+        },
+        "path": {
+          "description": "Relative scripts/... .py or .js path",
+          "type": "string"
+        },
+        "skill": {
+          "description": "Enabled skill name or id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "run_skill_script"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Run an ACTIVE workflow now, in the background. Optionally pass `file` (a file name) for a file-scoped workflow. After starting it, tell the user it is underway — do not wait for it or poll.",
+    "inputSchema": {
+      "properties": {
+        "file": {
+          "description": "Optional file name for a file-scoped workflow",
+          "type": "string"
+        },
+        "name_or_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name_or_id"
+      ],
+      "type": "object"
+    },
+    "name": "run_workflow"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create or update one MCP connector configuration. Supply a name plus a standard MCP server config object (command/args for local, or type:url for remote). Do not include headers, env, tokens, or credentials: those stay in Connectors. Every changed connector is saved DISABLED, so the user reviews it and explicitly enables/approves it before anything runs or reaches the network.",
+    "inputSchema": {
+      "properties": {
+        "config": {
+          "description": "MCP server configuration, without secrets",
+          "type": "object"
+        },
+        "name": {
+          "description": "Unique connector name (letters, digits, dot, dash, underscore)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "config"
+      ],
+      "type": "object"
+    },
+    "name": "save_mcp"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create or update a portable Agent Skill. Saves it DISABLED as a draft for human review. Put all trigger conditions in description and concise imperative Markdown in instructions; add reusable resources separately with write_skill_resource. When the user wants a skill based on attached room files, pass their file names in source_files: Arcelle snapshots their readable content under references/source-files/ without making the model repeat the documents.",
+    "inputSchema": {
+      "properties": {
+        "agent": {
+          "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts). Omit for a skill any agent may use.",
+          "type": "string"
+        },
+        "description": {
+          "description": "What the skill does and exactly when to use it",
+          "type": "string"
+        },
+        "instructions": {
+          "description": "The SKILL.md Markdown body",
+          "type": "string"
+        },
+        "name": {
+          "description": "Lowercase hyphenated name, at most 64 characters",
+          "type": "string"
+        },
+        "source_files": {
+          "description": "Optional names of attached/readable room files to bundle as portable reference snapshots (maximum 12)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "instructions"
+      ],
+      "type": "object"
+    },
+    "name": "save_skill"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph of nodes + edges [{from, to, branch?}]. Model nodes: generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, for_each_file {select, instruction} (runs on EACH selected file), agent_run {question}, extract {fields:[...]} (structured JSON out of {{input}}), route {prompt, labels:[...]} (tags input with one label → edges use branch:<label>, an N-way condition), vote {prompt, samples, mode:concat|majority}, refine {prompt, rubric, max_rounds} (generate→critique→revise loop), plan_and_map {objective, max_workers} (decompose→work→synthesize). Deterministic nodes (no model): transform {op:append|prepend|replace|upper|lower|trim|truncate|strip_html, find?, value?}, merge {mode:concat|dedupe_lines|numbered} (join parallel branches), http_fetch {url}, script_run {file, mode:import|transform} (run a room .py/.js; transform pipes {{input}}→stdin→stdout), save_file {name_template, format, mode}, condition {op, value}. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Parallelism = several edges out of one node re-joined by a merge. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Give every node a short `label` (2-4 words in the user's language for what that step does, e.g. \"Write the digest\") so the canvas and inspector read as plain steps, not kind names. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"label\":\"Write the digest\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"label\":\"Save today's digest\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix. After saving, don't stop there: call test_workflow to actually RUN it, read which step failed, fix it with update_workflow, and test again until test_workflow returns `VALIDATED: yes` — only then tell the user the draft is ready to activate. NEVER tell the user it's fixed or works before a test returns `VALIDATED: yes`; a script_run step can only be confirmed by an approved run on the Scripts page.",
+    "inputSchema": {
+      "properties": {
+        "binding": {
+          "description": "Optional {scope: general|file, kinds?, exts?, file_id?}",
+          "type": "object"
+        },
+        "definition": {
+          "description": "The workflow graph {version, nodes, edges}",
+          "type": "object"
+        },
+        "description": {
+          "type": "string"
+        },
+        "emoji": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "schedule": {
+          "description": "Optional {kind: interval|daily|weekly, param}",
+          "type": "object"
+        }
+      },
+      "required": [
+        "name",
+        "definition"
+      ],
+      "type": "object"
+    },
+    "name": "save_workflow"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Search all enabled, connected MCP tools installed in this room. Use this before run_mcp_tool. Returns exact tool ids, connector names, descriptions, and input schemas.",
+    "inputSchema": {
+      "properties": {
+        "connector": {
+          "description": "Optional connector name to search within.",
+          "type": "string"
+        },
+        "query": {
+          "description": "What capability or data source you need, such as stock prices, forecasts, web fetch, or prediction markets.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "search_mcp_tools"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Search all room files for content the excerpts already provided above do not cover. Use 2-4 keywords, not a full sentence. Results are verbatim file text safe to quote in annotate_file. To SHOW the user a passage you found, call open_file with find set to a short quote from these results — you never need a page number.",
+    "inputSchema": {
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "search_room"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Set one or more cells in a spreadsheet (.xlsx or .csv). Pass ALL changes in one call via updates.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "File name or part of it",
+          "type": "string"
+        },
+        "sheet": {
+          "description": "Sheet name (default: first sheet)",
+          "type": "string"
+        },
+        "updates": {
+          "description": "The cells to change, e.g. [{\"cell\":\"B2\",\"value\":\"120\"},{\"cell\":\"B3\",\"value\":\"95\"}]",
+          "items": {
+            "properties": {
+              "cell": {
+                "description": "Cell in A1 notation, like B7",
+                "type": "string"
+              },
+              "value": {
+                "description": "New value for the cell",
+                "type": "string"
+              }
+            },
+            "required": [
+              "cell",
+              "value"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "updates"
+      ],
+      "type": "object"
+    },
+    "name": "set_cells"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Start a durable BACKGROUND pass that reads an ENTIRE file part by part — every character, no matter how large the file is — and saves the result as a new file in the room. Use it whenever the user wants work covering a whole large file (summarize/analyze/translate it all), instead of answering from excerpts. It is slow (minutes to hours) but survives app restarts; the user sees a live progress card. mode \"merge\" (default) folds notes into one final document; mode \"stitch\" transforms each part and joins them in order (translation, rewriting). After starting it, tell the user it is underway — do not wait for it.",
+    "inputSchema": {
+      "properties": {
+        "instruction": {
+          "description": "What to do across the whole file, e.g. \"summarize thoroughly\", \"translate to French\", \"list every obligation with its section\"",
+          "type": "string"
+        },
+        "mode": {
+          "description": "merge = one final document distilled from the whole file (default); stitch = transform each part and join them in order",
+          "enum": [
+            "merge",
+            "stitch"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "File name or a distinctive part of it",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "instruction"
+      ],
+      "type": "object"
+    },
+    "name": "start_file_pass"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Whether the on-device speech-to-text model is installed and ready. Check this before promising a transcription.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "stt_status"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Build question/answer flashcards from this room's material and save them as a new file. Say what to focus on in instructions.",
+    "inputSchema": {
+      "properties": {
+        "instructions": {
+          "description": "What to cover, in the user's words",
+          "type": "string"
+        },
+        "refs": {
+          "description": "Optional file names to build from; omit to use the whole room",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "studio_flashcards"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Build a structured mind map from this room's material and save it as a new file.",
+    "inputSchema": {
+      "properties": {
+        "instructions": {
+          "description": "What to map, in the user's words",
+          "type": "string"
+        },
+        "refs": {
+          "description": "Optional file names to build from; omit to use the whole room",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "studio_mindmap"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "TEST a workflow you're building: run it (draft or active) to completion RIGHT NOW and get the result of every step back, so you can see what failed and fix it. This is how you iterate — save_workflow (draft) → test_workflow → read the failing step → update_workflow to fix it → test_workflow again → repeat until the result says `VALIDATED: yes`, then tell the user it's ready to activate. The result ends with `VALIDATED: yes` only when every step actually ran; treat `VALIDATED: no` as not-yet-working and never report success on it. Unlike run_workflow this WAITS and returns the outcome (each step's label, kind, whether it was skipped, and a preview of its output). It never changes the workflow's status — a tested workflow stays a DRAFT for the user to review and activate. A script_run step needs the user's approval (you can't approve code), so it PARKS in a test and comes back `VALIDATED: no` — that does NOT mean the script works; tell the user to approve and run it on the Scripts page, don't claim it's fixed. Only runs when no other job is busy; if it says another job is running, ask the user to wait and try again. Pass `file` (a file name) for a file-scoped workflow.",
+    "inputSchema": {
+      "properties": {
+        "file": {
+          "description": "Optional file name for a file-scoped workflow",
+          "type": "string"
+        },
+        "name_or_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name_or_id"
+      ],
+      "type": "object"
+    },
+    "name": "test_workflow"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Operate one control from the latest ui_snapshot by its mark number. The user watches every action. Example: {\"mark\": 12, \"action\": \"click\"}",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "click a control; type appends text into a field; set replaces the field's text; scroll moves the element's pane (text: \"up\" or \"down\")",
+          "enum": [
+            "click",
+            "type",
+            "set",
+            "scroll"
+          ],
+          "type": "string"
+        },
+        "mark": {
+          "description": "Mark number from the latest ui_snapshot",
+          "type": "integer"
+        },
+        "text": {
+          "description": "For type/set: the text. For scroll: \"up\" or \"down\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mark",
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "ui_act"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List every clickable/typable control currently visible in the app as numbered marks (role, label, region). Call this FIRST when asked to open or use an app surface — the Room Map (the Map toggle), the Memory panel, Studio buttons (Flashcards, Mind map, Podcast script), a viewer tab, or History. Those are app controls, NOT files: never search_room for them. Take a fresh snapshot before each ui_act — marks go stale when the screen changes. Consent-sensitive controls (settings, approvals) are never listed.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "ui_snapshot"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Correct a memory note that is now wrong or out of date. Identify it by a distinctive phrase from the note itself, not by an id.",
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "description": "The corrected note, in full",
+          "type": "string"
+        },
+        "find": {
+          "description": "A distinctive phrase from the note to correct",
+          "type": "string"
+        }
+      },
+      "required": [
+        "find",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "update_memory"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Change an existing workflow (fetch it first with list_workflows). Same validation as save_workflow. Updating an ACTIVE workflow returns it to draft until the user re-activates it — the review gate.",
+    "inputSchema": {
+      "properties": {
+        "binding": {
+          "type": "object"
+        },
+        "definition": {
+          "type": "object"
+        },
+        "description": {
+          "type": "string"
+        },
+        "emoji": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "name_or_id": {
+          "type": "string"
+        },
+        "schedule": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "name_or_id"
+      ],
+      "type": "object"
+    },
+    "name": "update_workflow"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Grab one frame from a video file in the room at a timestamp and look at it. Pair with the transcript's [m:ss] stamps to inspect the exact moment. Example: {\"name\": \"lecture.mp4\", \"at\": \"12:34\"}",
+    "inputSchema": {
+      "properties": {
+        "at": {
+          "description": "Timestamp like \"1:23\" or \"1:02:03\", or plain seconds like \"75\"",
+          "type": "string"
+        },
+        "name": {
+          "description": "Video file name or a distinctive part of it",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "at"
+      ],
+      "type": "object"
+    },
+    "name": "view_media_frame"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Capture what the user currently sees in the app window and look at it. Use when the words in the transcript aren't enough and you need the actual pixels (layout, an open image or PDF page, a chart).",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "view_screenshot"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Search the public web. Use for current events or information not in the room. Returns titles, URLs and snippets; fetch a URL with fetch_page for details.",
+    "inputSchema": {
+      "properties": {
+        "query": {
+          "description": "Short search query",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "web_search"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Replace the entire content of an existing text file. For small changes prefer edit_file.",
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "description": "The complete new file content",
+          "type": "string"
+        },
+        "name": {
+          "description": "File name or part of it",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "write_file"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Add or replace a text resource in a skill draft under scripts/, references/, assets/, agents/, or another relative folder. The skill is disabled again for review.",
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "path": {
+          "description": "Relative path, e.g. references/schema.md",
+          "type": "string"
+        },
+        "skill": {
+          "description": "Skill name or id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill",
+        "path",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "write_skill_resource"
+  }
+]

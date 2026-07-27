@@ -63,6 +63,84 @@ function speakerHue(speaker: string): number | null {
   return [155, 25, 265, 330, 95, 200][(n - 1) % 6];
 }
 
+/** GH #5: the speaker chip, renameable once you know who was talking.
+ *
+ * The machine label ("Speaker 2") stays the identity underneath — the name is
+ * an overlay keyed by it — so one edit renames every line that person said, and
+ * the name survives the engine re-clustering the meeting. Colour is keyed on
+ * the LABEL, not the name, so renaming doesn't change anyone's chip colour. */
+function SpeakerChip({
+  label,
+  name,
+  hue,
+  onRename,
+}: {
+  label: string;
+  name: string;
+  hue: number | null;
+  onRename: (next: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const style =
+    hue == null
+      ? undefined
+      : { background: `hsl(${hue} 60% 45% / .18)`, color: `hsl(${hue} 70% 35%)` };
+
+  if (editing) {
+    const commit = () => {
+      setEditing(false);
+      onRename(draft);
+    };
+    return (
+      <input
+        className="rec-speaker rec-speaker-input"
+        autoFocus
+        dir="auto"
+        maxLength={60}
+        value={draft}
+        aria-label={`Name for ${label}`}
+        data-testid="speaker-input"
+        placeholder={label}
+        onChange={(e) => setDraft(e.target.value)}
+        // Escape resets the draft first, so the blur it triggers commits the
+        // unchanged name — which the caller treats as a no-op.
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            setDraft(name);
+            setEditing(false);
+          }
+        }}
+      />
+    );
+  }
+  const named = name !== label;
+  return (
+    <button
+      className="rec-speaker rec-speaker-btn"
+      style={style}
+      data-speaker={label}
+      data-testid="speaker-chip"
+      title={
+        named
+          ? `Rename — the engine calls this voice ${label}`
+          : "Name this speaker — renames every line they said"
+      }
+      onClick={() => {
+        setDraft(named ? name : "");
+        setEditing(true);
+      }}
+    >
+      {name}
+    </button>
+  );
+}
+
 /** One phrase inside a turn. `visible` is the words to draw ("Show deleted"
  * already applied); null means the segment has no word timings — draw its
  * plain text. */
@@ -380,6 +458,37 @@ export default function RecordingView({
     }
   }
 
+  /** GH #5: what to CALL a speaker — the user's name if they gave one, else the
+   * engine's label. Every rendering of a speaker goes through this. */
+  function speakerName(label: string): string {
+    return meta?.speakerNames?.[label] || label;
+  }
+
+  async function renameSpeaker(label: string, next: string) {
+    const name = next.trim();
+    if (name === speakerName(label)) return; // unchanged (or Escape)
+    // Clicking an UNNAMED chip opens the editor with an empty draft, so a click
+    // followed by a click elsewhere commits "" — which is not a no-op by the
+    // check above (speakerName() returns the label, not ""). Treat "clear a
+    // name that was never set" as the nothing-happened it is, instead of a
+    // pointless write and a "Back to Speaker 2" toast for an edit nobody made.
+    if (!name && !meta?.speakerNames?.[label]) return;
+    try {
+      const updated = await api.recSetSpeakerName(fileId, label, name);
+      // Merge ONLY the names: a live recording is still appending segments via
+      // events, and the backend's copy of `segments` can lag behind ours.
+      setMeta((m) => (m ? { ...m, speakerNames: updated.speakerNames } : updated));
+      pushToast(
+        "success",
+        name
+          ? `Every line ${label} said is now "${name}".`
+          : `Back to "${label}".`,
+      );
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
+
   async function runTranslate() {
     if (!translateTo.trim() || busy) return;
     setBusy(true);
@@ -500,9 +609,9 @@ export default function RecordingView({
             </label>
             <span
               className="rec-opt"
-              title="Voices are told apart as people talk, and the labels correct themselves as the meeting goes on — nothing to set up"
+              title="Voices are told apart as people talk, and the labels correct themselves as the meeting goes on — nothing to set up. Afterwards, click a speaker's name to say who they were."
             >
-              Speakers detected automatically
+              Speakers detected automatically — name them later
             </span>
           </>
         )}
@@ -676,12 +785,12 @@ export default function RecordingView({
                 >
                   {formatTimestamp(turn.t0)}
                 </button>
-                <span
-                  className="rec-speaker"
-                  style={hue == null ? undefined : { background: `hsl(${hue} 60% 45% / .18)`, color: `hsl(${hue} 70% 35%)` }}
-                >
-                  {turn.speaker}
-                </span>
+                <SpeakerChip
+                  label={turn.speaker}
+                  name={speakerName(turn.speaker)}
+                  hue={hue}
+                  onRename={(next) => void renameSpeaker(turn.speaker, next)}
+                />
               </div>
               <div className="rec-turn-body" dir={turn.dir}>
                 {turn.segs.map(({ seg, visible }) => {
@@ -778,6 +887,15 @@ export default function RecordingView({
                 <span>
                   Rebuild the whole transcript from the audio? The current one moves to History;
                   the audio is untouched.
+                  {Object.keys(meta?.speakerNames ?? {}).length > 0 && (
+                    <>
+                      {" "}
+                      <b>
+                        The voices are re-numbered from scratch, so check the names you
+                        gave them afterwards.
+                      </b>
+                    </>
+                  )}
                 </span>
                 <button className="danger" onClick={() => void runRetranscribe()}>
                   Re-transcribe

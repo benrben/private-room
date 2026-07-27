@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .messages import Message
 
-#: commands.rs:104 — a runaway backstop, not a budget. The loop self-terminates
-#: via duplicate detection + forced synthesis + Stop, so this sits far above any
-#: real run.
-MAX_TOOL_ROUNDS: int = 1_000
-
-#: The plain no-tool chat path needs only a couple of rounds (agent.rs:1337).
-PLAIN_MAX_ROUNDS: int = 4
+#: LangGraph requires a finite recursion ceiling. This is deliberately far above
+#: a real run: all chat lanes share it, while no-calls, duplicate detection,
+#: forced synthesis, and Stop remain the normal termination mechanisms.
+AGENT_ROUND_BACKSTOP: int = 10_000
 
 #: models.rs:72 — the chat model stays warm across the conversation.
 KEEP_ALIVE_WARM: str = "30m"
@@ -23,67 +19,6 @@ KEEP_ALIVE_WARM: str = "30m"
 #: models.rs:74 — the short warmth for one-shot shaping calls (feedback drafting).
 #: The model need not linger after a single, rare structured turn.
 KEEP_ALIVE_SHORT: str = "2m"
-
-#: ollama.rs:224-231 ``num_ctx_for(has_tools=true, Chat)`` — the working-memory
-#: window handed to Ollama. RAM-adaptive: a 16 GB Mac must not OOM, but a 32 GB+
-#: Mac should get the fuller window rather than half of it. The sidecar always
-#: runs the tool tier (the catalog is `Some` even on the tool-less final round,
-#: CHG-32), so it never drops to the smaller no-tools window mid-answer.
-NUM_CTX_LOW: int = 12288
-NUM_CTX_HIGH: int = 24576
-
-#: ollama.rs:224-231 ``num_ctx_for(has_tools=false, Chat)`` — the SMALLER no-tools
-#: Chat window. The chat_commands one-shot calls (``ask_structured`` / ``ask_quiet``
-#: in chat_commands.rs) allocate this tier, not the tools-tier window above.
-NUM_CTX_NOTOOLS_LOW: int = 8192
-NUM_CTX_NOTOOLS_HIGH: int = 16384
-
-#: ollama.rs:220 — the RAM threshold above which the fuller window is safe.
-_HIGH_RAM_BYTES: int = 32 * 1024 * 1024 * 1024
-
-_num_ctx_cache: int | None = None
-_num_ctx_notools_cache: int | None = None
-
-
-def _total_ram_bytes() -> int:
-    """Total physical RAM in bytes, or 0 if it can't be determined.
-
-    ``os.sysconf`` works on macOS and Linux (verified on macOS: SC_PHYS_PAGES *
-    SC_PAGE_SIZE). No subprocess, no third-party dependency.
-    """
-    try:
-        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError, AttributeError):  # pragma: no cover - exotic OS
-        return 0
-
-
-def num_ctx_for_chat() -> int:
-    """The chat model's ``num_ctx``, sized to RAM like ollama.rs ``num_ctx_for``.
-
-    24576 on a 32 GB+ Mac, 12288 below (the Rust's Chat+tools tier). Computed once
-    and cached — RAM does not change under us, and the Rust caches it in a
-    ``OnceLock`` too. Unknown RAM (0) falls to the safe low window.
-    """
-    global _num_ctx_cache
-    if _num_ctx_cache is None:
-        _num_ctx_cache = NUM_CTX_HIGH if _total_ram_bytes() >= _HIGH_RAM_BYTES else NUM_CTX_LOW
-    return _num_ctx_cache
-
-
-def num_ctx_chat_notools() -> int:
-    """The no-tools Chat ``num_ctx`` (ollama.rs ``num_ctx_for(false, Chat)``).
-
-    16384 on a 32 GB+ Mac, 8192 below — the window the chat_commands one-shot
-    ``ask_structured`` / ``ask_quiet`` calls (``StructuredOpts`` default tier =
-    Chat, no tools) actually allocated. Cached like its tools-tier sibling.
-    """
-    global _num_ctx_notools_cache
-    if _num_ctx_notools_cache is None:
-        _num_ctx_notools_cache = (
-            NUM_CTX_NOTOOLS_HIGH if _total_ram_bytes() >= _HIGH_RAM_BYTES else NUM_CTX_NOTOOLS_LOW
-        )
-    return _num_ctx_notools_cache
-
 
 class McpConfig(BaseModel):
     """The per-run room bridge: loopback URL + a fresh bearer token."""
@@ -142,11 +77,14 @@ class RunRequest(BaseModel):
     #: shape). Engages only when ``model`` is non-local; None/absent = door open.
     privacy: dict[str, Any] | None = None
     provider: ProviderConfig | None = None
+    #: Display-only context window for the token bar, resolved by the host
+    #: (live from the Codex catalog for ``codex-cli``). NOT a cap — nothing in
+    #: the sidecar truncates or refuses on its account; a cloud CLI owns its
+    #: own window. Absent for engines that report a window themselves.
+    max_context: int | None = None
 
-    #: How many connected (third-party) MCP tools the host routed this turn, and
-    #: which cloud advisors are available. Both only feed the max_rounds choice
-    #: (agent.rs:1337): a turn with any real capability gets the long backstop,
-    #: a plain chat turn gets 4 rounds.
+    #: Host routing metadata retained for compatibility and observability. It no
+    #: longer lowers the agent-round allowance for plain chat.
     mcp_routes: int = 0
     advisors: list[str] = Field(default_factory=list)
 
@@ -175,19 +113,12 @@ class RunRequest(BaseModel):
     def resolved_max_rounds(
         self, ui: bool, jobs: bool, skills: bool = False, connectors: bool = False
     ) -> int:
-        """agent.rs:1337 — 4 rounds for a plain turn, the backstop otherwise."""
-        plain = (
-            self.mcp_routes == 0
-            and not self.web_enabled
-            and not self.advisors
-            and not ui
-            and not jobs
-            and not skills
-            and not connectors
+        """Return the shared high runaway backstop for every agent lane."""
+        return (
+            self.max_rounds
+            if self.max_rounds and self.max_rounds > 0
+            else AGENT_ROUND_BACKSTOP
         )
-        if plain:
-            return PLAIN_MAX_ROUNDS
-        return self.max_rounds if self.max_rounds and self.max_rounds > 0 else MAX_TOOL_ROUNDS
 
 
 class CancelRequest(BaseModel):
@@ -336,7 +267,7 @@ class VisionLocateRequest(BaseModel):
     Rust decrypts the image and picks the local vision model, then sends the
     ORIGINAL image bytes (base64) here; the sidecar does prepare/prompt/parse. The
     knobs mirror what ``locate_in_image`` handed ``chat_structured``: temperature
-    pinned to 0.0 for stable boxes, and a RAM-adaptive ``keep_alive`` (HLT-5) the
+    pinned to 0.0 for stable boxes, and a ``keep_alive`` (HLT-5) value the
     Rust side computes so a low-RAM Mac releases the multi-GB vision model quickly.
     """
 
@@ -349,12 +280,8 @@ class VisionLocateRequest(BaseModel):
     query: str
     base_url: str = "http://127.0.0.1:11434"
     temperature: float | None = 0.0
-    #: For byte-parity Rust should pass the ORIGINAL window: chat_structured ran
-    #: this with ``StructuredOpts::default()`` -> ``CtxTier::Job``, so
-    #: ``num_ctx_for(false, Job)`` = 65536 (low-RAM) / 131072 (32 GB+). That large
-    #: window matters — a 1000×1000 image is many vision tokens and the smaller
-    #: chat window could truncate them. Omitted -> the sidecar's RAM-adaptive chat
-    #: window (a fallback, NOT the original size).
+    #: Optional explicit engine override. Normal app calls omit this so the
+    #: selected model/server owns its context window.
     num_ctx: int | None = None
     keep_alive: str | None = None
     #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
@@ -452,16 +379,9 @@ class HealthResponse(BaseModel):
 
 
 __all__ = [
-    "MAX_TOOL_ROUNDS",
-    "PLAIN_MAX_ROUNDS",
+    "AGENT_ROUND_BACKSTOP",
     "KEEP_ALIVE_WARM",
     "KEEP_ALIVE_SHORT",
-    "NUM_CTX_LOW",
-    "NUM_CTX_HIGH",
-    "NUM_CTX_NOTOOLS_LOW",
-    "NUM_CTX_NOTOOLS_HIGH",
-    "num_ctx_for_chat",
-    "num_ctx_chat_notools",
     "McpConfig",
     "ProviderConfig",
     "Routing",

@@ -209,6 +209,12 @@ pub(crate) fn active_policy() -> Option<Arc<PolicyState>> {
 /// when the entity map is empty — there is then nothing to mask mechanically,
 /// and the SEC-1b per-call consent (which shows the user the exact args) is the
 /// floor. Whatever the local scanner has found for this room is enforced here.
+///
+/// ONE caller-side exception (`exec_tool`): connector "auto mode" skips this
+/// seam entirely, so an approved agent sends real arguments. Masking rewrites
+/// the values being asked ABOUT, which silently broke lookups; auto mode is
+/// the user's explicit "full approval". This function stays switch-blind — the
+/// exception lives at the call site, where the auto-mode flag is known.
 pub(crate) fn remote_seam_redactor() -> Option<Arc<PolicyState>> {
     policy_cell()
         .lock()
@@ -304,8 +310,12 @@ fn compute_policy(app: &tauri::AppHandle, state: &AppState) -> Option<PolicyStat
 }
 
 /// Attach the room policy to a sidecar request body when its `model` is
-/// non-local and the door is on. The ONE Rust-side injection point — every
-/// sidecar POST passes through here (see `sidecar.rs`).
+/// non-local and the door is on. The Rust-side injection point: BOTH sidecar
+/// gateways call it — `sidecar.rs::sidecar_json` (agent/feature endpoints) and
+/// `ollama.rs::sidecar_post` (the generate/embed gateway). Adding a third
+/// gateway without calling this re-opens the leak the latter had until
+/// 2026-07-25, where cloud engines received raw room content because
+/// `privacy.guard_outbound` no-ops on a missing policy.
 pub(crate) fn inject_policy(body: &serde_json::Value) -> Option<serde_json::Value> {
     let model = body.get("model").and_then(|m| m.as_str())?;
     if !(is_cloud_model(model) || is_external_engine(model)) {

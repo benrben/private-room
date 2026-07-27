@@ -8,6 +8,13 @@ every connected MCP tool arrives, namespaced ``server_tool`` — fall back to
 from __future__ import annotations
 
 _LABELS: dict[str, str] = {
+    # Hub v3: the Main agent's delegation calls read as WHO was asked.
+    "ask_file_agent": "Asked the File agent",
+    "ask_web_agent": "Asked the Web agent",
+    "ask_app_agent": "Asked the App agent",
+    "ask_jobs_agent": "Asked the Jobs agent",
+    "ask_skills_agent": "Asked the Skills agent",
+    "ask_connector_agent": "Asked the Connector agent",
     "list_room_files": "Listed the room's files",
     "search_room": "Searched the room",
     "open_file": "Opened a file",

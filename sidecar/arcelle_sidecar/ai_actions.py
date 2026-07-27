@@ -44,7 +44,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from . import llm
-from .config import KEEP_ALIVE_WARM, ProviderConfig, num_ctx_chat_notools
+from .config import KEEP_ALIVE_WARM, ProviderConfig
 from .messages import Message, compact_json, system_message, user_message
 
 #: chat_structured (ollama.rs) primes the schema onto the last user turn because
@@ -490,7 +490,6 @@ async def run_ai_action(
         messages,
         base_url,
         temperature=0.3,
-        num_ctx=num_ctx_chat_notools(),
         keep_alive=KEEP_ALIVE_WARM,
         format=_MARKDOWN_SCHEMA,
         privacy=privacy,
@@ -510,7 +509,6 @@ async def run_ai_action(
             [system_message(spec.system), user_message(user)],
             base_url,
             temperature=0.3,
-            num_ctx=num_ctx_chat_notools(),
             keep_alive=KEEP_ALIVE_WARM,
             privacy=privacy,
             provider=provider,
@@ -579,7 +577,6 @@ async def memory_suggestion(
             messages,
             base_url,
             temperature=0.2,
-            num_ctx=num_ctx_chat_notools(),
             keep_alive=KEEP_ALIVE_WARM,
             format=_MEMORY_SCHEMA,
             privacy=privacy,
@@ -651,7 +648,6 @@ async def suggest_file_meta(
             messages,
             base_url,
             temperature=0.3,
-            num_ctx=num_ctx_chat_notools(),
             keep_alive=KEEP_ALIVE_WARM,
             format=_FILE_META_SCHEMA,
             privacy=privacy,

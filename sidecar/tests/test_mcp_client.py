@@ -153,7 +153,7 @@ async def test_tools_list_and_ollama_shape() -> None:
     async with McpClient(URL, TOKEN, client=bridge()) as mcp:
         tools = await mcp.list_tools()
     names = [t.name for t in tools]
-    assert names == ["search_room", "list_room_files"]  # consult_advisor dropped
+    assert names == ["search_room", "list_room_files", "consult_advisor"]
     spec = tools[0].to_ollama()
     assert spec["type"] == "function"
     assert spec["function"]["name"] == "search_room"
@@ -162,11 +162,12 @@ async def test_tools_list_and_ollama_shape() -> None:
     assert tools[1].to_ollama()["function"]["parameters"] == {"type": "object", "properties": {}}
 
 
-async def test_consult_advisor_is_never_used_even_if_served() -> None:
-    # The recursion guard must hold even if the host regresses (SPEC §2.1).
+async def test_consult_advisor_is_kept_when_the_host_serves_it() -> None:
+    # The host now distinguishes a top-level bridge from a nested advisor
+    # bridge, so the client must preserve this dynamically served capability.
     async with McpClient(URL, TOKEN, client=bridge()) as mcp:
         tools = await mcp.list_tools()
-    assert not any(t.name == "consult_advisor" for t in tools)
+    assert any(t.name == "consult_advisor" for t in tools)
 
 
 async def test_tools_call_success() -> None:

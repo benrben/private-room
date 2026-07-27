@@ -3,7 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { api, RoomInfo } from "../api";
-import { stopMicTap } from "./liveRec";
+import { configureMic, stopMicTap } from "./liveRec";
 import { handleAgentUiRequest } from "../agent/driver";
 import { annotationTarget } from "./markup";
 import * as voice from "./voice";
@@ -75,17 +75,43 @@ export function useWorkspaceEffects(
       // background run would speak aloud here.
       voice.feedStreamDelta(delta);
     });
-    const unlistenStep = api.onAskStep((label) => {
+    const unlistenStep = api.onAskStep(({ label, node }) => {
       s.setSteps((st) => [...st, { label, ok: true }]);
+      // Also file it under the agent that ran it, for the graph's inspector.
+      // Steps with no node (every non-sidecar emitter) stay flat-list only.
+      if (!node) return;
+      s.setAgentSteps((by) => ({
+        ...by,
+        [node]: [...(by[node] ?? []), { label, ok: true }],
+      }));
     });
     const unlistenLane = api.onAskLane((label) => {
       s.setLane(label);
     });
-    const unlistenStepStatus = api.onAskStepStatus(({ ok }) => {
+    // Dispatch-first agent visibility: the roster arrives once per ask; the
+    // active-agent marker advances as plan steps start.
+    const unlistenPlan = api.onAskPlan((plan) => {
+      s.setAgentPlan(plan);
+    });
+    const unlistenAgent = api.onAskAgent((agent) => {
+      s.setActiveAgent(agent);
+    });
+    const unlistenStepStatus = api.onAskStepStatus(({ ok, node }) => {
       if (ok) return;
       s.setSteps((st) =>
         st.length ? [...st.slice(0, -1), { ...st[st.length - 1], ok: false }] : st,
       );
+      // Fail THIS node's last step, not the globally-last one: with siblings
+      // running concurrently the two are frequently different steps.
+      if (!node) return;
+      s.setAgentSteps((by) => {
+        const mine = by[node];
+        if (!mine?.length) return by;
+        return {
+          ...by,
+          [node]: [...mine.slice(0, -1), { ...mine[mine.length - 1], ok: false }],
+        };
+      });
     });
     const unlistenRound = api.onAskRound(() => {
       s.setStreamText("");
@@ -217,6 +243,12 @@ export function useWorkspaceEffects(
     a.refreshWebAccess();
     a.refreshAutolock();
     a.refreshPrivacy();
+    // GH #4: microphone clean-up is on unless the user opted out. Cached in
+    // liveRec because acquireMic can't await IPC without losing the gesture.
+    void api
+      .getSetting("mic_voice_processing")
+      .then((v) => configureMic(v !== "0"))
+      .catch(() => {});
     // Idea 3: the spoken voice's per-room config + the hands-free re-arm.
     void Promise.all([
       api.getSetting("voice_archetype"),
@@ -412,6 +444,8 @@ export function useWorkspaceEffects(
       unlisten.then((fn) => fn());
       unlistenStep.then((fn) => fn());
       unlistenLane.then((fn) => fn());
+      unlistenPlan.then((fn) => fn());
+      unlistenAgent.then((fn) => fn());
       unlistenStepStatus.then((fn) => fn());
       unlistenRound.then((fn) => fn());
       unlistenNotice.then((fn) => fn());
@@ -455,8 +489,13 @@ export function useWorkspaceEffects(
   useEffect(() => {
     const el = s.chatRef.current;
     if (el) el.scrollTop = el.scrollHeight;
+    // `agentPlan` is in here because the agent graph GROWS: each dispatch adds
+    // a row (and sometimes a band header) to the live bubble. Without it the
+    // list stays pinned to where the bubble used to end and the newest
+    // specialists render below the fold — the roster often grows in the gap
+    // before any delta arrives, so `streamText` does not cover this.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.messages, s.asking, s.streamText]);
+  }, [s.messages, s.asking, s.streamText, s.agentPlan]);
 
   useEffect(() => {
     if (s.prevAskingRef.current && !s.asking) {

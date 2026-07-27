@@ -9,9 +9,11 @@ import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 
 from arcelle_sidecar import chat as chat_module
+from arcelle_sidecar.budget import trim_messages_to_window, window_budget_bytes
 from arcelle_sidecar.chat import OllamaChatModel, _chunk_text, _to_langchain
-from arcelle_sidecar.config import KEEP_ALIVE_WARM, NUM_CTX_HIGH, NUM_CTX_LOW, num_ctx_for_chat
+from arcelle_sidecar.config import KEEP_ALIVE_WARM
 from arcelle_sidecar.messages import Message
+from arcelle_sidecar.model_limits import NUM_CTX_BUCKETS, max_num_ctx, pick_num_ctx
 
 
 async def _no_native_length(model: str, base_url: str) -> int | None:
@@ -69,29 +71,127 @@ def test_chunk_text_handles_str_and_blocks() -> None:
 
 def test_model_params_are_pinned() -> None:
     m = OllamaChatModel("qwen3.5:9b", "http://127.0.0.1:11434", temperature=0.7)
-    llm = m._llm()
+    llm = m._llm(None)
     assert llm.model == "qwen3.5:9b"
     assert llm.base_url == "http://127.0.0.1:11434"
-    # CHG-32: the window must not shrink on the tool-less final round. D4: the
-    # default is RAM-adaptive (ollama.rs:224) — 24576 on 32 GB+, 12288 below.
-    assert llm.num_ctx == num_ctx_for_chat()
-    assert llm.num_ctx in (NUM_CTX_LOW, NUM_CTX_HIGH)
-    assert (NUM_CTX_LOW, NUM_CTX_HIGH) == (12288, 24576)
+    assert m.num_ctx is None
     # HLT-5: the chat model stays warm across the conversation.
     assert llm.keep_alive == KEEP_ALIVE_WARM == "30m"
     assert llm.temperature == 0.7
 
 
-def test_num_ctx_is_ram_adaptive() -> None:
-    # D4: on a 32 GB+ Mac the Rust hands Ollama 24576 (ollama.rs:224); the sidecar
-    # must not hardcode half of that. Explicit override still wins.
-    assert num_ctx_for_chat() in (NUM_CTX_LOW, NUM_CTX_HIGH)
+def test_pick_num_ctx_buckets_and_caps() -> None:
+    # The measured live failure: a ~21KB turn (≈6.8k tokens) in the daemon's
+    # 4096 default window → context-shift → "Done.". 21KB must pick 16k.
+    assert pick_num_ctx(21_000, native_ctx=262_144) == 16_384
+    assert pick_num_ctx(1_000, native_ctx=262_144) == 8_192  # floor > daemon 4k
+    assert pick_num_ctx(60_000, native_ctx=262_144) == 32_768
+    # The job-sized payloads reach the job-sized buckets. A whole-file pass
+    # section and a deep summary's gathered reads are 100KB+, and a 32k ceiling
+    # put them straight back into the context-shift this exists to prevent.
+    assert pick_num_ctx(120_000, native_ctx=262_144) == 65_536
+    # …bounded by RAM, not by the caller: 131072 only on a 32 GB+ Mac.
+    assert pick_num_ctx(10_000_000, native_ctx=262_144) == max_num_ctx()
+    assert max_num_ctx() in (65_536, 131_072)
+    # A model whose native window is smaller than the bucket gets its native
+    # window — asking beyond it would degrade every token via RoPE stretch.
+    assert pick_num_ctx(21_000, native_ctx=8_192) == 8_192
+    assert pick_num_ctx(1_000, native_ctx=None) == NUM_CTX_BUCKETS[0]
+
+
+def test_the_window_budget_is_the_inverse_of_the_bucket_choice() -> None:
+    # `trim_messages_to_window` and `pick_num_ctx` must never disagree about
+    # whether a payload fits, or the trimmer would either do nothing (and let
+    # the daemon shift) or trim a payload that was already fine.
+    for payload in (1_000, 21_000, 60_000, 120_000, 400_000):
+        window = pick_num_ctx(payload, native_ctx=262_144)
+        if window == max_num_ctx() and payload > window_budget_bytes(window):
+            continue  # genuinely bigger than any window — the trimmer's job
+        assert payload <= window_budget_bytes(window), payload
+
+
+def test_an_oversized_turn_is_trimmed_deliberately_not_by_the_daemon() -> None:
+    # The last resort. Tool results are stubbed oldest-first; the system
+    # prompt, the recent turns and the assistant/tool pairing all survive.
+    huge = "x" * 300_000
+    messages: list[dict] = [
+        {"role": "system", "content": "SYSTEM DOCTRINE"},
+        {"role": "user", "content": "what does the contract say?"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+        {"role": "tool", "tool_name": "fetch_page", "content": huge},  # old
+        {"role": "assistant", "content": "an earlier answer"},
+        {"role": "user", "content": "and the notice period?"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "2"}]},
+        {"role": "tool", "tool_name": "search_room", "content": huge},  # recent
+        {"role": "user", "content": "quote it exactly"},
+    ]
+    assert trim_messages_to_window(messages, 0, 16_384) is True
+    assert messages[0]["content"] == "SYSTEM DOCTRINE", "the doctrine must survive"
+    assert messages[1]["content"] == "what does the contract say?"
+    assert messages[-1]["content"] == "quote it exactly"
+    # Pass 1 stubs the OLD result outright — it has already been reasoned over.
+    assert "trimmed to fit" in messages[3]["content"]
+    assert "fetch_page" in messages[3]["content"]
+    # Pass 2 cuts the RECENT one, which `_KEEP_RECENT` protects and which is
+    # bigger than the whole window on its own. Without this pass the prompt
+    # still wouldn't fit and the daemon would drop the doctrine instead.
+    assert messages[7]["content"].startswith("x"), "keep the head, cut the tail"
+    assert "cut here to fit" in messages[7]["content"]
+    # It actually fits now — that is the whole point.
+    assert not trim_messages_to_window(messages, 0, 16_384)
+    # Role pairing intact: every tool result still has its assistant turn.
+    assert messages[2].get("tool_calls") and messages[6].get("tool_calls")
+
+    # A payload that already fits is untouched, and a non-local model (no
+    # window of ours) is never trimmed at all.
+    small = [{"role": "system", "content": "hi"}, {"role": "user", "content": "yo"}]
+    assert trim_messages_to_window(small, 0, 16_384) is False
+    cloud = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+        {"role": "tool", "tool_name": "t", "content": huge},
+        {"role": "user", "content": "q"},
+    ]
+    assert trim_messages_to_window(cloud, 0, None) is False
+    assert cloud[3]["content"] == huge, "a cloud model owns its own window"
+
+
+async def test_local_calls_request_a_payload_fitted_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The "Done." live regression (2026-07-23): the daemon loads local models
+    # with a ~4k window and context-shifts the FRONT of an oversized prompt
+    # away. Every local call must therefore ask for a window that fits its
+    # actual payload — never leave the daemon default in charge.
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    m = OllamaChatModel("qwen3.5:4b", "http://127.0.0.1:11434")
+    assert await m._resolve_num_ctx(21_000) == 16_384  # the repro's turn size
+    assert m._last_num_ctx == 16_384
+    assert await m._resolve_num_ctx(1_000) == 8_192  # floor, never the 4k default
+    assert await m._resolve_num_ctx(10_000_000) == max_num_ctx()  # RAM-bounded top
+
+
+async def test_explicit_num_ctx_override_still_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
     forced = OllamaChatModel("m", "http://127.0.0.1:11434", num_ctx=99)
-    assert forced.num_ctx == 99
+    assert await forced._resolve_num_ctx(10_000_000) == 99
+
+
+async def test_cloud_models_keep_the_remote_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A `:cloud` model's window lives on the remote side — sending a local
+    # num_ctx would at best be ignored and at worst shrink it.
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    m = OllamaChatModel("qwen3:cloud", "http://127.0.0.1:11434")
+    assert await m._resolve_num_ctx(1_000_000) is None
 
 
 def test_temperature_is_omitted_when_unset() -> None:
-    llm = OllamaChatModel("m", "http://127.0.0.1:11434")._llm()
+    llm = OllamaChatModel("m", "http://127.0.0.1:11434")._llm(None)
     assert llm.temperature is None
 
 
@@ -137,7 +237,7 @@ def _fake_llm(model: OllamaChatModel, stream: _FakeStream) -> None:
         def astream(self, messages: object) -> _FakeStream:
             return stream
 
-    model._llm = lambda: _LLM()  # type: ignore[method-assign, assignment]
+    model._llm = lambda num_ctx=None: _LLM()  # type: ignore[method-assign, assignment]
 
 
 async def test_stream_breaks_the_token_loop_when_cancelled_mid_flight(
@@ -171,7 +271,9 @@ async def test_stream_breaks_the_token_loop_when_cancelled_mid_flight(
     assert calls == []
     # No usage_metadata on these hand-built chunks — falls back to the estimate.
     assert usage.is_real is False
-    assert usage.max_context == m.num_ctx
+    # A local model always runs in the window the call requested (the
+    # payload-fitted floor here — no catalog entry for "m").
+    assert usage.max_context == 8_192
 
 
 async def test_stream_delivers_everything_when_not_cancelled() -> None:
@@ -215,18 +317,20 @@ async def test_stream_surfaces_real_usage_when_ollama_reports_it(
     assert usage.is_real is True
     assert usage.input_tokens == 123
     assert usage.output_tokens == 7
-    assert usage.max_context == m.num_ctx
+    # The truthful ceiling is the requested window, not a display default.
+    assert usage.max_context == 8_192
 
 
-async def test_stream_uses_the_model_s_native_context_length_not_num_ctx(
+async def test_stream_reports_the_window_the_call_actually_ran_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Reported live 2026-07-21: a user's qwen3.5 model natively supports
-    # ~256k/128k context, but the bar showed the RAM-throttled working window
-    # (12288) instead. max_context must come from the model's own catalog
-    # entry, not `num_ctx`, whenever that lookup succeeds.
+    # History: 2026-07-21 made max_context the native advertised length so the
+    # bar wouldn't show a stale RAM-throttled 12288. But the native length is a
+    # capability, not the running window — with the daemon's 4k default the bar
+    # showed "1% of 262k used" on turns that had already overflowed and been
+    # context-shifted into garbage (the "Done." regression). The bar must show
+    # the window the call actually REQUESTED: the payload-fitted num_ctx.
     async def fake_native_length(model: str, base_url: str) -> int | None:
-        assert model == "qwen3.5:4b"
         return 262_144
 
     monkeypatch.setattr(chat_module, "native_context_length", fake_native_length)
@@ -239,8 +343,27 @@ async def test_stream_uses_the_model_s_native_context_length_not_num_ctx(
         pass
 
     _, _, usage = await m.stream([{"role": "user", "content": "hi"}], [], on_delta, cancel=None)
-    assert usage.max_context == 262_144
-    assert usage.max_context != m.num_ctx
+    assert usage.max_context == 8_192  # the requested window, not the 262k ceiling
+
+
+async def test_cloud_stream_still_reports_the_native_remote_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `:cloud` models run in their remote window — the native catalog entry
+    # (confirmed live 2026-07-21) stays the truthful ceiling there.
+    async def fake_native_length(model: str, base_url: str) -> int | None:
+        return 524_288
+
+    monkeypatch.setattr(chat_module, "native_context_length", fake_native_length)
+    stream = _FakeStream([AIMessageChunk(content="hi")])
+    m = OllamaChatModel("qwen3:cloud", "http://127.0.0.1:11434")
+    _fake_llm(m, stream)
+
+    async def on_delta(_: str) -> None:
+        pass
+
+    _, _, usage = await m.stream([{"role": "user", "content": "hi"}], [], on_delta, cancel=None)
+    assert usage.max_context == 524_288
 
 
 def test_chunks_merge_into_tool_calls() -> None:

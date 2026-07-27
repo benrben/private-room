@@ -30,6 +30,14 @@
 .connectors-head .settings-hint {
   max-width: 68ch;
 }
+.connectors-autoapprove {
+  margin-top: var(--sp-3);
+  max-width: 68ch;
+  align-items: flex-start;
+}
+.connectors-autoapprove span:last-child {
+  max-width: 62ch;
+}
 .connectors-h2 {
   font-size: 13px;
   font-weight: 620;
@@ -85,7 +93,10 @@
   margin: 0 0 var(--sp-2);
   font-size: 11px;
 }
-.connector-uncap {
+/* A full-width switch row inside the Connectors page (auto-approve). Named
+   for the shape, not for one feature: the per-connector "ignore the tool
+   limit" switch it was written for is gone along with the limit itself. */
+.connector-switch {
   display: flex;
   align-items: center;
   gap: var(--sp-2);

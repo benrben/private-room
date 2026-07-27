@@ -19,6 +19,31 @@ from .privacy import PrivacyPolicy, guard_outbound
 
 MODEL_SEPARATOR = ":" * 2
 
+# Arcelle-owned tools are known-good OpenAI function schemas. If one connected
+# third-party schema makes OpenRouter reject the catalog, retry with this set
+# instead of deleting *all* tools (which previously made file writes impossible).
+ARCELLE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "list_room_files", "search_room", "open_file", "mark_image",
+        "annotate_file", "create_file", "edit_file", "edit_files",
+        "write_file", "set_cells", "rename_file", "move_file", "add_memory",
+        "list_memories", "web_search", "fetch_page", "ui_snapshot", "ui_act",
+        "view_screenshot", "view_media_frame", "start_file_pass", "job_status",
+        "list_workflows", "save_workflow", "update_workflow", "delete_workflow",
+        "run_workflow", "test_workflow", "list_skills", "read_skill",
+        "read_skill_resource", "save_skill", "write_skill_resource",
+        "delete_skill_resource", "delete_skill", "run_skill_script", "list_mcps",
+        "read_mcp", "save_mcp", "delete_mcp", "search_mcp_tools",
+        "run_mcp_tool", "local_generate", "consult_advisor",
+    }
+)
+WRITE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "create_file", "edit_file", "edit_files", "write_file", "set_cells",
+        "rename_file", "move_file", "add_memory",
+    }
+)
+
 
 class ProviderApiError(httpx.HTTPError):
     pass
@@ -86,6 +111,31 @@ def _error_message(response: httpx.Response) -> str:
     return f"provider returned HTTP {response.status_code}"
 
 
+def _tool_name(spec: dict[str, Any]) -> str:
+    return str((spec.get("function") or {}).get("name") or "")
+
+
+def _arcelle_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [tool for tool in tools if _tool_name(tool) in ARCELLE_TOOL_NAMES]
+
+
+def _merge_stream_piece(current: str, piece: Any) -> str:
+    """Merge a streamed id/name fragment without duplicating repeated full values.
+
+    OpenRouter normally sends a function name only once, but some routed
+    OpenAI-compatible backends repeat it on later chunks. Blind concatenation
+    turned ``write_file`` into ``write_filewrite_file`` and the bridge rejected it.
+    """
+    incoming = str(piece or "")
+    if not incoming:
+        return current
+    if not current or incoming.startswith(current):
+        return incoming
+    if current.endswith(incoming):
+        return current
+    return current + incoming
+
+
 class OpenAICompatibleChatModel:
     def __init__(
         self,
@@ -129,8 +179,14 @@ class OpenAICompatibleChatModel:
             payload["stream_options"] = {"include_usage": True}
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        if tools and self.provider.supports_tools:
-            payload["tools"] = tools
+        if tools:
+            if self.provider.supports_tools:
+                payload["tools"] = tools
+            elif any(_tool_name(tool) in WRITE_TOOL_NAMES for tool in tools):
+                raise ProviderApiError(
+                    "The selected OpenRouter model does not support tool calling, "
+                    "so it cannot create or edit files. Choose a model with Tools capability."
+                )
         if format is not None:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -226,7 +282,7 @@ class OpenAICompatibleChatModel:
             # tool calling as the normal path, but on that pre-stream 400 retry
             # once without the rejected catalog so ordinary chat still works.
             # No delta or tool can have run before an HTTP error response.
-            retried_without_tools = False
+            retried_with_arcelle_tools = False
             while True:
                 async with client.stream(
                     "POST", self.endpoint, headers=self.headers, json=payload
@@ -234,12 +290,15 @@ class OpenAICompatibleChatModel:
                     if (
                         response.status_code == 400
                         and payload.get("tools")
-                        and not retried_without_tools
+                        and not retried_with_arcelle_tools
                     ):
                         await response.aread()
-                        payload.pop("tools", None)
-                        retried_without_tools = True
-                        continue
+                        original = payload["tools"]
+                        builtins = _arcelle_tools(original)
+                        if builtins and len(builtins) < len(original):
+                            payload["tools"] = builtins
+                            retried_with_arcelle_tools = True
+                            continue
                     if not response.is_success:
                         await response.aread()
                         raise ProviderApiError(_error_message(response))
@@ -274,9 +333,13 @@ class OpenAICompatibleChatModel:
                                 current = calls_by_index.setdefault(
                                     index, {"id": "", "name": "", "arguments": ""}
                                 )
-                                current["id"] += str(fragment.get("id") or "")
+                                current["id"] = _merge_stream_piece(
+                                    current["id"], fragment.get("id")
+                                )
                                 fn = fragment.get("function") or {}
-                                current["name"] += str(fn.get("name") or "")
+                                current["name"] = _merge_stream_piece(
+                                    current["name"], fn.get("name")
+                                )
                                 arguments = fn.get("arguments") or ""
                                 if isinstance(arguments, str):
                                     current["arguments"] += arguments

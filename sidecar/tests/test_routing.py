@@ -99,9 +99,10 @@ def test_management_tool_names_are_gated_in_their_own_lanes() -> None:
 
 
 def test_edit_files_is_a_write_tool() -> None:
-    # Wave 2 (Idea 7): the atomic batch tool must be gated off read-only turns
-    # (the sidecar filter DROPS listed write tools when write=False), and the
-    # Rust/Python change lands in the same commit per the routing docstring.
+    # Wave 2 (Idea 7): edit_files belongs to the write set. (2026-07-23: the
+    # write set is no longer dropped from the catalog — it is always offered —
+    # but the list still drives the lane label and the agent.rs name
+    # reservations, so membership stays pinned.)
     assert "edit_files" in WRITE_TOOL_NAMES
 
 
@@ -220,6 +221,25 @@ def test_routers_are_case_insensitive() -> None:
     assert wants_write_tools("EDIT the lease") is True
     assert wants_ui_tools("CLICK the button") is True
     assert wants_job_tools("the ENTIRE file") is True
+
+
+def test_hebrew_questions_route_every_lane() -> None:
+    # 2026-07-23 live QA: the hint lists were English-only substrings, so a
+    # Hebrew speaker could NEVER open a lane — the agent permanently lacked
+    # write/ui/job tools in Hebrew conversations. (to_lowercase is identity for
+    # Hebrew; plain substring matching.)
+    assert wants_write_tools("שמור את זה כקובץ") is True
+    assert wants_write_tools("ערוך את החוזה") is True
+    assert wants_write_tools("תרגם לעברית") is True
+    assert wants_ui_tools("פתח את הקובץ") is True
+    assert wants_ui_tools("צלם צילום מסך") is True
+    assert wants_job_tools("סכם את כל הספר") is True
+    assert wants_job_tools("תזמן משימה כל בוקר") is True
+    assert wants_skill_tools("צור מיומנות חדשה") is True
+    assert wants_mcp_management_tools("הצג את המחברים שלי") is True
+    # A plain Hebrew question opens nothing (the short-catalog win case).
+    assert wants_ui_tools("מה שכר הדירה בחוזה?") is False
+    assert wants_job_tools("מה שכר הדירה בחוזה?") is False
 
 
 # --- wants_ui_tools ---------------------------------------------------------

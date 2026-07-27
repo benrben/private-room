@@ -24,11 +24,15 @@ const DEFAULT_RATIOS: Record<PaneKey, number> = {
   ai: 0.24,
 };
 
-/** Drag/keyboard clamps, matching the reference feel: the library stays a
- * navigable strip, the AI pane stays wide enough for its composer, and the
- * center stays the dominant, readable column while others are visible. */
+/** Drag/keyboard clamps: the library stays a navigable strip at the low end and
+ * the AI pane stays wide enough for its composer, while `centerMin` is what
+ * actually protects the readable center column. The library's max is deliberately
+ * generous (GH #2 — it used to stop at 0.32, which read as "won't expand"); with
+ * three panes open `centerMin` binds first anyway, so the extra headroom is only
+ * reachable when a neighbour is collapsed — which is exactly when a wide file
+ * list is what the user wanted. */
 const CLAMP = {
-  library: { min: 0.13, max: 0.32 },
+  library: { min: 0.13, max: 0.5 },
   ai: { min: 0.2, max: 0.42 },
   centerMin: 0.4,
 };
@@ -40,6 +44,8 @@ const NARROW_QUERY = "(max-width: 1080px)";
 type Persisted = {
   ratios?: Partial<Record<PaneKey, number>>;
   hidden?: Partial<Record<PaneKey, boolean>>;
+  /** GH #2: the activity rail widened to icon + full label. */
+  railExpanded?: boolean;
 };
 
 function loadPersisted(key: string): Persisted {
@@ -74,6 +80,11 @@ export function useLayout(roomName: string) {
   }));
   const [focusPane, setFocusPane] = useState<PaneKey | null>(null);
   const [dragging, setDragging] = useState<"a" | "b" | null>(null);
+  /** GH #2: the rail widened to icon + full label. Persisted like the ratios —
+   * it's a standing preference, not a transient mode. */
+  const [railExpanded, setRailExpanded] = useState(
+    () => persisted.railExpanded === true,
+  );
   const [isNarrow, setIsNarrow] = useState(
     () => window.matchMedia(NARROW_QUERY).matches,
   );
@@ -86,14 +97,17 @@ export function useLayout(roomName: string) {
     return () => mq.removeEventListener("change", onChange);
   }, []);
 
-  // Persist ratios + hidden per room (focus is a transient mode).
+  // Persist ratios + hidden + rail width per room (focus is a transient mode).
   useEffect(() => {
     try {
-      localStorage.setItem(storageKey, JSON.stringify({ ratios, hidden }));
+      localStorage.setItem(
+        storageKey,
+        JSON.stringify({ ratios, hidden, railExpanded }),
+      );
     } catch {
       /* private-mode etc. — layout just won't persist */
     }
-  }, [storageKey, ratios, hidden]);
+  }, [storageKey, ratios, hidden, railExpanded]);
 
   /** Panes that currently own width. Narrow mode: exactly one (the focused
    * pane, else the first non-hidden in priority center > ai > library). */
@@ -185,32 +199,50 @@ export function useLayout(roomName: string) {
     setRatios({ ...DEFAULT_RATIOS });
     setHidden({ library: false, center: false, ai: false });
     setFocusPane(null);
+    setRailExpanded(false);
   }, []);
+
+  const toggleRail = useCallback(() => setRailExpanded((v) => !v), []);
 
   /** Shared resize math (pointer + keyboard). Side "a" sizes the library
    * against whichever neighbour is visible; side "b" sizes the AI pane
-   * against the center. */
+   * against the center.
+   *
+   * The two panes on either side of the splitter TRADE: their combined share is
+   * held constant, so the ratios keep summing to 1 and `nextEdge` (a fraction of
+   * the whole grid, straight off the pointer) stays directly comparable to the
+   * pane's own ratio. That is also what makes the floors real — growing one pane
+   * is bounded by `pair - <neighbour's min>`, so the neighbour can never be
+   * squeezed past its minimum. (Clamping each side independently, as this did
+   * before, let the sum drift above 1 and quietly pushed the center under
+   * `centerMin`.) */
   const applyResize = useCallback(
     (side: "a" | "b", nextEdge: number, centerHidden: boolean) => {
       setRatios((r) => {
         const next = { ...r };
         if (side === "a") {
-          const lib = Math.min(
-            CLAMP.library.max,
-            Math.max(CLAMP.library.min, nextEdge),
+          // The library trades with the center, or with the AI pane when the
+          // center is collapsed.
+          const withAi = centerHidden;
+          const pair = next.library + (withAi ? next.ai : next.center);
+          const floor = withAi ? CLAMP.ai.min : CLAMP.centerMin;
+          const lib = bound(
+            nextEdge,
+            CLAMP.library.min,
+            Math.min(CLAMP.library.max, pair - floor),
           );
-          const delta = lib - next.library;
           next.library = lib;
-          if (!centerHidden) {
-            next.center = Math.max(CLAMP.centerMin, next.center - delta);
-          } else {
-            next.ai = Math.max(CLAMP.ai.min, next.ai - delta);
-          }
+          if (withAi) next.ai = pair - lib;
+          else next.center = pair - lib;
         } else {
-          const ai = Math.min(CLAMP.ai.max, Math.max(CLAMP.ai.min, nextEdge));
-          const delta = ai - next.ai;
+          const pair = next.center + next.ai;
+          const ai = bound(
+            nextEdge,
+            CLAMP.ai.min,
+            Math.min(CLAMP.ai.max, pair - CLAMP.centerMin),
+          );
           next.ai = ai;
-          next.center = Math.max(CLAMP.centerMin, next.center - delta);
+          next.center = pair - ai;
         }
         return next;
       });
@@ -258,34 +290,19 @@ export function useLayout(roomName: string) {
     [applyResize],
   );
 
+  /** Arrow keys on a splitter. Goes through the same trade as the pointer so
+   * keyboard and mouse can never disagree about the floors; ArrowRight on the
+   * right splitter shrinks the AI pane (the edge moves right). */
   const keyResize = useCallback(
     (side: "a" | "b", direction: 1 | -1, big: boolean) => {
       const amount = (big ? 0.04 : 0.015) * direction;
-      setRatios((r) => {
-        const next = { ...r };
-        if (side === "a") {
-          const lib = Math.min(
-            CLAMP.library.max,
-            Math.max(CLAMP.library.min, next.library + amount),
-          );
-          next.center = Math.max(
-            CLAMP.centerMin,
-            next.center - (lib - next.library),
-          );
-          next.library = lib;
-        } else {
-          // ArrowRight on the right splitter shrinks the AI pane.
-          const ai = Math.min(
-            CLAMP.ai.max,
-            Math.max(CLAMP.ai.min, next.ai - amount),
-          );
-          next.center = Math.max(CLAMP.centerMin, next.center - (ai - next.ai));
-          next.ai = ai;
-        }
-        return next;
-      });
+      applyResize(
+        side,
+        side === "a" ? ratios.library + amount : ratios.ai - amount,
+        !visible.includes("center"),
+      );
     },
-    [],
+    [applyResize, ratios, visible],
   );
 
   // ⌘/Ctrl+1/2/3 toggle panes; Escape leaves focus mode. Capture phase so
@@ -322,6 +339,8 @@ export function useLayout(roomName: string) {
     visible,
     isNarrow,
     dragging,
+    railExpanded,
+    toggleRail,
     gridRef,
     gridStyle,
     showSplitA,
@@ -341,4 +360,11 @@ function clamp01(v: number | undefined, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0.05 && v < 0.95
     ? v
     : fallback;
+}
+
+/** Clamp into [lo, hi]. When the window is too narrow for both neighbours'
+ * floors, `hi` can fall below `lo` — the minimum wins, so a pane never
+ * collapses to nothing mid-drag. */
+function bound(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
 }

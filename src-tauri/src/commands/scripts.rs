@@ -390,6 +390,170 @@ pub fn list_scripts(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
     })
 }
 
+// --------------------------------------------------------------------------- #
+// Agent seam (2026-07-24). Scripts were a whole product area with no agent
+// reach: the base prompt teaches the model to AUTHOR a runnable script
+// (PEP-723 dependency block and all), and it then had no way to see one or run
+// it. These mirror the Tauri commands above but take `&AppState`/`&Window`,
+// the shapes `exec_tool` holds — same pattern as `agent_save_skill`.
+//
+// Running stays gated: `run_script` fingerprints the file's exact bytes and
+// shows the consent card unless that SHA was already approved on this Mac. A
+// script the agent just wrote is by definition a new fingerprint, so
+// agent-authored code ALWAYS reaches the user before it executes.
+// --------------------------------------------------------------------------- #
+
+/// The room's runnable scripts, one line each, for the agent.
+pub(crate) fn agent_list_scripts(app: &tauri::AppHandle, state: &AppState) -> Result<String, String> {
+    let approved: HashSet<String> = read_script_approvals(app).into_iter().collect();
+    let lines = state.with_room(|room| {
+        let mut out: Vec<String> = Vec::new();
+        for f in db::list_files(&room.conn)? {
+            let Some(lang) = script_lang_of(&f.name) else {
+                continue;
+            };
+            let bytes = db::get_file_bytes(&room.conn, &f.id)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let manifest = parse_script_manifest(&f.name, &String::from_utf8_lossy(&bytes));
+            let ok = approved.contains(&script_fingerprint(&bytes));
+            let deps = if manifest.deps.is_empty() {
+                String::new()
+            } else {
+                format!(", needs {}", manifest.deps.join(" "))
+            };
+            out.push(format!(
+                "- {} ({}{}) — {}",
+                f.name,
+                lang_str(lang),
+                deps,
+                if ok { "approved to run" } else { "needs the user's approval on first run" }
+            ));
+        }
+        Ok(out)
+    })?;
+    if lines.is_empty() {
+        return Ok("This room has no .py or .js scripts yet.".into());
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Run one script by file NAME (the agent never handles file ids).
+pub(crate) async fn agent_run_script(
+    window: &tauri::Window,
+    state: &AppState,
+    args: &serde_json::Value,
+    // The ask's Stop flag. The wait below is up to 150s inside one tool call,
+    // which is long enough that a user who presses Stop expects the turn to end
+    // — not to sit here until the timeout. The RUN itself keeps going (it is a
+    // durable job the user asked for, watchable in the Scripts view); what Stop
+    // ends is our waiting for it.
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<String, String> {
+    let wanted = args["name"].as_str().unwrap_or_default().trim().to_string();
+    if wanted.is_empty() {
+        return Err("Say which script to run, by file name.".into());
+    }
+    let (file_id, name) = state.with_room(|room| db::find_file_like(&room.conn, &wanted))?;
+    if script_lang_of(&name).is_none() {
+        return Err(format!("\"{name}\" is not a .py or .js script."));
+    }
+    let job_id = run_script_inner(window, state, file_id).await?;
+
+    // Live QA 2026-07-25: "run it on book.md and tell me the count" ran the
+    // script perfectly — exit 0, STDOUT `book.md: 1715 words` — and the agent
+    // answered "I don't have the number yet, sorry", because this tool used to
+    // return the moment the run STARTED. The answer sat in the run log a minute
+    // before the model wrote that. A script the user asked to run IS the
+    // question, so wait for it and hand back what it printed.
+    const RUN_TIMEOUT_SECS: u64 = 150;
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(job) = state.with_room(|room| db::get_job(&room.conn, &job_id)) {
+            match job.status.as_str() {
+                "done" => return Ok(clamp_script_output(&name, &script_output(state, &job_id))),
+                "error" => {
+                    let why = job.error.unwrap_or_else(|| "it failed".into());
+                    let out = script_output(state, &job_id);
+                    return Ok(if out.is_empty() {
+                        format!("Ran {name}, but it failed: {why}")
+                    } else {
+                        format!("Ran {name}, but it failed: {why}\nOutput before it stopped:\n{out}")
+                    });
+                }
+                // A script step parks when its code is not approved on this Mac.
+                "paused" => {
+                    return Ok(format!(
+                        "{name} is waiting for the user's approval before it can run — \
+                         the agent cannot approve code. Ask them to approve it on the \
+                         Scripts page, then run it again."
+                    ))
+                }
+                _ => {}
+            }
+        }
+        // Stop ends the WAIT, not the run — same words as the timeout, because
+        // from the model's side the situation is identical: the script is
+        // underway and its output is not available here.
+        let stopped = cancel.is_some_and(|c| c.load(Ordering::SeqCst));
+        if stopped || start.elapsed().as_secs() >= RUN_TIMEOUT_SECS {
+            // NOT a failure: the user asked for this run. Say plainly that the
+            // wait ended, never that the script failed.
+            return Ok(format!(
+                "Started {name}. It is still running, so its output isn't available \
+                 yet — tell the user it is underway and that they can watch it finish \
+                 in the Scripts view. Do not guess at its result."
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+}
+
+/// Everything the script printed, read back from the run's stored artifacts.
+/// A script auto-workflow is one `script_run` node, so step 0 holds it; the
+/// loop keeps working if that ever grows a second step.
+fn script_output(state: &AppState, job_id: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for step in 0..4 {
+        let Ok(Some(raw)) = state.with_room(|room| Ok(db::get_job_artifact(&room.conn, job_id, step)))
+        else {
+            break;
+        };
+        let text = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v["result"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        if !text.trim().is_empty() {
+            parts.push(text.trim().to_string());
+        }
+    }
+    parts.join("\n")
+}
+
+/// The model reads this; a runaway `print` loop must not eat the turn.
+fn clamp_script_output(name: &str, out: &str) -> String {
+    const MAX: usize = 4000;
+    if out.trim().is_empty() {
+        return format!("Ran {name}. It finished successfully and printed nothing.");
+    }
+    let mut body = out.to_string();
+    if body.len() > MAX {
+        let cut = body
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|i| *i <= MAX)
+            .last()
+            .unwrap_or(0);
+        body.truncate(cut);
+        body.push_str("\n… (output truncated)");
+    }
+    format!(
+        "Ran {name}. It finished successfully. Its output — quote these values \
+         exactly, they are the answer:\n{body}"
+    )
+}
+
 /// The parsed manifest for one script (the viewer header / consent card).
 #[tauri::command]
 pub fn get_script_manifest(state: State<'_, AppState>, file_id: String) -> Result<ScriptManifest, String> {
@@ -406,6 +570,17 @@ pub fn get_script_manifest(state: State<'_, AppState>, file_id: String) -> Resul
 pub async fn run_script(
     window: tauri::Window,
     state: State<'_, AppState>,
+    file_id: String,
+) -> Result<String, String> {
+    run_script_inner(&window, state.inner(), file_id).await
+}
+
+/// `run_script`'s body against the shapes `exec_tool` holds (`&AppState`,
+/// `&Window`) so the agent seam and the UI command share one implementation —
+/// including the consent gate, which must never have a second code path.
+pub(crate) async fn run_script_inner(
+    window: &tauri::Window,
+    state: &AppState,
     file_id: String,
 ) -> Result<String, String> {
     use tauri::Manager;
@@ -429,14 +604,14 @@ pub async fn run_script(
             interpreter_line: interpreter_line(&runner, &name),
             manifest: manifest.clone(),
         };
-        if !script_run_approved(&app, state.inner(), &window, &brief).await {
+        if !script_run_approved(&app, state, window, &brief).await {
             return Err("This script was not approved to run.".into());
         }
     }
 
     let wf_id = state.with_room(|room| ensure_script_workflow(&room.conn, &file_id, &name))?;
     let extra: HashSet<String> = [sha].into_iter().collect();
-    start_workflow_run(&window, state.inner(), &wf_id, "manual", None, &extra).await
+    start_workflow_run(window, state, &wf_id, "manual", None, &extra).await
 }
 
 /// Schedule (or clear, `kind=""`) a script. Server-side requires the script's
@@ -476,6 +651,28 @@ pub fn set_script_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_finished_script_hands_its_output_back_as_the_answer() {
+        // Live QA 2026-07-25: "run it on book.md and tell me the count" ran the
+        // script (exit 0, STDOUT `book.md: 1715 words`) and the agent replied
+        // "I don't have the number yet, sorry" — the tool returned at START, so
+        // the answer never reached the model.
+        let out = clamp_script_output("Word Counter.py", "book.md: 1715 words");
+        assert!(out.contains("book.md: 1715 words"));
+        assert!(out.contains("quote these values"), "the model must not paraphrase a number");
+        assert!(!out.contains("Started"), "a finished run must not read as merely started");
+
+        // A silent script is a success, not a missing answer to apologise for.
+        let quiet = clamp_script_output("quiet.py", "   \n ");
+        assert!(quiet.contains("printed nothing"));
+        assert!(!quiet.contains("quote these values"));
+
+        // A runaway print loop cannot eat the turn.
+        let huge = clamp_script_output("loud.py", &"x".repeat(20_000));
+        assert!(huge.len() < 5_000);
+        assert!(huge.ends_with("(output truncated)"));
+    }
 
     #[test]
     fn wf_matches_only_its_own_script_row() {

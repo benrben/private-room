@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "e2e": "wdio run e2e/wdio.conf.mjs",
-    "e2e:mock": "node e2e/mock-ollama.mjs"
+    "e2e:qa": "wdio run e2e/wdio.qa.conf.mjs",
+    "e2e:mock": "node e2e/mock-ollama.mjs",
+    "capture": "wdio run e2e/wdio.capture.conf.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
