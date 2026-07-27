@@ -3,6 +3,59 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.12.0 — 2026-07-27
+
+### Answers you can trust
+
+- **A failed send is never reported as sent.** The agent that sends email and
+  Slack messages had no check on its own claims, so a message that failed to go
+  out could still be described to you as sent. It is now held to the same
+  ground-truth check as anything that writes to your room.
+- **A successful save is never reported as failed.** Editing several files at
+  once — or moving one — recorded nothing, so Arcelle told you the change had
+  not landed when it had, and spent an extra round doing it.
+- **Every step of a multi-step task is checked, not just the first.** A task
+  like "summarize the lease, then save the notes" lost its safety check on the
+  step that does the writing.
+- **Transcribing a file you named loosely now works.** Asking to re-transcribe
+  "the meeting recording" made the agent look up which file you meant — and
+  that lookup used up its only turn, so it finished having found the file and
+  never transcribed it, while telling you it was done.
+- **Web answers are sourced.** Arcelle could answer from a search-result
+  snippet without opening the page, which its own rules call "not a source".
+- **A specialist that comes back empty-handed now says so** instead of showing
+  a green tick.
+
+### Faster multi-part questions
+
+- **Independent parts of a question run at the same time.** Ask "what does my
+  lease say about rent, and what is the current rate" and both are worked on
+  together, so the answer takes as long as the slower half rather than the sum.
+- **One request can carry a whole plan.** Arcelle can now dispatch a list of
+  tasks in a single step, saying which depend on which — dependent work waits,
+  everything else runs immediately, and each dependent step is handed what the
+  earlier one found.
+- **No more arbitrary limits.** The caps on how many specialists a question
+  could consult, and how many turns each could spend, are gone.
+
+### Sturdier under pressure
+
+- **One thing going wrong no longer loses the rest.** If a specialist fails
+  mid-question, its part is reported as failed and everything else still
+  arrives.
+- **Stop keeps what already finished.** Stopping a question used to discard
+  completed work; you now get what came back, clearly labelled as partial.
+- **Long answers degrade gracefully.** When a conversation outgrows the model's
+  window, Arcelle trims what it has already used before it touches the material
+  your answer is built from.
+
+### Image marking tells the truth
+
+- **"Could not locate that in this image" no longer hides a missing model.**
+  With no vision model installed, marking silently ran on a model that cannot
+  see and reported that your image did not contain the thing. It now says a
+  vision model is needed and offers to download it.
+
 ## 0.11.0 — 2026-07-21
 
 ### Bring your own cloud models
