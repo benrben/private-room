@@ -70,7 +70,10 @@ export default function Workspace({ info, onLock }: Props) {
   );
 
   const pendingApprovals =
-    s.mcpApprovals.length + s.editApprovals.length + s.scriptApprovals.length;
+    s.mcpApprovals.length +
+    s.editApprovals.length +
+    s.scriptApprovals.length +
+    s.browseConsents.length;
   const runningJobs =
     s.jobs.filter((j) => j.status === "running" || j.status === "queued")
       .length +

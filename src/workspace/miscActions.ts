@@ -6,6 +6,7 @@ import {
   ExternalModelInfo,
   frontPage,
   frontPageSuggestions,
+  BrowseConsentRequest,
   McpApproveRequest,
   McpServerStatus,
   RoomInfo,
@@ -26,7 +27,10 @@ export function makeMiscActions(
   function refreshWebAccess() {
     api
       .getSetting("web_provider")
-      .then((v) => s.setWebOn(v === "duckduckgo" || v === "searxng" || v === "brave"))
+      // Anything but "off"/unset is on. The retired provider names still read as
+      // on, so a room saved before the switch keeps its internet access — same
+      // rule as `web_access_enabled` in commands.rs.
+      .then((v) => s.setWebOn(!!v && v !== "off"))
       .catch(() => {});
     // Engine parity: whether connected MCP tools also ride along when a cloud
     // CLI answers (the advisor-tools switch) — the composer badge tells the
@@ -251,6 +255,17 @@ export function makeMiscActions(
     s.setMcpApprovals((q) => q.filter((r) => r.id !== req.id));
   }
 
+  /** BROWSE-1: answer the outbound-typing door.
+   *
+   * The tool call is parked on the same oneshot the DOM driver would have
+   * answered, so BOTH outcomes must reply — a dropped card would hang the
+   * agent's turn until its timeout rather than failing honestly.
+   */
+  function resolveBrowseConsent(req: BrowseConsentRequest, approved: boolean) {
+    api.resolveAgentUi(req.id, { approved }).catch(() => {});
+    s.setBrowseConsents((q) => q.filter((r) => r.id !== req.id));
+  }
+
   // Wave 2 (Idea 6): answer a diff-preview approval card.
   function resolveEditApproval(
     req: EditApproveRequest,
@@ -273,6 +288,22 @@ export function makeMiscActions(
     } catch {
       /* non-fatal */
     }
+  }
+
+  /** BROWSE-1: bring the private browser forward.
+   *
+   * Needed because the agent can open a page while the user is anywhere in the
+   * app. The page is a NATIVE webview positioned over this window — it does not
+   * belong to whatever pane happens to be showing — so if the area did not
+   * follow, a page would simply appear on top of the Files list with no way to
+   * reach its chrome.
+   */
+  function revealBrowser() {
+    s.setShowMap(false);
+    s.setShowWorkflows(false);
+    s.setShowScripts(false);
+    s.setOpenFile(null);
+    s.setArea("browser");
   }
 
   async function changeModel(value: string) {
@@ -334,8 +365,8 @@ export function makeMiscActions(
     connectedTools, approveMcp, keepMcpOff, loadFrontPage,
     saveSuggestedMemory, enableMemoryAutoSave, openScratchPad,
     copyReceipt, playSealSound, addMemory, saveMemoryEdit, activateResult,
-    resolveMcpApproval, resolveEditApproval,
-    revealMemory, changeModel, engineLabelOf,
+    resolveMcpApproval, resolveEditApproval, resolveBrowseConsent,
+    revealMemory, revealBrowser, changeModel, engineLabelOf,
     recordEngineModels,
     askConfirm, cancelConfirm, searchFlat,
   };

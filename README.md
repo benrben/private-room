@@ -317,7 +317,10 @@ are already there.
   (whisper.cpp on Metal) and the release DMG **ships the voice model**, so
   transcription works offline the moment you open it — no download.
 - **Web is off until you ask.** Search tools aren't even offered to the model
-  until you pick a provider in **Settings → Online features**. Fetches run in
+  until you turn the internet on in **Settings → Online features**. There's no
+  key to paste and no provider to choose: search is built in, and one query fans
+  out to several independent engines at once, merged into a single relevance
+  ranking so a blocked or rate-limited engine just drops out. Fetches run in
   Rust behind a private-network guard (CGNAT, multicast, reserved ranges, and
   IPv4-mapped-IPv6 tricks included), responses are capped at 8 MB, and pages
   are cached in the room.

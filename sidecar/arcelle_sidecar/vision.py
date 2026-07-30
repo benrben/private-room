@@ -29,17 +29,13 @@ from typing import Any
 from PIL import Image
 
 from .messages import compact_json
+from .model_text import SCHEMA_PRIMER, recover_json, strip_think_spans
 
 #: The square canvas every image is fitted to before grounding. Exactly 1000 so
 #: pixel coordinates and 0..1000-normalized coordinates COINCIDE (both divide to
 #: the same 0..1 value) — which is what makes box placement robust regardless of
 #: which convention the vision model answers in (vision.rs VISION_SQUARE).
 VISION_SQUARE: int = 1000
-
-#: chat_structured (ollama.rs:414) appends the schema to the last user turn so a
-#: small model fills the forced JSON with real content instead of empty strings —
-#: ``format`` constrains the grammar but the model never SEES the schema.
-_SCHEMA_PRIMING = "\n\nReply with ONLY JSON matching this schema, filling every field with real content:\n"
 
 
 def prepare_image(data: bytes) -> tuple[bytes, float, float]:
@@ -120,38 +116,7 @@ def boxes_schema() -> dict[str, Any]:
 
 def prime_with_schema(prompt: str, schema: dict[str, Any]) -> str:
     """Append the schema to the prompt, as chat_structured did to the user turn."""
-    return prompt + _SCHEMA_PRIMING + compact_json(schema)
-
-
-def strip_think_spans(raw: str) -> str:
-    """Remove ``<think>…</think>`` reasoning spans a model leaks into its visible
-    answer (ollama.rs ``strip_think_spans``). An UNTERMINATED ``<think>`` truncates
-    the rest: everything after it is unclosed reasoning, not answer."""
-    out = raw
-    while True:
-        start = out.find("<think>")
-        if start == -1:
-            break
-        rel = out[start:].find("</think>")
-        if rel == -1:
-            out = out[:start]
-            break
-        end = start + rel + len("</think>")
-        out = out[:start] + out[end:]
-    return out
-
-
-def recover_json(text: str) -> str:
-    """Recover the JSON payload from a structured-output response (ollama.rs
-    ``recover_json``). A no-op for models that honour ``format``; for models that
-    wrap it in a ```json fence or a ``<think>`` preamble, drop the think span then
-    slice from the first opening bracket to the last closing one."""
-    s = strip_think_spans(text.strip()).strip()
-    a = next((i for i, c in enumerate(s) if c in "{["), None)
-    b = next((i for i in range(len(s) - 1, -1, -1) if s[i] in "}]"), None)
-    if a is not None and b is not None and b >= a:
-        return s[a : b + 1]
-    return s
+    return prompt + SCHEMA_PRIMER + compact_json(schema)
 
 
 # One decoder instance: raw_decode parses ONE balanced JSON value from the start
@@ -322,8 +287,6 @@ __all__ = [
     "grounding_prompt",
     "boxes_schema",
     "prime_with_schema",
-    "strip_think_spans",
-    "recover_json",
     "boxes_from_items",
     "parse_boxes",
     "vision_locate",

@@ -151,13 +151,17 @@ pub async fn set_room_server(
     let (web_enabled, opts, room_path, room_name) = state.with_room(|room| {
         db::set_setting(&room.conn, "room_server_enabled", if enabled { "1" } else { "0" })?;
         db::set_setting(&room.conn, "room_server_scope", if want_full { "full" } else { "files" })?;
-        let opts = if want_full {
+        let mut opts = if want_full {
             let (port, token) = leash_identity(&room.conn)?;
             crate::room_mcp::StartOpts { port: Some(port), token: Some(token), ..Default::default() }
         } else {
             // Files tier keeps the fresh-token / ephemeral-port behavior.
             crate::room_mcp::StartOpts::default()
         };
+        // The per-agent web switches bind an EXTERNAL agent on the Leash too:
+        // the toggle means "this room does not do that", not "our own hub does
+        // not do that" (owner decision 2026-07-30).
+        opts.lanes = crate::commands::web_lanes(&room.conn);
         Ok((web_access_enabled(&room.conn), opts, room.path.clone(), room.name.clone()))
     })?;
     let want = leash_scope(Some(if want_full { "full" } else { "files" }), allow_cloud);
@@ -219,7 +223,12 @@ pub async fn regenerate_leash_token(
         let (port, token) = leash_identity(&room.conn)?;
         Ok((
             web_access_enabled(&room.conn),
-            crate::room_mcp::StartOpts { port: Some(port), token: Some(token), ..Default::default() },
+            crate::room_mcp::StartOpts {
+                port: Some(port),
+                token: Some(token),
+                lanes: crate::commands::web_lanes(&room.conn),
+                ..Default::default()
+            },
             room.path.clone(),
             room.name.clone(),
         ))

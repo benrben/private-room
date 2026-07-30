@@ -35,6 +35,12 @@ dependencies = [
     # Neural spoken voice (default engine): Edge neural TTS. The only network
     # call it makes is the user-facing speech synthesis seam in tts.py.
     "edge-tts>=7.0",
+    # The room's web search (websearch.py) — it scrapes several engines' HTML
+    # result pages, so it needs a real HTML parser, and a blocking HTTP client
+    # (it runs in a worker thread, not on the event loop). Both are pure wheels
+    # that PyInstaller bundles without system libs.
+    "requests>=2.32",
+    "beautifulsoup4>=4.12",
 ]
 
 [project.optional-dependencies]

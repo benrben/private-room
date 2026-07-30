@@ -24,6 +24,7 @@ import CloudView from "../viewers/CloudView";
 import FrontPage from "./FrontPage";
 import MemoryView from "./MemoryView";
 import ConnectorsView from "./ConnectorsView";
+import { BrowserView } from "./BrowserView";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkArea } from "./types";
@@ -93,6 +94,7 @@ export default function ViewerPane({
     skills: "Skills",
     memory: "Memory & scratch pad",
     connectors: "Connectors",
+    browser: "Private browser",
   };
   const folderName = openFile
     ? s.folders.find(
@@ -459,6 +461,8 @@ export default function ViewerPane({
         <div className="room-map-canvas">
           <RoomMap onOpenFile={(id) => a.viewFile(id)} />
         </div>
+      ) : area === "browser" ? (
+        <BrowserView parked={s.browseConsents.length > 0} />
       ) : area === "connectors" ? (
         <ConnectorsView />
       ) : area === "skills" ? (

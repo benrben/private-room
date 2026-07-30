@@ -274,8 +274,32 @@ export interface MessageEffects {
  * answers via api.resolveAgentUi(id, payload). */
 export interface AgentUiRequest {
   id: string;
-  kind: "ui_snapshot" | "ui_act" | "view_screenshot" | "media_frame";
+  kind:
+    | "ui_snapshot"
+    | "ui_act"
+    | "view_screenshot"
+    | "media_frame"
+    // BROWSE-1: the OUTBOUND privacy door. Unlike the others this is not
+    // performed by the DOM driver — it needs a human answer, so effects.ts
+    // intercepts it and queues a consent card.
+    | "browse_consent";
   args: Record<string, unknown>;
+}
+
+/** The agent is about to type ROOM content into a web page.
+ *
+ * Every other privacy door in the app points OUTBOUND TO A MODEL. This one
+ * points outbound to the open web, where no model is involved and
+ * `privacy.py` never sees it. Following the connector-argument lesson, the
+ * answer is consent shown with the REAL values — masking silently would just
+ * make the form submission fail in a way nobody could diagnose.
+ */
+export interface BrowseConsentRequest {
+  id: string;
+  url: string;
+  field: string;
+  text: string;
+  entities: string[];
 }
 
 export interface Memory {
@@ -936,4 +960,31 @@ export interface SkillResourceContent {
   kind: string;
   text: string | null;
   dataB64: string | null;
+}
+
+// --------------------------------------------------------------- BROWSE-1
+
+/** Live state of the private browser's child webview. */
+export interface BrowserInfo {
+  open: boolean;
+  url?: string | null;
+  title?: string | null;
+  ready?: string | null;
+  takeover?: boolean;
+  error?: string;
+}
+
+/** One row of the browser's audit trail.
+ *
+ * The inversion that makes the private browser trustworthy: the WEB persists
+ * nothing (non-persistent data store — no history, cookies or cache), while
+ * everything the AGENT did persists here, inside the encrypted room.
+ */
+export interface BrowseJournalRow {
+  id: number;
+  at: string;
+  /** open | read | act | look | consent | blocked | download | takeover | blocker */
+  kind: string;
+  url: string;
+  detail: string;
 }

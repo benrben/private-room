@@ -41,4 +41,7 @@ export type WorkArea =
   | "scripts"
   | "skills"
   | "memory"
-  | "connectors";
+  | "connectors"
+  // BROWSE-1: the private browser. Its page is a native child webview
+  // parked over the workspace pane, not a React subtree.
+  | "browser";

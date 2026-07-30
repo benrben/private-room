@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 // Split into submodules (behavior-preserving relocation). Each submodule is
 // re-exported below so existing paths (commands::foo) keep resolving unchanged.
+mod browse;
 mod external;
 mod providers;
 mod rooms;
@@ -48,6 +49,7 @@ mod scripts;
 mod skills;
 mod speech_cmds;
 
+pub use browse::*;
 pub use external::*;
 pub use providers::*;
 pub use rooms::*;
@@ -94,9 +96,63 @@ pub(crate) const MAX_CONTEXT_CHUNKS: usize = 6;
 pub(crate) const RETRIEVE_CANDIDATES: usize = MAX_CONTEXT_CHUNKS * 4;
 pub(crate) const MAX_ATTACHED_IMAGES: usize = 4;
 pub(crate) const MAX_HISTORY_MESSAGES: usize = 12;
-/// Whole-conversation history budget (chars), applied newest-first so recent
-/// turns survive and ancient ones drop wholesale instead of each being cut.
-pub(crate) const MAX_HISTORY_CHARS: usize = 12_000;
+/// The AGENT path's fetch bound, deliberately separate from
+/// `MAX_HISTORY_MESSAGES`. 12 rows starved it: with the byte budget below, a
+/// technical conversation kept only 3-8 messages. This is only a fetch bound —
+/// `history_budget_bytes` decides what is actually sent.
+///
+/// NOT shared with the `#command` path: `format_history` there builds
+/// oldest-first and clamps the HEAD, so raising its row count would hand those
+/// flows the OLDEST 8 KB and silently drop the recent conversation.
+pub(crate) const AGENT_HISTORY_MESSAGES: usize = 200;
+/// Upper bound on the hand-off, and now the ONLY one — see
+/// `history_budget_bytes` for the measurement that removed the rest.
+/// Digesting is cheap but not free, and an unbounded transcript would make the
+/// first turn of a years-old room pathological.
+///
+/// (The flat `MAX_HISTORY_CHARS = 12_000` that used to sit here was the
+/// pre-compaction amputation limit. It was measured to cost the model every
+/// fact it needed, and there is nothing left for it to be a floor of.)
+pub(crate) const HISTORY_HANDOFF_MAX: usize = 200_000;
+
+/// Bytes of conversation history handed to the engine for this model.
+///
+/// The flat 12,000 this replaces was tuned when the Ollama daemon's default
+/// window was ~4,096 tokens (`llama-server -c 4096`), where 12,000 B ≈ 4,000
+/// tokens was ~98% of the window — correctly sized for its time. The
+/// payload-fitted `num_ctx` fix raised the real local ceiling to 65,536 /
+/// 131,072 and the constant was never raised with it, so the engine was being
+/// handed ~10% of what it could hold.
+///
+/// Measured 2026-07-28 (revision-tracking task, n=4 paired): at 12,000 B the
+/// engine saw 0 of the 4 facts it needed. Raising the hand-off is only half the
+/// fix — the sidecar then COMPACTS what it receives rather than truncating it
+/// (`arcelle_sidecar/compaction.py`), which scored the same at 12 KB compacted
+/// as at 176 KB raw, on 19x fewer prompt tokens.
+///
+/// Then measured again, and the intermediate value this replaces (49,152 B for
+/// a local model) turned out to be the ceiling on the whole fix. Fraction of
+/// the needed facts still present in the payload the model finally saw:
+///
+/// ```text
+///   hand-off 49,152 B   0.56        hand-off whole conversation   1.00
+/// ```
+///
+/// Paired, +0.44, 4 wins / 0 losses / 0 ties. The facts were not being lost by
+/// the digest — they were amputated HERE, before the sidecar ever saw them, and
+/// no amount of compressing what survives can bring back what was cut. (The
+/// same run tested a rewritten digest prompt and it was WORSE, 0 wins / 1 loss
+/// / 3 ties, so the prompt was left alone.)
+///
+/// So this is now simply "hand over the conversation". Truncating on the way
+/// out made sense while the receiver would truncate again; it does not once the
+/// receiver compresses. Every engine gets the same treatment because compaction
+/// now covers all of them — local, `:cloud`, an OpenRouter provider, and a
+/// cloud CLI. `HISTORY_HANDOFF_MAX` remains the backstop so the first turn of a
+/// years-old room is not pathological.
+pub(crate) fn history_budget_bytes(_model: &str) -> usize {
+    HISTORY_HANDOFF_MAX
+}
 /// Injected persistent-memory budget (chars) and per-memory write cap.
 pub(crate) const MAX_MEMORY_INJECT_CHARS: usize = 1_500;
 pub(crate) const MAX_MEMORY_CONTENT_CHARS: usize = 500;
@@ -503,34 +559,31 @@ pub struct AiStatus {
     pub external: Vec<String>,
 }
 
-/// Settings → Online features "Test search": exercise the real provider
-/// path without the model, so a broken pipeline is visible immediately.
+/// Settings → Online features "Test search": exercise the real search path
+/// without the model, so a broken pipeline is visible immediately. The query is
+/// fixed and dull on purpose — a word the built-in reference engines always have
+/// an answer for, so a zero result means the pipeline, not the wording.
 #[tauri::command]
 pub async fn web_search_test(state: State<'_, AppState>) -> Result<String, String> {
-    let (provider, endpoint) = state.with_room(|room| {
-        Ok((
-            db::get_setting(&room.conn, "web_provider").unwrap_or_default(),
-            db::get_setting(&room.conn, "web_endpoint").unwrap_or_default(),
-        ))
-    })?;
-    let hits = match provider.as_str() {
-        "duckduckgo" | "brave" => web::search_duckduckgo("duckduckgo").await?,
-        "searxng" => web::search_searxng(&endpoint, "searxng").await?,
-        _ => {
-            return Err(
-                "Web access is off in this room — pick a provider above and press Save first. \
-                 (Each room has its own setting.)"
-                    .into(),
-            )
-        }
-    };
+    let enabled = state.with_room(|room| Ok(web_access_enabled(&room.conn)))?;
+    if !enabled {
+        return Err("Web access is off in this room — turn it on above and press Save \
+                    first. (Each room has its own setting.)"
+            .into());
+    }
+    let hits = web::search_web("wikipedia").await?;
     match hits.first() {
+        // Individual engines drop out silently when they are blocked, so the
+        // count is the honest signal of how much of the fusion answered.
         Some(hit) => Ok(format!(
-            "Working ✓ — {} results. Top hit: {}",
+            "Working ✓ — {} results. Top hit: {} ({})",
             hits.len(),
-            hit.title
+            hit.title,
+            hit.snippet
         )),
-        None => Err("The provider responded but returned no results — try again.".into()),
+        None => Err("Search ran, but every engine came back empty — you may be offline, \
+                     or on a network they all block. Try again in a minute."
+            .into()),
     }
 }
 
@@ -569,14 +622,86 @@ pub(crate) fn is_synced_path(path: &str) -> bool {
     false
 }
 
-/// The web tools exist for the model only when the user picked a provider
-/// in Settings → Online features. "brave" is a legacy value from before the
-/// key-less provider existed; those rooms run on DuckDuckGo.
+/// The web tools exist for the model only when the room's internet switch is on
+/// (Settings → Online features). There is no provider to choose any more — the
+/// app has exactly one search engine — so this is a plain on/off read.
+///
+/// `web_provider` keeps its name and its old values keep working: a room saved
+/// when the switch was a provider dropdown holds "duckduckgo", "searxng" or
+/// "brave", and every one of those meant "internet on", so they still do. Only
+/// "off" (or never having chosen) is off. That IS the migration — there is no
+/// rewrite step, and a room downgraded to an older build still reads as on.
 pub(crate) fn web_access_enabled(conn: &Connection) -> bool {
-    matches!(
-        db::get_setting(conn, "web_provider").as_deref(),
-        Some("duckduckgo") | Some("searxng") | Some("brave")
-    )
+    matches!(db::get_setting(conn, "web_provider").as_deref(), Some(v) if !v.is_empty() && v != "off")
+}
+
+/// The two web LANES a room may independently switch off (owner decision
+/// 2026-07-30). Both ride under [`web_access_enabled`]: with no search provider
+/// picked the room is offline and neither lane exists, whatever these say.
+///
+/// A lane being off removes that agent's tools from the served catalog, and
+/// nothing else — which is the whole mechanism. The sidecar's
+/// `worker_reachable` already requires a worker's box to intersect the served
+/// catalog, so an off lane makes its agent unreachable, drops it out of the
+/// `ask_web_agent` domain, and (if BOTH are off) removes the domain from the
+/// Main agent's catalog entirely. No new special case anywhere.
+///
+/// Deliberately does NOT gate the user's own Browser area: `browse_lane` is
+/// about the AGENT's access. `browse::require_web_enabled` — which the address
+/// bar goes through — stays on the master switch (owner decision 2026-07-30).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WebLanes {
+    /// `web_search` + `fetch_page` — the Web agent (`chat.web`).
+    pub search: bool,
+    /// The six `browse_*` tools — the Browser agent (`chat.browse`).
+    pub browse: bool,
+}
+
+impl Default for WebLanes {
+    /// Both on — the pre-toggle behaviour. This is the DEFAULT rather than the
+    /// derived all-false so that every `StartOpts { ..Default::default() }`
+    /// caller keeps serving the full web catalog; a bridge that silently served
+    /// no web tools would look exactly like a room that is offline.
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl WebLanes {
+    /// Both on: what every room did before the toggles existed, and what an
+    /// unset setting still means.
+    pub(crate) const ALL: Self = Self { search: true, browse: true };
+
+    /// Is this tool name gated by a lane that is currently off?
+    pub(crate) fn blocks(self, name: &str) -> bool {
+        if !self.search && matches!(name, "web_search" | "fetch_page") {
+            return true;
+        }
+        if !self.browse && browse::is_browse_tool(name) {
+            return true;
+        }
+        false
+    }
+}
+
+/// Read this room's two web lanes. ABSENT MEANS ON — every room that existed
+/// before the toggles keeps its current behaviour without a migration.
+pub(crate) fn web_lanes(conn: &Connection) -> WebLanes {
+    let on = |key: &str| db::get_setting(conn, key).as_deref() != Some("off");
+    WebLanes {
+        search: on("web_agent_search"),
+        browse: on("web_agent_browse"),
+    }
+}
+
+/// [`web_lanes`] for the currently open room. No room open → both on, matching
+/// the unset-setting default; the bridge cannot serve room tools then anyway.
+pub(crate) fn open_room_web_lanes(state: &AppState) -> WebLanes {
+    let guard = state.room.lock().unwrap();
+    guard
+        .as_ref()
+        .map(|room| web_lanes(&room.conn))
+        .unwrap_or_default()
 }
 
 /// ADD-21: the "AI advisors" advanced tool is enabled for this room. Off by

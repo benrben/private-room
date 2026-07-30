@@ -908,8 +908,8 @@ fn emit_workflow_node<R: tauri::Runtime>(
     status: &str,
     peek: Option<&str>,
 ) {
-    use tauri::{Emitter, Manager};
-    if let Some(w) = app.get_webview_window("main") {
+    use tauri::Emitter;
+    if let Some(w) = crate::main_window(app) {
         let _ = w.emit(
             "workflow-node",
             serde_json::json!({
@@ -2018,7 +2018,7 @@ fn save_file_node<R: tauri::Runtime>(
             )?
         }
     };
-    if let Some(w) = app.get_webview_window("main") {
+    if let Some(w) = crate::main_window(app) {
         let _ = w.emit("room-files-changed", ());
     }
     let id = meta.id.clone();
@@ -2040,12 +2040,9 @@ pub(crate) async fn run_agent_headless(
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
     use tauri::Manager;
-    let webview = app
-        .get_webview_window("main")
-        .ok_or("main window is gone")?;
-    let window = webview.as_ref().window();
+    let window = crate::main_window(app).ok_or("main window is gone")?;
     let state = app.state::<AppState>();
-    let (model, web_enabled, advisors_on, advisor_tools_on) = {
+    let (model, web_enabled, lanes, advisors_on, advisor_tools_on) = {
         let guard = state.room.lock().unwrap();
         let room = guard
             .as_ref()
@@ -2057,6 +2054,7 @@ pub(crate) async fn run_agent_headless(
         (
             models_room,
             web_access_enabled(&room.conn),
+            crate::commands::web_lanes(&room.conn),
             advisors_on,
             advisors_on && advisor_tools_enabled(&room.conn),
         )
@@ -2090,6 +2088,7 @@ pub(crate) async fn run_agent_headless(
             None,
             crate::room_mcp::StartOpts {
                 advisor: advisor_runtime,
+                lanes,
                 ..Default::default()
             },
         )
@@ -2980,8 +2979,16 @@ pub(crate) fn agent_list_workflows(state: &AppState, name: Option<&str>) -> Resu
         }
         None => {
             let wfs = db::list_workflows(&room.conn)?;
+            // The node grammar rides the INDEX, not the per-workflow fetch:
+            // this is the call the Workflow agent's flow fires as a free probe
+            // before authoring, so the reference lands exactly once per task
+            // instead of on every turn inside save_workflow's description.
+            // An empty room is the most likely place a model is about to write
+            // its first workflow, so it gets the reference too.
             if wfs.is_empty() {
-                return Ok("No workflows are saved in this room yet.".into());
+                return Ok(format!(
+                    "No workflows are saved in this room yet.{WORKFLOW_NODE_REFERENCE}"
+                ));
             }
             let lines: Vec<String> = wfs
                 .iter()
@@ -2996,7 +3003,7 @@ pub(crate) fn agent_list_workflows(state: &AppState, name: Option<&str>) -> Resu
                     )
                 })
                 .collect();
-            Ok(lines.join("\n"))
+            Ok(format!("{}{WORKFLOW_NODE_REFERENCE}", lines.join("\n")))
         }
     })
 }
@@ -3581,14 +3588,51 @@ fn clamp_test_report(s: String) -> String {
 /// Wave 4a: the workflow agent tools. Like the job tools, NEVER in `tools_catalog`
 /// (so a cloud client can't reach them) — served only over the bridge for the
 /// LocalEngine/ExternalAgent scopes and gated by the jobs routing flag.
+/// The node grammar `save_workflow` needs — served ONCE per workflow task as an
+/// epilogue on the `list_workflows` index, not on every turn the workflow tier
+/// is offered (2026-07-28).
+///
+/// It lived inside `save_workflow`'s own description: 2,668 characters of DSL
+/// against 1,203 for `test_workflow`, 860 for `create_file`, 639 for
+/// `start_file_pass`. Every turn that served the workflow tools paid for the
+/// whole grammar whether or not the model was authoring anything — a real bill
+/// against an 8k local window, and the reason those windows kept
+/// context-shifting.
+///
+/// `list_workflows` is the right home because the Workflow agent's flow opens
+/// with it as a free `probe` (see `agents.py`), so an authoring task gets the
+/// grammar on its first round, in full, exactly when it is about to be used.
+pub const WORKFLOW_NODE_REFERENCE: &str = "\n\n## Node reference (for save_workflow / update_workflow)\n\
+`definition` is {version, nodes, edges}; edges are [{from, to, branch?}].\n\
+MODEL nodes: generate {prompt, model} · summarize_file {select} · file_pass {select, instruction, mode} · \
+for_each_file {select, instruction} (runs on EACH selected file) · agent_run {question} · \
+extract {fields:[...]} (structured JSON out of {{input}}) · route {prompt, labels:[...]} (tags input with one \
+label → edges use branch:<label>, an N-way condition) · vote {prompt, samples, mode:concat|majority} · \
+refine {prompt, rubric, max_rounds} (generate→critique→revise loop) · \
+plan_and_map {objective, max_workers} (decompose→work→synthesize).\n\
+DETERMINISTIC nodes (no model): transform {op:append|prepend|replace|upper|lower|trim|truncate|strip_html, find?, value?} · \
+merge {mode:concat|dedupe_lines|numbered} (join parallel branches) · http_fetch {url} · \
+script_run {file, mode:import|transform} (runs a room .py/.js; transform pipes {{input}}→stdin→stdout) · \
+save_file {name_template, format, mode} · condition {op, value}.\n\
+`select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input.\n\
+Parallelism = several edges out of one node, re-joined by a merge. Prompts support {{input}} (upstream \
+results), {{files}} (file list), {{date}}. Give every node a short `label` (2-4 words in the user's \
+language, e.g. \"Write the digest\") so the canvas reads as plain steps, not kind names.\n\
+Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking \
+at (its nodes use select {\"type\":\"run_input\"}).\n\
+Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[\
+{\"id\":\"gen\",\"kind\":\"generate\",\"label\":\"Write the digest\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},\
+{\"id\":\"save\",\"kind\":\"save_file\",\"label\":\"Save today's digest\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\
+\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}";
+
 pub fn workflow_tools_specs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({"type": "function", "function": {"name": "list_workflows",
-            "description": "List the saved workflows in this room (name, id, status, schedule). Pass `name` to get one workflow's full definition JSON — needed before update_workflow.",
+            "description": "List the saved workflows in this room (name, id, status, schedule), and the full node reference you need to write one. Call this FIRST when creating or changing a workflow. Pass `name` to get one workflow's definition JSON — needed before update_workflow.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Optional: a workflow name to fetch its full definition"}}}}}),
         serde_json::json!({"type": "function", "function": {"name": "save_workflow",
-            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph of nodes + edges [{from, to, branch?}]. Model nodes: generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, for_each_file {select, instruction} (runs on EACH selected file), agent_run {question}, extract {fields:[...]} (structured JSON out of {{input}}), route {prompt, labels:[...]} (tags input with one label → edges use branch:<label>, an N-way condition), vote {prompt, samples, mode:concat|majority}, refine {prompt, rubric, max_rounds} (generate→critique→revise loop), plan_and_map {objective, max_workers} (decompose→work→synthesize). Deterministic nodes (no model): transform {op:append|prepend|replace|upper|lower|trim|truncate|strip_html, find?, value?}, merge {mode:concat|dedupe_lines|numbered} (join parallel branches), http_fetch {url}, script_run {file, mode:import|transform} (run a room .py/.js; transform pipes {{input}}→stdin→stdout), save_file {name_template, format, mode}, condition {op, value}. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Parallelism = several edges out of one node re-joined by a merge. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Give every node a short `label` (2-4 words in the user's language for what that step does, e.g. \"Write the digest\") so the canvas and inspector read as plain steps, not kind names. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"label\":\"Write the digest\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"label\":\"Save today's digest\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix. After saving, don't stop there: call test_workflow to actually RUN it, read which step failed, fix it with update_workflow, and test again until test_workflow returns `VALIDATED: yes` — only then tell the user the draft is ready to activate. NEVER tell the user it's fixed or works before a test returns `VALIDATED: yes`; a script_run step can only be confirmed by an approved run on the Scripts page.",
+            "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a graph of nodes + edges — call list_workflows first for the full node reference (kinds, `select` types, {{input}}/{{files}}/{{date}}, and a worked example). Validation is strict: an invalid definition comes back as a numbered list to fix. After saving, don't stop there: call test_workflow to actually RUN it, read which step failed, fix it with update_workflow, and test again until test_workflow returns `VALIDATED: yes` — only then tell the user the draft is ready to activate. NEVER tell the user it's fixed or works before a test returns `VALIDATED: yes`; a script_run step can only be confirmed by an approved run on the Scripts page.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string"},
                 "description": {"type": "string"},

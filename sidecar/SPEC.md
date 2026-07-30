@@ -94,8 +94,17 @@ substring matches (hint lists include Hebrew stems). Erring toward YES is safe.
   original conversation plus a `delegation_note` (which carries the referent
   baton — what earlier specialists produced), and only its REPORT returns to
   the main thread. A hub guard rejects any direct room-tool call from the
-  main agent before it reaches the bridge. `MAX_WORKER_CALLS` (5) bounds
-  runaway delegation. The `plan` event carries the GROWING pipeline roster
+  main agent before it reaches the bridge. Delegation is NOT capped by count —
+  `MAX_WORKER_CALLS` was deleted with the rest of the per-agent budgets. The
+  bound is `config.TURN_ROUND_BUDGET` (64): a whole-ask ceiling on model
+  rounds, spent by every loop in the tree through `Deps.spend_round`, because
+  `max_rounds` bounds ONE loop and every delegated child starts a fresh one at
+  round 0. Exhausting it aborts nothing — every remaining round is served
+  tool-less, so each live loop unwinds into a text answer and the user is told
+  once (`ROUND_BUDGET_STEP`). Measured 2026-07-27, before it existed: a Main
+  agent starved of history spent 32 rounds and 890 s across 16 delegations and
+  answered "not included in this room's content".
+  The `plan` event carries the GROWING pipeline roster
   (invoked workers in call order, Main agent always last) and `agent` events
   mark the active entry, so the UI renders e.g. File agent → Main agent live;
   the queue-jump guard still withholds the connector proxy pair from workers
@@ -173,30 +182,58 @@ Critical invariants (each has a test):
 - Blank final text becomes `"Done."` — but NOT when cancelled (never invent "Done." over
   an answer the user stopped).
 
-### 3.3 Fitting a LOCAL model's window
+### 3.3 Fitting the window
 
-There is no app-level context budget: the selected provider/model is the context
-authority and a cloud or API model is never trimmed. The one exception is a LOCAL Ollama
-call, where the app itself chooses `num_ctx` and the daemon's answer to an oversized
-prompt is to silently context-shift the FRONT of it away — the system prompt, the tool
-doctrine and the question.
+The host hands over the WHOLE conversation (`commands::HISTORY_HANDOFF_MAX`, 200 KB) and
+the sidecar makes it fit. It used to hand over a window-derived slice; measured
+2026-07-28, cutting there cost the model 0.44 of the facts it needed (4/4 paired losses)
+and nothing downstream can restore what was already amputated.
 
-1. `model_limits.pick_num_ctx(payload_bytes, native_ctx)` — smallest bucket of
+1. `compaction.compact_to_budget` — **compress, don't amputate**, in place of step 3 when
+   a payload cannot fit. The system message leads and the recent tail stays verbatim;
+   everything between becomes one `user` message of extracted facts, chunk-digested and
+   cached by content hash. The trailing partial chunk is left verbatim on purpose: it is
+   the only one whose contents shift as a turn grows, so digesting it would miss the
+   cache every round at a full model call each time.
+
+   **A safety valve, not a policy** — `SPEND_FRACTION` is 0.9, so an ordinary turn is
+   sent verbatim. Compaction beat TRUNCATION decisively at the same budget (0.44 vs 0.25
+   on a 2B, 1.00 vs 0.25 on a large model), which is why it exists; but measured end to
+   end against not compacting at all, verbatim beat compacted 0.38 to 0.19 (n=4, paired
+   1 win / 1 loss / 2 ties — no evidence of benefit once the payload already fits).
+   Wired and tested on every engine, local and cloud; `CLOUD_SPEND_FRACTION` stays at 0.9
+   until there is a cloud e2e arm, because the only end-to-end evidence is local.
+   A failed digest, or an engine whose window nobody stated, means no change at all.
+2. `model_limits.pick_num_ctx(payload_bytes, native_ctx)` — smallest bucket of
    `(8k, 16k, 32k, 64k, 128k)` that fits the payload plus generation headroom, clamped by
    RAM (`max_num_ctx()`: 128k on a 32 GB+ Mac, else 64k) and by the model's own native
-   window. Every local call sends one; `None` only for non-local models.
-2. `budget.trim_messages_to_window(messages, reserved_bytes, num_ctx)` — the last resort,
+   window. Every local call sends one; `None` only for non-local models. The daemon's
+   answer to an oversized prompt is to silently context-shift the FRONT of it away — the
+   system prompt, the tool doctrine and the question — which is what this prevents.
+3. `budget.trim_messages_to_window(messages, reserved_bytes, num_ctx)` — the last resort,
    when the payload still exceeds the window that was requested. `None` num_ctx is a
-   no-op. Two passes over `role: "tool"` content only, never the system message and never
-   a user/assistant turn:
+   no-op, so a non-local model is never truncated. Two passes over `role: "tool"` content
+   only, never the system message and never a user/assistant turn:
    - **stub** older results (before the last 4 messages) whose content is > 80 bytes;
    - **truncate** the survivors, newest included, to an equal share of the remaining
      budget, keeping each one's HEAD.
    Every cut leaves a marker, so a short answer is explainable in the transcript.
 
+Bytes-per-token is **measured, not assumed**: `model_limits.observe_token_ratio` feeds the
+engine's own `prompt_eval_count` back into an EWMA that `pick_num_ctx` and
+`window_budget_bytes` both consult. The flat 3 B/token they shared was measured at 51% of
+the true ratio for English prose and 121% for a number-dense turn — wrong in both
+directions, and a constant cannot be right for that spread. Clamped to
+`[BYTES_PER_TOKEN, 6.0]` with a 0.85 safety factor, so it can only ever grant more context
+than the constant did, never less.
+
 ### 3.4 `tool_step_label(name)`
 
-Exact map (see `agent.rs:1172`). Unknown names -> `"Ran the {name} tool"`.
+Exact map in `labels.py` — the ONLY step-label table in the product since the native
+agent loop (and its own `tool_step_label`) was deleted in 14111c6. Unknown names ->
+`"Ran the {name} tool"`, which is how every connected MCP tool arrives (namespaced
+`server_tool`) and must stay unenumerated. `tests/test_labels.py` pins that every
+`agents.ALL_REGISTRY_TOOLS` name has a row, so a new tool cannot ship label-less.
 
 ## 4. Streaming protocol (sidecar -> Rust host)
 
@@ -268,6 +305,16 @@ to a single chip when nothing was delegated.
 
 - `POST /cancel` body `{"run_id": "..."}` -> cancels that run (the loop checks between
   rounds and between tool calls).
+- `POST /web_search` body `{"query": "...", "limit": 12}` -> `{"hits": [{"title", "url",
+  "source", "date", "score"}, ...]}` — the room's ONE web search provider
+  (`websearch.py`): several independent engines queried and fused into a single
+  relevance ranking (70% reciprocal-rank fusion across engines + 30% title match).
+  The only endpoint here with no model in it. A blocked engine drops out silently, so
+  an empty `hits` means "no results", not "a scraper broke". Rust owns the room's
+  internet switch (it checks before calling), the 15-minute result cache, and the
+  `web_search` tool plumbing; the sidecar owns the engines. There is deliberately no
+  `resolve_dates` knob — filling missing dates means fetching each RESULT url from
+  Python, around the Rust SSRF guard every other outbound fetch goes through.
 
 ## 6. Privacy — HARD REQUIREMENTS
 
@@ -276,8 +323,15 @@ This product's entire promise is that nothing leaves the Mac.
 - Bind **127.0.0.1 only**. Never 0.0.0.0.
 - `LANGCHAIN_TRACING_V2`, `LANGSMITH_*`, `LANGCHAIN_API_KEY` must be forcibly disabled at
   import time (delete from `os.environ`) — LangSmith tracing would exfiltrate room content.
-- No telemetry, no analytics, no outbound network except: the Ollama base URL and the
-  loopback MCP bridge. There must be a test asserting this.
+- No telemetry, no analytics, no outbound network except: the Ollama base URL, the
+  loopback MCP bridge, and the two seams that exist in order to leave the Mac — the
+  neural-voice synthesiser (`tts.py`) and web search (`websearch.py`). There must be a
+  test asserting this, and it must name the allowed hosts rather than waive the check:
+  `test_privacy.py` pins web search to its engine list and holds every other module to
+  loopback-only, so a new outbound host anywhere else fails the suite.
+- Web search reaches the public internet ONLY when the room's internet switch is on.
+  Rust checks that before it calls `/web_search`; the sidecar has no copy of the setting
+  and must not grow one.
 - The sidecar never logs message content at INFO or above.
 
 ## 7. Tests (pytest)
@@ -294,6 +348,14 @@ network, no real model. Cover at minimum:
 - `pick_num_ctx`: bucketed, RAM-clamped, never above the model's native window
 - `trim_messages_to_window`: no-op under budget and for non-local models; stubs old tool
   msgs then truncates the survivors; never touches the system message or a user turn
+- `compact_to_budget`: system + newest turn survive verbatim, old turns become facts
+  rather than disappearing, the input list is not mutated, digests are cached, and a
+  failing digest degrades to the trim instead of failing the turn
+- `bytes_per_token`: cold start equals the constant, a measured ratio can raise it but
+  never lower it, a wild sample cannot move it, and it stays the inverse of
+  `window_budget_bytes`
+- the turn-wide round budget bounds the whole delegation tree (not one loop), still
+  answers when exhausted, and announces itself exactly once
 - pending images become a USER message
 - cancellation between rounds and between tool calls
 - blank final -> "Done."; blank + cancelled -> stays blank

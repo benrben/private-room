@@ -20,14 +20,13 @@ Two invariants:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from . import llm
-from .chat_docs import recover_json
 from .messages import system_message, user_message
+from .model_text import recover_json
 from .privacy import is_nonlocal_model
-
-import json
 
 #: Mark categories. ``concept`` is anything matched by a user concept rule.
 CATEGORIES = (

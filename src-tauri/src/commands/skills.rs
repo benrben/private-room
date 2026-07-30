@@ -383,7 +383,18 @@ pub(crate) fn agent_save_skill(
     let description = args["description"].as_str().unwrap_or_default();
     let instructions = args["instructions"].as_str().unwrap_or_default();
     // Which sub-agent this procedure belongs to; omitted = GENERAL.
-    let agent_owner = args["agent"].as_str().unwrap_or_default();
+    let agent_owner = args["agent"].as_str().unwrap_or_default().trim();
+    // A skill scoped to an id no worker has is invisible forever: never offered
+    // to a specialist, never surfaced to the user. Before this, one mistyped
+    // character ("file.read") produced exactly that, silently. Refuse with the
+    // real list so the model can correct itself in one round (2026-07-28).
+    if !agent_owner.is_empty() && !super::agent::SKILL_AGENT_IDS.contains(&agent_owner) {
+        return Err(format!(
+            "agent must be one of: {} — or omit it for a skill any agent may \
+             use. Got {agent_owner:?}; nothing was saved.",
+            super::agent::SKILL_AGENT_IDS.join(", ")
+        ));
+    }
     let name = validate_skill_fields(raw_name, description, instructions)?;
     let source_names: Vec<String> = args["source_files"]
         .as_array()

@@ -198,6 +198,46 @@ class OpenAICompatibleChatModel:
             }
         return payload
 
+    async def _digest(self, text: str) -> str:
+        """One compaction pass, as an ordinary (billed) completion."""
+        from .compaction import DIGEST_PROMPT
+
+        return await self.generate(
+            [
+                {"role": "system", "content": DIGEST_PROMPT},
+                {"role": "user", "content": text},
+            ]
+        )
+
+    async def _compact(
+        self, messages: list[Message], tools: list[dict[str, Any]]
+    ) -> list[Message]:
+        """Compress the older half of a long conversation before it is billed.
+
+        Budgeted off the provider's REAL catalog window, at the gentle cloud
+        fraction — this is here to stop a runaway transcript being re-sent
+        every round, not to ration a model that has room to spare. Unknown
+        window means no budget and no change.
+        """
+        from .budget import json_chars
+        from .compaction import (
+            CLOUD_SPEND_FRACTION,
+            compact_to_budget,
+            digest_chunk_bytes,
+            fit_budget_bytes,
+        )
+
+        window = self.provider.context_window
+        reserved = json_chars(tools) if tools else 0
+        out, _did = await compact_to_budget(
+            messages,
+            fit_budget_bytes(window, reserved, CLOUD_SPEND_FRACTION),
+            self._digest,
+            reserved,
+            digest_chunk_bytes(window, cloud=True),
+        )
+        return out
+
     async def generate(
         self,
         messages: list[Message],
@@ -269,6 +309,7 @@ class OpenAICompatibleChatModel:
         cancel: Optional[Cancellable] = None,
     ) -> tuple[str, list[ToolCall], RoundUsage]:
         send, _, engaged = guard_outbound(self.composite_model, messages, self.privacy)
+        send = await self._compact(send, tools)
         restorer = engaged.restorer() if engaged else None
         payload = self._payload(send, tools=tools, stream=True)
         parts: list[str] = []

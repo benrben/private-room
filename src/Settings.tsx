@@ -208,15 +208,17 @@ export default function Settings({
   const checkpoints = useCheckpoints();
 
   const {
-    webProvider,
-    setWebProvider,
-    webEndpoint,
-    setWebEndpoint,
+    webOn,
+    setWebOn,
     webSaved,
     webTesting,
     webTestResult,
     saveWebAccess,
     testWebSearch,
+    searchAgent,
+    setSearchAgent,
+    browseAgent,
+    setBrowseAgent,
   } = useOnlineSearch();
 
   const { advisorsOn, advisorToolsOn, onAdvisorsToggle, onAdvisorToolsToggle } =
@@ -438,16 +440,18 @@ export default function Settings({
                 onChanged={onModelsChanged}
               />
               <OnlineSection
-                webProvider={webProvider}
-                setWebProvider={setWebProvider}
-                webEndpoint={webEndpoint}
-                setWebEndpoint={setWebEndpoint}
+                webOn={webOn}
+                setWebOn={setWebOn}
                 webTesting={webTesting}
                 testWebSearch={testWebSearch}
                 saveWebAccess={saveWebAccess}
                 webSaved={webSaved}
                 webTestResult={webTestResult}
                 AlertIcon={AlertIcon}
+                searchAgent={searchAgent}
+                setSearchAgent={setSearchAgent}
+                browseAgent={browseAgent}
+                setBrowseAgent={setBrowseAgent}
               />
               <RemoteAiSection
                 closetUrl={closetUrl}

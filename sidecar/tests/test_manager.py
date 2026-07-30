@@ -6,6 +6,7 @@ agent's delegation catalog decide what a 4B model can reliably act on.
 
 from __future__ import annotations
 
+import json
 import re
 
 from arcelle_sidecar.agents import (
@@ -20,7 +21,6 @@ from arcelle_sidecar.agents import (
     MAX_BOX_TOOLS,
     REGISTRY,
     agent_tool_specs,
-    available_agents,
     get_agent,
     group_prompt,
     group_tools,
@@ -32,6 +32,7 @@ from arcelle_sidecar.routing import (
     JOB_TOOL_NAMES,
     MCP_MANAGEMENT_TOOL_NAMES,
     SKILL_TOOL_NAMES,
+    BROWSE_TOOL_NAMES,
     UI_TOOL_NAMES,
     WRITE_TOOL_NAMES,
 )
@@ -153,10 +154,10 @@ def test_a_recurring_ask_beats_the_broad_lane_list_and_reaches_workflows() -> No
     """Own vocabulary outranks inherited-only vocabulary.
 
     Live report 2026-07-24: "summarize every file each morning" routed to the
-    one-off file pass. `_JOB_HINTS` (the broad Rust-parity lane list jobs.run
+    one-off file pass. `JOB_HINTS` (the broad Rust-parity lane list jobs.run
     inherits) carries recurrence words, so jobs.run scored two inherited hits
     against jobs.workflows' one OWN hit — a 2-2 tie that fell through to the
-    first member. Doubling own hits in `_score` cannot fix that alone; the
+    first member. Doubling own hits in `_rank` cannot fix that alone; the
     tie-break has to rank own vocabulary above inherited.
     """
     assert resolve_worker("ask_jobs_agent", "summarize every file each morning") == "jobs.workflows"
@@ -304,8 +305,18 @@ def test_the_main_agent_is_the_hub_not_a_worker() -> None:
     main = get_agent(MAIN_AGENT_ID)
     assert main.main and main.tools == ()
     assert main.prompt  # it teaches its own delegation doctrine
-    # Never a routing candidate; the default WORKER is the File agent.
-    assert all(not s.main for s in available_agents(web_enabled=True))
+    # Never a routing candidate. The candidates ARE the domains' member tuples
+    # (that is all `resolve_worker` ever chooses among), so the invariant is
+    # that no domain lists the hub — and therefore no instruction, on any tier,
+    # can resolve to it. This used to be asserted through `available_agents`,
+    # which nothing shipped called and whose web rule had drifted (it filtered
+    # `chat.web` alone while `WEB_DEPENDENT_AGENT_IDS` also covers
+    # `chat.browse`); deleted 2026-07-30, the invariant re-pinned here.
+    assert all(MAIN_AGENT_ID not in members for _, members, _ in AGENT_TOOL_DOMAINS)
+    for tool, _, _ in AGENT_TOOL_DOMAINS:
+        for ask in ("do the thing", "answer me yourself", "summarize every file each morning"):
+            assert resolve_worker(tool, ask) != MAIN_AGENT_ID, (tool, ask)
+    # The default WORKER is the File agent.
     assert DEFAULT_AGENT_ID == "files.read"
     assert not get_agent(DEFAULT_AGENT_ID).main
 
@@ -329,8 +340,138 @@ _ALL_SERVED = (
     | set(JOB_TOOL_NAMES)
     | set(SKILL_TOOL_NAMES)
     | set(MCP_MANAGEMENT_TOOL_NAMES)
+    | set(BROWSE_TOOL_NAMES)
+    # The web tools were missing here: `worker_reachable` used to answer
+    # "reachable?" for chat.web from the room's web SETTING alone, so an
+    # "everything is served" fixture that served no web tools still produced a
+    # web domain. Once the setting became a necessary-not-sufficient condition
+    # (BROWSE-1 — a cloud-advisor tier serves web_search but no browse_*), the
+    # gap showed up as a missing domain here.
+    | {"web_search", "fetch_page"}
     | {"search_mcp_tools", "run_mcp_tool"}
 )
+
+
+#: The delegation catalog's PLUMBING, hand-typed once more.
+#:
+#: Until 2026-07-30 `agent_tool_specs` was ~90 lines of nested JSON-schema
+#: literal with the reachability logic buried inside it; the literal moved into
+#: `_INSTRUCTION_PARAM` / `_function_spec` / `_batch_tool_spec`. This is the
+#: shape the model was served BEFORE that move, written out independently, so a
+#: future refactor of those builders cannot quietly reshape the wire contract
+#: the host and every engine parse. The domain DESCRIPTIONS are data
+#: (`AGENT_TOOL_DOMAINS`) and are read from there rather than duplicated; the
+#: prose that only exists inside the schema is spelled out, because that prose
+#: is exactly what drifted in the 2026-07-28 bug.
+_EXPECTED_INSTRUCTION = {
+    "type": "string",
+    "description": (
+        "What you need this agent to do, as one clear task. Name the files "
+        "or targets."
+    ),
+}
+
+
+def _expected_domain_spec(name: str, description: str) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {"instruction": _EXPECTED_INSTRUCTION},
+                "required": ["instruction"],
+            },
+        },
+    }
+
+
+_EXPECTED_BATCH_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "ask_agents",
+        "description": (
+            "Ask SEVERAL specialists in ONE call. Prefer this whenever the "
+            "request has more than one part: tasks that do not depend on each "
+            "other run AT THE SAME TIME, so the whole batch costs as long as "
+            "its slowest task instead of the sum. Use depends_on only when a "
+            "task genuinely needs an earlier task's findings — those wait, "
+            "everything else runs together."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "The tasks to run, in any order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent": {
+                                "type": "string",
+                                "enum": ["file", "web", "app", "jobs", "skills", "connector"],
+                                "description": (
+                                    "Which specialist: file = this room's "
+                                    "own content; "
+                                    "web = the internet and browsing sites; "
+                                    "app = this app's interface; jobs = "
+                                    "workflows and whole-file passes; skills = "
+                                    "agent skills; connector = connected "
+                                    "services."
+                                ),
+                            },
+                            "instruction": _EXPECTED_INSTRUCTION,
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": (
+                                    "Positions (0-based) of tasks in THIS list "
+                                    "whose findings this task needs. Leave "
+                                    "empty when it can run immediately."
+                                ),
+                            },
+                        },
+                        "required": ["agent", "instruction"],
+                    },
+                }
+            },
+            "required": ["tasks"],
+        },
+    },
+}
+
+
+def test_the_delegation_catalog_json_is_byte_stable() -> None:
+    """One entry per domain plus the batch tool, exactly as before the builders.
+
+    Compared as JSON as well as by value: the entries reach the model as a
+    serialized catalog, so KEY ORDER is part of what shipped, and `==` on dicts
+    would not notice it changing.
+    """
+    described = {n: d for n, _, d in AGENT_TOOL_DOMAINS}
+    expected = [_expected_domain_spec(n, described[n]) for n, _, _ in AGENT_TOOL_DOMAINS]
+    expected.append(_EXPECTED_BATCH_SPEC)
+    specs = agent_tool_specs(web_enabled=True, served_names=_ALL_SERVED)
+    assert specs == expected
+    assert json.dumps(specs) == json.dumps(expected)
+
+    # The same plumbing on a tier that shrinks the roster: CORE alone reaches
+    # the File agent and — through list_skills/read_skill — the Skills agent,
+    # and nothing else. The enum's PROSE is generated from the same keys as the
+    # enum itself (2026-07-28: it was a hardcoded six-domain literal, and a
+    # web-disabled room kept reading "web = the internet").
+    narrow = agent_tool_specs(web_enabled=False, served_names=set(CORE_TOOLS))
+    assert narrow[:-1] == [
+        _expected_domain_spec(n, described[n])
+        for n in ("ask_file_agent", "ask_skills_agent")
+    ]
+    task = narrow[-1]["function"]["parameters"]["properties"]["tasks"]["items"]
+    assert task["properties"]["agent"]["enum"] == ["file", "skills"]
+    assert task["properties"]["agent"]["description"] == (
+        "Which specialist: file = this room's own content; skills = agent skills."
+    )
+    assert task["properties"]["instruction"] == _EXPECTED_INSTRUCTION
 
 
 def test_agent_tools_stay_inside_the_small_model_cap() -> None:

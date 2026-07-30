@@ -149,6 +149,37 @@ async def test_a_failure_becomes_an_error_event_not_a_500() -> None:
     assert events[-1] == {"t": "error", "v": "ollama is not running"}
 
 
+async def test_a_torn_down_run_never_looks_like_a_finished_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A BaseException out of run_agent used to leave a clean 200 whose body held only
+    # the step chips: no `final`, no `error`. The driver re-raised CancelledError while
+    # its `finally` still queued the sentinel, so the generator closed NORMALLY and
+    # gather(return_exceptions=True) ate the exception. sidecar.rs then read that as
+    # Done("") and `ask` persisted a zero-byte assistant row — a failure that read as
+    # success, with no diagnostic anywhere (live QA 2026-07-30, the Yahoo/ETF task).
+    from arcelle_sidecar import graph as graph_mod
+
+    async def torn(req: Any, deps: Any) -> str:
+        await deps.emit({"t": "step", "v": "Searched the web", "node": "main"})
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(graph_mod, "run_agent", torn)
+
+    app = app_with(FakeChatModel([Round(content="unused")]), FakeMCP())
+    async with client_for(app) as c:
+        resp = await c.post("/run", json=BODY)
+
+    assert resp.status_code == 200
+    events = [json.loads(line) for line in resp.text.strip().split("\n") if line]
+    assert events, "a torn run streamed nothing at all"
+    assert events[-1]["t"] == "error", (
+        f"stream ended on {events[-1]['t']!r}: the host reads a stream with no "
+        "`final` as a successful empty answer"
+    )
+    assert events[-1]["v"], "an error event with an empty message tells the user nothing"
+
+
 async def test_cancel_unknown_run_is_a_no_op() -> None:
     app = app_with(FakeChatModel([Round(content="hi")]), FakeMCP())
     async with client_for(app) as c:

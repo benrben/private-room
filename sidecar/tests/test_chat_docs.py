@@ -18,7 +18,7 @@ import httpx
 import pytest
 from ollama import ResponseError
 
-from arcelle_sidecar import chat_docs, llm
+from arcelle_sidecar import chat_docs, llm, model_text
 from arcelle_sidecar.server import create_app
 
 
@@ -334,6 +334,8 @@ def test_value_str_matches_rust() -> None:
 
 
 def test_recover_json_slices_first_to_last_bracket() -> None:
-    assert chat_docs.recover_json("noise {\"a\":1} tail") == '{"a":1}'
-    assert chat_docs.recover_json("```json\n[1,2]\n```") == "[1,2]"
-    assert chat_docs.recover_json("plain text") == "plain text"
+    # The helper now lives in model_text (one copy for all six callers); the
+    # assertions stay here because this module's reply parsing depends on them.
+    assert model_text.recover_json("noise {\"a\":1} tail") == '{"a":1}'
+    assert model_text.recover_json("```json\n[1,2]\n```") == "[1,2]"
+    assert model_text.recover_json("plain text") == "plain text"

@@ -1,4 +1,5 @@
 mod biometrics;
+pub mod browser;
 mod commands;
 pub mod db;
 pub mod extraction;
@@ -21,6 +22,41 @@ use commands::AppState;
 #[cfg(target_os = "macos")]
 use tauri::{Emitter, Manager};
 
+/// The app's one and only window label.
+pub(crate) const MAIN_WINDOW: &str = "main";
+
+/// The main WINDOW — never `get_webview_window`.
+///
+/// THE BUG THIS EXISTS FOR (BROWSE-1, 2026-07-30): tauri's
+/// `AppHandle::get_webview_window(label)` returns `Some` only while
+/// `Window::is_webview_window()` holds, and that is
+/// `self.webviews().iter().all(|w| w.label() == self.label())` — i.e. "this
+/// window hosts exactly one webview, and it shares the window's label".
+///
+/// The private browser is a CHILD webview (`browser::BROWSER_LABEL`) added to
+/// this very window. From the moment a page opens, the main window hosts two
+/// webviews, `is_webview_window()` goes false, and EVERY
+/// `get_webview_window("main")` in the codebase starts returning `None` —
+/// until the browser is closed. That silently took out the room MCP bridge's
+/// tool dispatch ("main window is gone" for every tool the agent called), the
+/// job/workflow progress events, and the scheduler.
+///
+/// `get_window` has no such predicate: a window is a window however many
+/// webviews it hosts. Every caller that only needs to `emit` or to hand a
+/// `&Window` to a command must use THIS.
+pub(crate) fn main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<tauri::Window<R>> {
+    tauri::Manager::get_window(app, MAIN_WINDOW)
+}
+
+/// The main window's own WEBVIEW — for the few callers that need the platform
+/// webview itself (screenshots) rather than the window. Also immune to the
+/// child-webview trap above: it is a direct label lookup.
+pub(crate) fn main_webview<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Option<tauri::Webview<R>> {
+    tauri::Manager::webviews(app).get(MAIN_WINDOW).cloned()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Sweep decrypted "Open in browser" previews left behind by a crashed or
@@ -35,6 +71,9 @@ pub fn run() {
         .manage(commands::HtmlPreviews::default())
         .manage(commands::MediaStreams::default())
         .manage(commands::AgentUi::default())
+        // BROWSE-1: the private browser area's state (takeover flag, last
+        // bounds, this session's agent journal).
+        .manage(browser::BrowserState::default())
         .manage(commands::RecState::default())
         .manage(commands::DictState::default())
         // ADD-24: stream staged room media (audio/video) with HTTP Range
@@ -295,6 +334,16 @@ pub fn run() {
             commands::speak_text,
             commands::speak_text_neural,
             commands::list_speech_voices,
+            // BROWSE-1: the private browser area.
+            commands::browser_navigate,
+            commands::browser_close,
+            commands::browser_set_bounds,
+            commands::browser_info,
+            commands::browser_go,
+            commands::browser_set_takeover,
+            commands::browser_journal,
+            commands::browser_clear_journal,
+            commands::browser_verify_private,
         ])
         .setup(|app| {
             // Wave 5 (Idea 13): sweep orphaned script-run workspaces left by a
@@ -325,6 +374,10 @@ pub fn run() {
                 sidecar_lifecycle::stop_if_ours();
                 // Decrypted "Open in browser" previews must not outlive the app.
                 commands::cleanup_browser_previews();
+                // BROWSE-1: Cmd-Q skips teardown_open_room, so the private
+                // browser is closed here too. Its store is non-persistent, so
+                // this is what actually discards the session's cookies/cache.
+                let _ = browser::close(_app);
                 // Wave 1a: Cmd-Q skips teardown_open_room, so drop the Leash
                 // discovery file here too — it must exist exactly while the
                 // Leash runs, never advertising a dead endpoint.
@@ -341,7 +394,7 @@ pub fn run() {
                 if let Some(path) = path {
                     let state = _app.state::<AppState>();
                     *state.pending_open.lock().unwrap() = Some(path.clone());
-                    if let Some(window) = _app.get_webview_window("main") {
+                    if let Some(window) = main_window(_app) {
                         let _ = window.emit("open-room-file", path);
                     }
                 }

@@ -36,6 +36,7 @@ const AREA_HEADINGS: Record<WorkArea, string> = {
   skills: "Skills",
   memory: "Memory",
   connectors: "Connectors",
+  browser: "Private browser",
 };
 
 /** The left pane. In the file-centric areas it unifies browsing (the real

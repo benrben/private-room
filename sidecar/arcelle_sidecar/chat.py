@@ -13,9 +13,15 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
 
 from .budget import json_chars, msg_len, trim_messages_to_window
+from .compaction import (
+    CLOUD_SPEND_FRACTION,
+    compact_to_budget,
+    digest_chunk_bytes,
+    fit_budget_bytes,
+)
 from .config import KEEP_ALIVE_WARM
 from .messages import Message, ToolCall, attach_images
-from .model_limits import native_context_length, pick_num_ctx
+from .model_limits import native_context_length, observe_token_ratio, pick_num_ctx
 from .privacy import PrivacyPolicy, guard_outbound, is_nonlocal_model
 
 #: Called with each streamed text delta.
@@ -208,6 +214,24 @@ class OllamaChatModel:
         self._last_num_ctx = num_ctx
         return num_ctx
 
+    async def _remote_window(self) -> int | None:
+        """A non-local model's OWN window, in tokens, or None.
+
+        Only meaningful for a `:cloud` tag: Ollama's catalog reports the real
+        remote length for those (confirmed live 2026-07-21). A local model has
+        `num_ctx` instead and never reaches here.
+        """
+        if not is_nonlocal_model(self.model):
+            return None
+        return await native_context_length(self.model, self.base_url)
+
+    async def _compaction_budget(self, num_ctx: int | None, reserved: int) -> int | None:
+        """Bytes of conversation this call may send, local window or remote."""
+        if num_ctx is not None:
+            return fit_budget_bytes(num_ctx, reserved)
+        window = await self._remote_window()
+        return fit_budget_bytes(window, reserved, CLOUD_SPEND_FRACTION)
+
     def _llm(self, num_ctx: int | None) -> Any:
         from langchain_ollama import ChatOllama
 
@@ -259,6 +283,47 @@ class OllamaChatModel:
             model=self.model,
             messages=attach_images(messages, images),
             format=format,
+            options=options,
+            keep_alive=self.keep_alive,
+            think=think,
+            stream=False,
+        )
+        return resp.message.content or ""
+
+    async def _digest(self, text: str) -> str:
+        """One compaction pass: a chunk of old conversation -> its durable facts.
+
+        Deliberately NOT routed through :meth:`generate`: that resolves (and
+        remembers) a ``num_ctx`` for the token bar, and a digest is bookkeeping,
+        not a round of the user's turn — it must not show up as one. Bounded
+        output, own window, no shared state touched.
+        """
+        from ollama import AsyncClient
+
+        from .compaction import DIGEST_NUM_PREDICT, DIGEST_PROMPT
+
+        msgs: list[Message] = [
+            {"role": "system", "content": DIGEST_PROMPT},
+            {"role": "user", "content": text},
+        ]
+        options: dict[str, Any] = {
+            "num_predict": DIGEST_NUM_PREDICT,
+            "temperature": 0,
+        }
+        if self.num_ctx is not None:
+            options["num_ctx"] = self.num_ctx
+        elif not is_nonlocal_model(self.model):
+            native = await native_context_length(self.model, self.base_url)
+            options["num_ctx"] = pick_num_ctx(
+                sum(msg_len(m) for m in msgs), native
+            )
+        # Same think rule as `generate` (ollama.rs:505): a thinking model spends
+        # the whole num_predict on hidden reasoning and returns empty content.
+        think = False if ("qwen3" in self.model and "instruct" not in self.model) else None
+        client = AsyncClient(host=self.base_url)
+        resp = await client.chat(
+            model=self.model,
+            messages=msgs,
             options=options,
             keep_alive=self.keep_alive,
             think=think,
@@ -332,6 +397,45 @@ class OllamaChatModel:
         num_ctx = await self._resolve_num_ctx(
             sum(msg_len(m) for m in send) + reserved
         )
+        # COMPACT before truncating. Both make the payload fit; only this one
+        # keeps the facts. Measured 2026-07-28: at the same byte budget a
+        # digested transcript scored 0.44 vs 0.25 (2B) and 1.00 vs 0.25 (32B)
+        # on a revision-tracking task, and a compacted 12 KB matched a raw
+        # 176 KB on 19x fewer prompt tokens. See :mod:`.compaction`.
+        #
+        # A `:cloud` model has no local `num_ctx` — this used to make compaction
+        # a no-op for it, which meant the one engine where every byte is BILLED
+        # was the one re-sending the whole transcript every round. It advertises
+        # its real remote window through the same catalog `native_context_length`
+        # reads, so budget against that instead, at the gentler cloud fraction.
+        # Unknown window -> None -> unchanged behaviour, as before.
+        budget = await self._compaction_budget(num_ctx, reserved)
+        compacted, did = await compact_to_budget(
+            send,
+            budget,
+            self._digest,
+            reserved,
+            digest_chunk_bytes(
+                num_ctx or await self._remote_window(), cloud=num_ctx is None
+            ),
+        )
+        if did:
+            # Re-fit the window to what is ACTUALLY going out. `num_ctx` above
+            # was sized to the raw payload, and the host now hands over the
+            # whole conversation — so without this a 200 KB history would ask
+            # Ollama for the 64k bucket and then send ~32k tokens into it,
+            # allocating twice the KV cache the call needs (measured elsewhere
+            # in this module at 64k ctx -> 7.7 GB on a 16 GB Mac). Still a
+            # bucket, so it stays byte-stable across the rounds of a turn and
+            # the prompt cache stays warm.
+            num_ctx = await self._resolve_num_ctx(
+                sum(msg_len(m) for m in compacted) + reserved
+            )
+            # Rebind rather than mutate: compaction REPLACES turns with a
+            # digest, so an in-place edit would corrupt the caller's history
+            # (guard_outbound hands back the caller's own list for a local
+            # model). The trim below still runs, as the last resort it was.
+            send = compacted
         # Last resort: the round loop can outgrow even the largest window this
         # Mac may ask for (a big attachment, a whole fetched page, a chatty
         # connector result). Shrink it deliberately here rather than letting the
@@ -345,6 +449,12 @@ class OllamaChatModel:
         # None there, so this returns immediately and a cloud model never loses
         # a byte to us.
         trim_messages_to_window(send, reserved, num_ctx)
+        # What we are ACTUALLY about to send, after compaction and the trim —
+        # the numerator of the bytes-per-token calibration `_round_usage`
+        # feeds. Measured here and threaded through for the same reason
+        # `num_ctx` is: one ChatModel is shared by every concurrent delegation
+        # child, so instance state would be last-writer-wins.
+        sent_bytes = sum(msg_len(m) for m in send) + reserved
         llm: Any = self._llm(num_ctx)
         if tools:
             llm = llm.bind_tools(tools)
@@ -401,9 +511,11 @@ class OllamaChatModel:
                         },
                     )
                 )
-        return content, calls, await self._round_usage(merged, num_ctx)
+        return content, calls, await self._round_usage(merged, num_ctx, sent_bytes)
 
-    async def _round_usage(self, merged: Any, num_ctx: int | None = None) -> RoundUsage:
+    async def _round_usage(
+        self, merged: Any, num_ctx: int | None = None, sent_bytes: int = 0
+    ) -> RoundUsage:
         """Real usage when Ollama reported it, else the char-estimate fallback
         signal (``is_real=False`` — the caller substitutes its own estimate).
 
@@ -430,6 +542,13 @@ class OllamaChatModel:
         )
         meta = getattr(merged, "usage_metadata", None) if merged is not None else None
         if meta:
+            # Close the loop: the engine just told us how many tokens the bytes
+            # we sent actually became. Every context budget in the app was
+            # GUESSING that ratio at a flat 3 B/token — measured, real content
+            # runs 2.5 to 5.9 — so feed the truth back rather than ship the
+            # guess. Local only: a non-local model has no window we size.
+            if sent_bytes and not is_nonlocal_model(self.model):
+                observe_token_ratio(sent_bytes, meta.get("input_tokens") or 0)
             return RoundUsage(
                 input_tokens=meta.get("input_tokens"),
                 output_tokens=meta.get("output_tokens"),

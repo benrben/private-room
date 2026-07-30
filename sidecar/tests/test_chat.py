@@ -376,3 +376,53 @@ def test_chunks_merge_into_tool_calls() -> None:
     merged = a + b
     assert _chunk_text(merged.content) == "Let me look."
     assert merged.tool_calls[0]["name"] == "search_room"
+
+
+async def test_the_window_is_refitted_to_what_compaction_actually_sends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host hands over the WHOLE conversation now, so the raw payload no
+    longer says what the call needs. Sizing `num_ctx` off the raw bytes and then
+    sending a compacted payload asks Ollama for roughly twice the KV cache the
+    call uses — 64k ctx costs ~7.7 GB on a 16 GB Mac (model_limits)."""
+
+    async def fake_native_length(model: str, base_url: str) -> int | None:
+        return 262_144
+
+    monkeypatch.setattr(chat_module, "native_context_length", fake_native_length)
+
+    async def tiny_digest(self, text: str) -> str:
+        return "facts: the rent is 4200"
+
+    monkeypatch.setattr(OllamaChatModel, "_digest", tiny_digest)
+
+    # Record the BYTES the window was fitted to, not the bucket it landed in:
+    # buckets are coarse (8k/16k/32k/64k/128k) and a shrink can easily stay
+    # inside one, which would make a bucket assertion pass or fail for reasons
+    # that have nothing to do with the behaviour under test.
+    asked: list[int] = []
+    real_resolve = OllamaChatModel._resolve_num_ctx
+
+    async def spy(self, payload_bytes: int) -> int | None:
+        asked.append(payload_bytes)
+        return await real_resolve(self, payload_bytes)
+
+    monkeypatch.setattr(OllamaChatModel, "_resolve_num_ctx", spy)
+
+    m = OllamaChatModel("qwen3.5:4b", "http://127.0.0.1:11434")
+    _fake_llm(m, _FakeStream([AIMessageChunk(content="ok")]))
+
+    async def on_delta(_: str) -> None:
+        pass
+
+    # Big enough to exceed even the largest window this Mac may ask for, so
+    # compaction engages at all — it is a safety valve now (SPEND_FRACTION 0.9),
+    # not something an ordinary turn triggers.
+    big: list[Message] = [{"role": "system", "content": "S"}] + [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i} " + "x" * 2_500}
+        for i in range(120)
+    ]
+    await m.stream(big, [], on_delta, cancel=None)
+
+    assert len(asked) == 2, f"the window was never re-fitted after compaction: {asked}"
+    assert asked[1] < asked[0], f"the re-fit saw no smaller payload: {asked}"

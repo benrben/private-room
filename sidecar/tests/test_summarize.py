@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
-from arcelle_sidecar import summarize
+from arcelle_sidecar import model_text, summarize
 from arcelle_sidecar.llm import LlmError
 from arcelle_sidecar.messages import ToolCall
 from arcelle_sidecar.server import create_app
@@ -84,15 +84,17 @@ def test_clean_one_liner() -> None:
 
 
 def test_strip_think_spans() -> None:
-    assert summarize.strip_think_spans("<think>hmm</think>answer") == "answer"
+    # The helper now lives in model_text (one copy for all six callers); the
+    # assertions stay here because this module's reply parsing depends on them.
+    assert model_text.strip_think_spans("<think>hmm</think>answer") == "answer"
     # An unterminated <think> truncates everything after it.
-    assert summarize.strip_think_spans("visible<think>leaked") == "visible"
+    assert model_text.strip_think_spans("visible<think>leaked") == "visible"
 
 
 def test_recover_json_unwraps_fence_and_think() -> None:
-    assert summarize.recover_json('```json\n{"a":1}\n```') == '{"a":1}'
-    assert summarize.recover_json('<think>x</think> ["a","b"] trailing') == '["a","b"]'
-    assert summarize.recover_json("no json here") == "no json here"
+    assert model_text.recover_json('```json\n{"a":1}\n```') == '{"a":1}'
+    assert model_text.recover_json('<think>x</think> ["a","b"] trailing') == '["a","b"]'
+    assert model_text.recover_json("no json here") == "no json here"
 
 
 def test_json_str_field() -> None:

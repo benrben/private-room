@@ -164,6 +164,7 @@ def make_request(
     messages: list[Message] | None = None,
     web_enabled: bool = False,
     max_rounds: int | None = None,
+    turn_max_rounds: int | None = None,
     mcp_routes: int = 0,
     advisors: list[str] | None = None,
     routing: dict[str, bool] | None = None,
@@ -188,6 +189,7 @@ def make_request(
         routing=routing,  # type: ignore[arg-type]
         web_enabled=web_enabled,
         max_rounds=max_rounds,
+        turn_max_rounds=turn_max_rounds,
         mcp_routes=mcp_routes,
         advisors=advisors or [],
         run_id=run_id,

@@ -170,8 +170,7 @@ async fn catch_up_pass(app: &tauri::AppHandle, generation: u64) {
 /// Start one scheduled run and advance the schedule's next run.
 async fn fire(app: &tauri::AppHandle, sched: &db::Schedule, wf: &db::Workflow, trigger: &str) {
     use tauri::Manager;
-    let Some(webview) = app.get_webview_window("main") else { return };
-    let window = webview.as_ref().window();
+    let Some(window) = crate::main_window(app) else { return };
     let state = app.state::<AppState>();
     let next = next_run_from_now(&sched.kind, &sched.param);
     match start_workflow_run(&window, &state, &wf.id, trigger, None, &std::collections::HashSet::new()).await {

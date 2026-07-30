@@ -957,7 +957,7 @@ pub(crate) async fn run_script_process<R: tauri::Runtime>(
 
     // room-files-changed after import (the publish-arm precedent).
     if !report.imported.is_empty() {
-        if let Some(w) = app.get_webview_window("main") {
+        if let Some(w) = crate::main_window(app) {
             let _ = w.emit("room-files-changed", ());
         }
     }

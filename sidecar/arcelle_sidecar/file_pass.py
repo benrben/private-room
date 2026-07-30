@@ -34,7 +34,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import llm
 from .config import KEEP_ALIVE_WARM, ProviderConfig
-from .messages import Message, compact_json, system_message, user_message
+from .messages import Message, system_message, user_message
+from .model_text import prime_schema, recover_json
 
 # --- caps (file_pass.rs constants) -----------------------------------------
 #: Per-window notes cap (merge mode). This is the FIRST and harshest fold — a
@@ -95,20 +96,13 @@ SECTION_SYSTEM: str = (
     "front of you — no overall preamble or conclusion."
 )
 
-#: chat_structured (ollama.rs) primes the schema onto the last user turn because
-#: Ollama's ``format`` constrains the GRAMMAR but the model never sees the schema —
-#: without the field names a small model fills the forced JSON with empty strings.
-_SCHEMA_PRIMER: str = (
-    "\n\nReply with ONLY JSON matching this schema, filling every field with real content:\n"
-)
-
 #: model_call returns None (→ skipped / fallback) after a double failure. A unique
 #: sentinel keeps that distinct from a model that legitimately returned JSON
 #: ``null`` (which Rust treats as ``Some(Null)`` — parsed, empty, not skipped).
 _SKIP = object()
 
 
-# --- byte-safe helpers (agent.rs clamp_bytes / ollama.rs recover_json) ------
+# --- byte-safe helpers (agent.rs clamp_bytes) -------------------------------
 
 
 def clamp_bytes(s: str, max_bytes: int) -> str:
@@ -126,41 +120,6 @@ def clamp_bytes(s: str, max_bytes: int) -> str:
     return raw[:max_bytes].decode("utf-8", errors="ignore")
 
 
-def strip_think_spans(raw: str) -> str:
-    """Drop ``<think>…</think>`` reasoning spans (ollama.rs ``strip_think_spans``).
-
-    An UNTERMINATED ``<think>`` truncates the rest — everything after it is unclosed
-    reasoning, not answer.
-    """
-    out = raw
-    while True:
-        start = out.find("<think>")
-        if start < 0:
-            break
-        rel = out.find("</think>", start)
-        if rel < 0:
-            out = out[:start]
-            break
-        out = out[:start] + out[rel + len("</think>") :]
-    return out
-
-
-def recover_json(text: str) -> str:
-    """Recover the JSON payload from a structured response (ollama.rs ``recover_json``).
-
-    A no-op for models that honour ``format``; for the ones that wrap the JSON in a
-    ```` ```json ```` fence or a ``<think>`` preamble (notably Ollama *cloud* models
-    that ignore ``format``) it drops the think span then slices from the first
-    opening bracket to the last closing one.
-    """
-    s = strip_think_spans(text.strip()).strip()
-    a = next((i for i, c in enumerate(s) if c in "{["), None)
-    b = next((i for i in range(len(s) - 1, -1, -1) if s[i] in "}]"), None)
-    if a is not None and b is not None and b >= a:
-        return s[a : b + 1]
-    return s
-
-
 def _is_fatal(code: str) -> bool:
     """A hard engine failure parks the job for Resume (file_pass.rs ``is_fatal``)."""
     return code == "OLLAMA_DOWN" or code.startswith("MODEL_MISSING")
@@ -173,19 +132,6 @@ def _field(parsed: Any, key: str) -> str:
         if isinstance(v, str):
             return v
     return ""
-
-
-def _prime_schema(messages: list[Message], schema: dict[str, Any]) -> list[Message]:
-    """Append the schema primer to the last user turn (chat_structured, ollama.rs).
-
-    Non-mutating: returns a fresh list so a caller's messages are untouched.
-    """
-    out: list[Message] = [dict(m) for m in messages]  # type: ignore[misc]
-    for m in reversed(out):
-        if m.get("role") == "user":
-            m["content"] = m.get("content", "") + _SCHEMA_PRIMER + compact_json(schema)
-            break
-    return out
 
 
 async def _structured_call(
@@ -212,7 +158,7 @@ async def _structured_call(
       :data:`_SKIP` (the caller's None branch);
     * otherwise the parsed JSON value (any JSON — the caller reads fields safely).
     """
-    primed = _prime_schema(messages, schema)
+    primed = prime_schema(messages, schema)
     for attempt in range(2):
         try:
             raw = await llm.generate(
@@ -453,8 +399,6 @@ __all__ = [
     "MAP_SYSTEM_MERGE",
     "SECTION_SYSTEM",
     "clamp_bytes",
-    "strip_think_spans",
-    "recover_json",
     "run_map",
     "run_section",
     "FilePassMapRequest",

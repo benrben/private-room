@@ -599,3 +599,94 @@ async def test_the_room_never_sees_a_tool_the_main_agent_should_not_have() -> No
     ]
     assert corrections, "the Main agent was allowed to touch a room tool"
     assert [c[0] for c in room.calls] == ["search_room"]
+
+
+# --------------------------------------------------------------------------- #
+# ERRAND — "what's the weather" in a room with the internet turned OFF
+# --------------------------------------------------------------------------- #
+
+
+async def test_web_off_room_refuses_instead_of_answering_from_the_room() -> None:
+    """The 2026-07-28 bug, end to end.
+
+    With web disabled, `ask_web_agent` is not in the catalog and `web` is not in
+    the batch enum — but `DOMAIN_KEYS` is unfiltered, so a model that still
+    emits `agent: "web"` used to resolve to `chat.web`, be found unreachable,
+    and fall through to `DEFAULT_AGENT_ID`: the FILE agent, answering a live
+    weather question out of room content. The task must be REFUSED and reported
+    MISSING instead, so the Main agent tells the user plainly.
+    """
+    room = Room(files={"trip.md": "Tel Aviv in July is hot and humid."})
+    engine = Engine(
+        {
+            "main": [
+                [
+                    tc(
+                        "ask_agents",
+                        tasks=[
+                            {"agent": "web", "instruction": "what is the weather in Tel Aviv now"},
+                        ],
+                    )
+                ],
+                "I can't browse the internet in this room.",
+            ],
+            # If the guard ever regresses, the File agent picks this up and the
+            # assertions below fire.
+            "files.read": [
+                [tc("search_room", query="weather Tel Aviv")],
+                "FOUND: Tel Aviv in July is hot and humid.",
+            ],
+        },
+        allow_drift=True,
+    )
+    out = await drive(
+        make_request("what's the weather in Tel Aviv", web_enabled=False, model=CLOUD),
+        engine,  # type: ignore[arg-type]
+        mcp=room,
+    )
+
+    assert out.final
+    # The refusal reached the Main agent as data it can act on...
+    reports = [
+        m
+        for msgs in out.chat.seen_by.get("main", [])
+        for m in msgs
+        if m.get("role") == "tool" and "MISSING" in (m.get("content") or "")
+    ]
+    assert reports, "the unavailable-domain task did not report MISSING"
+    assert any("no 'web' specialist" in (m.get("content") or "") for m in reports)
+    # ...and no worker was handed the web question. The File agent never ran, so
+    # the room was never searched for something the room cannot know.
+    assert "files.read" not in out.chat.seen_by
+    assert room.calls == []
+
+
+async def test_web_on_room_still_dispatches_the_same_batch_normally() -> None:
+    """The control: identical plan, web enabled — the guard must not fire."""
+    room = Room(files={})
+    out = await run(
+        "what's the weather in Tel Aviv",
+        {
+            "main": [
+                [
+                    tc(
+                        "ask_agents",
+                        tasks=[
+                            {"agent": "web", "instruction": "what is the weather in Tel Aviv now"},
+                        ],
+                    )
+                ],
+                "It is 31C and humid.",
+            ],
+            "chat.web": [
+                [tc("web_search", query="Tel Aviv weather")],
+                [tc("fetch_page", url="https://example.com/tlv")],
+                "FOUND: 31C, humid (example.com/tlv).",
+            ],
+        },
+        room,
+    )
+
+    assert out.final
+    assert "chat.web" in out.chat.seen_by, "the Web agent should have run"
+    assert [c[0] for c in room.calls][:1] == ["web_search"]

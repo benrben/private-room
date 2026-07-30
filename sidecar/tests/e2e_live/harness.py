@@ -174,6 +174,7 @@ async def run_ask(
     history: list[dict[str, str]] | None = None,
     temperature: float = 0.2,
     timeout: float = 420.0,
+    turn_max_rounds: int | None = None,
 ) -> dict[str, Any]:
     """One /run turn through the real app; returns a parsed event digest.
 
@@ -197,6 +198,12 @@ async def run_ask(
         "web_enabled": False,
         "run_id": "e2e",
     }
+    if turn_max_rounds is not None:
+        # The whole-ask round ceiling (config.TURN_ROUND_BUDGET). A test that
+        # deliberately starves the model needs this, or the starved run spends
+        # its time delegating in circles instead of answering — measured at 32
+        # rounds and 890 s before the bound existed.
+        body["turn_max_rounds"] = turn_max_rounds
     events: list[dict[str, Any]] = []
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),

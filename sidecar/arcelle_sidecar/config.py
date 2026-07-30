@@ -13,6 +13,24 @@ from .messages import Message
 #: forced synthesis, and Stop remain the normal termination mechanisms.
 AGENT_ROUND_BACKSTOP: int = 10_000
 
+#: How many model rounds ONE ASK may spend in total — the Main agent's own
+#: rounds plus every round of every specialist it delegates to.
+#:
+#: :data:`AGENT_ROUND_BACKSTOP` bounds a single loop, and each delegated child
+#: starts a FRESH loop at round 0, so the per-loop ceiling multiplies with the
+#: tree instead of bounding it. Measured 2026-07-28: a Main agent starved of
+#: history (the pre-compaction path) spent 32 rounds and 890 s across 16
+#: delegations, called ``search_room`` 14 times, and answered "not included in
+#: this room's content" — nothing anywhere said stop. The same ask on the
+#: compacted path took ONE round.
+#:
+#: This is a backstop, not a policy: it is set far above healthy work (a hub
+#: turn is ~2-4 rounds, and even six specialists at eight rounds each is 52) so
+#: that tripping it means the turn was not converging. When it trips, the loops
+#: do not abort — every remaining round is served TOOL-LESS, so each one unwinds
+#: into a text answer from what it already has.
+TURN_ROUND_BUDGET: int = 64
+
 #: models.rs:72 — the chat model stays warm across the conversation.
 KEEP_ALIVE_WARM: str = "30m"
 
@@ -72,6 +90,9 @@ class RunRequest(BaseModel):
     routing: Routing | None = None
     web_enabled: bool = False
     max_rounds: int | None = None
+    #: Whole-ask round ceiling across the delegation tree (:data:`TURN_ROUND_BUDGET`
+    #: when absent). 0 or negative disables it.
+    turn_max_rounds: int | None = None
     run_id: str = ""
     #: PRIV-1: the room's resolved privacy policy (:func:`.privacy.policy_from_payload`
     #: shape). Engages only when ``model`` is non-local; None/absent = door open.
@@ -119,6 +140,12 @@ class RunRequest(BaseModel):
             if self.max_rounds and self.max_rounds > 0
             else AGENT_ROUND_BACKSTOP
         )
+
+    def resolved_turn_rounds(self) -> int | None:
+        """The whole-ask round ceiling, or None if the caller disabled it."""
+        if self.turn_max_rounds is None:
+            return TURN_ROUND_BUDGET
+        return self.turn_max_rounds if self.turn_max_rounds > 0 else None
 
 
 class CancelRequest(BaseModel):
@@ -373,6 +400,24 @@ class PrivacyScanRequest(BaseModel):
     known: list[str] = Field(default_factory=list)
 
 
+class WebSearchRequest(BaseModel):
+    """Body of ``POST /web_search`` — the room's ONE web search provider.
+
+    No model, no engine choice: Settings → Online features is a bare on/off
+    switch, Rust checks it before calling, and :mod:`.websearch` fuses its own
+    fixed engine set. The query is the only thing that crosses the network.
+
+    There is deliberately no ``resolve_dates`` knob: filling in missing dates
+    means fetching each RESULT url from Python, which would bypass the Rust SSRF
+    guard that every other outbound fetch in this app goes through.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    query: str
+    limit: int = Field(default=12, ge=1, le=50)
+
+
 class HealthResponse(BaseModel):
     ok: bool = True
     version: str
@@ -380,6 +425,7 @@ class HealthResponse(BaseModel):
 
 __all__ = [
     "AGENT_ROUND_BACKSTOP",
+    "TURN_ROUND_BUDGET",
     "KEEP_ALIVE_WARM",
     "KEEP_ALIVE_SHORT",
     "McpConfig",
@@ -402,4 +448,5 @@ __all__ = [
     "KnowledgeExtractRequest",
     "GenerateDocRequest",
     "PrivacyScanRequest",
+    "WebSearchRequest",
 ]

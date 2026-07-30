@@ -572,6 +572,12 @@ pub async fn run_via_sidecar(
         room_mcp::StartOpts {
             privacy_bypass,
             advisor: advisor_runtime,
+            // The room's per-agent web switches. Read here rather than passed
+            // down with `web_enabled` because this is the bridge the AGENTS
+            // run on — the only place the toggles are meant to bite.
+            lanes: crate::commands::open_room_web_lanes(
+                &window.app_handle().state::<crate::commands::AppState>(),
+            ),
             ..Default::default()
         },
     )
@@ -696,6 +702,7 @@ pub async fn run_via_sidecar(
     }
 }
 
+#[derive(Debug)]
 enum StreamResult {
     Done(String, Option<serde_json::Value>, Option<serde_json::Value>),
     Cancelled(String, Option<serde_json::Value>, Option<serde_json::Value>),
@@ -766,6 +773,13 @@ async fn stream_run(
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut final_text = String::new();
+    // SPEC §4 promises exactly ONE `final` per run, and the graph floors an empty
+    // answer to DONE_TEXT (graph.py) — so a stream that ends without a `final` did
+    // not answer, it LOST the answer. Returning `Done("")` for that made a torn-down
+    // run byte-identical to a completed one: an empty assistant row, no `stopped`
+    // marker, no error, the turn reporting itself finished. Live QA 2026-07-30 (the
+    // Yahoo/ETF task) hit exactly that and produced zero bytes with no diagnostics.
+    let mut final_seen = false;
     // Token-budget bar: the latest round's usage snapshot seen so far — last
     // one wins, mirroring `final_text`'s own "whatever streamed so far" shape.
     let mut last_usage: Option<serde_json::Value> = None;
@@ -893,6 +907,7 @@ async fn stream_run(
                 }
                 Some("final") => {
                     final_text = str_v(&ev).to_string();
+                    final_seen = true;
                 }
                 // PRIV-1: what the door did this turn ("N details hidden") —
                 // arrives after `final`, rendered on the finished message.
@@ -930,7 +945,29 @@ async fn stream_run(
             }
         }
     }
-    StreamResult::Done(final_text, last_usage, last_plan)
+    stream_outcome(final_seen, final_text, tool_ran, last_usage, last_plan)
+}
+
+/// The end-of-stream verdict. Split out of [`stream_run`] so it can be unit-tested
+/// without a live sidecar — the whole point is the `false` arm, which used to be
+/// spelled `Done("")`.
+fn stream_outcome(
+    final_seen: bool,
+    final_text: String,
+    tool_ran: bool,
+    usage: Option<serde_json::Value>,
+    plan: Option<serde_json::Value>,
+) -> StreamResult {
+    if final_seen {
+        return StreamResult::Done(final_text, usage, plan);
+    }
+    StreamResult::Failed {
+        text: final_text,
+        error: "the agent sidecar ended the run without an answer".to_string(),
+        tool_ran,
+        usage,
+        plan,
+    }
 }
 
 fn str_v(ev: &serde_json::Value) -> &str {
@@ -993,6 +1030,31 @@ async fn cancel_run(base: &str, run_id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_that_never_sent_final_is_a_lost_answer_not_an_empty_one() {
+        // SPEC §4: exactly one `final` per run, and the graph floors an empty answer to
+        // "Done." before it reaches the wire. So a stream with no `final` LOST the
+        // answer. Reporting that as Done("") is how the Yahoo/ETF turn (live QA
+        // 2026-07-30) saved a zero-byte assistant message with no error at all.
+        match stream_outcome(false, String::new(), true, None, None) {
+            StreamResult::Failed { error, tool_ran, .. } => {
+                assert!(error.contains("without an answer"), "{error:?}");
+                assert!(tool_ran, "tool_ran must survive so the partial is kept");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // A partial that streamed before the tear-down is preserved, not discarded.
+        match stream_outcome(false, "half an answer".into(), false, None, None) {
+            StreamResult::Failed { text, .. } => assert_eq!(text, "half an answer"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // A real `final` — including the floored "Done." — still passes through.
+        match stream_outcome(true, "Done.".into(), true, None, None) {
+            StreamResult::Done(t, ..) => assert_eq!(t, "Done."),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
 
     #[test]
     fn error_sentinels_survive_the_migration() {

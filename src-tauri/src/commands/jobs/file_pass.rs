@@ -431,7 +431,7 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                     "generated",
                 )?
             };
-            if let Some(w) = app.get_webview_window("main") {
+            if let Some(w) = crate::main_window(app) {
                 let _ = w.emit("room-files-changed", ());
             }
             *published.lock().unwrap() = Some(meta);

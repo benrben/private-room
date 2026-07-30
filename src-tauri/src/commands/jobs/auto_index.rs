@@ -161,8 +161,7 @@ pub(crate) fn schedule_auto_index(app: &tauri::AppHandle, room_path: String) {
                         }
                         Ok(())
                     });
-                    let Some(webview) = app.get_webview_window("main") else { return };
-                    let window = webview.as_ref().window();
+                    let Some(window) = crate::main_window(&app) else { return };
                     let _ = start_deep_summary_inner(window, state.inner(), true).await;
                     return;
                 }

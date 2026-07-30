@@ -34,6 +34,8 @@ import type {
   SkillSummary,
   SkillBundle,
   SkillResourceContent,
+  BrowserInfo,
+  BrowseJournalRow,
   FileVersion,
   VersionContent,
   CheckpointMeta,
@@ -178,6 +180,32 @@ export const api = {
     invoke<PrivacyPreview>("privacy_preview", { fileId }),
   startPrivacyScan: () => invoke<void>("start_privacy_scan"),
   webSearchTest: () => invoke<string>("web_search_test"),
+
+  // BROWSE-1: the private browser area. The page itself is a NATIVE child
+  // webview, so these only drive its chrome — position, navigation, takeover,
+  // and the room-side journal of what the agent did.
+  browserNavigate: (url: string) => invoke<string>("browser_navigate", { url }),
+  browserClose: () => invoke<void>("browser_close"),
+  browserSetBounds: (x: number, y: number, width: number, height: number) =>
+    invoke<void>("browser_set_bounds", { x, y, width, height }),
+  browserInfo: () => invoke<BrowserInfo>("browser_info"),
+  browserGo: (action: "back" | "forward" | "reload" | "stop") =>
+    invoke<void>("browser_go", { action }),
+  browserSetTakeover: (on: boolean) =>
+    invoke<void>("browser_set_takeover", { on }),
+  browserJournal: (limit?: number) =>
+    invoke<BrowseJournalRow[]>("browser_journal", { limit }),
+  browserClearJournal: () => invoke<void>("browser_clear_journal"),
+  browserVerifyPrivate: () => invoke<boolean>("browser_verify_private"),
+  onBrowserJournal: (cb: (row: BrowseJournalRow) => void): Promise<UnlistenFn> =>
+    listen<BrowseJournalRow>("browser-journal", (e) => cb(e.payload)),
+  onBrowserNavigated: (cb: (url: string) => void): Promise<UnlistenFn> =>
+    listen<string>("browser-navigated", (e) => cb(e.payload)),
+  /** A navigation was refused by the same guard `fetch_page` uses — a private
+   *  or non-web address. Surfaced so a blocked click never looks like a
+   *  page that simply failed to load. */
+  onBrowserBlocked: (cb: (p: { url: string }) => void): Promise<UnlistenFn> =>
+    listen<{ url: string }>("browser-blocked", (e) => cb(e.payload)),
   setSetting: (key: string, value: string) =>
     invoke<void>("set_setting", { key, value }),
   mcpGetConfig: () => invoke<string>("mcp_get_config"),

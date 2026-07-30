@@ -235,6 +235,13 @@ CREATE TABLE IF NOT EXISTS skill_resources (
   UNIQUE(skill_id, path)
 );
 CREATE INDEX IF NOT EXISTS idx_skill_resources_skill ON skill_resources(skill_id);
+CREATE TABLE IF NOT EXISTS browse_journal (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  url TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
 "#;
 
 pub(crate) fn apply_key(conn: &Connection, password: &str) -> Result<(), String> {
@@ -721,6 +728,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     // not be opened at all (regression caught by
     // `roomfile::migrates_old_rooms_into_sessions`).
     add_column_if_missing(conn, "ALTER TABLE skills ADD COLUMN agent TEXT NOT NULL DEFAULT ''")?;
+    // BROWSE-1: the private browser's audit trail. Nothing about the WEB is
+    // persisted (the webview runs non-persistent); everything the AGENT did is,
+    // here, in the encrypted room.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS browse_journal (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           kind TEXT NOT NULL,
+           url TEXT NOT NULL DEFAULT '',
+           detail TEXT NOT NULL DEFAULT '',
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );",
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

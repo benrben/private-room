@@ -511,7 +511,7 @@ fn gather_context_and_save_question(
         };
 
         let history: Vec<(String, String)> = {
-            let mut rows = db::recent_messages(conn, chat_id, MAX_HISTORY_MESSAGES as i64)?;
+            let mut rows = db::recent_messages(conn, chat_id, AGENT_HISTORY_MESSAGES as i64)?;
             rows.reverse();
             rows
         };
@@ -734,7 +734,13 @@ fn gather_context_and_save_question(
         // budget, dropping the oldest wholesale rather than cutting each turn
         // to a silently-unterminated 4000-char head (char-safe throughout).
         let has_history = !history.is_empty();
-        for (role, content) in compact_history(history, MAX_HISTORY_CHARS) {
+        // The whole conversation, up to the backstop — NOT a window-derived
+        // slice. Measured 2026-07-28: cutting here to 49,152 B cost the model
+        // 0.44 of the facts it needed (4/4 paired losses), and the sidecar
+        // cannot compress back what was already amputated. See
+        // `commands::history_budget_bytes`.
+        let history_budget = history_budget_bytes(explicit_model.as_deref().unwrap_or(""));
+        for (role, content) in compact_history(history, history_budget) {
             chat_messages.push(ollama::ChatMessage::new(&role, content));
         }
 
@@ -960,6 +966,18 @@ pub(crate) async fn stream_answer(
         )
         .await
         {
+            // The graph floors an empty answer to DONE_TEXT before it reaches the
+            // wire, so `Done("")` here does not mean "the model said nothing" — it
+            // means the answer was LOST in transit. Persisting it produced a
+            // zero-byte assistant message that read as a finished turn (live QA
+            // 2026-07-30). Return `Ok` rather than `Err`, for the same reason the
+            // `Failed` arm below does: a tool may already have committed a
+            // side-effect, and `ask`'s `?` would discard the merged effects.
+            SidecarOutcome::Done(text) if text.trim().is_empty() => Ok(
+                "*(The agent finished without producing an answer — the reply was lost \
+                 before it reached the app, so nothing was written. Please try again.)*"
+                    .to_string(),
+            ),
             SidecarOutcome::Done(text) => Ok(text),
             SidecarOutcome::Failed { text, error } => {
                 // A tool already committed a side-effect this turn (the write/
@@ -1149,6 +1167,32 @@ pub async fn handoff_chat(state: State<'_, AppState>, chat_id: String) -> Result
     db::insert_handoff_message(&room.conn, &chat_id, &summary, Some(&usage_value))
 }
 
+/// The sub-agent ids a skill may be scoped to — the sidecar's worker registry
+/// (`agents.py` REGISTRY, every spec with `main=False`), in its order.
+///
+/// A skill saved against an id no-one has is invisible forever: it is never
+/// offered to any specialist and never surfaces to the user. That made a
+/// one-character typo an unrecoverable silent failure, so this is now BOTH the
+/// `save_skill` enum the model picks from and the value `save_skill` validates
+/// against. `sidecar/tests/test_skill_agent_parity.py` pins it to the registry
+/// across the language boundary.
+pub(crate) const SKILL_AGENT_IDS: &[&str] = &[
+    "files.read",
+    "scripts.run",
+    "chat.web",
+    "chat.browse",
+    "app.ui",
+    "jobs.run",
+    "jobs.workflows",
+    "skills.use",
+    "skills.author",
+    "connectors.admin",
+    "connectors.use",
+    "media.transcribe",
+    "media.video",
+    "creator.studio",
+];
+
 /// Every built-in agent tool name — also the reserved set MCP tools may not
 /// shadow. Keep in sync with `tools_catalog` and `exec_tool`.
 pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
@@ -1188,6 +1232,14 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "ui_act",
     "view_screenshot",
     "view_media_frame",
+    // BROWSE-1: the private browser's tools. Reserved here (like the UI tools)
+    // so a connected MCP server can never shadow a `browse_*` arm.
+    "browse_open",
+    "browse_read",
+    "browse_find",
+    "browse_snapshot",
+    "browse_do",
+    "browse_look",
     "start_file_pass",
     "job_status",
     "list_scripts",
@@ -1568,7 +1620,13 @@ pub(crate) fn mcp_management_tools_specs() -> Vec<serde_json::Value> {
 /// from CLIs actually installed on this Mac, so the model cannot select a
 /// provider that cannot run. This spec is attached to a per-turn bridge only;
 /// a consulted advisor's own bridge never receives it.
-pub(crate) fn consult_advisor_spec(advisors: &[String]) -> serde_json::Value {
+///
+/// `None` when no RECOGNISED advisor is installed (2026-07-28). The caller
+/// already skips an empty `advisors`, but `advisors` carrying only ids this
+/// function does not map — the day a third CLI is added — produced
+/// `"enum": []`: a parameter no value can satisfy, on a tool still advertised
+/// as callable. Serving nothing is the honest shape.
+pub(crate) fn consult_advisor_spec(advisors: &[String]) -> Option<serde_json::Value> {
     let mut names: Vec<&str> = Vec::new();
     if advisors.iter().any(|item| item == "claude-cli") {
         names.push("claude");
@@ -1576,14 +1634,17 @@ pub(crate) fn consult_advisor_spec(advisors: &[String]) -> serde_json::Value {
     if advisors.iter().any(|item| item == "codex-cli") {
         names.push("codex");
     }
-    serde_json::json!({"type": "function", "function": {
+    if names.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({"type": "function", "function": {
         "name": "consult_advisor",
         "description": "Delegate ONE hard, self-contained subtask to an installed cloud AI advisor (Claude or Codex). It is slow, may cost money, and the question leaves this Mac through the user's cloud account, so use it only when a second model would materially improve the answer. Put the full task and all necessary context in `question`. When advisor room tools are enabled, Claude may also inspect the room through its restricted bridge. Returns the advisor's written answer for use in the final response.",
         "parameters": {"type": "object", "properties": {
             "question": {"type": "string", "description": "Complete, self-contained task with all context the advisor needs."},
             "advisor": {"type": "string", "enum": names, "description": "Use codex for coding-heavy work; use claude otherwise."}
         }, "required": ["question"]}
-    }})
+    }}))
 }
 
 /// Wave 1a: tools served ONLY to an external agent on the Leash's full tier
@@ -1739,10 +1800,16 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
             "parameters": {"type": "object", "properties": {
                 "find": {"type": "string", "description": "A distinctive phrase from the note to forget"}},
                 "required": ["find"]}}}
+        // NOTE: `list_skills` takes an internal `agent` argument that the
+        // sidecar injects per worker (`graph.execute_tools` overwrites whatever
+        // arrived). It is deliberately NOT advertised: a parameter whose own
+        // description says "leave it out" is pure noise in the one schema a
+        // small model reads most often, and inviting it to supply a value it is
+        // then told to omit is a contradiction. The bridge still accepts the
+        // field — this only removes it from the model's view (2026-07-28).
         ,{"type": "function", "function": {"name": "list_skills",
             "description": "List the Agent Skills available to you, including disabled drafts. Call this to see which procedures exist for your domain, then read_skill to load one.",
-            "parameters": {"type": "object", "properties": {
-                "agent": {"type": "string", "description": "Internal: the calling sub-agent's id. The sidecar fills this; leave it out."}}}}}
+            "parameters": {"type": "object", "properties": {}}}}
         ,{"type": "function", "function": {"name": "read_skill",
             "description": "Load a skill's full SKILL.md instructions and resource tree. Call this when an available skill's description matches the user's task, before doing the work.",
             "parameters": {"type": "object", "properties": {
@@ -1761,7 +1828,12 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                 "description": {"type": "string", "description": "What the skill does and exactly when to use it"},
                 "instructions": {"type": "string", "description": "The SKILL.md Markdown body"},
                 "source_files": {"type": "array", "items": {"type": "string"}, "description": "Optional names of attached/readable room files to bundle as portable reference snapshots (maximum 12)"},
-                "agent": {"type": "string", "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts). Omit for a skill any agent may use."}},
+                // A real `enum`, not a list buried in prose (2026-07-28). These
+                // are dotted ids a small model reliably fumbles ("file.read"),
+                // and the codebase already uses enums where the value set is
+                // closed (add_memory.category, ask_agents.agent). Same list
+                // validates the call — see SKILL_AGENT_IDS.
+                "agent": {"type": "string", "enum": SKILL_AGENT_IDS, "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet search/fetch), chat.browse (driving web pages in the private browser), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts). Omit for a skill any agent may use."}},
                 "required": ["name", "description", "instructions"]}}}
         ,{"type": "function", "function": {"name": "write_skill_resource",
             "description": "Add or replace a text resource in a skill draft under scripts/, references/, assets/, agents/, or another relative folder. The skill is disabled again for review.",
@@ -1793,7 +1865,7 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
         let arr = tools.as_array_mut().unwrap();
         arr.push(serde_json::json!(
             {"type": "function", "function": {"name": "web_search",
-                "description": "Search the public web. Use for current events or information not in the room. Returns titles, URLs and snippets; fetch a URL with fetch_page for details.",
+                "description": "Search the public web across several engines at once, merged into one relevance ranking. Use for current events or information not in the room. Returns a title, a URL, and which engine found it — NOT the page's text, so call fetch_page on a URL to actually read it.",
                 "parameters": {"type": "object", "properties": {
                     "query": {"type": "string", "description": "Short search query"}},
                     "required": ["query"]}}}
@@ -1858,32 +1930,243 @@ pub(crate) struct McpRoute {
     pub(crate) client: Arc<tokio::sync::Mutex<mcp::Client>>,
 }
 
+/// Longest a slimmed property description may be, in CHARACTERS. 100 *bytes*
+/// was one clause of English — and about fifty characters of Hebrew, where the
+/// clause carrying "this cannot be undone" is usually the second one.
+pub(crate) const SCHEMA_DESC_MAX: usize = 150;
+
+/// Longest a slimmed TOOL description may be, in characters.
+pub(crate) const SCHEMA_TOOL_DESC_MAX: usize = 300;
+
+/// Longest enum a slimmed schema may advertise. An enum is a CLOSED set: values
+/// past the cap are not merely abbreviated, they are unreachable, so this is far
+/// more generous than the description budget and truncation is announced.
+pub(crate) const SCHEMA_ENUM_MAX: usize = 64;
+
+/// Bookends of the appended enum-truncation note. Stable, and the tail is
+/// deliberately distinctive rather than a bare `)` — a legitimate vendor
+/// description ending in a parenthesis must not be mistaken for our own note
+/// and dismembered. Together they let a second slimming pass recognise its own
+/// work, peel it off, and re-derive it instead of clamping it away
+/// (see [`slim_schema`]).
+const ENUM_NOTE_HEAD: &str = " (showing ";
+const ENUM_NOTE_TAIL: &str = "that is not listed)";
+
+/// Clamp text a MODEL reads as a complete sentence, marking the cut.
+///
+/// Counts CHARACTERS, not bytes, so a Hebrew description gets the same budget
+/// as an English one (a byte budget silently halves it) and the cut can never
+/// land mid-codepoint.
+///
+/// Deliberately NOT [`clamp_bytes`], which must stay silent: that one clamps
+/// content we STORE (memory notes, extracted text) where an appended ellipsis
+/// would be persisted corruption. Here the string is a description shown to the
+/// model, and an unmarked cut is worse than a short one — a connector tool
+/// documented "Permanently deletes the record. This cannot be undone." arrives
+/// as a fragment that reads as the whole truth.
+pub(crate) fn clamp_marked(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s;
+    }
+    // Reserve room for the marker so the result still respects `max` chars.
+    let keep = max.saturating_sub(1);
+    let cut: String = s.chars().take(keep).collect();
+    // Don't leave a dangling separator hanging before the marker.
+    let trimmed = cut.trim_end().trim_end_matches([',', ';', ':', '-', '(']);
+    format!("{}…", trimmed.trim_end())
+}
+
+/// Every built-in tool's advertised `parameters` schema, by name.
+///
+/// Built once from the SAME spec functions the bridge serves, so
+/// [`missing_required_arg`] validates against exactly what the model was told —
+/// there is no second copy of the contract to drift.
+fn builtin_param_schemas() -> &'static HashMap<String, serde_json::Value> {
+    static SCHEMAS: std::sync::OnceLock<HashMap<String, serde_json::Value>> =
+        std::sync::OnceLock::new();
+    SCHEMAS.get_or_init(|| {
+        let mut out = HashMap::new();
+        let mut absorb = |specs: Vec<serde_json::Value>| {
+            for spec in specs {
+                let Some(f) = spec.get("function") else { continue };
+                let (Some(name), Some(params)) =
+                    (f.get("name").and_then(|n| n.as_str()), f.get("parameters"))
+                else {
+                    continue;
+                };
+                out.insert(name.to_string(), params.clone());
+            }
+        };
+        // `web_enabled: true` so web_search/fetch_page are covered too; this is
+        // a validation table, not a catalog, so breadth is correct here.
+        absorb(
+            tools_catalog(true)
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        absorb(ui_tools_specs());
+        absorb(browse_tools_specs());
+        absorb(job_tools_specs());
+        absorb(crate::commands::workflow_tools_specs());
+        absorb(script_tools_specs());
+        absorb(studio_tools_specs());
+        absorb(transcribe_tools_specs());
+        absorb(mcp_management_tools_specs());
+        absorb(external_agent_tools_specs());
+        // The advisor spec's enum is runtime-dependent, but its `required` is
+        // not — a static rendering is the right shape for validation.
+        absorb(
+            consult_advisor_spec(&["claude-cli".to_string(), "codex-cli".to_string()])
+                .into_iter()
+                .collect(),
+        );
+        out
+    })
+}
+
+/// Required params whose EMPTY STRING is a documented, meaningful value.
+///
+/// `move_file`'s schema says "empty string for the top level" — so `""` is a
+/// real instruction there, not a model that forgot an argument, and the blank
+/// rule below must not swallow it. Kept as an explicit, greppable list because
+/// inferring it from prose ("if the description mentions 'empty'…") would be a
+/// guess about English, applied to a write path. Anything added here must
+/// genuinely document the empty case in its own parameter description.
+const EMPTY_STRING_IS_MEANINGFUL: &[(&str, &str)] = &[("move_file", "folder")];
+
+/// The first advertised-required argument this call failed to supply, if any.
+///
+/// "Supplied" is type-aware, because an empty value is usually the same failure
+/// as an absent one: a blank string resolves to the newest file, an empty array
+/// is a no-op batch, and an empty object is not a config. The exception is
+/// [`EMPTY_STRING_IS_MEANINGFUL`]. Absent and null are ALWAYS failures, for
+/// every parameter, with no exceptions.
+///
+/// Only TOP-level `required` is enforced — nested item contracts belong to the
+/// arm that understands them (`parse_batch_ops` numbers each entry).
+///
+/// The message follows the house convention (`"<param> is required — <hint>"`,
+/// see `edit_match`), and the hint is the parameter's OWN description, so the
+/// model is told the same thing the schema told it, in the place where it
+/// matters. Unknown tools (connected MCP routes) return `None`: their contracts
+/// are the connector's, not ours.
+pub(crate) fn missing_required_arg(tool: &str, args: &serde_json::Value) -> Option<String> {
+    let schema = builtin_param_schemas().get(tool)?;
+    let required = schema.get("required")?.as_array()?;
+    let props = schema.get("properties");
+    for entry in required {
+        let key = entry.as_str()?;
+        let empty_ok = EMPTY_STRING_IS_MEANINGFUL.contains(&(tool, key));
+        let supplied = match args.get(key) {
+            // Absent or null is always a failure, exceptions or not.
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::String(s)) => empty_ok || !s.trim().is_empty(),
+            Some(serde_json::Value::Array(a)) => !a.is_empty(),
+            Some(serde_json::Value::Object(o)) => !o.is_empty(),
+            // Numbers and booleans are meaningful at any value, including 0.
+            Some(_) => true,
+        };
+        if supplied {
+            continue;
+        }
+        let hint = props
+            .and_then(|p| p.get(key))
+            .and_then(|p| p.get("description"))
+            .and_then(|d| d.as_str())
+            .map(|d| format!(" — {d}"))
+            .unwrap_or_default();
+        return Some(format!(
+            "{key} is required{hint}. Nothing was done — call {tool} again with {key} set."
+        ));
+    }
+    None
+}
+
 /// CHG-29: strip a third-party JSON Schema down to what the model needs to call
 /// the tool, in place. Real MCP servers ship schemas with long descriptions,
 /// examples and huge enums that can consume thousands of the 12K-token window.
-/// Removes non-load-bearing keys, clamps every description to 100 chars, and
-/// caps enum arrays at 16 entries. Recursive over objects/arrays.
+/// Recursive over objects/arrays.
+///
+/// This is the ONLY transform between a connector's schema and the model — the
+/// slimmed copy is what `mcp_routes` stores, so both the catalog and
+/// `search_mcp_tools` serve it and nothing downstream can recover what was cut.
+/// That makes every silent loss here a capability the model cannot know it has.
+/// So (2026-07-28):
+///
+/// * enums are capped at [`SCHEMA_ENUM_MAX`], not 16, and a truncated enum SAYS
+///   so in its own description. Values past a silent cap were simply
+///   unreachable, with nothing in context hinting they existed.
+/// * descriptions are clamped with a visible marker (see [`clamp_marked`]).
+/// * `default` is KEPT. It tells the model which arguments it may safely omit;
+///   dropping it made a well-documented optional look mandatory-but-unexplained
+///   and invited invented values.
+/// * `additionalProperties` is kept only when it is `false` — one token that
+///   stops a small model inventing fields. A permissive object is noise.
 pub(crate) fn slim_schema(v: &mut serde_json::Value) {
     match v {
         serde_json::Value::Object(map) => {
-            for k in [
-                "$schema",
-                "title",
-                "examples",
-                "example",
-                "default",
-                "additionalProperties",
-                "$id",
-                "$comment",
-            ] {
+            for k in ["$schema", "title", "examples", "example", "$id", "$comment"] {
                 map.remove(k);
             }
-            map.retain(|k, _| !k.starts_with("x-"));
-            if let Some(serde_json::Value::String(d)) = map.get_mut("description") {
-                *d = clamp_bytes(std::mem::take(d), 100);
+            // Keep `additionalProperties: false` (load-bearing), drop the rest.
+            if map.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
+                map.remove("additionalProperties");
             }
-            if let Some(serde_json::Value::Array(en)) = map.get_mut("enum") {
-                en.truncate(16);
+            map.retain(|k, _| !k.starts_with("x-"));
+
+            // Peel off a note THIS function appended on an earlier pass before
+            // touching the description, remembering the real total. Without
+            // this, re-slimming clamps the note off the end (it sits past the
+            // budget) while the already-capped enum produces no replacement —
+            // the truncation warning would silently evaporate on the second
+            // pass. Routes are rebuilt every turn, so "slim twice" must be
+            // exactly "slim once".
+            let mut prior_total: Option<usize> = None;
+            if let Some(serde_json::Value::String(d)) = map.get_mut("description") {
+                if d.ends_with(ENUM_NOTE_TAIL) {
+                    if let Some(i) = d.rfind(ENUM_NOTE_HEAD) {
+                        prior_total = d[i..]
+                            .split(" of ")
+                            .nth(1)
+                            .and_then(|rest| rest.split(' ').next())
+                            .and_then(|n| n.parse::<usize>().ok());
+                        d.truncate(i);
+                    }
+                }
+            }
+
+            if let Some(serde_json::Value::String(d)) = map.get_mut("description") {
+                *d = clamp_marked(std::mem::take(d), SCHEMA_DESC_MAX);
+            }
+
+            // Announce a truncated enum in the description, so a model that
+            // needs a missing value can ask instead of assuming the list it can
+            // see is the whole list.
+            let truncated_total = match map.get_mut("enum") {
+                Some(serde_json::Value::Array(en)) if en.len() > SCHEMA_ENUM_MAX => {
+                    let total = en.len();
+                    en.truncate(SCHEMA_ENUM_MAX);
+                    Some(total)
+                }
+                // Already at the cap from a previous pass: keep the note honest
+                // by restoring the total it recorded.
+                _ => prior_total,
+            };
+            if let Some(total) = truncated_total {
+                let note = format!(
+                    "{ENUM_NOTE_HEAD}{SCHEMA_ENUM_MAX} of {total} allowed values \
+                     — ask the user if you need one {ENUM_NOTE_TAIL}"
+                );
+                match map.get_mut("description") {
+                    Some(serde_json::Value::String(d)) => d.push_str(&note),
+                    _ => {
+                        map.insert(
+                            "description".into(),
+                            serde_json::Value::String(note.trim_start().into()),
+                        );
+                    }
+                }
             }
             for (_, child) in map.iter_mut() {
                 slim_schema(child);
@@ -1933,8 +2216,11 @@ pub(crate) fn mcp_routes(state: &State<'_, AppState>) -> Vec<McpRoute> {
                 catalog_name = format!("{base}_{n}");
                 n += 1;
             }
-            // Long descriptions eat the context; cut at a char boundary.
-            let description: String = tool.description.chars().take(300).collect();
+            // Long descriptions eat the context. Cut with a visible marker —
+            // an unmarked slice reads as the whole description, and the clause
+            // a connector puts LAST is usually the one warning you the call is
+            // irreversible (2026-07-28).
+            let description = clamp_marked(tool.description.clone(), SCHEMA_TOOL_DESC_MAX);
             let mut schema = tool.schema.clone();
             slim_schema(&mut schema);
             let mut spec = serde_json::json!({"type": "function", "function": {
@@ -2028,6 +2314,19 @@ pub(crate) async fn exec_tool(
 ) -> Result<String, String> {
     use tauri::Emitter;
     let args = &call.arguments;
+    // Never trust the model's arguments (2026-07-28). Every arm below reads its
+    // arguments with `unwrap_or_default()`, so a missing REQUIRED string arrived
+    // as `""` and kept going: `find_file_like_full("")` is
+    // `LIKE '%' || '' || '%' … ORDER BY created_at DESC LIMIT 1`, i.e. the
+    // newest file in the room. `open_file({})` opened it and `edit_file` with
+    // matching text EDITED it — a wrong-target write with no error anywhere.
+    //
+    // Checked centrally, against each tool's own advertised schema, so the
+    // guard cannot drift from what the model was told and every future tool is
+    // covered the day it is added.
+    if let Some(err) = missing_required_arg(&call.name, args) {
+        return Err(err);
+    }
     match call.name.as_str() {
         "list_room_files" => {
             let guard = state.room.lock().unwrap();
@@ -2335,6 +2634,10 @@ pub(crate) async fn exec_tool(
                 GateOutcome::Error(e) => Err(e.message),
             }
         }
+        // BROWSE-1: the private browser. Dispatched as a block because all six
+        // share the takeover check, the page-script transport and the journal;
+        // the per-tool bodies live in `commands::browse`.
+        name if is_browse_tool(name) => exec_browse(window, name, args, effects).await,
         // ADD-25: the agent↔UI tools. Each is one round-trip through the
         // AgentUi bridge to the live webview driver; the driver enforces the
         // data-agent-blocked consent denylist a second time at act time.
@@ -2391,9 +2694,12 @@ pub(crate) async fn exec_tool(
             // permissions); the driver's viewer-pane composite is the fallback
             // (and the only path that can see <video> frames — hardware layers
             // render blank in native snapshots).
+            // The main WEBVIEW by label, not `get_webview_window`: once the
+            // private browser's child webview exists, that lookup returns None
+            // and the native path silently degraded to the driver composite.
             let native: Result<Vec<u8>, String> =
-                match window.app_handle().get_webview_window("main") {
-                    Some(wv) => crate::snapshot::capture_webview_png(&wv),
+                match crate::main_webview(&window.app_handle()) {
+                    Some(wv) => crate::snapshot::capture_png(&wv),
                     None => Err("The app window is gone.".into()),
                 };
             let b64 = match native {
@@ -2455,16 +2761,12 @@ pub(crate) async fn exec_tool(
         }
         "web_search" => {
             let query = args["query"].as_str().unwrap_or_default();
-            let (provider, _key, endpoint) = {
+            let enabled = {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
-                (
-                    db::get_setting(&room.conn, "web_provider").unwrap_or_default(),
-                    db::get_setting(&room.conn, "web_api_key").unwrap_or_default(),
-                    db::get_setting(&room.conn, "web_endpoint").unwrap_or_default(),
-                )
+                web_access_enabled(&room.conn)
             };
-            if !matches!(provider.as_str(), "duckduckgo" | "brave" | "searxng") {
+            if !enabled {
                 return Ok("Web access is turned off in Settings → Online features.".into());
             }
             // CHG-33: serve a recent (<15m) cached result list without touching
@@ -2473,7 +2775,7 @@ pub(crate) async fn exec_tool(
             let cached = {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
-                db::get_fresh_web_search(&room.conn, &provider, &endpoint, query)
+                db::get_fresh_web_search(&room.conn, query)
             };
             if let Some(results) = cached {
                 let _ = window.emit(
@@ -2482,10 +2784,13 @@ pub(crate) async fn exec_tool(
                 );
                 return Ok(clamp_tool_result(results));
             }
-            // CHG-33: once throttled this turn, don't hammer the provider — steer
-            // the model to salvage the answer from what it already has.
+            // CHG-33: once the search path has failed outright this turn, don't
+            // keep calling it — steer the model to salvage the answer from what it
+            // already has. A single blocked ENGINE no longer lands here: it drops
+            // out of the fusion silently and the remaining engines still answer,
+            // so this now means the whole search failed (sidecar down, timeout).
             if effects.web_search_throttled {
-                return Ok("Web search is temporarily rate-limited; answer from what you \
+                return Ok("Web search is unavailable right now; answer from what you \
                            already have or from fetched pages — do not search again this turn."
                     .into());
             }
@@ -2493,17 +2798,10 @@ pub(crate) async fn exec_tool(
                 "ask-step",
                 format!("Searching the web for \"{query}\" (leaves this Mac)"),
             );
-            let result = match provider.as_str() {
-                "duckduckgo" | "brave" => web::search_duckduckgo(query).await,
-                _ => web::search_searxng(&endpoint, query).await,
-            };
-            let hits = match result {
+            let hits = match web::search_web(query).await {
                 Ok(h) => h,
                 Err(e) => {
-                    let low = e.to_lowercase();
-                    if low.contains("rate-limit") || low.contains("human check") {
-                        effects.web_search_throttled = true;
-                    }
+                    effects.web_search_throttled = true;
                     return Err(e);
                 }
             };
@@ -2519,7 +2817,7 @@ pub(crate) async fn exec_tool(
             {
                 let guard = state.room.lock().unwrap();
                 if let Some(room) = guard.as_ref() {
-                    let _ = db::put_web_search(&room.conn, &provider, &endpoint, query, &results);
+                    let _ = db::put_web_search(&room.conn, query, &results);
                 }
             }
             Ok(clamp_tool_result(results))
@@ -3120,15 +3418,50 @@ pub(crate) async fn exec_tool(
     }
 }
 
-/// Format a fetched page's remaining readable text starting at char offset
-/// `start`. Tool-result pagination is no longer app-capped.
+/// Largest slice of a fetched page handed back in ONE tool result.
+///
+/// Matches the private browser's own `READ_MAX` (browser/page.js), so the two
+/// web-reading tools behave identically — a model that has learned to page
+/// through `browse_read` pages through `fetch_page` the same way.
+pub(crate) const FETCH_PAGE_WINDOW: usize = 40_000;
+
+/// Format a fetched page's readable text starting at char offset `start`,
+/// bounded to one window.
+///
+/// This USED to return `chars[start..]` — the whole remainder, unbounded —
+/// under the rule that "the provider/model is the context authority". Two
+/// things make that wrong rather than permissive:
+///
+/// 1. The tool's own schema already promises the opposite. It tells the model
+///    "if the result is truncated, call again with the same url and the start
+///    value from the truncation notice", so a pagination protocol was declared,
+///    documented, and never implemented — `start` could only ever be supplied
+///    by a model guessing.
+/// 2. Nothing downstream can undo it. `clamp_tool_result` is a deliberate
+///    no-op, and on a cloud room `budget::trim_messages_to_window`'s Python
+///    twin no-ops as well, while compaction's `_split` always keeps the NEWEST
+///    message whole however big it is. So one `fetch_page` of a heavy site
+///    (finance.yahoo.com is ~69 KB of text before any JS runs) went to the
+///    provider verbatim and the request was rejected — which the user sees as
+///    the Web agent "failing", with no report and no reason.
+///
+/// The authority argument survives intact: the model still decides how much of
+/// the page it wants, one window at a time, and nothing is amputated.
 pub(crate) fn fetch_page_window(title: &str, url: &str, text: &str, start: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
     let start = start.min(total);
+    let end = (start + FETCH_PAGE_WINDOW).min(total);
     let header = format!("[{title}] {url}\n\n");
-    let body: String = chars[start..].iter().collect();
-    format!("{header}{body}")
+    let body: String = chars[start..end].iter().collect();
+    if end < total {
+        format!(
+            "{header}{body}\n\n… {end} of {total} characters shown — call fetch_page \
+             again with the same url and start {end} for the rest."
+        )
+    } else {
+        format!("{header}{body}")
+    }
 }
 
 /// Tool results are passed through without an app-level character cap.
@@ -3981,4 +4314,450 @@ mod tests {
         assert!(text.contains(q), "highlighted quote must be verbatim: {q}");
     }
 
+    // ------------------------------------------------- the connector seam
+    //
+    // `slim_schema` is the ONLY transform between a connected MCP server's
+    // schema and the model. `mcp_routes` stores the slimmed copy, so both the
+    // catalog and `search_mcp_tools` serve it and nothing downstream can
+    // recover what was cut — every silent loss here is a capability the model
+    // cannot know it has. It shipped with zero tests (2026-07-28); these are
+    // that seam's contract.
+
+    #[test]
+    fn slim_keeps_a_reasonable_enum_whole() {
+        // The common case must be untouched: a 12-value enum is not truncated,
+        // and gains no confusing "showing N of M" note.
+        let vals: Vec<serde_json::Value> =
+            (0..12).map(|i| serde_json::json!(format!("v{i}"))).collect();
+        let mut s = serde_json::json!({"type": "object", "properties": {
+            "mode": {"type": "string", "enum": vals, "description": "pick one"}
+        }});
+        slim_schema(&mut s);
+        let m = &s["properties"]["mode"];
+        assert_eq!(m["enum"].as_array().unwrap().len(), 12);
+        assert_eq!(m["description"], "pick one");
+    }
+
+    #[test]
+    fn slim_announces_a_truncated_enum_instead_of_hiding_it() {
+        // An enum is a CLOSED set: a silently dropped value is unreachable AND
+        // invisible. Truncation must be stated so the model can ask.
+        let vals: Vec<serde_json::Value> =
+            (0..200).map(|i| serde_json::json!(format!("v{i}"))).collect();
+        let mut s = serde_json::json!({"type": "object", "properties": {
+            "region": {"type": "string", "enum": vals, "description": "where"}
+        }});
+        slim_schema(&mut s);
+        let r = &s["properties"]["region"];
+        assert_eq!(r["enum"].as_array().unwrap().len(), SCHEMA_ENUM_MAX);
+        let d = r["description"].as_str().unwrap();
+        assert!(d.starts_with("where"), "original description kept: {d}");
+        assert!(d.contains("of 200"), "must name the real total: {d}");
+        assert!(d.contains("ask the user"), "must say what to do: {d}");
+    }
+
+    #[test]
+    fn slim_does_not_dismember_a_vendor_description_that_ends_in_a_paren() {
+        // The note-peeling sentinel must be specific enough that ordinary
+        // prose ending in a parenthesis survives untouched.
+        let mut s = serde_json::json!({
+            "description": "Filter results (showing archived items too)"
+        });
+        slim_schema(&mut s);
+        assert_eq!(s["description"], "Filter results (showing archived items too)");
+    }
+
+    #[test]
+    fn slim_notes_a_truncated_enum_even_with_no_description_to_append_to() {
+        let vals: Vec<serde_json::Value> =
+            (0..100).map(|i| serde_json::json!(i)).collect();
+        let mut s = serde_json::json!({"enum": vals});
+        slim_schema(&mut s);
+        assert_eq!(s["enum"].as_array().unwrap().len(), SCHEMA_ENUM_MAX);
+        assert!(s["description"].as_str().unwrap().contains("of 100"));
+    }
+
+    #[test]
+    fn slim_marks_a_clamped_description() {
+        // The failure this prevents: "Permanently deletes the record. This
+        // cannot be undone." cut mid-sentence reads as the whole truth.
+        let long = format!("Deletes the record. {}", "x".repeat(400));
+        let mut s = serde_json::json!({"properties": {"id": {"description": long}}});
+        slim_schema(&mut s);
+        let d = s["properties"]["id"]["description"].as_str().unwrap();
+        assert!(d.ends_with('…'), "a cut description must say it was cut: {d}");
+        assert!(d.chars().count() <= SCHEMA_DESC_MAX, "len {}", d.chars().count());
+    }
+
+    #[test]
+    fn slim_leaves_a_short_description_completely_alone() {
+        let mut s = serde_json::json!({"description": "Send a message."});
+        slim_schema(&mut s);
+        assert_eq!(s["description"], "Send a message.");
+    }
+
+    #[test]
+    fn slim_budgets_hebrew_in_characters_not_bytes() {
+        // A byte budget silently halves non-Latin text. 120 Hebrew chars are
+        // ~240 bytes and must survive a 150-CHAR budget untouched.
+        let heb: String = "א".repeat(120);
+        let mut s = serde_json::json!({"description": heb.clone()});
+        slim_schema(&mut s);
+        assert_eq!(s["description"], heb, "Hebrew must not be byte-clamped");
+    }
+
+    #[test]
+    fn slim_never_splits_a_multibyte_character() {
+        // Cutting mid-codepoint is a panic in the byte world; prove the char
+        // world is safe at exactly the boundary.
+        for n in [149usize, 150, 151, 400] {
+            let heb: String = "שלום".repeat(n);
+            let mut s = serde_json::json!({"description": heb});
+            slim_schema(&mut s);
+            let d = s["description"].as_str().unwrap();
+            assert!(d.chars().count() <= SCHEMA_DESC_MAX, "n={n} len={}", d.chars().count());
+            // Round-tripping proves no codepoint was severed.
+            assert_eq!(d, String::from_utf8(d.as_bytes().to_vec()).unwrap());
+        }
+    }
+
+    #[test]
+    fn slim_keeps_default_so_the_model_knows_what_it_may_omit() {
+        // Dropping `default` made a well-documented optional look like an
+        // unexplained required field, and invited invented values.
+        let mut s = serde_json::json!({"properties": {
+            "limit": {"type": "integer", "default": 20},
+            "region": {"type": "string", "default": "us-east-1"}
+        }});
+        slim_schema(&mut s);
+        assert_eq!(s["properties"]["limit"]["default"], 20);
+        assert_eq!(s["properties"]["region"]["default"], "us-east-1");
+    }
+
+    #[test]
+    fn slim_keeps_additional_properties_false_and_drops_the_permissive_forms() {
+        // `false` is one token that stops a small model inventing fields.
+        let mut strict = serde_json::json!({"type": "object", "additionalProperties": false});
+        slim_schema(&mut strict);
+        assert_eq!(strict["additionalProperties"], false);
+
+        let mut loose = serde_json::json!({"type": "object", "additionalProperties": true});
+        slim_schema(&mut loose);
+        assert!(loose.get("additionalProperties").is_none());
+
+        let mut schema_form =
+            serde_json::json!({"type": "object", "additionalProperties": {"type": "string"}});
+        slim_schema(&mut schema_form);
+        assert!(schema_form.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn slim_still_strips_the_vendor_noise_it_was_written_for() {
+        let mut s = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "$id": "x", "$comment": "internal",
+            "title": "SendMessageRequest",
+            "examples": [{"a": 1}], "example": {"a": 1},
+            "x-google-enum-descriptions": ["..."],
+            "properties": {"a": {"type": "string", "title": "A", "x-vendor": 1}}
+        });
+        slim_schema(&mut s);
+        for k in ["$schema", "$id", "$comment", "title", "examples", "example"] {
+            assert!(s.get(k).is_none(), "{k} should be stripped");
+        }
+        assert!(s.as_object().unwrap().keys().all(|k| !k.starts_with("x-")));
+        assert!(s["properties"]["a"].get("title").is_none());
+        assert!(s["properties"]["a"].get("x-vendor").is_none());
+        assert_eq!(s["properties"]["a"]["type"], "string");
+    }
+
+    #[test]
+    fn slim_recurses_through_nested_objects_and_arrays() {
+        let long = "y".repeat(400);
+        let mut s = serde_json::json!({"properties": {"items": {"type": "array", "items": {
+            "type": "object", "title": "Item",
+            "properties": {"deep": {"description": long, "default": 3}}
+        }}}});
+        slim_schema(&mut s);
+        let deep = &s["properties"]["items"]["items"]["properties"]["deep"];
+        assert!(deep["description"].as_str().unwrap().ends_with('…'));
+        assert_eq!(deep["default"], 3, "defaults survive at depth");
+        assert!(s["properties"]["items"]["items"].get("title").is_none());
+    }
+
+    #[test]
+    fn slim_is_idempotent() {
+        // Routes are rebuilt per turn; slimming an already-slim schema must not
+        // keep chewing (an ellipsis on an ellipsis, a note on a note).
+        let vals: Vec<serde_json::Value> =
+            (0..200).map(|i| serde_json::json!(format!("v{i}"))).collect();
+        let mut once = serde_json::json!({"properties": {
+            "r": {"enum": vals, "description": "z".repeat(400)}
+        }});
+        slim_schema(&mut once);
+        let mut twice = once.clone();
+        slim_schema(&mut twice);
+        assert_eq!(once, twice, "slimming twice must equal slimming once");
+    }
+
+    // ------------------------------------------- required-argument guard
+    //
+    // Every exec_tool arm reads arguments with `unwrap_or_default()`, so a
+    // missing required string used to arrive as `""` and keep going. The file
+    // resolver is `LIKE '%' || ?1 || '%' … ORDER BY created_at DESC LIMIT 1`,
+    // so `""` matches THE NEWEST FILE IN THE ROOM: `open_file({})` opened it,
+    // and `edit_file` with matching text edited it. A wrong-target write, with
+    // no error anywhere. Validated centrally against each tool's own schema.
+
+    #[test]
+    fn a_missing_required_name_is_refused_not_resolved_to_the_newest_file() {
+        let err = missing_required_arg("open_file", &serde_json::json!({})).unwrap();
+        assert!(err.contains("name is required"), "got: {err}");
+        // The schema's own description becomes the hint the model acts on.
+        assert!(err.contains("File name or a distinctive part of it"), "got: {err}");
+        assert!(err.contains("Nothing was done"), "got: {err}");
+    }
+
+    #[test]
+    fn a_blank_or_whitespace_string_counts_as_missing() {
+        // `""` is the exact value `unwrap_or_default()` produced, and `"   "`
+        // is what a model emits when it knows it is guessing.
+        for bad in ["", "   ", "\n\t"] {
+            assert!(
+                missing_required_arg("open_file", &serde_json::json!({"name": bad})).is_some(),
+                "{bad:?} should not count as a supplied name"
+            );
+        }
+        assert!(
+            missing_required_arg("open_file", &serde_json::json!({"name": "lease.pdf"})).is_none()
+        );
+    }
+
+    #[test]
+    fn null_is_missing_too() {
+        assert!(
+            missing_required_arg("open_file", &serde_json::json!({"name": null})).is_some()
+        );
+    }
+
+    #[test]
+    fn the_guard_names_the_first_missing_argument_of_several() {
+        let err = missing_required_arg("edit_file", &serde_json::json!({"name": "a.md"})).unwrap();
+        assert!(err.contains("old_text is required"), "got: {err}");
+        let err2 = missing_required_arg(
+            "edit_file",
+            &serde_json::json!({"name": "a.md", "old_text": "x"}),
+        )
+        .unwrap();
+        assert!(err2.contains("new_text is required"), "got: {err2}");
+        assert!(missing_required_arg(
+            "edit_file",
+            &serde_json::json!({"name": "a.md", "old_text": "x", "new_text": "y"})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn empty_containers_are_missing_but_zero_and_false_are_not() {
+        // An empty array is a no-op batch; an empty object is not a config.
+        assert!(missing_required_arg("edit_files", &serde_json::json!({"edits": []})).is_some());
+        assert!(
+            missing_required_arg("save_mcp", &serde_json::json!({"name": "x", "config": {}}))
+                .is_some()
+        );
+        // ...but a numeric 0 is a real value and must pass. ui_act's `mark` is
+        // an integer, and mark 0 is a legitimate control.
+        assert!(missing_required_arg(
+            "ui_act",
+            &serde_json::json!({"mark": 0, "action": "click"})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn well_formed_calls_are_never_blocked() {
+        // The guard must be invisible in normal operation.
+        for (tool, args) in [
+            ("search_room", serde_json::json!({"query": "rent"})),
+            ("list_room_files", serde_json::json!({})),
+            ("list_memories", serde_json::json!({})),
+            ("create_file", serde_json::json!({"name": "a.md", "content": "hi"})),
+            ("rename_file", serde_json::json!({"name": "a", "new_name": "b"})),
+            // An empty folder string is the DOCUMENTED way to move to the top
+            // level, so `move_file` must not be caught by the blank-string rule.
+            ("move_file", serde_json::json!({"name": "a", "folder": ""})),
+            ("add_memory", serde_json::json!({"content": "likes tea"})),
+            ("start_file_pass", serde_json::json!({"name": "b.pdf", "instruction": "sum"})),
+            ("web_search", serde_json::json!({"query": "weather"})),
+            ("run_script", serde_json::json!({"name": "x.py"})),
+            ("save_workflow", serde_json::json!({"name": "w", "definition": {"version": 1}})),
+        ] {
+            assert!(
+                missing_required_arg(tool, &args).is_none(),
+                "{tool} wrongly rejected: {:?}",
+                missing_required_arg(tool, &args)
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_string_is_honoured_where_the_schema_documents_it() {
+        // `move_file`'s own description says "empty string for the top level",
+        // so `""` is an instruction, not an omission. Absent or null still is.
+        assert!(missing_required_arg(
+            "move_file",
+            &serde_json::json!({"name": "a.md", "folder": ""})
+        )
+        .is_none());
+        assert!(
+            missing_required_arg("move_file", &serde_json::json!({"name": "a.md"})).is_some(),
+            "an ABSENT folder is still a failure"
+        );
+        assert!(
+            missing_required_arg(
+                "move_file",
+                &serde_json::json!({"name": "a.md", "folder": null})
+            )
+            .is_some(),
+            "a NULL folder is still a failure"
+        );
+    }
+
+    #[test]
+    fn the_empty_string_exception_list_stays_honest() {
+        // Every entry must name a real tool, a real REQUIRED param of it, and
+        // that param must actually document the empty case — otherwise the
+        // exception is a silent hole in the guard.
+        for (tool, key) in EMPTY_STRING_IS_MEANINGFUL {
+            let schema = builtin_param_schemas()
+                .get(*tool)
+                .unwrap_or_else(|| panic!("{tool} is not a real tool"));
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert!(required.contains(key), "{tool}.{key} is not a required param");
+            let desc = schema["properties"][key]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase();
+            assert!(
+                desc.contains("empty"),
+                "{tool}.{key} claims an empty-string meaning its description \
+                 never documents: {desc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn connected_mcp_tools_are_not_our_contract_to_enforce() {
+        // A connector's own schema governs its calls; we must not invent one.
+        assert!(missing_required_arg("someserver_do_thing", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn every_advertised_required_argument_is_actually_enforced() {
+        // The sweep: for every built-in tool, dropping each required argument
+        // in turn must be refused. This is what makes the guard exhaustive —
+        // a tool added tomorrow with a new required field is covered without
+        // anyone remembering to write a test.
+        for (tool, schema) in builtin_param_schemas() {
+            let Some(required) = schema.get("required").and_then(|r| r.as_array()) else {
+                continue;
+            };
+            // A plausible full argument set for this tool, from its own schema.
+            let mut full = serde_json::Map::new();
+            for entry in required {
+                let key = entry.as_str().unwrap();
+                let ty = schema
+                    .get("properties")
+                    .and_then(|p| p.get(key))
+                    .and_then(|p| p.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("string");
+                full.insert(
+                    key.to_string(),
+                    match ty {
+                        "array" => serde_json::json!([{"placeholder": true}]),
+                        "object" => serde_json::json!({"placeholder": true}),
+                        "integer" | "number" => serde_json::json!(1),
+                        "boolean" => serde_json::json!(true),
+                        _ => serde_json::json!("x"),
+                    },
+                );
+            }
+            assert!(
+                missing_required_arg(tool, &serde_json::Value::Object(full.clone())).is_none(),
+                "{tool}: a complete argument set was rejected"
+            );
+            for entry in required {
+                let key = entry.as_str().unwrap();
+                let mut missing = full.clone();
+                missing.remove(key);
+                assert!(
+                    missing_required_arg(tool, &serde_json::Value::Object(missing)).is_some(),
+                    "{tool}: dropping required `{key}` was NOT refused"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clamp_marked_trims_a_dangling_separator_before_the_marker() {
+        assert_eq!(clamp_marked("abcd, efg".into(), 6), "abcd…");
+        // Already short enough: untouched, no marker.
+        assert_eq!(clamp_marked("abc".into(), 6), "abc");
+        // Exactly at the budget: untouched.
+        assert_eq!(clamp_marked("abcdef".into(), 6), "abcdef");
+    }
+
+    /// Live report 2026-07-30: the Web agent failed on finance.yahoo.com every
+    /// time. `fetch_page` returned `chars[start..]` — the whole remainder —
+    /// while its own schema told the model "if the result is truncated, call
+    /// again with the start value from the truncation notice". The protocol was
+    /// declared and never implemented, and nothing downstream could undo it on
+    /// a cloud room.
+    #[test]
+    fn a_fetched_page_comes_back_one_window_at_a_time() {
+        let text: String = "x".repeat(FETCH_PAGE_WINDOW * 2 + 500);
+        let first = fetch_page_window("T", "https://e.com", &text, 0);
+        assert!(
+            first.chars().count() < FETCH_PAGE_WINDOW + 500,
+            "a whole heavy page went out in one tool result: {} chars",
+            first.chars().count()
+        );
+        // The continuation the schema promises, with the offset to resume at.
+        assert!(first.contains(&format!("start {FETCH_PAGE_WINDOW}")), "{first:.400}");
+
+        // ...and following it walks to the end, losing nothing.
+        let second = fetch_page_window("T", "https://e.com", &text, FETCH_PAGE_WINDOW);
+        assert!(second.contains(&format!("start {}", FETCH_PAGE_WINDOW * 2)));
+        let last = fetch_page_window("T", "https://e.com", &text, FETCH_PAGE_WINDOW * 2);
+        assert!(
+            !last.contains("call fetch_page"),
+            "the final window still claims there is more: {last:.200}"
+        );
+    }
+
+    #[test]
+    fn a_short_page_is_returned_whole_with_no_truncation_notice() {
+        let out = fetch_page_window("Title", "https://e.com", "hello", 0);
+        assert_eq!(out, "[Title] https://e.com\n\nhello");
+    }
+
+    #[test]
+    fn a_start_past_the_end_of_a_page_does_not_panic() {
+        let out = fetch_page_window("T", "https://e.com", "short", 9_000);
+        assert!(!out.contains("call fetch_page"), "{out}");
+    }
+
+    /// The window is measured in CHARS, so a Hebrew page must not be sliced
+    /// mid-codepoint — `chars[start..end]` is safe, a byte slice would panic.
+    #[test]
+    fn a_multibyte_page_is_windowed_on_character_boundaries() {
+        let text: String = "שלום ".repeat(FETCH_PAGE_WINDOW);
+        let out = fetch_page_window("כותרת", "https://e.co.il", &text, 0);
+        assert!(out.contains("שלום"));
+        assert!(out.contains(&format!("start {FETCH_PAGE_WINDOW}")));
+    }
 }

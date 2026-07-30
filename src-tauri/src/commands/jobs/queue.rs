@@ -110,11 +110,9 @@ pub(crate) async fn pump(app: &tauri::AppHandle, window: &tauri::Window) {
 /// Wave 4a: called from `open_room`/`create_room` to restart any work left
 /// 'queued' from a previous session (open decision 2: auto-start at unlock).
 pub(crate) fn pump_on_open(app: &tauri::AppHandle) {
-    use tauri::Manager;
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let Some(webview) = app.get_webview_window("main") else { return };
-        let window = webview.as_ref().window();
+        let Some(window) = crate::main_window(&app) else { return };
         pump(&app, &window).await;
     });
 }

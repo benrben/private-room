@@ -633,17 +633,32 @@ pub(crate) fn count_batch_ops(ops: &[BatchOp]) -> (usize, usize) {
 
 /// Parse the tool's `edits` array into typed ops. Serde-tagged is the documented
 /// form, but a 4B model may omit the tag, so the variant is inferred from the
-/// fields present (a `new_name` with no edit fields ⇒ rename). Empty entries are
-/// skipped, exactly as `set_cells` skips empty cells.
+/// fields present (a `new_name` with no edit fields ⇒ rename).
+///
+/// A nameless entry is an ERROR, never a skip (2026-07-28). It used to
+/// `continue`, so a batch of three where one entry lost its `name` applied the
+/// other two and reported "Applied 2 change(s)" — the model had no way to learn
+/// that a third of its work silently evaporated, and the tool's own headline
+/// promise ("every edit is checked first, then all are applied together — if any
+/// single edit can't match, none are applied") was already broken at the parse
+/// step, before `plan_batch`'s atomic phase ever ran. `plan_batch` errors
+/// per-index on an empty `old_text`; this is the same contract, one stage
+/// earlier, in the same numbered style so a small model can act on it.
 pub(crate) fn parse_batch_ops(args: &serde_json::Value) -> Result<Vec<BatchOp>, String> {
     let arr = args["edits"].as_array().ok_or(
         "Pass edits: [{name, old_text, new_text}] (or {name, new_name} to rename) — one array.",
     )?;
+    let n = arr.len();
     let mut ops = Vec::new();
-    for e in arr {
+    for (i, e) in arr.iter().enumerate() {
         let name = e["name"].as_str().unwrap_or_default().trim().to_string();
         if name.is_empty() {
-            continue;
+            return Err(format!(
+                "Edit {} of {n}: name is required — every entry needs the file \
+                 to change, e.g. {{\"name\": \"notes.md\", \"old_text\": \"…\", \
+                 \"new_text\": \"…\"}}. Nothing was changed.",
+                i + 1
+            ));
         }
         let op = e["op"].as_str().unwrap_or_default();
         let has_new_name = !e["new_name"].as_str().unwrap_or_default().trim().is_empty();
@@ -1104,5 +1119,84 @@ mod tests {
         let r: BatchOp =
             serde_json::from_value(serde_json::json!({"op":"rename","name":"a","new_name":"b"})).unwrap();
         assert_eq!(r, BatchOp::Rename { name: "a".into(), new_name: "b".into() });
+    }
+
+    // --------------------------------------------------------------- parse
+    //
+    // `edit_files` promises the model: "every edit is checked first, then all
+    // are applied together — if any single edit can't match, none are applied."
+    // A nameless entry used to be skipped at parse time, so the batch applied
+    // the REST and reported success. The model was told "Applied 2 change(s)"
+    // for a three-edit plan and had no way to learn the third vanished. These
+    // pin the parse stage to the same all-or-nothing contract `plan_batch`
+    // already enforces.
+
+    #[test]
+    fn a_nameless_entry_fails_the_whole_batch_instead_of_being_skipped() {
+        let err = parse_batch_ops(&serde_json::json!({"edits": [
+            {"name": "a.md", "old_text": "x", "new_text": "y"},
+            {"old_text": "p", "new_text": "q"},
+            {"name": "c.md", "old_text": "m", "new_text": "n"},
+        ]}))
+        .unwrap_err();
+        // Numbered like plan_batch's errors, and 1-based for a human/model.
+        assert!(err.contains("Edit 2 of 3"), "got: {err}");
+        assert!(err.contains("name is required"), "got: {err}");
+        // It must say plainly that nothing landed — the whole point.
+        assert!(err.contains("Nothing was changed"), "got: {err}");
+    }
+
+    #[test]
+    fn a_blank_name_is_the_same_failure_as_a_missing_one() {
+        // `"   "` trims to empty: a model that emitted whitespace gets the same
+        // honest error, not a silent drop.
+        let err = parse_batch_ops(&serde_json::json!({"edits": [
+            {"name": "   ", "old_text": "x", "new_text": "y"},
+        ]}))
+        .unwrap_err();
+        assert!(err.contains("Edit 1 of 1"), "got: {err}");
+        assert!(err.contains("name is required"), "got: {err}");
+    }
+
+    #[test]
+    fn well_formed_batches_still_parse_both_shapes() {
+        // The tolerance that must NOT regress: the untagged form a 4B emits.
+        let ops = parse_batch_ops(&serde_json::json!({"edits": [
+            {"name": "a.md", "old_text": "x", "new_text": "y"},
+            {"name": "old.md", "new_name": "new.md"},
+        ]}))
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                BatchOp::Edit { name: "a.md".into(), old_text: "x".into(), new_text: "y".into() },
+                BatchOp::Rename { name: "old.md".into(), new_name: "new.md".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entry_with_a_name_but_no_operation_is_caught_downstream_atomically() {
+        // Parse accepts it (it looks like an edit); `plan_batch` then refuses
+        // the BATCH with a numbered error, so nothing is written. Verifying the
+        // two stages hand off rather than leaving a gap between them.
+        let ops = parse_batch_ops(&serde_json::json!({"edits": [
+            {"name": "a.md"},
+        ]}))
+        .unwrap();
+        let conn = db::open_in_memory_schema();
+        seed_text_file(&conn, "a.md", "hello");
+        // `PlannedWrite` is not Debug, so match rather than unwrap_err.
+        let err = match plan_batch(&conn, &ops) {
+            Err(e) => e,
+            Ok(_) => panic!("a nameless operation was planned instead of refused"),
+        };
+        assert!(err.contains("old_text is required"), "got: {err}");
+    }
+
+    #[test]
+    fn an_empty_edits_array_still_says_so() {
+        let err = parse_batch_ops(&serde_json::json!({"edits": []})).unwrap_err();
+        assert!(err.contains("No edits given"), "got: {err}");
     }
 }

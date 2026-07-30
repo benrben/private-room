@@ -7,7 +7,36 @@
 //! snapshots (WebKit limitation); video frames go through the driver's
 //! canvas `media_frame` path instead.
 
-/// Capture the window's webview as PNG bytes. Must be callable from any
+/// Anything that can hand a closure the platform WKWebView on the main
+/// thread. Both `WebviewWindow` (the app's own window) and `Webview` (BROWSE-1's
+/// child browser webview) expose the identical `with_webview`, so the capture
+/// body below is written once against this instead of twice against the two
+/// concrete types.
+pub trait PlatformWebviewHost {
+    fn with_platform_webview<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(tauri::webview::PlatformWebview) + Send + 'static;
+}
+
+impl PlatformWebviewHost for tauri::WebviewWindow {
+    fn with_platform_webview<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(tauri::webview::PlatformWebview) + Send + 'static,
+    {
+        self.with_webview(f).map_err(|e| e.to_string())
+    }
+}
+
+impl PlatformWebviewHost for tauri::Webview {
+    fn with_platform_webview<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(tauri::webview::PlatformWebview) + Send + 'static,
+    {
+        self.with_webview(f).map_err(|e| e.to_string())
+    }
+}
+
+/// Capture ANY hosted webview as PNG bytes. Must be callable from any
 /// thread EXCEPT the main thread: the WKWebView call itself is dispatched to
 /// the main thread (Tauri's `with_webview` guarantees its closure runs there
 /// — see the tauri 2.x docs for `Webview::with_webview`) and the result is
@@ -16,7 +45,7 @@
 /// loop to fire — so main-thread callers get an error instead of a hang.
 /// The agent loop calls this from a tokio worker thread, which is fine.
 #[cfg(target_os = "macos")]
-pub fn capture_webview_png(window: &tauri::WebviewWindow) -> Result<Vec<u8>, String> {
+pub fn capture_png(window: &impl PlatformWebviewHost) -> Result<Vec<u8>, String> {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -31,7 +60,7 @@ pub fn capture_webview_png(window: &tauri::WebviewWindow) -> Result<Vec<u8>, Str
     // delivers the snapshot. Fail fast rather than eat the 5s timeout.
     if MainThreadMarker::new().is_some() {
         return Err(
-            "capture_webview_png must not be called from the main thread (it would deadlock \
+            "capture_png must not be called from the main thread (it would deadlock \
              waiting for the snapshot completion handler)"
                 .into(),
         );
@@ -40,7 +69,7 @@ pub fn capture_webview_png(window: &tauri::WebviewWindow) -> Result<Vec<u8>, Str
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
 
     window
-        .with_webview(move |platform_webview| {
+        .with_platform_webview(move |platform_webview| {
             // This closure runs on the main thread (Tauri guarantee), so we
             // can talk to the MainThreadOnly WebKit classes directly.
             let outcome = (|| -> Result<(), String> {
@@ -128,6 +157,6 @@ pub fn capture_webview_png(window: &tauri::WebviewWindow) -> Result<Vec<u8>, Str
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn capture_webview_png(_window: &tauri::WebviewWindow) -> Result<Vec<u8>, String> {
+pub fn capture_png(_window: &impl PlatformWebviewHost) -> Result<Vec<u8>, String> {
     Err("Screenshots are only supported on macOS.".into())
 }

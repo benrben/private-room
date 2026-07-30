@@ -76,6 +76,35 @@ def test_flatten_uses_rust_role_labels_and_answer_tail() -> None:
     assert prompt.rstrip().endswith("Reply with the answer only.")
 
 
+def test_flatten_never_silently_drops_an_image_bearing_turn() -> None:
+    # These engines take ONE TEXT PROMPT, so a PNG on the turn cannot ride. The
+    # perception tools still append "the capture you requested is attached" to the
+    # text, and a harness believes the prompt — so rendering only `content` made it
+    # describe a page it had never seen. Live QA 2026-07-30: "the screenshot for the
+    # browser is not working" was this, silently.
+    prompt = external_llm.flatten_agent_messages(
+        [
+            {"role": "user", "content": "what does the ETF page look like?"},
+            {"role": "user", "content": "The capture you requested is attached.",
+             "images": ["iVBORw0KGgo="]},
+        ]
+    )
+    assert "cannot receive images" in prompt
+    assert "You have not seen them" in prompt
+    assert "1 image(s)" in prompt
+    # The one-shot path flattens too, and has the same hole.
+    assert "cannot receive images" in flatten_messages(
+        [{"role": "user", "content": "look", "images": ["iVBORw0KGgo="]}], None
+    )
+    # A turn with no images must not be nagged about images.
+    assert "cannot receive images" not in external_llm.flatten_agent_messages(
+        [{"role": "user", "content": "hi"}]
+    )
+    assert "cannot receive images" not in flatten_messages(
+        [{"role": "user", "content": "hi"}], None
+    )
+
+
 def test_flatten_folds_schema_into_a_json_only_instruction() -> None:
     schema = {"type": "object", "properties": {"markdown": {"type": "string"}}}
     prompt = flatten_messages([{"role": "user", "content": "go"}], schema)
@@ -561,3 +590,146 @@ def test_server_picks_the_cli_seam_for_an_external_engine() -> None:
     # A local model still gets the Ollama seam.
     local = _default_chat_model(RunRequest(model="qwen3.5:4b", question="hi"))
     assert isinstance(local, external_llm.ExternalChatModel) is False
+
+
+# ------------------------------------------------------------ compaction (CLI)
+#
+# A CLI is stateless per call, so every round re-sends the whole composed
+# transcript — the same bytes billed again and again. Measured 2026-07-28: a
+# compacted 12 KB transcript matched a raw 176 KB one on the large model (4/4
+# ties) at 19x fewer prompt tokens.
+
+
+def _long_history(turns: int = 60) -> list[dict[str, str]]:
+    msgs = [{"role": "system", "content": "You are the room assistant."}]
+    for i in range(turns):
+        msgs.append({"role": "user", "content": f"Q{i} " + "x" * 1_500})
+        msgs.append({"role": "assistant", "content": f"A{i} " + "y" * 1_500})
+    return msgs
+
+
+@pytest.mark.asyncio
+async def test_a_long_transcript_is_compacted_before_it_is_billed(monkeypatch) -> None:
+    sent: list[str] = []
+
+    async def fake_exec(*argv, **kwargs):
+        return _FakeProc(_envelope("ok"))
+
+    async def fake_digest(model, messages, **kw):
+        return "facts: the rent is 4200"
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(external_llm, "generate_external", fake_digest)
+
+    real_flatten = external_llm.flatten_agent_messages
+
+    def spy(messages, **kw):
+        out = real_flatten(messages, **kw)
+        sent.append(out)
+        return out
+
+    monkeypatch.setattr(external_llm, "flatten_agent_messages", spy)
+
+    async def on_delta(_d: str) -> None:
+        return None
+
+    history = _long_history()
+    raw = sum(len((m.get("content") or "").encode()) for m in history)
+    # A window the host actually stated — without one there is no budget at all.
+    await _model(max_context=32_000).stream(history, [], on_delta)
+
+    assert sent, "the prompt was never composed"
+    assert len(sent[-1].encode()) < raw, "the whole transcript was sent anyway"
+    assert "the rent is 4200" in sent[-1], "the digest did not reach the prompt"
+
+
+@pytest.mark.asyncio
+async def test_no_stated_window_means_the_transcript_goes_out_whole(monkeypatch) -> None:
+    """The guarantee that keeps this from ever being a regression: a guessed
+    window would mean trimming a real conversation to fit a guess."""
+    digested = False
+
+    async def fake_exec(*argv, **kwargs):
+        return _FakeProc(_envelope("ok"))
+
+    async def fake_digest(model, messages, **kw):
+        nonlocal digested
+        digested = True
+        return "facts"
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(external_llm, "generate_external", fake_digest)
+
+    async def on_delta(_d: str) -> None:
+        return None
+
+    await _model().stream(_long_history(), [], on_delta)  # no max_context
+    assert digested is False
+
+
+def test_the_native_tools_note_forbids_denying_a_tool_the_room_HAS() -> None:
+    """The disowning note has to cut BOTH ways (owner report 2026-07-30).
+
+    Written to stop Claude Code listing its own installed skills, the note said
+    only "your own environment's tools are not connected here" — and Claude
+    generalised it into "so I cannot browse the web", answering "I have no
+    web-browsing specialist" with `ask_web_agent` sitting in its MCP tool list.
+    Live probe: web, browse and jobs all refused with num_turns=1 and zero
+    delegations; with the reverse error spelled out, all three delegate.
+
+    So the note must keep BOTH halves. This pins the second one, which is the
+    one that was missing.
+    """
+    # The note is hard-wrapped prose, so match on collapsed whitespace — a
+    # phrase that happens to straddle a line break is still present.
+    note = " ".join(external_llm._NATIVE_TOOLS_NOTE.split())
+    # Half one: still disowns its own registry.
+    assert "must never be consulted" in note
+    # Half two: the room's own capabilities are real and must not be denied.
+    for claim in ("internet", "browser", "background jobs", "connected services"):
+        assert claim in note, f"the note no longer claims the room's {claim}"
+    assert "CALL IT" in note
+    for denial in (
+        "I can't browse the web",
+        "I have no web-browsing specialist",
+        "outside what this room can do",
+    ):
+        assert denial in note, (
+            f"the note stopped naming the denial {denial!r} — it was quoted "
+            "verbatim from a live refusal, which is why it is quoted at all"
+        )
+
+
+def test_the_native_note_survives_a_round_that_also_has_protocol_tools() -> None:
+    """`elif native:` dropped the note whenever ANY tool stayed on the text
+    protocol (live QA 2026-07-30: cloud Main denied both browsing and MCP
+    inspection while `room_mcp.rs` was serving it those very tools).
+
+    `tools` here is only what is LEFT on the envelope protocol; `native` says
+    real MCP endpoints are mounted this round. They are independent, and a round
+    can have both — anything the room bridge does not serve stays on the
+    envelope while `ask_*_agent` rides the hub. Chained as if/elif, the round
+    that most needed the note was the one guaranteed not to get it.
+    """
+    system = _model()._system([], TOOLS, native=True)
+    collapsed = " ".join(system.split())
+    assert "CALL IT" in collapsed, (
+        "the native note was dropped because a tool remained on the text "
+        "protocol — this is the round where Main decides whether to delegate"
+    )
+    # ...and the envelope protocol is still taught for the tool that needs it.
+    assert "create_file" in collapsed
+
+
+def test_a_fully_native_round_still_carries_the_note() -> None:
+    """The case that already worked — pinned so the fix cannot regress it."""
+    collapsed = " ".join(_model()._system([], [], native=True).split())
+    assert "CALL IT" in collapsed
+
+
+def test_a_round_with_no_native_endpoints_is_unchanged() -> None:
+    """No MCP endpoint mounted means nothing to claim: a pure text-protocol
+    engine (Codex on this path) must not be told it has native tools."""
+    collapsed = " ".join(_model()._system([], TOOLS, native=False).split())
+    assert "CALL IT" not in collapsed
+    assert "create_file" in collapsed

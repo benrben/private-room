@@ -18,7 +18,7 @@ import pytest
 from ollama import ResponseError
 from PIL import Image
 
-from arcelle_sidecar import llm, vision
+from arcelle_sidecar import llm, model_text, vision
 from arcelle_sidecar.server import create_app
 
 
@@ -192,17 +192,19 @@ def test_boxes_from_items_drops_degenerate_and_malformed() -> None:
     assert vision.boxes_from_items(items, 100.0, 100.0) == []
 
 
-# --- recover_json / strip_think_spans ---------------------------------------
+# --- the shared recover_json / strip_think_spans (model_text) ----------------
 
 
 def test_recover_json_unwraps_fence_and_think() -> None:
-    assert vision.recover_json('```json\n[{"a":1}]\n```') == '[{"a":1}]'
-    assert vision.recover_json("<think>hmm</think>  [1,2]  ") == "[1,2]"
+    # The helper now lives in model_text (one copy for all six callers); the
+    # assertions stay here because this module's reply parsing depends on them.
+    assert model_text.recover_json('```json\n[{"a":1}]\n```') == '[{"a":1}]'
+    assert model_text.recover_json("<think>hmm</think>  [1,2]  ") == "[1,2]"
 
 
 def test_strip_think_spans_truncates_unterminated() -> None:
-    assert vision.strip_think_spans("keep<think>drop the rest") == "keep"
-    assert vision.strip_think_spans("a<think>x</think>b") == "ab"
+    assert model_text.strip_think_spans("keep<think>drop the rest") == "keep"
+    assert model_text.strip_think_spans("a<think>x</think>b") == "ab"
 
 
 # --- /vision_locate endpoint ------------------------------------------------

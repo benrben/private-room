@@ -222,6 +222,12 @@ export function useWorkspaceEffects(
         }
       }
     });
+    // BROWSE-1: the agent can open a page from any area. The native webview is
+    // positioned over the window rather than inside a pane, so the area has to
+    // follow it or the page lands on top of whatever the user was looking at.
+    const unlistenBrowserNav = api.onBrowserNavigated(() => {
+      a.revealBrowser();
+    });
     const unlistenMcpApprove = api.onMcpApproveRequest((req) => {
       s.setMcpApprovals((q) => [...q, req]);
     });
@@ -235,6 +241,26 @@ export function useWorkspaceEffects(
     // and every outcome, including a thrown surprise, is answered so the
     // backend's oneshot never waits out its timeout.
     const unlistenAgentUi = api.onAgentUiRequest(async (req) => {
+      // BROWSE-1: the outbound-typing door needs a HUMAN answer, so it never
+      // reaches the DOM driver. It is queued as a consent card and resolved by
+      // `resolveBrowseConsent` — the same oneshot the driver would have
+      // answered, so the backend's tool call waits exactly as it does for any
+      // other agent-UI request.
+      if (req.kind === "browse_consent") {
+        s.setBrowseConsents((q) => [
+          ...q,
+          {
+            id: req.id,
+            url: String(req.args.url ?? ""),
+            field: String(req.args.field ?? "a field"),
+            text: String(req.args.text ?? ""),
+            entities: Array.isArray(req.args.entities)
+              ? (req.args.entities as string[])
+              : [],
+          },
+        ]);
+        return;
+      }
       const payload = await handleAgentUiRequest(req).catch((e) => ({
         error: String(e),
       }));
@@ -464,6 +490,7 @@ export function useWorkspaceEffects(
       unlistenUpdated.then((fn) => fn());
       unlistenFiles.then((fn) => fn());
       unlistenMcp.then((fn) => fn());
+      unlistenBrowserNav.then((fn) => fn());
       unlistenMcpApprove.then((fn) => fn());
       unlistenEditApprove.then((fn) => fn());
       unlistenAgentUi.then((fn) => fn());

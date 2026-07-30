@@ -45,15 +45,8 @@ from pydantic import BaseModel, ConfigDict
 
 from . import llm
 from .config import KEEP_ALIVE_WARM, ProviderConfig
-from .messages import Message, compact_json, system_message, user_message
-
-#: chat_structured (ollama.rs) primes the schema onto the last user turn because
-#: Ollama's ``format`` constrains the GRAMMAR but the model never sees the schema —
-#: without the field names a small model fills the forced JSON with empty strings.
-#: These features called chat_structured, so we reproduce the exact primer here.
-_SCHEMA_PRIMER: str = (
-    "\n\nReply with ONLY JSON matching this schema, filling every field with real content:\n"
-)
+from .messages import system_message, user_message
+from .model_text import prime_schema, recover_json, strip_think_spans
 
 # --- request bodies ---------------------------------------------------------
 #
@@ -337,42 +330,13 @@ class ActionError(Exception):
 # --- ported Rust helpers (verbatim semantics) -------------------------------
 
 
-def _strip_think_spans(raw: str) -> str:
-    """ollama.rs ``strip_think_spans``: drop ``<think>…</think>`` reasoning spans.
-
-    An UNTERMINATED ``<think>`` truncates the rest (everything after it is unclosed
-    reasoning, not answer)."""
-    out = raw
-    while True:
-        start = out.find("<think>")
-        if start == -1:
-            return out
-        rel = out.find("</think>", start)
-        if rel == -1:
-            return out[:start]
-        out = out[:start] + out[rel + len("</think>") :]
-
-
-def _recover_json(text: str) -> str:
-    """ollama.rs ``recover_json``: strip ``<think>``, then slice from the first
-    opening bracket to the last closing one so a fence-wrapped / reasoning-prefixed
-    reply still parses. A no-op for a model that already returns bare JSON."""
-    s = _strip_think_spans(text.strip()).strip()
-    opens = [i for i in (s.find("{"), s.find("[")) if i != -1]
-    open_idx = min(opens) if opens else -1
-    close_idx = max(s.rfind("}"), s.rfind("]"))
-    if open_idx != -1 and close_idx >= open_idx:
-        return s[open_idx : close_idx + 1]
-    return s
-
-
 def _load_obj(raw: str) -> dict[str, Any]:
     """Parse the recovered JSON into an object dict; ``{}`` on any failure.
 
     Mirrors json.rs, where a bad reply is missing data, not an error: every field
     helper below then reads from this dict and the caller falls back."""
     try:
-        val = json.loads(_recover_json(raw))
+        val = json.loads(recover_json(raw))
     except (ValueError, TypeError):
         return {}
     return val if isinstance(val, dict) else {}
@@ -425,18 +389,6 @@ def _instruction(instructions: str | None, default: str) -> str:
     return default
 
 
-def _prime_schema(messages: list[Message], schema: dict[str, Any]) -> list[Message]:
-    """Append the schema primer to the last user turn (chat_structured, ollama.rs).
-
-    Non-mutating: returns a fresh list so a caller's messages are untouched."""
-    out: list[Message] = [dict(m) for m in messages]  # type: ignore[misc]
-    for m in reversed(out):
-        if m.get("role") == "user":
-            m["content"] = m.get("content", "") + _SCHEMA_PRIMER + compact_json(schema)
-            break
-    return out
-
-
 # --- D5/D12: run one AI action ----------------------------------------------
 
 _MARKDOWN_SCHEMA: dict[str, Any] = {
@@ -484,7 +436,7 @@ async def run_ai_action(
 
     # A single-field markdown envelope: the model writes free-form Markdown into
     # one constrained string, so any action (tables, outlines, prose) fits.
-    messages = _prime_schema([system_message(spec.system), user_message(user)], _MARKDOWN_SCHEMA)
+    messages = prime_schema([system_message(spec.system), user_message(user)], _MARKDOWN_SCHEMA)
     raw = await llm.generate(
         model,
         messages,
@@ -515,7 +467,7 @@ async def run_ai_action(
         )
         obj = _load_obj(plain)
         markdown = (
-            _str_field(obj, "markdown") if obj else _strip_think_spans(plain).strip()
+            _str_field(obj, "markdown") if obj else strip_think_spans(plain).strip()
         )
     if not markdown:
         raise ActionError(
@@ -560,7 +512,7 @@ async def memory_suggestion(
     -> not worth — stays in Rust, as it's DB work). Each is clamped to 2000 bytes for
     the prompt. Swallows any engine failure to ``{"worth": false, "fact": ""}``,
     matching Rust's ``chat_structured(...).unwrap_or_default()``."""
-    messages = _prime_schema(
+    messages = prime_schema(
         [
             system_message(_MEMORY_SYSTEM),
             user_message(
@@ -635,7 +587,7 @@ async def suggest_file_meta(
         return echo()
 
     snippet = _clamp_bytes(text, 2000)
-    messages = _prime_schema(
+    messages = prime_schema(
         [
             system_message(_FILE_META_SYSTEM),
             user_message(f"Current file name: {current_name}\n\nBeginning of the text:\n{snippet}"),

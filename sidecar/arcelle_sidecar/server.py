@@ -25,14 +25,24 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import __version__, ai_actions, chat_docs, features, file_pass, handoff, llm, model_limits, vision, wf_nodes
+from . import (
+    __version__,
+    ai_actions,
+    chat_docs,
+    features,
+    file_pass,
+    handoff,
+    llm,
+    model_limits,
+    vision,
+    websearch,
+    wf_nodes,
+)
 from . import privacy as privacy_mod
 from . import privacy_scan as privacy_scan_mod
 from . import summarize as summarize_feature
 from . import tts as tts_mod
 from .chat import ChatModel, OllamaChatModel
-from .external_llm import ExternalChatModel, is_external_model
-from .provider_api import OpenAICompatibleChatModel
 from .config import (
     CancelRequest,
     CapabilitiesRequest,
@@ -51,10 +61,13 @@ from .config import (
     TtsRequest,
     VisionLocateRequest,
     WarmRequest,
+    WebSearchRequest,
 )
+from .external_llm import ExternalChatModel, is_external_model
 from .graph import CancelToken, Deps, Emit, Event, stream_events
 from .mcp_client import McpClient
 from .messages import compact_json
+from .provider_api import OpenAICompatibleChatModel
 
 log = logging.getLogger("arcelle_sidecar")
 
@@ -700,6 +713,38 @@ def create_app(
         except llm.LlmError as exc:
             return exc.response()
         return {"entities": entities}
+
+    # --- web search ---------------------------------------------------------
+    #
+    # The room's ONE search provider, and the only endpoint here with no model in
+    # it: websearch.py scrapes/queries a fixed set of engines and fuses them by
+    # relevance. Rust owns the on/off setting, the 15-minute result cache and the
+    # tool plumbing; this owns the engines.
+
+    @app.post("/web_search")
+    async def web_search(req: WebSearchRequest) -> Any:
+        query = req.query.strip()
+        if not query:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "web_search needs a query.", "code": "BAD_REQUEST"},
+            )
+        # websearch.search is BLOCKING (requests, seven engines in sequence, ~3-5s
+        # warm). On the event loop it would stall every other lane including
+        # /health, which the Rust lifecycle manager reads to decide the sidecar is
+        # alive — so it runs in a worker thread, always.
+        try:
+            hits = await asyncio.to_thread(websearch.search, query, req.limit)
+        except Exception as exc:
+            # Individual engines already fail soft; reaching here means the fusion
+            # itself broke, which is a bug, not a blocked engine. Log the type, not
+            # the query (SPEC §6).
+            log.warning("web_search failed: %s", type(exc).__name__)
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"Web search failed: {exc}", "code": "WEB_SEARCH_FAILED"},
+            )
+        return {"hits": hits}
 
     # --- summarize (MIGRATION Phase 2) --------------------------------------
     #

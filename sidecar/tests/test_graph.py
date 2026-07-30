@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Awaitable, Callable
 
+import pytest
 from conftest import (
     BUILTIN_TOOL_NAMES,
     FakeChatModel,
     FakeMCP,
     Round,
+    RunOutcome,
     call,
     drive,
     drive_worker,
@@ -17,13 +19,19 @@ from conftest import (
     specs,
 )
 
+from arcelle_sidecar.agents import BATCH_TOOL_NAME
 from arcelle_sidecar.chat import RoundUsage
 from arcelle_sidecar.mcp_client import ToolSpec
 
-from arcelle_sidecar.config import AGENT_ROUND_BACKSTOP
+from arcelle_sidecar.config import AGENT_ROUND_BACKSTOP, TURN_ROUND_BUDGET
 from arcelle_sidecar.graph import (
+    ROUND_BUDGET_STEP,
     CancelToken,
     Deps,
+    Event,
+    WorkerOutcome,
+    _Delegator,
+    _ToolPass,
     call_model,
     parse_plan,
     plan_waves,
@@ -41,6 +49,7 @@ from arcelle_sidecar.prompts import (
     IMAGE_HANDOFF,
     UI_PROMPT,
     WORKFLOWS_PROMPT,
+    duplicate_call_note,
 )
 from arcelle_sidecar.routing import MCP_MANAGEMENT_TOOL_NAMES, SKILL_TOOL_NAMES, WRITE_TOOL_NAMES
 
@@ -1097,6 +1106,102 @@ async def test_delegation_is_no_longer_capped() -> None:
     assert all("Report from the" in m["content"] for m in tools)
 
 
+class _NeverStops:
+    """A model that asks for one more specialist every single round.
+
+    Not a strawman: measured 2026-07-28, a Main agent starved of conversation
+    history (the pre-compaction hand-off) did exactly this — 32 rounds, 890 s,
+    16 delegations, ``search_room`` called 14 times, and a final answer of
+    "not included in this room's content". Nothing in the loop said stop,
+    because ``max_rounds`` bounds ONE loop and every child starts a fresh one.
+    """
+
+    def __init__(self) -> None:
+        self.rounds = 0
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        on_delta: Callable[[str], Awaitable[None]],
+        cancel: Any = None,
+    ) -> tuple[str, list[ToolCall], RoundUsage]:
+        self.rounds += 1
+        usage = RoundUsage(input_tokens=None, output_tokens=None, max_context=8192, is_real=False)
+        names = [t["function"]["name"] for t in tools]
+        if "ask_file_agent" in names:
+            return "", [call("ask_file_agent", instruction=f"find clause {self.rounds}")], usage
+        if "search_room" in names:
+            return "", [call("search_room", query=f"clause {self.rounds}")], usage
+        # Offered nothing — the tool-less round. This is the ONLY way out.
+        await on_delta("Here is what I have.")
+        return "Here is what I have.", [], usage
+
+
+async def _drive_never_stops(turn_max_rounds: int | None) -> tuple[RunOutcome, _NeverStops]:
+    chat = _NeverStops()
+    # `max_rounds` (per loop) is held at 4 in BOTH arms, so the only difference
+    # between them is the turn-wide budget. Without some per-loop cap the
+    # unbounded arm would run to AGENT_ROUND_BACKSTOP and never finish.
+    out = await drive(
+        make_request("what is the rent", max_rounds=4, turn_max_rounds=turn_max_rounds),
+        chat,  # type: ignore[arg-type]
+    )
+    return out, chat
+
+
+async def test_the_turn_budget_bounds_the_WHOLE_tree_not_one_loop() -> None:
+    """The bound the product was missing.
+
+    Mutation-shaped on purpose: the SAME runaway script is driven twice, and
+    the only difference is the turn budget. If `Deps.spend_round` stopped
+    working, the two arms would spend the same number of rounds and this fails.
+    """
+    bounded, bounded_chat = await _drive_never_stops(6)
+    unbounded, unbounded_chat = await _drive_never_stops(0)  # 0 = disabled
+
+    assert bounded_chat.rounds < unbounded_chat.rounds, (
+        "the turn budget changed nothing: per-loop max_rounds is still the only "
+        f"bound ({bounded_chat.rounds} vs {unbounded_chat.rounds} rounds)"
+    )
+    # Every loop still live when the budget trips costs ONE more (tool-less)
+    # round to unwind. That is the slack, and it is bounded by tree depth.
+    assert bounded_chat.rounds <= 6 + 4
+    # Both arms still terminate properly — the budget is not an abort.
+    assert sum(1 for k in bounded.kinds if k == "final") == 1
+    assert bounded.final.strip(), "an exhausted budget must still produce an answer"
+
+
+async def test_the_exhausted_budget_is_announced_exactly_once() -> None:
+    """The user is told the answer came from what was gathered, not from the
+    loop deciding it was finished — once, not once per unwinding loop."""
+    out, _ = await _drive_never_stops(6)
+    said = [e for e in out.events if e.get("t") == "step" and e.get("v") == ROUND_BUDGET_STEP]
+    assert len(said) == 1, f"announced {len(said)} times"
+
+
+async def test_a_healthy_turn_never_trips_the_budget() -> None:
+    """The default is a backstop, not a policy: a normal delegate-then-answer
+    turn on the SHIPPED default must not see it at all."""
+    chat = FakeChatModel(
+        [
+            Round(content="", calls=[call("ask_file_agent", instruction="find the rent")]),
+            Round(content="The lease says 4200."),
+            Round(content="The rent is 4200."),
+        ]
+    )
+    out = await drive(make_request("what is the rent"), chat)  # default budget
+
+    assert not [e for e in out.events if e.get("v") == ROUND_BUDGET_STEP]
+    assert "4200" in out.final
+
+
+def test_the_shipped_default_leaves_room_for_a_full_fan_out() -> None:
+    """Six specialists at eight rounds each, plus the hub's own, is 52. The
+    default must sit above that or it would be cutting real work short."""
+    assert TURN_ROUND_BUDGET > 6 * 8 + 4
+
+
 class _BarrierMCP(FakeMCP):
     """Releases a tool call only once ``width`` of them are in flight at once.
 
@@ -1459,6 +1564,97 @@ async def test_a_failing_task_does_not_strand_its_siblings() -> None:
     assert "Task 0 —" in batch_msg["content"], "the healthy sibling still reports"
 
 
+async def test_a_partial_batch_is_memoised_and_its_findings_reach_the_next_round() -> None:
+    """Two tasks, one of them impossible: the ONE that worked must still count.
+
+    `run_plan`'s `ok` was the AND of the per-task outcomes, and in the batch
+    branch `ok=False` skips BOTH `seen.add(key)` and `reports_so_far.append`. So
+    a partial batch (the common shape — one unavailable domain among several
+    real tasks) lost the successful task's report out of the findings baton, and
+    left the whole batch unmemoised so the model could re-emit it and the work
+    that HAD succeeded was re-run and re-paid for. Partial success counts as
+    success for exactly those two purposes; the report text stays truthful about
+    the task that could not run.
+    """
+    # Web is OFF in this room, so task 1's domain is recognised-but-unavailable
+    # — the phantom-key guard reports it MISSING instead of misrouting it.
+    plan = [
+        {"agent": "file", "instruction": "read the lease"},
+        {"agent": "web", "instruction": "check the market rate"},
+    ]
+
+    class _RepeatsTheBatch(_ByCatalogChat):
+        """Round 0: the batch. Round 1: the SAME batch plus one fresh
+        delegation — the second live call keeps the round from being
+        all-duplicate, so the loop still reaches round 2. Round 2: the answer."""
+
+        async def stream(self, messages, tools, on_delta, cancel=None):  # type: ignore[no-untyped-def]
+            names = {t["function"]["name"] for t in tools}
+            if self._who(names) != "main":
+                return await super().stream(messages, tools, on_delta, cancel)
+            self.seen_by_worker.setdefault("main", []).append([dict(m) for m in messages])
+            usage = RoundUsage(
+                input_tokens=None, output_tokens=None, max_context=8192, is_real=False
+            )
+            turn = self.turns.get("main", 0)
+            self.turns["main"] = turn + 1
+            if turn == 0:
+                return "", [call("ask_agents", tasks=plan)], usage
+            if turn == 1:
+                return (
+                    "",
+                    [
+                        call("ask_agents", tasks=plan),
+                        call("ask_file_agent", instruction="now act on the rent"),
+                    ],
+                    usage,
+                )
+            await on_delta("The rent is 1200.")
+            return "The rent is 1200.", [], usage
+
+    chat = _RepeatsTheBatch()
+    out = await drive(make_request("compare my rent to the market"), chat)  # type: ignore[arg-type]
+    assert out.final
+
+    main_thread = chat.seen_by_worker["main"][-1]
+    batch_msgs = [
+        m
+        for m in main_thread
+        if m.get("role") == "tool" and m.get("tool_name") == "ask_agents"
+    ]
+    assert len(batch_msgs) == 2, "the repeat should have been answered, not re-run"
+    # The report is still exactly as truthful as before: the good task reports,
+    # the impossible one says so in its own line.
+    assert "Task 0 —" in batch_msgs[0]["content"]
+    assert "could not run" in batch_msgs[0]["content"]
+    # Memoised: round 1's identical batch got the duplicate note, so the two
+    # real tasks were never re-run or re-paid for.
+    assert batch_msgs[1]["content"] == duplicate_call_note("ask_agents"), (
+        f"the partial batch was re-run instead of memoised: {batch_msgs[1]['content'][:200]}"
+    )
+    # ...and the successful task's report entered the findings baton, so the
+    # NEXT round's specialist was told what the last one found.
+    kickoffs = [
+        str(m.get("content") or "")
+        for msgs in chat.seen_by_worker["file"]
+        for m in msgs
+        if "reported earlier in this turn" in (m.get("content") or "")
+    ]
+    assert kickoffs, "the partial batch's findings never reached the next round"
+    assert "file did its part" in kickoffs[0], (
+        f"the finding did not travel, only its shape: {kickoffs[0][:400]}"
+    )
+    # The progress log names the plan's SIZE — the count is carried from the
+    # fan-out's parse rather than re-parsed here, so it must still be right.
+    notes = [
+        str(m.get("content") or "")
+        for msgs in chat.seen_by_worker["main"]
+        for m in msgs
+        if "Progress this turn" in (m.get("content") or "")
+    ]
+    assert any("ask_agents(2 tasks) -> reports received" in n for n in notes), notes
+
+
 async def test_an_unusable_plan_gets_a_corrective_note_not_silence() -> None:
     """An empty report reads as "done" to the model. A plan it can't run has to
     come back as a correction with the shape spelled out."""
@@ -1708,3 +1904,661 @@ async def test_stop_with_nothing_finished_still_says_nothing() -> None:
     chat = FakeChatModel([Round(content="", on_stream=token.cancel)])
     out = await drive(make_request(), chat, cancel=token)
     assert out.final == ""
+
+
+# --------------------------------------------------------------------------- #
+# the fan-out unit, on its own (`_Delegator`)
+# --------------------------------------------------------------------------- #
+#
+# The whole point of extracting `_Delegator` out of `execute_tools`
+# (2026-07-30): wave scheduling, a failing sibling and the drain-on-Stop path
+# used to be reachable only through a full `run_agent` with a scripted model per
+# child. These drive the fan-out directly, with `_run_worker` stubbed, so a
+# scheduling regression fails here instead of somewhere in a 9-event stream.
+
+
+def _delegator(
+    *,
+    events: list[Event] | None = None,
+    cancel: CancelToken | None = None,
+    web_enabled: bool = True,
+) -> _Delegator:
+    """A `_Delegator` wired to doubles, with an empty roster."""
+    sink = events if events is not None else []
+
+    async def emit(event: Event) -> None:
+        sink.append(event)
+
+    deps = Deps(
+        chat=FakeChatModel([]),  # type: ignore[arg-type]
+        emit=emit,
+        cancel=cancel if cancel is not None else CancelToken(),
+        mcp=FakeMCP(),  # type: ignore[arg-type]
+    )
+    return _Delegator(
+        deps=deps,
+        config={"configurable": {"deps": deps}},
+        state={  # type: ignore[typeddict-item]
+            "question": "compare my rent to the market",
+            "web_enabled": web_enabled,
+            "run_max_rounds": AGENT_ROUND_BACKSTOP,
+        },
+        pipeline=[],
+        batch=0,
+        referents_at_launch=[],
+        carryover=(),
+        served_names=set(BUILTIN_TOOL_NAMES),
+    )
+
+
+async def test_the_delegator_holds_a_wave_until_its_dependency_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`depends_on` gates the SCHEDULE, and the dependency's report travels."""
+    order: list[str] = []
+    upstreams: dict[str, tuple[str, ...]] = {}
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        order.append(f"start {instruction}")
+        upstreams[instruction] = tuple(upstream)
+        # Yield: if these two ran in ONE wave they would interleave here, and
+        # the ordering assertion below could not pass by accident.
+        await asyncio.sleep(0)
+        order.append(f"end {instruction}")
+        return WorkerOutcome(f"FOUND: {instruction}", True, False, [])
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    d = _delegator()
+    out = await d.run_plan(
+        [
+            {"agent": "file", "instruction": "read the lease", "depends_on": []},
+            {"agent": "web", "instruction": "check the market", "depends_on": [0]},
+        ]
+    )
+
+    assert order.index("end read the lease") < order.index("start check the market")
+    assert upstreams["read the lease"] == (), "wave 0 has nothing upstream of it"
+    assert any("FOUND: read the lease" in u for u in upstreams["check the market"]), (
+        f"the dependency's finding did not travel: {upstreams['check the market']}"
+    )
+    assert out.ok
+    assert "Task 0 —" in out.report and "Task 1 —" in out.report
+    # Waves are legible in the roster — that is what the batch number is for.
+    assert [e["batch"] for e in d.pipeline] == [0, 1]
+    assert [e["status"] for e in d.pipeline] == ["done", "done"]
+
+
+async def test_the_delegator_keeps_a_batch_alive_when_one_task_blows_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One task's crash costs that task, not the batch — and the surviving
+    task's report still makes the plan a success (the partial-batch rule)."""
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        if "market" in instruction:
+            raise RuntimeError("the web model fell over")
+        return WorkerOutcome("FOUND: rent is 1200", True, False, ["create_file: notes.md"])
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    d = _delegator()
+    out = await d.run_plan(
+        [
+            {"agent": "file", "instruction": "read the lease"},
+            {"agent": "web", "instruction": "check the market"},
+        ]
+    )
+
+    assert "Task 0 —" in out.report, "the healthy sibling was stranded"
+    assert "Task 1" in out.report and "failed" in out.report, "the crash was hidden"
+    assert out.ok, "a partial batch must still count as a success (2026-07-30)"
+    assert not out.cancelled
+    assert out.referents == ["create_file: notes.md"], "the survivor's baton was lost"
+    assert [e["status"] for e in d.pipeline] == ["done", "failed"]
+
+
+async def test_the_delegator_drain_cancels_a_child_still_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop between tool calls must not orphan a running sub-loop — and the
+    child's roster slot must stop pulsing rather than hang on `running`."""
+    started = asyncio.Event()
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        started.set()
+        await asyncio.sleep(3600)  # only cancellation gets us out of here
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    d = _delegator()
+    await d.launch([call("ask_file_agent", instruction="read the lease")], set())
+    assert len(d.tasks) == 1 and len(d.pipeline) == 1
+    assert list(d.launched_label) == ["c_ask_file_agent"]
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    await d.drain()
+
+    task = next(iter(d.tasks.values()))
+    assert task.done() and task.cancelled(), "the child outlived the turn"
+    assert [e["status"] for e in d.pipeline] == ["failed"]
+
+
+async def test_the_delegator_never_launches_a_duplicate_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`seen` (this turn's successes) and `launched` (this round's dispatches)
+    both have to suppress a second worker — the sequential pass answers the
+    repeat from the duplicate note, and a second child would re-pay for it."""
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        return WorkerOutcome("FOUND: rent is 1200", True, False, [])
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    repeat = call("ask_file_agent", instruction="read the lease")
+
+    memoised = _delegator()
+    await memoised.launch([repeat], {repeat.key()})
+    assert memoised.tasks == {} and memoised.pipeline == []
+
+    same_round = _delegator()
+    await same_round.launch([repeat, repeat], set())
+    assert len(same_round.tasks) == 1
+    assert len(same_round.pipeline) == 1, "the repeat got its own worker"
+    await same_round.drain()
+
+
+async def test_the_delegator_stops_between_waves_when_stop_lands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`run_plan` checks Stop BETWEEN waves, so a plan the user stopped costs
+    the waves already running and nothing more. Wave 1 must not launch, the
+    batch must report itself cancelled, and no roster slot may be claimed for a
+    task that never ran (a claimed slot pulses forever in the UI)."""
+    token = CancelToken()
+    started: list[str] = []
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        started.append(instruction)
+        # Stop lands WHILE wave 0 runs — the child itself finishes cleanly, so
+        # `cancelled` can only come from the between-waves check.
+        token.cancel()
+        return WorkerOutcome(f"FOUND: {instruction}", True, False, [])
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    d = _delegator(cancel=token)
+    out = await d.run_plan(
+        [
+            {"agent": "file", "instruction": "read the lease", "depends_on": []},
+            {"agent": "web", "instruction": "check the market", "depends_on": [0]},
+        ]
+    )
+
+    assert started == ["read the lease"], f"wave 1 ran after Stop: {started}"
+    assert out.cancelled, "the batch did not report the Stop back to the hub"
+    assert out.ok, "wave 0's real report still counts"
+    assert "Task 0 —" in out.report
+    assert "Task 1" not in out.report, "a task that never ran got a report line"
+    assert len(d.pipeline) == 1, "a roster slot was claimed for a wave that never ran"
+    assert d.pipeline[0]["status"] == "done", "wave 0's slot is still pulsing"
+
+
+# --------------------------------------------------------------------------- #
+# the sequential pass, on its own (`_ToolPass`)
+# --------------------------------------------------------------------------- #
+#
+# The other half of the same 2026-07-30 split. SPEC §3.2's invariants live in
+# this pass — duplicate suppression, "only SUCCESSFUL calls are memoised", the
+# hub guard, the LEDGER baton, the image handoff, drain-on-Stop — and until the
+# extraction every one of them could be reached only by driving a compiled graph
+# with a scripted model. These drive the pass directly.
+
+
+def _pass(
+    *,
+    agent_id: str = "files.read",
+    seen: set[str] | None = None,
+    events: list[Event] | None = None,
+    cancel: CancelToken | None = None,
+    mcp: FakeMCP | None = None,
+    tools: list[ToolSpec] | None = None,
+    on_event: Callable[[Event], None] | None = None,
+    pipeline: list[dict[str, Any]] | None = None,
+) -> _ToolPass:
+    """A `_ToolPass` built the way `execute_tools` builds one — through
+    `for_round`, so the accumulator unpacking is under test too.
+
+    ``on_event`` is the deterministic seam for "Stop was pressed at THIS point":
+    the event stream is the only thing the pass emits mid-loop, so hooking it is
+    how a test lands the token flip between two specific calls.
+
+    ``pipeline`` seeds a roster from EARLIER rounds — the only way to say "this
+    is not round 1", which is what the active-marker arithmetic reads."""
+    sink = events if events is not None else []
+
+    async def emit(event: Event) -> None:
+        sink.append(event)
+        if on_event is not None:
+            on_event(event)
+
+    deps = Deps(
+        chat=FakeChatModel([]),  # type: ignore[arg-type]
+        emit=emit,
+        cancel=cancel if cancel is not None else CancelToken(),
+        mcp=mcp if mcp is not None else FakeMCP(),  # type: ignore[arg-type]
+    )
+    served = [s.to_ollama() for s in (tools if tools is not None else specs())]
+    state: dict[str, Any] = {
+        "question": "what does the lease say about rent",
+        "web_enabled": True,
+        "write": True,
+        "run_max_rounds": AGENT_ROUND_BACKSTOP,
+        "agent_id": agent_id,
+        "served_specs": served,
+        "messages": [{"role": "system", "content": "You are the room assistant."}],
+        "seen": set(seen or set()),
+        "round": 3,
+        "pipeline": list(pipeline or []),
+    }
+    return _ToolPass.for_round(
+        deps,
+        state,  # type: ignore[arg-type]
+        {"configurable": {"deps": deps}},
+        state["messages"],
+    )
+
+
+def _tool_texts(p: _ToolPass) -> list[str]:
+    return [str(m.get("content")) for m in p.messages if m.get("role") == "tool"]
+
+
+async def test_the_pass_answers_a_duplicate_from_the_memo_without_re_running_it() -> None:
+    """CHG-3 / SPEC §3.2: an exact repeat gets the note, not a second execution
+    — and a round of ONLY repeats is what sets `force_synthesis`."""
+    repeat = call("open_file", name="lease.pdf")
+    mcp = FakeMCP()
+    p = _pass(seen={repeat.key()}, mcp=mcp)
+
+    await p.run([repeat])
+
+    assert mcp.calls == [], "the duplicate was re-executed"
+    assert _tool_texts(p) == [duplicate_call_note("open_file")]
+    assert p.all_dup, "the round was nothing but a repeat"
+    assert p.to_updates([])["force_synthesis"] is True
+
+
+async def test_the_pass_only_memoises_a_call_that_actually_worked() -> None:
+    """SPEC §3.2's retry rule: a failed call reports `Tool error:` and stays OUT
+    of `seen`, so a later round may try it again. `attempted` records it either
+    way — that is the ground truth a `verify` shape reads."""
+    mcp = FakeMCP(results={"open_file": ToolResult(text="no such file", is_error=True)})
+    bad = call("open_file", name="ghost.pdf")
+    p = _pass(mcp=mcp)
+
+    await p.run([bad])
+
+    assert _tool_texts(p) == ["Tool error: no such file"]
+    assert bad.key() not in p.seen, "a failed call was memoised and can never retry"
+    assert p.attempted == {"open_file"}
+    updates = p.to_updates([])
+    # set[tuple] serialises to None through LangGraph's JsonPlusSerializer,
+    # silently, so a checkpointed resume would come back with no memo at all.
+    assert all(isinstance(k, str) for k in updates["seen"])
+    assert all(isinstance(k, str) for k in updates["attempted"])
+
+
+async def test_a_successful_write_lands_in_BOTH_batons() -> None:
+    """A LEDGER_TOOLS success is recorded twice on purpose: `referents` is what
+    later specialists are told about, `produced` is what `graphs.verify_claims`
+    reads. Seeding only one of them disables the write-claim gate."""
+    p = _pass()
+
+    await p.run([call("create_file", name="notes.md")])
+
+    assert p.referents == ["create_file: notes.md"]
+    assert p.produced == ["create_file: notes.md"]
+    updates = p.to_updates([])
+    assert updates["referents"] == ["create_file: notes.md"]
+    assert updates["produced"] == ["create_file: notes.md"]
+
+
+async def test_a_failed_write_records_no_referent() -> None:
+    """The other half of the gate: recorded on SUCCESS ONLY, or every claim
+    looks supported and `verify_claims` can never fire."""
+    mcp = FakeMCP(results={"create_file": ToolResult(text="disk full", is_error=True)})
+    p = _pass(mcp=mcp)
+
+    await p.run([call("create_file", name="notes.md")])
+
+    assert p.referents == [] and p.produced == []
+
+
+async def test_the_hub_guard_corrects_the_main_agent_instead_of_acting() -> None:
+    """Hub v3: the MAIN agent never touches a room tool. Even if the model
+    drifts and emits one it is rejected before the bridge, with the note that
+    steers it back to delegation."""
+    mcp = FakeMCP()
+    p = _pass(agent_id="chat.answer", mcp=mcp)
+
+    await p.run([call("open_file", name="lease.pdf")])
+
+    assert mcp.calls == [], "the Main agent reached the bridge"
+    assert len(_tool_texts(p)) == 1
+    assert "you are the Main" in _tool_texts(p)[0]
+    assert "ask_*_agent" in _tool_texts(p)[0]
+    assert p.seen == set(), "a rejected call must not be memoised"
+
+
+async def test_captured_pixels_come_back_as_a_user_turn_right_after_the_result() -> None:
+    """ADD-25: Ollama reads images from USER turns, not tool turns — attach them
+    to the tool message and the model is blind. `pending_images` drains when the
+    handoff lands, so the next round cannot re-attach them."""
+    mcp = FakeMCP(
+        results={"ui_snapshot": ToolResult(text="captured", images=["b64-pixels"])}
+    )
+    p = _pass(mcp=mcp)
+
+    await p.run([call("ui_snapshot")])
+
+    assert [m["role"] for m in p.messages[-2:]] == ["tool", "user"]
+    assert p.messages[-1]["content"] == IMAGE_HANDOFF
+    assert p.messages[-1].get("images") == ["b64-pixels"]
+    assert p.pending_images == [], "the pixels would be re-attached next round"
+    assert p.to_updates([])["pending_images"] == []
+
+
+async def test_room_tools_run_one_at_a_time_in_the_models_call_order() -> None:
+    """Strictly sequential, and the tool messages land in the SAME order the
+    model emitted the calls — a provider that pairs them positionally sees a
+    scrambled transcript otherwise."""
+    order: list[str] = []
+    mcp = FakeMCP(on_call=lambda name, args: order.append(name))
+    p = _pass(mcp=mcp)
+
+    await p.run(
+        [call("search_room", query="rent"), call("open_file", name="lease.pdf"), call("list_room_files")]
+    )
+
+    assert order == ["search_room", "open_file", "list_room_files"]
+    assert [m.get("tool_name") for m in p.messages if m.get("role") == "tool"] == [
+        "search_room",
+        "open_file",
+        "list_room_files",
+    ]
+    assert not p.all_dup
+
+
+async def test_list_skills_is_scoped_to_the_calling_agent_by_the_pass() -> None:
+    """The Rust bridge is built per RUN, not per worker, so it cannot know which
+    specialist is asking — the pass injects the id before dispatch."""
+    mcp = FakeMCP()
+    p = _pass(agent_id="skills.use", mcp=mcp)
+
+    await p.run([call("list_skills")])
+
+    assert mcp.calls == [("list_skills", {"agent": "skills.use"})]
+
+
+async def test_a_mid_round_unlock_is_the_only_thing_that_returns_a_new_catalog() -> None:
+    """`tools` is the one conditional key in the update: request_tools rebuilt
+    the offered catalog, so the next round must be offered the new one."""
+    plain = _pass()
+    await plain.run([call("open_file", name="lease.pdf")])
+    assert "tools" not in plain.to_updates([])
+
+    unlocking = _pass()
+    await unlocking.run([call("request_tools", group="jobs")])
+    updates = unlocking.to_updates([])
+    assert "jobs" in updates["unlocked_groups"]
+    assert "start_file_pass" in {t["function"]["name"] for t in updates["tools"]}
+
+
+async def test_stop_between_tool_calls_drains_the_children_it_launched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SPEC §3.2: Stop is checked BETWEEN calls, and cancelling DRAINS the
+    in-flight children — an orphaned sub-loop outlives the turn and emits into a
+    dead run. The second delegation must never produce a tool message."""
+    token = CancelToken()
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        if "lease" in instruction:
+            return WorkerOutcome("Report from the File agent:\nrent is 1200", True, False, [])
+        await asyncio.sleep(3600)  # only cancellation gets us out of here
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    def stop_once_the_first_call_is_recorded(event: Event) -> None:
+        if event["t"] == "step_status":
+            token.cancel()
+
+    first = ToolCall(name="ask_file_agent", arguments={"instruction": "read the lease"}, id="c1")
+    second = ToolCall(name="ask_web_agent", arguments={"instruction": "check the market"}, id="c2")
+    p = _pass(
+        agent_id="chat.answer", cancel=token, on_event=stop_once_the_first_call_is_recorded
+    )
+
+    await p.fan_out([first, second])
+    assert len(p.delegator.tasks) == 2, "both delegations should have been launched"
+    await p.run([first, second])
+
+    assert p.cancelled, "the pass did not notice Stop"
+    assert len(_tool_texts(p)) == 1, "the stopped call still produced a tool message"
+    assert "rent is 1200" in _tool_texts(p)[0]
+    orphan = p.delegator.tasks["c2"]
+    assert orphan.done() and orphan.cancelled(), "the child outlived the turn"
+    assert p.to_updates([])["cancelled"] is True
+
+
+async def test_stop_inside_a_child_stops_the_pass_and_drains_its_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OTHER way Stop reaches the pass: not the between-calls check, but a
+    child reporting `cancelled` back (Stop landed while it was working). Its
+    report still lands — it did real work — and then the pass stops, so the
+    calls behind it never run and their children are drained.
+
+    Pinned because that stop is now a `return False` from the arm rather than a
+    `break` inside the loop (the 2026-07-30 `_ToolPass` split): dropping the
+    return value left the whole suite green, which is exactly the lost-break
+    regression this test exists to catch."""
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        if "lease" in instruction:
+            # ok AND cancelled: the child got something before Stop landed.
+            return WorkerOutcome("Report from the File agent:\nrent is 1200", True, True, [])
+        await asyncio.sleep(3600)  # only cancellation gets us out of here
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    first = ToolCall(name="ask_file_agent", arguments={"instruction": "read the lease"}, id="c1")
+    second = ToolCall(name="ask_web_agent", arguments={"instruction": "check the market"}, id="c2")
+    p = _pass(agent_id="chat.answer")
+
+    await p.fan_out([first, second])
+    # wait_for, not a bare await: if the Stop stopped stopping the pass it would
+    # walk on to the sleeping sibling and HANG the suite instead of failing it.
+    await asyncio.wait_for(p.run([first, second]), timeout=5)
+
+    assert p.cancelled, "a cancelled child did not stop the pass"
+    assert len(_tool_texts(p)) == 1, "the pass kept walking after the Stop"
+    assert "rent is 1200" in _tool_texts(p)[0], "the child's real work was thrown away"
+    orphan = p.delegator.tasks["c2"]
+    assert orphan.done() and orphan.cancelled(), "the sibling outlived the turn"
+    assert p.to_updates([])["cancelled"] is True
+
+
+async def test_stop_inside_a_batch_stops_the_pass_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same rule on the `ask_agents` arm, which has its own copy of it: a plan
+    that comes back cancelled reports what it got and then stops the pass, so
+    the delegation queued behind it is drained instead of run."""
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        if "lease" in instruction:
+            return WorkerOutcome("FOUND: rent is 1200", True, True, [])
+        await asyncio.sleep(3600)  # only cancellation gets us out of here
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    plan = ToolCall(
+        name=BATCH_TOOL_NAME,
+        arguments={"tasks": [{"agent": "file", "instruction": "read the lease"}]},
+        id="c1",
+    )
+    after = ToolCall(name="ask_web_agent", arguments={"instruction": "check the market"}, id="c2")
+    p = _pass(agent_id="chat.answer")
+
+    await p.fan_out([plan, after])
+    await asyncio.wait_for(p.run([plan, after]), timeout=5)  # see the test above
+
+    assert p.cancelled, "a cancelled batch did not stop the pass"
+    assert len(_tool_texts(p)) == 1, "the pass kept walking after the Stop"
+    assert "rent is 1200" in _tool_texts(p)[0], "the batch's real report was thrown away"
+    orphan = p.delegator.tasks["c2"]
+    assert orphan.done() and orphan.cancelled(), "the sibling outlived the turn"
+
+
+async def test_an_ask_agents_call_does_not_walk_the_active_marker_off_the_roster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fan-out's active marker is read OFF THE ROSTER, never counted from the
+    in-flight tasks. An `ask_agents` call parks a whole plan without claiming a
+    slot of its own (its tasks claim theirs later, wave by wave), so tasks
+    outnumber slots and `len(pipeline) - len(tasks) + 1` walked BACKWARDS off the
+    front: with an empty prior roster one such call silently lit the Main agent
+    and two raised `IndexError: list index out of range` out of `execute_tools`,
+    killing the turn (found 2026-07-30, live in 0.12.0)."""
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        await asyncio.sleep(3600)  # nothing finishes; the marker is under test
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    def plan_call(cid: str) -> ToolCall:
+        return ToolCall(
+            name=BATCH_TOOL_NAME,
+            arguments={"tasks": [{"agent": "file", "instruction": f"read {cid}"}]},
+            id=cid,
+        )
+
+    events: list[Event] = []
+    only_plans = _pass(agent_id="chat.answer", events=events)
+    await only_plans.fan_out([plan_call("c1"), plan_call("c2")])
+    marker = events[-1]["v"]
+    assert 1 <= marker["step"] <= marker["total"], f"off the roster: {marker}"
+    # No slot is claimed yet, so the only slot there IS is the Main agent's.
+    assert marker["step"] == marker["total"]
+    await only_plans.delegator.drain()
+
+    # The in-range-but-wrong half: a round that mixes the two kinds must point at
+    # the child that DID claim a slot, not count the plan against it.
+    mixed_events: list[Event] = []
+    mixed = _pass(agent_id="chat.answer", events=mixed_events)
+    child = ToolCall(name="ask_file_agent", arguments={"instruction": "read the lease"}, id="c3")
+    await mixed.fan_out([plan_call("c4"), child])
+    assert len(mixed.delegator.pipeline) == 1, "only the ask_*_agent child claims a slot here"
+    marker = mixed_events[-1]["v"]
+    assert marker["step"] == 1
+    assert marker["id"] == mixed.delegator.pipeline[0]["agent"]
+    await mixed.delegator.drain()
+
+    # And it must never land on a slot that already FINISHED — a done chip that
+    # pulses reads as work still in flight. With an earlier round in the roster
+    # and only plans in this one, nothing running is the honest answer, which is
+    # `_active_step`'s documented fallback: the Main agent's own slot.
+    prior = [
+        {
+            "agent": "files.read",
+            "instruction": "read the lease",
+            "status": "done",
+            "batch": 0,
+            "key": "files.read#0",
+        }
+    ]
+    later_events: list[Event] = []
+    later = _pass(agent_id="chat.answer", events=later_events, pipeline=prior)
+    await later.fan_out([plan_call("c5")])
+    marker = later_events[-1]["v"]
+    assert marker["step"] == marker["total"] == 2, f"lit a finished child: {marker}"
+    await later.delegator.drain()

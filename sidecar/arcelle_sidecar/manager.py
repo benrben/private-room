@@ -22,13 +22,13 @@ from .agents import (
     get_agent,
     reachable_members,
 )
-from .routing import _JOB_HINTS, _UI_HINTS
+from .routing import JOB_HINTS, UI_HINTS, wants_navigation
 
 #: Registry agents whose vocabulary lives in routing.py (the Rust-parity
 #: lists stay the single source of truth — do not duplicate them in agents.py).
 _ROUTING_HINTED: dict[str, tuple[str, ...]] = {
-    "app.ui": _UI_HINTS,
-    "jobs.run": _JOB_HINTS,
+    "app.ui": UI_HINTS,
+    "jobs.run": JOB_HINTS,
 }
 
 
@@ -37,20 +37,45 @@ _ROUTING_HINTED: dict[str, tuple[str, ...]] = {
 # --------------------------------------------------------------------------- #
 
 
-def _score(clause: str, spec: AgentSpec) -> int:
-    """Vocabulary hits of this agent's hint list in the clause. Substring
-    matching, same doctrine (and same lists, where shared) as the Rust
-    routers — erring toward a hit is safe, the box just gets offered.
+def _hits(q: str, spec: AgentSpec) -> tuple[list[str], list[str]]:
+    """This agent's matching hints in ``q``: (its OWN, the routing-inherited).
+
+    Substring matching, same doctrine (and same lists, where shared) as the
+    Rust routers — erring toward a hit is safe, the box just gets offered.
+
+    ``q`` is the ALREADY-LOWERCASED instruction: every rung of the tie-break in
+    :func:`resolve_worker` reads these two lists, so the hint tuples are walked
+    once per candidate instead of once per rung.
+    """
+    inherited = _ROUTING_HINTED.get(spec.id, ())
+    return [h for h in spec.hints if h in q], [h for h in inherited if h in q]
+
+
+def _rank(q: str, spec: AgentSpec) -> tuple[int, bool, int]:
+    """The sort key for one candidate worker — bigger wins, ties keep order.
+
+    Hit count first; then OWN vocabulary beats inherited-only; then the LONGEST
+    matched hint ("create a skill" is more specific than the bare "skill" both
+    siblings contain). A full tie leaves every candidate equal, so the caller's
+    first member — the domain's stated default — stands.
 
     An agent's OWN hints score double the routing-inherited lists: the
     inherited lists are deliberately broad (they gate whole lanes), so a
     sibling with a specific vocabulary ("workflow", "schedule") must win the
     tie against the broad lane list that also happens to contain its words.
+
+    The own-vocabulary rung is what makes that doubling actually decide:
+    "summarize every file each morning" gave jobs.run TWO inherited hits
+    ("every ", "each morning" — the broad lane list carries recurrence words)
+    and jobs.workflows ONE own hit, tying 2-2 and falling through to the
+    default, so a RECURRING request routed to the one-off file pass.
     """
-    q = clause.lower()
-    own = sum(2 for h in spec.hints if h in q)
-    inherited = sum(1 for h in _ROUTING_HINTED.get(spec.id, ()) if h in q)
-    return own + inherited
+    own, inherited = _hits(q, spec)
+    return (
+        2 * len(own) + len(inherited),
+        bool(own),
+        max((len(h) for h in own + inherited), default=0),
+    )
 
 
 def resolve_worker(
@@ -92,35 +117,30 @@ def resolve_worker(
         members = usable or (DEFAULT_AGENT_ID,)
     if len(members) == 1:
         return members[0]
+
+    # NAVIGATION INTENT WINS OUTRIGHT, ahead of all scoring (owner decision
+    # 2026-07-30). "go to Google and search for X" is a destination, and it used
+    # to lose to the search agent because `google` is a longer hint than `go to`
+    # — see `routing.NAV_INTENT` for why no amount of re-weighting fixes that.
+    #
+    # Only when the browser is actually reachable: the `members` list above is
+    # already filtered to workers that can act this run, so a room with the
+    # Browser agent switched off falls through to the scorer and lands on the
+    # Web agent, which searches instead (owner decision: fall back, don't
+    # refuse).
+    if "chat.browse" in members and wants_navigation(instruction):
+        return "chat.browse"
+
+    # Lowercased ONCE for the whole scoring pass (`_rank` and `_hits` take it
+    # as given): three rungs × every candidate used to re-lower the same string,
+    # and the innermost `q` shadowed this one.
     q = instruction.lower()
 
-    def longest_hit(member_id: str) -> int:
-        spec = get_agent(member_id)
-        hits = [len(h) for h in spec.hints if h in q]
-        hits += [len(h) for h in _ROUTING_HINTED.get(member_id, ()) if h in q]
-        return max(hits, default=0)
-
-    # Hit count first; then OWN vocabulary beats inherited-only; then the
-    # LONGEST matched hint ("create a skill" is more specific than the bare
-    # "skill" both siblings contain); a full tie falls to the first member —
-    # the domain's stated default.
-    #
-    # The own-vocabulary rung is what makes the doubling in `_score` actually
-    # decide: "summarize every file each morning" gave jobs.run TWO inherited
-    # hits ("every ", "each morning" — the broad lane list carries recurrence
-    # words) and jobs.workflows ONE own hit, tying 2-2 and falling through to
-    # the default, so a RECURRING request routed to the one-off file pass.
-    def owns_vocabulary(member_id: str) -> bool:
-        q = instruction.lower()
-        return any(h in q for h in get_agent(member_id).hints)
-
+    # Strictly-greater keeps the FIRST member on a full tie — the domain's
+    # stated default. See `_rank` for what each rung is for.
     best_id, best_key = members[0], (-1, False, -1)
     for member_id in members:
-        key = (
-            _score(instruction, get_agent(member_id)),
-            owns_vocabulary(member_id),
-            longest_hit(member_id),
-        )
+        key = _rank(q, get_agent(member_id))
         if key > best_key:
             best_id, best_key = member_id, key
     return best_id

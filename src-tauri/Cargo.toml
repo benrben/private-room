@@ -22,7 +22,12 @@ path = "src/bin/roomai.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# BROWSE-1: the private browser area hosts a CHILD webview inside the main
+# window (`Window::add_child` + `WebviewBuilder`), which tauri gates behind
+# `unstable`. It is a compile gate on already-shipped API surface, not a
+# pre-release fork of the runtime — `cargo check`/`build`/`bundle` are
+# unaffected for everything else in the app.
+tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
@@ -108,6 +113,18 @@ objc2-web-kit = { version = "0.3", features = [
     "WKSnapshotConfiguration",
     "WKWebView",
     "block2",
+    # BROWSE-1: the private browser area builds its own WKWebViewConfiguration
+    # before the child webview exists — a NON-PERSISTENT website data store (no
+    # history/cookies/cache ever touches the disk), the agent's page script as a
+    # document-start WKUserScript on every frame, and a compiled
+    # WKContentRuleList (trackers + the private-network block that mirrors
+    # web::guard for sub-resources, which on_navigation cannot see).
+    "WKWebViewConfiguration",
+    "WKWebsiteDataStore",
+    "WKUserContentController",
+    "WKUserScript",
+    "WKContentRuleList",
+    "WKContentRuleListStore",
 ] }
 # Idea 3: on-device speech synthesis (AVSpeechSynthesizer write-to-buffer —
 # no temp files, pitchMultiplier only exists in the API, not in `say`).

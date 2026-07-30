@@ -1,6 +1,14 @@
 import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api } from "../api";
-import { CheckIcon, CloseIcon, DownloadIcon, GlobeIcon, MicIcon, ScriptIcon } from "../icons";
+import {
+  CheckIcon,
+  CloseIcon,
+  DownloadIcon,
+  GlobeIcon,
+  MicIcon,
+  ScriptIcon,
+  ShieldIcon,
+} from "../icons";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import DiffPreview from "../viewers/DiffPreview";
@@ -125,6 +133,16 @@ function buildPaletteActions(
   return acts;
 }
 
+/** Host of a URL, for the consent card's "on <site>" phrasing. Falls back to
+ *  the raw string so a malformed URL still reads sensibly rather than blank. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url || "this page";
+  }
+}
+
 /** The fixed-position overlays that sit above everything: the MCP tool-call
  * approval card, the file context menu, the "Move to…" menu, the Finder-drop
  * highlight, and the ⌘K search/command palette. */
@@ -138,6 +156,7 @@ export default function Overlays({
   layout?: LayoutApi;
 }) {
   const pendingApproval = s.mcpApprovals[0];
+  const pendingBrowse = s.browseConsents[0];
   const pendingEdit = s.editApprovals[0];
   const pendingScript = s.scriptApprovals[0];
   const searchResults = s.searchResults;
@@ -274,6 +293,51 @@ export default function Overlays({
                 onClick={() => a.resolveMcpApproval(pendingApproval, "deny")}
               >
                 Don't allow
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {pendingBrowse && (
+        // BROWSE-1: the OUTBOUND door — room content about to be typed into a
+        // web page. `data-agent-blocked` for the same reason as every other
+        // consent surface: the agent must never be able to click its own
+        // approval. Shown with the REAL values, because the point is that the
+        // user is deciding about their own data.
+        //
+        // The browser's native webview is parked to 1x1 while this is open
+        // (BrowserView) — it floats above the whole window, so a modal cannot
+        // otherwise be seen.
+        <div className="approve-backdrop" data-agent-blocked>
+          <div className="approve-card" role="alertdialog" aria-modal="true">
+            <div className="approve-title">
+              <ShieldIcon size={17} /> Type this into the page?
+            </div>
+            <p className="approve-body">
+              The assistant wants to type something from this room into{" "}
+              <strong>{pendingBrowse.field}</strong> on{" "}
+              <strong>{hostOf(pendingBrowse.url)}</strong>. It matches
+              information you asked to keep private. Once it is typed, that site
+              has it.
+            </p>
+            <pre className="approve-args">{pendingBrowse.text}</pre>
+            {pendingBrowse.entities.length > 0 && (
+              <p className="approve-body">
+                Recognised: {pendingBrowse.entities.join(", ")}
+              </p>
+            )}
+            <div className="approve-actions">
+              <button
+                className="primary"
+                onClick={() => a.resolveBrowseConsent(pendingBrowse, true)}
+              >
+                Type it
+              </button>
+              <button
+                className="danger"
+                onClick={() => a.resolveBrowseConsent(pendingBrowse, false)}
+              >
+                Don't
               </button>
             </div>
           </div>

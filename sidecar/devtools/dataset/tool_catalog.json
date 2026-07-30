@@ -76,6 +76,130 @@
     "annotations": {
       "destructiveHint": false,
       "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Perform one or more actions on the current page, in order, stopping at the first failure. Batch related steps into ONE call rather than calling repeatedly. Returns what happened plus a fresh snapshot. Example: {\"actions\": [{\"type\": {\"ref\": \"e3\", \"text\": \"hello\", \"clear\": true}}, {\"click\": \"e7\"}]}",
+    "inputSchema": {
+      "properties": {
+        "actions": {
+          "description": "Actions in order. Each is ONE of: {\"click\": \"e4\"} | {\"type\": {\"ref\": \"e3\", \"text\": \"...\", \"clear\": true, \"submit\": true}} | {\"select\": {\"ref\": \"e5\", \"value\": \"...\"}} | {\"scroll\": \"down\"|\"up\"|\"top\"|\"bottom\"} | {\"scroll\": {\"to\": \"e9\"}} | {\"key\": \"Enter\"} | {\"click_at\": {\"x\": 120, \"y\": 340}} | {\"back\": true} | {\"wait_for\": {\"text\": \"...\"}}",
+          "items": {
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "actions"
+      ],
+      "type": "object"
+    },
+    "name": "browse_do"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Find controls on the current page whose label contains some text, without paying for a full snapshot. Returns the matching refs. Example: {\"text\": \"sign in\"}",
+    "inputSchema": {
+      "properties": {
+        "text": {
+          "description": "Text to look for in element labels",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "name": "browse_find"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Look at the current page as an image, with each interactive element's number drawn on it — the SAME numbers browse_snapshot returns, so you can read the list and see the layout together. Use it for layout questions, canvases, maps, or to check what actually happened after an action.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "browse_look"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Open a web page in the room's private browser and return the page's interactive elements. The browser keeps nothing — no history, cookies or cache. Use this when the user asks you to visit, check or look something up on a specific site. Example: {\"url\": \"https://example.com\"}",
+    "inputSchema": {
+      "properties": {
+        "url": {
+          "description": "Full http(s) URL to open",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "name": "browse_open"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Read the CURRENT page as text. This is the cheapest way to answer a question about a page — prefer it over snapshot/click loops whenever you only need to KNOW something rather than operate the page. Returns readable content with links; call again with a larger offset to continue a long page.",
+    "inputSchema": {
+      "properties": {
+        "mode": {
+          "description": "main = just the article/body (default); full = the whole page including navigation",
+          "enum": [
+            "main",
+            "full"
+          ],
+          "type": "string"
+        },
+        "offset": {
+          "description": "Character offset to continue from when the previous read was truncated",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "browse_read"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "List the current page's interactive elements as refs (e1, e2, …) with role, label and region. Take a fresh one before acting — refs go stale when the page changes. Password fields are never listed: they are fenced and the user must type those.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "browse_snapshot"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
       "openWorldHint": false,
       "readOnlyHint": false
     },
@@ -425,12 +549,7 @@
     },
     "description": "List the Agent Skills available to you, including disabled drafts. Call this to see which procedures exist for your domain, then read_skill to load one.",
     "inputSchema": {
-      "properties": {
-        "agent": {
-          "description": "Internal: the calling sub-agent's id. The sidecar fills this; leave it out.",
-          "type": "string"
-        }
-      },
+      "properties": {},
       "type": "object"
     },
     "name": "list_skills"
@@ -442,7 +561,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "List the saved workflows in this room (name, id, status, schedule). Pass `name` to get one workflow's full definition JSON — needed before update_workflow.",
+    "description": "List the saved workflows in this room (name, id, status, schedule), and the full node reference you need to write one. Call this FIRST when creating or changing a workflow. Pass `name` to get one workflow's definition JSON — needed before update_workflow.",
     "inputSchema": {
       "properties": {
         "name": {
@@ -841,7 +960,23 @@
     "inputSchema": {
       "properties": {
         "agent": {
-          "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts). Omit for a skill any agent may use.",
+          "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet search/fetch), chat.browse (driving web pages in the private browser), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts). Omit for a skill any agent may use.",
+          "enum": [
+            "files.read",
+            "scripts.run",
+            "chat.web",
+            "chat.browse",
+            "app.ui",
+            "jobs.run",
+            "jobs.workflows",
+            "skills.use",
+            "skills.author",
+            "connectors.admin",
+            "connectors.use",
+            "media.transcribe",
+            "media.video",
+            "creator.studio"
+          ],
           "type": "string"
         },
         "description": {
@@ -880,7 +1015,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a small graph of nodes + edges [{from, to, branch?}]. Model nodes: generate {prompt, model}, summarize_file {select}, file_pass {select, instruction, mode}, for_each_file {select, instruction} (runs on EACH selected file), agent_run {question}, extract {fields:[...]} (structured JSON out of {{input}}), route {prompt, labels:[...]} (tags input with one label → edges use branch:<label>, an N-way condition), vote {prompt, samples, mode:concat|majority}, refine {prompt, rubric, max_rounds} (generate→critique→revise loop), plan_and_map {objective, max_workers} (decompose→work→synthesize). Deterministic nodes (no model): transform {op:append|prepend|replace|upper|lower|trim|truncate|strip_html, find?, value?}, merge {mode:concat|dedupe_lines|numbered} (join parallel branches), http_fetch {url}, script_run {file, mode:import|transform} (run a room .py/.js; transform pipes {{input}}→stdin→stdout), save_file {name_template, format, mode}, condition {op, value}. `select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input. Parallelism = several edges out of one node re-joined by a merge. Prompts support {{input}} (upstream results), {{files}} (file list), {{date}}. Give every node a short `label` (2-4 words in the user's language for what that step does, e.g. \"Write the digest\") so the canvas and inspector read as plain steps, not kind names. Example: {\"name\":\"Morning digest\",\"emoji\":\"🌅\",\"definition\":{\"version\":1,\"nodes\":[{\"id\":\"gen\",\"kind\":\"generate\",\"label\":\"Write the digest\",\"model\":\"auto\",\"prompt\":\"Digest the new files:\\n{{files}}\"},{\"id\":\"save\",\"kind\":\"save_file\",\"label\":\"Save today's digest\",\"name_template\":\"Digest {{date}}\",\"format\":\"html\",\"mode\":\"create\"}],\"edges\":[{\"from\":\"gen\",\"to\":\"save\"}]},\"schedule\":{\"kind\":\"daily\",\"param\":\"08:00\"}}. Set binding {\"scope\":\"file\",\"kinds\":[\"pdf\"]} for a workflow that runs on the file the user is looking at (its nodes use select {\"type\":\"run_input\"}). Validation is strict — invalid definitions come back with a numbered list to fix. After saving, don't stop there: call test_workflow to actually RUN it, read which step failed, fix it with update_workflow, and test again until test_workflow returns `VALIDATED: yes` — only then tell the user the draft is ready to activate. NEVER tell the user it's fixed or works before a test returns `VALIDATED: yes`; a script_run step can only be confirmed by an approved run on the Scripts page.",
+    "description": "Create a reusable multi-step workflow as a DRAFT the user reviews and activates on the Workflows page. `definition` is a graph of nodes + edges — call list_workflows first for the full node reference (kinds, `select` types, {{input}}/{{files}}/{{date}}, and a worked example). Validation is strict: an invalid definition comes back as a numbered list to fix. After saving, don't stop there: call test_workflow to actually RUN it, read which step failed, fix it with update_workflow, and test again until test_workflow returns `VALIDATED: yes` — only then tell the user the draft is ready to activate. NEVER tell the user it's fixed or works before a test returns `VALIDATED: yes`; a script_run step can only be confirmed by an approved run on the Scripts page.",
     "inputSchema": {
       "properties": {
         "binding": {
@@ -1299,7 +1434,7 @@
       "openWorldHint": true,
       "readOnlyHint": true
     },
-    "description": "Search the public web. Use for current events or information not in the room. Returns titles, URLs and snippets; fetch a URL with fetch_page for details.",
+    "description": "Search the public web across several engines at once, merged into one relevance ranking. Use for current events or information not in the room. Returns a title, a URL, and which engine found it — NOT the page's text, so call fetch_page on a URL to actually read it.",
     "inputSchema": {
       "properties": {
         "query": {

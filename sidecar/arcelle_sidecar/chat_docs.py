@@ -38,7 +38,8 @@ from typing import Any
 
 from . import llm
 from .config import KEEP_ALIVE_WARM
-from .messages import Message, compact_json, system_message, user_message
+from .messages import Message, system_message, user_message
+from .model_text import prime_schema, recover_json, strip_think_spans
 
 # --- verbatim prompts (from the Rust) ---------------------------------------
 
@@ -64,50 +65,7 @@ DOC_SYS = (
 #: The value a field gets when the document does not contain it (cmd_extract).
 NOT_FOUND = "(not found)"
 
-#: ollama.rs chat_structured — the schema-in-prompt primer appended to the last
-#: user turn. Without the field names in the prompt a small model fills the
-#: forced JSON with empty strings, so this grounds its content.
-_SCHEMA_PRIMER_HEAD = (
-    "\n\nReply with ONLY JSON matching this schema, filling every field with real content:\n"
-)
-
-
 # --- Rust helper reproductions ----------------------------------------------
-
-
-def strip_think_spans(raw: str) -> str:
-    """ollama.rs ``strip_think_spans``: drop each ``<think>…</think>`` span; an
-    unterminated ``<think>`` truncates from there."""
-    out = raw
-    while True:
-        start = out.find("<think>")
-        if start == -1:
-            break
-        rel = out.find("</think>", start)
-        if rel == -1:
-            out = out[:start]
-            break
-        end = rel + len("</think>")
-        out = out[:start] + out[end:]
-    return out
-
-
-def recover_json(text: str) -> str:
-    """ollama.rs ``recover_json``: drop any ``<think>`` span, then slice from the
-    first opening bracket to the last closing one so a fenced / preamble-wrapped
-    JSON payload still parses. A no-op for a model that returns bare JSON."""
-    s = strip_think_spans(text.strip()).strip()
-    first = min(
-        (i for i, c in enumerate(s) if c in "{["),
-        default=-1,
-    )
-    last = max(
-        (i for i, c in enumerate(s) if c in "}]"),
-        default=-1,
-    )
-    if first != -1 and last != -1 and last >= first:
-        return s[first : last + 1]
-    return s
 
 
 #: docs_html.rs parse_string_list strips these from the START of a fallback line
@@ -166,17 +124,6 @@ def value_str(parsed: Any, key: str) -> str:
 # --- model calls (reproduce chat_structured / ask_quiet) --------------------
 
 
-def _prime_with_schema(messages: list[Message], schema: dict[str, Any]) -> list[Message]:
-    """ollama.rs chat_structured: append the schema to the LAST user turn
-    (non-mutating). ``serde_json::to_string`` is compact — ``compact_json`` here."""
-    msgs: list[Message] = [dict(m) for m in messages]  # type: ignore[misc]
-    for m in reversed(msgs):
-        if m.get("role") == "user":
-            m["content"] = (m.get("content") or "") + _SCHEMA_PRIMER_HEAD + compact_json(schema)
-            break
-    return msgs
-
-
 async def _structured(
     model: str,
     base_url: str,
@@ -190,7 +137,7 @@ async def _structured(
 ) -> str:
     """One structured turn = chat_structured: prime the prompt with the schema,
     generate with ``format=schema`` at the no-tools Chat window, recover the JSON."""
-    primed = _prime_with_schema(messages, schema)
+    primed = prime_schema(messages, schema)
     raw = await llm.generate(
         model,
         primed,
@@ -351,8 +298,6 @@ __all__ = [
     "LIST_NAMES_SYSTEM",
     "DOC_SYS",
     "NOT_FOUND",
-    "strip_think_spans",
-    "recover_json",
     "parse_string_list",
     "value_str",
     "extract_fields",

@@ -171,7 +171,7 @@ pub(crate) fn spawn_room_server_if_enabled(app: &tauri::AppHandle) {
                 db::get_setting(&room.conn, "room_server_enabled").as_deref() == Some("1");
             let scope_setting = db::get_setting(&room.conn, "room_server_scope");
             let scope = leash_scope(scope_setting.as_deref(), false);
-            let opts = if scope == crate::room_mcp::ToolScope::ExternalAgent {
+            let mut opts = if scope == crate::room_mcp::ToolScope::ExternalAgent {
                 match leash_identity(&room.conn) {
                     Ok((port, token)) => {
                         crate::room_mcp::StartOpts { port: Some(port), token: Some(token), ..Default::default() }
@@ -181,6 +181,7 @@ pub(crate) fn spawn_room_server_if_enabled(app: &tauri::AppHandle) {
             } else {
                 crate::room_mcp::StartOpts::default()
             };
+            opts.lanes = web_lanes(&room.conn);
             (
                 enabled,
                 web_access_enabled(&room.conn),
@@ -394,6 +395,13 @@ pub(crate) fn teardown_open_room(app: &tauri::AppHandle, state: &AppState) {
             let _ = live.handle.tx.send(recording::EngineMsg::Stop { done: done_tx });
         }
     }
+    // BROWSE-1: the private browser must not outlive the room. Its webview is
+    // non-persistent, so destroying it takes the whole session's cookies,
+    // cache and history with it — but a LIVE page left floating over a locked
+    // room would also still be showing whatever the room was looking at, and
+    // its agent journal has to flush into the DB while the DB is still open.
+    // Closed BEFORE the room handle drops, for exactly that reason.
+    let _ = crate::browser::close(app);
     *state.room.lock().unwrap() = None;
     // PRIV-1: the cached privacy policy holds the room's protected strings —
     // it must not outlive the room handle (same invariant as the MCP token).

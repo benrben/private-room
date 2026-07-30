@@ -12,6 +12,7 @@ use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use sha2::Sha256;
 
+mod browse;
 mod chats;
 mod embeddings;
 mod files;
@@ -30,6 +31,7 @@ mod versions;
 mod web_cache;
 mod workflows;
 
+pub use browse::*;
 pub use chats::*;
 pub use embeddings::*;
 pub use files::*;
@@ -164,9 +166,12 @@ pub(crate) fn table_exists(conn: &Connection, name: &str) -> Result<bool, String
 
 /// CHG-33: normalize a search query for cache keying — lowercase, trim, collapse
 /// internal whitespace — so exact repeats and case/spacing variants share a row.
-pub(crate) fn search_key(provider: &str, endpoint: &str, query: &str) -> String {
-    let q = query.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    format!("{provider}|{endpoint}|{q}")
+/// The key used to be namespaced by provider+endpoint, from when a room could
+/// point at one of several engines; there is only one search provider now, so the
+/// query alone identifies the row. Rows written by the old scheme simply never
+/// match again and age out on the 15-minute TTL.
+pub(crate) fn search_key(query: &str) -> String {
+    query.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 /// Fresh in-memory DB with the current SCHEMA — same statements a new room

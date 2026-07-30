@@ -320,12 +320,11 @@ pub(crate) async fn cmd_translate(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
 /// offline from files the room now owns, so the sources survive after the network
 /// is gone.
 ///
-/// CONTRACT-NOTE (D8 step 4): "web access" in this app is simply whether a
-/// provider is configured (`web_access_enabled` == provider set) — there is no
-/// separate on/off switch this command could toggle. So #research REQUIRES a
-/// provider already configured (step 1) and never mutates any web setting, which
-/// satisfies "turn web access OFF again if this command temporarily enabled it"
-/// trivially: it never enables anything, so it leaves nothing on.
+/// CONTRACT-NOTE (D8 step 4): "web access" in this app is the room's one
+/// internet switch (`web_access_enabled`). #research REQUIRES it already on
+/// (step 1) and never mutates any web setting, which satisfies "turn web access
+/// OFF again if this command temporarily enabled it" trivially: it never enables
+/// anything, so it leaves nothing on.
 pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     use tauri::Emitter;
     let question = ctx.args.trim();
@@ -333,32 +332,26 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         return Err("Usage: #research <question>".into());
     }
 
-    // (1) Require a web provider. If off, tell the user how to turn one on — a
+    // (1) Require the internet switch. If off, tell the user how to turn it on — a
     // saved assistant message, not an error toast, since it is actionable.
-    let (provider, endpoint) = ctx.state.with_room(|room| {
-        Ok((
-            db::get_setting(&room.conn, "web_provider").unwrap_or_default(),
-            db::get_setting(&room.conn, "web_endpoint").unwrap_or_default(),
-        ))
-    })?;
-    if !matches!(provider.as_str(), "duckduckgo" | "brave" | "searxng") {
+    let enabled = ctx
+        .state
+        .with_room(|room| Ok(crate::commands::web_access_enabled(&room.conn)))?;
+    if !enabled {
         return Ok(CommandResult {
-            content: "Web access is off in this room. Turn on a provider in \
+            content: "Web access is off in this room. Turn it on in \
                       **Settings → Online features**, then try #research again."
                 .into(),
             ..Default::default()
         });
     }
 
-    // (2) Search. Reuse the same provider dispatch the agent's web_search uses.
+    // (2) Search. The same one search path the agent's web_search uses.
     let _ = ctx.window.emit(
         "ask-step",
         format!("Searching the web for \"{question}\" (leaves this Mac)"),
     );
-    let hits = match provider.as_str() {
-        "duckduckgo" | "brave" => web::search_duckduckgo(question).await,
-        _ => web::search_searxng(&endpoint, question).await,
-    }?;
+    let hits = web::search_web(question).await?;
     if hits.is_empty() {
         return Ok(CommandResult {
             content: format!("No web results found for **{question}**."),

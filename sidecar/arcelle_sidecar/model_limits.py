@@ -48,13 +48,92 @@ _HIGH_RAM_BYTES: int = 32 * 1024 * 1024 * 1024
 #: Room left for the model's own output (and thinking) on top of the prompt.
 GENERATION_HEADROOM_TOKENS = 2_048
 
-#: Conservative bytes-per-token for the mixed payloads this app sends
-#: (English + Hebrew UTF-8 + JSON tool schemas). English prose runs ~4,
-#: Hebrew ~2.5, compact JSON ~3 — undercounting tokens is the failure mode
-#: that reintroduces silent truncation, so estimate low.
+#: Cold-start bytes-per-token, and the FLOOR the live calibration below may
+#: never go under. Undercounting tokens is the failure mode that reintroduces
+#: silent truncation, so a guess must be low.
+#:
+#: It is also, measured, far too low to use as the only number. Real ratios
+#: from qwen3.5:2b-mlx's own tokenizer (`prompt_eval_count`, 2026-07-28):
+#:
+#:     English prose      5.89 B/token      a 3-B budget fills  51% of the window
+#:     Hebrew prose       3.62 B/token                          83%
+#:     Hebrew + numbers   2.91 B/token                         103%
+#:     English + numbers  2.48 B/token                         121%
+#:     Code / markup      3.08 B/token                          98%
+#:
+#: So a constant is wrong in BOTH directions depending on what the user writes:
+#: ordinary English chat gets barely half the context it could have, while a
+#: number-dense turn overflows. That spread is content, not language — Hebrew
+#: costs ~1.23x the BYTES of the same content, a 19% penalty, not the halving
+#: it was assumed to be.
 BYTES_PER_TOKEN = 3
 
+#: Upper clamp on the calibrated ratio. Above this the estimate would be
+#: claiming a payload is ~2x lighter than the floor assumes, which is the
+#: overflow (silent context-shift) direction.
+_CAL_CEILING: float = 6.0
+
+#: Applied to every observation. Sub-1.0 makes the ratio SMALLER than measured,
+#: which sizes windows UP and content budgets DOWN — the safe direction for
+#: both users of this number.
+_CAL_SAFETY: float = 0.85
+
+#: EWMA weight for a new observation. High enough to follow a conversation that
+#: switches language or starts pasting code within a few rounds.
+_CAL_ALPHA: float = 0.3
+
+#: The live ratio, or None before anything has been observed. Process-global
+#: rather than per-model on purpose: measured spread across CONTENT (2.48 to
+#: 5.89) dwarfs the spread across tokenizers, a room chats with one model at a
+#: time, and the clamp plus `_CAL_SAFETY` absorb a model switch inside a few
+#: rounds. Only local calls consult it — a non-local model owns its own window
+#: and is never budgeted here.
+_calibration: float | None = None
+
 _max_ctx_cache: int | None = None
+
+
+def observe_token_ratio(payload_bytes: int, prompt_tokens: int) -> None:
+    """Feed one REAL (bytes, tokens) observation into the calibration.
+
+    The engine already tells us both numbers every round (Ollama's
+    ``prompt_eval_count``), so the app can measure the thing it was guessing
+    instead of shipping a constant that is wrong for most content.
+    """
+    global _calibration
+    if payload_bytes <= 0 or prompt_tokens <= 0:
+        return
+    ratio = payload_bytes / prompt_tokens
+    # A ratio outside this is not a tokenizer, it is a bug (a mis-paired
+    # payload/usage, or a report about a different call). Ignore rather than
+    # let one bad sample move the window sizing.
+    if not 1.0 <= ratio <= 20.0:
+        return
+    _calibration = (
+        ratio
+        if _calibration is None
+        else (1.0 - _CAL_ALPHA) * _calibration + _CAL_ALPHA * ratio
+    )
+
+
+def bytes_per_token() -> float:
+    """Bytes per token to assume right now — calibrated if we have measured it.
+
+    Never returns less than :data:`BYTES_PER_TOKEN`, so this can only ever
+    grant MORE context than the constant did, never less. Both callers move in
+    the safe direction together: :func:`pick_num_ctx` divides by it (a smaller
+    value asks for a bigger window) and :func:`.budget.window_budget_bytes`
+    multiplies by it (a smaller value allows fewer bytes).
+    """
+    if _calibration is None:
+        return float(BYTES_PER_TOKEN)
+    return min(max(_calibration * _CAL_SAFETY, float(BYTES_PER_TOKEN)), _CAL_CEILING)
+
+
+def reset_token_ratio() -> None:
+    """Drop the calibration (tests, and a model change in a long-lived process)."""
+    global _calibration
+    _calibration = None
 
 
 def _total_ram_bytes() -> int:
@@ -97,7 +176,7 @@ def pick_num_ctx(payload_bytes: int, native_ctx: int | None) -> int:
     handing an oversized prompt to Ollama is exactly the context-shift this
     module's docstring describes.
     """
-    want = payload_bytes // BYTES_PER_TOKEN + GENERATION_HEADROOM_TOKENS
+    want = int(payload_bytes / bytes_per_token()) + GENERATION_HEADROOM_TOKENS
     ceiling = max_num_ctx()
     chosen = next((b for b in NUM_CTX_BUCKETS if b >= want), NUM_CTX_BUCKETS[-1])
     chosen = min(chosen, ceiling)
@@ -142,7 +221,10 @@ __all__ = [
     "BYTES_PER_TOKEN",
     "GENERATION_HEADROOM_TOKENS",
     "NUM_CTX_BUCKETS",
+    "bytes_per_token",
     "max_num_ctx",
     "native_context_length",
+    "observe_token_ratio",
     "pick_num_ctx",
+    "reset_token_ratio",
 ]

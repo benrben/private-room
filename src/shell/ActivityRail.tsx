@@ -3,6 +3,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   FocusIcon,
+  GlobeIcon,
   GraphIcon,
   HomeIcon,
   LinkIcon,
@@ -47,6 +48,12 @@ const AREAS: {
     icon: (s) => <MemoryIcon size={s} />,
   },
   { key: "connectors", label: "Connectors", short: "Connect", icon: (s) => <LinkIcon size={s} /> },
+  {
+    key: "browser",
+    label: "Private browser",
+    short: "Browser",
+    icon: (s) => <GlobeIcon size={s} />,
+  },
 ];
 
 /** The activity rail. Two deliberately different groups: pane visibility

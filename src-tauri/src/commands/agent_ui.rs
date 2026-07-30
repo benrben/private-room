@@ -17,6 +17,22 @@ pub struct AgentUi {
 /// answers in milliseconds.
 const UI_REQUEST_TIMEOUT_SECS: u64 = 20;
 
+/// How long a request that needs a PERSON may wait.
+///
+/// THE BUG THIS EXISTS FOR (BROWSE-1, 2026-07-30): `browse_consent` — the
+/// outbound-typing door — rides this same channel, but it is not answered by
+/// the DOM driver in milliseconds. It renders a card and waits for the user to
+/// read what is about to be typed into a web page and decide. On the machine
+/// budget above, any hesitation past 20 seconds failed `browse_do` with "the
+/// app's interface didn't answer" and left the user clicking Approve on a card
+/// whose oneshot was already dead — a consent prompt that punished reading it.
+const UI_CONSENT_TIMEOUT_SECS: u64 = 600;
+
+/// Request kinds answered by a HUMAN rather than by the DOM driver.
+fn needs_a_person(kind: &str) -> bool {
+    kind == "browse_consent"
+}
+
 /// Ask the frontend driver to perform `kind` with `args`; returns its JSON
 /// reply. Times out (with the pending entry cleaned up) if the webview never
 /// answers — the tool then reports a plain error the model can react to.
@@ -34,8 +50,12 @@ pub(crate) async fn request_ui(
         "agent-ui-request",
         serde_json::json!({ "id": id, "kind": kind, "args": args }),
     );
-    match tokio::time::timeout(std::time::Duration::from_secs(UI_REQUEST_TIMEOUT_SECS), rx).await
-    {
+    let budget = if needs_a_person(kind) {
+        UI_CONSENT_TIMEOUT_SECS
+    } else {
+        UI_REQUEST_TIMEOUT_SECS
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(budget), rx).await {
         Ok(Ok(v)) => {
             if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
                 Err(err.to_string())
@@ -45,9 +65,20 @@ pub(crate) async fn request_ui(
         }
         _ => {
             ui.pending.lock().unwrap().remove(&id);
-            Err(format!(
-                "The app's interface didn't answer the {kind} request in time."
-            ))
+            // A human timeout is not a malfunction, and must not be reported as
+            // one: the truthful reading is "nobody approved it", which is a
+            // refusal the model has to respect rather than retry.
+            if needs_a_person(kind) {
+                Err(
+                    "The user did not answer the approval request, so nothing was typed. \
+                     Tell them it is still waiting rather than trying again."
+                        .into(),
+                )
+            } else {
+                Err(format!(
+                    "The app's interface didn't answer the {kind} request in time."
+                ))
+            }
         }
     }
 }

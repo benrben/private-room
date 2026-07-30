@@ -73,16 +73,34 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, TypedDict
+from typing import Any, Awaitable, Callable, NamedTuple, TypedDict
 
 from langchain_core.runnables import RunnableConfig
 
+from .agents import (
+    AGENT_TOOL_NAMES,
+    ALL_REGISTRY_TOOLS,
+    BATCH_TOOL_NAME,
+    DOMAIN_KEYS,
+    GROUPS,
+    MAIN_AGENT_ID,
+    AgentSpec,
+    agent_tool_specs,
+    get_agent,
+    group_prompt,
+    group_tools,
+    main_prompt,
+    normalize_domain_key,
+    reachable_domain_keys,
+    toolbox_for,
+)
 from .budget import json_chars
 from .chat import ChatModel
-from .usage import build_usage_event, categorize_messages
 from .config import AGENT_ROUND_BACKSTOP, RunRequest
 from .labels import tool_step_label
+from .manager import resolve_worker
 from .mcp_client import McpClient, ToolResult
 from .messages import (
     Message,
@@ -93,10 +111,10 @@ from .messages import (
 )
 from .privacy import is_nonlocal_model
 from .prompts import (
-    SKILLS_NOTE,
     DONE_TEXT,
     EMPTY_PLAN_NOTE,
     IMAGE_HANDOFF,
+    SKILLS_NOTE,
     TOOL_GROUP_LABELS,
     TOOL_GROUPS_PROMPT,
     correction_note,
@@ -106,21 +124,15 @@ from .prompts import (
     turn_progress_note,
     unlocked_note,
 )
-from .agents import (
-    AGENT_TOOL_NAMES,
-    ALL_REGISTRY_TOOLS,
-    BATCH_TOOL_NAME,
-    DOMAIN_KEYS,
-    GROUPS,
-    MAIN_AGENT_ID,
-    agent_tool_specs,
-    get_agent,
-    group_prompt,
-    group_tools,
-    toolbox_for,
-)
-from .manager import resolve_worker
 from .routing import ADVISOR_TOOL_NAMES, lane_label
+from .usage import build_usage_event, categorize_messages
+
+#: Failures here are mirrored to `arcelle-sidecar.log` by the host
+#: (`sidecar_lifecycle.rs::drain_stderr`). Nothing configures logging in this
+#: process, so `logging.lastResort` carries ERROR to stderr — which is exactly
+#: the stream the host drains. Do not log below ERROR from this module: it would
+#: be dropped, and a log line nobody can read is worse than none.
+_log = logging.getLogger("arcelle_sidecar.graph")
 
 #: An event emitted to the Rust host (SPEC §4).
 Event = dict[str, Any]
@@ -131,6 +143,11 @@ Emit = Callable[[Event], Awaitable[None]]
 #: ``AgentState.node_key``). Workers get ``"<agent_id>#<pipeline slot>"``; the
 #: hub is a singleton, so it gets a fixed name the UI can root the graph on.
 MAIN_NODE_KEY = "main"
+
+#: Shown in the step strip when the turn-wide round budget runs out. The user
+#: gets an answer either way; this says the answer came from what was already
+#: gathered rather than from the loop deciding it was finished.
+ROUND_BUDGET_STEP = "Round budget reached — answering with what we have"
 
 
 class CancelToken:
@@ -186,7 +203,36 @@ class Deps:
     #: the gap. Cloud engines have no resident model, so the caller raises it.
     #: 0/None means unbounded, which is what a cloud room wants.
     worker_parallel: int | None = None
+    #: The WHOLE ASK's model-round ceiling (`config.TURN_ROUND_BUDGET`), shared
+    #: by every loop in the delegation tree. `max_rounds` lives in state, and
+    #: each child starts a fresh state at round 0, so it bounds a loop and not a
+    #: turn — the one place a turn-wide count can live is here, because `Deps`
+    #: is the single object passed by reference all the way down.
+    #: None/0 = unbounded (what a headless caller that owns its own timeout wants).
+    turn_round_budget: int | None = None
+    _rounds_spent: int = field(default=0, repr=False, compare=False)
     _worker_sem: Any = field(default=None, repr=False, compare=False)
+
+    def spend_round(self) -> bool:
+        """Take one round from the TURN's budget; False once it is exhausted.
+
+        Not a lock: the batch of delegated children is concurrent, but each of
+        them awaits its own model call, and asyncio gives us a single thread —
+        ``+= 1`` between awaits cannot interleave.
+        """
+        self._rounds_spent += 1
+        if not self.turn_round_budget or self.turn_round_budget <= 0:
+            return True
+        return self._rounds_spent <= self.turn_round_budget
+
+    @property
+    def rounds_spent(self) -> int:
+        return self._rounds_spent
+
+    def just_exhausted(self) -> bool:
+        """True on the ONE round that first crossed the budget — so the user is
+        told once, not once per loop still unwinding."""
+        return bool(self.turn_round_budget) and self._rounds_spent == self.turn_round_budget + 1
 
     def worker_slot(self) -> Any:
         """An async context manager bounding concurrent children (or a no-op)."""
@@ -492,15 +538,26 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         # active sub-agent contributes its own paragraph; locked groups are
         # named ONLY at the group level (TOOL_GROUPS_PROMPT), so the model
         # keeps a stable self-image without unseen schemas.
+        # The Main agent's paragraph is GENERATED from the domains actually in
+        # the catalog `prepare` just built, not the static all-domains default
+        # on its spec: a web-disabled room must not read "the internet" in its
+        # own system prompt (2026-07-28). Workers use their static paragraph,
+        # which `test_every_agent_prompt_names_only_its_own_tools` already pins
+        # against their box.
+        paragraph = (
+            main_prompt(k for k, name in DOMAIN_KEYS.items() if name in offered)
+            if agent.main
+            else agent.prompt
+        )
         if (
-            agent.prompt
+            paragraph
             # served this scope — never describe unserved tools. The Main
             # agent's paragraph describes its ask_*_agent catalog instead,
             # which prepare just built (offered = its specialists).
             and (agent.main or set(agent.tools) & offered)
-            and agent.prompt not in (messages[0].get("content") or "")
+            and paragraph not in (messages[0].get("content") or "")
         ):
-            messages[0]["content"] = (messages[0].get("content") or "") + agent.prompt
+            messages[0]["content"] = (messages[0].get("content") or "") + paragraph
         # Skills sit one layer below the paragraph: the paragraph is who this
         # agent is and rides every turn; a skill is a saved procedure it loads
         # only when one applies. Workers only — the Main agent delegates rather
@@ -542,9 +599,26 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
 
     rnd = state.get("round", 0)
     max_rounds = state.get("max_rounds", AGENT_ROUND_BACKSTOP)
+    # The turn-wide budget, spent by EVERY loop in the tree (`Deps.spend_round`).
+    # Exhausting it does not abort anything: it makes this and every remaining
+    # round tool-less, which is the same mechanism as `last` below — so each
+    # loop still unwinds into a text answer instead of dying mid-delegation.
+    within_turn_budget = deps.spend_round()
+    if not within_turn_budget and deps.just_exhausted():
+        await deps.emit(
+            {
+                "t": "step",
+                "v": ROUND_BUDGET_STEP,
+                "node": str(state.get("node_key") or MAIN_NODE_KEY),
+            }
+        )
     # CHG-0/CHG-32: the final round (and any forced synthesis) is tool-less, so
     # the loop always ends with a text answer grounded in prior results.
-    last = (rnd + 1 == max_rounds) or bool(state.get("force_synthesis", False))
+    last = (
+        (rnd + 1 == max_rounds)
+        or bool(state.get("force_synthesis", False))
+        or not within_turn_budget
+    )
 
     messages: list[Message] = state["messages"]
     tools: list[dict[str, Any]] = state.get("tools", [])
@@ -813,6 +887,27 @@ def _referent_names(tool: str, args: dict[str, Any] | None) -> list[str]:
     return [str(name)[:80]] if name else []
 
 
+class WorkerOutcome(NamedTuple):
+    """What one delegation — a single specialist, or a whole ``ask_agents``
+    batch — hands back to the sequential pass.
+
+    A NamedTuple rather than a plain tuple so the fields name themselves at the
+    call sites: the collectors used to read ``result[1]`` / ``result[2]`` and
+    needed a comment to say which was which. Still a tuple, so
+    ``report, ok, cancelled, refs = ...`` keeps working.
+    """
+
+    #: The text that joins the MAIN thread as this call's tool message.
+    report: str
+    #: "Did something actually come back" — gates memoisation, the findings
+    #: baton and the green/red step chip. Never derived from a model call.
+    ok: bool
+    #: Stop was pressed somewhere inside this delegation.
+    cancelled: bool
+    #: Artifacts this delegation ADDED, for the caller to merge into the baton.
+    referents: list[str]
+
+
 async def _run_worker(
     state: AgentState,
     config: RunnableConfig,
@@ -821,10 +916,10 @@ async def _run_worker(
     referents: list[str],
     node_key: str,
     upstream: tuple[str, ...] = (),
-) -> tuple[str, bool, bool, list[str]]:
+) -> WorkerOutcome:
     """Execute one ask_*_agent delegation: run the specialist's own scoped
-    sub-loop and return ``(report, ok, cancelled, referents)``. Only the REPORT
-    joins the main thread — the worker's internal tool traffic stays its own.
+    sub-loop and return a :class:`WorkerOutcome`. Only the REPORT joins the main
+    thread — the worker's internal tool traffic stays its own.
 
     Runs CONCURRENTLY with its siblings (``execute_tools`` launches the whole
     round's batch before awaiting any of it), so this function touches no shared
@@ -923,7 +1018,7 @@ async def _run_worker(
         if report_text
         else f"The {worker.label} finished but returned no report."
     )
-    return report, ok, cancelled, worker_refs
+    return WorkerOutcome(report, ok, cancelled, worker_refs)
 
 
 def parse_plan(raw: Any) -> list[dict[str, Any]]:
@@ -999,17 +1094,833 @@ def plan_waves(tasks: list[dict[str, Any]]) -> list[list[int]]:
     return waves
 
 
+@dataclass(slots=True)
+class _Batch:
+    """One ``ask_agents`` plan's accumulators, every one of them keyed by task
+    INDEX — the position in the model's own plan, which is what its
+    ``depends_on`` numbers refer to.
+
+    Per-PLAN and NOT per-round, deliberately: two ``ask_agents`` calls in one
+    round run their plans concurrently against the same :class:`_Delegator`, so
+    this state cannot live on it without the two batches reading each other's
+    reports.
+    """
+
+    #: Task index -> the line that joins the plan's one combined tool message.
+    reports: dict[int, str] = field(default_factory=dict)
+    #: Per-task outcome. The plan's own `ok` is ANY of these — a batch whose
+    #: tasks ALL came back empty still cannot render as a green step (the
+    #: same reason a single delegation's `ok` stopped being hardcoded True),
+    #: but a PARTIAL batch counts as a success.
+    #:
+    #: It was the AND until 2026-07-30, and that cost the user real work: in
+    #: the BATCH_TOOL_NAME branch `ok=False` skips BOTH
+    #: `reports_so_far.append` and `seen.add(key)`. So a 3-task batch where
+    #: two tasks reported and one hit an unavailable domain (a) dropped both
+    #: real reports out of the findings baton — the next round's specialists
+    #: lost exactly the findings that baton was added to carry, and the
+    #: "find X then act on X" chain fell back to the hub restating X — and
+    #: (b) left the call unmemoised, so the model could legally re-emit the
+    #: identical batch next round and the two successful tasks were re-run
+    #: and re-paid for. The report TEXT is unchanged: every failed or
+    #: unavailable task still says so on its own line, so the Main agent can
+    #: still tell the user plainly what could not be done.
+    task_ok: dict[int, bool] = field(default_factory=dict)
+    #: The referent baton as the plan has grown it: what it started with, plus
+    #: every artifact its children reported, merged in dispatch order.
+    gathered: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _Delegator:
+    """One round's fan-out: launch every delegation, track its roster slot, and
+    drain the batch if the turn is torn down.
+
+    Extracted from ``execute_tools`` 2026-07-30. It was three async closures
+    (``_tracked``/``_register``/``_run_plan``) over ~15 locals inside a 567-line
+    node — the ONE function every graph shape shares and where SPEC §3.2's
+    invariants live — so none of its phases could be exercised on its own, which
+    is the worst possible place in the package to have no unit seam.
+    ``execute_tools`` keeps what only it can do (the assistant turn, the state
+    update); the strictly-sequential per-call pass is :class:`_ToolPass`, and
+    everything that runs CONCURRENTLY lives here.
+
+    Behaviour-identical by construction: ``pipeline`` is the SAME list object
+    ``execute_tools`` hands back in its updates, so a slot claimed here is
+    visible there — exactly what the closures' shared local did.
+    """
+
+    deps: Deps
+    config: RunnableConfig
+    state: AgentState
+    #: The turn's roster, shared BY REFERENCE with the caller (see above).
+    pipeline: list[dict[str, Any]]
+    #: This round's batch number; a wave adds its own offset (see `register`).
+    batch: int
+    #: The referent baton as it stood when this round's batch launched.
+    referents_at_launch: list[str]
+    #: Earlier ROUNDS' findings, prepended to every child's kickoff note.
+    carryover: tuple[str, ...]
+    #: What the bridge served this run — how a delegation resolves to a worker.
+    served_names: set[str]
+    #: Duplicate keys already dispatched this round.
+    launched: set[str] = field(default_factory=set)
+    #: call id -> the human label of whatever is running for it, so a crash can
+    #: be reported by name without re-resolving the worker in the error path.
+    launched_label: dict[str, str] = field(default_factory=dict)
+    #: call id -> how many tasks its `ask_agents` plan parsed to. Carried from
+    #: the fan-out, where the parse already happened, so the sequential pass's
+    #: progress line does not re-parse the whole plan just to count it.
+    plan_sizes: dict[str, int] = field(default_factory=dict)
+    #: call id -> the in-flight delegation the sequential pass will await.
+    tasks: dict[str, asyncio.Task[WorkerOutcome]] = field(default_factory=dict)
+
+    @classmethod
+    def for_round(
+        cls,
+        deps: Deps,
+        config: RunnableConfig,
+        state: AgentState,
+        referents: list[str],
+        reports_so_far: list[tuple[str, str]],
+    ) -> _Delegator:
+        """This round's fan-out, with everything it derives from ``state``.
+
+        ``referents`` and ``reports_so_far`` are the caller's own accumulators
+        (see :meth:`_ToolPass.for_round`) rather than re-read from state: the
+        batons this round's children are handed are the ones the round is
+        actually working with.
+        """
+        pipeline: list[dict[str, Any]] = list(state.get("pipeline", []))
+        served_names = {
+            s.get("function", {}).get("name") for s in state.get("served_specs", [])
+        }
+        # The baton as it stood when the batch launched — every sibling reads the
+        # SAME snapshot, since none of them can see another's artifacts yet.
+        referents_at_launch = list(referents)
+        # Findings from EARLIER ROUNDS only, for the same reason: siblings dispatched
+        # together ran blind to each other, so handing one another's reports around
+        # would be a lie about what was known when. Last two: enough for a
+        # find-then-act chain without re-sending the whole turn every round.
+        carryover: tuple[str, ...] = tuple(
+            f"The {label} reported earlier in this turn:\n{text}"
+            for label, text in reports_so_far[-2:]
+        )
+        # Children dispatched together share a batch number — the ONE fact that says
+        # "these ran at the same time", which no amount of roster diffing downstream
+        # can reconstruct reliably. Derived from the roster so it needs no state.
+        batch = max((int(e.get("batch") or 0) for e in pipeline), default=-1) + 1
+        return cls(
+            deps=deps,
+            config=config,
+            state=state,
+            pipeline=pipeline,
+            batch=batch,
+            referents_at_launch=referents_at_launch,
+            carryover=carryover,
+            served_names=served_names,
+        )
+
+    def register(self, worker_id: str, instruction: str, wave: int) -> dict[str, Any]:
+        """Claim this child's roster slot. Call order, before anything runs."""
+        entry: dict[str, Any] = {
+            "agent": worker_id,
+            "instruction": instruction,
+            "status": "running",
+            "batch": self.batch + wave,
+            "key": f"{worker_id}#{len(self.pipeline)}",
+        }
+        self.pipeline.append(entry)
+        return entry
+
+    async def tracked(
+        self,
+        entry: dict[str, Any],
+        worker_id: str,
+        instruction: str,
+        node_key: str,
+        baton: list[str] | None = None,
+        *,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        """Run one child, flipping ITS roster slot as it starts and finishes.
+
+        The status flip has to happen where the child actually ends, not where
+        the parent collects it: reports are collected in call order, so a fast
+        third child would otherwise keep pulsing on screen until the slow first
+        one returned — the exact illusion this feature exists to remove.
+        """
+        try:
+            result = await _run_worker(
+                self.state,
+                self.config,
+                worker_id,
+                instruction,
+                self.referents_at_launch if baton is None else baton,
+                node_key,
+                upstream,
+            )
+        except asyncio.CancelledError:
+            # Stop pressed / a sibling failed the round. Mark it, but do NOT
+            # emit — nothing is draining the queue once the run is torn down.
+            entry["status"] = "failed"
+            raise
+        except Exception:
+            entry["status"] = "failed"
+            await _emit_pipeline(self.deps, self.pipeline, _active_step(self.pipeline))
+            raise
+        entry["status"] = "done" if result.ok and not result.cancelled else "failed"
+        await _emit_pipeline(self.deps, self.pipeline, _active_step(self.pipeline))
+        return result
+
+    async def run_plan(self, plan: list[dict[str, Any]]) -> WorkerOutcome:
+        """Run one ``ask_agents`` batch wave by wave; one combined report back.
+
+        Independent tasks in a wave run concurrently; a wave starts only once
+        every task it depends on has reported, and those reports are handed to
+        the dependents verbatim. The whole plan is ONE tool call, so it returns
+        ONE tool message — the reports are labelled by task position, which is
+        what the model's `depends_on` indices refer to.
+        """
+        waves = plan_waves(plan)
+        batch = _Batch(gathered=list(self.referents_at_launch))
+        #: The domains actually offered this run — the same list that built the
+        #: `agent` enum the model chose from (see `reachable_domain_keys`).
+        live_domain_keys = reachable_domain_keys(
+            web_enabled=bool(self.state.get("web_enabled", False)),
+            served_names=self.served_names,
+        )
+        cancelled_any = False
+        for wave_no, wave in enumerate(waves):
+            if self.deps.cancel.cancelled:
+                cancelled_any = True
+                break
+            running = self._launch_wave(plan, wave, wave_no, batch, live_domain_keys)
+            await _emit_pipeline(self.deps, self.pipeline, _active_step(self.pipeline))
+            if await self._collect_wave(running, batch):
+                cancelled_any = True
+                break
+        text = "\n\n".join(batch.reports[i] for i in sorted(batch.reports)) or (
+            "No tasks ran — the plan was empty."
+        )
+        new_refs = [r for r in batch.gathered if r not in self.referents_at_launch]
+        return WorkerOutcome(text, any(batch.task_ok.values()), cancelled_any, new_refs)
+
+    def _launch_wave(
+        self,
+        plan: list[dict[str, Any]],
+        wave: list[int],
+        wave_no: int,
+        batch: _Batch,
+        live_domain_keys: list[str],
+    ) -> list[tuple[int, dict[str, Any], asyncio.Task[Any]]]:
+        """Start every task in ONE wave; collect none of them.
+
+        A task whose domain this room cannot serve is answered into ``batch``
+        here and never launches. Returns the in-flight tasks in dispatch order,
+        for :meth:`_collect_wave`.
+        """
+        baton = list(batch.gathered)
+        running: list[tuple[int, dict[str, Any], asyncio.Task[Any]]] = []
+        for idx in wave:
+            task_spec = plan[idx]
+            key = str(task_spec.get("agent", ""))
+            # Accept any spelling of a domain a small model might emit —
+            # short key, full tool name, or a member worker id.
+            norm = normalize_domain_key(key)
+            # UNRECOGNISED stays tolerant: fall through to resolve_worker's
+            # default, exactly as before. RECOGNISED-BUT-UNAVAILABLE is the
+            # bug this guard exists for — `DOMAIN_KEYS` is unfiltered, so a
+            # "web" task in a web-off room resolved to chat.web, found it
+            # unreachable, and landed on the File agent, which answered a
+            # weather question from room content. Report MISSING instead.
+            # Belt to the braces of the generated enum + description: even
+            # if that ever drifts again, this cannot become a fabrication.
+            if norm is not None and norm not in live_domain_keys:
+                available = ", ".join(live_domain_keys) or "none"
+                batch.reports[idx] = (
+                    f"Task {idx} could not run: this room has no {key!r} "
+                    f"specialist right now (available: {available}). "
+                    "MISSING: tell the user plainly that this room cannot "
+                    "do that part — do not answer it from memory."
+                )
+                batch.task_ok[idx] = False
+                continue
+            entry, task = self._launch_task(task_spec, norm, wave_no, baton, batch)
+            running.append((idx, entry, task))
+        return running
+
+    def _launch_task(
+        self,
+        task_spec: dict[str, Any],
+        norm: str | None,
+        wave_no: int,
+        baton: list[str],
+        batch: _Batch,
+    ) -> tuple[dict[str, Any], asyncio.Task[WorkerOutcome]]:
+        """Resolve ONE task to a worker, claim its roster slot, and start it."""
+        domain = DOMAIN_KEYS.get(norm, "") if norm else ""
+        instruction = str(task_spec["instruction"])
+        worker_id = resolve_worker(
+            # An unknown/absent domain key falls through to
+            # resolve_worker's own default rather than being refused.
+            domain,
+            instruction,
+            served_names=self.served_names,
+            web_enabled=bool(self.state.get("web_enabled", False)),
+        )
+        entry = self.register(worker_id, instruction, wave_no)
+        dep_reports = tuple(
+            batch.reports[d]
+            for d in sorted(set(task_spec.get("depends_on", [])))
+            if d in batch.reports
+        )
+        # Its own dependencies first; earlier ROUNDS' findings behind
+        # them, so a plan that follows a previous round still sees what
+        # that round learned.
+        upstream = dep_reports + self.carryover
+        return entry, asyncio.create_task(
+            self.tracked(
+                entry,
+                worker_id,
+                instruction,
+                entry["key"],
+                baton,
+                upstream=upstream,
+            )
+        )
+
+    async def _collect_wave(
+        self,
+        running: list[tuple[int, dict[str, Any], asyncio.Task[Any]]],
+        batch: _Batch,
+    ) -> bool:
+        """Await one wave and record it into ``batch``. True when a child came
+        back cancelled — Stop landed inside it, so the wave loop must stop."""
+        results = await asyncio.gather(
+            *(t for _, _, t in running), return_exceptions=True
+        )
+        cancelled_any = False
+        for (idx, entry, _), result in zip(running, results):
+            label = get_agent(str(entry["agent"])).label
+            if isinstance(result, BaseException):
+                # One task failing must not abort its siblings or the plan:
+                # the Main agent is told, and decides what to do with the
+                # rest. A raised exception here would strand the whole batch.
+                batch.reports[idx] = f"Task {idx} ({label}) failed: {result}"
+                batch.task_ok[idx] = False
+                continue
+            report, child_ok, child_cancelled, child_refs = result
+            batch.task_ok[idx] = bool(child_ok)
+            batch.reports[idx] = f"Task {idx} — {report}"
+            cancelled_any = cancelled_any or child_cancelled
+            for ref in child_refs:
+                if ref not in batch.gathered:
+                    batch.gathered.append(ref)
+        return cancelled_any
+
+    async def launch(self, calls: list[ToolCall], seen: set[str]) -> None:
+        """Start every delegation in ``calls``; collect none of them.
+
+        Each one is parked in ``self.tasks`` under its call id for the
+        sequential pass to await IN CALL ORDER. ``seen`` is the caller's memo of
+        this turn's already-successful calls, read-only.
+        """
+        for call in calls:
+            if call.name == BATCH_TOOL_NAME:
+                key = call.key()
+                if key in seen or key in self.launched:
+                    continue
+                plan = parse_plan((call.arguments or {}).get("tasks"))
+                if not plan:
+                    continue  # answered inline by the caller with a corrective note
+                self.launched.add(key)
+                self.launched_label[call.id] = "task plan"
+                # The size is recorded HERE, where the plan is already parsed:
+                # the progress line used to re-parse the whole argument just to
+                # count its tasks.
+                self.plan_sizes[call.id] = len(plan)
+                self.tasks[call.id] = asyncio.create_task(self.run_plan(plan))
+                continue
+            if call.name not in AGENT_TOOL_NAMES:
+                continue
+            key = call.key()
+            # Same-round duplicate: the sequential pass answers the repeat from
+            # `seen`/the duplicate note, so it must not get its own worker.
+            if key in seen or key in self.launched:
+                continue
+            self.launched.add(key)
+            instruction = str(
+                (call.arguments or {}).get("instruction") or self.state.get("question", "")
+            )
+            # Resolve HERE, not inside the worker: the pipeline roster has to be
+            # registered in call order before anything runs concurrently.
+            worker_id = resolve_worker(
+                call.name,
+                instruction,
+                served_names=self.served_names,
+                web_enabled=bool(self.state.get("web_enabled", False)),
+            )
+            entry = self.register(worker_id, instruction, 0)
+            self.launched_label[call.id] = get_agent(worker_id).label
+            self.tasks[call.id] = asyncio.create_task(
+                self.tracked(
+                    entry, worker_id, instruction, entry["key"], upstream=self.carryover
+                )
+            )
+
+    async def drain(self) -> None:
+        """Cancellation between calls must not orphan running sub-loops."""
+        for task in self.tasks.values():
+            if not task.done():
+                task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+
+
+@dataclass(slots=True)
+class _ToolPass:
+    """This round's SEQUENTIAL pass over the model's calls: one tool at a time,
+    in the model's own call order, and where SPEC §3.2's invariants live.
+
+    Extracted from ``execute_tools`` 2026-07-30, the second half of the split
+    that produced :class:`_Delegator`. It was a four-way dispatch inline in a
+    345-line node, every arm mutating a dozen shared locals, so the rules that
+    live here — duplicate suppression, the hub guard, "only SUCCESSFUL calls are
+    memoised", the LEDGER baton, the image handoff, drain-on-Stop — could be
+    reached only by invoking a compiled graph with a per-child scripted model.
+    They are unit-testable now.
+
+    A dataclass rather than a pile of parameters because the accumulators ARE
+    the state: every arm reads and writes several of them, and the node's whole
+    returned update is built from all of them at once (:meth:`to_updates`).
+    They are the SAME objects the caller unpacked and the same ones it hands
+    back, exactly as the inline locals were.
+
+    Sequential BY CONSTRUCTION: :meth:`run` awaits one arm before it looks at
+    the next call. A provider that pairs tool messages positionally sees a
+    scrambled transcript otherwise — which is why the delegations that DO
+    overlap are launched by :class:`_Delegator` before the pass starts and only
+    AWAITED here, in call order.
+    """
+
+    deps: Deps
+    config: RunnableConfig
+    state: AgentState
+    #: The ACTIVE sub-agent. The hub guard and `list_skills` scoping turn on it.
+    agent: AgentSpec
+    node: str
+    delegator: _Delegator
+    # --- the accumulators every arm mutates; see `for_round`
+    messages: list[Message]
+    seen: set[str]
+    attempted: set[str]
+    progress: list[str]
+    referents: list[str]
+    produced: list[str]
+    reports_so_far: list[tuple[str, str]]
+    unlocked: set[str]
+    pending_images: list[str]
+    #: The catalog a mid-round `request_tools` rebuilt, or None if none did —
+    #: the one key `to_updates` adds conditionally.
+    tools_update: list[dict[str, Any]] | None = None
+    all_dup: bool = True
+    cancelled: bool = False
+
+    @classmethod
+    def for_round(
+        cls,
+        deps: Deps,
+        state: AgentState,
+        config: RunnableConfig,
+        messages: list[Message],
+    ) -> _ToolPass:
+        """This round's pass, with every accumulator unpacked from ``state``.
+
+        COPIES of the state's collections, never the state's own objects (the
+        exception is ``messages``, which the node appends to in place exactly as
+        it always has): a LangGraph node returns its updates.
+        """
+        # The referent baton: artifacts later plan steps get told about by code.
+        referents: list[str] = list(state.get("referents", []))
+        # The FINDINGS baton: what specialists reported in EARLIER rounds. Carried
+        # to this round's children verbatim, so a "find X then act on X" chain never
+        # depends on the hub restating X in its own instruction.
+        reports_so_far: list[tuple[str, str]] = [
+            (str(a), str(b)) for a, b in state.get("reports", [])
+        ]
+        return cls(
+            deps=deps,
+            config=config,
+            state=state,
+            agent=get_agent(str(state.get("agent_id", ""))),
+            # Who is emitting: the hub, or one specific child slot. Stamped onto every
+            # step/step_status this loop emits (see AgentState.node_key).
+            node=str(state.get("node_key") or MAIN_NODE_KEY),
+            delegator=_Delegator.for_round(deps, config, state, referents, reports_so_far),
+            messages=messages,
+            seen=set(state.get("seen", set())),
+            # Every tool the model actually reached — the `verify` shapes' ground truth.
+            attempted=set(state.get("attempted", set())),
+            # The turn's verified action log (small-model mode re-injects it each round).
+            progress=list(state.get("progress", [])),
+            referents=referents,
+            # ...and the subset THIS loop produced, which is what the write gate reads.
+            produced=list(state.get("produced", [])),
+            reports_so_far=reports_so_far,
+            # Groups + catalog may change mid-round via request_tools.
+            unlocked=set(state.get("unlocked_groups", set())),
+            # Pixels captured this round, drained into a user message as soon as they
+            # appear (mirrors the Rust `effects.pending_images`).
+            pending_images=list(state.get("pending_images", [])),
+            cancelled=deps.cancel.cancelled,
+        )
+
+    async def fan_out(self, calls: list[ToolCall]) -> None:
+        """Fan-out: every delegation this round starts BEFORE any of them is awaited."""
+        # The Main agent's children run in PARALLEL. Its catalog is ask_*_agent and
+        # nothing else, so a round is either all-delegations (the Main agent) or
+        # all-regular-tools (a worker, whose catalog contains no ask_* at all) —
+        # which is why launching the delegations up front and then walking `calls`
+        # in order is safe: room tools still execute strictly sequentially, one at a
+        # time, exactly as before. Only the specialist sub-loops overlap.
+        #
+        # Awaiting in CALL ORDER (rather than as-completed) is deliberate: the tool
+        # messages must land in the same order the model emitted the calls, or a
+        # provider that pairs them positionally sees a scrambled transcript.
+        #
+        # A WORKER never delegates: its catalog holds no ask_* tool at all, so the
+        # whole scan is dead for one. Guarded ONCE here rather than tested per call
+        # inside the scan.
+        if self.agent.main:
+            await self.delegator.launch(calls, self.seen)
+
+        if self.delegator.tasks:
+            # One roster emit for the whole batch — every child in it is already
+            # marked `running`, so the UI lights them all at once. The legacy
+            # single active marker points at the first of them.
+            #
+            # Read OFF THE ROSTER (`_active_step` = the first slot still running)
+            # rather than computed as `len(pipeline) - len(tasks) + 1`, which was
+            # wrong whenever the two counts disagreed: an `ask_agents` call parks
+            # a `run_plan` task WITHOUT claiming a slot of its own (its tasks
+            # claim theirs later, inside `_launch_task`), so tasks outnumbered
+            # slots and the arithmetic walked BACKWARDS off the front of the
+            # roster — with an empty prior roster, one `ask_agents` call silently
+            # marked the Main agent active (`roster[-1]`) and two raised
+            # `IndexError: list index out of range` out of `execute_tools`,
+            # killing the turn. Found 2026-07-30; the same arithmetic is in
+            # 0.12.0. `_active_step` cannot go out of range by construction.
+            await _emit_pipeline(
+                self.deps,
+                self.delegator.pipeline,
+                active_step=_active_step(self.delegator.pipeline),
+            )
+
+    async def run(self, calls: list[ToolCall]) -> None:
+        """Walk this round's calls ONE AT A TIME, in the model's own call order —
+        each arm awaited before the next call is looked at, Stop checked BETWEEN
+        calls, and cancelling drains the in-flight children instead of orphaning
+        them."""
+        for call in calls:
+            # ADD-7: stop between tool calls.
+            if self.deps.cancel.cancelled:
+                self.cancelled = True
+                await self.delegator.drain()
+                break
+            # A skill may belong to ONE sub-agent, and `list_skills` scopes its
+            # answer to the caller. The Rust bridge is built per RUN, not per
+            # worker, so it cannot know which specialist is asking — we do, so the
+            # id is injected here rather than left to the model to remember.
+            if call.name == "list_skills":
+                call.arguments = {**(call.arguments or {}), "agent": self.agent.id}
+
+            key = call.key()
+            if key in self.seen:
+                # CHG-3: don't re-run an identical call or re-flood the context.
+                self.messages.append(
+                    tool_message(duplicate_call_note(call.name), call.name, call.id)
+                )
+                continue
+            self.all_dup = False
+
+            if self._rejected_by_hub_guard(call):
+                continue
+
+            # CHG-5: a human step label, not inline "⚙ name…" answer text. Stamped
+            # with the emitting loop's node so the UI can file it under the right
+            # agent — siblings run concurrently, so arrival order proves nothing.
+            await self.deps.emit(
+                {"t": "step", "v": tool_step_label(call.name), "node": self.node}
+            )
+
+            arm = self._arm_for(call)
+            if not await arm(call, key):
+                break
+
+        if self.delegator.tasks and not self.cancelled:
+            # The Main agent resumes — mark it active again so its chip pulses while
+            # it reads the batch's reports and decides the next move. This used to
+            # live at the tail of `_run_worker`; with a parallel batch it belongs
+            # here, once, after every child has been collected.
+            roster = self.delegator.pipeline
+            await _emit_pipeline(self.deps, roster, active_step=len(roster) + 1)
+
+    def _rejected_by_hub_guard(self, call: ToolCall) -> bool:
+        """True when this call was ANSWERED with the corrective note instead of
+        being run at all — the Main agent asking for a room tool."""
+        # Hub guard (v3): the MAIN agent never touches a room tool — even if
+        # the model drifts and emits one, it is rejected here, before the
+        # bridge, with a corrective note steering it back to delegation.
+        if (
+            self.agent.main
+            and call.name not in AGENT_TOOL_NAMES
+            and call.name != BATCH_TOOL_NAME
+        ):
+            self.messages.append(
+                tool_message(
+                    f"You have no tool named '{call.name}' — you are the Main "
+                    "agent and never act directly. Delegate with one of your "
+                    "ask_*_agent tools, or answer the user.",
+                    call.name,
+                    call.id,
+                )
+            )
+            return True
+        return False
+
+    def _arm_for(self, call: ToolCall) -> Callable[[ToolCall, str], Awaitable[bool]]:
+        """Which of the four kinds of call this is. Every arm returns "keep
+        going"; False stops the pass (Stop landed inside a child)."""
+        if call.name == "request_tools":
+            return self._request_tools
+        if call.name == BATCH_TOOL_NAME:
+            return self._batch
+        if call.name in AGENT_TOOL_NAMES:
+            return self._delegation
+        return self._room_tool
+
+    async def _request_tools(self, call: ToolCall, key: str) -> bool:
+        """One request_tools call: unlock a group and re-offer the catalog."""
+        # 2026-07-23: the lane escape hatch — resolved here, never sent to
+        # the bridge (the bridge has no such tool).
+        group = str((call.arguments or {}).get("group") or "")
+        result, ok, new_tools = _unlock_group(group, self.state, self.unlocked, self.messages)
+        if new_tools is not None:
+            self.tools_update = new_tools
+        await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
+        if ok:
+            self.seen.add(key)
+        self.progress.append(f"request_tools(group={group}) -> {'ok' if ok else 'error'}")
+        self.messages.append(tool_message(result, call.name, call.id))
+        return True
+
+    async def _batch(self, call: ToolCall, key: str) -> bool:
+        """One ``ask_agents`` call: collect the plan the fan-out already started."""
+        # A whole PLAN, already running wave by wave since the fan-out
+        # (`_Delegator.launch`). One call in, one tool message out.
+        task = self.delegator.tasks.get(call.id)
+        if task is None:
+            # `parse_plan` salvaged nothing. Say what was wrong rather than
+            # returning an empty report the model will read as "done".
+            await self.deps.emit({"t": "step_status", "ok": False, "node": self.node})
+            self.progress.append(f"{BATCH_TOOL_NAME}() -> unusable plan")
+            self.messages.append(tool_message(EMPTY_PLAN_NOTE, call.name, call.id))
+            return True
+        try:
+            report, ok, plan_cancelled, plan_refs = await task
+        except BaseException:
+            await self.delegator.drain()
+            raise
+        for ref in plan_refs:
+            if ref not in self.referents:
+                self.referents.append(ref)
+        if ok:
+            self.reports_so_far.append(("specialists", report))
+        await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
+        if ok:
+            self.seen.add(key)
+        self.progress.append(
+            f"{BATCH_TOOL_NAME}({self.delegator.plan_sizes.get(call.id, 0)} tasks)"
+            + (" -> reports received" if ok else " -> no reports")
+        )
+        self.messages.append(tool_message(report, call.name, call.id))
+        if plan_cancelled:
+            self.cancelled = True
+            await self.delegator.drain()
+            return False
+        return True
+
+    async def _delegation(self, call: ToolCall, key: str) -> bool:
+        """One ask_*_agent call: collect the specialist and record what it left."""
+        # Hub v3: the Main agent asked a specialist. Resolved and executed
+        # HERE — the bridge has no such tool; the worker's own sub-loop
+        # runs with its scoped box and only its REPORT returns to the
+        # main thread. The referent baton carries artifacts across
+        # specialists so no model has to remember another's work.
+        instruction = str(
+            (call.arguments or {}).get("instruction") or self.state.get("question", "")
+        )
+        report, ok, worker_cancelled, worker_refs = await self._child_outcome(
+            call, instruction
+        )
+        # Merge the child's baton in CALL order, de-duplicated: siblings ran
+        # blind to each other, so the union is what later rounds must see.
+        for ref in worker_refs:
+            if ref not in self.referents:
+                self.referents.append(ref)
+        if ok:
+            # Into the FINDINGS baton, so the NEXT round's specialists get
+            # this verbatim instead of the hub having to restate it.
+            self.reports_so_far.append(
+                (self.delegator.launched_label.get(call.id, "specialist"), report)
+            )
+        await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
+        if ok:
+            self.seen.add(key)
+        # Truthful either way: this log is the small model's only record of
+        # what actually happened, so it must never claim a report it lacks.
+        self.progress.append(
+            f"{call.name}({instruction[:60]}) -> "
+            + ("report received" if ok else "no report")
+        )
+        self.messages.append(tool_message(report, call.name, call.id))
+        if worker_cancelled:
+            self.cancelled = True
+            await self.delegator.drain()
+            return False
+        return True
+
+    async def _child_outcome(self, call: ToolCall, instruction: str) -> WorkerOutcome:
+        """Await ONE specialist and hand back its outcome, whatever happened."""
+        # Already running since the fan-out (`_Delegator.launch`) — this awaits
+        # it, it does not start it. A delegation with no task was launched by
+        # neither branch (only reachable if the batch scan and this one
+        # disagree), so run it inline rather than drop the call on the floor.
+        task = self.delegator.tasks.get(call.id)
+        try:
+            if task is None:
+                worker_id = resolve_worker(
+                    call.name,
+                    instruction,
+                    served_names=self.delegator.served_names,
+                    web_enabled=bool(self.state.get("web_enabled", False)),
+                )
+                fallback = self.delegator.register(worker_id, instruction, 0)
+                result = await _run_worker(
+                    self.state,
+                    self.config,
+                    worker_id,
+                    instruction,
+                    self.delegator.referents_at_launch,
+                    fallback["key"],
+                )
+                fallback["status"] = (
+                    "done" if result.ok and not result.cancelled else "failed"
+                )
+                return result
+            return await task
+        except asyncio.CancelledError:
+            # Stop, or the run being torn down. Not a specialist failure —
+            # let it propagate, after draining the siblings so they do not
+            # outlive the turn as orphans emitting into a dead run.
+            await self.delegator.drain()
+            raise
+        except Exception as exc:  # noqa: BLE001 - one child, not the ask
+            # ONE specialist blew up (a model error, the recursion limit).
+            # This used to re-raise, which killed the whole ask and threw
+            # away every sibling report that had already succeeded — while
+            # the identical crash inside `ask_agents` degraded to a per-task
+            # failure line, because `_Delegator.run_plan` writes out the right
+            # rule: "One task failing must not abort its siblings or the plan."
+            # The safer behaviour is now the DEFAULT rather than the special
+            # case. The Main agent is told, truthfully, and decides.
+            who = self.delegator.launched_label.get(call.id, "specialist")
+            return WorkerOutcome(f"The {who} could not finish: {exc}", False, False, [])
+
+    async def _room_tool(self, call: ToolCall, key: str) -> bool:
+        """One ordinary room tool, through the bridge — the only arm that does."""
+        outcome = await _run_one_tool(self.deps, call)
+        self.attempted.add(call.name)
+        ok = not outcome.is_error
+        # ADD-22: tell the UI whether the step succeeded, so a failed chip doesn't
+        # look identical to a successful one.
+        await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
+
+        if ok:
+            # Only remember successful calls, so a failed one may be re-attempted
+            # in a later round (bounded by the round backstop, not a retry cap).
+            self.seen.add(key)
+            result = outcome.text
+            # Referent baton: record produced artifacts so a LATER plan step's
+            # kickoff note can name them deterministically — and so the
+            # write-claim gate can tell a real write from a claimed one.
+            if call.name in LEDGER_TOOLS:
+                for artifact in _referent_names(call.name, call.arguments):
+                    entry_text = f"{call.name}: {artifact}"
+                    self.referents.append(entry_text)
+                    self.produced.append(entry_text)
+        else:
+            result = f"Tool error: {outcome.text}"
+        self.progress.append(
+            f"{call.name}({_args_summary(call.arguments)}) -> {'ok' if ok else 'error'}"
+        )
+
+        self.messages.append(tool_message(result, call.name, call.id))
+
+        # ADD-25: a perception tool captured pixels. Hand them to the (vision-
+        # capable) chat model as a USER message right after the tool result —
+        # Ollama reads images from user turns, not tool turns.
+        self.pending_images.extend(outcome.images)
+        if self.pending_images:
+            self.messages.append(user_message(IMAGE_HANDOFF, self.pending_images))
+            self.pending_images = []
+        return True
+
+    def to_updates(self, synth_turns: list[int]) -> dict[str, Any]:
+        """The node's state update. ``tools`` is the one conditional key: it
+        appears only if a mid-round `request_tools` rebuilt the offered catalog.
+        """
+        # A round of only repeats means the model is stuck: force a tool-less
+        # synthesis next round instead of spinning to the round backstop.
+        force_synthesis = bool(self.state.get("force_synthesis", False)) or self.all_dup
+
+        updates: dict[str, Any] = {
+            "messages": self.messages,
+            "seen": self.seen,
+            "force_synthesis": force_synthesis,
+            "round": self.state.get("round", 0) + 1,
+            "calls": [],
+            "pending_images": self.pending_images,
+            "progress": self.progress,
+            "referents": self.referents,
+            "produced": self.produced,
+            "reports": self.reports_so_far,
+            "attempted": self.attempted,
+            "synth_turns": synth_turns,
+            "synth": False,
+            "unlocked_groups": self.unlocked,
+            "pipeline": self.delegator.pipeline,
+            "cancelled": self.cancelled or self.deps.cancel.cancelled,
+        }
+        if self.tools_update is not None:
+            updates["tools"] = self.tools_update
+        return updates
+
+
 async def execute_tools(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Run this round's calls, with duplicate suppression and image handoff."""
+    """Run this round's calls, with duplicate suppression and image handoff.
+
+    Three phases, each its own unit: FAN OUT every delegation (concurrent,
+    :class:`_Delegator`), walk the calls one at a time (sequential,
+    :meth:`_ToolPass.run`), hand back the state update
+    (:meth:`_ToolPass.to_updates`). The assistant turn below is the only thing
+    still inline — it has to land between reading the model's calls and running
+    any of them.
+    """
     deps = _deps(config)
-    agent = get_agent(str(state.get("agent_id", "")))
-    # Who is emitting: the hub, or one specific child slot. Stamped onto every
-    # step/step_status this loop emits (see AgentState.node_key).
-    node = str(state.get("node_key") or MAIN_NODE_KEY)
     messages: list[Message] = state["messages"]
-    seen: set[str] = set(state.get("seen", set()))
     calls: list[ToolCall] = state.get("calls", [])
-    rnd = state.get("round", 0)
 
     # A GRAPH-synthesized tool turn is not the model speaking. `probe` and
     # `perceive` fire a deterministic call and never touch `final_text`, so
@@ -1024,520 +1935,10 @@ async def execute_tools(state: AgentState, config: RunnableConfig) -> dict[str, 
     if state.get("synth"):
         synth_turns.append(len(messages) - 1)
 
-    all_dup = True
-    cancelled = deps.cancel.cancelled
-    # Pixels captured this round, drained into a user message as soon as they
-    # appear (mirrors the Rust `effects.pending_images`).
-    pending_images: list[str] = list(state.get("pending_images", []))
-    # The turn's verified action log (small-model mode re-injects it each round).
-    progress: list[str] = list(state.get("progress", []))
-    # The referent baton: artifacts later plan steps get told about by code.
-    referents: list[str] = list(state.get("referents", []))
-    # ...and the subset THIS loop produced, which is what the write gate reads.
-    produced: list[str] = list(state.get("produced", []))
-    # The FINDINGS baton: what specialists reported in EARLIER rounds. Carried
-    # to this round's children verbatim, so a "find X then act on X" chain never
-    # depends on the hub restating X in its own instruction.
-    reports_so_far: list[tuple[str, str]] = [
-        (str(a), str(b)) for a, b in state.get("reports", [])
-    ]
-    # Every tool the model actually reached — the `verify` shapes' ground truth.
-    attempted: set[str] = set(state.get("attempted", set()))
-    # Groups + catalog may change mid-round via request_tools.
-    unlocked: set[str] = set(state.get("unlocked_groups", set()))
-    tools_update: list[dict[str, Any]] | None = None
-
-    # ----------------------------------------------------------------------- #
-    # Fan-out: every delegation this round starts BEFORE any of them is awaited.
-    # ----------------------------------------------------------------------- #
-    #
-    # The Main agent's children run in PARALLEL. Its catalog is ask_*_agent and
-    # nothing else, so a round is either all-delegations (the Main agent) or
-    # all-regular-tools (a worker, whose catalog contains no ask_* at all) —
-    # which is why launching the delegations up front and then walking `calls`
-    # in order is safe: room tools still execute strictly sequentially, one at a
-    # time, exactly as before. Only the specialist sub-loops overlap.
-    #
-    # Awaiting in CALL ORDER (rather than as-completed) is deliberate: the tool
-    # messages must land in the same order the model emitted the calls, or a
-    # provider that pairs them positionally sees a scrambled transcript.
-    pipeline: list[dict[str, Any]] = list(state.get("pipeline", []))
-    served_names = {
-        s.get("function", {}).get("name") for s in state.get("served_specs", [])
-    }
-    # The baton as it stood when the batch launched — every sibling reads the
-    # SAME snapshot, since none of them can see another's artifacts yet.
-    referents_at_launch = list(referents)
-    # Findings from EARLIER ROUNDS only, for the same reason: siblings dispatched
-    # together ran blind to each other, so handing one another's reports around
-    # would be a lie about what was known when. Last two: enough for a
-    # find-then-act chain without re-sending the whole turn every round.
-    carryover: tuple[str, ...] = tuple(
-        f"The {label} reported earlier in this turn:\n{text}"
-        for label, text in reports_so_far[-2:]
-    )
-    tasks: dict[str, asyncio.Task[tuple[str, bool, bool, list[str]]]] = {}
-    launched: set[str] = set()
-    #: call id -> the human label of whatever is running for it, so a crash can
-    #: be reported by name without re-resolving the worker in the error path.
-    launched_label: dict[str, str] = {}
-    # Children dispatched together share a batch number — the ONE fact that says
-    # "these ran at the same time", which no amount of roster diffing downstream
-    # can reconstruct reliably. Derived from the roster so it needs no state.
-    batch = max((int(e.get("batch") or 0) for e in pipeline), default=-1) + 1
-
-    async def _tracked(
-        entry: dict[str, Any],
-        worker_id: str,
-        instruction: str,
-        node_key: str,
-        baton: list[str] | None = None,
-        *,
-        upstream: tuple[str, ...] = (),
-    ) -> tuple[str, bool, bool, list[str]]:
-        """Run one child, flipping ITS roster slot as it starts and finishes.
-
-        The status flip has to happen where the child actually ends, not where
-        the parent collects it: reports are collected in call order, so a fast
-        third child would otherwise keep pulsing on screen until the slow first
-        one returned — the exact illusion this feature exists to remove.
-        """
-        try:
-            result = await _run_worker(
-                state,
-                config,
-                worker_id,
-                instruction,
-                referents_at_launch if baton is None else baton,
-                node_key,
-                upstream,
-            )
-        except asyncio.CancelledError:
-            # Stop pressed / a sibling failed the round. Mark it, but do NOT
-            # emit — nothing is draining the queue once the run is torn down.
-            entry["status"] = "failed"
-            raise
-        except Exception:
-            entry["status"] = "failed"
-            await _emit_pipeline(deps, pipeline, _active_step(pipeline))
-            raise
-        # result = (report, ok, cancelled, referents)
-        entry["status"] = "done" if result[1] and not result[2] else "failed"
-        await _emit_pipeline(deps, pipeline, _active_step(pipeline))
-        return result
-
-    def _register(worker_id: str, instruction: str, wave: int) -> dict[str, Any]:
-        """Claim this child's roster slot. Call order, before anything runs."""
-        entry: dict[str, Any] = {
-            "agent": worker_id,
-            "instruction": instruction,
-            "status": "running",
-            "batch": batch + wave,
-            "key": f"{worker_id}#{len(pipeline)}",
-        }
-        pipeline.append(entry)
-        return entry
-
-    async def _run_plan(
-        plan: list[dict[str, Any]],
-    ) -> tuple[str, bool, bool, list[str]]:
-        """Run one ``ask_agents`` batch wave by wave; one combined report back.
-
-        Independent tasks in a wave run concurrently; a wave starts only once
-        every task it depends on has reported, and those reports are handed to
-        the dependents verbatim. The whole plan is ONE tool call, so it returns
-        ONE tool message — the reports are labelled by task position, which is
-        what the model's `depends_on` indices refer to.
-        """
-        waves = plan_waves(plan)
-        reports: dict[int, str] = {}
-        #: Per-task outcome. The plan's own `ok` is the AND of these, so a batch
-        #: whose tasks all came back empty cannot render as a green step — the
-        #: same reason a single delegation's `ok` stopped being hardcoded True.
-        task_ok: dict[int, bool] = {}
-        gathered: list[str] = list(referents_at_launch)
-        cancelled_any = False
-        for wave_no, wave in enumerate(waves):
-            if deps.cancel.cancelled:
-                cancelled_any = True
-                break
-            baton = list(gathered)
-            running: list[tuple[int, dict[str, Any], asyncio.Task[Any]]] = []
-            for idx in wave:
-                task_spec = plan[idx]
-                domain = DOMAIN_KEYS.get(str(task_spec.get("agent", "")), "")
-                instruction = str(task_spec["instruction"])
-                worker_id = resolve_worker(
-                    # An unknown/absent domain key falls through to
-                    # resolve_worker's own default rather than being refused.
-                    domain,
-                    instruction,
-                    served_names=served_names,
-                    web_enabled=bool(state.get("web_enabled", False)),
-                )
-                entry = _register(worker_id, instruction, wave_no)
-                dep_reports = tuple(
-                    reports[d]
-                    for d in sorted(set(task_spec.get("depends_on", [])))
-                    if d in reports
-                )
-                # Its own dependencies first; earlier ROUNDS' findings behind
-                # them, so a plan that follows a previous round still sees what
-                # that round learned.
-                upstream = dep_reports + carryover
-                running.append(
-                    (
-                        idx,
-                        entry,
-                        asyncio.create_task(
-                            _tracked(
-                                entry,
-                                worker_id,
-                                instruction,
-                                entry["key"],
-                                baton,
-                                upstream=upstream,
-                            )
-                        ),
-                    )
-                )
-            await _emit_pipeline(deps, pipeline, _active_step(pipeline))
-            results = await asyncio.gather(
-                *(t for _, _, t in running), return_exceptions=True
-            )
-            for (idx, entry, _), result in zip(running, results):
-                label = get_agent(str(entry["agent"])).label
-                if isinstance(result, BaseException):
-                    # One task failing must not abort its siblings or the plan:
-                    # the Main agent is told, and decides what to do with the
-                    # rest. A raised exception here would strand the whole batch.
-                    reports[idx] = f"Task {idx} ({label}) failed: {result}"
-                    task_ok[idx] = False
-                    continue
-                report, child_ok, child_cancelled, child_refs = result
-                task_ok[idx] = bool(child_ok)
-                reports[idx] = f"Task {idx} — {report}"
-                cancelled_any = cancelled_any or child_cancelled
-                for ref in child_refs:
-                    if ref not in gathered:
-                        gathered.append(ref)
-            if cancelled_any:
-                break
-        text = "\n\n".join(reports[i] for i in sorted(reports)) or (
-            "No tasks ran — the plan was empty."
-        )
-        new_refs = [r for r in gathered if r not in referents_at_launch]
-        return text, bool(reports) and all(task_ok.values()), cancelled_any, new_refs
-
-    for call in calls:
-        if agent.main is False:
-            continue
-        if call.name == BATCH_TOOL_NAME:
-            key = call.key()
-            if key in seen or key in launched:
-                continue
-            plan = parse_plan((call.arguments or {}).get("tasks"))
-            if not plan:
-                continue  # answered inline below with a corrective note
-            launched.add(key)
-            launched_label[call.id] = "task plan"
-            tasks[call.id] = asyncio.create_task(_run_plan(plan))
-            continue
-        if call.name not in AGENT_TOOL_NAMES:
-            continue
-        key = call.key()
-        # Same-round duplicate: the sequential pass below answers the repeat
-        # from `seen`/the duplicate note, so it must not get its own worker.
-        if key in seen or key in launched:
-            continue
-        launched.add(key)
-        instruction = str(
-            (call.arguments or {}).get("instruction") or state.get("question", "")
-        )
-        # Resolve HERE, not inside the worker: the pipeline roster has to be
-        # registered in call order before anything runs concurrently.
-        worker_id = resolve_worker(
-            call.name,
-            instruction,
-            served_names=served_names,
-            web_enabled=bool(state.get("web_enabled", False)),
-        )
-        node_key = f"{worker_id}#{len(pipeline)}"
-        entry: dict[str, Any] = {
-            "agent": worker_id,
-            "instruction": instruction,
-            "status": "running",
-            "batch": batch,
-            "key": node_key,
-        }
-        pipeline.append(entry)
-        launched_label[call.id] = get_agent(worker_id).label
-        tasks[call.id] = asyncio.create_task(
-            _tracked(entry, worker_id, instruction, node_key, upstream=carryover)
-        )
-
-    if tasks:
-        # One roster emit for the whole batch — every child in it is already
-        # marked `running`, so the UI lights them all at once. The legacy
-        # single active marker points at the first of them.
-        await _emit_pipeline(
-            deps, pipeline, active_step=len(pipeline) - len(tasks) + 1
-        )
-
-    async def _drain_tasks() -> None:
-        """Cancellation between calls must not orphan running sub-loops."""
-        for task in tasks.values():
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-    for call in calls:
-        # ADD-7: stop between tool calls.
-        if deps.cancel.cancelled:
-            cancelled = True
-            await _drain_tasks()
-            break
-        # A skill may belong to ONE sub-agent, and `list_skills` scopes its
-        # answer to the caller. The Rust bridge is built per RUN, not per
-        # worker, so it cannot know which specialist is asking — we do, so the
-        # id is injected here rather than left to the model to remember.
-        if call.name == "list_skills":
-            call.arguments = {**(call.arguments or {}), "agent": agent.id}
-
-        key = call.key()
-        if key in seen:
-            # CHG-3: don't re-run an identical call or re-flood the context.
-            messages.append(tool_message(duplicate_call_note(call.name), call.name, call.id))
-            continue
-        all_dup = False
-
-        # Hub guard (v3): the MAIN agent never touches a room tool — even if
-        # the model drifts and emits one, it is rejected here, before the
-        # bridge, with a corrective note steering it back to delegation.
-        if (
-            get_agent(str(state.get("agent_id", ""))).main
-            and call.name not in AGENT_TOOL_NAMES
-            and call.name != BATCH_TOOL_NAME
-        ):
-            messages.append(
-                tool_message(
-                    f"You have no tool named '{call.name}' — you are the Main "
-                    "agent and never act directly. Delegate with one of your "
-                    "ask_*_agent tools, or answer the user.",
-                    call.name,
-                    call.id,
-                )
-            )
-            continue
-
-        # CHG-5: a human step label, not inline "⚙ name…" answer text. Stamped
-        # with the emitting loop's node so the UI can file it under the right
-        # agent — siblings run concurrently, so arrival order proves nothing.
-        await deps.emit({"t": "step", "v": tool_step_label(call.name), "node": node})
-
-        if call.name == "request_tools":
-            # 2026-07-23: the lane escape hatch — resolved here, never sent to
-            # the bridge (the bridge has no such tool).
-            group = str((call.arguments or {}).get("group") or "")
-            result, ok, new_tools = _unlock_group(group, state, unlocked, messages)
-            if new_tools is not None:
-                tools_update = new_tools
-            await deps.emit({"t": "step_status", "ok": ok, "node": node})
-            if ok:
-                seen.add(key)
-            progress.append(f"request_tools(group={group}) -> {'ok' if ok else 'error'}")
-            messages.append(tool_message(result, call.name, call.id))
-            continue
-
-        if call.name == BATCH_TOOL_NAME:
-            # A whole PLAN, already running wave by wave since the fan-out
-            # above. One call in, one tool message out.
-            task = tasks.get(call.id)
-            if task is None:
-                # `parse_plan` salvaged nothing. Say what was wrong rather than
-                # returning an empty report the model will read as "done".
-                await deps.emit({"t": "step_status", "ok": False, "node": node})
-                progress.append(f"{BATCH_TOOL_NAME}() -> unusable plan")
-                messages.append(tool_message(EMPTY_PLAN_NOTE, call.name, call.id))
-                continue
-            try:
-                report, ok, plan_cancelled, plan_refs = await task
-            except BaseException:
-                await _drain_tasks()
-                raise
-            for ref in plan_refs:
-                if ref not in referents:
-                    referents.append(ref)
-            if ok:
-                reports_so_far.append(("specialists", report))
-            await deps.emit({"t": "step_status", "ok": ok, "node": node})
-            if ok:
-                seen.add(key)
-            progress.append(
-                f"{BATCH_TOOL_NAME}({len(parse_plan((call.arguments or {}).get('tasks')))} tasks)"
-                + (" -> reports received" if ok else " -> no reports")
-            )
-            messages.append(tool_message(report, call.name, call.id))
-            if plan_cancelled:
-                cancelled = True
-                await _drain_tasks()
-                break
-            continue
-
-        if call.name in AGENT_TOOL_NAMES:
-            # Hub v3: the Main agent asked a specialist. Resolved and executed
-            # HERE — the bridge has no such tool; the worker's own sub-loop
-            # runs with its scoped box and only its REPORT returns to the
-            # main thread. The referent baton carries artifacts across
-            # specialists so no model has to remember another's work.
-            instruction = str(
-                (call.arguments or {}).get("instruction") or state.get("question", "")
-            )
-            # Already running since the fan-out above — this awaits it, it does
-            # not start it. A delegation with no task was launched by neither
-            # branch (only reachable if the batch scan and this one disagree),
-            # so run it inline rather than drop the call on the floor.
-            task = tasks.get(call.id)
-            try:
-                if task is None:
-                    worker_id = resolve_worker(
-                        call.name,
-                        instruction,
-                        served_names=served_names,
-                        web_enabled=bool(state.get("web_enabled", False)),
-                    )
-                    fallback_key = f"{worker_id}#{len(pipeline)}"
-                    fallback: dict[str, Any] = {
-                        "agent": worker_id,
-                        "instruction": instruction,
-                        "status": "running",
-                        "batch": batch,
-                        "key": fallback_key,
-                    }
-                    pipeline.append(fallback)
-                    report, ok, worker_cancelled, worker_refs = await _run_worker(
-                        state,
-                        config,
-                        worker_id,
-                        instruction,
-                        referents_at_launch,
-                        fallback_key,
-                    )
-                    fallback["status"] = "done" if ok and not worker_cancelled else "failed"
-                else:
-                    report, ok, worker_cancelled, worker_refs = await task
-            except asyncio.CancelledError:
-                # Stop, or the run being torn down. Not a specialist failure —
-                # let it propagate, after draining the siblings so they do not
-                # outlive the turn as orphans emitting into a dead run.
-                await _drain_tasks()
-                raise
-            except Exception as exc:  # noqa: BLE001 - one child, not the ask
-                # ONE specialist blew up (a model error, the recursion limit).
-                # This used to re-raise, which killed the whole ask and threw
-                # away every sibling report that had already succeeded — while
-                # the identical crash inside `ask_agents` degraded to a per-task
-                # failure line, because `_run_plan` writes out the right rule:
-                # "One task failing must not abort its siblings or the plan."
-                # The safer behaviour is now the DEFAULT rather than the special
-                # case. The Main agent is told, truthfully, and decides.
-                who = launched_label.get(call.id, "specialist")
-                report = f"The {who} could not finish: {exc}"
-                ok, worker_cancelled, worker_refs = False, False, []
-            # Merge the child's baton in CALL order, de-duplicated: siblings ran
-            # blind to each other, so the union is what later rounds must see.
-            for ref in worker_refs:
-                if ref not in referents:
-                    referents.append(ref)
-            if ok:
-                # Into the FINDINGS baton, so the NEXT round's specialists get
-                # this verbatim instead of the hub having to restate it.
-                reports_so_far.append((launched_label.get(call.id, "specialist"), report))
-            await deps.emit({"t": "step_status", "ok": ok, "node": node})
-            if ok:
-                seen.add(key)
-            # Truthful either way: this log is the small model's only record of
-            # what actually happened, so it must never claim a report it lacks.
-            progress.append(
-                f"{call.name}({instruction[:60]}) -> "
-                + ("report received" if ok else "no report")
-            )
-            messages.append(tool_message(report, call.name, call.id))
-            if worker_cancelled:
-                cancelled = True
-                await _drain_tasks()
-                break
-            continue
-
-        outcome = await _run_one_tool(deps, call)
-        attempted.add(call.name)
-        ok = not outcome.is_error
-        # ADD-22: tell the UI whether the step succeeded, so a failed chip doesn't
-        # look identical to a successful one.
-        await deps.emit({"t": "step_status", "ok": ok, "node": node})
-
-        if ok:
-            # Only remember successful calls, so a failed one may be re-attempted
-            # in a later round (bounded by the round backstop, not a retry cap).
-            seen.add(key)
-            result = outcome.text
-            # Referent baton: record produced artifacts so a LATER plan step's
-            # kickoff note can name them deterministically — and so the
-            # write-claim gate can tell a real write from a claimed one.
-            if call.name in LEDGER_TOOLS:
-                for artifact in _referent_names(call.name, call.arguments):
-                    entry_text = f"{call.name}: {artifact}"
-                    referents.append(entry_text)
-                    produced.append(entry_text)
-        else:
-            result = f"Tool error: {outcome.text}"
-        progress.append(
-            f"{call.name}({_args_summary(call.arguments)}) -> {'ok' if ok else 'error'}"
-        )
-
-        messages.append(tool_message(result, call.name, call.id))
-
-        # ADD-25: a perception tool captured pixels. Hand them to the (vision-
-        # capable) chat model as a USER message right after the tool result —
-        # Ollama reads images from user turns, not tool turns.
-        pending_images.extend(outcome.images)
-        if pending_images:
-            messages.append(user_message(IMAGE_HANDOFF, pending_images))
-            pending_images = []
-
-    # A round of only repeats means the model is stuck: force a tool-less
-    # synthesis next round instead of spinning to the round backstop.
-    force_synthesis = bool(state.get("force_synthesis", False)) or all_dup
-
-    if tasks and not cancelled:
-        # The Main agent resumes — mark it active again so its chip pulses while
-        # it reads the batch's reports and decides the next move. This used to
-        # live at the tail of `_run_worker`; with a parallel batch it belongs
-        # here, once, after every child has been collected.
-        await _emit_pipeline(deps, pipeline, active_step=len(pipeline) + 1)
-
-    updates: dict[str, Any] = {
-        "messages": messages,
-        "seen": seen,
-        "force_synthesis": force_synthesis,
-        "round": rnd + 1,
-        "calls": [],
-        "pending_images": pending_images,
-        "progress": progress,
-        "referents": referents,
-        "produced": produced,
-        "reports": reports_so_far,
-        "attempted": attempted,
-        "synth_turns": synth_turns,
-        "synth": False,
-        "unlocked_groups": unlocked,
-        "pipeline": pipeline,
-        "cancelled": cancelled or deps.cancel.cancelled,
-    }
-    if tools_update is not None:
-        updates["tools"] = tools_update
-    return updates
+    tool_pass = _ToolPass.for_round(deps, state, config, messages)
+    await tool_pass.fan_out(calls)
+    await tool_pass.run(calls)
+    return tool_pass.to_updates(synth_turns)
 
 
 async def synthesize(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -1603,6 +2004,13 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     # No per-agent budget narrows this any more: the Main agent delegates until
     # it has what it needs, bounded only by the shared runaway backstop.
     max_rounds = run_max_rounds
+    # The turn-wide ceiling is armed HERE rather than at the Deps construction
+    # site, because this is the single choke point every ask goes through — the
+    # HTTP route, a headless workflow `agent_run`, and the test harness all
+    # arrive by calling this function, and a bound that some entry points miss
+    # is not a bound. A caller that pre-set one keeps it.
+    if deps.turn_round_budget is None:
+        deps.turn_round_budget = req.resolved_turn_rounds()
 
     # The ask lives in `question` (a REQUIRED field); `messages` is optional
     # history. Chat callers ALSO append the ask as the final user turn, but
@@ -1732,10 +2140,33 @@ async def stream_events(req: RunRequest, deps_factory: Callable[[Emit], Deps]):
     async def driver() -> None:
         try:
             await run_agent(req, deps)
-        except asyncio.CancelledError:  # pragma: no cover - shutdown path
+        except asyncio.CancelledError:
+            # `finally` below still queues the sentinel, so the NDJSON stream closes
+            # CLEANLY — with neither `final` nor `error`. The host read that as a
+            # successful empty answer and saved a zero-byte reply (live QA 2026-07-30,
+            # the Yahoo/ETF task). A torn-down run must never look like a finished one:
+            # say so on the wire BEFORE propagating.
+            # ...and to the LOG as well as the wire. The wire message is one
+            # sentence for the user; the traceback is the only thing that says
+            # WHICH await died, and it is what `arcelle-sidecar.log` exists for
+            # (sidecar_lifecycle.rs mirrors stderr there — a bundled app has no
+            # other copy). Live QA 2026-07-30: three agents "lost the reply" and
+            # the log was empty, so the cause could only be guessed at.
+            _log.error("run torn down before it produced an answer", exc_info=True)
+            await queue.put(
+                {"t": "error", "v": "the run was torn down before it produced an answer"}
+            )
             raise
-        except Exception as exc:  # noqa: BLE001 - any failure must reach the host
-            await queue.put({"t": "error", "v": str(exc)})
+        except BaseException as exc:  # noqa: BLE001 - any failure must reach the host
+            # BaseException, not Exception: a bare `Exception` clause let every
+            # BaseException (SystemExit, KeyboardInterrupt, a nested CancelledError)
+            # out through the same silent door as above. `or type(...)` because
+            # str() on several httpx/asyncio errors is the empty string, which would
+            # emit {"t": "error", "v": ""} and tell the user nothing.
+            _log.error("run failed: %s", type(exc).__name__, exc_info=True)
+            await queue.put({"t": "error", "v": str(exc) or type(exc).__name__})
+            if not isinstance(exc, Exception):
+                raise
         finally:
             await queue.put(None)
 

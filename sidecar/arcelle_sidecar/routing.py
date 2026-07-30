@@ -36,7 +36,12 @@ tests, so a Hebrew question ("שמור את זה כקובץ") must find Hebrew h
 lane can never fire for a Hebrew-speaking user.
 
 The hint lists are product behaviour. If you change one here, change the Rust in
-the same commit or the two engines drift.
+the same commit or the two engines drift. They are also PUBLIC (they lost their
+leading underscore on 2026-07-30): ``manager.py`` scores the sibling workers of
+``app.ui`` and ``jobs.run`` on ``UI_HINTS`` / ``JOB_HINTS`` rather than
+duplicating them in the registry, and ``agents.py`` cites them by name. An
+underscore that another module imports across the boundary is a lie about the
+name's reach — this vocabulary is part of what the module ships.
 """
 
 from __future__ import annotations
@@ -90,6 +95,87 @@ UI_TOOL_NAMES: tuple[str, ...] = (
     "view_media_frame",
 )
 
+#: BROWSE-1: the private browser's tools. Mirrors
+#: ``commands::browse::BROWSE_TOOL_NAMES`` on the Rust side — the host only
+#: serves these when the room's web setting is on, so a browser box is
+#: automatically unreachable in a web-disabled room without a special case.
+BROWSE_TOOL_NAMES: tuple[str, ...] = (
+    "browse_open",
+    "browse_read",
+    "browse_find",
+    "browse_snapshot",
+    "browse_do",
+    "browse_look",
+)
+
+#: NAVIGATION INTENT — "take me to a place on the web", as opposed to "find out
+#: something from the web". When the Browser agent is reachable, ANY of these
+#: sends the ask to it outright, ahead of all hint scoring.
+#:
+#: THE BUG THIS EXISTS FOR (owner report 2026-07-30): "go to Google and search
+#: for X" routed to the SEARCH agent. Both siblings scored 2 — `go to` for the
+#: browser, `google` for search — and the tie fell to the longest matched hint,
+#: where "google" (6) beats "go to" (5). So the single most natural way to ask
+#: for the browser reliably got the thing that is not the browser, and the
+#: search agent then answered from a snippet of a page it never opened.
+#:
+#: Scoring cannot fix this, because the two lists overlap by design: a
+#: destination is very often a site whose NAME is also a search word. Navigation
+#: intent is not one more hint to weigh, it is a decision already made by the
+#: user — so it is a gate in front of the scorer, not an entry in it.
+#:
+#: Deliberately verbs and prepositions ONLY — never bare site names. "google
+#: the tallest building" is a search and must stay one; "go to google" is a
+#: destination. The verb is the whole signal.
+NAV_INTENT: tuple[str, ...] = (
+    # English: the verb, plus the "…to" forms people actually type. Both
+    # "go to" and "going to" are needed — neither is a substring of the other.
+    "go to",
+    "goto",
+    "going to",
+    "browse to",
+    "browse ",
+    "navigate to",
+    "navigate ",
+    "open the site",
+    "open the page",
+    "open the url",
+    "open up",
+    "visit",
+    "pull up",
+    "head to",
+    "head over to",
+    "take me to",
+    "load the page",
+    "load up",
+    "surf",
+    "on the browser",
+    "in the browser",
+    "use the browser",
+    "with the browser",
+    # Hebrew: same split — an imperative form and a "to the site" form.
+    "כנס ל",
+    "היכנס ל",
+    "תיכנס ל",
+    "לך ל",
+    "גלוש",
+    "פתח את האתר",
+    "פתח את הדף",
+    "נווט ל",
+    "בדפדפן",
+    "עם הדפדפן",
+)
+
+
+def wants_navigation(text: str) -> bool:
+    """Did the user ask to GO somewhere, rather than to find something out?
+
+    Substring matching like every other router here. A false positive costs a
+    page open where a search would have done; a false negative is the bug above.
+    """
+    q = text.lower()
+    return any(h in q for h in NAV_INTENT)
+
 #: The whole-file pass tools (ADD-32) plus the workflow CRUD/run tools.
 #: These MUST be dropped when the jobs router does not fire (graph._filter_catalog
 #: is a drop-list) — else they'd bloat every turn's catalog and defeat the
@@ -112,7 +198,7 @@ ADVISOR_TOOL_NAMES: tuple[str, ...] = ("consult_advisor",)
 
 # --- hint lists, verbatim from the Rust -------------------------------------
 
-_WRITE_HINTS: tuple[str, ...] = (
+WRITE_HINTS: tuple[str, ...] = (
     "edit", "change", "replace", "fix", "update", "rewrite", "write ", "add ",
     "create", "make ", "new file", "save", "delete", "remove", "set ", "fill",
     "insert", "append", "rename", "correct", "remember", "note ", "jot", "record",
@@ -124,7 +210,7 @@ _WRITE_HINTS: tuple[str, ...] = (
     "תיקייה", "טיוטה", "קובץ חדש",
 )
 
-_UI_HINTS: tuple[str, ...] = (
+UI_HINTS: tuple[str, ...] = (
     "click", "press ", "button", "screenshot", "screen", "scroll", "navigate",
     "menu", "sidebar", "watch", "frame", "video", "look at", "looking at",
     "interface", "use the app", "the app", "type in", "toggle", "what do you see",
@@ -140,7 +226,7 @@ _UI_HINTS: tuple[str, ...] = (
     "כפתור", "סרטון", "וידאו", "תמונה", "סגור", "עבור אל", "תפריט", "לוח",
 )
 
-_JOB_HINTS: tuple[str, ...] = (
+JOB_HINTS: tuple[str, ...] = (
     "whole", "entire", "entirely", "all of", "every ", "everything", "full",
     "fully", "complete", "completely", "cover", "thorough", "in depth",
     "in-depth", "translate", "book", "throughout", "end to end", "cover to cover",
@@ -156,9 +242,9 @@ _JOB_HINTS: tuple[str, ...] = (
     "כל בוקר", "כל יום", "כל שבוע", "פרק אחר פרק", "שורה אחר שורה",
 )
 
-_SKILL_HINTS: tuple[str, ...] = ("skill", "agent instruction", "מיומנות", "סקיל")
+SKILL_HINTS: tuple[str, ...] = ("skill", "agent instruction", "מיומנות", "סקיל")
 
-_MCP_MANAGEMENT_HINTS: tuple[str, ...] = (
+MCP_MANAGEMENT_HINTS: tuple[str, ...] = (
     "mcp", "connector", "connectors", "integration", "integrations",
     "מחבר", "מחברים", "אינטגרצ",
 )
@@ -171,27 +257,27 @@ def _any_hint(question: str, hints: tuple[str, ...]) -> bool:
 
 def wants_write_tools(question: str) -> bool:
     """Offer the file-mutating built-ins this turn? (agent.rs `wants_write_tools`)"""
-    return _any_hint(question, _WRITE_HINTS)
+    return _any_hint(question, WRITE_HINTS)
 
 
 def wants_ui_tools(question: str) -> bool:
     """Offer the UI/perception tools (and their system-prompt paragraph)? (agent.rs `wants_ui_tools`)"""
-    return _any_hint(question, _UI_HINTS)
+    return _any_hint(question, UI_HINTS)
 
 
 def wants_job_tools(question: str) -> bool:
     """Offer the whole-file pass tools (and their paragraph)? (agent.rs `wants_job_tools`)"""
-    return _any_hint(question, _JOB_HINTS)
+    return _any_hint(question, JOB_HINTS)
 
 
 def wants_skill_tools(question: str) -> bool:
     """Offer Agent Skill CRUD/resource tools only for a skill request."""
-    return _any_hint(question, _SKILL_HINTS)
+    return _any_hint(question, SKILL_HINTS)
 
 
 def wants_mcp_management_tools(question: str) -> bool:
     """Offer connector CRUD only when the user asks about MCP/connectors."""
-    return _any_hint(question, _MCP_MANAGEMENT_HINTS)
+    return _any_hint(question, MCP_MANAGEMENT_HINTS)
 
 
 def lane_label(*, ui: bool, write: bool, web_enabled: bool) -> str:
@@ -220,8 +306,16 @@ __all__ = [
     "SKILL_TOOL_NAMES",
     "MCP_MANAGEMENT_TOOL_NAMES",
     "UI_TOOL_NAMES",
+    "BROWSE_TOOL_NAMES",
+    "NAV_INTENT",
     "JOB_TOOL_NAMES",
     "ADVISOR_TOOL_NAMES",
+    "WRITE_HINTS",
+    "UI_HINTS",
+    "JOB_HINTS",
+    "SKILL_HINTS",
+    "MCP_MANAGEMENT_HINTS",
+    "wants_navigation",
     "wants_write_tools",
     "wants_ui_tools",
     "wants_job_tools",

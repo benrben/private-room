@@ -470,4 +470,72 @@ mod tests {
         assert!(generic_fallback);
     }
 
+    // ------------------------------------------------- the history hand-off
+    //
+    // What the model is given to work with. Measured 2026-07-28 on a
+    // revision-tracking task (four values, each revised 1-3 times across a
+    // ~104 KB conversation; score = fraction of the four CURRENT values still
+    // present in the payload the model finally saw, n=4 paired):
+    //
+    //     hand-off 49,152 B ....... 0.56
+    //     hand-off whole convo .... 1.00      +0.44, 4 wins / 0 losses
+    //
+    // The facts were amputated HERE, before the sidecar's compaction could
+    // compress them. Nothing downstream can restore what this dropped.
+
+    #[test]
+    fn the_hand_off_is_the_whole_conversation_not_a_window_slice() {
+        // It used to be derived from the engine's window (~49 KB local, ~6% of
+        // a cloud CLI's). Every engine now gets the same thing, because the
+        // sidecar compacts on every path rather than truncating again.
+        let local = crate::commands::history_budget_bytes("qwen3.5:4b");
+        let cloud = crate::commands::history_budget_bytes("claude-cli");
+        let provider = crate::commands::history_budget_bytes("openrouter::x/y");
+        assert_eq!(local, crate::commands::HISTORY_HANDOFF_MAX);
+        assert_eq!(local, cloud);
+        assert_eq!(local, provider);
+        // And it is far above the pre-fix 12,000 that cost the model every fact.
+        assert!(local > 12_000 * 10);
+    }
+
+    #[test]
+    fn a_long_conversation_survives_the_hand_off_intact() {
+        // ~104 KB, the size the experiment used. At the old 49,152 B budget
+        // this lost more than half the turns; at the new one it loses none.
+        let history: Vec<(String, String)> = (0..40)
+            .flat_map(|i| {
+                [
+                    ("user".to_string(), format!("Q{i} {}", "x".repeat(1_300))),
+                    ("assistant".to_string(), format!("A{i} {}", "y".repeat(1_300))),
+                ]
+            })
+            .collect();
+        let raw: usize = history.iter().map(|(_, c)| c.len()).sum();
+        assert!(raw > 100_000, "fixture too small: {raw}");
+
+        let kept = compact_history(history.clone(), crate::commands::history_budget_bytes("qwen3.5:4b"));
+        assert_eq!(kept.len(), history.len(), "turns were dropped");
+        // The OLDEST turn is the one truncation takes first, and the one a
+        // revision-tracking question most often needs.
+        assert!(kept[0].1.starts_with("Q0 "));
+
+        let old_budget = 49_152;
+        let starved = compact_history(history, old_budget);
+        assert!(
+            starved.len() < kept.len(),
+            "the old budget kept everything too — the fixture proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_backstop_still_bounds_a_years_old_room() {
+        let history: Vec<(String, String)> = (0..400)
+            .map(|i| ("user".to_string(), format!("T{i} {}", "z".repeat(2_000))))
+            .collect();
+        let kept = compact_history(history, crate::commands::history_budget_bytes(""));
+        let bytes: usize = kept.iter().map(|(_, c)| c.len()).sum();
+        assert!(bytes <= crate::commands::HISTORY_HANDOFF_MAX);
+        assert!(!kept.is_empty());
+    }
 }
+

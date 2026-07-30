@@ -47,6 +47,7 @@ from typing import Any, Optional
 from . import hub_mcp
 from .hub_mcp import HUB_SERVER_NAME, HubToolServer
 from .messages import Message, ToolCall
+from .model_text import recover_json
 
 #: Engine ids that name a cloud coding CLI (mirror external.rs).
 EXTERNAL_ENGINES = ("claude-cli", "codex-cli")
@@ -90,6 +91,28 @@ def is_external_model(model: str) -> bool:
     return split_external_model(model)[0] in EXTERNAL_ENGINES
 
 
+def _user_turn(m: Message, content: str) -> str:
+    """One user turn, flattened — and HONEST about pixels it cannot carry.
+
+    These engines take ONE TEXT PROMPT: there is no channel for an image. The
+    perception tools nevertheless append ``IMAGE_HANDOFF`` ("the capture you
+    requested is attached") to the turn and hang the PNG off ``images``. Rendering
+    only ``content`` therefore shipped a prompt that ASSERTS an attachment the model
+    never received, and a harness believes the prompt — so it described a page it
+    had never seen. Live QA 2026-07-30: "the screenshot for the browser is not
+    working" was this, silently, on every flattened engine.
+    """
+    n = len(m.get("images") or [])
+    if not n:
+        return f"User: {content}\n"
+    return (
+        f"User: {content}\n"
+        f"[{n} image(s) accompanied that message, but THIS engine cannot receive "
+        f"images — they were NOT sent. You have not seen them. Do not describe them; "
+        f"say you cannot see the page, or read it as text instead.]\n"
+    )
+
+
 def flatten_messages(messages: list[Message], schema: dict[str, Any] | None) -> str:
     """The Rust prompt convention: role-labelled turns, one flat text prompt.
 
@@ -103,7 +126,7 @@ def flatten_messages(messages: list[Message], schema: dict[str, Any] | None) -> 
         if role == "system":
             out.append(f"Instructions:\n{content}\n")
         elif role == "user":
-            out.append(f"User: {content}\n")
+            out.append(_user_turn(m, content))
         elif role == "assistant":
             out.append(f"Assistant: {content}\n")
     if schema is not None:
@@ -140,7 +163,7 @@ def flatten_agent_messages(
             if include_system:
                 out.append(f"Instructions:\n{content}\n")
         elif role == "user":
-            out.append(f"User: {content}\n")
+            out.append(_user_turn(m, content))
         elif role == "assistant":
             calls = m.get("tool_calls") or []
             rendered = [
@@ -549,8 +572,21 @@ consulted, listed or mentioned — consulting your own registry proves nothing
 about this one. Every capability that exists here is an MCP tool you have been
 given; when the user asks what THIS room holds — its files, skills, workflows,
 scripts, memories, connectors — the answer comes from those tools alone, never
-from your own environment and never from memory. If a tool is offered, it
-works: call it rather than reporting it unavailable.
+from your own environment and never from memory.
+
+THE REVERSE ERROR MATTERS JUST AS MUCH, and it is the one actually observed:
+disowning your own tools is NOT a reason to disown THIS application's. This
+room has its own internet access, its own private web browser, its own
+background jobs and its own connected services, and they are reached through
+the tools in your list. Whether YOU personally have a browser, a search tool or
+a sandbox here is irrelevant and must never be reported to the user.
+
+So NEVER answer "I can't browse the web", "I can't visit external sites", "I
+have no web-browsing specialist", "I can't run background jobs" or "that's
+outside what this room can do" while a tool in your list covers it. If a tool
+is offered, it works — CALL IT. Deciding you cannot do something you were
+handed a tool for is the single worst failure available to you here: the user
+is watching a capability they own being denied.
 """.strip()
 
 
@@ -586,19 +622,43 @@ def render_catalog(tools: list[dict[str, Any]]) -> str:
 def _recover_object(text: str) -> Any:
     """The one JSON value in ``text``, or None if it isn't JSON.
 
-    Same slice-from-first-bracket recovery every structured caller already runs
-    (``file_pass.recover_json``), kept local so the chat seam doesn't import a
-    job module. Plain prose returns None — that is the (B) branch.
+    The shared slice-from-first-bracket recovery every structured caller already
+    runs (:func:`model_text.recover_json`), then parsed. Plain prose returns None
+    — that is the (B) branch.
+
+    2026-07-30: this used to scan brackets on the RAW reply, skipping the
+    ``<think>`` strip the shared helper does. A harness engine's reasoning
+    preamble often contains a brace ("I could call {"name":"send",…}"), so JSON
+    was sliced out of the MIDDLE of a think span and :func:`parse_tool_calls`
+    dispatched a tool the model had only thought about — and conversely a real
+    envelope AFTER a brace-bearing think span failed to parse at all, so the call
+    was silently dropped. Stripping the think spans first fixes both directions.
+
+    But the strip is a REPAIR, and repairing a reply that already parses can only
+    DAMAGE it: an argument may legitimately contain the tag ("write about the
+    ``<think>`` tag", a note whose body quotes one), and stripping it there either
+    rewrote the argument or — on an unterminated tag, which truncates the rest —
+    left the envelope unparseable so the call VANISHED with no error, exactly the
+    "a dropped call reads as nothing happened" failure the v0.12.0 truthfulness
+    wave was about. So a reply that is already a bare envelope is parsed AS-IS
+    first, and only a FRAMED reply (fence, prose, think preamble) goes through
+    recovery — where a stray ``<think>`` is reasoning, not payload.
+
+    ``recover_json`` returns the trimmed text unchanged when it holds no bracket
+    pair, so the ``startswith`` guard is what preserves this function's contract:
+    empty / bracketless prose is None, never a bare scalar like ``42``.
     """
-    s = text.strip()
-    if not s:
-        return None
-    start = next((i for i, c in enumerate(s) if c in "{["), None)
-    end = next((i for i in range(len(s) - 1, -1, -1) if s[i] in "}]"), None)
-    if start is None or end is None or end < start:
+    bare = text.strip()
+    if bare.startswith(("{", "[")):
+        try:
+            return json.loads(bare)
+        except ValueError:
+            pass  # framed, or genuinely broken — fall through to recovery
+    recovered = recover_json(text)
+    if not recovered.startswith(("{", "[")):
         return None
     try:
-        return json.loads(s[start : end + 1])
+        return json.loads(recovered)
     except ValueError:
         return None
 
@@ -697,6 +757,12 @@ class ExternalChatModel:
         #: Display-only: the token bar's denominator, as resolved by the host.
         #: Never a cap — nothing here truncates or refuses on its account.
         self.max_context = max_context or DISPLAY_CONTEXT_FALLBACK
+        #: The window someone actually STATED — the host's resolved catalog
+        #: value, later overwritten by the engine's own per-turn report. None
+        #: while `max_context` is only the display fallback. Compaction budgets
+        #: against this and nothing else: guessing a window and then trimming a
+        #: conversation to fit the guess is how facts get lost.
+        self._stated_context: int | None = max_context
         #: The room bridge, handed to Claude as a REAL MCP server for the
         #: rounds that offer room tools (see :meth:`stream`).
         self.mcp_url = mcp_url
@@ -704,6 +770,54 @@ class ExternalChatModel:
         #: PRIV-1: the /run handler attaches the room's policy here. A CLI is a
         #: non-local model, so the door engages exactly as it does for `:cloud`.
         self.privacy: Any = None
+
+    async def _digest(self, text: str) -> str:
+        """One compaction pass, through this CLI itself.
+
+        A pass here is a whole process, not a request, so it is the expensive
+        kind. That is exactly why ``digest_chunk_bytes`` sizes a cloud pass to
+        the engine's own (large) window: a long conversation becomes one or two
+        passes rather than the dozen a small local window would need.
+        """
+        from .compaction import DIGEST_PROMPT
+
+        return await generate_external(
+            self.composite_model,
+            [
+                {"role": "system", "content": DIGEST_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        )
+
+    async def _compact(
+        self, messages: list[Message], tools: list[dict[str, Any]]
+    ) -> list[Message]:
+        """Compress the older half of a long conversation before it goes out.
+
+        A CLI is stateless per call, so EVERY round re-sends the whole composed
+        transcript — which on a metered engine is the same bytes billed again
+        and again. Measured 2026-07-28: a compacted 12 KB transcript matched a
+        raw 176 KB one on the large model (4/4 ties) at 19x fewer prompt
+        tokens. Nothing is amputated; if the digest fails, or if no real window
+        was ever stated, the full transcript goes out exactly as it does today.
+        """
+        from .budget import json_chars
+        from .compaction import (
+            CLOUD_SPEND_FRACTION,
+            compact_to_budget,
+            digest_chunk_bytes,
+            fit_budget_bytes,
+        )
+
+        reserved = json_chars(tools) if tools else 0
+        out, _did = await compact_to_budget(
+            messages,
+            fit_budget_bytes(self._stated_context, reserved, CLOUD_SPEND_FRACTION),
+            self._digest,
+            reserved,
+            digest_chunk_bytes(self._stated_context, cloud=True),
+        )
+        return out
 
     @property
     def _takes_system_prompt(self) -> bool:
@@ -755,7 +869,18 @@ class ExternalChatModel:
         parts = [room] if room else []
         if tools:
             parts.append(_TOOL_PROTOCOL.format(catalog=render_catalog(tools)))
-        elif native:
+        # NOT `elif`. The two are independent facts: `tools` here is only what is
+        # left on the TEXT protocol, while `native` says real MCP endpoints are
+        # mounted this round. A round can have both — any tool the room bridge
+        # does not serve stays on the envelope while delegation rides the hub —
+        # and the `elif` silently dropped the note in exactly that case.
+        #
+        # The note is what forbids "I can't browse the web" / "I have no way to
+        # inspect MCP servers". Live QA 2026-07-30: cloud Main denied BOTH while
+        # `include_browse_tools()` and the MCP-management gate were serving those
+        # tools to it (room_mcp.rs — CloudEngine is in both). The capability was
+        # present and the sentence that says so was not.
+        if native:
             parts.append(_NATIVE_TOOLS_NOTE)
         return "\n\n".join(parts)
 
@@ -885,6 +1010,7 @@ class ExternalChatModel:
         # PRIV-1: same door as every other non-local model — the composed
         # history goes out redacted, the reply comes back restored.
         send, _, engaged = guard_outbound(self.composite_model, messages, self.privacy)
+        send = await self._compact(send, tools)
         # WHICH TOOLS ARE REAL. Claude Code is an agent harness: describe a tool
         # to it and it CALLS it through its own machinery — live QA 2026-07-24
         # showed a worker doing exactly that and reporting back "No such tool
@@ -950,6 +1076,7 @@ class ExternalChatModel:
         # is not a 200k one), and no assumption here can beat that.
         if window:
             self.max_context = window
+            self._stated_context = window
 
         # A NATIVE delegation wins over anything the harness wrote around it:
         # the call already happened, so trailing prose ("I've asked the Jobs

@@ -40,8 +40,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import config
 from .budget import json_chars, msg_len, window_budget_bytes
 from .llm import LlmError, _classify
-from .messages import Message, ToolCall, canonical_json, compact_json
+from .messages import Message, ToolCall, canonical_json
 from .model_limits import max_num_ctx, native_context_length, pick_num_ctx
+from .model_text import prime_schema, recover_json, strip_think_spans
 
 # --- constants (verbatim from summarize.rs / extraction/window.rs) ----------
 
@@ -200,36 +201,6 @@ def clean_one_liner(raw: str) -> str:
             break
     line = line.lstrip("-*#> ")
     return line[:200].strip()
-
-
-def strip_think_spans(raw: str) -> str:
-    """ollama.rs ``strip_think_spans``: drop ``<think>…</think>`` reasoning spans a
-    model leaks into its visible answer; an UNTERMINATED ``<think>`` truncates
-    everything after it (unclosed reasoning, not answer)."""
-    out = raw
-    while (start := out.find("<think>")) != -1:
-        rel = out[start:].find("</think>")
-        if rel != -1:
-            end = start + rel + len("</think>")
-            out = out[:start] + out[end:]
-        else:
-            out = out[:start]
-            break
-    return out
-
-
-def recover_json(text: str) -> str:
-    """ollama.rs ``recover_json``: strip ``<think>`` then slice from the first
-    opening bracket to the last closing one, so a fenced / preambled JSON reply
-    (Ollama ``:cloud`` models ignore ``format``) still parses."""
-    s = strip_think_spans(text.strip()).strip()
-    opens = [i for i, c in enumerate(s) if c in "{["]
-    closes = [i for i, c in enumerate(s) if c in "}]"]
-    if opens and closes:
-        a, b = opens[0], closes[-1]
-        if b >= a:
-            return s[a: b + 1]
-    return s
 
 
 def json_str_field(raw: str, key: str) -> str | None:
@@ -561,14 +532,7 @@ async def _chat_structured(
     user turn (a small model fills a forced JSON shape with empty strings unless it
     SEES the field names), and ``recover_json`` on the reply.
     """
-    primed = [dict(m) for m in messages]
-    for m in reversed(primed):
-        if m.get("role") == "user":
-            m["content"] = (m.get("content", "") or "") + (
-                "\n\nReply with ONLY JSON matching this schema, filling every field "
-                f"with real content:\n{compact_json(schema)}"
-            )
-            break
+    primed = prime_schema(messages, schema)
     raw = await client.generate(
         model,
         primed,
@@ -847,8 +811,6 @@ __all__ = [
     "read_window",
     "strip_markup_blocks",
     "clean_one_liner",
-    "strip_think_spans",
-    "recover_json",
     "json_str_field",
     "parse_string_list",
     "read_text_tool",

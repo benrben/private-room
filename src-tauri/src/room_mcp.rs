@@ -124,6 +124,21 @@ impl ToolScope {
     fn include_media_perception(self) -> bool {
         matches!(self, ToolScope::CloudEngine | ToolScope::ExternalAgent)
     }
+    /// BROWSE-1: the private browser's tools. Same trust class as
+    /// `include_media_perception` plus the local engine — the browser shows WEB
+    /// content, never the user's screen, so the reason `include_ui_tools` is
+    /// local-only does not apply here. A merely CONSULTED advisor still never
+    /// gets them: driving a browser is an action, not advice.
+    ///
+    /// The doors that make this safe are engine-independent by construction:
+    /// the navigation guard, the password fence and the outbound-typing consent
+    /// all live in Rust, below every engine.
+    fn include_browse_tools(self) -> bool {
+        matches!(
+            self,
+            ToolScope::LocalEngine | ToolScope::CloudEngine | ToolScope::ExternalAgent
+        )
+    }
     /// Connector configuration can start local programs or reach remote
     /// services, so its CRUD tools belong only to the engine the user chose to
     /// run this room — local or a cloud CLI — never to a consulted advisor or
@@ -174,9 +189,12 @@ impl AdvisorRuntime {
     }
 
     fn tool(&self) -> Option<serde_json::Value> {
-        (!self.advisors.is_empty())
-            .then(|| commands::consult_advisor_spec(&self.advisors))
-            .and_then(|spec| to_mcp_tool(&spec, true))
+        // `consult_advisor_spec` itself returns None when no RECOGNISED CLI is
+        // present, so an `advisors` list carrying only unknown ids serves no
+        // tool rather than one with an unsatisfiable empty enum.
+        commands::consult_advisor_spec(&self.advisors)
+            .as_ref()
+            .and_then(|spec| to_mcp_tool(spec, true))
     }
 }
 
@@ -261,6 +279,9 @@ pub struct StartOpts {
     /// Present only for a top-level model turn with Advisors enabled. Nested
     /// advisor bridges and persistent Leash servers always leave this `None`.
     pub advisor: Option<AdvisorRuntime>,
+    /// The room's per-agent web switches (Settings → Online features). Defaults
+    /// to both ON, so a caller that does not care keeps today's catalog.
+    pub lanes: commands::WebLanes,
 }
 
 /// Bind loopback and serve MCP until `stop()`. `scope` fixes what the bridge
@@ -313,6 +334,7 @@ pub async fn start(
     let tool_ran_task = tool_ran.clone();
     let privacy_bypass = opts.privacy_bypass;
     let advisor = opts.advisor;
+    let lanes = opts.lanes;
     let task = tauri::async_runtime::spawn(async move {
         // Each connection watches the same shutdown channel, so `stop()`
         // severs LIVE keep-alive connections too — not just future accepts (a
@@ -332,7 +354,7 @@ pub async fn start(
                     let advisor = advisor.clone();
                     tauri::async_runtime::spawn(async move {
                         let _ = handle_conn(
-                            stream, app, tok, web_enabled, scope, effects, tool_ran, rx,
+                            stream, app, tok, web_enabled, lanes, scope, effects, tool_ran, rx,
                             privacy_bypass, advisor,
                         )
                         .await;
@@ -395,6 +417,7 @@ async fn handle_conn(
     app: tauri::AppHandle,
     token: String,
     web_enabled: bool,
+    lanes: commands::WebLanes,
     scope: ToolScope,
     effects: Option<EffectsSink>,
     tool_ran: Arc<AtomicBool>,
@@ -412,6 +435,7 @@ async fn handle_conn(
                 &app,
                 &body,
                 web_enabled,
+                lanes,
                 scope,
                 effects.as_ref(),
                 &tool_ran,
@@ -550,6 +574,7 @@ async fn dispatch_jsonrpc(
     app: &tauri::AppHandle,
     body: &[u8],
     web_enabled: bool,
+    lanes: commands::WebLanes,
     scope: ToolScope,
     effects: Option<&EffectsSink>,
     tool_ran: &AtomicBool,
@@ -574,13 +599,14 @@ async fn dispatch_jsonrpc(
         })),
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => Ok(serde_json::json!({
-            "tools": served_tools(app, web_enabled, scope, advisor)
+            "tools": served_tools(app, web_enabled, lanes, scope, advisor)
         })),
         "tools/call" => {
             tool_call(
                 app,
                 &req["params"],
                 web_enabled,
+                lanes,
                 scope,
                 effects,
                 tool_ran,
@@ -632,6 +658,20 @@ fn arcelle_tool_annotations(name: &str) -> Option<serde_json::Value> {
         // Reads that may contact the public web. Arcelle only advertises them
         // when the room's Online features setting is enabled.
         "web_search" | "fetch_page" => (true, false, true, true),
+        // BROWSE-1: reads of a live web page. `open_world` because they reach
+        // the public internet; `read_only` because none of them changes the
+        // room. `browse_open` is NOT idempotent — loading a URL twice can post
+        // analytics, advance a session, or land somewhere else entirely.
+        "browse_read" | "browse_find" | "browse_snapshot" | "browse_look" => {
+            (true, false, true, true)
+        }
+        "browse_open" => (true, false, false, true),
+        // Driving a page is an ACTION on the open web: it can submit forms and
+        // spend the user's credentials on a site. Not read-only, not
+        // idempotent, and honestly open-world. Marked non-destructive because
+        // the room itself is untouched and every typing action carrying room
+        // data passes the outbound consent door first.
+        "browse_do" => (false, false, false, true),
         // A paid cloud consultation. It does not mutate the room, but it sends
         // the supplied question to the selected advisor and is not idempotent.
         "consult_advisor" => (false, false, false, true),
@@ -908,6 +948,13 @@ fn scoped_specs(web_enabled: bool, scope: ToolScope) -> Vec<serde_json::Value> {
     if scope.include_media_perception() {
         extras.extend(commands::media_tools_specs());
     }
+    // Gated on `web_enabled` — the user's existing "may this room reach the
+    // web" switch — rather than on the browser being open, which would be
+    // circular: the model could never call `browse_open` because the tool that
+    // opens the browser would only appear once it was already open.
+    if web_enabled && scope.include_browse_tools() {
+        extras.extend(commands::browse_tools_specs());
+    }
     list.extend(extras.iter().filter_map(|tool| to_mcp_tool(tool, true)));
     list
 }
@@ -919,6 +966,7 @@ fn scoped_specs(web_enabled: bool, scope: ToolScope) -> Vec<serde_json::Value> {
 fn served_tools(
     app: &tauri::AppHandle,
     web_enabled: bool,
+    lanes: commands::WebLanes,
     scope: ToolScope,
     advisor: Option<&AdvisorRuntime>,
 ) -> Vec<serde_json::Value> {
@@ -929,7 +977,7 @@ fn served_tools(
     } else {
         Vec::new()
     };
-    served_tools_with(web_enabled, scope, advisor, &routes)
+    served_tools_with(web_enabled, lanes, scope, advisor, &routes)
 }
 
 /// [`served_tools`] against routes the caller already has. `tools/call` needs
@@ -938,11 +986,25 @@ fn served_tools(
 /// connector's tools a second time, under the `mcp` lock, on every single call.
 fn served_tools_with(
     web_enabled: bool,
+    lanes: commands::WebLanes,
     scope: ToolScope,
     advisor: Option<&AdvisorRuntime>,
     routes: &[commands::McpRoute],
 ) -> Vec<serde_json::Value> {
     let mut list = scoped_specs(web_enabled, scope);
+    // The room's per-agent web switches, applied HERE because this one function
+    // is what both `tools/list` (line ~595) and `tools/call`'s allow-check go
+    // through — so a lane the user turned off is neither advertised nor
+    // executable, and the two can never disagree. `scoped_specs` above stays
+    // pure TIER truth ("what may this trust level ever serve"); a lane is user
+    // PREFERENCE layered on top, which is why they are separate steps.
+    if lanes != commands::WebLanes::ALL {
+        list.retain(|t| {
+            t.get("name")
+                .and_then(|n| n.as_str())
+                .is_none_or(|n| !lanes.blocks(n))
+        });
+    }
     if !matches!(scope, ToolScope::ExternalAgent) {
         if let Some(tool) = advisor.and_then(AdvisorRuntime::tool) {
             list.push(tool);
@@ -961,6 +1023,7 @@ async fn tool_call(
     app: &tauri::AppHandle,
     params: &serde_json::Value,
     web_enabled: bool,
+    lanes: commands::WebLanes,
     scope: ToolScope,
     effects_sink: Option<&EffectsSink>,
     tool_ran: &AtomicBool,
@@ -1009,7 +1072,7 @@ async fn tool_call(
     // `consult_advisor` appears only when this exact top-level bridge carries an
     // AdvisorRuntime. Nested advisor bridges carry None, so a fabricated call
     // cannot recurse even though the tool is available to every primary model.
-    if !served_tools_with(web_enabled, scope, advisor, &routes)
+    if !served_tools_with(web_enabled, lanes, scope, advisor, &routes)
         .iter()
         .any(|t| t["name"].as_str() == Some(&name))
     {
@@ -1170,11 +1233,11 @@ async fn tool_call(
         name: dispatch_name,
         arguments: dispatch_arguments,
     };
-    let window = app
-        .get_webview_window("main")
-        .ok_or("main window is gone")?
-        .as_ref()
-        .window();
+    // `crate::main_window`, NOT `get_webview_window` — see its doc comment. This
+    // is the dispatch point for EVERY tool the sidecar calls, and with the old
+    // lookup opening the private browser turned every one of them into
+    // "main window is gone" for the rest of the session.
+    let window = crate::main_window(app).ok_or("main window is gone")?;
     // ADD-33: the LOCAL engine accumulates effects into the run-scoped sink so
     // `wrote`/`annotation`/`boxes` reach the post-answer gate; a cloud scope uses
     // a throwaway default (its effects are correctly discarded). The tokio guard
@@ -1434,6 +1497,190 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecognised_advisor_serves_no_tool_instead_of_an_empty_enum() {
+        // The day a THIRD cloud CLI is added, `advisors` is non-empty but maps
+        // to no name: the old code emitted `"enum": []` — a parameter no value
+        // can satisfy, on a tool still advertised as callable. Serve nothing.
+        let runtime = AdvisorRuntime::new(
+            vec!["future-cli".into()],
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        assert!(runtime.tool().is_none(), "an unknown CLI must serve no tool");
+        assert!(commands::consult_advisor_spec(&["future-cli".to_string()]).is_none());
+        // A known CLI alongside an unknown one still works, listing only the
+        // one that can actually run.
+        let mixed = commands::consult_advisor_spec(&[
+            "future-cli".to_string(),
+            "codex-cli".to_string(),
+        ])
+        .expect("a recognised CLI must still serve the tool");
+        assert_eq!(
+            mixed["function"]["parameters"]["properties"]["advisor"]["enum"],
+            serde_json::json!(["codex"])
+        );
+    }
+
+    #[test]
+    fn every_served_tool_carries_annotations() {
+        // The fourth parity assertion (2026-07-28). Name-parity between the
+        // catalog, the dispatcher and BUILTIN_TOOL_NAMES is already pinned
+        // three ways, but `arcelle_tool_annotations` ends in `_ => return None`
+        // — so a tool added without an arm ships UNANNOTATED and silently: a
+        // destructive verb arrives at a non-interactive Codex subprocess with
+        // no `destructiveHint`, and nothing anywhere says so.
+        //
+        // Every tool, every tier, must be annotated.
+        for web in [true, false] {
+            for scope in [
+                ToolScope::CloudAdvisor { include_mcp: true },
+                ToolScope::CloudAdvisor { include_mcp: false },
+                ToolScope::CloudEngine,
+                ToolScope::LocalEngine,
+                ToolScope::ExternalAgent,
+            ] {
+                for tool in scoped_specs(web, scope) {
+                    let name = tool["name"].as_str().unwrap_or("<unnamed>");
+                    let ann = &tool["annotations"];
+                    assert!(
+                        ann.is_object(),
+                        "{name} ({scope:?}, web={web}) is served with no annotations — \
+                         add an arm to arcelle_tool_annotations"
+                    );
+                    for hint in [
+                        "readOnlyHint",
+                        "destructiveHint",
+                        "idempotentHint",
+                        "openWorldHint",
+                    ] {
+                        assert!(
+                            ann[hint].is_boolean(),
+                            "{name} ({scope:?}) is missing {hint}"
+                        );
+                    }
+                    // A read-only tool that also claims to be destructive is a
+                    // contradiction the client cannot act on.
+                    if ann["readOnlyHint"] == serde_json::json!(true) {
+                        assert_eq!(
+                            ann["destructiveHint"],
+                            serde_json::json!(false),
+                            "{name} is read-only AND destructive"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rough token count for a served catalog: ~4 chars per token is the usual
+    /// English approximation and is the right precision here — this guards an
+    /// order of magnitude, not a byte.
+    fn approx_tokens(specs: &[serde_json::Value]) -> usize {
+        specs
+            .iter()
+            .map(|s| serde_json::to_string(s).map(|t| t.len()).unwrap_or(0))
+            .sum::<usize>()
+            / 4
+    }
+
+    #[test]
+    fn each_tier_catalog_stays_inside_its_token_budget() {
+        // Context caps are engine-blind: the same catalog is sent to a room
+        // whose local window is 8k and to codex-cli's 272k. On the small end
+        // the catalog is a real fraction of the whole budget, and a catalog
+        // that quietly regrows is how a 4B starts context-shifting mid-turn
+        // and answering "Done." to work it never did.
+        //
+        // MEASURED 2026-07-28, web enabled (the larger case), after moving the
+        // workflow node grammar out of `save_workflow`'s description:
+        //   CloudAdvisor  26 tools  ~4.2k    CloudEngine    46 tools  ~7.3k
+        //   ExternalAgent 43 tools  ~7.0k    LocalEngine    49 tools  ~7.8k
+        //
+        // This is the BRIDGE catalog — what a cloud CLI or external agent sees
+        // whole. An in-room worker is narrowed to its box first (`toolbox_for`
+        // in the sidecar), so it never carries all of this; the tiers that do
+        // are the ones with big windows. The budgets below sit ~25% above the
+        // measurement: ordinary tool work never trips them, while a change that
+        // meaningfully grows the catalog has to come here and say so out loud.
+        // Lower them when a wave makes real headroom; never raise one without
+        // measuring the window it eats.
+        for (scope, budget) in [
+            (ToolScope::CloudAdvisor { include_mcp: true }, 5_300usize),
+            (ToolScope::CloudEngine, 9_100),
+            (ToolScope::LocalEngine, 9_700),
+            (ToolScope::ExternalAgent, 8_800),
+        ] {
+            let tokens = approx_tokens(&scoped_specs(true, scope));
+            assert!(
+                tokens <= budget,
+                "{scope:?} catalog is ~{tokens} tokens, over its {budget} budget — \
+                 if this growth is intended, raise the budget here and say why"
+            );
+        }
+    }
+
+    #[test]
+    fn the_workflow_grammar_is_not_in_the_always_served_description() {
+        // The 2,668-char node DSL used to live in `save_workflow`'s own
+        // description, so every turn that served the workflow tier paid for the
+        // whole grammar whether or not the model was authoring anything. It now
+        // rides the `list_workflows` RESULT — the free probe the Workflow
+        // agent's flow fires first — so it arrives once per task instead.
+        let save = scoped_specs(false, ToolScope::LocalEngine)
+            .into_iter()
+            .find(|t| t["name"] == "save_workflow")
+            .expect("save_workflow is served to LocalEngine");
+        let desc = save["description"].as_str().unwrap();
+        assert!(
+            desc.len() < 1_000,
+            "save_workflow's description is back up to {} chars",
+            desc.len()
+        );
+        // The grammar's distinctive tokens must be gone from the description...
+        for marker in ["dedupe_lines", "missing_summary", "strip_html", "plan_and_map"] {
+            assert!(!desc.contains(marker), "{marker} is back in the description");
+        }
+        // ...but the iteration contract it must NOT lose stays put.
+        assert!(desc.contains("VALIDATED: yes"));
+        assert!(desc.contains("DRAFT"));
+        // ...and the description must point at where the grammar now lives.
+        assert!(desc.contains("list_workflows"), "the model must be told where to look");
+
+        // The reference itself is complete, wherever it is served from.
+        let reference = crate::commands::WORKFLOW_NODE_REFERENCE;
+        for marker in [
+            "dedupe_lines",
+            "missing_summary",
+            "strip_html",
+            "plan_and_map",
+            "run_input",
+            "{{files}}",
+        ] {
+            assert!(reference.contains(marker), "{marker} missing from the node reference");
+        }
+    }
+
+    #[test]
+    fn the_mcp_proxy_pair_is_annotated_too() {
+        // These bypass `to_mcp_tool` (they are already MCP-shaped), so the
+        // sweep above cannot see them — assert them directly.
+        for tool in mcp_proxy_tools() {
+            let name = tool["name"].as_str().unwrap();
+            for hint in [
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
+                assert!(
+                    tool["annotations"][hint].is_boolean(),
+                    "{name} is missing {hint}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn head_end_and_headers() {
         let raw = b"POST /mcp HTTP/1.1\r\nContent-Length: 2\r\nAuthorization: Bearer abc\r\n\r\n{}";
         let end = find_head_end(raw).unwrap();
@@ -1510,6 +1757,137 @@ mod tests {
             "tool catalog drifted from {}; regenerate with UPDATE_TOOL_SNAPSHOT=1",
             path.display()
         );
+    }
+
+    /// The two per-agent web switches (owner decision 2026-07-30).
+    ///
+    /// The mechanism under test is deliberately indirect: a lane being off just
+    /// removes its tools from the served catalog, and the sidecar's
+    /// `worker_reachable` (which requires a worker's box to intersect that
+    /// catalog) does the rest. So what has to be true here is exactly "the tools
+    /// are gone, and ONLY those tools" — plus, critically, that `tools/call`
+    /// agrees with `tools/list`, since both go through `served_tools_with`.
+    #[test]
+    fn each_web_lane_can_be_switched_off_independently() {
+        use commands::WebLanes;
+        let names = |lanes: WebLanes| -> Vec<String> {
+            served_tools_with(true, lanes, ToolScope::LocalEngine, None, &[])
+                .into_iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let search_tools = ["web_search", "fetch_page"];
+        let both = names(WebLanes::ALL);
+        for n in search_tools.iter().chain(commands::BROWSE_TOOL_NAMES.iter()) {
+            assert!(both.contains(&n.to_string()), "{n} missing with both lanes on");
+        }
+
+        // Search off: the Web agent's box goes, the browser's stays.
+        let no_search = names(WebLanes { search: false, browse: true });
+        for n in search_tools {
+            assert!(!no_search.contains(&n.to_string()), "{n} survived search=off");
+        }
+        for n in commands::BROWSE_TOOL_NAMES {
+            assert!(no_search.contains(&n.to_string()), "{n} lost to an unrelated lane");
+        }
+
+        // Browser off: the mirror image.
+        let no_browse = names(WebLanes { search: true, browse: false });
+        for n in commands::BROWSE_TOOL_NAMES {
+            assert!(!no_browse.contains(&n.to_string()), "{n} survived browse=off");
+        }
+        for n in search_tools {
+            assert!(no_browse.contains(&n.to_string()), "{n} lost to an unrelated lane");
+        }
+
+        // Both off is a room with no web AGENTS but still a working room: the
+        // rest of the catalog must be untouched, or this would be
+        // indistinguishable from flipping the master switch.
+        let neither = names(WebLanes { search: false, browse: false });
+        for n in search_tools.iter().chain(commands::BROWSE_TOOL_NAMES.iter()) {
+            assert!(!neither.contains(&n.to_string()), "{n} survived both lanes off");
+        }
+        for core in ["list_room_files", "search_room", "open_file"] {
+            assert!(neither.contains(&core.to_string()), "{core} must not depend on a web lane");
+        }
+        assert!(
+            neither.len() + search_tools.len() + commands::BROWSE_TOOL_NAMES.len() == both.len(),
+            "turning the lanes off removed something other than the two web boxes"
+        );
+    }
+
+    /// A lane that is off must not merely be UNADVERTISED — it must be
+    /// unexecutable. `tools/call` name-checks against `served_tools_with`, so
+    /// this pins that the two use the same predicate rather than drifting into
+    /// "hidden but still callable", which is how a privacy switch becomes a lie.
+    #[test]
+    fn a_switched_off_lane_is_not_callable_either() {
+        use commands::WebLanes;
+        for (lanes, blocked) in [
+            (WebLanes { search: false, browse: true }, "web_search"),
+            (WebLanes { search: true, browse: false }, "browse_open"),
+        ] {
+            let served = served_tools_with(true, lanes, ToolScope::LocalEngine, None, &[]);
+            assert!(
+                !served
+                    .iter()
+                    .any(|t| t["name"].as_str() == Some(blocked)),
+                "{blocked} is still in the catalog tools/call validates against"
+            );
+            assert!(lanes.blocks(blocked), "{blocked} must be reported as lane-blocked");
+        }
+    }
+
+    /// BROWSE-1: the private browser rides the room's single internet switch.
+    ///
+    /// Live QA 2026-07-29: the first browser test failed with "this room does
+    /// not have a tool … to browse the live internet" — which was CORRECT (the
+    /// room was offline) but proved nothing about the wiring. This pins both
+    /// halves so the honest refusal and the working case are each a test.
+    #[test]
+    fn browse_tools_follow_the_rooms_internet_switch() {
+        for scope in [ToolScope::LocalEngine, ToolScope::CloudEngine, ToolScope::ExternalAgent] {
+            let off: Vec<_> = scoped_specs(false, scope)
+                .into_iter()
+                .filter(|t| t["name"].as_str().is_some_and(|n| n.starts_with("browse_")))
+                .collect();
+            assert!(off.is_empty(), "{scope:?} advertises browsing in an OFFLINE room");
+
+            let on: Vec<String> = scoped_specs(true, scope)
+                .into_iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .filter(|n| n.starts_with("browse_"))
+                .collect();
+            for name in commands::BROWSE_TOOL_NAMES {
+                assert!(
+                    on.iter().any(|n| n == name),
+                    "{scope:?} is missing {name} with the internet ON"
+                );
+            }
+        }
+        // A merely CONSULTED advisor never gets them, on or off: driving a
+        // browser is an action, not advice.
+        for include_mcp in [true, false] {
+            let advisor = scoped_specs(true, ToolScope::CloudAdvisor { include_mcp });
+            assert!(
+                !advisor.iter().any(|t| t["name"]
+                    .as_str()
+                    .is_some_and(|n| n.starts_with("browse_"))),
+                "a consulted advisor must never be able to drive the browser"
+            );
+        }
+    }
+
+    /// Diagnostic: print exactly what a LocalEngine room with the internet ON
+    /// is served, so the sidecar's `served_names` can be reproduced offline.
+    #[test]
+    #[ignore]
+    fn dump_local_engine_served_names() {
+        let names: Vec<String> = scoped_specs(true, ToolScope::LocalEngine)
+            .into_iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        println!("SERVED={}", serde_json::to_string(&names).unwrap());
     }
 
     #[test]

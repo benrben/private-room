@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "test:page": "node --test \"e2e/page-script/*.test.mjs\"",
     "e2e": "wdio run e2e/wdio.conf.mjs",
     "e2e:qa": "wdio run e2e/wdio.qa.conf.mjs",
     "e2e:mock": "node e2e/mock-ollama.mjs",

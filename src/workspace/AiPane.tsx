@@ -34,7 +34,10 @@ export default function AiPane({
   area: WorkArea;
 }) {
   const pendingApprovals =
-    s.mcpApprovals.length + s.editApprovals.length + s.scriptApprovals.length;
+    s.mcpApprovals.length +
+    s.editApprovals.length +
+    s.scriptApprovals.length +
+    s.browseConsents.length;
   const jobsRunning =
     s.jobs.filter((j) => j.status === "running" || j.status === "queued")
       .length +
@@ -254,7 +257,10 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
   );
 
   const pendingApprovals =
-    s.mcpApprovals.length + s.editApprovals.length + s.scriptApprovals.length;
+    s.mcpApprovals.length +
+    s.editApprovals.length +
+    s.scriptApprovals.length +
+    s.browseConsents.length;
   const running = s.jobs.filter(
     (j) => j.status === "running" || j.status === "queued",
   );
@@ -301,6 +307,20 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
               </div>
               <div className="activity-copy">
                 A connected tool wants to run — review the open consent card.
+              </div>
+            </div>
+          ))}
+          {s.browseConsents.map((r) => (
+            <div key={r.id} className="activity-row">
+              <div className="activity-row-head">
+                <span className="activity-row-title">
+                  Type room information into a page?
+                </span>
+                <span className="activity-state">Waiting</span>
+              </div>
+              <div className="activity-copy">
+                The assistant wants to type something private into {r.field} —
+                review the open consent card.
               </div>
             </div>
           ))}

@@ -48,9 +48,9 @@ from pydantic import BaseModel, ConfigDict
 
 from . import llm
 from .config import KEEP_ALIVE_WARM, ProviderConfig
-from .file_pass import recover_json
 from .graph import CancelToken
 from .messages import user_message
+from .model_text import recover_json
 
 # --------------------------------------------------------------------------- #
 # the one model call — wf_generate's exact body, minus the HTTP hop

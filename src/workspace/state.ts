@@ -16,6 +16,7 @@ import {
   Folder,
   FrontPage,
   Job,
+  BrowseConsentRequest,
   McpApproveRequest,
   McpServerStatus,
   Memory,
@@ -165,6 +166,9 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [mcpApprovals, setMcpApprovals] = useState<McpApproveRequest[]>([]);
+  // BROWSE-1: queued outbound-typing consent cards (room content about to be
+  // typed into a web page), mirroring mcpApprovals.
+  const [browseConsents, setBrowseConsents] = useState<BrowseConsentRequest[]>([]);
   // Wave 2 (Idea 6): queued diff-preview approval cards, mirroring mcpApprovals.
   const [editApprovals, setEditApprovals] = useState<EditApproveRequest[]>([]);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
@@ -385,6 +389,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     renamingFile, setRenamingFile, fileFilter, setFileFilter,
     addMenuOpen, setAddMenuOpen, roomMenuOpen, setRoomMenuOpen,
     modelMenuOpen, setModelMenuOpen, mcpApprovals, setMcpApprovals,
+    browseConsents, setBrowseConsents,
     editApprovals, setEditApprovals,
     dragOverFolder, setDragOverFolder, internalDragRef,
     renamingFolder, setRenamingFolder,

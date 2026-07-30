@@ -3,6 +3,94 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## Unreleased
+
+### One search engine, built in
+
+- **No more picking a search provider.** Settings → Online features used to make
+  you choose between DuckDuckGo and running your own SearXNG server (and, before
+  that, Brave with an API key you had to get yourself). All of that is gone. It's
+  now a single switch: let this room reach the internet, or don't.
+- **Search asks several engines at once and merges the answers.** One query fans
+  out to seven independent sources — general web engines, an encyclopedia, and a
+  news feed — and the results come back as one list, ranked by how highly the
+  engines rated each page *and* how many of them agreed on it. Pages several
+  engines put near the top rise to the top.
+- **A blocked engine no longer means a failed search.** Any single engine can be
+  rate-limited, ask for a human check, or change its layout; when that happens it
+  simply drops out and the rest still answer. The old setup had one engine, so
+  one bad day meant "search is broken, try again in a minute".
+- **Every result says where it came from.** Each hit now carries the engine that
+  found it, its date when the source publishes one, and how relevant it scored —
+  instead of the marketing blurb search pages print under a link.
+- **Rooms you already have keep working.** A room where you'd picked a provider
+  opens with the internet switch already on. Nothing to redo.
+
+### A private browser, and an assistant that can use it
+
+- **New Browser area: a web browser that keeps nothing.** It has no history, no
+  cookies, no cache and no saved logins — not "cleared on exit", but never
+  written to disk in the first place — and it blocks ads and trackers before
+  the request leaves your Mac. The shield in the toolbar is a live check of the
+  browser's own storage, not a label.
+- **Ask the assistant to look something up and it opens the page itself.** It
+  can read a page, find and click things, fill in forms, and look at the page
+  as a picture with every clickable thing numbered — the same numbers it uses
+  when it describes them to you, so you can follow along.
+- **You can take the wheel at any time.** "Take over" pauses the assistant's
+  browsing; it will say its tools are paused rather than pretending to act.
+- **Nothing of yours goes into a web page without you saying so.** If the
+  assistant is about to type something you marked private into a site, it stops
+  and shows you the exact text and the exact site first.
+- **The web forgets; your room remembers.** Everything the assistant did in the
+  browser — every page, click and consent — is kept in a Journal inside your
+  encrypted room, so you can read back exactly what happened. You can clear it
+  whenever you like.
+- **The browser can't be used to reach this Mac.** Addresses on your own
+  computer or home network are refused, in the address bar and inside pages
+  alike, and passwords fields are fenced off from the assistant entirely.
+
+### Answers you can trust
+
+- **A room with the internet turned off says so, instead of answering from your
+  files.** Arcelle still described "the internet" as one of its specialities in
+  a room where web access was off, so asking for the weather could quietly reach
+  the file specialist, which answered out of your documents. Every list of what
+  Arcelle can do is now built from what that room actually has, and a request
+  for a specialist the room does not have is reported plainly rather than
+  handed to a different one.
+- **Changing several files at once is all-or-nothing, as promised.** If one
+  entry in a multi-file change was missing its file name, that entry was
+  silently dropped and the rest were applied — and the result still said the
+  change had landed. Now the whole batch stops and names the entry to fix.
+- **A tool called without a file name no longer edits the wrong file.** A
+  missing name was treated as an empty search, which matched the most recently
+  added file in the room — so a malformed request could open, or edit, a file
+  nobody named. Every tool now refuses a request that is missing something it
+  requires, and says which part was missing.
+- **A skill can no longer be filed under a specialist that does not exist.** One
+  mistyped character used to save the skill to nowhere: it was never offered to
+  anyone and never shown to you again.
+
+### Connected services
+
+- **Connector tools keep their warnings.** Descriptions from connected services
+  were trimmed mid-sentence with nothing to show they had been cut, so a tool
+  documented as permanent and irreversible could arrive reading as routine.
+  Trimmed text is now marked, and the budget is measured in characters, so
+  Hebrew and other non-Latin descriptions get the same room as English.
+- **Connector options are no longer quietly hidden.** Where a connected tool
+  offered a long list of allowed values, everything past the first sixteen was
+  dropped with nothing said — those choices were simply unreachable. The list is
+  now far longer, and when it is still shortened Arcelle says so.
+
+### Faster on small models
+
+- **Less of every request is spent describing the tools.** The full workflow
+  node reference — the largest tool description in the app — moved out of every
+  turn and into the moment Arcelle actually looks up your workflows, leaving
+  more of a small local model's context for your actual question.
+
 ## 0.12.0 — 2026-07-27
 
 ### Answers you can trust

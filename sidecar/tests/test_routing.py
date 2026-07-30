@@ -9,16 +9,16 @@ import pytest
 
 import arcelle_sidecar
 from arcelle_sidecar.routing import (
+    JOB_HINTS,
     JOB_TOOL_NAMES,
+    MCP_MANAGEMENT_HINTS,
     MCP_MANAGEMENT_TOOL_NAMES,
+    SKILL_HINTS,
     SKILL_TOOL_NAMES,
+    UI_HINTS,
     UI_TOOL_NAMES,
+    WRITE_HINTS,
     WRITE_TOOL_NAMES,
-    _JOB_HINTS,
-    _MCP_MANAGEMENT_HINTS,
-    _SKILL_HINTS,
-    _UI_HINTS,
-    _WRITE_HINTS,
     lane_label,
     wants_job_tools,
     wants_mcp_management_tools,
@@ -68,14 +68,14 @@ def test_hint_lists_are_verbatim_ports_of_the_rust_arrays() -> None:
 
     # The three hint lists, order-exact. The UI list is the base HINTS followed
     # by APP_NAVIGATION_VERBS (agent.rs:807 `HINTS || APP_NAVIGATION_VERBS`).
-    assert _rust_str_list(src, "fn wants_write_tools") == _WRITE_HINTS
-    assert _rust_str_list(src, "fn wants_job_tools") == _JOB_HINTS
-    assert _rust_str_list(src, "fn wants_skill_tools") == _SKILL_HINTS
-    assert _rust_str_list(src, "fn wants_mcp_management_tools") == _MCP_MANAGEMENT_HINTS
+    assert _rust_str_list(src, "fn wants_write_tools") == WRITE_HINTS
+    assert _rust_str_list(src, "fn wants_job_tools") == JOB_HINTS
+    assert _rust_str_list(src, "fn wants_skill_tools") == SKILL_HINTS
+    assert _rust_str_list(src, "fn wants_mcp_management_tools") == MCP_MANAGEMENT_HINTS
     ui_expected = _rust_str_list(src, "fn wants_ui_tools") + _rust_str_list(
         src, "APP_NAVIGATION_VERBS: &[&str]"
     )
-    assert ui_expected == _UI_HINTS
+    assert ui_expected == UI_HINTS
 
 # --- the lists themselves ---------------------------------------------------
 

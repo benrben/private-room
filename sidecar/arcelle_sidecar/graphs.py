@@ -67,7 +67,8 @@ Shapes
                      Prompt chaining with a deterministic gate.
                      media.transcribe.
 ``perceive_act``     prepare -> perceive -> trim_images -> act -> perceive...
-                     WebVoyager's see-act loop, one live screenshot. app.ui.
+                     WebVoyager's see-act loop, one live screenshot. app.ui,
+                     chat.browse.
 ``chain_stage``      an ORDERED chain of one-tool stages. chat.web.
 ``recall_act_check`` free index prefetch, act, check the result, bounded
                      repair. scripts.run, skills.use, skills.author,
@@ -85,12 +86,10 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from .agents import MAIN_AGENT_ID, REGISTRY, get_agent
 from .config import AGENT_ROUND_BACKSTOP
-from .messages import Message, ToolCall
 from .graph import (
     AgentState,
     call_model,
@@ -100,6 +99,7 @@ from .graph import (
     route_after_tools,
     synthesize,
 )
+from .messages import Message, ToolCall
 
 #: Every shape a registered agent may declare. `AgentSpec.template` is
 #: validated against this at import time, so a typo is a startup error rather
@@ -119,6 +119,25 @@ TEMPLATES: tuple[str, ...] = (
 # --------------------------------------------------------------------------- #
 # template-specific nodes
 # --------------------------------------------------------------------------- #
+#
+# These take `(state)` and NOTHING ELSE. None of them needs the RunnableConfig:
+# the run's `Deps` live in it, but only `.graph`'s nodes read them (`graph._deps`)
+# — these work off `state` plus the agent registry. Every one of them used to
+# declare a `config` parameter it never touched, which is a lie about what the
+# node depends on and hides which nodes really do have dependencies.
+#
+# Do NOT "tidy" that into `_config`. LangGraph resolves the config by the
+# parameter's LITERAL NAME (`_internal._runnable.KWARGS_CONFIG_KEYS`): rename it
+# and it is no longer injected, so the node is called with one argument and
+# raises `TypeError: missing 1 required positional argument: '_config'` on the
+# first turn. Verified against langgraph 1.2.9 (2026-07-30) all three ways —
+# `(state, config)` works, `(state)` works, `(state, _config)` fails at invoke.
+# Dropping it is the supported form, not a trick: `RunnableCallable.__init__`
+# injects only the kwargs the signature actually asks for, and `add_node` infers
+# the input schema from the FIRST parameter's hint, which is unchanged.
+#
+# The nodes in `.graph` (prepare/call_model/execute_tools/synthesize) keep their
+# `config` — that is that module's call, and it is not ours to change here.
 
 
 #: Tools whose whole purpose is to leave an artifact behind. If one of these
@@ -150,7 +169,7 @@ CLAIM_UNSUPPORTED = (
 )
 
 
-async def verify_claims(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+async def verify_claims(state: AgentState) -> dict[str, Any]:
     """Ground-truth gate for agents that mutate the user's room.
 
     A small model will happily report "I saved the summary to notes.md" after a
@@ -216,7 +235,7 @@ def route_after_verify(state: AgentState) -> str:
     return "synthesize"
 
 
-async def probe(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+async def probe(state: AgentState) -> dict[str, Any]:
     """Fire this agent's opening tool call WITHOUT spending a model round.
 
     ``execute_tools`` runs whatever is in ``state["calls"]``; it does not care
@@ -238,6 +257,13 @@ async def probe(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     if not any(
         (t.get("function") or {}).get("name") == name for t in state.get("tools", [])
     ):
+        return {}
+    # ...and only once the probe's PRECONDITION has been met. `chat.browse`
+    # cannot snapshot a page before `browse_open` has made one; firing anyway
+    # spent a guaranteed failure — journalled where the user reads it — as the
+    # opening move of every browse task. See `Flow.probe_after`.
+    after = spec.flow.probe_after
+    if after and after not in set(state.get("attempted", set())):
         return {}
     probe_call = ToolCall(name=name, arguments={})
     # A re-capture is the GRAPH's decision, not the model looping, so it must be
@@ -295,13 +321,13 @@ def route_after_probe(state: AgentState) -> str:
     return "blocked" if any(b.lower() in last for b in blockers) else "call_model"
 
 
-async def probe_answer(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+async def probe_answer(state: AgentState) -> dict[str, Any]:
     """The blocked answer, composed in code. No model call at all."""
     spec = get_agent(state.get("agent_id", ""))
     return {"final_text": spec.flow.blocked_answer, "stop": True}
 
 
-async def stage_catalog(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+async def stage_catalog(state: AgentState) -> dict[str, Any]:
     """Offer exactly the ONE tool this stage is for, then advance the stage.
 
     Prompt chaining, with the chain expressed as wiring instead of as English.
@@ -414,7 +440,7 @@ def route_after_stage_tools(state: AgentState) -> str:
     return "force_final"
 
 
-async def check_result(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+async def check_result(state: AgentState) -> dict[str, Any]:
     """Read the last tool result for a failure the model should be shown.
 
     The code-assistant tutorial's own A/B is the reason this is a predicate and
@@ -476,7 +502,7 @@ def route_after_check(state: AgentState) -> str:
 STALE_IMAGE = "[earlier screenshot — superseded by the current one below]"
 
 
-async def trim_images(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+async def trim_images(state: AgentState) -> dict[str, Any]:
     """Keep ONE live screenshot in context; strip the pixels from the rest.
 
     WebVoyager's shipped answer to the same problem. Every capture lands as a
@@ -514,7 +540,7 @@ def route_after_perceive(state: AgentState) -> str:
     return "trim_images"
 
 
-async def route_action(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+async def route_action(state: AgentState) -> dict[str, Any]:
     """Pick the one terminal verb this ask wants, in plain Python.
 
     LangGraph's Router pattern is explicitly "a single LLM call **or
@@ -589,8 +615,16 @@ def _react(g: StateGraph) -> StateGraph:
     return g
 
 
-async def _force_final(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """End the tool phase: the next model round is the tool-less one."""
+async def _force_final(state: AgentState) -> dict[str, Any]:  # noqa: ARG001
+    """End the tool phase: the next model round is the tool-less one.
+
+    Reads nothing, but `state` STAYS: LangGraph passes the state positionally, so
+    the shortest honest signature a node can have is one parameter. Verified
+    against langgraph 1.2.9 — a zero-argument node raises
+    ``TypeError: takes 0 positional arguments but 1 was given`` at invoke time,
+    i.e. it compiles clean and dies on the first real turn. Hence the scoped
+    ARG001 suppression rather than a smaller signature.
+    """
     return {"force_synthesis": True}
 
 
@@ -1036,6 +1070,7 @@ for _spec in REGISTRY:
 GRAPH_CHAT_ANSWER = graph_for("chat.answer")
 GRAPH_FILES_READ = graph_for("files.read")
 GRAPH_CHAT_WEB = graph_for("chat.web")
+GRAPH_CHAT_BROWSE = graph_for("chat.browse")
 GRAPH_APP_UI = graph_for("app.ui")
 GRAPH_JOBS_RUN = graph_for("jobs.run")
 GRAPH_JOBS_WORKFLOWS = graph_for("jobs.workflows")

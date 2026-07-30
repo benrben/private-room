@@ -353,7 +353,7 @@ async def test_only_the_newest_screenshot_keeps_its_pixels() -> None:
             {"role": "user", "content": "[screenshot]", "images": ["BBB"]},
         ]
     }
-    out = await trim_images(state, {})
+    out = await trim_images(state)
     msgs = out["messages"]
     assert "images" not in msgs[1], "the stale capture kept its pixels"
     assert msgs[1]["content"] == STALE_IMAGE
@@ -1469,9 +1469,11 @@ def test_the_main_prompt_does_not_teach_the_agent_to_deny_its_specialists() -> N
     Same failure class as the catalog/prompt mismatch that made it say "I can't
     save files": teach it to disown a capability and it will.
     """
-    from arcelle_sidecar.prompts import MAIN_PROMPT
+    from arcelle_sidecar.agents import DOMAIN_KEY_ORDER, main_prompt
 
-    low = MAIN_PROMPT.lower()
+    # The all-domains rendering: these clauses are structural and must survive
+    # whatever the reachable set is.
+    low = main_prompt(DOMAIN_KEY_ORDER).lower()
     # It must still be told not to narrate the machinery...
     assert "do not narrate the machinery" in low
     assert "as if you did the work yourself" in low

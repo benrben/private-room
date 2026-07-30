@@ -6,14 +6,8 @@ const WEB_CACHE_TTL: &str = "-24 hours";
 const WEB_SEARCH_TTL: &str = "-15 minutes";
 
 /// CHG-33: cache a web_search result list (the formatted, pre-clamp text).
-pub fn put_web_search(
-    conn: &Connection,
-    provider: &str,
-    endpoint: &str,
-    query: &str,
-    results: &str,
-) -> Result<(), String> {
-    let key = search_key(provider, endpoint, query);
+pub fn put_web_search(conn: &Connection, query: &str, results: &str) -> Result<(), String> {
+    let key = search_key(query);
     execute_one(
         conn,
         "INSERT INTO web_searches(query_key, results_text, saved_at)
@@ -26,13 +20,8 @@ pub fn put_web_search(
 }
 
 /// CHG-33: a cached web_search result list if searched within the TTL, else None.
-pub fn get_fresh_web_search(
-    conn: &Connection,
-    provider: &str,
-    endpoint: &str,
-    query: &str,
-) -> Option<String> {
-    let key = search_key(provider, endpoint, query);
+pub fn get_fresh_web_search(conn: &Connection, query: &str) -> Option<String> {
+    let key = search_key(query);
     conn.query_row(
         "SELECT results_text FROM web_searches
          WHERE query_key = ?1

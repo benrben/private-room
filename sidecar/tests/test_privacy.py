@@ -12,12 +12,33 @@ import os
 import pathlib
 import re
 import socket
+from urllib.parse import urlparse
 
 import arcelle_sidecar
 from arcelle_sidecar import LOOPBACK_HOST, disable_tracing
 from arcelle_sidecar.__main__ import _bind, _parse_args
 
 PKG_DIR = pathlib.Path(arcelle_sidecar.__file__).parent
+
+#: The ONE module allowed to reach the public internet from literal URLs in this
+#: package: the room's web search. It exists to leave the Mac — that is the whole
+#: feature — and it is reached only when the room's internet switch is on, which
+#: Rust checks before it ever calls. Every other module stays loopback-only, so
+#: this list is what keeps "nothing leaves the Mac" an enforceable claim instead
+#: of a hope: a new outbound host anywhere else still fails the test below.
+WEB_SEARCH_MODULE = "websearch.py"
+
+#: Exactly the engines the search seam may talk to. Adding one is a deliberate,
+#: reviewed change to this list — not something a selector edit can smuggle in.
+SEARCH_HOSTS = {
+    "api.duckduckgo.com",
+    "en.wikipedia.org",
+    "html.duckduckgo.com",
+    "news.google.com",
+    "search.brave.com",
+    "search.marginalia.nu",
+    "www.mojeek.com",
+}
 
 
 def test_tracing_env_vars_are_cleared_at_import() -> None:
@@ -153,21 +174,35 @@ def test_no_source_file_binds_a_public_interface() -> None:
         assert '"::"' not in code, path
 
 
-def test_the_only_outbound_hosts_are_ollama_and_the_loopback_bridge() -> None:
-    """No telemetry, no analytics, no third-party endpoint anywhere in the source."""
+def test_the_only_outbound_hosts_are_ollama_the_bridge_and_web_search() -> None:
+    """No telemetry, no analytics, no third-party endpoint anywhere in the source.
+
+    Every literal URL in the package must be loopback — the Ollama base URL and
+    the MCP bridge URL both arrive per-run from the Rust host — with exactly one
+    exception, the search seam, checked against its own host list below.
+    """
     url_re = re.compile(r"https?://[^\s\"'\)]+")
-    found: set[str] = set()
     for path in PKG_DIR.rglob("*.py"):
+        if path.name == WEB_SEARCH_MODULE:
+            continue
         for match in url_re.findall(path.read_text()):
-            found.add(match.rstrip(".,"))
-    # Every literal URL in the package must be loopback. The Ollama base URL and
-    # the MCP bridge URL both arrive per-run from the Rust host.
-    for url in found:
-        assert url.startswith("http://127.0.0.1"), f"non-loopback URL in source: {url}"
+            url = match.rstrip(".,")
+            assert url.startswith("http://127.0.0.1"), f"non-loopback URL in {path.name}: {url}"
+
+
+def test_web_search_reaches_only_its_declared_engines() -> None:
+    """The search seam's URLs must all be engines on the reviewed list — so a new
+    outbound host cannot arrive as a side effect of fixing a scraper."""
+    url_re = re.compile(r"https?://[^\s\"'\)]+")
+    source = (PKG_DIR / WEB_SEARCH_MODULE).read_text()
+    hosts = {urlparse(url.rstrip(".,")).hostname for url in url_re.findall(source)}
+    # The one non-engine URL is the app's own homepage, inside the descriptive
+    # User-Agent that Wikimedia's policy requires. Nothing is ever fetched from it.
+    assert hosts - {"github.com"} == SEARCH_HOSTS
 
 
 def test_no_analytics_or_tracing_imports() -> None:
-    banned = ("langsmith", "posthog", "segment", "sentry_sdk", "opentelemetry", "requests")
+    banned = ("langsmith", "posthog", "segment", "sentry_sdk", "opentelemetry")
     for path in PKG_DIR.rglob("*.py"):
         code = "\n".join(
             line
@@ -177,6 +212,12 @@ def test_no_analytics_or_tracing_imports() -> None:
         for name in banned:
             assert f"import {name}" not in code, (path, name)
             assert f"from {name}" not in code, (path, name)
+        # A blocking HTTP client is banned everywhere but the search seam: the rest
+        # of the sidecar is async and loopback-only, so a `requests` import there
+        # is either a new outbound seam or an event-loop stall.
+        if path.name != WEB_SEARCH_MODULE:
+            assert "import requests" not in code, path
+            assert "from requests" not in code, path
 
 
 def test_access_log_is_off() -> None:

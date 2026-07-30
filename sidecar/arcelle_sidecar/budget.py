@@ -87,13 +87,16 @@ def json_chars(value: Any) -> int:
 def window_budget_bytes(num_ctx: int) -> int:
     """How many payload BYTES fit the window a local call requested.
 
-    The inverse of ``model_limits.pick_num_ctx``, using the same conservative
-    bytes-per-token ratio and reserving the same generation headroom, so the
-    two can never disagree about whether a payload fits.
+    The inverse of ``model_limits.pick_num_ctx``, using the same bytes-per-token
+    ratio and reserving the same generation headroom, so the two can never
+    disagree about whether a payload fits. That ratio is now measured from the
+    engine's own token counts rather than assumed (``model_limits.
+    bytes_per_token``), which is what stops ordinary English chat from being
+    held to about half the window it has.
     """
-    from .model_limits import BYTES_PER_TOKEN, GENERATION_HEADROOM_TOKENS
+    from .model_limits import GENERATION_HEADROOM_TOKENS, bytes_per_token
 
-    return max(0, (num_ctx - GENERATION_HEADROOM_TOKENS)) * BYTES_PER_TOKEN
+    return int(max(0, (num_ctx - GENERATION_HEADROOM_TOKENS)) * bytes_per_token())
 
 
 def _truncate_bytes(s: str, limit: int) -> str:
@@ -198,7 +201,68 @@ def trim_messages_to_window(
     return trimmed
 
 
+def fit_oversized_results(
+    messages: list[Message], budget_bytes: int | None, reserved_bytes: int = 0
+) -> tuple[list[Message], bool]:
+    """Cut tool results until ``messages`` fits ``budget_bytes``. Never mutates.
+
+    The counterpart of :func:`trim_messages_to_window` for the engines that are
+    NOT local Ollama, and the one guard that was missing entirely. Every other
+    defence has a hole a single big tool result walks straight through:
+
+    * the app clamps nothing (``clamp_tool_result`` is a deliberate no-op),
+    * ``trim_messages_to_window`` returns immediately on ``num_ctx is None``,
+      which is every cloud and CLI engine, and it is the ONLY caller-side fit —
+      ``chat.py`` calls it, ``provider_api.py`` and ``external_llm.py`` do not,
+    * compaction digests the OLDER half and leaves the recent tail verbatim,
+      and ``compaction._split`` always keeps the newest message whole however
+      big it is (``if used + n > recent_bytes and recent``, so the first
+      iteration cannot break).
+
+    So one oversized result — a ``fetch_page`` of a heavy site, a 40 KB
+    ``browse_read`` on top of the ones before it — reached the provider intact
+    and the request was rejected. The worker then returned no report, which
+    :func:`graph._run_worker` scores as ``ok=False``: a red "failed" node and a
+    Main agent left to improvise about why it could not read the page.
+
+    Deliberately narrow, and the same invariants as its local twin: only
+    ``role: "tool"`` content is cut, never the system prompt, the question, the
+    assistant's turns or the ``tool_calls`` pairing; each survivor keeps its
+    HEAD and an equal share of what the fixed parts leave; every cut leaves a
+    visible marker. Reports are cut like anything else here — this runs only
+    when the request would otherwise be REJECTED, where a trimmed report beats
+    no answer at all.
+    """
+    if budget_bytes is None or not messages:
+        return messages, False
+    if total_chars(messages, reserved_bytes) <= budget_bytes:
+        return messages, False
+    survivors = [
+        i
+        for i, m in enumerate(messages)
+        if m.get("role") == "tool" and _blen(m.get("content") or "") > _MIN_STUB_LEN
+    ]
+    if not survivors:
+        return messages, False
+    fixed = total_chars(messages, reserved_bytes) - sum(
+        _blen(messages[i].get("content") or "") for i in survivors
+    )
+    share = max(_MIN_STUB_LEN, (budget_bytes - fixed) // len(survivors))
+    out = [dict(m) for m in messages]
+    cut = False
+    for i in survivors:
+        content = out[i].get("content") or ""
+        if _blen(content) <= share:
+            continue
+        label = out[i].get("tool_name") or "tool"
+        note = f"\n… [{label} result cut here to fit this model's context]"
+        out[i]["content"] = _truncate_bytes(content, max(0, share - _blen(note))) + note
+        cut = True
+    return (out, True) if cut else (messages, False)
+
+
 __all__ = [
+    "fit_oversized_results",
     "msg_len",
     "total_chars",
     "json_chars",

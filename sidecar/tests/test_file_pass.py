@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
-from arcelle_sidecar import file_pass, llm
+from arcelle_sidecar import file_pass, llm, model_text
 from arcelle_sidecar.server import create_app
 
 
@@ -65,7 +65,7 @@ def client_for(app: Any) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://sidecar")
 
 
-# --- clamp_bytes / recover_json (byte-safe helpers) -------------------------
+# --- clamp_bytes (byte-safe helper) / the shared recover_json ---------------
 
 
 def test_clamp_bytes_never_splits_a_char() -> None:
@@ -79,12 +79,14 @@ def test_clamp_bytes_never_splits_a_char() -> None:
 
 
 def test_recover_json_strips_fence_and_think() -> None:
-    assert json.loads(file_pass.recover_json('```json\n{"a":1}\n```')) == {"a": 1}
-    assert json.loads(file_pass.recover_json("<think>reasoning</think>{\"a\":2}")) == {"a": 2}
+    # The helper now lives in model_text (one copy for all six callers); this is
+    # still asserted here because _structured_call's parse depends on it.
+    assert json.loads(model_text.recover_json('```json\n{"a":1}\n```')) == {"a": 1}
+    assert json.loads(model_text.recover_json("<think>reasoning</think>{\"a\":2}")) == {"a": 2}
     # An unterminated think span truncates the rest — recover_json then finds no
     # brackets and returns "" (the caller's parse fails → retry/skip).
-    assert file_pass.recover_json("<think>no end") == ""
-    assert json.loads(file_pass.recover_json('{"a":3}')) == {"a": 3}
+    assert model_text.recover_json("<think>no end") == ""
+    assert json.loads(model_text.recover_json('{"a":3}')) == {"a": 3}
 
 
 # --- map --------------------------------------------------------------------

@@ -10,7 +10,7 @@
 //! bound to `127.0.0.1` only. The sidecar never sees the room key — it reaches
 //! the room's tools solely through the token-guarded loopback MCP bridge.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -112,6 +112,36 @@ fn forget() {
     }
 }
 
+/// Where the sidecar's stderr is mirrored. A released app launched from Finder has
+/// no usable stderr of its own, so "run it from a terminal" is not a diagnosis path
+/// for a user — the traceback has to land in a file.
+pub fn stderr_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("arcelle-sidecar.log")
+}
+
+/// Drain the child's stderr on a detached thread, mirroring each line to the app's
+/// own stderr (useful in dev) and appending it to [`stderr_log_path`] (the only copy
+/// a bundled app keeps). Draining is MANDATORY, not a nicety: `Stdio::piped()` with
+/// nobody reading fills the pipe buffer and blocks the sidecar mid-write.
+fn drain_stderr(stderr: std::process::ChildStderr) {
+    std::thread::spawn(move || {
+        // Truncate once per spawn so the file is about THIS run, then append.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(stderr_log_path())
+            .ok();
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            eprintln!("[sidecar] {line}");
+            if let Some(f) = file.as_mut() {
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+            }
+        }
+    });
+}
+
 /// Spawn the process, block (on a blocking thread) reading stdout until it prints
 /// `SIDECAR_PORT=N`, then confirm `/health`. The port line is how we learn the
 /// ephemeral port without a bind-and-release race.
@@ -119,9 +149,20 @@ async fn spawn_and_wait() -> Result<String, String> {
     let mut cmd = launch_command().ok_or_else(|| "SIDECAR_UNAVAILABLE".to_string())?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        // NOT `Stdio::null()`. The sidecar's ENTIRE diagnostic channel is stderr:
+        // `logging.basicConfig` installs a root StreamHandler there, uvicorn writes
+        // "Exception in ASGI application" + traceback there, and asyncio writes
+        // "Task exception was never retrieved" there. Discarding it is why a run that
+        // visibly did work could fail with NO error message anywhere on the machine
+        // (live QA 2026-07-30) — the traceback naming the cause was printed and
+        // thrown away. Piped here and drained below; an undrained pipe would fill
+        // and wedge the child, so the reader thread is not optional.
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|_| "SIDECAR_UNAVAILABLE".to_string())?;
     let pid = child.id();
+    if let Some(stderr) = child.stderr.take() {
+        drain_stderr(stderr);
+    }
     let stdout = child
         .stdout
         .take()

@@ -24,7 +24,9 @@ uv pip install --python "$VENV/bin/python" -e . pyinstaller
 
 # --collect-all pulls a package's submodules + data + metadata; the langgraph /
 # langchain / pydantic stacks load code by dynamic import so static analysis
-# misses them. Package IMPORT names here (langchain_core, not langchain-core);
+# misses them. Web search adds four more for the same reason: bs4 picks its HTML
+# parser by name at runtime, soupsieve is its CSS-selector engine, and requests
+# needs certifi's cacert.pem as DATA or every https call fails to verify. Package IMPORT names here (langchain_core, not langchain-core);
 # the sidecar depends on langchain-core/langchain-ollama directly, NOT the
 # `langchain` umbrella. --copy-metadata takes DISTRIBUTION names for the
 # importlib.metadata.version() lookups these libraries do at import time.
@@ -51,6 +53,10 @@ uv pip install --python "$VENV/bin/python" -e . pyinstaller
   --collect-all pydantic_core \
   --collect-all edge_tts \
   --collect-all aiohttp \
+  --collect-all bs4 \
+  --collect-all soupsieve \
+  --collect-all requests \
+  --collect-all certifi \
   --copy-metadata edge-tts \
   --copy-metadata langgraph \
   --copy-metadata langchain-core \

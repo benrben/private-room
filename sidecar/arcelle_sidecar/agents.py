@@ -28,14 +28,16 @@ flag stays as the promotion mechanism for the next one.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .prompts import (
+    BROWSE_PROMPT,
     CONNECTORS_ADMIN_PROMPT,
     CONNECTORS_USE_PROMPT,
     FILE_PASS_PROMPT,
     FILES_PROMPT,
-    MAIN_PROMPT,
+    MAIN_PROMPT_TEMPLATE,
     SCRIPTS_PROMPT,
     SKILLS_AUTHOR_PROMPT,
     SKILLS_USE_PROMPT,
@@ -47,6 +49,7 @@ from .prompts import (
     WORKFLOWS_PROMPT,
 )
 from .routing import (
+    BROWSE_TOOL_NAMES,
     JOB_TOOL_NAMES,
     MCP_MANAGEMENT_TOOL_NAMES,
     SKILL_TOOL_NAMES,
@@ -86,6 +89,18 @@ class Flow:
     #: A tool fired deterministically as the FIRST act of the turn, for agents
     #: whose opening move is a constant. Zero model cost.
     probe: str = ""
+    #: A tool that must have RUN before ``probe`` is worth firing. Empty = the
+    #: probe has no precondition, which is the common case.
+    #:
+    #: THE BUG THIS EXISTS FOR (2026-07-30): `app.ui` can perceive at any time
+    #: because the app's own interface always exists, and `chat.browse` copied
+    #: that pattern — but a web PAGE does not exist until `browse_open` has run.
+    #: So every browse task opened with a `browse_snapshot` that could only fail
+    #: ("The browser isn't open. Use browse_open first."), which the host
+    #: journals as an `error` the USER reads back. A guaranteed failed first
+    #: step on every task of a whole feature, and a small model's opening
+    #: context poisoned with an error it did not cause.
+    probe_after: str = ""
     #: Substrings in the probe's result that mean "this cannot be done". The
     #: predicate fails OPEN when none match, so drifting Rust wording degrades
     #: to today's behaviour rather than to a refusal.
@@ -152,6 +167,125 @@ class AgentSpec:
 
 
 # --------------------------------------------------------------------------- #
+# DOMAIN VOCABULARY — the single source for every prose listing of "what the
+# specialists cover". Defined ABOVE the registry because the Main agent's
+# system paragraph is built from it (see `main_prompt`).
+# --------------------------------------------------------------------------- #
+
+#: One SHORT plain-words blurb per domain key.
+#:
+#: Why this exists (2026-07-28): the batch tool's ``agent`` enum description and
+#: the Main agent's paragraph were both hardcoded six-domain literals, while the
+#: catalog itself is built from REACHABLE domains only. In a web-disabled room
+#: the enum correctly dropped ``web`` and ``ask_web_agent`` vanished from the
+#: catalog — but the description still read "web = the internet", the only text
+#: left in context claiming the capability existed, and the exact text a model
+#: reads to pick a key. It would emit ``agent: "web"``, which ``DOMAIN_KEYS``
+#: (unfiltered) resolves happily, and ``resolve_worker`` then falls back to the
+#: File agent: a weather question answered from room content. That is precisely
+#: the confident-non-answer failure ``worker_reachable`` was written to kill,
+#: arriving through the DESCRIPTION instead of through the router.
+#:
+#: Generate every capability listing from this dict. Never hardcode one.
+#: EVERY blurb is ONE comma-free noun phrase. `domain_areas` joins them WITH
+#: commas, so a comma inside one garbles the whole capability sentence — it read
+#: "…content, scripts, transcripts, studio, the internet, and browsing sites,
+#: this app's interface…", where no item's boundary is findable. Claude Code then
+#: dropped the web item when listing what it could do and refused to browse
+#: (owner report 2026-07-30). The per-domain DETAIL lives in each
+#: ``AGENT_TOOL_DOMAINS`` description, which the model sees in the same catalog;
+#: this dict is the at-a-glance AREA name only. `test_no_domain_blurb_contains_a_comma`
+#: pins it.
+DOMAIN_BLURBS: dict[str, str] = {
+    "file": "this room's own content",
+    "web": "the internet and browsing sites",
+    "app": "this app's interface",
+    "jobs": "workflows and whole-file passes",
+    "skills": "agent skills",
+    "connector": "connected services",
+}
+
+#: Definition order, not alphabetical — ``file`` is the default worker's domain
+#: and the most common pick, so it leads every generated list a model reads.
+#: A literal (not derived from ``DOMAIN_KEYS``) because the registry below is
+#: built before ``AGENT_TOOL_DOMAINS`` exists; the assert beside ``DOMAIN_KEYS``
+#: pins the two together.
+DOMAIN_KEY_ORDER: tuple[str, ...] = (
+    "file",
+    "web",
+    "app",
+    "jobs",
+    "skills",
+    "connector",
+)
+
+
+def domain_listing(keys: Iterable[str]) -> str:
+    """``"file = this room's content…; web = the internet"`` for `keys`.
+
+    Ordered by :data:`DOMAIN_KEY_ORDER` regardless of the caller's order, so
+    the string is deterministic and always leads with the default domain.
+    """
+    wanted = set(keys)
+    return "; ".join(
+        f"{k} = {DOMAIN_BLURBS[k]}" for k in DOMAIN_KEY_ORDER if k in wanted
+    )
+
+
+def domain_areas(keys: Iterable[str]) -> str:
+    """The same domains as plain AREAS, for user-facing prose in the prompt.
+
+    ``"the internet, this app's interface and connected services"`` — no keys,
+    no tool names: the Main agent describes areas to the user, never plumbing.
+    """
+    wanted = set(keys)
+    parts = [DOMAIN_BLURBS[k] for k in DOMAIN_KEY_ORDER if k in wanted]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def main_prompt(keys: Iterable[str]) -> str:
+    """The Main agent's system paragraph for exactly the REACHABLE domains.
+
+    ``keys`` are the short domain keys whose ``ask_*_agent`` tool is actually
+    in the catalog this turn. Both capability sentences are filled from them,
+    so the prompt can never advertise a specialist the model has no tool for.
+
+    THE BUG THIS SHAPE EXISTS FOR (owner report 2026-07-30). This was:
+
+        wanted = [k for k in DOMAIN_KEY_ORDER if k in set(keys)]
+
+    `set(keys)` sits in the comprehension's CONDITION, so it is re-evaluated
+    once per item of ``DOMAIN_KEY_ORDER``. Against a list that is merely
+    wasteful; against the GENERATOR ``graph.prepare`` actually passes, the first
+    evaluation drains it and every later one builds `set()` from an exhausted
+    iterator — so only ``DOMAIN_KEY_ORDER[0]`` (`file`) could ever survive.
+
+    The Main agent's prompt therefore claimed ONE domain no matter how many its
+    catalog held, on every single turn. A local model mostly ignored the prose
+    and called the tools it could see; **Claude Code trusted the prompt** — the
+    documented harness-engine order of authority — and answered "I have no
+    web-browsing specialist" with zero delegations, for a room that had one.
+    Every unit test passed a list, which re-iterates, so the suite never saw it.
+
+    Materialised ONCE, and the tests below pass a generator on purpose.
+    """
+    have = set(keys)
+    wanted = [k for k in DOMAIN_KEY_ORDER if k in have]
+    return MAIN_PROMPT_TEMPLATE.format(
+        # The sentence already named ask_file_agent, so this half lists the
+        # others. With file the only reachable domain it degrades to a plain
+        # "there are no other specialists" rather than a dangling "for .".
+        other_areas=domain_areas([k for k in wanted if k != "file"])
+        or "nothing else — you have no other specialists",
+        all_areas=domain_areas(wanted) or "this room's content",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # CORE — always offered: the base-prompt-taught set (agent.rs) + read tools
 # --------------------------------------------------------------------------- #
 
@@ -191,9 +325,17 @@ _SKILLS_AUTHOR: tuple[str, ...] = tuple(n for n in SKILL_TOOL_NAMES if n not in 
 REGISTRY: tuple[AgentSpec, ...] = (
     AgentSpec(
         id="chat.answer",
-        # Delegations one ask may chain, not work per specialist. Eight covers the
-        # longest real pipeline seen in e2e (file -> jobs -> connector) with room
-        # to spare; past that the Main agent is looping, not planning.
+        # This carried a delegation-chain budget of eight ("the longest real
+        # pipeline seen in e2e — file -> jobs -> connector — with room to
+        # spare"). The per-agent round budgets were removed (2026-07-27, owner
+        # call) and `Flow` no longer has the field, so NOTHING caps how many
+        # delegations one ask may chain. What bounds the hub today is turn-wide,
+        # not per-agent: `config.TURN_ROUND_BUDGET` (64, carried down the whole
+        # tree by `graph.Deps.turn_round_budget`) counts this agent's rounds plus
+        # every round of every specialist it delegates to, and tripping it does
+        # not abort — the remaining rounds are served TOOL-LESS so each loop
+        # unwinds into a text answer. `config.AGENT_ROUND_BACKSTOP` bounds this
+        # single loop and is deliberately far above real work.
         flow=Flow(),
         # dispatches to specialists; never touches a room tool
         template="supervisor",
@@ -202,15 +344,25 @@ REGISTRY: tuple[AgentSpec, ...] = (
         "for anything that needs the room or tools, answers directly what it "
         "knows, and composes every final answer itself.",
         tools=(),  # its ONLY tools are the ask_*_agent calls (agent_tool_specs)
-        prompt=MAIN_PROMPT,
+        # The all-domains default, for anything reading the spec statically.
+        # `graph.prepare` substitutes the REACHABLE-domain paragraph per turn
+        # (see `main_prompt`), so this exact string is never what a live turn
+        # sees when a domain is unreachable.
+        prompt=main_prompt(DOMAIN_KEY_ORDER),
         read_only=True,
         main=True,
     ),
     AgentSpec(
         id="files.read",
-        # Read/search/edit over many files genuinely varies. Twelve lets "fix the
-        # typo in each of these five notes" finish; it no longer lets a stuck
-        # loop run to 10,000.
+        # This carried a round budget of twelve, sized so that "fix the typo in
+        # each of these five notes" could finish while a stuck loop could not run
+        # to 10,000. The per-agent budgets were removed (2026-07-27, owner call),
+        # so a many-file errand is now bounded only by the shared runaway
+        # backstop `config.AGENT_ROUND_BACKSTOP` (10,000 — i.e. the exact number
+        # that budget existed to avoid) and by the turn-wide
+        # `config.TURN_ROUND_BUDGET` it shares with the hub and its siblings.
+        # What keeps this agent honest is `react_verify`'s ground-truth check on
+        # what it claims to have changed, not a cap.
         flow=Flow(),
         # mutates the user's room — claims get a ground-truth check
         template="react_verify",
@@ -269,6 +421,62 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # unlock mid-turn.
     ),
     AgentSpec(
+        id="chat.browse",
+        # BROWSE-1. A SIBLING of chat.web under ask_web_agent rather than a
+        # seventh domain: the Main agent's catalog is capped at 6 because a 4B
+        # picks reliably among no more, and "the internet" is one idea to a
+        # user whether it is answered by fetching a page or by driving one.
+        #
+        # `perceive_act` for the same reason app.ui uses it: browsing is a
+        # see-then-act loop, and firing the snapshot deterministically as the
+        # probe makes a round ONE action instead of a snapshot-then-action
+        # pair. `trim_images` then keeps exactly one live page picture in
+        # context, which is what makes browse_look affordable to use freely on
+        # a small model.
+        # `probe_after`: the free snapshot is worth exactly as much as it is on
+        # app.ui, but only once a page EXISTS — see `Flow.probe_after` for the
+        # guaranteed-failure this gate removes from the opening round.
+        flow=Flow(probe="browse_snapshot", probe_after="browse_open"),
+        template="perceive_act",
+        label="Browser agent",
+        description="Open and operate web pages in the room's private browser.",
+        tools=BROWSE_TOOL_NAMES,
+        # The discriminator against its sibling is NOT "does this mention the
+        # web" — both do. It is: **is a specific destination named, or is a
+        # page to be operated?** Open-ended questions ("the latest news", "the
+        # weather") carry chat.web's vocabulary and no destination, so they
+        # keep falling to the search agent, which is the domain's default.
+        #
+        # Live QA 2026-07-29 wrote this list: the first pass only carried
+        # interaction verbs ("click", "fill in"), so every ordinary phrasing —
+        # "go to en.wikipedia.org and search for X", "open example.com and tell
+        # me what it says" — scored ZERO here, tied at 0-0 and fell through to
+        # chat.web. The browser was fully wired and simply never chosen. Hence
+        # the navigation verbs and the URL/domain fragments, which are what a
+        # named destination actually looks like as a substring.
+        hints=(
+            # a destination was named
+            "http", "www.", ".com", ".org", ".net", ".io/", ".gov", ".edu",
+            ".co.", ".ai/", ".dev",
+            # navigation verbs
+            "go to", "open ", "visit", "browse", "browser", "navigate",
+            "pull up", "head to", "load the",
+            # page/site nouns
+            "website", "web page", "webpage", "the site", "on the site",
+            "the page", "on the page", "this page",
+            # operating a page
+            "click", "fill in", "fill out", "log in", "logging in", "sign in",
+            "form", "checkout", "add to cart", "book a", "submit",
+            "select the", "dropdown",
+            "דפדפן", "גלוש", "פתח את האתר", "באתר", "לחץ", "מלא", "טופס",
+            "כנס ל", "היכנס", "אתר", "דף",
+        ),
+        prompt=BROWSE_PROMPT,
+        # NOT read_only: browse_do submits forms on the open web.
+        # No group, for the same reason as chat.web — web access is a room
+        # setting, never something an agent unlocks mid-turn.
+    ),
+    AgentSpec(
         id="app.ui",
         # The agent that runs longest by nature: WebVoyager budgets 150 steps
         # and CUA 100, against LangGraph's default of 25. It carried the roster's
@@ -282,7 +490,7 @@ REGISTRY: tuple[AgentSpec, ...] = (
         description="See and operate this app's own interface for the user.",
         tools=UI_TOOL_NAMES,
         prompt=UI_PROMPT,
-        # Vocabulary: routing._UI_HINTS (Rust-parity) — wired in manager.py.
+        # Vocabulary: routing.UI_HINTS (Rust-parity) — wired in manager.py.
         group="app_ui",
     ),
     AgentSpec(
@@ -314,7 +522,7 @@ REGISTRY: tuple[AgentSpec, ...] = (
         description="Cover an ENTIRE file with a durable background job; report job status.",
         tools=_JOBS_RUN,
         prompt=FILE_PASS_PROMPT,
-        # Vocabulary: routing._JOB_HINTS (Rust-parity) — wired in manager.py.
+        # Vocabulary: routing.JOB_HINTS (Rust-parity) — wired in manager.py.
         group="jobs",
     ),
     AgentSpec(
@@ -587,9 +795,14 @@ AGENT_TOOL_DOMAINS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ),
     (
         "ask_web_agent",
-        ("chat.web",),
-        "Ask the Web agent to search the internet or fetch a page for current "
-        "or outside information (news, weather, prices, docs).",
+        ("chat.web", "chat.browse"),
+        "Ask the Web agent about anything on the internet: search for current "
+        "or outside information (news, weather, prices, docs), or OPEN and "
+        "OPERATE a specific web page in the room's private browser — read it, "
+        "click, fill a form, sign in, work through a site. ALWAYS repeat the "
+        "exact address or site name the user gave (\"en.wikipedia.org\") in "
+        "your instruction: it decides whether the page is opened in the "
+        "browser or merely searched for.",
     ),
     (
         "ask_app_agent",
@@ -649,6 +862,15 @@ DOMAIN_KEYS: dict[str, str] = {
     for name, _, _ in AGENT_TOOL_DOMAINS
 }
 
+# Every generated listing must cover exactly the real domains — a domain added
+# without a blurb, or a blurb for a domain that no longer exists, would drift
+# the prose away from the catalog again. Fail at import instead.
+assert set(DOMAIN_BLURBS) == set(DOMAIN_KEYS) == set(DOMAIN_KEY_ORDER), (
+    "DOMAIN_BLURBS/DOMAIN_KEY_ORDER must cover exactly the AGENT_TOOL_DOMAINS "
+    f"keys; blurbs={sorted(DOMAIN_BLURBS)} order={sorted(DOMAIN_KEY_ORDER)} "
+    f"domains={sorted(DOMAIN_KEYS)}"
+)
+
 #: EVERY tool name this registry knows: CORE, every agent's box, and the
 #: ask_*_agent domain tools. This is the test for "did the registry mean to
 #: own this name?", used by ``graph._select_tools`` to tell a genuine
@@ -672,6 +894,10 @@ ALL_REGISTRY_TOOLS: frozenset[str] = frozenset(
 )
 
 
+#: Workers that exist only when the room's web setting is on.
+WEB_DEPENDENT_AGENT_IDS: frozenset[str] = frozenset({"chat.web", "chat.browse"})
+
+
 def worker_reachable(spec: AgentSpec, *, web_enabled: bool, served_names: set[str]) -> bool:
     """Could this worker actually ACT with what the bridge served this run?
 
@@ -684,8 +910,21 @@ def worker_reachable(spec: AgentSpec, *, web_enabled: bool, served_names: set[st
     """
     if not spec.available:
         return False
-    if spec.id == "chat.web":
-        return web_enabled
+    # Web access is a ROOM SETTING, so it is a NECESSARY condition for both
+    # internet workers — never a sufficient one. Both halves matter and each
+    # has its own live failure:
+    #
+    # * Without the setting check, a web-disabled room keeps "the internet" in
+    #   its domain listing and the model dispatches to a worker that cannot
+    #   act (`test_web_disabled_room_never_mentions_the_internet`).
+    # * Without the served-tools check below, a tier that serves no `browse_*`
+    #   (a cloud advisor) still routes browsing to an EMPTY box — the same
+    #   confident-non-answer this function was written to kill.
+    #
+    # So this returns False early and then falls through to the box check,
+    # rather than returning `web_enabled` as the whole answer.
+    if spec.id in WEB_DEPENDENT_AGENT_IDS and not web_enabled:
+        return False
     if not spec.tools:
         # CORE-only workers (the File agent) ride the always-served base.
         return bool(set(CORE_TOOLS) & served_names)
@@ -703,6 +942,149 @@ def reachable_members(
     )
 
 
+#: Every spelling of a domain a model might plausibly emit -> its short key.
+#: Built from the registry, so it cannot drift: the short key ("web"), the full
+#: tool name ("ask_web_agent"), and every member WORKER id ("chat.web") all
+#: resolve to the same domain.
+#:
+#: Small models are loose with identifiers — they echo a worker id from a
+#: report, or the tool name instead of the enum key. Accepting all three costs
+#: nothing and turns a whole class of near-miss into a correct dispatch. What
+#: it must NOT do is accept a spelling of a domain that is not available this
+#: run: see `normalize_domain_key`.
+_DOMAIN_ALIASES: dict[str, str] = {}
+for _name, _members, _ in AGENT_TOOL_DOMAINS:
+    _key = _name.removeprefix("ask_").removesuffix("_agent")
+    _DOMAIN_ALIASES[_key] = _key
+    _DOMAIN_ALIASES[_name] = _key
+    for _m in _members:
+        _DOMAIN_ALIASES[_m] = _key
+del _name, _members, _key, _m
+
+
+def normalize_domain_key(raw: str) -> str | None:
+    """One domain key for any spelling a model might emit, else ``None``.
+
+    ``None`` means "not a domain at all" — the caller should keep its existing
+    tolerant fallback (route to the default worker) rather than refuse, which
+    is how a garbled key has always behaved. A recognised-but-unavailable
+    domain is a DIFFERENT case and must be refused; compare the result against
+    :func:`reachable_domain_keys`.
+    """
+    return _DOMAIN_ALIASES.get(raw.strip().lower())
+
+
+def reachable_domain_keys(*, web_enabled: bool, served_names: set[str]) -> list[str]:
+    """The short domain keys offered this run, in :data:`DOMAIN_KEY_ORDER`.
+
+    THE definition of "which specialists exist right now". Everything that has
+    to agree with the catalog derives from this one function: the ``ask_agents``
+    enum, that enum's prose description, the Main agent's system paragraph, and
+    the batch dispatcher's phantom-key guard. Four consumers, one truth — that
+    is the whole point (2026-07-28).
+    """
+    live = {
+        name
+        for name, members, _ in AGENT_TOOL_DOMAINS
+        if reachable_members(members, web_enabled=web_enabled, served_names=served_names)
+    }
+    return [k for k in DOMAIN_KEY_ORDER if DOMAIN_KEYS[k] in live]
+
+
+#: The ONE argument every delegation carries, per-domain and per batch task
+#: alike. The two were hand-typed separately and differed only in where the
+#: lines wrapped — the sentence a model reads was already byte-identical, so
+#: there is one copy and no chance of them drifting apart.
+_INSTRUCTION_PARAM: dict[str, str] = {
+    "type": "string",
+    "description": (
+        "What you need this agent to do, as one clear task. Name the files "
+        "or targets."
+    ),
+}
+
+
+def _function_spec(name: str, description: str, parameters: dict) -> dict:
+    """One entry in the wire catalog (the OpenAI/Ollama ``function`` shape).
+
+    Byte-for-byte what the two hand-typed literals produced, key order included:
+    the host and every engine parse this, so the shape is a contract — see
+    ``test_the_delegation_catalog_json_is_byte_stable``.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        },
+    }
+
+
+def _instruction_only_params() -> dict:
+    """``{instruction}`` — the whole argument list of an ``ask_*_agent`` tool.
+
+    A fresh dict per call (and a copy of :data:`_INSTRUCTION_PARAM` inside it):
+    the catalog is handed out to be filtered, appended to and rendered, and one
+    dict shared by every entry of every call would turn any in-place edit into a
+    global one. The hand-typed literals built a new dict per entry; so does this.
+    """
+    return {
+        "type": "object",
+        "properties": {"instruction": dict(_INSTRUCTION_PARAM)},
+        "required": ["instruction"],
+    }
+
+
+def _batch_tool_spec(keys: list[str]) -> dict:
+    """The ``ask_agents`` fan-out entry, whose ``agent`` enum IS ``keys``."""
+    task = {
+        "type": "object",
+        "properties": {
+            "agent": {
+                "type": "string",
+                "enum": keys,
+                # Generated from the SAME `keys` as the enum — never a
+                # hardcoded list. See DOMAIN_BLURBS for why.
+                "description": f"Which specialist: {domain_listing(keys)}.",
+            },
+            "instruction": dict(_INSTRUCTION_PARAM),
+            "depends_on": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": (
+                    "Positions (0-based) of tasks in THIS list whose findings "
+                    "this task needs. Leave empty when it can run immediately."
+                ),
+            },
+        },
+        "required": ["agent", "instruction"],
+    }
+    return _function_spec(
+        BATCH_TOOL_NAME,
+        (
+            "Ask SEVERAL specialists in ONE call. Prefer this whenever "
+            "the request has more than one part: tasks that do not "
+            "depend on each other run AT THE SAME TIME, so the whole "
+            "batch costs as long as its slowest task instead of the "
+            "sum. Use depends_on only when a task genuinely needs an "
+            "earlier task's findings — those wait, everything else "
+            "runs together."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "The tasks to run, in any order.",
+                    "items": task,
+                }
+            },
+            "required": ["tasks"],
+        },
+    )
+
+
 def agent_tool_specs(*, web_enabled: bool, served_names: set[str]) -> list[dict]:
     """The main agent's tool catalog: one entry per REACHABLE domain.
 
@@ -710,100 +1092,21 @@ def agent_tool_specs(*, web_enabled: bool, served_names: set[str]) -> list[dict]
     intersects the served catalog (the File agent's box is CORE, which the
     bridge always serves in agent scope). Web is a room setting.
     """
-    out: list[dict] = []
-    for name, members, description in AGENT_TOOL_DOMAINS:
-        if not reachable_members(members, web_enabled=web_enabled, served_names=served_names):
-            continue
-        out.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "instruction": {
-                                "type": "string",
-                                "description": (
-                                    "What you need this agent to do, as one "
-                                    "clear task. Name the files or targets."
-                                ),
-                            }
-                        },
-                        "required": ["instruction"],
-                    },
-                },
-            }
-        )
+    keys = reachable_domain_keys(web_enabled=web_enabled, served_names=served_names)
+    live = {DOMAIN_KEYS[k] for k in keys}
+    out: list[dict] = [
+        _function_spec(name, description, _instruction_only_params())
+        for name, _members, description in AGENT_TOOL_DOMAINS
+        if name in live
+    ]
     if not out:
+        # No reachable specialist means no batch tool either: a fan-out over an
+        # empty roster is a call the model can only get wrong.
         return out
-    keys = sorted(k for k, name in DOMAIN_KEYS.items() if any(o["function"]["name"] == name for o in out))
-    out.append(
-        {
-            "type": "function",
-            "function": {
-                "name": BATCH_TOOL_NAME,
-                "description": (
-                    "Ask SEVERAL specialists in ONE call. Prefer this whenever "
-                    "the request has more than one part: tasks that do not "
-                    "depend on each other run AT THE SAME TIME, so the whole "
-                    "batch costs as long as its slowest task instead of the "
-                    "sum. Use depends_on only when a task genuinely needs an "
-                    "earlier task's findings — those wait, everything else "
-                    "runs together."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "tasks": {
-                            "type": "array",
-                            "description": "The tasks to run, in any order.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "agent": {
-                                        "type": "string",
-                                        "enum": keys,
-                                        "description": (
-                                            "Which specialist: file = this "
-                                            "room's content, scripts, "
-                                            "transcripts, studio; web = the "
-                                            "internet; app = this app's "
-                                            "interface; jobs = workflows and "
-                                            "whole-file passes; skills = agent "
-                                            "skills; connector = connected "
-                                            "services."
-                                        ),
-                                    },
-                                    "instruction": {
-                                        "type": "string",
-                                        "description": (
-                                            "What you need this agent to do, as "
-                                            "one clear task. Name the files or "
-                                            "targets."
-                                        ),
-                                    },
-                                    "depends_on": {
-                                        "type": "array",
-                                        "items": {"type": "integer"},
-                                        "description": (
-                                            "Positions (0-based) of tasks in "
-                                            "THIS list whose findings this task "
-                                            "needs. Leave empty when it can run "
-                                            "immediately."
-                                        ),
-                                    },
-                                },
-                                "required": ["agent", "instruction"],
-                            },
-                        }
-                    },
-                    "required": ["tasks"],
-                },
-            },
-        }
-    )
+    # `keys` came from reachable_domain_keys above — the enum, its description
+    # and the Main agent's prompt therefore list the SAME domains in the SAME
+    # order. A small model sees one consistent world, not three.
+    out.append(_batch_tool_spec(keys))
     return out
 
 
@@ -818,16 +1121,6 @@ def get_agent(agent_id: str) -> AgentSpec:
     """The spec for ``agent_id``; unknown ids degrade to the read-only default
     (a stale/foreign id must never crash a turn)."""
     return _BY_ID.get(agent_id) or _BY_ID[DEFAULT_AGENT_ID]
-
-
-def available_agents(*, web_enabled: bool) -> list[AgentSpec]:
-    """WORKER agents the manager may route to this run. The main agent is
-    never a routing candidate — it only synthesizes (run_agent appends it)."""
-    return [
-        spec
-        for spec in REGISTRY
-        if spec.available and not spec.main and (spec.id != "chat.web" or web_enabled)
-    ]
 
 
 def group_tools(group: str) -> set[str]:
@@ -874,16 +1167,22 @@ __all__ = [
     "AGENT_TOOL_DOMAINS",
     "AGENT_TOOL_NAMES",
     "BATCH_TOOL_NAME",
+    "DOMAIN_BLURBS",
     "DOMAIN_KEYS",
+    "DOMAIN_KEY_ORDER",
     "AgentSpec",
     "CORE_TOOLS",
     "DEFAULT_AGENT_ID",
     "MAIN_AGENT_ID",
     "GROUPS",
     "agent_tool_specs",
+    "domain_areas",
+    "domain_listing",
+    "main_prompt",
+    "normalize_domain_key",
+    "reachable_domain_keys",
     "MAX_BOX_TOOLS",
     "REGISTRY",
-    "available_agents",
     "get_agent",
     "group_prompt",
     "reachable_members",

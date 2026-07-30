@@ -423,6 +423,41 @@ REPLIES: dict[str, Any] = {
         "2. Reuters | https://reuters.com/markets/israel-rates — coverage of the July decision."
     ),
     "fetch_page": "Bank of Israel. The interest rate is 4.25%, effective 2026-07-07.",
+    # --- private browser (BROWSE-1) ----------------------------------------
+    "browse_open": (
+        "Example Shop — https://shop.example/p/123\n"
+        "7 interactive elements on Example Shop\n"
+        'e1 link "Home" [nav]\n'
+        'e2 searchbox "Search products" [form] (empty)\n'
+        'e3 button "Add to basket" [main]\n'
+        'e4 link "Delivery info" [main]'
+    ),
+    "browse_read": (
+        "Example Shop — https://shop.example/p/123\n\n"
+        "# Waxed Cotton Boots\n\n£42.00, in stock. Free delivery over £50."
+    ),
+    "browse_find": (
+        '1 match(es) for "basket":\ne3 button "Add to basket" [main]'
+    ),
+    "browse_snapshot": (
+        "Example Shop — https://shop.example/p/123\n"
+        "4 interactive elements on Example Shop\n"
+        'e1 link "Home" [nav]\n'
+        'e2 searchbox "Search products" [form] (empty)\n'
+        'e3 button "Add to basket" [main]\n'
+        'e4 link "Delivery info" [main]'
+    ),
+    "browse_do": (
+        '1. clicked e3 — button "Add to basket"\n\nThe page now:\n'
+        "Basket (1) — https://shop.example/basket\n"
+        '2 interactive elements on Basket (1)\n'
+        'e1 button "Checkout" [main]\n'
+        'e2 link "Keep shopping" [nav]'
+    ),
+    "browse_look": (
+        "Looking at Example Shop — every interactive element is numbered with "
+        "the same ref browse_snapshot uses."
+    ),
     # --- app driving -------------------------------------------------------
     "ui_snapshot": (
         "1: [button] Map\n2: [button] Files\n3: [button] Recordings\n"
@@ -520,7 +555,7 @@ REPLIES: dict[str, Any] = {
 #: format instead of the task. Every group below clears the floor on real,
 #: distinct intents.
 GROUPS: dict[str, tuple[str, ...]] = {
-    "knowledge": ("chat.answer", "chat.web", "files.read"),
+    "knowledge": ("chat.answer", "chat.web", "chat.browse", "files.read"),
     "automation": ("jobs.run", "jobs.workflows", "scripts.run"),
     "extend": ("skills.use", "skills.author", "connectors.admin", "connectors.use"),
     "media_app": ("media.transcribe", "media.video", "creator.studio", "app.ui"),
