@@ -3,7 +3,7 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
-## Unreleased
+## 0.13.0 — 2026-07-30
 
 ### One search engine, built in
 
@@ -49,6 +49,15 @@ All notable, user-facing changes to Arcelle. Versions follow
 - **The browser can't be used to reach this Mac.** Addresses on your own
   computer or home network are refused, in the address bar and inside pages
   alike, and passwords fields are fenced off from the assistant entirely.
+- **Two separate switches for what the assistant may do online.** Searching the
+  web and driving the browser are now independent: turn either off and the
+  assistant is not offered those tools at all, so it cannot use one by mistake
+  — and it will say plainly that it can't rather than pretend. Your own Browser
+  area is unaffected either way; these govern the assistant, not you.
+- **"Go to", "browse to", "navigate to" always open the page.** Asking to go
+  somewhere specific used to fall through to the search agent, which looked the
+  site up instead of opening it. Naming a destination now reaches the browser
+  every time, in English and Hebrew alike.
 
 ### Answers you can trust
 
@@ -71,6 +80,28 @@ All notable, user-facing changes to Arcelle. Versions follow
 - **A skill can no longer be filed under a specialist that does not exist.** One
   mistyped character used to save the skill to nowhere: it was never offered to
   anyone and never shown to you again.
+- **Reading a heavy page no longer kills the whole request.** Fetching a big
+  site handed the entire page to the model in one go. On a cloud room nothing
+  trimmed it, so the request was rejected and the specialist came back with
+  nothing — you saw a failed step and an assistant improvising about why it
+  couldn't read the page. Pages now arrive a chunk at a time, with the
+  assistant told how to read on, and no single result can overflow the model
+  again whichever engine you use.
+- **The assistant stops denying things it can do.** On a cloud engine it would
+  answer "I can't browse the web" or "I have no way to inspect connected
+  services" while those very tools were available to it. The sentence that
+  tells it otherwise was being dropped on exactly the turns where it decides
+  what to do.
+- **Once the browser was open, the assistant's other tools stopped working.**
+  Opening a page changed how the app found its own main window, and every tool
+  that needed it failed — silently, including background jobs and the
+  scheduler.
+
+### When something goes wrong
+
+- **A failed answer now leaves a trace.** If a run ends without producing an
+  answer, the reason is written to a log file on this Mac instead of vanishing.
+  Nothing about your room or your question is logged — only the failure.
 
 ### Connected services
 
