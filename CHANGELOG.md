@@ -3,6 +3,44 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.14.0 — 2026-08-01
+
+### Recordings finally split speakers where they actually change
+
+- **Two people talking back and forth no longer melt into one "Speaker 1".**
+  The old pipeline labeled whole phrases, and most real conversation puts two
+  voices inside a single phrase — so short exchanges collapsed into one
+  speaker. Recordings are now re-examined in 1.5-second steps and the
+  transcript is cut exactly where the voice changes, both for live
+  recordings and for **Re-transcribe** on anything you already recorded.
+  On our meeting test set this took speaker mix-ups from 17.9% to 1.3%.
+- **No more phantom speakers.** A couple of seconds of laughter, overlap, or
+  an odd-sounding word could previously mint a "Speaker 4" who owned one
+  line. A voice now has to carry real speech mass before it counts as a
+  person; short odd moments join the nearest real voice instead.
+- **The recording benchmark ships with the code.** A permanent acceptance
+  harness scores the real pipeline against reference meetings, so future
+  changes to speaker separation get measured, not eyeballed.
+
+### The browser grows downloads, search, and tabs
+
+- **Downloads that behave.** Click a download link and the file lands through
+  one guarded funnel — size-capped, origin-checked, recorded as a job you can
+  watch. The assistant can save a link, a file, or a page's media for you,
+  and video sites work through the same door.
+- **A real search page.** Searching in the browser opens a results page of
+  its own — with previews, and an on-demand AI summary whose every claim
+  links back to the result it came from.
+- **Tabs.** The browser now holds several pages at once.
+
+### Spoken voice is now fully neural
+
+- **The robotic fallback voice is gone.** Arcelle speaks only with the neural
+  voices; the on-device engine and its settings have been removed.
+- **The voice list is live.** Voices come from the speech engine's actual
+  catalog (322 voices today), grouped by language, with preview — instead of
+  a bundled list that goes stale.
+
 ## 0.13.0 — 2026-07-30
 
 ### One search engine, built in
