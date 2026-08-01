@@ -69,6 +69,12 @@ _LABELS: dict[str, str] = {
     "browse_find": "Looked for a control on the page",
     "browse_do": "Operated the page",
     "browse_look": "Looked at the page",
+    # BROWSE-2: web content arriving as room files. "Saved" only where the tool
+    # result confirms a landed file; download_media only STARTS a job.
+    "browse_save": "Saved the page into the room",
+    "save_link": "Saved a link into the room",
+    "download_url": "Downloaded a file into the room",
+    "download_media": "Started a media download",
     # ADD-25: the agent is operating the app with the user watching.
     "ui_snapshot": "Looked at the app's controls",
     "ui_act": "Operated the app",

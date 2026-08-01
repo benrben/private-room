@@ -75,8 +75,12 @@ _LINE_MARKERS = "0123456789-*.) "
 
 def parse_string_list(raw: str) -> list[str]:
     """docs_html.rs ``parse_string_list``: a JSON array of strings (tolerating
-    leading/trailing prose), else newline/bullet splitting. Trimmed, deduped
-    case-insensitively, capped at 12. Byte length (< 80) matches the Rust."""
+    leading/trailing prose), else newline/bullet splitting. Trimmed and deduped
+    case-insensitively; byte length (< 80) matches the Rust.
+
+    Uncapped: ``#add-file for each`` writes a file per item the user asked for,
+    so a 20-item list must not quietly become the first 12 files.
+    """
     cleaned = strip_think_spans(raw)
     items: list[str] = []
     start = cleaned.find("[")
@@ -105,8 +109,6 @@ def parse_string_list(raw: str) -> list[str]:
             continue
         seen.add(low)
         out.append(s)
-        if len(out) >= 12:
-            break
     return out
 
 
@@ -230,12 +232,13 @@ async def enumerate_names(
     provider: Any | None = None,
 ) -> list[str]:
     """knowledge.rs cmd_add_file "for each" — enumerate the ``subject`` as short
-    names from the conversation (max 12), guaranteed a JSON string array."""
+    names from the conversation, guaranteed a JSON string array. Uncapped: the
+    user gets a file per item they named, however many that is."""
     schema = {"type": "array", "items": {"type": "string"}}
     messages = [
         system_message(LIST_NAMES_SYSTEM),
         user_message(
-            f"From the conversation below, list the {subject} as short names (max 12). "
+            f"From the conversation below, list EVERY one of the {subject} as short names. "
             f"If there are none, return an empty array.\n\nConversation:\n{conversation}"
         ),
     ]

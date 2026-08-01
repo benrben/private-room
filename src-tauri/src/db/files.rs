@@ -9,12 +9,26 @@ pub fn insert_file(
     text: Option<&str>,
     source: &str,
 ) -> Result<FileMeta, String> {
+    insert_file_from_url(conn, name, mime, bytes, text, source, None)
+}
+
+/// BROWSE-2 (D19): like [`insert_file`], recording where the bytes came from.
+/// Every file that arrived over the network keeps its source URL.
+pub fn insert_file_from_url(
+    conn: &Connection,
+    name: &str,
+    mime: &str,
+    bytes: &[u8],
+    text: Option<&str>,
+    source: &str,
+    origin_url: Option<&str>,
+) -> Result<FileMeta, String> {
     let id = Uuid::new_v4().to_string();
     execute_one(
         conn,
-        "INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id, name, mime, bytes.len() as i64, source, bytes, text],
+        "INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text, origin_url)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, name, mime, bytes.len() as i64, source, bytes, text, origin_url],
     )?;
     insert_chunks(conn, &id, text)?;
     get_file_meta(conn, &id)

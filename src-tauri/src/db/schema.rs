@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS files (
   -- ADD-17: cached one-line "what is this file" summary, cleared whenever the
   -- file's content changes so re-summarizing only touches new/changed files.
   ai_summary TEXT,
+  -- BROWSE-2 (D19): where a downloaded file came from. NULL for everything
+  -- that did not arrive over the network (uploads, generated files).
+  origin_url TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -82,6 +85,15 @@ CREATE TABLE IF NOT EXISTS web_pages (
 );
 -- RM-2: one cache row per URL so repeat fetches upsert instead of piling up.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_web_pages_url ON web_pages(url);
+-- BROWSE-3b: preview-image bytes for search results, keyed by the image's own
+-- URL. Every byte arrived through the Rust guard, so the results page can render
+-- from data URLs and never make a request of its own.
+CREATE TABLE IF NOT EXISTS web_images (
+  url TEXT PRIMARY KEY,
+  mime TEXT NOT NULL,
+  bytes BLOB NOT NULL,
+  saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -530,6 +542,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // BROWSE-3b: preview-image cache for search results. Guarded like the tables
+    // above — old rooms never ran the new SCHEMA.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS web_images (
+           url TEXT PRIMARY KEY,
+           mime TEXT NOT NULL,
+           bytes BLOB NOT NULL,
+           saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );",
+    )
+    .map_err(|e| e.to_string())?;
+
     // ADD-27: live-recording metadata, one JSON row per recording file.
     // Guarded like the tables above — old rooms never ran the new SCHEMA.
     conn.execute_batch(
@@ -567,6 +591,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     // invalidate a stale summary). Guarded ALTER, like folder_id above.
     if table_exists(conn, "files")? && !column_exists(conn, "files", "ai_summary")? {
         conn.execute("ALTER TABLE files ADD COLUMN ai_summary TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    // BROWSE-2 (D19): download provenance. Guarded ALTER like ai_summary above.
+    if table_exists(conn, "files")? && !column_exists(conn, "files", "origin_url")? {
+        conn.execute("ALTER TABLE files ADD COLUMN origin_url TEXT", [])
             .map_err(|e| e.to_string())?;
     }
 

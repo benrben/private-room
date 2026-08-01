@@ -45,11 +45,13 @@ from .prompts import (
     TRANSCRIBE_PROMPT,
     UI_PROMPT,
     VIDEO_PROMPT,
+    WEB_OFF_NOTE,
     WEB_PROMPT,
     WORKFLOWS_PROMPT,
 )
 from .routing import (
     BROWSE_TOOL_NAMES,
+    DOWNLOAD_TOOL_NAMES,
     JOB_TOOL_NAMES,
     MCP_MANAGEMENT_TOOL_NAMES,
     SKILL_TOOL_NAMES,
@@ -247,7 +249,7 @@ def domain_areas(keys: Iterable[str]) -> str:
     return ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
-def main_prompt(keys: Iterable[str]) -> str:
+def main_prompt(keys: Iterable[str], *, web_off: bool = False) -> str:
     """The Main agent's system paragraph for exactly the REACHABLE domains.
 
     ``keys`` are the short domain keys whose ``ask_*_agent`` tool is actually
@@ -272,10 +274,15 @@ def main_prompt(keys: Iterable[str]) -> str:
     Every unit test passed a list, which re-iterates, so the suite never saw it.
 
     Materialised ONCE, and the tests below pass a generator on purpose.
+
+    ``web_off`` appends :data:`WEB_OFF_NOTE`. The catalog alone says only that
+    the web domain is absent; without a reason the model invents one, and it
+    picks permanence ("this room has no browsing tool") over the truth (a switch
+    is off). See the note for the live refusal that prompted it.
     """
     have = set(keys)
     wanted = [k for k in DOMAIN_KEY_ORDER if k in have]
-    return MAIN_PROMPT_TEMPLATE.format(
+    paragraph = MAIN_PROMPT_TEMPLATE.format(
         # The sentence already named ask_file_agent, so this half lists the
         # others. With file the only reachable domain it degrades to a plain
         # "there are no other specialists" rather than a dangling "for .".
@@ -283,6 +290,7 @@ def main_prompt(keys: Iterable[str]) -> str:
         or "nothing else — you have no other specialists",
         all_areas=domain_areas(wanted) or "this room's content",
     )
+    return paragraph + WEB_OFF_NOTE if web_off else paragraph
 
 
 # --------------------------------------------------------------------------- #
@@ -405,15 +413,19 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # is structural. Bounded at 3 model calls vs unbounded before.
         flow=Flow(
             stages=("web_search", "fetch_page"),
-            keep=("search_room",),
+            # BROWSE-2: the download verbs stay offered through every stage —
+            # `stage_catalog` narrows each round to keep ∪ {stage tool}, so a
+            # verb not in `keep` would be unreachable in this box.
+            keep=("search_room", *DOWNLOAD_TOOL_NAMES),
         ),
         template="chain_stage",
         label="Web agent",
         description="Find or fetch current information from the internet.",
-        tools=("web_search", "fetch_page"),
+        tools=("web_search", "fetch_page", *DOWNLOAD_TOOL_NAMES),
         hints=(
             "web", "online", "internet", "news", "latest", "google",
-            "חפש ברשת", "באינטרנט", "חדשות", "מזג אוויר",
+            "download", "save the link", "save this link",
+            "חפש ברשת", "באינטרנט", "חדשות", "מזג אוויר", "הורד",
         ),
         prompt=WEB_PROMPT,
         read_only=True,
@@ -440,6 +452,11 @@ REGISTRY: tuple[AgentSpec, ...] = (
         template="perceive_act",
         label="Browser agent",
         description="Open and operate web pages in the room's private browser.",
+        # BROWSE-2: browse_save rode into BROWSE_TOOL_NAMES; the download verbs
+        # deliberately did NOT — "download the report on that page" is a
+        # browse_do CLICK (the browser imports the file automatically), and
+        # explicit-URL downloads are chat.web's job. Keeping this box at the
+        # browse verbs holds it inside the small-model choice budget.
         tools=BROWSE_TOOL_NAMES,
         # The discriminator against its sibling is NOT "does this mention the
         # web" — both do. It is: **is a specific destination named, or is a
@@ -757,7 +774,10 @@ REGISTRY: tuple[AgentSpec, ...] = (
 
 #: Sub-agent boxes may not exceed this (CORE is exempt — its size is dictated
 #: by the byte-stable Rust prompt, not by choice).
-MAX_BOX_TOOLS = 6
+# Raised 6 → 7 for BROWSE-2: browse_save is a browse-native verb (capture the
+# page you are looking at) and the browse box was already at the cap. Still a
+# cap — a new tool must argue its way in, not ride a raise.
+MAX_BOX_TOOLS = 7
 
 #: The default WORKER for a clause nothing claims: the File agent (CORE
 #: read+write) — every ask is delegated to a specialist; the main agent

@@ -2,8 +2,9 @@
 
 What these pin, and why each one is a bug that actually happens:
 
-* The browser box is EXACTLY the six Rust tools. A drift either way is silent —
-  a Python-only name is never served, a Rust-only name is never offered.
+* The browser box is EXACTLY the Rust browse tools. A drift either way is
+  silent — a Python-only name is never served, a Rust-only name is never
+  offered.
 * Both internet workers vanish when the room's web setting is off. The
   capability-truth wave exists because a domain listing that still says "the
   internet" makes the model dispatch to a worker that cannot act, and answer
@@ -50,7 +51,7 @@ def _spec(agent_id: str):
     raise AssertionError(f"{agent_id} is not registered")
 
 
-def test_the_browser_box_is_exactly_the_six_rust_tools() -> None:
+def test_the_browser_box_is_exactly_the_rust_browse_tools() -> None:
     spec = _spec("chat.browse")
     assert spec.tools == BROWSE_TOOL_NAMES
     assert len(spec.tools) <= MAX_BOX_TOOLS

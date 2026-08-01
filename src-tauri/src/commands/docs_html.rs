@@ -267,23 +267,32 @@ pub(crate) fn html_titled_doc(name: &str, title: &str, body: &str) -> String {
     }
 }
 
-/// Pinned-file text as context, plus the file names, under a shared char budget.
-pub(crate) fn refs_context(conn: &Connection, refs: &[String], budget: usize) -> (String, Vec<String>) {
+/// Pinned files as (name, full text) pairs — for commands that process each
+/// @file on its own. No truncation and no file skipped: the caller decides how
+/// to fit a long file into model calls (see `cmd_windows`), because deciding it
+/// here can only mean throwing text away.
+pub(crate) fn refs_files(conn: &Connection, refs: &[String]) -> Vec<(String, String)> {
+    refs.iter()
+        .filter_map(|id| db::get_file_full(conn, id).ok())
+        .map(|(name, _mime, _bytes, text)| (name, text.unwrap_or_default()))
+        .collect()
+}
+
+/// Pinned-file text as one context blob, plus the file names — the WHOLE text of
+/// every @file, in order.
+///
+/// This used to clamp each file to 6000 bytes and silently drop any file once a
+/// shared budget ran out, which is what made `#minutes` on an hour-long meeting
+/// cover only its first ~5 minutes: ~6 KB of transcript is about 1000 words. A
+/// command that can't fit this in one call now windows it and runs a pass per
+/// window instead of losing the tail.
+pub(crate) fn refs_context(conn: &Connection, refs: &[String]) -> (String, Vec<String>) {
+    let files = refs_files(conn, refs);
+    let names = files.iter().map(|(n, _)| n.clone()).collect();
     let mut ctx = String::new();
-    let mut names = Vec::new();
-    let mut used = 0usize;
-    for id in refs {
-        if let Ok((name, _mime, _bytes, text)) = db::get_file_full(conn, id) {
-            names.push(name.clone());
-            if let Some(t) = text {
-                let room = budget.saturating_sub(used).min(6000);
-                if room < 200 {
-                    continue;
-                }
-                let take = clamp_bytes(t, room);
-                used += take.len();
-                ctx.push_str(&format!("[file: {name}]\n{take}\n\n"));
-            }
+    for (name, text) in &files {
+        if !text.trim().is_empty() {
+            ctx.push_str(&format!("[file: {name}]\n{text}\n\n"));
         }
     }
     (ctx, names)
@@ -371,6 +380,21 @@ mod tests {
         let two = "| A |\n|---|\n| 1 |\n\ntext\n\n| Z |\n|---|\n| 9 |";
         let last = extract_md_table(two).unwrap();
         assert_eq!(last[0], vec!["Z"]);
+    }
+
+    #[test]
+    fn refs_context_keeps_every_file_whole() {
+        // The regression this replaces: each file was clamped to 6000 bytes and
+        // any file past a shared budget was dropped entirely — which is what made
+        // #minutes cover only the opening minutes of a long meeting.
+        let conn = db::mem();
+        let big = "x".repeat(40_000);
+        let a = db::add_file(&conn, "meeting.txt", &big);
+        let b = db::add_file(&conn, "notes.md", "the last word");
+        let (ctx, names) = refs_context(&conn, &[a, b]);
+        assert_eq!(names, vec!["meeting.txt", "notes.md"]);
+        assert!(ctx.contains(&big), "the whole file is present, not a 6000-byte prefix");
+        assert!(ctx.contains("the last word"), "a later file is never dropped");
     }
 
     #[test]

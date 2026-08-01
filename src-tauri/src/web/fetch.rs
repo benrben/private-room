@@ -1,6 +1,15 @@
 use super::*;
 
-const MAX_PAGE_CHARS: usize = 12_000;
+/// Hard cap on the readable text one `fetch_page` yields.
+///
+/// Was 12,000 — which silently disabled the pagination protocol it sits behind:
+/// `agent::fetch_page_window` windows 40,000 characters and tells the model to
+/// call again with the next `start`, but text truncated at 12,000 can never
+/// reach a second window, so `end < total` was unreachable and the "read the
+/// rest" instruction was never true. Raised well past one window so long pages
+/// (a 69 KB finance page was the motivating example) can actually be paged
+/// through. The 8 MiB byte cap upstream still bounds the fetch itself.
+const MAX_PAGE_CHARS: usize = 200_000;
 
 /// Hard cap on how much of any response body gets buffered. Generous, because
 /// #research pages and YouTube watch pages legitimately run to multiple MB —
@@ -177,6 +186,158 @@ pub async fn fetch_readable(url: &str) -> Result<(String, String, Vec<u8>), Stri
         body
     };
     Ok((title, text, raw))
+}
+
+// ---------------------------------------------------------------- binary downloads (BROWSE-2)
+
+/// D15: hard per-file cap for anything downloaded into the room. A room file is
+/// one SQLite blob with a practical ceiling of ~1 GB — refuse before storage
+/// does, with a message that names the real limit.
+pub const MAX_DOWNLOAD_BYTES: u64 = 800 * 1024 * 1024;
+
+/// D18: how much `download_url` fetches inline (within one tool call). Anything
+/// bigger belongs on the durable-job tier, not in a chat round.
+pub const INLINE_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A file staged to the app's temp area by [`download_to_temp`], ready for
+/// `import_download` to move into the room.
+pub struct Downloaded {
+    pub path: std::path::PathBuf,
+    pub file_name: String,
+    pub mime: String,
+    pub size_bytes: u64,
+}
+
+/// Outcome of a capped download. `TooLarge` is an OUTCOME, not an error,
+/// because the caller chooses what it means: at the inline cap it promotes the
+/// download to a background job (D18); at the hard cap it is a truthful
+/// refusal (D15).
+pub enum DownloadOutcome {
+    Done(Downloaded),
+    TooLarge,
+}
+
+/// Keep a network-supplied filename honest: alphanumerics plus `. - _`, at
+/// most 80 chars, never empty. Callers always prefix a UUID before using it as
+/// a path component, so traversal sequences die here AND can't escape there.
+pub fn safe_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .take(80)
+        .collect();
+    if cleaned.trim_matches(['.', '_']).is_empty() {
+        "download".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// The server's suggested filename from a Content-Disposition header, if any.
+/// Reads `filename*=charset''value` (kept raw — percent escapes fall to
+/// `safe_file_name`) and quoted or bare `filename=`.
+fn disposition_file_name(value: &str) -> Option<String> {
+    for part in value.split(';').map(str::trim) {
+        let ext = part.strip_prefix("filename*=");
+        let plain = part.strip_prefix("filename=");
+        let raw = match (ext, plain) {
+            (Some(v), _) => v.rsplit("''").next().unwrap_or(v),
+            (None, Some(v)) => v,
+            _ => continue,
+        };
+        let name = raw.trim_matches('"').trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Download any URL — binary included — to a staged temp file, streaming and
+/// size-capped. Same SSRF posture as every other fetch (public-URL check,
+/// SEC-5 DNS pinning, hop-by-hop redirect re-checks); unlike `fetch_page` it
+/// accepts every content type. The caller owns the staged file: import it into
+/// the room, then delete it.
+///
+/// `cancel` is polled per chunk (a set flag aborts with "Stopped." and removes
+/// the partial file); `progress` receives (bytes so far, declared total).
+pub async fn download_to_temp(
+    url: &str,
+    cap: u64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<DownloadOutcome, String> {
+    use std::io::Write;
+
+    let mut resp = guarded_get(url).await?;
+    if resp.content_length().is_some_and(|len| len > cap) {
+        return Ok(DownloadOutcome::TooLarge);
+    }
+    let declared = resp.content_length();
+    let suggested = resp
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(disposition_file_name)
+        .or_else(|| {
+            reqwest::Url::parse(url).ok().and_then(|u| {
+                u.path_segments()
+                    .and_then(|s| s.filter(|p| !p.is_empty()).next_back().map(str::to_string))
+            })
+        })
+        .unwrap_or_else(|| "download".to_string());
+    let file_name = safe_file_name(&suggested);
+    let header_mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_lowercase())
+        .filter(|m| !m.is_empty() && m != "application/octet-stream");
+    let mime = header_mime.unwrap_or_else(|| {
+        mime_guess::from_path(&file_name)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string()
+    });
+
+    let dir = std::env::temp_dir().join("arcelle-downloads");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not stage the download: {e}"))?;
+    let path = dir.join(format!("{}-{}", uuid::Uuid::new_v4(), file_name));
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(&path).map_err(|e| format!("Could not stage the download: {e}"))?,
+    );
+    let mut total: u64 = 0;
+    loop {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            drop(out);
+            let _ = std::fs::remove_file(&path);
+            return Err("Stopped.".into());
+        }
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                total += chunk.len() as u64;
+                if total > cap {
+                    drop(out);
+                    let _ = std::fs::remove_file(&path);
+                    return Ok(DownloadOutcome::TooLarge);
+                }
+                if let Err(e) = out.write_all(&chunk) {
+                    drop(out);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("Could not stage the download: {e}"));
+                }
+                progress(total, declared);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                drop(out);
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("The download failed partway: {e}"));
+            }
+        }
+    }
+    out.flush().map_err(|e| format!("Could not stage the download: {e}"))?;
+    Ok(DownloadOutcome::Done(Downloaded { path, file_name, mime, size_bytes: total }))
 }
 
 // ---------------------------------------------------------------- YouTube transcripts (ADD-19)
@@ -383,10 +544,300 @@ mod tests {
     }
 
     #[test]
+    fn download_names_are_sanitized_into_a_safe_filename() {
+        assert_eq!(safe_file_name("report.pdf"), "report.pdf");
+        assert_eq!(safe_file_name("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(safe_file_name("a b;rm -rf /"), "a_b_rm_-rf__");
+        assert!(safe_file_name(&"x".repeat(500)).len() <= 80);
+        // A name that sanitizes to nothing meaningful must not become a path
+        // component like "" or "..".
+        assert_eq!(safe_file_name(""), "download");
+        assert_eq!(safe_file_name(".."), "download");
+        assert_eq!(safe_file_name("///"), "download");
+    }
+
+    #[test]
+    fn content_disposition_filenames_are_read_in_both_forms() {
+        assert_eq!(
+            disposition_file_name(r#"attachment; filename="report q3.pdf""#).as_deref(),
+            Some("report q3.pdf")
+        );
+        assert_eq!(
+            disposition_file_name("attachment; filename*=UTF-8''data.csv").as_deref(),
+            Some("data.csv")
+        );
+        assert_eq!(disposition_file_name("inline"), None);
+    }
+
+    #[test]
     fn extracts_html_title() {
         assert_eq!(
             html_title("<html><head><TITLE>Hello &amp; more</TITLE></head>"),
             Some("Hello & more".to_string())
+        );
+    }
+}
+
+// ---------------------------------------------------------------- result previews (BROWSE-3b)
+
+/// How much of a result page to read while enriching it. Everything we want —
+/// `og:image`, `meta description`, `<title>`, the icon link — lives in `<head>`,
+/// so a quarter-megabyte is generous; the readable text we keep is a bonus from
+/// bytes already in hand, not a reason to read further.
+const MAX_PREVIEW_HTML_BYTES: usize = 256 * 1024;
+
+/// Hard cap per preview image. Real `og:image` files are 20–150 KB; anything
+/// larger is a full-resolution hero shot we have no use for at card size.
+pub const MAX_PREVIEW_IMAGE_BYTES: usize = 200 * 1024;
+
+/// What one enrich pass learns about a result page (BROWSE-3b).
+pub struct PagePreview {
+    /// Absolute URL of the page's own preview image, if it declares one.
+    pub image_url: Option<String>,
+    /// Absolute URL of the page's favicon, if it declares one.
+    pub icon_url: Option<String>,
+    /// The page's own `meta description` — first-party and usually better
+    /// written than the engine's snippet.
+    pub description: Option<String>,
+    pub title: Option<String>,
+    /// Readable text, so a later Peek is already paid for.
+    pub text: String,
+}
+
+/// Read one `<meta>` value by property/name, case-insensitively. A deliberately
+/// small scanner rather than a DOM parse: we are reading four known keys out of
+/// a `<head>`, and pulling in a full HTML parser for that would be the tail
+/// wagging the dog.
+fn meta_content(html: &str, keys: &[&str]) -> Option<String> {
+    let lower = html.to_lowercase();
+    for key in keys {
+        // Both quote styles: `property="og:image"` and `property='og:image'`
+        // are equally legal, and a page that uses single quotes is not a page
+        // without a preview image. (attr_value already handled both; this
+        // needle did not, so single-quoted pages silently lost their image.)
+        for quote in ['"', '\''] {
+            let needle = format!("{quote}{key}{quote}");
+            let mut from = 0;
+            while let Some(at) = lower[from..].find(&needle) {
+                let at = from + at;
+                // Walk back to the opening tag, then forward to its end. A
+                // fragment with no opening tag is skipped, never fatal: one
+                // malformed match must not abandon the remaining keys.
+                let Some(tag_start) = lower[..at].rfind('<') else {
+                    from = at + needle.len();
+                    continue;
+                };
+                let tag_end = at + lower[at..].find('>').unwrap_or(0);
+                if tag_end <= tag_start {
+                    from = at + needle.len();
+                    continue;
+                }
+                let tag = &html[tag_start..tag_end];
+                if let Some(value) = attr_value(tag, "content") {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        return Some(html_unescape(value));
+                    }
+                }
+                from = at + needle.len();
+            }
+        }
+    }
+    None
+}
+
+/// Pull one attribute's value out of a single tag. Handles both quote styles;
+/// unquoted values are rare enough in real `<head>` markup to skip.
+fn attr_value(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let at = lower.find(&format!("{attr}="))?;
+    let rest = &tag[at + attr.len() + 1..];
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let end = rest[1..].find(quote)?;
+    Some(rest[1..1 + end].to_string())
+}
+
+/// The `href` of the page's icon link, if it declares one.
+fn icon_href(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find("<link") {
+        let at = from + at;
+        let end = at + lower[at..].find('>').unwrap_or(0);
+        if end <= at {
+            break;
+        }
+        let tag = &html[at..end];
+        let rel = attr_value(tag, "rel").unwrap_or_default().to_lowercase();
+        if rel.split_whitespace().any(|r| r == "icon" || r == "shortcut") {
+            if let Some(href) = attr_value(tag, "href").filter(|h| !h.trim().is_empty()) {
+                return Some(html_unescape(href.trim()));
+            }
+        }
+        from = end;
+    }
+    None
+}
+
+/// The five entities that actually show up in `content=` attributes. Not a
+/// general unescaper — a title with `&#8212;` in it is cosmetically wrong, not
+/// broken, and a full entity table is not worth carrying for that.
+fn html_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+/// Resolve a possibly-relative asset URL against the page it came from, and
+/// refuse anything that isn't plain http(s) — a `data:` or `javascript:` URL in
+/// an `og:image` must never reach the fetcher.
+fn absolutize(base: &str, href: &str) -> Option<String> {
+    let joined = reqwest::Url::parse(base).ok()?.join(href.trim()).ok()?;
+    matches!(joined.scheme(), "http" | "https").then(|| joined.to_string())
+}
+
+/// Read one result page for its preview metadata (BROWSE-3b).
+///
+/// This is the enrich pass: the same guarded GET as every other fetch — public
+/// URL check, SEC-5 DNS pinning, hop-by-hop redirect re-checks — reading at most
+/// [`MAX_PREVIEW_HTML_BYTES`]. It is `reqwest`, not a browser: no cookie jar, no
+/// script execution, no referrer, no storage. That is what lets the results page
+/// show real thumbnails without any origin ever seeing a browser fingerprint.
+pub async fn fetch_preview(url: &str) -> Result<PagePreview, String> {
+    let resp = guarded_get(url).await?;
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if !(content_type.contains("html") || content_type.is_empty()) {
+        return Err(format!("Not an HTML page (content-type: {content_type})."));
+    }
+    let mut raw = body_capped(resp, true).await?;
+    raw.truncate(MAX_PREVIEW_HTML_BYTES);
+    let html = decode_body(&raw, &content_type);
+    Ok(preview_from_html(url, &html))
+}
+
+/// The parsing half of [`fetch_preview`], split out so it can be tested without
+/// a network.
+fn preview_from_html(url: &str, html: &str) -> PagePreview {
+    let image = meta_content(html, &["og:image", "twitter:image", "og:image:url"])
+        .and_then(|href| absolutize(url, &href));
+    let icon = icon_href(html)
+        .and_then(|href| absolutize(url, &href))
+        // Every site serves /favicon.ico whether or not it says so.
+        .or_else(|| absolutize(url, "/favicon.ico"));
+    PagePreview {
+        image_url: image,
+        icon_url: icon,
+        description: meta_content(html, &["og:description", "description", "twitter:description"])
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty()),
+        title: meta_content(html, &["og:title"]).or_else(|| html_title(html)),
+        text: extraction::strip_html(html),
+    }
+}
+
+/// Fetch one image through the same guard, refusing anything that isn't an
+/// image or is bigger than a card needs. Returns (mime, bytes).
+pub async fn fetch_image(url: &str) -> Result<(String, Vec<u8>), String> {
+    let resp = guarded_get(url).await?;
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if !mime.starts_with("image/") {
+        return Err(format!("Not an image (content-type: {mime})."));
+    }
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_PREVIEW_IMAGE_BYTES as u64)
+    {
+        return Err("Preview image is too large.".into());
+    }
+    let bytes = body_capped(resp, false).await?;
+    if bytes.len() > MAX_PREVIEW_IMAGE_BYTES {
+        return Err("Preview image is too large.".into());
+    }
+    Ok((mime, bytes))
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    const PAGE: &str = r#"<html><head>
+        <title>Fallback title</title>
+        <meta property="og:title" content="Speaker diarisation">
+        <meta property="og:image" content="/img/hero.png">
+        <meta name="description" content="Who spoke &amp; when.">
+        <link rel="shortcut icon" href="https://cdn.example.com/i.png">
+      </head><body><main>Body text here.</main></body></html>"#;
+
+    #[test]
+    fn reads_og_image_description_and_icon() {
+        let p = preview_from_html("https://example.com/a/b", PAGE);
+        assert_eq!(p.image_url.as_deref(), Some("https://example.com/img/hero.png"));
+        assert_eq!(p.icon_url.as_deref(), Some("https://cdn.example.com/i.png"));
+        assert_eq!(p.description.as_deref(), Some("Who spoke & when."));
+        assert_eq!(p.title.as_deref(), Some("Speaker diarisation"));
+        assert!(p.text.contains("Body text here."));
+    }
+
+    /// A page with no og:title still gets a title — the results page would
+    /// otherwise show the engine's, which is often worse.
+    #[test]
+    fn falls_back_to_the_title_tag() {
+        let p = preview_from_html("https://example.com/", "<html><head><title>Plain</title></head></html>");
+        assert_eq!(p.title.as_deref(), Some("Plain"));
+        assert!(p.image_url.is_none());
+    }
+
+    /// The designed fallback: no og:image means a monogram tile, not a broken
+    /// image slot.
+    #[test]
+    fn a_page_without_a_preview_image_reports_none() {
+        let p = preview_from_html("https://example.com/", "<html><head></head><body>x</body></html>");
+        assert!(p.image_url.is_none());
+        // …but every site still gets the conventional icon path.
+        assert_eq!(p.icon_url.as_deref(), Some("https://example.com/favicon.ico"));
+    }
+
+    /// A `data:` URL in an og:image must never reach the fetcher.
+    #[test]
+    fn refuses_non_http_asset_urls() {
+        let html = r#"<meta property="og:image" content="data:image/png;base64,AAA">"#;
+        assert!(preview_from_html("https://example.com/", html).image_url.is_none());
+    }
+
+    #[test]
+    fn resolves_protocol_relative_and_absolute_images() {
+        let html = r#"<meta property="og:image" content="//cdn.example.com/a.jpg">"#;
+        assert_eq!(
+            preview_from_html("https://example.com/p", html).image_url.as_deref(),
+            Some("https://cdn.example.com/a.jpg")
+        );
+    }
+
+    #[test]
+    fn single_quoted_attributes_parse() {
+        let html = "<meta property='og:image' content='https://a.com/x.png'>";
+        assert_eq!(
+            preview_from_html("https://a.com/", html).image_url.as_deref(),
+            Some("https://a.com/x.png")
         );
     }
 }

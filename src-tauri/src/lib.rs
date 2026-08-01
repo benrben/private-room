@@ -13,7 +13,6 @@ mod room_mcp;
 mod sidecar;
 mod sidecar_lifecycle;
 pub(crate) mod snapshot;
-pub mod speech;
 pub mod stt;
 mod token_usage;
 pub mod web;
@@ -268,6 +267,8 @@ pub fn run() {
             // bridge + YouTube video import.
             commands::resolve_agent_ui,
             commands::import_youtube_video,
+            commands::import_media_url,
+            commands::start_download_job,
             // ADD-27: live Recording file (streaming transcription, editing,
             // translate). ADD-28: feedback → GitHub issue.
             commands::rec_start,
@@ -330,13 +331,16 @@ pub fn run() {
             commands::import_skill_folder,
             commands::export_skill_folder,
             commands::compose_skill,
-            // Idea 3: supernatural voice — on-device speech synthesis.
-            commands::speak_text,
+            // Idea 3: supernatural voice — neural synthesis via the sidecar.
             commands::speak_text_neural,
-            commands::list_speech_voices,
+            commands::list_neural_voices,
             // BROWSE-1: the private browser area.
             commands::browser_navigate,
             commands::browser_close,
+            commands::browser_new_tab,
+            commands::browser_select_tab,
+            commands::browser_close_tab,
+            commands::browser_tabs,
             commands::browser_set_bounds,
             commands::browser_info,
             commands::browser_go,
@@ -344,6 +348,13 @@ pub fn run() {
             commands::browser_journal,
             commands::browser_clear_journal,
             commands::browser_verify_private,
+            commands::browser_save_page,
+            // BROWSE-3: the address bar's search half.
+            commands::browser_search,
+            commands::browser_preview,
+            commands::browser_peek,
+            commands::browser_search_summary,
+            commands::import_search_result,
         ])
         .setup(|app| {
             // Wave 5 (Idea 13): sweep orphaned script-run workspaces left by a

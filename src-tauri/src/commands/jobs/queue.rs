@@ -150,6 +150,7 @@ async fn start_job_from_row(
             .map(|_| true),
         "workflow" => start_workflow_row(window, &state, &job, &room_path, cancel).map(|_| true),
         "studio" => start_studio_row(window, &state, &job, &room_path, cancel).map(|_| true),
+        "download" => start_download_row(window, &state, &job, &room_path, cancel).map(|_| true),
         _ => Err("This job kind can't be started.".into()),
     };
     match started {

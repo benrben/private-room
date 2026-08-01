@@ -105,10 +105,15 @@ pub(crate) struct CmdCtx<'a> {
     refs: &'a [String],
     /// Text after the command word, with @tokens already stripped by the UI.
     args: &'a str,
-    /// Prior conversation as plain text (oldest-first), already budget-clamped.
+    /// Prior conversation as plain text (oldest-first) — the whole chat since
+    /// the last handoff; commands window it when it outgrows one call.
     history: &'a str,
     temperature: Option<f64>,
     cancel: Arc<AtomicBool>,
+    /// Windows of the source a pass could not read (the model errored or timed
+    /// out on them). Full ops means the whole source is READ — when a slice of it
+    /// wasn't, the reply says so instead of quietly covering less.
+    unread: AtomicUsize,
 }
 
 /// What a command produces: a chat message plus optional viewer effects.
@@ -120,14 +125,21 @@ pub(crate) struct CommandResult {
 }
 
 /// Wall-clock ceiling for a single non-streamed command step (`ask_quiet`).
-/// Well above a normal local generation (seconds) but far below the shared
-/// 10-minute HTTP timeout, so a stalled model fails fast with a clear message
-/// instead of freezing the step chip.
-const COMMAND_STEP_TIMEOUT_SECS: u64 = 180;
+/// Sized for one full window of source (`CMD_WINDOW_CHARS`) on a slow local
+/// model, and still far below the shared 10-minute HTTP timeout, so a stalled
+/// model fails fast with a clear message instead of freezing the step chip. A
+/// step that does time out counts as an unread window and is reported — it never
+/// silently shrinks the coverage.
+const COMMAND_STEP_TIMEOUT_SECS: u64 = 300;
 
 impl CmdCtx<'_> {
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Record that one window of the source could not be read.
+    fn note_unread(&self) {
+        self.unread.fetch_add(1, Ordering::SeqCst);
     }
 
     /// One model call streamed live into the chat (for answers the user reads).
@@ -219,15 +231,90 @@ impl CmdCtx<'_> {
         )
         .await
     }
+
+    /// The MAP half of a full pass: one quiet call per window of `source`, in
+    /// order. `label` names the work in the step chip ("Reading part 3/9"); a
+    /// Stop between windows ends the pass with what it already has, and a window
+    /// whose call fails contributes nothing instead of aborting the whole run
+    /// (one bad slice must not cost the user the other twenty).
+    async fn map_windows(
+        &self,
+        source: &str,
+        label: &str,
+        system: &str,
+        user: impl Fn(&str) -> String,
+        temp: Option<f64>,
+    ) -> Vec<String> {
+        use tauri::Emitter;
+        let windows = cmd_windows(source);
+        let total = windows.len();
+        let mut out = Vec::new();
+        for (i, w) in windows.iter().enumerate() {
+            if self.cancelled() {
+                break;
+            }
+            if total > 1 {
+                let _ = self
+                    .window
+                    .emit("ask-step", format!("{label} ({}/{})", i + 1, total));
+            }
+            match self.ask_quiet(system, user(w), temp).await {
+                Ok(piece) if !piece.trim().is_empty() => out.push(piece.trim().to_string()),
+                // Nothing back for this slice: the source was not fully read, and
+                // the user is told so rather than left with a shorter answer.
+                _ => self.note_unread(),
+            }
+        }
+        out
+    }
+
+    /// The REDUCE half: fold notes down to something one call can hold, by
+    /// re-folding while they are still too big. Every round has already seen the
+    /// whole source, so this loses detail, never coverage — the opposite of a
+    /// clamp, which loses the end of the source outright.
+    async fn fold_notes(&self, notes: Vec<String>, label: &str) -> String {
+        let mut text = notes.join("\n\n");
+        for _ in 0..FOLD_MAX_ROUNDS {
+            if text.len() <= CMD_WINDOW_CHARS || self.cancelled() {
+                break;
+            }
+            let before = text.len();
+            let round = self
+                .map_windows(&text, label, NOTE_SYS, |w| format!("Notes:\n{w}"), Some(0.2))
+                .await;
+            if round.is_empty() {
+                break;
+            }
+            let joined = round.join("\n\n");
+            // A round that didn't shrink won't shrink next time either.
+            if joined.len() >= before {
+                break;
+            }
+            text = joined;
+        }
+        text
+    }
+
+    /// The whole of `text`, reduced to what one call can hold WITHOUT dropping
+    /// any of it: returned unchanged when it already fits, otherwise notes over
+    /// every window, folded. This is the "full ops" replacement for
+    /// `clamp_bytes(text, N)`.
+    async fn digest(&self, text: &str, label: &str) -> String {
+        if text.len() <= CMD_WINDOW_CHARS {
+            return text.to_string();
+        }
+        let notes = self
+            .map_windows(text, label, NOTE_SYS, |w| format!("Part of the source:\n{w}"), Some(0.2))
+            .await;
+        self.fold_notes(notes, label).await
+    }
 }
 
-/// How many web results the Airlock pulls into the room per #research run.
-pub(crate) const RESEARCH_SOURCES: usize = 4;
-
-/// Format prior conversation as plain text (oldest-first), markup stripped and
-/// budget-clamped, for commands that reason over history (#add-file for-each,
-/// #to-sheet).
-pub(crate) fn format_history(history: &[(String, String)], budget: usize) -> String {
+/// Format prior conversation as plain text (oldest-first), markup stripped, for
+/// commands that reason over history (#add-file for-each, #to-sheet, #minutes on
+/// a discussion). The whole conversation since the last handoff — a command that
+/// can't fit it in one call windows it (`cmd_windows`) rather than clamping it.
+pub(crate) fn format_history(history: &[(String, String)]) -> String {
     let mut out = String::new();
     for (role, content) in history {
         let content = strip_markup_blocks(content);
@@ -236,7 +323,55 @@ pub(crate) fn format_history(history: &[(String, String)], budget: usize) -> Str
         }
         out.push_str(&format!("\n[{role}]\n{content}\n"));
     }
-    clamp_bytes(out.trim().to_string(), budget)
+    out.trim().to_string()
+}
+
+// ---- full ops: a pass per window, never a truncation ----------------------
+//
+// A `#command` reads its whole source. When the source is bigger than one model
+// call can hold, it is split into consecutive windows — every byte lands in
+// exactly one window, with a small overlap so nothing straddling a cut is lost
+// (`extraction::partition_windows`, the same primitive the exhaustive file pass
+// uses) — and the command runs one pass per window, then merges. Truncating
+// instead is what silently reduced `#minutes` to the first few minutes of a
+// meeting and `#extract` to the first pages of a report.
+
+/// Source bytes per pass. Comfortably inside a small local model's native window
+/// once the sidecar fits `num_ctx` to the payload, and large enough that an
+/// ordinary document is still a single call — so short sources cost exactly what
+/// they cost before.
+pub(crate) const CMD_WINDOW_CHARS: usize = 16_000;
+
+/// Bytes carried from the previous window, so a sentence spanning a cut is seen
+/// whole by at least one pass. Merges dedupe what the overlap repeats.
+pub(crate) const CMD_WINDOW_OVERLAP: usize = 400;
+
+/// Guard against a fold that never shrinks (a model that echoes its input), NOT
+/// a coverage cap: every round already saw the whole source, and the loop also
+/// stops the moment a round fails to shrink.
+const FOLD_MAX_ROUNDS: usize = 6;
+
+/// System prompt for the map half of a fold: notes on one window that stand in
+/// for it completely.
+const NOTE_SYS: &str = "You take faithful, dense notes on ONE part of a longer source. Keep every \
+                        fact, name, number, date, decision, commitment and telling quote a reader \
+                        of the whole source would need — these notes will REPLACE this part later, \
+                        so anything you leave out is lost. No preamble, no commentary.";
+
+/// Every window of `text`, in order — exhaustive. A text that already fits is one
+/// window, so the single-call path is unchanged.
+pub(crate) fn cmd_windows(text: &str) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if text.len() <= CMD_WINDOW_CHARS {
+        return vec![text.to_string()];
+    }
+    extraction::partition_windows(text, CMD_WINDOW_CHARS, CMD_WINDOW_OVERLAP)
+        .into_iter()
+        .map(|(s, e)| text[s..e].to_string())
+        .collect()
 }
 
 /// Run a prebuilt "#name" workflow. Mirrors `ask`'s cancel/save boilerplate but
@@ -277,8 +412,12 @@ pub async fn run_command(
         let room = guard.as_ref().ok_or("No room is open.")?;
         let conn = &room.conn;
         let temperature: Option<f64> = db::get_setting(conn, "temperature").and_then(|s| s.parse().ok());
+        // The WHOLE conversation since the last handoff, not the last 12 turns:
+        // a command that reasons over the chat (#minutes on a discussion,
+        // #add-file for-each, #to-sheet) must see all of it. `-1` is SQLite's
+        // "no limit"; long conversations are windowed at the point of use.
         let history: Vec<(String, String)> = {
-            let mut rows = db::recent_messages(conn, &chat_id, MAX_HISTORY_MESSAGES as i64)?;
+            let mut rows = db::recent_messages(conn, &chat_id, -1)?;
             rows.reverse();
             rows
         };
@@ -317,7 +456,7 @@ pub async fn run_command(
             best_local_default(&models)
         }
     };
-    let history_text = format_history(&history, 8000);
+    let history_text = format_history(&history);
 
     let ctx = CmdCtx {
         window: &window,
@@ -328,6 +467,7 @@ pub async fn run_command(
         history: &history_text,
         temperature,
         cancel: cancel.clone(),
+        unread: AtomicUsize::new(0),
     };
 
     let result = match command.as_str() {
@@ -357,6 +497,15 @@ pub async fn run_command(
     if stopped {
         content.push_str(" *(stopped)*");
     }
+    // Full ops is a promise about coverage, so a slice the model failed on is
+    // stated outright rather than left to look like a complete answer.
+    let unread = ctx.unread.load(Ordering::SeqCst);
+    if unread > 0 && !stopped {
+        content.push_str(&format!(
+            "\n\n_Note: {unread} part(s) of the source couldn't be read (the model failed or timed \
+             out on them), so they aren't reflected above. Re-run to try them again._"
+        ));
+    }
     if content.trim().is_empty() {
         content = "Done.".into();
     }
@@ -366,6 +515,49 @@ pub async fn run_command(
     // Phase 3 (locked): save the assistant reply (HLT-7: room may have closed) —
     // same persistence seam as `ask`.
     persist_assistant_reply(&state, &chat_id, content, res.sources, effects_value)
+}
+
+#[cfg(test)]
+mod full_ops_tests {
+    use super::*;
+
+    #[test]
+    fn short_source_is_a_single_window() {
+        // Nothing changes for an ordinary document: one window, one model call.
+        let text = "a short meeting transcript";
+        assert_eq!(cmd_windows(text), vec![text.to_string()]);
+        assert!(cmd_windows("   ").is_empty());
+    }
+
+    #[test]
+    fn long_source_is_covered_end_to_end() {
+        // An hour of transcript: every byte must land in some window, including
+        // the last line — the whole point of the change.
+        let body = (0..4000)
+            .map(|i| format!("[00:{:02}] speaker {i}: line number {i}\n", i % 60))
+            .collect::<String>();
+        let text = format!("{body}FINAL LINE: the meeting ended.");
+        let windows = cmd_windows(&text);
+        assert!(windows.len() > 1, "a source this size takes several passes");
+        assert!(
+            windows.last().unwrap().contains("FINAL LINE"),
+            "the end of the source is read, not clamped away"
+        );
+        // Consecutive coverage: joining the windows reproduces every line.
+        let joined = windows.join("");
+        for probe in ["line number 0", "line number 1999", "line number 3999"] {
+            assert!(joined.contains(probe), "{probe} was dropped");
+        }
+    }
+
+    #[test]
+    fn windows_stay_within_one_pass() {
+        let text = "sentence. ".repeat(20_000);
+        for w in cmd_windows(&text) {
+            // partition_windows may overshoot to a seam; the overlap bounds it.
+            assert!(w.len() <= CMD_WINDOW_CHARS + CMD_WINDOW_OVERLAP);
+        }
+    }
 }
 
 // ================================================================= moonshot (Section D)

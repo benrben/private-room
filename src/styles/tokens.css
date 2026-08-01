@@ -52,6 +52,19 @@
   --tok-skills: #00997c;
   --tok-files: #8d73ce;
 
+  /* BROWSE-3 search: one fixed hue per search engine. These are IDENTITY, not
+     status — an engine keeps its hue and its slot on every consensus dial, so
+     "who agreed" is readable by position without reading a word. Kept apart
+     from the --tok-* set above (different surface, different meaning) and from
+     the green/amber/red triad, which stays reserved for status. */
+  --eng-duckduckgo: #4da3c0;
+  --eng-brave: #c77bb6;
+  --eng-mojeek: #4fae96;
+  --eng-marginalia: #9d85d6;
+  --eng-wikipedia: #6f9fd8;
+  --eng-ddgia: #dfbc72;
+  --eng-news: #83cfaa;
+
   /* Shape + rhythm. Restrained radii; 4/8px spacing. */
   --radius-sm: 5px;
   --radius: 7px;
@@ -124,6 +137,17 @@
   --tok-tools: #872e78;
   --tok-skills: #007456;
   --tok-files: #5f439c;
+
+  /* Engine identity hues re-derived for the light surface — same order, same
+     meaning, darkened to hold contrast on --panel/--panel-2 rather than being
+     naively reused from dark. */
+  --eng-duckduckgo: #00648c;
+  --eng-brave: #872e78;
+  --eng-mojeek: #007456;
+  --eng-marginalia: #5f439c;
+  --eng-wikipedia: #0053a5;
+  --eng-ddgia: #876116;
+  --eng-news: #2f7c58;
 }
 
 /* Quiet, theme-matched scrollbars everywhere. */

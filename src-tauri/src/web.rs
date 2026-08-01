@@ -18,8 +18,52 @@ pub use search::*;
 /// or the home network. Actionable and safe to surface to the model/UI.
 pub(crate) const PRIVATE_BLOCKED: &str = "This address points to a private network and was blocked.";
 
-pub struct SearchHit {
+/// One fused web result, structurally — the shape the sidecar's fusion actually
+/// produces, kept whole instead of being flattened into a provenance sentence at
+/// this boundary (BROWSE-3).
+///
+/// The agent still reads a numbered text list (see [`render_hits`]), but the
+/// browser's results page needs the parts separately: which engines agreed (the
+/// consensus dial), the engine's own snippet, the fused score. One struct feeds
+/// both, so the model and the user are looking at the same search.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WebHit {
     pub title: String,
     pub url: String,
-    pub snippet: String,
+    /// Every engine that returned this URL, in the fusion's priority order.
+    /// Cross-engine agreement is the ranking signal we can show and Google
+    /// cannot — one engine listing a page twice never lands here twice.
+    #[serde(default)]
+    pub engines: Vec<String>,
+    #[serde(default)]
+    pub date: Option<String>,
+    /// The engine's own result snippet, when it gave one. Replaced by the
+    /// page's `meta description` once the enrich pass runs (BROWSE-3b).
+    #[serde(default)]
+    pub snippet: Option<String>,
+    #[serde(default)]
+    pub score: f64,
+}
+
+impl WebHit {
+    /// The engine that surfaced this hit first, for the one-line provenance the
+    /// model reads. Never empty — a hit with no engines is a malformed row, and
+    /// "web" is the honest fallback.
+    pub fn source(&self) -> &str {
+        self.engines.first().map(String::as_str).unwrap_or("web")
+    }
+}
+
+/// A whole search, as the browser's results page consumes it (BROWSE-3).
+/// `merged` and `took_ms` are what make the header's consensus line true
+/// ("31 hits merged into 12 · 1.8s") rather than decorative.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPage {
+    pub hits: Vec<WebHit>,
+    pub merged: u32,
+    pub took_ms: u32,
+    /// Served from this Mac's 15-minute cache without touching the network.
+    pub cached: bool,
 }

@@ -624,6 +624,54 @@
     };
   }
 
+  // ---------------------------------------------------------------- capture
+
+  // Caps for saving a page into the room (BROWSE-2). Far larger than READ_MAX:
+  // this feeds a room FILE, not a model turn — but still bounded, because a
+  // runaway SPA DOM can be arbitrarily huge.
+  var CAPTURE_TEXT_MAX = 800000;
+  var CAPTURE_HTML_MAX = 4000000;
+
+  /** The page — or the user's current selection — as save-ready content:
+   *  readable markdown plus the raw HTML of the LIVE DOM. Unlike a re-fetch,
+   *  this is what is actually on screen: scripts run, logins honoured. */
+  function capture(args) {
+    var what = args && args.what === "selection" ? "selection" : "page";
+    if (what === "selection") {
+      var sel = "";
+      try {
+        sel = String(window.getSelection() || "");
+      } catch (e) {}
+      sel = sel.trim();
+      if (!sel) return { ok: false, error: "Nothing is selected on the page." };
+      return {
+        ok: true,
+        what: what,
+        url: location.href,
+        title: document.title || "",
+        text: sel.slice(0, CAPTURE_TEXT_MAX),
+        html: "",
+        truncated: sel.length > CAPTURE_TEXT_MAX,
+      };
+    }
+    var text = readMarkdown("main");
+    var html = "";
+    try {
+      html = document.documentElement
+        ? "<!doctype html>\n" + document.documentElement.outerHTML
+        : "";
+    } catch (e) {}
+    return {
+      ok: true,
+      what: what,
+      url: location.href,
+      title: document.title || "",
+      text: text.slice(0, CAPTURE_TEXT_MAX),
+      html: html.slice(0, CAPTURE_HTML_MAX),
+      truncated: text.length > CAPTURE_TEXT_MAX || html.length > CAPTURE_HTML_MAX,
+    };
+  }
+
   // ------------------------------------------------------------------- find
 
   function find(args) {
@@ -1058,6 +1106,8 @@
           return snapshot(args || {});
         case "read":
           return read(args);
+        case "capture":
+          return capture(args);
         case "find":
           return find(args);
         case "begin":
@@ -1087,6 +1137,7 @@
     _internals: {
       snapshot: snapshot,
       read: read,
+      capture: capture,
       find: find,
       doOne: doOne,
       resolve: resolve,

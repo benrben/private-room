@@ -973,11 +973,26 @@ pub(crate) async fn stream_answer(
             // 2026-07-30). Return `Ok` rather than `Err`, for the same reason the
             // `Failed` arm below does: a tool may already have committed a
             // side-effect, and `ask`'s `?` would discard the merged effects.
-            SidecarOutcome::Done(text) if text.trim().is_empty() => Ok(
-                "*(The agent finished without producing an answer — the reply was lost \
-                 before it reached the app, so nothing was written. Please try again.)*"
-                    .to_string(),
-            ),
+            // "nothing was written" was a CLAIM, not a check — and it was false
+            // exactly when it mattered. Live QA 2026-07-30 (v0.13.0): a read-only
+            // question dispatched two File agents, one edited a source file, the
+            // user pressed Stop, and this arm told them nothing had been written
+            // while an Undo-edit button sat on screen proving otherwise. That is
+            // the precise failure this app's anti-fabrication doctrine exists to
+            // prevent, committed by the app's own prose rather than by a model.
+            //
+            // `effects.wrote` is the deterministic ground truth CHG-10 already
+            // maintains for the fabrication gate (set only when a write tool
+            // SUCCEEDED), and `run_via_sidecar` merges the bridge's effects into
+            // it on every outcome — including this one. So the honest sentence is
+            // available; it just was not being read. Same rule as the `Failed`
+            // arm below, which has always said "any change shown here was already
+            // applied".
+            SidecarOutcome::Done(text) if text.trim().is_empty() => Ok(if effects.wrote {
+                LOST_REPLY_AFTER_WRITE.to_string()
+            } else {
+                LOST_REPLY_CLEAN.to_string()
+            }),
             SidecarOutcome::Done(text) => Ok(text),
             SidecarOutcome::Failed { text, error } => {
                 // A tool already committed a side-effect this turn (the write/
@@ -1240,6 +1255,12 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "browse_snapshot",
     "browse_do",
     "browse_look",
+    // BROWSE-2: capture the live page into the room (browse box)…
+    "browse_save",
+    // …and the download/save tools (web box + browse box).
+    "save_link",
+    "download_url",
+    "download_media",
     "start_file_pass",
     "job_status",
     "list_scripts",
@@ -1880,6 +1901,30 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
         ));
     }
     tools
+}
+
+/// BROWSE-2 (D17): the download/save tools. Web-gated like `fetch_page`, but
+/// served only to the engine tiers (`include_browse_tools` class in the room
+/// bridge) — downloading into the room is an ACTION, so a merely consulted
+/// advisor never sees these.
+pub(crate) fn download_tools_specs() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type": "function", "function": {"name": "save_link",
+            "description": "Save a web page into this room as a readable Markdown file (title, source URL, readable text). A YouTube link saves the video's transcript instead. Use when the user asks to save, keep or bookmark a link.",
+            "parameters": {"type": "object", "properties": {
+                "url": {"type": "string", "description": "Full http(s) URL"}},
+                "required": ["url"]}}}),
+        serde_json::json!({"type": "function", "function": {"name": "download_url",
+            "description": "Download the file at a URL (PDF, CSV, image, archive, …) into this room. Up to 64 MB arrives immediately; a bigger file continues as a background job — report the job id and track it with job_status. Not for web pages (save_link) or videos on streaming sites (download_media).",
+            "parameters": {"type": "object", "properties": {
+                "url": {"type": "string", "description": "Full http(s) URL of the file"}},
+                "required": ["url"]}}}),
+        serde_json::json!({"type": "function", "function": {"name": "download_media",
+            "description": "Download the video/audio from a media page (YouTube and most video sites) into this room as a background job. Returns the job id — track it with job_status. The file is transcribed automatically after it arrives.",
+            "parameters": {"type": "object", "properties": {
+                "url": {"type": "string", "description": "Full http(s) URL of the video page"}},
+                "required": ["url"]}}}),
+    ]
 }
 
 /// ADD-25: the UI/perception tool specs. Deliberately NOT part of
@@ -2777,12 +2822,16 @@ pub(crate) async fn exec_tool(
                 let room = guard.as_ref().ok_or("No room is open.")?;
                 db::get_fresh_web_search(&room.conn, query)
             };
-            if let Some(results) = cached {
+            if let Some(hits) = cached {
                 let _ = window.emit(
                     "ask-step",
                     format!("Using recent search results for \"{query}\" (from this Mac's cache)"),
                 );
-                return Ok(clamp_tool_result(results));
+                // BROWSE-3: the cache holds hits now, not rendered text, and the
+                // browser's results page shares this row. A search the user ran
+                // in the address bar lands here as a free hit — same web, same
+                // ranking, whichever of the two asked first.
+                return Ok(clamp_tool_result(web::render_hits(&hits)));
             }
             // CHG-33: once the search path has failed outright this turn, don't
             // keep calling it — steer the model to salvage the answer from what it
@@ -2808,19 +2857,13 @@ pub(crate) async fn exec_tool(
             if hits.is_empty() {
                 return Ok("No results found.".into());
             }
-            let results = hits
-                .iter()
-                .enumerate()
-                .map(|(i, h)| format!("{}. {}\n   {}\n   {}", i + 1, h.title, h.url, h.snippet))
-                .collect::<Vec<_>>()
-                .join("\n");
             {
                 let guard = state.room.lock().unwrap();
                 if let Some(room) = guard.as_ref() {
-                    let _ = db::put_web_search(&room.conn, query, &results);
+                    let _ = db::put_web_search(&room.conn, query, &hits);
                 }
             }
-            Ok(clamp_tool_result(results))
+            Ok(clamp_tool_result(web::render_hits(&hits)))
         }
         "fetch_page" => {
             let url = args["url"].as_str().unwrap_or_default();
@@ -2853,6 +2896,87 @@ pub(crate) async fn exec_tool(
                 (title, text)
             };
             Ok(fetch_page_window(&title, url, &text, start))
+        }
+        // BROWSE-2 (D17): the download/save arms. All three re-check the web
+        // switch (the catalog gate is advisory; the switch is the law) and end
+        // in the one ingestion funnel (D13).
+        "save_link" => {
+            let url = args["url"].as_str().unwrap_or_default().trim().to_string();
+            let enabled = {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                web_access_enabled(&room.conn)
+            };
+            if !enabled {
+                return Ok("Web access is turned off in Settings → Online features.".into());
+            }
+            let _ = window.emit("ask-step", format!("Saving {url} into the room (leaves this Mac)"));
+            match import_link_impl(state, &url).await {
+                Ok(meta) => {
+                    let _ = window.emit("room-files-changed", ());
+                    Ok(format!("Saved \"{}\" into the room.", meta.name))
+                }
+                Err(e) if e == "YT_NO_CAPTIONS" => Ok(
+                    "This video has no captions to save as a transcript. Use download_media to \
+                     download the video itself — it will be transcribed after it arrives."
+                        .into(),
+                ),
+                Err(e) => Err(e),
+            }
+        }
+        "download_url" => {
+            use tauri::Manager;
+            let url = args["url"].as_str().unwrap_or_default().trim().to_string();
+            let enabled = {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                web_access_enabled(&room.conn)
+            };
+            if !enabled {
+                return Ok("Web access is turned off in Settings → Online features.".into());
+            }
+            let _ = window.emit("ask-step", format!("Downloading {url} (leaves this Mac)"));
+            let app = window.app_handle().clone();
+            match web::download_to_temp(&url, web::INLINE_DOWNLOAD_BYTES, None, |_, _| {}).await? {
+                web::DownloadOutcome::Done(d) => {
+                    let size = d.size_bytes;
+                    let meta = import_download(&app, &d.path, &d.file_name, &url)?;
+                    Ok(format!(
+                        "Downloaded \"{}\" ({:.1} MB) into the room.",
+                        meta.name,
+                        size as f64 / (1024.0 * 1024.0)
+                    ))
+                }
+                // D18: bigger than the inline cap — promote to a background job
+                // instead of failing, and say so.
+                web::DownloadOutcome::TooLarge => {
+                    let job_id =
+                        start_download_job_inner(window, state, &url, DOWNLOAD_ENGINE_FETCH)
+                            .await?;
+                    Ok(format!(
+                        "The file is bigger than {} MB, so it is downloading as background job \
+                         {job_id} — track it with job_status.",
+                        web::INLINE_DOWNLOAD_BYTES / (1024 * 1024)
+                    ))
+                }
+            }
+        }
+        "download_media" => {
+            let url = args["url"].as_str().unwrap_or_default().trim().to_string();
+            let enabled = {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                web_access_enabled(&room.conn)
+            };
+            if !enabled {
+                return Ok("Web access is turned off in Settings → Online features.".into());
+            }
+            let job_id =
+                start_download_job_inner(window, state, &url, DOWNLOAD_ENGINE_MEDIA).await?;
+            Ok(format!(
+                "Downloading the media as background job {job_id} — track it with job_status. \
+                 The file will be transcribed automatically after it arrives."
+            ))
         }
         "mark_image" => {
             let image_name = args["image_name"].as_str().unwrap_or_default().to_lowercase();
@@ -3467,6 +3591,46 @@ pub(crate) fn fetch_page_window(title: &str, url: &str, text: &str, start: usize
 /// Tool results are passed through without an app-level character cap.
 pub(crate) fn clamp_tool_result(s: String) -> String {
     s
+}
+
+// --------------------------------------------------------------------------- #
+// the app's own "this turn produced no answer" notices
+//
+// Written by Arcelle, not by a model, and persisted as the assistant message —
+// which means everything downstream that reasons about "the last answer" will
+// happily reason about THESE. Live QA 2026-07-30 (v0.13.0): a stopped run left
+// one of them as the reply, the memory suggester read it as an answer, and
+// offered to save "The room's revenue is 0." — a number that appears in no file
+// in the room, one click from becoming a permanent memory.
+//
+// Kept as constants with one predicate over them so the wording and the checks
+// cannot drift apart; `failure_notices_are_recognised_by_their_own_predicate`
+// pins that.
+// --------------------------------------------------------------------------- #
+
+/// No answer, and nothing was written — safe to just retry.
+pub(crate) const LOST_REPLY_CLEAN: &str =
+    "*(The agent finished without producing an answer — the reply was lost before \
+     it reached the app, so nothing was written. Please try again.)*";
+
+/// No answer, but a write ALREADY COMMITTED. Never tell the user nothing was
+/// written here: `effects.wrote` is the deterministic ground truth and an
+/// Undo-edit control is on screen contradicting the claim.
+pub(crate) const LOST_REPLY_AFTER_WRITE: &str =
+    "*(The agent finished without producing an answer — the reply was lost before \
+     it reached the app. A change was already applied to this room before that \
+     happened; check the file and undo it if it was not what you wanted.)*";
+
+/// The mid-run failure note's stable fragment (the rest carries the error text).
+pub(crate) const STOPPED_MID_RUN: &str = "hit an error and stopped mid-run";
+
+/// Is this assistant message one of Arcelle's own failure notices rather than a
+/// real answer? Anything that reads the "last answer" must ask this first.
+pub(crate) fn is_failure_notice(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("*(The agent ")
+        && (t.contains("the reply was lost before it reached the app")
+            || t.contains(STOPPED_MID_RUN))
 }
 
 /// Largest byte index <= `max` that is a char boundary. Stable-Rust stand-in
@@ -4700,6 +4864,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The notices and the predicate that recognises them live in one place so
+    /// they cannot drift; this is what holds that. If someone rewords a notice
+    /// without updating `is_failure_notice`, the memory suggester silently goes
+    /// back to treating "the reply was lost" as an answer worth remembering.
+    #[test]
+    fn failure_notices_are_recognised_by_their_own_predicate() {
+        assert!(is_failure_notice(LOST_REPLY_CLEAN));
+        assert!(is_failure_notice(LOST_REPLY_AFTER_WRITE));
+        let mid_run = format!(
+            "*(The agent {STOPPED_MID_RUN}: boom. Any change shown here was already applied.)*"
+        );
+        assert!(is_failure_notice(&mid_run));
+        // A real answer is never mistaken for one — including one that merely
+        // TALKS about a failed agent.
+        assert!(!is_failure_notice("Revenue is $1.2M in one note and $900K in the other."));
+        assert!(!is_failure_notice("The agent hit an error and stopped mid-run, apparently."));
+        assert!(!is_failure_notice(""));
+    }
+
+    /// The half of the pair that was actually false in the field.
+    #[test]
+    fn the_after_write_notice_never_claims_nothing_was_written() {
+        assert!(!LOST_REPLY_AFTER_WRITE.contains("nothing was written"));
+        assert!(LOST_REPLY_AFTER_WRITE.contains("already applied"));
+        // ...and the clean one still says it, because there it is true.
+        assert!(LOST_REPLY_CLEAN.contains("nothing was written"));
     }
 
     #[test]

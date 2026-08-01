@@ -386,8 +386,8 @@ def create_app(
         """Neural spoken voice: sentence text -> normalized WAV (b64).
 
         The one seam where reply text leaves for speech (see tts.py). A dead
-        or offline service is a clean 502 so the webview can fall back to the
-        on-device AVSpeech voice for that sentence.
+        or offline service is a clean 502; the webview skips that sentence
+        (neural is the only engine — there is no fallback voice).
         """
         text = req.text.strip()
         if not text:
@@ -405,6 +405,22 @@ def create_app(
                 {"code": "TTS_UNAVAILABLE", "error": str(exc)}, status_code=502
             )
         return {"audio_b64": tts_mod.wav_b64(wav)}
+
+    @app.post("/tts/voices")
+    async def tts_voices() -> Any:
+        """The service's LIVE voice catalog, for the Settings picker.
+
+        Dynamic by design — nothing is bundled, so new service voices appear
+        without an app update. The fetch carries no room data. A dead
+        service (and no last-good cache) is a 502; the webview keeps the
+        saved voice and says the list couldn't load.
+        """
+        try:
+            return {"voices": await tts_mod.list_neural_voices()}
+        except tts_mod.TtsError as exc:
+            return JSONResponse(
+                {"code": "TTS_UNAVAILABLE", "error": str(exc)}, status_code=502
+            )
 
 
     @app.post("/label")
@@ -729,12 +745,13 @@ def create_app(
                 status_code=400,
                 content={"error": "web_search needs a query.", "code": "BAD_REQUEST"},
             )
-        # websearch.search is BLOCKING (requests, seven engines in sequence, ~3-5s
-        # warm). On the event loop it would stall every other lane including
+        # websearch.timed_search is BLOCKING (requests, seven engines in sequence,
+        # ~3-5s warm). On the event loop it would stall every other lane including
         # /health, which the Rust lifecycle manager reads to decide the sidecar is
-        # alive — so it runs in a worker thread, always.
+        # alive — so it runs in a worker thread, always. It returns the whole
+        # response body: hits plus 'merged'/'tookMs' telemetry.
         try:
-            hits = await asyncio.to_thread(websearch.search, query, req.limit)
+            payload = await asyncio.to_thread(websearch.timed_search, query, req.limit)
         except Exception as exc:
             # Individual engines already fail soft; reaching here means the fusion
             # itself broke, which is a bug, not a blocked engine. Log the type, not
@@ -744,7 +761,7 @@ def create_app(
                 status_code=502,
                 content={"error": f"Web search failed: {exc}", "code": "WEB_SEARCH_FAILED"},
             )
-        return {"hits": hits}
+        return payload
 
     # --- summarize (MIGRATION Phase 2) --------------------------------------
     #

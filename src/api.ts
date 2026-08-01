@@ -35,6 +35,8 @@ import type {
   SkillBundle,
   SkillResourceContent,
   BrowserInfo,
+  BrowserSearchResult,
+  ResultPreview,
   BrowseJournalRow,
   FileVersion,
   VersionContent,
@@ -67,7 +69,7 @@ import type {
   RoomServerStatus,
   RoomRole,
   ExternalModelInfo,
-  VoiceInfo,
+  NeuralVoiceInfo,
   AskPrivacy,
   AiProviderStatus,
   AskTokenUsage,
@@ -78,6 +80,7 @@ import type {
   PrivacyPreview,
   PrivacyScanProgress,
   PrivacyStatus,
+  BrowserTab,
 } from "./apiTypes";
 
 export const api = {
@@ -186,6 +189,13 @@ export const api = {
   // and the room-side journal of what the agent did.
   browserNavigate: (url: string) => invoke<string>("browser_navigate", { url }),
   browserClose: () => invoke<void>("browser_close"),
+  /** Open another page. Pass "" for an empty tab. Returns its id. */
+  browserNewTab: (url: string) => invoke<string>("browser_new_tab", { url }),
+  /** Show one page and park the rest — no webview is created or destroyed, so
+   *  a background page keeps its scroll, its forms and its session. */
+  browserSelectTab: (id: string) => invoke<void>("browser_select_tab", { id }),
+  browserCloseTab: (id: string) => invoke<void>("browser_close_tab", { id }),
+  browserTabs: () => invoke<BrowserTab[]>("browser_tabs"),
   browserSetBounds: (x: number, y: number, width: number, height: number) =>
     invoke<void>("browser_set_bounds", { x, y, width, height }),
   browserInfo: () => invoke<BrowserInfo>("browser_info"),
@@ -197,6 +207,38 @@ export const api = {
     invoke<BrowseJournalRow[]>("browser_journal", { limit }),
   browserClearJournal: () => invoke<void>("browser_clear_journal"),
   browserVerifyPrivate: () => invoke<boolean>("browser_verify_private"),
+  /** BROWSE-3: the address bar's second half. Text that isn't a URL runs a real
+   *  search instead of erroring, and shares the assistant's own 15-minute
+   *  cache — searching here warms the model's next lookup, and vice versa. */
+  browserSearch: (query: string) =>
+    invoke<BrowserSearchResult>("browser_search", { query }),
+  /** BROWSE-3b: the enrich pass. Reads result pages for their own preview
+   *  image, description and text. Progressive and never blocking — the results
+   *  are already on screen when this is called, and a page that refuses us just
+   *  keeps its monogram tile. */
+  browserPreview: (urls: string[]) =>
+    invoke<ResultPreview[]>("browser_preview", { urls }),
+  /** BROWSE-3: readable text for one result's inline Peek. Usually free — the
+   *  enrich pass already cached it. */
+  browserPeek: (url: string) => invoke<string>("browser_peek", { url }),
+  /** BROWSE-3: one grounded paragraph over the top results, written by the
+   *  room's own engine with every claim cited by result number. */
+  browserSearchSummary: (query: string) =>
+    invoke<string>("browser_search_summary", { query }),
+  /** BROWSE-3: the ＋ button — seal one result into the room as a source. A
+   *  page saves a readable Markdown copy, a YouTube link its captions, and
+   *  anything else goes through the binary download funnel. */
+  importSearchResult: (url: string, title: string) =>
+    invoke<FileMeta>("import_search_result", { url, title }),
+  /** BROWSE-2: save the current page (or the user's selection) into the room.
+   *  Returns a human sentence naming what was saved. */
+  browserSavePage: (what: "page" | "selection") =>
+    invoke<string>("browser_save_page", { what }),
+  /** BROWSE-2 (D18): download a URL (engine "fetch") or a video/audio page
+   *  (engine "media", via yt-dlp) as a durable background job. Returns the
+   *  job id; progress arrives on the normal job-progress events. */
+  startDownloadJob: (url: string, engine: "fetch" | "media") =>
+    invoke<string>("start_download_job", { url, engine }),
   onBrowserJournal: (cb: (row: BrowseJournalRow) => void): Promise<UnlistenFn> =>
     listen<BrowseJournalRow>("browser-journal", (e) => cb(e.payload)),
   onBrowserNavigated: (cb: (url: string) => void): Promise<UnlistenFn> =>
@@ -206,6 +248,15 @@ export const api = {
    *  page that simply failed to load. */
   onBrowserBlocked: (cb: (p: { url: string }) => void): Promise<UnlistenFn> =>
     listen<{ url: string }>("browser-blocked", (e) => cb(e.payload)),
+  /** BROWSE-2 (D9): a file the page downloaded finished importing into the
+   *  room (`ok`) or truthfully failed (`ok: false`, `error` says why). */
+  onBrowserDownload: (
+    cb: (p: { url: string; name: string; ok: boolean; error?: string }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ url: string; name: string; ok: boolean; error?: string }>(
+      "browser-download",
+      (e) => cb(e.payload),
+    ),
   setSetting: (key: string, value: string) =>
     invoke<void>("set_setting", { key, value }),
   mcpGetConfig: () => invoke<string>("mcp_get_config"),
@@ -501,23 +552,19 @@ export const api = {
   onDictPartial: (cb: (text: string) => void): Promise<UnlistenFn> =>
     listen<string>("dict-partial", (e) => cb(e.payload)),
 
-  // ---- Idea 3: supernatural voice (on-device AVSpeech synthesis) ----
-  /** Synthesize one sentence-sized chunk (≤1,000 chars) to WAV, base64. */
-  speakText: (
-    text: string,
-    voiceId: string | null,
-    rate: number,
-    pitch: number,
-    volume: number,
-  ) => invoke<string>("speak_text", { text, voiceId, rate, pitch, volume }),
-  /** Neural spoken voice (default engine): one chunk via the sidecar's Edge
-   *  TTS seam — normalized WAV, base64. `voice` picks from the curated
-   *  roster (null = Andrew, the product default). Fails when offline;
-   *  callers fall back to speakText (on-device) per sentence. */
+  // ---- Idea 3: supernatural voice (neural synthesis via the sidecar) ----
+  /** The spoken voice: one sentence-sized chunk (≤1,000 chars) via the
+   *  sidecar's Edge TTS seam — normalized WAV, base64. `voice` picks from
+   *  the curated multilingual roster (null = Andrew, the product default).
+   *  Fails when offline; the caller skips that sentence (there is no
+   *  on-device fallback voice). */
   speakTextNeural: (text: string, voice: string | null) =>
     invoke<string>("speak_text_neural", { text, voice }),
-  /** Installed system voices, for the Settings picker. */
-  listSpeechVoices: () => invoke<VoiceInfo[]>("list_speech_voices"),
+  /** The service's LIVE voice catalog for the Settings picker — nothing is
+   *  bundled; new service voices appear without an app update. Fails when
+   *  offline (and the sidecar has no last-good copy); the picker then keeps
+   *  the saved voice and says the list couldn't load. */
+  listNeuralVoices: () => invoke<NeuralVoiceInfo[]>("list_neural_voices"),
 
   // ---- AI actions (per-file / whole-room one-shot Markdown generators) ----
   /** The catalog of AI actions (file- and room-scoped), for the menus. */
@@ -770,6 +817,10 @@ export const api = {
   // ADD-26: download a YouTube video into the room (yt-dlp on first use).
   importYoutubeVideo: (url: string) =>
     invoke<ImportReport>("import_youtube_video", { url }),
+  /** BROWSE-2: the same download for ANY yt-dlp-supported site (yt-dlp
+   *  fetched on first use). Emits the same ytdlp-progress events. */
+  importMediaUrl: (url: string) =>
+    invoke<ImportReport>("import_media_url", { url }),
   onYtdlpProgress: (
     cb: (p: { status: string; percent: number | null }) => void,
   ): Promise<UnlistenFn> =>

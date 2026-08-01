@@ -55,6 +55,25 @@ WEB_TOOLS = [
     tool_spec("fetch_page", "Fetch and read one page.", url={"type": "string"}),
 ]
 
+#: BROWSE-2: the ingestion verbs chat.web carries alongside search/fetch.
+DOWNLOAD_TOOLS = [
+    tool_spec(
+        "save_link",
+        "Save a web page into the room as a readable Markdown file.",
+        url={"type": "string"},
+    ),
+    tool_spec(
+        "download_url",
+        "Download the file at a URL into the room.",
+        url={"type": "string"},
+    ),
+    tool_spec(
+        "download_media",
+        "Download a page's video into the room as a background job.",
+        url={"type": "string"},
+    ),
+]
+
 STUDIO_TOOLS = [
     tool_spec("studio_flashcards", "Generate flashcards.", source={"type": "string"}),
     tool_spec("studio_mindmap", "Generate a mind map.", source={"type": "string"}),
@@ -225,6 +244,34 @@ async def test_the_web_agent_searches_then_fetches() -> None:
     assert "fetch_page" in calls, (
         f"the fetch is structural in chain_stage, not optional: {calls}"
     )
+
+
+async def test_the_web_agent_saves_a_link_with_the_one_step_verb() -> None:
+    """BROWSE-2: "save this link" must reach save_link.
+
+    The failure this guards: the model imitates the save with fetch_page +
+    create_file (two rounds, no provenance column) or — worse — claims a save
+    with no tool call at all. save_link is in the chain's keep-list, so it is
+    offered at every stage; a URL the user already supplied needs no search."""
+
+    def reply(name: str, args: dict[str, Any]) -> str:
+        if name == "save_link":
+            return 'Saved "Bank of Israel — Monetary Policy.md" into the room.'
+        return "OK."
+
+    bridge = RecordingBridge(
+        tools=CORE_SUBSET + WEB_TOOLS + DOWNLOAD_TOOLS, reply=reply
+    )
+    try:
+        out = await run_worker_live(
+            "chat.web",
+            "Save https://boi.org.il/en/monetary into this room so I can read it offline",
+            bridge=bridge,
+        )
+    finally:
+        bridge.close()
+    assert "save_link" in out["tool_calls"], out["tool_calls"]
+    assert out["final"].strip() != "Done."
 
 
 # --- route_act (creator.studio) — the deterministic verb pick ---------------- #

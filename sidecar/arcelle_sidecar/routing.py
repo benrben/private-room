@@ -106,6 +106,19 @@ BROWSE_TOOL_NAMES: tuple[str, ...] = (
     "browse_snapshot",
     "browse_do",
     "browse_look",
+    # BROWSE-2: capture the live page (or the user's selection) into the room.
+    "browse_save",
+)
+
+#: BROWSE-2 (D17): fetch web content INTO the room. The host serves these with
+#: the same web gate as the browse tools. Boxed on ``chat.web`` only: the
+#: Browser agent ingests by CLICKING download links (the browser imports the
+#: file automatically) and by ``browse_save`` — its box stays within the
+#: small-model choice budget.
+DOWNLOAD_TOOL_NAMES: tuple[str, ...] = (
+    "save_link",
+    "download_url",
+    "download_media",
 )
 
 #: NAVIGATION INTENT — "take me to a place on the web", as opposed to "find out

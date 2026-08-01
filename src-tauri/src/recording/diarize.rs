@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use super::{RecSegment, SAMPLE_RATE};
+use super::{RecSegment, RecWord, SAMPLE_RATE};
 
 /// The bundled TitaNet-small speaker-embedding model.
 pub const MODEL_FILE: &str = "nemo_en_titanet_small.onnx";
@@ -152,6 +152,34 @@ const MIN_CLUSTER_FRAMES: usize = 312;
 /// (the normal case). Far above a real meeting's distinct voices, so it only
 /// ever stops pathological runaway labeling.
 const AUTO_MAX_SPEAKERS: usize = 8;
+
+// ---- The sub-window split pass (ADD-28) -----------------------------------
+// A phrase is cut at SILENCES, so when someone answers without a pause both
+// voices land in ONE phrase — and a phrase carries one label. Measured on
+// AMI (2026-08-01): 60% of reference speech sat inside phrases holding two
+// or more speakers; no per-phrase labeling can recover that. The split pass
+// re-cuts each phrase into fixed sub-windows, clusters THOSE, and breaks the
+// phrase wherever consecutive words disagree on the voice.
+
+/// Sub-window size and hop, centiseconds (1.5 s / 0.75 s — the granularity
+/// production diarizers embed at; shorter windows measured near-coin-flip).
+const SPLIT_WIN_CS: i64 = 150;
+const SPLIT_HOP_CS: i64 = 75;
+
+/// Voiced frames (16 ms) a SUB-WINDOW needs to help define a voice (~0.3 s).
+/// The phrase gate (~1 s) is unreachable inside a 1.5 s window — under it
+/// every window is weak and whole meetings collapse to one voice (measured:
+/// 39 of 39 test windows at 1 speaker). This gate exists ONLY for the split
+/// pass; phrases keep [`MIN_NEW_VOICE_FRAMES`].
+const SPLIT_MIN_VOICE_FRAMES: usize = 20;
+
+/// A COUNT-driven merge must still clear this centered-space similarity.
+/// The eigengap count is an estimate, not evidence: unguarded, a Count(1)
+/// verdict fused 57 audibly distinct windows without a single voice
+/// comparison, and erased real 4th speakers from full meetings. 0.07 sits on
+/// the measured plateau (0.07–0.08) where every held-out meeting keeps its
+/// true speaker count and nothing over-splits.
+const COUNT_FLOOR: f32 = 0.07;
 
 /// The clustering constants of an embedding SPACE: where its same-speaker
 /// mass sits once the session channel has been removed. Each print
@@ -701,8 +729,21 @@ pub fn cluster(
     spans: &[(i64, i64)],
     max_speakers: usize,
 ) -> Vec<Option<usize>> {
+    cluster_gated(prints, spans, max_speakers, MIN_NEW_VOICE_FRAMES)
+}
+
+/// [`cluster`] with the voice-defining evidence bar as a parameter: phrases
+/// use [`MIN_NEW_VOICE_FRAMES`], the split pass's 1.5 s sub-windows use
+/// [`SPLIT_MIN_VOICE_FRAMES`] — same recipe, two evidence scales.
+fn cluster_gated(
+    prints: &[&VoicePrint],
+    spans: &[(i64, i64)],
+    max_speakers: usize,
+    min_voice_frames: usize,
+) -> Vec<Option<usize>> {
     debug_assert_eq!(prints.len(), spans.len());
-    let strong: Vec<usize> = (0..prints.len()).filter(|i| prints[*i].is_strong()).collect();
+    let defines = |p: &VoicePrint| p.voiced_frames >= min_voice_frames && !p.is_silent();
+    let strong: Vec<usize> = (0..prints.len()).filter(|i| defines(prints[*i])).collect();
     let mut out = vec![None; prints.len()];
     if strong.is_empty() {
         // Nothing long enough to define a voice: everyone who spoke is one.
@@ -802,7 +843,10 @@ pub fn cluster(
         // Past the cap, keep merging the nearest pair regardless.
         let done = voices.len() <= cap
             && match stop {
-                Stop::Count(k) => voices.len() <= k.max(1),
+                // The floor turns the count from an override into a bound:
+                // however few voices the eigengap claims, two clusters that
+                // do not actually sound alike are never fused.
+                Stop::Count(k) => voices.len() <= k.max(1) || sim < COUNT_FLOOR,
                 Stop::Bar(bar) => sim < bar,
                 Stop::MergeAll => false,
             };
@@ -876,8 +920,25 @@ pub fn cluster(
     } else {
         (MIN_CLUSTER_PHRASES, MIN_CLUSTER_FRAMES)
     };
-    let is_real = |v: &Voice| v.members.len() >= min_phrases || v.frames >= min_frames;
-    while voices.len() > 1 {
+    // At the sub-window evidence scale a "member" is a 1.5 s window, not a
+    // phrase, so the phrase-count clause is meaningless there: three windows
+    // (~2 s of speech) would register as a person. Sub-window clusters must
+    // carry MIN_CLUSTER_FRAMES of voiced mass, full stop — measured on the
+    // 39-slice/4-meeting bench this alone takes split-success 38→39 and
+    // mean confusion 4.8→3.7 while leaving every meeting at 4/4 speakers.
+    let window_scale = min_voice_frames == SPLIT_MIN_VOICE_FRAMES;
+    let is_real = |v: &Voice| {
+        if window_scale {
+            v.frames >= min_frames.max(MIN_CLUSTER_FRAMES)
+        } else {
+            v.members.len() >= min_phrases || v.frames >= min_frames
+        }
+    };
+    // The sub-window pass also keeps a hard floor of two voices: absorbing
+    // the last alternative would resurrect the merge-everyone bug the split
+    // exists to fix, and a solo session loses nothing by keeping a runt.
+    let absorb_floor = if window_scale { 2 } else { 1 };
+    while voices.len() > absorb_floor {
         let Some(worst) = (0..voices.len())
             .filter(|i| !is_real(&voices[*i]))
             .min_by_key(|i| voices[*i].frames)
@@ -961,7 +1022,7 @@ pub fn cluster(
             let mut sums: Vec<Vec<f32>> = vec![vec![0f32; units[0].len()]; k];
             let mut mass = vec![0usize; k];
             for (w, i) in seq.iter().enumerate() {
-                if !prints[*i].is_strong() {
+                if !defines(prints[*i]) {
                     continue;
                 }
                 let fr = prints[*i].voiced_frames.max(1) as f32;
@@ -1119,7 +1180,18 @@ pub fn relabel(segments: &mut [RecSegment], max_speakers: usize) -> bool {
     if phrases < 2 {
         return false;
     }
+    apply_names(segments, &in_room, &in_meeting)
+}
 
+/// Turn per-lane voice GROUPS (segment indices per voice) into on-screen
+/// names — "You" for the mic's main talker, sticky "Speaker N" for everyone
+/// else — and write them. Shared by [`relabel`] (phrase groups) and
+/// [`split_by_voice`] (sub-window groups): one naming brain, two clusterings.
+fn apply_names(
+    segments: &mut [RecSegment],
+    in_room: &[Vec<usize>],
+    in_meeting: &[Vec<usize>],
+) -> bool {
     // Whoever does most of the talking into this Mac's microphone is its
     // owner. (Not "the mic lane" — the colleague beside them is on it too.)
     let frames = |g: &Vec<usize>| -> usize {
@@ -1225,6 +1297,220 @@ fn lane_voices(segments: &[RecSegment], lane: &str, cap: usize) -> Vec<Vec<usize
     groups
 }
 
+// ------------------------------------------------------------ the split pass
+
+/// One phrase's sub-window prints: fixed 1.5 s windows at a 0.75 s hop, each
+/// embedded on its own, spans on the recording's absolute timeline. Computed
+/// on the decode thread while the phrase's audio is in hand, so the stop-time
+/// split pays only for clustering.
+pub fn window_prints(samples: &[f32], t0_cs: i64) -> Vec<(i64, i64, VoicePrint)> {
+    let cs_len = samples.len() as i64 * 100 / SAMPLE_RATE as i64;
+    let mut out = Vec::new();
+    let mut t = 0i64;
+    while t < cs_len - 20 {
+        let end = (t + SPLIT_WIN_CS).min(cs_len);
+        let i0 = (t * SAMPLE_RATE as i64 / 100) as usize;
+        let i1 = ((end * SAMPLE_RATE as i64 / 100) as usize).min(samples.len());
+        if i1 > i0 {
+            out.push((t0_cs + t, t0_cs + end, embed(&samples[i0..i1])));
+        }
+        if end >= cs_len {
+            break;
+        }
+        t += SPLIT_HOP_CS;
+    }
+    out
+}
+
+/// Frames-weighted mean of the windows overlapping `[t0, t1)`, renormalized —
+/// the print a split piece carries forward. `voiced_frames` is approximated
+/// from window overlap (windows cover the timeline twice at this hop, hence
+/// the halving); it only feeds the evidence gates and the who-talks-most
+/// mass, which tolerate that.
+fn span_print(wins: &[(i64, i64, VoicePrint)], t0: i64, t1: i64) -> Option<VoicePrint> {
+    let mut sum: Vec<f32> = Vec::new();
+    let mut frames = 0f32;
+    for (b, e, p) in wins {
+        let ov = (t1.min(*e) - t0.max(*b)) as f32;
+        if ov <= 0.0 || p.is_silent() {
+            continue;
+        }
+        if sum.is_empty() {
+            sum = vec![0.0; p.vec.len()];
+        }
+        if sum.len() != p.vec.len() {
+            continue; // never mix print generations in one mean
+        }
+        let w = p.voiced_frames as f32 * ov / (*e - *b).max(1) as f32;
+        for (a, x) in sum.iter_mut().zip(&p.vec) {
+            *a += x * w;
+        }
+        frames += w;
+    }
+    let norm = sum.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if sum.is_empty() || norm < 1e-6 {
+        return None;
+    }
+    sum.iter_mut().for_each(|x| *x /= norm);
+    Some(VoicePrint { vec: sum, voiced_frames: (frames / 2.0) as usize })
+}
+
+/// The offline voice pass (ADD-28), run wherever the full audio is at hand
+/// (stop, pause, re-transcribe): cluster every phrase's sub-windows, give
+/// each WORD the voice of its nearest window, and cut phrases wherever
+/// consecutive words disagree — so two people answering each other without a
+/// pause stop sharing one label. The pieces then get their names through the
+/// same [`apply_names`] the phrase path uses.
+///
+/// `wins_for` supplies a segment's sub-window prints (from the decode-time
+/// cache, or embedded on the spot from the recording). Lanes stay walls, as
+/// in [`relabel`]. Returns true when the transcript changed.
+pub fn split_by_voice(
+    segments: &mut Vec<RecSegment>,
+    max_speakers: usize,
+    mut wins_for: impl FnMut(&RecSegment) -> Vec<(i64, i64, VoicePrint)>,
+) -> bool {
+    let cap = if max_speakers == 0 { AUTO_MAX_SPEAKERS } else { max_speakers };
+    let seg_wins: Vec<Vec<(i64, i64, VoicePrint)>> =
+        segments.iter().map(|s| wins_for(s)).collect();
+
+    // plan[i]: the pieces segment i becomes — (lane voice, word range) — or
+    // None to keep it untouched (legacy rows, window-less phrases).
+    let mut plan: Vec<Option<Vec<(Option<usize>, std::ops::Range<usize>)>>> =
+        vec![None; segments.len()];
+    let mut lane_voice_count = [0usize; 2];
+    for (lane_no, lane) in ["mic", "sys"].into_iter().enumerate() {
+        let idx: Vec<usize> = (0..segments.len())
+            .filter(|i| segments[*i].source == lane && !seg_wins[*i].is_empty())
+            .collect();
+        let mut prints: Vec<&VoicePrint> = Vec::new();
+        let mut spans: Vec<(i64, i64)> = Vec::new();
+        let mut owner: Vec<usize> = Vec::new();
+        for i in &idx {
+            for (b, e, p) in &seg_wins[*i] {
+                prints.push(p);
+                spans.push((*b, *e));
+                owner.push(*i);
+            }
+        }
+        if prints.len() < 2 {
+            continue;
+        }
+        let ids = cluster_gated(&prints, &spans, cap, SPLIT_MIN_VOICE_FRAMES);
+        lane_voice_count[lane_no] =
+            ids.iter().flatten().copied().max().map_or(0, |m| m + 1);
+        for i in &idx {
+            let wins: Vec<(usize, (i64, i64))> = (0..prints.len())
+                .filter(|k| owner[*k] == *i)
+                .map(|k| (k, spans[k]))
+                .collect();
+            let seg = &segments[*i];
+            // Each word takes the voice of the window whose center is
+            // nearest; unknowns (silence, weak windows) never cut a turn —
+            // they ride with the voice already speaking.
+            let mut labels: Vec<Option<usize>> = Vec::with_capacity(seg.words.len());
+            let mut last: Option<usize> = None;
+            for w in &seg.words {
+                let mid = (w.t0 + w.t1) / 2;
+                let best = wins
+                    .iter()
+                    .min_by_key(|(_, (b, e))| ((b + e) / 2 - mid).abs())
+                    .and_then(|(k, _)| ids[*k])
+                    .or(last);
+                last = best;
+                labels.push(best);
+            }
+            if let Some(first) = labels.iter().flatten().next().copied() {
+                for l in labels.iter_mut() {
+                    if l.is_none() {
+                        *l = Some(first);
+                    }
+                }
+            }
+            let mut cuts: Vec<(Option<usize>, std::ops::Range<usize>)> = Vec::new();
+            let mut start = 0usize;
+            for w in 1..labels.len() {
+                if labels[w] != labels[start] {
+                    cuts.push((labels[start], start..w));
+                    start = w;
+                }
+            }
+            if !labels.is_empty() {
+                cuts.push((labels[start], start..labels.len()));
+            }
+            plan[*i] = Some(cuts);
+        }
+    }
+
+    // Rebuild the transcript: a multi-voice phrase becomes its pieces —
+    // words, timings, text and prints all follow the cut.
+    let mut rebuilt: Vec<RecSegment> = Vec::new();
+    let mut groups: [Vec<Vec<usize>>; 2] = [
+        (0..lane_voice_count[0]).map(|_| Vec::new()).collect(),
+        (0..lane_voice_count[1]).map(|_| Vec::new()).collect(),
+    ];
+    let mut split_any = false;
+    for (i, seg) in segments.iter().enumerate() {
+        let lane_no = usize::from(seg.source != "mic");
+        match &plan[i] {
+            Some(cuts) if !cuts.is_empty() => {
+                let many = cuts.len() > 1;
+                split_any |= many;
+                for (voice, range) in cuts {
+                    let words: Vec<RecWord> = seg.words[range.clone()].to_vec();
+                    let t0 = if range.start == 0 {
+                        seg.t0
+                    } else {
+                        words.first().map_or(seg.t0, |w| w.t0)
+                    };
+                    let t1 = if range.end == seg.words.len() {
+                        seg.t1
+                    } else {
+                        words.last().map_or(seg.t1, |w| w.t1)
+                    };
+                    let text = if many {
+                        words
+                            .iter()
+                            .map(|w| w.w.trim())
+                            .filter(|w| !w.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    } else {
+                        seg.text.clone()
+                    };
+                    let print = span_print(&seg_wins[i], t0, t1).or_else(|| seg.voice.clone());
+                    if let Some(v) = voice {
+                        groups[lane_no][*v].push(rebuilt.len());
+                    }
+                    rebuilt.push(RecSegment {
+                        id: if many {
+                            uuid::Uuid::new_v4().to_string()
+                        } else {
+                            seg.id.clone()
+                        },
+                        source: seg.source.clone(),
+                        speaker: seg.speaker.clone(),
+                        t0,
+                        t1,
+                        text,
+                        words,
+                        lang: seg.lang.clone(),
+                        voice: print,
+                    });
+                }
+            }
+            _ => rebuilt.push(seg.clone()),
+        }
+    }
+    let [mic_groups, sys_groups] = groups;
+    let renamed = apply_names(&mut rebuilt, &mic_groups, &sys_groups);
+    if split_any || renamed {
+        *segments = rebuilt;
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,6 +1607,67 @@ mod tests {
             model_path()
         );
         p
+    }
+
+    /// ADD-28: two people answering each other with NO pause land in ONE
+    /// phrase, and a phrase carries one label — the split pass must cut the
+    /// phrase at the voice change, keep the words with their halves, and
+    /// give the halves different speakers.
+    #[test]
+    fn split_pass_cuts_a_two_voice_phrase() {
+        let Some(a) = say("Samantha", LINE_A) else { return };
+        let Some(a2) = say("Samantha", LINE_C) else { return };
+        let Some(b) = say("Daniel", LINE_B) else { return };
+        let Some(b2) = say("Daniel", LINE_D) else { return };
+        let mut audio = a;
+        audio.extend(&a2);
+        let cut_cs = (audio.len() * 100 / SAMPLE_RATE) as i64;
+        audio.extend(&b);
+        audio.extend(&b2);
+        let total_cs = (audio.len() * 100 / SAMPLE_RATE) as i64;
+
+        // Synthetic words every 40 cs: the split must land them correctly
+        // without any help from real word timings.
+        let words: Vec<RecWord> = (0..total_cs / 40)
+            .map(|k| RecWord { w: format!("w{k}"), t0: k * 40, t1: k * 40 + 35, del: false })
+            .collect();
+        let n_words = words.len();
+        let mut segments = vec![RecSegment {
+            id: "one".into(),
+            source: "sys".into(),
+            speaker: "Speaker 1".into(),
+            t0: 0,
+            t1: total_cs,
+            text: "two people, one phrase".into(),
+            words,
+            lang: None,
+            voice: Some(nembed(&audio)),
+        }];
+        let changed = split_by_voice(&mut segments, 0, |seg| {
+            let i0 = seg.t0.max(0) as usize * (SAMPLE_RATE / 100);
+            let i1 = (seg.t1.max(0) as usize * (SAMPLE_RATE / 100)).min(audio.len());
+            window_prints(&audio[i0..i1], seg.t0)
+        });
+        assert!(changed, "the split pass saw a two-voice phrase and did nothing");
+        assert!(segments.len() >= 2, "phrase not split: {} piece(s)", segments.len());
+        assert_eq!(
+            segments.iter().map(|s| s.words.len()).sum::<usize>(),
+            n_words,
+            "words lost or duplicated by the cut"
+        );
+        let first = &segments[0];
+        let last = &segments[segments.len() - 1];
+        assert_ne!(first.speaker, last.speaker, "the pieces share one label");
+        // The cut nearest the true voice change must land within one window.
+        let boundary = segments[..segments.len() - 1]
+            .iter()
+            .map(|s| s.t1)
+            .min_by_key(|t| (t - cut_cs).abs())
+            .expect("at least one cut");
+        assert!(
+            (boundary - cut_cs).abs() <= 150,
+            "cut at {boundary}cs, true voice change at {cut_cs}cs"
+        );
     }
 
     /// The condition the DSP print could never pass, now REQUIRED: two women
@@ -1982,5 +2329,44 @@ mod tests {
         assert_eq!(book.assign(Some(&print)), "Speaker 3");
         // The same voice again keeps its new number.
         assert_eq!(book.assign(Some(&print)), "Speaker 3");
+    }
+
+    /// At the sub-window scale, a cluster of a few windows (~2 s of speech)
+    /// must not register as its own speaker — it joins an existing voice —
+    /// while the two real voices stay apart (the floor-of-two guard).
+    #[test]
+    fn window_scale_phantom_is_absorbed() {
+        let unit = |axis: usize, frames: usize| {
+            let mut vec = vec![0.0f32; BANDS - 1];
+            vec[axis] = 1.0;
+            VoicePrint { vec, voiced_frames: frames }
+        };
+        let mut prints: Vec<VoicePrint> = Vec::new();
+        for _ in 0..30 {
+            prints.push(unit(0, 70)); // voice A: plenty of mass
+        }
+        for _ in 0..25 {
+            prints.push(unit(1, 70)); // voice B: plenty of mass
+        }
+        for _ in 0..3 {
+            prints.push(unit(2, 65)); // distinct but tiny: 195 frames < bar
+        }
+        let refs: Vec<&VoicePrint> = prints.iter().collect();
+        let spans: Vec<(i64, i64)> =
+            (0..prints.len()).map(|i| (i as i64 * 75, i as i64 * 75 + 150)).collect();
+        let ids = cluster_gated(&refs, &spans, 8, SPLIT_MIN_VOICE_FRAMES);
+        let a = ids[0].expect("voice A labeled");
+        let b = ids[35].expect("voice B labeled");
+        assert_ne!(a, b, "the two real voices merged");
+        for id in &ids[..30] {
+            assert_eq!(*id, Some(a), "voice A fragmented");
+        }
+        for id in &ids[30..55] {
+            assert_eq!(*id, Some(b), "voice B fragmented");
+        }
+        for id in &ids[55..] {
+            let got = id.expect("phantom windows labeled");
+            assert!(got == a || got == b, "tiny cluster founded speaker {got}");
+        }
     }
 }

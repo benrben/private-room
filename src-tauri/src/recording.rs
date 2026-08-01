@@ -847,6 +847,10 @@ pub struct DecodeOut {
     detected: Option<(String, f32)>,
     /// Voiceprint of the phrase (system lane only) for speaker clustering.
     emb: Option<diarize::VoicePrint>,
+    /// Sub-window prints for the stop-time split pass (ADD-28), computed
+    /// here on the decode thread because this is the last place the phrase's
+    /// audio exists per lane.
+    wins: Vec<(i64, i64, diarize::VoicePrint)>,
 }
 
 /// Cross-thread view of the live session for quick status reads.
@@ -1033,7 +1037,14 @@ pub fn retranscribe(
         });
         progress(t1, total_cs);
     }
-    diarize::relabel(&mut meta.segments, max_speakers as usize);
+    diarize::split_by_voice(&mut meta.segments, max_speakers as usize, |seg| {
+        let i0 = (seg.t0.max(0) as usize) * (SAMPLE_RATE / 100);
+        let i1 = ((seg.t1.max(0) as usize) * (SAMPLE_RATE / 100)).min(samples.len());
+        if i1 <= i0 {
+            return Vec::new();
+        }
+        diarize::window_prints(&samples[i0..i1], seg.t0)
+    });
     // The carried-over cuts are the user's studio deletions. Re-marking the
     // freshly derived words that fall inside them keeps that promise:
     // deleted content must not resurface in the transcript, the search
@@ -1087,6 +1098,11 @@ pub fn start_engine<R: tauri::Runtime>(
                 // Both lanes get a voiceprint: people in the room share the
                 // microphone, so "the mic" is not a person.
                 let emb = (job.kind == JobKind::Final).then(|| diarize::embed(&job.samples));
+                let wins = if job.kind == JobKind::Final {
+                    diarize::window_prints(&job.samples, offset_cs)
+                } else {
+                    Vec::new()
+                };
                 let _ = engine_tx.send(EngineMsg::DecodeDone(DecodeOut {
                     kind: job.kind,
                     source: job.source,
@@ -1095,6 +1111,7 @@ pub fn start_engine<R: tauri::Runtime>(
                     segs: phrase.segs,
                     detected: phrase.detected,
                     emb,
+                    wins,
                 }));
             }
         });
@@ -1146,6 +1163,11 @@ struct Engine<R: tauri::Runtime> {
     /// reliable dead-mic signal.
     last_mic_push: std::time::Instant,
     mic_flagged: bool,
+    /// Sub-window prints per live segment id, collected from the decode
+    /// thread for the stop/pause split pass (ADD-28). Segments not in here —
+    /// resumed history, pieces of an earlier split — are re-embedded from the
+    /// mixed timeline when the pass runs.
+    win_cache: std::collections::HashMap<String, Vec<(i64, i64, diarize::VoicePrint)>>,
 }
 
 impl<R: tauri::Runtime> Engine<R> {
@@ -1199,6 +1221,7 @@ impl<R: tauri::Runtime> Engine<R> {
             last_level_emit: std::time::Instant::now(),
             last_mic_push: std::time::Instant::now(),
             mic_flagged: false,
+            win_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -1525,6 +1548,7 @@ impl<R: tauri::Runtime> Engine<R> {
                         return;
                     }
                     let echoed = self.meta.segments.remove(twin);
+                    self.win_cache.remove(&echoed.id);
                     self.emit_drop(&echoed.id);
                     // The dropped row was meeting audio, not the room: any
                     // language vote it cast on the mic lane was pollution.
@@ -1563,6 +1587,9 @@ impl<R: tauri::Runtime> Engine<R> {
                     .rposition(|s| s.t0 <= seg.t0)
                     .map(|i| i + 1)
                     .unwrap_or(0);
+                if !out.wins.is_empty() {
+                    self.win_cache.insert(seg.id.clone(), out.wins);
+                }
                 self.meta.segments.insert(at, seg.clone());
                 let _ = self.app.emit(
                     "rec-segment",
@@ -1582,6 +1609,28 @@ impl<R: tauri::Runtime> Engine<R> {
                 }
             }
         }
+    }
+
+    /// The stop/pause voice pass: split phrases at their voice changes using
+    /// the sub-window prints collected while decoding (segments without a
+    /// cache entry — resumed history, pieces from an earlier pause — are
+    /// re-embedded from the mixed timeline on the spot). No UI event here:
+    /// every caller persists the meta right after and the UI reloads it
+    /// whole.
+    fn split_speakers(&mut self) {
+        let Self { meta, win_cache, mixed, .. } = self;
+        let cap = meta.max_speakers as usize;
+        diarize::split_by_voice(&mut meta.segments, cap, |seg| {
+            if let Some(w) = win_cache.get(&seg.id) {
+                return w.clone();
+            }
+            let i0 = (seg.t0.max(0) as usize) * (SAMPLE_RATE / 100);
+            let i1 = ((seg.t1.max(0) as usize) * (SAMPLE_RATE / 100)).min(mixed.len());
+            if i1 <= i0 {
+                return Vec::new();
+            }
+            diarize::window_prints(&mixed[i0..i1], seg.t0)
+        });
     }
 
     /// Re-derive every meeting speaker from the whole recording's voices and,
@@ -1615,8 +1664,15 @@ impl<R: tauri::Runtime> Engine<R> {
     fn flush(&mut self, full: bool) -> bool {
         use tauri::Manager;
         // The transcript about to be written must carry the best labels the
-        // recording can support, not the provisional live ones.
-        self.relabel_speakers();
+        // recording can support, not the provisional live ones. Stop/pause
+        // additionally run the split pass: the full mixed timeline is in
+        // hand, so phrases holding two voices become two labeled turns
+        // (ADD-28) — a periodic save sticks to the cheap phrase relabel.
+        if full {
+            self.split_speakers();
+        } else {
+            self.relabel_speakers();
+        }
         self.meta.duration_cs = cs_of_samples(self.mixed.len());
         let text = transcript_text(&self.meta);
         let meta_json = serde_json::to_string(&self.meta).unwrap_or_default();
@@ -2996,6 +3052,7 @@ mod tests {
                 kind: JobKind::Final,
                 source: Source::Mic,
                 start,
+                wins: Vec::new(),
                 n_samples: SAMPLE_RATE * 2,
                 segs: vec![crate::stt::SegOut {
                     t0,

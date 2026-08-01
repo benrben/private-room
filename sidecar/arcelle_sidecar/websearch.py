@@ -10,9 +10,10 @@ below are an internal detail of that one provider, not choices a user makes.
 Privacy: the query is the only thing that leaves the Mac here, and it goes to
 every engine in :data:`DEFAULT_ENGINES`. Nothing in this module logs the query or
 any result text — an engine failure logs the ENGINE's name, never its input
-(SPEC §6). :func:`search` is deliberately called with ``resolve_dates=False`` by
-the HTTP route: date resolution fetches each result URL from Python, which would
-step around the Rust SSRF guard that every other outbound fetch goes through.
+(SPEC §6). The HTTP route enters through :func:`timed_search`, which has no
+``resolve_dates`` parameter at all: date resolution fetches each result URL from
+Python, which would step around the Rust SSRF guard that every other outbound
+fetch goes through.
 """
 
 from __future__ import annotations
@@ -21,10 +22,13 @@ import argparse
 import itertools
 import logging
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from email.utils import parsedate_to_datetime
 from functools import wraps
 from operator import itemgetter
@@ -36,6 +40,7 @@ from bs4 import BeautifulSoup, Tag
 
 __all__ = [
     "search",
+    "timed_search",
     "duckduckgo",
     "brave",
     "mojeek",
@@ -46,7 +51,8 @@ __all__ = [
     "DEFAULT_ENGINES",
 ]
 
-#: A hit is ``{'title', 'url', 'source', 'date'}``; :func:`search` adds ``'score'``.
+#: A hit is ``{'title', 'url', 'source', 'date', 'snippet'}``; fusion adds
+#: ``'engines'`` (every engine that returned the URL) and :func:`search` ``'score'``.
 Hit = dict[str, Any]
 #: An engine takes a query (plus optional tuning kwargs) and never raises.
 Engine = Callable[..., list[Hit]]
@@ -65,26 +71,70 @@ _UA_CYCLE = itertools.cycle(_USER_AGENTS)
 
 _SESSION = requests.Session()
 
+# The engines run in parallel (see _fuse), and a requests.Session is not
+# documented thread-safe, so each worker thread gets its own. Connection reuse
+# still applies where it actually pays — an engine retrying its own host.
+_LOCAL = threading.local()
+
+
+def _session() -> requests.Session:
+    """This thread's session. The main thread keeps the module-level one, so
+    single-threaded callers and the tests see exactly what they always did."""
+    if threading.current_thread() is threading.main_thread():
+        return _SESSION
+    session = getattr(_LOCAL, "session", None)
+    if session is None:
+        session = _LOCAL.session = requests.Session()
+    return session
+
 
 def _browser_headers() -> dict[str, str]:
     """Fresh headers with the next UA in the rotation — the only place UAs are picked."""
     return {"User-Agent": next(_UA_CYCLE), "Accept-Language": "en-US,en;q=0.9"}
 
 
+#: Seconds to wait for a TCP connection, separately from reading the response.
+#: A host that will not accept a connection in this long is down or blocking us;
+#: waiting the full read budget for it just burns the user's search. (Measured:
+#: DuckDuckGo connect-timing-out at 20s × 3 attempts was 64s of a 64s search.)
+_CONNECT_TIMEOUT = 5.0
+
+#: How long the whole fan-out may take. Engines still running when it expires
+#: simply do not contribute — the same fail-soft rule as an engine that errors,
+#: applied to one that is merely too slow to be useful.
+FANOUT_BUDGET = 22.0
+
+
+def _timeout(read: float) -> tuple[float, float]:
+    """(connect, read) for requests. Call sites pass the read budget they want;
+    the connect half is bounded here so one dead host cannot own the search."""
+    return (min(_CONNECT_TIMEOUT, read), read)
+
+
 def _get(url: str, **kwargs: Any) -> requests.Response:
     """GET with a rotating UA and a default timeout; caller headers win."""
-    kwargs.setdefault("timeout", 20)
+    timeout = kwargs.pop("timeout", 20)
+    if not isinstance(timeout, tuple):
+        timeout = _timeout(timeout)
     headers = _browser_headers() | kwargs.pop("headers", {})
-    return _SESSION.get(url, headers=headers, **kwargs)
+    return _session().get(url, headers=headers, timeout=timeout, **kwargs)
 
 
-def _hit(title: str | None, url: str | None, source: str, date: str | None = None) -> Hit:
-    """`date` is an ISO string 'YYYY-MM-DD' when known, else None."""
+def _hit(
+    title: str | None,
+    url: str | None,
+    source: str,
+    date: str | None = None,
+    snippet: str | None = None,
+) -> Hit:
+    """`date` is an ISO string 'YYYY-MM-DD' when known, else None. `snippet` is the
+    engine's own result blurb, whitespace-trimmed; whitespace-only becomes None."""
     return {
         "title": (title or "").strip(),
         "url": (url or "").strip(),
         "source": source,
         "date": date,
+        "snippet": (snippet or "").strip() or None,
     }
 
 
@@ -127,9 +177,12 @@ def _collect(
     exclude: str | None = None,
     min_title: int = 0,
     unwrap: Callable[[str], str] = lambda href: href,
+    snippet: Callable[[Tag], str | None] = lambda anchor: None,
 ) -> list[Hit]:
     """Turn scraped `<a>` tags into at most `k` deduped hits, dropping self-links
-    (`exclude`), non-http hrefs and titles shorter than `min_title`."""
+    (`exclude`), non-http hrefs and titles shorter than `min_title`. `snippet` maps
+    a kept anchor to its result blurb elsewhere in the soup — best-effort by nature
+    (it reads markup the engine already sent, never fetches), so None is normal."""
     hits: list[Hit] = []
     seen: set[str] = set()
     for anchor in anchors:
@@ -144,7 +197,7 @@ def _collect(
         ):
             continue
         seen.add(key)
-        hits.append(_hit(title, href, source))
+        hits.append(_hit(title, href, source, snippet=snippet(anchor)))
         if len(hits) >= k:
             break
     if not hits:
@@ -152,6 +205,11 @@ def _collect(
         # rot silently. Both land here looking exactly like an empty search.
         _log.warning("%s: 200 OK but no results parsed — bot-check or changed layout?", source)
     return hits
+
+
+def _text_of(element: Tag | None) -> str | None:
+    """Element text for the snippet extractors, or None when the lookup missed."""
+    return element.get_text(" ", strip=True) if element is not None else None
 
 
 _DATE_SELECTORS = (
@@ -225,14 +283,23 @@ def _ddg_anchors(soup: BeautifulSoup) -> Iterable[Tag]:
             yield anchor
 
 
-@_fails_soft
+def _ddg_snippet(anchor: Tag) -> str | None:
+    """The blurb sits beside the title link, inside the same result block."""
+    block = anchor.find_parent("div", class_=["result", "web-result"])
+    return _text_of(block.select_one(".result__snippet")) if block else None
+
+
 def _ddg_attempt(query: str, k: int) -> list[Hit]:
-    """One POST to the no-JS endpoint. Empty on a challenge page or a non-200."""
-    response = _SESSION.post(
+    """One POST to the no-JS endpoint. Empty on a challenge page or a non-200.
+
+    NOT fail-soft: the caller needs to tell "DDG answered with a challenge"
+    (worth retrying) from "DDG could not be reached at all" (not worth
+    retrying). `duckduckgo` is itself fail-soft, so nothing escapes to fusion."""
+    response = _session().post(
         _DDG_URL,
         data={"q": query, "b": "", "kl": "us-en"},
         headers=_browser_headers() | _DDG_HEADERS,
-        timeout=20,
+        timeout=_timeout(20),
     )
     if response.status_code != 200 or "challenge-form" in response.text:
         # Expected and self-healing: the caller retries with a new UA, so this is
@@ -240,7 +307,9 @@ def _ddg_attempt(query: str, k: int) -> list[Hit]:
         _log.debug("ddg attempt blocked (HTTP %s)", response.status_code)
         return []
     soup = BeautifulSoup(response.text, "html.parser")
-    return _collect(_ddg_anchors(soup), "duckduckgo", k=k, unwrap=_unwrap_ddg)
+    return _collect(
+        _ddg_anchors(soup), "duckduckgo", k=k, unwrap=_unwrap_ddg, snippet=_ddg_snippet
+    )
 
 
 def duckduckgo(query: str, k: int = 10, tries: int = 3) -> list[Hit]:
@@ -251,8 +320,16 @@ def duckduckgo(query: str, k: int = 10, tries: int = 3) -> list[Hit]:
     for attempt in range(tries):
         if attempt:  # 202 / challenge / empty -> wait a moment, rotate UA, try again
             time.sleep(2)
-        if hits := _ddg_attempt(query, k):
-            return hits
+        try:
+            if hits := _ddg_attempt(query, k):
+                return hits
+        except requests.RequestException as exc:
+            # Unreachable is not the same as blocked. Retrying a host that will
+            # not complete a TCP handshake just spends the fan-out's budget on
+            # a foregone conclusion — it was 3 x 5s + 2 x 2s of every search
+            # from a network that cannot reach DDG at all.
+            _log.warning("duckduckgo unreachable (%s); not retrying", type(exc).__name__)
+            return []
     _log.warning("duckduckgo blocked after %d attempts", tries)
     return []  # still blocked after retries; the other engines below cover you
 
@@ -260,6 +337,12 @@ def duckduckgo(query: str, k: int = 10, tries: int = 3) -> list[Hit]:
 # Brave's result markup also matches its own chrome ("Images", "Settings", "Log in"),
 # and every one of those labels is shorter than a real headline.
 _BRAVE_MIN_TITLE = 11
+
+
+def _brave_snippet(anchor: Tag) -> str | None:
+    """Brave wraps each result in a `.snippet` card; the blurb is its description."""
+    block = anchor.find_parent(class_="snippet")
+    return _text_of(block.select_one(".snippet-description, .snippet-content")) if block else None
 
 
 @_fails_soft
@@ -271,7 +354,20 @@ def brave(query: str, k: int = 10) -> list[Hit]:
         return []
     soup = BeautifulSoup(response.text, "html.parser")
     anchors = soup.select("a.h[href^='http'], #results .snippet a[href^='http'], .snippet-title")
-    return _collect(anchors, "brave", k=k, exclude="brave.com", min_title=_BRAVE_MIN_TITLE)
+    return _collect(
+        anchors,
+        "brave",
+        k=k,
+        exclude="brave.com",
+        min_title=_BRAVE_MIN_TITLE,
+        snippet=_brave_snippet,
+    )
+
+
+def _mojeek_snippet(anchor: Tag) -> str | None:
+    """Mojeek keeps title and blurb (`p.s`) as siblings inside one `<li>`."""
+    block = anchor.find_parent("li")
+    return _text_of(block.select_one("p.s")) if block else None
 
 
 @_fails_soft
@@ -283,7 +379,15 @@ def mojeek(query: str, k: int = 10) -> list[Hit]:
         return []
     soup = BeautifulSoup(response.text, "html.parser")
     anchors = soup.select("ul.results-standard li a.title, li h2 a, a.ob")
-    return _collect(anchors, "mojeek", k=k, exclude="mojeek.com")
+    return _collect(anchors, "mojeek", k=k, exclude="mojeek.com", snippet=_mojeek_snippet)
+
+
+def _marginalia_snippet(anchor: Tag) -> str | None:
+    """The description `<p>` follows the result's `<h2>`. Stop at the NEXT `<h2>`,
+    or a description-less result would steal its neighbour's blurb."""
+    heading = anchor.find_parent("h2")
+    following = heading.find_next(["p", "h2"]) if heading else None
+    return _text_of(following) if following is not None and following.name == "p" else None
 
 
 @_fails_soft
@@ -293,7 +397,10 @@ def marginalia(query: str, k: int = 10) -> list[Hit]:
     if not _ok(response, "marginalia"):
         return []
     soup = BeautifulSoup(response.text, "html.parser")
-    return _collect(soup.select("h2 a[href]"), "marginalia", k=k, exclude="marginalia")
+    return _collect(
+        soup.select("h2 a[href]"), "marginalia", k=k, exclude="marginalia",
+        snippet=_marginalia_snippet,
+    )
 
 
 @_fails_soft
@@ -305,13 +412,30 @@ def duckduckgo_ia(query: str, k: int = 10) -> list[Hit]:
     ).json()
     hits = []
     if data.get("AbstractURL"):
-        hits.append(_hit(data.get("Heading", ""), data["AbstractURL"], "ddg-ia"))
+        # no_html=1 above keeps AbstractText plain; related topics reuse their
+        # Text as the title, so a snippet there would just repeat it.
+        hits.append(
+            _hit(
+                data.get("Heading", ""),
+                data["AbstractURL"],
+                "ddg-ia",
+                snippet=data.get("AbstractText") or data.get("Abstract"),
+            )
+        )
     hits.extend(
         _hit(topic.get("Text", ""), topic["FirstURL"], "ddg-ia")
         for topic in data.get("RelatedTopics", [])
         if isinstance(topic, dict) and topic.get("FirstURL")
     )
     return hits[:k]
+
+
+def _rss_snippet(description: str | None) -> str | None:
+    """Google News item descriptions are HTML (a link back to the article plus the
+    outlet's name); keep the text, drop the tags."""
+    if not description:
+        return None
+    return BeautifulSoup(description, "html.parser").get_text(" ", strip=True)
 
 
 @_fails_soft
@@ -326,6 +450,7 @@ def google_news(query: str, k: int = 10) -> list[Hit]:
             item.findtext("link"),
             "news",
             _rss_date(item.findtext("pubDate")),
+            snippet=_rss_snippet(item.findtext("description")),
         )
         for item in root.iter("item")
     )
@@ -351,8 +476,11 @@ def wikipedia(query: str, k: int = 6) -> list[Hit]:
     # logging a full traceback on every search.
     if not _ok(response, "wikipedia"):
         return []
-    _query, titles, _descriptions, urls = response.json()
-    return [_hit(title, url, "wikipedia") for title, url in zip(titles, urls, strict=True)]
+    _query, titles, descriptions, urls = response.json()
+    return [
+        _hit(title, url, "wikipedia", snippet=description)
+        for title, description, url in zip(titles, descriptions, urls, strict=True)
+    ]
 
 
 # ── the one call you use ─────────────────────────────────────────────────────────────────
@@ -389,25 +517,107 @@ def _score(query: str, hit: Hit, rrf_share: float) -> float:
 
 
 def _fuse(
-    query: str, engines: Iterable[Engine], *, delay: float, rrf_k: int
-) -> tuple[dict[str, Hit], dict[str, float]]:
-    """Run every engine and return (page by URL, summed reciprocal rank by URL).
-    A page ranked `rank` by one engine contributes 1/(rrf_k + rank) — once per engine,
-    or an engine listing the same page twice would look like two engines agreeing."""
+    query: str,
+    engines: Iterable[Engine],
+    *,
+    delay: float,
+    rrf_k: int,
+    budget: float = FANOUT_BUDGET,
+) -> tuple[dict[str, Hit], dict[str, float], int]:
+    """Run every engine and return (page by URL, summed reciprocal rank by URL,
+    raw hit count before dedup). A page ranked `rank` by one engine contributes
+    1/(rrf_k + rank) — once per engine, or an engine listing the same page twice
+    would look like two engines agreeing.
+
+    The page keeps the FIRST engine's dict (so 'source' stays that engine's name)
+    and gains 'engines': every engine that returned the URL, in the order the
+    engines ran — DEFAULT_ENGINES order, which is the priority order. A later
+    engine also fills in 'snippet' when the earlier ones had none, so dedup never
+    throws away the only blurb we got."""
+    engines = list(engines)
+    # Run the engines CONCURRENTLY. They are independent network calls to
+    # different hosts, and running them one after another made the wall clock
+    # the SUM of seven timeouts — measured at 86s for one query, which the
+    # browser's results page shows as a dead "Searching…" screen (owner report
+    # 2026-08-01). In parallel the cost is the slowest single engine.
+    #
+    # `delay` is the politeness knob for the CLI, and spacing requests out is
+    # its entire purpose, so that path stays sequential.
+    if delay:
+        results: list[list[Hit]] = []
+        for i, engine in enumerate(engines):
+            if i:
+                time.sleep(delay)  # be polite; protects your IP reputation
+            results.append(engine(query))
+    else:
+        # Results are slotted BY INDEX, so the merge below still sees the
+        # engines in DEFAULT_ENGINES order no matter what order they finish in.
+        # That order is load-bearing: it decides each page's 'source' and the
+        # order of its 'engines' list.
+        results = [[] for _ in engines]
+        pool = ThreadPoolExecutor(max_workers=max(len(engines), 1))
+        try:
+            futures = {pool.submit(engine, query): i for i, engine in enumerate(engines)}
+            try:
+                for future in as_completed(list(futures), timeout=budget):
+                    results[futures[future]] = future.result() or []
+            except FuturesTimeout:
+                late = [engines[i].__name__ for f, i in futures.items() if not f.done()]
+                # Engine names only, never the query (SPEC §6).
+                _log.warning("web search: %s missed the %.0fs budget", ", ".join(late), budget)
+        finally:
+            # Do NOT wait: a straggler blocked on a dead host would put the
+            # whole budget back. Its thread finishes on its own and is
+            # reclaimed; its result is simply not part of this search.
+            pool.shutdown(wait=False)
+
     merged: dict[str, Hit] = {}
     rrf: defaultdict[str, float] = defaultdict(float)
-    for i, engine in enumerate(engines):
-        if delay and i:
-            time.sleep(delay)  # be polite; protects your IP reputation
+    collected = 0
+    for hits in results:
         counted: set[str] = set()
-        for rank, hit in enumerate(engine(query), start=1):
+        for rank, hit in enumerate(hits, start=1):
+            collected += 1
             key = _dedupe_key(hit["url"])
             if not key or key in counted:
                 continue
             counted.add(key)
-            merged.setdefault(key, dict(hit))
+            page = merged.setdefault(key, dict(hit, engines=[]))
+            if hit["source"] not in page["engines"]:
+                page["engines"].append(hit["source"])
+            if page.get("snippet") is None and hit.get("snippet"):
+                page["snippet"] = hit["snippet"]
             rrf[key] += 1.0 / (rrf_k + rank)
-    return merged, rrf
+    return merged, rrf, collected
+
+
+def _ranked(
+    query: str,
+    limit: int,
+    *,
+    engines: Iterable[Engine] | None = None,
+    delay: float = 0.0,
+    rrf_k: int = 60,
+    budget: float = FANOUT_BUDGET,
+) -> tuple[list[Hit], int]:
+    """search() minus the public shape: (hits, raw hit count before dedup) — the
+    count is what the route reports as 'merged'."""
+    merged, rrf, collected = _fuse(
+        query,
+        DEFAULT_ENGINES if engines is None else engines,
+        delay=delay,
+        rrf_k=rrf_k,
+        budget=budget,
+    )
+    if not merged:
+        return [], collected
+
+    top_rrf = max(rrf.values()) or 1.0
+    scored = [
+        dict(hit, score=_score(query, hit, rrf[key] / top_rrf)) for key, hit in merged.items()
+    ]
+    scored.sort(key=itemgetter("score"), reverse=True)
+    return scored[:limit], collected
 
 
 def search(
@@ -420,7 +630,11 @@ def search(
     rrf_k: int = 60,
 ) -> list[Hit]:
     """Return up to `limit` deduped web links, most-relevant first:
-        [{'title','url','source','date','score'}, ...]
+        [{'title','url','source','date','snippet','engines','score'}, ...]
+
+    'engines' lists every engine that returned the URL (in DEFAULT_ENGINES order);
+    'source' is always engines[0]. 'snippet' is the first non-empty blurb among
+    those engines, in the same order.
 
     score (0..1, relative within this query) = 70% Reciprocal-Rank-Fusion + 30% title match.
       - RRF rewards links the engines rank HIGH and that MULTIPLE engines agree on
@@ -431,26 +645,30 @@ def search(
 
     Dates: news carries a real date for free. resolve_dates=True fills dates for the other
     links too (one fetch per dateless link, only for the `limit` links you get back)."""
-    merged, rrf = _fuse(
-        query,
-        DEFAULT_ENGINES if engines is None else engines,
-        delay=delay,
-        rrf_k=rrf_k,
-    )
-    if not merged:
-        return []
-
-    top_rrf = max(rrf.values()) or 1.0
-    scored = [
-        dict(hit, score=_score(query, hit, rrf[key] / top_rrf)) for key, hit in merged.items()
-    ]
-    scored.sort(key=itemgetter("score"), reverse=True)
-    hits = scored[:limit]
-
+    hits, _collected = _ranked(query, limit, engines=engines, delay=delay, rrf_k=rrf_k)
     if resolve_dates:
         for hit in hits:
             hit["date"] = hit["date"] or _page_date(hit["url"])
     return hits
+
+
+def timed_search(
+    query: str, limit: int = 12, *, engines: Iterable[Engine] | None = None
+) -> dict[str, Any]:
+    """What ``POST /web_search`` returns: ``{'hits', 'merged', 'tookMs'}`` —
+    the fused hits plus how much raw material the fusion saw ('merged', hits
+    across all engines before URL dedup) and the wall-clock milliseconds.
+
+    Deliberately NO ``resolve_dates`` parameter: the route-facing entry point
+    must not even own the knob that fetches result URLs from Python (that would
+    step around the Rust SSRF guard — see the module docstring)."""
+    started = time.monotonic()
+    hits, collected = _ranked(query, limit, engines=engines)
+    return {
+        "hits": hits,
+        "merged": collected,
+        "tookMs": int((time.monotonic() - started) * 1000),
+    }
 
 
 _NO_DATE = "     —    "  # same width as an ISO date, so columns line up

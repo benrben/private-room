@@ -12,49 +12,23 @@ import { base64ToBytes } from "../viewers/util";
  * synthesis pump, decode, scheduling callbacks — captures `epoch` and no-ops
  * when it went stale. beginTurn()/roundBoundary() advance BOTH epoch and
  * turnEpoch (audio killed, turn alive); cancelAll() advances only epoch
- * (turn dead: a later endOfTurn is a no-op, and a late-resolving speak_text
- * can never schedule audio after Stop or lock). */
+ * (turn dead: a later endOfTurn is a no-op, and a late-resolving synthesis
+ * call can never schedule audio after Stop or lock). */
 
 export type VoiceArchetype = "off" | "demon" | "ghost" | "wraith" | "ancient" | "custom";
 
-/** Which synthesizer voices the room:
- *  - "neural" (default): Edge neural TTS via the sidecar — Andrew
- *    multilingual at +22% rate / -2 Hz pitch, normalized to ~-16 LUFS. A
- *    neural synthetic voice, not a human recording; the sentence text goes
- *    to Microsoft's service (Settings discloses this).
- *  - "device": the original on-device AVSpeech path — nothing leaves the Mac.
- *  Neural failures (offline, sidecar down) fall back to "device" per
- *  sentence, so speech degrades instead of going silent. */
-export type VoiceEngine = "neural" | "device";
+/** The room speaks with ONE engine: Edge neural TTS via the sidecar —
+ * multilingual voices at +22% rate / -2 Hz pitch, normalized to ~-16 LUFS.
+ * Neural synthetic voices, not human recordings; the sentence text goes to
+ * Microsoft's service (Settings discloses this). A failed sentence (offline,
+ * sidecar down) is skipped — there is no on-device fallback voice. */
 
-/** The curated neural-voice roster (Edge TTS short names, all verified
- * against the live catalog). "Multilingual" voices speak dozens of languages
- * — including Hebrew — with one natural timbre; Avri/Hila are Hebrew-native.
- * The sidecar accepts any of these ids in TtsRequest.voice; an empty id
- * means the product default (Andrew). */
-export interface NeuralVoice {
-  id: string;
-  label: string;
-  hint: string;
-}
-
-export const NEURAL_VOICES: NeuralVoice[] = [
-  { id: "en-US-AndrewMultilingualNeural", label: "Andrew", hint: "warm male · multilingual · default" },
-  { id: "en-US-BrianMultilingualNeural", label: "Brian", hint: "calm male · multilingual" },
-  { id: "en-US-AvaMultilingualNeural", label: "Ava", hint: "bright female · multilingual" },
-  { id: "en-US-EmmaMultilingualNeural", label: "Emma", hint: "friendly female · multilingual" },
-  { id: "fr-FR-RemyMultilingualNeural", label: "Rémy", hint: "French male · multilingual" },
-  { id: "fr-FR-VivienneMultilingualNeural", label: "Vivienne", hint: "French female · multilingual" },
-  { id: "de-DE-SeraphinaMultilingualNeural", label: "Seraphina", hint: "German female · multilingual" },
-  { id: "he-IL-AvriNeural", label: "Avri", hint: "Hebrew male" },
-  { id: "he-IL-HilaNeural", label: "Hila", hint: "Hebrew female" },
-];
+/** There is NO bundled voice roster: the Settings picker is fed from the
+ * service's live catalog (api.listNeuralVoices) and the sidecar accepts any
+ * catalog id in TtsRequest.voice. An empty/null id means the sidecar's
+ * product default (Andrew, multilingual). */
 
 export interface VoiceParams {
-  /** AVSpeech pitchMultiplier, 0.5–2.0. */
-  pitch: number;
-  /** AVSpeech rate, 0.1–0.7. */
-  rate: number;
   /** Convolver wet mix 0–1 (custom archetype also derives IR length from it). */
   reverb: number;
   /** WaveShaper drive 0–1 (k = 8·d; 0 bypasses the shaper). */
@@ -62,24 +36,19 @@ export interface VoiceParams {
 }
 
 export const ARCHETYPE_DEFAULTS: Record<Exclude<VoiceArchetype, "custom">, VoiceParams> = {
-  off: { pitch: 1.0, rate: 0.5, reverb: 0, distortion: 0 },
-  demon: { pitch: 0.5, rate: 0.45, reverb: 0.4, distortion: 0.5 },
-  ghost: { pitch: 1.15, rate: 0.4, reverb: 0.6, distortion: 0 },
+  off: { reverb: 0, distortion: 0 },
+  demon: { reverb: 0.4, distortion: 0.5 },
+  ghost: { reverb: 0.6, distortion: 0 },
   // Wraith is deliberately its own preset (the user's list names all four):
-  // higher/faster-shimmer than ghost, longer tail.
-  wraith: { pitch: 1.3, rate: 0.38, reverb: 0.7, distortion: 0 },
-  ancient: { pitch: 0.8, rate: 0.42, reverb: 0.3, distortion: 0.19 },
+  // more shimmer than ghost, longer tail.
+  wraith: { reverb: 0.7, distortion: 0 },
+  ancient: { reverb: 0.3, distortion: 0.19 },
 };
-
-/** Synthesis-side volume per archetype (whispery presets speak softer). */
-const ARCHETYPE_VOLUME: Record<string, number> = { ghost: 0.85, wraith: 0.8 };
 
 interface VoiceConfig {
   archetype: VoiceArchetype;
   params: VoiceParams;
-  voiceId: string | null;
   autoSpeak: boolean;
-  engine: VoiceEngine;
   /** Curated neural voice id; null/"" = the product default (Andrew). */
   neuralVoiceId: string | null;
 }
@@ -90,11 +59,7 @@ let ctx: AudioContext | null = null;
 let cfg: VoiceConfig = {
   archetype: "off",
   params: { ...ARCHETYPE_DEFAULTS.off },
-  voiceId: null,
   autoSpeak: false,
-  // Privacy-safe default: on-device until the user explicitly opts into neural
-  // (cloud Edge TTS). Matches useVoiceSettings' default.
-  engine: "device",
   neuralVoiceId: null,
 };
 
@@ -269,8 +234,6 @@ export function speakText(
   opts?: {
     archetype?: VoiceArchetype;
     params?: VoiceParams;
-    voiceId?: string | null;
-    engine?: VoiceEngine;
     neuralVoiceId?: string | null;
     onState?: (playing: boolean) => void;
   },
@@ -282,15 +245,11 @@ export function speakText(
   if (
     opts?.archetype !== undefined ||
     opts?.params ||
-    opts?.voiceId !== undefined ||
-    opts?.engine !== undefined ||
     opts?.neuralVoiceId !== undefined
   ) {
     overrides = {
       archetype: opts?.archetype ?? cfg.archetype,
       params: opts?.params ?? cfg.params,
-      voiceId: opts?.voiceId === undefined ? cfg.voiceId : opts.voiceId,
-      engine: opts?.engine ?? cfg.engine,
       neuralVoiceId:
         opts?.neuralVoiceId === undefined ? cfg.neuralVoiceId : opts.neuralVoiceId,
     };
@@ -309,8 +268,6 @@ export function speakText(
 let overrides: {
   archetype: VoiceArchetype;
   params: VoiceParams;
-  voiceId: string | null;
-  engine: VoiceEngine;
   neuralVoiceId: string | null;
 } | null = null;
 
@@ -324,14 +281,6 @@ function activeArchetype(): VoiceArchetype {
 
 function activeParams(): VoiceParams {
   return overrides?.params ?? cfg.params;
-}
-
-function activeVoiceId(): string | null {
-  return overrides?.voiceId ?? cfg.voiceId;
-}
-
-function activeEngine(): VoiceEngine {
-  return overrides?.engine ?? cfg.engine;
 }
 
 function activeNeuralVoiceId(): string | null {
@@ -432,27 +381,15 @@ async function pump(): Promise<void> {
     while (sentenceQueue.length > 0) {
       const myEpoch = epoch;
       const text = sentenceQueue.shift()!;
-      const p = activeParams();
-      const volume = ARCHETYPE_VOLUME[activeArchetype()] ?? 1.0;
       let b64: string;
       try {
-        if (activeEngine() === "neural") {
-          try {
-            // Edge neural (+22%, -2 Hz, ~-16 LUFS) via the sidecar, with the
-            // room's chosen roster voice (null = Andrew). Volume shaping for
-            // whispery archetypes still applies in the DSP graph via
-            // `master.gain`, not synthesis-side.
-            b64 = await api.speakTextNeural(text, activeNeuralVoiceId());
-          } catch {
-            // Offline / sidecar down: this sentence falls back to the
-            // on-device voice rather than going silent.
-            b64 = await api.speakText(text, activeVoiceId(), p.rate, p.pitch, volume);
-          }
-        } else {
-          b64 = await api.speakText(text, activeVoiceId(), p.rate, p.pitch, volume);
-        }
+        // Edge neural (+22%, -2 Hz, ~-16 LUFS) via the sidecar, with the
+        // room's chosen roster voice (null = Andrew). Volume shaping for
+        // whispery archetypes applies in the DSP graph via `master.gain`,
+        // not synthesis-side.
+        b64 = await api.speakTextNeural(text, activeNeuralVoiceId());
       } catch {
-        continue; // one failed sentence must not kill the rest
+        continue; // offline / sidecar down: skip this sentence, try the next
       }
       if (epoch !== myEpoch) return;
       const c = ctx;

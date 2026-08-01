@@ -180,3 +180,85 @@ async def test_tts_route_maps_engine_failure_to_502(
         resp = await c.post("/tts", json={"text": "Hello."})
     assert resp.status_code == 502
     assert resp.json()["code"] == "TTS_UNAVAILABLE"
+
+
+# --- the live voice catalog --------------------------------------------------
+
+
+async def test_voices_route_returns_live_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    voices = [
+        {"id": "he-IL-AvriNeural", "gender": "Male", "locale": "he-IL"},
+        {"id": "en-US-AvaMultilingualNeural", "gender": "Female", "locale": "en-US"},
+    ]
+
+    async def fake_list() -> list[dict[str, str]]:
+        return voices
+
+    monkeypatch.setattr(tts, "list_neural_voices", fake_list)
+    async with client_for(app()) as c:
+        resp = await c.post("/tts/voices", json={})
+    assert resp.status_code == 200
+    assert resp.json() == {"voices": voices}
+
+
+async def test_voices_route_maps_catalog_failure_to_502(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def boom() -> list[dict[str, str]]:
+        raise tts.TtsError("voice catalog unavailable: offline")
+
+    monkeypatch.setattr(tts, "list_neural_voices", boom)
+    async with client_for(app()) as c:
+        resp = await c.post("/tts/voices", json={})
+    assert resp.status_code == 502
+    assert resp.json()["code"] == "TTS_UNAVAILABLE"
+
+
+async def test_catalog_trims_sorts_and_serves_last_good_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """list_neural_voices: raw service rows -> trimmed sorted dicts; a later
+    fetch failure serves the cached catalog instead of erroring."""
+    import sys
+    import types
+
+    raw = [
+        {
+            "ShortName": "he-IL-HilaNeural",
+            "Gender": "Female",
+            "Locale": "he-IL",
+            "FriendlyName": "ignored",
+        },
+        {
+            "ShortName": "de-DE-FlorianMultilingualNeural",
+            "Gender": "Male",
+            "Locale": "de-DE",
+        },
+        {"Gender": "Male", "Locale": "xx-XX"},  # no ShortName -> dropped
+    ]
+    calls = {"n": 0}
+
+    async def fake_list_voices() -> list[dict[str, str]]:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("offline")
+        return raw
+
+    fake_mod = types.SimpleNamespace(list_voices=fake_list_voices)
+    monkeypatch.setitem(sys.modules, "edge_tts", fake_mod)
+    monkeypatch.setattr(tts, "_voices_cache", None)
+
+    got = await tts.list_neural_voices()
+    assert got == [
+        {"id": "de-DE-FlorianMultilingualNeural", "gender": "Male", "locale": "de-DE"},
+        {"id": "he-IL-HilaNeural", "gender": "Female", "locale": "he-IL"},
+    ]
+    # Second call fails at the service -> the last good catalog is served.
+    assert await tts.list_neural_voices() == got
+
+    # No cache at all -> the failure surfaces as TtsError.
+    monkeypatch.setattr(tts, "_voices_cache", None)
+    with pytest.raises(tts.TtsError):
+        await tts.list_neural_voices()

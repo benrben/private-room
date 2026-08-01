@@ -512,11 +512,12 @@ export interface SttStatus {
   sizeMb: number;
 }
 
-/** Idea 3: one installed system speech voice (AVSpeechSynthesisVoice). */
-export interface VoiceInfo {
+/** Idea 3: one voice from the Edge service's LIVE catalog (the app bundles
+ * no roster — the picker is fed from `list_neural_voices` at open). */
+export interface NeuralVoiceInfo {
   id: string;
-  name: string;
-  lang: string;
+  gender: string;
+  locale: string;
 }
 
 /** Friendly display names for models we ship guidance for. The stored setting
@@ -967,11 +968,75 @@ export interface SkillResourceContent {
 /** Live state of the private browser's child webview. */
 export interface BrowserInfo {
   open: boolean;
+  /** A new tab that has not navigated yet. The native view is parked while
+   *  this is true, so the start screen underneath is actually visible. */
+  blank?: boolean;
   url?: string | null;
   title?: string | null;
   ready?: string | null;
   takeover?: boolean;
   error?: string;
+}
+
+/** One open private-browser page (`browser_tabs`).
+ *
+ * These are never persisted: a restored list of visited URLs is a browsing
+ * history, which is the one thing this browser promises not to keep. */
+export interface BrowserTab {
+  id: string;
+  title: string;
+  url: string;
+  active: boolean;
+}
+
+/** One fused web result (BROWSE-3).
+ *
+ * The engines that agreed on a URL are kept as a LIST, not collapsed to one
+ * name: cross-engine agreement is a ranking signal we can show and a single
+ * search engine cannot. */
+export interface WebHit {
+  title: string;
+  url: string;
+  /** Every engine that returned this URL, in the fusion's priority order. */
+  engines: string[];
+  date?: string | null;
+  /** The engine's own blurb, upgraded to the page's `meta description` once
+   *  the enrich pass has read it. */
+  snippet?: string | null;
+  score: number;
+}
+
+/** What the browser's results page renders for one search (BROWSE-3). */
+export interface BrowserSearchResult {
+  hits: WebHit[];
+  /** Raw hits collected across all engines before dedup — the honest
+   *  denominator behind "31 merged into 12". */
+  merged: number;
+  tookMs: number;
+  /** Served from this Mac's 15-minute cache, no network touched. */
+  cached: boolean;
+  query: string;
+  /** False when the room turned result previews off: every card keeps its
+   *  monogram tile and no result origin is contacted. */
+  previewsEnabled: boolean;
+  /** False when the room has no engine configured — the view must not offer a
+   *  summary button that can only fail. */
+  summaryAvailable: boolean;
+}
+
+/** One result's preview, from the enrich pass (BROWSE-3b).
+ *
+ * Images arrive as data URLs because the results page must never fetch
+ * anything itself — every byte comes through the Rust guard. */
+export interface ResultPreview {
+  url: string;
+  image?: string | null;
+  icon?: string | null;
+  description?: string | null;
+  title?: string | null;
+  /** The page was read; if `image` is still null it simply has no preview
+   *  image, and the card should stop waiting and keep its monogram tile. */
+  done: boolean;
 }
 
 /** One row of the browser's audit trail.

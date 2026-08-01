@@ -228,6 +228,15 @@ export function useWorkspaceEffects(
     const unlistenBrowserNav = api.onBrowserNavigated(() => {
       a.revealBrowser();
     });
+    // BROWSE-2 (D9): a browser download finished importing into the room —
+    // or truthfully failed. The file list refreshes via room-files-changed.
+    const unlistenBrowserDownload = api.onBrowserDownload((p) => {
+      if (p.ok) {
+        s.pushToast("success", `${p.name} arrived in the room.`);
+      } else {
+        s.pushToast("error", `Download of ${p.name} failed: ${p.error ?? "unknown error"}`);
+      }
+    });
     const unlistenMcpApprove = api.onMcpApproveRequest((req) => {
       s.setMcpApprovals((q) => [...q, req]);
     });
@@ -279,12 +288,10 @@ export function useWorkspaceEffects(
     void Promise.all([
       api.getSetting("voice_archetype"),
       api.getSetting("voice_params"),
-      api.getSetting("voice_id"),
       api.getSetting("voice_autospeak"),
       api.getSetting("voice_handsfree"),
-      api.getSetting("voice_engine"),
       api.getSetting("voice_neural_id"),
-    ]).then(([arch, params, voiceId, auto, hands, engine, neuralId]) => {
+    ]).then(([arch, params, auto, hands, neuralId]) => {
       let parsed: voice.VoiceParams | null = null;
       try {
         parsed = params ? (JSON.parse(params) as voice.VoiceParams) : null;
@@ -299,10 +306,7 @@ export function useWorkspaceEffects(
           voice.ARCHETYPE_DEFAULTS[
             archetype === "custom" ? "off" : archetype
           ],
-        voiceId: voiceId || null,
         autoSpeak: auto === "1",
-        // Neural is the product default; "device" is the explicit opt-out.
-        engine: engine === "device" ? "device" : "neural",
         neuralVoiceId: neuralId || null,
       });
       s.setAutoSpeak(auto === "1");
@@ -491,6 +495,7 @@ export function useWorkspaceEffects(
       unlistenFiles.then((fn) => fn());
       unlistenMcp.then((fn) => fn());
       unlistenBrowserNav.then((fn) => fn());
+      unlistenBrowserDownload.then((fn) => fn());
       unlistenMcpApprove.then((fn) => fn());
       unlistenEditApprove.then((fn) => fn());
       unlistenAgentUi.then((fn) => fn());

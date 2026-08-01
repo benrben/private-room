@@ -1,15 +1,18 @@
-"""Neural TTS backend (spoken answers, default engine).
+"""Neural TTS backend (spoken answers — the room's only speech engine).
 
-The room's default spoken voice is Microsoft Edge neural TTS via the
-``edge-tts`` package — voice ``en-US-AndrewMultilingualNeural`` at +22% rate
-and -2 Hz pitch, loudness-normalized to approximately -16 LUFS. It is a
-neural synthetic voice, not a human recording, and Settings says so.
+The spoken voice is Microsoft Edge neural TTS via the ``edge-tts`` package —
+default voice ``en-US-AndrewMultilingualNeural`` at +22% rate and -2 Hz
+pitch, loudness-normalized to approximately -16 LUFS. The Settings picker is
+fed from the service's LIVE catalog (:func:`list_neural_voices`) — nothing
+is bundled, so new service voices appear without an app update. They are
+neural synthetic voices, not human recordings, and Settings says so.
 
 Privacy: this is the ONE seam where reply text leaves the Mac for speech —
 the sentence to be spoken goes to Microsoft's service (same doctrine as
-external_llm: an explicitly surfaced cloud engine, switchable to the
-on-device AVSpeech voice in Settings → Spoken voice). Nothing else rides
-along: no room name, no files, no history — only the sentence text.
+external_llm: an explicitly surfaced cloud engine, disclosed in Settings →
+Spoken voice). Nothing else rides along: no room name, no files, no history
+— only the sentence text. A failure (offline, service refused) surfaces as
+an error and the webview skips that sentence; there is no fallback voice.
 
 Pipeline: edge-tts streams MP3 → ``/usr/bin/afconvert`` (ships with macOS,
 same no-ffmpeg doctrine as recording) decodes to mono 16-bit WAV →
@@ -52,6 +55,49 @@ AFCONVERT = "/usr/bin/afconvert"
 
 class TtsError(RuntimeError):
     """Synthesis failed (offline, service refused, decode failed)."""
+
+
+# --- the voice catalog -------------------------------------------------------
+
+#: Last catalog successfully fetched from the service — served when a
+#: re-fetch fails, so Settings keeps its voice list through a network blip.
+#: Process-lifetime only; never persisted, never hard-coded.
+_voices_cache: list[dict[str, str]] | None = None
+
+
+async def list_neural_voices() -> list[dict[str, str]]:
+    """The service's full live voice catalog, trimmed to what the picker
+    needs — ``{id, gender, locale}`` per voice, sorted by id.
+
+    Dynamic on purpose (user decision 2026-08-01): no bundled roster. A
+    voice is vetted by the user listening to it (Settings → Preview), not
+    by pre-testing here. The fetch carries no room data — only the request
+    itself leaves the Mac. On failure the last good catalog is served if
+    one exists; otherwise :class:`TtsError`.
+    """
+    global _voices_cache
+    import edge_tts  # deferred: keeps module import (and tests) offline-safe
+
+    try:
+        raw = await edge_tts.list_voices()
+    except Exception as exc:  # offline, service refused — one surface
+        if _voices_cache is not None:
+            return _voices_cache
+        raise TtsError(f"voice catalog unavailable: {exc}") from exc
+    voices = sorted(
+        (
+            {
+                "id": v.get("ShortName", ""),
+                "gender": v.get("Gender", ""),
+                "locale": v.get("Locale", ""),
+            }
+            for v in raw
+            if v.get("ShortName")
+        ),
+        key=lambda v: v["id"],
+    )
+    _voices_cache = voices
+    return voices
 
 
 # --- synthesis ---------------------------------------------------------------

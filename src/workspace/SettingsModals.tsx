@@ -122,14 +122,15 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
     };
   }, []);
 
-  /** ADD-26: download the video and let the room transcribe it on-device.
-   * Shared by the explicit "also save the video" checkbox and the automatic
-   * no-captions fallback. The download can take minutes, so the modal stays
-   * open with progress. Returns true when a video landed. */
+  /** ADD-26 → BROWSE-2: download the video and let the room transcribe it
+   * on-device. Shared by the explicit video option (any yt-dlp-supported
+   * site, not just YouTube) and the automatic no-captions fallback. The
+   * download can take minutes, so the modal stays open with progress.
+   * Returns true when a video landed. */
   async function downloadAndTranscribe(url: string): Promise<boolean> {
     setDownloading(true);
     try {
-      const report = await api.importYoutubeVideo(url);
+      const report = await api.importMediaUrl(url);
       s.setFiles(await api.listFiles());
       if (report.errors.length > 0) {
         s.pushToast("error", report.errors.join("\n"));
@@ -209,8 +210,22 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
     }
   }
 
+  /** BROWSE-2: video-only path for a non-YouTube site — no captions to try
+   * first, so it goes straight to the downloader. Failure on an unsupported
+   * site surfaces truthfully via the toast in downloadAndTranscribe. */
+  async function submitVideoOnly() {
+    const url = s.linkUrl.trim();
+    if (!url || s.importingLink) return;
+    s.setImportingLink(true);
+    try {
+      await downloadAndTranscribe(url);
+    } finally {
+      s.setImportingLink(false);
+    }
+  }
+
   function submit() {
-    if (isYoutube && saveVideo) void submitWithVideo();
+    if (saveVideo) void (isYoutube ? submitWithVideo() : submitVideoOnly());
     else void submitCaptionsOrFallback();
   }
 
@@ -245,7 +260,9 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
                 what leaves the Mac and what doesn't, before the click. */}
             {isYoutube
               ? "This sends the public video link to YouTube to fetch it — your room files stay on this Mac."
-              : "This fetches one page from the internet — your room files stay on this Mac."}
+              : saveVideo
+                ? "This sends the public link to the site to fetch its video — your room files stay on this Mac."
+                : "This fetches one page from the internet — your room files stay on this Mac."}
           </p>
           <input
             className="add-link-input"
@@ -259,34 +276,42 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
               if (e.key === "Escape" && !s.importingLink) s.setShowAddLink(false);
             }}
           />
-          {isYoutube && (
-            <div
-              className="yt-mode"
-              role="radiogroup"
-              aria-label="What to import"
+          {/* BROWSE-2: the video option is offered for every URL — yt-dlp
+              covers most video sites, and an unsupported one fails honestly. */}
+          <div
+            className="yt-mode"
+            role="radiogroup"
+            aria-label="What to import"
+          >
+            <button
+              className={`yt-mode-opt${!saveVideo ? " active" : ""}`}
+              role="radio"
+              aria-checked={!saveVideo}
+              disabled={s.importingLink}
+              onClick={() => setSaveVideo(false)}
             >
-              <button
-                className={`yt-mode-opt${!saveVideo ? " active" : ""}`}
-                role="radio"
-                aria-checked={!saveVideo}
-                disabled={s.importingLink}
-                onClick={() => setSaveVideo(false)}
-              >
-                <span className="yt-mode-name">Transcript only</span>
-                <span className="yt-mode-sub">captions, small and fast</span>
-              </button>
-              <button
-                className={`yt-mode-opt${saveVideo ? " active" : ""}`}
-                role="radio"
-                aria-checked={saveVideo}
-                disabled={s.importingLink}
-                onClick={() => setSaveVideo(true)}
-              >
-                <span className="yt-mode-name">Video + transcript</span>
-                <span className="yt-mode-sub">larger, plays offline forever</span>
-              </button>
-            </div>
-          )}
+              <span className="yt-mode-name">
+                {isYoutube ? "Transcript only" : "Page text"}
+              </span>
+              <span className="yt-mode-sub">
+                {isYoutube ? "captions, small and fast" : "readable copy, small and fast"}
+              </span>
+            </button>
+            <button
+              className={`yt-mode-opt${saveVideo ? " active" : ""}`}
+              role="radio"
+              aria-checked={saveVideo}
+              disabled={s.importingLink}
+              onClick={() => setSaveVideo(true)}
+            >
+              <span className="yt-mode-name">
+                {isYoutube ? "Video + transcript" : "Video from this page"}
+              </span>
+              <span className="yt-mode-sub">
+                {isYoutube ? "larger, plays offline forever" : "works on most video sites"}
+              </span>
+            </button>
+          </div>
           {downloading && (
             <span className="banner-pull">
               <span className="banner-pull-label">
@@ -326,7 +351,9 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
                     ? saveVideo
                       ? "Import video"
                       : "Import transcript"
-                    : "Save page"}
+                    : saveVideo
+                      ? "Download video"
+                      : "Save page"}
             </button>
           </div>
         </div>

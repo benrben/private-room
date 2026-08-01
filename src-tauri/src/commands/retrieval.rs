@@ -112,8 +112,29 @@ pub(crate) fn retrieve_context_excluding(
     question_embedding: Option<&[f32]>,
     exclude: &std::collections::HashSet<i64>,
 ) -> Result<(Vec<ScoredChunk>, bool), String> {
+    retrieve_context_limited(conn, question, question_embedding, exclude, Some(MAX_CONTEXT_CHUNKS))
+}
+
+/// As `retrieve_context_excluding`, but with the result count as a parameter.
+/// `None` means every match, for callers that are SHOWING results rather than
+/// spending a context window on them (#find): capping a search result list at the
+/// six chunks a prompt can afford hides matches the user came to see.
+pub(crate) fn retrieve_context_limited(
+    conn: &Connection,
+    question: &str,
+    question_embedding: Option<&[f32]>,
+    exclude: &std::collections::HashSet<i64>,
+    limit: Option<usize>,
+) -> Result<(Vec<ScoredChunk>, bool), String> {
     /// RRF damping constant; standard value.
     const RRF_K: f32 = 60.0;
+    // Rank enough candidates per signal to fill the requested result count; an
+    // unlimited request pools everything the index can return (SQLite treats a
+    // negative LIMIT as no limit, which `i64::MAX` matches in practice).
+    let candidates = match limit {
+        Some(n) => n.saturating_mul(4).max(RETRIEVE_CANDIDATES),
+        None => i64::MAX as usize,
+    };
     struct Cand {
         file_name: String,
         text: String,
@@ -124,7 +145,7 @@ pub(crate) fn retrieve_context_excluding(
 
     // Keyword signal: chunks ranked best-first by bm25 → RRF rank.
     if let Some(expr) = fts_match_expr(question_terms(question).iter().map(String::as_str)) {
-        let hits = db::search_chunks_fts_ranked(conn, &expr, RETRIEVE_CANDIDATES)?;
+        let hits = db::search_chunks_fts_ranked(conn, &expr, candidates)?;
         for (rank, (rowid, name, text, _bm25)) in hits.into_iter().enumerate() {
             let e = pool.entry(rowid).or_insert_with(|| Cand {
                 file_name: name,
@@ -150,7 +171,7 @@ pub(crate) fn retrieve_context_excluding(
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(RETRIEVE_CANDIDATES);
+        scored.truncate(candidates);
         let need_text: Vec<i64> = scored
             .iter()
             .map(|(rowid, _)| *rowid)
@@ -196,7 +217,9 @@ pub(crate) fn retrieve_context_excluding(
             })
             .collect();
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(MAX_CONTEXT_CHUNKS);
+        if let Some(n) = limit {
+            scored.truncate(n);
+        }
         // Every RRF-pooled chunk scores > 0; empty only when exclusion removed
         // all of them — the caller distinguishes that from a true no-match.
         return Ok((scored, false));
@@ -204,7 +227,7 @@ pub(crate) fn retrieve_context_excluding(
 
     // Generic questions ("summarize this") match nothing; fall back to the
     // most recently added content so the model still sees the room.
-    let scored = db::recent_chunks(conn, MAX_CONTEXT_CHUNKS)?
+    let scored = db::recent_chunks(conn, limit.unwrap_or(MAX_CONTEXT_CHUNKS))?
         .into_iter()
         .map(|(file_name, text)| ScoredChunk {
             rowid: -1,

@@ -3,7 +3,7 @@ use base64::Engine;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::State;
 use uuid::Uuid;
@@ -441,6 +441,10 @@ pub struct FileMeta {
     /// HLT-4: true when indexing hit the chunk cap, so only the first part of
     /// the file is searchable. Derived live from the chunk count, no column.
     pub partially_indexed: bool,
+    /// BROWSE-2/BROWSE-3: the address this file arrived from, or None for
+    /// anything that came off this Mac. Lets a file row say "from boi.org.il"
+    /// instead of leaving provenance buried in the Markdown body.
+    pub origin_url: Option<String>,
 }
 
 /// ADD-16: one flat folder. Files reference it by `folder_id`.
@@ -575,11 +579,17 @@ pub async fn web_search_test(state: State<'_, AppState>) -> Result<String, Strin
     match hits.first() {
         // Individual engines drop out silently when they are blocked, so the
         // count is the honest signal of how much of the fusion answered.
+        // BROWSE-3: hits are structured now, so the diagnostic reports the real
+        // consensus (how many engines agreed) rather than a formatted sentence.
         Some(hit) => Ok(format!(
-            "Working ✓ — {} results. Top hit: {} ({})",
+            "Working ✓ — {} results. Top hit: {} (found by {})",
             hits.len(),
             hit.title,
-            hit.snippet
+            match hit.engines.len() {
+                0 => "no engine".to_string(),
+                1 => hit.source().to_string(),
+                n => format!("{n} engines"),
+            }
         )),
         None => Err("Search ran, but every engine came back empty — you may be offline, \
                      or on a network they all block. Try again in a minute."
@@ -653,7 +663,7 @@ pub(crate) fn web_access_enabled(conn: &Connection) -> bool {
 pub(crate) struct WebLanes {
     /// `web_search` + `fetch_page` — the Web agent (`chat.web`).
     pub search: bool,
-    /// The six `browse_*` tools — the Browser agent (`chat.browse`).
+    /// The `browse_*` tools — the Browser agent (`chat.browse`).
     pub browse: bool,
 }
 

@@ -118,6 +118,92 @@ pub fn import_files(
     Ok(ImportReport { imported, errors })
 }
 
+/// BROWSE-2: import one downloaded file into the room and delete its staged
+/// temp copy. The single-file twin of [`import_files`], reachable from
+/// background threads (browser downloads, agent tools, download jobs) — the
+/// same funnel: extraction, OCR/STT lanes, auto-index, privacy scan — plus the
+/// download provenance (D19: `source="download"` and the origin URL).
+pub(crate) fn import_download(
+    app: &tauri::AppHandle,
+    staged: &std::path::Path,
+    display_name: &str,
+    origin_url: &str,
+) -> Result<FileMeta, String> {
+    use tauri::Manager;
+    // D15: the room stores a file as one SQLite blob (~1 GB ceiling) — refuse
+    // before storage does, with the real limit in the message. Checked here so
+    // EVERY inlet (browser click, agent tool, download job) hits the same cap.
+    let size = std::fs::metadata(staged).map(|m| m.len()).unwrap_or(0);
+    if size > web::MAX_DOWNLOAD_BYTES {
+        let _ = std::fs::remove_file(staged);
+        return Err(format!(
+            "{display_name} is {} MB — larger than the {} MB limit for a room file.",
+            size / (1024 * 1024),
+            web::MAX_DOWNLOAD_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes = match std::fs::read(staged) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = std::fs::remove_file(staged);
+            return Err(format!("{display_name}: {e}"));
+        }
+    };
+    let mime = mime_guess::from_path(display_name)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
+    let mut text = extraction::extract_text(display_name, &bytes);
+    if text.as_deref().map_or(true, |t| t.trim().is_empty()) && !extraction::is_image(&mime) {
+        // MarkItDown reads from a path; the staged file still ends with the
+        // real name ("{uuid}-{name}"), so its extension survives.
+        text = extraction::markitdown_extract(&staged.to_string_lossy());
+    }
+    let _ = std::fs::remove_file(staged);
+
+    let ext = extraction::extension_of(display_name);
+    let no_text = text.as_deref().map_or(true, |t| t.trim().is_empty());
+    let needs_ocr = no_text && ocr::is_ocr_candidate(&mime, &ext);
+    let needs_stt = no_text && stt::media_kind(&mime, &ext).is_some();
+
+    let state = app.state::<AppState>();
+    let room_epoch = state.room_epoch();
+    let (meta, room_path) = state.with_room(|room| {
+        let meta = db::insert_file_from_url(
+            &room.conn,
+            display_name,
+            &mime,
+            &bytes,
+            text.as_deref(),
+            "download",
+            Some(origin_url),
+        )?;
+        Ok((meta, room.path.clone()))
+    })?;
+    if needs_ocr || needs_stt {
+        let job = JobMeta {
+            id: meta.id.clone(),
+            name: display_name.to_string(),
+            mime: mime.clone(),
+            ext,
+            room_path: room_path.clone(),
+            epoch: room_epoch,
+        };
+        if needs_stt {
+            enqueue_stt(app, job);
+        } else {
+            enqueue_ocr(app, job);
+        }
+    }
+    schedule_auto_index(app, room_path);
+    schedule_privacy_scan(app.clone());
+    {
+        use tauri::Emitter;
+        let _ = app.emit("room-files-changed", ());
+    }
+    Ok(meta)
+}
+
 /// CHG-27: a background enrichment job carrying only metadata — NOT the file
 /// bytes. The file is already in the room DB before dispatch, so the worker
 /// re-reads bytes under the room lock; this keeps peak memory to one in-flight
@@ -550,9 +636,120 @@ fn is_missing_captions(err: &str) -> bool {
 /// tools are off. The saved file (source "web") is indexed and searchable.
 #[tauri::command]
 pub async fn import_link(state: State<'_, AppState>, url: String) -> Result<FileMeta, String> {
+    import_link_impl(state.inner(), &url).await
+}
+
+/// BROWSE-3: the ＋ button on a search result — save this page into the room as
+/// a source the assistant can actually read.
+///
+/// One funnel, three branches, all existing machinery:
+/// - a YouTube link saves its captions (no video download),
+/// - an ordinary readable page saves a Markdown copy,
+/// - anything that isn't text (a PDF, an image, a media file) goes through the
+///   binary funnel — [`import_download`] — so it gets the 800 MB cap, MarkItDown
+///   extraction and the OCR/STT lanes for free.
+///
+/// The text branches deliberately go through [`save_web_markdown`], which
+/// records `origin_url` and schedules the index and privacy passes — the three
+/// things the older page-import paths each forgot in a different way.
+pub(crate) async fn import_web_source(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    url: &str,
+    fallback_title: &str,
+) -> Result<FileMeta, String> {
+    if web::youtube_video_id(url).is_some() {
+        let (title, text) = match web::youtube_transcript(url).await {
+            Ok(v) => v,
+            Err(e) if is_missing_captions(&e) => {
+                return Err(
+                    "This video has no captions to save. Open it and use Save → Download video \
+                     to transcribe it on this Mac."
+                        .into(),
+                )
+            }
+            Err(e) => return Err(e),
+        };
+        let title = pick_title(&title, fallback_title, url);
+        return save_web_markdown(app, state, url, &format!("{title} (transcript)"), &text);
+    }
+    match web::fetch_readable(url).await {
+        Ok((title, text, _html)) if !text.trim().is_empty() => {
+            let title = pick_title(&title, fallback_title, url);
+            save_web_markdown(app, state, url, &title, &text)
+        }
+        // Not a readable text page — a PDF, an image, a media file. That is a
+        // perfectly good source; it just belongs in the binary funnel.
+        _ => match web::download_to_temp(url, web::MAX_DOWNLOAD_BYTES, None, |_, _| {}).await? {
+            web::DownloadOutcome::Done(d) => {
+                let name = d.file_name.clone();
+                import_download(app, &d.path, &name, url)
+            }
+            // import_download names the real limit the same way; say it here
+            // too, because nothing was staged to hand it.
+            web::DownloadOutcome::TooLarge => Err(format!(
+                "That file is larger than the {} MB limit for a room file.",
+                web::MAX_DOWNLOAD_BYTES / (1024 * 1024)
+            )),
+        },
+    }
+}
+
+/// First non-empty of: the page's own title, the search result's title, the URL.
+fn pick_title(page: &str, fallback: &str, url: &str) -> String {
+    for candidate in [page.trim(), fallback.trim()] {
+        if !candidate.is_empty() {
+            return candidate.to_string();
+        }
+    }
+    url.to_string()
+}
+
+/// Save one fetched web page as a room file, the way every web import should
+/// have been doing it.
+///
+/// Three fixes ride here, each of which was a real gap: `origin_url` is recorded
+/// (the column existed and only `import_download` ever wrote it), and the
+/// auto-index and privacy scans are scheduled (only the binary funnel did).
+/// A web page saved through here is indistinguishable from a downloaded file in
+/// everything that matters downstream.
+pub(crate) fn save_web_markdown(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    url: &str,
+    title: &str,
+    text: &str,
+) -> Result<FileMeta, String> {
+    let (meta, room_path) = state.with_room(|room| {
+        let saved = db::current_date(&room.conn);
+        let name = link_file_name(title, url);
+        let content = format!("# {title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
+        let meta = db::insert_file_from_url(
+            &room.conn,
+            &name,
+            "text/markdown",
+            content.as_bytes(),
+            Some(&content),
+            "web",
+            Some(url),
+        )?;
+        Ok((meta, room.path.clone()))
+    })?;
+    schedule_auto_index(app, room_path);
+    schedule_privacy_scan(app.clone());
+    {
+        use tauri::Emitter;
+        let _ = app.emit("room-files-changed", ());
+    }
+    Ok(meta)
+}
+
+/// The command's body, callable from the agent's `save_link` tool arm with the
+/// same fetch, the same SEC-5 guard and the same saved shape.
+pub(crate) async fn import_link_impl(state: &AppState, url: &str) -> Result<FileMeta, String> {
     // ADD-19: a YouTube link imports the video's own captions as a timestamped
     // transcript (no video download) instead of the watch page's JS soup.
-    let is_youtube = web::youtube_video_id(&url).is_some();
+    let is_youtube = web::youtube_video_id(url).is_some();
     let (title, text) = if is_youtube {
         // ADD-26: when a video simply has no captions, signal the frontend with
         // a sentinel so it can auto-fall-back to downloading the video and

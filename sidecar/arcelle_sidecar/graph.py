@@ -545,7 +545,10 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         # which `test_every_agent_prompt_names_only_its_own_tools` already pins
         # against their box.
         paragraph = (
-            main_prompt(k for k, name in DOMAIN_KEYS.items() if name in offered)
+            main_prompt(
+                (k for k, name in DOMAIN_KEYS.items() if name in offered),
+                web_off=not state.get("web_enabled", False),
+            )
             if agent.main
             else agent.prompt
         )

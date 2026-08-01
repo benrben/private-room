@@ -148,6 +148,27 @@
 
   // #gate → land on the start screen (no open room) to QA onboarding.
   const gateMode = location.hash === "#gate";
+  /* BROWSE-3: the browser's results page. Fixtures chosen to exercise the
+     states that actually differ — a five-engine consensus at the top, a
+     single-engine long-tail hit, one result with NO preview image (the
+     monogram fallback is a designed state, not a failure), and a dated news
+     hit. The tiny inline SVG stands in for the enrich pass's data URLs. */
+  const searchHits = [
+    { title: "Speaker diarisation — Wikipedia", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", engines: ["wikipedia", "duckduckgo", "brave", "mojeek", "ddg-ia"], date: null, snippet: "The process of partitioning an audio stream into homogeneous segments according to speaker identity — answering “who spoke when”.", score: 0.98 },
+    { title: "pyannote-audio: neural speaker diarization toolkit", url: "https://github.com/pyannote/pyannote-audio", engines: ["duckduckgo", "brave", "mojeek"], date: null, snippet: "Pretrained pipelines and DER benchmarks on AMI, DIHARD and VoxConverse, with recipes for fine-tuning segmentation models.", score: 0.86 },
+    { title: "DIHARD III: evaluation plan and results", url: "https://arxiv.org/abs/2012.01477", engines: ["duckduckgo", "brave"], date: "2021-02-11", snippet: "Diarization across eleven domains, from clean interviews to restaurant conversation, with track-level DER leaderboards.", score: 0.79 },
+    { title: "NIST Rich Transcription evaluation series", url: "https://www.nist.gov/itl/iad/mig/rich-transcription-evaluation", engines: ["mojeek", "marginalia", "duckduckgo"], date: null, snippet: "The series that defined diarization scoring: DER, collar conventions, and the meeting-room test sets systems still report against.", score: 0.71 },
+    { title: "What is speaker diarization, and how does it work?", url: "https://www.assemblyai.com/blog/speaker-diarization", engines: ["brave", "duckduckgo"], date: "2026-03-18", snippet: "The modern pipeline — VAD, embeddings, clustering, resegmentation — and the failure modes that actually move DER in production.", score: 0.64 },
+    { title: "New diarization model tops the VoxSRC leaderboard", url: "https://news.ycombinator.com/item?id=44120001", engines: ["news"], date: "2026-07-28", snippet: "A sub-second streaming diarizer claims state of the art; the thread asks whether leaderboard DER survives real meeting audio.", score: 0.58 },
+    { title: "Notes on TitaNet embeddings for meeting audio", url: "https://blog.fastforward.dev/titanet-meetings", engines: ["marginalia"], date: null, snippet: "Why per-frame embedding quality matters less than window purity once your audio has real crosstalk.", score: 0.51 },
+    { title: "AMI Corpus — 100 hours of annotated meetings", url: "https://groups.inf.ed.ac.uk/ami/corpus/", engines: ["mojeek", "duckduckgo", "marginalia"], date: null, snippet: "Headset and distant-microphone recordings with word-level and speaker-turn annotation, free for research use.", score: 0.47 },
+  ];
+  const qaThumb = (hue) =>
+    "data:image/svg+xml;base64," +
+    btoa(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${hue} 55% 42%)"/><stop offset="1" stop-color="hsl(${hue + 40} 45% 22%)"/></linearGradient></defs><rect width="320" height="180" fill="url(#g)"/><circle cx="240" cy="52" r="46" fill="rgba(255,255,255,.14)"/></svg>`,
+    );
+
   const commands = {
     room_info: () =>
       gateMode
@@ -162,6 +183,50 @@
           ]
         : [],
     list_files: () => files,
+    // BROWSE-3: the browser's search half.
+    browser_search: (a2) => ({
+      hits: searchHits,
+      merged: 31,
+      tookMs: 1840,
+      cached: false,
+      query: (a2 && a2.query) || "speaker diarization benchmarks",
+      previewsEnabled: true,
+      summaryAvailable: true,
+    }),
+    // The enrich pass. Deliberately incomplete: the TitaNet blog gets no
+    // image, so QA always sees the monogram fallback next to real previews.
+    browser_preview: (a2) =>
+      ((a2 && a2.urls) || []).map((url, i) => ({
+        url,
+        image: url.includes("fastforward") ? null : qaThumb((i * 47) % 360),
+        icon: null,
+        description: null,
+        title: null,
+        done: true,
+      })),
+    browser_peek: () =>
+      "Speaker diarisation is the process of partitioning an audio stream containing human speech into homogeneous segments according to the identity of each speaker. It can enhance the readability of an automatic speech transcription by structuring the audio stream into speaker turns.",
+    browser_search_summary: () =>
+      new Promise((resolve) =>
+        setTimeout(
+          () =>
+            resolve(
+              "Speaker diarization splits an audio stream into segments by speaker identity, and is scored with the diarization error rate [1]. Open toolkits such as pyannote publish DER benchmarks on AMI, DIHARD and VoxConverse [2], while the DIHARD III evaluation showed that conversational and restaurant audio remain by far the hardest domains [3].",
+            ),
+          900,
+        ),
+      ),
+    import_search_result: (a2) => ({
+      id: `f-web-${Math.random().toString(36).slice(2, 8)}`,
+      name: `${((a2 && a2.title) || "result").slice(0, 40)}.md`,
+      mimeType: "text/markdown",
+      sizeBytes: 8400,
+      source: "web",
+      hasText: true,
+      createdAt: new Date().toISOString(),
+      folderId: null,
+      partiallyIndexed: false,
+    }),
     list_folders: () => folders,
     list_memories: () => memories,
     list_chats: () => chats,
@@ -254,10 +319,18 @@
     list_room_checkpoints: () => ({ entries: [{ id: "ck1", name: "Checkpoint — Jul 18", createdAt: iso(1440), sizeBytes: 18_000_000, auto: false }], totalBytes: 18_000_000 }),
     stt_status: () => ({ installed: true, downloading: false, sizeMb: 620 }),
     room_server_status: () => ({ running: false, url: "", config: "", scope: "files", stable: false, allowCloud: false }),
-    list_speech_voices: () => [{ id: "com.apple.samantha", name: "Samantha", lang: "en-US" }],
+    // The Settings picker's live catalog (dynamic in the real app — a tiny
+    // fixed sample here keeps the grouped select renderable offline).
+    list_neural_voices: () => [
+      { id: "en-US-AndrewMultilingualNeural", gender: "Male", locale: "en-US" },
+      { id: "en-US-AvaMultilingualNeural", gender: "Female", locale: "en-US" },
+      { id: "he-IL-AvriNeural", gender: "Male", locale: "he-IL" },
+      { id: "he-IL-HilaNeural", gender: "Female", locale: "he-IL" },
+    ],
     // Voice QA: a tiny valid silent WAV so decodeAudioData succeeds and the
     // auto-speak pipeline schedules real (inaudible) audio end-to-end.
-    speak_text: () => {
+    // (Neural is the only engine — the app never calls anything else.)
+    speak_text_neural: () => {
       window.__qaSpeaks = (window.__qaSpeaks || 0) + 1;
       const rate = 8000, n = 400; // 50 ms of silence
       const buf = new ArrayBuffer(44 + n * 2);

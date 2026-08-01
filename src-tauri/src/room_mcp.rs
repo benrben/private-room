@@ -672,6 +672,13 @@ fn arcelle_tool_annotations(name: &str) -> Option<serde_json::Value> {
         // the room itself is untouched and every typing action carrying room
         // data passes the outbound consent door first.
         "browse_do" => (false, false, false, true),
+        // BROWSE-2: capture the ALREADY-LOADED page into the room. Mutates the
+        // room (new files, recoverable) without reaching the network.
+        "browse_save" => (false, false, false, false),
+        // BROWSE-2: fetch web content INTO the room. Room-mutating (new files,
+        // recoverable) and honestly open-world — the fetch reaches the public
+        // internet. Not idempotent: re-downloading lands another copy.
+        "save_link" | "download_url" | "download_media" => (false, false, false, true),
         // A paid cloud consultation. It does not mutate the room, but it sends
         // the supplied question to the selected advisor and is not idempotent.
         "consult_advisor" => (false, false, false, true),
@@ -954,6 +961,9 @@ fn scoped_specs(web_enabled: bool, scope: ToolScope) -> Vec<serde_json::Value> {
     // opens the browser would only appear once it was already open.
     if web_enabled && scope.include_browse_tools() {
         extras.extend(commands::browse_tools_specs());
+        // BROWSE-2 (D17): the download/save tools share the browse trust class
+        // — engine tiers only, never a consulted advisor. Same web gate.
+        extras.extend(commands::download_tools_specs());
     }
     list.extend(extras.iter().filter_map(|tool| to_mcp_tool(tool, true)));
     list

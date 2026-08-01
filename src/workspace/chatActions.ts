@@ -385,7 +385,7 @@ export function makeChatActions(
   function stopAsk() {
     // Stop must silence speech NOW — and kill the turn's voice epoch so the
     // cancelled ask's endOfTurn (runGuarded's finally) can't speak the
-    // leftover sentence buffer, and no in-flight speak_text lands late.
+    // leftover sentence buffer, and no in-flight synthesis lands late.
     voice.cancelAll();
     s.setSpeakingMsgId(null);
     const id = s.askIdRef.current;

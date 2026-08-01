@@ -462,7 +462,14 @@ export default function ViewerPane({
           <RoomMap onOpenFile={(id) => a.viewFile(id)} />
         </div>
       ) : area === "browser" ? (
-        <BrowserView parked={s.browseConsents.length > 0} />
+        <BrowserView
+          parked={s.browseConsents.length > 0}
+          // BROWSE-3: ＋ on a result imports it AND pins it to the composer, so
+          // the page's text is in the very next turn rather than only findable
+          // by a later search.
+          onAttach={(file) => a.toggleAttach(file)}
+          onAsk={(query) => s.setQuestion(query)}
+        />
       ) : area === "connectors" ? (
         <ConnectorsView />
       ) : area === "skills" ? (

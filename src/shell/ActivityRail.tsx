@@ -23,6 +23,12 @@ import type { WorkArea } from "../workspace/types";
 
 export type { WorkArea };
 
+/** The rail's own label for an area, reused by the tab strip so a tab and its
+ * rail button can never disagree about what a place is called. */
+export function areaLabel(key: WorkArea): string {
+  return AREAS.find((a) => a.key === key)?.label ?? "Files";
+}
+
 const AREAS: {
   key: Exclude<WorkArea, "files">;
   label: string;

@@ -271,6 +271,15 @@ pub async fn memory_suggestion(
     let (Some(u), Some(a)) = (last_user, last_assistant) else {
         return Ok(MemorySuggestion { worth: false, fact: String::new() });
     };
+    // A turn that produced no answer has nothing worth remembering, and the
+    // suggester cannot tell: what it receives as "the assistant's answer" is
+    // Arcelle's own failure notice. Live QA 2026-07-30 (v0.13.0) — a stopped
+    // read-only revenue question left that notice as the reply and the chip
+    // offered to save "The room's revenue is 0.", a figure in none of the
+    // room's files, behind a one-click Save-to-memory button.
+    if crate::commands::agent::is_failure_notice(&a) {
+        return Ok(MemorySuggestion { worth: false, fact: String::new() });
+    }
     let model = match resolve_structured_model(&state).await {
         Some(m) => m,
         None => return Ok(MemorySuggestion { worth: false, fact: String::new() }),

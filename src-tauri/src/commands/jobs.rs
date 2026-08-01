@@ -34,6 +34,11 @@ pub use scheduler::*;
 mod script_run;
 pub use script_run::*;
 
+// BROWSE-2 (D18): the "download" job kind — URL/media downloads as durable
+// background work with progress and cancel.
+mod download;
+pub use download::*;
+
 /// Where a step runs — decides how many may run at once. Local-model work is
 /// serial because only one model is resident; CPU and cloud work fan out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -809,7 +814,10 @@ pub async fn resume_job(
     if job.parent_job_id.is_some() {
         return Err("This job runs as part of a workflow — resume the workflow instead.".into());
     }
-    if !matches!(job.kind.as_str(), "deep_summary" | "file_pass" | "workflow" | "studio") {
+    if !matches!(
+        job.kind.as_str(),
+        "deep_summary" | "file_pass" | "workflow" | "studio" | "download"
+    ) {
         return Err("This job can't be resumed.".into());
     }
     // Wave 4a: resume through the QUEUE — set the row back to 'queued' and submit.

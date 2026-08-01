@@ -9,7 +9,13 @@ pub(crate) async fn cmd_summarize(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
         if text.trim().is_empty() {
             return Err(format!("\"{name}\" has no readable text to summarize."));
         }
-        let doc = clamp_bytes(text, 8000);
+        // Full ops: the whole file is read. A file bigger than one call becomes
+        // notes over every window, folded down — so the summary covers the end of
+        // a long document, which an 8000-byte clamp never did.
+        let doc = ctx.digest(&text, &format!("Reading {name}")).await;
+        if doc.trim().is_empty() {
+            return Err(format!("Couldn't read \"{name}\" — the model returned nothing."));
+        }
         let out = ctx
             .ask_streaming(
                 "You summarize a document faithfully and concisely.",
@@ -30,8 +36,10 @@ pub(crate) async fn cmd_summarize(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
     if inventory.is_empty() {
         return Err("This room has no files to summarize yet.".into());
     }
+    // Every file in the room, not the first 60 — a room overview that ignores
+    // most of the room isn't an overview.
     let mut listing = String::new();
-    for (name, mime, summary) in inventory.iter().take(60) {
+    for (name, mime, summary) in inventory.iter() {
         match summary {
             Some(s) if !s.trim().is_empty() => {
                 listing.push_str(&format!("- {name} — {}\n", s.trim()))
@@ -39,6 +47,7 @@ pub(crate) async fn cmd_summarize(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
             _ => listing.push_str(&format!("- {name} ({mime})\n")),
         }
     }
+    let listing = ctx.digest(&listing, "Reading the file list").await;
     let out = ctx
         .ask_streaming(
             "You describe what a personal document room is for, based only on the file list given.",
@@ -60,7 +69,25 @@ pub(crate) async fn cmd_compare(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
     if ctx.refs.len() < 2 {
         return Err("Add at least two files with @ — e.g. #compare @plan-a.md @plan-b.md".into());
     }
-    let (refctx, names) = ctx.state.with_room(|room| Ok(refs_context(&room.conn, ctx.refs, 9000)))?;
+    // Full ops: every file is read end to end. Each is digested on its own first
+    // (a no-op for a file that already fits), so the comparison sees all of a
+    // long document instead of whatever fit under a shared 9000-byte budget —
+    // where, with three files pinned, the third often got nothing at all.
+    let files = ctx.state.with_room(|room| Ok(refs_files(&room.conn, ctx.refs)))?;
+    let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    let mut refctx = String::new();
+    for (name, text) in &files {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let digest = ctx.digest(text, &format!("Reading {name}")).await;
+        if !digest.trim().is_empty() {
+            refctx.push_str(&format!("[file: {name}]\n{digest}\n\n"));
+        }
+    }
+    // Several long files can still add up past one call; fold the assembled
+    // context rather than cutting the last file off.
+    let refctx = ctx.digest(&refctx, "Lining the documents up").await;
     if refctx.trim().is_empty() {
         return Err("Those files have no readable text to compare.".into());
     }
@@ -160,9 +187,14 @@ pub(crate) async fn cmd_transcribe(ctx: &CmdCtx<'_>) -> Result<CommandResult, St
 /// timeline-styled HTML minutes document (ADD-22). The model only fills the
 /// structured `minutes_schema`; Rust renders the template. Falls back to the
 /// recent chat when no @ files are pinned.
+///
+/// Full ops: the WHOLE source is minuted. A meeting longer than one model call
+/// is split into consecutive windows, each window produces its own structured
+/// minutes, and `merge_minutes` stitches them into one timeline — so a two-hour
+/// meeting yields a two-hour timeline instead of its first ~5 minutes.
 pub(crate) async fn cmd_minutes(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     use tauri::Emitter;
-    let (refctx, ref_names) = ctx.state.with_room(|room| Ok(refs_context(&room.conn, ctx.refs, 12000)))?;
+    let (refctx, ref_names) = ctx.state.with_room(|room| Ok(refs_context(&room.conn, ctx.refs)))?;
     // A pinned file with no readable text is usually an un-transcribed recording.
     if !ctx.refs.is_empty() && refctx.trim().is_empty() {
         return Err(
@@ -182,20 +214,51 @@ pub(crate) async fn cmd_minutes(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
                 .into(),
         );
     };
-    let _ = ctx.window.emit("ask-step", "Building the meeting minutes…");
-    let raw = ctx
-        .ask_structured(
-            "You turn a meeting transcript or notes into structured minutes. Produce a short \
-             title; the date if stated; attendees if named; a TIMELINE of the discussion as an \
-             ordered list of items, each with an optional time or phase label, a short topic, and \
-             a 1-2 sentence summary; the key decisions; and action items with an owner when known. \
-             Base everything ONLY on the source — leave a field empty rather than inventing it.",
-            format!("Source:\n{source}"),
-            Some(0.3),
-            &minutes_schema(),
-        )
-        .await?;
-    let parsed: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
+    const MINUTES_SYS: &str =
+        "You turn a meeting transcript or notes into structured minutes. Produce a short \
+         title; the date if stated; attendees if named; a TIMELINE of the discussion as an \
+         ordered list of items, each with an optional time or phase label, a short topic, and \
+         a 1-2 sentence summary; the key decisions; and action items with an owner when known. \
+         Base everything ONLY on the source — leave a field empty rather than inventing it.";
+
+    // One structured pass per window of the meeting, in order. A window whose
+    // call fails is skipped rather than aborting the run, and a Stop keeps the
+    // minutes built so far — the same best-effort contract as every other pass.
+    let windows = cmd_windows(&source);
+    let total = windows.len();
+    let mut parts: Vec<serde_json::Value> = Vec::new();
+    for (i, w) in windows.iter().enumerate() {
+        if ctx.cancelled() {
+            break;
+        }
+        let _ = ctx.window.emit(
+            "ask-step",
+            if total > 1 {
+                format!("Building the meeting minutes — part {}/{}…", i + 1, total)
+            } else {
+                "Building the meeting minutes…".to_string()
+            },
+        );
+        let user = if total > 1 {
+            format!(
+                "This is part {} of {} of one meeting, in order. Minute THIS part only; earlier \
+                 and later parts are handled separately.\n\nSource:\n{w}",
+                i + 1,
+                total
+            )
+        } else {
+            format!("Source:\n{w}")
+        };
+        let Ok(raw) = ctx.ask_structured(MINUTES_SYS, user, Some(0.3), &minutes_schema()).await else {
+            ctx.note_unread();
+            continue;
+        };
+        match serde_json::from_str::<serde_json::Value>(raw.trim()) {
+            Ok(v) => parts.push(v),
+            Err(_) => ctx.note_unread(),
+        }
+    }
+    let parsed = merge_minutes(&parts);
     let has_timeline = parsed
         .get("timeline")
         .and_then(|v| v.as_array())
@@ -220,8 +283,14 @@ pub(crate) async fn cmd_minutes(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
     let meta = ctx.state.with_room(|room| create_note(&room.conn, &name, &doc))?;
     let _ = ctx.window.emit("room-files-changed", ());
     let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
+    let items = parsed["timeline"].as_array().map_or(0, |a| a.len());
+    let coverage = if total > 1 {
+        format!(" — a {items}-point timeline, read in {total} passes over the whole source")
+    } else {
+        " — a timeline of the meeting".to_string()
+    };
     Ok(CommandResult {
-        content: format!("Created **{}** — a timeline of the meeting.", meta.name),
+        content: format!("Created **{}**{coverage}.", meta.name),
         sources: ref_names,
         ..Default::default()
     })
@@ -365,7 +434,8 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     let mut imported: Vec<(String, String)> = Vec::new(); // (file name, text)
     let mut source_names: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for hit in hits.iter().filter(|h| seen.insert(h.url.clone())).take(RESEARCH_SOURCES) {
+    // Every distinct result the search returned, not the first four.
+    for hit in hits.iter().filter(|h| seen.insert(h.url.clone())) {
         if ctx.cancelled() {
             break;
         }
@@ -401,7 +471,9 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
                 Err(_) => continue,
             }
         };
-        imported.push((meta.name.clone(), clamp_bytes(text, 4000)));
+        // The room keeps the whole page (it always did); the answer now reads the
+        // whole page too, instead of its first 4000 bytes.
+        imported.push((meta.name.clone(), text));
         source_names.push(meta.name);
     }
     let _ = ctx.window.emit("room-files-changed", ());
@@ -420,9 +492,13 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     // offline: the context is built from files the room now owns.
     let mut context = String::new();
     for (name, text) in &imported {
-        context.push_str(&format!("## Source: {name}\n{text}\n\n"));
+        // Long pages are read in full and noted down, not cut at 4000 bytes —
+        // otherwise the answer cites a source it only half read.
+        let digest = ctx.digest(text, &format!("Reading {name}")).await;
+        context.push_str(&format!("## Source: {name}\n{digest}\n\n"));
     }
-    let context = clamp_bytes(context, 12_000);
+    // Many sources can still exceed one call; fold rather than drop the last few.
+    let context = ctx.digest(&context, "Reading the saved sources").await;
     let _ = ctx.window.emit("ask-step", "Answering from the saved sources");
     let answer = ctx
         .ask_streaming(

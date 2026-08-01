@@ -160,6 +160,19 @@
   background: var(--danger-bg, rgba(180, 50, 47, 0.14));
 }
 
+/* BROWSE-2: the Save strip — a second chrome ROW, never a dropdown, because
+   the native page floats above every DOM element. */
+.browser-save-row {
+  background: var(--panel, var(--bg));
+  justify-content: flex-start;
+}
+
+.browser-save-hint {
+  margin-left: auto;
+  font-size: 11.5px;
+  opacity: 0.65;
+}
+
 /* ------------------------------------------------------------------ body */
 
 .browser-body {
@@ -325,4 +338,524 @@
 .browse-consent .bc-actions {
   display: flex;
   gap: 8px;
+}
+
+/* ---------- BROWSE-3: the search results page ----------
+   Rendered in the HOST while the native webview is parked at 1x1 (the start
+   screen's mechanism). Everything is in normal flow — no popovers, no
+   overlays — because the moment the user opens a result the native page comes
+   back and would swallow anything floating.
+
+   The layout encodes the ranking: a feature card, a two-up row, then compact
+   rows. That is the whole point — a flat list gives the 8th result the same
+   authority as the 1st. */
+
+.bsearch {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 22px 26px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  background:
+    radial-gradient(520px 190px at 24% -40px, var(--accent-ghost), transparent 70%),
+    var(--bg);
+  outline: none;
+}
+
+/* ---- header ---- */
+.bsearch-head h1 {
+  margin: 0 0 8px;
+  font-size: 25px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  color: var(--text-strong);
+  text-wrap: balance;
+}
+
+/* Seven segments, one per engine, lit when that engine returned something.
+   The fused ranking made visible in one glance. */
+.bsearch-fuse {
+  display: flex;
+  gap: 3px;
+  height: 4px;
+  max-width: 330px;
+  margin-bottom: 8px;
+}
+
+.bsearch-fuse i {
+  flex: 1;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--line) 60%, transparent);
+  transform-origin: left;
+  animation: bsearch-grow 0.45s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+  animation-delay: calc(var(--i) * 60ms);
+}
+
+.bsearch-fuse i.on[data-engine="duckduckgo"] { background: var(--eng-duckduckgo); }
+.bsearch-fuse i.on[data-engine="brave"] { background: var(--eng-brave); }
+.bsearch-fuse i.on[data-engine="mojeek"] { background: var(--eng-mojeek); }
+.bsearch-fuse i.on[data-engine="marginalia"] { background: var(--eng-marginalia); }
+.bsearch-fuse i.on[data-engine="wikipedia"] { background: var(--eng-wikipedia); }
+.bsearch-fuse i.on[data-engine="ddg-ia"] { background: var(--eng-ddgia); }
+.bsearch-fuse i.on[data-engine="news"] { background: var(--eng-news); }
+
+@keyframes bsearch-grow {
+  from { transform: scaleX(0); opacity: 0; }
+}
+
+.bsearch-meta {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.bsearch-meta .sep { color: var(--faint); margin: 0 5px; }
+.bsearch-meta .privacy { color: var(--accent-2); }
+.bsearch-meta .hint {
+  color: var(--faint);
+  border-bottom: 1px dotted var(--faint);
+  cursor: help;
+}
+
+/* ---- ask + summary invitations ---- */
+.bsearch-ask,
+.bsearch-summary-ask {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 10px 14px;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: linear-gradient(105deg, var(--accent-ghost), transparent 72%);
+  border: 1px solid var(--accent-soft);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+}
+
+.bsearch-ask:hover,
+.bsearch-summary-ask:hover {
+  background: linear-gradient(105deg, var(--accent-soft), transparent 72%);
+}
+
+.bsearch-ask svg,
+.bsearch-summary-ask svg { color: var(--accent); flex: none; }
+.bsearch-ask b,
+.bsearch-summary-ask b { color: var(--text-strong); font-weight: 600; }
+
+/* ---- the AI summary ---- */
+.bsearch-summary {
+  padding: 12px 15px 13px;
+  background: var(--panel-2);
+  border: 1px solid var(--accent-soft);
+  border-radius: var(--radius-lg);
+}
+
+.bsearch-summary-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--text-strong);
+  margin-bottom: 7px;
+}
+
+.bsearch-summary-head svg { color: var(--accent); }
+.bsearch-summary-note {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--faint);
+  font-weight: 400;
+}
+
+.bsearch-summary-text {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.bsearch-summary-busy,
+.bsearch-summary-error { margin: 0; font-size: 12.5px; color: var(--muted); }
+.bsearch-summary-error { color: var(--red); }
+
+/* A citation is a control, not decoration: it jumps to the result it came
+   from, because a summary you cannot check against its sources has no
+   business sitting above them. */
+.bsearch-cite {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  margin: 0 2px;
+  vertical-align: baseline;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent-2);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.bsearch-cite:hover { background: var(--accent); color: var(--accent-ink); }
+
+/* ---- cards ---- */
+.bsearch-duo { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.bsearch-rows { display: flex; flex-direction: column; gap: 8px; }
+
+.bsearch-card {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  cursor: pointer;
+  outline: none;
+  animation: bsearch-enter 0.34s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+  transition: transform 0.14s ease, box-shadow 0.14s ease, border-color 0.14s ease;
+}
+
+@keyframes bsearch-enter {
+  from { opacity: 0; transform: translateY(7px); }
+}
+
+.bsearch-card:hover {
+  transform: translateY(-2px);
+  background: var(--panel-2);
+  border-color: var(--line);
+  box-shadow: 0 8px 26px var(--shadow);
+}
+
+.bsearch-card.sel,
+.bsearch-card:focus-visible {
+  background: var(--panel-2);
+  border-color: var(--accent-soft);
+  box-shadow: 0 0 0 1px var(--accent-soft), 0 8px 26px var(--shadow);
+}
+
+.bsearch-card h3 {
+  margin: 0;
+  font-weight: 650;
+  color: var(--text-strong);
+  line-height: 1.3;
+}
+
+.bsearch-card:hover h3,
+.bsearch-card.sel h3 {
+  text-decoration: underline;
+  text-decoration-color: var(--accent-soft);
+  text-underline-offset: 3px;
+}
+
+.bsearch-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+
+/* tier 1 — the feature card */
+.bsearch-card.feature { display: grid; grid-template-columns: minmax(0, 1fr) 244px; }
+.bsearch-card.feature .bsearch-body { padding: 15px 17px 13px; gap: 5px; }
+.bsearch-card.feature h3 { font-size: 17.5px; }
+.bsearch-card.feature .bsearch-img { min-height: 168px; }
+.bsearch-card.feature .bsearch-snippet { -webkit-line-clamp: 2; }
+.bsearch-card.feature .bsearch-metarow { margin-top: auto; padding-top: 6px; }
+
+.bsearch-eyebrow {
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  font-weight: 650;
+  color: var(--accent-2);
+}
+
+/* tier 2 — the two-up row */
+.bsearch-card.duo { display: flex; flex-direction: column; }
+.bsearch-card.duo .bsearch-img { height: 108px; }
+.bsearch-card.duo .bsearch-body { padding: 11px 13px 12px; flex: 1; }
+.bsearch-card.duo h3 { font-size: 14.5px; }
+.bsearch-card.duo .bsearch-snippet { -webkit-line-clamp: 2; }
+.bsearch-card.duo .bsearch-metarow { margin-top: auto; padding-top: 5px; }
+
+/* tier 3 — compact rows */
+.bsearch-card.row { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 12px; padding: 11px 13px; }
+.bsearch-card.row .bsearch-img { width: 62px; height: 62px; border-radius: var(--radius); }
+.bsearch-card.row h3 { font-size: 13.5px; }
+.bsearch-card.row .bsearch-snippet { -webkit-line-clamp: 1; font-size: 12.5px; }
+
+/* ---- the image slot ----
+   Fixed size, always present: the preview fades in when the enrich pass lands
+   so nothing on the page moves. A page with no og:image keeps its monogram —
+   that is the designed state, not a failure. */
+.bsearch-img {
+  position: relative;
+  flex: none;
+  overflow: hidden;
+  background: var(--panel-2);
+}
+
+.bsearch-img.waiting {
+  background: linear-gradient(100deg, var(--panel-2) 40%, var(--hover) 50%, var(--panel-2) 60%);
+  background-size: 200% 100%;
+  animation: bsearch-shimmer 1.2s linear infinite;
+}
+
+@keyframes bsearch-shimmer {
+  to { background-position: -200% 0; }
+}
+
+.bsearch-img img,
+.bsearch-mono {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  animation: bsearch-fade 0.5s ease both;
+}
+
+.bsearch-img img { object-fit: cover; transition: transform 0.5s ease; }
+.bsearch-card:hover .bsearch-img img { transform: scale(1.035); }
+
+.bsearch-mono {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+@keyframes bsearch-fade {
+  from { opacity: 0; }
+}
+
+/* ---- card meta ---- */
+.bsearch-crumb {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bsearch-crumb b { font-weight: 500; }
+.bsearch-crumb i { font-style: normal; color: var(--faint); margin: 0 2px; }
+.bsearch-favicon { width: 13px; height: 13px; border-radius: 3px; flex: none; }
+
+.bsearch-snippet {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--text);
+  opacity: 0.88;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.bsearch-metarow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  min-height: 26px;
+  margin-top: 5px;
+}
+
+/* The consensus dial: every engine owns a fixed wedge, so agreement is
+   readable by SHAPE. Google cannot show you this; we can. */
+.bsearch-dial {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  flex: none;
+  -webkit-mask: radial-gradient(farthest-side, transparent 52%, #000 54%);
+  mask: radial-gradient(farthest-side, transparent 52%, #000 54%);
+}
+
+.bsearch-engn { font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+
+.bsearch-date {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--hover);
+  border-radius: var(--radius-sm);
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+
+.bsearch-rel {
+  width: 50px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line-soft);
+  overflow: hidden;
+}
+
+.bsearch-rel i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transform-origin: left;
+  animation: bsearch-grow 0.5s 0.2s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+
+.bsearch-inroom {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--green);
+  white-space: nowrap;
+}
+
+.bsearch-acts { margin-left: auto; display: flex; gap: 4px; opacity: 0; transition: opacity 0.12s; }
+.bsearch-card:hover .bsearch-acts,
+.bsearch-card.sel .bsearch-acts,
+.bsearch-card.peeked .bsearch-acts { opacity: 1; }
+
+.bsearch-acts .browser-btn { width: 26px; min-width: 26px; height: 26px; padding: 0; }
+.bsearch-add.done { color: var(--green); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
+
+.bsearch-spin {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  animation: bsearch-spin 0.7s linear infinite;
+}
+
+@keyframes bsearch-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ---- peek ---- */
+.bsearch-peek {
+  margin-top: 9px;
+  padding: 10px 12px;
+  background: var(--editor);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  animation: bsearch-enter 0.22s ease both;
+}
+
+.bsearch-peek-head {
+  font-size: 11px;
+  color: var(--faint);
+  letter-spacing: 0.03em;
+  margin-bottom: 6px;
+}
+
+.bsearch-peek p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+  opacity: 0.92;
+  max-height: 190px;
+  overflow-y: auto;
+}
+
+/* ---- states ---- */
+.bsearch-empty {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.bsearch-empty svg { color: var(--faint); }
+.bsearch-empty h2 { margin: 10px 0 4px; font-size: 16px; color: var(--text-strong); }
+.bsearch-empty p { margin: 0; font-size: 13px; }
+
+.bsearch-error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 13px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 34%, transparent);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.bsearch-foot {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+/* The "back to results" row: normal flow, like the Save strip, because the
+   native page is back on screen by then and nothing may float over it. */
+.browser-results-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.browser-results-row b { color: var(--text-strong); font-weight: 600; }
+
+@media (max-width: 720px) {
+  .bsearch { padding: 16px; }
+  .bsearch-card.feature { grid-template-columns: 1fr; }
+  .bsearch-card.feature .bsearch-img { min-height: 128px; order: -1; }
+  .bsearch-duo { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bsearch-card,
+  .bsearch-fuse i,
+  .bsearch-rel i,
+  .bsearch-peek,
+  .bsearch-img img,
+  .bsearch-mono { animation: none !important; }
+  .bsearch-img.waiting { animation: none; }
+  .bsearch-card { transition: none; }
+  .bsearch-card:hover { transform: none; }
+  .bsearch-card:hover .bsearch-img img { transform: none; }
+}
+
+/* Loading skeletons: the shape of the answer, drawn before the answer. A
+   spinner on an empty pane is indistinguishable from a hang — which is exactly
+   how a slow fan-out was read (owner report 2026-08-01). */
+.bsearch-fuse i.pending {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+  animation: bsearch-pulse 1.1s ease-in-out infinite;
+  animation-delay: calc(var(--i) * 90ms);
+}
+
+@keyframes bsearch-pulse {
+  0%, 100% { opacity: 0.28; }
+  50% { opacity: 1; }
+}
+
+.bsearch-skel {
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(100deg, var(--panel) 40%, var(--panel-2) 50%, var(--panel) 60%);
+  background-size: 200% 100%;
+  animation: bsearch-shimmer 1.2s linear infinite;
+}
+
+.bsearch-skel.feature { height: 172px; }
+.bsearch-skel.duo { height: 190px; }
+.bsearch-skel.row { height: 88px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .bsearch-skel,
+  .bsearch-fuse i.pending { animation: none; }
 }

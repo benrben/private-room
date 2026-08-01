@@ -178,7 +178,7 @@ async def test_list_mode_parses_json_array(fake_client: type[FakeAsyncClient]) -
     sent = fake_client.calls["chat"]["messages"]
     assert sent[0]["content"] == "You extract a list of short names from a conversation."
     assert sent[1]["content"].startswith(
-        "From the conversation below, list the tickers as short names (max 12). "
+        "From the conversation below, list EVERY one of the tickers as short names. "
         "If there are none, return an empty array.\n\nConversation:\nI like AAPL, MSFT and NVDA."
     )
     # list mode is structured too: array grammar + priming.
@@ -319,9 +319,9 @@ def test_parse_string_list_matches_rust() -> None:
     assert chat_docs.parse_string_list("1. Apple\n2. apple\n- Microsoft") == ["Apple", "Microsoft"]
     # <think> stripped before parsing.
     assert chat_docs.parse_string_list("<think>reasoning</think>[\"X\"]") == ["X"]
-    # capped at 12.
+    # Uncapped: "for each" writes a file per item, so a 20-item list stays 20.
     big = json.dumps([f"n{i}" for i in range(20)])
-    assert len(chat_docs.parse_string_list(big)) == 12
+    assert len(chat_docs.parse_string_list(big)) == 20
 
 
 def test_value_str_matches_rust() -> None:

@@ -191,6 +191,19 @@ mod tests {
     }
 
     #[test]
+    fn recent_messages_limit_minus_one_means_no_limit() {
+        // `#`-commands read the WHOLE conversation with limit -1 (SQLite's "no
+        // limit") instead of the last 12 turns — if that ever stopped meaning
+        // unlimited, every command would silently reason over an empty history.
+        let conn = mem();
+        for i in 0..40 {
+            insert_message(&conn, "c1", "user", &format!("m{i}"), &[], None).unwrap();
+        }
+        assert_eq!(recent_messages(&conn, "c1", -1).unwrap().len(), 40);
+        assert_eq!(recent_messages(&conn, "c1", 12).unwrap().len(), 12);
+    }
+
+    #[test]
     fn recent_messages_returns_everything_with_no_handoff_marker() {
         let conn = mem();
         insert_message(&conn, "c1", "user", "one", &[], None).unwrap();

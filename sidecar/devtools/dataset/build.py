@@ -458,6 +458,17 @@ REPLIES: dict[str, Any] = {
         "Looking at Example Shop — every interactive element is numbered with "
         "the same ref browse_snapshot uses."
     ),
+    # --- saving/downloading into the room (BROWSE-2) -----------------------
+    "browse_save": (
+        'Saved "Waxed Cotton Boots — Example Shop.md" (readable copy) and '
+        '"Waxed Cotton Boots — Example Shop.html" (exact HTML) into the room.'
+    ),
+    "save_link": 'Saved "Bank of Israel — Monetary Policy.md" into the room.',
+    "download_url": 'Downloaded "q3-report.pdf" (2.4 MB) into the room.',
+    "download_media": (
+        "Downloading the media as background job 3f2a — track it with "
+        "job_status. The file will be transcribed automatically after it arrives."
+    ),
     # --- app driving -------------------------------------------------------
     "ui_snapshot": (
         "1: [button] Map\n2: [button] Files\n3: [button] Recordings\n"

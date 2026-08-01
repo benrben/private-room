@@ -185,6 +185,29 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Save the CURRENT page into the room as files: a readable Markdown copy (searchable) plus the exact HTML. Captures the live page as rendered, logins and scripts included — works where fetch_page can't. what=selection saves only the text the user has selected on the page.",
+    "inputSchema": {
+      "properties": {
+        "what": {
+          "description": "Default page",
+          "enum": [
+            "page",
+            "selection"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "browse_save"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": true,
       "readOnlyHint": true
@@ -335,6 +358,50 @@
       "type": "object"
     },
     "name": "delete_workflow"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Download the video/audio from a media page (YouTube and most video sites) into this room as a background job. Returns the job id — track it with job_status. The file is transcribed automatically after it arrives.",
+    "inputSchema": {
+      "properties": {
+        "url": {
+          "description": "Full http(s) URL of the video page",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "name": "download_media"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Download the file at a URL (PDF, CSV, image, archive, …) into this room. Up to 64 MB arrives immediately; a bigger file continues as a background job — report the job id and track it with job_status. Not for web pages (save_link) or videos on streaming sites (download_media).",
+    "inputSchema": {
+      "properties": {
+        "url": {
+          "description": "Full http(s) URL of the file",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "name": "download_url"
   },
   {
     "annotations": {
@@ -921,6 +988,28 @@
       "type": "object"
     },
     "name": "run_workflow"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Save a web page into this room as a readable Markdown file (title, source URL, readable text). A YouTube link saves the video's transcript instead. Use when the user asks to save, keep or bookmark a link.",
+    "inputSchema": {
+      "properties": {
+        "url": {
+          "description": "Full http(s) URL",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "name": "save_link"
   },
   {
     "annotations": {

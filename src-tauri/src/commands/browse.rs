@@ -32,6 +32,11 @@
 
 use super::*;
 use crate::browser;
+
+/// BROWSE-3: the address bar's search half — results page, enrich pass, and the
+/// ＋ that turns a result into a room source.
+mod search;
+pub use search::*;
 use std::time::Duration;
 use tauri::Manager;
 
@@ -82,6 +87,10 @@ pub(crate) fn browse_tools_specs() -> Vec<serde_json::Value> {
         serde_json::json!({"type": "function", "function": {"name": "browse_look",
             "description": "Look at the current page as an image, with each interactive element's number drawn on it — the SAME numbers browse_snapshot returns, so you can read the list and see the layout together. Use it for layout questions, canvases, maps, or to check what actually happened after an action.",
             "parameters": {"type": "object", "properties": {}}}}),
+        serde_json::json!({"type": "function", "function": {"name": "browse_save",
+            "description": "Save the CURRENT page into the room as files: a readable Markdown copy (searchable) plus the exact HTML. Captures the live page as rendered, logins and scripts included — works where fetch_page can't. what=selection saves only the text the user has selected on the page.",
+            "parameters": {"type": "object", "properties": {
+                "what": {"type": "string", "enum": ["page", "selection"], "description": "Default page"}}}}}),
     ]
 }
 
@@ -93,6 +102,8 @@ pub(crate) const BROWSE_TOOL_NAMES: &[&str] = &[
     "browse_snapshot",
     "browse_do",
     "browse_look",
+    // BROWSE-2: capture the live page (or the user's selection) into the room.
+    "browse_save",
 ];
 
 pub(crate) fn is_browse_tool(name: &str) -> bool {
@@ -553,8 +564,75 @@ async fn exec_browse_inner(
             ))
         }
 
+        "browse_save" => {
+            let what = match args["what"].as_str() {
+                Some("selection") => "selection",
+                _ => "page",
+            };
+            capture_and_save(&app, what).await
+        }
+
         other => Err(format!("Unknown browsing tool: {other}")),
     }
+}
+
+/// BROWSE-2 (D21): capture the live DOM and save it into the room — a readable
+/// Markdown copy that carries the search text, plus (for a full page) the exact
+/// HTML as a fidelity twin with no chunks of its own, so the page is never
+/// indexed twice. Shared by the agent's `save_page` tool and the toolbar's Save
+/// menu (`browser_save_page`) — D22, one code path.
+async fn capture_and_save(app: &tauri::AppHandle, what: &str) -> Result<String, String> {
+    let v = browser::call(app, "capture", serde_json::json!({ "what": what })).await?;
+    let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let html = v.get("html").and_then(|h| h.as_str()).unwrap_or("").to_string();
+    if text.trim().is_empty() && html.trim().is_empty() {
+        return Err("The page returned nothing to save — it may still be loading.".into());
+    }
+    let state = app.state::<AppState>();
+    let saved_names = state.with_room(|room| {
+        let saved = db::current_date(&room.conn);
+        let display_title = if title.trim().is_empty() { url.clone() } else { title.clone() };
+        let base_title = if what == "selection" {
+            format!("{display_title} (selection)")
+        } else {
+            display_title.clone()
+        };
+        let md_name = link_file_name(&base_title, &url);
+        let content = format!("# {display_title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
+        let md = db::insert_file_from_url(
+            &room.conn,
+            &md_name,
+            "text/markdown",
+            content.as_bytes(),
+            Some(&content),
+            "web",
+            Some(&url),
+        )?;
+        let mut names = vec![md.name];
+        if what == "page" && !html.trim().is_empty() {
+            let html_name = format!("{}.html", md_name.trim_end_matches(".md"));
+            let twin = db::insert_file_from_url(
+                &room.conn,
+                &html_name,
+                "text/html",
+                html.as_bytes(),
+                None,
+                "web",
+                Some(&url),
+            )?;
+            names.push(twin.name);
+        }
+        Ok(names)
+    })?;
+    browser::journal(app, "save", &url, &format!("Saved {}", saved_names.join(" and ")));
+    let _ = tauri::Emitter::emit(app, "room-files-changed", ());
+    Ok(match saved_names.as_slice() {
+        [md, html] => format!("Saved \"{md}\" (readable copy) and \"{html}\" (exact HTML) into the room."),
+        [only] => format!("Saved \"{only}\" into the room."),
+        _ => "Saved into the room.".to_string(),
+    })
 }
 
 fn summarize_actions(v: &serde_json::Value) -> String {
@@ -647,6 +725,50 @@ pub fn browser_close(app: tauri::AppHandle) -> Result<(), String> {
     browser::close(&app)
 }
 
+/// BROWSE-2: the toolbar's Save page / Save selection. Same capture-and-save
+/// path as the agent's `browse_save` tool (D22). No web gate: this reads the
+/// ALREADY-LOADED page — nothing is fetched, and no page can exist in a room
+/// whose internet switch was off when it was opened.
+#[tauri::command]
+pub async fn browser_save_page(app: tauri::AppHandle, what: String) -> Result<String, String> {
+    capture_and_save(&app, if what == "selection" { "selection" } else { "page" }).await
+}
+
+/// Open a page in a NEW tab. Same guard as `browser_navigate` — a new tab is
+/// still a navigation, and the address it is given gets the identical check.
+#[tauri::command]
+pub async fn browser_new_tab(app: tauri::AppHandle, url: String) -> Result<String, String> {
+    require_web_enabled(&app.state::<AppState>())?;
+    let url = url.trim().to_string();
+    // An empty new tab is the webview's own idle document, not a destination —
+    // `navigation_allowed` already treats `about:` that way, and there is
+    // nothing for the URL guard to check because nothing is fetched.
+    let checked = if url.is_empty() {
+        "about:blank".to_string()
+    } else {
+        let full = if url.contains("://") { url } else { format!("https://{url}") };
+        browse_guard_url(&full).await?
+    };
+    let id = browser::new_tab(&app, &checked)?;
+    browser::journal(&app, "open", &checked, "Opened by the user in a new tab");
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn browser_select_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    browser::select_tab(&app, &id)
+}
+
+#[tauri::command]
+pub fn browser_close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    browser::close_tab(&app, &id)
+}
+
+#[tauri::command]
+pub fn browser_tabs(app: tauri::AppHandle) -> Vec<browser::TabInfo> {
+    browser::tab_list(&app)
+}
+
 #[tauri::command]
 pub fn browser_set_bounds(
     app: tauri::AppHandle,
@@ -666,8 +788,17 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
     let info = browser::call(&app, "info", serde_json::json!({}))
         .await
         .unwrap_or_else(|e| serde_json::json!({ "error": e }));
+    // The page script answers for the MAIN frame, so this is the authoritative
+    // "where is this page" — write it back so a record corrupted by a
+    // sub-frame navigation heals on the next poll instead of persisting as a
+    // wrong tab title (or, before `is_recordable_url`, a vanished page).
+    if let Some(url) = info.get("url").and_then(|u| u.as_str()) {
+        browser::record_active_url(&app, url);
+    }
     Ok(serde_json::json!({
         "open": true,
+        // Recorded, not read from the page script — a blank page runs no script.
+        "blank": browser::is_blank(&app),
         "url": info.get("url").cloned().unwrap_or(serde_json::Value::Null),
         "title": info.get("title").cloned().unwrap_or(serde_json::Value::Null),
         "ready": info.get("ready").cloned().unwrap_or(serde_json::Value::Null),

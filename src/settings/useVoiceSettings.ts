@@ -1,38 +1,33 @@
 import { useEffect, useState } from "react";
-import { api, VoiceInfo } from "../api";
+import { api, NeuralVoiceInfo } from "../api";
 import * as voice from "../workspace/voice";
 import {
   ARCHETYPE_DEFAULTS,
   VoiceArchetype,
-  VoiceEngine,
   VoiceParams,
 } from "../workspace/voice";
 
-/** Idea 3: Spoken-voice section — engine + archetype + sliders + system
- * voice, persisted per room (settings K/V). Saving also reconfigures the
- * live voice singleton so the change applies without reopening the room. */
+/** Idea 3: Spoken-voice section — neural voice + archetype + sliders,
+ * persisted per room (settings K/V). Saving also reconfigures the live voice
+ * singleton so the change applies without reopening the room. The voice list
+ * is fetched LIVE from the service's catalog each time Settings mounts —
+ * nothing is bundled, so new service voices appear on their own. */
 export function useVoiceSettings() {
-  // Privacy-safe default: on-device voice keeps every spoken sentence on this
-  // Mac. Neural (cloud Edge TTS, which sends the sentence text off-device) is an
-  // explicit opt-in — see the getSetting below.
-  const [engine, setEngine] = useState<VoiceEngine>("device");
   const [neuralVoiceId, setNeuralVoiceId] = useState("");
   const [archetype, setArchetype] = useState<VoiceArchetype>("off");
   const [params, setParams] = useState<VoiceParams>({
     ...ARCHETYPE_DEFAULTS.off,
   });
-  const [voiceId, setVoiceId] = useState("");
-  const [voices, setVoices] = useState<VoiceInfo[]>([]);
+  const [voices, setVoices] = useState<NeuralVoiceInfo[]>([]);
+  const [voicesError, setVoicesError] = useState(false);
   const [saved, setSaved] = useState(false);
   const [previewing, setPreviewing] = useState(false);
 
   useEffect(() => {
-    api.listSpeechVoices().then(setVoices).catch(() => {});
-    api.getSetting("voice_engine").then((v) => {
-      // On-device is the privacy-safe default; "neural" (cloud Edge TTS) is the
-      // explicit opt-in that sends spoken sentence text off this Mac.
-      if (v === "neural") setEngine("neural");
-    });
+    api
+      .listNeuralVoices()
+      .then(setVoices)
+      .catch(() => setVoicesError(true));
     api.getSetting("voice_neural_id").then((v) => {
       if (v) setNeuralVoiceId(v);
     });
@@ -46,9 +41,6 @@ export function useVoiceSettings() {
       } catch {
         /* malformed save — keep defaults */
       }
-    });
-    api.getSetting("voice_id").then((v) => {
-      if (v) setVoiceId(v);
     });
   }, []);
 
@@ -65,16 +57,12 @@ export function useVoiceSettings() {
   }
 
   async function save() {
-    await api.setSetting("voice_engine", engine);
     await api.setSetting("voice_neural_id", neuralVoiceId);
     await api.setSetting("voice_archetype", archetype);
     await api.setSetting("voice_params", JSON.stringify(params));
-    await api.setSetting("voice_id", voiceId);
     voice.configure({
-      engine,
       archetype,
       params,
-      voiceId: voiceId || null,
       neuralVoiceId: neuralVoiceId || null,
     });
     setSaved(true);
@@ -92,10 +80,8 @@ export function useVoiceSettings() {
     voice.ensureUnlocked();
     setPreviewing(true);
     voice.speakText("I have read every page you keep in this room.", {
-      engine,
       archetype,
       params,
-      voiceId: voiceId || null,
       neuralVoiceId: neuralVoiceId || null,
       onState: (playing) => {
         if (!playing) setPreviewing(false);
@@ -104,17 +90,14 @@ export function useVoiceSettings() {
   }
 
   return {
-    engine,
-    setEngine,
     neuralVoiceId,
     setNeuralVoiceId,
     archetype,
     pickArchetype,
     params,
     setParam,
-    voiceId,
-    setVoiceId,
     voices,
+    voicesError,
     save,
     saved,
     preview,

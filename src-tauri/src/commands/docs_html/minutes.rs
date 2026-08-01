@@ -37,6 +37,77 @@ pub(crate) fn minutes_schema() -> serde_json::Value {
     })
 }
 
+/// Merge per-window minutes into one document's worth of structured fields.
+/// Deterministic — Rust does the merging, so a long meeting can't lose its second
+/// half to a model that only had room for the first. Timeline items keep window
+/// order (the meeting's own order); the window overlap and any repeated decision
+/// or attendee are deduped case-insensitively.
+pub(crate) fn merge_minutes(parts: &[serde_json::Value]) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let first_str = |key: &str| -> String {
+        parts
+            .iter()
+            .filter_map(|p| p.get(key).and_then(|v| v.as_str()))
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut seen_str: HashSet<String> = HashSet::new();
+    let mut attendees: Vec<Value> = Vec::new();
+    let mut decisions_seen: HashSet<String> = HashSet::new();
+    let mut decisions: Vec<Value> = Vec::new();
+    let mut timeline_seen: HashSet<String> = HashSet::new();
+    let mut timeline: Vec<Value> = Vec::new();
+    let mut actions_seen: HashSet<String> = HashSet::new();
+    let mut actions: Vec<Value> = Vec::new();
+    let key_of = |s: &str| s.trim().to_lowercase();
+    let field = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+
+    for p in parts {
+        for a in p.get("attendees").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+            if let Some(s) = a.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                if seen_str.insert(key_of(s)) {
+                    attendees.push(json!(s));
+                }
+            }
+        }
+        for d in p.get("decisions").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+            if let Some(s) = d.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                if decisions_seen.insert(key_of(s)) {
+                    decisions.push(json!(s));
+                }
+            }
+        }
+        for it in p.get("timeline").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+            let (topic, summary) = (field(it, "topic"), field(it, "summary"));
+            if topic.is_empty() && summary.is_empty() {
+                continue;
+            }
+            if timeline_seen.insert(format!("{}|{}", key_of(&topic), key_of(&summary))) {
+                timeline.push(it.clone());
+            }
+        }
+        for a in p.get("actions").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+            let (owner, task) = (field(a, "owner"), field(a, "task"));
+            if task.is_empty() {
+                continue;
+            }
+            if actions_seen.insert(format!("{}|{}", key_of(&owner), key_of(&task))) {
+                actions.push(a.clone());
+            }
+        }
+    }
+    json!({
+        "title": first_str("title"),
+        "date": first_str("date"),
+        "attendees": attendees,
+        "timeline": timeline,
+        "decisions": decisions,
+        "actions": actions,
+    })
+}
+
 /// Render structured minutes into a timeline-styled HTML body using the shared
 /// `DOC_STYLE` components (hero, chips, timeline, checklist, table). Every section
 /// is omitted when empty, and all text is escaped. Pure and testable.
@@ -141,6 +212,46 @@ pub(crate) fn render_minutes_html(p: &serde_json::Value, title: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_minutes_stitches_every_pass_into_one_timeline() {
+        // Two windows of one long meeting. The second half must survive — with a
+        // single clamped pass it never reached the model at all.
+        let first = serde_json::json!({
+            "title": "Quarterly review",
+            "date": "2026-07-05",
+            "attendees": ["Ana", "Ben"],
+            "timeline": [{"time": "09:00", "topic": "Kickoff", "summary": "Reviewed goals."}],
+            "decisions": ["Ship on Friday"],
+            "actions": [{"owner": "Ana", "task": "Send recap"}]
+        });
+        let second = serde_json::json!({
+            "title": "",
+            "date": "",
+            // The window overlap re-shows Kickoff, and Ben attends throughout.
+            "attendees": ["ben", "Cai"],
+            "timeline": [
+                {"time": "09:00", "topic": "Kickoff", "summary": "Reviewed goals."},
+                {"time": "10:30", "topic": "Budget", "summary": "Agreed Q3 numbers."}
+            ],
+            "decisions": ["ship on friday", "Hire a designer"],
+            "actions": [{"owner": "Ana", "task": "Send recap"}, {"task": "Book room"}]
+        });
+        let m = merge_minutes(&[first, second]);
+        assert_eq!(m["title"], "Quarterly review", "title comes from the first pass that has one");
+        assert_eq!(m["date"], "2026-07-05");
+        // Overlap deduped case-insensitively; order of first appearance kept.
+        assert_eq!(m["attendees"], serde_json::json!(["Ana", "Ben", "Cai"]));
+        assert_eq!(m["decisions"], serde_json::json!(["Ship on Friday", "Hire a designer"]));
+        let timeline = m["timeline"].as_array().unwrap();
+        assert_eq!(timeline.len(), 2, "the repeated item is merged, not doubled");
+        assert_eq!(timeline[0]["topic"], "Kickoff");
+        assert_eq!(timeline[1]["topic"], "Budget", "the late part of the meeting is in the minutes");
+        assert_eq!(m["actions"].as_array().unwrap().len(), 2);
+        // A merge of nothing stays empty (the caller turns that into the
+        // "couldn't find a meeting" error rather than an empty document).
+        assert!(merge_minutes(&[]).get("timeline").unwrap().as_array().unwrap().is_empty());
+    }
 
     #[test]
     fn render_minutes_html_builds_timeline() {

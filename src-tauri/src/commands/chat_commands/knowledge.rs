@@ -5,7 +5,9 @@ pub(crate) async fn cmd_remember(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     if fact.is_empty() {
         return Err("Usage: #remember <fact>".into());
     }
-    let fact = clamp_bytes(fact.to_string(), MAX_MEMORY_CONTENT_CHARS);
+    // Saved verbatim: a fact worth remembering isn't worth silently cutting at
+    // 500 characters. (Settings → Memory still applies its own editor limit.)
+    let fact = fact.to_string();
     ctx.state.with_room(|room| {
         if duplicate_memory(&room.conn, &fact)?.is_some() {
             return Ok(CommandResult {
@@ -28,17 +30,21 @@ pub(crate) async fn cmd_find(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> 
         return Err("Usage: #find <keywords>".into());
     }
     let emb = embed_question(query).await;
-    let (chunks, fallback) =
-        ctx.state.with_room(|room| retrieve_context(&room.conn, query, emb.as_deref()))?;
+    // #find is a search result list the user reads, not prompt context — show
+    // every match, not the top 6 that a model's context window can afford.
+    let emb_ref = emb.as_deref();
+    let (chunks, fallback) = ctx
+        .state
+        .with_room(|room| retrieve_context_limited(&room.conn, query, emb_ref, &HashSet::new(), None))?;
     if fallback || chunks.is_empty() {
         return Ok(CommandResult {
             content: format!("No matches found for **{query}**."),
             ..Default::default()
         });
     }
-    let mut body = format!("Matches for **{query}**:\n\n");
+    let mut body = format!("Matches for **{query}** ({}):\n\n", chunks.len());
     let mut sources: Vec<String> = Vec::new();
-    for c in chunks.iter().take(MAX_CONTEXT_CHUNKS) {
+    for c in chunks.iter() {
         let snippet = make_snippet(&c.text, query, 140);
         body.push_str(&format!("- **{}** — {snippet}\n", c.file_name));
         if !sources.contains(&c.file_name) {
@@ -61,9 +67,10 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     if let Some(pos) = lower.find("for each") {
         let subject = a[pos + "for each".len()..].trim().trim_start_matches(':').trim();
         // Enumerate: the one genuinely fuzzy step. MIGRATION Phase 3: the prompt,
-        // schema and `parse_string_list` (dedupe + cap 12) live in the sidecar's
-        // /knowledge_extract mode:list, which returns the finished `items`. Rust
-        // keeps the subject parse, the empty-list error, and the per-item loop.
+        // schema and `parse_string_list` (dedupe, no cap — a 20-item list makes 20
+        // files) live in the sidecar's /knowledge_extract mode:list, which returns
+        // the finished `items`. Rust keeps the subject parse, the empty-list
+        // error, and the per-item loop.
         let req = serde_json::json!({
             "model": ctx.model,
             "base_url": ollama::resolved_base_url(),
@@ -145,7 +152,10 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         }
         _ => (None, a.to_string()),
     };
-    let refctx = ctx.state.with_room(|room| Ok(refs_context(&room.conn, ctx.refs, 8000).0))?;
+    // Whole pinned files as the brief; digested (not clamped) if they outgrow one
+    // call, so a document written "from @source.pdf" reflects all of it.
+    let refctx = ctx.state.with_room(|room| Ok(refs_context(&room.conn, ctx.refs).0))?;
+    let refctx = ctx.digest(&refctx, "Reading the pinned files").await;
     // MIGRATION Phase 3: the DOC_SYS body generation lives in the sidecar's
     // /generate_doc mode:single (which builds "{context}Write a … document about:
     // {topic}"). Rust keeps refs_context, the empty-body error, and the naming.
@@ -204,23 +214,48 @@ pub(crate) async fn cmd_highlight(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
     if extracted.trim().is_empty() {
         return Err(format!("\"{real_name}\" has no readable text to highlight."));
     }
-    let doc = clamp_bytes(extracted.clone(), 6000);
-    let quote = ctx
-        .ask_quiet(
-            "You locate an exact passage. Output ONLY the shortest verbatim quote from the \
-             document that best matches the request — copied character-for-character, with no \
-             quotation marks around it and no other words.",
-            format!("Request: {thing}\n\nDocument:\n{doc}"),
-            Some(0.0),
-        )
-        .await?;
-    let quote = quote.trim().trim_matches('"').trim().to_string();
-    if quote.is_empty() {
-        return Err(format!("Couldn't find \"{thing}\" in {real_name}."));
+    // Full ops: search the WHOLE document, one window at a time, stopping at the
+    // first window that yields a quote the file actually contains. A passage past
+    // the old 6000-byte clamp — page 3 of anything — used to be unfindable.
+    const QUOTE_SYS: &str =
+        "You locate an exact passage. Output ONLY the shortest verbatim quote from the \
+         document that best matches the request — copied character-for-character, with no \
+         quotation marks around it and no other words. If this part of the document does not \
+         contain the requested thing, output nothing at all.";
+    let windows = cmd_windows(&extracted);
+    let total = windows.len();
+    let mut found: Option<(serde_json::Value, String)> = None;
+    for (i, w) in windows.iter().enumerate() {
+        if ctx.cancelled() {
+            break;
+        }
+        if total > 1 {
+            let _ = ctx
+                .window
+                .emit("ask-step", format!("Looking for it ({}/{})", i + 1, total));
+        }
+        let Ok(quote) = ctx
+            .ask_quiet(QUOTE_SYS, format!("Request: {thing}\n\nDocument:\n{w}"), Some(0.0))
+            .await
+        else {
+            ctx.note_unread();
+            continue;
+        };
+        let quote = quote.trim().trim_matches('"').trim().to_string();
+        if quote.is_empty() {
+            continue;
+        }
+        // The annotation is built against the FULL text, so a quote found in a
+        // later window still resolves to its real position in the file.
+        if let Ok(hit) =
+            build_annotation(file_id, &real_name, Some(&extracted), &quote, "", None, None, None)
+        {
+            found = Some(hit);
+            break;
+        }
     }
     let (payload, described) =
-        build_annotation(file_id, &real_name, Some(&extracted), &quote, "", None, None, None)
-            .map_err(|_| format!("Couldn't find an exact passage for \"{thing}\" in {real_name}."))?;
+        found.ok_or_else(|| format!("Couldn't find an exact passage for \"{thing}\" in {real_name}."))?;
     let _ = ctx.window.emit("agent-annotate", &payload);
     let effects = ToolEffects {
         annotation: Some(payload),
@@ -287,13 +322,7 @@ pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
     if fields.is_empty() {
         return Err("Say which fields to extract — e.g. #extract revenue, CEO from @a @b".into());
     }
-    let files: Vec<(String, String)> = ctx.state.with_room(|room| {
-        Ok(ctx.refs
-            .iter()
-            .filter_map(|id| db::get_file_full(&room.conn, id).ok())
-            .map(|(name, _m, _b, text)| (name, text.unwrap_or_default()))
-            .collect())
-    })?;
+    let files = ctx.state.with_room(|room| Ok(refs_files(&room.conn, ctx.refs)))?;
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut header = vec!["File".to_string()];
     header.extend(fields.iter().cloned());
@@ -316,32 +345,65 @@ pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
             }
             continue;
         }
-        let doc = clamp_bytes(text.clone(), 6000);
         // MIGRATION Phase 3: the per-field schema, prompt, structured call and
         // "(not found)" defaulting live in the sidecar's /knowledge_extract
         // mode:fields, which returns `values` keyed by every requested field. Rust
-        // keeps the 6000-char clamp, the CSV assembly and the ask-step emits. To
+        // keeps the windowing, the CSV assembly and the ask-step emits. To
         // preserve the old best-effort behavior (a failed structured call became a
         // `(not found)` row rather than aborting the whole run), a sidecar error
         // maps to an all-`(not found)` row for this file.
-        let req = serde_json::json!({
-            "model": ctx.model,
-            "base_url": ollama::resolved_base_url(),
-            "mode": "fields",
-            "fields": fields,
-            "document": doc,
-            "temperature": 0.0,
-            "keep_alive": KEEP_ALIVE_WARM,
-        });
-        let values = crate::sidecar::sidecar_json("/knowledge_extract", &req)
-            .await
-            .ok()
-            .map(|v| v["values"].clone())
-            .unwrap_or_else(|| serde_json::json!({}));
+        //
+        // Full ops: read the whole file, window by window, keeping the first real
+        // value found for each field and stopping as soon as every field is
+        // answered. A figure on page 9 used to be "(not found)" because only the
+        // first 6000 bytes were ever shown to the model.
+        let windows = cmd_windows(text);
+        let total = windows.len();
+        let mut found: HashMap<String, String> = HashMap::new();
+        for (w_i, doc) in windows.iter().enumerate() {
+            if ctx.cancelled() || found.len() == fields.len() {
+                break;
+            }
+            if total > 1 {
+                let _ = ctx.window.emit(
+                    "ask-step",
+                    format!("Reading {name} — part {}/{} ({}/{})", w_i + 1, total, i + 1, files.len()),
+                );
+            }
+            // Only ask for what is still missing, so later windows get a smaller,
+            // sharper question instead of re-deriving what page 1 already gave.
+            let missing: Vec<String> =
+                fields.iter().filter(|f| !found.contains_key(*f)).cloned().collect();
+            let req = serde_json::json!({
+                "model": ctx.model,
+                "base_url": ollama::resolved_base_url(),
+                "mode": "fields",
+                "fields": missing,
+                "document": doc,
+                "temperature": 0.0,
+                "keep_alive": KEEP_ALIVE_WARM,
+            });
+            let values = match crate::sidecar::sidecar_json("/knowledge_extract", &req).await {
+                Ok(v) => v["values"].clone(),
+                // This window went unread — a field it held reads as "(not found)"
+                // unless a later window has it, so say so rather than imply the
+                // whole file was searched.
+                Err(_) => {
+                    ctx.note_unread();
+                    serde_json::json!({})
+                }
+            };
+            for f in &missing {
+                let val = value_str(&values, f);
+                let val = val.trim();
+                if !val.is_empty() && !val.eq_ignore_ascii_case("(not found)") {
+                    found.insert(f.clone(), val.to_string());
+                }
+            }
+        }
         let mut row = vec![name.clone()];
         for f in &fields {
-            let val = value_str(&values, f);
-            row.push(if val.is_empty() { "(not found)".to_string() } else { val });
+            row.push(found.remove(f).unwrap_or_else(|| "(not found)".to_string()));
         }
         rows.push(row);
     }

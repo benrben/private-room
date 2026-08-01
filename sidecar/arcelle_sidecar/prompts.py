@@ -37,6 +37,27 @@ from __future__ import annotations
 #:
 #: ``{other_areas}`` = every reachable domain EXCEPT file (the sentence already
 #: named ask_file_agent). ``{all_areas}`` = every reachable domain.
+#: Appended when the room's internet switch is OFF.
+#:
+#: Removing the web domain from the catalog stops the confabulation the template
+#: note above describes, but it leaves the model with an ABSENCE and no reason
+#: for it — so it supplies its own, and the reason it picks is permanence. Live
+#: QA 2026-07-30 (v0.13.0), web off: "This room doesn't have a general
+#: web-browsing tool … There's no connector or tool available." True about this
+#: turn, wrong about the app, and it sends the user looking for a feature they
+#: already own instead of to the switch that turns it on.
+#:
+#: So the catalog says WHAT is reachable and this says WHY the rest is not.
+WEB_OFF_NOTE = (
+    "\n\nTHE INTERNET IS SWITCHED OFF for this room, in Settings → Online "
+    "features. That is a setting the user controls, not a missing capability: "
+    "this app HAS web search and its own private browser. If you are asked to "
+    "search, browse, open a site or fetch a page, say plainly that the room's "
+    "internet is turned off and that they can turn it on in Settings → Online "
+    "features. Never say this room has no browser, no web tool, or no "
+    "connector for it, and never guess at page content instead."
+)
+
 MAIN_PROMPT_TEMPLATE = (
     "\n\nYou are the MAIN AGENT. You never touch files or tools yourself — "
     "your specialist agents do the work. For ANYTHING about this room's "
@@ -109,6 +130,15 @@ WEB_PROMPT = (
     "you were told to update) — always include the source URLs in what you "
     "save, and say the file name in your report. Never edit a room file you "
     "were not asked to touch, and never claim a save an editor did not confirm. "
+    # BROWSE-2: the one-step ingestion verbs. Each result names what landed (or
+    # the job id), so the report repeats the tool's answer, never invents one.
+    "To save a whole PAGE as a room file in one step, save_link fetches it and "
+    "saves a readable copy with its source URL (a YouTube link saves the "
+    "video's transcript). To download a FILE at a URL — a PDF, CSV, image, "
+    "archive — use download_url; a big file continues as a background job and "
+    "you report the job id. To download the VIDEO from a media page use "
+    "download_media: it always runs as a background job — report the job id "
+    "and that transcription follows, never that the video is already here. "
     'Example — task: "what is the current central-bank rate?" -> web_search '
     "-> fetch_page(the official page) -> FOUND: \"4.25%, effective 2026-07-07 "
     '(boi.org.il/en/monetary-policy)".'
@@ -176,15 +206,18 @@ BROWSE_PROMPT = (
     # Owner decision 2026-07-30: "read a page and keep it" is one job, and the
     # write verbs were already in this box — the prompt simply never said so, so
     # the agent reported page text and left saving to a second round trip.
-    "WHEN THE USER ASKS YOU TO KEEP, SAVE OR COLLECT what is on a page, write "
-    "it into this room yourself with create_file (a new note) or write_file "
-    "(replacing one you were told to update): browse_read hands you the page "
-    "text, so \"copy this into a file\" is read-then-write and needs nobody "
-    "else. Include the source URL in what you save and name the file in your "
-    "report. A file the PAGE downloads (a CSV, a PDF) is imported into this "
-    "room automatically — clicking the download link is all it takes, then say "
-    "what arrived. Never edit a room file you were not asked to touch, and "
-    "never claim a save that did not happen. "
+    # BROWSE-2 made the download-import sentence TRUE (it shipped as a promise
+    # first — the truthfulness bug the plan's Phase 1 existed to close).
+    "WHEN THE USER ASKS YOU TO KEEP, SAVE OR COLLECT what is on a page: "
+    "browse_save saves the CURRENT page into the room as a readable copy plus "
+    "its exact HTML ({\"what\": \"selection\"} saves just the text the user has "
+    "selected) — prefer it over copying page text by hand. create_file / "
+    "write_file remain for notes you compose yourself; include the source URL "
+    "and name the file in your report. A file the PAGE downloads (a CSV, a "
+    "PDF) is imported into this room automatically — clicking the download "
+    "link is all it takes; report that the download started, and the room "
+    "announces the file when it lands. Never edit a room file you were not "
+    "asked to touch, and never claim a save that did not happen. "
     'Example — task: "check the price on that product page" -> browse_open -> '
     'browse_read -> FOUND: "£42.00, in stock (shop.example/p/123)".'
 )

@@ -72,7 +72,7 @@ pub const CHUNK_CAP: usize = 20_000;
 /// the row mapper's indices always line up with the SELECT.
 pub(crate) const FILE_META_COLS: &str = "f.id, f.name, f.mime_type, f.size_bytes, f.source, \
      f.extracted_text, f.created_at, f.folder_id, \
-     (SELECT count(*) FROM chunks WHERE file_id = f.id)";
+     (SELECT count(*) FROM chunks WHERE file_id = f.id), f.origin_url";
 
 pub(crate) fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
     let chunk_count: i64 = row.get(8)?;
@@ -87,6 +87,10 @@ pub(crate) fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
         folder_id: row.get(7)?,
         // HLT-4: hitting the cap means only the first part is searchable.
         partially_indexed: chunk_count >= CHUNK_CAP as i64,
+        // BROWSE-3: where this file came from, when it came over the network.
+        // The column has been written since BROWSE-2 and read by nothing —
+        // provenance is only useful if the UI can show it.
+        origin_url: row.get(9)?,
     })
 }
 
