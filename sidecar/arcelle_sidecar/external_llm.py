@@ -48,6 +48,7 @@ from . import hub_mcp
 from .hub_mcp import HUB_SERVER_NAME, HubToolServer
 from .messages import Message, ToolCall
 from .model_text import recover_json
+from .prompts import READ_RESULT_TOOL
 
 #: Engine ids that name a cloud coding CLI (mirror external.rs).
 EXTERNAL_ENGINES = ("claude-cli", "codex-cli")
@@ -192,7 +193,13 @@ def flatten_agent_messages(
 #: Hub-internal tool names: resolved inside the graph, never on the room
 #: bridge. They reach a harness engine through the hub's OWN MCP endpoint
 #: (:mod:`.hub_mcp`), and fall back to the text protocol for Codex.
-_HUB_ONLY_TOOLS = ("request_tools",)
+#:
+#: `read_result` belongs here for exactly the reason `request_tools` does — it
+#: is minted by `execute_tools` and the bridge has no such tool. Left out, it
+#: would ride the room allowlist, and a harness that called it would be told by
+#: its OWN runtime that the tool does not exist, which is the "No such tool
+#: available" failure this split was written to end.
+_HUB_ONLY_TOOLS = ("request_tools", READ_RESULT_TOOL)
 
 
 def _is_hub_only(name: str) -> bool:

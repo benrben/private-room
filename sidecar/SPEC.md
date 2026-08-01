@@ -114,6 +114,19 @@ substring matches (hint lists include Hebrew stems). Erring toward YES is safe.
   groups = agents.py `GROUPS`); the system prompt names locked groups via
   `TOOL_GROUPS_PROMPT` so the model keeps a stable self-image without unseen
   schemas.
+- `read_result`, the second local mini-tool (results.py): a tool result over
+  `SPILL_BYTES` is PARKED whole for the run and the thread gets a head plus its
+  ref, because truncating it was irreversible — `seen` memoises on arguments, so
+  re-running the tool is a duplicate the loop refuses. The reader is minted the
+  moment something is parked, scoped by `AgentState.spills` to the loop that saw
+  the text, and re-applied by `prompts.with_read_result` on every catalog
+  rebuild (an unlock, a narrowed stage) since no box and no served catalog
+  contains it.
+- A delegation's REPORT is judged before it joins the main thread
+  (graphs.py `report_failure`, no model call): an acknowledgement after real tool
+  work, or the report contract's own three lines filled with "nothing", is an
+  empty report and the step is marked failed rather than green. Artifacts the
+  baton recorded but the report never named are appended to it.
 
 The exact hint lists are in `agent.rs` (`wants_write_tools:751`, `wants_ui_tools:767`,
 `wants_job_tools:788`) and MUST be ported verbatim — they are product behaviour. The Rust
@@ -161,6 +174,11 @@ for round in 0..max_rounds:
         if near_budget:
             result += "\n[Note: tool budget nearly exhausted — answer the user in your
                        next reply.]"
+        if byte_len(result) > SPILL_BYTES:   # results.py — park it, don't truncate it
+            ref = store.put(name, result)    # whole text, in memory, for this run
+            spills.append(ref)               # scopes who may read it back
+            offered += read_result spec      # minted here; the bridge has no such tool
+            result = head(result) + "[Shortened: … held as {ref} …]"
         push tool message(result, tool_name=name)
         if pending_images:              # a perception tool captured pixels
             push USER message with images and the text:

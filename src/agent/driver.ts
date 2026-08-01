@@ -620,6 +620,12 @@ async function mediaFrame(
         imageB64: drawToPngB64(video, video.videoWidth, video.videoHeight),
         width: video.videoWidth,
         height: video.videoHeight,
+        // The time actually PRESENTED, not the one asked for. A request past
+        // the end clamps to `duration`, and `presentedFrame`'s play/pause nudge
+        // advances the pipeline — so the two can differ, and the caption used
+        // to assert the requested time either way. A model comparing a frame
+        // against a transcript then has no way to see the drift.
+        atSeconds: video.currentTime,
       };
     } catch {
       return { error: "That video's frames couldn't be exported to an image." };

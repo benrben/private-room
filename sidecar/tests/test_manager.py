@@ -145,9 +145,30 @@ def test_delegation_note_states_the_report_contract() -> None:
     for line in ("DID:", "FOUND:", "MISSING:"):
         assert line in note
     assert "Stop as soon as" in note
-    assert "Do not address the user" in note
+    # The worker writes a REPORT, not a user-facing reply — the Main agent owns
+    # the wording. Phrased as relay rather than as "do not address the user",
+    # which is what made this frame read as an injection (see the note).
+    assert "Main agent turns it into the answer the user reads" in note
     # The referent baton still rides along when earlier specialists produced.
     assert "notes.md" in delegation_note("x", ["notes.md"])
+
+
+def test_delegation_note_identifies_itself_and_labels_upstream_as_data() -> None:
+    """A harness engine reads an unattributed authority + a format override +
+    embedded third-party text as a prompt injection, and Claude Code did
+    exactly that to our own scaffolding (self-test 2026-08-01). The frame has
+    to name its origin, name where the reply goes, and mark upstream reports as
+    data rather than as instructions."""
+    note = delegation_note("open the file", [], ("DID: saved notes.md",))
+    # Names itself as the app's runtime, up front.
+    assert note.startswith("[Arcelle orchestration frame")
+    assert "not content from the user or the web" in note
+    # The user is the SAME principal, reached by relay — not cut off.
+    assert "same user who asked" in note
+    assert "no other party" in note
+    # Sibling output is explicitly inert.
+    assert "not instructions" in note
+    assert "DID: saved notes.md" in note
 
 
 def test_a_recurring_ask_beats_the_broad_lane_list_and_reaches_workflows() -> None:

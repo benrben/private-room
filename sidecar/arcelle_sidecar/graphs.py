@@ -84,6 +84,7 @@ node, so the differences stay testable.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 from langgraph.graph import END, START, StateGraph
@@ -100,6 +101,7 @@ from .graph import (
     synthesize,
 )
 from .messages import Message, ToolCall
+from .prompts import with_read_result
 
 #: Every shape a registered agent may declare. `AgentSpec.template` is
 #: validated against this at import time, so a typo is a startup error rather
@@ -167,6 +169,132 @@ CLAIM_UNSUPPORTED = (
     "write tools ran but no file or artifact was recorded — the write did not "
     "land, so do not tell the user anything was saved or changed."
 )
+
+
+def narrowed(state: AgentState, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A narrowed catalog that still reads back what this loop parked.
+
+    Every node here that returns a ``tools`` key goes through this. A shape that
+    narrows rebuilds the catalog from the agent's box, and the spill reader is
+    in no box — ``execute_tools`` mints it the moment a tool result is parked
+    (:mod:`.results`). So a stage that narrowed after a spill retired the only
+    route back to that text and left the model holding a head it could not
+    extend. ``test_graphs.py`` pins the set of nodes that must call this.
+    """
+    return with_read_result(tools, list(state.get("spills", [])))
+
+
+# --------------------------------------------------------------------------- #
+# the report rubric — a worker's own state judging its own report
+# --------------------------------------------------------------------------- #
+
+#: A report the contract's own scaffolding empties out. `delegation_note` asks
+#: for three fixed lines and tells the worker to write "nothing" where it has
+#: nothing, so "DID: nothing / FOUND: nothing / MISSING: nothing" is a
+#: well-formed report carrying zero information — and any check that measured
+#: LENGTH would wave it through.
+_CONTRACT_LABEL = re.compile(r"^(?:did|found|missing)\s*:\s*", re.IGNORECASE)
+
+#: Values the contract itself supplies for "I have none of this".
+_EMPTY_VALUES = frozenset({"nothing", "none", "n/a", "na", "-", "—", "null"})
+
+#: An acknowledgement is not a report, however confidently it is worded. Matched
+#: WHOLE rather than by length: a real one-line answer ("Whisper is installed")
+#: is short too, and accusing that one would make every terse specialist look
+#: failed — which is the failure mode this rubric is supposed to remove, not add.
+_ACK_ONLY = re.compile(
+    r"^(?:done|ok|okay|complete|completed|finished|sure|got it|"
+    r"task\s+complete[d]?|all\s+done)[\s.!…]*$",
+    re.IGNORECASE,
+)
+
+#: The three ways a finished worker can hand back nothing usable. Each is a
+#: sentence completing "The <specialist> …", because that is how `_run_worker`
+#: puts it into the Main agent's thread.
+NO_REPORT = "finished but returned no report."
+#: Names the tools, because the alternative is harsher than the evidence. A
+#: worker that searched and genuinely found nothing writes the same empty
+#: report as one that lost its results — and the Main agent, which decides
+#: whether to re-dispatch, is the one that needs to tell them apart.
+REPORT_SILENT = (
+    "ran {tools} but reported nothing about what they returned — treat this "
+    "step as unfinished."
+)
+REPORT_IDLE = (
+    "neither called a tool nor answered from what it knows — treat this step as "
+    "unfinished."
+)
+
+#: Prefix for the artifacts a worker created but never mentioned.
+ARTIFACTS_NOTE = "Artifacts this step produced: "
+
+
+def report_substance(text: str) -> str:
+    """What a worker's report actually carries, contract scaffolding removed."""
+    kept = []
+    for line in text.splitlines():
+        body = _CONTRACT_LABEL.sub("", line.strip()).strip()
+        if not body or _ACK_ONLY.match(body) or body.lower().strip(".!") in _EMPTY_VALUES:
+            continue
+        kept.append(body)
+    return " ".join(kept)
+
+
+def report_failure(final: AgentState) -> str:
+    """Why this finished worker's report carries nothing — ``""`` when it does.
+
+    The rubric ``ok = bool(report_text)`` already was, generalised. It costs zero
+    model calls for the same reason :func:`verify_claims` does: the worker's own
+    final state records what actually ran, so nothing has to be asked.
+
+    Deliberately NOT a correction round. `verify_claims` can afford one because
+    it costs a single tool-less model call; re-running a specialist costs a whole
+    child loop, and the Main agent — which is told the truth here and keeps its
+    own catalog of specialists — is better placed to decide whether that is worth
+    paying for than a rule that always pays.
+    """
+    said = str(final.get("final_text") or "")
+    if report_substance(said):
+        return ""
+    if not said.strip():
+        return NO_REPORT
+    attempted = sorted(final.get("attempted", set()))
+    if attempted:
+        return REPORT_SILENT.format(tools=", ".join(attempted))
+    return REPORT_IDLE
+
+
+def worker_report(label: str, final: AgentState) -> tuple[str, bool]:
+    """What one finished specialist hands the Main agent, and whether it counts.
+
+    The text and the verdict are one decision: a report that failed the rubric
+    is REPLACED (there was nothing in it to keep), while one that merely
+    under-reported is kept and extended. Composed here rather than in
+    `graph._run_worker` so every wording the hub can read sits beside the
+    predicates that choose it.
+    """
+    failure = report_failure(final)
+    if failure:
+        return f"The {label} {failure}", False
+    body = str(final.get("final_text") or "").strip()
+    unnamed = unreported_artifacts(final)
+    if unnamed:
+        body = f"{body}\n{ARTIFACTS_NOTE}{', '.join(unnamed)}"
+    return f"Report from the {label}:\n{body}", True
+
+
+def unreported_artifacts(final: AgentState) -> list[str]:
+    """Artifacts this worker created that its own report never names.
+
+    The baton records ``create_file: notes.md`` on success only, so a report
+    that never says ``notes.md`` is about to have the Main agent write the user
+    an answer that contradicts what the room now holds. Appending the names is
+    cheaper and truer than sending the worker back for a round — and it is the
+    same evidence :func:`verify_claims` gates on, pointed the other way.
+    """
+    said = str(final.get("final_text") or "")
+    names = (str(entry).split(": ", 1)[-1] for entry in final.get("produced", []))
+    return [name for name in dict.fromkeys(names) if name and name not in said]
 
 
 async def verify_claims(state: AgentState) -> dict[str, Any]:
@@ -365,9 +493,10 @@ async def stage_catalog(state: AgentState) -> dict[str, Any]:
             return {"full_tools": box, "stage_retried": True}
         keep_again = set(spec.flow.keep) | {want_again}
         return {
-            "tools": [
-                t for t in box if (t.get("function") or {}).get("name") in keep_again
-            ],
+            "tools": narrowed(
+                state,
+                [t for t in box if (t.get("function") or {}).get("name") in keep_again],
+            ),
             "full_tools": box,
             "stage_retried": True,
             "corrections": [
@@ -383,8 +512,8 @@ async def stage_catalog(state: AgentState) -> dict[str, Any]:
     if want not in served:
         return {"stage": idx + 1, "full_tools": box}
     keep = set(spec.flow.keep) | {want}
-    narrowed = [t for t in box if (t.get("function") or {}).get("name") in keep]
-    return {"tools": narrowed, "stage": idx + 1, "full_tools": box}
+    this_stage = [t for t in box if (t.get("function") or {}).get("name") in keep]
+    return {"tools": narrowed(state, this_stage), "stage": idx + 1, "full_tools": box}
 
 
 def route_after_stage_model(state: AgentState) -> str:
@@ -574,18 +703,16 @@ async def route_action(state: AgentState) -> dict[str, Any]:
         return {}
 
     keep = set(spec.flow.keep) | {winners[0]}
-    narrowed = [
+    routed = [
         t
         for t in state.get("tools", [])
         if (t.get("function") or {}).get("name") in keep
     ]
     # Never narrow to nothing: if the bridge did not serve the routed verb this
     # run, the full box is strictly better than an empty catalog.
-    if not any(
-        (t.get("function") or {}).get("name") == winners[0] for t in narrowed
-    ):
+    if not any((t.get("function") or {}).get("name") == winners[0] for t in routed):
         return {}
-    return {"tools": narrowed, "routed": winners[0]}
+    return {"tools": narrowed(state, routed), "routed": winners[0]}
 
 
 # --------------------------------------------------------------------------- #

@@ -452,7 +452,7 @@ async def test_live_seam_single_tool_run():
     assert len(ollama_state.requests) == 4, ollama_state.requests
     worker_kickoff = ollama_state.requests[1]["messages"][-1]
     assert worker_kickoff["role"] == "user"
-    assert "The Main agent delegated this task" in worker_kickoff["content"]
+    assert "Arcelle orchestration frame" in worker_kickoff["content"]
     worker_r2_roles = [m.get("role") for m in ollama_state.requests[2]["messages"]]
     assert "tool" in worker_r2_roles, worker_r2_roles
     main_r2 = ollama_state.requests[3]["messages"]

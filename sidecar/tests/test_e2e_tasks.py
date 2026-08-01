@@ -314,7 +314,7 @@ async def test_errand_a_dependent_chain_passes_findings_forward() -> None:
         str(m.get("content") or "")
         for msgs in out.chat.seen_by.get("files.read", [])
         for m in msgs
-        if "depend on" in str(m.get("content") or "")
+        if "depends on" in str(m.get("content") or "")
     ]
     assert kickoffs, "the dependent task got no upstream findings"
     assert "rent 1200" in " ".join(kickoffs)

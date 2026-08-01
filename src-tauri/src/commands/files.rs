@@ -243,18 +243,48 @@ pub(crate) fn enqueue_ocr(app: &tauri::AppHandle, job: JobMeta) {
     let _ = tx.send(job);
 }
 
+/// What the STT lane is doing right now, so `stt_status` can answer "is it
+/// done?" — the agent's only way to check.
+///
+/// The lane is an unbounded mpsc channel with no observable depth, and
+/// `retranscribe_file` is NOT a durable job (it never reaches the jobs table),
+/// so `job_status` cannot see it. The Transcription agent could therefore start
+/// a re-transcription and never learn whether it finished: the self-test
+/// (2026-08-01, wave 5) correctly graded its own "done" as unverifiable. This
+/// pair is the smallest thing that makes the claim checkable — `stt_status` is
+/// already that agent's free probe, so it costs no extra round.
+pub(crate) static STT_PENDING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static STT_CURRENT: Mutex<Option<String>> = Mutex::new(None);
+
+/// A snapshot of the lane: (file being transcribed now, jobs still queued).
+pub(crate) fn stt_progress() -> (Option<String>, usize) {
+    let current = STT_CURRENT.lock().unwrap().clone();
+    // `STT_PENDING` counts the in-flight one too; report the QUEUE behind it.
+    let pending = STT_PENDING.load(Ordering::SeqCst);
+    (current, pending.saturating_sub(1).max(0))
+}
+
 pub(crate) fn enqueue_stt(app: &tauri::AppHandle, job: JobMeta) {
     let app = app.clone();
     let tx = STT_TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<JobMeta>();
         std::thread::spawn(move || {
             for job in rx {
+                *STT_CURRENT.lock().unwrap() = Some(job.name.clone());
                 run_stt_job(&app, job);
+                // Cleared BEFORE the count drops, so a reader can never see
+                // "nothing running" while the count still says one is.
+                *STT_CURRENT.lock().unwrap() = None;
+                STT_PENDING.fetch_sub(1, Ordering::SeqCst);
             }
         });
         tx
     });
-    let _ = tx.send(job);
+    STT_PENDING.fetch_add(1, Ordering::SeqCst);
+    if tx.send(job).is_err() {
+        STT_PENDING.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Re-run on-device transcription for one audio/video file, replacing its

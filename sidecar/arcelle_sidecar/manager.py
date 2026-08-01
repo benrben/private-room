@@ -37,6 +37,27 @@ _ROUTING_HINTED: dict[str, tuple[str, ...]] = {
 # --------------------------------------------------------------------------- #
 
 
+def _matches(hint: str, q: str) -> bool:
+    """One hint against the lowercased instruction.
+
+    Plain hints are substrings, the same doctrine as the Rust routers. A hint
+    written ``"create+skill"`` is an ALL-OF: every ``+``-separated part must
+    appear somewhere in ``q``, in any order and at any distance.
+
+    THE BUG THIS EXISTS FOR (self-test 2026-08-01, wave 2). ``skills.author``
+    was reachable only through contiguous phrases like ``"create a skill"``, so
+    "create a small draft skill called self-test-demo" scored author 0 / use 1
+    and the request went to the READ-ONLY sibling, which correctly answered that
+    it cannot create skills. Nothing was broken except the vocabulary — and no
+    finite list of contiguous phrases covers "create a small draft skill",
+    "create a skill for X", "make me a new skill that…". A verb and its noun in
+    the same sentence is what the intent actually looks like.
+    """
+    if "+" in hint:
+        return all(part in q for part in hint.split("+"))
+    return hint in q
+
+
 def _hits(q: str, spec: AgentSpec) -> tuple[list[str], list[str]]:
     """This agent's matching hints in ``q``: (its OWN, the routing-inherited).
 
@@ -48,7 +69,10 @@ def _hits(q: str, spec: AgentSpec) -> tuple[list[str], list[str]]:
     once per candidate instead of once per rung.
     """
     inherited = _ROUTING_HINTED.get(spec.id, ())
-    return [h for h in spec.hints if h in q], [h for h in inherited if h in q]
+    return (
+        [h for h in spec.hints if _matches(h, q)],
+        [h for h in inherited if _matches(h, q)],
+    )
 
 
 def _rank(q: str, spec: AgentSpec) -> tuple[int, bool, int]:

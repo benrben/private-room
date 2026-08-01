@@ -47,7 +47,7 @@ def _is_report(m: Message) -> bool:
 _KEEP_RECENT: int = 4
 
 
-def _blen(s: str) -> int:
+def byte_len(s: str) -> int:
     """UTF-8 byte length.
 
     The Rust counts ``String::len()`` — which is BYTES, not codepoints
@@ -64,10 +64,10 @@ def msg_len(m: Message) -> int:
 
     Byte lengths, to match ``String::len()`` in agent.rs:1145.
     """
-    n = _blen(m.get("content") or "")
+    n = byte_len(m.get("content") or "")
     tool_calls = m.get("tool_calls")
     if tool_calls is not None:
-        n += _blen(compact_json(tool_calls))
+        n += byte_len(compact_json(tool_calls))
     return n
 
 
@@ -81,7 +81,7 @@ def json_chars(value: Any) -> int:
     Bytes, not codepoints — the Rust measures ``tools.to_string().len()``
     (agent.rs:1347), which is the UTF-8 byte length.
     """
-    return _blen(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    return byte_len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
 def window_budget_bytes(num_ctx: int) -> int:
@@ -99,7 +99,7 @@ def window_budget_bytes(num_ctx: int) -> int:
     return int(max(0, (num_ctx - GENERATION_HEADROOM_TOKENS)) * bytes_per_token())
 
 
-def _truncate_bytes(s: str, limit: int) -> str:
+def truncate_bytes(s: str, limit: int) -> str:
     """Head of ``s`` within ``limit`` UTF-8 bytes, cut on a codepoint boundary."""
     raw = s.encode("utf-8")
     if len(raw) <= limit:
@@ -149,7 +149,7 @@ def trim_messages_to_window(
     candidates = [
         m
         for m in messages[1:keep_from]
-        if m.get("role") == "tool" and _blen(m.get("content") or "") > _MIN_STUB_LEN
+        if m.get("role") == "tool" and byte_len(m.get("content") or "") > _MIN_STUB_LEN
     ]
     # Ordinary room-tool results FIRST, specialist reports LAST.
     #
@@ -169,7 +169,7 @@ def trim_messages_to_window(
             # to four partial parts instead of silently losing one.
             content = m.get("content") or ""
             note = "\n… [report cut here to fit this model's context]"
-            m["content"] = _truncate_bytes(content, _REPORT_HEAD) + note
+            m["content"] = truncate_bytes(content, _REPORT_HEAD) + note
             trimmed = True
             continue
         label = m.get("tool_name") or "tool"
@@ -182,21 +182,21 @@ def trim_messages_to_window(
     survivors = [
         m
         for m in messages
-        if m.get("role") == "tool" and _blen(m.get("content") or "") > _MIN_STUB_LEN
+        if m.get("role") == "tool" and byte_len(m.get("content") or "") > _MIN_STUB_LEN
     ]
     if not survivors:
         return trimmed
     fixed = total_chars(messages, reserved_bytes) - sum(
-        _blen(m.get("content") or "") for m in survivors
+        byte_len(m.get("content") or "") for m in survivors
     )
     share = max(_MIN_STUB_LEN, (budget - fixed) // len(survivors))
     for m in survivors:
         content = m.get("content") or ""
-        if _blen(content) <= share:
+        if byte_len(content) <= share:
             continue
         label = m.get("tool_name") or "tool"
         note = f"\n… [{label} result cut here to fit this model's context]"
-        m["content"] = _truncate_bytes(content, max(0, share - _blen(note))) + note
+        m["content"] = truncate_bytes(content, max(0, share - byte_len(note))) + note
         trimmed = True
     return trimmed
 
@@ -240,32 +240,34 @@ def fit_oversized_results(
     survivors = [
         i
         for i, m in enumerate(messages)
-        if m.get("role") == "tool" and _blen(m.get("content") or "") > _MIN_STUB_LEN
+        if m.get("role") == "tool" and byte_len(m.get("content") or "") > _MIN_STUB_LEN
     ]
     if not survivors:
         return messages, False
     fixed = total_chars(messages, reserved_bytes) - sum(
-        _blen(messages[i].get("content") or "") for i in survivors
+        byte_len(messages[i].get("content") or "") for i in survivors
     )
     share = max(_MIN_STUB_LEN, (budget_bytes - fixed) // len(survivors))
     out = [dict(m) for m in messages]
     cut = False
     for i in survivors:
         content = out[i].get("content") or ""
-        if _blen(content) <= share:
+        if byte_len(content) <= share:
             continue
         label = out[i].get("tool_name") or "tool"
         note = f"\n… [{label} result cut here to fit this model's context]"
-        out[i]["content"] = _truncate_bytes(content, max(0, share - _blen(note))) + note
+        out[i]["content"] = truncate_bytes(content, max(0, share - byte_len(note))) + note
         cut = True
     return (out, True) if cut else (messages, False)
 
 
 __all__ = [
+    "byte_len",
     "fit_oversized_results",
+    "json_chars",
     "msg_len",
     "total_chars",
-    "json_chars",
     "trim_messages_to_window",
+    "truncate_bytes",
     "window_budget_bytes",
 ]

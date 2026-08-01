@@ -46,7 +46,10 @@ EXPECTED = {
 #: user installed), and `request_tools` is resolved inside graph.py — the bridge
 #: has no such tool. graph.py emits the step BEFORE that branch, so it still
 #: needs a row. Anything else here is a typo in a `_LABELS` key.
-NON_REGISTRY_LABELS = {"consult_advisor", "request_tools"}
+#: Labelled but not in the registry: the host injects one and the loop mints
+#: the other two, so the bridge never serves them and the drift check must
+#: not read them as stale rows.
+NON_REGISTRY_LABELS = {"consult_advisor", "request_tools", "read_result"}
 
 
 @pytest.mark.parametrize(("name", "label"), sorted(EXPECTED.items()))
@@ -139,3 +142,24 @@ def test_no_label_is_empty_or_a_raw_tool_name() -> None:
         assert label[0].isupper(), (
             f"{name}'s label should read as a sentence: {label!r}"
         )
+
+
+def test_every_loop_resolved_mini_tool_has_a_label_too() -> None:
+    """`ALL_REGISTRY_TOOLS` cannot cover these — the bridge does not serve them,
+    the loop mints them (`request_tools`, `read_result`). They still reach the
+    step strip by name, so leaving one out puts "Ran the read_result tool" in
+    front of the user: the same fallback leak the registry check exists to stop,
+    arriving through the one door that check cannot see.
+    """
+    from arcelle_sidecar.external_llm import _HUB_ONLY_TOOLS
+
+    minted = {name for name in _HUB_ONLY_TOOLS if not name.startswith("ask_")}
+    missing = sorted(minted - set(_LABELS))
+    assert not missing, (
+        f"loop-resolved tool(s) with no human step label: {missing} — add a row "
+        "to labels.py._LABELS and to NON_REGISTRY_LABELS above"
+    )
+    assert minted <= NON_REGISTRY_LABELS, (
+        "a loop-resolved tool's label must be declared non-registry, or the "
+        "stale-row check will read it as drift"
+    )

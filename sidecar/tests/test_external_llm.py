@@ -733,3 +733,42 @@ def test_a_round_with_no_native_endpoints_is_unchanged() -> None:
     collapsed = " ".join(_model()._system([], TOOLS, native=False).split())
     assert "CALL IT" not in collapsed
     assert "create_file" in collapsed
+
+
+# --- the loop's own mini-tools never ride the room bridge ----------------------
+
+
+def _spec(name: str) -> dict:
+    return {"type": "function", "function": {"name": name, "parameters": {}}}
+
+
+def test_loop_resolved_tools_are_kept_off_the_room_allowlist() -> None:
+    """`request_tools` and `read_result` are minted inside `graph.py`; the room
+    bridge has no such tools. Handed to a harness as room tools, its OWN runtime
+    answers "No such tool available" — the failure the hub endpoint exists to
+    end."""
+    offered = [_spec("create_file"), _spec("request_tools"), _spec("read_result")]
+    assert external_llm._bridge_tools(offered) == ["create_file"]
+
+
+def test_loop_resolved_tools_reach_a_harness_through_the_hub_endpoint() -> None:
+    """Off the room allowlist is only half the fix — a harness CALLS tools, it
+    does not narrate them, so they need a real endpoint of their own."""
+    assert external_llm._is_hub_only("read_result")
+    assert external_llm._is_hub_only("request_tools")
+    assert external_llm._is_hub_only("ask_file_agent")
+    assert not external_llm._is_hub_only("fetch_page")
+
+
+def test_the_hub_only_list_names_every_tool_the_bridge_cannot_serve() -> None:
+    """The anti-drift lock: a new loop-resolved mini-tool that forgets this list
+    is served to the CLI as a room tool and fails at the far end, where the
+    error text comes from the harness rather than from us."""
+    from arcelle_sidecar.agents import ALL_REGISTRY_TOOLS
+    from arcelle_sidecar.prompts import READ_RESULT_TOOL
+
+    loop_resolved = {"request_tools", READ_RESULT_TOOL}
+    assert set(external_llm._HUB_ONLY_TOOLS) == loop_resolved
+    assert not (loop_resolved & ALL_REGISTRY_TOOLS), (
+        "a loop-resolved tool must never also be a registry tool the bridge serves"
+    )

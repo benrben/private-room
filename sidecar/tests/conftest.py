@@ -203,6 +203,10 @@ class RunOutcome:
     chat: FakeChatModel
     mcp: FakeMCP
     cancel: CancelToken
+    #: The run's `Deps` — the only handle on anything that lives for the RUN
+    #: rather than for one loop's state, which today means the parked-result
+    #: store (`results.ResultStore`).
+    deps: Any = None
     #: The worker sub-loop's FINAL AgentState (``drive_worker`` only; ``drive``
     #: goes through ``run_agent``, which returns text). The structural facts a
     #: shape test cares about — did the verify gate raise a correction, what
@@ -229,7 +233,7 @@ class RunOutcome:
             m
             for m in seen
             if "Progress this turn" not in (m.get("content") or "")
-            and "The Main agent delegated this task" not in (m.get("content") or "")
+            and "Arcelle orchestration frame" not in (m.get("content") or "")
         ]
 
 
@@ -249,7 +253,9 @@ async def drive(
 
     deps = Deps(chat=chat, emit=emit, cancel=cancel, mcp=mcp)  # type: ignore[arg-type]
     final = await run_agent(req, deps)
-    return RunOutcome(final=final, events=events, chat=chat, mcp=mcp, cancel=cancel)
+    return RunOutcome(
+        final=final, events=events, chat=chat, mcp=mcp, cancel=cancel, deps=deps
+    )
 
 
 async def drive_worker(
@@ -302,6 +308,9 @@ async def drive_worker(
         # empty regardless — that is the distinction the write gate turns on.
         "referents": list(referents or []),
         "produced": [],
+        # Seeded empty like a real child's: a loop may only read back what IT
+        # parked, however much the run's shared store holds.
+        "spills": [],
         "pipeline": [],
         "worker_base_messages": [],
         "messages": messages,
@@ -330,6 +339,7 @@ async def drive_worker(
         chat=chat,
         mcp=mcp,
         cancel=cancel,
+        deps=deps,
         state=dict(final_state),
     )
 

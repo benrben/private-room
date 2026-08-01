@@ -1487,3 +1487,65 @@ def test_the_main_prompt_does_not_teach_the_agent_to_deny_its_specialists() -> N
     assert "never the tool names" in low
     # The blanket prohibition that caused the denial must be gone.
     assert "never show that format, the agents" not in low
+
+
+# --- the catalog rebuilds a spilled result has to survive ---------------------
+
+
+def test_every_node_that_rebuilds_the_catalog_keeps_the_spill_reader() -> None:
+    """`read_result` is minted mid-round by `execute_tools`, so it is in no
+    agent's box and in nothing the bridge serves (`results.py`). Any node that
+    returns a `tools` key rebuilds the catalog from a box — and would retire the
+    reader unless it goes through `graphs.narrowed`.
+
+    Pinned as the SET of such nodes rather than as behaviour: a new narrowing
+    shape is exactly the case a behavioural test cannot reach, and this makes
+    adding one a deliberate act.
+    """
+    import ast
+    import inspect
+
+    from arcelle_sidecar import graphs as graphs_mod
+
+    def returned_catalogs(fn: ast.AST) -> list[ast.expr]:
+        return [
+            value
+            for ret in ast.walk(fn)
+            if isinstance(ret, ast.Return) and isinstance(ret.value, ast.Dict)
+            for key, value in zip(ret.value.keys, ret.value.values)
+            if isinstance(key, ast.Constant) and key.value == "tools"
+        ]
+
+    source = ast.parse(inspect.getsource(graphs_mod))
+    rebuilders = {
+        fn.name: returned_catalogs(fn)
+        for fn in ast.walk(source)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and returned_catalogs(fn)
+    }
+
+    assert set(rebuilders) == {"stage_catalog", "route_action"}, (
+        "a node started rebuilding the catalog — route its `tools` value through "
+        f"`narrowed(state, …)` and add it here: {sorted(rebuilders)}"
+    )
+    for name, catalogs in rebuilders.items():
+        for catalog in catalogs:
+            assert (
+                isinstance(catalog, ast.Call)
+                and isinstance(catalog.func, ast.Name)
+                and catalog.func.id == "narrowed"
+            ), f"{name} returns a catalog that did not go through narrowed()"
+
+
+def test_narrowed_is_a_no_op_until_something_is_parked() -> None:
+    """It runs on every narrowing round, so the common case must not change."""
+    from arcelle_sidecar.graphs import narrowed
+
+    box = [{"type": "function", "function": {"name": "web_search"}}]
+    assert narrowed({}, box) == box
+    assert narrowed({"spills": []}, box) == box
+
+    with_reader = narrowed({"spills": ["res_1"]}, box)
+    assert [t["function"]["name"] for t in with_reader] == ["web_search", "read_result"]
+    # ...and re-narrowing an already-carrying catalog does not double it up.
+    assert narrowed({"spills": ["res_1"]}, with_reader) == with_reader

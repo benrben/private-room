@@ -347,7 +347,7 @@ async def test_main_agent_delegates_to_the_file_agent_and_answers() -> None:
     assert report["content"].startswith("Report from the File agent:")
     # The worker saw the delegation note, not the main's tool traffic.
     worker_seen = out.chat.seen_messages[1]
-    assert "The Main agent delegated this task" in worker_seen[-1]["content"]
+    assert "Arcelle orchestration frame" in worker_seen[-1]["content"]
     assert not any(m.get("role") == "tool" for m in worker_seen)
     # Worker offered room tools; main offered only specialists.
     assert "search_room" in out.chat.offered_names[1]
@@ -385,7 +385,7 @@ async def test_main_agent_chains_two_specialists_with_the_referent_baton() -> No
     assert [c[0] for c in mcp.calls] == ["start_file_pass"]
     # The baton: the SECOND worker's kickoff names what the first produced.
     conn_seen = out.chat.seen_messages[4]
-    assert "The Main agent delegated this task" in conn_seen[-1]["content"]
+    assert "Arcelle orchestration frame" in conn_seen[-1]["content"]
     assert "start_file_pass: book" in conn_seen[-1]["content"]
     # Queue-jump guard: the Jobs agent never saw the connector proxy pair.
     assert "run_mcp_tool" not in out.chat.offered_names[1]
@@ -1413,7 +1413,7 @@ async def test_ask_agents_holds_a_dependent_task_until_its_deps_report() -> None
         m
         for msgs in chat.seen_by_worker["web"]
         for m in msgs
-        if "The task(s) you depend on have already run" in (m.get("content") or "")
+        if "earlier steps this one depends on" in (m.get("content") or "")
     )
     assert "file did its part" in web_kickoff["content"]
 

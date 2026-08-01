@@ -96,7 +96,7 @@ from .agents import (
     reachable_domain_keys,
     toolbox_for,
 )
-from .budget import json_chars
+from .budget import byte_len, json_chars
 from .chat import ChatModel
 from .config import AGENT_ROUND_BACKSTOP, RunRequest
 from .labels import tool_step_label
@@ -114,6 +114,7 @@ from .prompts import (
     DONE_TEXT,
     EMPTY_PLAN_NOTE,
     IMAGE_HANDOFF,
+    READ_RESULT_TOOL,
     SKILLS_NOTE,
     TOOL_GROUP_LABELS,
     TOOL_GROUPS_PROMPT,
@@ -121,9 +122,12 @@ from .prompts import (
     delegation_note,
     duplicate_call_note,
     request_tools_spec,
+    spill_note,
     turn_progress_note,
     unlocked_note,
+    with_read_result,
 )
+from .results import SPILL_BYTES, ResultStore, read_spill
 from .routing import ADVISOR_TOOL_NAMES, lane_label
 from .usage import build_usage_event, categorize_messages
 
@@ -203,6 +207,13 @@ class Deps:
     #: the gap. Cloud engines have no resident model, so the caller raises it.
     #: 0/None means unbounded, which is what a cloud room wants.
     worker_parallel: int | None = None
+    #: Tool results too big for the thread, parked whole (:mod:`.results`).
+    #:
+    #: Per RUN, because `Deps` is built per request (`server.py`) and passed by
+    #: reference into every child loop — so the store is created and freed with
+    #: the run, and no teardown has to remember it. Which refs a given loop may
+    #: READ is scoped separately, by `AgentState.spills`.
+    results: ResultStore = field(default_factory=ResultStore)
     #: The WHOLE ASK's model-round ceiling (`config.TURN_ROUND_BUDGET`), shared
     #: by every loop in the delegation tree. `max_rounds` lives in state, and
     #: each child starts a fresh state at round 0, so it bounds a loop and not a
@@ -275,6 +286,16 @@ class AgentState(TypedDict, total=False):
     plan_multi: bool
     #: request_tools groups opened mid-turn (monotonic within the step).
     unlocked_groups: set[str]
+    #: Refs of tool results THIS loop parked whole (:mod:`.results`), in the
+    #: order they were parked. Scopes `read_result`: the store hangs off `Deps`
+    #: and is shared by the whole delegation tree, so without this a specialist
+    #: could read text a sibling fetched and never showed it.
+    #:
+    #: MUST be declared here — LangGraph filters a node's returned dict against
+    #: this schema and SILENTLY DROPS unknown keys, so an undeclared list would
+    #: read empty forever and the reader would be retired the round after it
+    #: appeared. Same trap as `stage_retried`.
+    spills: list[str]
     #: The referent baton: artifacts produced by EARLIER specialists this turn
     #: ("file created: X"), injected into the next delegation's kickoff note by
     #: code — the model never has to remember cross-agent state.
@@ -961,6 +982,9 @@ async def _run_worker(
         # guard — cross-domain sequencing belongs to the Main agent).
         "plan_multi": True,
         "unlocked_groups": set(),
+        # Seeded EMPTY like `produced`: the run's store is shared, but a child
+        # may only read back what IT parked.
+        "spills": [],
         "referents": list(referents),
         # Seeded EMPTY, deliberately: this child's write-claim gate must judge
         # what IT wrote, not what the Main agent's baton already carried.
@@ -983,7 +1007,7 @@ async def _run_worker(
     # agent's claims pass a ground-truth check first. Imported here rather than
     # at module scope because `graphs` composes the node functions defined in
     # THIS module — a top-level import would be circular.
-    from .graphs import graph_for, recursion_limit_for
+    from .graphs import graph_for, recursion_limit_for, worker_report
 
     # One slot per child. Unbounded on a cloud room; serialized on a local one,
     # where a single resident model means N children are contention, not speed.
@@ -997,7 +1021,6 @@ async def _run_worker(
                 "recursion_limit": recursion_limit_for(worker.id, max_rounds),
             },
         )  # type: ignore[assignment]
-    report_text = (final.get("final_text", "") or "").strip()
     # What the child ADDED, not the baton it was handed — the caller merges this
     # back, and returning the whole baton would just re-merge the parent's own
     # entries (harmless today only because the merge de-duplicates).
@@ -1015,12 +1038,14 @@ async def _run_worker(
     # sent back to restate when one does, so by the time the report exists it
     # has already been corrected, and counting it here would mark a
     # successfully-corrected child as failed.
-    ok = bool(report_text)
-    report = (
-        f"Report from the {worker.label}:\n{report_text}"
-        if report_text
-        else f"The {worker.label} finished but returned no report."
-    )
+    #
+    # 2026-08-01: `bool(final_text)` was that verdict, and it passed the one
+    # shape the local models actually produce — "Done." after a round of real
+    # tool calls, or the contract's own three lines filled with "nothing". Both
+    # are empty reports wearing a green chip, and the Main agent composes the
+    # user's answer out of them. `graphs.worker_report` is the same question
+    # asked properly, still with no model call.
+    report, ok = worker_report(worker.label, final)
     return WorkerOutcome(report, ok, cancelled, worker_refs)
 
 
@@ -1523,9 +1548,12 @@ class _ToolPass:
     produced: list[str]
     reports_so_far: list[tuple[str, str]]
     unlocked: set[str]
+    #: Refs this loop has parked, oldest first (see `AgentState.spills`).
+    spills: list[str]
     pending_images: list[str]
-    #: The catalog a mid-round `request_tools` rebuilt, or None if none did —
-    #: the one key `to_updates` adds conditionally.
+    #: The catalog a mid-round rebuild produced — `request_tools` unlocking a
+    #: group, or a spill minting the reader — or None if neither happened. The
+    #: one key `to_updates` adds conditionally.
     tools_update: list[dict[str, Any]] | None = None
     all_dup: bool = True
     cancelled: bool = False
@@ -1573,6 +1601,8 @@ class _ToolPass:
             reports_so_far=reports_so_far,
             # Groups + catalog may change mid-round via request_tools.
             unlocked=set(state.get("unlocked_groups", set())),
+            # ...and via a parked result, which mints the reader the same way.
+            spills=list(state.get("spills", [])),
             # Pixels captured this round, drained into a user message as soon as they
             # appear (mirrors the Rust `effects.pending_images`).
             pending_images=list(state.get("pending_images", [])),
@@ -1692,11 +1722,44 @@ class _ToolPass:
             return True
         return False
 
+    def _set_catalog(self, tools: list[dict[str, Any]]) -> None:
+        """Adopt a rebuilt catalog, keeping the spill reader offered.
+
+        `request_tools` rebuilds from the SERVED specs, which never contain
+        `read_result` — it is minted here, not by the bridge — so a rebuild that
+        did not come back through this method would retire the only route to a
+        shortened result. Same reason `graphs.narrowed` exists for the shapes
+        that narrow the catalog between rounds.
+        """
+        self.tools_update = with_read_result(tools, self.spills)
+
+    def _park_if_oversized(self, tool: str, result: str) -> str:
+        """The result, or a head plus the ref that reads the rest.
+
+        Parking happens at CAPTURE, not at fit time. The budget's own guard
+        runs only when a request would otherwise be rejected — far too late for
+        a local 4B whose whole window is smaller than one big page — and what it
+        does then is truncate, which is the loss this replaces.
+        """
+        if byte_len(result) <= SPILL_BYTES:
+            return result
+        spill = self.deps.results.put(tool, result)
+        self.spills.append(spill.ref)
+        self._set_catalog(
+            self.tools_update
+            if self.tools_update is not None
+            else list(self.state.get("tools", []))
+        )
+        head = spill.head()
+        return spill_note(spill.ref, head, len(head), len(spill.text))
+
     def _arm_for(self, call: ToolCall) -> Callable[[ToolCall, str], Awaitable[bool]]:
-        """Which of the four kinds of call this is. Every arm returns "keep
+        """Which of the five kinds of call this is. Every arm returns "keep
         going"; False stops the pass (Stop landed inside a child)."""
         if call.name == "request_tools":
             return self._request_tools
+        if call.name == READ_RESULT_TOOL:
+            return self._read_result
         if call.name == BATCH_TOOL_NAME:
             return self._batch
         if call.name in AGENT_TOOL_NAMES:
@@ -1710,11 +1773,30 @@ class _ToolPass:
         group = str((call.arguments or {}).get("group") or "")
         result, ok, new_tools = _unlock_group(group, self.state, self.unlocked, self.messages)
         if new_tools is not None:
-            self.tools_update = new_tools
+            self._set_catalog(new_tools)
         await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
         if ok:
             self.seen.add(key)
         self.progress.append(f"request_tools(group={group}) -> {'ok' if ok else 'error'}")
+        self.messages.append(tool_message(result, call.name, call.id))
+        return True
+
+    async def _read_result(self, call: ToolCall, key: str) -> bool:
+        """One read_result call: more of a result this loop already parked.
+
+        Resolved HERE, never sent to the bridge — the bridge has no such tool,
+        exactly like `request_tools`. Not recorded in `attempted` for the same
+        reason: that set is the write gate's ground truth about ROOM tools, and
+        reading text this loop already fetched changed nothing in the room.
+        """
+        args = call.arguments or {}
+        result, ok = read_spill(self.deps.results, self.spills, args)
+        await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
+        if ok:
+            self.seen.add(key)
+        self.progress.append(
+            f"{call.name}({_args_summary(args)}) -> {'ok' if ok else 'error'}"
+        )
         self.messages.append(tool_message(result, call.name, call.id))
         return True
 
@@ -1869,7 +1951,9 @@ class _ToolPass:
             f"{call.name}({_args_summary(call.arguments)}) -> {'ok' if ok else 'error'}"
         )
 
-        self.messages.append(tool_message(result, call.name, call.id))
+        self.messages.append(
+            tool_message(self._park_if_oversized(call.name, result), call.name, call.id)
+        )
 
         # ADD-25: a perception tool captured pixels. Hand them to the (vision-
         # capable) chat model as a USER message right after the tool result —
@@ -1903,6 +1987,7 @@ class _ToolPass:
             "synth_turns": synth_turns,
             "synth": False,
             "unlocked_groups": self.unlocked,
+            "spills": self.spills,
             "pipeline": self.delegator.pipeline,
             "cancelled": self.cancelled or self.deps.cancel.cancelled,
         }
@@ -2074,6 +2159,7 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
         "node_key": MAIN_NODE_KEY,
         "plan_multi": False,
         "unlocked_groups": set(),
+        "spills": [],
         "referents": [],
         "pipeline": pipeline,
         "worker_base_messages": [dict(m) for m in messages],  # type: ignore[misc]

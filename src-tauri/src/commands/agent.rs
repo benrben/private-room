@@ -2486,10 +2486,19 @@ pub(crate) async fn exec_tool(
             } else {
                 ""
             };
+            // Head AND tail. The head alone made "did my append land?"
+            // unanswerable with this tool — the only verb an agent has for
+            // reading back a file it just wrote (self-test 2026-08-01, wave 3).
+            // Char-safe both ends (the head was once a raw byte slice that
+            // panicked on multibyte text).
             let snippet = text
-                // Char-safe prefix (was a raw byte slice that panicked on
-                // multibyte text).
-                .map(|t| format!("\nIt begins:\n{}", clamp_bytes(t, 1200)))
+                .map(|t| {
+                    let head = clamp_bytes(t.clone(), 1200);
+                    match tail_bytes(&t, 600) {
+                        "" => format!("\nIt begins:\n{head}"),
+                        tail => format!("\nIt begins:\n{head}\n…\nIt ends:\n{tail}"),
+                    }
+                })
                 .unwrap_or_default();
             Ok(format!("Opened \"{real_name}\" in the viewer{target}.{note}{snippet}"))
         }
@@ -2797,10 +2806,16 @@ pub(crate) async fn exec_tool(
                 .as_str()
                 .ok_or("The frame capture came back empty.")?
                 .to_string();
+            // Caption the frame the driver actually PRESENTED. A seek past the
+            // end clamps, and the decoder nudge can advance it, so a caption
+            // built from `at` can quietly disagree with the pixels — which is
+            // exactly the kind of drift a model then reports as a
+            // transcript/video mismatch it cannot explain.
+            let shown = v["atSeconds"].as_f64().unwrap_or(at);
             perceive_image(
                 effects,
                 b64,
-                &format!("the frame at {}s of \"{real_name}\"", at.round() as u64),
+                &format!("the frame at {}s of \"{real_name}\"", shown.round() as u64),
             )
             .await
         }
@@ -3230,9 +3245,52 @@ pub(crate) async fn exec_tool(
                 "studio_mindmap" => super::mindmap_spec(),
                 _ => super::podcast_spec(),
             };
-            let refs: Option<Vec<String>> = args["refs"].as_array().map(|a| {
-                a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
-            });
+            // The schema says `refs` are file NAMES (that is what a model has —
+            // it reads names out of list_room_files/search_room), but
+            // `gather_files_text` looks every entry up as a file ID and
+            // `continue`s on a miss. So an agent-driven studio call that named
+            // its source ALWAYS produced an empty blob and the studio blamed the
+            // file: "The files you mentioned have no readable text to work
+            // with." — on a file whose text open_file prints happily. Every
+            // generator, every file; the only calls that worked were the ones
+            // that omitted `refs` and fell through to whole-room scope
+            // (self-test 2026-08-01, wave 6). Resolve names here, the same way
+            // retranscribe_file does, and let an id through untouched for a
+            // model that echoes one back.
+            let refs: Option<Vec<String>> = match args["refs"].as_array() {
+                None => None,
+                Some(a) => {
+                    let wanted: Vec<String> = a
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                        .map(str::to_string)
+                        .collect();
+                    let guard = state.room.lock().unwrap();
+                    let room = guard.as_ref().ok_or("No room is open.")?;
+                    let mut ids: Vec<String> = Vec::new();
+                    let mut missing: Vec<String> = Vec::new();
+                    for want in &wanted {
+                        if db::get_file_name(&room.conn, want).is_ok() {
+                            ids.push(want.clone()); // already an id
+                        } else if let Ok((id, _)) = db::find_file_like(&room.conn, want) {
+                            ids.push(id);
+                        } else {
+                            missing.push(want.clone());
+                        }
+                    }
+                    // Name what didn't resolve instead of silently dropping it —
+                    // a studio built from half the sources it was given is the
+                    // quiet wrong answer this whole path just produced.
+                    if !missing.is_empty() && ids.is_empty() {
+                        return Err(format!(
+                            "No file matching {} in this room.{}",
+                            missing.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(" or "),
+                            db::file_names_hint(&room.conn)
+                        ));
+                    }
+                    if ids.is_empty() { None } else { Some(ids) }
+                }
+            };
             let instructions = args["instructions"].as_str().map(str::to_string);
             let meta = super::run_studio(window, &st, spec, None, instructions, refs, None).await?;
             Ok(format!("Saved \"{}\" into the room.", meta.name))
@@ -3240,8 +3298,21 @@ pub(crate) async fn exec_tool(
         "stt_status" => {
             use tauri::Manager;
             let s = super::stt_status(window.app_handle().clone())?;
+            // Report the LANE, not just the model. `retranscribe_file` rides the
+            // STT queue and never becomes a durable job, so `job_status` cannot
+            // see it — without this the agent starts a re-transcription and has
+            // no way to learn it finished, which is exactly what the self-test
+            // (2026-08-01, wave 5) had to grade as unverifiable. This is the
+            // Transcription agent's free probe, so the check costs no round.
+            let lane = match super::stt_progress() {
+                (Some(name), 0) => format!(" Transcribing \"{name}\" right now."),
+                (Some(name), queued) => {
+                    format!(" Transcribing \"{name}\" right now, {queued} more waiting.")
+                }
+                (None, _) => " Nothing is transcribing right now.".to_string(),
+            };
             Ok(if s.installed {
-                "The on-device speech model is installed and ready.".to_string()
+                format!("The on-device speech model is installed and ready.{lane}")
             } else if s.downloading {
                 "The on-device speech model is still downloading.".to_string()
             } else {
@@ -3265,7 +3336,15 @@ pub(crate) async fn exec_tool(
             let app = window.app_handle().clone();
             let st = app.state::<AppState>();
             super::retranscribe_file(app.clone(), st, file_id)?;
-            Ok(format!("Re-transcribing {name} on this computer; nothing is uploaded."))
+            // Name the check, or the model reports a queued job as a finished
+            // one. This runs on the STT lane, not the durable job table, so
+            // job_status is the WRONG place to look and a model that tries it
+            // gets an unrelated list back (self-test 2026-08-01, wave 5).
+            Ok(format!(
+                "Queued {name} for re-transcription on this computer; nothing is uploaded. \
+                 It is not finished yet — call stt_status to see whether the lane is still \
+                 busy, and open_file once it is clear. Do not use job_status for this."
+            ))
         }
         "list_skills" => {
             let guard = state.room.lock().unwrap();
@@ -3654,6 +3733,26 @@ pub(crate) fn clamp_bytes(mut s: String, max: usize) -> String {
         s.truncate(floor_boundary(&s, max));
     }
     s
+}
+
+/// The LAST `max` bytes of `s`, never splitting a char. Empty when `s` already
+/// fits (the caller has the whole thing and needs no tail).
+///
+/// Exists so `open_file` can show a file's END. Before this it returned only
+/// "It begins:" + the first 1200 bytes, which means an agent appending to a
+/// growing file — a log, a running note — had NO way to see whether its write
+/// landed, and `verify_claims` has nothing to check against either. The
+/// self-test (2026-08-01, wave 3) caught its own append silently missing only
+/// because it fell back to `search_room`.
+pub(crate) fn tail_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return "";
+    }
+    let mut cut = s.len() - max;
+    while cut < s.len() && !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    &s[cut..]
 }
 
 /// ADD-25: hand a captured image (screenshot / video frame) to the model.

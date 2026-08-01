@@ -27,6 +27,10 @@ _LABELS: dict[str, str] = {
     # request_tools branch resolves it locally, so the name DOES reach this
     # table even though the bridge has no such tool.
     "request_tools": "Asked for more tools",
+    # The other loop-resolved mini-tool (2026-08-01, results.py). Same story: the
+    # step is emitted before `_read_result` resolves it, so the name lands here
+    # even though the bridge has never heard of it.
+    "read_result": "Read more of a long result",
     "list_room_files": "Listed the room's files",
     "search_room": "Searched the room",
     "open_file": "Opened a file",

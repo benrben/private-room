@@ -602,9 +602,21 @@ REGISTRY: tuple[AgentSpec, ...] = (
         description="Create, modify or delete Agent Skills (drafts, human-reviewed).",
         tools=_SKILLS_AUTHOR,
         prompt=SKILLS_AUTHOR_PROMPT,
+        # ALL-OF hints (see `manager._matches`): the discriminator against the
+        # read-only sibling is an AUTHORING VERB somewhere in a sentence that is
+        # already about skills — not a contiguous phrase. The contiguous list
+        # alone sent "create a small draft skill called self-test-demo" to
+        # `skills.use`, which answered that it has no create verb (self-test
+        # 2026-08-01, wave 2). Safe to be this broad because siblings are scored
+        # only WITHIN their own domain: the ask already reached `ask_skills_agent`.
         hints=(
-            "create a skill", "new skill", "edit the skill", "update the skill",
-            "delete the skill", "turn this into a skill", "מיומנות חדשה", "צור מיומנות",
+            "create+skill", "make+skill", "write+skill", "build+skill",
+            "author+skill", "new+skill", "draft+skill", "add+skill",
+            "edit+skill", "update+skill", "change+skill", "modify+skill",
+            "improve+skill", "rename+skill", "delete+skill", "remove+skill",
+            "turn this into a skill",
+            "צור+מיומנות", "כתוב+מיומנות", "בנה+מיומנות", "חדשה+מיומנות",
+            "ערוך+מיומנות", "עדכן+מיומנות", "מחק+מיומנות",
         ),
         group="skills",
     ),

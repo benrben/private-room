@@ -3416,10 +3416,26 @@ pub(crate) async fn agent_test_workflow(
     // behind a running job that is ITSELF waiting on this call (a parent workflow's
     // agent_run node) would hang — so refuse rather than queue.
     if state.running_job.lock().unwrap().is_some() {
-        return Err(
-            "Another job is running right now — ask the user to wait for it to finish, then test the workflow again."
-                .into(),
-        );
+        // Terminal, and it says so. This used to read "ask the user to wait …
+        // then test the workflow again", which a model hears as "retry": the
+        // self-test (2026-08-01, wave 3) burned seven identical calls against
+        // this line in 90 seconds because nothing in it says the answer will
+        // not change this turn. The busy slot is held by a background job the
+        // agent cannot advance, so retrying is guaranteed waste.
+        //
+        // Validation has already PASSED to reach here, which is the part the
+        // agent was actually asked for — say so, or an honest report reads as
+        // total failure.
+        // Still an Err: the test genuinely did not run, so the step chip must
+        // stay red. What changes is that the text is now terminal.
+        return Err(format!(
+            "Test of \"{}\" did NOT run: another background job holds the single job slot. \
+             Its definition validates, but it has not been test-run. Do not call \
+             test_workflow again this turn — the slot cannot free while you wait, so every \
+             retry returns this same line. Tell the user it is saved and valid, and that \
+             they can test-run it once the running job finishes.",
+            wf.name
+        ));
     }
 
     // A file-scoped (run_input) workflow needs a file to run on.
