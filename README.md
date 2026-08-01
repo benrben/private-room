@@ -1,29 +1,81 @@
-# Arcelle
+<a id="readme-top"></a>
+
+<div align="center">
 
 ![Arcelle — a private AI workspace sealed inside a single file](docs/banner.png)
 
-<p align="center">
-  <a href="https://github.com/benrben/private-room/releases/latest"><img src="docs/badge-download.svg" alt="Download the latest DMG" height="28"></a>
-  <img src="docs/badge-encrypted.svg" alt="Encrypted on your Mac" height="28">
-  <img src="docs/badge-offline.svg" alt="Offline-first" height="28">
-  <img src="docs/badge-local-ai.svg" alt="Local AI via Ollama" height="28">
-  <img src="docs/badge-touchid.svg" alt="Touch ID unlock" height="28">
-  <img src="docs/badge-macos.svg" alt="Made for macOS" height="28">
-</p>
+# Arcelle
 
-<p align="center"><b>A private AI workspace that lives inside a single file.</b><br>
+**A private AI workspace that lives inside a single file.**
+
 Double-click it, unlock it with your password, and everything — your files,
-your chats, the AI's memory — is sealed in <b>one encrypted document</b>.<br>
-Nothing leaves your Mac unless you say so.</p>
+your chats, the AI's memory — is sealed in **one encrypted document**.
+Nothing leaves your Mac unless you say so.
+
+<a href="https://github.com/benrben/private-room/releases/latest"><img src="docs/badge-download.svg" alt="Download the latest DMG" height="28"></a>
+<img src="docs/badge-encrypted.svg" alt="Encrypted on your Mac" height="28">
+<img src="docs/badge-offline.svg" alt="Offline-first" height="28">
+<img src="docs/badge-local-ai.svg" alt="Local AI via Ollama" height="28">
+<img src="docs/badge-touchid.svg" alt="Touch ID unlock" height="28">
+<img src="docs/badge-macos.svg" alt="Made for macOS" height="28">
+
+[Download](#getting-started) ·
+[Feature tour](#features) ·
+[How it works](#how-it-works) ·
+[Changelog](CHANGELOG.md) ·
+[Report a bug](https://github.com/benrben/private-room/issues/new) ·
+[Request a feature](https://github.com/benrben/private-room/issues/new)
+
+</div>
 
 ![The Arcelle workspace: library, document, and AI side by side](docs/screens/workspace.png)
 
 <p align="center">
-  <a href="https://github.com/benrben/private-room/raw/main/art/private-room-productivity-witness-protection.mp4"><img src="docs/video-poster.png" alt="Watch the video — the chaos has entered witness protection" width="720"></a><br>
-  <b>🎬 Watch the video (74 s)</b> — <i>one job, seven apps… until the chaos enters witness protection.</i>
+  <a href="https://github.com/benrben/private-room/raw/main/art/arcelle-30-second-publish-master.mp4"><img src="docs/video-poster.png" alt="Watch the Arcelle video — work with context" width="720"></a><br>
+  <b>🎬 Watch the video (30 s)</b> — <i>your AI tools are excellent… the handoff is still your job.</i>
 </p>
 
 ---
+
+<details>
+<summary><b>Table of contents</b></summary>
+
+- [About the project](#about-the-project)
+  - [Why it's different](#why-its-different)
+  - [Built with](#built-with)
+- [Getting started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [Install the app](#install-the-app)
+  - [First run](#first-run)
+  - [Staying up to date](#staying-up-to-date)
+- [Features](#features)
+  - [One shell, three panes](#one-shell-three-panes)
+  - [What's in a room](#whats-in-a-room)
+  - [The AI lives in the room](#the-ai-lives-in-the-room)
+  - [Chat commands](#chat-commands)
+  - [One room, any engine](#one-room-any-engine)
+  - [Cloud privacy, mechanically enforced](#cloud-privacy-mechanically-enforced)
+  - [The private browser](#the-private-browser)
+  - [Automate the boring parts](#automate-the-boring-parts)
+  - [Record the meeting, keep the proof](#record-the-meeting-keep-the-proof)
+  - [Memory you can see](#memory-you-can-see)
+  - [Files, viewers & organization](#files-viewers--organization)
+  - [On-device by default](#on-device-by-default)
+- [How it works](#how-it-works)
+  - [Engineered for a 4B model](#engineered-for-a-4b-model)
+- [Development](#development)
+  - [Repository layout](#repository-layout)
+  - [Tests](#tests)
+  - [Design system](#design-system)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
+- [Contact & support](#contact--support)
+- [Acknowledgments](#acknowledgments)
+
+</details>
+
+## About the project
 
 A `.roomai` file works like a document. Double-click it in Finder, unlock it
 with your password (or a fingerprint), and you're inside a private workspace
@@ -33,7 +85,7 @@ it, back it up, or AirDrop it like any other document. By default nothing
 leaves your computer: the AI runs locally through Ollama — and if you *choose*
 to point a room at a cloud engine, the app says so out loud, everywhere.
 
-## Why it's different
+### Why it's different
 
 - 📍 **A local AI that can't fake a citation.** Every claim is pinned to the
   exact sentence in your document — and the app *verifies the quote before it
@@ -62,21 +114,112 @@ to point a room at a cloud engine, the app says so out loud, everywhere.
   audio, watch a live transcript build with speakers told apart automatically,
   and keep the whole thing — audio, transcript, speakers — inside the encrypted
   file.
+- 🌐 **A browser that keeps nothing — and the AI can drive it.** A private
+  browser with no history, no cookies, no cache and no saved logins — not
+  "cleared on exit", never written to disk in the first place — with ads and
+  trackers blocked before the request leaves your Mac. Ask the assistant to
+  look something up and it opens the page itself, while every page, click and
+  consent is journaled inside your encrypted room. See
+  [The private browser](#the-private-browser).
 - 🪶 **Tuned for a small model.** Built to be reliable on a 4B local model —
   constrained decoding, deterministic tool routing, and honest "I can't do
   that in place" behavior instead of confident nonsense. See
   [Engineered for a 4B model](#engineered-for-a-4b-model).
 
-## One shell, three panes
+### Built with
+
+| Layer | Technology |
+|---|---|
+| Shell | [Tauri 2](https://tauri.app) (Rust) · [React 19](https://react.dev) + TypeScript · [Vite](https://vite.dev) |
+| Core | Rust — crypto, extraction, indexing, jobs, schedules, MCP server |
+| AI engine | Python 3.13 + [LangGraph](https://langchain-ai.github.io/langgraph/), as a bundled localhost sidecar |
+| Storage | [SQLCipher](https://www.zetetic.net/sqlcipher/) (AES-256) via `rusqlite` |
+| Models | [Ollama](https://ollama.com) · Ollama `:cloud` · Claude Code / Codex CLI · [OpenRouter](https://openrouter.ai) |
+| On-device ML | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) on Metal · Apple Vision OCR · TitaNet speaker embeddings (ONNX via `tract`) |
+| Web | WKWebView (the private browser) · [Model Context Protocol](https://modelcontextprotocol.io) connectors |
+| Viewers | PDF.js · docx-preview · SheetJS · Monaco |
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Getting started
+
+### Prerequisites
+
+- **macOS 12 or later, Apple Silicon.**
+- **[Ollama](https://ollama.com)**, for the local AI engine:
+
+  ```sh
+  brew install ollama            # or download it from https://ollama.com
+  ```
+
+  You don't need to start it — the app starts the daemon on demand and stops it
+  after five idle minutes, and never touches a daemon you started yourself.
+
+Dictation, transcription, and OCR need nothing extra: the Whisper voice model
+is bundled inside the app.
+
+### Install the app
+
+1. **[⬇︎ Download the latest DMG](https://github.com/benrben/private-room/releases/latest)**,
+   open it, and drag **Arcelle** into **Applications**.
+2. This build is ad-hoc signed (**not notarized**), so the first time you open
+   it macOS warns *"Apple could not verify 'Arcelle' is free of malware…"*
+   That's expected for an un-notarized app — the full source is in this repo.
+   Clear the download quarantine once, then open it normally:
+
+   ```sh
+   /usr/bin/xattr -cr "/Applications/Arcelle.app"
+   ```
+
+   (Use the full path `/usr/bin/xattr` — a Python `xattr` on your PATH has no
+   `-r` flag.) Rather not use Terminal? Double-click the app, click **Done** on
+   the warning, then **System Settings → Privacy & Security → Open Anyway**.
+
+Prefer to build it yourself? See [Development](#development).
+
+### First run
+
+1. **Create a room.** Pick a password — it *is* the encryption key — and
+   optionally print the one-time recovery key.
+2. **Pick a model.** Arcelle shows a model picker on first launch; choose one
+   (e.g. `qwen3.5:4b`, ~3.4 GB) and it downloads with a progress bar, no
+   Terminal needed.
+3. **Start from a template.** A new room can begin **Blank**, or as **Legal**,
+   **Medical**, **Research**, **Journal**, or a guided **Demo** room with a
+   couple of sample files to try highlighting and `#extract` on — each pre-fills
+   tuned instructions, a few starter memories, and a welcome note. It's all
+   ordinary, editable content; nothing is locked in.
+4. **Drop files in and ask something.** Import is drag-and-drop; indexing runs
+   in the background; answers arrive with citations you can click.
+
+### Staying up to date
+
+Arcelle checks its signed GitHub releases on launch and offers any newer build
+in one click. You can also check on demand from **Settings → App → Updates &
+version** — it downloads the release, verifies its signature, installs it, and
+relaunches into the new version.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Features
+
+### One shell, three panes
 
 The window is a persistent workspace, not a stack of screens. An activity rail
 walks the room's areas — Home, Room Map, Recordings, Workflows, Scripts,
-Memory, Settings — while the workspace splits into three draggable panes:
+Skills, Memory, Connectors, and the private Browser, with Focus and Settings
+pinned at the bottom — while the workspace splits into three draggable panes:
 **Library** (your sources), **Workspace** (the current document), and **AI**
-(Chat, Studio, and a live Activity feed). A status bar always tells the truth:
-which engine is answering, whether it's local or cloud, what's running in the
-background, and what's waiting for your approval. `⌘K` is both room search and
-a command palette that runs real app commands.
+(Chat, Studio, and a live Activity feed). The rail collapses to an icon strip
+or expands to full labels, and the choice sticks per room. A tab strip keeps
+files, areas, and browser pages open side by side; file and area tabs are
+restored with the room, while **browser tabs are deliberately never persisted**
+— a restored list of visited URLs is a history file wearing a different hat.
+
+A status bar always tells the truth: which engine is answering, whether it's
+local or cloud, what's running in the background, and what's waiting for your
+approval. `⌘K` is both room search and a command palette that runs real app
+commands.
 
 ![Room home: continue where you left off, with every capability one click away](docs/screens/home.png)
 
@@ -85,7 +228,7 @@ flows through one token system so both are first-class.
 
 ![The same workspace in the light theme](docs/screens/workspace-light.png)
 
-## What's in a room
+### What's in a room
 
 | | |
 |---|---|
@@ -94,30 +237,41 @@ flows through one token system so both are first-class.
 | **Recordings** | Live meeting capture (mic + system audio) with real-time transcription and automatic speaker identification |
 | **Workflows** | Visual multi-step AI pipelines with schedules, run history, and per-step artifacts |
 | **Scripts** | Runnable Python/JavaScript files with declared inputs and outputs, schedulable like workflows |
+| **Skills** | Folder-shaped `SKILL.md` bundles — reusable procedures the AI loads only when a task calls for them, with their own scripts, references, and assets |
 | **Memory** | Everything the AI remembers about you — a full area with categories, approval flow, and a shared scratch pad |
+| **Connectors** | MCP tool connectors, installed from a live registry or by hand, with per-tool switches and OAuth sign-in |
+| **Browser** | A private browser that persists nothing, blocks ads and trackers, and the assistant can drive on your behalf |
 | **Studio** | Flashcards, mind maps, podcast scripts, and a living room summary, generated as background jobs |
-| **Settings** | Per-room engine and model, creativity, custom instructions, role, Touch ID, dictation, online features, and one-click app updates |
+| **Settings** | Per-room engine and model, creativity, custom instructions, role, Touch ID, dictation, online features, cloud privacy, and one-click app updates |
 
-**Start from a template.** A new room can begin **Blank**, or as **Legal**,
-**Medical**, **Research**, or **Journal** — each pre-fills tuned instructions, a
-few starter memories, and a welcome note. It's all ordinary, editable content;
-nothing is locked in.
-
-## The AI lives in the room
+### The AI lives in the room
 
 The model isn't a chat box bolted on the side — it can act on the room.
+
+**It's a team, not one loop.** Chat is a hub: the Main agent holds no room
+tools at all, only the ability to dispatch **specialists** — files, scripts,
+web, browser, jobs, workflows, skills, connectors, transcription, video,
+studio, and the UI. Each specialist is the same loop wearing a smaller toolbox
+and a sharper prompt (~6 tools on top of a shared core), which is what keeps a
+4B model from drowning in a catalog. Several can run **in parallel** in one
+round, and the AI pane draws the live hub-and-spoke graph as they light up —
+click any node to see what it was asked and what it reported back. A room that
+lacks an ability (web off, for instance) simply has no such specialist, and
+says so plainly instead of quietly handing the question to a different one.
 
 - 👁️ **It can see.** Attach an image with the paperclip and ask about it.
   *"Where is X?"* draws labeled boxes on the image; grounding auto-routes to a
   Qwen-VL model when one is installed. Images are transcoded and downscaled
   before inference, so formats Ollama can't decode just work — and images
   never leave the Mac, even on a cloud engine.
-- 🕹️ **It can drive the app.** The model has tools — `search_room`,
-  `list_room_files`, `open_file` (jumps to a page, cell, or phrase),
-  `mark_image`, `annotate_file`, `create_file`, `edit_file`, `edit_files`,
-  `set_cells`, `add_memory` — so *"open the budget spreadsheet at Q3"*,
-  *"mark the signature in this scan"*, or *"fix the typo in my notes"*
-  actually happen in the UI.
+- 🕹️ **It can drive the app.** Every specialist carries the same core verbs —
+  `search_room`, `list_room_files`, `open_file` (jumps to a page, cell, or
+  phrase), `annotate_file`, `mark_image`, `create_file`, `edit_file`,
+  `edit_files`, `set_cells`, `rename_file`, `move_file`, and the memory verbs
+  (`add_memory`, `update_memory`, `delete_memory`, so a wrong note it wrote
+  isn't permanent) — so *"open the budget spreadsheet at Q3"*, *"mark the
+  signature in this scan"*, or *"fix the typo in my notes"* actually happen in
+  the UI.
 - ✏️ **It can edit files — reliably.** Exact-text replacement with a
   normalization layer (curly quotes, NBSP, CRLF, dash variants) that tolerates
   cosmetic drift but still demands a unique match — a miss fails safely with a
@@ -132,20 +286,40 @@ The model isn't a chat box bolted on the side — it can act on the room.
   including pointed Hebrew against unpointed quotes), anchors to the closest
   match if it's slightly off, and each reply carries a 📍 chip that re-opens
   the highlight.
+- 🌐 **It can browse.** Ask it to look something up and it opens the page in
+  the private browser, reads it, clicks things, fills forms, and can look at
+  the page as a picture with every clickable element numbered — the same
+  numbers it uses when it describes them to you. Take over whenever you like;
+  it says its tools are paused rather than pretending to act. See
+  [The private browser](#the-private-browser).
 - 🗣️ **It can speak.** Answers can be read aloud — per message or for every
-  answer — through the room's voice archetypes. The default voice is Andrew
-  (en-US, multilingual), a **neural synthetic voice, not a human recording**,
-  synthesized by Microsoft's Edge TTS service at +22% rate / −2 Hz pitch and
-  normalized to ≈−16 LUFS; only the sentence being spoken leaves the Mac,
-  and only while speaking is on. Prefer zero network? Settings → Spoken
-  voice switches to the fully on-device macOS voice — which is also the
-  automatic fallback whenever you're offline.
+  answer — through the room's voice archetypes. Voices are **neural synthetic
+  voices, not human recordings**, synthesized by Microsoft's Edge TTS service
+  at +22% rate / −2 Hz pitch and normalized to ≈−16 LUFS; only the sentence
+  being spoken leaves the Mac, and only while speaking is on. The list is read
+  live from the engine's own catalog (322 voices today), grouped by language
+  with a Preview button, so it never goes stale — the default is Andrew
+  (en-US, multilingual). There is no robotic on-device fallback any more:
+  offline, a sentence is simply skipped.
+- 📚 **It learns skills.** A skill is a folder-shaped `SKILL.md` bundle with
+  optional `scripts/`, `references/`, and `assets/` — importable and exportable
+  without being flattened. The assistant sees only enabled skill *names* and
+  triggers up front, then reads the full instructions or one resource when the
+  task actually calls for it. Imported and AI-drafted skills start disabled,
+  and a skill's helper scripts run only after you review and approve their
+  exact content.
 - 🧠 **It remembers — with your approval.** Memory suggestions from
   conversations wait for a yes by default (or flow in automatically if you
   opt in), and everything it knows is visible and editable in the Memory area.
 - 🔎 **It retrieves.** Imported files are chunked, indexed automatically in
   the background, and keyword-scored; the best excerpts travel with your
   question, and sources are shown on each answer.
+- 📊 **It shows you the bill.** A live token-budget bar under the composer
+  shows how full the context window is, segmented by what's filling it —
+  system prompt, history, tool results, skills, file reads — with exact counts
+  behind a click. Running low? **Hand off** summarizes the conversation and
+  continues the same chat on a fresh, much smaller context. Where the engine
+  reports real usage the bar uses it; everywhere else it says it's estimating.
 
 ### Chat commands
 
@@ -164,9 +338,15 @@ model into the right shape:
 | `#transcribe` | Show the transcript of an `@recording` |
 | `#minutes` | Turn a `@recording`'s transcript (or notes) into timeline-style HTML minutes |
 | `#translate` | Translate an `@file` into another language |
+| `#research` | Search the web, save each source into the room, then answer offline from those files |
+| `#checkpoint` | Save a named checkpoint of the whole room (roll back later in Settings) |
 | `#remember` | Save a fact to the room's permanent memory |
 
-## One room, any engine
+Every `#command` reads its **whole** source — a long book or a two-hour
+transcript is walked window by window and merged, and if a window can't be
+read the reply says so instead of quietly covering less.
+
+### One room, any engine
 
 A room picks its engine once, and **every** AI feature honors it — chat, the
 agent, summaries, deep file passes, AI actions, studios, suggestions, and
@@ -184,11 +364,17 @@ workflow steps. No feature quietly falls back to a different brain.
   over a per-question localhost MCP bridge, so the cloud model can search and
   edit room files while decryption stays in-process. The bridge dies when the
   answer returns.
+- **OpenRouter** — paste an API key in Settings and it's validated and stored
+  in the macOS **Keychain**, never in a room file. The model list is the live
+  catalog for *your* account, with search, context windows, and current
+  input/output pricing; filter it by capability (tool calling, vision,
+  reasoning, structured JSON) and use the pick anywhere the room's engine is
+  used. Same streaming, same room and MCP tools, same cloud-privacy door.
 
 Four things intentionally stay on-device no matter the engine: dictation,
 quick local generation, image grounding boxes, and the UI-driving tools.
 
-## Cloud privacy, mechanically enforced
+### Cloud privacy, mechanically enforced
 
 ![Settings → Cloud privacy: the door, the block list, private topics, and scan status](docs/screens/cloud-privacy.png)
 
@@ -219,7 +405,7 @@ room files. Images never leave while the door is on.
 
 ![Cloud view: the exact redacted document a cloud model would receive](docs/screens/cloud-view.png)
 
-### The Leash: let outside agents work in your room
+#### The Leash: let outside agents work in your room
 
 Flip a switch and an unlocked room becomes a local MCP server that agents on
 your Mac — Claude Code, Codex, Claude Desktop, Cursor — can connect to over
@@ -229,7 +415,59 @@ excluded by design). Copy-paste config, per-app approval, and instant
 revocation: regenerate the token or stop the server and live connections are
 severed on the spot. Lock the room and their access dies with it.
 
-## Automate the boring parts
+#### Connectors: bring outside tools in
+
+The Leash lets outside agents into your room; **Connectors** are the other
+direction — outside tools brought to *your* room's AI. The Connectors area
+installs MCP servers by hand or from the public Model Context Protocol registry,
+with filters for verified publishers, local-only, and "no API key needed."
+Browsing that registry is the app's *only* unprompted outbound request, so it
+sits behind an explicit opt-in; nothing about your room is sent, only the
+catalog comes back. A connector that ships both a local package and a hosted
+endpoint installs the **local** one, with a one-tap switch to the cloud
+version. Remote connectors are badged loudly, run their arguments through the
+same redaction door before anything leaves the Mac, and can sign in with OAuth
+(discovery, dynamic registration, and PKCE, through the system browser) without
+leaving the app. Every connector — and every individual tool inside it — has
+its own on/off switch, and installing from the marketplace goes through the
+same approval and content-fingerprint gate as a hand-written config.
+
+### The private browser
+
+A full browser area inside the room, built on a native child webview — so it
+renders exactly what Safari renders and costs the app nothing extra in size.
+
+- **It persists nothing.** No history, no cookies, no cache, no form data, no
+  saved logins — the webview uses a non-persistent data store, so none of it is
+  ever written to disk. The shield in the toolbar is a **live check of the
+  browser's own storage**, not a label.
+- **Ads and trackers die before the request leaves.** A content-blocking rule
+  list is compiled into the webview, so blocked requests are never made.
+- **It can't be a path to this Mac.** Every top-level navigation runs the same
+  public-URL check the fetcher uses, and sub-resources are blocked at the
+  network layer, so addresses on your own computer or home network are refused
+  from the address bar and from inside a page alike. Password fields are fenced
+  off from the assistant entirely.
+- **Tabs, and a search page of its own.** Several pages at once; searching
+  opens a results page built from the same fused multi-engine search, with
+  previews, one-click save into the room, and an on-demand AI summary whose
+  every claim links back to the result it came from.
+- **Downloads through one guarded door.** Clicked downloads and assistant-side
+  saves (a link, a file, a page's media) go through a single funnel — size
+  capped, origin recorded, and tracked as a job you can watch — landing in the
+  room as ordinary encrypted files.
+- **The web forgets; your room remembers.** Every page, click, and consent from
+  the *assistant* is written to a Journal inside the encrypted room, so you can
+  read back exactly what happened — and clear it whenever you like.
+- **Nothing of yours is typed into a page without you saying so.** If the
+  assistant is about to enter text you marked private into a site, it stops and
+  shows you the exact text and the exact site first.
+- **Two switches, and they're yours.** Settings → Online features has the
+  room's master internet switch, and under it two independent abilities for the
+  AI: *search the web* and *use the private browser*. Turn either off and those
+  tools aren't offered at all. The Browser area stays yours either way.
+
+### Automate the boring parts
 
 ![Workflows: describe a pipeline and let the assistant build it](docs/screens/workflows.png)
 
@@ -267,7 +505,7 @@ severed on the spot. Lock the room and their access dies with it.
 
 ![Scripts: real Python files with explicit inputs, outputs, and consent](docs/screens/scripts.png)
 
-## Record the meeting, keep the proof
+### Record the meeting, keep the proof
 
 Record your microphone plus the Mac's system audio (ScreenCaptureKit) and
 watch the transcript build live as people speak — with speakers told apart
@@ -278,7 +516,19 @@ pipeline. If the app dies mid-recording, checkpoints are spliced back together
 the next time the room opens — nothing recorded is lost. Everything stays in
 the encrypted file.
 
-## Memory you can see
+**Speakers split where the voice actually changes.** Most real conversation
+puts two people inside a single spoken phrase, so labeling whole phrases
+collapsed quick back-and-forth into one "Speaker 1". Audio is now re-examined
+in 1.5-second steps and the transcript is cut at the voice change — on our
+meeting test set that took speaker mix-ups from 17.9% to 1.3%. Phantom speakers
+are gone too: a voice has to carry real speech mass before it counts as a
+person, so a couple of seconds of laughter or overlap joins the nearest real
+voice instead of minting a "Speaker 4". A permanent benchmark harness
+(`src-tauri/tests/diar_bench.rs`) scores the shipping pipeline against
+reference meetings with RTTM ground truth, so future changes get measured
+rather than eyeballed.
+
+### Memory you can see
 
 ![Memory: everything the AI remembers, grouped and editable](docs/screens/memory.png)
 
@@ -289,46 +539,7 @@ approval unless you opt into auto-save. A pinned **scratch pad** is one click
 away — a canonical, versioned room file that you and the AI both write, with a
 reconcile banner instead of silent clobbering when you both edit at once.
 
-## On-device by default
-
-Everything that touches your data runs on your Mac, using capabilities that
-are already there.
-
-- **Encryption.** Your password is the SQLCipher key (PBKDF2-derived
-  internally). A wrong password can't read a single byte; there's no backdoor
-  and no cloud reset — the only other way in is a recovery key you chose to
-  print when you created the room. Changing your password re-wraps the
-  recovery code (the old one stops working, and the app shows you the new
-  one).
-- **Touch ID unlock.** Opt in per room and unlock with a fingerprint. The
-  password is sealed in the macOS Keychain behind a `biometryCurrentSet`
-  access control — it never touches the room file or any plain file, and
-  re-enrolling a finger invalidates it.
-- **Checkpoints.** Snapshot the whole room — like a git commit for your
-  `.roomai` — and roll back to any of them. Rollback takes a "before
-  rollback" safety copy first and refuses to run while jobs or recordings are
-  in flight.
-- **OCR for scans.** When a PDF or image has no extractable text, Apple's
-  Vision framework recognizes it (English + Hebrew) entirely on-device.
-  Visual-order Hebrew PDFs — the ones that extract as mirrored gibberish
-  everywhere else — are detected and repaired at import, vowel points and
-  all.
-- **Dictation & transcription.** A Whisper engine is *compiled into* the app
-  (whisper.cpp on Metal) and the release DMG **ships the voice model**, so
-  transcription works offline the moment you open it — no download.
-- **Web is off until you ask.** Search tools aren't even offered to the model
-  until you turn the internet on in **Settings → Online features**. There's no
-  key to paste and no provider to choose: search is built in, and one query fans
-  out to several independent engines at once, merged into a single relevance
-  ranking so a blocked or rate-limited engine just drops out. Fetches run in
-  Rust behind a private-network guard (CGNAT, multicast, reserved ranges, and
-  IPv4-mapped-IPv6 tricks included), responses are capped at 8 MB, and pages
-  are cached in the room.
-- **Honest privacy labels.** The status bar and engine picker always show
-  what's local and what leaves the Mac; cloud is opt-in and labeled at the
-  moment of choice, not buried in settings.
-
-## Files, viewers & organization
+### Files, viewers & organization
 
 Imported files are stored as encrypted blobs and previewed with real viewers —
 all bundled locally, no CDN, no network fetch.
@@ -355,6 +566,51 @@ all bundled locally, no CDN, no network fetch.
 - **Export.** Export any file (byte-identical for originals) or the whole
   room; a one-time notice reminds you that copies leave the encrypted vault.
 
+### On-device by default
+
+Everything that touches your data runs on your Mac, using capabilities that
+are already there.
+
+- **Encryption.** Your password is the SQLCipher key (PBKDF2-derived
+  internally). A wrong password can't read a single byte; there's no backdoor
+  and no cloud reset — the only other way in is a recovery key you chose to
+  print when you created the room. Changing your password re-wraps the
+  recovery code (the old one stops working, and the app shows you the new
+  one).
+- **Touch ID unlock.** Opt in per room and unlock with a fingerprint. The
+  password is sealed in the macOS Keychain behind a `biometryCurrentSet`
+  access control — it never touches the room file or any plain file, and
+  re-enrolling a finger invalidates it.
+- **Checkpoints.** Snapshot the whole room — like a git commit for your
+  `.roomai` — and roll back to any of them. Rollback takes a "before
+  rollback" safety copy first and refuses to run while jobs or recordings are
+  in flight.
+- **OCR for scans.** When a PDF or image has no extractable text, Apple's
+  Vision framework recognizes it (English + Hebrew) entirely on-device.
+  Visual-order Hebrew PDFs — the ones that extract as mirrored gibberish
+  everywhere else — are detected and repaired at import, vowel points and
+  all.
+- **Dictation & transcription.** A Whisper engine is *compiled into* the app
+  (whisper.cpp on Metal) and the release DMG **ships the voice model**, so
+  transcription works offline the moment you open it — no download.
+- **Web is off until you ask.** No online tool is offered to the model — and
+  the browser's address bar refuses to load anything — until you turn the
+  internet on in **Settings → Online features**; then *search the web* and
+  *use the private browser* are two separate switches under it. There's no key
+  to paste and no provider to choose: search is built in, and one query fans
+  out to seven independent engines at once, merged into a single relevance
+  ranking so a blocked or rate-limited engine just drops out, with each hit
+  carrying the engine that found it. Fetches run in Rust behind a
+  private-network guard (CGNAT, multicast, reserved ranges, and
+  IPv4-mapped-IPv6 tricks included), responses are capped at 8 MB, arrive a
+  bounded chunk at a time so one heavy page can't blow the model's context,
+  and pages are cached in the room.
+- **Honest privacy labels.** The status bar and engine picker always show
+  what's local and what leaves the Mac; cloud is opt-in and labeled at the
+  moment of choice, not buried in settings.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
 ## How it works
 
 ```mermaid
@@ -363,21 +619,25 @@ flowchart LR
         DB[("SQLCipher · AES-256<br/>files · chats · memory<br/>recordings · versions")]
     end
     subgraph app ["Arcelle.app"]
-        UI["React shell<br/>rail · three panes · status bar"]
+        UI["React shell<br/>rail · tabs · three panes · status bar"]
         CORE["Rust core — Tauri<br/>crypto · extraction · indexing<br/>jobs · schedules · MCP server"]
-        AI["AI engine sidecar<br/>Python · LangGraph<br/>agent · summaries · studios"]
+        AI["AI engine sidecar<br/>Python · LangGraph<br/>hub + domain specialists<br/>summaries · studios"]
         LOCAL["On-device: whisper.cpp<br/>Vision OCR · TitaNet"]
+        WEB["Private browser<br/>child webview · no disk state"]
     end
     OLLAMA["Ollama<br/>local models"]
-    CLIS["Claude Code / Codex CLI<br/>your own account, opt-in"]
+    CLIS["Claude Code / Codex CLI / OpenRouter<br/>your own account, opt-in"]
+    MCP["Connectors (MCP)<br/>local packages · remote + OAuth"]
     AGENTS["Outside agents via the Leash<br/>Claude Desktop · Cursor — loopback only"]
 
     UI <--> CORE
     CORE <--> DB
     CORE <--> AI
     CORE <--> LOCAL
+    CORE <--> WEB
     AI <--> OLLAMA
     AI -. "opt-in, labeled" .-> CLIS
+    AI -. "per-tool switches" .-> MCP
     AGENTS -. "bearer token + per-app approval" .-> CORE
 ```
 
@@ -395,10 +655,10 @@ flowchart LR
    it's indexed like any other file.
 
 The sidecar binds to localhost only, never sees the room key, and is spawned,
-health-checked, and shut down by the app. Its behavior is covered by 600+
+health-checked, and shut down by the app. Its behavior is covered by 1,500+
 tests across Rust and Python.
 
-## Engineered for a 4B model
+### Engineered for a 4B model
 
 Arcelle targets a 4B local model on a 16 GB Mac — small enough to run
 comfortably, small enough to wander. So judgment lives in deterministic Rust,
@@ -420,69 +680,54 @@ not in the model's good intentions:
 - **Cache-stable prompts.** The system prompt is kept KV-cache-stable so warm
   replies stay fast.
 
-## Download
-
-**[⬇︎ Download the latest DMG](https://github.com/benrben/private-room/releases/latest)** — macOS 12 or later, Apple Silicon.
-
-1. Open the `.dmg` and drag **Arcelle** into **Applications**.
-2. This build is ad-hoc signed (**not notarized**), so the first time you open
-   it macOS warns *"Apple could not verify 'Arcelle' is free of malware…"*
-   That's expected for an un-notarized app — the full source is in this repo.
-   Clear the download quarantine once, then open it normally:
-
-   ```sh
-   /usr/bin/xattr -cr "/Applications/Arcelle.app"
-   ```
-
-   (Use the full path `/usr/bin/xattr` — a Python `xattr` on your PATH has no
-   `-r` flag.) Rather not use Terminal? Double-click the app, click **Done** on
-   the warning, then **System Settings → Privacy & Security → Open Anyway**.
-3. Install the local AI engine — **Ollama**:
-
-   ```sh
-   brew install ollama            # or get it from https://ollama.com
-   ```
-
-   That's it — the app starts and stops the Ollama daemon itself. On first
-   launch Arcelle shows a **model picker** — choose one (e.g.
-   `qwen3.5:4b`, ~3.4 GB) and it downloads with a progress bar, no Terminal
-   needed. Dictation, transcription, and OCR need nothing extra — the Whisper
-   voice model is **bundled in the app**.
-
-**Staying up to date.** Arcelle checks its signed GitHub releases on
-launch and offers any newer build in one click. You can also check on demand
-from **Settings → App → Updates & version** — it downloads the release,
-verifies its signature, installs it, and relaunches into the new version.
-
-Prefer to build it yourself? See [Development](#development).
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Development
 
+Requires **Rust**, **Node**, [**uv**](https://docs.astral.sh/uv/) (builds and
+runs the Python sidecar), and [**Ollama**](https://ollama.com). Pull a model
+from inside the app (Settings → Model manager) or `ollama pull qwen3.5:4b`.
+
 ```sh
+git clone https://github.com/benrben/private-room.git
+cd private-room
 npm install
 npm run tauri dev            # run the app
 npm run tauri build          # build Arcelle.app + DMG (registers .roomai)
-cd src-tauri && cargo test   # Rust: encryption, extraction, routing (347 tests)
-cd sidecar && pytest tests   # Python: the AI engine sidecar (415 tests)
-npm run e2e                  # headless end-to-end smoke test (mock model)
-npm run build && node qa/make-qa.mjs && npx vite preview
-                             # → open /qa.html: full UI in a browser w/ mock IPC
 ```
 
-Requires: Rust, Node, [uv](https://docs.astral.sh/uv/) (builds and runs the
-Python sidecar), and [Ollama](https://ollama.com). Pull a model from inside
-the app (Settings → Model manager) or `ollama pull qwen3.5:4b`. Release
-builds bundle the Whisper voice model — see [RELEASING.md](RELEASING.md) for
-the one-time fetch, signing, and the full release pipeline.
+Release builds bundle the Whisper voice model — see
+[RELEASING.md](RELEASING.md) for the one-time fetch, signing, and the full
+release pipeline.
 
-**Stack:** Tauri 2 (Rust) · React 19 + TypeScript · Python 3.13 + LangGraph ·
-SQLCipher (AES-256) · Ollama · whisper.cpp · Apple Vision · TitaNet (ONNX).
+### Repository layout
 
-Related docs: [RELEASING.md](RELEASING.md) (release pipeline),
-[CHANGELOG.md](CHANGELOG.md) (what shipped when),
-[e2e/](e2e/README.md) (smoke test), [art/](art/README.md) (brand assets).
+| Path | What's in it |
+|---|---|
+| [src/](src/) | React + TypeScript shell — panes, viewers, areas, chat |
+| [src-tauri/](src-tauri/) | Rust core — crypto, extraction, indexing, jobs, browser, MCP server |
+| [sidecar/](sidecar/) | Python + LangGraph AI engine (agents, workflows, studios) |
+| [e2e/](e2e/README.md) | End-to-end suites (real app, and browser-hosted UI with mock IPC) |
+| [qa/](qa/) | Manual QA harness and the every-button UA checklist |
+| [docs/](docs/) | Badges, banner, and product screenshots |
+| [art/](art/README.md) | Master brand artwork and the asset-generation pipeline |
+| [scripts/](scripts/) | Signing and release automation |
 
-## Design
+### Tests
+
+```sh
+cd src-tauri && cargo test          # Rust: crypto, extraction, routing, browser (571 tests)
+cd sidecar   && uv run pytest tests # Python: the AI engine sidecar (988 tests)
+npm run test:page                   # the browser page-script contract (39 tests)
+npm run e2e                         # headless end-to-end smoke test (mock model)
+npm run build && node qa/make-qa.mjs && npx vite preview
+                                    # → open /qa.html: full UI in a browser w/ mock IPC
+```
+
+> **Note:** use `uv run pytest` inside `sidecar/` — a bare `pytest` picks up
+> the wrong environment.
+
+### Design system
 
 The brand is a violet keyhole-doorway on ink — private, sealed, calm. Every
 color in the app flows through CSS custom properties
@@ -505,6 +750,8 @@ the interface stays monochrome and consistent and the violet accent is reserved
 for selected and primary actions. Master artwork and the asset-generation
 pipeline live in [`art/`](art/README.md).
 
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
 ## Roadmap
 
 Shipped since the first cut:
@@ -514,9 +761,16 @@ Shipped since the first cut:
 - [x] Room templates (Legal, Medical, Research, Journal)
 - [x] Room-as-MCP-server for other AI tools, with per-app approval (the Leash)
 - [x] Workflows, runnable room scripts, and background studios
-- [x] Live meeting recording with speaker identification
-- [x] Engine parity: Ollama, `:cloud`, Claude Code, and Codex CLI everywhere
-- [x] Light theme and the three-pane shell
+- [x] Live meeting recording with speaker identification, split at the voice change
+- [x] Engine parity: Ollama, `:cloud`, Claude Code, Codex CLI, and OpenRouter everywhere
+- [x] Light theme, the three-pane shell, and workspace tabs
+- [x] Cloud privacy: mechanical redaction at every exit, with a per-file Cloud view
+- [x] Skills — portable `SKILL.md` bundles the AI loads only when needed
+- [x] A connector marketplace for MCP tools, with OAuth sign-in
+- [x] Built-in multi-engine web search (no key, no provider to pick)
+- [x] The private browser, driveable by the assistant, with downloads and tabs
+- [x] A hub of domain specialists that run in parallel, drawn live in the AI pane
+- [x] The token-budget bar and one-click conversation handoff
 
 Next:
 
@@ -524,3 +778,64 @@ Next:
 - [ ] In-place `.xlsx` editing beyond single cells, and DOCX export
 - [ ] Notarized releases (Developer ID)
 - [ ] Windows port (Tauri)
+
+See the [open issues](https://github.com/benrben/private-room/issues) for
+everything else on the pile, and [CHANGELOG.md](CHANGELOG.md) for what shipped
+when.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Contributing
+
+Bug reports, reproductions, and ideas are genuinely useful — please
+[open an issue](https://github.com/benrben/private-room/issues/new). If you'd
+like to send code:
+
+1. Fork the repo and create a branch (`git checkout -b feature/thing`).
+2. Make the change, and add a test next to the code you touched.
+3. Keep every suite green — `cargo test`, `uv run pytest tests`,
+   `npm run test:page`, and `npm run build` (which type-checks).
+4. Open a pull request describing the behavior change, not just the diff.
+
+User-facing changes belong in [CHANGELOG.md](CHANGELOG.md), written the way
+the rest of it is: what you can now do, in plain language.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## License
+
+This repository does not carry an open-source license yet, so default
+copyright applies: the source is published so you can read it, audit it, and
+build the app for yourself. If you want to reuse any of it,
+[ask first](https://github.com/benrben/private-room/issues/new) — happy to
+talk.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Contact & support
+
+- **Bugs and feature requests:** [GitHub issues](https://github.com/benrben/private-room/issues)
+- **Project:** [github.com/benrben/private-room](https://github.com/benrben/private-room)
+- **Releases:** [latest DMG and release notes](https://github.com/benrben/private-room/releases)
+
+Related docs: [RELEASING.md](RELEASING.md) (release pipeline),
+[CHANGELOG.md](CHANGELOG.md) (what shipped when),
+[e2e/README.md](e2e/README.md) (test suites),
+[art/README.md](art/README.md) (brand assets).
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Acknowledgments
+
+Arcelle stands on a lot of other people's work:
+
+- [Tauri](https://tauri.app) and [wry](https://github.com/tauri-apps/wry) — the shell and the webviews
+- [SQLCipher](https://www.zetetic.net/sqlcipher/) — encryption at rest
+- [Ollama](https://ollama.com) — local model serving
+- [LangGraph](https://langchain-ai.github.io/langgraph/) — the agent engine
+- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — on-device speech-to-text
+- [NVIDIA NeMo TitaNet](https://catalog.ngc.nvidia.com/models) and [tract](https://github.com/sonos/tract) — speaker embeddings
+- [PDF.js](https://mozilla.github.io/pdf.js/), [SheetJS](https://sheetjs.com), [docx-preview](https://github.com/VolodymyrBaydalka/docxjs), [Monaco](https://microsoft.github.io/monaco-editor/) — the viewers
+- [Model Context Protocol](https://modelcontextprotocol.io) — the tool bridge in both directions
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>

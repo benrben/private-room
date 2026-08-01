@@ -12,11 +12,15 @@ as React components in `src/icons.tsx`; the favicon is `public/logo.svg`.
 | `dmg-bg.svg` | `src-tauri/dmg-background.tiff` | render at 660×400 and 1320×800, then `tiffutil -cathidpicheck a.png b.png -out …` |
 | `banner.svg` | `docs/banner.png` (README banner) | render at 2560×1280 |
 
-`private-room-productivity-witness-protection.mp4` is the 74-second launch
-video (1080p): "one job, seven apps" → product tour → the chaos enters
-witness protection. Its end-card poster frame is `docs/video-poster.png`,
+`arcelle-30-second-publish-master.mp4` is the 30-second launch video (1080p):
+"your AI tools are excellent" → "the handoff is still your job" → product
+beats → the "Work with context." end card. That end card is the poster frame
+`docs/video-poster.png` (`ffmpeg -ss 29.8 -i <mp4> -frames:v 1 -vf scale=1280:-2`),
 which the README links to the raw mp4; the video is also attached to GitHub
-releases as an asset.
+releases as an asset. It replaced the pre-rebrand 74-second
+`private-room-productivity-witness-protection.mp4`, removed in 8dbcba6 —
+re-generate the poster whenever the master video changes, or the README's
+front-page card goes stale.
 
 The README badge pills (`docs/badge-*.svg`) are hand-authored SVGs, not
 generated — edit them directly, keeping the pill recipe: `#161a22` fill,
