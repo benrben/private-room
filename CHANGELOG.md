@@ -3,6 +3,66 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.15.0 — 2026-08-02
+
+A repair release. The whole app was read end to end — every Rust, Python and
+TypeScript file — and the 484 problems that turned up were fixed. Most of them
+you will never notice, which is the point. These are the ones you will.
+
+### Your unsaved work stops disappearing
+
+- **Nothing closes over unsaved edits any more.** Closing the window, quitting,
+  locking the room, opening a new tab, switching tabs, closing a tab — all
+  twelve ways out now stop and ask you first. Several of them used to throw
+  away whatever you had typed without a word.
+- **Locking no longer cuts off an answer mid-sentence.** If the assistant is
+  still writing when you lock, you get asked before it is stopped.
+- **Keyboard shortcuts that never fired now fire.** Next and previous tab
+  (⇧⌘] and ⇧⌘[) were listening for the wrong key the whole time. Jump to a
+  tab by position is ⌥⌘1 through ⌥⌘9. ⌘1/2/3 still show and hide the panes,
+  and nothing else steals them.
+- **Closing a tab closes the file it was showing**, instead of leaving it
+  open and invisible.
+
+### Documents behave
+
+- **Spreadsheets stop eating your formulas.** Clicking into a formula cell and
+  clicking away used to overwrite the formula with the text `=SUM(...)`.
+  Nothing is written unless you actually change something, and typing a formula
+  into a cell now tells you plainly that it is not supported instead of quietly
+  storing it as text. Blank rows no longer shift every row below them.
+- **PDF citations highlight every time.** Following a second citation in a PDF
+  you already had open used to scroll to the right place and highlight nothing.
+  Find-in-page highlights also survive scrolling away and back.
+- **Recordings say what they will do.** A recording that already has audio
+  offers "Continue recording", and continuing genuinely appends rather than
+  starting over. Exported subtitles are cut on the right timings.
+
+### The window survives a bad panel
+
+- **One broken panel no longer blanks the whole app.** A crash inside a viewer,
+  the chat or the browser is now caught and shown in place, with everything
+  else still working and a button to reload just that piece.
+
+### Around the code
+
+- **The app carries a licence** (MIT), a security policy, and automated checks
+  that run on every change.
+- **One command now checks a release before it ships.** All six version files,
+  the changelog, the bundled models, and every test suite — after 0.14.0 went
+  out with a stale lockfile inside it.
+- **The signature covers the whole bundle.** The offline command-line tool
+  shipped inside the app was signed after the app was sealed, which invalidated
+  the seal; macOS could refuse to open the result.
+- The test suites roughly doubled: 738 on the app, 1,241 on the AI service,
+  85 on the page scripts.
+
+*Not yet:* an update is still a ~600 MB download, because the speech model
+ships inside the app. Making it download on first use like every other model is
+real work and is not done — and the shortcut version of that fix silently broke
+transcription in an unreleased build, so it stays as it is until the real one
+exists.
+
 ## 0.14.0 — 2026-08-01
 
 ### Recordings finally split speakers where they actually change
