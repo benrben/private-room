@@ -412,8 +412,13 @@ async def test_live_seam_single_tool_run():
     # `node` names the emitting agent's graph slot — the ONLY way to attribute a
     # step once siblings run concurrently and their events interleave.
     assert step_status == {"t": "step_status", "ok": True, "node": "files.read#0"}
-    for d in [e for e in events if e["t"] == "delta"]:
-        assert set(d.keys()) == {"t", "v"} and isinstance(d["v"], str)
+    # `delta` and `round` carry the same optional `node` stamp `step` does — the
+    # host reads only `t`/`v` (`str_v`), so the extra key is inert there, and it
+    # is what lets a consumer say WHOSE words these are. (Updated 2026-08-01;
+    # this asserted the key set was exactly {"t","v"}.)
+    for d in [e for e in events if e["t"] in ("delta", "round")]:
+        assert set(d.keys()) <= {"t", "v", "node"}
+        assert d["t"] == "round" or isinstance(d["v"], str)
 
     # (d) The worker's report streams, then the Main agent's answer streams —
     #     the frontend clears live text on each "round", so the user sees only

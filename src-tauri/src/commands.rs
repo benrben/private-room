@@ -95,15 +95,26 @@ pub(crate) const MAX_CONTEXT_CHUNKS: usize = 6;
 /// vector-only (synonym) chunk can surface above weak keyword hits.
 pub(crate) const RETRIEVE_CANDIDATES: usize = MAX_CONTEXT_CHUNKS * 4;
 pub(crate) const MAX_ATTACHED_IMAGES: usize = 4;
-pub(crate) const MAX_HISTORY_MESSAGES: usize = 12;
-/// The AGENT path's fetch bound, deliberately separate from
-/// `MAX_HISTORY_MESSAGES`. 12 rows starved it: with the byte budget below, a
-/// technical conversation kept only 3-8 messages. This is only a fetch bound —
-/// `history_budget_bytes` decides what is actually sent.
+/// The hand-off's fetch bound (`handoff_chat`) — deliberately IDENTICAL to
+/// `AGENT_HISTORY_MESSAGES`, not a smaller sibling of it.
 ///
-/// NOT shared with the `#command` path: `format_history` there builds
-/// oldest-first and clamps the HEAD, so raising its row count would hand those
-/// flows the OLDEST 8 KB and silently drop the recent conversation.
+/// It was 12 while an ordinary turn already read 200, and the marker a hand-off
+/// writes is a hard cut-off: `db::recent_messages` starts every later turn at
+/// the newest marker. So in a long conversation the recap summarized only the
+/// last dozen messages and then made everything before them unreachable — no
+/// warning, no undo. A recap has to cover at least as much as the turn it is
+/// replacing.
+pub(crate) const MAX_HISTORY_MESSAGES: usize = AGENT_HISTORY_MESSAGES;
+/// The AGENT path's fetch bound. 12 rows starved it: with the byte budget
+/// below, a technical conversation kept only 3-8 messages. This is only a fetch
+/// bound — `history_budget_bytes` decides what is actually sent.
+///
+/// NOT shared with the `#command` path: those read the WHOLE conversation since
+/// the last hand-off (`recent_messages(conn, chat, -1)`, SQLite's "no limit")
+/// and window it at the point of use, because `#minutes` on a discussion has to
+/// see all of it. (The note that used to sit here — that `format_history`
+/// clamps the HEAD, so a bigger row count would hand those flows the oldest
+/// 8 KB — described the pre-"full ops" behaviour; it clamps nothing now.)
 pub(crate) const AGENT_HISTORY_MESSAGES: usize = 200;
 /// Upper bound on the hand-off, and now the ONLY one — see
 /// `history_budget_bytes` for the measurement that removed the rest.
@@ -424,6 +435,12 @@ pub struct RecentRoom {
     // and simply show no timestamp).
     #[serde(default)]
     pub opened_at: Option<i64>,
+    /// True when nothing is at `path` any more — the file was moved, deleted,
+    /// or sits on a drive that isn't plugged in. Recomputed by `list_recent` on
+    /// every read; the copy that lands in recent.json is only ever a stale
+    /// cache, never the answer.
+    #[serde(default)]
+    pub missing: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -616,17 +633,50 @@ pub(crate) fn info_of(app: &tauri::AppHandle, room: &Room) -> Result<RoomInfo, S
     })
 }
 
+/// Folders directly under the home directory that a sync client creates by
+/// default. `Library/CloudStorage/` covers the modern File-Provider clients
+/// (Dropbox, Google Drive, OneDrive, Box); these are the ones that still sync a
+/// plain home folder, including the clients that never used a File Provider at
+/// all (Syncthing, Resilio, pCloud, Nextcloud).
+pub(crate) const SYNCED_HOME_FOLDERS: &[&str] = &[
+    "Dropbox",
+    "Google Drive",
+    "OneDrive",
+    "Box",
+    "Box Sync",
+    "Sync", // Syncthing's default folder, and Sync.com
+    "Resilio Sync",
+    "BTSync",
+    "pCloud Drive",
+    "pCloudDrive",
+    "Nextcloud",
+    "ownCloud",
+    "Seafile",
+    "MEGA",
+    "MEGAsync",
+    "Tresorit",
+    "Yandex.Disk",
+    "Creative Cloud Files",
+];
+
 /// True when the room file lives under a known cloud-sync root — databases and
 /// file sync are a dangerous mix, so the UI warns once (HLT-6). Covers iCloud
 /// (`Library/Mobile Documents`), modern `Library/CloudStorage/` (Dropbox,
-/// Google Drive, OneDrive), and legacy `~/Dropbox`.
+/// Google Drive, OneDrive, Box), and the plain home folders in
+/// [`SYNCED_HOME_FOLDERS`] — which used to be `~/Dropbox` alone, so a room in
+/// `~/Sync` (Syncthing) or `~/pCloudDrive` was silently unwarned.
 pub(crate) fn is_synced_path(path: &str) -> bool {
     if path.contains("Library/Mobile Documents") || path.contains("Library/CloudStorage/") {
         return true;
     }
     if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() && path.starts_with(&format!("{home}/Dropbox")) {
-            return true;
+        let home = home.trim_end_matches('/');
+        if !home.is_empty() {
+            // The trailing separator matters: `~/Dropboxes/room` is not in
+            // Dropbox, and the room file is always INSIDE one of these.
+            return SYNCED_HOME_FOLDERS
+                .iter()
+                .any(|folder| path.starts_with(&format!("{home}/{folder}/")));
         }
     }
     false
@@ -760,5 +810,35 @@ pub(crate) fn embed_chunks_by_keyword(conn: &Connection, keyword: &str) {
             [0.0f32, 1.0]
         };
         db::set_chunk_embedding(conn, &id, &db::embedding_to_blob(&v)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_warning_covers_more_than_dropbox_and_icloud() {
+        // HLT-6 warned about iCloud, CloudStorage and ~/Dropbox only, so a room
+        // in Syncthing's or pCloud's folder got no warning at all.
+        assert!(is_synced_path("/Users/x/Library/Mobile Documents/room.roomai"));
+        assert!(is_synced_path("/Users/x/Library/CloudStorage/Dropbox/room.roomai"));
+        let home = std::env::var("HOME").expect("HOME is set on macOS");
+        for folder in ["Dropbox", "Sync", "pCloudDrive", "Resilio Sync", "Nextcloud"] {
+            let path = format!("{home}/{folder}/room.roomai");
+            assert!(is_synced_path(&path), "{path} must warn");
+        }
+        // A folder that merely starts with a sync folder's name does not.
+        assert!(!is_synced_path(&format!("{home}/Dropboxes/room.roomai")));
+        assert!(!is_synced_path(&format!("{home}/Documents/room.roomai")));
+    }
+
+    #[test]
+    fn the_hand_off_reads_as_much_as_an_ordinary_turn() {
+        // A hand-off's marker is a hard cut-off for every later turn, so a
+        // recap that saw fewer messages than a turn does silently drops the
+        // rest of the conversation for good. It used to read 12 against 200.
+        assert!(MAX_HISTORY_MESSAGES >= AGENT_HISTORY_MESSAGES);
+        assert!(MAX_HISTORY_MESSAGES > 12);
     }
 }

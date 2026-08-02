@@ -174,7 +174,7 @@ class Engine:
         turn = self.turns.get(who, 0)
         self.turns[who] = turn + 1
         usage = RoundUsage(
-            input_tokens=None, output_tokens=None, max_context=8192, is_real=False
+            input_tokens=None, max_context=8192, is_real=False
         )
 
         steps = self.script.get(who, [])

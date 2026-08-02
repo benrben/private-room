@@ -12,7 +12,13 @@
  * pixels, and what makes a coverage gap countable rather than a hunch.
  *
  *   npm run capture                  # the full matrix
- *   SKIP_BUILD=1 CAPTURE_SMOKE=1 npm run capture   # a few shots, to check wiring
+ *   SKIP_BUILD=1 CAPTURE_SMOKE=1 npm run capture   # a slice, to check wiring
+ *
+ * CAPTURE_SMOKE narrows every list (two areas, one theme, one size, two files)
+ * but still runs EVERY spec, because the wiring worth checking is the
+ * selectors — a renamed button drops its screens silently, and a smoke run
+ * that skipped seven of the eight specs could not see that. It prints the
+ * coverage it did not reach instead of failing on it; the full run throws.
  */
 
 import fs from "node:fs";
@@ -26,7 +32,13 @@ const MANIFEST = path.join(OUT, "_shots.jsonl");
 
 const SMOKE = !!process.env.CAPTURE_SMOKE;
 
-/** The eight product areas, by their stable `data-area` attribute. */
+/** The nine product areas, by their stable `data-area` attribute.
+ *
+ * The Browser was the missing ninth: the mock answered none of its commands,
+ * so the area could not be walked at all and the dataset had no picture of it.
+ * It contributes its `full` shot like any other area — its start screen is
+ * static, so `empty`/`loading`/`error` are reported as unreached below for the
+ * same reason the Recordings start screen is. */
 const AREAS = [
   ["home", "Room home"],
   ["map", "Room Map"],
@@ -36,6 +48,7 @@ const AREAS = [
   ["skills", "Skills"],
   ["memory", "Memory & scratch pad"],
   ["connectors", "Connectors"],
+  ["browser", "Private browser"],
 ];
 
 /** Every visual state a pane can be in — not just the stocked one. */
@@ -62,8 +75,41 @@ const FILES = [
   ["Product review.m4a", "recording"],
 ];
 
+/** Every Settings page, by the label the nav actually renders. */
+const SETTINGS_PAGES = [
+  "AI & behavior",
+  "Voice",
+  "Privacy & recovery",
+  "Connections",
+  "History & storage",
+  "App",
+];
+
+/** Pane-layout shots: the toggle to press, and what the result depicts. */
+const LAYOUT_TOGGLES = [
+  ['button[aria-label="Toggle the Library pane (⌘1)"]', "library pane hidden"],
+  ['button[aria-label="Toggle the AI and Studio pane (⌘3)"]', "AI pane hidden"],
+  ['button[aria-label="Focus the editor — hide both side panes"]', "focus mode"],
+];
+
+const PALETTE_DETAILS = ["command palette open", "command palette with results"];
+const CHROME_DETAILS = ["rail collapsed", "rail expanded"];
+const CHAT_DETAILS = ["agents starting", "agent running", "agents done"];
+
+/** The room's stock content, by the name the mock always serves. A pane that
+ * still lists these is a FULL pane — whatever state was asked for. */
+const STOCK = FILES.map(([name]) => name.replace(/\.[^.]+$/, ""));
+
+/** Trim a list down for the smoke run, which is about wiring, not breadth. */
+const few = (list, n) => (SMOKE ? list.slice(0, n) : list);
+
 let n = 0;
 const shots = [];
+/** `state/area` pairs whose screenshot was NOT taken because the state never
+ * reached the pane — deduplicated, since the same pair recurs once per theme
+ * and window size. Reported at the end: a missing shot is recoverable, a
+ * mislabelled one silently teaches the model the wrong thing. */
+const unreached = new Set();
 
 function ensureDirs() {
   fs.rmSync(OUT, { recursive: true, force: true });
@@ -112,6 +158,35 @@ async function goArea(area) {
   return true;
 }
 
+/** The area's own pane — the subject of a `kind: "area"` shot — as text. */
+async function paneText() {
+  const pane = await $(".pane-center");
+  if (!(await pane.isExisting())) return "";
+  return (await pane.getText()).replace(/\s+/g, " ").trim();
+}
+
+/** Why this pane does NOT show the state that was asked for, or `null` if it
+ * does.
+ *
+ * `?qa_state=` only reaches commands `qa/qa-mock.js` recognises as reads. It
+ * used to recognise them by name prefix alone, so `front_page`, `room_graph`
+ * and `mcp_status` sailed through and the pane came back fully stocked while
+ * the manifest said "empty", "loading" or "error". A mislabelled screenshot is
+ * worse than a missing one: the whole point of this dataset is that the
+ * manifest line is true of the pixels. Both rules below are evidence, not
+ * heuristics — an identical pane cannot have changed state, and a pane still
+ * listing the room's files is not an empty, pending or failed one.
+ *
+ * A pane with no data of its own (the Recordings start screen, today) is
+ * identical in all four states and is skipped for the same reason: there is no
+ * such thing as a picture of it loading. */
+function whyNotShowing(text, full) {
+  if (text === full) return "the pane is identical to the full state";
+  const stock = STOCK.filter((name) => text.includes(name));
+  if (stock.length) return `the pane still lists ${stock.join(", ")}`;
+  return null;
+}
+
 describe("capture the app's screens", () => {
   before(ensureDirs);
 
@@ -131,6 +206,7 @@ describe("capture the app's screens", () => {
     const themes = tally("theme");
     const areas = tally("area");
     const viewers = tally("viewer");
+    const details = tally("detail");
     console.log(`\ncaptured ${shots.length} shots -> ${OUT}`);
     for (const [name, t] of [
       ["kind", kinds],
@@ -138,8 +214,23 @@ describe("capture the app's screens", () => {
       ["theme", themes],
       ["area", areas],
       ["viewer", viewers],
+      ["detail", details],
     ]) {
       console.log(`${name}: ${JSON.stringify(t)}`);
+    }
+    if (unreached.size) {
+      console.log(
+        `\n${unreached.size} area/state combinations were NOT captured — the ` +
+          `state never reached the pane, so the label would have contradicted ` +
+          `the pixels:`,
+      );
+      for (const line of unreached) console.log(`  ${line}`);
+      console.log(
+        `  why: either that pane has no data of its own (a static start screen ` +
+          `has no empty, pending or failed look), or its loader is not one ` +
+          `qa/qa-mock.js counts as a read — see the EXTRA_READS set there, ` +
+          `which is what ?qa_state= acts on.`,
+      );
     }
 
     // THE COVERAGE CONTRACT. A capture that quietly comes up short is the
@@ -147,6 +238,10 @@ describe("capture the app's screens", () => {
     // green having captured ZERO viewers, because one selector matched nothing
     // and the loop moved on. Checking each expected bucket is non-empty catches
     // that class of gap, not just the instances someone remembered to guard.
+    //
+    // `detail` is in here for the same reason as `viewer`: every `continue` on
+    // a missing selector above is a screen dropping silently out of the set,
+    // and a renamed Settings page or layout toggle takes its shots with it.
     const missing = [];
     const want = {
       kind: ["area", "viewer", "settings", "overlay", "layout", "chrome", "chat"],
@@ -154,31 +249,64 @@ describe("capture the app's screens", () => {
       theme: THEMES,
       area: AREAS.map(([k]) => k),
       viewer: FILES.map(([, v]) => v),
+      detail: [
+        ...SETTINGS_PAGES,
+        ...PALETTE_DETAILS,
+        ...LAYOUT_TOGGLES.map(([, d]) => d),
+        ...CHROME_DETAILS,
+        ...CHAT_DETAILS,
+      ],
     };
-    const got = { kind: kinds, state: states, theme: themes, area: areas, viewer: viewers };
+    const got = {
+      kind: kinds,
+      state: states,
+      theme: themes,
+      area: areas,
+      viewer: viewers,
+      detail: details,
+    };
     for (const [dim, expected] of Object.entries(want)) {
       for (const key of expected) if (!got[dim][key]) missing.push(`${dim}=${key}`);
     }
-    if (missing.length) {
-      throw new Error(
-        `capture is missing coverage for: ${missing.join(", ")} — ` +
-          `a calibration set with these gaps reports that machinery as unused`,
-      );
-    }
+    if (!missing.length) return;
+    const complaint =
+      `capture is missing coverage for: ${missing.join(", ")} — ` +
+      `a calibration set with these gaps reports that machinery as unused`;
+    // The smoke run captures a deliberate slice of the matrix, so the contract
+    // cannot hold there — but printing it keeps the smoke honest about what it
+    // did NOT look at, instead of failing the documented command every time.
+    if (SMOKE) console.log(`\n[smoke] ${complaint}`);
+    else throw new Error(complaint);
   });
 
   it("every area, in every state, in both themes, at three window sizes", async () => {
-    const areas = SMOKE ? AREAS.slice(0, 2) : AREAS;
-    const states = SMOKE ? ["full", "empty"] : STATES;
-    const themes = SMOKE ? ["dark"] : THEMES;
-    const sizes = SMOKE ? [VIEWPORTS[0]] : VIEWPORTS.slice(0, 3);
+    const areas = few(AREAS, 2);
+    // Every STATE, even in the smoke run: the wiring most likely to be broken
+    // is the `?qa_state=` plumbing itself, and a pass that never asks for
+    // `loading` or `error` cannot see it.
+    const themes = few(THEMES, 1);
+    const sizes = few(VIEWPORTS.slice(0, 3), 1);
+    /** area -> its pane in the `full` state, to tell a real empty/loading/
+     *  error pane from one the state never reached. STATES[0] is "full", so
+     *  this is always filled in before it is read. */
+    const stocked = new Map();
     for (const [w, h] of sizes) {
       await browser.setWindowSize(w, h);
       for (const theme of themes) {
-        for (const state of states) {
+        for (const state of STATES) {
           for (const [area, label] of areas) {
             await open({ state, theme });
             if (!(await goArea(area))) continue;
+            const text = await paneText();
+            if (state === "full") {
+              stocked.set(area, text);
+            } else {
+              const why = whyNotShowing(text, stocked.get(area));
+              if (why) {
+                unreached.add(`${state} never reached ${area} — ${why}`);
+                continue;
+              }
+            }
             await shoot({ kind: "area", area, label, state, theme, w, h });
           }
         }
@@ -188,14 +316,13 @@ describe("capture the app's screens", () => {
   });
 
   it("settings, every page, both themes", async () => {
-    if (SMOKE) return;
-    for (const theme of THEMES) {
+    for (const theme of few(THEMES, 1)) {
       await open({ theme });
       const gear = await $('button[aria-label="Open room settings (⌘,)"]');
       if (!(await gear.isExisting())) continue;
       await gear.click();
       await browser.pause(500);
-      for (const page of ["AI & behavior", "Voice", "Privacy & recovery", "Connections"]) {
+      for (const page of few(SETTINGS_PAGES, 2)) {
         const tab = await $(".settings-nav").$(`button*=${page}`);
         if (!(await tab.isExisting())) continue;
         await tab.click();
@@ -206,29 +333,23 @@ describe("capture the app's screens", () => {
   });
 
   it("the command palette, open and typed into", async () => {
-    if (SMOKE) return;
-    for (const theme of THEMES) {
+    const [openDetail, resultsDetail] = PALETTE_DETAILS;
+    for (const theme of few(THEMES, 1)) {
       await open({ theme });
       const search = await $('button[aria-label="Search this room or run a command (⌘K)"]');
       if (!(await search.isExisting())) continue;
       await search.click();
       await browser.pause(400);
-      await shoot({ kind: "overlay", detail: "command palette open", state: "empty", theme, w: 1440, h: 900 });
+      await shoot({ kind: "overlay", detail: openDetail, state: "empty", theme, w: 1440, h: 900 });
       await browser.keys("apollo".split(""));
       await browser.pause(500);
-      await shoot({ kind: "overlay", detail: "command palette with results", state: "full", theme, w: 1440, h: 900 });
+      await shoot({ kind: "overlay", detail: resultsDetail, state: "full", theme, w: 1440, h: 900 });
     }
   });
 
   it("the pane layouts — library only, focus, all three", async () => {
-    if (SMOKE) return;
-    const toggles = [
-      ['button[aria-label="Toggle the Library pane (⌘1)"]', "library pane hidden"],
-      ['button[aria-label="Toggle the AI and Studio pane (⌘3)"]', "AI pane hidden"],
-      ['button[aria-label="Focus the editor — hide both side panes"]', "focus mode"],
-    ];
-    for (const theme of THEMES) {
-      for (const [sel, detail] of toggles) {
+    for (const theme of few(THEMES, 1)) {
+      for (const [sel, detail] of LAYOUT_TOGGLES) {
         await open({ theme });
         const btn = await $(sel);
         if (!(await btn.isExisting())) continue;
@@ -240,17 +361,16 @@ describe("capture the app's screens", () => {
   });
 
   it("each viewer kind, both themes, at two window sizes", async () => {
-    if (SMOKE) return;
     // Select on `title`, not on text: the row LABEL is `displayName(f.name)`,
     // which strips the extension, so `.file-name=clean-code.pdf` matches
     // nothing. It silently matched nothing on the first full run — the spec
     // passed and captured zero viewers, which is the worst outcome available
     // here: a calibration set missing every document viewer reports that
     // machinery as unused. Hence the throw below rather than a `continue`.
-    for (const [w, h] of [VIEWPORTS[0], VIEWPORTS[3]]) {
+    for (const [w, h] of few([VIEWPORTS[0], VIEWPORTS[3]], 1)) {
       await browser.setWindowSize(w, h);
-      for (const theme of THEMES) {
-        for (const [file, viewer] of FILES) {
+      for (const theme of few(THEMES, 1)) {
+        for (const [file, viewer] of few(FILES, 2)) {
           await open({ theme });
           const row = await $(`.file-name[title="${file}"]`);
           if (!(await row.isExisting())) {
@@ -268,11 +388,10 @@ describe("capture the app's screens", () => {
   });
 
   it("the widest window, every area", async () => {
-    if (SMOKE) return;
     const [w, h] = VIEWPORTS[3];
     await browser.setWindowSize(w, h);
-    for (const theme of THEMES) {
-      for (const [area, label] of AREAS) {
+    for (const theme of few(THEMES, 1)) {
+      for (const [area, label] of few(AREAS, 2)) {
         await open({ theme });
         if (!(await goArea(area))) continue;
         await shoot({ kind: "area", area, label, state: "full", theme, w, h });
@@ -282,22 +401,21 @@ describe("capture the app's screens", () => {
   });
 
   it("the rail collapsed and expanded", async () => {
-    if (SMOKE) return;
-    for (const theme of THEMES) {
+    const [collapsed, expanded] = CHROME_DETAILS;
+    for (const theme of few(THEMES, 1)) {
       await open({ theme });
-      await shoot({ kind: "chrome", detail: "rail collapsed", state: "full", theme, w: 1440, h: 900 });
+      await shoot({ kind: "chrome", detail: collapsed, state: "full", theme, w: 1440, h: 900 });
       const exp = await $('[data-testid="rail-expander"]');
       if (await exp.isExisting()) {
         await exp.click();
         await browser.pause(400);
-        await shoot({ kind: "chrome", detail: "rail expanded", state: "full", theme, w: 1440, h: 900 });
+        await shoot({ kind: "chrome", detail: expanded, state: "full", theme, w: 1440, h: 900 });
       }
     }
   });
 
   it("the assistant answering, with its agent strip", async () => {
-    if (SMOKE) return;
-    for (const theme of THEMES) {
+    for (const theme of few(THEMES, 1)) {
       await open({ theme });
       const box = await $("textarea");
       if (!(await box.isExisting())) continue;
@@ -306,9 +424,9 @@ describe("capture the app's screens", () => {
       // The mock walks the roster over ~1.2s; three shots catch the strip
       // mid-walk, which is the state a user actually stares at.
       for (const [ms, detail] of [
-        [200, "agents starting"],
-        [700, "agent running"],
-        [1600, "agents done"],
+        [200, CHAT_DETAILS[0]],
+        [700, CHAT_DETAILS[1]],
+        [1600, CHAT_DETAILS[2]],
       ]) {
         await browser.pause(ms === 200 ? 200 : 500);
         await shoot({ kind: "chat", detail, state: "full", theme, w: 1440, h: 900 });

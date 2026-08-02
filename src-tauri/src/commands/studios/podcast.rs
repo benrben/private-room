@@ -100,9 +100,10 @@ pub(crate) fn render_podcast_html(title: &str, turns: &[PodcastTurn]) -> String 
             html_escape(&t.line)
         ));
     }
-    PODCAST_TEMPLATE
-        .replace("__TITLE__", &html_escape(title))
-        .replace("__ROWS__", &rows)
+    fill_template(
+        PODCAST_TEMPLATE,
+        &[("__TITLE__", &html_escape(title)), ("__ROWS__", &rows)],
+    )
 }
 
 pub(crate) const PODCAST_TEMPLATE: &str = r####"<!doctype html>

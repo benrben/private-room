@@ -262,8 +262,12 @@ export function makeRecordingActions(
   function dictateIntoFile() {
     if (!s.openFile) return;
     const id = s.openFile.id;
-    const current = s.openFile.content.text ?? "";
     dictateTo("file", async (text) => {
+      // Re-read at WRITE time, never the snapshot taken when the microphone
+      // opened: speaking takes seconds, and anything the user, the AI, a
+      // workflow or a script wrote to the file meanwhile would otherwise be
+      // rolled back by our write (same doctrine as dictateJournal).
+      const current = (await api.getFileContent(id)).text ?? "";
       await api.updateFileContent(
         id,
         current ? `${current.replace(/\s+$/, "")}\n\n${text}\n` : `${text}\n`,
@@ -291,17 +295,26 @@ export function makeRecordingActions(
     // while the click that triggered this is still "active", and rec_start
     // below costs several IPC round-trips. Asking afterwards fails with
     // NotAllowedError even though permission was granted long ago.
+    const withSystem = opts?.systemAudio ?? true;
     let mic: MediaStream | null = null;
     try {
       mic = await acquireMic();
     } catch (e) {
-      // Meeting audio can still be recorded; say so instead of dying.
-      s.pushToast("error", `${e instanceof Error ? e.message : e} (the Mac's audio keeps recording)`);
+      // Meeting audio can still be recorded — but ONLY if it was ticked. With
+      // it off, a dead microphone means nothing at all is being captured, and
+      // promising otherwise hands the user an empty recording.
+      const msg = e instanceof Error ? e.message : String(e);
+      s.pushToast(
+        "error",
+        withSystem
+          ? `${msg} (the Mac's audio keeps recording)`
+          : `${msg} — and the Mac's audio is off, so nothing at all is being captured. Stop, then start again with "Include the Mac's audio" ticked.`,
+      );
     }
     try {
       const res = await api.recStart({
         fileId: fileId ?? null,
-        systemAudio: opts?.systemAudio ?? true,
+        systemAudio: withSystem,
         liveTranslate: opts?.liveTranslate ?? null,
       });
       // The engine always starts with live transcription ON — sync the
@@ -340,7 +353,17 @@ export function makeRecordingActions(
     try {
       mic = await acquireMic();
     } catch (e) {
-      s.pushToast("error", `${e instanceof Error ? e.message : e} (the Mac's audio keeps recording)`);
+      const msg = e instanceof Error ? e.message : String(e);
+      // Ask the live session whether the Mac's audio lane is actually on
+      // ("on" | "error" | "off") rather than assuming it — with it off, a dead
+      // microphone means nothing is being captured at all.
+      const live = await api.recLiveStatus().catch(() => null);
+      s.pushToast(
+        "error",
+        live?.sys[0] === "on"
+          ? `${msg} (the Mac's audio keeps recording)`
+          : `${msg} — and the Mac's audio is not being recorded, so nothing at all is being captured.`,
+      );
     }
     try {
       await api.recResume();

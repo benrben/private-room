@@ -65,9 +65,35 @@ const FLUSH_EVERY_SEGMENTS: usize = 8;
 /// provisionally mislabeled get corrected on screen while the conversation is
 /// still going.
 const RELABEL_EVERY_SEGMENTS: usize = 2;
+/// …but re-clustering is the engine thread's only heavy step, and that thread
+/// also mixes the incoming audio and drives the level meter. Once a pass costs
+/// more than this many milliseconds it buys itself proportionally more phrases
+/// of quiet, so a three-hour meeting can't freeze the meter for seconds at a
+/// time (see [`relabel_interval`]).
+const RELABEL_TIME_BUDGET_MS: u128 = 40;
+/// Ceiling on that back-off: even a very expensive pass runs this often, or a
+/// long meeting would stop correcting its speakers on screen entirely.
+const RELABEL_MAX_SEGMENTS: usize = 64;
 /// Hard session ceiling (3 h): the mixed timeline lives in memory while
 /// recording (~230 MB/h of f32), so a forgotten recorder stops itself.
 const MAX_SESSION_SAMPLES: usize = SAMPLE_RATE * 3 * 3600;
+/// Share of a re-transcribe's progress bar that belongs to the phrase-by-
+/// phrase decode. The rest is the whole-recording speaker pass, which starts
+/// only after the last phrase and runs for tens of seconds on a long file —
+/// reporting 100% before it began made a working rebuild look stuck.
+const RETRANSCRIBE_DECODE_PCT: i64 = 92;
+/// What [`retranscribe`] returns when its `stop` flag goes up. A rebuild
+/// publishes nothing until it finishes, so a stopped one leaves the recording
+/// exactly as it was — the message says so, because "Stopped." on its own
+/// reads like the transcript may be half-rewritten.
+pub const RETRANSCRIBE_STOPPED: &str = "Stopped — the transcript is unchanged.";
+/// A lane that has been silent for longer than this while the OTHER lane kept
+/// recording was not there yet (the ScreenCaptureKit tap needs seconds to come
+/// up, and again after every resume). Its next batch is written at the shared
+/// timeline's head instead of where the lane left off, so meeting speech is
+/// not filed seconds before it happened. Below this, the two lanes are simply
+/// out of phase by a chunk or two and must be left alone.
+const LANE_RESYNC_GAP: usize = SAMPLE_RATE / 2;
 
 /// Two phrases are the same sound reaching both lanes when they overlap in
 /// time by this much of the shorter one. The lanes segment independently, so
@@ -124,10 +150,14 @@ pub struct RecCut {
     pub t1: i64,
 }
 
+/// A recording's stored metadata. Shape changes are handled by serde alone —
+/// new fields carry `#[serde(default)]`, retired ones (there used to be a
+/// `version` counter nobody read) are simply ignored when an older room's JSON
+/// is parsed. There is no version dispatch, so nothing here may pretend there
+/// is one.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RecMeta {
-    pub version: u32,
     pub duration_cs: i64,
     pub segments: Vec<RecSegment>,
     pub cuts: Vec<RecCut>,
@@ -156,7 +186,6 @@ pub struct RecMeta {
 impl Default for RecMeta {
     fn default() -> Self {
         Self {
-            version: 1,
             duration_cs: 0,
             segments: Vec::new(),
             cuts: Vec::new(),
@@ -193,6 +222,17 @@ pub fn format_stamp(cs: i64) -> String {
     } else {
         format!("[{m}:{sec:02}]")
     }
+}
+
+/// How many phrases to wait before the next whole-recording re-cluster, given
+/// how long the last one took. A cheap pass keeps the near-every-phrase
+/// cadence that lets a mislabeled speaker be corrected while the conversation
+/// is still going; an expensive one (a long meeting: the pass grows with every
+/// voice heard so far) backs off in proportion, so the engine thread never
+/// spends much more than [`RELABEL_TIME_BUDGET_MS`] per phrase on it.
+fn relabel_interval(elapsed_ms: u128) -> usize {
+    (elapsed_ms.div_ceil(RELABEL_TIME_BUDGET_MS) as usize)
+        .clamp(RELABEL_EVERY_SEGMENTS, RELABEL_MAX_SEGMENTS)
 }
 
 /// Words, lowercased, punctuation dropped — Whisper punctuates the same sound
@@ -490,6 +530,11 @@ struct Lane {
     /// Trained voice detector; `None` (model missing or broken) falls back
     /// to the energy gate — a VAD problem must never break a recording.
     vad: Option<NeuralVad>,
+    /// Set while the lane is (re)starting: the next batch is the first sound
+    /// this lane has produced since the session began or resumed, so its
+    /// write position must be re-anchored to the shared timeline before it is
+    /// mixed. See [`LANE_RESYNC_GAP`] and [`Lane::resync_to`].
+    resync: bool,
 }
 
 impl Lane {
@@ -504,7 +549,20 @@ impl Lane {
             floor: 2e-3,
             level: 0.0,
             vad: NeuralVad::new(),
+            resync: true,
         }
+    }
+
+    /// Re-anchor an idle lane to `head` on the shared timeline. Only ever
+    /// called with no phrase open (the lane has produced nothing since the
+    /// session started or resumed), so the sub-frame carry and the pre-roll
+    /// ring hold audio from before the gap and are dropped with it.
+    fn resync_to(&mut self, head: usize) {
+        self.ingested = head;
+        self.pos = head;
+        self.carry.clear();
+        self.ring.clear();
+        self.voiced_run = 0;
     }
 
     /// Feed 16 kHz samples; returns any phrases that just closed as
@@ -851,10 +909,19 @@ pub struct DecodeOut {
     /// here on the decode thread because this is the last place the phrase's
     /// audio exists per lane.
     wins: Vec<(i64, i64, diarize::VoicePrint)>,
+    /// Why the speech engine could not decode this phrase, when it could not.
+    /// A phrase the engine choked on is NOT silence — swallowing this made a
+    /// damaged model produce a recording in which nobody ever spoke.
+    err: Option<String>,
 }
+
+/// What a stop reports when the final write into the room did not happen.
+pub const SAVE_FAILED: &str = "The recording could not be saved into the room.";
 
 /// Cross-thread view of the live session for quick status reads.
 pub struct RecShared {
+    /// "recording" | "paused" | "saving" | "saved" | "failed". The last two
+    /// are terminal — the engine thread is gone.
     pub status: Mutex<String>,
     pub duration_cs: AtomicI64,
     /// Latest per-source health, [mic, sys]: ("on" | "error" | "off", human
@@ -862,6 +929,11 @@ pub struct RecShared {
     /// rec-source events alone are lost on a viewer that mounts after a fast
     /// failure, which is exactly when the user most needs the banner.
     pub sources: Mutex<[(String, String); 2]>,
+    /// The finished session's verdict, set once by `Engine::finish`. A Stop
+    /// that arrives after the engine already stopped itself (3-hour ceiling,
+    /// room closed) reads its answer here instead of finding a dead channel
+    /// and reporting a timeout for a recording that saved fine.
+    pub outcome: Mutex<Option<Result<RecMeta, String>>>,
 }
 
 pub struct EngineConfig {
@@ -971,50 +1043,89 @@ fn merge_phrase(segs: &[crate::stt::SegOut]) -> (String, Vec<RecWord>, Option<St
 /// lock → Watch, same constants), every phrase gets a voiceprint, and one
 /// [`diarize::relabel`] at the end derives the speakers from all voices at
 /// once. Everything is source "sys": the mixed file has no lane identity left,
-/// so nobody becomes "You" — speakers are "Speaker N". `cuts` and
-/// `max_speakers` are the ONLY survivors of the old meta: prior studio
-/// deletions keep applying to the (unchanged) timeline, and a pinned
-/// participant count stays pinned.
+/// so nobody becomes "You" — speakers are "Speaker N". The old meta's `cuts`,
+/// `max_speakers` and `speaker_names` survive: prior studio deletions keep
+/// applying to the (unchanged) timeline, a pinned participant count stays
+/// pinned, and the names the user typed are an overlay on the labels, exactly
+/// as [`RecMeta::speaker_names`] promises. Everything else is rebuilt.
+///
+/// A decode failure is an error, never silence — a broken or missing model
+/// would otherwise rewrite the whole recording as "nobody spoke".
 ///
 /// `progress` is called after each decoded phrase with
 /// (done centiseconds, total centiseconds), ending at (total, total).
+///
+/// `stop` is polled between phrases: a rebuild runs for minutes on a long
+/// recording, so it must be abandonable (Stop, or the room closing under it).
+/// A stopped rebuild returns [`RETRANSCRIBE_STOPPED`] and writes nothing — the
+/// whole meta is handed back at the end or not at all, so the stored
+/// transcript is untouched either way.
 pub fn retranscribe(
     model: &std::path::Path,
     samples: &[f32],
-    cuts: Vec<RecCut>,
-    max_speakers: u32,
+    prior: &RecMeta,
     mut progress: impl FnMut(i64, i64),
-) -> RecMeta {
+    stop: impl Fn() -> bool,
+) -> Result<RecMeta, String> {
     let total_cs = cs_of_samples(samples.len());
-    let mut meta = RecMeta { duration_cs: total_cs, cuts, max_speakers, ..Default::default() };
-
-    // Chunked like live capture so the lane's carry buffer stays small — a
-    // 3 h recording must not be copied whole into it.
-    let mut lane = Lane::new(0);
-    let mut phrases = Vec::new();
-    for part in samples.chunks(SAMPLE_RATE) {
-        phrases.extend(lane.push(part));
-    }
-    phrases.extend(lane.flush_active());
+    let max_speakers = prior.max_speakers;
+    let mut meta = RecMeta {
+        duration_cs: total_cs,
+        cuts: prior.cuts.clone(),
+        max_speakers,
+        speaker_names: prior.speaker_names.clone(),
+        ..Default::default()
+    };
 
     let mut lang = LaneLang::default();
     let mut book = match max_speakers {
         0 => diarize::SpeakerBook::auto(),
         n => diarize::SpeakerBook::with_cap(n as usize),
     };
-    for (start, audio) in phrases {
+    // Chunked like live capture so the lane's carry buffer stays small, and
+    // each phrase is transcribed the moment it closes rather than piling up:
+    // a collected phrase list is a SECOND full copy of a 3 h recording's
+    // audio (~1 GB) on top of the samples the caller already holds.
+    let mut lane = Lane::new(0);
+    let mut parts = samples.chunks(SAMPLE_RATE);
+    let mut ready: VecDeque<(usize, Vec<f32>)> = VecDeque::new();
+    let mut fed_everything = false;
+    loop {
+        // Cheap (one atomic load per second of audio) and checked before the
+        // decoder, which is where the minutes go.
+        if stop() {
+            return Err(RETRANSCRIBE_STOPPED.into());
+        }
+        let Some((start, audio)) = ready.pop_front() else {
+            if fed_everything {
+                break;
+            }
+            match parts.next() {
+                Some(part) => ready.extend(lane.push(part)),
+                None => {
+                    fed_everything = true;
+                    ready.extend(lane.flush_active());
+                }
+            }
+            continue;
+        };
         let (t0, t1) = (cs_of_samples(start), cs_of_samples(start + audio.len()));
+        // The speaker pass below runs after the last phrase and can take tens
+        // of seconds; the decode owns only the first slice of the bar, so a
+        // rebuild never sits at 100% while it is still working.
+        let done = |cs: i64| cs * RETRANSCRIBE_DECODE_PCT / 100;
         let mode = match lang.hint() {
             Some(l) => crate::stt::LangMode::Watch(l),
             None => crate::stt::LangMode::Sniff,
         };
-        let phrase = crate::stt::transcribe_segments(model, &audio, t0, mode).unwrap_or_default();
+        let phrase = crate::stt::transcribe_segments(model, &audio, t0, mode)
+            .map_err(|e| format!("Transcribing at {} failed: {e}", format_stamp(t0)))?;
         let (text, words, seg_lang, _mean_p) = merge_phrase(&phrase.segs);
         if text.trim().is_empty() {
             // Same wrong-lock escape as live: a locked lane whose finals keep
             // decoding to nothing eventually unlocks and re-detects.
             lang.note_empty_final();
-            progress(t1, total_cs);
+            progress(done(t1), total_cs);
             continue;
         }
         lang.observe(
@@ -1035,9 +1146,15 @@ pub fn retranscribe(
             lang: seg_lang,
             voice: Some(emb),
         });
-        progress(t1, total_cs);
+        progress(done(t1), total_cs);
     }
-    diarize::split_by_voice(&mut meta.segments, max_speakers as usize, |seg| {
+    // The speaker pass has no inner checkpoint and runs for tens of seconds on
+    // a long meeting, so this is the last chance to give up before it starts.
+    if stop() {
+        return Err(RETRANSCRIBE_STOPPED.into());
+    }
+    let RecMeta { segments, speaker_names, .. } = &mut meta;
+    diarize::split_by_voice(segments, max_speakers as usize, speaker_names, |seg| {
         let i0 = (seg.t0.max(0) as usize) * (SAMPLE_RATE / 100);
         let i1 = ((seg.t1.max(0) as usize) * (SAMPLE_RATE / 100)).min(samples.len());
         if i1 <= i0 {
@@ -1057,7 +1174,7 @@ pub fn retranscribe(
         }
     }
     progress(total_cs, total_cs);
-    meta
+    Ok(meta)
 }
 
 pub fn start_engine<R: tauri::Runtime>(
@@ -1069,6 +1186,7 @@ pub fn start_engine<R: tauri::Runtime>(
         status: Mutex::new("recording".to_string()),
         duration_cs: AtomicI64::new(cs_of_samples(cfg.base_samples.len())),
         sources: Mutex::new([("on".into(), String::new()), ("off".into(), String::new())]),
+        outcome: Mutex::new(None),
     });
 
     install_diarize_model(&app);
@@ -1093,8 +1211,11 @@ pub fn start_engine<R: tauri::Runtime>(
                     (None, JobKind::Final) => crate::stt::LangMode::Sniff,
                     (None, JobKind::Partial) => crate::stt::LangMode::Auto,
                 };
-                let phrase = crate::stt::transcribe_segments(&model, &job.samples, offset_cs, mode)
-                    .unwrap_or_default();
+                let (phrase, err) =
+                    match crate::stt::transcribe_segments(&model, &job.samples, offset_cs, mode) {
+                        Ok(p) => (p, None),
+                        Err(e) => (crate::stt::PhraseOut::default(), Some(e)),
+                    };
                 // Both lanes get a voiceprint: people in the room share the
                 // microphone, so "the mic" is not a person.
                 let emb = (job.kind == JobKind::Final).then(|| diarize::embed(&job.samples));
@@ -1112,6 +1233,7 @@ pub fn start_engine<R: tauri::Runtime>(
                     detected: phrase.detected,
                     emb,
                     wins,
+                    err,
                 }));
             }
         });
@@ -1150,8 +1272,31 @@ struct Engine<R: tauri::Runtime> {
     last_final_start: [Option<usize>; 2],
     #[cfg(target_os = "macos")]
     sys_tap: Option<sck::SysAudioTap>,
+    /// A meeting-audio tap is being set up on its helper thread. Bringing one
+    /// up takes seconds, so a pause/resume inside that window would otherwise
+    /// start a SECOND one — two taps, everything recorded and transcribed
+    /// twice, and the abandoned one capturing for the rest of the session.
+    #[cfg(target_os = "macos")]
+    sys_tap_starting: bool,
     paused: bool,
+    /// Pause force-closed a sentence that is still in the decoder; the run
+    /// loop saves once more when it lands, so quitting while paused cannot
+    /// lose the last thing that was said.
+    pause_pending: bool,
     stopping: Option<mpsc::Sender<Result<RecMeta, String>>>,
+    /// A decode failure has already been reported. A model that cannot decode
+    /// fails on EVERY phrase; one honest error is the signal, a hundred is
+    /// noise — but silence would look like nobody spoke.
+    decode_error_reported: bool,
+    /// Phrases still to arrive before the next whole-recording re-cluster.
+    /// Adaptive: re-clustering is the engine thread's only heavy step and it
+    /// grows with the meeting, so the interval grows with how long the last
+    /// pass took (see [`RELABEL_TIME_BUDGET_MS`]).
+    relabel_countdown: usize,
+    /// One live translation at a time, in order, on one resolved model — a
+    /// job per finished sentence used to re-resolve the model and race live
+    /// transcription for the machine.
+    translate_tx: LiveTranslateQueue,
     segments_since_flush: usize,
     /// Mixed-timeline length at the last flush — the time-based flush trigger
     /// (audio must persist even when no segments land to count).
@@ -1163,6 +1308,11 @@ struct Engine<R: tauri::Runtime> {
     /// reliable dead-mic signal.
     last_mic_push: std::time::Instant,
     mic_flagged: bool,
+    /// Has ANY microphone batch arrived this session? A mic that never
+    /// connected (no device, blocked in System Settings) needs different
+    /// advice from one that connected and then died — "pause and resume to
+    /// reconnect" cannot help something that was never there.
+    mic_ever_pushed: bool,
     /// Sub-window prints per live segment id, collected from the decode
     /// thread for the stop/pause split pass (ADD-28). Segments not in here —
     /// resumed history, pieces of an earlier split — are re-embedded from the
@@ -1191,6 +1341,7 @@ impl<R: tauri::Runtime> Engine<R> {
         // Re-seed the numbering from prior segments so a resumed meeting keeps
         // naming new voices after the ones it already knows.
         book.seed_labels(&meta.segments);
+        let translate_tx = spawn_live_translator(app.clone(), cfg.file_id.clone());
         Self {
             mixed,
             mic: Lane::new(base),
@@ -1212,8 +1363,14 @@ impl<R: tauri::Runtime> Engine<R> {
             last_final_start: [None, None],
             #[cfg(target_os = "macos")]
             sys_tap: None,
+            #[cfg(target_os = "macos")]
+            sys_tap_starting: false,
             paused: false,
+            pause_pending: false,
             stopping: None,
+            decode_error_reported: false,
+            relabel_countdown: RELABEL_EVERY_SEGMENTS,
+            translate_tx,
             segments_since_flush: 0,
             // Resumed base audio is already durable in the stored WAV —
             // checkpoints must cover only samples recorded after resume.
@@ -1221,6 +1378,7 @@ impl<R: tauri::Runtime> Engine<R> {
             last_level_emit: std::time::Instant::now(),
             last_mic_push: std::time::Instant::now(),
             mic_flagged: false,
+            mic_ever_pushed: false,
             win_cache: std::collections::HashMap::new(),
         }
     }
@@ -1249,6 +1407,15 @@ impl<R: tauri::Runtime> Engine<R> {
                 self.finish();
                 break;
             }
+            // A pause force-closes the sentence in progress, and that final is
+            // still in the decoder when Pause's own save runs. Save again once
+            // it lands, so quitting the app while paused can't lose the last
+            // thing that was said.
+            if self.pause_pending && self.paused && !self.decode_busy && self.final_queue.is_empty()
+            {
+                self.pause_pending = false;
+                let _ = self.flush(true);
+            }
         }
     }
 
@@ -1260,17 +1427,22 @@ impl<R: tauri::Runtime> Engine<R> {
                 }
             }
             #[cfg(target_os = "macos")]
-            EngineMsg::SysTap(result) => match result {
-                Ok(tap) => {
-                    if self.stopping.is_some() || self.paused {
+            EngineMsg::SysTap(result) => {
+                self.sys_tap_starting = false;
+                match result {
+                    // Never keep two taps: a second one would record and
+                    // transcribe the meeting twice, and the one we dropped
+                    // would go on capturing for the rest of the session.
+                    Ok(tap) if self.stopping.is_some() || self.paused || self.sys_tap.is_some() => {
                         tap.stop();
-                    } else {
+                    }
+                    Ok(tap) => {
                         self.sys_tap = Some(tap);
                         self.emit_source("sys", "on", "");
                     }
+                    Err(e) => self.emit_source("sys", "error", &e),
                 }
-                Err(e) => self.emit_source("sys", "error", &e),
-            },
+            }
             EngineMsg::SetLiveTranslate(lang) => self.live_translate = lang,
             EngineMsg::SetLiveStt(on) => {
                 self.live_stt = on;
@@ -1295,33 +1467,30 @@ impl<R: tauri::Runtime> Engine<R> {
                     lane.empty_streak = 0;
                 }
                 self.stop_sys_tap();
+                // The sentence Pause just closed is still decoding; the run
+                // loop saves again when it lands (see `pause_pending`).
+                self.pause_pending = self.decode_busy || !self.final_queue.is_empty();
                 let _ = self.flush(true);
                 *self.shared.status.lock().unwrap() = "paused".into();
                 self.emit_state();
             }
             EngineMsg::Resume => {
                 self.paused = false;
+                self.pause_pending = false;
                 self.last_mic_push = std::time::Instant::now();
+                // Neither lane is producing sound yet, and the meeting tap
+                // takes seconds to come back: both re-anchor to the timeline
+                // head on their first batch instead of resuming where they
+                // stopped.
+                self.mic.resync = true;
+                self.sys.resync = true;
                 if self.cfg.system_audio {
                     self.start_sys_tap();
                 }
                 *self.shared.status.lock().unwrap() = "recording".into();
                 self.emit_state();
             }
-            EngineMsg::Stop { done } => {
-                self.close_open_phrases();
-                self.stop_sys_tap();
-                self.partial_pending = None;
-                self.stopping = Some(done);
-                *self.shared.status.lock().unwrap() = "saving".into();
-                self.emit_state();
-                // Make the audio bytes durable NOW, before the transcript tail
-                // finishes decoding: a checkpoint append is cheap, and it lets
-                // the UI truthfully say "your audio is saved" the moment Stop
-                // is pressed instead of after a possibly-long decode drain.
-                let _ = self.flush(false);
-                self.emit_save_progress("transcribing");
-            }
+            EngineMsg::Stop { done } => self.begin_stop(Some(done)),
             EngineMsg::DecodeDone(out) => {
                 self.decode_busy = false;
                 self.integrate(out);
@@ -1334,30 +1503,73 @@ impl<R: tauri::Runtime> Engine<R> {
         false
     }
 
+    /// Begin the stop→saved drain. `done` is the Stop command's reply channel
+    /// when a user pressed Stop, `None` when the engine stopped itself (the
+    /// 3-hour ceiling, the room closing under it). Idempotent: a second call
+    /// only adopts a reply channel, so a Stop that races a self-stop is still
+    /// answered instead of finding a finished engine.
+    fn begin_stop(&mut self, done: Option<mpsc::Sender<Result<RecMeta, String>>>) {
+        if self.stopping.is_some() {
+            if let Some(done) = done {
+                self.stopping = Some(done);
+            }
+            return;
+        }
+        self.close_open_phrases();
+        self.stop_sys_tap();
+        self.partial_pending = None;
+        self.pause_pending = false;
+        self.stopping = Some(done.unwrap_or_else(|| mpsc::channel().0));
+        *self.shared.status.lock().unwrap() = "saving".into();
+        self.emit_state();
+        // Make the audio bytes durable NOW, before the transcript tail
+        // finishes decoding: a checkpoint append is cheap, and it lets
+        // the UI truthfully say "your audio is saved" the moment Stop
+        // is pressed instead of after a possibly-long decode drain.
+        let _ = self.flush(false);
+        self.emit_save_progress("transcribing");
+    }
+
     fn ingest(&mut self, source: Source, rate: u32, samples: &[f32]) {
         if source == Source::Mic {
             self.last_mic_push = std::time::Instant::now();
+            self.mic_ever_pushed = true;
             if self.mic_flagged {
                 self.mic_flagged = false;
                 self.emit_source("mic", "on", "");
             }
         }
         let samples = resample_to_16k(samples, rate);
-        // Mix into the shared timeline at the lane's own position: both lanes
-        // started together, so lane-local position IS the timeline position.
+        // Mix into the shared timeline at the lane's own position. The lanes
+        // do NOT start together — the ScreenCaptureKit tap takes seconds to
+        // come up, at the start of the session and again after every resume —
+        // so a lane opening after a real gap is re-anchored to the timeline's
+        // head first. Without that, everything the meeting lane hears is
+        // filed however many seconds late it was, growing with each resume.
+        let head = self.mixed.len();
         let at = {
             let lane = match source {
                 Source::Mic => &mut self.mic,
                 Source::Sys => &mut self.sys,
             };
+            if lane.resync {
+                lane.resync = false;
+                if head.saturating_sub(lane.ingested) >= LANE_RESYNC_GAP {
+                    lane.resync_to(head);
+                }
+            }
             let at = lane.ingested;
             lane.ingested += samples.len();
             at
         };
         let need = at + samples.len();
         if need > MAX_SESSION_SAMPLES {
+            // Stop RIGHT HERE, not via a queued message: every batch already
+            // sitting in the channel would otherwise trip the ceiling again
+            // and pop its own copy of this error, and a user Stop racing them
+            // would find the session already finished.
             self.emit_error("Recording reached the 3-hour session limit — stopping.");
-            let _ = self.self_tx.send(EngineMsg::Stop { done: mpsc::channel().0 });
+            self.begin_stop(None);
             return;
         }
         if self.mixed.len() < need {
@@ -1396,12 +1608,18 @@ impl<R: tauri::Runtime> Engine<R> {
         // means the tap is dead, not quiet.
         if !self.mic_flagged && self.last_mic_push.elapsed().as_secs() >= 6 {
             self.mic_flagged = true;
-            self.emit_source(
-                "mic",
-                "error",
+            // A microphone that never connected at all (no device, blocked in
+            // System Settings) must not be told to "reconnect" — pausing and
+            // resuming cannot reattach something that was never attached.
+            let message = if self.mic_ever_pushed {
                 "The microphone stopped sending audio — the Mac's audio keeps recording. \
-                 Pause and resume to reconnect the microphone.",
-            );
+                 Pause and resume to reconnect the microphone."
+            } else {
+                "No microphone audio has arrived — the Mac's audio keeps recording. \
+                 Check that a microphone is connected and that Arcelle is allowed to use it \
+                 in System Settings → Privacy & Security → Microphone."
+            };
+            self.emit_source("mic", "error", message);
         }
         if self.live_stt {
             for source in [Source::Mic, Source::Sys] {
@@ -1489,6 +1707,19 @@ impl<R: tauri::Runtime> Engine<R> {
     }
 
     fn integrate(&mut self, out: DecodeOut) {
+        // A phrase the speech engine choked on is not silence. Say so once —
+        // a model that cannot decode fails on every phrase, so one honest
+        // error is the signal and a hundred is noise — and never let the
+        // recording quietly come out as "nobody spoke".
+        if let Some(err) = &out.err {
+            if !self.decode_error_reported {
+                self.decode_error_reported = true;
+                self.emit_error(&format!(
+                    "The speech engine could not transcribe part of this recording ({err}). \
+                     The audio is still being saved; you can rebuild the transcript later."
+                ));
+            }
+        }
         match out.kind {
             JobKind::Partial => {
                 // A partial that was already in the decoder when live STT was
@@ -1596,12 +1827,19 @@ impl<R: tauri::Runtime> Engine<R> {
                     serde_json::json!({ "fileId": self.cfg.file_id, "segment": seg }),
                 );
                 if let Some(lang) = self.live_translate.clone() {
-                    spawn_live_translation(self.app.clone(), self.cfg.file_id.clone(), seg, lang);
+                    // Never blocking: the engine thread also carries the audio,
+                    // so a slow translator must fall behind on its own and drop
+                    // lines, not stall the recording. What it drops is the
+                    // OLDEST waiting line — see [`LiveTranslateQueue`].
+                    self.translate_tx.push(seg, lang);
                 }
                 self.segments_since_flush += 1;
                 // Re-cluster from time to time so the speakers sort themselves
-                // out *during* the conversation, not only at the end.
-                if self.segments_since_flush >= RELABEL_EVERY_SEGMENTS {
+                // out *during* the conversation, not only at the end — but on
+                // a schedule that backs off as the pass gets expensive, since
+                // this thread is also the one mixing the incoming audio.
+                self.relabel_countdown = self.relabel_countdown.saturating_sub(1);
+                if self.relabel_countdown == 0 {
                     self.relabel_speakers();
                 }
                 if self.segments_since_flush >= FLUSH_EVERY_SEGMENTS {
@@ -1620,7 +1858,8 @@ impl<R: tauri::Runtime> Engine<R> {
     fn split_speakers(&mut self) {
         let Self { meta, win_cache, mixed, .. } = self;
         let cap = meta.max_speakers as usize;
-        diarize::split_by_voice(&mut meta.segments, cap, |seg| {
+        let RecMeta { segments, speaker_names, .. } = meta;
+        diarize::split_by_voice(segments, cap, speaker_names, |seg| {
             if let Some(w) = win_cache.get(&seg.id) {
                 return w.clone();
             }
@@ -1635,9 +1874,15 @@ impl<R: tauri::Runtime> Engine<R> {
 
     /// Re-derive every meeting speaker from the whole recording's voices and,
     /// when a label moved, tell the UI so the transcript on screen corrects
-    /// itself mid-conversation.
+    /// itself mid-conversation. Times itself and schedules the next pass
+    /// accordingly ([`relabel_interval`]).
     fn relabel_speakers(&mut self) {
-        if !diarize::relabel(&mut self.meta.segments, self.meta.max_speakers as usize) {
+        let began = std::time::Instant::now();
+        let cap = self.meta.max_speakers as usize;
+        let RecMeta { segments, speaker_names, .. } = &mut self.meta;
+        let moved = diarize::relabel(segments, cap, speaker_names);
+        self.relabel_countdown = relabel_interval(began.elapsed().as_millis());
+        if !moved {
             return;
         }
         let labels: Vec<_> = self
@@ -1686,13 +1931,16 @@ impl<R: tauri::Runtime> Engine<R> {
                     // readable, and the next flush retries the whole tail.
                     let audio = if full {
                         let wav = encode_wav(&self.mixed);
-                        crate::db::update_file_content(
+                        // ONE transaction: a complete WAV whose checkpoints
+                        // survived would be spliced onto itself by the next
+                        // crash recovery, and part of the recording would
+                        // play twice.
+                        crate::db::finalize_rec_audio(
                             &room.conn,
                             &self.cfg.file_id,
                             &wav,
                             Some(&text),
                         )
-                        .and_then(|_| crate::db::clear_rec_chunks(&room.conn, &self.cfg.file_id))
                     } else {
                         crate::db::append_rec_chunk(
                             &room.conn,
@@ -1723,9 +1971,15 @@ impl<R: tauri::Runtime> Engine<R> {
                 // NOT durable. Say so loudly, keep the un-flushed range
                 // marked dirty (flushed_samples stays put) so the next flush
                 // retries the whole tail, and keep recording in memory.
-                self.emit_error(&format!(
-                    "Saving the recording failed ({db_err}) — retrying; do not close the room."
-                ));
+                // There is no next flush during the FINAL write, so that case
+                // must not promise a retry that will never happen.
+                self.emit_error(&if self.stopping.is_some() {
+                    format!("Saving the recording failed ({db_err}). {SAVE_FAILED}")
+                } else {
+                    format!(
+                        "Saving the recording failed ({db_err}) — retrying; do not close the room."
+                    )
+                });
                 return false;
             }
             Err(None) => {
@@ -1744,17 +1998,28 @@ impl<R: tauri::Runtime> Engine<R> {
         true
     }
 
+    /// The final write, then the terminal state. The order matters: saying
+    /// "saved" before knowing whether the write worked put a green badge next
+    /// to a red error. A failed final write ends the session as "failed" —
+    /// still terminal (the session entry clears, the chip goes away), just not
+    /// a lie.
     fn finish(&mut self) {
         self.emit_save_progress("writing");
         let saved = self.flush(true);
-        *self.shared.status.lock().unwrap() = "saved".into();
+        // The result is kept here too: an engine that stopped itself (the
+        // 3-hour ceiling) has already answered a dummy channel, and a Stop
+        // arriving afterwards would otherwise see a dead engine and report a
+        // timeout for a recording that saved perfectly.
+        *self.shared.outcome.lock().unwrap() =
+            Some(if saved { Ok(self.meta.clone()) } else { Err(SAVE_FAILED.to_string()) });
+        *self.shared.status.lock().unwrap() = if saved { "saved" } else { "failed" }.into();
         self.emit_state();
         if let Some(done) = self.stopping.take() {
             // A failed final write must fail the STOP, not smile through it.
             let _ = done.send(if saved {
                 Ok(self.meta.clone())
             } else {
-                Err("The recording could not be saved into the room.".into())
+                Err(SAVE_FAILED.to_string())
             });
         }
     }
@@ -1762,13 +2027,23 @@ impl<R: tauri::Runtime> Engine<R> {
     fn start_sys_tap(&mut self) {
         #[cfg(target_os = "macos")]
         {
+            // Bringing a tap up takes seconds (permission + capture start).
+            // Pausing and resuming inside that window must not start a second
+            // one — the meeting would be recorded and transcribed twice.
+            if self.sys_tap.is_some() || self.sys_tap_starting {
+                return;
+            }
+            self.sys_tap_starting = true;
             let engine_tx = self.self_tx.clone();
             let audio_tx = self.self_tx.clone();
             std::thread::spawn(move || {
-                let result = sck::SysAudioTap::start(Box::new(move |samples: &[f32]| {
+                // macOS reports the rate it actually negotiated; the engine
+                // resamples whatever arrives rather than assuming it got what
+                // it asked for.
+                let result = sck::SysAudioTap::start(Box::new(move |samples: &[f32], rate: u32| {
                     let _ = audio_tx.send(EngineMsg::Audio {
                         source: Source::Sys,
-                        rate: SAMPLE_RATE as u32,
+                        rate,
                         samples: samples.to_vec(),
                     });
                 }));
@@ -1901,46 +2176,127 @@ impl<R: tauri::Runtime> Engine<R> {
     }
 }
 
-/// Translate one fresh segment on the LOCAL model and ship it to the UI —
-/// fire-and-forget: live translation is a lens over the transcript, never a
-/// gate on it. (The durable, whole-file translation is `rec_translate`.)
-fn spawn_live_translation<R: tauri::Runtime>(
+/// At most this many finished sentences may wait for the translator. Past
+/// that the oldest are simply not translated: live translation is a lens over
+/// the transcript, never a gate on it, and a queue that outgrows the model
+/// would show translations minutes behind the words they belong to.
+const LIVE_TRANSLATE_QUEUE: usize = 8;
+
+/// The hand-off from the engine thread to the live translator: a newest-wins
+/// ring plus a wake-up.
+///
+/// A bounded channel alone dropped the WRONG end. `try_send` on a full channel
+/// throws away the sentence being offered — the line just spoken — and keeps
+/// delivering the stale ones queued behind it, so a fast stretch of a meeting
+/// is exactly the part that never gets translated. Here the newest sentence
+/// always gets in and the oldest one still waiting is the one given up, which
+/// is what the cap above promises.
+struct LiveTranslateQueue {
+    waiting: Arc<Mutex<VecDeque<(RecSegment, String)>>>,
+    /// Wake-up only (depth 1): the sentences live in `waiting`. Dropping this
+    /// is what ends the worker, so the worker must never hold a clone.
+    wake: tauri::async_runtime::Sender<()>,
+}
+
+impl LiveTranslateQueue {
+    fn new() -> (Self, tauri::async_runtime::Receiver<()>) {
+        let (wake, wake_rx) = tauri::async_runtime::channel::<()>(1);
+        (Self { waiting: Arc::new(Mutex::new(VecDeque::new())), wake }, wake_rx)
+    }
+
+    /// Offer a finished sentence. Never blocks, never fails; over the cap the
+    /// oldest waiting sentence is dropped to make room.
+    fn push(&self, seg: RecSegment, lang: String) {
+        {
+            let mut waiting = self.waiting.lock().unwrap();
+            waiting.push_back((seg, lang));
+            while waiting.len() > LIVE_TRANSLATE_QUEUE {
+                waiting.pop_front();
+            }
+        }
+        // Full = the worker already has a wake-up pending; it will find this
+        // sentence when it drains.
+        let _ = self.wake.try_send(());
+    }
+}
+
+/// The session's live-translation worker: ONE task, ONE resolved model, one
+/// sentence at a time, translations emitted as `rec-live-translation`.
+///
+/// Every finished sentence used to start its own task, which first asked for
+/// the whole installed-model list and then picked its own default instead of
+/// the room's — one extra request per sentence, all at once, competing with
+/// live transcription for the machine. The model is resolved once, lazily
+/// (nothing is asked of Ollama until a translation is actually wanted).
+fn spawn_live_translator<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     file_id: String,
-    seg: RecSegment,
-    lang: String,
-) {
+) -> LiveTranslateQueue {
+    let (queue, mut wake_rx) = LiveTranslateQueue::new();
+    // The Arc only — a Sender clone here would keep the wake channel open
+    // forever and the task would outlive the recording it belongs to.
+    let waiting = queue.waiting.clone();
     tauri::async_runtime::spawn(async move {
-        let models = match crate::ollama::list_models().await {
-            Ok(m) if !m.is_empty() => m,
-            _ => return,
-        };
-        let model = crate::commands::best_local_default(&models);
-        let prompt = format!(
-            "Translate this into {lang}. Output ONLY the translation, nothing else.\n\n{}",
-            seg.text
-        );
-        let messages = vec![crate::ollama::ChatMessage::new("user", prompt)];
-        // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools, no Stop).
-        if let Ok(out) = crate::ollama::generate(
-            &model,
-            messages,
-            Some(0.2),
-            "5m",
-            None,
-            crate::ollama::CtxTier::Chat,
-        )
-        .await
-        {
-            let text = crate::commands::strip_think_spans(&out).trim().to_string();
-            if !text.is_empty() {
-                let _ = app.emit(
-                    "rec-live-translation",
-                    serde_json::json!({ "fileId": file_id, "segId": seg.id, "text": text }),
+        let mut model: Option<String> = None;
+        while wake_rx.recv().await.is_some() {
+            // Drain in order, oldest first; the guard is never held across an
+            // await (the engine thread must never wait on this lock).
+            loop {
+                let next = waiting.lock().unwrap().pop_front();
+                let Some((seg, lang)) = next else { break };
+                if model.is_none() {
+                    let models = match crate::ollama::list_models().await {
+                        Ok(m) if !m.is_empty() => m,
+                        _ => continue, // Ollama down: try again on the next line
+                    };
+                    // The room's chosen model, like every other AI action here
+                    // — falling back to the best local one only when the room
+                    // has no setting of its own.
+                    model = Some(room_translation_model(&app, &models));
+                }
+                let Some(model) = model.as_deref() else { continue };
+                let prompt = format!(
+                    "Translate this into {lang}. Output ONLY the translation, nothing else.\n\n{}",
+                    seg.text
                 );
+                let messages = vec![crate::ollama::ChatMessage::new("user", prompt)];
+                // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools, no Stop).
+                let Ok(out) = crate::ollama::generate(
+                    model,
+                    messages,
+                    Some(0.2),
+                    "5m",
+                    None,
+                    crate::ollama::CtxTier::Chat,
+                )
+                .await
+                else {
+                    continue;
+                };
+                let text = crate::commands::strip_think_spans(&out).trim().to_string();
+                if !text.is_empty() {
+                    let _ = app.emit(
+                        "rec-live-translation",
+                        serde_json::json!({ "fileId": file_id, "segId": seg.id, "text": text }),
+                    );
+                }
             }
         }
     });
+    queue
+}
+
+/// The model live translation runs on: the room's own setting when it has one,
+/// else the best local model installed.
+fn room_translation_model<R: tauri::Runtime>(app: &tauri::AppHandle<R>, models: &[String]) -> String {
+    use tauri::Manager;
+    let state = app.state::<crate::commands::AppState>();
+    let chosen = state
+        .room
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|room| crate::commands::model_setting(&room.conn)));
+    chosen.unwrap_or_else(|| crate::commands::best_local_default(models))
 }
 
 #[cfg(test)]
@@ -1966,6 +2322,47 @@ mod tests {
         assert_eq!(time_overlap((100, 400), (6100, 6400)), 0.0);
         // A short phrase fully inside a long one still counts as contained.
         assert_eq!(time_overlap((100, 900), (300, 400)), 1.0);
+    }
+
+    /// Live translation is a lens on what is being said NOW. When the model
+    /// falls behind, the sentence just spoken must still get in and the oldest
+    /// one still waiting is the one given up — `try_send` on a bounded channel
+    /// did the exact opposite: it threw away the arriving sentence and kept
+    /// delivering the stale ones behind it, so a fast stretch of the meeting
+    /// was precisely the part that never got translated.
+    #[test]
+    fn the_live_translation_queue_drops_the_oldest_sentence_not_the_newest() {
+        let (queue, _wake_rx) = LiveTranslateQueue::new();
+        let spoken = LIVE_TRANSLATE_QUEUE + 3;
+        for i in 0..spoken {
+            queue.push(
+                RecSegment {
+                    id: format!("s{i}"),
+                    source: "sys".into(),
+                    speaker: "Speaker 1".into(),
+                    t0: i as i64 * 100,
+                    t1: i as i64 * 100 + 90,
+                    text: format!("line {i}"),
+                    words: Vec::new(),
+                    lang: None,
+                    voice: None,
+                },
+                "Hebrew".into(),
+            );
+        }
+        let ids: Vec<String> =
+            queue.waiting.lock().unwrap().iter().map(|(s, _)| s.id.clone()).collect();
+        assert_eq!(ids.len(), LIVE_TRANSLATE_QUEUE, "the cap stopped holding: {ids:?}");
+        assert_eq!(
+            ids.last().map(String::as_str),
+            Some(format!("s{}", spoken - 1)).as_deref(),
+            "the sentence just spoken is the one that got dropped: {ids:?}"
+        );
+        assert_eq!(
+            ids.first().map(String::as_str),
+            Some("s3"),
+            "the stalest lines were kept over the newest ones: {ids:?}"
+        );
     }
 
     // ------------------------------------------------ sticky-language policy
@@ -2942,6 +3339,7 @@ mod tests {
             status: Mutex::new("recording".into()),
             duration_cs: AtomicI64::new(0),
             sources: Mutex::new([("on".into(), String::new()), ("off".into(), String::new())]),
+            outcome: Mutex::new(None),
         });
         let mut eng = Engine::new(
             app.handle().clone(),
@@ -2998,6 +3396,147 @@ mod tests {
         assert_eq!(eng.mixed.len(), burst.len() * 2);
     }
 
+    /// Build a bare engine for the lane-level tests: no room, no model, the
+    /// decode queue observed from outside.
+    fn test_engine(
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+        job_tx: mpsc::Sender<DecodeJob>,
+    ) -> Engine<tauri::test::MockRuntime> {
+        use tauri::Manager;
+        // No room is open, so a flush is a no-op that says the room closed —
+        // but the state has to EXIST for the engine to ask.
+        app.manage(crate::commands::AppState::default());
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(RecShared {
+            status: Mutex::new("recording".into()),
+            duration_cs: AtomicI64::new(0),
+            sources: Mutex::new([("on".into(), String::new()), ("off".into(), String::new())]),
+            outcome: Mutex::new(None),
+        });
+        Engine::new(
+            app.clone(),
+            EngineConfig {
+                file_id: "f".into(),
+                room_path: String::new(),
+                model_path: PathBuf::from("/nonexistent-model.bin"),
+                base_samples: Vec::new(),
+                meta: RecMeta::default(),
+                system_audio: true,
+                live_translate: None,
+            },
+            tx,
+            job_tx,
+            shared,
+            rx,
+        )
+    }
+
+    /// The two capture lanes do NOT start together: the microphone is live at
+    /// once, while ScreenCaptureKit needs seconds of permission and start-up
+    /// round-trips — and again after every resume. Meeting audio that arrives
+    /// late has to land where it was actually heard; mixing it in at the
+    /// lane's own untouched position wrote it seconds early, on top of what
+    /// the microphone had already recorded, and every pause added more.
+    #[test]
+    fn a_late_lane_lands_where_it_was_heard_not_where_it_left_off() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (job_tx, _job_rx) = mpsc::channel::<DecodeJob>();
+        let mut eng = test_engine(app.handle(), job_tx);
+
+        // Three seconds of microphone while the meeting tap is still coming up.
+        eng.ingest(Source::Mic, SAMPLE_RATE as u32, &vec![0.25f32; SAMPLE_RATE * 3]);
+        assert_eq!(eng.mixed.len(), SAMPLE_RATE * 3);
+
+        // The tap comes up and delivers its first second.
+        eng.ingest(Source::Sys, SAMPLE_RATE as u32, &vec![0.5f32; SAMPLE_RATE]);
+        assert_eq!(
+            eng.mixed.len(),
+            SAMPLE_RATE * 4,
+            "the late lane was written over audio that was recorded before it existed"
+        );
+        assert!(
+            eng.mixed[..SAMPLE_RATE * 3].iter().all(|s| (*s - 0.25).abs() < 1e-6),
+            "meeting audio landed before the moment it was heard"
+        );
+        assert!(eng.mixed[SAMPLE_RATE * 3..].iter().all(|s| (*s - 0.5).abs() < 1e-6));
+
+        // From here the lanes advance independently and overlap honestly: the
+        // microphone's next second covers the same wall-clock second the
+        // meeting lane just wrote.
+        eng.ingest(Source::Mic, SAMPLE_RATE as u32, &vec![0.25f32; SAMPLE_RATE]);
+        assert_eq!(eng.mixed.len(), SAMPLE_RATE * 4, "the mic lane jumped forward too");
+        assert!(eng.mixed[SAMPLE_RATE * 3..].iter().all(|s| (*s - 0.75).abs() < 1e-6));
+
+        // A resume re-arms both lanes, and the tap is late again.
+        eng.handle(EngineMsg::Pause);
+        eng.handle(EngineMsg::Resume);
+        eng.ingest(Source::Mic, SAMPLE_RATE as u32, &vec![0.25f32; SAMPLE_RATE * 2]);
+        eng.ingest(Source::Sys, SAMPLE_RATE as u32, &vec![0.5f32; SAMPLE_RATE]);
+        assert_eq!(eng.mixed.len(), SAMPLE_RATE * 7, "the resumed tap drifted again");
+    }
+
+    /// …but two lanes that are merely a chunk out of phase — the normal case,
+    /// every 250 ms batch — must be left exactly where they are. Snapping on
+    /// ordinary jitter would move the meeting lane a quarter-second every
+    /// resume for no reason.
+    #[test]
+    fn ordinary_lane_jitter_never_moves_a_lane() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (job_tx, _job_rx) = mpsc::channel::<DecodeJob>();
+        let mut eng = test_engine(app.handle(), job_tx);
+
+        let chunk = SAMPLE_RATE / 4; // 250 ms, one worklet batch
+        assert!(chunk < LANE_RESYNC_GAP, "the gap bar must sit above one batch");
+        eng.ingest(Source::Mic, SAMPLE_RATE as u32, &vec![0.25f32; chunk]);
+        eng.ingest(Source::Sys, SAMPLE_RATE as u32, &vec![0.5f32; chunk]);
+        assert_eq!(eng.mixed.len(), chunk, "the lanes were pulled apart by normal jitter");
+        assert!(eng.mixed.iter().all(|s| (*s - 0.75).abs() < 1e-6));
+    }
+
+    /// A microphone that never connected at all gets advice that can help;
+    /// telling someone to "pause and resume to reconnect" a microphone that
+    /// was never there is worse than saying nothing.
+    #[test]
+    fn a_mic_that_never_connected_is_not_told_to_reconnect() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (job_tx, _job_rx) = mpsc::channel::<DecodeJob>();
+        let mut eng = test_engine(app.handle(), job_tx);
+
+        eng.last_mic_push = std::time::Instant::now() - std::time::Duration::from_secs(7);
+        eng.tick();
+        let never = eng.shared.sources.lock().unwrap()[0].clone();
+        assert_eq!(never.0, "error");
+        assert!(!never.1.contains("reconnect"), "{}", never.1);
+        assert!(never.1.contains("System Settings"), "{}", never.1);
+
+        // One that DID connect and then went quiet keeps the old advice.
+        eng.mic_flagged = false;
+        eng.mic_ever_pushed = true;
+        eng.last_mic_push = std::time::Instant::now() - std::time::Duration::from_secs(7);
+        eng.tick();
+        let died = eng.shared.sources.lock().unwrap()[0].clone();
+        assert!(died.1.contains("Pause and resume"), "{}", died.1);
+    }
+
+    /// Re-clustering is the engine thread's only heavy step, and that thread
+    /// also mixes the incoming audio: a pass that runs long has to buy itself
+    /// proportionally more quiet, or a long meeting freezes the level meter.
+    #[test]
+    fn relabel_backs_off_when_the_pass_gets_expensive() {
+        assert_eq!(relabel_interval(0), RELABEL_EVERY_SEGMENTS, "a free pass stays frequent");
+        assert_eq!(relabel_interval(RELABEL_TIME_BUDGET_MS), RELABEL_EVERY_SEGMENTS);
+        // Ten budgets of work buys ten phrases of quiet: ~one budget per phrase.
+        assert_eq!(relabel_interval(RELABEL_TIME_BUDGET_MS * 10), 10);
+        // …up to a ceiling, so it never stops correcting speakers entirely.
+        assert_eq!(relabel_interval(RELABEL_TIME_BUDGET_MS * 10_000), RELABEL_MAX_SEGMENTS);
+    }
+
     /// The degraded-echo rule: a mic phrase that coincides with meeting
     /// speech and decodes with rock-bottom confidence is the Mac's speakers
     /// heard through the room ("Thank you." over and over) — dropped. The
@@ -3015,6 +3554,7 @@ mod tests {
             status: Mutex::new("recording".into()),
             duration_cs: AtomicI64::new(0),
             sources: Mutex::new([("on".into(), String::new()), ("off".into(), String::new())]),
+            outcome: Mutex::new(None),
         });
         let mut eng = Engine::new(
             app.handle().clone(),
@@ -3064,6 +3604,7 @@ mod tests {
                 }],
                 detected: None,
                 emb: None,
+                err: None,
             }
         };
 
@@ -3617,9 +4158,9 @@ mod tests {
         }
 
         // The room file's old meta is ruined — corrupted words, wrong lane,
-        // wrong language. Only its cuts and participant count may survive.
+        // wrong language. Only its cuts, participant count and the names the
+        // user typed may survive.
         let old = RecMeta {
-            version: 1,
             duration_cs: cs_of_samples(audio.len()),
             segments: vec![RecSegment {
                 id: "junk".into(),
@@ -3634,13 +4175,20 @@ mod tests {
             }],
             cuts: vec![RecCut { t0: 10, t1: 20 }],
             max_speakers: 0,
-            speaker_names: BTreeMap::new(),
+            speaker_names: BTreeMap::from([("Speaker 1".to_string(), "Dana".to_string())]),
         };
 
         let mut ticks: Vec<(i64, i64)> = Vec::new();
-        let meta = retranscribe(&model, &audio, old.cuts.clone(), old.max_speakers, |d, t| {
-            ticks.push((d, t));
-        });
+        let meta = retranscribe(
+            &model,
+            &audio,
+            &old,
+            |d, t| {
+                ticks.push((d, t));
+            },
+            || false,
+        )
+        .expect("re-transcribe must not fail with the real model");
 
         let shown = meta
             .segments
@@ -3667,12 +4215,53 @@ mod tests {
         assert_eq!(meta.duration_cs, cs_of_samples(audio.len()), "duration must be preserved");
         assert_eq!(meta.cuts, old.cuts, "studio cuts must pass through");
         assert_eq!(meta.max_speakers, old.max_speakers);
+        // GH #5: the names the user typed are an overlay on the labels and
+        // must survive a rebuild — dropping them silently was the bug.
+        assert!(
+            meta.speaker_names.values().any(|n| n == "Dana"),
+            "the typed speaker name was thrown away: {:?}",
+            meta.speaker_names
+        );
 
         assert_eq!(ticks.last(), Some(&(meta.duration_cs, meta.duration_cs)));
         assert!(
             ticks.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].1 == w[1].1),
             "progress must be monotone over a fixed total: {ticks:?}"
         );
+        // Only the LAST tick reports done: the speaker pass runs after the
+        // final phrase, and sitting at 100% while it works looked finished
+        // and stuck at the same time.
+        assert!(
+            ticks[..ticks.len() - 1].iter().all(|(d, t)| *d < *t),
+            "the decode pass claimed the whole bar: {ticks:?}"
+        );
+    }
+
+    /// Rebuilding a long recording used to be unstoppable: the only way out
+    /// was to quit the app, and closing the room left the pass grinding on.
+    /// The `stop` flag is honored before the decoder — no model is needed to
+    /// prove it, because a stopped rebuild never reaches one.
+    #[test]
+    fn a_stopped_rebuild_gives_up_before_it_decodes_anything() {
+        let audio = vec![0.2f32; SAMPLE_RATE * 3];
+        let prior = RecMeta {
+            duration_cs: cs_of_samples(audio.len()),
+            cuts: vec![RecCut { t0: 10, t1: 20 }],
+            speaker_names: BTreeMap::from([("Speaker 1".to_string(), "Dana".to_string())]),
+            ..Default::default()
+        };
+        let missing_model = std::path::Path::new("/nonexistent/whisper-model.bin");
+
+        let mut ticks = 0usize;
+        let err = retranscribe(missing_model, &audio, &prior, |_, _| ticks += 1, || true)
+            .expect_err("a stopped rebuild must not report success");
+        assert_eq!(err, RETRANSCRIBE_STOPPED);
+        // Reaching the decoder with that path would have failed with
+        // "Transcribing at 0:00 failed" instead — the flag is checked first.
+        assert_eq!(ticks, 0, "a stopped rebuild decoded a phrase anyway");
+        // The message has to say the recording survived; the caller writes the
+        // returned meta or nothing at all, and there is no partial state.
+        assert!(err.contains("unchanged"), "{err}");
     }
 
     #[test]
@@ -3759,5 +4348,14 @@ mod tests {
         assert!(meta.speaker_names.is_empty());
         let round = serde_json::to_string(&meta).unwrap();
         assert!(!round.contains("speakerNames"), "{round}");
+        // The retired `version` counter: rooms that stored one still open,
+        // and nothing writes it any more.
+        assert!(!round.contains("version"), "{round}");
+        // …and its absence is not a reason to lose a transcript. There is no
+        // version dispatch, so a meta without one is simply a meta.
+        let no_version = r#"{"durationCs":500,"segments":[],"cuts":[],"maxSpeakers":0}"#;
+        let meta: RecMeta =
+            serde_json::from_str(no_version).expect("a meta with no version must parse");
+        assert_eq!(meta.duration_cs, 500);
     }
 }

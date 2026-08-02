@@ -34,7 +34,6 @@ export interface TabsApi {
   /** Focus the tab for `kind:ref`, creating it if this is the first time. */
   open: (kind: TabKind, ref: string, title: string) => void;
   close: (id: string) => void;
-  closeOthers: (id: string) => void;
   activate: (id: string) => void;
   /** Retitle in place — a page's `<title>` and a renamed file both land here. */
   retitle: (id: string, title: string) => void;
@@ -90,9 +89,17 @@ export function useTabs(roomName: string): TabsApi {
 
   const open = useCallback((kind: TabKind, ref: string, title: string) => {
     const id = tabId(kind, ref);
-    setTabs((prev) =>
-      prev.some((t) => t.id === id) ? prev : [...prev, { id, kind, ref, title }],
-    );
+    setTabs((prev) => {
+      const at = prev.findIndex((t) => t.id === id);
+      if (at < 0) return [...prev, { id, kind, ref, title }];
+      // Re-opening carries the CURRENT title. Titles used to be fixed at
+      // creation, so a renamed file kept its old name on its tab for the rest
+      // of the session.
+      if (prev[at].title === title) return prev;
+      const next = [...prev];
+      next[at] = { ...next[at], title };
+      return next;
+    });
     setActiveId(id);
   }, []);
 
@@ -110,11 +117,6 @@ export function useTabs(roomName: string): TabsApi {
       });
       return next;
     });
-  }, []);
-
-  const closeOthers = useCallback((id: string) => {
-    setTabs((prev) => prev.filter((t) => t.id === id));
-    setActiveId(id);
   }, []);
 
   const retitle = useCallback((id: string, title: string) => {
@@ -171,7 +173,6 @@ export function useTabs(roomName: string): TabsApi {
     active: tabs.find((t) => t.id === activeId) ?? null,
     open,
     close,
-    closeOthers,
     activate: setActiveId,
     retitle,
     move,

@@ -510,3 +510,34 @@ async def test_extract_returns_pretty_json_and_survives_garbage(monkeypatch) -> 
         context="…",
     )
     assert "_raw" in out2["result"]
+
+
+# --------------------------------------------------------------------------- #
+# the dev-only Studio seam: a partial state must not crash the run
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("graph", "state"),
+    [
+        (wf_nodes.REFINE_GRAPH, {"base": "write it"}),          # no rubric/budget
+        (wf_nodes.MAP_GRAPH, {"objective": "do it"}),           # no context/width
+        (wf_nodes.VOTE_GRAPH, {"prompt": "answer"}),            # no width/mode
+    ],
+)
+async def test_partial_studio_state_runs_instead_of_raising_keyerror(
+    graph, state, monkeypatch
+) -> None:
+    """`langgraph dev` invokes these with whatever JSON the developer typed, so a
+    missing key used to end the run on a raw KeyError instead of a readable
+    result. The `run_*` entry points always seed the full state; Studio does not.
+    """
+    script = Script(["only draft"] * 4)
+    final = await graph.ainvoke(
+        state,
+        config={
+            "configurable": {"deps": _deps(script, CancelToken(), monkeypatch)},
+            "recursion_limit": 8,
+        },
+    )
+    assert final.get("draft") or final.get("answer")

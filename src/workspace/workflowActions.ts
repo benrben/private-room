@@ -32,11 +32,6 @@ export function makeWorkflowActions(
     s.setShowWorkflows(true);
   }
 
-  function closeWorkflows() {
-    s.setShowWorkflows(false);
-    s.setWfDetailId(null);
-  }
-
   async function runWorkflowNow(id: string, fileId?: string) {
     const wf = s.workflows.find((w) => w.id === id);
     await tryToast(s, async () => {
@@ -151,7 +146,6 @@ export function makeWorkflowActions(
     refreshWorkflows,
     openWorkflows,
     openWorkflowDetail,
-    closeWorkflows,
     runWorkflowNow,
     runWorkflowOn,
     setWorkflowStatus,
@@ -164,5 +158,4 @@ export function makeWorkflowActions(
   };
 }
 
-export type WorkflowActions = ReturnType<typeof makeWorkflowActions>;
 export type { Workflow };

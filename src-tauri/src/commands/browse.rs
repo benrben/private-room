@@ -179,8 +179,19 @@ fn format_read(v: &serde_json::Value) -> String {
     }
     let mut out = format!("{title} — {url}\n\n{text}");
     if v.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
-        let next = v.get("offset").and_then(|o| o.as_u64()).unwrap_or(0)
-            + text.chars().count() as u64;
+        // The page reports where to carry on from, in the units it sliced
+        // with. Recounting here in Rust `char`s was a different count from
+        // JavaScript's UTF-16 code units the moment the page held an emoji, so
+        // the offset came back short and the next chunk repeated text the
+        // model had already read. The recount stays only as a fallback for a
+        // page script older than this field.
+        let next = v
+            .get("nextOffset")
+            .and_then(|o| o.as_u64())
+            .unwrap_or_else(|| {
+                v.get("offset").and_then(|o| o.as_u64()).unwrap_or(0)
+                    + text.chars().count() as u64
+            });
         let total = v.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
         out.push_str(&format!(
             "\n\n… {next} of {total} characters shown — call browse_read again with offset {next} for the rest."
@@ -446,12 +457,18 @@ async fn exec_browse_inner(
                 .unwrap_or_default();
             let occurrences = v.get("textOccurrences").and_then(|t| t.as_u64()).unwrap_or(0);
             if matches.is_empty() {
+                // browse_find searches the numbering the model already has,
+                // rather than re-scanning (which would cancel every ref it was
+                // just given). A control that appeared since that numbering was
+                // taken is therefore invisible here — so say what to do about it.
                 return Ok(if occurrences > 0 {
                     format!(
-                        "No control is labelled \"{text}\", but the page text mentions it {occurrences} time(s) — browse_read to see the context."
+                        "No control is labelled \"{text}\", but the page text mentions it {occurrences} time(s) — browse_read to see the context, or browse_snapshot if the page has changed since your last one."
                     )
                 } else {
-                    format!("Nothing on this page matches \"{text}\".")
+                    format!(
+                        "Nothing on this page matches \"{text}\". If the page has changed since your last snapshot, take a fresh browse_snapshot and look again."
+                    )
                 });
             }
             let listed = serde_json::json!({ "elements": matches });
@@ -559,8 +576,9 @@ async fn exec_browse_inner(
             let url = info.get("url").and_then(|u| u.as_str()).unwrap_or("");
             browser::journal(&app, "look", url, "Looked at the page");
             Ok(format!(
-                "Looking at {} — every interactive element is numbered with the same ref browse_snapshot uses.",
-                info.get("title").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).unwrap_or(url)
+                "Looking at {} — every interactive element is numbered with the same ref browse_snapshot uses.{}",
+                info.get("title").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).unwrap_or(url),
+                uncapturable_media_note(&info).unwrap_or_default(),
             ))
         }
 
@@ -591,7 +609,7 @@ async fn capture_and_save(app: &tauri::AppHandle, what: &str) -> Result<String, 
         return Err("The page returned nothing to save — it may still be loading.".into());
     }
     let state = app.state::<AppState>();
-    let saved_names = state.with_room(|room| {
+    let (saved_names, room_path) = state.with_room(|room| {
         let saved = db::current_date(&room.conn);
         let display_title = if title.trim().is_empty() { url.clone() } else { title.clone() };
         let base_title = if what == "selection" {
@@ -624,8 +642,15 @@ async fn capture_and_save(app: &tauri::AppHandle, what: &str) -> Result<String, 
             )?;
             names.push(twin.name);
         }
-        Ok(names)
+        Ok((names, room.path.clone()))
     })?;
+    // Every other web import (`save_web_markdown`, `import_download`) starts
+    // these two after the file lands; this one started neither, so a page saved
+    // from the browser was searchable immediately, had no AI description, and
+    // sat outside the privacy scan until some unrelated import happened to
+    // schedule one.
+    schedule_auto_index(app, room_path);
+    schedule_privacy_scan(app.clone());
     browser::journal(app, "save", &url, &format!("Saved {}", saved_names.join(" and ")));
     let _ = tauri::Emitter::emit(app, "room-files-changed", ());
     Ok(match saved_names.as_slice() {
@@ -681,6 +706,24 @@ async fn look_png(app: &tauri::AppHandle) -> Result<String, String> {
         Duration::from_secs(10),
     )
     .await?;
+    // Every exit from here on must un-paint. The early return for a parked
+    // webview used to skip it, leaving the numbered pink outlines on the page
+    // the human is looking at — the badges are for the model, and the browser
+    // must not stay annotated because a screenshot failed.
+    let outcome = capture_look_png(app).await;
+    let _ = browser::call_async(
+        app,
+        "annotate",
+        serde_json::json!({ "on": false }),
+        Duration::from_secs(10),
+    )
+    .await;
+    outcome
+}
+
+/// The screenshot half of [`look_png`], split out so its caller can un-paint
+/// the badges on every path.
+async fn capture_look_png(app: &tauri::AppHandle) -> Result<String, String> {
     let wv = browser::webview(app).ok_or("The browser isn't open.")?;
     // capture_png must not run on the main thread (it would deadlock on the
     // snapshot completion handler), so it goes to a blocking worker.
@@ -695,14 +738,25 @@ async fn look_png(app: &tauri::AppHandle) -> Result<String, String> {
              card) and ask again."
         ));
     }
-    let _ = browser::call_async(
-        app,
-        "annotate",
-        serde_json::json!({ "on": false }),
-        Duration::from_secs(10),
-    )
-    .await;
     downscale_png_b64(&png, 1280)
+}
+
+/// What a screenshot of this page CANNOT show, in the tool result itself.
+///
+/// `WKWebView`'s snapshot API composites the DOM, not the media layers: a
+/// playing `<video>`, a WebGL canvas and a plugin surface all come back as
+/// empty rectangles. The picture is still worth taking — the rest of the page
+/// is in it — but reporting it as a complete view is how a model ends up
+/// describing a playing video as "nothing there". The page script counts the
+/// visible media areas so the caveat is only attached when there is one.
+fn uncapturable_media_note(info: &serde_json::Value) -> Option<String> {
+    let n = info.get("mediaAreas").and_then(|m| m.as_u64()).unwrap_or(0);
+    (n > 0).then(|| {
+        format!(
+            " Note: {n} video/3D area(s) on this page cannot be captured and appear \
+             BLANK in the picture — do not describe them as empty."
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -785,9 +839,14 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
     if !browser::is_open(&app) {
         return Ok(serde_json::json!({ "open": false }));
     }
-    let info = browser::call(&app, "info", serde_json::json!({}))
-        .await
-        .unwrap_or_else(|e| serde_json::json!({ "error": e }));
+    let (info, error) = match browser::call(&app, "info", serde_json::json!({})).await {
+        Ok(info) => (info, None),
+        // The reason the page did not answer used to be written into a local
+        // and then dropped, so the poll returned nulls, the address bar kept
+        // showing the last URL it knew, and a page that had stopped answering
+        // looked exactly like one that was fine. Hand the reason back.
+        Err(e) => (serde_json::Value::Null, Some(e)),
+    };
     // The page script answers for the MAIN frame, so this is the authoritative
     // "where is this page" — write it back so a record corrupted by a
     // sub-frame navigation heals on the next poll instead of persisting as a
@@ -795,28 +854,60 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
     if let Some(url) = info.get("url").and_then(|u| u.as_str()) {
         browser::record_active_url(&app, url);
     }
-    Ok(serde_json::json!({
+    // With no answer from the page, our own RECORD of where this page was sent
+    // is the only honest address there is — better than a null the view falls
+    // back to its last known value for.
+    let url = match info.get("url").cloned() {
+        Some(url) if !url.is_null() => url,
+        _ => browser::active_url(&app)
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+    };
+    let mut out = serde_json::json!({
         "open": true,
         // Recorded, not read from the page script — a blank page runs no script.
         "blank": browser::is_blank(&app),
-        "url": info.get("url").cloned().unwrap_or(serde_json::Value::Null),
+        "url": url,
         "title": info.get("title").cloned().unwrap_or(serde_json::Value::Null),
         "ready": info.get("ready").cloned().unwrap_or(serde_json::Value::Null),
         "takeover": app.state::<browser::BrowserState>().takeover.load(Ordering::SeqCst),
-    }))
+    });
+    // Present ONLY when there is a reason, so the field means what `apiTypes.ts`
+    // declares it to mean (`error?: string`). A `null` on every poll is not an
+    // optional field, it is a null one — and the view would have to know the
+    // difference for no gain.
+    if let Some(reason) = error {
+        out["error"] = serde_json::Value::from(reason);
+    }
+    Ok(out)
+}
+
+/// What one chrome action runs, and whether it puts the browser back on the
+/// network.
+///
+/// Back, forward and reload all issue a real load, so a room whose internet
+/// switch reads "Off — room stays offline" must refuse them exactly like the
+/// address bar does. `stop` only CANCELS a load, which is always allowed —
+/// refusing it would mean the one control that takes a room offline faster
+/// than anything else stopped working the moment you turned the room offline.
+fn browser_go_js(action: &str) -> Result<(&'static str, bool), String> {
+    Ok(match action {
+        "back" => ("history.back()", true),
+        "forward" => ("history.forward()", true),
+        "reload" => ("location.reload()", true),
+        "stop" => ("window.stop()", false),
+        _ => return Err(format!("Unknown browser action: {action}")),
+    })
 }
 
 /// back / forward / reload / stop, driven from the chrome.
 #[tauri::command]
 pub async fn browser_go(app: tauri::AppHandle, action: String) -> Result<(), String> {
+    let (js, goes_online) = browser_go_js(&action)?;
+    if goes_online {
+        require_web_enabled(&app.state::<AppState>())?;
+    }
     let wv = browser::webview(&app).ok_or("The browser isn't open.")?;
-    let js = match action.as_str() {
-        "back" => "history.back()",
-        "forward" => "history.forward()",
-        "reload" => "location.reload()",
-        "stop" => "window.stop()",
-        _ => return Err(format!("Unknown browser action: {action}")),
-    };
     wv.eval(js).map_err(|e| e.to_string())
 }
 
@@ -844,11 +935,18 @@ pub fn browser_journal(
     db::list_browse_journal(&room.conn, limit.unwrap_or(300))
 }
 
+/// Clear the browser's whole record: the journal AND the web cache behind it.
+///
+/// The cache is not an implementation detail from the user's side — it holds
+/// the words they searched for and the full text and thumbnails of the result
+/// pages, inside a browser that promises to keep nothing. Clearing the journal
+/// while leaving that behind was a Clear button that did not clear.
 #[tauri::command]
 pub fn browser_clear_journal(state: State<'_, AppState>) -> Result<(), String> {
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
-    db::clear_browse_journal(&room.conn)
+    db::clear_browse_journal(&room.conn)?;
+    db::clear_web_cache(&room.conn)
 }
 
 /// Ask the LIVE webview whether its storage is really ephemeral. Surfaced in
@@ -972,11 +1070,26 @@ mod tests {
     fn truncated_reads_say_exactly_how_to_continue() {
         let v = serde_json::json!({
             "title": "Doc", "url": "https://x/", "text": "abcde",
-            "truncated": true, "offset": 100, "total": 900,
+            "truncated": true, "offset": 100, "nextOffset": 105, "total": 900,
         });
         let out = format_read(&v);
         assert!(out.contains("offset 105"), "got: {out}");
         assert!(out.contains("of 900 characters"));
+        // The PAGE's own count wins. Rust counts `char`s and JavaScript counts
+        // UTF-16 code units, so an emoji makes them differ by one — and a short
+        // offset makes the next chunk repeat text already read.
+        let emoji = serde_json::json!({
+            "title": "Doc", "url": "https://x/", "text": "a🎉b",
+            "truncated": true, "offset": 0, "nextOffset": 4, "total": 900,
+        });
+        let out = format_read(&emoji);
+        assert!(out.contains("offset 4"), "the page's own count must win: {out}");
+        // A page script older than `nextOffset` still gets a usable answer.
+        let legacy = serde_json::json!({
+            "title": "Doc", "url": "https://x/", "text": "abcde",
+            "truncated": true, "offset": 100, "total": 900,
+        });
+        assert!(format_read(&legacy).contains("offset 105"));
         // A complete read must not invite a pointless follow-up call.
         let done = serde_json::json!({
             "title": "Doc", "url": "https://x/", "text": "abcde", "truncated": false,
@@ -1035,6 +1148,36 @@ mod tests {
                 specs.iter().any(|s| s["function"]["name"] == *name),
                 "{name} is dispatchable but never advertised"
             );
+        }
+    }
+
+    /// The room's internet switch is a promise ("this room stays offline"), and
+    /// Back/Forward/Reload are real loads. Stop is the exception: cancelling a
+    /// load must never be refused for being offline.
+    #[test]
+    fn only_the_chrome_actions_that_load_are_gated_on_the_internet_switch() {
+        assert_eq!(browser_go_js("back"), Ok(("history.back()", true)));
+        assert_eq!(browser_go_js("forward"), Ok(("history.forward()", true)));
+        assert_eq!(browser_go_js("reload"), Ok(("location.reload()", true)));
+        assert_eq!(browser_go_js("stop"), Ok(("window.stop()", false)));
+        assert!(browser_go_js("teleport").is_err());
+    }
+
+    /// A screenshot composites the DOM, not the media layers, so a playing
+    /// video is a blank rectangle in the picture. The model must be told, or it
+    /// describes the video as "nothing there".
+    #[test]
+    fn a_page_with_video_warns_that_the_picture_cannot_show_it() {
+        let note = uncapturable_media_note(&serde_json::json!({ "mediaAreas": 2 })).unwrap();
+        assert!(note.contains("BLANK"), "{note:?}");
+        assert!(note.contains('2'), "{note:?}");
+        // An ordinary page must not carry the caveat.
+        for quiet in [
+            serde_json::json!({ "mediaAreas": 0 }),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(uncapturable_media_note(&quiet), None, "for {quiet}");
         }
     }
 

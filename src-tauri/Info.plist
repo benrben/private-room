@@ -2,17 +2,54 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- ADD-18: dictation records from the microphone; audio is transcribed
-       on-device and never leaves this Mac. -->
+  <!-- ADD-18/ADD-27: the microphone feeds meeting recording, voice messages and
+       dictation. This one sentence is what the user reads before granting the
+       permission, so it has to match what the app actually does: Whisper runs
+       on-device, so the AUDIO never leaves the Mac — but the resulting TEXT can
+       be sent onward (translation, spoken replies, chat) if the user has picked
+       a cloud engine. -->
   <key>NSMicrophoneUsageDescription</key>
-  <string>Arcelle uses the microphone for voice messages and dictation. Audio is transcribed on this Mac and never leaves it.</string>
+  <string>Arcelle uses the microphone to record meetings and for voice messages and dictation. Audio is transcribed on this Mac and the recording itself never leaves it; only text, and only if you choose a cloud AI engine, is ever sent anywhere.</string>
   <!-- Re-declares the .arcelle / .roomai associations from tauri.conf.json so
        the document icon (bundled via resources) can be attached; user-supplied
        plist keys take precedence over the generated ones. The legacy .roomai
-       extension stays registered so existing vaults still open. -->
+       extension stays registered so existing vaults still open.
+
+       Modern Launch Services matches documents by UTI, not by extension, so the
+       app EXPORTS its own type below and the document type claims it via
+       LSItemContentTypes. Without an exported declaration the Finder icon and
+       "Open With" for room files are guesswork and can regress after an update
+       or an OS upgrade. CFBundleTypeExtensions stays as the legacy fallback. -->
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>com.benreich.privateroom.workspace</string>
+      <key>UTTypeDescription</key>
+      <string>Arcelle Workspace</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.data</string>
+      </array>
+      <key>UTTypeIconFile</key>
+      <string>document.icns</string>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>arcelle</string>
+          <string>roomai</string>
+        </array>
+      </dict>
+    </dict>
+  </array>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>com.benreich.privateroom.workspace</string>
+      </array>
       <key>CFBundleTypeExtensions</key>
       <array>
         <string>arcelle</string>

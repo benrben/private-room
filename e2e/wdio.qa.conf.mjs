@@ -66,12 +66,23 @@ export const config = {
       run("npm", ["run", "build"], "vite build");
       run(process.execPath, [path.join(projectRoot, "qa", "make-qa.mjs")], "make-qa");
     }
+    // `--host 127.0.0.1` is load-bearing: vite's default host is `localhost`,
+    // which on macOS resolves to ::1 first, so the server listens on IPv6 ONLY
+    // and every request to 127.0.0.1 — the poll below and then Chrome itself —
+    // is refused. The whole suite died with ERR_CONNECTION_REFUSED before this.
     preview = spawn(
       path.join(projectRoot, "node_modules", ".bin", "vite"),
-      ["preview", "--port", PORT, "--strictPort"],
+      ["preview", "--host", "127.0.0.1", "--port", PORT, "--strictPort"],
       { cwd: projectRoot, stdio: "inherit" },
     );
-    await waitFor(BASE_URL);
+    try {
+      await waitFor(BASE_URL);
+    } catch (err) {
+      // Otherwise a half-started preview keeps --strictPort's port and the
+      // NEXT run fails too, for a different and more confusing reason.
+      preview.kill();
+      throw err;
+    }
   },
 
   onComplete: () => {

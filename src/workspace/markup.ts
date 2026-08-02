@@ -69,10 +69,15 @@ export function isModelReady(ai: AiStatus | null | undefined, model: string): bo
   if (!ai) return false;
   const [engine] = splitExternalModel(model);
   if (ai.external.includes(engine)) return true;
+  // Both directions match only across a `:` TAG BOUNDARY. A bare prefix test
+  // would call "qwen3.5:4b" installed because an unrelated "qwen3" is — the
+  // download card then never appears and the turn fails with MODEL_MISSING.
   return (
     ai.running &&
     (ai.models.includes(model) ||
-      ai.models.some((m) => m.startsWith(model + ":") || model.startsWith(m)))
+      ai.models.some(
+        (m) => m.startsWith(model + ":") || model.startsWith(m + ":"),
+      ))
   );
 }
 

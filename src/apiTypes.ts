@@ -934,6 +934,10 @@ export interface SkillSummary {
   description: string;
   enabled: boolean;
   createdBy: "user" | "agent" | "import";
+  /** Which domain agent owns this skill (`agent:` in SKILL.md frontmatter).
+   * "" = general: offered to every agent, which is what an ordinary
+   * hand-written skill stays. */
+  agent: string;
   resourceCount: number;
   createdAt: string;
   updatedAt: string;

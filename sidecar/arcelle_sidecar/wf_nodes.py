@@ -32,6 +32,12 @@ endpoint tolerates that (``/file_pass_map`` wastes at most one generation); a
 these nodes take a ``run_id``, register a :class:`~.graph.CancelToken` in the
 server's existing :class:`~.server.RunRegistry`, and Stop reaches them through
 the ``/cancel`` route that ``/run`` already uses.
+
+Every node reads its state with ``.get`` and a default. The ``run_*`` entry
+points always seed the whole state, but ``langgraph dev`` invokes these graphs
+with whatever JSON the developer typed into Studio, and a missing key there
+ended the run on a raw ``KeyError`` instead of just running with an empty
+objective/prompt.
 """
 
 from __future__ import annotations
@@ -202,14 +208,14 @@ class RefineState(TypedDict, total=False):
 
 
 async def refine_draft(state: RefineState, config: RunnableConfig) -> dict[str, Any]:
-    return {"draft": await _deps(config).gen(state["base"]), "judged": 0}
+    return {"draft": await _deps(config).gen(state.get("base", "")), "judged": 0}
 
 
 async def refine_judge(state: RefineState, config: RunnableConfig) -> dict[str, Any]:
     prompt = (
-        f"Judge the draft against this bar: {state['rubric']}.\n"
+        f"Judge the draft against this bar: {state.get('rubric', REFINE_DEFAULT_RUBRIC)}.\n"
         'Return ONLY JSON {"pass": <bool>, "feedback": <what to fix>}.\n\n'
-        f"Draft:\n{state['draft']}"
+        f"Draft:\n{state.get('draft', '')}"
     )
     raw = await _deps(config).gen(prompt, REFINE_VERDICT_SCHEMA)
     verdict = _parse_or(raw, {"pass": True, "feedback": ""})
@@ -223,15 +229,15 @@ async def refine_judge(state: RefineState, config: RunnableConfig) -> dict[str, 
 
 async def refine_revise(state: RefineState, config: RunnableConfig) -> dict[str, Any]:
     prompt = (
-        f"{state['base']}\n\nYour previous draft:\n{state['draft']}\n\n"
-        f"Revise it to fix this feedback:\n{state['feedback']}"
+        f"{state.get('base', '')}\n\nYour previous draft:\n{state.get('draft', '')}\n\n"
+        f"Revise it to fix this feedback:\n{state.get('feedback', '')}"
     )
     return {"draft": await _deps(config).gen(prompt)}
 
 
 def _after_draft(state: RefineState) -> str:
     # `for _ in 1..rounds` runs zero times when rounds == 1.
-    return "judge" if state["budget"] > 1 else END
+    return "judge" if state.get("budget", 1) > 1 else END
 
 
 def _after_judge(state: RefineState) -> str:
@@ -241,7 +247,7 @@ def _after_judge(state: RefineState) -> str:
 def _after_revise(state: RefineState) -> str:
     # Iteration i (1-based) judged once; the loop body ends after `rounds - 1`
     # iterations, and the last revise's draft is returned WITHOUT a re-judge.
-    return "judge" if state.get("judged", 0) < state["budget"] - 1 else END
+    return "judge" if state.get("judged", 0) < state.get("budget", 1) - 1 else END
 
 
 def _build_refine() -> Any:
@@ -311,10 +317,11 @@ class MapState(TypedDict, total=False):
 
 
 async def map_plan(state: MapState, config: RunnableConfig) -> dict[str, Any]:
+    width = state.get("width", 1)
     prompt = (
         f"Break this objective into a short list of independent subtasks (no more "
-        f'than {state["width"]}). Return ONLY JSON {{"subtasks": ["…"]}}.\n\n'
-        f'Objective:\n{state["objective"]}\n\nContext:\n{state["context"]}'
+        f'than {width}). Return ONLY JSON {{"subtasks": ["…"]}}.\n\n'
+        f'Objective:\n{state.get("objective", "")}\n\nContext:\n{state.get("context", "")}'
     )
     raw = await _deps(config).gen(prompt, PLAN_SCHEMA)
     parsed = _parse_or(raw, {"subtasks": []})
@@ -324,14 +331,16 @@ async def map_plan(state: MapState, config: RunnableConfig) -> dict[str, Any]:
         for s in parsed["subtasks"]:
             if isinstance(s, str) and s.strip():
                 items.append(s.strip())
-            if len(items) == state["width"]:
+            if len(items) == width:
                 break
     return {"subtasks": items}
 
 
 async def map_direct(state: MapState, config: RunnableConfig) -> dict[str, Any]:
     """No decomposition — answer the objective directly (Rust's fallback arm)."""
-    text = await _deps(config).gen(f'{state["objective"]}\n\nContext:\n{state["context"]}')
+    text = await _deps(config).gen(
+        f'{state.get("objective", "")}\n\nContext:\n{state.get("context", "")}'
+    )
     return {"answer": text}
 
 
@@ -345,10 +354,10 @@ async def map_worker(state: dict[str, Any], config: RunnableConfig) -> dict[str,
 
 
 async def map_synthesize(state: MapState, config: RunnableConfig) -> dict[str, Any]:
-    joined = "\n\n".join(s for _, s in sorted(state["results"], key=lambda p: p[0]))
+    joined = "\n\n".join(s for _, s in sorted(state.get("results") or [], key=lambda p: p[0]))
     prompt = (
         "Combine these subtask results into one coherent answer to the "
-        f'objective.\n\nObjective:\n{state["objective"]}\n\nResults:\n{joined}'
+        f'objective.\n\nObjective:\n{state.get("objective", "")}\n\nResults:\n{joined}'
     )
     return {"answer": await _deps(config).gen(prompt)}
 
@@ -358,7 +367,15 @@ def _after_plan(state: MapState) -> Any:
     if not subtasks:
         return "direct"
     return [
-        Send("worker", {"i": i, "subtask": s, "objective": state["objective"], "context": state["context"]})
+        Send(
+            "worker",
+            {
+                "i": i,
+                "subtask": s,
+                "objective": state.get("objective", ""),
+                "context": state.get("context", ""),
+            },
+        )
         for i, s in enumerate(subtasks)
     ]
 
@@ -400,11 +417,14 @@ async def run_plan_and_map(
 # vote — self-consistency sampling
 # --------------------------------------------------------------------------- #
 
-VOTE_MODES = ("concat", "majority")
-
 
 def aggregate_votes(mode: str, samples: list[str]) -> str:
     """Rust ``aggregate_votes`` (workflow.rs), semantics preserved exactly.
+
+    ``mode`` is "majority" or anything else, which is "concat". The VALIDATION of
+    the two legal modes belongs to the plan compiler that owns the palette
+    (workflow.rs ``VOTE_MODES``) and is not repeated here — a list published
+    beside this function looked like a check it never performed.
 
     The subtle half is majority's tie rule: highest count wins, and a TIE goes
     to the LOWEST first-seen index. That is why the samples must arrive in
@@ -440,14 +460,14 @@ async def vote_sample(state: dict[str, Any], config: RunnableConfig) -> dict[str
 
 
 async def vote_tally(state: VoteState, config: RunnableConfig) -> dict[str, Any]:
-    ordered = [s for _, s in sorted(state["samples"], key=lambda p: p[0])]
+    ordered = [s for _, s in sorted(state.get("samples") or [], key=lambda p: p[0])]
     return {"answer": aggregate_votes(state.get("mode", "concat"), ordered)}
 
 
 def _fan_votes(state: VoteState) -> Any:
     return [
-        Send("sample", {"i": i, "prompt": state["prompt"]})
-        for i in range(state["width"])
+        Send("sample", {"i": i, "prompt": state.get("prompt", "")})
+        for i in range(state.get("width", 1))
     ]
 
 
@@ -547,12 +567,10 @@ async def run_extract(
         f"exactly these keys: {', '.join(fields)}.\n\nText:\n{context}"
     )
     raw = await deps.gen(prompt, build_extract_schema(fields))
-    cleaned = recover_json(raw)
+    # `_parse_or` already ran the reply through recover_json, and its fallback is
+    # a plain dict, so `val` is always JSON-serializable — pretty-print it.
     val = _parse_or(raw, {"_raw": raw})
-    try:
-        return {"result": json.dumps(val, indent=2, ensure_ascii=False)}
-    except (TypeError, ValueError):  # pragma: no cover - json.dumps on odd input
-        return {"result": cleaned}
+    return {"result": json.dumps(val, indent=2, ensure_ascii=False)}
 
 
 async def run_route(
@@ -615,7 +633,6 @@ class WfNodeRequest(BaseModel):
 __all__ = [
     "MAP_GRAPH",
     "VOTE_GRAPH",
-    "VOTE_MODES",
     "aggregate_votes",
     "build_extract_schema",
     "pick_route_label",

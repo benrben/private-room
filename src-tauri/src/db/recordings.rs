@@ -52,6 +52,27 @@ pub fn clear_rec_chunks(conn: &Connection, file_id: &str) -> Result<(), String> 
     execute_one(conn, "DELETE FROM rec_chunks WHERE file_id = ?1", [file_id])
 }
 
+/// Write the assembled WAV (plus its transcript) and drop the now-redundant
+/// checkpoints as ONE transaction.
+///
+/// These used to be two independent statements, and nothing tied them
+/// together: a failure — or a crash — between them left a complete recording
+/// with its checkpoints still on disk, and the next `recover_rec_chunks`
+/// dutifully spliced that tail onto the end of audio that already contained
+/// it, so part of the recording played twice. Either both land or neither
+/// does; the flush that failed simply retries.
+pub fn finalize_rec_audio(
+    conn: &Connection,
+    file_id: &str,
+    wav: &[u8],
+    text: Option<&str>,
+) -> Result<(), String> {
+    in_transaction(conn, || {
+        update_file_content(conn, file_id, wav, text)?;
+        clear_rec_chunks(conn, file_id)
+    })
+}
+
 /// Recover any recording whose live session died before its final write:
 /// splice the checkpointed tail onto the stored WAV and clear the chunks.
 /// Idempotent, and free when there is nothing to recover (the normal case).
@@ -104,5 +125,42 @@ mod tests {
         // Deleting the file takes the meta row with it (ON DELETE CASCADE).
         delete_file(&conn, &id).unwrap();
         assert!(get_rec_meta(&conn, &id).is_none());
+    }
+
+    /// The final write and the checkpoint cleanup are one step. A complete
+    /// WAV whose checkpoints survived would be spliced onto itself by the
+    /// next crash recovery, and part of the recording would play twice.
+    #[test]
+    fn finalizing_writes_the_wav_and_clears_the_checkpoints_together() {
+        let conn = mem();
+        let id = add_file(&conn, "call.wav", "(live recording)");
+        let tail = vec![0.5f32; 800];
+        append_rec_chunk(&conn, &id, &tail).unwrap();
+        append_rec_chunk(&conn, &id, &tail).unwrap();
+
+        let whole = crate::recording::encode_wav(&vec![0.5f32; 1600]);
+        finalize_rec_audio(&conn, &id, &whole, Some("(live recording)\n")).unwrap();
+        assert_eq!(get_file_bytes(&conn, &id).unwrap().as_deref(), Some(whole.as_slice()));
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM rec_chunks WHERE file_id = ?1", [&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "checkpoints survived a completed write");
+
+        // Recovery over a finalized recording is a no-op, so nothing is
+        // appended to audio that already contains it.
+        assert_eq!(recover_rec_chunks(&conn).unwrap(), 0);
+        assert_eq!(get_file_bytes(&conn, &id).unwrap().as_deref(), Some(whole.as_slice()));
+
+        // A write that fails leaves the checkpoints alone, so the next flush
+        // can still retry the whole tail. (The transaction is what makes the
+        // two halves inseparable in either direction.)
+        append_rec_chunk(&conn, &id, &tail).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(finalize_rec_audio(&conn, &id, &whole, None).is_ok());
+        conn.execute_batch("ROLLBACK").unwrap();
+        let still: i64 = conn
+            .query_row("SELECT count(*) FROM rec_chunks WHERE file_id = ?1", [&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still, 1, "a rolled-back write must keep its checkpoints");
     }
 }

@@ -20,8 +20,11 @@ _LABELS: dict[str, str] = {
     "ask_jobs_agent": "Asked the Jobs agent",
     "ask_skills_agent": "Asked the Skills agent",
     "ask_connector_agent": "Asked the Connector agent",
-    # One batch call is a whole PLAN whose tasks run at the same time; a chip
-    # reading "Asked the File agent" would under-report what is happening.
+    # One batch call is a whole PLAN carrying several asks, so a chip reading
+    # "Asked the File agent" would under-report what is happening. "at once"
+    # is about the CALL, not the clock: a local room runs the children strictly
+    # one after another (`Deps.worker_parallel = 1`), which is why the batch
+    # tool's own description no longer promises wall-clock parallelism either.
     "ask_agents": "Asked several agents at once",
     # The lane escape hatch (2026-07-23). graph.py emits this step BEFORE the
     # request_tools branch resolves it locally, so the name DOES reach this

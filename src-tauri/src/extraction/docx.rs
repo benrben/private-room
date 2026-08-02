@@ -1,8 +1,51 @@
 use super::*;
 
+/// The parts of a Word file that carry prose, in reading order after the body.
+/// Only `word/document.xml` used to be read, so a clause living in a footnote,
+/// a header, a footer or a review comment was invisible to search and to the
+/// assistant with nothing saying part of the document had been skipped.
+/// Header/footer parts are numbered (`header1.xml`, `header2.xml`, …), so they
+/// are discovered from the archive rather than named here.
+const DOCX_EXTRA_PARTS: &[(&str, &str)] = &[
+    ("word/footnotes.xml", "footnotes"),
+    ("word/endnotes.xml", "endnotes"),
+    ("word/comments.xml", "comments"),
+];
+
 pub(crate) fn extract_docx(bytes: &[u8]) -> Option<String> {
     let xml = read_zip_entry(bytes, "word/document.xml")?;
-    Some(xml_paras_to_text(&xml, "</w:p>"))
+    let mut out = xml_paras_to_text(&xml, "</w:p>");
+    for (entry, label) in DOCX_EXTRA_PARTS {
+        push_docx_part(&mut out, bytes, entry, label);
+    }
+    // Headers and footers are per-section parts; take them in archive order.
+    let names = zip_entry_names(bytes);
+    for name in &names {
+        let label = if name.starts_with("word/header") {
+            "header"
+        } else if name.starts_with("word/footer") {
+            "footer"
+        } else {
+            continue;
+        };
+        if name.ends_with(".xml") {
+            push_docx_part(&mut out, bytes, name, label);
+        }
+    }
+    Some(out)
+}
+
+/// Append one labelled part's text, if it exists and holds anything readable.
+/// The label matters: without it the model cannot tell a footnote's small print
+/// from the body clause it qualifies.
+fn push_docx_part(out: &mut String, bytes: &[u8], entry: &str, label: &str) {
+    let Some(xml) = read_zip_entry(bytes, entry) else { return };
+    let text = xml_paras_to_text(&xml, "</w:p>");
+    if text.trim().is_empty() {
+        return;
+    }
+    out.push_str(&format!("\n[{label}]\n"));
+    out.push_str(&text);
 }
 
 fn encode_xml_text(s: &str) -> String {
@@ -253,6 +296,40 @@ mod tests {
         );
         let text = extract_text("contract.docx", &bytes).expect("docx text");
         assert!(text.contains("Hello contract"));
+    }
+
+    #[test]
+    fn reads_headers_footers_footnotes_and_comments() {
+        // Only word/document.xml used to be read, so a clause hiding in a
+        // footnote (or a header, footer or review comment) was invisible to
+        // search and to the assistant, with nothing saying it had been skipped.
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, body) in [
+                ("word/document.xml", "<w:p><w:t>The body clause.</w:t></w:p>"),
+                (
+                    "word/footnotes.xml",
+                    "<w:p><w:t>Subject to the arbitration rider.</w:t></w:p>",
+                ),
+                ("word/header1.xml", "<w:p><w:t>CONFIDENTIAL DRAFT</w:t></w:p>"),
+                ("word/footer1.xml", "<w:p><w:t>Page of the agreement</w:t></w:p>"),
+                ("word/comments.xml", "<w:p><w:t>Check this with legal.</w:t></w:p>"),
+            ] {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let text = extract_text("contract.docx", &cursor.into_inner()).expect("docx text");
+        assert!(text.contains("The body clause."), "got: {text}");
+        assert!(text.contains("[footnotes]"), "footnotes unlabelled: {text}");
+        assert!(text.contains("arbitration rider"), "footnote missing: {text}");
+        assert!(text.contains("CONFIDENTIAL DRAFT"), "header missing: {text}");
+        assert!(text.contains("Page of the agreement"), "footer missing: {text}");
+        assert!(text.contains("Check this with legal."), "comment missing: {text}");
     }
 
     #[test]

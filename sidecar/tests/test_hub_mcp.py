@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 import pytest
 
-from arcelle_sidecar import external_llm, hub_mcp
+from arcelle_sidecar import external_llm, hub_mcp, mcp_client
 from arcelle_sidecar.hub_mcp import (
     DELEGATION_ACK,
     HubToolServer,
@@ -88,6 +88,17 @@ def test_a_call_is_captured_and_acknowledged_not_executed() -> None:
         assert server.calls == [("ask_jobs_agent", {"instruction": "daily digest"})]
 
 
+def test_the_ack_stops_the_answer_but_not_a_second_delegation() -> None:
+    """`_Delegator.launch` fans out every delegation in a round before awaiting
+    any, so a Claude room can hand three specialists their work in ONE turn. The
+    ack used to say "do not call another tool", which threw that away: three
+    round trips at three times the cost for a three-part request. What it must
+    still stop is answering, because no report has come back yet."""
+    assert "do not call another tool" not in DELEGATION_ACK
+    assert "in this same turn" in DELEGATION_ACK
+    assert "do not write the answer yet" in DELEGATION_ACK
+
+
 def test_an_unoffered_specialist_is_refused_not_invented() -> None:
     with HubToolServer([ASK_JOBS], "tok") as server:
         out = rpc(
@@ -148,6 +159,11 @@ def test_the_transport_bounds_the_body_and_rejects_a_malformed_one() -> None:
         conn.send(b"{}")  # far less than promised: the 413 must not wait for it
         over_long = conn.getresponse()
         assert over_long.status == 413
+        # The body was refused unread, so it is still queued on the socket: a
+        # kept-alive connection would parse those bytes as the next request
+        # line and answer a run of 400s until it died. The refusal ends it.
+        assert over_long.getheader("Connection") == "close"
+        assert over_long.will_close is True
         over_long.read()
         conn.close()
 
@@ -262,6 +278,17 @@ def test_dispatch_initialize_declares_tools_and_nothing_else() -> None:
     assert reply["result"]["capabilities"] == {"tools": {}}
     assert reply["result"]["protocolVersion"] == "2024-11-05"
     assert reply["result"]["serverInfo"]["name"] == "arcelle-hub"
+
+
+def test_both_halves_of_the_sidecar_announce_one_protocol_revision() -> None:
+    # The hub endpoint and the room-bridge client are the two MCP speakers in
+    # this process. Two literals could drift, and the CLI on the other side
+    # would be told two different revisions by the same app.
+    status, reply = dispatch(
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize"}, _listed(ASK_JOBS), []
+    )
+    assert status == 200 and reply is not None
+    assert reply["result"]["protocolVersion"] == mcp_client.PROTOCOL_VERSION
 
 
 def test_dispatch_lists_exactly_the_offered_tools() -> None:

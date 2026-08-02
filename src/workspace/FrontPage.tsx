@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import { api, FrontPage as FrontPageData, fileKindLabel } from "../api";
 import {
+  BookOpenIcon,
   ChatBubbleIcon,
   FileTypeIcon,
+  GlobeIcon,
   GraphIcon,
+  LinkIcon,
   MemoryIcon,
   MicIcon,
   ScriptIcon,
@@ -15,6 +18,7 @@ import { isCloudEngine } from "./markup";
 import { visibleWorkflows } from "./workflows/selectors";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import type { LayoutApi } from "../shell/useLayout";
 
 type BriefTone = "danger" | "warn" | "info";
 interface BriefItem {
@@ -135,13 +139,15 @@ export default function FrontPage({
   page,
   s,
   a,
+  layout,
 }: {
   page: FrontPageData;
   s: WSState;
   a: WSActions;
+  layout: LayoutApi;
 }) {
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
-  const goArea = (area: "recordings" | "memory") => {
+  const goArea = (area: "recordings" | "memory" | "skills" | "connectors" | "browser") => {
     s.setShowMap(false);
     s.setShowWorkflows(false);
     s.setShowScripts(false);
@@ -199,6 +205,9 @@ export default function FrontPage({
                 onClick={() => {
                   s.setActiveChatId(c.id);
                   s.setAiTab("chat");
+                  // The conversation lives in the AI pane — reveal it, or a
+                  // collapsed pane makes this click look like nothing.
+                  layout.showPane("ai");
                 }}
               >
                 <span className="home-row-icon">
@@ -217,7 +226,9 @@ export default function FrontPage({
         <section className="home-section">
           <div className="home-section-head">
             <h2>Work in this room</h2>
-            <span>All capabilities</span>
+            {/* This list is a shortcut into the areas, not an inventory —
+                it said "All capabilities" while omitting three of them. */}
+            <span>Go to an area</span>
           </div>
           <div className="home-list">
             <button className="home-row" onClick={() => goArea("recordings")}>
@@ -291,7 +302,13 @@ export default function FrontPage({
               </span>
               <span className="home-row-meta">Memory</span>
             </button>
-            <button className="home-row" onClick={() => s.setAiTab("studio")}>
+            <button
+              className="home-row"
+              onClick={() => {
+                s.setAiTab("studio");
+                layout.showPane("ai");
+              }}
+            >
               <span className="home-row-icon">
                 <SparkIcon size={15} />
               </span>
@@ -302,6 +319,46 @@ export default function FrontPage({
                 </span>
               </span>
               <span className="home-row-meta">Studio</span>
+            </button>
+            {/* The rail has nine areas; this list used to show six, so anyone
+                who navigated from Home concluded the other three didn't exist. */}
+            <button className="home-row" onClick={() => a.revealBrowser()}>
+              <span className="home-row-icon">
+                <GlobeIcon size={15} />
+              </span>
+              <span className="home-row-main">
+                <span className="home-row-title">Read the web privately</span>
+                <span className="home-row-copy">
+                  A browser that keeps no history, with search and downloads
+                  straight into the room
+                </span>
+              </span>
+              <span className="home-row-meta">Browser</span>
+            </button>
+            <button className="home-row" onClick={() => goArea("skills")}>
+              <span className="home-row-icon">
+                <BookOpenIcon size={15} />
+              </span>
+              <span className="home-row-main">
+                <span className="home-row-title">Teach the AI a skill</span>
+                <span className="home-row-copy">
+                  Reusable instructions and resources, stored encrypted in this
+                  room
+                </span>
+              </span>
+              <span className="home-row-meta">Skills</span>
+            </button>
+            <button className="home-row" onClick={() => goArea("connectors")}>
+              <span className="home-row-icon">
+                <LinkIcon size={15} />
+              </span>
+              <span className="home-row-main">
+                <span className="home-row-title">Connect outside tools</span>
+                <span className="home-row-copy">
+                  MCP connectors — every call asks first
+                </span>
+              </span>
+              <span className="home-row-meta">Connectors</span>
             </button>
           </div>
         </section>
@@ -325,7 +382,9 @@ export default function FrontPage({
                   className="fp-suggestion"
                   onClick={() => {
                     s.setQuestion(sug);
-                    s.composerRef.current?.focus();
+                    // Bring the chat forward first: focusing a composer that
+                    // isn't mounted stored the question out of sight.
+                    a.focusComposer(layout);
                   }}
                 >
                   {sug}

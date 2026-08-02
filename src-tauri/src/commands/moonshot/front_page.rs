@@ -60,7 +60,7 @@ pub fn front_page(state: State<'_, AppState>) -> Result<FrontPage, String> {
 /// list (or empty) when the model is unreachable or the room is empty.
 #[tauri::command]
 pub async fn front_page_suggestions(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let (room_name, file_names, cached) = {
+    let (room_path, room_name, file_names, cached) = {
         let guard = state.room.lock().unwrap();
         let Some(room) = guard.as_ref() else {
             return Ok(Vec::new());
@@ -74,7 +74,7 @@ pub async fn front_page_suggestions(state: State<'_, AppState>) -> Result<Vec<St
         let cached = db::get_meta(&room.conn, FRONT_PAGE_SUGGESTIONS_KEY)
             .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
             .unwrap_or_default();
-        (room.name.clone(), names, cached)
+        (room.path.clone(), room.name.clone(), names, cached)
     };
     if file_names.is_empty() {
         return Ok(Vec::new());
@@ -104,9 +104,14 @@ pub async fn front_page_suggestions(state: State<'_, AppState>) -> Result<Vec<St
     if questions.is_empty() {
         return Ok(cached);
     }
+    // These questions name THIS room's files. The model call above can take
+    // minutes, so cache them only if the same room is still open — unlocking
+    // another one mid-generation used to file one room's questions in another.
     if let Some(room) = state.room.lock().unwrap().as_ref() {
-        if let Ok(json) = serde_json::to_string(&questions) {
-            let _ = db::set_meta(&room.conn, FRONT_PAGE_SUGGESTIONS_KEY, &json);
+        if room.path == room_path {
+            if let Ok(json) = serde_json::to_string(&questions) {
+                let _ = db::set_meta(&room.conn, FRONT_PAGE_SUGGESTIONS_KEY, &json);
+            }
         }
     }
     Ok(questions)

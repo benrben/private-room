@@ -72,6 +72,11 @@ export function BrowserSearch({
   const [summaryBusy, setSummaryBusy] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [sel, setSel] = useState(0);
+  // True once the enrich pass has SETTLED — including when it failed, or came
+  // back short. Without it a rejected call left every top card shimmering
+  // forever, because the shimmer only ever cleared when a row arrived, so the
+  // monogram fallback below could never be reached.
+  const [previewsSettled, setPreviewsSettled] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
 
   // --- the enrich pass -----------------------------------------------------
@@ -85,7 +90,11 @@ export function BrowserSearch({
     setSummary(null);
     setSummaryError(null);
     setSel(0);
-    if (!result.previewsEnabled || hits.length === 0) return;
+    setPreviewsSettled(false);
+    if (!result.previewsEnabled || hits.length === 0) {
+      setPreviewsSettled(true);
+      return;
+    }
     let live = true;
     void api
       .browserPreview(hits.slice(0, PREVIEW_COUNT).map((h) => h.url))
@@ -99,6 +108,11 @@ export function BrowserSearch({
       })
       .catch(() => {
         /* previews are decoration: a failure leaves monogram tiles */
+      })
+      .finally(() => {
+        // Settled either way. A card that never got a row must fall back to its
+        // monogram tile, not shimmer for the life of the page.
+        if (live) setPreviewsSettled(true);
       });
     return () => {
       live = false;
@@ -191,6 +205,15 @@ export function BrowserSearch({
     [hits, sel, onOpen, onOpenNewTab, peek, add],
   );
 
+  // Hand the keyboard to the results the moment they arrive. Every single-key
+  // action above is dead until this container holds focus, and a page that
+  // ignores ArrowDown right after a search reads as broken rather than as
+  // "press Tab first". The search was started from the address bar, so nothing
+  // is being typed into when this runs.
+  useEffect(() => {
+    listRef.current?.focus({ preventScroll: true });
+  }, [hits]);
+
   useEffect(() => {
     const el = listRef.current?.querySelector<HTMLElement>(`[data-idx="${sel}"]`);
     el?.scrollIntoView({ block: "nearest" });
@@ -205,7 +228,7 @@ export function BrowserSearch({
       tier={tier}
       selected={idx === sel}
       preview={previews[hit.url]}
-      previewsEnabled={result.previewsEnabled}
+      previewsPending={result.previewsEnabled && !previewsSettled}
       peek={hit.url in peeks ? peeks[hit.url] : undefined}
       addState={adds[hit.url] ?? "idle"}
       relative={hit.score / maxScore}
@@ -373,6 +396,15 @@ function SearchHeader({ result }: { result: BrowserSearchResult }) {
         )}
         <span className="sep">·</span>
         <span className="privacy">only your query left this Mac</span>
+        {/* The keys are live as soon as the results are (the page takes focus
+            on arrival): say so, because a single-key shortcut nobody is told
+            about is not a feature. */}
+        {result.hits.length > 0 && (
+          <>
+            <span className="sep">·</span>
+            <span>↑↓ or j/k move · ↩ open · p peek · a add to the chat</span>
+          </>
+        )}
         {result.previewsEnabled && (
           <>
             <span className="sep">·</span>
@@ -486,7 +518,7 @@ function SearchCard({
   tier,
   selected,
   preview,
-  previewsEnabled,
+  previewsPending,
   peek,
   addState,
   relative,
@@ -501,7 +533,9 @@ function SearchCard({
   tier: "feature" | "duo" | "row";
   selected: boolean;
   preview?: ResultPreview;
-  previewsEnabled: boolean;
+  /** The enrich pass is still out. Once it settles every card without a
+   *  preview shows its monogram tile — nothing waits forever. */
+  previewsPending: boolean;
   peek?: string | null;
   addState: AddState;
   relative: number;
@@ -515,7 +549,7 @@ function SearchCard({
   // The page's own description beats the engine's blurb — it is first-party and
   // usually better written. Only once the enrich pass has actually read it.
   const blurb = preview?.description || hit.snippet || null;
-  const waiting = previewsEnabled && !preview && idx < PREVIEW_COUNT;
+  const waiting = previewsPending && !preview && idx < PREVIEW_COUNT;
 
   return (
     <article
@@ -525,7 +559,22 @@ function SearchCard({
       aria-label={hit.title}
       onFocus={onSelect}
       onClick={(e) => {
-        if ((e.target as HTMLElement).closest("button")) return;
+        // Buttons act for themselves, and the reader preview exists to be
+        // READ — neither is a request to leave the page.
+        if ((e.target as HTMLElement).closest("button, .bsearch-peek")) return;
+        // A drag that selected text is not a click on the card: navigating
+        // would throw the selection away the moment it was made. Only a
+        // selection inside THIS card counts, so a stale one elsewhere on the
+        // page can never swallow a real click.
+        const picked = window.getSelection();
+        if (
+          picked &&
+          !picked.isCollapsed &&
+          picked.toString().trim() &&
+          e.currentTarget.contains(picked.anchorNode)
+        ) {
+          return;
+        }
         onSelect();
         onOpen();
       }}

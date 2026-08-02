@@ -12,6 +12,36 @@ pub fn insert_file(
     insert_file_from_url(conn, name, mime, bytes, text, source, None)
 }
 
+/// Run `body` inside a transaction — unless the caller already opened one
+/// (the batch-edit path in `commands::edit_match` wraps several writes of its
+/// own, and SQLite has no nested `BEGIN`).
+///
+/// Two things ride on this. A file row and its search chunks must land
+/// TOGETHER: written separately, a failure partway through indexing reported
+/// the import as failed while leaving the file in the library, only partly
+/// searchable and with nothing marking it. And a book-length file produces
+/// thousands of chunk INSERTs, each its own commit and its own disk write —
+/// one transaction turns that back into one.
+pub(crate) fn in_transaction<T>(
+    conn: &Connection,
+    body: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if !conn.is_autocommit() {
+        return body();
+    }
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+    match body() {
+        Ok(v) => {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// BROWSE-2 (D19): like [`insert_file`], recording where the bytes came from.
 /// Every file that arrived over the network keeps its source URL.
 pub fn insert_file_from_url(
@@ -24,14 +54,28 @@ pub fn insert_file_from_url(
     origin_url: Option<&str>,
 ) -> Result<FileMeta, String> {
     let id = Uuid::new_v4().to_string();
-    execute_one(
-        conn,
-        "INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text, origin_url)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![id, name, mime, bytes.len() as i64, source, bytes, text, origin_url],
-    )?;
-    insert_chunks(conn, &id, text)?;
+    in_transaction(conn, || {
+        execute_one(
+            conn,
+            "INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text, origin_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, name, mime, bytes.len() as i64, source, bytes, text, origin_url],
+        )?;
+        insert_chunks(conn, &id, text)
+    })?;
     get_file_meta(conn, &id)
+}
+
+/// The id and name of a file already holding EXACTLY these bytes, if any.
+/// `size_bytes` is checked first so the blob comparison only ever runs against
+/// same-sized rows.
+pub fn file_with_same_bytes(conn: &Connection, bytes: &[u8]) -> Option<(String, String)> {
+    conn.query_row(
+        "SELECT id, name FROM files WHERE size_bytes = ?1 AND original_bytes = ?2 LIMIT 1",
+        params![bytes.len() as i64, bytes],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .ok()
 }
 
 /// List every file's metadata, newest first.
@@ -244,30 +288,34 @@ pub fn update_file_content(
     bytes: &[u8],
     text: Option<&str>,
 ) -> Result<(), String> {
-    // ADD-17: content changed, so the cached one-liner is stale — clear it so
-    // the next "Summarize room" run re-summarizes this file.
-    execute_one(
-        conn,
-        "UPDATE files SET original_bytes = ?2, extracted_text = ?3, size_bytes = ?4,
-             ai_summary = NULL
-         WHERE id = ?1",
-        params![id, bytes, text, bytes.len() as i64],
-    )?;
-    execute_one(conn, "DELETE FROM chunks WHERE file_id = ?1", [id])?;
-    insert_chunks(conn, id, text)
+    in_transaction(conn, || {
+        // ADD-17: content changed, so the cached one-liner is stale — clear it
+        // so the next "Summarize room" run re-summarizes this file.
+        execute_one(
+            conn,
+            "UPDATE files SET original_bytes = ?2, extracted_text = ?3, size_bytes = ?4,
+                 ai_summary = NULL
+             WHERE id = ?1",
+            params![id, bytes, text, bytes.len() as i64],
+        )?;
+        execute_one(conn, "DELETE FROM chunks WHERE file_id = ?1", [id])?;
+        insert_chunks(conn, id, text)
+    })
 }
 
 /// Update ONLY a file's extracted text (and its search index), leaving the
 /// stored bytes alone — a live recording's periodic saves refresh the
 /// transcript while the audio goes through the cheap checkpoint path.
 pub fn set_file_extracted_text(conn: &Connection, id: &str, text: &str) -> Result<(), String> {
-    execute_one(
-        conn,
-        "UPDATE files SET extracted_text = ?2, ai_summary = NULL WHERE id = ?1",
-        params![id, text],
-    )?;
-    execute_one(conn, "DELETE FROM chunks WHERE file_id = ?1", [id])?;
-    insert_chunks(conn, id, Some(text))
+    in_transaction(conn, || {
+        execute_one(
+            conn,
+            "UPDATE files SET extracted_text = ?2, ai_summary = NULL WHERE id = ?1",
+            params![id, text],
+        )?;
+        execute_one(conn, "DELETE FROM chunks WHERE file_id = ?1", [id])?;
+        insert_chunks(conn, id, Some(text))
+    })
 }
 
 pub fn delete_file(conn: &Connection, id: &str) -> Result<(), String> {
@@ -354,11 +402,16 @@ where
     query_one(
         conn,
         &format!(
+            // `created_at` is second-resolution, so two files added in the same
+            // second tie and SQLite is free to return either. `rowid DESC`
+            // breaks the tie toward the one added last — the same tiebreaker
+            // `file_by_exact_name` and `list_files` already use, so all three
+            // agree on which file is "the newest match".
             "SELECT {cols} FROM files
              WHERE lower(name) LIKE '%' || ?1 || '%'
                {image_filter}
                {derived_filter}
-             ORDER BY created_at DESC LIMIT 1"
+             ORDER BY created_at DESC, rowid DESC LIMIT 1"
         ),
         [needle],
         map,
@@ -417,28 +470,6 @@ pub fn find_image_like(
     .map_err(|_| format!("No image matching \"{needle}\" in this room."))
 }
 
-/// HLT-3: rank chunks by an FTS5 MATCH query, best (lowest bm25) first.
-/// Returns (file name, chunk text, bm25 score) — smaller score = better match.
-/// `match_expr` is a ready-built FTS5 query (e.g. `"foo" OR "bar"`).
-pub fn search_chunks_fts(
-    conn: &Connection,
-    match_expr: &str,
-    limit: usize,
-) -> Result<Vec<(String, String, f64)>, String> {
-    query_rows(
-        conn,
-        "SELECT f.name, c.text, bm25(chunks_fts)
-         FROM chunks_fts
-         JOIN chunks c ON c.rowid = chunks_fts.rowid
-         JOIN files f ON f.id = c.file_id
-         WHERE chunks_fts MATCH ?1
-         ORDER BY bm25(chunks_fts)
-         LIMIT ?2",
-        params![match_expr, limit as i64],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )
-}
-
 /// ADD-6: file rows whose name contains `needle` (already lowercased).
 pub fn files_name_like(conn: &Connection, needle: &str) -> Result<Vec<(String, String)>, String> {
     query_rows(
@@ -452,6 +483,13 @@ pub fn files_name_like(conn: &Connection, needle: &str) -> Result<Vec<(String, S
 
 /// ADD-6: file content hits via FTS — (file id, name, matching chunk text) for
 /// the best-ranked chunk. The caller trims a snippet out of the chunk text.
+///
+/// The only reason this is not `search_chunks_fts_ranked` (db/embeddings.rs)
+/// with columns dropped: the search overlay opens the file it lists, so it needs
+/// `f.id`, and the ranked variant returns the CHUNK rowid instead (the key its
+/// keyword/vector blend scores on). Same MATCH/ORDER BY/LIMIT shape otherwise —
+/// tune one and tune the other. A third copy that returned `(name, text, bm25)`
+/// was only ever reached from tests and is gone.
 pub fn files_content_fts(
     conn: &Connection,
     match_expr: &str,
@@ -479,20 +517,82 @@ mod tests {
     fn fts_index_finds_and_stays_in_sync() {
         let conn = mem();
         let id = add_file(&conn, "lease.txt", "The tenant pays rent on the first of each month.");
-        let hits = search_chunks_fts(&conn, "\"rent\"", 5).unwrap();
+        let hits = search_chunks_fts_ranked(&conn, "\"rent\"", 5).unwrap();
         assert_eq!(hits.len(), 1, "inserted chunk is searchable via the FTS index");
-        assert_eq!(hits[0].0, "lease.txt");
+        assert_eq!(hits[0].1, "lease.txt");
         update_file_content(&conn, &id, b"The landlord provides parking spaces.", Some("The landlord provides parking spaces.")).unwrap();
         assert!(
-            search_chunks_fts(&conn, "\"rent\"", 5).unwrap().is_empty(),
+            search_chunks_fts_ranked(&conn, "\"rent\"", 5).unwrap().is_empty(),
             "update fires the triggers: old terms drop out of the FTS index"
         );
-        assert_eq!(search_chunks_fts(&conn, "\"parking\"", 5).unwrap().len(), 1, "new terms appear");
+        assert_eq!(search_chunks_fts_ranked(&conn, "\"parking\"", 5).unwrap().len(), 1, "new terms appear");
         delete_file(&conn, &id).unwrap();
         assert!(
-            search_chunks_fts(&conn, "\"parking\"", 5).unwrap().is_empty(),
+            search_chunks_fts_ranked(&conn, "\"parking\"", 5).unwrap().is_empty(),
             "delete removes the file's text from the FTS index"
         );
+    }
+
+    #[test]
+    fn a_write_and_its_index_land_together_or_not_at_all() {
+        // What makes `insert_file` all-or-nothing: the row and its search
+        // chunks share one transaction, so an import that dies partway through
+        // indexing can't leave a file in the library that is listed as failed
+        // and only partly searchable.
+        let conn = mem();
+        let count = |c: &Connection| -> i64 {
+            c.query_row("SELECT count(*) FROM folders", [], |r| r.get(0)).unwrap()
+        };
+        let outcome = in_transaction(&conn, || {
+            execute_one(&conn, "INSERT INTO folders(id, name) VALUES ('x', 'X')", [])?;
+            Err::<(), String>("indexing blew up".into())
+        });
+        assert_eq!(outcome.unwrap_err(), "indexing blew up");
+        assert_eq!(count(&conn), 0, "the partial write rolled back with the failure");
+
+        // A successful body commits.
+        in_transaction(&conn, || {
+            execute_one(&conn, "INSERT INTO folders(id, name) VALUES ('y', 'Y')", [])
+        })
+        .unwrap();
+        assert_eq!(count(&conn), 1);
+
+        // SQLite has no nested BEGIN, so inside a caller's own transaction
+        // (the batch-edit path) this must be a pass-through, not a second one.
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        in_transaction(&conn, || {
+            execute_one(&conn, "INSERT INTO folders(id, name) VALUES ('z', 'Z')", [])
+        })
+        .unwrap();
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(count(&conn), 1, "the outer transaction still owns the outcome");
+    }
+
+    #[test]
+    fn same_bytes_are_recognized_as_an_existing_file() {
+        let conn = mem();
+        let id = add_file(&conn, "lease.pdf", "the very same text");
+        let bytes = get_file_bytes(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            file_with_same_bytes(&conn, &bytes),
+            Some((id, "lease.pdf".to_string()))
+        );
+        // Different bytes of the same length are NOT a match.
+        let mut other = bytes.clone();
+        other[0] ^= 0xFF;
+        assert_eq!(file_with_same_bytes(&conn, &other), None);
+        assert_eq!(file_with_same_bytes(&conn, b"nothing like it"), None);
+    }
+
+    #[test]
+    fn fuzzy_finder_breaks_a_same_second_tie_toward_the_newer_file() {
+        // `created_at` only records whole seconds, so two files added in the
+        // same second used to tie and SQLite could return either.
+        let conn = mem();
+        add_file(&conn, "report-v1.txt", "older");
+        let newer = add_file(&conn, "report-v2.txt", "newer");
+        conn.execute("UPDATE files SET created_at = '2026-01-01T00:00:00Z'", []).unwrap();
+        assert_eq!(find_file_like(&conn, "report").unwrap().0, newer);
     }
 
     #[test]

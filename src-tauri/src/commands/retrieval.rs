@@ -160,16 +160,19 @@ pub(crate) fn retrieve_context_limited(
     // Vector signal: brute-force cosine over (rowid, blob) — no text shuttled.
     // Pool only positive-cosine chunks, ranked by cosine → RRF rank; hydrate
     // text for the winners not already present from the keyword pass.
+    // Scored while STREAMING the blobs (`for_each_chunk_embedding` +
+    // `cosine_similarity_blob`): collecting every embedding into a Vec first,
+    // and decoding each one into a Vec<f32>, meant tens of MB allocated and
+    // thrown away per question on a book-sized room, all under the room lock.
+    // Only the (rowid, cosine) pairs — 12 bytes a chunk — are kept.
     if let Some(q) = question_embedding {
-        let mut scored: Vec<(i64, f32)> = db::chunk_embedding_vectors(conn)?
-            .into_iter()
-            .filter_map(|(rowid, blob)| {
-                db::blob_to_embedding(&blob).and_then(|emb| {
-                    let cos = db::cosine_similarity(q, &emb);
-                    (cos > 0.0).then_some((rowid, cos))
-                })
-            })
-            .collect();
+        let mut scored: Vec<(i64, f32)> = Vec::new();
+        db::for_each_chunk_embedding(conn, |rowid, blob| {
+            let cos = db::cosine_similarity_blob(q, blob);
+            if cos > 0.0 {
+                scored.push((rowid, cos));
+            }
+        })?;
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(candidates);
         let need_text: Vec<i64> = scored
@@ -244,17 +247,39 @@ pub(crate) fn retrieve_context_limited(
 /// first matching word of `needle`, then to the start of the text. Whitespace
 /// is collapsed so multi-line file text reads as one line. Pure and testable.
 pub(crate) fn make_snippet(haystack: &str, needle: &str, radius: usize) -> String {
+    /// Greek final sigma: `str::to_lowercase` picks ς at a word end while
+    /// `char::to_lowercase` always gives σ. Folding both sides to σ keeps the
+    /// per-char lowering below interchangeable with the needle's.
+    fn fold(c: char) -> char {
+        if c == 'ς' {
+            'σ'
+        } else {
+            c
+        }
+    }
     let normalized: String = haystack.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower = normalized.to_lowercase();
+    let chars: Vec<char> = normalized.chars().collect();
+    // Lowercasing is length-preserving in neither bytes NOR chars — Turkish 'İ'
+    // (U+0130) lowercases to TWO chars — so an offset into the lowered text says
+    // nothing about the original. Lower char by char, remembering where each
+    // original char landed, and map a hit back through that. Counting the chars
+    // of `lower[..hit]` against `normalized` (what this did) drifts one char per
+    // 'İ' and, once the drift passes `radius`, slices `chars[start..end]` with
+    // start > end — a panic on any room holding a page of Turkish headings.
+    let mut lower = String::with_capacity(normalized.len());
+    let mut starts: Vec<usize> = Vec::with_capacity(chars.len());
+    for c in &chars {
+        starts.push(lower.len());
+        lower.extend(c.to_lowercase().map(fold));
+    }
     let find = |n: &str| {
-        let n = n.trim().to_lowercase();
+        let n: String = n.trim().to_lowercase().chars().map(fold).collect();
         if n.is_empty() {
             None
         } else {
             lower.find(&n)
         }
     };
-    let chars: Vec<char> = normalized.chars().collect();
     // No match to center on: return a clipped preview from the start.
     let Some(byte) = find(needle).or_else(|| needle.split_whitespace().find_map(find)) else {
         let mut out: String = chars.iter().take(radius * 2).collect();
@@ -263,7 +288,9 @@ pub(crate) fn make_snippet(haystack: &str, needle: &str, radius: usize) -> Strin
         }
         return out;
     };
-    let char_pos = lower[..byte].chars().count();
+    // `starts` is strictly increasing (every char lowers to at least one byte),
+    // so the last entry at or before the hit is the char the hit begins in.
+    let char_pos = starts.partition_point(|&s| s <= byte).saturating_sub(1);
     let start = char_pos.saturating_sub(radius);
     let end = (char_pos + radius).min(chars.len());
     let mut out = String::new();
@@ -370,6 +397,25 @@ mod tests {
         // No match → a preview from the start, never a panic.
         let none = make_snippet("just some words here", "zzzzz", 5);
         assert!(none.starts_with("just"));
+    }
+
+    #[test]
+    fn snippet_survives_a_lowercase_that_changes_length() {
+        // Turkish 'İ' (U+0130) lowercases to TWO chars, so a byte offset into
+        // the lowered text drifts one char per 'İ'. With more of them before the
+        // match than `radius`, the old char-count arithmetic produced
+        // start > end and `chars[start..end]` panicked — a room holding a page
+        // of Turkish headings took the whole window down on any search.
+        let heading = "İSTANBUL BÜYÜKŞEHİR BELEDİYESİ ";
+        let text = format!("{}kira sözleşmesi", heading.repeat(18));
+        let snip = make_snippet(&text, "sözleşmesi", 60);
+        assert!(snip.contains("sözleşmesi"), "match must be in the snippet: {snip:?}");
+        // Centered on the match at the very end, so it is clipped only in front.
+        assert!(snip.starts_with('…') && !snip.ends_with('…'));
+        // And a match BEFORE the length-changing chars still centers correctly.
+        let early = format!("kira sözleşmesi {}", heading.repeat(18));
+        let snip = make_snippet(&early, "sözleşmesi", 20);
+        assert!(snip.contains("sözleşmesi"), "got {snip:?}");
     }
 
     #[test]

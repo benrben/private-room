@@ -7,6 +7,9 @@ import HtmlView from "../viewers/HtmlView";
 import ImageView from "../viewers/ImageView";
 import MarkdownView from "../viewers/MarkdownView";
 import TextView from "./TextView";
+// The extension → language table lives on its own and imports nothing, so
+// reading it here never drags monaco-editor into the eager startup bundle.
+import { languageForFile } from "../viewers/languages";
 
 // The heavy viewers (monaco-editor, pdfjs-dist, xlsx, docx-preview, the live
 // recording editor) load on demand so they stay out of the eager startup
@@ -54,54 +57,6 @@ class ViewerChunkBoundary extends Component<
     }
     return this.props.children;
   }
-}
-
-// Copied from ../viewers/monacoSetup — importing it from there would pull all
-// of monaco-editor into the eager bundle just for this extension lookup.
-const LANGUAGE_BY_EXT: Record<string, string> = {
-  ts: "typescript",
-  tsx: "typescript",
-  js: "javascript",
-  jsx: "javascript",
-  py: "python",
-  rs: "rust",
-  json: "json",
-  md: "markdown",
-  markdown: "markdown",
-  html: "html",
-  htm: "html",
-  css: "css",
-  scss: "scss",
-  less: "less",
-  yaml: "yaml",
-  yml: "yaml",
-  toml: "ini",
-  ini: "ini",
-  sql: "sql",
-  sh: "shell",
-  bash: "shell",
-  zsh: "shell",
-  java: "java",
-  c: "c",
-  h: "c",
-  cpp: "cpp",
-  hpp: "cpp",
-  cs: "csharp",
-  go: "go",
-  rb: "ruby",
-  php: "php",
-  swift: "swift",
-  kt: "kotlin",
-  xml: "xml",
-  r: "r",
-  lua: "lua",
-  scala: "scala",
-  pl: "perl",
-};
-
-function languageForFile(name: string): string {
-  const ext = name.split(".").pop()?.toLowerCase() ?? "";
-  return LANGUAGE_BY_EXT[ext] ?? "plaintext";
 }
 
 interface ViewerRouterProps {

@@ -59,3 +59,22 @@ include = ["arcelle_sidecar*"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = [".", "tests"]
+
+# Linting — `npm run lint:py` (uvx ruff check .), and the same command in
+# .github/workflows/ci.yml. Nothing installs a hook: it runs when you run it.
+[tool.ruff]
+line-length = 100
+extend-exclude = [".build-venv", "build", "dist"]
+
+[tool.ruff.lint]
+# The mistake-finding core only — undefined names, unused imports, broken
+# f-strings, shadowed builtins, syntax errors (E4/E7/E9 + pyflakes). Style and
+# opinion rules (import sorting, pyupgrade, string quoting) are deliberately
+# NOT selected: they would flag ~200 places in a tree that reads fine, and a
+# linter nobody can run green is a linter nobody runs. This set passes today.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests import a symbol to prove it is exported, and use one-letter loop names
+# in throwaway comprehensions. Both are noise there, not in the package.
+"tests/**" = ["F401", "E741"]

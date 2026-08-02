@@ -307,10 +307,21 @@ export function useLayout(roomName: string) {
 
   // ⌘/Ctrl+1/2/3 toggle panes; Escape leaves focus mode. Capture phase so
   // the focus-Escape wins over the workspace's close-file Escape.
+  //
+  // These three keys have exactly ONE meaning in this app — the one the rail's
+  // own labels promise. The claim is settled here (capture + stopPropagation)
+  // so a second handler can never also act on the same press; tab-by-position
+  // lives on ⌥⌘1–⌥⌘9, which is why Option is excluded below.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && ["1", "2", "3"].includes(e.key)) {
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        ["1", "2", "3"].includes(e.key)
+      ) {
         e.preventDefault();
+        e.stopPropagation();
         togglePane(PANE_ORDER[Number(e.key) - 1]);
         return;
       }

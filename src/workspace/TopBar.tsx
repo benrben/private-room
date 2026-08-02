@@ -330,6 +330,18 @@ export default function TopBar({
                 >
                   Reveal in Finder
                 </button>
+                {/* The one discoverable way in to the shortcut list — the
+                    keys themselves were only learnable from tooltips. */}
+                <button
+                  className="pop-item"
+                  role="menuitem"
+                  onClick={() => {
+                    s.setShowShortcuts(true);
+                    s.setRoomMenuOpen(false);
+                  }}
+                >
+                  Keyboard shortcuts (⌘/)
+                </button>
                 {/* ADD-28: feedback → GitHub issue (opens in YOUR browser). */}
                 <button
                   className="pop-item"

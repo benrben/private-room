@@ -77,7 +77,53 @@ export function resolveRefs(
     cleaned += text[i];
     i += 1;
   }
-  return { refIds, cleaned: cleaned.replace(/\s+/g, " ").trim() };
+  // Only HORIZONTAL runs collapse — removing an "@name" span leaves a double
+  // space behind, and that is all this tidy-up is for. Newlines are the user's
+  // structure (a multi-line brief under a #command reaches the model intact).
+  return {
+    refIds,
+    cleaned: cleaned
+      .replace(/[^\S\n]+/g, " ")
+      .replace(/ *\n */g, "\n")
+      .trim(),
+  };
+}
+
+/** The backend only honours an explicit skill when "/name" is the FIRST token
+ *  of the message (`explicit_skill_request` in agent.rs). Typing a file
+ *  reference first ("@lease.pdf /lease-review …") would otherwise be accepted
+ *  and then silently ignored, so the token is hoisted to the front before the
+ *  message is sent. The "@" spans stay in the text — Regenerate parses them
+ *  back out of the saved message. */
+export function hoistSkill(text: string, skill: string): string {
+  if (/^\s*\//.test(text)) return text.trim();
+  // Normally the token stands alone; the loose form covers a reference that
+  // ran straight into it ("@x/lease-review"), which `resolveRefs` still reads
+  // as a skill once the "@x" span is lifted out.
+  const spaced = new RegExp(`(^|\\s)/${skill}(?=\\s|$)`);
+  const loose = new RegExp(`/${skill}(?=\\s|$)`);
+  const without = (spaced.test(text) ? text.replace(spaced, "$1") : text.replace(loose, ""))
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .trim();
+  return without ? `/${skill} ${without}` : `/${skill}`;
+}
+
+/** A file name that no file in the room is using yet: "AI note.md" →
+ *  "AI note 2.md". Two answers saved with the suggested name would otherwise
+ *  both be called "AI note.md", and a source chip can only ever open one of
+ *  them (the newest). */
+export function uniqueFileName(name: string, taken: readonly string[]): string {
+  const used = new Set(taken.map((n) => n.toLowerCase()));
+  if (!used.has(name.toLowerCase())) return name;
+  const dot = name.lastIndexOf(".");
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  for (let n = 2; n < 1000; n++) {
+    const candidate = `${base} ${n}${ext}`;
+    if (!used.has(candidate.toLowerCase())) return candidate;
+  }
+  return `${base} ${Date.now()}${ext}`;
 }
 
 /** Parse a composed message into a command (if any), its cleaned args, and the

@@ -1,0 +1,39 @@
+# Clippy settings for the Rust host — `npm run lint:rust`, and the report-only
+# `clippy` step in .github/workflows/ci.yml.
+#
+# Nothing here silences a lint: clippy.toml only holds thresholds, and the lint
+# SET is clippy's default (correctness + suspicious + style + complexity + perf).
+# The thresholds below are raised to what this tree already is, so the linter is
+# adoptable today rather than opening with hundreds of style complaints — tighten
+# them as the code is cleaned up, don't loosen them further.
+#
+# Not wired into any hook: it runs when you run it (or in CI, where it reports
+# but does not fail the build).
+
+# The recording/diarization and chat entry points genuinely thread a lot of
+# state through one call (default is 7).
+too-many-arguments-threshold = 12
+
+# Nested Result/Option/HashMap shapes around the DB and the sidecar bridge
+# (default is 250).
+type-complexity-threshold = 350
+
+# `unwrap()`/`expect()` inside a test that is asserting a value exists is the
+# clearest way to write it; these only matter if the restriction lints are
+# enabled locally.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Project nouns that are not typos. `..` keeps clippy's own default list.
+doc-valid-idents = [
+    "SQLCipher",
+    "PyInstaller",
+    "LangGraph",
+    "LangChain",
+    "TitaNet",
+    "WKWebView",
+    "ScreenCaptureKit",
+    "OpenRouter",
+    "TouchID",
+    "..",
+]

@@ -325,7 +325,7 @@ pub fn open_room(path: &str, password: &str) -> Result<Connection, String> {
             migrate(&conn)?;
             Ok(conn)
         }
-        _ => Err("This file is not a Arcelle project.".into()),
+        _ => Err("This file is not an Arcelle project.".into()),
     }
 }
 

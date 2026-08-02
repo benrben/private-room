@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import monaco from "./monacoSetup";
+import monaco, { monacoTheme, watchMonacoTheme } from "./monacoSetup";
 import { SaveIcon } from "../icons";
 
 interface Props {
@@ -46,7 +46,7 @@ export default function CodeEditor({
     const editor = monaco.editor.create(hostRef.current, {
       value,
       language,
-      theme: "vs-dark",
+      theme: monacoTheme(),
       readOnly: !!readOnly,
       automaticLayout: true,
       minimap: { enabled: false },
@@ -56,15 +56,6 @@ export default function CodeEditor({
       padding: { top: 10 },
     });
     editorRef.current = editor;
-    if (find) {
-      const match = editor
-        .getModel()
-        ?.findMatches(find, false, false, false, null, false)[0];
-      if (match) {
-        editor.setSelection(match.range);
-        editor.revealRangeInCenter(match.range);
-      }
-    }
     const sub = editor.onDidChangeModelContent(() => markDirty(true));
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       if (onSaveRef.current) {
@@ -81,6 +72,26 @@ export default function CodeEditor({
     // The parent keys this component by file id, so mount-once is correct.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Follow the app's light/dark switch instead of staying black in light mode.
+  useEffect(watchMonacoTheme, []);
+
+  /** Jump to the word the AI (or a search result) pointed at. Runs on every
+   * change of `find`, not once at mount — a second request in an already-open
+   * file used to be ignored entirely. The find widget is opened seeded with
+   * the term, so the FIRST hit is a starting point, not the only one: Enter /
+   * ⌘G walks the rest. */
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || !find) return;
+    const match = editor
+      .getModel()
+      ?.findMatches(find, false, false, false, null, false)[0];
+    if (!match) return;
+    editor.setSelection(match.range);
+    editor.revealRangeInCenter(match.range);
+    void editor.getAction("actions.find")?.run();
+  }, [find]);
 
   function save() {
     const editor = editorRef.current;

@@ -17,8 +17,87 @@
    * Applied to READ commands only, so the shell still mounts and the state is
    * visible where a user would see it: inside the pane, not instead of it. */
   const QA_STATE = new URLSearchParams(location.search).get("qa_state") || "full";
+
+  /* Reads whose NAME does not begin with one of the prefixes below. Guessing
+   * from the name alone silently excluded Home, Settings, the recording pane,
+   * the connectors pane and the browser — none of their loaders are called
+   * `list_*`/`get_*` — so `?qa_state=` never reached them and their empty,
+   * loading and failed looks were never captured. Anything a pane fetches on
+   * mount belongs here; `room_info` deliberately does NOT (blanking it ejects
+   * the shell to the gate, which is a different screenshot entirely). */
+  const EXTRA_READS = new Set([
+    "front_page",
+    "front_page_suggestions",
+    "room_graph",
+    "studio_prompts",
+    "ai_action_prompts",
+    "workflow_templates",
+    "ai_status",
+    "model_capabilities",
+    "recommended_models",
+    "stt_status",
+    "privacy_status",
+    "room_server_status",
+    "app_diag",
+    "rec_live_status",
+    "rec_get",
+    "mcp_status",
+    "mcp_get_config",
+    "mcp_get_tool_prefs",
+    "mcp_registry_search",
+    "mcp_registry_optin_status",
+    "mcp_oauth_status",
+    "browser_info",
+    "browser_tabs",
+    "browser_journal",
+    "browser_search",
+  ]);
   const isRead = (cmd) =>
-    /^(list_|get_|read_|search_|load_|fetch_)/.test(cmd) || cmd === "room_stats";
+    /^(list_|get_|read_|search_|load_|fetch_)/.test(cmd) || EXTRA_READS.has(cmd);
+
+  /* Every command this mock does NOT answer, with a call count, on
+   * `window.__qaUnhandled`. A silent `[]` for an unfaked read is the worst
+   * outcome a harness can produce: the pane renders blank, the run stays
+   * green, and the screenshot is filed as a picture of the real app. The
+   * fallback still returns a non-crashing shape — but it now leaves a record a
+   * spec (or a human reading the console) can fail on.
+   *   node qa/check-mock-coverage.mjs   lists the gap without running the app. */
+  const noteUnhandled = (cmd, fallback) => {
+    const seen = (window.__qaUnhandled = window.__qaUnhandled || {});
+    seen[cmd] = (seen[cmd] || 0) + 1;
+    if (seen[cmd] === 1) {
+      console.warn("[qa-mock] NO FIXTURE for command:", cmd);
+      showGap();
+    }
+    return fallback;
+  };
+
+  /* ...and the same fact ON the page, because the two records above are only
+   * seen by someone who went looking. A pane fed an unfaked read draws a
+   * perfectly healthy-looking empty list — "no skills yet", "no providers", an
+   * empty marketplace — and a person eyeballing the harness before a release
+   * has no way to tell that apart from the real empty state. This badge says
+   * which it is, in the same frame as the emptiness, and lands in any
+   * screenshot taken of it. `pointer-events: none` so it can never take a
+   * click the spec meant for the app. */
+  const showGap = () => {
+    if (!document.body) {
+      document.addEventListener("DOMContentLoaded", showGap, { once: true });
+      return;
+    }
+    let el = document.getElementById("qa-mock-gap");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "qa-mock-gap";
+      el.style.cssText =
+        "position:fixed;left:0;bottom:0;z-index:2147483647;pointer-events:none;" +
+        "max-width:60vw;padding:4px 8px;font:11px/1.4 ui-monospace,monospace;" +
+        "background:#e5646c;color:#fff;border-top-right-radius:6px";
+      document.body.appendChild(el);
+    }
+    const names = Object.keys(window.__qaUnhandled || {}).sort();
+    el.textContent = `qa-mock has no fixture for ${names.length} command(s) — what you see below them is the MOCK'S emptiness, not the app's: ${names.join(", ")}`;
+  };
 
   /** Same object shape, every collection emptied — an empty room, not a broken
    * one. Blanking the whole response instead would crash panes that read
@@ -109,7 +188,123 @@
     { id: "j1", kind: "deep_summary", title: "Room summary", plan: null, state: null, cursor: 3, total: 5, status: "running", error: null, createdAt: iso(2), updatedAt: iso(0) },
   ];
 
-  const settings = { memory_auto_save: "0", autolock_minutes: "off", web_provider: "off", voice_archetype: "off", edit_approval: "off" };
+  /* Skills area. One of each `createdBy`, one disabled, and one with no
+   * resources — the row variants the list actually draws. Without these the
+   * pane rendered blank in EVERY qa_state, so its "empty" capture was
+   * indistinguishable from its "full" one. */
+  const skills = [
+    { id: "sk-brief", name: "Release brief", description: "Turn a week of room changes into a one-page brief.", enabled: true, createdBy: "user", agent: "", resourceCount: 2, createdAt: iso(5000), updatedAt: iso(120) },
+    { id: "sk-cite", name: "Citation hygiene", description: "Check every claim in a draft against the source it cites.", enabled: true, createdBy: "agent", agent: "files.read", resourceCount: 0, createdAt: iso(3400), updatedAt: iso(900) },
+    { id: "sk-hebrew", name: "Hebrew RTL cleanup", description: "Repair visual-order Hebrew pasted out of a PDF.", enabled: false, createdBy: "import", agent: "", resourceCount: 1, createdAt: iso(9000), updatedAt: iso(8000) },
+  ];
+  const skillInstructions = {
+    "sk-brief": "# Release brief\n\nRead the week's changed files, then write one page: what shipped, what moved, what is still open.",
+    "sk-cite": "# Citation hygiene\n\nFor every claim, open the cited file and quote the sentence that supports it. Flag anything you cannot ground.",
+    "sk-hebrew": "# Hebrew RTL cleanup\n\nDetect visual-order Hebrew and reverse it per line before any other processing.",
+  };
+  const skillResources = {
+    "sk-brief": [
+      { path: "references/tone.md", kind: "reference", sizeBytes: 1840, text: true, updatedAt: iso(400) },
+      { path: "scripts/collect.py", kind: "script", sizeBytes: 920, text: true, updatedAt: iso(400) },
+    ],
+    "sk-cite": [],
+    "sk-hebrew": [
+      { path: "references/bidi-notes.md", kind: "reference", sizeBytes: 610, text: true, updatedAt: iso(8000) },
+    ],
+  };
+
+  /* Connectors area. All four status dots at once (connected local, connected
+   * remote, disabled, failed-with-an-error-line) — the pane's whole visual
+   * vocabulary in one screenshot. */
+  const mcpServers = [
+    { name: "filesystem", status: "connected", error: null, tools: ["read_file", "write_file", "list_directory"], remote: false },
+    { name: "linear", status: "connected", error: null, tools: ["create_issue", "search_issues", "update_issue"], remote: true },
+    { name: "sqlite", status: "disabled", error: null, tools: [], remote: false },
+    { name: "weather", status: "failed", error: "spawn weather-mcp ENOENT", tools: [], remote: false },
+  ];
+  const mcpToolPrefs = { linear: ["update_issue"] };
+  const mcpCatalog = [
+    { id: "io.github.modelcontextprotocol/filesystem", name: "filesystem", title: "Filesystem", icon: null, description: "Read and write files in directories you choose.", publisher: "modelcontextprotocol", verified: true, remote: false, transport: "stdio", repository: "https://github.com/modelcontextprotocol/servers", install: { kind: "stdio", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem"], envKeys: [] }, altInstall: null },
+    { id: "com.linear/linear", name: "linear", title: "Linear", icon: null, description: "Issues, projects and cycles from your Linear workspace.", publisher: "linear.app", verified: true, remote: true, transport: "http", repository: null, install: { kind: "http", url: "https://mcp.linear.app/mcp", headerKeys: ["Authorization"] }, altInstall: null },
+    { id: "dev.example/sqlite", name: "sqlite", title: null, icon: null, description: "Query a local SQLite database.", publisher: "example.dev", verified: false, remote: false, transport: "stdio", repository: "https://example.dev/sqlite-mcp", install: { kind: "stdio", command: "uvx", args: ["mcp-server-sqlite"], envKeys: [] }, altInstall: null },
+  ];
+
+  /* Private browser. LIVE STATE, not a snapshot: the pages below are created,
+   * navigated, selected and closed by the same commands the chrome calls, and
+   * `browser_info` is DERIVED from whichever page is active — so the address
+   * bar, the padlock, Save, the start screen, the tab strip and the journal all
+   * tell one story instead of four.
+   *
+   * Before this, every browser MUTATION was unfaked: `browser_navigate`
+   * returned the fallback `null`, the view assigned that straight into the
+   * address bar, and the next keystroke threw on `null.trim()`. That is why
+   * the Browser area was the one screen QA could not use.
+   *
+   * It starts with NO page, which is the real cold state — the native child
+   * webview does not exist until something navigates, so a fresh room's
+   * Browser area really is a start screen with the back/forward/Save buttons
+   * disabled. Type an address (or press New page) and the harness walks the
+   * same path the app does. What can never appear here is the page itself: it
+   * is a native view floating above the DOM, so once something is loaded the
+   * stage is the empty rectangle that view would be parked over. */
+  const browserTabs = [];
+  const browserState = { takeover: false };
+  const activeTab = () => browserTabs.find((t) => t.active) ?? null;
+  /** The title a page gets from its address, the way a real `<title>` reads. */
+  const titleFor = (url) => {
+    try {
+      const u = new URL(url);
+      const last = u.pathname.split("/").filter(Boolean).pop();
+      return `${(last || u.hostname).replace(/[-_]/g, " ")} — ${u.hostname}`;
+    } catch {
+      return url;
+    }
+  };
+  const browseJournal = [
+    { id: 4, at: iso(1), kind: "read", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", detail: "read 3,120 words" },
+    { id: 3, at: iso(2), kind: "consent", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", detail: "typing allowed once" },
+    { id: 2, at: iso(4), kind: "blocked", url: "https://ads.example.com/track", detail: "content blocker" },
+    { id: 1, at: iso(5), kind: "open", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", detail: "opened by the Web agent" },
+  ];
+  /** Record what the harness just did, newest first, and tell the view — the
+   * journal panel refreshes on the event, not on a poll, so a row that is only
+   * appended here would not appear until it was reopened. */
+  const journal = (kind, url, detail) => {
+    const row = { id: (browseJournal[0]?.id ?? 0) + 1, at: new Date().toISOString(), kind, url, detail };
+    browseJournal.unshift(row);
+    window.__qaEmit?.("browser-journal", row);
+    return row;
+  };
+
+  /* Settings → Connections → AI providers, and the live catalog behind the
+   * cloud tab of the engine-model picker. */
+  const aiProviders = [{ id: "openrouter", label: "OpenRouter", connected: true }];
+  const engineModels = {
+    openrouter: [
+      { slug: "anthropic/claude-sonnet-4.6", label: "Claude Sonnet 4.6", efforts: [], defaultEffort: null, contextWindow: 200000, description: "Balanced reasoning and speed.", inputPrice: "0.000003", outputPrice: "0.000015", inputModalities: ["text", "image"], tools: true, vision: true, reasoning: true, structuredOutputs: true },
+      { slug: "openai/gpt-5.6-sol", label: "GPT-5.6 Sol", efforts: ["low", "medium", "high"], defaultEffort: "medium", contextWindow: 400000, description: "Coding-heavy work.", inputPrice: "0.00000125", outputPrice: "0.00001", inputModalities: ["text"], tools: true, vision: false, reasoning: true, structuredOutputs: true },
+    ],
+    "claude-cli": [
+      { slug: "sonnet", label: "Sonnet (CLI default)", efforts: [], defaultEffort: null, contextWindow: 200000, description: null, inputPrice: null, outputPrice: null, inputModalities: ["text"], tools: true, vision: true, reasoning: false, structuredOutputs: false },
+    ],
+  };
+
+  /* The room-role picker (Create screen + Settings → Room role). An empty list
+   * hides the picker entirely, so the mock has to mirror the real roster. */
+  const roles = [
+    { id: "default", name: "Assistant", blurb: "A calm, careful helper grounded in your files.", instructions: "", prompts: ["Summarize this room", "What should I look at first?"], commands: ["summarize", "find"] },
+    { id: "tutor", name: "Tutor", blurb: "Explains patiently and checks your understanding.", instructions: "You are a patient tutor.", prompts: ["Teach me the key ideas in this room", "Quiz me on @file"], commands: ["summarize", "research"] },
+    { id: "critic", name: "Critic", blurb: "Pushes back and finds the weak points.", instructions: "You are a sharp but fair critic.", prompts: ["What's weak about @file?"], commands: ["compare", "find"] },
+    { id: "opposing-counsel", name: "Opposing counsel", blurb: "Argues the other side to stress-test your case.", instructions: "You act as opposing counsel.", prompts: ["Argue against @contract"], commands: ["compare", "extract"] },
+    { id: "scribe", name: "Scribe", blurb: "Turns discussion into tidy notes and minutes.", instructions: "You are a meticulous scribe.", prompts: ["Take minutes from @recording"], commands: ["minutes", "to-sheet"] },
+  ];
+
+  /* `web_provider` is ON: with the internet switch off the app hides the whole
+   * browser half of the workspace — no page tabs are adopted from
+   * `browser_tabs`, the tab strip's New page button is not rendered, and the
+   * Browser area is a chrome bar over a start screen with nothing behind it.
+   * The harness has to sit on the side of the switch where those exist. */
+  const settings = { memory_auto_save: "0", autolock_minutes: "off", web_provider: "on", voice_archetype: "off", edit_approval: "off" };
 
   // A saved recording with a real transcript (GH #5 speaker naming). Mutable:
   // rec_set_speaker_name writes the overlay back here, so a reload inside one
@@ -269,10 +464,180 @@
     workflow_templates: () => [],
     list_scripts: () => scripts,
     list_jobs: () => jobs,
-    mcp_status: () => [],
-    mcp_get_config: () => "",
+    get_job_step_artifact: () => null,
+    // Connectors area (and the marketplace inside it).
+    mcp_status: () => mcpServers,
+    mcp_get_config: () => JSON.stringify({ mcpServers: {} }, null, 2),
+    get_mcp_auto_approve: () => false,
+    mcp_get_tool_prefs: () => JSON.stringify(mcpToolPrefs),
+    mcp_registry_optin_status: () => true,
+    mcp_registry_search: (a2) => {
+      const q = ((a2 && a2.query) || "").toLowerCase();
+      return mcpCatalog.filter((e) => !q || (e.title ?? e.name).toLowerCase().includes(q) || e.description.toLowerCase().includes(q));
+    },
+    mcp_oauth_status: () => false,
+    // Skills area.
+    list_skills: () => skills,
+    get_skill: (a2) => {
+      const found = skills.find((sk) => sk.id === (a2 && a2.id));
+      if (!found) return null;
+      // SkillBundle.skill is a Skill: the summary WITHOUT resourceCount, plus
+      // the instructions body the detail pane edits.
+      const { resourceCount: _n, ...summary } = found;
+      return { skill: { ...summary, instructions: skillInstructions[found.id] ?? "" }, resources: skillResources[found.id] ?? [] };
+    },
+    get_skill_resource: (a2) => ({ path: (a2 && a2.path) || "", kind: "reference", text: "# Reference\n\nA short skill resource.", dataB64: null }),
+    /* Private browser. The page is a native child webview, so the one thing
+     * this mock cannot produce is the page itself; everything the chrome reads
+     * and writes around it is real state here. Mirrors the Rust commands:
+     * `browser_navigate`/`browser_new_tab` return the SETTLED url / the new tab
+     * id (the view assigns the return value straight into the address bar and
+     * the tab strip), the rest return null.
+     *
+     * The AGENT's tools (`browse_open`, `browse_click`, `browse_screenshot`,
+     * `browse_save`, the SoM numbering) are deliberately absent: they are not
+     * Tauri commands the frontend invokes at all — they reach Rust through the
+     * sidecar's MCP bridge, which does not exist in this harness. Agent
+     * behaviour is faked in the `ask` branch below instead. */
+    browser_info: () => {
+      const t = activeTab();
+      // No page, no webview — the same `{ open: false }` Rust answers before
+      // anything has navigated, which is what disables the chrome buttons.
+      if (!t) return { open: false };
+      return {
+        open: true,
+        blank: !t.url,
+        url: t.url || null,
+        title: t.url ? t.title : null,
+        ready: t.url ? "complete" : null,
+        takeover: browserState.takeover,
+      };
+    },
+    browser_tabs: () => browserTabs,
+    browser_journal: (a2) => browseJournal.slice(0, (a2 && a2.limit) || browseJournal.length),
+    browser_verify_private: () => true,
+    // Bounds are pushed several times a second by the view's ResizeObserver.
+    // Nothing to park in a plain browser, but it must not be an unhandled
+    // command: that alone made every Browser-area capture and spec suspect.
+    browser_set_bounds: () => null,
+    // The address bar. Same normalisation as Rust (bare host → https), and the
+    // same refusal for the addresses `browse_guard_url` rejects, so QA sees the
+    // real error banner rather than a navigation that silently "works".
+    browser_navigate: (a2) => {
+      const raw = String((a2 && a2.url) || "").trim();
+      const url = raw.includes("://") ? raw : `https://${raw}`;
+      if (/^https?:\/\/(localhost|127\.|0\.|10\.|192\.168\.|\[?::1)/i.test(url)) {
+        throw new Error(`Blocked ${url} — that address points at this Mac or a private network.`);
+      }
+      // `browser::ensure` creates the page when there isn't one, so the first
+      // address typed into a cold browser has to open it rather than fail.
+      let t = activeTab();
+      if (!t) {
+        t = { id: "bt" + Math.random().toString(36).slice(2, 7), title: "", url: "", active: true };
+        browserTabs.push(t);
+      }
+      t.url = url;
+      t.title = titleFor(url);
+      journal("open", url, "Opened by the user");
+      window.__qaEmit?.("browser-navigated", url);
+      return url;
+    },
+    browser_new_tab: (a2) => {
+      const raw = String((a2 && a2.url) || "").trim();
+      const url = raw && !raw.includes("://") ? `https://${raw}` : raw;
+      const tab = { id: "bt" + Math.random().toString(36).slice(2, 7), title: url ? titleFor(url) : "New tab", url, active: true };
+      for (const t of browserTabs) t.active = false;
+      browserTabs.push(tab);
+      journal("open", url || "about:blank", "Opened by the user in a new tab");
+      return tab.id;
+    },
+    browser_select_tab: (a2) => {
+      const id = a2 && a2.id;
+      if (!browserTabs.some((t) => t.id === id)) throw new Error("That page is already closed.");
+      for (const t of browserTabs) t.active = t.id === id;
+      return null;
+    },
+    browser_close_tab: (a2) => {
+      const i = browserTabs.findIndex((t) => t.id === (a2 && a2.id));
+      if (i < 0) return null;
+      const [gone] = browserTabs.splice(i, 1);
+      // Closing the ACTIVE page has to leave some page active, or the chrome
+      // reads "no browser" while a tab is still on screen.
+      if (gone.active && browserTabs.length) browserTabs[browserTabs.length - 1].active = true;
+      return null;
+    },
+    // back / forward / reload / stop. There is no history to walk without a
+    // real page; what QA checks here is that the buttons report rather than
+    // silently do nothing, and that an unknown action still errors.
+    browser_go: (a2) => {
+      const action = (a2 && a2.action) || "";
+      if (!["back", "forward", "reload", "stop"].includes(action)) {
+        throw new Error(`Unknown browser action: ${action}`);
+      }
+      return null;
+    },
+    browser_set_takeover: (a2) => {
+      browserState.takeover = !!(a2 && a2.on);
+      journal("takeover", "", browserState.takeover ? "User took over the browser" : "User handed the browser back");
+      return null;
+    },
+    browser_clear_journal: () => {
+      browseJournal.length = 0;
+      return null;
+    },
+    // BROWSE-2: the Save strip. Returns the same sentence the Rust command
+    // does — the view prints it verbatim in the notice banner.
+    browser_save_page: (a2) => {
+      const t = activeTab();
+      if (!t || !t.url) throw new Error("No page is open.");
+      const stem = titleFor(t.url).split(" — ")[0].slice(0, 40) || "page";
+      return (a2 && a2.what) === "selection"
+        ? `Saved "${stem} (selection).md" into the room.`
+        : `Saved "${stem}.md" (readable copy) and "${stem}.html" (exact HTML) into the room.`;
+    },
+    // The other two buttons on that same strip — Save link and Download video.
+    // Faked here because a Save strip where half the buttons throw is not the
+    // strip the app ships.
+    import_link: (a2) => ({
+      id: `f-link-${Math.random().toString(36).slice(2, 8)}`,
+      name: `${titleFor(String((a2 && a2.url) || "")).split(" — ")[0].slice(0, 40) || "link"}.md`,
+      mimeType: "text/markdown",
+      sizeBytes: 6200,
+      source: "web",
+      hasText: true,
+      createdAt: new Date().toISOString(),
+      folderId: null,
+      partiallyIndexed: false,
+    }),
+    // The notice this returns to sends the user to the Activity view for the
+    // job's card, so the job has to actually be there when they look.
+    start_download_job: (a2) => {
+      const job = {
+        id: "j" + Math.random().toString(36).slice(2, 8),
+        kind: "download",
+        title: String((a2 && a2.url) || "Download").slice(0, 60),
+        plan: null,
+        state: null,
+        cursor: 0,
+        total: 1,
+        status: "running",
+        error: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      jobs.push(job);
+      return job.id;
+    },
+    // Settings → Connections → AI providers, and the picker's cloud catalog.
+    list_ai_providers: () => aiProviders,
+    list_engine_models: (a2) => engineModels[(a2 && a2.engine) || ""] ?? [],
+    web_search_test: () => "Working ✓ — 8 results. Top hit: Speaker diarisation — Wikipedia (via wikipedia · relevance 0.94)",
+    // The room-role picker (Create screen + Settings → Room role).
+    list_roles: () => roles,
+    memory_suggestion: () => ({ worth: true, fact: "Ben prefers release briefs under one page" }),
     get_file_content: (a2) => contents[a2?.id] ?? { kind: "text", name: "unknown", mime: "text/plain", editable: false, text: "(no preview)", dataB64: null },
     list_file_versions: () => [],
+    get_file_version: () => ({ fileName: "Ideas.md", versionText: "# Workspace model\n\nKeep sources and AI in one view.", currentText: contents["f-ideas"].text }),
     search_all: (a2) => ({
       files: files.filter((f) => f.name.toLowerCase().includes((a2?.query ?? "").toLowerCase())).map((f) => ({ id: f.id, name: f.name, snippet: "…" })),
       messages: [],
@@ -345,20 +710,19 @@
       new Uint8Array(buf).forEach((b) => { bin += String.fromCharCode(b); });
       return btoa(bin);
     },
-    // Streaming dictation. Without these the composer mic throws, and the
-    // error toast then sits on top of the button the next click needs.
+    // Streaming dictation (start → push → stop) is the ONLY dictation path the
+    // app has; the old send-the-whole-clip `transcribe_audio` is still a Rust
+    // command but no screen calls it, so faking it here only implied a route
+    // that is gone. Without these three the composer mic throws, and the error
+    // toast then sits on top of the button the next click needs.
     dict_start: () => null,
     dict_push_audio: () => null,
     dict_cancel: () => null,
+    // First stop yields a follow-up (drives one hands-free auto-send loop),
+    // later stops yield silence so the QA run terminates.
     dict_stop: () => {
       window.__qaDictStops = (window.__qaDictStops || 0) + 1;
       return window.__qaDictStops === 1 ? "and a follow-up question" : "";
-    },
-    // First stop yields a follow-up (drives one hands-free auto-send loop),
-    // later stops yield silence so the QA run terminates.
-    transcribe_audio: () => {
-      window.__qaTranscribes = (window.__qaTranscribes || 0) + 1;
-      return window.__qaTranscribes === 1 ? "and a follow-up question" : "";
     },
     recommended_models: () => ({ vision: "qwen2.5vl:3b", embed: "nomic-embed-text" }),
     get_ollama_url: () => "",
@@ -440,7 +804,7 @@
         }
         return fn(args);
       }
-      if (cmd.startsWith("list_")) return [];
+      if (cmd.startsWith("list_")) return noteUnhandled(cmd, []);
       if (cmd === "ask" || cmd === "run_command") {
         window.__qaAsks = (window.__qaAsks || 0) + 1;
         (window.__qaAskLog = window.__qaAskLog || []).push(args?.question ?? args?.text ?? "?");
@@ -547,8 +911,7 @@
           setTimeout(() => resolve({ id: "msg-live", role: "assistant", content: "Thinking about your sources… here is a grounded answer.", sources: ["Ideas.md"], createdAt: new Date().toISOString(), effects: null }), Number(window.__qaTurnMs) || 4200),
         );
       }
-      console.warn("[qa-mock] unhandled command:", cmd, args);
-      return null;
+      return noteUnhandled(cmd, null);
     },
   };
 

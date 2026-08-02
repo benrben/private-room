@@ -1,14 +1,19 @@
-//! Diarization acceptance benchmark (ADD-28) — not a pass/fail test.
+//! Diarization acceptance benchmark (ADD-28) — a pass/fail test.
 //!
 //! Runs the SHIPPING offline pipeline (`recording::retranscribe`, which now
 //! includes the sub-window split pass) over a manifest of real recordings
-//! with RTTM ground truth and reports DER per row. This is the regression
-//! harness for the 2026-08-01 split-pass acceptance numbers:
-//! 39 AMI two-speaker slices >= 95% split-success, 4 full meetings at 4/4
-//! speakers (data + manifests live in ~/diarization-lab).
+//! with RTTM ground truth, reports DER per row, and FAILS when a row misses
+//! the acceptance bar. This is the regression harness for the 2026-08-01
+//! split-pass acceptance numbers: 39 AMI two-speaker slices >= 95%
+//! split-success, 4 full meetings at 4/4 speakers (data + manifests live in
+//! ~/diarization-lab). Printing numbers nobody compared to anything is what
+//! it used to do, which meant it could never notice a regression.
 //!
 //!   PR_BENCH_MANIFEST=…/manifest.tsv   (sid\twav\trttm per line)
-//!   PR_BENCH_RESULTS=…/out.jsonl       (one JSON line per row)
+//!   PR_BENCH_RESULTS=…/out.jsonl       (one JSON line per row; REWRITTEN
+//!                                       each run, never appended to)
+//!   PR_BENCH_MAX_DER=…                 (per-row DER ceiling, default 30)
+//!   PR_BENCH_ALLOW_SPEAKER_DRIFT=1     (don't fail on a wrong speaker count)
 //!   cargo test --release --test diar_bench -- --ignored --nocapture
 
 use std::collections::HashMap;
@@ -175,12 +180,26 @@ fn der(ref_segs: &[(f64, f64, String)], hyp_segs: &[(f64, f64, String)], total_s
     Der { der: d(miss + fa + conf), miss: d(miss), fa: d(fa), conf: d(conf) }
 }
 
+/// Per-row DER ceiling. The shipped split pass scores far below this on the
+/// acceptance set; the bar is here to catch a regression, not to be tight.
+const DEFAULT_MAX_DER: f64 = 30.0;
+
 #[test]
 #[ignore = "acceptance benchmark; set PR_BENCH_MANIFEST"]
 fn bench_manifest() {
     use std::io::Write;
     let manifest = std::env::var("PR_BENCH_MANIFEST").expect("set PR_BENCH_MANIFEST");
     let results = std::env::var("PR_BENCH_RESULTS").expect("set PR_BENCH_RESULTS");
+    let max_der: f64 = std::env::var("PR_BENCH_MAX_DER")
+        .ok()
+        .map(|v| v.parse().expect("PR_BENCH_MAX_DER"))
+        .unwrap_or(DEFAULT_MAX_DER);
+    let allow_drift = std::env::var("PR_BENCH_ALLOW_SPEAKER_DRIFT").is_ok();
+    // Rewritten, not appended to: a results file that accumulates every run
+    // makes "the numbers" whatever you last looked at.
+    let mut out =
+        std::fs::File::create(&results).expect("create PR_BENCH_RESULTS");
+    let mut failures: Vec<String> = Vec::new();
     for line in std::fs::read_to_string(&manifest).expect("read manifest").lines() {
         if line.trim().is_empty() {
             continue;
@@ -197,8 +216,14 @@ fn bench_manifest() {
             pcm.truncate(n);
         }
         let total_s = pcm.len() as f64 / 16000.0;
-        let meta =
-            arcelle_lib::recording::retranscribe(&model(), &pcm, Vec::new(), 0, |_, _| {});
+        let meta = arcelle_lib::recording::retranscribe(
+            &model(),
+            &pcm,
+            &arcelle_lib::recording::RecMeta::default(),
+            |_, _| {},
+            || false, // never stopped: the bench measures a full pass
+        )
+        .expect("retranscribe");
         let mut refs = parse_rttm(rttm);
         refs.retain(|(b, _, _)| *b < total_s);
         let hyps: Vec<(f64, f64, String)> = meta
@@ -220,9 +245,18 @@ fn bench_manifest() {
             d.fa,
             d.conf
         );
-        let mut out =
-            std::fs::OpenOptions::new().create(true).append(true).open(&results).unwrap();
         writeln!(out, "{row}").unwrap();
         eprintln!("{row}");
+        if d.der > max_der {
+            failures.push(format!("{sid}: DER {:.2} > {max_der:.2}", d.der));
+        }
+        if !allow_drift && speakers.len() != ref_n.len() {
+            failures.push(format!(
+                "{sid}: found {} speaker(s), ground truth has {}",
+                speakers.len(),
+                ref_n.len()
+            ));
+        }
     }
+    assert!(failures.is_empty(), "diarization regressed:\n  {}", failures.join("\n  "));
 }

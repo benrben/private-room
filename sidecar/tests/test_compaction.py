@@ -61,11 +61,17 @@ async def test_a_payload_that_fits_is_left_alone():
 
 
 async def test_tiny_payloads_are_never_compacted():
-    """A digest of a two-turn chat is worse than the chat."""
+    """A digest of a two-turn chat is worse than the chat.
+
+    Asserted on the OUTPUT rather than on the return flag: below
+    `MIN_COMPACT_BYTES` nothing is digested, but a payload over budget is still
+    made to fit (see `fit_oversized_results`), so the flag can be True.
+    """
     msgs = _convo(1, body_bytes=100)
     assert sum(msg_len(m) for m in msgs) < MIN_COMPACT_BYTES
-    _, did = await compact_to_budget(msgs, 10, _fake_digest)
-    assert did is False
+    out, _did = await compact_to_budget(msgs, 10, _fake_digest)
+    assert len(out) == len(msgs), "the turns were replaced by a digest"
+    assert not any("supersede" in (m.get("content") or "") for m in out)
 
 
 async def test_compaction_fits_the_budget_and_keeps_system_and_recent():
@@ -127,17 +133,45 @@ async def test_digests_are_cached_across_calls():
     assert calls == first, "the second compaction re-digested instead of reusing"
 
 
-async def test_a_failing_digest_degrades_to_todays_behaviour():
-    """A model error must not fail the turn: fall through, and let the existing
-    `trim_messages_to_window` make it fit exactly as it does today."""
+async def test_a_failing_digest_never_fails_the_turn():
+    """A model error must not raise, and must not amputate: nothing is
+    replaced by a digest, and the caller still gets a payload it can send."""
 
     async def boom(text: str) -> str:
         raise RuntimeError("model exploded")
 
     msgs = _convo(60)
-    out, did = await compact_to_budget(msgs, 20_000, boom)
-    assert did is False
-    assert out is msgs
+    before = [dict(m) for m in msgs]
+    out, _did = await compact_to_budget(msgs, 20_000, boom)
+    assert msgs == before, "the caller's own history was mutated"
+    assert not any("supersede" in (m.get("content") or "") for m in out)
+    assert len(out) == len(msgs)
+
+
+async def test_a_failed_digest_is_not_cached_as_an_empty_summary():
+    """One flaky call used to retire a stretch of the conversation for the rest
+    of the session: the "" it filed under that chunk's hash was indistinguishable
+    from a real digest, so the turns behind it were never seen — or retried —
+    again. A failure is not an answer; the next round asks again."""
+    calls = 0
+
+    async def flaky(text: str) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("engine was restarting")
+        return await _fake_digest(text)
+
+    msgs = _convo(60)
+    first, _ = await compact_to_budget(msgs, 20_000, flaky)
+    # The stretch that failed is declared missing rather than silently dropped.
+    assert "could not be summarised" in first[1]["content"]
+
+    second, _ = await compact_to_budget(msgs, 20_000, flaky)
+    assert "could not be summarised" not in second[1]["content"], (
+        "the failed chunk was cached as an empty digest and never retried"
+    )
+    assert "Q0" in second[1]["content"]
 
 
 def test_fit_budget_leaves_headroom_below_the_hard_wall():
@@ -152,9 +186,26 @@ def test_fit_budget_leaves_headroom_below_the_hard_wall():
     assert fit_budget_bytes(None) is None
 
 
-def test_reserved_bytes_come_off_the_budget():
-    """Tool schemas ride the same window; ignoring them re-creates the overflow."""
-    assert fit_budget_bytes(32_768, 5_000) == fit_budget_bytes(32_768) - 5_000
+async def test_the_tool_catalog_is_charged_once_not_twice():
+    """Tool schemas ride the same window, and they are charged on the PAYLOAD
+    side (`compact_to_budget` adds them to the total). `fit_budget_bytes` used
+    to take them off the budget as well, so every room on all three engines
+    started compacting a catalog's worth of bytes earlier than it had to."""
+    assert fit_budget_bytes(32_768, 5_000) == fit_budget_bytes(32_768)
+
+    reserved = 5_000
+    budget = fit_budget_bytes(32_768, reserved)
+    # A payload that fits the window exactly once the catalog is counted...
+    body = budget - reserved - 2_000
+    msgs = [
+        {"role": "system", "content": "SYSTEM PROMPT"},
+        {"role": "user", "content": "x" * (body // 2)},
+        {"role": "assistant", "content": "y" * (body // 2)},
+    ]
+    assert sum(msg_len(m) for m in msgs) + reserved <= budget
+    # ...is not compacted. Double-charging pushed exactly this payload over.
+    out, did = await compact_to_budget(msgs, budget, _fake_digest, reserved)
+    assert did is False and out is msgs
 
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +257,26 @@ def test_an_unknown_window_still_means_no_budget_at_all() -> None:
     """The contract that keeps this from ever being a regression: if nobody has
     stated a real window, nothing is compacted and the payload goes out whole."""
     assert fit_budget_bytes(None, 0, compaction.CLOUD_SPEND_FRACTION) is None
+
+
+async def test_the_digest_cache_cannot_grow_without_limit():
+    """Nothing outside this module clears it — not closing a room, not switching
+    rooms, not deleting the chat — so every digest of every conversation stayed
+    resident for the life of the process, each one a paragraph of the user's own
+    content. The working set survives; what a finished room left behind does
+    not."""
+    from arcelle_sidecar.compaction import _CACHE, _CACHE_MAX_ENTRIES
+
+    for room in range(30):
+        msgs = [{"role": "system", "content": "SYSTEM PROMPT"}]
+        for i in range(30):
+            # Distinct content per room, or every room hashes to the same
+            # chunks and this test proves nothing.
+            msgs.append({"role": "user", "content": f"room{room} Q{i} " + "x" * 1_200})
+            msgs.append({"role": "assistant", "content": f"room{room} A{i} " + "y" * 1_200})
+        await compact_to_budget(msgs, 12_000, _fake_digest)
+        assert len(_CACHE) <= _CACHE_MAX_ENTRIES
+    assert len(_CACHE) == _CACHE_MAX_ENTRIES, "nothing was ever evicted"
 
 
 def test_a_local_digest_pass_does_not_grow_with_the_window() -> None:
@@ -328,11 +399,10 @@ async def test_a_failed_digest_still_cuts_the_oversized_result():
     """`if not parts` is the digest-failed path. It returned the input as-is on
     the theory that the trimmer runs afterwards — true only on a local room.
 
-    Note what is NOT claimed: that the payload fits. With the digest broken and
-    72 KB of prose against a 40 KB budget, nothing fits without amputating the
-    user's own turns, which this layer deliberately refuses to do — the same
-    invariant `trim_messages_to_window` holds. What it guarantees is that the
-    half-megabyte page is no longer part of the request.
+    The page goes first and goes hardest: it is a tool result, and those are
+    cut before a single byte of the user's own turns. Only if that still leaves
+    the request oversized — 72 KB of prose against a 40 KB budget, with the
+    digest broken — do the turns themselves lose their middles.
     """
 
     async def broken(_text: str) -> str:

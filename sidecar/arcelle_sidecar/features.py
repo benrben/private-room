@@ -32,6 +32,7 @@ from typing import Any
 from . import llm
 from .config import KEEP_ALIVE_SHORT, KEEP_ALIVE_WARM
 from .messages import system_message, user_message
+from .model_text import recover_json
 
 # --- front page: starter questions (front_page.rs) --------------------------
 
@@ -52,9 +53,17 @@ def _parse_questions(raw: str) -> list[str]:
 
     front_page.rs: collect every string in ``questions``, drop the blank ones
     (empty after trim), keep the first three. The kept strings are returned
-    verbatim (the Rust filter does not trim the survivors)."""
+    verbatim (the Rust filter does not trim the survivors).
+
+    Run through :func:`.model_text.recover_json` first, like every other
+    structured caller (chat_docs, ai_actions, external_llm). This was a bare
+    ``json.loads`` on the raw reply, which is fine for a model that honours
+    ``format`` and wrong for the ones that do not — an Ollama ``:cloud`` model
+    fence-wraps its JSON or prefixes a ``<think>`` span, the strict parse
+    rejected it, and the front page silently showed no starter questions at
+    all."""
     try:
-        data = json.loads(raw.strip())
+        data = json.loads(recover_json(raw))
     except (ValueError, TypeError):
         return []
     if not isinstance(data, dict):
@@ -121,9 +130,14 @@ def _parse_or_fallback(raw: str, text: str) -> tuple[str, str]:
 
     feedback.rs: require both a non-blank title and a non-blank body (trimmed);
     otherwise title = the first line of the raw feedback (max 70 chars, or
-    "Feedback" if there is none) and body = "## What happened\\n\\n{text}"."""
+    "Feedback" if there is none) and body = "## What happened\\n\\n{text}".
+
+    :func:`.model_text.recover_json` first, for the same reason
+    :func:`_parse_questions` needs it: a fence-wrapped reply from a cloud model
+    fell straight through to the fallback, so the feedback form quietly used
+    the user's first line as the issue title and never told anyone."""
     try:
-        data = json.loads(raw.strip())
+        data = json.loads(recover_json(raw))
     except (ValueError, TypeError):
         data = None
     if isinstance(data, dict):

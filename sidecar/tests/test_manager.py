@@ -20,14 +20,17 @@ from arcelle_sidecar.agents import (
     MAIN_AGENT_ID,
     MAX_BOX_TOOLS,
     REGISTRY,
+    AgentSpec,
     agent_tool_specs,
     get_agent,
     group_prompt,
+    group_servable,
     group_tools,
     toolbox_for,
 )
+from arcelle_sidecar.agents import main_prompt, worker_reachable
 from arcelle_sidecar.manager import resolve_worker
-from arcelle_sidecar.prompts import delegation_note
+from arcelle_sidecar.prompts import TOOL_GROUP_LABELS, delegation_note
 from arcelle_sidecar.routing import (
     JOB_TOOL_NAMES,
     MCP_MANAGEMENT_TOOL_NAMES,
@@ -46,6 +49,35 @@ def test_agent_ids_are_unique_and_namespaced() -> None:
     ids = [s.id for s in REGISTRY]
     assert len(ids) == len(set(ids))
     assert all("." in i for i in ids)
+
+
+def test_the_spec_carries_no_field_the_running_app_never_reads() -> None:
+    """Both decorative fields were removed on 2026-08-01; this pins the rest.
+
+    ``read_only`` was the dangerous one: a per-agent "never changes anything"
+    flag that read as a safety switch while nothing enforced it — a spec marked
+    read-only could still be handed ``browse_do`` and no code path would
+    notice. ``description`` was a one-liner on every row, kept for a
+    constrained classifier that was never built.
+
+    Every name below is read somewhere in the running app (``graph.prepare``,
+    ``worker_reachable``, ``toolbox_for``, ``manager.resolve_worker``,
+    ``graphs.graph_for``, the agent strip). A new field has to earn the same,
+    and an unread one must not drift back in behind a plausible docstring.
+    """
+    assert set(AgentSpec.__dataclass_fields__) == {
+        "id",
+        "label",
+        "tools",
+        "requires",
+        "prompt",
+        "hints",
+        "available",
+        "group",
+        "template",
+        "flow",
+        "main",
+    }
 
 
 def test_no_box_exceeds_the_small_model_cap() -> None:
@@ -72,6 +104,11 @@ def test_groups_cover_exactly_the_gated_lanes() -> None:
         assert group_prompt(g), g  # every unlock has a paragraph to append
 
 
+#: Underscore-shaped words that appear in a paragraph and are NOT tools. Every
+#: other one is read as a tool name by the guard below; keep this list tiny.
+_NOT_TOOL_WORDS = {"depends_on"}  # a batch-task FIELD, not a verb
+
+
 def test_every_agent_prompt_names_only_its_own_tools() -> None:
     """The rule this module states in prose, enforced.
 
@@ -80,15 +117,25 @@ def test_every_agent_prompt_names_only_its_own_tools() -> None:
     workflow tools, so each was briefed on tools it does not hold (six and two
     respectively) — which is exactly how a model is taught to hallucinate a
     call it has no schema for.
+
+    THE HOLE THIS TEST HAD (2026-08-01). It only flagged a word that is some
+    OTHER registered agent's tool, so a prompt naming a tool NO agent holds
+    sailed through — and two shipped that way: STUDIO_PROMPT told the Studio
+    agent to call ``stage_preview_html`` (a UI staging command the bridge never
+    serves an agent, so following the instruction produced a red failed step
+    reading "Ran the stage_preview_html tool"), and MAIN_PROMPT_TEMPLATE quoted
+    ``ask_ui_agent`` as the tool name never to say aloud — a tool that does not
+    exist, in the one paragraph whose own rule is never to show a name that
+    does not resolve. The universe is now SHAPE, not membership: anything
+    spelled like a tool must be one this agent actually holds.
     """
-    every_tool = set(CORE_TOOLS) | {t for s in REGISTRY for t in s.tools}
-    every_tool |= {"request_tools", *AGENT_TOOL_NAMES}
     for spec in REGISTRY:
         allowed = set(CORE_TOOLS) | set(spec.tools)
         if spec.main:  # its box IS the delegation catalog
-            allowed |= set(AGENT_TOOL_NAMES)
-        named = {w for w in re.findall(r"[a-z][a-z0-9_]{3,}", spec.prompt) if w in every_tool}
-        assert not named - allowed, f"{spec.id} names tools it lacks: {sorted(named - allowed)}"
+            allowed |= set(AGENT_TOOL_NAMES) | {BATCH_TOOL_NAME}
+        named = set(re.findall(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+", spec.prompt))
+        unheld = named - allowed - _NOT_TOOL_WORDS
+        assert not unheld, f"{spec.id} names tools it lacks: {sorted(unheld)}"
 
 
 def test_every_agent_owns_a_unique_prompt() -> None:
@@ -300,14 +347,38 @@ def test_a_cloud_cli_room_reaches_every_domain_the_local_engine_does() -> None:
         )
         == "jobs.workflows"
     )
-    # The screen is the one thing a cloud engine still cannot touch. The App
-    # agent stays reachable on its media half — "what happens at 0:30 in the
-    # video" now works on a Claude room — but holds NO screen tool, so a
-    # click request comes back as an honest MISSING rather than a fabrication.
-    assert "ask_app_agent" in names
-    box = toolbox_for("app.ui", _CLOUD_ENGINE_TIER)
-    assert "view_media_frame" in box
-    assert not box & _SCREEN_TOOLS
+    # The screen is the one thing a cloud engine still cannot touch — and the
+    # App DOMAIN goes with it (2026-08-01).
+    #
+    # This used to assert the opposite: `ask_app_agent in names`, on the
+    # reasoning that the agent "stays reachable on its media half … but holds
+    # NO screen tool, so a click request comes back as an honest MISSING". It
+    # does not. `view_media_frame` is a room video's pixels, which the CLI tier
+    # serves as CONTENT, and it was the ONLY tool of this box that tier served
+    # — so `worker_reachable`'s any-one-of-them test passed on a tool that has
+    # nothing to do with the app's interface. The Main agent was then offered a
+    # specialist described as "see or operate this app's own interface", and
+    # UI_PROMPT briefed it on ui_snapshot/ui_act, neither of which it holds:
+    # ask it to open a view and it invents the call or reports an act that
+    # never happened. `AgentSpec.requires` makes both screen verbs necessary.
+    #
+    # Nothing is lost — watching a room video is `media.video`'s job under
+    # ask_file_agent, and that still works here.
+    assert "ask_app_agent" not in names
+    assert "view_media_frame" in toolbox_for("media.video", _CLOUD_ENGINE_TIER)
+    assert (
+        resolve_worker(
+            "ask_file_agent", "what's on screen at 3:20 of talk.mp4",
+            served_names=_CLOUD_ENGINE_TIER,
+        )
+        == "media.video"
+    )
+    # …and it comes straight back the moment the screen verbs are served.
+    local = _CLOUD_ENGINE_TIER | _SCREEN_TOOLS
+    assert "ask_app_agent" in [
+        s["function"]["name"]
+        for s in agent_tool_specs(web_enabled=True, served_names=local)
+    ]
 
 
 def test_the_main_agent_is_told_not_to_substitute_or_obey_reports() -> None:
@@ -412,13 +483,19 @@ _EXPECTED_BATCH_SPEC = {
     "type": "function",
     "function": {
         "name": "ask_agents",
+        # Reworded 2026-08-01. It used to promise wall-clock parallelism ("run
+        # AT THE SAME TIME … the whole batch costs as long as its slowest task
+        # instead of the sum"), which only a cloud room delivers: `server.py`
+        # pins `worker_parallel = 1` on a LOCAL room, so its children run one
+        # after another and the batch really does cost the sum. What holds on
+        # both engines is one call instead of several, one set of reports back.
         "description": (
             "Ask SEVERAL specialists in ONE call. Prefer this whenever the "
-            "request has more than one part: tasks that do not depend on each "
-            "other run AT THE SAME TIME, so the whole batch costs as long as "
-            "its slowest task instead of the sum. Use depends_on only when a "
-            "task genuinely needs an earlier task's findings — those wait, "
-            "everything else runs together."
+            "request has more than one part: one call carrying every part is "
+            "far more reliable than several separate calls, and all the "
+            "reports come back together. Use depends_on only when a task "
+            "genuinely needs an earlier task's findings — those wait for it, "
+            "everything else starts straight away."
         ),
         "parameters": {
             "type": "object",
@@ -663,3 +740,272 @@ def test_hebrew_instructions_resolve_too() -> None:
 
 def test_unknown_tool_degrades_to_the_default_worker() -> None:
     assert resolve_worker("ask_nobody", "whatever") == DEFAULT_AGENT_ID
+
+
+# --------------------------------------------------------------------------- #
+# everyday words must not claim a specialist (the 2026-08-01 vocabulary wave)
+#
+# Every one of these is the same shape of bug: a hint short enough to be an
+# ordinary English word, matched with no word boundaries, against a sibling
+# (files.read) that carries NO vocabulary at all — so ONE accidental hit is
+# enough to win the domain outright and brief the wrong agent for the job.
+# --------------------------------------------------------------------------- #
+
+
+def test_an_ordinary_web_question_is_not_hijacked_by_the_word_information() -> None:
+    """"form" is a substring of "information", and the longer match wins.
+
+    The tie-break in `_rank` ends on the LONGEST matched hint, so chat.browse's
+    "form" (4) beat chat.web's "web" (3): "search the web for information
+    about X" was handed to the Browser agent, which holds no search tool and
+    had to guess an address for a question that named no destination.
+    """
+    for instruction in (
+        "search the web for information about lithium batteries",
+        "find information online about the new tax rules",
+        "what is the latest information on the eurozone rate",
+    ):
+        assert resolve_worker("ask_web_agent", instruction) == "chat.web", instruction
+    # …without losing the real thing the hint is for.
+    for instruction in (
+        "fill in the form on that page and submit it",
+        "there is a form at the bottom — complete it for me",
+    ):
+        assert resolve_worker("ask_web_agent", instruction) == "chat.browse", instruction
+
+
+def test_reading_a_transcript_is_not_a_request_to_make_one_again() -> None:
+    """The bare noun "transcript" was a hint of the RE-transcription agent.
+
+    "Summarize the meeting transcript" is what a user says about a transcript
+    that already exists, and it scored media.transcribe 1 against the hintless
+    File agent's 0 — so the ask was briefed to re-run the speech model on the
+    very file it was asked to summarize.
+    """
+    for instruction in (
+        "summarize the meeting transcript",
+        "what does the transcript say about the budget",
+        "pull the action items out of the interview transcript",
+    ):
+        assert resolve_worker("ask_file_agent", instruction) == "files.read", instruction
+    # Asking for the transcript to be MADE, or REMADE, still lands correctly.
+    for instruction in (
+        "transcribe talk.m4a",
+        "redo the transcript for talk.mp4",
+        "the transcript came out in the wrong language",
+        "there is no transcript for this recording",
+        "fix the transcript, it is full of errors",
+    ):
+        assert (
+            resolve_worker("ask_file_agent", instruction) == "media.transcribe"
+        ), instruction
+
+
+def test_asking_for_a_transcript_to_be_made_reaches_the_transcriber() -> None:
+    """The other half of the narrowing above, and the half it dropped.
+
+    Replacing the bare noun with complaint pairs (transcript+redo/wrong/…)
+    covered every way of saying "this transcript is bad" and no way of saying
+    "please make one": "make me a transcript of the standup" landed on the File
+    agent, which holds neither stt_status nor retranscribe_file, so a recording
+    with no transcript came back as MISSING instead of being transcribed.
+
+    The tell is the INDEFINITE article — "a transcript" is one that does not
+    exist yet, "THE transcript" is one you want to read — which is why these
+    are contiguous phrases and not the obvious ALL-OF pairs: `transcript+make`
+    also matches "make flashcards from the transcript", and `_rank`'s last rung
+    prefers the LONGEST hit, so a 15-character pair would take that ask off
+    creator.studio outright.
+    """
+    for instruction in (
+        "make a transcript of the standup recording",
+        "create a transcript of the interview",
+        "i need a transcript of yesterday's meeting",
+        "make me a transcript of talk.mp4",
+        "please produce a transcript of the call",
+        "give me a new transcript of the lecture",
+    ):
+        assert (
+            resolve_worker("ask_file_agent", instruction) == "media.transcribe"
+        ), instruction
+    # The definite article still means the one that exists — and no sibling
+    # loses an ask to the new phrases.
+    for instruction, worker in (
+        ("make a summary of the transcript", "files.read"),
+        ("i need a summary of the transcript", "files.read"),
+        ("read me the transcript", "files.read"),
+        ("make flashcards from the transcript", "creator.studio"),
+        ("create flashcards from the transcript", "creator.studio"),
+    ):
+        assert resolve_worker("ask_file_agent", instruction) == worker, instruction
+
+
+def test_studying_a_file_is_not_a_request_for_flashcards() -> None:
+    """"study" is an ordinary English verb for reading something carefully."""
+    for instruction in (
+        "study the lease and tell me the break clause",
+        "study these figures and say what changed",
+    ):
+        assert resolve_worker("ask_file_agent", instruction) == "files.read", instruction
+    for instruction in (
+        "make flashcards from the biology notes",
+        "build me a study guide for chapter 4",
+        "turn this into a quiz",
+        "a mind map of the whole report, please",
+    ):
+        assert resolve_worker("ask_file_agent", instruction) == "creator.studio", instruction
+
+
+def test_a_question_that_merely_mentions_python_is_not_a_script_run() -> None:
+    """The language name was a bare hint, and it is far more often a SUBJECT."""
+    for instruction in (
+        "what does the report say about python",
+        "which of my notes mention python",
+    ):
+        assert resolve_worker("ask_file_agent", instruction) == "files.read", instruction
+    for instruction in (
+        "run the python script that builds the ETF report",
+        "write a python script to rename these files",
+    ):
+        assert resolve_worker("ask_file_agent", instruction) == "scripts.run", instruction
+
+
+# --------------------------------------------------------------------------- #
+# reachability: a box needs its LOAD-BEARING tools, not merely one of them
+# --------------------------------------------------------------------------- #
+
+
+def test_the_app_agent_needs_the_screen_verbs_not_just_any_tool_in_its_box() -> None:
+    """`worker_reachable`'s any-one-of-them test is the wrong question here.
+
+    `app.ui`'s box is the four UI_TOOL_NAMES, and one of them —
+    `view_media_frame` — is a room VIDEO's pixels, which `room_mcp::ToolScope`
+    classes as content and serves to a cloud-CLI room while the three screen
+    tools stay local-only. So the App agent read as reachable on a tool that
+    has nothing to do with the app's interface, and UI_PROMPT then briefed it
+    on ui_snapshot/ui_act regardless.
+    """
+    spec = get_agent("app.ui")
+    assert set(spec.requires) == {"ui_snapshot", "ui_act"}
+    media_only = set(CORE_TOOLS) | {"view_media_frame"}
+    assert not worker_reachable(spec, web_enabled=True, served_names=media_only)
+    # A tier serving the screen verbs gets the agent back.
+    assert worker_reachable(
+        spec, web_enabled=True, served_names=media_only | {"ui_snapshot", "ui_act"}
+    )
+    # Nothing else in the roster is gated this way — `requires` is the
+    # exception, and a spec that sets it must mean it.
+    assert [s.id for s in REGISTRY if s.requires] == ["app.ui"]
+
+
+def test_a_group_is_servable_only_when_a_member_could_actually_act() -> None:
+    """The request_tools gates ask the SAME question and used to ask it the
+    old way: "was any tool of this group served".
+
+    `app_ui`'s group is `app.ui`'s box, so on a cloud-CLI tier that test passes
+    on `view_media_frame` alone — and the model is then offered "app_ui (see
+    and operate this app's own interface)" in its prompt, can spend a round
+    unlocking it, and gets UI_PROMPT's briefing on ui_snapshot/ui_act, none of
+    which it holds. `group_servable` reuses `worker_reachable`, so the two
+    doors cannot disagree.
+    """
+    cloud = _CLOUD_ENGINE_TIER
+    assert group_tools("app_ui") & cloud == {"view_media_frame"}, "premise moved"
+    assert not group_servable("app_ui", cloud)
+    # The lanes a cloud room really can unlock are untouched.
+    assert [g for g in GROUPS if group_servable(g, cloud)] == [
+        "jobs",
+        "skills",
+        "connectors",
+    ]
+    # And the screen verbs bring the group straight back.
+    assert group_servable("app_ui", cloud | _SCREEN_TOOLS)
+    # A bridge that served nothing offers no unlock at all.
+    assert not any(group_servable(g, set()) for g in GROUPS)
+
+
+# --------------------------------------------------------------------------- #
+# prompts that contradicted the catalog they shipped with
+# --------------------------------------------------------------------------- #
+
+
+def test_the_skill_builder_is_not_told_it_cannot_read_skills() -> None:
+    """Its own `Flow.probe` runs list_skills as the FIRST act of every turn,
+    and read_skill has been in CORE since 2026-07-24 — while the paragraph
+    said "You cannot list or read existing skills … put that in MISSING". A
+    user asking to change an existing skill could be refused as impossible
+    with the index of those skills already in the agent's context."""
+    spec = get_agent("skills.author")
+    assert spec.flow.probe == "list_skills"
+    assert {"list_skills", "read_skill"} <= set(CORE_TOOLS)
+    assert "cannot list or read" not in spec.prompt
+    assert "list_skills" in spec.prompt and "read_skill" in spec.prompt
+
+
+def test_the_studio_agent_is_not_told_to_stage_a_preview_it_cannot_stage() -> None:
+    """`stage_preview_html` is a UI staging command the bridge never serves an
+    agent, so obeying the instruction produced a red failed step reading "Ran
+    the stage_preview_html tool" — and nothing is previewed either way: each
+    generator SAVES a new room file (agent.rs says so in its own schemas)."""
+    spec = get_agent("creator.studio")
+    assert "stage_preview_html" not in spec.prompt
+    assert "preview staged" not in spec.prompt
+    assert "new file" in spec.prompt
+
+
+def test_the_batch_tool_does_not_promise_wall_clock_parallelism() -> None:
+    """A LOCAL room pins `Deps.worker_parallel = 1` (server.py) because it has
+    ONE resident model, so a five-task batch costs the sum, not the longest —
+    while the description sold "run AT THE SAME TIME … instead of the sum" to
+    every engine. The model planned against a promise half the rooms cannot
+    keep, and the agent strip showed five specialists working while four
+    waited for a slot."""
+    batch = agent_tool_specs(web_enabled=True, served_names=_ALL_SERVED)[-1]
+    text = batch["function"]["description"].lower()
+    assert batch["function"]["name"] == BATCH_TOOL_NAME
+    for promise in ("at the same time", "slowest", "instead of the sum"):
+        assert promise not in text, promise
+    # The reason to batch that IS true on both engines survives.
+    assert "one call" in text and "reports come back together" in text
+    assert "at the same time" not in get_agent(MAIN_AGENT_ID).prompt.lower()
+
+
+def test_a_room_with_no_specialists_is_not_told_to_call_the_file_agent() -> None:
+    """`agent_tool_specs` returns an EMPTY catalog when the bridge served
+    nothing, and MAIN_PROMPT_TEMPLATE's first sentence orders ask_file_agent
+    unconditionally — a tool the model demonstrably does not have. Told to
+    call one anyway it either fabricates the call or answers about the room
+    from memory, which is the whole failure the hub exists to prevent."""
+    assert agent_tool_specs(web_enabled=False, served_names=set()) == []
+    prompt = main_prompt([])
+    assert "ask_file_agent" not in prompt
+    assert "NO specialist agents" in prompt
+    assert "never answer about this room's content from memory" in prompt
+    # A room that CAN reach the file agent is unchanged.
+    assert "ask_file_agent" in main_prompt(["file"])
+
+
+def test_the_referent_baton_says_when_it_was_shortened() -> None:
+    """It carries the six most recent artifacts and used to carry them
+    silently, so a later specialist read a complete-looking list with an
+    earlier file missing from it and reported that file as non-existent. An
+    incomplete list read as exhaustive is a false negative, not a gap."""
+    six = [f"note{i}.md" for i in range(6)]
+    note = delegation_note("x", six)
+    assert "note0.md" in note and "most recent of" not in note
+
+    many = [f"note{i}.md" for i in range(9)]
+    trimmed = delegation_note("x", many)
+    assert "note0.md" not in trimmed  # genuinely dropped
+    assert "note8.md" in trimmed
+    assert "the 6 most recent of 9" in trimmed
+    assert "list_room_files" in trimmed  # …and how to reach the rest
+
+
+def test_every_unlockable_group_has_a_human_label() -> None:
+    """`prompts.request_tools_spec` and `graph.prepare` both subscript
+    TOOL_GROUP_LABELS with a name straight out of GROUPS, so a group added
+    without a label raises KeyError while a turn's catalog is being built —
+    a crash mid-answer. `agents.py` asserts this at import; restated here so a
+    failure names itself."""
+    assert set(GROUPS) <= set(TOOL_GROUP_LABELS)

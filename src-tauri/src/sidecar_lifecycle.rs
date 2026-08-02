@@ -1,10 +1,12 @@
 //! ADD-33: manage the local Python/LangGraph agent sidecar the same way
 //! [`crate::ollama_lifecycle`] manages the Ollama daemon.
 //!
-//! The sidecar is the OPTIONAL agent brain: when the `agent_engine` setting is
-//! `langgraph`, [`crate::sidecar`] runs the answer through it instead of the
-//! native `agent_loop`. This module owns the process — spawn it on demand, learn
-//! the loopback port it chose, hand out its base URL, and SIGTERM it on app exit.
+//! The sidecar is the app's SOLE AI engine — not an option and not a preference.
+//! The native `agent_loop` it once stood beside is deleted, so if this module
+//! cannot start the process the app cannot answer at all; there is nothing to
+//! fall back to. (The old `agent_engine` setting is gone too.) This module owns
+//! the process — spawn it on demand, learn the loopback port it chose, hand out
+//! its base URL, and SIGTERM it on app exit.
 //!
 //! Same safety rule as Ollama: we only ever stop a process WE spawned, and it is
 //! bound to `127.0.0.1` only. The sidecar never sees the room key — it reaches
@@ -12,6 +14,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -24,6 +27,11 @@ struct Lifecycle {
     our_pid: Mutex<Option<u32>>,
     /// The base URL (`http://127.0.0.1:PORT`) of the running sidecar, once known.
     base_url: Mutex<Option<String>>,
+    /// Requests WE currently have in flight on that sidecar. Never replace a
+    /// sidecar while this is > 0 unless it is provably gone: the count is the
+    /// only thing that distinguishes "nobody is using it" from "the user's
+    /// answer is streaming through it right now".
+    inflight: AtomicUsize,
 }
 
 fn lc() -> &'static Lifecycle {
@@ -31,7 +39,32 @@ fn lc() -> &'static Lifecycle {
     LC.get_or_init(|| Lifecycle {
         our_pid: Mutex::new(None),
         base_url: Mutex::new(None),
+        inflight: AtomicUsize::new(0),
     })
+}
+
+/// RAII marker for ONE request we have in flight on the sidecar, mirroring
+/// [`crate::ollama_lifecycle::Busy`]. Every caller of [`ensure_up`] takes one and
+/// holds it for the whole duration of its HTTP call — a streaming answer, a
+/// ten-hour file pass — so [`ensure_up`] on another task cannot SIGTERM the
+/// process that is serving it.
+pub struct Busy;
+
+/// Register one in-flight sidecar request; the returned guard unregisters it on
+/// drop (including when the future is cancelled by Stop).
+pub fn busy() -> Busy {
+    lc().inflight.fetch_add(1, Ordering::SeqCst);
+    Busy
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        lc().inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn inflight() -> usize {
+    lc().inflight.load(Ordering::SeqCst)
 }
 
 /// How to launch the sidecar. In a bundled app this is the PyInstaller one-file
@@ -78,15 +111,31 @@ fn default_dev_sidecar_dir() -> String {
 
 /// Ensure a sidecar is up and return its base URL. If one we started is already
 /// running, reuse it. Otherwise spawn it, read the `SIDECAR_PORT=` line it prints
-/// on stdout, and health-check it. `Err` means the sidecar could not start — the
-/// caller falls back to the native engine.
+/// on stdout, and health-check it. `Err` means the sidecar could not start, and
+/// there is nothing behind it — the caller surfaces an error to the user.
+///
+/// Callers must take a [`busy`] guard for the lifetime of the request they then
+/// make, so a concurrent `ensure_up` can see that the sidecar is serving
+/// something before it decides to replace it.
 pub async fn ensure_up() -> Result<String, String> {
     if let Some(url) = current_base_url() {
-        if health(&url).await {
+        let verdict = probe_recorded(&url).await;
+        if verdict == Probe::Healthy {
             return Ok(url);
         }
-        // A recorded sidecar that no longer answers: forget it and respawn.
-        forget();
+        if !should_replace(verdict, inflight()) {
+            // It accepted the connection, so the process is alive — it is merely
+            // busy — and requests of ours are riding on it. Ride on it too: the
+            // caller's own budget decides, rather than this probe killing an
+            // answer that is mid-stream.
+            return Ok(url);
+        }
+        // A recorded sidecar that is genuinely gone, or wedged with nothing of
+        // ours riding on it: STOP it, then respawn. Merely forgetting it left a
+        // wedged Python process holding its port, its resident memory and its
+        // Ollama connection until the Mac was restarted, and every subsequent
+        // stall stacked another one up.
+        stop_ours();
     }
     // Single-flight spawn: two concurrent asks must not each launch a sidecar.
     static SPAWNING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -103,12 +152,19 @@ fn current_base_url() -> Option<String> {
     lc().base_url.lock().ok().and_then(|g| g.clone())
 }
 
-fn forget() {
+/// Stop the sidecar WE spawned, if any, and drop what we knew about it. Used
+/// both on app shutdown and when a recorded sidecar stops answering: a process
+/// that has wedged still owns its port and its memory, so respawning without
+/// killing it leaks one Python process per stall.
+fn stop_ours() {
     if let Ok(mut u) = lc().base_url.lock() {
         *u = None;
     }
-    if let Ok(mut p) = lc().our_pid.lock() {
-        *p = None;
+    let pid = lc().our_pid.lock().ok().and_then(|mut p| p.take());
+    if let Some(pid) = pid {
+        // SIGTERM by PID; the reaper thread `spawn_and_wait` left running on the
+        // `Child` handle collects it, so no `<defunct>` entry is left behind.
+        let _ = Command::new("kill").arg(pid.to_string()).status();
     }
 }
 
@@ -119,34 +175,78 @@ pub fn stderr_log_path() -> std::path::PathBuf {
     std::env::temp_dir().join("arcelle-sidecar.log")
 }
 
+/// The PREVIOUS run's log. The app restarts the sidecar automatically the moment
+/// it stops answering, so truncating on every spawn wiped the traceback that
+/// explained the crash before anyone could read it — exactly the one-off failure
+/// that is hardest to reproduce. One generation is kept here instead.
+pub fn previous_stderr_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("arcelle-sidecar.prev.log")
+}
+
 /// Drain the child's stderr on a detached thread, mirroring each line to the app's
 /// own stderr (useful in dev) and appending it to [`stderr_log_path`] (the only copy
 /// a bundled app keeps). Draining is MANDATORY, not a nicety: `Stdio::piped()` with
 /// nobody reading fills the pipe buffer and blocks the sidecar mid-write.
 fn drain_stderr(stderr: std::process::ChildStderr) {
+    // Rotate rather than truncate: the run that just died is usually the one
+    // worth reading, and it is the run the auto-restart replaced.
+    let _ = std::fs::rename(stderr_log_path(), previous_stderr_log_path());
+    mirror_stderr(stderr, "sidecar", stderr_log_path());
+}
+
+/// Drain a child's piped stderr on a detached thread, mirroring each line to the
+/// app's own stderr (useful in dev) and appending it to `path` (the only copy a
+/// bundled app keeps). Shared with [`crate::ollama_lifecycle`], whose daemon has
+/// the same "the explanation only exists on stderr" problem.
+///
+/// Draining is MANDATORY once a pipe is requested, not a nicety: `Stdio::piped()`
+/// with nobody reading fills the pipe buffer and blocks the child mid-write.
+pub(crate) fn mirror_stderr(
+    stderr: std::process::ChildStderr,
+    tag: &'static str,
+    path: std::path::PathBuf,
+) {
     std::thread::spawn(move || {
-        // Truncate once per spawn so the file is about THIS run, then append.
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(stderr_log_path())
+            .open(&path)
             .ok();
+        let mut written = 0usize;
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            eprintln!("[sidecar] {line}");
+            eprintln!("[{tag}] {line}");
+            // Keep DRAINING past the budget (an unread pipe wedges the child)
+            // but stop growing the file. A chatty daemon logging every request
+            // for hours must not fill the user's disk with a temp file nothing
+            // reads, and the useful part of a crash log is where it started.
+            if written >= STDERR_LOG_BUDGET {
+                continue;
+            }
             if let Some(f) = file.as_mut() {
                 let _ = writeln!(f, "{line}");
                 let _ = f.flush();
+                written += line.len() + 1;
+                if written >= STDERR_LOG_BUDGET {
+                    let _ = writeln!(f, "[arcelle] log budget reached — further output dropped");
+                    let _ = f.flush();
+                }
             }
         }
     });
 }
 
+/// How much of a child's stderr is kept on disk per run.
+const STDERR_LOG_BUDGET: usize = 2 * 1024 * 1024;
+
 /// Spawn the process, block (on a blocking thread) reading stdout until it prints
 /// `SIDECAR_PORT=N`, then confirm `/health`. The port line is how we learn the
 /// ephemeral port without a bind-and-release race.
 async fn spawn_and_wait() -> Result<String, String> {
-    let mut cmd = launch_command().ok_or_else(|| "SIDECAR_UNAVAILABLE".to_string())?;
+    let mut cmd = launch_command().ok_or_else(|| {
+        unavailable("no sidecar to launch — no bundled binary in Resources/ and no \
+                     ARCELLE_SIDECAR_PYTHON pointing at a Python with the package")
+    })?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         // NOT `Stdio::null()`. The sidecar's ENTIRE diagnostic channel is stderr:
@@ -158,7 +258,9 @@ async fn spawn_and_wait() -> Result<String, String> {
         // thrown away. Piped here and drained below; an undrained pipe would fill
         // and wedge the child, so the reader thread is not optional.
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|_| "SIDECAR_UNAVAILABLE".to_string())?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| unavailable(&format!("could not start the sidecar: {e}")))?;
     let pid = child.id();
     if let Some(stderr) = child.stderr.take() {
         drain_stderr(stderr);
@@ -166,7 +268,7 @@ async fn spawn_and_wait() -> Result<String, String> {
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "SIDECAR_UNAVAILABLE".to_string())?;
+        .ok_or_else(|| unavailable("the sidecar's stdout could not be captured"))?;
 
     // Read the announce line on a blocking thread (std pipe), bounded by a
     // timeout race so a silent/hung child cannot wedge the ask forever.
@@ -187,17 +289,28 @@ async fn spawn_and_wait() -> Result<String, String> {
     let port = match port {
         Ok(Ok(Some(p))) => p,
         _ => {
-            // Never announced a port (crash on import, bad interpreter): reap it
-            // so we don't leak the child, and report unavailable.
+            // Never announced a port (crash on import, bad interpreter, a
+            // START_TIMEOUT elapsed): kill it so we don't leak the child, and
+            // say WHICH of those it was — the traceback itself is already in
+            // `stderr_log_path`.
             let _ = Command::new("kill").arg(pid.to_string()).status();
-            return Err("SIDECAR_UNAVAILABLE".to_string());
+            let _ = child.wait();
+            return Err(unavailable(&format!(
+                "the sidecar printed no SIDECAR_PORT line within {}s (see {})",
+                START_TIMEOUT.as_secs(),
+                stderr_log_path().display()
+            )));
         }
     };
-    // Keep the child handle alive for the process lifetime by leaking it: the
-    // sidecar is a long-lived daemon we manage by PID (like `ollama serve`),
-    // stopped via `stop_if_ours` on exit. Dropping `child` here would not kill
-    // it (no kill_on_drop on std Command), but we must not join it either.
-    std::mem::forget(child);
+    // The sidecar is a long-lived daemon we manage by PID (like `ollama serve`),
+    // stopped via `stop_if_ours` on exit — so the handle must outlive this call.
+    // It used to be `std::mem::forget`-ed, which never waits: every restart (and
+    // the daemon restarts on every stall) left a `<defunct>` entry under the
+    // app's name for the rest of the session. Park the handle on a thread that
+    // does nothing but `wait`, which reaps it the moment it actually exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 
     let url = format!("http://127.0.0.1:{port}");
     let start = Instant::now();
@@ -214,7 +327,19 @@ async fn spawn_and_wait() -> Result<String, String> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let _ = Command::new("kill").arg(pid.to_string()).status();
-    Err("SIDECAR_UNAVAILABLE".to_string())
+    Err(unavailable(&format!(
+        "the sidecar announced port {port} but never passed /health within {}s (see {})",
+        START_TIMEOUT.as_secs(),
+        stderr_log_path().display()
+    )))
+}
+
+/// The sidecar-could-not-start error. The `SIDECAR_UNAVAILABLE` head is kept
+/// because it is the string the surfaces above match on; the reason follows it
+/// instead of being discarded, so a broken interpreter, a busy port and a crash
+/// on import stop reading as the same blank failure.
+fn unavailable(reason: &str) -> String {
+    format!("SIDECAR_UNAVAILABLE: {reason}")
 }
 
 /// Parse the `SIDECAR_PORT=NNNN` handshake line the sidecar prints on startup.
@@ -222,40 +347,105 @@ fn parse_port_line(line: &str) -> Option<u16> {
     line.trim().strip_prefix("SIDECAR_PORT=")?.trim().parse().ok()
 }
 
-/// True when the sidecar answers `/health` with `{"ok": true}` within ~1s.
-async fn health(base: &str) -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(1500))
-        .build()
-    {
+/// What one `/health` probe of a recorded sidecar found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Probe {
+    /// Answered `{"ok": true}` — reuse it.
+    Healthy,
+    /// Did not answer in time, but the connection was ACCEPTED: the process is
+    /// alive, its event loop is just busy (a local model streaming through it, a
+    /// multi-megabyte body being parsed, swap pressure).
+    Busy,
+    /// Nothing is listening on that port any more — the process is gone.
+    Gone,
+}
+
+/// How long one probe waits for `/health`.
+const HEALTH_TIMEOUT: Duration = Duration::from_millis(1500);
+/// How many probes a recorded sidecar gets before we act on the answer, and the
+/// gap between them. One missed probe is not evidence of anything; only the
+/// healthy path is hot, and it returns on the first attempt.
+const PROBE_ATTEMPTS: usize = 3;
+const PROBE_GAP: Duration = Duration::from_millis(300);
+
+/// Should a recorded sidecar be SIGTERMed and replaced? Pure, so the policy is
+/// testable without a process: a live-but-busy sidecar is replaced only when
+/// nothing of ours is riding on it (otherwise the kill takes down a streaming
+/// answer or a running job), while one that is gone has nothing to protect.
+fn should_replace(verdict: Probe, inflight: usize) -> bool {
+    match verdict {
+        Probe::Healthy => false,
+        Probe::Busy => inflight == 0,
+        Probe::Gone => true,
+    }
+}
+
+/// Probe a recorded sidecar up to [`PROBE_ATTEMPTS`] times. Any healthy answer
+/// wins immediately; a single accepted-but-silent attempt is enough to rule out
+/// "the process is gone", because a dead port refuses instantly.
+async fn probe_recorded(base: &str) -> Probe {
+    let mut verdict = Probe::Gone;
+    for attempt in 0..PROBE_ATTEMPTS {
+        match probe_once(base).await {
+            Probe::Healthy => return Probe::Healthy,
+            Probe::Busy => verdict = Probe::Busy,
+            Probe::Gone => {}
+        }
+        if attempt + 1 < PROBE_ATTEMPTS {
+            tokio::time::sleep(PROBE_GAP).await;
+        }
+    }
+    verdict
+}
+
+/// One `/health` probe, classified. Anything that is not a refused connection
+/// counts as ALIVE: an answer we could not parse, a non-2xx status and a timeout
+/// all came from a process that is still there.
+async fn probe_once(base: &str) -> Probe {
+    let client = match reqwest::Client::builder().timeout(HEALTH_TIMEOUT).build() {
         Ok(c) => c,
-        Err(_) => return false,
+        // Our own failure to build a client says nothing about the sidecar, and
+        // must never be the reason one is killed.
+        Err(_) => return Probe::Busy,
     };
     let resp = match client.get(format!("{base}/health")).send().await {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(e) if e.is_connect() => return Probe::Gone,
+        Err(_) => return Probe::Busy,
     };
     if !resp.status().is_success() {
-        return false;
+        return Probe::Busy;
     }
-    resp.json::<serde_json::Value>()
+    let ok = resp
+        .json::<serde_json::Value>()
         .await
         .ok()
         .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if ok {
+        Probe::Healthy
+    } else {
+        Probe::Busy
+    }
+}
+
+/// True when the sidecar answers `/health` with `{"ok": true}` within ~1.5s.
+async fn health(base: &str) -> bool {
+    probe_once(base).await == Probe::Healthy
 }
 
 /// Stop a sidecar we started — used on app shutdown so we never leak a
 /// background Python process we spawned. A no-op if none is running.
+///
+/// Also removes the stderr mirrors. They are plain, unencrypted files in the
+/// Mac's shared temp folder holding whatever the engine printed, they are only
+/// useful while the session that produced them is being diagnosed, and nothing
+/// in the app ever offered to open them — so leaving them behind after a clean
+/// quit is only a leak.
 pub fn stop_if_ours() {
-    if let Ok(mut slot) = lc().our_pid.lock() {
-        if let Some(pid) = slot.take() {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
-        }
-    }
-    if let Ok(mut u) = lc().base_url.lock() {
-        *u = None;
-    }
+    stop_ours();
+    let _ = std::fs::remove_file(stderr_log_path());
+    let _ = std::fs::remove_file(previous_stderr_log_path());
 }
 
 #[cfg(test)]
@@ -274,5 +464,72 @@ mod tests {
     #[test]
     fn dev_sidecar_dir_points_at_the_package() {
         assert!(default_dev_sidecar_dir().ends_with("/sidecar"));
+    }
+
+    #[test]
+    fn an_unavailable_error_keeps_the_reason_it_used_to_drop() {
+        // Three unrelated failures (nothing to launch, spawn failed, no port
+        // line) all used to surface as the bare sentinel, so a broken Python
+        // install, a busy port and a crash on import were indistinguishable.
+        let e = unavailable("could not start the sidecar: No such file or directory");
+        assert!(e.starts_with("SIDECAR_UNAVAILABLE"), "{e}");
+        assert!(e.contains("No such file or directory"), "{e}");
+    }
+
+    #[test]
+    fn a_busy_sidecar_is_never_killed_out_from_under_a_request() {
+        // Regression: one missed 1.5s /health probe used to SIGTERM the sidecar,
+        // and `ensure_up` runs before EVERY sidecar request — including the ones
+        // a tool call makes while an answer is streaming. A moment of event-loop
+        // starvation therefore killed the user's in-flight answer and any
+        // background job (a file pass has a ten-hour budget) sharing the process.
+        assert!(!should_replace(Probe::Healthy, 0));
+        assert!(!should_replace(Probe::Healthy, 3));
+        // Alive (the connection was accepted) with work of ours riding on it.
+        assert!(!should_replace(Probe::Busy, 1));
+        assert!(!should_replace(Probe::Busy, 9));
+        // Alive but idle → replacing it costs nothing, and this is how a
+        // genuinely wedged sidecar still gets recovered rather than leaked.
+        assert!(should_replace(Probe::Busy, 0));
+        // Nothing is listening any more: there is nothing left to protect.
+        assert!(should_replace(Probe::Gone, 0));
+        assert!(should_replace(Probe::Gone, 4));
+    }
+
+    #[test]
+    fn the_busy_guard_counts_requests_in_flight() {
+        let before = inflight();
+        {
+            let _a = busy();
+            assert_eq!(inflight(), before + 1);
+            let _b = busy();
+            assert_eq!(inflight(), before + 2);
+        }
+        assert_eq!(inflight(), before);
+    }
+
+    #[tokio::test]
+    async fn a_silent_port_reads_as_busy_and_a_closed_one_as_gone() {
+        // The whole distinction rests on this: a wedged Python process still has
+        // its socket bound, so the kernel completes the handshake and the probe
+        // TIMES OUT, while a process that is really gone refuses instantly.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Bound, never answers — alive.
+        assert_eq!(probe_once(&format!("http://127.0.0.1:{port}")).await, Probe::Busy);
+        drop(listener);
+        // Same port with nothing behind it — gone.
+        assert_eq!(probe_once(&format!("http://127.0.0.1:{port}")).await, Probe::Gone);
+    }
+
+    #[test]
+    fn the_two_stderr_mirrors_are_distinct_files() {
+        // The current run's log is rotated to the `.prev` name on each spawn, so
+        // the crash that triggered the automatic restart survives it.
+        assert_ne!(stderr_log_path(), previous_stderr_log_path());
+        assert!(stderr_log_path().to_string_lossy().ends_with("arcelle-sidecar.log"));
+        assert!(previous_stderr_log_path()
+            .to_string_lossy()
+            .ends_with("arcelle-sidecar.prev.log"));
     }
 }

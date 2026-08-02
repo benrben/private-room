@@ -311,9 +311,13 @@ says so plainly instead of quietly handing the question to a different one.
 - 🧠 **It remembers — with your approval.** Memory suggestions from
   conversations wait for a yes by default (or flow in automatically if you
   opt in), and everything it knows is visible and editable in the Memory area.
-- 🔎 **It retrieves.** Imported files are chunked, indexed automatically in
-  the background, and keyword-scored; the best excerpts travel with your
-  question, and sources are shown on each answer.
+- 🔎 **It retrieves.** Imported files are chunked and indexed automatically in
+  the background; the best excerpts travel with your question, and sources are
+  shown on each answer. Keyword scoring works out of the box; **Settings →
+  AI & behavior → AI helpers → Turn on semantic search** adds meaning-based
+  retrieval — it downloads a small embedding model, re-indexes what's already
+  in the room, and from then on both signals are fused (reciprocal rank), so a
+  question finds the right paragraph even when it shares no words with it.
 - 📊 **It shows you the bill.** A live token-budget bar under the composer
   shows how full the context window is, segmented by what's filling it —
   system prompt, history, tool results, skills, file reads — with exact counts
@@ -523,10 +527,18 @@ in 1.5-second steps and the transcript is cut at the voice change — on our
 meeting test set that took speaker mix-ups from 17.9% to 1.3%. Phantom speakers
 are gone too: a voice has to carry real speech mass before it counts as a
 person, so a couple of seconds of laughter or overlap joins the nearest real
-voice instead of minting a "Speaker 4". A permanent benchmark harness
-(`src-tauri/tests/diar_bench.rs`) scores the shipping pipeline against
-reference meetings with RTTM ground truth, so future changes get measured
-rather than eyeballed.
+voice instead of minting a "Speaker 4". Those numbers come from an acceptance
+harness that ships with the code (`src-tauri/tests/diar_bench.rs`): it runs the
+shipping pipeline over real meetings with RTTM ground truth and **fails** when
+a row misses its diarization-error bar, so a regression is caught rather than
+eyeballed. It is opt-in rather than part of `cargo test`, because the audio it
+scores is other people's recordings and can't be committed — point it at your
+own set:
+
+```sh
+PR_BENCH_MANIFEST=…/manifest.tsv PR_BENCH_RESULTS=…/out.jsonl \
+  cargo test --release --test diar_bench -- --ignored --nocapture
+```
 
 ### Memory you can see
 
@@ -696,9 +708,9 @@ npm run tauri dev            # run the app
 npm run tauri build          # build Arcelle.app + DMG (registers .roomai)
 ```
 
-Release builds bundle the Whisper voice model — see
-[RELEASING.md](RELEASING.md) for the one-time fetch, signing, and the full
-release pipeline.
+Release builds bundle three on-device models (Whisper, TitaNet, Silero — 615 MB
+together, none of them committed) — see [RELEASING.md](RELEASING.md) for the
+one-time fetch, signing, and the full release pipeline.
 
 ### Repository layout
 
@@ -709,23 +721,48 @@ release pipeline.
 | [sidecar/](sidecar/) | Python + LangGraph AI engine (agents, workflows, studios) |
 | [e2e/](e2e/README.md) | End-to-end suites (real app, and browser-hosted UI with mock IPC) |
 | [qa/](qa/) | Manual QA harness and the every-button UA checklist |
+| [pm-request/](pm-request/) | Design documents — why the agent hub, browser, downloads and search are shaped the way they are, and what each one deliberately left undone |
 | [docs/](docs/) | Badges, banner, and product screenshots |
 | [art/](art/README.md) | Master brand artwork and the asset-generation pipeline |
-| [scripts/](scripts/) | Signing and release automation |
+| [scripts/](scripts/) | Signing, release automation, and the release preflight |
 
 ### Tests
 
 ```sh
-cd src-tauri && cargo test          # Rust: crypto, extraction, routing, browser (571 tests)
-cd sidecar   && uv run pytest tests # Python: the AI engine sidecar (988 tests)
-npm run test:page                   # the browser page-script contract (39 tests)
-npm run e2e                         # headless end-to-end smoke test (mock model)
+npm test                # the first four, in one go (a few minutes)
+
+npm run test:rust       # Rust: crypto, extraction, routing, browser (688 tests)
+npm run test:sidecar    # Python: the AI engine sidecar (1213 tests)
+npm run test:page       # the browser page-script + QA-mock contracts (51 tests)
+npm run build           # TypeScript type-check + the production bundle
+npm run e2e:qa          # UI regressions in Chrome against a mock backend
 npm run build && node qa/make-qa.mjs && npx vite preview
-                                    # → open /qa.html: full UI in a browser w/ mock IPC
+                        # → open /qa.html: full UI in a browser w/ mock IPC
 ```
 
-> **Note:** use `uv run pytest` inside `sidecar/` — a bare `pytest` picks up
-> the wrong environment.
+Before a release, `npm run preflight` adds the checks a publish needs on top of
+those suites — that the version agrees across all seven files that carry it,
+and that `CHANGELOG.md` has an entry for it (`scripts/preflight.sh --checks`
+does just those two, in seconds). Nothing installs any of this as a git hook:
+it runs when you run it, never behind your back. `npm run lint` (ruff for
+Python, clippy for Rust) is advisory and deliberately outside `npm test`.
+
+> **Notes.** Running pytest by hand inside `sidecar/` needs `uv run pytest` —
+> a bare `pytest` picks up the wrong environment. The counts above move with
+> every wave of work; the suites are the source of truth, not this table.
+>
+> One more suite exists, `npm run e2e`, which drives the *real* packaged app
+> through `tauri-driver` — it **cannot run on macOS** (WKWebView has no
+> WebDriver), so on the machine this app is developed on, `npm run e2e:qa` is
+> the end-to-end suite that actually runs. It covers the real components,
+> state and event wiring against `qa/qa-mock.js`, but not the Rust commands.
+> The mock still fakes only about half of them — `node qa/check-mock-coverage.mjs`
+> names the rest, and anything it has no fixture for is recorded on
+> `window.__qaUnhandled` and shouted on the page itself, so a list that is
+> empty because the *mock* has no data can never be mistaken for a real empty
+> state. The one thing no harness can show is the browser's page: it is a
+> native webview, so the Browser area renders its chrome, tabs, journal and
+> search over an empty stage. See [e2e/README.md](e2e/README.md).
 
 ### Design system
 
@@ -771,11 +808,17 @@ Shipped since the first cut:
 - [x] The private browser, driveable by the assistant, with downloads and tabs
 - [x] A hub of domain specialists that run in parallel, drawn live in the AI pane
 - [x] The token-budget bar and one-click conversation handoff
+- [x] Semantic search — an opt-in embedding model, fused with keyword scoring
 
 Next:
 
-- [ ] Embedding-based retrieval (sqlite-vec)
+- [ ] A vector index (sqlite-vec) — semantic search ships, but the vector pass
+      still scans every chunk, which will not hold for very large rooms
 - [ ] In-place `.xlsx` editing beyond single cells, and DOCX export
+- [ ] Downloading a file that needs the site's own login (`startDownloadUsingRequest`)
+      — clicked downloads already carry the session's cookies, so the gap is
+      only "fetch an authed asset no link points at"
+- [ ] **Save as PDF** from the browser (needs `WKPDFConfiguration`)
 - [ ] Notarized releases (Developer ID)
 - [ ] Windows port (Tauri)
 
@@ -793,8 +836,8 @@ like to send code:
 
 1. Fork the repo and create a branch (`git checkout -b feature/thing`).
 2. Make the change, and add a test next to the code you touched.
-3. Keep every suite green — `cargo test`, `uv run pytest tests`,
-   `npm run test:page`, and `npm run build` (which type-checks).
+3. Keep every suite green — `npm test` runs the Rust, Python, page-script and
+   TypeScript checks in one go.
 4. Open a pull request describing the behavior change, not just the diff.
 
 User-facing changes belong in [CHANGELOG.md](CHANGELOG.md), written the way

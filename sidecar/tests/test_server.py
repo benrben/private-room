@@ -10,9 +10,15 @@ import httpx
 import pytest
 from conftest import FakeChatModel, FakeMCP, Round, call
 
-from arcelle_sidecar import __version__
+from arcelle_sidecar import __version__, server, tts
 from arcelle_sidecar.chat import RoundUsage
-from arcelle_sidecar.config import AGENT_ROUND_BACKSTOP, RunRequest
+from arcelle_sidecar.config import (
+    AGENT_ROUND_BACKSTOP,
+    CLOUD_WORKER_PARALLEL,
+    RunRequest,
+    TtsRequest,
+)
+from arcelle_sidecar.llm import LlmError
 from arcelle_sidecar.messages import Message, ToolCall
 from arcelle_sidecar.server import RunRegistry, create_app
 
@@ -208,7 +214,7 @@ async def test_cancel_stops_a_live_run() -> None:
             await on_delta("partial")
             started.set()
             await release.wait()  # the user presses Stop right about here
-            usage = RoundUsage(input_tokens=None, output_tokens=None, max_context=8192, is_real=False)
+            usage = RoundUsage(input_tokens=None, max_context=8192, is_real=False)
             return "partial", [ToolCall(name="write_file", arguments={"name": "x"}, id="c1")], usage
 
     chat = BlockingChat()
@@ -237,6 +243,36 @@ async def test_cancel_stops_a_live_run() -> None:
     assert events[-1] == {"t": "final", "v": "partial"}
 
 
+async def test_a_cloud_room_fans_out_but_not_unbounded(monkeypatch: Any) -> None:
+    """How many delegated children may hold a model round at once.
+
+    A LOCAL room pins 1 — one resident model, so concurrency is contention. A
+    cloud room used to get `None`, meaning UNBOUNDED, so a plan with twenty
+    tasks opened twenty PAID conversations in the same instant: a rate-limit
+    wall and a cost spike, not twenty-way speed.
+    """
+    seen: list[int | None] = []
+
+    async def spy(req: Any, deps_factory: Any) -> Any:
+        async def emit(_event: Any) -> None:
+            return None
+
+        seen.append(deps_factory(emit).worker_parallel)
+        yield {"t": "final", "v": ""}
+
+    monkeypatch.setattr(server, "stream_events", spy)
+    app = app_with(FakeChatModel([Round(content="hi")]), FakeMCP())
+    async with client_for(app) as c:
+        async with c.stream("POST", "/run", json=BODY) as resp:
+            async for _line in resp.aiter_lines():
+                pass
+        async with c.stream("POST", "/run", json={**BODY, "model": "qwen3.5:cloud"}) as resp:
+            async for _line in resp.aiter_lines():
+                pass
+
+    assert seen == [1, CLOUD_WORKER_PARALLEL]
+
+
 def test_registry_lifecycle() -> None:
     from arcelle_sidecar.graph import CancelToken
 
@@ -255,32 +291,44 @@ def test_run_request_defaults_and_routing_fallback() -> None:
     assert req.ollama_base_url == "http://127.0.0.1:11434"
     # No routing block from the host -> the sidecar runs the routers itself.
     assert req.resolved_routing() == (True, False, False, False, False)
-    assert req.resolved_max_rounds(ui=False, jobs=False) == AGENT_ROUND_BACKSTOP
+    assert req.resolved_max_rounds() == AGENT_ROUND_BACKSTOP
 
     req2 = RunRequest(model="m", question="what is the rent", web_enabled=True, max_rounds=24)
-    assert req2.resolved_max_rounds(ui=False, jobs=False) == 24
+    assert req2.resolved_max_rounds() == 24
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "ui", "jobs", "expected"),
+    ("kwargs", "expected"),
     [
-        (dict(), False, False, AGENT_ROUND_BACKSTOP),
-        (dict(mcp_routes=1), False, False, AGENT_ROUND_BACKSTOP),
-        (dict(advisors=["cloud"]), False, False, AGENT_ROUND_BACKSTOP),
-        (dict(web_enabled=True), False, False, AGENT_ROUND_BACKSTOP),
-        (dict(), True, False, AGENT_ROUND_BACKSTOP),
-        (dict(), False, True, AGENT_ROUND_BACKSTOP),
-        (dict(web_enabled=True), False, False, AGENT_ROUND_BACKSTOP),
-        (dict(web_enabled=True, max_rounds=8), False, False, 8),
-        (dict(max_rounds=8), False, False, 8),
+        (dict(), AGENT_ROUND_BACKSTOP),
+        (dict(advisors=["cloud"]), AGENT_ROUND_BACKSTOP),
+        (dict(web_enabled=True), AGENT_ROUND_BACKSTOP),
+        (dict(web_enabled=True, max_rounds=8), 8),
+        (dict(max_rounds=8), 8),
     ],
 )
-def test_resolved_max_rounds_over_the_plain_predicate(
-    kwargs: dict, ui: bool, jobs: bool, expected: int
-) -> None:
+def test_resolved_max_rounds_over_the_plain_predicate(kwargs: dict, expected: int) -> None:
     # Every lane uses the same high backstop; an explicit test override still wins.
     req = RunRequest(model="m", question="q", **kwargs)
-    assert req.resolved_max_rounds(ui=ui, jobs=jobs) == expected
+    assert req.resolved_max_rounds() == expected
+
+
+def test_resolved_max_rounds_ignores_the_routing_flags_a_caller_still_passes() -> None:
+    # The lane flags used to narrow this; nothing has read them since the
+    # per-lane budgets were removed, so passing them changes nothing.
+    req = RunRequest(model="m", question="q")
+    assert req.resolved_max_rounds(True, True, True, True) == AGENT_ROUND_BACKSTOP
+    assert req.resolved_max_rounds() == req.resolved_max_rounds(False, False)
+
+
+def test_the_host_may_still_send_retired_run_fields() -> None:
+    # `mcp_routes` was dropped from the model; the host is not being changed in
+    # lockstep, so an unknown field must be ignored, not a 422.
+    req = RunRequest.model_validate(
+        {"model": "m", "question": "q", "mcp_routes": 3, "advisors": ["cloud"]}
+    )
+    assert not hasattr(req, "mcp_routes")
+    assert req.advisors == ["cloud"]
 
 
 @pytest.mark.parametrize(
@@ -291,3 +339,104 @@ def test_host_routing_wins_over_local_routing(host_says: dict, expected: bool) -
     # The host's decision is authoritative so the two engines can never drift.
     req = RunRequest(model="m", question="edit the lease", routing=host_says)  # type: ignore[arg-type]
     assert req.resolved_routing()[0] is expected
+
+
+# --- request bounds ---------------------------------------------------------
+
+
+async def test_an_oversized_body_is_refused_before_it_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cap is read when the app is built, so a small one can be pinned here.
+    monkeypatch.setattr(server, "MAX_REQUEST_BYTES", 64)
+    app = create_app()
+    async with client_for(app) as c:
+        over = await c.post("/cancel", json={"run_id": "x" * 200})
+        under = await c.post("/cancel", json={"run_id": "short"})
+    assert over.status_code == 413
+    assert over.json()["code"] == "BODY_TOO_LARGE"
+    # The bound refuses nothing a real caller sends.
+    assert under.status_code == 200
+    assert under.json() == {"ok": True, "known": False}
+
+
+def test_the_default_body_bound_is_far_above_a_real_request() -> None:
+    # A base64 image or a file-pass window is the biggest body the app sends;
+    # the bound exists to refuse the absurd, not to clamp a feature.
+    assert server.MAX_REQUEST_BYTES >= 64 << 20
+
+
+# --- Stop for the one-shot endpoints ----------------------------------------
+
+
+class _Caller:
+    """Just enough of a Starlette request for `until_hangup`: the hang-up check."""
+
+    def __init__(self, *, gone: bool) -> None:
+        self.gone = gone
+
+    async def is_disconnected(self) -> bool:
+        return self.gone
+
+
+async def test_a_one_shot_call_is_cancelled_when_the_caller_hangs_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "_HANGUP_POLL_SECS", 0.01)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def work() -> str:
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "nobody is left to read this"
+
+    with pytest.raises(server.ClientGone):
+        await server.until_hangup(_Caller(gone=True), work())  # type: ignore[arg-type]
+    assert started.is_set()
+    # The point of the whole thing: the engine call really stops, so the local
+    # model is not still generating for a caller that has gone.
+    assert cancelled.is_set()
+
+
+async def test_a_one_shot_call_that_finishes_returns_its_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "_HANGUP_POLL_SECS", 0.01)
+
+    async def work() -> str:
+        return "the summary"
+
+    assert await server.until_hangup(_Caller(gone=False), work()) == "the summary"  # type: ignore[arg-type]
+
+
+async def test_a_one_shot_call_surfaces_its_own_failure_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The wrapper must not swallow or reshape the engine's sentinel contract.
+    monkeypatch.setattr(server, "_HANGUP_POLL_SECS", 0.01)
+
+    async def work() -> str:
+        raise LlmError("MODEL_MISSING", "model 'm' not found")
+
+    with pytest.raises(LlmError) as caught:
+        await server.until_hangup(_Caller(gone=False), work())  # type: ignore[arg-type]
+    assert caught.value.code == "MODEL_MISSING"
+
+
+# --- the spoken-voice defaults ----------------------------------------------
+
+
+def test_the_tts_request_does_not_restate_the_voice_spec() -> None:
+    # tts.py owns the product voice; a second copy here would silently win over
+    # it, because this body is the one the app actually goes through.
+    body = TtsRequest(text="hello")
+    assert (body.voice, body.rate, body.pitch) == (
+        tts.DEFAULT_VOICE,
+        tts.DEFAULT_RATE,
+        tts.DEFAULT_PITCH,
+    )

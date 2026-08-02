@@ -15,7 +15,6 @@ export interface PanZoomApi {
   view: View;
   setView: React.Dispatch<React.SetStateAction<View>>;
   svgRef: React.RefObject<SVGSVGElement | null>;
-  svgPoint: (clientX: number, clientY: number) => { x: number; y: number };
   onWheel: (e: React.WheelEvent) => void;
   zoomBy: (factor: number) => void;
   resetView: () => void;
@@ -40,6 +39,7 @@ export function usePanZoom({
   const panRef = useRef<{ x: number; y: number } | null>(null);
   const movedRef = useRef(false);
 
+  /** Client px → stage-local px. Used only by the wheel handler below. */
   function svgPoint(clientX: number, clientY: number): { x: number; y: number } {
     const rect = svgRef.current?.getBoundingClientRect();
     return { x: clientX - (rect?.left ?? 0), y: clientY - (rect?.top ?? 0) };
@@ -107,7 +107,6 @@ export function usePanZoom({
     view,
     setView,
     svgRef,
-    svgPoint,
     onWheel,
     zoomBy,
     resetView,

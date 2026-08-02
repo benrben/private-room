@@ -8,7 +8,7 @@
 /** Fold typographic look-alikes so quotes from extracted text match the
  * rendered document: curly quotes, dashes, ligatures, exotic spaces, and
  * soft hyphens (which the renderer may drop entirely). */
-export function foldChar(ch: string): string {
+function foldChar(ch: string): string {
   switch (ch) {
     case "‘":
     case "’":
@@ -60,7 +60,7 @@ export function foldChar(ch: string): string {
  *   - collapse every run of whitespace (incl. newlines) to a single space.
  * The normalized form is trimmed (no leading/trailing space).
  */
-export function normalizeWithMap(src: string): { norm: string; map: number[] } {
+function normalizeWithMap(src: string): { norm: string; map: number[] } {
   let norm = "";
   const map: number[] = [];
   let pendingSpace = false;
@@ -115,7 +115,7 @@ export function normalizeForMatch(s: string): string {
  * whitespace-collapsed match, then a whitespace-free one, because text
  * extractors and renderers frequently disagree on where spaces fall.
  */
-export function locateQuote(
+function locateQuote(
   source: string,
   quote: string,
 ): { start: number; end: number } | null {
@@ -230,7 +230,7 @@ function buildDomSource(root: HTMLElement): {
 
 /** Find `quote` across the text nodes under `root` as a DOM Range,
  * tolerant of whitespace/case/soft-hyphen/line-break differences. */
-export function findQuoteRange(root: HTMLElement, quote: string): Range | null {
+function findQuoteRange(root: HTMLElement, quote: string): Range | null {
   const { text, map } = buildDomSource(root);
   const hit = locateQuote(text, quote);
   if (!hit) return null;
@@ -241,6 +241,17 @@ export function findQuoteRange(root: HTMLElement, quote: string): Range | null {
   range.setStart(start.node, start.offset);
   range.setEnd(end.node, end.offset + 1);
   return range;
+}
+
+/** The element the older-WKWebView fallback painted, so the next apply — or a
+ * clear — can take the yellow back off it. Without this the paragraph stays
+ * highlighted for the rest of the session and a second citation inside it
+ * shows no change at all. */
+let flashedEl: HTMLElement | null = null;
+
+function clearFlash(): void {
+  flashedEl?.classList.remove("quote-flash");
+  flashedEl = null;
 }
 
 /** Paint a resolved range via the CSS Custom Highlight API (or flash a
@@ -257,7 +268,11 @@ function paintQuoteRange(range: Range): void {
       range.commonAncestorContainer instanceof HTMLElement
         ? range.commonAncestorContainer
         : range.commonAncestorContainer.parentElement;
-    el?.classList.add("quote-flash");
+    clearFlash();
+    if (el) {
+      el.classList.add("quote-flash");
+      flashedEl = el;
+    }
   }
   const anchor =
     range.startContainer instanceof HTMLElement
@@ -299,53 +314,29 @@ export function clearQuoteHighlight(): void {
   (CSS as unknown as { highlights?: Map<string, unknown> }).highlights?.delete(
     HIGHLIGHT_NAME,
   );
+  clearFlash();
 }
 
 /* ============================ Receipts ============================ *
  * A "receipt" is a quote the app can prove: found word-for-word in a source
- * file, so it earns a green "verified" check. These are small, reusable
- * helpers layered on top of the existing quote-anchoring above — the
- * imperative viewers (PdfView) drop `makeReceiptBadge()` next to a located
- * highlight. No change to the highlight logic itself.
+ * file, so it earns a green "verified" check. The imperative viewers
+ * (PdfView) drop `makeReceiptBadge()` next to a located highlight. No change
+ * to the highlight logic itself.
  * ---------------------------------------------------------------- */
-
-/** Stable class name for the "verified" receipt badge (styled in App.css by
- *  the CSS track). */
-export const RECEIPT_BADGE_CLASS = "receipt-badge";
-
-/** A framework-neutral description of the badge, so a React caller can render
- *  `<span className={b.className} title={b.title}>{b.symbol} {b.label}</span>`
- *  without pulling in any DOM helper. */
-export interface ReceiptBadge {
-  className: string;
-  symbol: string;
-  label: string;
-  title: string;
-}
-
-export function receiptBadge(label = "Verified"): ReceiptBadge {
-  return {
-    className: RECEIPT_BADGE_CLASS,
-    symbol: "✓",
-    label,
-    title: "This quote was found word-for-word in the source.",
-  };
-}
 
 /** DOM factory for imperative viewers that paint overlays by hand (PdfView).
  *  Returns `<span class="receipt-badge">✓ Verified</span>`; the caller
  *  positions it. Look (green, pill) is owned by the `.receipt-badge` CSS. */
 export function makeReceiptBadge(label = "Verified"): HTMLSpanElement {
-  const b = receiptBadge(label);
   const el = document.createElement("span");
-  el.className = b.className;
-  el.title = b.title;
-  el.textContent = `${b.symbol} ${b.label}`;
+  el.className = "receipt-badge";
+  el.title = "This quote was found word-for-word in the source.";
+  el.textContent = `✓ ${label}`;
   return el;
 }
 
 /** "B7" -> zero-based row/col, or null. */
-export function parseA1(cell: string): { r: number; c: number } | null {
+function parseA1(cell: string): { r: number; c: number } | null {
   const m = /^([A-Z]+)([0-9]+)$/.exec(cell.trim().toUpperCase());
   if (!m) return null;
   let c = 0;

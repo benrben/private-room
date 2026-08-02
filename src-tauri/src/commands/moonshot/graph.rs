@@ -8,7 +8,6 @@ pub struct GraphNode {
     pub id: String,
     pub name: String,
     pub folder: Option<String>,
-    pub summary: Option<String>,
     /// "file" | "memory"
     pub kind: String,
 }
@@ -18,7 +17,12 @@ pub struct GraphNode {
 pub struct GraphEdge {
     pub a: String,
     pub b: String,
+    /// Link strength on one shared 0..1 scale (see `link_strength`), NOT the raw
+    /// similarity — the two signals below are measured differently.
     pub weight: f32,
+    /// Which signal produced the link: "vector" (mean-embedding cosine) or
+    /// "keyword" (term overlap, used while a file has no embeddings yet).
+    pub kind: String,
     /// Up to 3 short reason strings (shared terms) explaining the link.
     pub shared: Vec<String>,
 }
@@ -42,9 +46,23 @@ pub(crate) struct GraphFile {
     id: String,
     name: String,
     folder: Option<String>,
-    summary: Option<String>,
     mean: Option<Vec<f32>>,
     terms: Vec<String>,
+}
+
+/// Put a raw similarity on the ONE 0..1 scale the map draws, ranks and caps by:
+/// each signal's own threshold maps to `GRAPH_VEC_THRESHOLD`, a perfect match to
+/// 1.0. Cosine and Jaccard are different measurements — a 0.12 term overlap is
+/// about as strong a keyword link as a room ever produces, while a 0.12 cosine
+/// is noise — so sending both raw drew every keyword edge as a near-invisible
+/// hairline, labelled it "12% similar", and made it the first edge dropped when
+/// the viewer's edge cap bit.
+pub(crate) fn link_strength(raw: f32, threshold: f32) -> f32 {
+    if threshold >= 1.0 {
+        return raw.clamp(0.0, 1.0);
+    }
+    let above = ((raw - threshold) / (1.0 - threshold)).clamp(0.0, 1.0);
+    GRAPH_VEC_THRESHOLD + above * (1.0 - GRAPH_VEC_THRESHOLD)
 }
 
 /// Jaccard similarity of two term lists treated as sets. 0 when either is empty.
@@ -85,7 +103,6 @@ pub(crate) fn build_room_graph(conn: &Connection) -> Result<RoomGraph, String> {
         .filter(|f| !is_summary_file(&f.name, &f.source))
         .take(GRAPH_MAX_FILES)
         .collect();
-    let keep: HashSet<String> = metas.iter().map(|f| f.id.clone()).collect();
 
     // One pass over chunks: accumulate a summed embedding + a text blob per file.
     struct Acc {
@@ -94,12 +111,18 @@ pub(crate) fn build_room_graph(conn: &Connection) -> Result<RoomGraph, String> {
         text: String,
     }
     let mut acc: HashMap<String, Acc> = HashMap::new();
-    {
+    if !metas.is_empty() {
+        // ONLY the files the map will draw. Reading every chunk in the room and
+        // discarding all but these afterwards made the map's open time scale
+        // with the whole room instead of with the 60 nodes on it.
+        let placeholders = vec!["?"; metas.len()].join(",");
         let mut stmt = conn
-            .prepare("SELECT file_id, embedding, text FROM chunks")
+            .prepare(&format!(
+                "SELECT file_id, embedding, text FROM chunks WHERE file_id IN ({placeholders})"
+            ))
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(rusqlite::params_from_iter(metas.iter().map(|m| m.id.as_str())), |r| {
                 let file_id: String = r.get(0)?;
                 let emb: Option<Vec<u8>> = r.get(1)?;
                 let text: String = r.get(2)?;
@@ -108,9 +131,6 @@ pub(crate) fn build_room_graph(conn: &Connection) -> Result<RoomGraph, String> {
             .map_err(|e| e.to_string())?;
         for row in rows {
             let (file_id, emb, text) = row.map_err(|e| e.to_string())?;
-            if !keep.contains(&file_id) {
-                continue;
-            }
             let entry = acc.entry(file_id).or_insert_with(|| Acc {
                 sum: Vec::new(),
                 n: 0,
@@ -148,7 +168,6 @@ pub(crate) fn build_room_graph(conn: &Connection) -> Result<RoomGraph, String> {
                 id: m.id.clone(),
                 name: m.name.clone(),
                 folder: m.folder_id.as_ref().and_then(|fid| folders.get(fid).cloned()),
-                summary: None,
                 mean,
                 terms,
             }
@@ -162,7 +181,6 @@ pub(crate) fn build_room_graph(conn: &Connection) -> Result<RoomGraph, String> {
             id: f.id.clone(),
             name: f.name.clone(),
             folder: f.folder.clone(),
-            summary: f.summary.clone(),
             kind: "file".into(),
         })
         .collect();
@@ -171,7 +189,6 @@ pub(crate) fn build_room_graph(conn: &Connection) -> Result<RoomGraph, String> {
             id: format!("mem:{}", m.id),
             name: clamp_words(&m.content, 60),
             folder: None,
-            summary: None,
             kind: "memory".into(),
         });
     }
@@ -181,15 +198,18 @@ pub(crate) fn build_room_graph(conn: &Connection) -> Result<RoomGraph, String> {
     let mut edges: Vec<GraphEdge> = Vec::new();
     for i in 0..files.len() {
         for j in (i + 1)..files.len() {
-            let (weight, threshold) = match (&files[i].mean, &files[j].mean) {
-                (Some(a), Some(b)) => (db::cosine_similarity(a, b), GRAPH_VEC_THRESHOLD),
-                _ => (jaccard(&files[i].terms, &files[j].terms), GRAPH_KW_THRESHOLD),
+            let (raw, threshold, kind) = match (&files[i].mean, &files[j].mean) {
+                (Some(a), Some(b)) => {
+                    (db::cosine_similarity(a, b), GRAPH_VEC_THRESHOLD, "vector")
+                }
+                _ => (jaccard(&files[i].terms, &files[j].terms), GRAPH_KW_THRESHOLD, "keyword"),
             };
-            if weight >= threshold {
+            if raw >= threshold {
                 edges.push(GraphEdge {
                     a: files[i].id.clone(),
                     b: files[j].id.clone(),
-                    weight,
+                    weight: link_strength(raw, threshold),
+                    kind: kind.into(),
                     shared: shared_terms(&files[i].terms, &files[j].terms, 3),
                 });
             }
@@ -222,6 +242,22 @@ mod tests {
         assert!((jaccard(&a, &b) - 0.5).abs() < 1e-6, "2 shared of 4 total → 0.5");
         assert_eq!(shared_terms(&a, &b, 3), vec!["rent", "pets"]);
         assert_eq!(jaccard(&[], &a), 0.0, "empty input is no signal");
+    }
+
+    #[test]
+    fn keyword_and_vector_links_share_one_strength_scale() {
+        // A link that only just clears its own bar reads the same either way…
+        assert!((link_strength(GRAPH_KW_THRESHOLD, GRAPH_KW_THRESHOLD) - GRAPH_VEC_THRESHOLD).abs() < 1e-6);
+        assert!((link_strength(GRAPH_VEC_THRESHOLD, GRAPH_VEC_THRESHOLD) - GRAPH_VEC_THRESHOLD).abs() < 1e-6);
+        // …and a perfect match is 1.0 on both.
+        assert!((link_strength(1.0, GRAPH_KW_THRESHOLD) - 1.0).abs() < 1e-6);
+        assert!((link_strength(1.0, GRAPH_VEC_THRESHOLD) - 1.0).abs() < 1e-6);
+        // Vector edges are unchanged (their threshold IS the shared floor), so
+        // nothing about an embedded room's map moves.
+        assert!((link_strength(0.8, GRAPH_VEC_THRESHOLD) - 0.8).abs() < 1e-6);
+        // A strong term overlap now outranks a barely-there cosine, instead of
+        // being drawn as a hairline and dropped first at the edge cap.
+        assert!(link_strength(0.5, GRAPH_KW_THRESHOLD) > link_strength(0.56, GRAPH_VEC_THRESHOLD));
     }
 
     #[test]
@@ -268,6 +304,7 @@ mod tests {
         assert_eq!(g.edges.len(), 1);
         let e = &g.edges[0];
         assert!(e.weight >= GRAPH_VEC_THRESHOLD);
+        assert_eq!(e.kind, "vector", "both files have embeddings");
         let ends = [e.a.clone(), e.b.clone()];
         assert!(ends.contains(&a) && ends.contains(&b));
         assert!(!ends.contains(&c), "orthogonal file is not linked");

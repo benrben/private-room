@@ -3,7 +3,7 @@
 //! are not even offered to the model otherwise.
 
 use crate::extraction;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 mod fetch;

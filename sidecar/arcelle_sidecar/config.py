@@ -7,29 +7,62 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from .messages import Message
+from .tts import DEFAULT_PITCH, DEFAULT_RATE, DEFAULT_VOICE
 
 #: LangGraph requires a finite recursion ceiling. This is deliberately far above
 #: a real run: all chat lanes share it, while no-calls, duplicate detection,
 #: forced synthesis, and Stop remain the normal termination mechanisms.
 AGENT_ROUND_BACKSTOP: int = 10_000
 
-#: How many model rounds ONE ASK may spend in total — the Main agent's own
-#: rounds plus every round of every specialist it delegates to.
+#: The RUNAWAY NET for one ask — the Main agent's own rounds plus every round of
+#: every specialist it delegates to.
 #:
 #: :data:`AGENT_ROUND_BACKSTOP` bounds a single loop, and each delegated child
 #: starts a FRESH loop at round 0, so the per-loop ceiling multiplies with the
-#: tree instead of bounding it. Measured 2026-07-28: a Main agent starved of
-#: history (the pre-compaction path) spent 32 rounds and 890 s across 16
-#: delegations, called ``search_room`` 14 times, and answered "not included in
-#: this room's content" — nothing anywhere said stop. The same ask on the
-#: compacted path took ONE round.
+#: tree instead of bounding it. Something turn-wide is therefore needed.
 #:
-#: This is a backstop, not a policy: it is set far above healthy work (a hub
-#: turn is ~2-4 rounds, and even six specialists at eight rounds each is 52) so
-#: that tripping it means the turn was not converging. When it trips, the loops
-#: do not abort — every remaining round is served TOOL-LESS, so each one unwinds
-#: into a text answer from what it already has.
-TURN_ROUND_BUDGET: int = 64
+#: It is NOT the termination policy — :data:`NO_PROGRESS_ROUNDS` is. This was 64,
+#: sized off "even six specialists at eight rounds each is 52", which quietly
+#: made a COUNT the thing that ends a turn: a genuinely large errand (split a
+#: long document, work through forty files) is not converging any less for
+#: needing a hundred rounds, but at 64 every remaining loop was disarmed
+#: mid-task and had to answer from whatever it had. Raised far above any real
+#: errand so that tripping it means a loop is spinning, not working.
+#:
+#: Kept at all — rather than deleted for the progress gate — because progress
+#: alone cannot bound the hub. A supervisor can keep delegating with a freshly
+#: worded instruction every round; each child returns a differently worded
+#: report, so nothing ever looks like a repeat while no work advances. That is
+#: exactly the measured 2026-07-28 runaway (32 rounds, 890 s, 16 delegations,
+#: ``search_room`` called 14 times, and an answer of "not included in this
+#: room's content"). Two different failures need two different nets.
+#:
+#: Tripping it does not abort: every remaining round is served TOOL-LESS, so each
+#: loop unwinds into a text answer from what it already has.
+TURN_ROUND_BACKSTOP: int = 400
+
+#: How many CONSECUTIVE rounds may produce nothing new before a loop is made
+#: tool-less. THIS is the termination policy: a loop stops because it stopped
+#: getting anywhere, not because a counter ran out.
+#:
+#: It replaced a one-strike rule — a single all-duplicate round forced synthesis
+#: immediately. That fired on legitimate work: re-reading a file just written to
+#: confirm the write, polling a job, retrying a call that failed for a transient
+#: reason. One wasted round is a model correcting itself; three in a row is a
+#: model stuck.
+NO_PROGRESS_ROUNDS: int = 3
+
+#: How many delegated children a CLOUD room may run at once
+#: (``graph.Deps.worker_parallel``).
+#:
+#: A LOCAL room pins 1: one resident model means concurrent children are
+#: contention, not throughput. A cloud room has no resident model, so it was
+#: given no bound at all — and a plan with twenty tasks then opened twenty PAID
+#: conversations in the same instant, which is a rate-limit wall and a cost
+#: spike rather than twenty-way speed. This is the middle: real fan-out, with a
+#: ceiling small enough that no plan can turn into a burst the provider refuses.
+#: Nothing is dropped — a child past the ceiling waits for a slot.
+CLOUD_WORKER_PARALLEL: int = 4
 
 #: models.rs:72 — the chat model stays warm across the conversation.
 KEEP_ALIVE_WARM: str = "30m"
@@ -90,9 +123,13 @@ class RunRequest(BaseModel):
     routing: Routing | None = None
     web_enabled: bool = False
     max_rounds: int | None = None
-    #: Whole-ask round ceiling across the delegation tree (:data:`TURN_ROUND_BUDGET`
-    #: when absent). 0 or negative disables it.
+    #: Whole-ask runaway net across the delegation tree
+    #: (:data:`TURN_ROUND_BACKSTOP` when absent). 0 or negative disables it.
     turn_max_rounds: int | None = None
+    #: Consecutive no-progress rounds a loop may spend before it is made
+    #: tool-less (:data:`NO_PROGRESS_ROUNDS` when absent). 0 or negative
+    #: disables the progress gate entirely.
+    turn_max_stalls: int | None = None
     run_id: str = ""
     #: PRIV-1: the room's resolved privacy policy (:func:`.privacy.policy_from_payload`
     #: shape). Engages only when ``model`` is non-local; None/absent = door open.
@@ -104,9 +141,8 @@ class RunRequest(BaseModel):
     #: own window. Absent for engines that report a window themselves.
     max_context: int | None = None
 
-    #: Host routing metadata retained for compatibility and observability. It no
-    #: longer lowers the agent-round allowance for plain chat.
-    mcp_routes: int = 0
+    #: Which advisor connectors the room has installed. Only the emptiness of
+    #: this list is read (``graph.py`` gates the ``consult_advisor`` tool on it).
     advisors: list[str] = Field(default_factory=list)
 
     def resolved_routing(self) -> tuple[bool, bool, bool, bool, bool]:
@@ -131,10 +167,14 @@ class RunRequest(BaseModel):
         )
         return write, ui, jobs, skills, connectors
 
-    def resolved_max_rounds(
-        self, ui: bool, jobs: bool, skills: bool = False, connectors: bool = False
-    ) -> int:
-        """Return the shared high runaway backstop for every agent lane."""
+    def resolved_max_rounds(self, *_lanes: bool) -> int:
+        """Return the shared high runaway backstop for every agent lane.
+
+        Takes no input: every lane gets the same ceiling, and only an explicit
+        ``max_rounds`` on the request narrows it. The routing flags older call
+        sites still hand over positionally are accepted and dropped — nothing
+        here has read them since the per-lane budgets were removed.
+        """
         return (
             self.max_rounds
             if self.max_rounds and self.max_rounds > 0
@@ -142,10 +182,16 @@ class RunRequest(BaseModel):
         )
 
     def resolved_turn_rounds(self) -> int | None:
-        """The whole-ask round ceiling, or None if the caller disabled it."""
+        """The whole-ask runaway net, or None if the caller disabled it."""
         if self.turn_max_rounds is None:
-            return TURN_ROUND_BUDGET
+            return TURN_ROUND_BACKSTOP
         return self.turn_max_rounds if self.turn_max_rounds > 0 else None
+
+    def resolved_turn_stalls(self) -> int | None:
+        """Consecutive no-progress rounds allowed, or None if the gate is off."""
+        if self.turn_max_stalls is None:
+            return NO_PROGRESS_ROUNDS
+        return self.turn_max_stalls if self.turn_max_stalls > 0 else None
 
 
 class CancelRequest(BaseModel):
@@ -241,16 +287,18 @@ class TtsRequest(BaseModel):
     """Body of ``POST /tts`` — the neural spoken-voice synthesis seam.
 
     Only the sentence text (plus prosody knobs) reaches the service; the
-    defaults are the product voice spec (Andrew multilingual, +22% rate,
-    -2 Hz pitch). See :mod:`.tts` for the privacy doctrine.
+    defaults come from :mod:`.tts`, which owns the product voice spec — they
+    are NOT restated here, because this body is the one the app actually goes
+    through and a second copy would silently win over the named one. See
+    :mod:`.tts` for the privacy doctrine.
     """
 
     model_config = ConfigDict(extra="ignore")
 
     text: str
-    voice: str = "en-US-AndrewMultilingualNeural"
-    rate: str = "+22%"
-    pitch: str = "-2Hz"
+    voice: str = DEFAULT_VOICE
+    rate: str = DEFAULT_RATE
+    pitch: str = DEFAULT_PITCH
 
 
 class LabelRequest(BaseModel):
@@ -425,7 +473,9 @@ class HealthResponse(BaseModel):
 
 __all__ = [
     "AGENT_ROUND_BACKSTOP",
-    "TURN_ROUND_BUDGET",
+    "TURN_ROUND_BACKSTOP",
+    "NO_PROGRESS_ROUNDS",
+    "CLOUD_WORKER_PARALLEL",
     "KEEP_ALIVE_WARM",
     "KEEP_ALIVE_SHORT",
     "McpConfig",

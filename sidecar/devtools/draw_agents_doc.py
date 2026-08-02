@@ -16,9 +16,11 @@ import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from arcelle_sidecar.agents import (  # noqa: E402
+    AGENT_TOOL_DOMAINS,
     ALL_REGISTRY_TOOLS,
     CORE_TOOLS,
     REGISTRY,
+    AgentSpec,
     agent_tool_specs,
     toolbox_for,
 )
@@ -68,6 +70,37 @@ TEMPLATE_BLURB = {
         "first move, so paying a model round for it is waste."
     ),
 }
+
+
+def blurb(spec: AgentSpec) -> str:
+    """The one-line role, read from where the RUNNING app reads it.
+
+    This used to print ``spec.description``, a field carried on every row for a
+    constrained classifier that was never built; it went on 2026-08-01 and this
+    script — its last reader — died on the attribute at the first agent, which
+    is worse than it sounds: the documented usage above redirects stdout into
+    AGENTS.md, so following it truncated the only roster doc there is.
+
+    The first sentence of the agent's own ``prompt`` says the same thing and
+    cannot go stale, because the model is briefed with it every turn. Agents
+    with no paragraph of their own fall back to their domain's blurb in the
+    Main agent's catalog — the other place a role is actually stated.
+    """
+    text = " ".join(spec.prompt.split())
+    if text:
+        # The opening sentence, and the next one while that is still just a
+        # name ("You are the WEB AGENT.") rather than a description.
+        sentences = text.split(". ")
+        head = sentences[0]
+        for nxt in sentences[1:]:
+            if len(head) >= 60:
+                break
+            head = f"{head}. {nxt}"
+        return head if head.endswith((".", "!", "?", "…")) else f"{head}."
+    for _name, members, desc in AGENT_TOOL_DOMAINS:
+        if spec.id in members:
+            return " ".join(desc.split())
+    return spec.label
 
 
 def mermaid(template: str) -> str:
@@ -173,7 +206,7 @@ def main() -> None:
         t = template_for(spec.id)
         w(f"### `{spec.id}` — {spec.label}")
         w("")
-        w(f"> {spec.description}")
+        w(f"> {blurb(spec)}")
         w("")
         w(f"**Shape:** `{t}`")
         if spec.main:

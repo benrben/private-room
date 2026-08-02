@@ -63,12 +63,19 @@ export const config = {
       run("npm", ["run", "build"], "vite build");
       run(process.execPath, [path.join(projectRoot, "qa", "make-qa.mjs")], "make-qa");
     }
+    // See wdio.qa.conf.mjs: without an explicit `--host 127.0.0.1`, vite binds
+    // ::1 only on macOS and everything below is refused.
     preview = spawn(
       path.join(projectRoot, "node_modules", ".bin", "vite"),
-      ["preview", "--port", PORT, "--strictPort"],
+      ["preview", "--host", "127.0.0.1", "--port", PORT, "--strictPort"],
       { cwd: projectRoot, stdio: "inherit" },
     );
-    await waitFor(BASE_URL);
+    try {
+      await waitFor(BASE_URL);
+    } catch (err) {
+      preview.kill();
+      throw err;
+    }
   },
 
   onComplete: () => {

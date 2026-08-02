@@ -109,6 +109,21 @@ const server = http.createServer(async (req, res) => {
     ]);
   }
 
+  // POST /api/show — a model's metadata, WITHOUT loading it. The sidecar's
+  // `capabilities()` reads `capabilities` from here and the Settings badges
+  // follow; an empty 200 (what the catch-all below used to answer) reads as a
+  // model that can do nothing at all, which is a lie about the demo model —
+  // the whole smoke test is one round of tool-calling.
+  if (req.method === "POST" && url.startsWith("/api/show")) {
+    return json(res, {
+      capabilities: ["completion", "tools"],
+      details: { family: "qwen3", parameter_size: "4B", quantization_level: "Q4_K_M" },
+      model_info: { "general.parameter_count": 4_000_000_000, "qwen3.context_length": 32768 },
+      parameters: "stop \"<|im_end|>\"",
+      template: "{{ .Prompt }}",
+    });
+  }
+
   // POST /api/generate — used by warm(); the app ignores the body of the reply.
   if (req.method === "POST" && url.startsWith("/api/generate")) {
     return ndjson(res, [{ model: MODEL, response: "", done: true }]);
@@ -128,7 +143,11 @@ const server = http.createServer(async (req, res) => {
     return json(res, {});
   }
 
-  // Everything else: harmless empty 200.
+  // Everything else: harmless empty 200 — but SAID OUT LOUD. A silent `{}` for
+  // an endpoint nobody faked is how /api/show came to report a model with no
+  // capabilities: the call succeeded, the answer was empty, and nothing in the
+  // run mentioned it.
+  console.warn(`[mock-ollama] NO FIXTURE for ${req.method} ${url} — answering {}`);
   json(res, {});
 });
 

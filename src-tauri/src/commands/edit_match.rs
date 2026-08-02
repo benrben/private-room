@@ -249,6 +249,13 @@ pub(crate) struct PreviewEdit {
 /// Preview text stays bounded so a huge file's diff can't blow the IPC payload.
 const PREVIEW_CLIP: usize = 200_000;
 
+/// Largest file the forgiving (fuzzy) fallback will scan. `normalize_with_spans`
+/// builds a `Vec<char>` AND a `Range<usize>` per char — roughly 20–40× the
+/// file's size in memory — and it all happens while the room lock is held, so
+/// the whole app is frozen for the duration. Above this the exact match stands
+/// on its own.
+const MAX_FUZZY_BYTES: usize = 4 * 1024 * 1024;
+
 pub(crate) fn hash_bytes(b: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -469,7 +476,13 @@ pub(crate) fn compute_edit_bytes(
             "wrong_type",
         )),
         ext if extraction::is_text_extension(ext) => {
-            let content = String::from_utf8_lossy(bytes).into_owned();
+            // An edit rewrites the file's bytes. Reading non-UTF-8 bytes
+            // lossily turns every unreadable byte into U+FFFD, so applying an
+            // edit to a latin-1/windows-1252 file would silently replace all
+            // its accented letters with boxes — for a one-word change.
+            let content = std::str::from_utf8(bytes)
+                .map_err(|_| EditError::new(non_utf8_error(real_name), "wrong_type"))?
+                .to_string();
             let exact = content.matches(old_text).count();
             if exact == 1 {
                 Ok((content.replace(old_text, new_text).into_bytes(), 1, EditMethod::Exact))
@@ -486,6 +499,19 @@ pub(crate) fn compute_edit_bytes(
                         "ambiguous",
                     ))
                 }
+            } else if content.len() > MAX_FUZZY_BYTES {
+                // The forgiving matcher below materializes the whole file as a
+                // `Vec<char>` plus a byte span per char — tens of times the
+                // file's size in memory, all of it built under the room lock.
+                // Past this size the exact match is the only one offered.
+                Err(EditError::new(
+                    format!(
+                        "Could not find that exact text in \"{real_name}\". This file is too \
+                         large for the forgiving match, so the quote has to be exact — copy \
+                         it from the file, including spacing and punctuation."
+                    ),
+                    "not_found",
+                ))
             } else {
                 match fuzzy_find(&content, old_text) {
                     FuzzyFind::Unique(range) => {
@@ -760,11 +786,16 @@ pub(crate) fn plan_batch(conn: &Connection, ops: &[BatchOp]) -> Result<Vec<Plann
     let mut plans = Vec::with_capacity(order.len());
     for id in order {
         let entry = working.remove(&id).unwrap();
-        let name_for_text = entry.new_name.clone().unwrap_or_else(|| entry.real_name.clone());
         if entry.dirty {
             let original = entry.original.unwrap_or_default();
             let new_bytes = entry.bytes.unwrap();
-            let (before, after, clipped) = preview_pair(&name_for_text, &original, &new_bytes);
+            // Render the preview with the file's CURRENT name — the bytes on
+            // both sides are in the current format, and the edit was computed
+            // against it. Using the new name meant a batch that renamed
+            // notes.md → notes.docx drew both panes through the docx reader,
+            // so the approval card was blank or gibberish for a change that
+            // would then be saved perfectly correctly.
+            let (before, after, clipped) = preview_pair(&entry.real_name, &original, &new_bytes);
             plans.push(PlannedWrite {
                 file_id: id,
                 real_name: entry.real_name,
@@ -955,7 +986,7 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].cause, "AI edit");
         // FTS finds the new text.
-        let hits = db::search_chunks_fts(&conn, "octillion", 5).unwrap();
+        let hits = db::search_chunks_fts_ranked(&conn, "octillion", 5).unwrap();
         assert!(!hits.is_empty(), "reindexed text should be searchable");
     }
 
@@ -1044,7 +1075,7 @@ mod tests {
         let vb = db::list_file_versions(&conn, &b).unwrap();
         assert_eq!(va[0].cause, vb[0].cause);
         assert!(va[0].cause.contains(&format!("batch {}", applied.batch_id)));
-        assert!(!db::search_chunks_fts(&conn, "quux", 5).unwrap().is_empty());
+        assert!(!db::search_chunks_fts_ranked(&conn, "quux", 5).unwrap().is_empty());
     }
 
     #[test]
@@ -1096,6 +1127,58 @@ mod tests {
         // The valid edit rolled back with the invalid rename.
         assert_eq!(current_bytes(&conn, &a), b"keep me");
         assert!(db::list_file_versions(&conn, &a).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_edit_refuses_a_file_that_is_not_utf8_instead_of_mangling_it() {
+        // 0xE9 is "é" in latin-1. Read lossily every unreadable byte becomes
+        // U+FFFD, so applying a one-word edit used to replace the file's
+        // accented letters with boxes and write that back.
+        let conn = db::open_in_memory_schema();
+        let latin1 = b"Le si\xE8ge social est \xE0 Paris.";
+        let id = db::insert_file(&conn, "note.txt", "text/plain", latin1, None, "upload")
+            .unwrap()
+            .id;
+        let err = run_edit_file(&conn, "note.txt", "Paris", "Lyon", false).unwrap_err();
+        assert_eq!(err.outcome, "wrong_type");
+        assert!(err.message.contains("UTF-8"), "got: {}", err.message);
+        assert_eq!(current_bytes(&conn, &id), latin1, "bytes untouched");
+    }
+
+    #[test]
+    fn a_huge_file_skips_the_forgiving_match_but_still_edits_exactly() {
+        // The fuzzy fallback costs 20–40× the file's size in memory under the
+        // room lock, so past MAX_FUZZY_BYTES it is not attempted.
+        let conn = db::open_in_memory_schema();
+        let mut body = "filler line of ordinary prose.\n".repeat(200_000); // ~6 MB
+        body.push_str("the target phrase here");
+        assert!(body.len() > MAX_FUZZY_BYTES);
+        let id = seed_text_file(&conn, "big.txt", &body);
+        // An EXACT quote still works at any size.
+        run_edit_file(&conn, "big.txt", "the target phrase here", "replaced", false).unwrap();
+        assert!(String::from_utf8(current_bytes(&conn, &id)).unwrap().ends_with("replaced"));
+        // A drifted quote gets an honest "has to be exact", not a freeze.
+        let err = run_edit_file(&conn, "big.txt", "the  target\u{00A0}phrase", "x", false).unwrap_err();
+        assert_eq!(err.outcome, "not_found");
+        assert!(err.message.contains("has to be exact"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn a_rename_that_changes_the_type_still_previews_the_real_content() {
+        // The preview used to be rendered with the NEW name, so renaming a
+        // .md to a .docx in the same batch drew both panes through the docx
+        // reader and the approval card came up empty.
+        let conn = db::open_in_memory_schema();
+        seed_text_file(&conn, "notes.md", "hello world");
+        let ops = vec![
+            BatchOp::Edit { name: "notes.md".into(), old_text: "hello".into(), new_text: "goodbye".into() },
+            BatchOp::Rename { name: "notes.md".into(), new_name: "notes.docx".into() },
+        ];
+        let plans = plan_batch(&conn, &ops).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].before.contains("hello world"), "before was blank: {:?}", plans[0].before);
+        assert!(plans[0].after.contains("goodbye world"), "after was blank: {:?}", plans[0].after);
+        assert_eq!(plans[0].rename_to.as_deref(), Some("notes.docx"));
     }
 
     #[test]

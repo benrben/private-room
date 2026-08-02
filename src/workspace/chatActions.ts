@@ -3,12 +3,30 @@ import {
   KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { api, FileTarget, memorySuggestion, Message } from "../api";
-import { fileToBase64, parseComposer, tokenAtCaret } from "./composer";
+import {
+  fileToBase64,
+  hoistSkill,
+  parseComposer,
+  tokenAtCaret,
+  uniqueFileName,
+} from "./composer";
 import { runGuarded } from "./guard";
 import { splitMarkupBlocks } from "./markup";
 import { HELP_COMMAND } from "./constants";
 import * as voice from "./voice";
 import { WSState } from "./state";
+
+/** The chat the UI is showing RIGHT NOW. A turn's callbacks close over the `s`
+ * of the render that started it, so they cannot ask which conversation is on
+ * screen minutes later — and painting a finished turn's messages into whatever
+ * chat the user has since switched to is exactly the bug this prevents.
+ * `makeChatActions` runs on every Workspace render, which keeps this current. */
+const liveChat: { id: string | null } = { id: null };
+
+/** Edit-approval ids already declined by a turn teardown. `setEditApprovals`'
+ * updater is allowed to run more than once for one update (StrictMode, a
+ * re-entrant render), so the decline it fires has to be idempotent. */
+const declinedApprovals = new Set<string>();
 
 /** Chat sessions + the AI-turn flow + the composer's #, @, and / autocomplete. Cross-hook
  * deps threaded from the shell: files' viewFile (openSource), recording's
@@ -26,23 +44,32 @@ export function makeChatActions(
   },
 ) {
   const { viewFile, openOllamaApp, downloadModel, refreshAi, playSealSound } = deps;
+  liveChat.id = s.activeChatId;
 
   async function newChat() {
-    const c = await api.createChat();
-    s.setChats(await api.listChats());
-    s.setActiveChatId(c.id);
+    try {
+      const c = await api.createChat();
+      s.setChats(await api.listChats());
+      s.setActiveChatId(c.id);
+    } catch (e) {
+      s.pushToast("error", `Couldn't start a new chat: ${e}`);
+    }
   }
 
   async function removeChat(id: string) {
-    await api.deleteChat(id);
-    const remaining = await api.listChats();
-    if (remaining.length === 0) {
-      const c = await api.createChat();
-      s.setChats([c]);
-      s.setActiveChatId(c.id);
-    } else {
-      s.setChats(remaining);
-      if (s.activeChatId === id) s.setActiveChatId(remaining[0].id);
+    try {
+      await api.deleteChat(id);
+      const remaining = await api.listChats();
+      if (remaining.length === 0) {
+        const c = await api.createChat();
+        s.setChats([c]);
+        s.setActiveChatId(c.id);
+      } else {
+        s.setChats(remaining);
+        if (s.activeChatId === id) s.setActiveChatId(remaining[0].id);
+      }
+    } catch (e) {
+      s.pushToast("error", `Couldn't delete this chat: ${e}`);
     }
   }
 
@@ -63,6 +90,7 @@ export function makeChatActions(
         s.setAgentSteps({});
         s.setMemSuggestion(null);
         s.editedRef.current = new Set();
+        declinedApprovals.clear();
         // Idea 3: a new turn silences the old answer and opens a fresh voice
         // epoch (stale synthesis/decodes can never schedule audio into it).
         voice.beginTurn();
@@ -86,78 +114,100 @@ export function makeChatActions(
       openOllamaApp,
       finish: async () => {
         s.askIdRef.current = null;
-        const msgs = await api.getMessages(chatId);
-        s.setMessages(msgs);
-        const lastMsg = msgs[msgs.length - 1];
-        // Idea 3: flush the voice's sentence remainder. The fallback text
-        // covers external CLI engines (they emit no ask-delta — the pipeline
-        // was fed nothing, so endOfTurn speaks the persisted answer instead).
-        // runGuarded runs this in `finally`, so a user-pressed Stop reaches
-        // here too — endOfTurn no-ops then (stopAsk killed the turn's epoch).
-        voice.endOfTurn(
-          lastMsg?.role === "assistant"
-            ? (lastMsg.effects ? lastMsg.content : splitMarkupBlocks(lastMsg.content).text)
-            : undefined,
-        );
-        if (lastMsg?.role === "assistant" && lastMsg.content.trim()) {
-          memorySuggestion(chatId)
-            .then(async (sug) => {
-              if (!(sug.worth && sug.fact.trim())) return;
-              const fact = sug.fact.trim();
-              // Wave 1b (idea 5): opt-in auto-save replaces the chip entirely.
-              if (s.memAutoSaveRef.current) {
-                try {
-                  const m = await api.addMemory(fact);
-                  s.setMemories(await api.listMemories());
-                  // addMemory dedups by returning the EXISTING row — only a
-                  // genuinely new memory earns the toast + Forget undo, or the
-                  // undo would delete a memory the user saved long ago.
-                  const isNew =
-                    Math.abs(Date.now() - Date.parse(m.createdAt)) < 10_000;
-                  if (isNew) {
-                    s.pushToast("success", `Remembered: ${fact}`, {
-                      label: "Forget",
-                      run: () => {
-                        void api.deleteMemory(m.id).then(async () => {
-                          s.setMemories(await api.listMemories());
-                        });
-                      },
-                    });
+        // EVERY reload below can fail (a locked/compacting room, a dropped
+        // IPC). None of them may strand the composer on "Stop": the busy flags
+        // are lowered in this function's own `finally`, whatever happens.
+        try {
+          const msgs = await api.getMessages(chatId);
+          // Only paint the conversation the user is actually looking at. Switching
+          // chats mid-answer used to repaint the OLD transcript under the NEW
+          // header; the answer is filed correctly either way, and the chat-switch
+          // effect loads the right messages.
+          if (liveChat.id === chatId) s.setMessages(msgs);
+          const lastMsg = msgs[msgs.length - 1];
+          // Idea 3: flush the voice's sentence remainder. The fallback text
+          // covers external CLI engines (they emit no ask-delta — the pipeline
+          // was fed nothing, so endOfTurn speaks the persisted answer instead).
+          // runGuarded runs this in `finally`, so a user-pressed Stop reaches
+          // here too — endOfTurn no-ops then (stopAsk killed the turn's epoch).
+          voice.endOfTurn(
+            lastMsg?.role === "assistant"
+              ? (lastMsg.effects ? lastMsg.content : splitMarkupBlocks(lastMsg.content).text)
+              : undefined,
+          );
+          if (lastMsg?.role === "assistant" && lastMsg.content.trim()) {
+            memorySuggestion(chatId)
+              .then(async (sug) => {
+                if (!(sug.worth && sug.fact.trim())) return;
+                const fact = sug.fact.trim();
+                // Wave 1b (idea 5): opt-in auto-save replaces the chip entirely.
+                if (s.memAutoSaveRef.current) {
+                  try {
+                    const m = await api.addMemory(fact);
+                    s.setMemories(await api.listMemories());
+                    // addMemory dedups by returning the EXISTING row — only a
+                    // genuinely new memory earns the toast + Forget undo, or the
+                    // undo would delete a memory the user saved long ago.
+                    const isNew =
+                      Math.abs(Date.now() - Date.parse(m.createdAt)) < 10_000;
+                    if (isNew) {
+                      s.pushToast("success", `Remembered: ${fact}`, {
+                        label: "Forget",
+                        run: () => {
+                          void api.deleteMemory(m.id).then(async () => {
+                            s.setMemories(await api.listMemories());
+                          });
+                        },
+                      });
+                    }
+                  } catch {
+                    /* auto-save must never disturb the finished answer */
                   }
-                } catch {
-                  /* auto-save must never disturb the finished answer */
+                } else if (liveChat.id === chatId) {
+                  // The card belongs to THIS conversation. If the user has moved
+                  // on, dropping it is right — it would otherwise appear pinned
+                  // under a chat that never asked the question.
+                  s.setMemSuggestion({ fact });
                 }
-              } else {
-                s.setMemSuggestion({ fact });
-              }
-            })
-            .catch(() => {});
-        }
-        const edited = [...s.editedRef.current];
-        if (edited.length) {
-          const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
-          if (lastAssistant) {
-            s.setUndoByMsg((u) => ({ ...u, [lastAssistant.id]: edited }));
+              })
+              .catch(() => {});
           }
+          const edited = [...s.editedRef.current];
+          if (edited.length) {
+            const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+            if (lastAssistant) {
+              s.setUndoByMsg((u) => ({ ...u, [lastAssistant.id]: edited }));
+            }
+          }
+          s.setChats(await api.listChats());
+          api.listFiles().then(s.setFiles).catch(() => {});
+          api.listMemories().then(s.setMemories).catch(() => {});
+        } catch (e) {
+          s.pushToast(
+            "error",
+            `The answer finished but this chat couldn't be reloaded: ${e}`,
+          );
+        } finally {
+          s.setAsking(false);
+          s.setStreamText("");
+          s.setSteps([]);
+          s.setLane("");
+          s.setAgentPlan(null);
+          s.setActiveAgent(null);
+          s.setAgentSteps({});
+          // Wave 2 (Idea 6): the run is over (finished OR stopped — this is
+          // runGuarded's `finally`). Decline any diff-preview card still queued: the
+          // tools/call task that awaits it is gone, so applying now would mutate a
+          // turn that no longer exists (second-pass addendum).
+          s.setEditApprovals((q) => {
+            for (const r of q) {
+              if (declinedApprovals.has(r.id)) continue;
+              declinedApprovals.add(r.id);
+              api.resolveEditApproval(r.id, "deny").catch(() => {});
+            }
+            return [];
+          });
         }
-        s.setChats(await api.listChats());
-        api.listFiles().then(s.setFiles);
-        api.listMemories().then(s.setMemories);
-        s.setAsking(false);
-        s.setStreamText("");
-        s.setSteps([]);
-        s.setLane("");
-        s.setAgentPlan(null);
-        s.setActiveAgent(null);
-        s.setAgentSteps({});
-        // Wave 2 (Idea 6): the run is over (finished OR stopped — this is
-        // runGuarded's `finally`). Decline any diff-preview card still queued: the
-        // tools/call task that awaits it is gone, so applying now would mutate a
-        // turn that no longer exists (second-pass addendum).
-        s.setEditApprovals((q) => {
-          for (const r of q) api.resolveEditApproval(r.id, "deny").catch(() => {});
-          return [];
-        });
       },
     });
   }
@@ -184,7 +234,21 @@ export function makeChatActions(
       effects: null,
     };
     s.setMessages((m) => [...m, optimistic]);
-    await askOnce(lastUser.content, [], true);
+    // Re-attach what the first attempt had. The @-mentions are parsed back out
+    // of the saved text (the same recovery `regenerate` does), and anything
+    // still on the paperclip rides along — asking again with the real details
+    // but WITHOUT the evidence produced a worse answer for no stated reason.
+    const parsed = parseComposer(
+      lastUser.content,
+      s.commands,
+      s.skills,
+      s.files,
+      s.folders,
+    );
+    const attachmentIds = [
+      ...new Set([...s.attachments.map((f) => f.id), ...parsed.refIds]),
+    ];
+    await askOnce(lastUser.content, attachmentIds, true);
   }
 
   /** `text` overrides the composer draft (hands-free dictation sends the
@@ -197,9 +261,12 @@ export function makeChatActions(
     const raw = (text ?? s.question).trim();
     if (!raw || s.asking || !s.activeChatId) return;
     if (/^#help(\s|$)/i.test(raw)) {
-      s.setQuestion("");
       s.setAc(null);
       s.setShowHelp(true);
+      // Only a bare "#help" is just a request for the list. "#help how do I…"
+      // still opens it, but the question stays in the box — throwing away what
+      // someone typed with no way to get it back is never the right answer.
+      if (/^#help\s*$/i.test(raw)) s.setQuestion("");
       return;
     }
     const parsed = parseComposer(raw, s.commands, s.skills, s.files, s.folders);
@@ -220,10 +287,15 @@ export function makeChatActions(
     }
     s.setQuestion("");
     s.setAc(null);
+    // The backend only reads "/skill" as the FIRST token, so a message that
+    // names a file first has its skill hoisted to the front — otherwise it was
+    // accepted and then quietly ignored. Sending and showing the same text
+    // keeps the transcript honest about what was actually asked.
+    const outgoing = parsed.skill ? hoistSkill(raw, parsed.skill) : raw;
     const optimistic: Message = {
       id: `pending-${Date.now()}`,
       role: "user",
-      content: raw,
+      content: outgoing,
       sources: [],
       createdAt: "",
       effects: null,
@@ -240,7 +312,7 @@ export function makeChatActions(
         ...new Set([...s.attachments.map((f) => f.id), ...parsed.refIds]),
       ];
       s.setAttachments([]);
-      await askOnce(raw, attachmentIds);
+      await askOnce(outgoing, attachmentIds);
     }
   }
 
@@ -469,10 +541,104 @@ export function makeChatActions(
     }
   }
 
+  /** Rewrite one of your own messages and ask again from there. A chat is a
+   * straight line, so everything after the edited question goes with it —
+   * those answers belong to a question that was never asked. */
+  async function editAndResend(messageId: string, newText: string) {
+    if (s.asking || !s.activeChatId) return;
+    const chatId = s.activeChatId;
+    const text = newText.trim();
+    if (!text) return;
+    const idx = s.messages.findIndex((m) => m.id === messageId);
+    if (idx < 0) return;
+    // Validate BEFORE anything is deleted — a typo'd #command must not cost
+    // the user the tail of their conversation.
+    const parsed = parseComposer(text, s.commands, s.skills, s.files, s.folders);
+    if (parsed.commandError) {
+      const names = s.commands.map((c) => `#${c.name}`).join(", ");
+      s.pushToast(
+        "error",
+        `#${parsed.commandError} isn't a command. Try: ${names || "(none available)"}`,
+      );
+      return;
+    }
+    if (parsed.skillError) {
+      s.pushToast(
+        "error",
+        `/${parsed.skillError} isn't an enabled skill. Type / to choose from enabled skills.`,
+      );
+      return;
+    }
+    const outgoing = parsed.skill ? hoistSkill(text, parsed.skill) : text;
+    let removed = true;
+    try {
+      // Newest first, so an interrupted run never leaves an answer stranded
+      // above the question it came from.
+      for (const m of [...s.messages.slice(idx)].reverse()) {
+        await api.deleteMessage(m.id);
+      }
+    } catch (e) {
+      removed = false;
+      s.pushToast("error", `Couldn't rewrite this message: ${e}`);
+    }
+    // Repaint from the room either way, so the transcript on screen matches
+    // what is actually stored before anything else happens.
+    try {
+      s.setMessages(await api.getMessages(chatId));
+    } catch (e) {
+      s.pushToast("error", `Couldn't reload this chat: ${e}`);
+      return;
+    }
+    // A half-removed tail must not be asked on top of — the old answers would
+    // sit between the question and its new reply.
+    if (!removed) return;
+    const optimistic: Message = {
+      id: `pending-${Date.now()}`,
+      role: "user",
+      content: outgoing,
+      sources: [],
+      createdAt: "",
+      effects: null,
+    };
+    s.setMessages((m) => [...m, optimistic]);
+    if (parsed.command) {
+      await runTurn((askId) =>
+        api.runCommand(chatId, parsed.command!, parsed.args, parsed.refIds, outgoing, askId),
+      );
+    } else {
+      await askOnce(outgoing, parsed.refIds);
+    }
+  }
+
   function copyMessage(m: Message) {
     const clean = splitMarkupBlocks(m.content).text;
     navigator.clipboard.writeText(clean).then(
       () => s.pushToast("success", "Copied to clipboard."),
+      (e) => s.pushToast("error", String(e)),
+    );
+  }
+
+  /** The whole thread as plain markdown. Copying an answer at a time was the
+   * only way to get a conversation out of the room. */
+  function copyConversation() {
+    if (s.messages.length === 0) {
+      s.pushToast("info", "There's nothing in this chat yet.");
+      return;
+    }
+    const title = s.chats.find((c) => c.id === s.activeChatId)?.title ?? "Chat";
+    const body = s.messages
+      .map((m) => {
+        if (m.kind === "handoff") {
+          return `**Context summarized, continuing**\n\n${m.content}`;
+        }
+        const who = m.role === "assistant" ? "Room AI" : "You";
+        const text =
+          m.role === "assistant" ? splitMarkupBlocks(m.content).text : m.content;
+        return `**${who}**\n\n${text}`;
+      })
+      .join("\n\n---\n\n");
+    navigator.clipboard.writeText(`# ${title}\n\n${body}\n`).then(
+      () => s.pushToast("success", "The whole chat was copied to the clipboard."),
       (e) => s.pushToast("error", String(e)),
     );
   }
@@ -552,11 +718,21 @@ export function makeChatActions(
 
   async function saveToRoom(message: Message) {
     if (!s.saveDraft || s.saveDraft.id !== message.id) return;
-    const name = s.saveDraft.name.trim() || "AI note.md";
-    const meta = await api.saveGeneratedFile(name, message.content);
-    s.setFiles(await api.listFiles());
-    s.setSaveDraft(null);
-    s.pushToast("success", `Saved "${meta.name}" into the room.`);
+    // Two files with one name is a trap: the source chip under an answer can
+    // only ever open one of them (the newest), so it would show a note the
+    // answer did not come from. Save alongside instead of on top.
+    const name = uniqueFileName(
+      s.saveDraft.name.trim() || "AI note.md",
+      s.files.map((f) => f.name),
+    );
+    try {
+      const meta = await api.saveGeneratedFile(name, message.content);
+      s.setFiles(await api.listFiles());
+      s.setSaveDraft(null);
+      s.pushToast("success", `Saved "${meta.name}" into the room.`);
+    } catch (e) {
+      s.pushToast("error", `Couldn't save this answer: ${e}`);
+    }
   }
 
   function toggleAttach(file: import("../api").FileMeta) {
@@ -570,7 +746,8 @@ export function makeChatActions(
   return {
     newChat, removeChat, runTurn, askOnce, askAgainWithRealDetails, send, autocompleteItems,
     refreshAutocomplete, insertComposerToken, acceptAutocomplete,
-    onComposerKeyDown, stopAsk, handleLock, regenerate, copyMessage,
+    onComposerKeyDown, stopAsk, handleLock, regenerate, editAndResend,
+    copyMessage, copyConversation,
     copyAllText, openSource, startRename, commitRename, onComposerPaste,
     makeMinutes, saveToRoom, toggleAttach, handoffContext,
   };

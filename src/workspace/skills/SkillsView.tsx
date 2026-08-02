@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { api, formatSize, SkillBundle, SkillResourceContent } from "../../api";
 import {
   BookOpenIcon,
@@ -227,6 +228,20 @@ export default function SkillsView({ s, a }: Props) {
     }
   }
 
+  /** Ask before throwing typed-but-unsaved work away: the SKILL.md fields and
+   * the open resource's text live only in this component, so every move that
+   * replaces them (another file, a new file, leaving the editor) is a silent
+   * delete unless it stops to ask. `scope` is what the move actually discards. */
+  async function confirmDiscard(scope: "resource" | "editor"): Promise<boolean> {
+    const pending = scope === "resource" ? resourceDirty : resourceDirty || dirty;
+    if (!pending) return true;
+    const what = resourceDirty ? (resource?.path ?? "this file") : "SKILL.md";
+    return await confirm(`Discard your unsaved changes to ${what}?`, {
+      title: "Unsaved changes",
+      kind: "warning",
+    });
+  }
+
   async function openResource(path: string) {
     if (!bundle) return;
     try {
@@ -239,8 +254,37 @@ export default function SkillsView({ s, a }: Props) {
     }
   }
 
+  /** A folder row click. `openResource` itself stays silent — the save/add paths
+   * re-open a file they have just written and must never prompt. */
+  async function chooseResource(path: string) {
+    if (resource?.path === path) return;
+    if (!(await confirmDiscard("resource"))) return;
+    await openResource(path);
+  }
+
+  /** The SKILL.md row: the main instructions, i.e. no resource open. */
+  async function chooseMain() {
+    if (!resource) return;
+    if (!(await confirmDiscard("resource"))) return;
+    setResource(null);
+    setResourceText("");
+    setResourceDirty(false);
+  }
+
+  /** Back to the skill list — the whole editor, drafts included, goes with it. */
+  async function leaveEditor() {
+    if (!(await confirmDiscard("editor"))) return;
+    s.setSelectedSkillId(null);
+    setDraft(null);
+    setBundle(null);
+    setResource(null);
+    setResourceText("");
+    setResourceDirty(false);
+  }
+
   async function addResource() {
     if (!bundle || !newResourcePath.trim()) return;
+    if (!(await confirmDiscard("resource"))) return;
     try {
       await api.saveSkillResource(bundle.skill.id, newResourcePath.trim(), { text: "" });
       const path = newResourcePath.trim();
@@ -266,6 +310,13 @@ export default function SkillsView({ s, a }: Props) {
 
   async function removeResource() {
     if (!bundle || !resource) return;
+    // Unlike an ordinary room file this has no version history, so the click IS
+    // the point of no return — and deleting the whole skill already asks.
+    const ok = await confirm(
+      `Remove ${resource.path} from ${bundle.skill.name}? Skill files have no version history, so this can't be undone.`,
+      { title: "Remove file", kind: "warning" },
+    );
+    if (!ok) return;
     try {
       await api.deleteSkillResource(bundle.skill.id, resource.path);
       setResource(null);
@@ -419,7 +470,7 @@ export default function SkillsView({ s, a }: Props) {
   return (
     <div className="skills-page skill-editor-page">
       <div className="skill-editor-head">
-        <button className="subtle" onClick={() => { s.setSelectedSkillId(null); setDraft(null); setBundle(null); }}>← All skills</button>
+        <button className="subtle" onClick={() => void leaveEditor()}>← All skills</button>
         <div className="skill-editor-actions">
           {bundle && <button className="subtle btn-ic" onClick={() => void exportFolder()}><FolderIcon size={13} /> Export folder</button>}
           <button className="primary btn-ic" disabled={!dirty || busy} onClick={() => void saveMetadata()}><SaveIcon size={13} /> {busy ? "Saving…" : "Save SKILL.md"}</button>
@@ -471,13 +522,16 @@ export default function SkillsView({ s, a }: Props) {
             <div className="skill-resources-head">
               <div><strong>Folder contents</strong><small>Encrypted inside this room</small></div>
             </div>
-            <button className={`skill-resource-row ${resource?.path === "SKILL.md" ? "active" : ""}`} onClick={() => setResource(null)}>
+            {/* SKILL.md is the row that is selected when NO resource is open —
+                keying its highlight off `resource.path` meant clicking it
+                cleared the very value the highlight was read from. */}
+            <button className={`skill-resource-row ${resource ? "" : "active"}`} onClick={() => void chooseMain()}>
               <BookOpenIcon size={14} /><span><strong>SKILL.md</strong><small>metadata + instructions</small></span>
             </button>
             {bundle.resources.map((r) => {
               const label = pathLabel(r.path);
               return (
-                <button key={r.path} className={`skill-resource-row ${resource?.path === r.path ? "active" : ""}`} onClick={() => void openResource(r.path)}>
+                <button key={r.path} className={`skill-resource-row ${resource?.path === r.path ? "active" : ""}`} onClick={() => void chooseResource(r.path)}>
                   <FolderIcon size={14} />
                   <span><strong>{label.name}</strong><small>{label.folder} · {r.kind} · {Math.max(1, Math.ceil(r.sizeBytes / 1024))} KB</small></span>
                 </button>

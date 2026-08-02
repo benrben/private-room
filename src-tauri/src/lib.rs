@@ -142,6 +142,7 @@ pub fn run() {
             commands::touchid_open,
             commands::close_room,
             commands::room_info,
+            commands::rename_room,
             commands::take_pending_open,
             commands::import_files,
             commands::list_files,

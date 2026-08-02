@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, roomGraph } from "../../api";
 import type { RoomGraph, GraphEdge, SimNode, SimEdge, View } from "./types";
-import { MAX_EDGES, MAX_NODES, AREA_PER_NODE, COOL } from "./constants";
+import { MAX_EDGES, MAX_NODES, AREA_PER_NODE, COOL, GRAPH_MAX_FILES } from "./constants";
 import { seedFrom, mulberry32, runTick, computeFit } from "./layout";
 
 interface RoomGraphParams {
@@ -10,20 +10,44 @@ interface RoomGraphParams {
   userAdjustedRef: React.MutableRefObject<boolean>;
   layoutRef: React.MutableRefObject<{ nodes: SimNode[]; edges: SimEdge[] } | null>;
   setView: (v: View) => void;
-  setFocus: (id: string | null) => void;
+  setFocus: React.Dispatch<React.SetStateAction<string | null>>;
 }
 
 export interface RoomGraphApi {
   graph: RoomGraph | null;
   status: string;
+  /** Set when the map couldn't be built — the raw reason, for the details
+   * line under a plain-English message + Retry. */
+  error: string | null;
+  reload: () => void;
   size: { w: number; h: number };
   cappedEdges: GraphEdge[];
   fileNodeCount: number;
+  /** True when the map is AT the backend's newest-N-files ceiling. It is NOT
+   * proof that anything was left out: the payload can't tell a room of exactly
+   * N from a room of a thousand, so the header must only claim what this
+   * means — the map covers the newest N — and never that older files exist. */
+  atFileLimit: boolean;
   degree: Map<string, number>;
   adjacency: Map<string, Set<string>>;
   topNode: string | null;
   nonce: number;
 }
+
+/** Everything about a fetched graph that the map actually draws. A file write
+ * anywhere in the room re-fetches; if this is unchanged there is nothing to
+ * redraw, and re-seeding the layout would throw away the reader's pan, zoom
+ * and selection for no reason. */
+function graphSignature(g: RoomGraph): string {
+  return JSON.stringify([
+    g.nodes.map((n) => [n.id, n.name, n.kind, n.folder ?? "", n.summary ?? ""]),
+    g.edges.map((e) => [e.a, e.b, e.weight, e.shared]),
+  ]);
+}
+
+/** Room-file bursts (an import, an agent writing a dozen files) fire many
+ * change events in a row — coalesce them into one fetch. */
+const RELOAD_DEBOUNCE_MS = 400;
 
 /* The room_graph() fetch, the stage-measure/re-fit ResizeObserver, and the
  * spring-layout settle loop — plus the derived graph data (capped edges,
@@ -40,32 +64,56 @@ export function useRoomGraph({
 }: RoomGraphParams): RoomGraphApi {
   const [graph, setGraph] = useState<RoomGraph | null>(null);
   const [status, setStatus] = useState("Mapping the room…");
+  const [error, setError] = useState<string | null>(null);
   const [size, setSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
   const [nonce, bump] = useState(0);
   const rerender = () => bump((v) => v + 1);
+  /** Signature of the graph currently on screen — a re-fetch that matches it
+   * is dropped, so an unrelated file write can't reset the view. */
+  const sigRef = useRef<string | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const reload = useCallback(() => {
+    setError(null);
+    setStatus("Mapping the room…");
+    setReloadNonce((n) => n + 1);
+  }, []);
 
   // ---- fetch the graph on mount, and whenever the room's files change ----
   useEffect(() => {
+    // PER-RUN, deliberately not a ref: the effect re-runs on the Retry button's
+    // nonce, and a component-level flag reset to true at the top of each run
+    // undoes the previous run's cleanup — a debounced fetch still in flight
+    // would then land (or re-raise its error) on top of the retry's result.
     let alive = true;
+    let timer = 0;
     const load = () => {
       roomGraph()
         .then((g) => {
           if (!alive) return;
-          setGraph(g);
           setStatus("");
+          setError(null);
+          const sig = graphSignature(g);
+          if (sig === sigRef.current) return; // nothing on the map changed
+          sigRef.current = sig;
+          setGraph(g);
         })
         .catch((e) => {
           if (!alive) return;
-          setStatus(String(e));
+          setStatus("");
+          setError(String(e));
         });
     };
     load();
-    const un = api.onRoomFilesChanged(load);
+    const un = api.onRoomFilesChanged(() => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(load, RELOAD_DEBOUNCE_MS);
+    });
     return () => {
       alive = false;
+      window.clearTimeout(timer);
       un.then((fn) => fn());
     };
-  }, []);
+  }, [reloadNonce]);
 
   // ---- measure the stage; lay out to (and re-fit at) the real pixel size ----
   useEffect(() => {
@@ -136,10 +184,14 @@ export function useRoomGraph({
       .map((e) => ({ ai: idx.get(e.a)!, bi: idx.get(e.b)!, edge: e }));
 
     layoutRef.current = { nodes: sim, edges: simEdges };
-    // Fresh graph → drop any manual pan/zoom and re-frame to fit.
-    userAdjustedRef.current = false;
-    setFocus(null);
-    setView(computeFit(sim, sizeRef.current.w, sizeRef.current.h));
+    // Re-frame only when the reader hasn't grabbed the canvas: a graph change
+    // is not a reason to throw away their pan/zoom. Likewise the selection
+    // survives unless the file it pointed at is gone from the map.
+    const present = new Set(sim.map((n) => n.id));
+    setFocus((cur) => (cur && present.has(cur) ? cur : null));
+    if (!userAdjustedRef.current) {
+      setView(computeFit(sim, sizeRef.current.w, sizeRef.current.h));
+    }
 
     const k = Math.sqrt(AREA_PER_NODE);
     let temp = k * 2;
@@ -200,5 +252,18 @@ export function useRoomGraph({
     return best;
   }, [graph, degree]);
 
-  return { graph, status, size, cappedEdges, fileNodeCount, degree, adjacency, topNode, nonce };
+  return {
+    graph,
+    status,
+    error,
+    reload,
+    size,
+    cappedEdges,
+    fileNodeCount,
+    atFileLimit: fileNodeCount >= GRAPH_MAX_FILES,
+    degree,
+    adjacency,
+    topNode,
+    nonce,
+  };
 }

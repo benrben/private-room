@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
-from arcelle_sidecar import file_pass, llm, model_text
+from arcelle_sidecar import budget, file_pass, llm, model_text
 from arcelle_sidecar.server import create_app
 
 
@@ -65,17 +65,20 @@ def client_for(app: Any) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://sidecar")
 
 
-# --- clamp_bytes (byte-safe helper) / the shared recover_json ---------------
+# --- the shared byte-safe cut / the shared recover_json ---------------------
 
 
-def test_clamp_bytes_never_splits_a_char() -> None:
+def test_truncate_bytes_never_splits_a_char() -> None:
+    # Every PASS cap is a BYTE cap and cuts through budget.truncate_bytes — the
+    # sidecar's one copy of agent.rs clamp_bytes/floor_boundary (file_pass and
+    # ai_actions both used to carry their own).
     # "é" is 2 bytes in UTF-8; a 3-byte cap must drop the whole second char, not
-    # half of it — matching agent.rs floor_boundary walking back to a boundary.
-    assert file_pass.clamp_bytes("éé", 3) == "é"
-    assert file_pass.clamp_bytes("éé", 4) == "éé"
-    assert file_pass.clamp_bytes("abc", 10) == "abc"
+    # half of it — matching floor_boundary walking back to a boundary.
+    assert budget.truncate_bytes("éé", 3) == "é"
+    assert budget.truncate_bytes("éé", 4) == "éé"
+    assert budget.truncate_bytes("abc", 10) == "abc"
     # A 4-byte emoji cut at 2 bytes yields nothing, never mojibake.
-    assert file_pass.clamp_bytes("🙂x", 2) == ""
+    assert budget.truncate_bytes("🙂x", 2) == ""
 
 
 def test_recover_json_strips_fence_and_think() -> None:
@@ -190,10 +193,38 @@ async def test_map_thread_is_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(art["thread"].encode("utf-8")) == file_pass.PASS_THREAD_MAX
 
 
+async def test_map_stitch_failure_is_skipped_not_pasted_back_untransformed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # STITCH transforms the text, so the SOURCE is not a stand-in for its own
+    # transform: falling back to it dropped a chunk of the original language into
+    # a translation, unmarked, while the publish footer still read "complete
+    # coverage". Stitch marks the window skipped so Rust writes
+    # "[part N could not be processed]" and counts it in the coverage line.
+    fake = set_replies(monkeypatch, "not json", "still not json")
+    art = await file_pass.run_map(
+        model="m", base_url="http://h:1", mode="stitch", file_name="f",
+        instruction="Translate into French", part=2, total=5, start=0, end=10,
+        text_len=100, thread="carried context", window_text="the untranslated English text",
+    )
+    assert art == {"result": "", "thread": "carried context", "skipped": True}
+    assert len(fake.calls) == 2  # one retry
+
+
+async def test_map_stitch_empty_reply_is_also_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same rule for a valid-but-empty stitch reply — no untransformed paste-back.
+    set_replies(monkeypatch, json.dumps({"result": "  ", "thread": "ignored"}))
+    art = await file_pass.run_map(
+        model="m", base_url="http://h:1", mode="stitch", file_name="f", instruction="i",
+        part=0, total=2, start=0, end=10, text_len=100, thread="", window_text="source text",
+    )
+    assert art == {"result": "", "thread": "", "skipped": True}
+
+
 async def test_map_double_parse_failure_falls_back_to_raw_window_text(monkeypatch: pytest.MonkeyPatch) -> None:
     # A double parse failure (e.g. a small model can't wrap code/CSV in the forced
-    # JSON) no longer drops the window: the raw window text is used so the content
-    # is still COVERED, and the incoming thread flows on for the next window.
+    # JSON) no longer drops the window: in MERGE mode the raw window text is used
+    # so the content is still COVERED, and the incoming thread flows on.
     fake = set_replies(monkeypatch, "not json", "still not json")
     art = await file_pass.run_map(
         model="m", base_url="http://h:1", mode="merge", file_name="f", instruction="i",

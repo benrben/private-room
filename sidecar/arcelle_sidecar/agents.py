@@ -37,11 +37,13 @@ from .prompts import (
     CONNECTORS_USE_PROMPT,
     FILE_PASS_PROMPT,
     FILES_PROMPT,
+    MAIN_PROMPT_NO_SPECIALISTS,
     MAIN_PROMPT_TEMPLATE,
     SCRIPTS_PROMPT,
     SKILLS_AUTHOR_PROMPT,
     SKILLS_USE_PROMPT,
     STUDIO_PROMPT,
+    TOOL_GROUP_LABELS,
     TRANSCRIBE_PROMPT,
     UI_PROMPT,
     VIDEO_PROMPT,
@@ -127,23 +129,45 @@ class Flow:
 
 @dataclass(frozen=True, slots=True)
 class AgentSpec:
-    """One sub-agent, fully described as data."""
+    """One sub-agent, fully described as data.
+
+    Every field below is READ by the running loop. Two were not, and both went
+    on 2026-08-01: ``read_only`` — decoration shaped like a safety switch, since
+    a spec could be marked read-only and still be handed ``browse_do`` with no
+    code path noticing — and ``description``, a one-liner carried on every row
+    for a constrained classifier that was never built. An agent's role is
+    already stated where something actually reads it: the first sentence of its
+    ``prompt`` (the model reads that every turn) and the per-domain blurb in
+    :data:`AGENT_TOOL_DOMAINS` (the Main agent's catalog).
+    """
 
     #: Stable id, ``domain.name`` (e.g. ``"jobs.run"``).
     id: str
-    #: Human label for step chips.
+    #: Human label for step chips (``graph.py`` reads it for the agent strip and
+    #: for the worker's report header).
     label: str
-    #: One-liner for the (future) constrained classifier and for docs.
-    description: str
     #: Tools this agent ADDS on top of CORE. ≤ MAX_BOX_TOOLS; tests pin it.
     tools: tuple[str, ...]
+    #: The tools WITHOUT WHICH this box cannot do its job. ``worker_reachable``
+    #: requires ALL of them on top of its usual "some tool of this box was
+    #: served" test. Empty — the normal case — means every tool in the box is
+    #: equally load-bearing and any one of them is enough to be useful.
+    #:
+    #: THE BUG THIS EXISTS FOR (2026-08-01): ``app.ui``'s box is the four
+    #: UI_TOOL_NAMES, one of which is ``view_media_frame`` — a room video's
+    #: pixels, which ``room_mcp::ToolScope`` classes as CONTENT and therefore
+    #: serves to a cloud-CLI room, while the three SCREEN tools stay local-only.
+    #: An any-one-of-them test passed on that single unrelated tool, so a Claude
+    #: or Codex room was offered an App agent that cannot see or click anything
+    #: and was briefed by UI_PROMPT on ui_snapshot/ui_act regardless. Watching a
+    #: video is already ``media.video``'s job under ``ask_file_agent``, so
+    #: nothing is lost by dropping the domain on those tiers.
+    requires: tuple[str, ...] = ()
     #: System-prompt paragraph appended while this agent is active ("" = the
     #: base prompt already covers it).
     prompt: str = ""
     #: Deterministic routing vocabulary (lowercase substrings, EN + Hebrew).
     hints: tuple[str, ...] = ()
-    #: True when the box only reads/presents — the safe default lane.
-    read_only: bool = False
     #: False while the host serves no tools for this box (documents the
     #: target tree without offering the unlockable).
     available: bool = True
@@ -279,9 +303,21 @@ def main_prompt(keys: Iterable[str], *, web_off: bool = False) -> str:
     the web domain is absent; without a reason the model invents one, and it
     picks permanence ("this room has no browsing tool") over the truth (a switch
     is off). See the note for the live refusal that prompted it.
+
+    NO reachable domain at all gets :data:`MAIN_PROMPT_NO_SPECIALISTS` instead.
+    The normal template's first sentence orders the model to call
+    ``ask_file_agent``, and that half cannot be filtered — it is the sentence's
+    subject — so on the tier where ``agent_tool_specs`` returns an EMPTY catalog
+    the model was told to call the one tool it certainly does not have.
     """
     have = set(keys)
     wanted = [k for k in DOMAIN_KEY_ORDER if k in have]
+    if not wanted:
+        return (
+            MAIN_PROMPT_NO_SPECIALISTS + WEB_OFF_NOTE
+            if web_off
+            else MAIN_PROMPT_NO_SPECIALISTS
+        )
     paragraph = MAIN_PROMPT_TEMPLATE.format(
         # The sentence already named ask_file_agent, so this half lists the
         # others. With file the only reachable domain it degrades to a plain
@@ -338,7 +374,7 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # spare"). The per-agent round budgets were removed (2026-07-27, owner
         # call) and `Flow` no longer has the field, so NOTHING caps how many
         # delegations one ask may chain. What bounds the hub today is turn-wide,
-        # not per-agent: `config.TURN_ROUND_BUDGET` (64, carried down the whole
+        # not per-agent: `config.TURN_ROUND_BACKSTOP` (400, carried down the whole
         # tree by `graph.Deps.turn_round_budget`) counts this agent's rounds plus
         # every round of every specialist it delegates to, and tripping it does
         # not abort — the remaining rounds are served TOOL-LESS so each loop
@@ -348,16 +384,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # dispatches to specialists; never touches a room tool
         template="supervisor",
         label="Main agent",
-        description="The user's single interlocutor: calls specialist agents "
-        "for anything that needs the room or tools, answers directly what it "
-        "knows, and composes every final answer itself.",
         tools=(),  # its ONLY tools are the ask_*_agent calls (agent_tool_specs)
         # The all-domains default, for anything reading the spec statically.
         # `graph.prepare` substitutes the REACHABLE-domain paragraph per turn
         # (see `main_prompt`), so this exact string is never what a live turn
         # sees when a domain is unreachable.
         prompt=main_prompt(DOMAIN_KEY_ORDER),
-        read_only=True,
         main=True,
     ),
     AgentSpec(
@@ -368,17 +400,15 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # so a many-file errand is now bounded only by the shared runaway
         # backstop `config.AGENT_ROUND_BACKSTOP` (10,000 — i.e. the exact number
         # that budget existed to avoid) and by the turn-wide
-        # `config.TURN_ROUND_BUDGET` it shares with the hub and its siblings.
+        # `config.TURN_ROUND_BACKSTOP` it shares with the hub and its siblings.
         # What keeps this agent honest is `react_verify`'s ground-truth check on
         # what it claims to have changed, not a cap.
         flow=Flow(),
         # mutates the user's room — claims get a ground-truth check
         template="react_verify",
         label="File agent",
-        description="Read, search, open and edit the room's files — the default specialist.",
         tools=(),  # CORE alone (read + write verbs)
         prompt=FILES_PROMPT,
-        read_only=False,
     ),
     AgentSpec(
         id="scripts.run",
@@ -392,11 +422,23 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="recall_act_check",
         label="Scripts agent",
-        description="See and run this room's .py/.js scripts (the user approves each new one).",
         tools=("list_scripts", "run_script"),
         prompt=SCRIPTS_PROMPT,
         hints=(
-            "script", "run it", "run the", ".py", ".js", "python", "execute",
+            # " script" is SPACE-ANCHORED because "transcript" ends in "script":
+            # once the bare noun stopped claiming media.transcribe (below),
+            # "summarize the meeting transcript" fell to THIS agent instead —
+            # the same everyday-word bug one seat along. "javascript" is spelled
+            # out for the same reason, since the anchor drops it.
+            " script", "javascript", "run it", "run the", ".py", ".js",
+            "execute",
+            # ALL-OF (see `manager._matches`). A bare "python" was a hint, and
+            # it is far more often the SUBJECT of a room question than an
+            # instruction: "what does the report say about python" reached this
+            # agent, which opens by listing scripts. The language name only
+            # counts when the sentence also asks for a program to be run or
+            # written.
+            "python+run", "python+script", "python+write", "python+execute",
             "סקריפט", "הרץ", "להריץ", "פייתון",
         ),
         # Sibling of files.read under ask_file_agent: a script IS a room file,
@@ -420,7 +462,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="chain_stage",
         label="Web agent",
-        description="Find or fetch current information from the internet.",
         tools=("web_search", "fetch_page", *DOWNLOAD_TOOL_NAMES),
         hints=(
             "web", "online", "internet", "news", "latest", "google",
@@ -428,7 +469,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
             "חפש ברשת", "באינטרנט", "חדשות", "מזג אוויר", "הורד",
         ),
         prompt=WEB_PROMPT,
-        read_only=True,
         # No group: web access is a ROOM SETTING, not something an agent may
         # unlock mid-turn.
     ),
@@ -451,7 +491,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
         flow=Flow(probe="browse_snapshot", probe_after="browse_open"),
         template="perceive_act",
         label="Browser agent",
-        description="Open and operate web pages in the room's private browser.",
         # BROWSE-2: browse_save rode into BROWSE_TOOL_NAMES; the download verbs
         # deliberately did NOT — "download the report on that page" is a
         # browse_do CLICK (the browser imports the file automatically), and
@@ -481,15 +520,20 @@ REGISTRY: tuple[AgentSpec, ...] = (
             # page/site nouns
             "website", "web page", "webpage", "the site", "on the site",
             "the page", "on the page", "this page",
-            # operating a page
+            # operating a page. " form" is SPACE-ANCHORED: the bare stem is a
+            # substring of "information", and because this scorer breaks a tie
+            # on the LONGEST matched hint, "form" (4) beat chat.web's "web" (3)
+            # — so "search the web for information about X" was handed to the
+            # Browser agent, which holds no search tool and had to guess an
+            # address. The anchored form still catches "the form"/"a form"/"web
+            # form" and drops information/platform/perform/transform.
             "click", "fill in", "fill out", "log in", "logging in", "sign in",
-            "form", "checkout", "add to cart", "book a", "submit",
+            " form", "checkout", "add to cart", "book a", "submit",
             "select the", "dropdown",
             "דפדפן", "גלוש", "פתח את האתר", "באתר", "לחץ", "מלא", "טופס",
             "כנס ל", "היכנס", "אתר", "דף",
         ),
         prompt=BROWSE_PROMPT,
-        # NOT read_only: browse_do submits forms on the open web.
         # No group, for the same reason as chat.web — web access is a room
         # setting, never something an agent unlocks mid-turn.
     ),
@@ -504,10 +548,19 @@ REGISTRY: tuple[AgentSpec, ...] = (
         flow=Flow(probe="ui_snapshot"),
         template="perceive_act",
         label="App agent",
-        description="See and operate this app's own interface for the user.",
         tools=UI_TOOL_NAMES,
+        # SEEING and CLICKING are what this agent IS: `flow.probe` fires
+        # ui_snapshot as its opening move and UI_PROMPT briefs it on ui_act.
+        # Without both, everything the prompt tells it to do is a tool it does
+        # not hold — see `AgentSpec.requires` for the cloud-CLI tier where the
+        # box's fourth tool (view_media_frame) alone kept the domain offered.
+        requires=("ui_snapshot", "ui_act"),
         prompt=UI_PROMPT,
-        # Vocabulary: routing.UI_HINTS (Rust-parity) — wired in manager.py.
+        # This agent's vocabulary is routing.UI_HINTS, and NOTHING consults it:
+        # `app` is a single-member domain, so `resolve_worker` returns app.ui
+        # before any scoring runs. The `_ROUTING_HINTED` row that claimed to
+        # wire it in was removed 2026-08-01; UI_HINTS itself is still the Rust
+        # parity list `routing.wants_ui_tools` matches on.
         group="app_ui",
     ),
     AgentSpec(
@@ -536,7 +589,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="route_act",
         label="Jobs agent",
-        description="Cover an ENTIRE file with a durable background job; report job status.",
         tools=_JOBS_RUN,
         prompt=FILE_PASS_PROMPT,
         # Vocabulary: routing.JOB_HINTS (Rust-parity) — wired in manager.py.
@@ -555,7 +607,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="recall_act_check",
         label="Workflow agent",
-        description="Author, test, schedule or run saved multi-step workflows.",
         tools=_JOBS_WORKFLOWS,
         prompt=WORKFLOWS_PROMPT,
         hints=(
@@ -577,11 +628,9 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="recall_act_check",
         label="Skills agent",
-        description="Find, read and run Agent Skills.",
         tools=_SKILLS_USE,
         prompt=SKILLS_USE_PROMPT,
         hints=("skill", "agent instruction", "מיומנות", "סקיל"),
-        read_only=True,
         group="skills",
     ),
     AgentSpec(
@@ -599,7 +648,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="recall_act_check",
         label="Skill-builder agent",
-        description="Create, modify or delete Agent Skills (drafts, human-reviewed).",
         tools=_SKILLS_AUTHOR,
         prompt=SKILLS_AUTHOR_PROMPT,
         # ALL-OF hints (see `manager._matches`): the discriminator against the
@@ -625,7 +673,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # inspect then edit a small fixed set of server configs.
         flow=Flow(),
         label="Connector setup agent",
-        description="Inspect or configure MCP connector integrations (drafts only).",
         tools=MCP_MANAGEMENT_TOOL_NAMES,
         prompt=CONNECTORS_ADMIN_PROMPT,
         # ADMINISTRATIVE INTENT ONLY — never the bare subject noun. Live QA
@@ -669,7 +716,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
         template="react_verify",
         flow=Flow(),
         label="Connector agent",
-        description="Reach the user's connected third-party tools (email, calendar, chat…).",
         tools=("search_mcp_tools", "run_mcp_tool"),
         prompt=CONNECTORS_USE_PROMPT,
         hints=(
@@ -702,14 +748,37 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # model round is available for the actual work.
         template="probe_gate_act",
         label="Transcription agent",
-        description="Transcribe or re-transcribe audio/video on-device.",
         # NOT transcribe_audio (it takes base64 bytes from the recorder UI)
         # and NOT rec_retranscribe (it drives a live recording session) — an
         # agent can supply neither. Re-transcribing a room FILE is the
         # operation it can actually perform.
         tools=("stt_status", "retranscribe_file"),
         prompt=TRANSCRIBE_PROMPT,
-        hints=("transcribe", "transcript", "re-transcribe", "תמלל", "תמלול"),
+        # VERBS, plus the noun only when the sentence asks for a transcript to
+        # be MADE (or made again). The bare noun "transcript" used to be a hint,
+        # and it is what a user says when they want to READ one: "summarize the meeting
+        # transcript" scored here 1-0 against the hintless File agent and was
+        # briefed to re-run the speech model on a file it was asked to
+        # summarize. ("re-transcribe" was also redundant — it contains
+        # "transcribe".)
+        hints=(
+            "transcribe", "transcription", "תמלל", "תמלול",
+            # ALL-OF (see `manager._matches`): noun + a remake verb/complaint.
+            "transcript+redo", "transcript+again", "transcript+wrong",
+            "transcript+missing", "transcript+no ", "transcript+fix",
+            "transcript+bad", "transcript+poor", "transcript+empty",
+            # …and the ask that wants one MADE without saying "transcribe"
+            # ("make me a transcript of the standup"). The tell is the
+            # INDEFINITE article: you ask for "a transcript" when it does not
+            # exist yet and for "THE transcript" when you want to read the one
+            # that does. These stay CONTIGUOUS phrases on purpose — the obvious
+            # ALL-OF spelling (transcript+make / +create / +need) re-opens the
+            # false positive the pairs above were narrowed to close, and worse:
+            # "make flashcards from the transcript" would match it, and because
+            # the last tie-break rung prefers the LONGEST matched hint, the
+            # 15-character pair beats creator.studio's "flashcard" outright.
+            "a transcript of", "me a transcript", "new transcript",
+        ),
     ),
     AgentSpec(
         id="media.video",
@@ -728,7 +797,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # normal case, so the frames must stay.
         template="react",
         label="Video agent",
-        description="Watch a room video: look at what is on screen at a moment.",
         # One tool, deliberately. The value of this box is not its size — it is
         # that SOMEBODY owns watching, with CORE's search_room (which returns
         # the transcript's [m:ss] stamps) as the way in.
@@ -744,7 +812,6 @@ REGISTRY: tuple[AgentSpec, ...] = (
             "frame at", ".mp4", ".mov", "on screen at",
             "וידאו", "סרטון", "קליפ", "סצנה", "פריים",
         ),
-        read_only=True,
     ),
     AgentSpec(
         id="creator.studio",
@@ -776,11 +843,18 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="route_act",
         label="Studio agent",
-        description="Generate flashcards, mind maps or podcast scripts from room content.",
         # stage_preview_html is a UI staging call, not an agent verb.
         tools=("studio_flashcards", "studio_mindmap", "generate_podcast_script"),
         prompt=STUDIO_PROMPT,
-        hints=("flashcard", "mind map", "mindmap", "podcast", "study", "כרטיסי", "מפת חשיבה"),
+        # "study" was a bare hint, and it is an ordinary English verb for
+        # READING something carefully: "study the lease" scored here 1-0 against
+        # the hintless File agent and was briefed to generate flashcards. Only
+        # the phrases that name a study ARTIFACT survive.
+        hints=(
+            "flashcard", "flash card", "mind map", "mindmap", "podcast", "quiz",
+            "study guide", "study aid", "study material", "help me study",
+            "כרטיסי", "מפת חשיבה",
+        ),
     ),
 )
 
@@ -801,6 +875,18 @@ MAIN_AGENT_ID = "chat.answer"
 
 #: The request_tools groups, in stable order (drives the unlock enum).
 GROUPS: tuple[str, ...] = ("app_ui", "jobs", "skills", "connectors")
+
+# The group NAMES live here and their human labels live in `prompts.py`, and
+# both `prompts.request_tools_spec` and `graph.prepare` subscript
+# TOOL_GROUP_LABELS directly with a name out of GROUPS. A group added here
+# without a label would therefore raise KeyError in the middle of building a
+# turn's catalog — a crash mid-answer, at the one moment the user is watching.
+# The same import-time guard the domain blurbs get (see the assert beside
+# DOMAIN_KEYS), so the mistake costs a failed start-up instead.
+assert set(GROUPS) <= set(TOOL_GROUP_LABELS), (
+    "every request_tools group needs a prompts.TOOL_GROUP_LABELS row; missing="
+    f"{sorted(set(GROUPS) - set(TOOL_GROUP_LABELS))}"
+)
 
 # --------------------------------------------------------------------------- #
 # agent-tools — the MAIN agent's catalog (owner decision 2026-07-23 v3):
@@ -929,6 +1015,17 @@ ALL_REGISTRY_TOOLS: frozenset[str] = frozenset(
 #: Workers that exist only when the room's web setting is on.
 WEB_DEPENDENT_AGENT_IDS: frozenset[str] = frozenset({"chat.web", "chat.browse"})
 
+# Neither internet worker belongs to a request_tools GROUP — web access is a
+# room setting, never something an agent unlocks mid-turn — which is what lets
+# `group_servable` answer without knowing the setting. Same import-time guard
+# as GROUPS/TOOL_GROUP_LABELS above: if a web-dependent agent is ever grouped,
+# a web-disabled room would be offered that unlock, and the mistake should cost
+# a failed start-up rather than a hallucinated capability.
+assert not (WEB_DEPENDENT_AGENT_IDS & {s.id for s in REGISTRY if s.group}), (
+    "a web-dependent agent may not belong to a request_tools group; "
+    f"grouped={sorted(WEB_DEPENDENT_AGENT_IDS & {s.id for s in REGISTRY if s.group})}"
+)
+
 
 def worker_reachable(spec: AgentSpec, *, web_enabled: bool, served_names: set[str]) -> bool:
     """Could this worker actually ACT with what the bridge served this run?
@@ -956,6 +1053,11 @@ def worker_reachable(spec: AgentSpec, *, web_enabled: bool, served_names: set[st
     # So this returns False early and then falls through to the box check,
     # rather than returning `web_enabled` as the whole answer.
     if spec.id in WEB_DEPENDENT_AGENT_IDS and not web_enabled:
+        return False
+    # A box whose load-bearing tools are missing is dead however much of the
+    # REST of it was served — the any-one-of-them test below cannot see that,
+    # because to it one tool is as good as another. See `AgentSpec.requires`.
+    if not set(spec.requires) <= served_names:
         return False
     if not spec.tools:
         # CORE-only workers (the File agent) ride the always-served base.
@@ -1092,16 +1194,25 @@ def _batch_tool_spec(keys: list[str]) -> dict:
         },
         "required": ["agent", "instruction"],
     }
+    # The description used to sell WALL-CLOCK parallelism — "run AT THE SAME
+    # TIME, so the whole batch costs as long as its slowest task instead of the
+    # sum". That is true only on a cloud room. A LOCAL room has one resident
+    # model, so `server.py` sets `Deps.worker_parallel = 1` on purpose and the
+    # children run strictly one after another: the batch costs the sum, and the
+    # agent strip shows five specialists "working" while four wait for a slot.
+    # The model was planning against a promise the room cannot keep. What is
+    # true on BOTH engines is what the tool is actually for — one call instead
+    # of several (the regime a small model is reliable in), one set of reports
+    # back — so that is what it now says.
     return _function_spec(
         BATCH_TOOL_NAME,
         (
             "Ask SEVERAL specialists in ONE call. Prefer this whenever "
-            "the request has more than one part: tasks that do not "
-            "depend on each other run AT THE SAME TIME, so the whole "
-            "batch costs as long as its slowest task instead of the "
-            "sum. Use depends_on only when a task genuinely needs an "
-            "earlier task's findings — those wait, everything else "
-            "runs together."
+            "the request has more than one part: one call carrying every "
+            "part is far more reliable than several separate calls, and "
+            "all the reports come back together. Use depends_on only "
+            "when a task genuinely needs an earlier task's findings — "
+            "those wait for it, everything else starts straight away."
         ),
         {
             "type": "object",
@@ -1164,6 +1275,29 @@ def group_tools(group: str) -> set[str]:
     return out
 
 
+def group_servable(group: str, served_names: set[str]) -> bool:
+    """Could unlocking ``group`` actually give the model something to DO?
+
+    THE question both request_tools gates ask, and until now both asked it as
+    "was ANY tool of this group served" — the same any-one-of-them test
+    :func:`worker_reachable` had to stop trusting. On the cloud-CLI tier
+    ``app_ui`` passes that test on ``view_media_frame`` alone (a room video's
+    pixels, served as CONTENT) while the three SCREEN tools stay local-only, so
+    the group was offered in the prompt, a round could be spent unlocking it,
+    and :func:`group_prompt` then briefed the model on ui_snapshot/ui_act —
+    exactly the failure :attr:`AgentSpec.requires` was added to kill, reached
+    through the other entrance.
+
+    A group is servable when at least one MEMBER is reachable, which is one
+    definition (this delegates) rather than two that can drift apart.
+    """
+    return any(
+        worker_reachable(spec, web_enabled=True, served_names=served_names)
+        for spec in REGISTRY
+        if spec.group == group
+    )
+
+
 def group_prompt(group: str) -> str:
     """EVERY paragraph a group unlock appends, concatenated in registry order.
 
@@ -1217,6 +1351,7 @@ __all__ = [
     "REGISTRY",
     "get_agent",
     "group_prompt",
+    "group_servable",
     "reachable_members",
     "worker_reachable",
     "group_tools",

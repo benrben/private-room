@@ -116,6 +116,17 @@ export class El {
   get innerText() {
     return this.textContent;
   }
+  /** Enough of a serializer for `capture()`, which saves the page's HTML
+   *  alongside its markdown. Attributes and nesting are what "Save page" is
+   *  judged on; entity handling beyond `"` is not what that code decides. */
+  get outerHTML() {
+    const tag = this.tagName.toLowerCase();
+    const attrs = Object.entries(this.attrs)
+      .map(([k, v]) => ` ${k}="${String(v).replace(/"/g, "&quot;")}"`)
+      .join("");
+    const inner = this.__text + this.children.map((c) => c.outerHTML).join("");
+    return `<${tag}${attrs}>${inner}</${tag}>`;
+  }
 
   closest(sel) {
     let n = this;
@@ -270,6 +281,7 @@ class Doc {
 }
 
 let doc = new Doc();
+let selectionText = "";
 
 /** Install a fresh global environment and return `window.__arcelleBrowse`. */
 export function install(scriptSource) {
@@ -292,6 +304,11 @@ export function install(scriptSource) {
   g.Event = class { constructor(type, init) { Object.assign(this, init); this.type = type; } };
   g.PerformanceObserver = class { observe() {} disconnect() {} };
   g.MutationObserver = class { observe() {} disconnect() {} };
+  // `capture({what:"selection"})` stringifies the Selection object, so this
+  // models the toString rather than a text property. Empty until a test sets
+  // one, which is the state "Save selection" has to refuse.
+  selectionText = "";
+  g.getSelection = () => ({ toString: () => selectionText });
 
   // The script guards against double-injection; clear the previous run's copy.
   delete g.__arcelleBrowse;
@@ -302,6 +319,11 @@ export function install(scriptSource) {
 
 export function currentDocument() {
   return doc;
+}
+
+/** What `window.getSelection()` reports, for the "Save selection" path. */
+export function setSelection(text) {
+  selectionText = String(text ?? "");
 }
 
 export { doc };

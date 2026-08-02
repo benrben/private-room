@@ -1,0 +1,156 @@
+/* ------------------------------------------------------------------ *
+ * PdfView extras: the selectable text layer over each rasterized page,
+ * and the page box that keeps canvas, text layer and quote highlights on
+ * exactly the same coordinates.
+ *
+ * The `.textLayer` rules are the ones pdf.js itself requires (its spans are
+ * positioned in PERCENT of the page box and sized from `--total-scale-factor`
+ * × `--font-height`) — copied from pdfjs-dist/web/pdf_viewer.css rather than
+ * importing that 100 KB sheet, of which this is the only part we use.
+ * ------------------------------------------------------------------ */
+
+/* Exactly the page: the canvas's own `margin: 0 auto` would otherwise centre
+   it inside a wider wrap, leaving the overlays a few px out. */
+.pdf-page-box {
+  position: relative;
+  margin: 0 auto 14px;
+}
+.pdf-page-box > .pdf-page {
+  margin: 0;
+}
+
+.textLayer {
+  color-scheme: only light;
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  text-align: initial;
+  opacity: 1;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 1;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+}
+
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x))
+    scale(var(--min-font-size-inv));
+}
+
+.textLayer .markedContent {
+  display: contents;
+}
+
+.textLayer ::selection {
+  background: rgba(120, 160, 255, 0.35);
+}
+
+/* The quote highlight and its receipt badge sit above the canvas but BELOW the
+   text layer, so a highlighted passage is still selectable. */
+.pdf-page-box .pdf-hl,
+.pdf-page-box .pdf-hl-badge,
+.pdf-page-box .pdf-find-hl {
+  z-index: 0;
+}
+
+/* ---- ⌘F: find inside this document ---- */
+/* Deliberately NOT the citation yellow: a citation highlight is a receipt
+   ("this sentence is on this page"), a find hit is just where you looked. */
+.pdf-find-hl {
+  position: absolute;
+  background: rgba(120, 160, 255, 0.45);
+  border-radius: 2px;
+  pointer-events: none;
+  mix-blend-mode: multiply;
+}
+
+.pdf-findbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.pdf-find-input {
+  flex: 1;
+  min-width: 0;
+  max-width: 320px;
+  padding: 3px 7px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.pdf-find-count {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---- toolbar: where am I / jump to a page ---- */
+.pdf-page-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.pdf-page-jump input {
+  width: 3.4em;
+  padding: 2px 4px;
+  font: inherit;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+/* Scan progress: a moving readout and a way out of a long, fruitless search. */
+.pdf-scan {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pdf-scan-bar {
+  flex: 1;
+  max-width: 220px;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--line-soft, rgba(255, 255, 255, 0.08));
+}
+.pdf-scan-bar > i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.1s linear;
+}

@@ -20,28 +20,45 @@ const TOO_LARGE: &str = "The page is too large to fetch.";
 
 /// Read a body into memory without trusting the server about its size: reject
 /// on a declared oversize Content-Length, then stream chunks and stop at
-/// `MAX_FETCH_BYTES`. With `truncate` the first cap bytes are kept (for
-/// callers that window the text anyway); otherwise an oversized body errors.
-async fn body_capped(mut resp: reqwest::Response, truncate: bool) -> Result<Vec<u8>, String> {
+/// `limit`. With `truncate` the first `limit` bytes are kept (for callers that
+/// window the text anyway); otherwise an oversized body errors with
+/// `too_large`.
+///
+/// The limit is a PARAMETER because the callers want very different amounts.
+/// A preview needs the `<head>` and an `og:image` needs a card-sized picture —
+/// both used to stream up to the whole 8 MiB page cap and then throw away
+/// almost all of it, which is real bandwidth on a metered connection, eight
+/// results at a time.
+async fn body_capped_to(
+    mut resp: reqwest::Response,
+    limit: usize,
+    truncate: bool,
+    too_large: &str,
+) -> Result<Vec<u8>, String> {
     if !truncate
         && resp
             .content_length()
-            .map_or(false, |len| len > MAX_FETCH_BYTES as u64)
+            .map_or(false, |len| len > limit as u64)
     {
-        return Err(TOO_LARGE.into());
+        return Err(too_large.into());
     }
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        if buf.len() + chunk.len() > MAX_FETCH_BYTES {
+        if buf.len() + chunk.len() > limit {
             if !truncate {
-                return Err(TOO_LARGE.into());
+                return Err(too_large.into());
             }
-            buf.extend_from_slice(&chunk[..MAX_FETCH_BYTES - buf.len()]);
+            buf.extend_from_slice(&chunk[..limit - buf.len()]);
             break;
         }
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+/// The whole-page read: everything up to [`MAX_FETCH_BYTES`].
+async fn body_capped(resp: reqwest::Response, truncate: bool) -> Result<Vec<u8>, String> {
+    body_capped_to(resp, MAX_FETCH_BYTES, truncate, TOO_LARGE).await
 }
 
 /// Decode capped body bytes per the Content-Type charset — what `resp.text()`
@@ -58,32 +75,37 @@ fn decode_body(raw: &[u8], content_type: &str) -> String {
         .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned())
 }
 
-/// Redirect policy for `fetch_page`: cap the hops and refuse any that lands on
-/// a private/loopback address (search keeps the plain policy in `client()`).
-fn guarded_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 5 {
-            return attempt.error("Too many redirects.");
-        }
-        if hop_host_is_public(attempt.url()) {
-            attempt.follow()
-        } else {
-            attempt.error(PRIVATE_BLOCKED)
-        }
-    })
-}
+/// How many redirect hops one fetch may take before it gives up.
+const MAX_REDIRECTS: usize = 5;
 
-/// A client dedicated to `fetch_page`: DNS for `host` is pinned to the
-/// already-checked `addr` (closing the check-vs-fetch rebinding window) and
-/// redirects are re-checked hop by hop.
+/// A client dedicated to ONE HOP of a guarded fetch: DNS for `host` is pinned
+/// to the already-checked `addr` (closing the check-vs-fetch rebinding window)
+/// and redirects are NOT followed here — [`guarded_get`] follows them itself so
+/// every hop gets the same pinning the first one got.
 fn fetch_client(host: &str, addr: SocketAddr) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .user_agent("Mozilla/5.0 (Macintosh) Arcelle/0.1")
-        .redirect(guarded_redirect_policy())
+        .redirect(reqwest::redirect::Policy::none())
         .resolve(host, addr)
         .build()
         .map_err(|e| e.to_string())
+}
+
+/// Where a response says to go next, absolutized against the URL it came from.
+///
+/// `None` for anything that is not a redirect, and for a redirect with no
+/// usable `Location` — which then falls through to the normal status handling
+/// rather than being followed to nowhere.
+fn redirect_target(status: u16, location: Option<&str>, from: &reqwest::Url) -> Option<String> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    let location = location?.trim();
+    if location.is_empty() {
+        return None;
+    }
+    from.join(location).ok().map(|u| u.to_string())
 }
 
 fn html_title(html: &str) -> Option<String> {
@@ -101,23 +123,47 @@ fn html_title(html: &str) -> Option<String> {
 /// check, then SEC-5 pinning — resolve the host, confirm every address is
 /// public, and pin the connection to the checked address so it can't be
 /// swapped for a private one between here and the actual fetch.
+///
+/// Redirects are followed HERE rather than by reqwest, because reqwest's
+/// redirect policy is the wrong shape for this guard. It is synchronous, so it
+/// could only resolve the next hop with the blocking resolver — and then
+/// reqwest resolved that host AGAIN, unpinned, to actually connect. A hostile
+/// server could answer the check with a public address and the connection with
+/// a private one, which is the exact rebinding window the pinning exists to
+/// close. Following the chain by hand means every hop gets the whole guard:
+/// literal check, DNS resolve of ALL addresses, and a client pinned to the one
+/// that was checked.
 async fn guarded_get(url: &str) -> Result<reqwest::Response, String> {
-    let parsed = check_public_http_url(url)?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "Invalid URL: no host.".to_string())?
-        .to_string();
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addr = resolve_public_addr(&host, port).await?;
-    let resp = fetch_client(&host, addr)?
-        .get(parsed)
-        .send()
-        .await
-        .map_err(|e| format!("Could not fetch the page: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("The page returned HTTP {}.", resp.status()));
+    let mut next = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let parsed = check_public_http_url(&next)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "Invalid URL: no host.".to_string())?
+            .to_string();
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let addr = resolve_public_addr(&host, port).await?;
+        let resp = fetch_client(&host, addr)?
+            .get(parsed.clone())
+            .send()
+            .await
+            .map_err(|e| format!("Could not fetch the page: {e}"))?;
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if let Some(target) = redirect_target(resp.status().as_u16(), location.as_deref(), &parsed)
+        {
+            next = target;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("The page returned HTTP {}.", resp.status()));
+        }
+        return Ok(resp);
     }
-    Ok(resp)
+    Err("Too many redirects.".into())
 }
 
 pub async fn fetch_page(url: &str) -> Result<(String, String), String> {
@@ -569,6 +615,46 @@ mod tests {
         assert_eq!(disposition_file_name("inline"), None);
     }
 
+    /// Redirects are followed by hand so every hop gets the same guard the
+    /// first one got — which means this is where the chain is decided.
+    #[test]
+    fn redirect_targets_are_recognised_and_absolutized() {
+        let from = reqwest::Url::parse("https://example.com/a/b").unwrap();
+        // Relative Location resolves against the URL it came from.
+        assert_eq!(
+            redirect_target(302, Some("/next"), &from).as_deref(),
+            Some("https://example.com/next")
+        );
+        // Absolute, including a cross-origin hop — the one the guard must
+        // re-check rather than trust.
+        assert_eq!(
+            redirect_target(301, Some("http://127.0.0.1:11434/api"), &from).as_deref(),
+            Some("http://127.0.0.1:11434/api")
+        );
+        for status in [303, 307, 308] {
+            assert!(redirect_target(status, Some("/x"), &from).is_some(), "{status}");
+        }
+        // Not a redirect, or a redirect with nothing usable to follow: fall
+        // through to the normal status handling instead of chasing nowhere.
+        assert_eq!(redirect_target(200, Some("/x"), &from), None);
+        assert_eq!(redirect_target(404, Some("/x"), &from), None);
+        assert_eq!(redirect_target(302, None, &from), None);
+        assert_eq!(redirect_target(302, Some("   "), &from), None);
+    }
+
+    /// A redirect chain must terminate. `guarded_get` resolves DNS and opens a
+    /// connection per hop, so an unbounded chain is an unbounded fetch.
+    #[test]
+    fn the_redirect_chain_is_bounded() {
+        assert!(MAX_REDIRECTS > 0 && MAX_REDIRECTS <= 10);
+        let src = include_str!("fetch.rs");
+        assert!(
+            src.contains("redirect(reqwest::redirect::Policy::none())"),
+            "reqwest must not follow redirects itself — an auto-followed hop is \
+             resolved a second time, unpinned"
+        );
+    }
+
     #[test]
     fn extracts_html_title() {
         assert_eq!(
@@ -589,6 +675,11 @@ const MAX_PREVIEW_HTML_BYTES: usize = 256 * 1024;
 /// Hard cap per preview image. Real `og:image` files are 20–150 KB; anything
 /// larger is a full-resolution hero shot we have no use for at card size.
 pub const MAX_PREVIEW_IMAGE_BYTES: usize = 200 * 1024;
+
+/// What an oversized preview image says. Distinct from [`TOO_LARGE`]: this is
+/// a thumbnail, and telling the user "the page is too large to fetch" when a
+/// picture was too big explains nothing.
+const IMAGE_TOO_LARGE: &str = "Preview image is too large.";
 
 /// What one enrich pass learns about a result page (BROWSE-3b).
 pub struct PagePreview {
@@ -719,8 +810,10 @@ pub async fn fetch_preview(url: &str) -> Result<PagePreview, String> {
     if !(content_type.contains("html") || content_type.is_empty()) {
         return Err(format!("Not an HTML page (content-type: {content_type})."));
     }
-    let mut raw = body_capped(resp, true).await?;
-    raw.truncate(MAX_PREVIEW_HTML_BYTES);
+    // Stop READING at the preview cap, rather than streaming the whole page in
+    // and then throwing 97% of it away: eight results at up to 8 MiB each is
+    // 64 MB of download for four `<head>` tags apiece.
+    let raw = body_capped_to(resp, MAX_PREVIEW_HTML_BYTES, true, TOO_LARGE).await?;
     let html = decode_body(&raw, &content_type);
     Ok(preview_from_html(url, &html))
 }
@@ -762,16 +855,11 @@ pub async fn fetch_image(url: &str) -> Result<(String, Vec<u8>), String> {
     if !mime.starts_with("image/") {
         return Err(format!("Not an image (content-type: {mime})."));
     }
-    if resp
-        .content_length()
-        .is_some_and(|len| len > MAX_PREVIEW_IMAGE_BYTES as u64)
-    {
-        return Err("Preview image is too large.".into());
-    }
-    let bytes = body_capped(resp, false).await?;
-    if bytes.len() > MAX_PREVIEW_IMAGE_BYTES {
-        return Err("Preview image is too large.".into());
-    }
+    // Capped at the CARD's budget, not the page budget. A server that declares
+    // no Content-Length used to stream up to 8 MiB before the size was checked
+    // — and then reported "The page is too large to fetch", which says nothing
+    // about an image.
+    let bytes = body_capped_to(resp, MAX_PREVIEW_IMAGE_BYTES, false, IMAGE_TOO_LARGE).await?;
     Ok((mime, bytes))
 }
 

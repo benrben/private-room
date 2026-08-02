@@ -22,5 +22,3 @@ export function makeSkillActions(s: WSState) {
 
   return { refreshSkills, openSkill };
 }
-
-export type SkillActions = ReturnType<typeof makeSkillActions>;

@@ -7,7 +7,7 @@ import {
   FileVersion,
   suggestFileMeta,
 } from "../api";
-import { displayName } from "./composer";
+import { displayName, uniqueFileName } from "./composer";
 import { tryToast } from "./guard";
 import { WSState } from "./state";
 
@@ -176,11 +176,10 @@ export function makeFileActions(s: WSState) {
       const name = /\.[^.]+$/.test(title) ? title : `${title}${ext}`;
       await api.renameFile(sug.fileId, name);
       if (s.openFileRef.current?.id === sug.fileId) {
-        // Update BOTH the top-level name and content.name — the viewer header
-        // reads `openFile.content.name`, so touching only the outer name left it
-        // showing the old filename until a reopen.
+        // `content.name` is the ONE name the open file carries — the viewer
+        // header, the breadcrumb and the tab strip all read it.
         s.setOpenFile((o) =>
-          o ? { ...o, name, content: o.content ? { ...o.content, name } : o.content } : o,
+          o ? { ...o, content: o.content ? { ...o.content, name } : o.content } : o,
         );
       }
     }
@@ -276,23 +275,41 @@ export function makeFileActions(s: WSState) {
       const report = await api.importFiles(paths);
       s.setFiles(await api.listFiles());
       reportImport(report);
+    } catch (e) {
+      // Drag-and-drop already reported its failures; the picker used to
+      // swallow them, so a refused import looked like a click that did nothing.
+      s.pushToast("error", `Could not add those files: ${String(e)}`);
     } finally {
       s.setImportProgress(null);
     }
   }
 
   async function removeFile(id: string) {
-    await api.deleteFile(id);
-    s.setFiles(await api.listFiles());
+    try {
+      await api.deleteFile(id);
+    } catch (e) {
+      s.pushToast("error", `Could not remove that file: ${String(e)}`);
+      return;
+    }
     s.setAttachments((a) => a.filter((f) => f.id !== id));
     // A viewer left open on the deleted file would keep fetching a row that
     // no longer exists ("Query returned no rows" toasts).
     if (s.openFileRef.current?.id === id) s.setOpenFile(null);
     s.setRecLive((r) => (r?.fileId === id ? null : r));
+    await tryToast(s, async () => s.setFiles(await api.listFiles()));
   }
 
   async function viewFile(id: string, target?: FileTarget) {
-    s.setOpenFile({ id, content: await api.getFileContent(id), target });
+    let content: FileContent;
+    try {
+      content = await api.getFileContent(id);
+    } catch (e) {
+      // Opening is the most-used action in the app; failing it silently left
+      // the previous file on screen and read as a dead click.
+      s.pushToast("error", `Could not open that file: ${String(e)}`);
+      return;
+    }
+    s.setOpenFile({ id, content, target });
     s.setEditMode(false);
     s.setShowMap(false);
   }
@@ -340,23 +357,77 @@ print(data.upper())
     }
   }
 
+  /** The editor calls this and immediately paints "all changes saved" — its
+   * onSave is fire-and-forget — so a failed write MUST be loud here, and must
+   * leave the dirty mirror raised so the unsaved-edits guard still stops a tab
+   * switch from throwing the text away. */
   async function saveEdit(newText: string) {
-    if (!s.openFile) return;
-    await api.updateFileContent(s.openFile.id, newText);
-    s.setFiles(await api.listFiles());
+    const current = s.openFile;
+    if (!current) return;
+    try {
+      await api.updateFileContent(current.id, newText);
+    } catch (e) {
+      s.editorDirtyRef.current = true;
+      s.pushToast(
+        "error",
+        `Could not save "${current.content.name}" — your edit is still in the editor. ${String(e)}`,
+      );
+      return;
+    }
     s.setOpenFile({
-      ...s.openFile,
-      content: { ...s.openFile.content, text: newText },
+      ...current,
+      content: { ...current.content, text: newText },
     });
-    s.pushToast("success", `Saved "${s.openFile.content.name}".`);
+    s.pushToast("success", `Saved "${current.content.name}".`);
+    await tryToast(s, async () => s.setFiles(await api.listFiles()));
   }
 
   async function saveEditAsCopy(newText: string) {
-    if (!s.openFile) return;
-    const base = s.openFile.content.name.replace(/\.[^.]+$/, "");
-    const meta = await api.saveGeneratedFile(`${base} (edited).md`, newText);
-    s.setFiles(await api.listFiles());
-    s.pushToast("success", `Saved "${meta.name}" into the room — the original file is unchanged.`);
+    const current = s.openFile;
+    if (!current) return;
+    const base = current.content.name.replace(/\.[^.]+$/, "");
+    try {
+      const meta = await api.saveGeneratedFile(`${base} (edited).md`, newText);
+      s.setFiles(await api.listFiles());
+      s.pushToast("success", `Saved "${meta.name}" into the room — the original file is unchanged.`);
+    } catch (e) {
+      s.editorDirtyRef.current = true;
+      s.pushToast(
+        "error",
+        `Could not save a copy of "${current.content.name}" — your edit is still in the editor. ${String(e)}`,
+      );
+    }
+  }
+
+  /** Branch the open note: a second file in the room with the same text.
+   * Without this the only way to fork a file was to export a copy out of the
+   * room and import it back. Offered for genuinely editable text only — the
+   * stored bytes of a PDF or a recording cannot be copied from here. */
+  async function duplicateOpenFile() {
+    const current = s.openFile;
+    if (!current || current.content.text == null) return;
+    const name = current.content.name;
+    const dot = name.lastIndexOf(".");
+    const base = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : "";
+    try {
+      // Duplicate twice and "<base> (copy)" is taken; Rust does not dedup
+      // (`save_generated_impl` inserts straight through), so the library would
+      // hold two indistinguishable rows and a source chip could only ever open
+      // the newer one. "(copy) 2" instead.
+      const meta = await api.saveGeneratedFile(
+        uniqueFileName(
+          `${base} (copy)${ext}`,
+          s.files.map((f) => f.name),
+        ),
+        current.content.text,
+      );
+      s.setFiles(await api.listFiles());
+      await viewFile(meta.id);
+      s.pushToast("success", `Duplicated as "${meta.name}".`);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
   }
 
   async function editCell(sheet: string, cell: string, value: string) {
@@ -434,11 +505,10 @@ print(data.upper())
     await tryToast(s, () => api.renameFile(pending.id, name), async () => {
       s.setFiles(await api.listFiles());
       if (s.openFileRef.current?.id === pending.id) {
-        // Update BOTH the top-level name and content.name — the viewer header
-        // reads `openFile.content.name`, so touching only the outer name left it
-        // showing the old filename until a reopen.
+        // `content.name` is the ONE name the open file carries — the viewer
+        // header, the breadcrumb and the tab strip all read it.
         s.setOpenFile((o) =>
-          o ? { ...o, name, content: o.content ? { ...o.content, name } : o.content } : o,
+          o ? { ...o, content: o.content ? { ...o.content, name } : o.content } : o,
         );
       }
     });
@@ -468,7 +538,7 @@ print(data.upper())
     undoEdits, suggestImports, dismissImportSuggestion, applyImportSuggestion,
     applyAllImportSuggestions, dismissAllImportSuggestions,
     reportImport, importFiles, removeFile, viewFile, createNewNote, createNewScript, saveEdit, saveEditAsCopy,
-    editCell, editModeOf, startCreateFolder, commitCreateFolder,
+    duplicateOpenFile, editCell, editModeOf, startCreateFolder, commitCreateFolder,
     commitFolderRename, deleteFolder, moveFile, commitRenameFile,
     toggleFolderCollapse, clampMenu,
   };

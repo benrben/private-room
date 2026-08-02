@@ -37,7 +37,12 @@ struct SendCell<T>(T);
 unsafe impl<T> Send for SendCell<T> {}
 
 pub struct TapIvars {
-    on_samples: Box<dyn Fn(&[f32]) + Send + Sync>,
+    on_samples: Box<dyn Fn(&[f32], u32) + Send + Sync>,
+    /// The sample rate macOS actually negotiated, read back from the
+    /// configuration rather than assumed. It has always been what we asked
+    /// for; if a future macOS answers differently the engine resamples
+    /// instead of playing and transcribing the meeting at the wrong speed.
+    rate: u32,
 }
 
 define_class!(
@@ -60,15 +65,15 @@ define_class!(
                 return;
             }
             if let Some(samples) = extract_f32(sample_buffer) {
-                (self.ivars().on_samples)(&samples);
+                (self.ivars().on_samples)(&samples, self.ivars().rate);
             }
         }
     }
 );
 
 impl TapOutput {
-    fn new(on_samples: Box<dyn Fn(&[f32]) + Send + Sync>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(TapIvars { on_samples });
+    fn new(on_samples: Box<dyn Fn(&[f32], u32) + Send + Sync>, rate: u32) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(TapIvars { on_samples, rate });
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -110,7 +115,13 @@ pub struct SysAudioTap {
 impl SysAudioTap {
     /// Set up and start the tap. Blocking (shareable-content lookup + capture
     /// start round-trips); call from a worker thread, never the main one.
-    pub fn start(on_samples: Box<dyn Fn(&[f32]) + Send + Sync>) -> Result<SysAudioTap, String> {
+    /// `on_samples` is handed each batch together with the sample rate macOS
+    /// negotiated for the stream — asked for, but read back rather than
+    /// assumed, so a rate we did not get is resampled instead of silently
+    /// shifting the whole meeting lane's pitch and timing.
+    pub fn start(
+        on_samples: Box<dyn Fn(&[f32], u32) + Send + Sync>,
+    ) -> Result<SysAudioTap, String> {
         // Audio capture arrived in ScreenCaptureKit with macOS 13.
         let os = NSProcessInfo::processInfo().operatingSystemVersion();
         if os.majorVersion < 13 {
@@ -161,11 +172,14 @@ impl SysAudioTap {
             config.setWidth(2);
             config.setHeight(2);
         }
+        // What macOS settled on, not what we asked for.
+        let rate = unsafe { config.sampleRate() };
+        let rate = if rate > 0 { rate as u32 } else { SAMPLE_RATE as u32 };
         let stream = unsafe {
             SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None)
         };
 
-        let output = TapOutput::new(on_samples);
+        let output = TapOutput::new(on_samples, rate);
         let queue = DispatchQueue::new("com.benreich.privateroom.sysaudio", None);
         unsafe {
             stream

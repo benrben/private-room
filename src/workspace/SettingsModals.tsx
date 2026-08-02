@@ -233,8 +233,11 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
     <div
       className="settings-backdrop"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !s.importingLink)
-          s.setShowAddLink(false);
+        // Closing is ALWAYS allowed. A video download runs for minutes, and
+        // with every dismissal switched off the whole app was held hostage by
+        // a download started by mistake. The fetch keeps going in the
+        // background and still reports itself with a toast.
+        if (e.target === e.currentTarget) s.setShowAddLink(false);
       }}
     >
       <div className="settings add-link-modal">
@@ -249,7 +252,6 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
             className="subtle btn-ic"
             title="Close"
             onClick={() => s.setShowAddLink(false)}
-            disabled={s.importingLink}
           >
             <CloseIcon size={12} />
           </button>
@@ -273,7 +275,7 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
             onChange={(e) => s.setLinkUrl(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") submit();
-              if (e.key === "Escape" && !s.importingLink) s.setShowAddLink(false);
+              if (e.key === "Escape") s.setShowAddLink(false);
             }}
           />
           {/* BROWSE-2: the video option is offered for every URL — yt-dlp
@@ -315,7 +317,8 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
           {downloading && (
             <span className="banner-pull">
               <span className="banner-pull-label">
-                Downloading <strong>video</strong>…
+                Downloading <strong>video</strong>… you can close this — it
+                keeps going and lands in the room.
               </span>
               <span className="pull-bar">
                 <span
@@ -331,12 +334,8 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
             </span>
           )}
           <div className="settings-actions">
-            <button
-              className="subtle"
-              onClick={() => s.setShowAddLink(false)}
-              disabled={s.importingLink}
-            >
-              Cancel
+            <button className="subtle" onClick={() => s.setShowAddLink(false)}>
+              {s.importingLink ? "Close" : "Cancel"}
             </button>
             <button
               className="primary"

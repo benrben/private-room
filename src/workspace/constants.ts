@@ -35,6 +35,11 @@ export const RECOMMENDED_MODELS: {
   },
 ];
 
+/** Room setting recording that the Memory introduction has been seen. A room
+ * setting, not a browser key: it must survive renaming/moving the room file and
+ * must never be shared between two rooms that happen to be named alike. */
+export const MEMORY_INTRO_SEEN = "memory_intro_seen";
+
 /** Client-only "#help" command. It isn't a backend command (it opens the
  * command list in the composer instead of asking the model), so it's kept
  * separate from `list_chat_commands` and only surfaced in the UI hints. */

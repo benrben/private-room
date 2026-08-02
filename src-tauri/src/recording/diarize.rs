@@ -67,6 +67,7 @@ mod fbank;
 mod titanet;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -353,9 +354,18 @@ impl VoicePrint {
         self.voiced_frames == 0 || self.vec.iter().all(|x| *x == 0.0)
     }
 
-    /// Enough speech to define a voice rather than merely be labeled with one.
+    /// Enough speech to define a voice rather than merely be labeled with one,
+    /// at a caller-chosen evidence scale: whole phrases use
+    /// [`MIN_NEW_VOICE_FRAMES`], the split pass's 1.5 s sub-windows use
+    /// [`SPLIT_MIN_VOICE_FRAMES`]. THE rule — `cluster_gated` calls this, so
+    /// the app and the tests can never be measuring different things.
+    pub fn defines_voice(&self, min_frames: usize) -> bool {
+        self.voiced_frames >= min_frames && !self.is_silent()
+    }
+
+    /// [`Self::defines_voice`] at the phrase scale.
     pub fn is_strong(&self) -> bool {
-        self.voiced_frames >= MIN_NEW_VOICE_FRAMES && !self.is_silent()
+        self.defines_voice(MIN_NEW_VOICE_FRAMES)
     }
 }
 
@@ -742,8 +752,8 @@ fn cluster_gated(
     min_voice_frames: usize,
 ) -> Vec<Option<usize>> {
     debug_assert_eq!(prints.len(), spans.len());
-    let defines = |p: &VoicePrint| p.voiced_frames >= min_voice_frames && !p.is_silent();
-    let strong: Vec<usize> = (0..prints.len()).filter(|i| defines(prints[*i])).collect();
+    let strong: Vec<usize> =
+        (0..prints.len()).filter(|i| prints[*i].defines_voice(min_voice_frames)).collect();
     let mut out = vec![None; prints.len()];
     if strong.is_empty() {
         // Nothing long enough to define a voice: everyone who spoke is one.
@@ -1022,7 +1032,7 @@ fn cluster_gated(
             let mut sums: Vec<Vec<f32>> = vec![vec![0f32; units[0].len()]; k];
             let mut mass = vec![0usize; k];
             for (w, i) in seq.iter().enumerate() {
-                if !defines(prints[*i]) {
+                if !prints[*i].defines_voice(min_voice_frames) {
                     continue;
                 }
                 let fr = prints[*i].voiced_frames.max(1) as f32;
@@ -1162,6 +1172,11 @@ impl SpeakerBook {
 /// generation (see `lane_voices`). Returns true when a label actually moved,
 /// so the caller can tell the UI.
 ///
+/// `names` is the user's label → name overlay (GH #5). It is carried WITH the
+/// voice: when a group's label changes, the name the user typed changes label
+/// with it. Keying the name to a label alone meant that every time the
+/// clusterer moved a label, "Dana" appeared on somebody else's lines.
+///
 /// **A lane is not a person, but it is a wall.** Colleagues in the room share
 /// one microphone, so mic phrases must be clustered rather than all called
 /// "You". Yet once the microphone's echo of the meeting has been removed
@@ -1169,7 +1184,11 @@ impl SpeakerBook {
 /// only the room, the system lane only the meeting. No voice can span both, so
 /// each lane is clustered on its own — which also keeps two similar voices on
 /// opposite sides of the wall from being merged into one person.
-pub fn relabel(segments: &mut [RecSegment], max_speakers: usize) -> bool {
+pub fn relabel(
+    segments: &mut [RecSegment],
+    max_speakers: usize,
+    names: &mut BTreeMap<String, String>,
+) -> bool {
     let cap = if max_speakers == 0 { AUTO_MAX_SPEAKERS } else { max_speakers };
     let in_room = lane_voices(segments, "mic", cap);
     let in_meeting = lane_voices(segments, "sys", cap);
@@ -1180,17 +1199,48 @@ pub fn relabel(segments: &mut [RecSegment], max_speakers: usize) -> bool {
     if phrases < 2 {
         return false;
     }
-    apply_names(segments, &in_room, &in_meeting)
+    apply_names(segments, &in_room, &in_meeting, names)
+}
+
+/// Move the user's names onto the labels their voices now carry.
+///
+/// `moves` is (the label a group used to show, the label it shows now), one
+/// entry per group whose label changed. A swap is handled because the new map
+/// is built from scratch rather than edited in place, and a name whose voice
+/// vanished from the transcript is dropped rather than left to attach itself
+/// to whoever inherits the number.
+fn move_names(names: &mut BTreeMap<String, String>, moves: &[(String, String)]) {
+    if names.is_empty() || moves.is_empty() {
+        return;
+    }
+    let mut next: BTreeMap<String, String> = BTreeMap::new();
+    for (from, to) in moves {
+        if let Some(name) = names.get(from) {
+            next.insert(to.clone(), name.clone());
+        }
+    }
+    // Labels no group moved away from keep their name — unless a mover has
+    // already claimed that label, whose name wins.
+    for (label, name) in names.iter() {
+        if moves.iter().any(|(from, _)| from == label) {
+            continue;
+        }
+        next.entry(label.clone()).or_insert_with(|| name.clone());
+    }
+    *names = next;
 }
 
 /// Turn per-lane voice GROUPS (segment indices per voice) into on-screen
 /// names — "You" for the mic's main talker, sticky "Speaker N" for everyone
 /// else — and write them. Shared by [`relabel`] (phrase groups) and
 /// [`split_by_voice`] (sub-window groups): one naming brain, two clusterings.
+///
+/// The user's typed names travel with the groups (see [`move_names`]).
 fn apply_names(
     segments: &mut [RecSegment],
     in_room: &[Vec<usize>],
     in_meeting: &[Vec<usize>],
+    names: &mut BTreeMap<String, String>,
 ) -> bool {
     // Whoever does most of the talking into this Mac's microphone is its
     // owner. (Not "the mic lane" — the colleague beside them is on it too.)
@@ -1253,6 +1303,34 @@ fn apply_names(
     if let Some(you) = you {
         named.push((&in_room[you], "You".to_string()));
     }
+
+    // What each group was CALLED before this pass — the label most of its
+    // phrases show on screen — so the user's name for that voice can follow
+    // it to whatever label it is about to get.
+    let mut moves: Vec<(String, String)> = Vec::new();
+    for (group, name) in &named {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for slot in group.iter() {
+            let label = segments[*slot].speaker.as_str();
+            match counts.iter_mut().find(|(l, _)| *l == label) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((label, 1)),
+            }
+        }
+        let was = counts
+            .iter()
+            .fold(None::<(&str, usize)>, |best, (l, n)| match best {
+                Some((_, m)) if *n <= m => best,
+                _ => Some((l, *n)),
+            })
+            .map(|(l, _)| l.to_string());
+        // A voice that split in two: only the first piece inherits the name,
+        // rather than the same person appearing twice under it.
+        if let Some(was) = was.filter(|w| w != name && !moves.iter().any(|(f, _)| f == w)) {
+            moves.push((was, name.clone()));
+        }
+    }
+    move_names(names, &moves);
 
     let mut changed = false;
     for (group, name) in named {
@@ -1363,11 +1441,14 @@ fn span_print(wins: &[(i64, i64, VoicePrint)], t0: i64, t1: i64) -> Option<Voice
 /// same [`apply_names`] the phrase path uses.
 ///
 /// `wins_for` supplies a segment's sub-window prints (from the decode-time
-/// cache, or embedded on the spot from the recording). Lanes stay walls, as
-/// in [`relabel`]. Returns true when the transcript changed.
+/// cache, or embedded on the spot from the recording). `names` is the user's
+/// label → name overlay, carried with the voices exactly as in [`relabel`].
+/// Lanes stay walls, as in [`relabel`]. Returns true when the transcript
+/// changed.
 pub fn split_by_voice(
     segments: &mut Vec<RecSegment>,
     max_speakers: usize,
+    names: &mut BTreeMap<String, String>,
     mut wins_for: impl FnMut(&RecSegment) -> Vec<(i64, i64, VoicePrint)>,
 ) -> bool {
     let cap = if max_speakers == 0 { AUTO_MAX_SPEAKERS } else { max_speakers };
@@ -1503,7 +1584,7 @@ pub fn split_by_voice(
         }
     }
     let [mic_groups, sys_groups] = groups;
-    let renamed = apply_names(&mut rebuilt, &mic_groups, &sys_groups);
+    let renamed = apply_names(&mut rebuilt, &mic_groups, &sys_groups, names);
     if split_any || renamed {
         *segments = rebuilt;
         return true;
@@ -1643,7 +1724,7 @@ mod tests {
             lang: None,
             voice: Some(nembed(&audio)),
         }];
-        let changed = split_by_voice(&mut segments, 0, |seg| {
+        let changed = split_by_voice(&mut segments, 0, &mut BTreeMap::new(), |seg| {
             let i0 = seg.t0.max(0) as usize * (SAMPLE_RATE / 100);
             let i1 = (seg.t1.max(0) as usize * (SAMPLE_RATE / 100)).min(audio.len());
             window_prints(&audio[i0..i1], seg.t0)
@@ -1911,7 +1992,7 @@ mod tests {
             // What the live pass got wrong after the resume: a third voice.
             seg("Speaker 3", "sys", Some(nembed(&sam2))),
         ];
-        assert!(relabel(&mut segments, 0), "the drifted new label was never corrected");
+        assert!(relabel(&mut segments, 0, &mut BTreeMap::new()), "the drifted new label was never corrected");
         assert_eq!(segments[0].speaker, "Speaker 4", "old-generation label must not move");
         assert_eq!(segments[1].speaker, "Speaker 5", "old-generation label must not move");
         assert_eq!(segments[2].speaker, "Speaker 1");
@@ -2191,14 +2272,14 @@ mod tests {
             seg("You", "mic", Some(dsp_embed(&dan2))),
             seg("Speaker 9", "sys", None), // legacy row, no voiceprint
         ];
-        assert!(relabel(&mut segments, 0), "expected a correction");
+        assert!(relabel(&mut segments, 0, &mut BTreeMap::new()), "expected a correction");
         assert_eq!(segments[0].speaker, "Speaker 1");
         assert_eq!(segments[1].speaker, "You", "the mic-dominant voice is you");
         assert_eq!(segments[2].speaker, "Speaker 1", "phantom speaker survived");
         assert_eq!(segments[3].speaker, "You");
         assert_eq!(segments[4].speaker, "Speaker 9", "legacy segment must be left alone");
         // Idempotent: a second pass changes nothing.
-        assert!(!relabel(&mut segments, 0));
+        assert!(!relabel(&mut segments, 0, &mut BTreeMap::new()));
     }
 
     /// A re-cluster must not renumber people who never changed. First-
@@ -2216,7 +2297,7 @@ mod tests {
             seg("Speaker 1", "sys", Some(dsp_embed(&dan))),
             seg("Speaker 2", "sys", Some(dsp_embed(&sam2))),
         ];
-        assert!(!relabel(&mut segments, 0), "nothing moved, so nothing may change");
+        assert!(!relabel(&mut segments, 0, &mut BTreeMap::new()), "nothing moved, so nothing may change");
         assert_eq!(segments[0].speaker, "Speaker 2");
         assert_eq!(segments[1].speaker, "Speaker 1");
         assert_eq!(segments[2].speaker, "Speaker 2");
@@ -2235,7 +2316,7 @@ mod tests {
             seg("Speaker 1", "sys", Some(dsp_embed(&sam2))),
             seg("Speaker 6", "sys", Some(dsp_embed(&dan))),
         ];
-        relabel(&mut segments, 0);
+        relabel(&mut segments, 0, &mut BTreeMap::new());
         assert_eq!(segments[0].speaker, "Speaker 1");
         assert_eq!(segments[1].speaker, "Speaker 1");
         assert_eq!(segments[2].speaker, "Speaker 2", "the stray high number must compact");
@@ -2254,7 +2335,7 @@ mod tests {
             seg("Speaker 1", "sys", Some(dsp_embed(&sam2))),
             seg("Speaker 2", "sys", Some(dsp_embed(&sam3))), // the resume's fresh number
         ];
-        assert!(relabel(&mut segments, 0), "the drifted label was never corrected");
+        assert!(relabel(&mut segments, 0, &mut BTreeMap::new()), "the drifted label was never corrected");
         assert!(segments.iter().all(|s| s.speaker == "Speaker 1"), "{segments:?}");
     }
 
@@ -2270,7 +2351,7 @@ mod tests {
             seg("You", "mic", Some(dsp_embed(&sam))), // in the room, not at the Mac
             seg("You", "mic", Some(dsp_embed(&dan2))),
         ];
-        assert!(relabel(&mut segments, 0), "the room's second voice went unnoticed");
+        assert!(relabel(&mut segments, 0, &mut BTreeMap::new()), "the room's second voice went unnoticed");
         assert_eq!(segments[0].speaker, "You", "most of the mic's speech is yours");
         assert_eq!(segments[1].speaker, "Speaker 1");
         assert_eq!(segments[2].speaker, "You");
@@ -2288,7 +2369,7 @@ mod tests {
             seg("x", "sys", Some(dsp_embed(&dan))),
             seg("x", "sys", Some(dsp_embed(&sam2))),
         ];
-        relabel(&mut segments, 0);
+        relabel(&mut segments, 0, &mut BTreeMap::new());
         assert!(
             segments.iter().all(|s| s.speaker != "You"),
             "a voice the microphone never heard was called 'You'",
@@ -2296,6 +2377,63 @@ mod tests {
         assert_eq!(segments[0].speaker, "Speaker 1");
         assert_eq!(segments[1].speaker, "Speaker 2");
         assert_eq!(segments[2].speaker, "Speaker 1");
+    }
+
+    /// GH #5: a name is attached to a VOICE, not to the label string. When a
+    /// re-cluster moves a group's number, the name the user typed moves with
+    /// it — it used to stay on the number and land on somebody else's lines.
+    #[test]
+    fn a_typed_name_follows_its_voice_when_the_label_moves() {
+        let unit = |axis: usize| {
+            let mut vec = vec![0.0f32; BANDS - 1];
+            vec[axis] = 1.0;
+            VoicePrint { vec, voiced_frames: MIN_NEW_VOICE_FRAMES * 2 }
+        };
+        // One voice, mislabeled by the live pass as two: the second half went
+        // out under "Speaker 2" and the user named THAT one "Dana".
+        let mut segments = vec![
+            seg("Speaker 1", "sys", Some(unit(0))),
+            seg("Speaker 2", "sys", Some(unit(0))),
+            seg("Speaker 2", "sys", Some(unit(0))),
+        ];
+        let mut names = BTreeMap::from([("Speaker 2".to_string(), "Dana".to_string())]);
+        assert!(relabel(&mut segments, 0, &mut names), "the split labels were never merged");
+        let merged = segments[0].speaker.clone();
+        assert!(segments.iter().all(|s| s.speaker == merged), "{segments:?}");
+        assert_eq!(
+            names.get(merged.as_str()).map(String::as_str),
+            Some("Dana"),
+            "the name did not follow the voice: {names:?}",
+        );
+        assert_eq!(names.len(), 1, "a stale entry was left behind: {names:?}");
+    }
+
+    /// The name map is rebuilt, not edited in place, so two voices trading
+    /// numbers trade their names too instead of one overwriting the other.
+    #[test]
+    fn swapped_labels_swap_their_names() {
+        let mut names = BTreeMap::from([
+            ("Speaker 1".to_string(), "Ana".to_string()),
+            ("Speaker 2".to_string(), "Ben".to_string()),
+            ("Speaker 3".to_string(), "Cy".to_string()),
+        ]);
+        move_names(
+            &mut names,
+            &[
+                ("Speaker 1".to_string(), "Speaker 2".to_string()),
+                ("Speaker 2".to_string(), "Speaker 1".to_string()),
+            ],
+        );
+        assert_eq!(names.get("Speaker 1").map(String::as_str), Some("Ben"));
+        assert_eq!(names.get("Speaker 2").map(String::as_str), Some("Ana"));
+        // A label nothing moved away from keeps its name.
+        assert_eq!(names.get("Speaker 3").map(String::as_str), Some("Cy"));
+
+        // A voice that left the transcript takes its name with it rather than
+        // leaving it for whoever inherits the number.
+        let mut gone = BTreeMap::from([("Speaker 2".to_string(), "Dana".to_string())]);
+        move_names(&mut gone, &[("Speaker 2".to_string(), "You".to_string())]);
+        assert_eq!(gone, BTreeMap::from([("You".to_string(), "Dana".to_string())]));
     }
 
     #[test]
@@ -2368,5 +2506,38 @@ mod tests {
             let got = id.expect("phantom windows labeled");
             assert!(got == a || got == b, "tiny cluster founded speaker {got}");
         }
+    }
+
+    /// The evidence bar the clusterer applies IS `VoicePrint::defines_voice`,
+    /// at whichever scale the pass runs on — there is no second, hand-written
+    /// copy of the rule that could drift away from the one under test.
+    #[test]
+    fn defines_voice_is_the_bar_the_clusterer_uses() {
+        let print = |frames: usize| {
+            let mut vec = vec![0.0f32; BANDS - 1];
+            vec[0] = 1.0;
+            VoicePrint { vec, voiced_frames: frames }
+        };
+        // Between the two scales: a sub-window may define a voice, a phrase
+        // that short may not.
+        let middling = print(SPLIT_MIN_VOICE_FRAMES + 1);
+        assert!(middling.defines_voice(SPLIT_MIN_VOICE_FRAMES));
+        assert!(!middling.defines_voice(MIN_NEW_VOICE_FRAMES));
+        assert!(!middling.is_strong(), "is_strong is the phrase scale");
+        assert!(print(MIN_NEW_VOICE_FRAMES).is_strong());
+        // Silence never defines a voice, however many frames it claims.
+        let silent = VoicePrint { vec: vec![0.0f32; BANDS - 1], voiced_frames: 10_000 };
+        assert!(!silent.defines_voice(1));
+
+        // And the clusterer agrees: with only sub-bar prints there is nothing
+        // to found a voice on, so everyone who spoke collapses onto one.
+        let prints = vec![middling.clone(), middling.clone(), print(SPLIT_MIN_VOICE_FRAMES)];
+        let refs: Vec<&VoicePrint> = prints.iter().collect();
+        let spans: Vec<(i64, i64)> =
+            (0..prints.len()).map(|i| (i as i64 * 300, i as i64 * 300 + 200)).collect();
+        assert_eq!(
+            cluster_gated(&refs, &spans, 8, MIN_NEW_VOICE_FRAMES),
+            vec![Some(0), Some(0), Some(0)]
+        );
     }
 }

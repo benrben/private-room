@@ -7,8 +7,9 @@ char-length estimate: bucket every message's byte length by what it is
 (system prompt / conversation history / tool result / skill content / file
 read), then — when a real aggregate is known for the round — scale the
 estimated shares proportionally so they sum to the real number instead of the
-rougher char-based one. `CHARS_PER_TOKEN` is a conservative display estimate
-shared with the Rust-side accounting.
+rougher char-based one. When no aggregate is known the estimate is all there
+is, so it uses the ratio the app has actually MEASURED this session
+(:func:`.model_limits.bytes_per_token`) rather than the cold-start constant.
 """
 
 from __future__ import annotations
@@ -18,10 +19,15 @@ from typing import Any
 from .budget import msg_len
 from .chat import RoundUsage
 from .messages import Message
+from .model_limits import BYTES_PER_TOKEN, bytes_per_token
 from .routing import SKILL_TOOL_NAMES
 
-#: chars/token — kept identical to token_usage.rs.
-CHARS_PER_TOKEN: int = 3
+#: bytes/token before anything has been measured — the cold-start floor, kept
+#: identical to `token_usage.rs`'s `CHARS_PER_TOKEN` (that module runs this same
+#: categorization for the external CLI engines). It is only the FLOOR: measured
+#: 2026-07-28, ordinary English prose runs 5.89 B/token, so estimating at a flat
+#: 3 told the user they had burned about twice the tokens they had.
+CHARS_PER_TOKEN: int = BYTES_PER_TOKEN
 
 #: The built-in tools whose results are literal file text/excerpts
 #: (agent.rs BUILTIN_TOOL_NAMES / room_mcp.rs — "search_room"/"open_file").
@@ -33,10 +39,15 @@ CATEGORIES: tuple[str, ...] = ("system", "history", "tools", "skills", "files")
 
 
 def categorize_messages(messages: list[Message], tools_chars: int) -> dict[str, int]:
-    """Bucket every message's byte length into one of the 5 categories.
+    """Bucket every message's byte cost into one of the 5 categories.
 
     ``tools_chars`` seeds "tools" — the serialized tool-catalog schema actually
     offered THIS round (the tool-less final round offers none, so pass 0 then).
+
+    A picture is charged at :data:`.budget.IMAGE_BYTES` by ``msg_len``, so an
+    attached screenshot lands in "files" at what it really costs the prompt.
+    Measuring only its caption gave the heaviest turns in the app the smallest
+    "files" slice.
     """
     totals: dict[str, int] = {c: 0 for c in CATEGORIES}
     totals["tools"] += max(tools_chars, 0)
@@ -71,8 +82,16 @@ def build_usage_event(
     breakdown describes; the model's own reply only enters context on the
     NEXT round (once persisted as an assistant message), so it is correctly
     left out of "total tokens consumed so far".
+
+    The estimate divides by the LIVE bytes-per-token ratio, not by
+    :data:`CHARS_PER_TOKEN`. On the rounds where an engine reports no usage the
+    estimate is the whole bar, and a flat 3 against the 5.89 the app measured
+    for English prose told the user they had spent roughly double.
     """
-    est_breakdown = {c: max(breakdown_chars.get(c, 0), 0) // CHARS_PER_TOKEN for c in CATEGORIES}
+    per_token = bytes_per_token()
+    est_breakdown = {
+        c: int(max(breakdown_chars.get(c, 0), 0) / per_token) for c in CATEGORIES
+    }
     est_total = sum(est_breakdown.values())
     real_total = usage.input_tokens if usage.is_real else None
 

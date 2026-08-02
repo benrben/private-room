@@ -12,6 +12,8 @@ import {
 } from "../icons";
 import { displayName } from "./composer";
 import { isCloudEngine, isExternalEngine } from "./markup";
+import { bestLocalModel } from "./localModel";
+import { RECOMMENDED_MODELS } from "./constants";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import TokenBudgetBar from "./TokenBudgetBar";
@@ -60,6 +62,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
             <button
               className="tidy-dismiss"
               title="Dismiss"
+              aria-label="Dismiss these suggestions"
               onClick={() => a.dismissAllImportSuggestions()}
             >
               <CloseIcon size={12} />
@@ -97,19 +100,46 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
           </div>
         ))
       )}
-      {isCloudEngine(s.model) && (
-        <div className="cloud-strip" title="This room is using a cloud model — your prompts and attached context are sent to it.">
-          <span className="cloud-strip-label">
-            <CloudIcon size={13} /> Cloud · leaves this Mac
-          </span>
-          <button
-            className="cloud-strip-action"
-            onClick={() => a.changeModel(s.ai?.defaultModel ?? "")}
-          >
-            Use local
-          </button>
-        </div>
-      )}
+      {isCloudEngine(s.model) &&
+        (() => {
+          // "Use local" has to land on a model that actually runs on this Mac.
+          // `ai.defaultModel` echoes the room's SAVED model setting, which in a
+          // cloud room is the cloud model itself — switching to it was a no-op.
+          // Taking the FIRST installed model instead is no better: that list is
+          // Ollama's raw /api/tags order, so it can name the grounding model or
+          // a 1B with no tool calling. Ask in the host's own preference order.
+          const localModel = bestLocalModel(
+            (s.ai?.models ?? []).filter((m) => !isCloudEngine(m)),
+            RECOMMENDED_MODELS.map((m) => m.name),
+          );
+          return (
+            <div className="cloud-strip" title="This room is using a cloud model — your prompts and attached context are sent to it.">
+              <span className="cloud-strip-label">
+                <CloudIcon size={13} /> Cloud · leaves this Mac
+              </span>
+              <button
+                className="cloud-strip-action"
+                title={
+                  localModel
+                    ? `Switch this room to ${localModel}, which runs on this Mac`
+                    : "No on-device model is installed yet"
+                }
+                onClick={() => {
+                  if (!localModel) {
+                    s.pushToast(
+                      "info",
+                      "No on-device model is installed yet — download one in Settings → AI model.",
+                    );
+                    return;
+                  }
+                  void a.changeModel(localModel);
+                }}
+              >
+                Use local
+              </button>
+            </div>
+          );
+        })()}
       {/* Engine parity: every engine can reach these tools now — local and
           `:cloud` through the sidecar loop, external CLIs through the room
           bridge (web always when enabled; connected MCP tools only when the
@@ -142,13 +172,16 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
         const q = s.question.trim().toLowerCase();
         if (!q) return null;
         const attachedIds = new Set(s.attachments.map((f) => f.id));
-        const hit = s.files.find(
-          (f) =>
-            f.mimeType.startsWith("image/") &&
-            !attachedIds.has(f.id) &&
-            f.name.length >= 3 &&
-            q.includes(f.name.toLowerCase()),
-        );
+        // Match the name the user actually SEES as well as the stored one:
+        // every list in the app labels files with `displayName` (no extension),
+        // so "what's in the receipt?" must nudge just like "receipt.png" does.
+        const hit = s.files.find((f) => {
+          if (!f.mimeType.startsWith("image/") || attachedIds.has(f.id)) return false;
+          const names = [f.name, displayName(f.name)];
+          return names.some(
+            (n) => n.length >= 3 && q.includes(n.toLowerCase()),
+          );
+        });
         if (!hit) return null;
         return (
           <div className="attach-nudge">
@@ -222,6 +255,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               <button
                 className="toast-close"
                 title="Close"
+                aria-label="Close the command list"
                 onClick={() => s.setShowHelp(false)}
               >
                 <CloseIcon size={12} />
@@ -300,7 +334,10 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
             <button
               className={`icon-btn mic-btn ${a.micState("composer").cls}`}
               title={a.micState("composer").title}
-              disabled={a.micState("composer").disabled || s.asking}
+              aria-label={a.micState("composer").title}
+              // NOT gated on `asking`: the box itself stays typable while an
+              // answer streams, so speaking the next question must be too.
+              disabled={a.micState("composer").disabled}
               onClick={() => {
                 // Streaming dictation paints the words into the box as they
                 // are spoken; the shaped final replaces them. `base` is what
@@ -319,6 +356,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               <button
                 className="send-btn stop"
                 title="Stop this answer"
+                aria-label="Stop this answer"
                 onClick={a.stopAsk}
               >
                 <StopIcon size={14} />
@@ -327,6 +365,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               <button
                 className="send-btn"
                 title="Send ⏎"
+                aria-label="Send"
                 onClick={() => void a.send()}
                 disabled={!s.question.trim()}
               >

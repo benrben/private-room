@@ -1,7 +1,15 @@
-import { useEffect } from "react";
-import { api, RoomInfo } from "../api";
-import { CheckIcon, CloseIcon, MemoryIcon, MicIcon, PencilIcon } from "../icons";
-import { formatWhen } from "./composer";
+import { useEffect, useState } from "react";
+import { api, Memory, RoomInfo } from "../api";
+import {
+  CheckIcon,
+  CloseIcon,
+  MemoryIcon,
+  MicIcon,
+  PencilIcon,
+  SearchIcon,
+} from "../icons";
+import { formatWhen, uniqueFileName } from "./composer";
+import { MEMORY_INTRO_SEEN } from "./constants";
 import DeleteControl from "./DeleteControl";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -37,15 +45,66 @@ export default function MemoryView({
   a: WSActions;
   info: RoomInfo;
 }) {
+  // A long-lived room accumulates memories faster than a single ungrouped
+  // list can be read: filter, order, and take a copy out.
+  const [filter, setFilter] = useState("");
+  const [newestFirst, setNewestFirst] = useState(false);
+  const q = filter.trim().toLowerCase();
+  const matches = (m: Memory) =>
+    !q ||
+    m.content.toLowerCase().includes(q) ||
+    (m.category ?? "").toLowerCase().includes(q);
+  // The stored order is oldest-first; the toggle only ever reverses it, so
+  // "what the room returned" stays the resting state.
+  const shown: Memory[] = s.memories
+    .filter(matches)
+    .sort((x, y) =>
+      newestFirst
+        ? y.createdAt.localeCompare(x.createdAt)
+        : x.createdAt.localeCompare(y.createdAt),
+    );
+
+  /** Write every memory into an ordinary room note — the readable copy the
+   * list itself can't be (and the thing an "Export a copy…" can then take out
+   * of the room, since exporting works on files). */
+  async function saveAsNote() {
+    const lines = MEMORY_GROUPS.filter((g) =>
+      s.memories.some((m) => groupKey(m) === g.key),
+    ).flatMap((g) => [
+      `## ${g.label}`,
+      "",
+      ...s.memories
+        .filter((m) => groupKey(m) === g.key)
+        .map((m) => `- ${m.content}  _(added ${formatWhen(m.createdAt)})_`),
+      "",
+    ]);
+    const body = [`# Memory — ${info.name}`, "", ...lines].join("\n");
+    try {
+      // Save the list twice and both notes are called the same thing — Rust
+      // never dedups, so the room would carry two rows nothing can tell apart.
+      const meta = await api.saveGeneratedFile(
+        uniqueFileName(
+          `Memory — ${info.name}.md`,
+          s.files.map((f) => f.name),
+        ),
+        body,
+      );
+      s.setFiles(await api.listFiles());
+      s.pushToast("success", `Saved "${meta.name}" into the room.`);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
   // Opening the area is the "I've seen it" moment for the first-run intro.
+  // The marker is a ROOM setting: keyed by the room's file name it came back
+  // after a rename, and two rooms with the same file name shared it.
   useEffect(() => {
     if (!s.showMemoryIntro) return;
     s.setShowMemoryIntro(false);
-    try {
-      localStorage.setItem(`memoryIntroSeen:${info.name}`, "1");
-    } catch {
+    api.setSetting(MEMORY_INTRO_SEEN, "1").catch(() => {
       /* non-fatal */
-    }
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -78,6 +137,11 @@ export default function MemoryView({
                 ? "Stop recording"
                 : "Speak a memory"
             }
+            aria-label={
+              s.dictOwner === "memory" && s.dictState === "recording"
+                ? "Stop recording"
+                : "Speak a memory"
+            }
             disabled={a.micState("memory").disabled}
             onClick={() =>
               a.dictateTo("memory", (text) =>
@@ -105,6 +169,45 @@ export default function MemoryView({
           </button>
         </div>
 
+        {s.memories.length > 0 && (
+          <div className="source-tools">
+            <label className="search-field">
+              <SearchIcon size={13} />
+              <input
+                type="search"
+                placeholder="Filter memories"
+                aria-label="Filter memories"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+              />
+              {filter && (
+                <button
+                  className="side-search-clear"
+                  title="Clear the filter"
+                  aria-label="Clear the filter"
+                  onClick={() => setFilter("")}
+                >
+                  <CloseIcon size={11} />
+                </button>
+              )}
+            </label>
+            <button
+              className="subtle"
+              title="Reverse the order these were added in"
+              onClick={() => setNewestFirst((o) => !o)}
+            >
+              {newestFirst ? "Newest first" : "Oldest first"}
+            </button>
+            <button
+              className="subtle"
+              title="Write every memory into a Markdown note in this room"
+              onClick={() => void saveAsNote()}
+            >
+              Save as a note
+            </button>
+          </div>
+        )}
+
         {s.memories.length === 0 && (
           <div className="memory-view-empty">
             <MemoryIcon size={20} />
@@ -114,15 +217,24 @@ export default function MemoryView({
             </p>
           </div>
         )}
+        {s.memories.length > 0 && shown.length === 0 && (
+          <div className="memory-view-empty">
+            <MemoryIcon size={20} />
+            <p>
+              No memory matches “{filter.trim()}”. {s.memories.length} saved in
+              total.
+            </p>
+          </div>
+        )}
 
         {MEMORY_GROUPS.filter((g) =>
-          s.memories.some((m) => groupKey(m) === g.key),
-        ).map((g, _, shown) => (
+          shown.some((m) => groupKey(m) === g.key),
+        ).map((g, _, groups) => (
           <section key={g.key ?? "other"} className="memory-group">
-            {!(shown.length === 1 && g.key === null) && (
+            {!(groups.length === 1 && g.key === null) && (
               <div className="group-heading">{g.label}</div>
             )}
-            {s.memories
+            {shown
               .filter((m) => groupKey(m) === g.key)
               .map((m) =>
                 s.editingMemory?.id === m.id ? (
@@ -192,6 +304,7 @@ export default function MemoryView({
                       <button
                         className="chip-btn"
                         title="Edit this memory"
+                        aria-label="Edit this memory"
                         onClick={() =>
                           s.setEditingMemory({
                             id: m.id,

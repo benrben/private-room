@@ -55,6 +55,28 @@ impl Transport {
     }
 }
 
+/// A stable fingerprint of ONE server's transport — everything that decides
+/// where a call goes and how. Two configs with the same key reach the same
+/// place the same way, so an already-connected client can be carried across a
+/// config apply instead of being torn down and dialled again. Without it,
+/// flipping one connector's switch restarted every other connector. Pure —
+/// unit-tested.
+pub fn config_key(cfg: &ServerConfig) -> String {
+    fn pairs(map: &HashMap<String, String>) -> String {
+        let mut kv: Vec<String> = map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        kv.sort(); // HashMap order is not stable; the key must be
+        kv.join("\u{1e}")
+    }
+    match &cfg.transport {
+        Transport::Stdio { command, args, env } => format!(
+            "stdio\u{1f}{command}\u{1f}{}\u{1f}{}",
+            args.join("\u{1e}"),
+            pairs(env)
+        ),
+        Transport::Http { url, headers } => format!("http\u{1f}{url}\u{1f}{}", pairs(headers)),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub transport: Transport,
@@ -176,6 +198,9 @@ pub struct Server {
     /// UI badges it and the outbound-redaction seam keys off it.
     pub remote: bool,
     pub client: Option<Arc<tokio::sync::Mutex<Client>>>,
+    /// [`config_key`] of the config this entry was built from, so a later apply
+    /// can tell "same server, untouched" from "same name, different target".
+    pub config_key: String,
 }
 
 /// Lives in AppState behind a std Mutex — hold it only briefly, never
@@ -308,6 +333,35 @@ fn collect_tools(result: &serde_json::Value, into: &mut Vec<Tool>) -> Option<Str
     result["nextCursor"].as_str().map(String::from)
 }
 
+/// How much of a stdio server's stderr we keep for its error message.
+const STDERR_TAIL_MAX: usize = 2000;
+
+/// Append one stderr line to the retained tail, keeping the last
+/// [`STDERR_TAIL_MAX`] bytes.
+///
+/// The trim MUST land on a char boundary. Slicing at a raw byte offset panicked
+/// the moment a server logged anything non-ASCII (an accent, an emoji): the
+/// reader task died, the tail mutex was left poisoned so the real error message
+/// panicked too, and with nothing draining the pipe a chatty child then blocked
+/// mid-write — the connector sat on "Connecting…" forever. Pure — unit-tested.
+fn push_stderr_line(tail: &mut String, line: &str) {
+    tail.push_str(line);
+    tail.push('\n');
+    if tail.len() > STDERR_TAIL_MAX {
+        let mut cut = tail.len() - STDERR_TAIL_MAX;
+        while cut < tail.len() && !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        *tail = tail[cut..].to_string();
+    }
+}
+
+/// Lock the stderr tail, tolerating poisoning — a panic anywhere near this
+/// buffer must not turn every later error message into a second panic.
+fn lock_tail(tail: &Mutex<String>) -> std::sync::MutexGuard<'_, String> {
+    tail.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// GUI apps on macOS get a bare PATH, so `npx`/`uvx` from a server config
 /// would not be found. Ask a login shell once, like detect_external does.
 fn login_shell_path() -> &'static str {
@@ -371,13 +425,7 @@ impl StdioClient {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let mut t = tail.lock().unwrap();
-                    t.push_str(&line);
-                    t.push('\n');
-                    let len = t.len();
-                    if len > 2000 {
-                        *t = t[len - 2000..].to_string();
-                    }
+                    push_stderr_line(&mut lock_tail(&tail), &line);
                 }
             });
         }
@@ -481,7 +529,7 @@ impl StdioClient {
                 .map_err(|_| format!("Server timed out on {method}."))?
                 .map_err(|e| format!("Server stdout failed: {e}"))?
                 .ok_or_else(|| {
-                    let tail = self.stderr_tail.lock().unwrap().trim().to_string();
+                    let tail = lock_tail(&self.stderr_tail).trim().to_string();
                     if tail.is_empty() {
                         "Server exited.".to_string()
                     } else {
@@ -877,6 +925,67 @@ mod tests {
         let bad = auth_error_message("initialize", 401, None);
         assert!(bad.contains("valid token"));
         assert!(bad.contains("401"));
+    }
+
+    #[test]
+    fn config_key_identifies_an_unchanged_server() {
+        // Same target, same key → the live connection is carried across a config
+        // apply instead of every connector restarting.
+        let a = parse_config(
+            r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"],"env":{"A":"1","B":"2"}}}}"#,
+        )
+        .unwrap();
+        let b = parse_config(
+            r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"],"env":{"B":"2","A":"1"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config_key(&a[0].1),
+            config_key(&b[0].1),
+            "env order is not a change — HashMap iteration order must not leak in"
+        );
+        // Enabling/disabling is not a transport change either.
+        let off =
+            parse_config(r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"],"env":{"A":"1","B":"2"},"disabled":true}}}"#)
+                .unwrap();
+        assert_eq!(config_key(&a[0].1), config_key(&off[0].1));
+        // Anything that changes WHERE the call goes does change the key.
+        for changed in [
+            r#"{"mcpServers":{"web":{"command":"uvx","args":["other"],"env":{"A":"1","B":"2"}}}}"#,
+            r#"{"mcpServers":{"web":{"command":"npx","args":["ddg"],"env":{"A":"1","B":"2"}}}}"#,
+            r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"],"env":{"A":"9","B":"2"}}}}"#,
+        ] {
+            let c = parse_config(changed).unwrap();
+            assert_ne!(config_key(&a[0].1), config_key(&c[0].1), "{changed}");
+        }
+        // Remote: url and headers (the bearer) both count — a refreshed token
+        // must reconnect rather than keep dialling with the old one.
+        let h1 = parse_config(r#"{"mcpServers":{"gh":{"url":"https://x/mcp","headers":{"Authorization":"Bearer a"}}}}"#).unwrap();
+        let h2 = parse_config(r#"{"mcpServers":{"gh":{"url":"https://x/mcp","headers":{"Authorization":"Bearer b"}}}}"#).unwrap();
+        assert_ne!(config_key(&h1[0].1), config_key(&h2[0].1));
+        // A local and a remote server never collide.
+        assert_ne!(config_key(&a[0].1), config_key(&h1[0].1));
+    }
+
+    #[test]
+    fn stderr_tail_trims_on_char_boundaries() {
+        // A server that logs accents/emoji used to panic the reader task here,
+        // which lost the real error AND left the child blocked on a full pipe.
+        let mut tail = String::new();
+        for _ in 0..40 {
+            push_stderr_line(&mut tail, "héllo wörld 🚀 — connector said something");
+        }
+        assert!(tail.len() <= STDERR_TAIL_MAX + 64, "tail must stay bounded");
+        assert!(tail.is_char_boundary(0));
+        // The retained text is still valid UTF-8 with whole characters, and the
+        // newest line survived.
+        assert!(tail.ends_with("🚀 — connector said something\n"));
+        // A single line longer than the cap is kept whole-charactered too.
+        let mut one = String::new();
+        push_stderr_line(&mut one, &"🚀".repeat(2000));
+        assert!(one.len() <= STDERR_TAIL_MAX + 8);
+        assert!(one.starts_with('🚀'));
+        assert!(one.ends_with('\n'));
     }
 
     #[test]

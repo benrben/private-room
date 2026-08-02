@@ -41,15 +41,25 @@ fi
 
 # ADD-33: build + stage the Python agent sidecar (onedir PyInstaller bundle) into
 # src-tauri/resources/sidecar/ BEFORE the app build, so tauri.conf.json's resource
-# map can bundle it into Contents/Resources/. Skipped if the toolchain is absent
-# (the app still ships; the sidecar just isn't available and the agent uses the
-# native engine).
-if command -v uv >/dev/null 2>&1; then
-  echo "▶ Building the agent sidecar…"
-  ./sidecar/build-sidecar.sh
-else
-  echo "⚠ uv not found — skipping the sidecar bundle (app will use the native engine)."
+# map can bundle it into Contents/Resources/. This is NOT optional: since the
+# LangGraph migration the sidecar is the app's only AI engine (there is no native
+# fallback), and tauri.conf.json lists the staged dir as a required resource — so
+# without it the build fails on a missing resource or, worse, ships an app in
+# which nothing AI-powered works.
+if ! command -v uv >/dev/null 2>&1; then
+  echo "✗ uv not found — the Python agent sidecar cannot be built." >&2
+  echo "  It is the app's ONLY AI engine; a release without it is broken." >&2
+  echo "  Install it (https://docs.astral.sh/uv/) and re-run." >&2
+  exit 1
 fi
+echo "▶ Building the agent sidecar…"
+./sidecar/build-sidecar.sh
+
+# `strip = "symbols"` (src-tauri/Cargo.toml) drops the debug info that carries the
+# build machine's absolute paths; these remap the ones baked into panic messages
+# by `file!()`, which survive stripping. Cargo's `trim-paths` would replace both
+# flags once it stabilizes.
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$PWD=/arcelle --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
 
 # The /usr/bin PATH shim keeps the real xattr/hdiutil ahead of any overrides so
 # the bundlers work (project memory: private-room-build-xattr-shim).
@@ -63,6 +73,14 @@ SIG="${TAR}.sig"
 DMG_DIR="src-tauri/target/release/bundle/dmg"
 DMG="${DMG_DIR}/Arcelle_${VER}_aarch64.dmg"
 ENTITLEMENTS="src-tauri/Entitlements.plist"
+
+# The crate also builds the offline `roomai` CLI (ADD-20), and the bundler copies
+# EVERY [[bin]] into Contents/MacOS/. It is a developer/support tool, not a
+# shipped feature: nothing in the app, the README or the release notes mentions
+# it, and it adds ~25 MB to every download and every update. Drop it before
+# signing — the app is signed below, so removing it now keeps the seal valid.
+# Build it on demand with: cargo build --release --bin roomai
+rm -f "${APP}/Contents/MacOS/roomai"
 
 DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null \
   | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"' || true)"
@@ -118,7 +136,10 @@ else
   scripts/macsign.sh "$APP"
 fi
 
-# Both artifacts come from the exact app that was just signed.
+# Both artifacts come from the exact app that was just signed — which is why the
+# DMG is rolled by hand here instead of by `tauri build --bundles dmg`: the
+# bundler packages the app BEFORE this script signs it. tauri.conf.json therefore
+# carries no dmg styling block; this plain hdiutil window is what users get.
 echo "▶ Packaging updater tar + DMG from the final app…"
 tar -czf "$TAR" -C "$MACOS" "Arcelle.app"
 PATH=/usr/bin:"$PATH" npm run tauri signer sign -- \
@@ -175,7 +196,11 @@ if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   # A release already exists for this tag (e.g. a DMG-only release cut without
   # the signing key). Add/replace the signed assets — this is what turns on
   # auto-update by publishing latest.json + the matching signed payload.
-  echo "▶ Release ${TAG} exists — uploading signed assets (clobber)…"
+  echo "▶ Release ${TAG} exists — updating notes + uploading signed assets (clobber)…"
+  # The notes are also what the in-app update prompt shows, so a re-run must
+  # publish the CURRENT text, not leave whatever the first run wrote.
+  gh release edit "$TAG" --repo "$REPO" \
+    --title "Arcelle ${VER}" --notes "$NOTES"
   gh release upload "$TAG" --repo "$REPO" --clobber "${ASSETS[@]}"
 else
   echo "▶ Creating GitHub release ${TAG}…"

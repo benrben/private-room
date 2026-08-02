@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { WorkflowNode, WorkflowEdge } from "../../api";
 import { KIND_LABELS, kindLabel } from "./kinds";
 
@@ -89,6 +90,34 @@ function csv(v: unknown): string {
 }
 function parseCsv(raw: string): string[] {
   return raw.split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+/** A comma-separated list box that keeps the RAW text while you type. Round-tripping
+ * every keystroke through parseCsv/csv ate the comma the instant it was typed (the
+ * empty tail is dropped), so a list could only be pasted in whole — the same raw
+ * mirror the binding's extension box already keeps. Remount it (a `key` that carries
+ * the step id) to re-seed from a different step. */
+function CsvField({
+  value,
+  placeholder,
+  onChange,
+}: {
+  value: unknown;
+  placeholder: string;
+  onChange: (parts: string[]) => void;
+}) {
+  const [raw, setRaw] = useState(() => csv(value));
+  return (
+    <input
+      type="text"
+      placeholder={placeholder}
+      value={raw}
+      onChange={(e) => {
+        setRaw(e.target.value);
+        onChange(parseCsv(e.target.value));
+      }}
+    />
+  );
 }
 
 export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEdgesChange, files }: Props) {
@@ -253,11 +282,11 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
       {node.kind === "extract" && (
         <label>
           Fields to pull out <span style={{ opacity: 0.6, fontWeight: 400 }}>(comma-separated)</span>
-          <input
-            type="text"
+          <CsvField
+            key={`${node.id}:fields`}
+            value={node.fields}
             placeholder="title, author, date"
-            value={csv(node.fields)}
-            onChange={(e) => set("fields", parseCsv(e.target.value))}
+            onChange={(v) => set("fields", v)}
           />
         </label>
       )}
@@ -270,11 +299,11 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
           </label>
           <label>
             Labels <span style={{ opacity: 0.6, fontWeight: 400 }}>(comma-separated — each becomes a branch)</span>
-            <input
-              type="text"
+            <CsvField
+              key={`${node.id}:labels`}
+              value={node.labels}
               placeholder="urgent, normal, ignore"
-              value={csv(node.labels)}
-              onChange={(e) => set("labels", parseCsv(e.target.value))}
+              onChange={(v) => set("labels", v)}
             />
           </label>
         </>
@@ -500,8 +529,7 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
         </>
       )}
 
-      {node.kind === "generate" && ModelSeg}
-      {MODEL_KINDS.has(node.kind) && node.kind !== "generate" && ModelSeg}
+      {MODEL_KINDS.has(node.kind) && ModelSeg}
 
       {/* Fan-in: pick which steps feed into this one (check several to merge
           parallel branches here). Branch edges from a condition/route are shown

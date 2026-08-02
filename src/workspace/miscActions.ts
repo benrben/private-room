@@ -12,8 +12,10 @@ import {
   RoomInfo,
 } from "../api";
 import { tryToast } from "./guard";
+import { MEMORY_INTRO_SEEN } from "./constants";
 import { FlatResult } from "./types";
 import { WSState } from "./state";
+import type { LayoutApi } from "../shell/useLayout";
 
 /** Memory, MCP approvals, front page, search, panes, and model-switch handlers.
  * Cross-hook: `viewFile` (files) is threaded in for search. */
@@ -229,17 +231,39 @@ export function makeMiscActions(
     );
   }
 
+  /** Scroll a chat message into view and MARK it, once the conversation it
+   * belongs to has actually rendered. A single fixed delay was a guess: a long
+   * conversation was still painting when it expired, so the jump landed at the
+   * bottom of the chat and the matching message was never pointed out. */
+  function revealMessage(messageId: string, tries = 40) {
+    const el = document.getElementById(`msg-${messageId}`);
+    if (!el) {
+      if (tries > 0)
+        window.setTimeout(() => revealMessage(messageId, tries - 1), 50);
+      return;
+    }
+    el.scrollIntoView({ block: "center" });
+    // Set directly rather than through a class: this mark is temporary by
+    // design and must never look like a stuck selection.
+    el.style.outline = "2px solid var(--accent)";
+    el.style.outlineOffset = "3px";
+    el.style.borderRadius = "8px";
+    window.setTimeout(() => {
+      el.style.outline = "";
+      el.style.outlineOffset = "";
+      el.style.borderRadius = "";
+    }, 2600);
+  }
+
   function activateResult(r: FlatResult) {
     if (r.kind === "file") {
       viewFile(r.id, { find: r.snippet });
     } else if (r.kind === "message") {
       s.setActiveChatId(r.chatId);
-      const mid = r.messageId;
-      window.setTimeout(() => {
-        document
-          .getElementById(`msg-${mid}`)
-          ?.scrollIntoView({ block: "center" });
-      }, 120);
+      // The message lives in the chat tab — a hit picked while Studio or
+      // Activity is showing must bring the conversation forward first.
+      s.setAiTab("chat");
+      revealMessage(r.messageId);
     } else {
       // A memory hit opens the Memory area, where the row can be edited.
       revealMemory();
@@ -283,11 +307,31 @@ export function makeMiscActions(
     s.setOpenFile(null);
     s.setArea("memory");
     s.setShowMemoryIntro(false);
-    try {
-      localStorage.setItem(`memoryIntroSeen:${info.name}`, "1");
-    } catch {
-      /* non-fatal */
-    }
+    // A room setting, not a browser key keyed by file name — see constants.ts.
+    api.setSetting(MEMORY_INTRO_SEEN, "1").catch(() => {
+      /* non-fatal: the intro is cosmetic */
+    });
+  }
+
+  /** Put the question box in front of the user, then focus it.
+   *
+   * "Ask the room" and the suggested questions used to focus a textarea that
+   * simply isn't mounted on the Studio/Activity tab or when the AI pane is
+   * collapsed — the click did nothing, and a chosen suggestion was stored out
+   * of sight. Show the pane and the chat tab FIRST; the composer may only be
+   * mounting as a result, so the focus retries briefly. */
+  function focusComposer(layout?: LayoutApi) {
+    s.setAiTab("chat");
+    layout?.showPane("ai");
+    const tryFocus = (tries: number) => {
+      const el = s.composerRef.current;
+      if (el) {
+        el.focus();
+        return;
+      }
+      if (tries > 0) window.setTimeout(() => tryFocus(tries - 1), 40);
+    };
+    tryFocus(12);
   }
 
   /** BROWSE-1: bring the private browser forward.
@@ -323,17 +367,16 @@ export function makeMiscActions(
   }
 
   // ---- ADD-3: two-step delete ----
+  /** Arm the "Delete? ✓ ✕" question. It WAITS for an answer: it used to
+   * disarm itself after three seconds, so anyone who paused to read it clicked
+   * ✓ on a button that had already turned back into the bin — which just
+   * re-asked, and read as a broken control. Only ✕, another armed confirm, or
+   * an explicit cancel takes it back down. */
   function askConfirm(key: string) {
-    window.clearTimeout(s.confirmTimer.current);
     s.setConfirmDelete(key);
-    s.confirmTimer.current = window.setTimeout(
-      () => s.setConfirmDelete((k) => (k === key ? null : k)),
-      3000,
-    );
   }
 
   function cancelConfirm() {
-    window.clearTimeout(s.confirmTimer.current);
     s.setConfirmDelete(null);
   }
 
@@ -366,7 +409,7 @@ export function makeMiscActions(
     saveSuggestedMemory, enableMemoryAutoSave, openScratchPad,
     copyReceipt, playSealSound, addMemory, saveMemoryEdit, activateResult,
     resolveMcpApproval, resolveEditApproval, resolveBrowseConsent,
-    revealMemory, revealBrowser, changeModel, engineLabelOf,
+    revealMemory, revealBrowser, focusComposer, changeModel, engineLabelOf,
     recordEngineModels,
     askConfirm, cancelConfirm, searchFlat,
   };

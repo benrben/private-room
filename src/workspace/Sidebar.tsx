@@ -76,7 +76,10 @@ export default function LibraryPane({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [s.addMenuOpen, s]);
 
-  const headerCount = fileArea
+  // null = this area has no list to count, so no badge is drawn. A hard "0"
+  // beside an area that never lists anything (the browser) reads as "empty",
+  // which is a different and untrue claim.
+  const headerCount: number | null = fileArea
     ? s.files.length
     : area === "workflows"
       ? visibleWorkflows(s.workflows).length
@@ -90,13 +93,15 @@ export default function LibraryPane({
             ? s.memories.length
             : area === "connectors"
               ? s.mcpStatuses.length
-              : 0;
+              : null;
 
   return (
     <>
       <div className="pane-header">
         <div className="pane-heading">{AREA_HEADINGS[area]}</div>
-        <span className="count-badge">{headerCount}</span>
+        {headerCount !== null && (
+          <span className="count-badge">{headerCount}</span>
+        )}
         <div className="pane-actions">
           <button
             className="pane-icon-btn"
@@ -170,6 +175,7 @@ export default function LibraryPane({
               <button
                 className="side-search-clear"
                 title="Clear the filter"
+                aria-label="Clear the filter"
                 onClick={() => s.setFileFilter("")}
               >
                 <CloseIcon size={11} />
@@ -197,6 +203,7 @@ export default function LibraryPane({
       {area === "skills" && <SkillsNav s={s} a={a} />}
       {area === "memory" && <MemoryNav s={s} a={a} />}
       {area === "connectors" && <ConnectorsNav s={s} />}
+      {area === "browser" && <BrowserNav />}
 
       {(fileArea || area === "recordings") && (
         <div className="source-footer">
@@ -457,6 +464,7 @@ function BrowsePanel({
                 <button
                   className="chip-btn"
                   title="Rename folder"
+                  aria-label="Rename folder"
                   onClick={() =>
                     s.setRenamingFolder({ id: folder.id, name: folder.name })
                   }
@@ -773,6 +781,29 @@ function SkillsNav({ s, a }: { s: WSState; a: WSActions }) {
           <span className="area-nav-state">{skill.createdBy === "agent" ? "AI" : skill.createdBy}</span>
         </button>
       ))}
+    </div>
+  );
+}
+
+/* ---------- Private browser lens ---------- */
+
+/** The browser keeps nothing on disk, so this pane has nothing to list — which
+ * is exactly why it must SAY so. It used to render the heading and then an
+ * empty column, which reads as a bug rather than as a promise being kept. */
+function BrowserNav() {
+  return (
+    <div className="library-scroll">
+      <p className="area-nav-intro">
+        Open pages live in the tab strip above the page itself — there is no
+        list here because this browser keeps no history, no bookmarks and no
+        cookies between sessions.
+      </p>
+      <div className="group-heading">While you browse</div>
+      <p className="area-nav-intro">
+        Save a page or a download into the room from the browser's own toolbar;
+        anything you save becomes an ordinary encrypted room file and appears in
+        the Library.
+      </p>
     </div>
   );
 }

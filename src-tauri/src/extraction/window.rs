@@ -39,21 +39,45 @@ pub fn smart_filter(text: &str) -> String {
     out
 }
 
-/// A long line that is mostly symbols, or contains an unbroken 80+ char run
+/// A long line that is mostly symbols, or that IS one unbroken 80+ char run
 /// (base64, hex dumps, minified blobs), is junk for a human-language summary.
+///
+/// Both halves are deliberately narrow, because both used to take real content
+/// with them:
+/// - table and box-drawing characters count as words, so a compact `| a | b |`
+///   or `│ a │ b │` row survives — the promise that tables pass through was
+///   only true for loosely-spaced ones;
+/// - one long token no longer condemns its whole line. A reference, a citation
+///   or a "data available at https://…" line is mostly prose around a single
+///   long identifier, and it used to vanish from summaries with no note.
 fn looks_like_noise(line: &str) -> bool {
     if line.len() < 40 {
         return false;
     }
     let total = line.chars().count().max(1);
-    let wordish = line
-        .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || ".,;:!?'\"()-/&%$€@".contains(*c))
-        .count();
+    let wordish = line.chars().filter(|c| is_wordish(*c)).count();
     if (wordish as f32) / (total as f32) < 0.7 {
         return true;
     }
-    line.split_whitespace().any(|w| w.len() > 80)
+    // A web address is content, however long. Anything else only counts when
+    // it is essentially the entire line.
+    line.split_whitespace()
+        .filter(|w| !w.contains("://"))
+        .any(|w| {
+            let n = w.chars().count();
+            n > 80 && n * 10 >= total * 9
+        })
+}
+
+/// Characters that make a line read as text rather than as a blob: letters,
+/// digits, whitespace, ordinary punctuation, and the rules and pipes real
+/// tables are drawn with (ASCII `|`/`+` and the box-drawing block).
+fn is_wordish(c: char) -> bool {
+    c.is_alphanumeric()
+        || c.is_whitespace()
+        || ".,;:!?'\"()-/&%$€@".contains(c)
+        || matches!(c, '|' | '+')
+        || ('\u{2500}'..='\u{257F}').contains(&c)
 }
 
 /// ADD-32: partition a whole text into consecutive windows of ~`target` bytes
@@ -132,6 +156,27 @@ mod tests {
         assert!(f.contains("Another useful line"));
         assert!(!f.contains("QmFzZTY0"));
         assert!(!f.contains("~~~~"));
+    }
+
+    #[test]
+    fn filter_keeps_citations_and_table_rows() {
+        // Regression: one 80+ char token used to drop the whole line, so
+        // reference lists and "data available at …" lines disappeared from
+        // every summary with nothing saying anything had been cut.
+        let cite = "Smith, J. (2020). A study of things. Journal of Things 4(2). \
+                    Data available at https://example.org/datasets/2020/a-very-long-identifier-here-1234567890";
+        // And compact table rows, which the symbol-ratio rule caught even
+        // though the comment beside it promised tables pass through.
+        let ascii_row = "| Widget A | 12 | 3.50 | In stock | Warehouse 4 | 2026-01-01 |";
+        let box_row = "│ Widget A │ 12 │ 3.50 │ In stock │ Warehouse 4 │ 2026-01-01 │";
+        let text = format!("{cite}\n{ascii_row}\n{box_row}");
+        let f = smart_filter(&text);
+        assert!(f.contains("Smith, J."), "citation dropped: {f}");
+        assert!(f.contains("a-very-long-identifier"), "url dropped: {f}");
+        assert!(f.contains("| Widget A |"), "ascii table row dropped: {f}");
+        assert!(f.contains("│ Widget A │"), "box table row dropped: {f}");
+        // A line that IS one long blob is still junk.
+        assert!(looks_like_noise(&"QmFzZTY0anVuaw".repeat(9)));
     }
 
     #[test]

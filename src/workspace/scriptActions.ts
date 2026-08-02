@@ -77,5 +77,3 @@ export function makeScriptActions(s: WSState) {
     resolveScriptApproval,
   };
 }
-
-export type ScriptActions = ReturnType<typeof makeScriptActions>;

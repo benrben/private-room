@@ -42,6 +42,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
+from .mcp_client import PROTOCOL_VERSION
+
 #: Ceiling on a single request's body. The only bodies this endpoint ever sees
 #: are small JSON-RPC envelopes; a larger `Content-Length` is a bug or a stuck
 #: client, and reading it would block the handler thread indefinitely.
@@ -56,12 +58,19 @@ _SOCKET_TIMEOUT = 30.0
 HUB_SERVER_NAME = "hub"
 
 #: What a captured delegation returns to the CLI. It must read as SUCCESS (the
-#: specialist really is about to run) while stopping the harness from doing
-#: anything else — the real report arrives as the next round's transcript.
+#: specialist really is about to run) while stopping the harness from ANSWERING
+#: — the real report arrives as the next round's transcript.
+#:
+#: It used to say "do not call another tool", which serialized the one thing the
+#: hub is built for: `_Delegator.launch` fans out every delegation in a round
+#: before awaiting any, so a three-part request that Claude could have handed to
+#: three specialists at once instead took three round trips, at three times the
+#: cost. Delegating MORE is explicitly allowed; everything else still waits.
 DELEGATION_ACK = (
     "Delegated. That specialist is running now; its report will reach you in "
-    "your next turn. Stop here: do not call another tool and do not write the "
-    "answer yet."
+    "your next turn. If this request needs other specialists too, ask them now "
+    "in this same turn — they run together. Do not do the work yourself and do "
+    "not write the answer yet: you do not have any report back."
 )
 
 
@@ -95,10 +104,12 @@ def _initialize() -> dict[str, Any]:
 
     A CLI's MCP client negotiates against ``protocolVersion`` and identifies
     the endpoint by ``serverInfo`` — floating either changes what the client
-    on the other side agreed to.
+    on the other side agreed to. The revision itself is
+    :data:`.mcp_client.PROTOCOL_VERSION`, the single copy the sidecar's two
+    halves both announce; a second literal here could drift from it.
     """
     return {
-        "protocolVersion": "2024-11-05",
+        "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {"tools": {}},
         "serverInfo": {"name": "arcelle-hub", "version": "1"},
     }
@@ -244,6 +255,12 @@ class _HubRequestHandler(BaseHTTPRequestHandler):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
+            if self.close_connection:
+                # Set by `_read_body` when it refused a body it never read (and
+                # by the client's own `Connection: close`). Say so on the wire:
+                # a keep-alive reply here would be followed by the leftover
+                # bytes, which the next `parse_request` reads as a request line.
+                self.send_header("Connection", "close")
             self.end_headers()
             if payload:
                 self.wfile.write(payload)
@@ -266,12 +283,26 @@ class _HubRequestHandler(BaseHTTPRequestHandler):
         read -> dispatch -> send. ``None`` means the reply is already written:
         413 for a `Content-Length` past :data:`_MAX_BODY`, 400 for a body that
         is not a JSON object.
+
+        The two refusals that never consume the body also END the connection.
+        Those bytes are still queued on the socket, and on a kept-alive
+        connection the next `parse_request` reads them as a request line —
+        a run of confusing 400s until the connection dies. A body we did read
+        leaves the connection reusable, malformed or not.
         """
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            if length < 0 or length > _MAX_BODY:
-                self._send(413)
-                return None
+        except ValueError:
+            # An unparseable Content-Length means we cannot tell where this
+            # body ends, so we cannot skip past it either.
+            self.close_connection = True
+            self._send(400)
+            return None
+        if length < 0 or length > _MAX_BODY:
+            self.close_connection = True
+            self._send(413)
+            return None
+        try:
             body = json.loads(self.rfile.read(length) or b"{}")
         except (ValueError, OSError):
             self._send(400)
@@ -339,7 +370,7 @@ class HubToolServer:
         # keep-alive, and a single-threaded server serves one connection to
         # completion before accepting the next — so a client that holds an idle
         # keep-alive connection open (Claude Code's MCP client does) blocks every
-        # later request until the round's 300s timeout, and `close()`'s
+        # later request until the round ends on its own, and `close()`'s
         # `shutdown()` blocks behind the same handler. Both hangs would sit
         # inside `ExternalChatModel.stream`'s `finally`, taking the whole ask
         # with them. Daemon threads so a wedged handler can never keep the

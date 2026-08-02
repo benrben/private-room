@@ -140,7 +140,7 @@ def test_a_tool_round_is_always_followed_by_a_model_round(template: str) -> None
     # And `route_after_tools`'s CANCELLATION escape survives in every shape:
     # synthesize must be reachable from a tool round WITHOUT another model
     # call. Stop must stop — not "stop after the next 90-second tool" — and
-    # §3.2 forbids inventing "Done." over an answer the user stopped.
+    # §3.2 forbids inventing an answer over one the user stopped.
     # Asserted as reachability, not as a direct edge: `react_verify` routes its
     # escape through `verify` (which returns "synthesize" when cancelled), and
     # that is still a model-free path.
@@ -176,9 +176,9 @@ def test_react_verify_gates_the_answer_behind_the_check() -> None:
 def test_every_template_composes_the_invariant_bearing_nodes(template: str) -> None:
     """THE load-bearing test.
 
-    SPEC §3.2's guarantees — tool-less final round, only-successful-calls
+    SPEC §3.2's guarantees — tool-less final round, only-successful-ROOM-calls
     memoised, all-duplicate forces synthesis, cancellation between rounds and
-    between tool calls, blank becomes "Done." but never when cancelled — are
+    between tool calls, a blank answer never read back as success — are
     properties of these three functions. A template that swapped in its own
     node would silently opt out of all of them, so every shape must use these.
     """
@@ -761,6 +761,159 @@ def test_chain_stage_routes_a_declined_stage_back_to_the_chain() -> None:
         )
         == "synthesize"
     )
+
+
+def test_a_side_tool_cannot_quietly_spend_a_staged_web_step() -> None:
+    """`stage` counts stages OFFERED, and ANY tool call advances the chain.
+
+    `chat.web` keeps `search_room` and the download verbs offered alongside
+    every stage (`flow.keep`), so a round that searched the ROOM consumed the
+    "search the web" stage: the chain moved on to `fetch_page`, `web_search` was
+    never offered again, and the Web agent could finish a web task having never
+    touched the web. Only the DECLINED-stage exit re-offered a missed verb, and
+    this case leaves through the exit taken after a tool ran.
+    """
+    from arcelle_sidecar.graphs import route_after_stage_tools
+
+    stages = get_agent("chat.web").flow.stages
+    spent_on_a_side_tool = {
+        "agent_id": "chat.web",
+        "round": 1,
+        "max_rounds": 9,
+        "stage": len(stages),  # every stage OFFERED...
+        "attempted": {"search_room"},  # ...and none of them called
+    }
+    assert route_after_stage_tools(spent_on_a_side_tool) == "stage_catalog"  # type: ignore[arg-type]
+    # Bounded: the single re-offer, then the answer round.
+    assert (
+        route_after_stage_tools(
+            {**spent_on_a_side_tool, "stage_retried": True}  # type: ignore[arg-type]
+        )
+        == "force_final"
+    )
+    # And a chain that really did run its verbs closes as before.
+    assert (
+        route_after_stage_tools(
+            {**spent_on_a_side_tool, "attempted": set(stages)}  # type: ignore[arg-type]
+        )
+        == "force_final"
+    )
+
+
+async def test_the_missed_stage_order_is_retired_once_it_is_obeyed() -> None:
+    """Nothing in `corrections` expires on its own — `call_model` re-injects the
+    whole list EVERY round — and the re-offer note is an order to call a tool.
+
+    So the chain's closing round, which offers ZERO tools by design, still
+    carried "call fetch_page now, then answer", and a small model answered "I
+    will now fetch the page" instead of writing the answer. There were tests
+    proving a correction is RAISED and none proving one goes away.
+    """
+    from conftest import FakeChatModel, FakeMCP, Round, call, drive_worker, make_request
+
+    from arcelle_sidecar.mcp_client import ToolResult
+
+    chat = FakeChatModel(
+        [
+            Round(content="", calls=[call("web_search", query="central bank rate")]),
+            # Stage 2 offers fetch_page — declined, which raises the order.
+            Round(content="The rate is 4.25% (from the snippet)."),
+            # Re-offered, and obeyed this time.
+            Round(content="", calls=[call("fetch_page", url="https://boi.org.il")]),
+            Round(content='FOUND: "4.25%, effective 2026-07-07" (boi.org.il).'),
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(["web_search", "fetch_page", "search_room"]),
+        results={
+            "web_search": ToolResult(text="boi.org.il — rate 4.25%"),
+            "fetch_page": ToolResult(text="Effective 2026-07-07 the rate is 4.25%."),
+        },
+    )
+    out = await drive_worker(
+        make_request("what is the current central-bank rate?", web_enabled=True),
+        chat,
+        mcp,
+        agent_id="chat.web",
+    )
+
+    assert not out.state.get("corrections"), (
+        f"the obeyed order was still in force: {out.state.get('corrections')}"
+    )
+    # ...and the round that had to WRITE the answer never saw it either.
+    last = out.chat.seen_messages[-1]
+    assert not any(
+        "You have not called" in (m.get("content") or "") for m in last
+    ), "the tool-less answer round was still being ordered to call a tool"
+
+
+async def test_an_unobeyed_tool_order_never_reaches_the_tool_less_round() -> None:
+    """The retirement `_force_final` used to do had the wrong predicate.
+
+    `_live_corrections` drops an order once the tool HAS been called, but the
+    order is raised only because it was NOT — so it survived in exactly the case
+    the retirement exists for: the model spends its re-offer round on a
+    `flow.keep` side tool, the chain closes, and the tool-less answer round is
+    still ordered to "call web_search now". A small model then narrates the call
+    it cannot make instead of writing the answer.
+    """
+    from conftest import FakeChatModel, FakeMCP, Round, call, drive_worker, make_request
+
+    from arcelle_sidecar.mcp_client import ToolResult
+
+    chat = FakeChatModel(
+        [
+            # Stage 1 offers web_search; a kept side tool is called instead.
+            Round(content="", calls=[call("search_room", query="rate")]),
+            # Stage 2 offers fetch_page; the side tool again (different args, so
+            # it is not suppressed as a duplicate).
+            Round(content="", calls=[call("search_room", query="central bank")]),
+            # The single re-offer of web_search — declined the same way.
+            Round(content="", calls=[call("search_room", query="boi")]),
+            # ...and now the tool-less answer round.
+            Round(content="From the room's own files: the rate is 4.25%."),
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(["web_search", "fetch_page", "search_room"]),
+        results={"search_room": ToolResult(text="lease.pdf — rate 4.25%")},
+    )
+    out = await drive_worker(
+        make_request("what is the current central-bank rate?", web_enabled=True),
+        chat,
+        mcp,
+        agent_id="chat.web",
+    )
+
+    last = out.chat.seen_messages[-1]
+    assert not out.chat.offered[-1], "the closing round was supposed to be tool-less"
+    assert not any(
+        "You have not called" in (m.get("content") or "") for m in last
+    ), "the tool-less answer round was ordered to call a tool it was not offered"
+
+
+def test_a_ground_truth_correction_is_not_retired_by_a_tool_call() -> None:
+    """The retirement is narrow on purpose. `CLAIM_UNSUPPORTED` is a fact about
+    what the tools did, so it stays true until the model restates its answer —
+    only the ORDER to call something is made false by calling it."""
+    from arcelle_sidecar.graphs import (
+        CLAIM_UNSUPPORTED,
+        STAGE_MISSED_NOTE,
+        _live_corrections,
+    )
+
+    state = {
+        "attempted": {"fetch_page", "create_file"},
+        "corrections": [
+            CLAIM_UNSUPPORTED,
+            STAGE_MISSED_NOTE.format(tool="fetch_page"),
+            STAGE_MISSED_NOTE.format(tool="web_search"),
+        ],
+    }
+    assert _live_corrections(state) == [  # type: ignore[arg-type]
+        CLAIM_UNSUPPORTED,
+        STAGE_MISSED_NOTE.format(tool="web_search"),
+    ]
 
 
 def test_stage_and_perceive_routers_fail_open_like_the_shared_one() -> None:

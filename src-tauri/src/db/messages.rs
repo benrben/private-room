@@ -1,14 +1,32 @@
 use super::*;
 
+/// Escape the LIKE wildcards in a user's search text so `%` and `_` match
+/// themselves. `%` and `_` are the only two characters SQLite's LIKE treats
+/// specially, so searching "50%" silently matched every row containing "50" and
+/// "a_b" matched "axb". Every `LIKE '%' || ?1 || '%'` query must pair this with
+/// `ESCAPE '\'` — see `messages_like` below for the shape.
+pub fn like_escape(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len());
+    for c in needle.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// ADD-6: chat messages whose content contains `needle` (already lowercased) —
 /// (chat id, message id, content). Orphan (chat_id NULL) rows are skipped.
+/// `needle` is taken literally: its LIKE wildcards are escaped here, so callers
+/// pass the user's raw text.
 pub fn messages_like(conn: &Connection, needle: &str) -> Result<Vec<(String, String, String)>, String> {
     query_rows(
         conn,
         "SELECT chat_id, id, content FROM messages
-         WHERE chat_id IS NOT NULL AND lower(content) LIKE '%' || ?1 || '%'
+         WHERE chat_id IS NOT NULL AND lower(content) LIKE '%' || ?1 || '%' ESCAPE '\\'
          ORDER BY rowid DESC LIMIT 30",
-        [needle],
+        [like_escape(needle)],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )
 }
@@ -170,6 +188,26 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn like_wildcards_in_the_query_are_taken_literally() {
+        let conn = mem();
+        insert_message(&conn, "c1", "user", "the deposit is 50% of rent", &[], None).unwrap();
+        insert_message(&conn, "c1", "user", "we owe 50 pounds", &[], None).unwrap();
+        insert_message(&conn, "c1", "user", "table a_b", &[], None).unwrap();
+        insert_message(&conn, "c1", "user", "table axb", &[], None).unwrap();
+        // "50%" used to match "50 pounds" too — % is a LIKE wildcard.
+        let hits = messages_like(&conn, "50%").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].2.contains("50% of rent"));
+        // "_" is the other one: it matched any single character.
+        let hits = messages_like(&conn, "a_b").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].2.ends_with("a_b"));
+        // An ordinary query is unaffected.
+        assert_eq!(messages_like(&conn, "deposit").unwrap().len(), 1);
+        assert_eq!(like_escape("100% _sure_"), r"100\% \_sure\_");
     }
 
     #[test]

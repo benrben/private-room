@@ -101,8 +101,11 @@ pub(crate) fn open_room_impl(
         // A live recording that died with the app left audio checkpoints
         // behind — splice them onto the WAV so nothing recorded is lost.
         match db::recover_rec_chunks(&r.conn) {
-            Ok(0) | Err(_) => {}
+            Ok(0) => {}
             Ok(n) => eprintln!("recovered {n} interrupted recording(s)"),
+            // Swallowing this meant the user simply found the end of a meeting
+            // missing, with nothing said either way — on every unlock, forever.
+            Err(e) => report_rec_recovery_failure(app, &r.path, e),
         }
     }
     refresh_mcp(app);
@@ -119,6 +122,44 @@ pub(crate) fn open_room_impl(
     refresh_policy(app, state);
     schedule_privacy_scan(app.clone());
     Ok(info)
+}
+
+/// Tell the user that audio left behind by a crashed recording could NOT be
+/// spliced back. Rides the recording area's existing `rec-error` channel (an
+/// error toast), because a rescue that silently does nothing looks exactly like
+/// a meeting whose end was never recorded.
+///
+/// Emitted on a short delay: `open_room_impl` returns before the workspace
+/// mounts its event listeners, and an event nobody is listening for is the same
+/// silence. Re-checks that this room is still the open one first, so locking up
+/// immediately can't produce a toast about a room that is gone.
+fn report_rec_recovery_failure(app: &tauri::AppHandle, room_path: &str, err: String) {
+    eprintln!("recording recovery failed: {err}");
+    let (app, room_path) = (app.clone(), room_path.to_string());
+    tauri::async_runtime::spawn(async move {
+        use tauri::{Emitter as _, Manager as _};
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let still_open = app
+            .state::<AppState>()
+            .room
+            .lock()
+            .map(|g| g.as_ref().is_some_and(|r| r.path == room_path))
+            .unwrap_or(false);
+        if !still_open {
+            return;
+        }
+        let _ = app.emit(
+            "rec-error",
+            serde_json::json!({
+                "fileId": "",
+                "message": format!(
+                    "Audio from an interrupted recording could not be restored: {err} \
+                     Nothing was lost — it is still stored in the room, and the rescue \
+                     runs again the next time you unlock it."
+                ),
+            }),
+        );
+    });
 }
 
 /// Recovery (the printed sheet): create a recovery key for the CURRENTLY OPEN
@@ -265,16 +306,12 @@ pub async fn close_room(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
     // path uses (Wave 3, Idea 9). close_room ignores whether every writer
     // reported done; the teardown below is the correctness backstop.
     let _ = drain_inflight(&app, &state).await;
-    // SEC-7: reclaim space before closing when a large amount was freed (e.g.
-    // the user deleted big files). Small deletions skip the slow vacuum.
-    {
-        let guard = state.room.lock().unwrap();
-        if let Some(room) = guard.as_ref() {
-            if db::reclaimable_bytes(&room.conn).unwrap_or(0) > 10 * 1024 * 1024 {
-                let _ = db::vacuum(&room.conn);
-            }
-        }
-    }
+    // SEC-7 used to VACUUM here whenever more than 10 MB was reclaimable, which
+    // made "Lock" rewrite the entire (possibly multi-GB) room file with no
+    // message, no progress and no way to skip — deleting two documents from a
+    // big room was enough to trigger it. Compacting is now only ever the
+    // explicit Settings → "Compact room" action (`compact_room`), which reports
+    // what it reclaimed; locking just locks.
     // The synchronous teardown (room handle, MCP bridge + servers, consents,
     // staged media, agent-UI round-trips) is shared with the open-over-open
     // path — see `teardown_open_room`.
@@ -456,6 +493,56 @@ pub fn room_info(
         Some(room) => Ok(Some(info_of(&app, room)?)),
         None => Ok(None),
     }
+}
+
+/// Longest room name we will store. Long enough for any sentence someone would
+/// call a room, short enough that the top bar and the recents list stay
+/// readable.
+pub(crate) const MAX_ROOM_NAME_CHARS: usize = 120;
+
+/// Rename the open room.
+///
+/// The name lives in the room's own encrypted `meta` table, where `create_room`
+/// wrote it once from the file name — and nothing ever wrote it again. Renaming
+/// the `.roomai` file in Finder changed nothing (the name is read from `meta`,
+/// not the path), so the file and the app showed different names forever, and
+/// "Save a copy" carried the original's name into the duplicate.
+///
+/// Both copies of the name are updated together: the room's `meta` (the
+/// authority, which travels with the file) and the recents entry for this path
+/// (which has to carry its own copy — it names rooms that are locked).
+#[tauri::command]
+pub fn rename_room(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<RoomInfo, String> {
+    // Wave 3 (Idea 9): a rollback is about to replace this DB — a name written
+    // now would be swapped away without a word.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("A room needs a name.".into());
+    }
+    if name.chars().count() > MAX_ROOM_NAME_CHARS {
+        return Err(format!(
+            "That name is too long — {MAX_ROOM_NAME_CHARS} characters at most."
+        ));
+    }
+    let info = {
+        let mut guard = state.room.lock().unwrap();
+        let room = guard.as_mut().ok_or("No room is open.")?;
+        db::set_meta(&room.conn, "name", name)?;
+        room.name = name.to_string();
+        info_of(&app, room)?
+    };
+    let _ = write_recent(
+        &app,
+        &rename_recent(read_recent(&app), &info.path, &info.name),
+    );
+    Ok(info)
 }
 
 #[tauri::command]

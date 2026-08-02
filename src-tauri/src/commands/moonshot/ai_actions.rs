@@ -204,6 +204,12 @@ pub async fn ai_action(
         .iter()
         .find(|s| s.id == action)
         .ok_or_else(|| format!("\"{action}\" isn't a known AI action."))?;
+    // Wave 3 (Idea 9): like `run_studio`, an AI action gathers now and writes a
+    // file minutes later — don't start one while a rollback is swapping the DB,
+    // or a result read from the old copy of the room lands in the restored one.
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
     let instr = studio_instruction(instructions, spec.default_prompt);
     let (label, text) = state.with_room(|room| {
         match refs.as_ref().filter(|r| !r.is_empty()) {
@@ -214,7 +220,17 @@ pub async fn ai_action(
     let model = resolve_structured_model(&state)
         .await
         .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
-    let _ = window.emit("ask-step", spec.title);
+    // Say where the material is going, exactly as a Studio run does — Summarize,
+    // Translate and Research hand the same document to the same cloud engine, so
+    // the reminder shouldn't depend on which menu the user started from.
+    let _ = window.emit(
+        "ask-step",
+        if is_cloud_model(&model) || is_external_engine(&model) {
+            format!("{} — your cloud AI is working (content leaves this Mac)…", spec.title)
+        } else {
+            spec.title.to_string()
+        },
+    );
     // MIGRATION Phase 3: the 14-action prompt table (system prompts), the
     // user-message assembly (grounding + research's `question`/translate's target
     // language), the schema, the model call and the markdown extraction all live in

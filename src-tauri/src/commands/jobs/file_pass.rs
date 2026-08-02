@@ -143,6 +143,11 @@ struct PassArtifact {
     thread: String,
     #[serde(default)]
     skipped: bool,
+    /// publish only: the deliverable it wrote. Makes the step idempotent — a
+    /// crash between the write and the checkpoint replays publish, and without
+    /// this the replay left a SECOND identical "Full pass — …" file behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_id: Option<String>,
 }
 
 fn load_artifact(conn: &Connection, job_id: &str, step_id: usize) -> Option<PassArtifact> {
@@ -249,7 +254,7 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                     if is_fatal(&s) {
                         return Err(s);
                     }
-                    PassArtifact { result: String::new(), thread, skipped: true }
+                    PassArtifact { result: String::new(), thread, skipped: true, file_id: None }
                 }
             };
             let guard = state.room.lock().unwrap();
@@ -333,6 +338,7 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                         result: sections.join("\n\n"),
                         thread: String::new(),
                         skipped: false,
+                        file_id: None,
                     }
                 }
             };
@@ -370,6 +376,33 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                     skipped
                 )
             };
+            // Idempotent publish: this step re-runs whenever the app died in
+            // the split second between writing the deliverable and saving the
+            // checkpoint. Reuse the file it already wrote (a versioned
+            // overwrite, undoable) instead of minting a second identical one.
+            let prior = load_artifact(&room.conn, job_id, step.id).and_then(|a| a.file_id);
+            let write_deliverable = |name: &str, mime: &str, content: &str| {
+                if let Some(prev) = prior.as_deref() {
+                    if db::get_file_meta(&room.conn, prev).is_ok() {
+                        store_file_bytes(
+                            &room.conn,
+                            prev,
+                            content.as_bytes(),
+                            Some(content),
+                            &format!("Full pass re-run — {}", plan.file_name),
+                        )?;
+                        return db::get_file_meta(&room.conn, prev);
+                    }
+                }
+                db::insert_file(
+                    &room.conn,
+                    name,
+                    mime,
+                    content.as_bytes(),
+                    Some(content),
+                    "generated",
+                )
+            };
             let meta = if plan.mode == "stitch" {
                 let inputs: Vec<usize> = step.params["inputs"]
                     .as_array()
@@ -389,14 +422,7 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                 }
                 body.push_str(&format!("---\n\n_{coverage}_\n"));
                 let name = format!("Full pass — {}.md", plan.file_name);
-                db::insert_file(
-                    &room.conn,
-                    &name,
-                    "text/markdown",
-                    body.as_bytes(),
-                    Some(&body),
-                    "generated",
-                )?
+                write_deliverable(&name, "text/markdown", &body)?
             } else {
                 // Sectioned: concatenate each section's composed HTML in order.
                 let section_ids: Vec<usize> = step.params["sections"]
@@ -422,15 +448,20 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                     "{html_body}\n<hr/>\n<p><em>{coverage}</em></p>"
                 );
                 let content = html_document(&name, &body);
-                db::insert_file(
-                    &room.conn,
-                    &name,
-                    "text/html",
-                    content.as_bytes(),
-                    Some(&content),
-                    "generated",
-                )?
+                write_deliverable(&name, "text/html", &content)?
             };
+            // Record what was written BEFORE the runner's checkpoint, so a
+            // replay from any later crash finds it.
+            store_artifact(
+                &room.conn,
+                job_id,
+                step.id,
+                &PassArtifact {
+                    result: coverage.clone(),
+                    file_id: Some(meta.id.clone()),
+                    ..Default::default()
+                },
+            )?;
             if let Some(w) = crate::main_window(app) {
                 let _ = w.emit("room-files-changed", ());
             }
@@ -739,7 +770,7 @@ mod tests {
     }
 
     fn art(result: &str, skipped: bool) -> PassArtifact {
-        PassArtifact { result: result.into(), thread: String::new(), skipped }
+        PassArtifact { result: result.into(), thread: String::new(), skipped, file_id: None }
     }
 
     /// Drive one step against the mock room, returning its result and whatever
@@ -806,13 +837,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn publish_inserts_a_brand_new_file_on_every_replay() {
-        // THE non-idempotent side effect. `db::insert_file` mints a fresh uuid
-        // and INSERTs — there is no upsert-by-name — so re-running the publish
-        // step (a cursor reset, or a crash between insert_file and
-        // checkpoint_job) leaves the room with a SECOND "Full pass — …" file
-        // plus a second copy of its search chunks. Any migration that resets a
-        // paused job to cursor=0 duplicates the deliverable once per resume.
+    async fn publish_replays_onto_the_same_file_instead_of_duplicating_it() {
+        // `db::insert_file` mints a fresh uuid, so publish used to leave a
+        // SECOND identical "Full pass — …" file (and a second copy of its search
+        // chunks) whenever it re-ran — a crash between the write and
+        // `checkpoint_job`, or a resume from a reset cursor. It now records the
+        // file it wrote in its own artifact and overwrites that file on a
+        // replay, which is versioned, so the previous deliverable is still
+        // recoverable through Time Machine.
+        //
+        // UPDATED (this wave): the old test asserted the duplicate as the
+        // pinned behaviour.
         let room = "/tmp/r2.roomai";
         let app = mock_room(room);
         let plan = plan_for("merge", vec![(0, 4)], 4);
@@ -833,14 +868,19 @@ mod tests {
         assert!(r2.is_ok());
 
         let m1 = m1.expect("publish records the file it wrote");
-        let m2 = m2.expect("the replay records ANOTHER file");
+        let m2 = m2.expect("the replay records the SAME file");
         assert_eq!(m1.name, "Full pass — book.txt.html");
-        assert_eq!(m2.name, m1.name);
-        assert_ne!(m1.id, m2.id, "publish must be pinned as NON-idempotent");
+        assert_eq!(m2.id, m1.id, "a replay must not mint a second deliverable");
         let same_name = with_conn(&app, |c| {
             db::list_files(c).unwrap().into_iter().filter(|f| f.name == m1.name).count()
         });
-        assert_eq!(same_name, 2, "two runs of publish leave two files in the room");
+        assert_eq!(same_name, 1, "two runs of publish leave ONE file in the room");
+        // The overwrite is snapshotted, so the first deliverable is recoverable.
+        let versions = with_conn(&app, |c| db::list_file_versions(c, &m1.id).unwrap().len());
+        assert_eq!(versions, 1, "the replay's overwrite is undoable");
+        // The publish step's own artifact carries the file id that makes it so.
+        let recorded = with_conn(&app, |c| load_artifact(c, &job, publish.id).unwrap().file_id);
+        assert_eq!(recorded.as_deref(), Some(m1.id.as_str()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -43,7 +43,7 @@ pub(crate) async fn start_download_job_inner(
     let title = download_title(url, engine);
     let (job_id, room_path) = state.with_room(|room| {
         if queue::at_capacity(&room.conn) {
-            return Err("Too many background jobs are already waiting — let one finish first.".into());
+            return Err(queue::QUEUE_FULL.into());
         }
         let id = db::create_job(&room.conn, "download", &title, &plan, 100)?;
         Ok((id, room.path.clone()))

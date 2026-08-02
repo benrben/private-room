@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import monaco from "./monacoSetup";
+import monaco, { monacoTheme, watchMonacoTheme } from "./monacoSetup";
 import { languageForFile } from "./monacoSetup";
 
 /** Idea 11: is this text Hebrew/Arabic-dominant? Monaco renders bidi runs
@@ -45,7 +45,7 @@ export default function DiffView({ original, modified, fileName }: Props) {
       wordWrap: "on",
       minimap: { enabled: false },
       fontSize: 13,
-      theme: "vs-dark",
+      theme: monacoTheme(),
       scrollBeyondLastLine: false,
     });
     const lang = languageForFile(fileName);
@@ -60,6 +60,9 @@ export default function DiffView({ original, modified, fileName }: Props) {
     // Keyed by version id in the parent, so mount-once is correct.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Follow the app's light/dark switch instead of staying black in light mode.
+  useEffect(watchMonacoTheme, []);
 
   return <div className="compare-diff-host" ref={hostRef} />;
 }

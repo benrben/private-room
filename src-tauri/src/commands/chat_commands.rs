@@ -132,6 +132,82 @@ pub(crate) struct CommandResult {
 /// silently shrinks the coverage.
 const COMMAND_STEP_TIMEOUT_SECS: u64 = 300;
 
+/// Longest gap with NO token before a STREAMED step counts as stalled. Prompt
+/// processing on a slow local model can take minutes before the first token, so
+/// this is deliberately generous — but silence past it is a hang, and without a
+/// ceiling the only way out was quitting the app.
+const COMMAND_STREAM_IDLE_SECS: u64 = COMMAND_STEP_TIMEOUT_SECS;
+
+/// The cloud-CLI twin of [`COMMAND_STREAM_IDLE_SECS`]. A harness engine
+/// (claude-cli / codex-cli) cannot stream: the sidecar hands the CLI's whole
+/// reply back as ONE delta at the very end (`llm.generate_stream`, the
+/// `is_external_model` branch), so the "silence" clock spans the entire answer
+/// and a five-minute ceiling would kill a long but perfectly healthy
+/// `#summarize` / `#research` with stall advice that cannot apply. Sized just
+/// past the sidecar's own wedged-CLI budget (`external_llm.EXTERNAL_IDLE_SECS`,
+/// 900 s) so that error surfaces first and this only catches a stream that never
+/// ends at all. API-backed providers (openrouter, `:cloud`) DO stream delta by
+/// delta, so they keep the ordinary ceiling.
+const COMMAND_STREAM_IDLE_CLI_SECS: u64 = 960;
+
+/// How long a streamed step may go with no token before it counts as stalled,
+/// for the engine actually answering.
+fn stream_idle_secs(model: &str) -> u64 {
+    if is_cli_engine(model) {
+        COMMAND_STREAM_IDLE_CLI_SECS
+    } else {
+        COMMAND_STREAM_IDLE_SECS
+    }
+}
+
+/// How long Stop waits for the stream to notice the flag by itself (it samples
+/// it as each chunk arrives, and then hands back the partial answer it already
+/// showed) before we hang up on its behalf. A model that has gone quiet never
+/// gets another chunk, which is how Stop came to be ignored entirely.
+const COMMAND_STOP_GRACE_MS: u64 = 1_500;
+
+/// The watchdog half of [`CmdCtx::ask_streaming`], split out so the Stop and
+/// stall paths can be exercised without a window. Drives `fut` while sampling
+/// the Stop flag and the gap since the last token; `last_token` and `partial`
+/// are the handles the delta callback writes to.
+///
+/// ADD-7's contract is that Stop ABANDONS the stream but KEEPS the partial
+/// (`sidecar::generate_stream` breaks on the flag and returns `Ok(full)`), so
+/// hanging up on the stream's behalf hands back the same partial. Returning an
+/// error here instead would be turned into an empty message by `run_command`
+/// and the text the user watched arrive would vanish from the chat.
+async fn watch_stream(
+    fut: impl std::future::Future<Output = Result<String, String>>,
+    cancel: &AtomicBool,
+    last_token: &Mutex<std::time::Instant>,
+    partial: &Mutex<String>,
+    idle_secs: u64,
+    grace_ms: u64,
+) -> Result<String, String> {
+    tokio::pin!(fut);
+    let mut stop_seen: Option<std::time::Instant> = None;
+    loop {
+        tokio::select! {
+            res = &mut fut => return res,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    let since = *stop_seen.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= std::time::Duration::from_millis(grace_ms) {
+                        return Ok(partial.lock().unwrap().clone());
+                    }
+                }
+                if last_token.lock().unwrap().elapsed()
+                    >= std::time::Duration::from_secs(idle_secs)
+                {
+                    return Err("The model stopped responding. Try a shorter \
+                                selection, or switch to a faster model in Settings."
+                        .into());
+                }
+            }
+        }
+    }
+}
+
 impl CmdCtx<'_> {
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
@@ -159,16 +235,36 @@ impl CmdCtx<'_> {
             KEEP_ALIVE_WARM,
             ollama::CtxTier::Chat,
         );
-        let out = crate::sidecar::generate_stream(
+        // The sidecar only samples the cancel flag as each chunk arrives, so a
+        // model that goes quiet swallows Stop, and one that stalls outright never
+        // returns at all. Watch the flag and the gap since the last token
+        // alongside the stream; dropping the future closes the connection, which
+        // is exactly what the in-stream Stop does.
+        let last_token = Arc::new(Mutex::new(std::time::Instant::now()));
+        // Mirror of what has streamed so far, so hanging up on Stop's behalf can
+        // still hand back the partial the user is looking at (see `watch_stream`).
+        let partial = Arc::new(Mutex::new(String::new()));
+        let seen = last_token.clone();
+        let mirror = partial.clone();
+        let fut = crate::sidecar::generate_stream(
             "/generate_stream",
             &body,
             Some(self.cancel.clone()),
-            |d| {
+            move |d| {
+                *seen.lock().unwrap() = std::time::Instant::now();
+                mirror.lock().unwrap().push_str(d);
                 let _ = window.emit("ask-delta", d);
             },
+        );
+        watch_stream(
+            fut,
+            &self.cancel,
+            &last_token,
+            &partial,
+            stream_idle_secs(self.model),
+            COMMAND_STOP_GRACE_MS,
         )
-        .await?;
-        Ok(out)
+        .await
     }
 
     /// One model call whose output is NOT shown as chat (it becomes a file, a
@@ -556,6 +652,60 @@ mod full_ops_tests {
         for w in cmd_windows(&text) {
             // partition_windows may overshoot to a seam; the overlap bounds it.
             assert!(w.len() <= CMD_WINDOW_CHARS + CMD_WINDOW_OVERLAP);
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_watchdog_tests {
+    use super::*;
+
+    /// A stream that never finishes on its own — the watchdog has to end it.
+    fn never() -> impl std::future::Future<Output = Result<String, String>> {
+        std::future::pending()
+    }
+
+    #[tokio::test]
+    async fn stop_keeps_the_partial_the_user_already_saw() {
+        // ADD-7: Stop abandons the stream but KEEPS the text that streamed in.
+        // Hanging up on the stream's behalf must honour the same contract —
+        // returning an error here made `run_command` save "*(stopped)*" alone.
+        let cancel = AtomicBool::new(true);
+        let last = Mutex::new(std::time::Instant::now());
+        let partial = Mutex::new("half an answer already on screen".to_string());
+        let got = watch_stream(never(), &cancel, &last, &partial, 300, 0).await;
+        assert_eq!(got, Ok("half an answer already on screen".into()));
+    }
+
+    #[tokio::test]
+    async fn a_silent_stream_still_gets_hung_up_on() {
+        // The other half of the same watchdog: no Stop, no token, past the idle
+        // budget — that IS a hang, and it keeps its actionable message.
+        let cancel = AtomicBool::new(false);
+        let last = Mutex::new(std::time::Instant::now());
+        let partial = Mutex::new(String::new());
+        let got = watch_stream(never(), &cancel, &last, &partial, 0, 1_500).await;
+        assert!(got.unwrap_err().contains("stopped responding"));
+    }
+
+    #[test]
+    fn a_cloud_cli_is_not_judged_by_a_streaming_clock() {
+        // claude-cli / codex-cli emit exactly one delta, at the very end, so the
+        // silence clock spans the whole answer: a five-minute ceiling would kill
+        // any long #summarize / #research on those engines. The budget has to
+        // clear the sidecar's own wedged-CLI cutoff (EXTERNAL_IDLE_SECS = 900).
+        for m in ["claude-cli", "codex-cli::gpt-5.6-sol", "claude-cli::opus::high"] {
+            assert!(
+                stream_idle_secs(m) > 900,
+                "{m} would be killed mid-answer at {}s",
+                stream_idle_secs(m)
+            );
+        }
+        // Everything else really does stream token by token — including the
+        // API-backed providers, which go through the sidecar's provider branch —
+        // so silence there IS a stall and keeps the responsive ceiling.
+        for m in ["qwen3.5:4b", "minimax-m3:cloud", "openrouter::vendor/model"] {
+            assert_eq!(stream_idle_secs(m), COMMAND_STREAM_IDLE_SECS, "{m}");
         }
     }
 }

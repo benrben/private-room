@@ -1,31 +1,26 @@
 /* BROWSE-3: what the address bar decides, from the text alone.
  *
  * These run under `npm run test:page` (node --test), alongside the page-script
- * tests. The rules are mirrored from src/workspace/address.ts — the module is
- * TypeScript, so the regexes are restated here rather than imported. If you
- * change one, change both; the cases below are the contract.
+ * tests. They exercise the REAL `src/workspace/address.ts` — an earlier version
+ * of this file restated the regexes, so the address bar could break without a
+ * single test going red. The module is TypeScript and these tests are plain
+ * Node, so the source is type-stripped with the `typescript` dev dependency
+ * (already installed for `npm run build`) and imported from memory. No compiled
+ * output, no build step, nothing to keep in sync.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import ts from "typescript";
 
-const HOSTISH = /^[^\s/?#]+\.[^\s/?#.]{2,}([/:?#].*)?$/;
-const HOST_PORT = /^[^\s/?#]+:\d+([/?#].*)?$/;
-const IPV4 = /^\d{1,3}(\.\d{1,3}){3}(:\d+)?([/?#].*)?$/;
-
-function classifyAddress(input) {
-  const text = input.trim();
-  if (!text) return null;
-  if (text.startsWith("?")) {
-    const query = text.slice(1).trim();
-    return query ? { kind: "search", query } : null;
-  }
-  if (text.includes("://")) return { kind: "url", url: text };
-  if (/\s/.test(text)) return { kind: "search", query: text };
-  if (HOSTISH.test(text) || IPV4.test(text) || HOST_PORT.test(text)) {
-    return { kind: "url", url: `https://${text}` };
-  }
-  return { kind: "search", query: text };
-}
+const here = dirname(fileURLToPath(import.meta.url));
+const SOURCE = readFileSync(join(here, "../../src/workspace/address.ts"), "utf8");
+const JS = ts.transpileModule(SOURCE, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText;
+const { classifyAddress } = await import(`data:text/javascript,${encodeURIComponent(JS)}`);
 
 test("empty input does nothing", () => {
   assert.equal(classifyAddress(""), null);

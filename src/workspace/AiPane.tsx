@@ -16,6 +16,7 @@ import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkArea } from "./types";
 import { LayoutApi } from "../shell/useLayout";
+import { pendingApprovalCount, runningJobCount } from "../shell/activity";
 
 /** Pane 3: persistent Chat / Studio / Activity tabs. Chat keeps the entire
  * existing conversation surface; Studio hosts the room's transformations;
@@ -33,16 +34,10 @@ export default function AiPane({
   layout: LayoutApi;
   area: WorkArea;
 }) {
-  const pendingApprovals =
-    s.mcpApprovals.length +
-    s.editApprovals.length +
-    s.scriptApprovals.length +
-    s.browseConsents.length;
-  const jobsRunning =
-    s.jobs.filter((j) => j.status === "running" || j.status === "queued")
-      .length +
-    (s.summaryStarting ? 1 : 0) +
-    (s.recLive?.status === "saving" ? 1 : 0);
+  // One definition, shared with the status bar and the Activity list — see
+  // ../shell/activity.
+  const pendingApprovals = pendingApprovalCount(s);
+  const jobsRunning = runningJobCount(s);
   const cloud = isCloudEngine(s.model);
   return (
     <>
@@ -235,10 +230,7 @@ function StudioView({
 function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
   // A once-a-second tick so running cards' elapsed time advances. Armed only
   // while something is actually running.
-  const jobActive =
-    s.summaryStarting ||
-    s.recLive?.status === "saving" ||
-    s.jobs.some((j) => j.status === "running" || j.status === "queued");
+  const jobActive = runningJobCount(s) > 0;
   const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
     if (!jobActive) return;
@@ -256,24 +248,21 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
     [nowTick],
   );
 
-  const pendingApprovals =
-    s.mcpApprovals.length +
-    s.editApprovals.length +
-    s.scriptApprovals.length +
-    s.browseConsents.length;
+  const pendingApprovals = pendingApprovalCount(s);
   const running = s.jobs.filter(
     (j) => j.status === "running" || j.status === "queued",
   );
   const parked = s.jobs.filter(
     (j) => j.status !== "running" && j.status !== "queued",
   );
+  // A recording is "being written out" while EITHER signal is up — the two
+  // arrive a beat apart, and the counters use the same rule.
+  const savingRec = s.recSave != null || s.recLive?.status === "saving";
   const nothing =
     pendingApprovals === 0 &&
-    running.length === 0 &&
+    runningJobCount(s) === 0 &&
     parked.length === 0 &&
-    !s.summaryStarting &&
-    !s.importProgress &&
-    s.recLive?.status !== "saving";
+    !s.importProgress;
 
   return (
     <div className="activity-view">
@@ -341,7 +330,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
       {(running.length > 0 ||
         s.summaryStarting ||
         s.importProgress ||
-        s.recLive?.status === "saving") && (
+        savingRec) && (
         <div className="activity-group-title">Running now</div>
       )}
 
@@ -382,7 +371,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
       {/* A recording being finalized keeps a visible card here, so leaving
           the recording view never turns the save into a mystery. The audio
           is already durable when this card appears — the label says so. */}
-      {s.recLive?.status === "saving" && (
+      {savingRec && (
         <div className="activity-row" role="status">
           <div className="activity-row-head">
             <span className="activity-row-title">Saving recording</span>
@@ -397,18 +386,20 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
                 ? `Audio saved — transcribing (${s.recSave.remaining} to go)`
                 : "Audio saved — finishing the transcript…"}
           </div>
-          <div className="activity-row-actions">
-            <button
-              className="subtle"
-              title="Open the recording"
-              onClick={() => {
-                const id = s.recLive?.fileId;
-                if (id) void a.viewFile(id);
-              }}
-            >
-              Open
-            </button>
-          </div>
+          {s.recLive?.fileId && (
+            <div className="activity-row-actions">
+              <button
+                className="subtle"
+                title="Open the recording"
+                onClick={() => {
+                  const id = s.recLive?.fileId;
+                  if (id) void a.viewFile(id);
+                }}
+              >
+                Open
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -470,6 +461,7 @@ function JobRow({
           <button
             className="chip-btn"
             title="Dismiss this job"
+            aria-label="Dismiss this job"
             onClick={() => void a.dismissJob(j.id)}
           >
             <CloseIcon size={11} />

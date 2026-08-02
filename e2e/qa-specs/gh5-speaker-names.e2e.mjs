@@ -9,6 +9,12 @@
 // The Rust half of the same contract (the overlay does not touch `segments`,
 // and legacy recordings without the field still load) is covered by
 // recording::tests::speaker_names_* — this spec covers the UI and the round trip.
+//
+// WHAT THIS SPEC CANNOT SEE. `qa/qa-mock.js` stands in for the backend, so the
+// refusals `rec_set_speaker_name` makes on data the UI cannot produce — an
+// empty `speaker`, and a recording with no transcript yet — are not exercised
+// here and need a Rust test of their own. Everything below is a clause the
+// mock mirrors faithfully, so a green run means the same thing on both sides.
 
 import { openApp, openFile } from "./helpers.mjs";
 
@@ -36,9 +42,31 @@ async function rename(nth, name, key = "Enter") {
   await (await $$(CHIP))[nth].click();
   const input = await $(INPUT);
   await input.waitForDisplayed({ timeout: 5_000 });
-  await input.setValue(name);
+  // Backspaces rather than setValue()'s clear: a chip that already HAS a name
+  // opens with that name as the draft, and WebDriver's clear writes `.value`
+  // directly — React's controlled-input tracker can miss it, which would leave
+  // the old name in front of the new one.
+  const held = (await input.getValue()).length;
+  for (let i = 0; i < held; i++) await browser.keys(["Backspace"]);
+  if (name) await input.addValue(name);
   await browser.keys([key]);
   await $(INPUT).waitForExist({ reverse: true, timeout: 5_000 });
+}
+
+/** Whether ANY speaker still carries a user-given name.
+ *
+ * The chips cannot answer this: a name equal to the machine label renders
+ * exactly like no name at all. The re-transcribe confirmation can — it warns
+ * about re-numbering only while the overlay is non-empty, which is the one
+ * place "cleared" and "stored an entry that shadows itself" look different. */
+async function warnsAboutNames() {
+  await (await $('button[title^="Rebuild the transcript"]')).click();
+  const confirm = await $(".rec-retrans-confirm");
+  await confirm.waitForDisplayed({ timeout: 5_000 });
+  const text = await confirm.getText();
+  await (await $(".rec-retrans-confirm button.subtle")).click();
+  await confirm.waitForDisplayed({ reverse: true, timeout: 5_000 });
+  return /check the names you gave them/i.test(text);
 }
 
 describe("GH #5 — naming a speaker after the recording is transcribed", () => {
@@ -103,6 +131,42 @@ describe("GH #5 — naming a speaker after the recording is transcribed", () => 
       timeoutMsg: "emptying the name did not restore the machine label",
     });
     await expect(await chipNames()).toEqual(["Speaker 1", "Speaker 2", "Speaker 1"]);
+  });
+
+  it("treats the engine's own label as clearing the name, not as a new one", async () => {
+    // `rec_set_speaker_name` deletes the overlay when the name equals the
+    // machine label, rather than storing an entry that shadows itself — so
+    // typing "Speaker 1" over "Dana" has to end up back where it started.
+    await rename(0, "Dana");
+    await browser.waitUntil(async () => (await chipNames())[0] === "Dana");
+    await expect(await warnsAboutNames()).toBe(true);
+
+    await rename(0, "Speaker 1");
+    await browser.waitUntil(async () => (await chipNames())[0] === "Speaker 1", {
+      timeout: 5_000,
+      timeoutMsg: "naming a speaker after their own label did not clear the name",
+    });
+    await expect(await chipNames()).toEqual(["Speaker 1", "Speaker 2", "Speaker 1"]);
+    // …and the overlay is GONE, not holding "Speaker 1" -> "Speaker 1".
+    await expect(await warnsAboutNames()).toBe(false);
+  });
+
+  it("caps a pasted essay at the 60 characters the backend keeps", async () => {
+    // A name long enough to blow out the transcript's speaker prefix is a paste
+    // accident; the backend takes the first 60 characters, and the field must
+    // not let more than that through in the first place.
+    const essay = "Dana".repeat(50);
+    await (await $$(CHIP))[0].click();
+    const input = await $(INPUT);
+    await input.waitForDisplayed({ timeout: 5_000 });
+    await input.addValue(essay);
+    await expect(await input.getValue()).toBe(essay.slice(0, 60));
+
+    await browser.keys(["Enter"]);
+    await browser.waitUntil(async () => (await chipNames())[0] === essay.slice(0, 60), {
+      timeout: 5_000,
+      timeoutMsg: "the committed name was not the first 60 characters",
+    });
   });
 
   it("abandons the edit on Escape", async () => {

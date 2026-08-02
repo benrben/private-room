@@ -1,5 +1,10 @@
 export const MAX_EDGES = 400; // cap rendered/simulated edges — keep it snappy
 export const MAX_NODES = 800;
+/** Mirrors GRAPH_MAX_FILES in src-tauri/src/commands/moonshot/graph.rs: the
+ * backend maps only the newest N files, so a room with more than that gets a
+ * partial map. Kept here so the header can SAY so instead of presenting the
+ * count as the whole room. */
+export const GRAPH_MAX_FILES = 60;
 export const AREA_PER_NODE = 8000; // ideal-distance k = sqrt(AREA_PER_NODE) ≈ 89px
 export const COOL = 0.94; // temperature decay per tick
 export const GRAVITY = 0.015; // gentle pull to centre so the graph stays framed

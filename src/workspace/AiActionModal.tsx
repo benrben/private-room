@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { tokenAtCaret } from "./composer";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -5,10 +6,34 @@ import { WSActions } from "./actions";
 /** The editable-prompt modal for an AI action. Reuses the Studio prompt CSS +
  * the shared @-mention autocomplete. Extracted verbatim from renderAiActionModal. */
 export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
+  // Escape closes this window, exactly as it closes Studio, Compare and the
+  // usage popover. Without it, Escape reached the app-level handler and closed
+  // the FILE behind the dialog while the dialog stayed put. Capture-phase, and
+  // never while the action is running (that would strand the run's own state).
+  const open = s.aiPrompt !== null;
+  const running = s.aiBusy;
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      // The @-file list closes FIRST, and its Escape lives on the textarea —
+      // stopping here would swallow the key at `window` before React's root
+      // ever saw it, so with the popover up Escape closed neither the list nor
+      // the dialog. Bail before the stop, not after it. (Nothing underneath
+      // acts on it either: the app-level handler ignores Escape while the
+      // focus is in an input or textarea.)
+      if (s.studioAc) return;
+      e.stopPropagation();
+      if (running) return;
+      s.setAiPrompt(null);
+    }
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, running, s.studioAc]);
   if (!s.aiPrompt) return null;
   const aiPrompt = s.aiPrompt;
   const def = aiPrompt.def;
-  const running = s.aiBusy;
   // ADD-27: "translate" reuses the question field to carry the language.
   const questionMissing =
     (def.needsQuestion || def.needsLanguage) && !aiPrompt.question.trim();

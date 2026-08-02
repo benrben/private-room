@@ -38,13 +38,18 @@ export default function FileRow({
         s.setCtxMenu({ file: f, x: e.clientX, y: e.clientY });
       }}
     >
-      {s.renamingFile?.id === f.id ? (
+      {/* Not when the VIEWER opened the rename: the library lists a row for the
+          open file too, and two autoFocus inputs on one state slot blur — and
+          so cancel — each other in the same commit. */}
+      {s.renamingFile?.id === f.id && s.renamingFile.where !== "viewer" ? (
         <input
           className="file-rename-input"
           autoFocus
           dir="auto"
           value={s.renamingFile.name}
-          onChange={(e) => s.setRenamingFile({ id: f.id, name: e.target.value })}
+          onChange={(e) =>
+            s.setRenamingFile({ id: f.id, name: e.target.value, where: "library" })
+          }
           onBlur={a.commitRenameFile}
           onKeyDown={(e) => {
             if (e.key === "Enter") a.commitRenameFile();
@@ -86,6 +91,12 @@ export default function FileRow({
               ? "Attach image to your next question (vision)"
               : "Pin this file into your next question"
           }
+          aria-label={
+            f.mimeType.startsWith("image/")
+              ? "Attach image to your next question (vision)"
+              : "Pin this file into your next question"
+          }
+          aria-pressed={attached}
           onClick={() => a.toggleAttach(f)}
         >
           <PaperclipIcon size={14} />
@@ -93,6 +104,7 @@ export default function FileRow({
         <button
           className="chip-btn"
           title="More actions"
+          aria-label="More actions"
           onClick={(e) => {
             const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
             s.setMoveMenuFor(null);

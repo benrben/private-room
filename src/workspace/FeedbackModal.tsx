@@ -4,6 +4,11 @@ import { api, AppDiag } from "../api";
 import { SparklesIcon } from "../icons";
 import { WSState } from "./state";
 
+/** How long a prefilled new-issue link may be. GitHub answers 414 well before
+ * this, and browsers have their own ceilings; staying under 6 KB keeps the
+ * whole report intact on every path that does work. */
+const MAX_ISSUE_URL = 6000;
+
 /** ADD-28: feedback → GitHub issue.
  *
  * Write it yourself, or let the LOCAL model shape your words into a title +
@@ -53,13 +58,27 @@ export default function FeedbackModal({ s }: { s: WSState }) {
 
   async function openIssue() {
     if (!ready || !diag) return;
+    const base = `https://github.com/${diag.repo}/issues/new`;
     const url =
-      `https://github.com/${diag.repo}/issues/new` +
-      `?title=${encodeURIComponent(title.trim())}` +
+      `${base}?title=${encodeURIComponent(title.trim())}` +
       `&body=${encodeURIComponent(finalBody)}`;
+    // A web address has a length limit, and "Draft it for me" happily writes a
+    // report past it — the link then arrives truncated or is refused outright.
+    // Over the limit the body travels on the clipboard instead, and the toast
+    // says so rather than claiming the report was carried across.
+    const tooLong = url.length > MAX_ISSUE_URL;
     try {
-      await openUrl(url);
-      s.pushToast("success", "Opened GitHub in your browser — press Submit there to file it.");
+      if (tooLong) {
+        await navigator.clipboard.writeText(finalBody);
+        await openUrl(`${base}?title=${encodeURIComponent(title.trim())}`);
+        s.pushToast(
+          "info",
+          "This report is too long to travel in a link — it's on your clipboard. Paste it into the issue body, then press Submit.",
+        );
+      } else {
+        await openUrl(url);
+        s.pushToast("success", "Opened GitHub in your browser — press Submit there to file it.");
+      }
       s.setShowFeedback(false);
     } catch (e) {
       s.pushToast("error", String(e));

@@ -16,6 +16,20 @@
 //!
 //! Docker-based servers can't be auto-provisioned (Docker is a background
 //! service, not a binary), so those surface a clear "install Docker" note.
+//!
+//! NOT IN THE BUILD (audit findings 80 + 228, 2026-08-01). Nothing declares
+//! `mod runtimes;`, so none of this ships and neither command can be invoked —
+//! a connector needing `uvx`/`npx` on a Mac without them still fails with the
+//! raw launcher error. It is complete and unit-tested, so this is one decision,
+//! not a repair. Ship it with all four of:
+//!   1. `mod runtimes; pub use runtimes::*;` in `commands.rs`,
+//!   2. `commands::mcp_runtime_for_command` + `commands::mcp_provision_runtime`
+//!      in `lib.rs`'s `invoke_handler`,
+//!   3. `mcp.rs`'s launcher prepending [`path_prefix`] to `login_shell_path()`
+//!      — without it a downloaded runtime is on no PATH the child ever sees,
+//!   4. the "Download runtime" prompt in `src/workspace/ConnectorsView.tsx`.
+//! Or delete the file. Half of it is the one outcome worth avoiding: a download
+//! button that fetches 45 MB into a folder nothing looks in.
 
 use futures_util::StreamExt;
 use serde::Serialize;

@@ -8,18 +8,19 @@ notes), stores the returned artifact, and does the no-model ``publish`` step. Th
 module owns only the COMPUTE — the exact prompts, the structured model call, and
 the parse/clamp of the model's output into the artifact the Rust side persists.
 
-Artifact contract (identical for all three steps, the shape Rust's ``PassArtifact``
+Artifact contract (identical for both steps, the shape Rust's ``PassArtifact``
 stores): ``{"result": str, "thread": str, "skipped": bool}``.
 
 The step semantics are reproduced byte-for-byte from Rust:
 
 * map — one window's output (merge-mode dense notes, or stitch-mode transformed
-  text) plus a short running thread. A double model failure yields the *incoming*
-  thread unchanged and ``skipped=true`` so the next window still reads in context.
-* merge — fold sibling note sections into one; a double failure falls back to the
-  verbatim concatenation (``skipped=false`` — nothing already read is lost).
-* compose — write the final HTML deliverable from the merged notes; a double
-  failure publishes the raw notes (``skipped=false``).
+  text) plus a short running thread. In merge mode a failed window falls back to
+  its raw text (still covered, ``skipped=false``); in stitch mode there is no
+  honest stand-in for a transform, so the window is marked ``skipped=true`` and
+  the *incoming* thread flows on so the next window still reads in context.
+* section — write ONE ordered section of the final HTML deliverable from a small
+  group of consecutive windows' notes; a double failure publishes that group's
+  raw notes (``skipped=false`` — nothing already read is lost).
 
 Privacy (SPEC §6): the model I/O goes through :func:`llm.generate` (loopback-only
 Ollama, tracing stripped at import) exactly like every other sidecar LLM call.
@@ -33,6 +34,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import llm
+from .budget import truncate_bytes
 from .config import KEEP_ALIVE_WARM, ProviderConfig
 from .messages import Message, system_message, user_message
 from .model_text import prime_schema, recover_json
@@ -44,17 +46,10 @@ from .model_text import prime_schema, recover_json
 PASS_NOTES_MAX: int = 4_000
 #: The running thread handed from window to window.
 PASS_THREAD_MAX: int = 1_200
-#: Merge fan-in — a merge folds up to this many sibling sections (mirrors
-#: file_pass.rs ``PASS_MERGE_GROUP``); the merge ceiling is sized around it.
-PASS_MERGE_GROUP: int = 6
-#: Floor for a merged section — a merge never clamps below this, so tiny files
-#: and any low-context tier stay at least as good as the old fixed cap.
-PASS_MERGE_FLOOR: int = 8_000
-#: The composed final document (single-compose legacy path).
-PASS_COMPOSE_MAX: int = 120_000
-#: One composed SECTION (the sectioned path — each section covers a small group of
-#: windows, so it never approaches the whole-doc cap; the final document is the
-#: ordered concatenation of the sections and may exceed PASS_COMPOSE_MAX).
+#: One composed SECTION. Each section covers a small group of consecutive windows
+#: (Rust plans the grouping — file_pass.rs ``PASS_SECTION_WINDOWS``), so it never
+#: approaches whole-document size; the final document is the ordered
+#: concatenation of the sections and may be far larger than this.
 PASS_SECTION_MAX: int = 40_000
 
 #: file_pass.rs ``model_call`` passes ``Some(0.2)`` — steady, low-variance reads.
@@ -102,22 +97,12 @@ SECTION_SYSTEM: str = (
 _SKIP = object()
 
 
-# --- byte-safe helpers (agent.rs clamp_bytes) -------------------------------
-
-
-def clamp_bytes(s: str, max_bytes: int) -> str:
-    """Truncate to at most ``max_bytes`` UTF-8 bytes without splitting a char.
-
-    Mirrors agent.rs ``clamp_bytes``/``floor_boundary``: Rust string lengths and
-    caps are BYTE counts, so the artifact must be clamped in bytes, not chars, or
-    a merge group could overflow the window a Hebrew/CJK file fits under in Rust.
-    """
-    raw = s.encode("utf-8")
-    if len(raw) <= max_bytes:
-        return s
-    # errors="ignore" drops a partial trailing multibyte char — the same result
-    # as floor_boundary walking back to the last char boundary <= max.
-    return raw[:max_bytes].decode("utf-8", errors="ignore")
+# --- step helpers -----------------------------------------------------------
+#
+# Every cap below is a BYTE cap: Rust string lengths and caps are byte counts, so
+# clamping in chars would let a Hebrew/CJK file overflow the window it fits under
+# in Rust. :func:`budget.truncate_bytes` is the sidecar's one implementation of
+# that cut (agent.rs ``clamp_bytes``/``floor_boundary``).
 
 
 def _is_fatal(code: str) -> bool:
@@ -212,7 +197,8 @@ async def run_map(
 
     ``thread`` is the previous window's carried thread ("" for the first part),
     loaded from the prior artifact by Rust. On a double model failure the *incoming*
-    thread flows through unchanged and the window is marked skipped.
+    thread flows through unchanged; merge mode keeps the window's raw text as the
+    reading, stitch mode marks it skipped (see the fallback branch below).
     """
     stitch = mode == "stitch"
     system = MAP_SYSTEM_STITCH if stitch else MAP_SYSTEM_MERGE
@@ -250,20 +236,29 @@ async def run_map(
     if not result:
         # The structured reply was a double-failure (_SKIP) or a valid-but-EMPTY
         # reply. A small model often can't wrap CODE / CSV / tabular content — full
-        # of braces and quotes — in the forced {notes, thread} JSON, so it returns
-        # nothing usable even for a window that clearly HAS text. Rather than drop
-        # the window (which reads to the user as "0 of N parts could not be
-        # processed" for a file we can plainly see), fall back to the raw window
-        # text so this content is still COVERED: the section step then composes a
-        # summary from it (or, failing that, publishes it raw). Coverage stays
-        # honest — only a genuinely empty window is marked skipped.
-        fallback = clamp_bytes(window_text.strip(), result_cap)
+        # of braces and quotes — in the forced JSON, so it returns nothing usable
+        # even for a window that clearly HAS text.
+        if stitch:
+            # STITCH TRANSFORMS the text (translate, rewrite), so the source is
+            # not a stand-in for its own transform: pasting it back would publish
+            # a chunk of the ORIGINAL language into the translation, unmarked,
+            # while the footer still claimed complete coverage. Mark the window
+            # skipped — Rust then writes "[part N could not be processed]" where
+            # it belongs and counts it in the coverage line.
+            return {"result": "", "thread": thread, "skipped": True}
+        # MERGE only READS the window into notes, so the raw text IS a faithful
+        # (if unsummarized) reading of it. Rather than drop the window — which
+        # reads to the user as "1 of N parts could not be processed" for a file
+        # we can plainly see — keep it so the content is still COVERED: the
+        # section step composes from it, or failing that publishes it raw. Only a
+        # genuinely empty window is marked skipped.
+        fallback = truncate_bytes(window_text.strip(), result_cap)
         if fallback:
             return {"result": fallback, "thread": thread, "skipped": False}
         return {"result": "", "thread": thread, "skipped": True}
     return {
-        "result": clamp_bytes(result, result_cap),
-        "thread": clamp_bytes(_field(parsed, "thread").strip(), PASS_THREAD_MAX),
+        "result": truncate_bytes(result, result_cap),
+        "thread": truncate_bytes(_field(parsed, "thread").strip(), PASS_THREAD_MAX),
         "skipped": False,
     }
 
@@ -327,8 +322,8 @@ async def run_section(
     if not html:
         # Composing this section failed or came back empty: keep the reading by
         # publishing the group's raw notes (clamped) rather than dropping it.
-        return {"result": clamp_bytes(notes, PASS_SECTION_MAX), "thread": "", "skipped": False}
-    return {"result": clamp_bytes(html, PASS_SECTION_MAX), "thread": "", "skipped": False}
+        return {"result": truncate_bytes(notes, PASS_SECTION_MAX), "thread": "", "skipped": False}
+    return {"result": truncate_bytes(html, PASS_SECTION_MAX), "thread": "", "skipped": False}
 
 
 # --- request bodies (the whole-file PASS step endpoints) --------------------
@@ -388,9 +383,6 @@ class FilePassSectionRequest(BaseModel):
 __all__ = [
     "PASS_NOTES_MAX",
     "PASS_THREAD_MAX",
-    "PASS_MERGE_GROUP",
-    "PASS_MERGE_FLOOR",
-    "PASS_COMPOSE_MAX",
     "PASS_SECTION_MAX",
     "PASS_TEMPERATURE",
     "PASS_MAP_PREDICT",
@@ -398,7 +390,6 @@ __all__ = [
     "MAP_SYSTEM_STITCH",
     "MAP_SYSTEM_MERGE",
     "SECTION_SYSTEM",
-    "clamp_bytes",
     "run_map",
     "run_section",
     "FilePassMapRequest",

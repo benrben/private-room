@@ -23,7 +23,7 @@ Run it twice if you care about engine parity: once on a local model, once on a
 cloud/CLI engine. A 4B will drop waves; a cloud engine will complete them — the
 *difference* is the interesting result.
 
-Why waves and not one shot: `TURN_ROUND_BUDGET` is 64 rounds **turn-wide**
+Why waves and not one shot: `TURN_ROUND_BACKSTOP` is 400 rounds **turn-wide**
 (the hub's rounds plus every worker round it spawns). Past it the remaining
 rounds are served tool-less, so one mega-turn quietly degrades into prose. One
 wave per turn keeps every check inside a real tool budget.

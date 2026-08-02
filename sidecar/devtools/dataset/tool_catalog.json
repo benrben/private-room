@@ -650,10 +650,6 @@
     "description": "Run one prompt on the user's LOCAL model on this Mac and return its text (or JSON when a schema is given). Slow but private — use it for steps whose content must not leave this machine. For reading a whole huge file use start_file_pass instead.",
     "inputSchema": {
       "properties": {
-        "long": {
-          "description": "true to allow a big-context call for large prompts (slower prefill)",
-          "type": "boolean"
-        },
         "prompt": {
           "description": "The full, self-contained prompt",
           "type": "string"
@@ -886,7 +882,7 @@
   },
   {
     "annotations": {
-      "destructiveHint": true,
+      "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": false

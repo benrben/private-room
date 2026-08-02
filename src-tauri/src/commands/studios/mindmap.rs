@@ -131,9 +131,10 @@ pub(crate) fn render_mindmap_html(title: &str, root: &str, nodes: &[MindNode]) -
         "<ul class=\"tree\"><li>{}</li></ul>",
         node_html(root, &kids, 0, &mut seen)
     );
-    MINDMAP_TEMPLATE
-        .replace("__TITLE__", &html_escape(title))
-        .replace("__TREE__", &tree)
+    fill_template(
+        MINDMAP_TEMPLATE,
+        &[("__TITLE__", &html_escape(title)), ("__TREE__", &tree)],
+    )
 }
 
 pub(crate) const MINDMAP_TEMPLATE: &str = r####"<!doctype html>

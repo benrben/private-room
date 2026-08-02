@@ -334,7 +334,14 @@ fn bench_real_wav() {
     eprintln!("audio: {:.0}s  ({})", total_s, wav);
 
     let t = std::time::Instant::now();
-    let meta = arcelle_lib::recording::retranscribe(&model(), &pcm, Vec::new(), 0, |_, _| {});
+    let meta = arcelle_lib::recording::retranscribe(
+        &model(),
+        &pcm,
+        &arcelle_lib::recording::RecMeta::default(),
+        |_, _| {},
+        || false, // never stopped: the bench measures a full pass
+    )
+    .expect("retranscribe");
     eprintln!("pipeline took {:.0}s ({:.1}x realtime)", t.elapsed().as_secs_f64(), total_s / t.elapsed().as_secs_f64());
 
     // ---- what the user sees

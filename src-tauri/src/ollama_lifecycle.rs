@@ -78,10 +78,32 @@ impl Drop for Busy {
     }
 }
 
+/// The HOST of a base URL, lowercased — scheme, credentials, port and path all
+/// stripped, IPv6 literals unbracketed. Substring matching on the whole URL is
+/// not good enough: `http://localhost-box.lan:11434` and
+/// `http://ollama.127.0.0.1.nip.io` both CONTAIN a loopback spelling while
+/// naming somebody else's machine.
+fn host_of(base: &str) -> String {
+    let after_scheme = base.rsplit("://").next().unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match hostport.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => hostport.split(':').next().unwrap_or(hostport),
+    };
+    host.trim().to_ascii_lowercase()
+}
+
 /// Is the resolved base URL a local daemon we may start/stop? A remote override
-/// (the closet supercomputer) is off-limits.
+/// (the closet supercomputer) is off-limits — starting a local daemon for it
+/// wastes the user's time and then reports the REMOTE box down anyway.
 fn base_is_local(base: &str) -> bool {
-    base.contains("127.0.0.1") || base.contains("localhost") || base.contains("0.0.0.0")
+    let host = host_of(base);
+    host == "localhost"
+        || host == "0.0.0.0"
+        || host == "::1"
+        || host == "::"
+        || host.starts_with("127.")
 }
 
 /// True if the daemon answers `/api/version` within ~1s.
@@ -160,19 +182,43 @@ pub async fn ensure_up(base: &str) -> Result<Busy, String> {
     if reachable(base).await {
         return Ok(guard);
     }
-    let bin = ollama_bin().ok_or_else(|| "OLLAMA_DOWN".to_string())?;
-    // Detach: no inherited stdio, its own session, so it outlives this call but
-    // we still hold its PID.
-    let child = Command::new(&bin)
+    let Some(bin) = ollama_bin() else {
+        eprintln!("[ollama] not starting the daemon: no `ollama` binary on PATH or in /Applications");
+        return Err("OLLAMA_DOWN".to_string());
+    };
+    // Detach: its own session, so it outlives this call but we still hold its
+    // PID. stderr is PIPED, not discarded — a busy port, a broken install and
+    // "not enough memory" all end up as the same generic OLLAMA_DOWN line, and
+    // the daemon's own explanation was the only thing that told them apart.
+    let mut child = match Command::new(&bin)
         .arg("serve")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|_| "OLLAMA_DOWN".to_string())?;
-    if let Ok(mut slot) = lc().our_pid.lock() {
-        *slot = Some(child.id());
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[ollama] could not start `{bin} serve`: {e}");
+            return Err("OLLAMA_DOWN".to_string());
+        }
+    };
+    let pid = child.id();
+    if let Some(stderr) = child.stderr.take() {
+        // MANDATORY once piped: nobody reading fills the pipe and wedges the
+        // daemon mid-write. Mirrors to `arcelle-ollama.log`, the only copy a
+        // bundled app (which has no usable stderr of its own) can keep.
+        crate::sidecar_lifecycle::mirror_stderr(stderr, "ollama", daemon_log_path());
     }
+    if let Ok(mut slot) = lc().our_pid.lock() {
+        *slot = Some(pid);
+    }
+    // Reap on exit rather than leaking the handle: `ollama serve` is stopped and
+    // restarted every time the idle watcher sleeps it, and an unwaited child
+    // leaves a `<defunct>` entry under the app's name each time.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     // Poll until it answers (model load is separate; we only need the socket).
     let start = Instant::now();
     while start.elapsed() < START_TIMEOUT {
@@ -183,14 +229,24 @@ pub async fn ensure_up(base: &str) -> Result<Busy, String> {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     // The spawn never became reachable (port conflict, broken install): forget
-    // the PID so the watcher can't later kill an innocent process, and reap it.
+    // the PID so the watcher can't later kill an innocent process, and stop it.
     if let Ok(mut slot) = lc().our_pid.lock() {
-        if slot.map(|p| p == child.id()).unwrap_or(false) {
+        if slot.map(|p| p == pid).unwrap_or(false) {
             *slot = None;
         }
     }
-    let _ = Command::new("kill").arg(child.id().to_string()).status();
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    eprintln!(
+        "[ollama] `{bin} serve` never answered within {}s — see {}",
+        START_TIMEOUT.as_secs(),
+        daemon_log_path().display()
+    );
     Err("OLLAMA_DOWN".to_string())
+}
+
+/// Where the daemon's stderr is mirrored, alongside the sidecar's own log.
+pub fn daemon_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("arcelle-ollama.log")
 }
 
 /// Spawn the idle watcher exactly once. It periodically checks the pure
@@ -226,12 +282,17 @@ pub async fn is_awake(base: &str) -> bool {
 
 /// Stop a daemon we started, now — used on app shutdown so we never leak a
 /// background `ollama serve` we spawned. A no-op for an external daemon.
+///
+/// Also removes the daemon's stderr mirror: it is a plain temp file useful only
+/// while the session that produced it is being diagnosed, so it should not
+/// outlive a clean quit (same rule as the sidecar's own log).
 pub fn stop_if_ours() {
     if let Ok(mut slot) = lc().our_pid.lock() {
         if let Some(pid) = slot.take() {
             let _ = Command::new("kill").arg(pid.to_string()).status();
         }
     }
+    let _ = std::fs::remove_file(daemon_log_path());
 }
 
 #[cfg(test)]
@@ -257,6 +318,22 @@ mod tests {
         assert!(base_is_local("http://localhost:11434"));
         assert!(!base_is_local("http://closet.local:11434"));
         assert!(!base_is_local("http://192.168.1.50:11434"));
+    }
+
+    #[test]
+    fn a_remote_host_that_merely_spells_loopback_is_not_this_mac() {
+        // The check used to be `contains`, so any of these started a local
+        // daemon nobody asked for, waited for it, and then reported the REMOTE
+        // box down anyway.
+        assert!(!base_is_local("http://localhost-box.lan:11434"));
+        assert!(!base_is_local("http://my-localhost.example.com:11434"));
+        assert!(!base_is_local("http://ollama.127.0.0.1.nip.io:11434"));
+        assert!(!base_is_local("http://box:11434/127.0.0.1"));
+        // …while the real loopback spellings still are.
+        assert!(base_is_local("http://127.0.0.5:11434"));
+        assert!(base_is_local("http://[::1]:11434"));
+        assert!(base_is_local("http://user:pw@localhost:11434"));
+        assert!(base_is_local("127.0.0.1:11434"));
     }
 
     #[test]

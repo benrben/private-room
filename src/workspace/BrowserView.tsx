@@ -6,7 +6,14 @@ import type {
   BrowserSearchResult,
   FileMeta,
 } from "../apiTypes";
-import { GlobeIcon, ShieldIcon, ChevronLeftIcon, ChevronRightIcon } from "../icons";
+import {
+  GlobeIcon,
+  ShieldIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  LockIcon,
+  AlertIcon,
+} from "../icons";
 import { classifyAddress } from "./address";
 import { BrowserSearch, BrowserSearchSkeleton } from "./BrowserSearch";
 
@@ -28,7 +35,46 @@ import { BrowserSearch, BrowserSearchSkeleton } from "./BrowserSearch";
  *     above, so the layout has to be honest about it.)
  */
 
+/** The poll for browser state.
+ *
+ *  NOT a slow safety net: `browser-navigated` has exactly one producer in the
+ *  whole app — the agent's `browse_open` tool (commands/browse.rs). A person
+ *  CLICKING A LINK inside the page goes through wry's `on_navigation` hook,
+ *  which records the new URL in Rust state and emits nothing, and the explicit
+ *  refreshes cover only typed addresses, opened search results and the
+ *  back/forward/reload buttons. So the single most common browsing action is
+ *  seen here or nowhere, and every tick of delay is a tick of the address bar
+ *  naming the previous page — and of the padlock still promising HTTPS after a
+ *  click or redirect has dropped the user onto http. That is the exact false
+ *  assurance the padlock exists to prevent, so this stays fast. (It matches the
+ *  tab strip's own reconcile timer in Workspace.tsx, which never slowed down.) */
 const POLL_MS = 1200;
+/** How long after a navigation event the title and readiness keep settling —
+ *  one extra sample, rather than waiting out the slow tick. */
+const SETTLE_MS = 700;
+
+/** A journal row's time, in the reader's own zone.
+ *
+ * The rows are stored UTC (`...Z`). Printing that string with the `Z` filed off
+ * dated 3pm work as noon — every other time in the app is local, and a record
+ * you have to convert in your head is not a record you can check. */
+function journalTime(at: string): string {
+  const d = new Date(at);
+  return Number.isNaN(d.getTime())
+    ? at
+    : d.toLocaleString(undefined, { dateStyle: "short", timeStyle: "medium" });
+}
+
+/** The scheme of the page actually on screen — `null` for a blank tab or an
+ *  address that will not parse. */
+function schemeOf(url?: string | null): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).protocol;
+  } catch {
+    return null;
+  }
+}
 
 export function BrowserView({
   parked,
@@ -77,12 +123,19 @@ export function BrowserView({
   const blank = info.blank === true;
 
   // --- bounds: keep the native view glued to the placeholder ---------------
+  // The rect Rust was last told about. Rust remembers it (`BrowserState.bounds`)
+  // and re-applies it itself whenever a page is created or switched, so
+  // re-sending an unchanged rect achieves nothing — this makes a measurement
+  // that finds nothing moved cost no IPC at all.
+  const sentRef = useRef("");
   const pushBounds = useCallback(() => {
     // PARKED: a consent card (or any other modal) is open, the page has
     // nowhere to be yet, or the results page is up. The native page floats
     // above every DOM element in this window, so the only way anything
     // underneath can be seen is to shrink the page out of the way first.
     if (parked || blank || searchOpen) {
+      if (sentRef.current === "parked") return;
+      sentRef.current = "parked";
       void api.browserSetBounds(0, 0, 1, 1).catch(() => {});
       return;
     }
@@ -90,6 +143,9 @@ export function BrowserView({
     if (!el) return;
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) return;
+    const key = `${r.left},${r.top},${r.width},${r.height}`;
+    if (key === sentRef.current) return;
+    sentRef.current = key;
     void api.browserSetBounds(r.left, r.top, r.width, r.height).catch(() => {});
   }, [parked, blank, searchOpen]);
 
@@ -98,16 +154,41 @@ export function BrowserView({
     const el = stageRef.current;
     if (!el) return;
     // A ResizeObserver alone misses the case that matters most here: the pane
-    // moving without changing size (the rail collapsing, a splitter dragging,
-    // the window moving). Watch both.
+    // moving without changing size (the rail collapsing, a splitter dragging).
+    // So: the observer and the window resize for size changes, a rAF loop for
+    // as long as a pointer is down (that is every drag, followed at 60fps
+    // instead of the old four-times-a-second tick), and a slow measurement
+    // afterwards for anything that animated to a stop on its own. Only a rect
+    // that actually changed reaches Rust.
     const ro = new ResizeObserver(pushBounds);
     ro.observe(el);
     window.addEventListener("resize", pushBounds);
-    const tick = window.setInterval(pushBounds, 250);
+    let raf = 0;
+    const follow = () => {
+      pushBounds();
+      raf = window.requestAnimationFrame(follow);
+    };
+    const onDown = () => {
+      if (!raf) raf = window.requestAnimationFrame(follow);
+    };
+    const onUp = () => {
+      if (raf) window.cancelAnimationFrame(raf);
+      raf = 0;
+      // One last measurement after the layout has settled from the drag.
+      window.setTimeout(pushBounds, 60);
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onUp, true);
+    const settle = window.setInterval(pushBounds, 1000);
     return () => {
       ro.disconnect();
       window.removeEventListener("resize", pushBounds);
-      window.clearInterval(tick);
+      window.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onUp, true);
+      if (raf) window.cancelAnimationFrame(raf);
+      window.clearInterval(settle);
     };
   }, [pushBounds]);
 
@@ -165,7 +246,11 @@ export function BrowserView({
       api.onBrowserJournal(() => {
         if (journalOpen) void loadJournal();
       }),
-      api.onBrowserNavigated(() => void refresh()),
+      api.onBrowserNavigated(() => {
+        void refresh();
+        // The title and readiness arrive a beat after the navigation itself.
+        window.setTimeout(() => void refresh(), SETTLE_MS);
+      }),
       api.onBrowserBlocked((p) =>
         setError(
           `Blocked ${p.url} — that address points at this Mac or a private network.`,
@@ -311,6 +396,24 @@ export function BrowserView({
       : ephemeral === false
         ? "WARNING: this page's storage is NOT ephemeral."
         : "Private browsing: nothing is saved to disk.";
+  // The button is a JOURNAL toggle that happens to state a privacy fact. Name
+  // the action first: a control whose only label is a claim gives no hint that
+  // pressing it does anything.
+  const shieldLabel = `${journalOpen ? "Hide" : "Show"} the activity journal. ${shield}`;
+
+  // Is the page on screen actually ENCRYPTED? The shield next to it only ever
+  // meant "nothing is written to disk" — it says nothing about the wire, and
+  // sites here can be signed into and typed into by the agent. Read from the
+  // settled URL Rust reports, so a redirect down to http is visible. Silent
+  // while the results page or the start screen is up: the address bar is
+  // showing a query then, and a padlock over a query would be a claim about a
+  // page nobody is looking at.
+  const scheme = schemeOf(searchOpen || blank ? null : info.url);
+  const secure = scheme === "https:";
+  const insecure = scheme === "http:";
+  const schemeLabel = secure
+    ? "Encrypted connection — this page was served over HTTPS."
+    : "Not encrypted — this page was served over plain HTTP. Anything you type into it, including passwords, travels in the clear.";
 
   return (
     <div className="browser-area">
@@ -349,7 +452,33 @@ export function BrowserView({
             void go();
           }}
         >
-          <GlobeIcon size={14} />
+          {secure || insecure ? (
+            <span
+              role="img"
+              aria-label={schemeLabel}
+              title={schemeLabel}
+              style={{
+                display: "inline-flex",
+                ...(insecure ? { color: "var(--danger, #b4322f)" } : null),
+              }}
+            >
+              {secure ? <LockIcon size={13} /> : <AlertIcon size={14} />}
+            </span>
+          ) : (
+            <GlobeIcon size={14} />
+          )}
+          {insecure && (
+            <span
+              style={{
+                color: "var(--danger, #b4322f)",
+                fontSize: "11px",
+                fontWeight: 600,
+                whiteSpace: "nowrap",
+              }}
+            >
+              Not secure
+            </span>
+          )}
           <input
             aria-label="Address — search the web, or type an address and press Enter"
             placeholder="Search or enter a web address"
@@ -366,8 +495,9 @@ export function BrowserView({
         <button
           className={`browser-shield${ephemeral === false ? " warn" : ""}`}
           type="button"
-          aria-label={shield}
-          title={shield}
+          aria-label={shieldLabel}
+          title={shieldLabel}
+          aria-pressed={journalOpen}
           onClick={() => setJournalOpen((v) => !v)}
         >
           <ShieldIcon size={14} />
@@ -543,7 +673,7 @@ export function BrowserView({
                     <span className="jk">{row.kind}</span>
                     <span className="jd">{row.detail}</span>
                     {row.url && <span className="ju">{row.url}</span>}
-                    <time>{row.at.replace("T", " ").replace("Z", "")}</time>
+                    <time dateTime={row.at}>{journalTime(row.at)}</time>
                   </li>
                 ))}
               </ol>

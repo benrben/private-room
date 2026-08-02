@@ -95,6 +95,27 @@ pub fn export_file(
     })
 }
 
+/// Reduce a stored file name to something that can only land INSIDE the folder
+/// the user picked: keep the last path component and neutralise separators /
+/// NUL. Nothing validates a file's name on the way IN (a download, a
+/// model-generated file and a skill resource all name themselves), so a row
+/// called `../../Library/LaunchAgents/x.plist` would otherwise write outside
+/// the chosen folder. The `roomai` CLI's `sanitize` is the same rule for the
+/// same reason — the two live in different crates and cannot share it.
+pub(crate) fn safe_export_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "unnamed".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Choose a destination name inside a folder that will not overwrite anything:
 /// on a clash, insert " (2)", " (3)", … before the extension. `is_taken`
 /// reports whether a candidate name already exists.
@@ -131,7 +152,9 @@ pub fn export_all(state: State<'_, AppState>, dest_dir: String) -> Result<u32, S
             let bytes = db::get_file_bytes(&room.conn, &f.id)?.unwrap_or_default();
             // Files written earlier this run land on disk, so the existence check
             // also dedups same-named files against each other.
-            let name = unique_export_name(&f.name, |candidate| dir.join(candidate).exists());
+            let name = unique_export_name(&safe_export_name(&f.name), |candidate| {
+                dir.join(candidate).exists()
+            });
             std::fs::write(dir.join(&name), &bytes)
                 .map_err(|e| format!("Could not write \"{name}\": {e}"))?;
             written += 1;
@@ -267,6 +290,26 @@ pub fn compact_room(state: State<'_, AppState>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_name_can_never_escape_the_chosen_folder() {
+        // A stored name is never validated on the way in, so "Export all files"
+        // used to hand it straight to `dir.join(...)`.
+        assert_eq!(safe_export_name("../../Library/LaunchAgents/evil.plist"), "evil.plist");
+        assert_eq!(safe_export_name("/etc/passwd"), "passwd");
+        assert_eq!(safe_export_name("a\\b\\c.txt"), "c.txt");
+        assert_eq!(safe_export_name(".."), "unnamed");
+        assert_eq!(safe_export_name("   "), "unnamed");
+        assert_eq!(safe_export_name("with\0nul.txt"), "with_nul.txt");
+        // Ordinary names are untouched.
+        assert_eq!(safe_export_name("Lease 2026.pdf"), "Lease 2026.pdf");
+        // And the sanitized name is what the clash suffix is built from.
+        let taken: std::collections::HashSet<String> = ["evil.plist".to_string()].into();
+        assert_eq!(
+            unique_export_name(&safe_export_name("../evil.plist"), |c| taken.contains(c)),
+            "evil (2).plist"
+        );
+    }
 
     #[test]
     fn export_name_suffixes_on_clash() {

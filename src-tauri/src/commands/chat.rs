@@ -33,6 +33,22 @@ pub fn delete_message(state: State<'_, AppState>, id: String) -> Result<(), Stri
     state.with_room(|room| db::delete_message(&room.conn, &id))
 }
 
+/// D15: a pasted image or voice note is held in memory whole and stored as one
+/// SQLite blob, exactly like a file added by link — so it gets the same ceiling
+/// instead of no ceiling at all. Measured on the BASE64 (4 chars per 3 bytes) so
+/// an oversized paste is refused before it is decoded into a second copy.
+fn check_paste_size(b64_len: usize, display_name: &str) -> Result<(), String> {
+    let size = (b64_len / 4 * 3) as u64;
+    if size > crate::web::MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "{display_name} is {} MB — larger than the {} MB limit for a room file.",
+            size / (1024 * 1024),
+            crate::web::MAX_DOWNLOAD_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
 /// ADD-8: import a pasted screenshot. Base64-decode, then go through the same
 /// insert/index path any uploaded file uses (source "upload").
 #[tauri::command]
@@ -41,6 +57,7 @@ pub fn import_image_bytes(
     name: String,
     b64: String,
 ) -> Result<FileMeta, String> {
+    check_paste_size(b64.len(), &name)?;
     state.with_room(|room| {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64.as_bytes())
@@ -64,6 +81,7 @@ pub fn import_audio_bytes(
     name: String,
     b64: String,
 ) -> Result<FileMeta, String> {
+    check_paste_size(b64.len(), &name)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| format!("Could not read the recording: {e}"))?;
@@ -92,5 +110,22 @@ pub fn import_audio_bytes(
         JobMeta { id: meta.id.clone(), name, mime, ext, room_path, epoch },
     );
     Ok(meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pasted_media_gets_the_same_ceiling_a_linked_file_does() {
+        // An ordinary paste is untouched.
+        assert!(check_paste_size(1024, "shot.png").is_ok());
+        // Exactly at the limit still passes; one base64 quantum over does not.
+        let at_limit = crate::web::MAX_DOWNLOAD_BYTES as usize / 3 * 4;
+        assert!(check_paste_size(at_limit, "shot.png").is_ok());
+        let err = check_paste_size(at_limit + 4, "voice note.m4a").unwrap_err();
+        assert!(err.contains("voice note.m4a"), "names the file: {err}");
+        assert!(err.contains("limit for a room file"), "states the limit: {err}");
+    }
 }
 

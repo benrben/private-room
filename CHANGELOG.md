@@ -32,6 +32,9 @@ All notable, user-facing changes to Arcelle. Versions follow
   its own — with previews, and an on-demand AI summary whose every claim
   links back to the result it came from.
 - **Tabs.** The browser now holds several pages at once.
+- *Not yet:* saving a file that no link points at but that needs the site's own
+  login, and "Save as PDF" of the page you're reading. Clicking a download link
+  on a site you're signed in to does work — those carry the session with them.
 
 ### Spoken voice is now fully neural
 

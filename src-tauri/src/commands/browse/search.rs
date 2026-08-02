@@ -191,7 +191,7 @@ async fn preview_one(state: &AppState, url: String) -> ResultPreview {
         if let Some(room) = guard.as_ref() {
             let _ = db::save_web_page(
                 &room.conn,
-                &url,
+                &cache_key(&url),
                 page.title.as_deref().unwrap_or_default(),
                 &page.text,
             );
@@ -268,9 +268,10 @@ pub async fn browser_peek(
     url: String,
 ) -> Result<String, String> {
     require_web_enabled(&state)?;
+    let key = cache_key(&url);
     let cached = {
         let guard = state.room.lock().unwrap();
-        guard.as_ref().and_then(|room| db::get_fresh_web_page(&room.conn, &url))
+        guard.as_ref().and_then(|room| db::get_fresh_web_page(&room.conn, &key))
     };
     if let Some((_, text)) = cached {
         if !text.trim().is_empty() {
@@ -285,7 +286,7 @@ pub async fn browser_peek(
     {
         let guard = state.room.lock().unwrap();
         if let Some(room) = guard.as_ref() {
-            let _ = db::save_web_page(&room.conn, &checked, &title, &text);
+            let _ = db::save_web_page(&room.conn, &cache_key(&checked), &title, &text);
         }
     }
     Ok(clip(&text, PEEK_CHARS))
@@ -323,9 +324,10 @@ pub async fn browser_search_summary(
         if sources.len() >= SUMMARY_SOURCES {
             break;
         }
+        let key = cache_key(&hit.url);
         let cached = {
             let guard = state.room.lock().unwrap();
-            guard.as_ref().and_then(|room| db::get_fresh_web_page(&room.conn, &hit.url))
+            guard.as_ref().and_then(|room| db::get_fresh_web_page(&room.conn, &key))
         };
         let text = match cached {
             Some((_, text)) if !text.trim().is_empty() => text,
@@ -333,7 +335,7 @@ pub async fn browser_search_summary(
                 Ok((title, text)) => {
                     let guard = state.room.lock().unwrap();
                     if let Some(room) = guard.as_ref() {
-                        let _ = db::save_web_page(&room.conn, &hit.url, &title, &text);
+                        let _ = db::save_web_page(&room.conn, &key, &title, &text);
                     }
                     text
                 }
@@ -363,7 +365,11 @@ pub async fn browser_search_summary(
         crate::ollama::CtxTier::Chat,
     )
     .await?;
-    let text = text.trim().to_string();
+    // A thinking model puts its private reasoning in `<think>…</think>` before
+    // the answer, and `generate` hands the raw text back. Unstripped, the
+    // monologue was rendered as the summary paragraph sitting above the real
+    // results — the one place on the page that has to be trustworthy.
+    let text = crate::ollama::strip_think_spans(&text).trim().to_string();
     if text.is_empty() {
         return Err("The engine returned nothing for this summary.".into());
     }
@@ -379,6 +385,24 @@ const SUMMARY_PROMPT: &str = "You summarize web search results for someone who h
     brackets, like [1] or [2]. If the sources disagree, say so. If they do not answer the \
     question, say plainly that they do not — never fill the gap from your own knowledge. \
     No preamble, no headings, no list: just the paragraph.";
+
+/// The key a fetched page is cached under.
+///
+/// The search engine writes a URL one way (`https://example.com`) and
+/// `reqwest::Url` normalizes it another (`https://example.com/`), so looking a
+/// page up under the engine's spelling while filing it under the normalized
+/// one meant the two never met: for every plain domain the Peek cache could
+/// not be hit, and expanding the same result re-downloaded the page every
+/// single time. One key, used by everything that reads or writes the cache.
+///
+/// Deliberately the LITERAL check only — no DNS — because this runs on the
+/// cache-hit path, which must not touch the network. The full guard still runs
+/// before anything is actually fetched.
+fn cache_key(url: &str) -> String {
+    crate::web::check_public_http_url(url)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| url.to_string())
+}
 
 /// Clip text to a char budget on a whitespace boundary where possible, so a
 /// source never ends mid-word.
@@ -417,5 +441,32 @@ mod tests {
     #[test]
     fn data_url_carries_the_mime_and_base64() {
         assert_eq!(data_url("image/png", b"hi"), "data:image/png;base64,aGk=");
+    }
+
+    /// The whole point of the Peek cache is that expanding a result is free.
+    /// It never was for a plain domain: the engine's spelling and the
+    /// normalized one the fetch filed it under could not match.
+    #[test]
+    fn one_cache_key_serves_both_the_lookup_and_the_save() {
+        // A bare domain as an engine writes it, and the same address after
+        // `reqwest::Url` has normalized it, must land on one key.
+        assert_eq!(cache_key("https://example.com"), cache_key("https://example.com/"));
+        assert_eq!(cache_key("https://example.com"), "https://example.com/");
+        // Case in the host is normalized too; the path is left alone.
+        assert_eq!(cache_key("https://EXAMPLE.com/A"), "https://example.com/A");
+        // Something the checker refuses is still a usable key rather than a
+        // panic or a silent collapse to the empty string.
+        assert_eq!(cache_key("not a url"), "not a url");
+    }
+
+    /// The summary sits directly above the real results. A thinking model's
+    /// private monologue rendered there is worse than no summary at all.
+    #[test]
+    fn the_summary_strips_the_models_private_reasoning() {
+        let raw = "<think>Let me weigh source 1 against 2.</think>\nRates held steady [1].";
+        assert_eq!(
+            crate::ollama::strip_think_spans(raw).trim(),
+            "Rates held steady [1]."
+        );
     }
 }

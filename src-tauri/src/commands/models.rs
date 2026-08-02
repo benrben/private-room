@@ -47,12 +47,56 @@ pub(crate) fn best_local_default(models: &[String]) -> String {
 /// gemma3 describes fine even though it aims boxes badly, and the default
 /// qwen3.5 is multimodal. Text-only chat models get a vision-model describe
 /// pass instead of an attached image.
+///
+/// NAME MATCHING ONLY, and therefore the fallback rather than the answer — see
+/// [`chat_model_sees_images`], which asks the engine. Kept for the moments the
+/// engine says nothing at all (a stopped sidecar must not turn a
+/// known-multimodal model blind mid-session) and for the remaining synchronous
+/// call site in `commands::vision`.
 pub(crate) fn is_vision_chat_model(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     !is_embedding_model(&m)
         && ["vl", "llava", "vision", "moondream", "minicpm-v", "gemma3", "qwen3.5"]
             .iter()
             .any(|k| m.contains(k))
+}
+
+/// ADD-25: can this chat model read an image — ASKED, not guessed.
+///
+/// Ollama already reports a `vision` capability through `/api/show` (metadata
+/// only, no model load), and an OpenRouter model's input modalities ride the
+/// catalog the picker fetches. Deciding this by matching seven substrings in the
+/// name meant a newly installed multimodal model with an unfamiliar name was
+/// treated as blind: its images were described to it second-hand by another
+/// model, and "mark this image" refused with "no vision model installed".
+///
+/// Order of truth: an API provider's catalog → Ollama's own capability list →
+/// [`is_vision_chat_model`] only when neither answered.
+pub(crate) async fn chat_model_sees_images(model: &str) -> bool {
+    if is_embedding_model(model) {
+        return false;
+    }
+    // A cloud CLI is a separate subprocess with no image channel from here —
+    // its perception tools go through a local vision model instead.
+    if is_cli_engine(model) {
+        return false;
+    }
+    if is_api_provider_model(model) {
+        // The provider capability cache is in-memory and filled only by a
+        // catalog fetch, and the gateways that trigger one all run LATER in the
+        // turn than this call. So the first ask after every launch decided
+        // vision by matching substrings in the slug: a capable model whose name
+        // lacks vl/vision/llava/gemma3/qwen3.5 read as blind for exactly one
+        // turn (its screenshot routed through a local describe pass, or refused
+        // outright), and the second ask was right — the shape of a bug.
+        ensure_provider_catalog(model).await;
+        return provider_model_vision(model).unwrap_or_else(|| is_vision_chat_model(model));
+    }
+    let caps = ollama::capabilities(model).await;
+    if caps.is_empty() {
+        return is_vision_chat_model(model);
+    }
+    caps.iter().any(|c| c == "vision")
 }
 
 /// Grounding ("where is X") routes to a Qwen-VL model: measured on a known
@@ -219,10 +263,70 @@ pub async fn warm_model(state: State<'_, AppState>) -> Result<(), String> {
     ollama::warm(&chat_model).await
 }
 
+/// Smallest change in a download's percentage worth repainting the bar for.
+const PULL_PROGRESS_STEP: f64 = 0.5;
+
+/// The cancel-registry key a running download is filed under, so Stop reaches
+/// it. One download per model, keyed by the model's own name — the frontend
+/// already knows that name (it is what it asked to pull), so no new id has to be
+/// invented, handed out or kept in sync.
+pub(crate) fn pull_cancel_key(name: &str) -> String {
+    format!("pull:{name}")
+}
+
+/// Download a model, reporting progress on `pull-progress`.
+///
+/// Cancellable FROM HERE DOWN: the flag is registered in the SAME registry
+/// chat's Stop uses, so `cancel_ask("pull:<model name>")` abandons a running
+/// download, which returns [`ollama::PULL_CANCELLED`].
+///
+/// The symptom this exists for — a 3 GB vision helper is unstoppable once
+/// started, with no Cancel, no Pause and no effect from leaving the screen — is
+/// NOT fixed yet: no download surface calls `cancel_ask` with a `pull:` key, so
+/// nothing can reach this. Wiring one Stop button to
+/// `api.cancelAsk('pull:' + name)` on each of the three (Settings → model
+/// download, Settings → helpers, the image viewer's vision-helper offer)
+/// completes it; the Rust half is done and tested.
 #[tauri::command]
-pub async fn pull_model(window: tauri::Window, name: String) -> Result<(), String> {
+pub async fn pull_model(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<(), String> {
     use tauri::Emitter;
-    ollama::pull(&name, |status, percent| {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let key = pull_cancel_key(&name);
+    state
+        .cancels
+        .lock()
+        .unwrap()
+        .insert(key.clone(), cancel.clone());
+    // Removes the registry entry on every return path, including the `?` ones.
+    let _cancel_guard = CancelGuard {
+        state: state.inner(),
+        ask_id: key,
+    };
+    // A multi-gigabyte pull emits a progress line per chunk — hundreds a second,
+    // each one a separate IPC message and a React render, for a bar that cannot
+    // show more than about 200 distinct positions. Forward only what actually
+    // changes something the user can see: a new phase, half a percent of
+    // progress, or the final 100%.
+    let mut last_status = String::new();
+    let mut last_percent: Option<f64> = None;
+    ollama::pull_cancellable(&name, &cancel, |status, percent| {
+        let phase_changed = status != last_status;
+        let moved = match (percent, last_percent) {
+            (Some(now), Some(before)) => (now - before).abs() >= PULL_PROGRESS_STEP || now >= 100.0,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if !phase_changed && !moved {
+            return;
+        }
+        last_status = status.to_string();
+        if percent.is_some() {
+            last_percent = percent;
+        }
         let _ = window.emit(
             "pull-progress",
             serde_json::json!({ "status": status, "percent": percent }),
@@ -251,6 +355,17 @@ mod tests {
         // 32 GB Mac keeps a distinct vision model warm too.
         assert_eq!(vision_keep_alive(32 * gb, "qwen2.5vl", "qwen3.5:4b"), "30m");
         assert_eq!(vision_keep_alive(64 * gb, "qwen2.5vl", "qwen3.5:4b"), "30m");
+    }
+
+    #[test]
+    fn a_download_is_filed_under_a_key_the_caller_can_rebuild() {
+        // The Stop button has only the model name to work with, so the key must
+        // be derivable from it alone — `cancel_ask("pull:" + model)`. Pinned
+        // because the frontend rebuilds this string rather than being handed it.
+        assert_eq!(pull_cancel_key("qwen2.5vl"), "pull:qwen2.5vl");
+        assert_eq!(pull_cancel_key("qwen2.5vl:7b"), "pull:qwen2.5vl:7b");
+        // Two different downloads never share an entry.
+        assert_ne!(pull_cancel_key("a"), pull_cancel_key("b"));
     }
 
     #[test]

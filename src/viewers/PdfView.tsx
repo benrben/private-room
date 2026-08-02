@@ -3,6 +3,7 @@ import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { locateQuoteHebrewAware, makeReceiptBadge } from "./highlight";
 import { base64ToBytes } from "./util";
+import "./pdf.css";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -112,13 +113,21 @@ function makeCopyButton(text: string): HTMLButtonElement {
  * highlight divs over the canvas. Item-level granularity: every text run
  * the match passes through gets a box. `scroll` brings the first box into
  * view (suppressed on zoom re-renders, which preserve reading position).
+ *
+ * `opts` separates the two callers: a CITATION paints `.pdf-hl` and earns the
+ * green receipt badge (the quote was verified on this page); an ordinary
+ * ⌘F find paints `.pdf-find-hl` and earns nothing — it is the reader's own
+ * search, not a claim about where a sentence came from.
  */
 async function highlightQuoteOnPage(
   page: pdfjs.PDFPageProxy,
   wrap: HTMLDivElement,
   quote: string,
   scroll = true,
+  opts?: { className?: string; badge?: boolean },
 ): Promise<boolean> {
+  const boxClass = opts?.className ?? "pdf-hl";
+  const wantBadge = opts?.badge ?? true;
   // Normalization-tolerant match: locateQuote folds case, whitespace,
   // newlines, soft hyphens, line-end hyphenation and typographic
   // look-alikes, and can span the many items pdf.js splits a line into.
@@ -129,8 +138,11 @@ async function highlightQuoteOnPage(
   const hit = locateQuoteHebrewAware(text, quote);
   if (!hit) return false;
 
-  const canvas = wrap.querySelector("canvas");
-  if (!canvas) return false;
+  // Overlays go in the page BOX (exactly the page's own coordinate space),
+  // never in the wrap, which can be wider than the page.
+  const box = wrap.querySelector<HTMLDivElement>(".pdf-page-box");
+  const canvas = box?.querySelector("canvas");
+  if (!box || !canvas) return false;
   const cssWidth = parseFloat(canvas.style.width) || canvas.clientWidth;
   const base = page.getViewport({ scale: 1 });
   const viewport = page.getViewport({ scale: cssWidth / base.width });
@@ -143,17 +155,17 @@ async function highlightQuoteOnPage(
     const tx = pdfjs.Util.transform(viewport.transform, it.transform);
     const fontH = Math.hypot(tx[2], tx[3]);
     const hl = document.createElement("div");
-    hl.className = "pdf-hl";
+    hl.className = boxClass;
     hl.style.left = `${tx[4]}px`;
     hl.style.top = `${tx[5] - fontH}px`;
     hl.style.width = `${Math.max((it.width ?? 0) * viewport.scale, 2)}px`;
     hl.style.height = `${fontH * 1.2}px`;
-    wrap.appendChild(hl);
+    box.appendChild(hl);
     first = first ?? hl;
   }
   // A painted highlight means locateQuote found the quote verbatim on this
   // page — a receipt. Tag the first box with a green "verified" check.
-  if (first) {
+  if (first && wantBadge) {
     const badge = makeReceiptBadge();
     badge.classList.add("pdf-hl-badge");
     // Position only (look comes from the .receipt-badge CSS): sit just above
@@ -165,7 +177,7 @@ async function highlightQuoteOnPage(
     badge.style.pointerEvents = "none";
     badge.style.zIndex = "3";
     badge.style.whiteSpace = "nowrap";
-    wrap.appendChild(badge);
+    box.appendChild(badge);
   }
   if (scroll) first?.scrollIntoView({ block: "center", behavior: "smooth" });
   return first != null;
@@ -190,6 +202,10 @@ export default function PdfView({
   const estHeightRef = useRef(600);
   /** Where the quote highlight lives, so a recycled page repaints it. */
   const highlightRef = useRef<{ page: number; quote: string } | null>(null);
+  /** Same, for the ⌘F hit currently being shown: without it, scrolling away
+   * from the hit and back in a document long enough for the recycler to bite
+   * showed a bare page while the find bar still counted the match. */
+  const findHlRef = useRef<{ page: number; quote: string } | null>(null);
   const hoverRef = useRef(false);
   const targetRef = useRef(target);
   targetRef.current = target;
@@ -200,10 +216,35 @@ export default function PdfView({
   // A document that can't be opened gets a calm recovery panel, never a raw
   // exception — the technical error goes to the console for debugging.
   const [failed, setFailed] = useState(false);
+  /** Live readout of the "find the quoted passage" scan, so a long search
+   * never looks frozen — and can be abandoned. */
+  const [scan, setScan] = useState<{ at: number; total: number } | null>(null);
+  const scanCancelRef = useRef(false);
+  /** Which page is at the top of the viewport, and the jump box's draft. */
+  const [curPage, setCurPage] = useState(1);
+  const [pageDraft, setPageDraft] = useState("");
+  /** ⌘F: find inside THIS document. ⌘F used to open the room-wide search, so
+   * the one place a reader expects to search — the page in front of them —
+   * was the one place they could not. */
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  /** Pages carrying the searched phrase, and which of them is showing. */
+  const [findHits, setFindHits] = useState<number[]>([]);
+  const [findAt, setFindAt] = useState(0);
+  const [finding, setFinding] = useState(false);
+  /** The phrase `findHits` belongs to: Enter steps to the next hit while it is
+   * unchanged, and re-scans when it is not. "" = nothing searched yet. */
+  const findForRef = useRef("");
+  const findInputRef = useRef<HTMLInputElement>(null);
+  const findTokenRef = useRef(0);
   const scaleRef = useRef(scale);
   scaleRef.current = scale;
 
   const targetKey = JSON.stringify(target ?? null);
+  const targetKeyRef = useRef(targetKey);
+  targetKeyRef.current = targetKey;
+  /** The target the pages on screen are already aimed at. */
+  const appliedTargetRef = useRef<string | null>(null);
 
   /** Collapse a rendered page back to a fixed-height placeholder. */
   const recyclePage = useCallback((p: number) => {
@@ -252,9 +293,35 @@ export default function PdfView({
         canvas.className = "pdf-page";
         await page.render({ canvas, viewport }).promise;
         if (token !== renderTokenRef.current) return;
-        wrap.replaceChildren(canvas);
+        // The page BOX is exactly the page: canvas, selectable text and any
+        // quote highlight all share one coordinate space inside it.
+        const cssScale = cssWidth / base.width;
+        const box = document.createElement("div");
+        box.className = "pdf-page-box";
+        box.style.width = `${cssWidth}px`;
+        box.style.setProperty("--total-scale-factor", String(cssScale));
+        box.style.setProperty("--scale-round-x", "1px");
+        box.style.setProperty("--scale-round-y", "1px");
+        box.appendChild(canvas);
+        wrap.replaceChildren(box);
         wrap.style.minHeight = "";
         wrap.dataset.rendered = "1";
+
+        // Selectable text: pdf.js positions transparent spans over the raster,
+        // so a sentence can be dragged over and copied like on any web page.
+        // Without it a PDF is a picture of words.
+        const textLayerDiv = document.createElement("div");
+        textLayerDiv.className = "textLayer";
+        box.appendChild(textLayerDiv);
+        const textLayer = new pdfjs.TextLayer({
+          textContentSource: page.streamTextContent(),
+          container: textLayerDiv,
+          viewport: page.getViewport({ scale: cssScale }),
+        });
+        await textLayer.render().catch(() => {
+          /* a page whose text can't be laid out still shows its raster */
+        });
+        if (token !== renderTokenRef.current) return;
 
         // UX-2: per-page copy button, hidden when the page has no text.
         const pageText = pageTextFromItems(await readTextItems(page));
@@ -266,6 +333,15 @@ export default function PdfView({
         const hl = highlightRef.current;
         if (hl && hl.page === p) {
           await highlightQuoteOnPage(page, wrap, hl.quote, false);
+        }
+        // Same for the ⌘F hit on screen, so the find bar's count and the page
+        // never disagree after a recycle.
+        const fh = findHlRef.current;
+        if (fh && fh.page === p) {
+          await highlightQuoteOnPage(page, wrap, fh.quote, false, {
+            className: "pdf-find-hl",
+            badge: false,
+          });
         }
 
         const live = livePagesRef.current;
@@ -285,6 +361,110 @@ export default function PdfView({
     [recyclePage],
   );
 
+  /** Strip the previous target's highlight boxes and receipt badge, so a
+   * second citation doesn't leave the first one painted. */
+  const clearHighlightBoxes = useCallback(() => {
+    highlightRef.current = null;
+    for (const wrap of pageWrapsRef.current) {
+      wrap
+        .querySelectorAll(".pdf-hl, .pdf-hl-badge")
+        .forEach((el) => el.remove());
+    }
+  }, []);
+
+  /**
+   * Aim the viewer at the current target: find the quoted passage by TEXT (no
+   * rasterizing needed), hinted page first, then render that one page and
+   * paint the highlight. Separate from buildPages so a new citation reuses the
+   * document and the pages already on screen.
+   */
+  const applyTarget = useCallback(
+    async (token: number) => {
+      const pdf = pdfRef.current;
+      const wraps = pageWrapsRef.current;
+      const tgt = targetRef.current;
+      if (!pdf || wraps.length === 0) return;
+
+      if (tgt?.quote) {
+        const quote = tgt.quote;
+        const order = [...Array(pdf.numPages).keys()].map((i) => i + 1);
+        if (tgt.page && tgt.page >= 1 && tgt.page <= pdf.numPages) {
+          order.splice(order.indexOf(tgt.page), 1);
+          order.unshift(tgt.page);
+        }
+        let foundPage: number | null = null;
+        scanCancelRef.current = false;
+        // Reading every page of a long book is a real wait, and it is the
+        // worst wait when the passage isn't there at all: narrate it every few
+        // pages (not every fifty, which reads as frozen) and offer a way out.
+        const narrate = order.length > 20;
+        if (narrate) setScan({ at: 0, total: order.length });
+        try {
+          for (let k = 0; k < order.length; k++) {
+            const p = order[k];
+            if (token !== renderTokenRef.current) return;
+            if (scanCancelRef.current) {
+              setStatus("Search stopped — the document is still open.");
+              return;
+            }
+            if (narrate && k % 5 === 0) setScan({ at: k, total: order.length });
+            const page = await pdf.getPage(p);
+            const { text } = pageSource(await readTextItems(page));
+            if (locateQuoteHebrewAware(text, quote)) {
+              foundPage = p;
+              break;
+            }
+            // Release the page's parsed operator list again — scanning a
+            // 1,200-page book otherwise grows memory the whole way down.
+            if (wraps[p - 1]?.dataset.rendered !== "1") page.cleanup();
+          }
+        } finally {
+          setScan(null);
+        }
+        if (token !== renderTokenRef.current) return;
+        setStatus("");
+        if (foundPage != null) {
+          highlightRef.current = { page: foundPage, quote };
+          const wrap = wraps[foundPage - 1];
+          wrap?.scrollIntoView({ block: "center" });
+          await renderPage(foundPage, token);
+          if (token !== renderTokenRef.current) return;
+          // renderPage only paints the highlight while it RASTERIZES a page; a
+          // page that was already live — the normal case for a follow-up
+          // citation near where the reader already is — bails out of it early,
+          // and clearHighlightBoxes has just wiped the previous highlight. So
+          // paint it here when it isn't already there, exactly as showFindHit
+          // does for its own hits.
+          if (wrap && !wrap.querySelector(".pdf-hl")) {
+            const page = await pdf.getPage(foundPage);
+            if (token !== renderTokenRef.current) return;
+            await highlightQuoteOnPage(page, wrap, quote, false);
+            if (token !== renderTokenRef.current) return;
+          }
+          const box = wrap?.querySelector(".pdf-hl");
+          box?.scrollIntoView({ block: "center", behavior: "smooth" });
+        } else {
+          setStatus(
+            tgt.page
+              ? `Couldn't locate the highlighted text — showing page ${tgt.page} instead.`
+              : "Couldn't locate the highlighted text in this PDF.",
+          );
+          if (tgt.page) {
+            wraps[Math.min(tgt.page, pdf.numPages) - 1]?.scrollIntoView({
+              block: "start",
+              behavior: "smooth",
+            });
+          }
+        }
+      } else if (tgt?.page) {
+        wraps[
+          Math.min(Math.max(tgt.page, 1), pdf.numPages) - 1
+        ]?.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+    },
+    [renderPage],
+  );
+
   /**
    * Build one fixed-height placeholder per page — every page of the
    * document, however many — and arm an IntersectionObserver that renders
@@ -297,13 +477,13 @@ export default function PdfView({
       const container = containerRef.current;
       if (!pdf || !container) return;
       const token = ++renderTokenRef.current;
-      const tgt = targetRef.current;
       const restoring = restoreIdx != null;
 
       observerRef.current?.disconnect();
       container.innerHTML = "";
       livePagesRef.current = [];
       highlightRef.current = null;
+      findHlRef.current = null;
       const wraps: HTMLDivElement[] = [];
       pageWrapsRef.current = wraps;
 
@@ -349,59 +529,7 @@ export default function PdfView({
           return;
         }
 
-        if (tgt?.quote) {
-          // Find the quote by TEXT (no rasterizing needed), hinted page
-          // first — then render that one page and paint the highlight.
-          const quote = tgt.quote;
-          const order = [...Array(pdf.numPages).keys()].map((i) => i + 1);
-          if (tgt.page && tgt.page >= 1 && tgt.page <= pdf.numPages) {
-            order.splice(order.indexOf(tgt.page), 1);
-            order.unshift(tgt.page);
-          }
-          let foundPage: number | null = null;
-          for (let k = 0; k < order.length; k++) {
-            const p = order[k];
-            if (token !== renderTokenRef.current) return;
-            // A long document takes a while to scan — narrate progress.
-            if (k % 50 === 0 && order.length > 100) {
-              setStatus(
-                `Searching the document for the passage… (page ${k + 1} of ${order.length})`,
-              );
-            }
-            const page = await pdf.getPage(p);
-            const { text } = pageSource(await readTextItems(page));
-            if (locateQuoteHebrewAware(text, quote)) {
-              foundPage = p;
-              break;
-            }
-          }
-          if (token === renderTokenRef.current) setStatus("");
-          if (token !== renderTokenRef.current) return;
-          if (foundPage != null) {
-            highlightRef.current = { page: foundPage, quote };
-            wraps[foundPage - 1]?.scrollIntoView({ block: "center" });
-            await renderPage(foundPage, token);
-            // renderPage repainted the highlight; now center on the box.
-            const box = wraps[foundPage - 1]?.querySelector(".pdf-hl");
-            box?.scrollIntoView({ block: "center", behavior: "smooth" });
-          } else {
-            setStatus(
-              tgt.page
-                ? `Couldn't locate the highlighted text — showing page ${tgt.page} instead.`
-                : "Couldn't locate the highlighted text in this PDF.",
-            );
-            if (tgt.page) {
-              wraps[Math.min(tgt.page, pdf.numPages) - 1]?.scrollIntoView({
-                block: "start",
-                behavior: "smooth",
-              });
-            }
-          }
-        } else if (tgt?.page) {
-          wraps[
-            Math.min(Math.max(tgt.page, 1), pdf.numPages) - 1
-          ]?.scrollIntoView({ block: "start", behavior: "smooth" });
-        }
+        await applyTarget(token);
       } catch (e) {
         if (token === renderTokenRef.current) {
           console.error("PDF render failed:", e);
@@ -410,10 +538,13 @@ export default function PdfView({
         }
       }
     },
-    [renderPage],
+    [renderPage, applyTarget],
   );
 
-  // Load the document once per file/target, then build the lazy pages.
+  // Load the document ONCE per file, then build the lazy pages. The target is
+  // deliberately NOT a dependency: a second quote in an already-open book used
+  // to throw away the parsed document, decode the bytes again and rebuild every
+  // page — multiple seconds of stall for nothing but a different highlight.
   useEffect(() => {
     let cancelled = false;
     const container = containerRef.current;
@@ -427,6 +558,7 @@ export default function PdfView({
         if (cancelled) return;
         pdfRef.current = pdf;
         setNumPages(pdf.numPages);
+        appliedTargetRef.current = targetKeyRef.current;
         await buildPages(scaleRef.current, null);
       } catch (e) {
         if (!cancelled) {
@@ -439,13 +571,25 @@ export default function PdfView({
     return () => {
       cancelled = true;
       renderTokenRef.current++; // cancel any in-flight render
+      scanCancelRef.current = true;
       observerRef.current?.disconnect();
       observerRef.current = null;
       task.destroy();
       pdfRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataB64, targetKey, buildPages]);
+  }, [dataB64, buildPages]);
+
+  // A NEW target on the already-open document: drop the old highlight and
+  // re-aim, reusing every parsed and rasterized page.
+  useEffect(() => {
+    if (!pdfRef.current || pageWrapsRef.current.length === 0) return;
+    if (appliedTargetRef.current === targetKey) return;
+    appliedTargetRef.current = targetKey;
+    clearHighlightBoxes();
+    void applyTarget(renderTokenRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetKey]);
 
   // UX-3: re-render on zoom, debounced, preserving reading position.
   useEffect(() => {
@@ -467,13 +611,149 @@ export default function PdfView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scale, buildPages]);
 
+  /** Drop the find highlights (never the citation ones — different class). */
+  const clearFindBoxes = useCallback(() => {
+    findHlRef.current = null;
+    for (const wrap of pageWrapsRef.current) {
+      wrap.querySelectorAll(".pdf-find-hl").forEach((el) => el.remove());
+    }
+  }, []);
+
+  /** Show one hit: scroll its page in, rasterize it, paint the match. */
+  const showFindHit = useCallback(
+    async (pageNo: number, needle: string) => {
+      const pdf = pdfRef.current;
+      const wrap = pageWrapsRef.current[pageNo - 1];
+      if (!pdf || !wrap) return;
+      clearFindBoxes();
+      // Remembered so a recycled page repaints this hit on its way back.
+      findHlRef.current = { page: pageNo, quote: needle };
+      const token = renderTokenRef.current;
+      wrap.scrollIntoView({ block: "start" });
+      await renderPage(pageNo, token);
+      if (token !== renderTokenRef.current) return;
+      // renderPage repaints the remembered hit itself when it rasterizes the
+      // page fresh; drop that copy so exactly one set of boxes is painted and
+      // scrolled to below.
+      wrap.querySelectorAll(".pdf-find-hl").forEach((el) => el.remove());
+      const page = await pdf.getPage(pageNo);
+      if (token !== renderTokenRef.current) return;
+      await highlightQuoteOnPage(page, wrap, needle, true, {
+        className: "pdf-find-hl",
+        badge: false,
+      });
+    },
+    [clearFindBoxes, renderPage],
+  );
+
+  /** Search every page for `raw` by TEXT — no rasterizing — then show the
+   * first hit. Same normalization the citation highlight uses, so a phrase
+   * broken across lines or hyphenated still matches. */
+  const runFind = useCallback(
+    async (raw: string) => {
+      const pdf = pdfRef.current;
+      const needle = raw.trim();
+      clearFindBoxes();
+      setFindHits([]);
+      setFindAt(0);
+      findForRef.current = needle;
+      if (!pdf || !needle) return;
+      const token = ++findTokenRef.current;
+      setFinding(true);
+      const hits: number[] = [];
+      try {
+        for (let p = 1; p <= pdf.numPages; p++) {
+          if (token !== findTokenRef.current) return;
+          const page = await pdf.getPage(p);
+          const { text } = pageSource(await readTextItems(page));
+          if (locateQuoteHebrewAware(text, needle)) hits.push(p);
+          // Same memory discipline as the citation scan: a page parsed only
+          // to be read is released again.
+          if (pageWrapsRef.current[p - 1]?.dataset.rendered !== "1") page.cleanup();
+        }
+      } finally {
+        if (token === findTokenRef.current) setFinding(false);
+      }
+      if (token !== findTokenRef.current) return;
+      setFindHits(hits);
+      setFindAt(0);
+      if (hits.length > 0) await showFindHit(hits[0], needle);
+    },
+    [clearFindBoxes, showFindHit],
+  );
+
+  /** Next/previous hit, wrapping at both ends. */
+  const stepFind = useCallback(
+    (delta: number) => {
+      if (findHits.length === 0) return;
+      const next = (findAt + delta + findHits.length) % findHits.length;
+      setFindAt(next);
+      void showFindHit(findHits[next], findForRef.current);
+    },
+    [findAt, findHits, showFindHit],
+  );
+
+  const closeFind = useCallback(() => {
+    findTokenRef.current++; // abandon a scan still running
+    setFinding(false);
+    setFindOpen(false);
+    setFindHits([]);
+    setFindAt(0);
+    findForRef.current = "";
+    clearFindBoxes();
+  }, [clearFindBoxes]);
+
+  /** Scroll a 1-based page to the top of the viewer. */
+  const goToPage = useCallback((p: number) => {
+    const wraps = pageWrapsRef.current;
+    if (wraps.length === 0) return;
+    const idx = Math.min(Math.max(Math.round(p), 1), wraps.length) - 1;
+    wraps[idx]?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }, []);
+
+  // Which page am I on? The toolbar used to show only a total, so in a long
+  // document there was no way to tell where you were or to jump anywhere.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    let raf = 0;
+    const measure = () => {
+      raf = 0;
+      const wraps = pageWrapsRef.current;
+      if (wraps.length === 0) return;
+      const top = container.getBoundingClientRect().top;
+      for (let i = 0; i < wraps.length; i++) {
+        if (wraps[i].getBoundingClientRect().bottom >= top + 4) {
+          setCurPage(i + 1);
+          return;
+        }
+      }
+      setCurPage(wraps.length);
+    };
+    const onScroll = () => {
+      if (!raf) raf = requestAnimationFrame(measure);
+    };
+    // The scroll may happen on this element or on an ancestor pane; capture.
+    window.addEventListener("scroll", onScroll, true);
+    measure();
+    return () => {
+      window.removeEventListener("scroll", onScroll, true);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [numPages]);
+
   const clamp = (s: number) =>
     Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(s * 100) / 100));
   const zoomIn = useCallback(() => setScale((s) => clamp(s + SCALE_STEP)), []);
   const zoomOut = useCallback(() => setScale((s) => clamp(s - SCALE_STEP)), []);
   const fitWidth = useCallback(() => setScale(1), []);
 
-  // ⌘+ / ⌘- / ⌘0 while the viewer is hovered or focused.
+  // ⌘+ / ⌘- / ⌘0 / ⌘F while the viewer is hovered or focused.
+  //
+  // CAPTURE phase on purpose: the workspace's own ⌘F (the room-wide search)
+  // listens on the window too, and it checks `defaultPrevented`. Claiming the
+  // key here — before any bubble listener runs — is what lets the document in
+  // front of the reader answer ⌘F instead of the room.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!e.metaKey) return;
@@ -490,10 +770,18 @@ export default function PdfView({
       } else if (e.key === "0") {
         e.preventDefault();
         fitWidth();
+      } else if (e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        setFindOpen(true);
+        // After the bar has mounted; select so a second ⌘F retypes.
+        window.setTimeout(() => {
+          findInputRef.current?.focus();
+          findInputRef.current?.select();
+        }, 0);
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [zoomIn, zoomOut, fitWidth]);
 
   return (
@@ -550,9 +838,130 @@ export default function PdfView({
           Fit width
         </button>
         {numPages > 0 && (
-          <span className="pdf-page-total">{numPages} pages</span>
+          <label className="pdf-page-jump">
+            Page
+            <input
+              type="text"
+              inputMode="numeric"
+              aria-label={`Page number, ${numPages} pages in this document`}
+              value={pageDraft === "" ? String(curPage) : pageDraft}
+              onChange={(e) => setPageDraft(e.target.value.replace(/\D/g, ""))}
+              onFocus={(e) => e.currentTarget.select()}
+              onBlur={() => setPageDraft("")}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                const n = parseInt(pageDraft, 10);
+                if (!Number.isNaN(n)) goToPage(n);
+                setPageDraft("");
+                e.currentTarget.blur();
+              }}
+            />
+            <span className="pdf-page-total">of {numPages}</span>
+          </label>
         )}
+        <button
+          type="button"
+          className="pdf-zoom-fit"
+          onClick={() => {
+            setFindOpen(true);
+            window.setTimeout(() => findInputRef.current?.focus(), 0);
+          }}
+          title="Find in this document (⌘F)"
+        >
+          Find
+        </button>
       </div>
+      )}
+      {!failed && findOpen && (
+        <div className="pdf-findbar" role="search">
+          <input
+            ref={findInputRef}
+            type="text"
+            className="pdf-find-input"
+            dir="auto"
+            placeholder="Find in this document"
+            aria-label="Find in this document"
+            value={findQuery}
+            onChange={(e) => setFindQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                closeFind();
+                return;
+              }
+              if (e.key !== "Enter") return;
+              e.preventDefault();
+              // Enter searches a new phrase, and steps through the hits of one
+              // already searched (Shift+Enter goes back) — what every find bar
+              // does, and it saves re-reading the whole document per hit.
+              if (findQuery.trim() && findQuery.trim() === findForRef.current) {
+                stepFind(e.shiftKey ? -1 : 1);
+              } else {
+                void runFind(findQuery);
+              }
+            }}
+          />
+          <span className="pdf-find-count" role="status">
+            {finding
+              ? "Searching…"
+              : findForRef.current === "" || findQuery.trim() !== findForRef.current
+                ? ""
+                : findHits.length === 0
+                  ? "No matches"
+                  : `Page ${findHits[findAt]} · ${findAt + 1} of ${findHits.length}`}
+          </span>
+          <button
+            type="button"
+            className="pdf-zoom-btn"
+            onClick={() => stepFind(-1)}
+            disabled={findHits.length === 0}
+            title="Previous match (⇧⏎)"
+            aria-label="Previous match"
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            className="pdf-zoom-btn"
+            onClick={() => stepFind(1)}
+            disabled={findHits.length === 0}
+            title="Next match (⏎)"
+            aria-label="Next match"
+          >
+            ↓
+          </button>
+          <button
+            type="button"
+            className="pdf-zoom-btn"
+            onClick={closeFind}
+            title="Close the find bar (Esc)"
+            aria-label="Close the find bar"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      {/* A long, possibly fruitless scan gets a moving readout and a way out
+          — the old one repainted every 50 pages and could not be stopped. */}
+      {scan && (
+        <div className="viewer-status pdf-scan" role="status">
+          <span>
+            Searching for the passage… page {scan.at + 1} of {scan.total}
+          </span>
+          <span className="pdf-scan-bar" aria-hidden>
+            <i style={{ width: `${Math.round((scan.at / scan.total) * 100)}%` }} />
+          </span>
+          <button
+            type="button"
+            className="subtle"
+            onClick={() => {
+              scanCancelRef.current = true;
+            }}
+          >
+            Cancel
+          </button>
+        </div>
       )}
       {status && <div className="viewer-status">{status}</div>}
       {/* Named landmark + page count so assistive tech keeps its bearings

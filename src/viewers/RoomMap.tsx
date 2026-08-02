@@ -58,6 +58,9 @@ export type { GraphNode, GraphEdge, RoomGraph, RoomMapProps } from "./roomMap/ty
 export default function RoomMap({ onOpenFile }: RoomMapProps) {
   const [tip, setTip] = useState<Tip | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
+  // A canvas of stars is unreachable without a mouse; the same connections are
+  // also offered as a plain, tabbable list.
+  const [listView, setListView] = useState(false);
   // Sticky selection: survives mouse-leave so its label + neighbour labels
   // persist without needing hover. Cleared by clicking empty canvas / reset.
   const [focus, setFocus] = useState<string | null>(null);
@@ -77,8 +80,20 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
 
   // The graph fetch + layout. Threads pan-zoom's setView (re-frame on
   // measure/settle) and selection's setFocus (reset on a fresh graph).
-  const { graph, status, size, cappedEdges, fileNodeCount, degree, adjacency, topNode, nonce } =
-    useRoomGraph({ stageRef, sizeRef, userAdjustedRef, layoutRef, setView, setFocus });
+  const {
+    graph,
+    status,
+    error,
+    reload,
+    size,
+    cappedEdges,
+    fileNodeCount,
+    atFileLimit,
+    degree,
+    adjacency,
+    topNode,
+    nonce,
+  } = useRoomGraph({ stageRef, sizeRef, userAdjustedRef, layoutRef, setView, setFocus });
 
   const focusId = focus ?? topNode;
   const focusNeighbors = focusId ? adjacency.get(focusId) ?? null : null;
@@ -163,24 +178,104 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, size, hasStage, focusId, focusNeighbors, degree, nonce]);
 
+  // The same graph as plain text: every file, its folder and what it links to.
+  // The canvas is mouse-only by nature, so this is the keyboard / screen-reader
+  // route to the exact same information.
+  const listRows = useMemo(() => {
+    const byId = new Map((graph?.nodes ?? []).map((n) => [n.id, n]));
+    return (graph?.nodes ?? [])
+      .filter((n) => n.kind === "file")
+      .map((n) => ({
+        id: n.id,
+        name: n.name,
+        folder: n.folder || "Top level",
+        links: [...(adjacency.get(n.id) ?? [])]
+          .map((id) => byId.get(id)?.name ?? id)
+          .sort((a, b) => a.localeCompare(b)),
+      }))
+      .sort(
+        (a, b) => b.links.length - a.links.length || a.name.localeCompare(b.name),
+      );
+  }, [graph, adjacency]);
+
   return (
     <div className="room-map" style={{ position: "relative", width: "100%", height: "100%" }}>
       <div className="room-map-toolbar">
         <GraphIcon size={16} />
         <span className="room-map-title">Room map</span>
         {graph && !showEmpty && (
-          <span className="room-map-count">
-            · {fileNodeCount} file{fileNodeCount === 1 ? "" : "s"} · {cappedEdges.length} link
+          <span
+            className="room-map-count"
+            title={
+              // Being AT the ceiling doesn't prove anything was left out — a
+              // room of exactly this many files is mapped in full — so say what
+              // is true either way rather than accusing the room of hiding
+              // files it may not have.
+              atFileLimit
+                ? `This map covers the ${fileNodeCount} newest files in the room; if there are more than that, the older ones aren't on it.`
+                : undefined
+            }
+          >
+            · {atFileLimit ? "newest " : ""}
+            {fileNodeCount} file{fileNodeCount === 1 ? "" : "s"} · {cappedEdges.length} link
             {cappedEdges.length === 1 ? "" : "s"}
           </span>
+        )}
+        {graph && !showEmpty && (
+          <button
+            type="button"
+            className="subtle rm-listtoggle"
+            aria-pressed={listView}
+            title="Show the same files and connections as a plain, keyboard-reachable list"
+            onClick={() => setListView((v) => !v)}
+          >
+            {listView ? "Map" : "List"}
+          </button>
         )}
       </div>
 
       <div className="room-map-stage" ref={stageRef}>
         {status && <div className="viewer-status">{status}</div>}
+        {/* A raw exception where the status line goes leaves the reader stuck;
+            say what happened in plain words and offer the retry. */}
+        {error && (
+          <div className="room-map-error" role="alert">
+            <p>
+              The room map couldn’t be built. Nothing in the room was changed —
+              this is only the map.
+            </p>
+            <p className="room-map-error-detail">{error}</p>
+            <button type="button" className="subtle" onClick={reload}>
+              Try again
+            </button>
+          </div>
+        )}
 
-        {showEmpty ? (
+        {error ? null : showEmpty ? (
           <div className="room-map-empty">{EMPTY_TEXT}</div>
+        ) : listView ? (
+          <div className="room-map-list">
+            <ul>
+              {listRows.map((row) => (
+                <li key={row.id}>
+                  <button
+                    type="button"
+                    className="rm-list-name"
+                    onClick={() => onOpenFile?.(row.id)}
+                    disabled={!onOpenFile}
+                  >
+                    {row.name}
+                  </button>
+                  <span className="rm-list-folder">{row.folder}</span>
+                  <div className="rm-list-links">
+                    {row.links.length === 0
+                      ? "No connections found"
+                      : `Linked to: ${row.links.join(", ")}`}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
         ) : (
           hasStage && (
             <svg
@@ -257,7 +352,7 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
         )}
 
         {/* Reset / zoom affordances — pan+zoom can wander, so offer a re-fit. */}
-        {!showEmpty && hasStage && (
+        {!showEmpty && !listView && !error && hasStage && (
           <div className="rm-controls">
             <button
               type="button"

@@ -14,11 +14,14 @@ and each one exists because the naive version misbehaved on a 4B local model:
 * **The final round offers ZERO tools.** Otherwise the loop's last act is a
   side-effect call whose result nobody ever reads, and the user gets no answer.
   A tool-less round forces a text answer grounded in the results already in hand.
-* **Only SUCCESSFUL calls are memoised.** A failed call is not in ``seen``, so
-  the model may re-attempt it in a LATER round — transient failures shouldn't be
-  permanent. This is NOT a hard "one retry" cap: a call that keeps failing can be
-  re-attempted once per round, bounded only by the runaway backstop, until
-  synthesis.
+* **Only SUCCESSFUL ROOM TOOL calls are memoised.** A failed one is not in
+  ``seen``, so the model may re-attempt it in a LATER round — transient failures
+  shouldn't be permanent. This is NOT a hard "one retry" cap: a call that keeps
+  failing can be re-attempted once per round, bounded only by the runaway
+  backstop, until synthesis. A DELEGATION is memoised either way
+  (``_ToolPass._memoise_delegation``): re-running a specialist is a whole child
+  loop rather than one call, and its outcome — empty report included — is
+  already in the thread for the model to read.
 * **An all-duplicate round forces synthesis.** If every call this round was an
   exact repeat, the model is looping; spending the remaining budget on repeats
   helps nobody, so the next round is the tool-less one.
@@ -98,7 +101,7 @@ from .agents import (
 )
 from .budget import byte_len, json_chars
 from .chat import ChatModel
-from .config import AGENT_ROUND_BACKSTOP, RunRequest
+from .config import AGENT_ROUND_BACKSTOP, NO_PROGRESS_ROUNDS, RunRequest
 from .labels import tool_step_label
 from .manager import resolve_worker
 from .mcp_client import McpClient, ToolResult
@@ -153,6 +156,42 @@ MAIN_NODE_KEY = "main"
 #: gathered rather than from the loop deciding it was finished.
 ROUND_BUDGET_STEP = "Round budget reached — answering with what we have"
 
+#: How many lines of the turn's action log the small-model note re-sends. The
+#: log itself is kept WHOLE in state — it is what an inspected turn reads, and
+#: what `verify` appends to. What is bounded is the copy paid for out of the
+#: model's window every single round.
+PROGRESS_NOTE_LINES = 12
+
+#: Stands in for the actions the tail dropped. `turn_progress_note` numbers what
+#: it is handed from 1 under a heading that reads like the turn's COMPLETE action
+#: list, so a silently trimmed log told the model actions 9-20 were actions
+#: 1-12 — and a model that believes the list is complete re-issues an older call.
+#: The duplicate guard catches that, so the cost is a wasted round, not a wrong
+#: answer; one honest line removes it. It occupies one of the lines above, so the
+#: note's size is bounded exactly as before.
+PROGRESS_ELIDED = "({n} earlier actions omitted — they are further up in this thread)"
+
+#: The honest net for a turn that ended with no words AND nothing to show for
+#: itself. `DONE_TEXT` is a claim of success, and it is only true over work that
+#: actually happened; said over a turn where no specialist reported and nothing
+#: was written, it tells the user the app finished something it never started.
+NOTHING_TEXT = (
+    "I could not produce an answer for that — nothing was run and nothing was "
+    "changed. Please try asking again."
+)
+
+#: The same honesty for the turn that DID run something and has nothing to show
+#: for it — a specialist that failed or was refused, a tool round that came back
+#: empty. A specialist's report is recorded on SUCCESS only, so all of those fell
+#: through to `NOTHING_TEXT`, which told the user nothing had been run while the
+#: step beside it was red. Both halves of this sentence are facts the loop owns:
+#: the action log is non-empty and the referent baton is not.
+NOTHING_USABLE_TEXT = (
+    "I could not produce an answer for that. Some steps ran, but none of them "
+    "came back with anything I can use, and nothing was changed. Please try "
+    "asking again."
+)
+
 
 class CancelToken:
     """The ask's Stop button, seen from inside the loop."""
@@ -204,8 +243,11 @@ class Deps:
     #: inflate the payload each of them fits a window to. `wf_nodes.NodeDeps`
     #: already carries exactly this knob for the workflow lanes and defaults it
     #: to 1 for the same reason; the hub's fan-out shipped unbounded, which is
-    #: the gap. Cloud engines have no resident model, so the caller raises it.
-    #: 0/None means unbounded, which is what a cloud room wants.
+    #: the gap. Cloud engines have no resident model, so the caller raises it —
+    #: to `config.CLOUD_WORKER_PARALLEL`, not to unbounded: twenty tasks meant
+    #: twenty PAID conversations opening in the same instant.
+    #: 0/None means unbounded, which only a headless caller that owns its own
+    #: rate limiting should ask for.
     worker_parallel: int | None = None
     #: Tool results too big for the thread, parked whole (:mod:`.results`).
     #:
@@ -214,15 +256,23 @@ class Deps:
     #: the run, and no teardown has to remember it. Which refs a given loop may
     #: READ is scoped separately, by `AgentState.spills`.
     results: ResultStore = field(default_factory=ResultStore)
-    #: The WHOLE ASK's model-round ceiling (`config.TURN_ROUND_BUDGET`), shared
+    #: The WHOLE ASK's runaway net (`config.TURN_ROUND_BACKSTOP`), shared
     #: by every loop in the delegation tree. `max_rounds` lives in state, and
     #: each child starts a fresh state at round 0, so it bounds a loop and not a
     #: turn — the one place a turn-wide count can live is here, because `Deps`
     #: is the single object passed by reference all the way down.
     #: None/0 = unbounded (what a headless caller that owns its own timeout wants).
     turn_round_budget: int | None = None
+    #: How many CONSECUTIVE no-progress rounds a loop may spend before it is
+    #: made tool-less (`config.NO_PROGRESS_ROUNDS`). Unlike the net above this
+    #: is a THRESHOLD, not a counter — the count itself is per-loop and lives in
+    #: `AgentState.stalls`, because a worker that repeats itself should end its
+    #: own loop, not its siblings'. None/0 = the gate is off.
+    turn_stall_budget: int | None = NO_PROGRESS_ROUNDS
     _rounds_spent: int = field(default=0, repr=False, compare=False)
     _worker_sem: Any = field(default=None, repr=False, compare=False)
+    #: Which loop (`AgentState.node_key`) currently holds the live answer area.
+    _live_node: str | None = field(default=None, repr=False, compare=False)
 
     def spend_round(self) -> bool:
         """Take one round from the TURN's budget; False once it is exhausted.
@@ -236,14 +286,35 @@ class Deps:
             return True
         return self._rounds_spent <= self.turn_round_budget
 
-    @property
-    def rounds_spent(self) -> int:
-        return self._rounds_spent
-
     def just_exhausted(self) -> bool:
         """True on the ONE round that first crossed the budget — so the user is
         told once, not once per loop still unwinding."""
         return bool(self.turn_round_budget) and self._rounds_spent == self.turn_round_budget + 1
+
+    def claim_live(self, node: str) -> bool:
+        """True when THIS loop may stream its round into the live answer area.
+
+        There is exactly ONE of those in the UI, and a `round` event BLANKS it
+        (`effects.ts`) before the deltas that follow. A round of the hub's
+        dispatches its whole batch of specialists at once, and every one of them
+        streamed into that same area: the user watched fragments of three agents
+        shuffled together and repeatedly erased, and read-aloud spoke the
+        jumble. Whoever gets there first holds it until its round ends — the
+        siblings are still visible as step chips and roster nodes, and the
+        answer the user keeps is composed by the hub either way.
+
+        A LEASE, not a lock: a loop that does not get it simply stays quiet.
+        Nothing waits on anything, so this cannot deadlock or reorder events.
+        """
+        if self._live_node is None:
+            self._live_node = node
+            return True
+        return self._live_node == node
+
+    def release_live(self, node: str) -> None:
+        """Give the live area back, if this loop is what is holding it."""
+        if self._live_node == node:
+            self._live_node = None
 
     def worker_slot(self) -> Any:
         """An async context manager bounding concurrent children (or a no-op)."""
@@ -351,6 +422,10 @@ class AgentState(TypedDict, total=False):
     #: serde reason as `seen`.
     attempted: set[str]
     force_synthesis: bool
+    #: Consecutive rounds this loop has spent without learning anything
+    #: new. Reset to 0 by any round that does. At
+    #: `Deps.turn_stall_budget` the next round is served tool-less.
+    stalls: int
     round: int
     calls: list[ToolCall]
     pending_images: list[str]
@@ -367,13 +442,11 @@ class AgentState(TypedDict, total=False):
     #: tool-less round to answer a correction (so the gate cannot loop).
     verified: bool
     corrected: bool
-    #: `check_result` (the recall_act_check shape): the result check has run
-    #: this round, how many bounded repair rounds it has spent, and whether the
-    #: repair round has already been taken — together they keep the check from
-    #: firing twice and the repair from looping.
-    checked: bool
+    #: `check_result` (the recall_act_check shape): how many bounded repair
+    #: rounds this loop has spent — the gate's WHOLE budget. `checked` and
+    #: `repaired` sat here too, left over from the latch the counter replaced;
+    #: both were written on every visit and read by nothing (removed 2026-08-01).
     repairs: int
-    repaired: bool
     #: `check_result`'s decision for `route_after_check`, recomputed every visit.
     #: The gate used to be a LATCH (`checked` -> `repaired` -> stop), which made
     #: `repair_cap` a boolean: the two agents declaring 2 were given 1. The node
@@ -489,14 +562,78 @@ def _select_tools(
     return out
 
 
-def _locked_groups(served_names: set[str], current: set[str], unlocked: set[str]) -> list[str]:
+def _why(exc: BaseException) -> str:
+    """A reason a person can read.
+
+    ``str()`` on several httpx/asyncio errors is the EMPTY STRING, so every
+    place that reports a failure by interpolating the exception could produce
+    "failed:" with nothing after it — a line that is then handed to the Main
+    agent and from there to the user. ``stream_events`` already solved this for
+    the run-level error; the delegation paths interpolated raw and did not.
+    """
+    return str(exc) or type(exc).__name__
+
+
+async def _list_tools(deps: Deps) -> list[Any]:
+    """The bridge's catalog, with ONE retry and a sentence the user can act on.
+
+    This is the FIRST thing every loop does, before any work — so a hiccup here
+    costs nothing but the turn, and the turn used to end in whatever raw
+    httpx/JSON-RPC text the exception carried, with no retry and no explanation.
+    One retry covers the transient case. A second failure is reported as itself
+    rather than swallowed, because continuing with an EMPTY catalog would be
+    worse: an agent with no tools does not say so, it answers from memory.
+    """
+    if deps.mcp is None:
+        return []
+    try:
+        return await deps.mcp.list_tools()
+    except asyncio.CancelledError:
+        raise
+    except Exception as first:  # noqa: BLE001 - retried once, then reported
+        try:
+            return await deps.mcp.list_tools()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # BOTH reasons, and they are often different — "connection refused"
+            # then "timed out" is the shape of a bridge coming down mid-turn.
+            # Only the retry's reason goes in the sentence the user reads; the
+            # first attempt's belongs in the log with the traceback.
+            _log.error(
+                "the room's tool catalog could not be loaded (first attempt: %s)",
+                _why(first),
+                exc_info=True,
+            )
+            raise RuntimeError(
+                # `_why` falls back to the exception's class NAME, which is never
+                # empty, so this used to read `_why(exc) or _why(first)` with a
+                # second half that could not be reached.
+                "this room's tools could not be loaded, so nothing could be "
+                f"done safely: {_why(exc)}"
+            ) from exc
+
+
+def _locked_groups(
+    served_names: set[str], current: set[str], unlocked: set[str], own: str = ""
+) -> list[str]:
     """request_tools groups still locked AND actually servable this run (an
     advisor-scope bridge never serves ui tools — offering an unlockable group
-    would teach the model to hallucinate)."""
+    would teach the model to hallucinate).
+
+    ``own`` is the asking agent's OWN group, and it is never offered. The hatch
+    exists for a lane the keyword routers MISSED — a reader that turns out to
+    need the jobs tools — not for widening an agent inside its own domain,
+    where the box is a deliberate scope decision and a sibling already holds the
+    rest. Without this, `skills.use` (read and run only, by its own paragraph)
+    could unlock the `skills` group and reach save_skill and delete_skill; the
+    Main agent routes an authoring ask to `skills.author` instead.
+    """
     return [
         g
         for g in GROUPS
         if g not in unlocked
+        and g != own
         and (group_tools(g) & served_names)
         and not (group_tools(g) <= current)
     ]
@@ -520,12 +657,17 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         await deps.emit(
             {
                 "t": "lane",
-                "v": lane_label(ui=agent.id == "app.ui", write=write, web_enabled=web_enabled),
+                "v": lane_label(
+                    ui=agent.id == "app.ui",
+                    write=write,
+                    web_enabled=web_enabled,
+                    agent_id=agent.id,
+                ),
             }
         )
 
     # Never hardcode the catalog — the host decides our trust scope (SPEC §2.1).
-    served = await deps.mcp.list_tools() if deps.mcp is not None else []
+    served = await _list_tools(deps)
     served_specs = [s.to_ollama() for s in served]
     served_names = {s.get("function", {}).get("name") for s in served_specs}
     # Hub v3: the MAIN agent's only tools are its specialists — the
@@ -550,7 +692,7 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     # bridge actually serves) stay reachable through one always-on mini-tool —
     # a lane the vocabulary missed is one trivial enum call away instead of
     # permanently invisible.
-    locked = [] if agent.main else _locked_groups(served_names, offered, unlocked)
+    locked = [] if agent.main else _locked_groups(served_names, offered, unlocked, agent.group)
     if locked:
         tools.append(request_tools_spec(locked))
     if messages and messages[0].get("role") == "system":
@@ -603,6 +745,7 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         "messages": messages,
         "seen": set(),
         "force_synthesis": False,
+        "stalls": 0,
         "round": 0,
         "calls": [],
         "pending_images": [],
@@ -623,19 +766,14 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
 
     rnd = state.get("round", 0)
     max_rounds = state.get("max_rounds", AGENT_ROUND_BACKSTOP)
+    node = str(state.get("node_key") or MAIN_NODE_KEY)
     # The turn-wide budget, spent by EVERY loop in the tree (`Deps.spend_round`).
     # Exhausting it does not abort anything: it makes this and every remaining
     # round tool-less, which is the same mechanism as `last` below — so each
     # loop still unwinds into a text answer instead of dying mid-delegation.
     within_turn_budget = deps.spend_round()
     if not within_turn_budget and deps.just_exhausted():
-        await deps.emit(
-            {
-                "t": "step",
-                "v": ROUND_BUDGET_STEP,
-                "node": str(state.get("node_key") or MAIN_NODE_KEY),
-            }
-        )
+        await deps.emit({"t": "step", "v": ROUND_BUDGET_STEP, "node": node})
     # CHG-0/CHG-32: the final round (and any forced synthesis) is tool-less, so
     # the loop always ends with a text answer grounded in prior results.
     last = (
@@ -647,13 +785,29 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
     messages: list[Message] = state["messages"]
     tools: list[dict[str, Any]] = state.get("tools", [])
     # CHG-5: a fresh model round begins — the frontend clears its live text, so
-    # what the user sees is always exactly the current round's words.
-    await deps.emit({"t": "round"})
+    # what the user sees is always exactly the current round's words. Which is
+    # exactly why only ONE loop at a time may say it (`Deps.claim_live`): a
+    # batch of specialists all writing into that one area is a jumble that each
+    # of them then blanks.
+    #
+    # Both events carry the emitting node. Unlike step/step_status, the HOST does
+    # not forward it — `ask-round` is emitted with an empty payload and
+    # `ask-delta` with just the text — and it is not needed for display either,
+    # because the lease above already guarantees the live area has exactly one
+    # writer, so "the active agent" is never ambiguous. The stamp is on the wire
+    # as the evidence the lease is checked AGAINST (a `delta` landing inside
+    # another node's live block is a lease bug, and only the stamp can show it);
+    # forwarding it in `sidecar.rs` is a future option, not something the UI does
+    # today.
+    live = deps.claim_live(node)
+    if live:
+        await deps.emit({"t": "round", "node": node})
 
     offered: list[dict[str, Any]] = [] if last else tools
 
     async def on_delta(d: str) -> None:
-        await deps.emit({"t": "delta", "v": d})
+        if live:
+            await deps.emit({"t": "delta", "v": d, "node": node})
 
     # Small-local mode (BFCL 2025, ICML): the dominant multi-turn failure of
     # small models is losing track of what already happened. Re-inject the
@@ -666,7 +820,20 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
     progress: list[str] = list(state.get("progress", []))
     notes: list[str] = []
     if small and progress:
-        notes.append(turn_progress_note(progress))
+        # The TAIL, not the whole log. The note is rebuilt every round and the
+        # budget protects a note from trimming, so an unbounded one grows all
+        # turn and is paid for out of the same window as the tool RESULTS — on a
+        # long turn the fitter starts dropping the file contents and search hits
+        # that the note is only a one-line summary of. The recent steps are the
+        # ones a small model loses track of; the older ones are still above it
+        # in the thread — which the note SAYS when it trims, because the list is
+        # numbered from 1 either way and otherwise reads as the whole turn.
+        if len(progress) <= PROGRESS_NOTE_LINES:
+            shown = progress
+        else:
+            kept = progress[-(PROGRESS_NOTE_LINES - 1):]
+            shown = [PROGRESS_ELIDED.format(n=len(progress) - len(kept)), *kept]
+        notes.append(turn_progress_note(shown))
     # A ground-truth correction is NOT gated on `small`. It says the tools
     # disagree with what the model is about to claim, which a cloud engine can
     # be just as wrong about — and it is the whole point of a `verify` shape.
@@ -675,7 +842,15 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
         notes.append(correction_note(corrections))
     to_send = messages + [{"role": "user", "content": n} for n in notes] if notes else messages
 
-    content, calls, usage = await deps.chat.stream(to_send, offered, on_delta, deps.cancel)
+    try:
+        content, calls, usage = await deps.chat.stream(
+            to_send, offered, on_delta, deps.cancel
+        )
+    finally:
+        # Hand the live area back the moment this round stops talking — whether
+        # it answered, failed or was cancelled. A lease nobody releases is a
+        # muted UI for the rest of the turn.
+        deps.release_live(node)
 
     # A small local model used to be held to ONE call per round here (BFCL: FC
     # mode gets call COUNTS wrong ~4x more often than prompting does). That cap
@@ -688,8 +863,14 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
     # Token-budget bar: categorize what was actually SENT this round (the tool
     # catalog offered this round, not the cached full-catalog `tools_chars` —
     # the tool-less final round offers none, and the breakdown must reflect that).
-    breakdown_chars = categorize_messages(messages, json_chars(offered))
-    await deps.emit({"t": "usage", **build_usage_event(rnd, usage, breakdown_chars)})
+    # `to_send`, not `messages`: the ephemeral notes above ARE part of the
+    # request, so leaving them out under-counted every round that carried one —
+    # only the colours on an engine that reports its own totals, but the whole
+    # number on an engine that does not.
+    breakdown_chars = categorize_messages(to_send, json_chars(offered))
+    await deps.emit(
+        {"t": "usage", "node": node, **build_usage_event(rnd, usage, breakdown_chars)}
+    )
 
     cancelled = deps.cancel.cancelled
     stop = last or cancelled or not calls
@@ -703,9 +884,26 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
 
 
 async def _run_one_tool(deps: Deps, call: ToolCall) -> ToolResult:
+    """One room tool. A failure of ANY kind comes back as a tool RESULT.
+
+    `McpClient.call_tool` turns its own protocol errors into `is_error` results
+    for exactly this reason — "so the round can still make progress" — but it
+    catches `McpError` only. A dropped connection or a timed-out request raises
+    httpx straight through the tool loop instead: the specialist died mid-task,
+    its half-finished work went with it, and raw transport text ended up in the
+    answer. A tool that could not run is a result the model can read and react
+    to, and that is true whether the room refused or the socket did.
+    """
     if deps.mcp is None:
         return ToolResult(text="no room bridge is available", is_error=True)
-    return await deps.mcp.call_tool(call.name, call.arguments)
+    try:
+        return await deps.mcp.call_tool(call.name, call.arguments)
+    except asyncio.CancelledError:
+        # Stop, or the run being torn down — not a tool failure.
+        raise
+    except Exception as exc:  # noqa: BLE001 - one tool, not the whole ask
+        _log.error("the room bridge failed on %s", call.name, exc_info=True)
+        return ToolResult(text=f"the room bridge failed: {_why(exc)}", is_error=True)
 
 
 def _args_summary(arguments: dict[str, Any] | None, limit: int = 40) -> str:
@@ -732,6 +930,17 @@ def _unlock_group(
             False,
             None,
         )
+    own = get_agent(str(state.get("agent_id", ""))).group
+    if group == own:
+        # The hatch widens a MISSED lane, never an agent inside its own domain
+        # (see `_locked_groups`). The enum never offers this, so reaching here
+        # means the model asked for it anyway.
+        return (
+            f"The rest of the {group} tools belong to another specialist. Do what "
+            "your own instructions allow and report the rest as MISSING.",
+            False,
+            None,
+        )
     names = group_tools(group)
     if not served_names & names:
         # An advisor-scope bridge never serves these — don't pretend otherwise.
@@ -746,7 +955,7 @@ def _unlock_group(
         plan_multi=bool(state.get("plan_multi", False)),
     )
     offered = {s.get("function", {}).get("name") for s in tools}
-    still_locked = _locked_groups(served_names, offered, unlocked)
+    still_locked = _locked_groups(served_names, offered, unlocked, own)
     if still_locked:
         tools.append(request_tools_spec(still_locked))
     # The group is unlocked, so NOW its system-prompt paragraph applies (same
@@ -911,6 +1120,24 @@ def _referent_names(tool: str, args: dict[str, Any] | None) -> list[str]:
     return [str(name)[:80]] if name else []
 
 
+def _unavailable_note(key: str, available: list[str]) -> str:
+    """What the Main agent is told when it asks for a specialist this room lacks.
+
+    ONE wording for BOTH delegation paths. The batch dispatcher grew this guard
+    first and the direct ``ask_*_agent`` path never got it — that path only
+    calls `resolve_worker`, which falls through to the DEFAULT worker when every
+    member of a domain is unreachable. So "ask the Web agent what the weather
+    is" in a web-off room was answered out of the user's own documents, under a
+    "File agent" label.
+    """
+    names = ", ".join(available) or "none"
+    return (
+        f"This room has no {key!r} specialist right now (available: {names}). "
+        "MISSING: tell the user plainly that this room cannot do that part — "
+        "do not answer it from memory."
+    )
+
+
 class WorkerOutcome(NamedTuple):
     """What one delegation — a single specialist, or a whole ``ask_agents``
     batch — hands back to the sequential pass.
@@ -994,6 +1221,7 @@ async def _run_worker(
         "messages": base,
         "seen": set(),
         "force_synthesis": False,
+        "stalls": 0,
         "round": 0,
         "calls": [],
         "pending_images": [],
@@ -1183,7 +1411,8 @@ class _Delegator:
     state: AgentState
     #: The turn's roster, shared BY REFERENCE with the caller (see above).
     pipeline: list[dict[str, Any]]
-    #: This round's batch number; a wave adds its own offset (see `register`).
+    #: This round's batch number — the band everything dispatched at round start
+    #: shares. Later waves take their own band from `wave_batch`.
     batch: int
     #: The referent baton as it stood when this round's batch launched.
     referents_at_launch: list[str]
@@ -1191,6 +1420,13 @@ class _Delegator:
     carryover: tuple[str, ...]
     #: What the bridge served this run — how a delegation resolves to a worker.
     served_names: set[str]
+    #: The domains this room can actually serve, by short key — THE definition
+    #: of "which specialists exist right now" (`reachable_domain_keys`). Read by
+    #: BOTH delegation paths, so neither can dispatch a phantom.
+    live_domain_keys: list[str]
+    #: The next free band number, handed out by `wave_batch`. Seeded lazily from
+    #: `batch` so no constructor has to remember to keep the two in step.
+    next_batch: int | None = None
     #: Duplicate keys already dispatched this round.
     launched: set[str] = field(default_factory=set)
     #: call id -> the human label of whatever is running for it, so a crash can
@@ -1247,18 +1483,71 @@ class _Delegator:
             referents_at_launch=referents_at_launch,
             carryover=carryover,
             served_names=served_names,
+            # The same list that built the `agent` enum the model chose from, so
+            # the guard and the catalog cannot disagree.
+            live_domain_keys=reachable_domain_keys(
+                web_enabled=bool(state.get("web_enabled", False)),
+                served_names=served_names,
+            ),
         )
 
-    def register(self, worker_id: str, instruction: str, wave: int) -> dict[str, Any]:
+    def wave_batch(self, wave_no: int) -> int:
+        """The parallel BAND one wave belongs to — what makes concurrency legible.
+
+        Everything a round dispatches at once shares the round's band, and that
+        includes the FIRST wave of every ``ask_agents`` plan in it: those really
+        do start together. Every LATER wave takes a band of its own, because it
+        did not. The band used to be `round batch + wave index`, so two plans
+        launched in the same round had their second waves drawn as one group
+        however far apart they actually ran.
+
+        Allocation is atomic by construction: no await between the read and the
+        write, and asyncio gives us one thread.
+        """
+        if wave_no == 0:
+            return self.batch
+        if self.next_batch is None:
+            self.next_batch = self.batch + 1
+        band = self.next_batch
+        self.next_batch += 1
+        return band
+
+    def register(self, worker_id: str, instruction: str, batch: int) -> dict[str, Any]:
         """Claim this child's roster slot. Call order, before anything runs."""
         entry: dict[str, Any] = {
             "agent": worker_id,
             "instruction": instruction,
             "status": "running",
-            "batch": self.batch + wave,
+            "batch": batch,
             "key": f"{worker_id}#{len(self.pipeline)}",
         }
         self.pipeline.append(entry)
+        return entry
+
+    def unavailable(self, domain_key: str | None) -> str | None:
+        """The refusal for a domain this room cannot serve, else ``None``.
+
+        ``None`` for an UNRECOGNISED name keeps the tolerant fallback a garbled
+        key has always had: `resolve_worker` lands on the default worker.
+        Recognised-but-unavailable is the case this refuses.
+        """
+        if domain_key is None or domain_key in self.live_domain_keys:
+            return None
+        return _unavailable_note(domain_key, self.live_domain_keys)
+
+    def register_unavailable(
+        self, tool: str, instruction: str, batch: int
+    ) -> dict[str, Any]:
+        """A roster slot, already marked failed, for a delegation this room
+        cannot run.
+
+        The specialist is named WITHOUT ``served_names``: we are naming the one
+        the user asked for, not choosing one to run. Without this the task was
+        simply absent from the live picture — the assistant was told in text and
+        said so, but the diagram showed a turn that never asked.
+        """
+        entry = self.register(resolve_worker(tool, instruction), instruction, batch)
+        entry["status"] = "failed"
         return entry
 
     async def tracked(
@@ -1312,18 +1601,12 @@ class _Delegator:
         """
         waves = plan_waves(plan)
         batch = _Batch(gathered=list(self.referents_at_launch))
-        #: The domains actually offered this run — the same list that built the
-        #: `agent` enum the model chose from (see `reachable_domain_keys`).
-        live_domain_keys = reachable_domain_keys(
-            web_enabled=bool(self.state.get("web_enabled", False)),
-            served_names=self.served_names,
-        )
         cancelled_any = False
         for wave_no, wave in enumerate(waves):
             if self.deps.cancel.cancelled:
                 cancelled_any = True
                 break
-            running = self._launch_wave(plan, wave, wave_no, batch, live_domain_keys)
+            running = self._launch_wave(plan, wave, wave_no, batch)
             await _emit_pipeline(self.deps, self.pipeline, _active_step(self.pipeline))
             if await self._collect_wave(running, batch):
                 cancelled_any = True
@@ -1340,7 +1623,6 @@ class _Delegator:
         wave: list[int],
         wave_no: int,
         batch: _Batch,
-        live_domain_keys: list[str],
     ) -> list[tuple[int, dict[str, Any], asyncio.Task[Any]]]:
         """Start every task in ONE wave; collect none of them.
 
@@ -1349,6 +1631,7 @@ class _Delegator:
         for :meth:`_collect_wave`.
         """
         baton = list(batch.gathered)
+        band = self.wave_batch(wave_no)
         running: list[tuple[int, dict[str, Any], asyncio.Task[Any]]] = []
         for idx in wave:
             task_spec = plan[idx]
@@ -1364,17 +1647,18 @@ class _Delegator:
             # weather question from room content. Report MISSING instead.
             # Belt to the braces of the generated enum + description: even
             # if that ever drifts again, this cannot become a fabrication.
-            if norm is not None and norm not in live_domain_keys:
-                available = ", ".join(live_domain_keys) or "none"
-                batch.reports[idx] = (
-                    f"Task {idx} could not run: this room has no {key!r} "
-                    f"specialist right now (available: {available}). "
-                    "MISSING: tell the user plainly that this room cannot "
-                    "do that part — do not answer it from memory."
-                )
+            refusal = self.unavailable(norm)
+            if refusal is not None:
+                batch.reports[idx] = f"Task {idx} could not run. {refusal}"
                 batch.task_ok[idx] = False
+                # ...and it shows up in the live picture as the failed node it
+                # is, rather than being silently absent from the diagram while
+                # the assistant is told about it in text.
+                self.register_unavailable(
+                    DOMAIN_KEYS.get(norm or "", ""), str(task_spec["instruction"]), band
+                )
                 continue
-            entry, task = self._launch_task(task_spec, norm, wave_no, baton, batch)
+            entry, task = self._launch_task(task_spec, norm, band, baton, batch)
             running.append((idx, entry, task))
         return running
 
@@ -1382,7 +1666,7 @@ class _Delegator:
         self,
         task_spec: dict[str, Any],
         norm: str | None,
-        wave_no: int,
+        band: int,
         baton: list[str],
         batch: _Batch,
     ) -> tuple[dict[str, Any], asyncio.Task[WorkerOutcome]]:
@@ -1397,7 +1681,7 @@ class _Delegator:
             served_names=self.served_names,
             web_enabled=bool(self.state.get("web_enabled", False)),
         )
-        entry = self.register(worker_id, instruction, wave_no)
+        entry = self.register(worker_id, instruction, band)
         dep_reports = tuple(
             batch.reports[d]
             for d in sorted(set(task_spec.get("depends_on", [])))
@@ -1435,7 +1719,10 @@ class _Delegator:
                 # One task failing must not abort its siblings or the plan:
                 # the Main agent is told, and decides what to do with the
                 # rest. A raised exception here would strand the whole batch.
-                batch.reports[idx] = f"Task {idx} ({label}) failed: {result}"
+                # `_why`, not the bare exception: several of the errors that land
+                # here str() to "", and "failed:" with nothing after it is what
+                # the Main agent would then tell the user.
+                batch.reports[idx] = f"Task {idx} ({label}) failed: {_why(result)}"
                 batch.task_ok[idx] = False
                 continue
             report, child_ok, child_cancelled, child_refs = result
@@ -1477,6 +1764,13 @@ class _Delegator:
             # `seen`/the duplicate note, so it must not get its own worker.
             if key in seen or key in self.launched:
                 continue
+            # A domain this room cannot serve gets no worker at all — the
+            # sequential pass answers it with the same MISSING note the batch
+            # path uses (`_ToolPass._delegation`). Launching it would hand the
+            # ask to `resolve_worker`'s DEFAULT specialist under the label of
+            # the one the model asked for.
+            if self.unavailable(normalize_domain_key(call.name)) is not None:
+                continue
             self.launched.add(key)
             instruction = str(
                 (call.arguments or {}).get("instruction") or self.state.get("question", "")
@@ -1489,7 +1783,7 @@ class _Delegator:
                 served_names=self.served_names,
                 web_enabled=bool(self.state.get("web_enabled", False)),
             )
-            entry = self.register(worker_id, instruction, 0)
+            entry = self.register(worker_id, instruction, self.batch)
             self.launched_label[call.id] = get_agent(worker_id).label
             self.tasks[call.id] = asyncio.create_task(
                 self.tracked(
@@ -1624,7 +1918,8 @@ class _ToolPass:
         #
         # A WORKER never delegates: its catalog holds no ask_* tool at all, so the
         # whole scan is dead for one. Guarded ONCE here rather than tested per call
-        # inside the scan.
+        # inside the scan — and a worker that invents one anyway is refused by
+        # `_rejected_by_catalog_guard`, not run inline off an empty base thread.
         if self.agent.main:
             await self.delegator.launch(calls, self.seen)
 
@@ -1677,7 +1972,7 @@ class _ToolPass:
                 continue
             self.all_dup = False
 
-            if self._rejected_by_hub_guard(call):
+            if self._rejected_by_catalog_guard(call):
                 continue
 
             # CHG-5: a human step label, not inline "⚙ name…" answer text. Stamped
@@ -1699,28 +1994,46 @@ class _ToolPass:
             roster = self.delegator.pipeline
             await _emit_pipeline(self.deps, roster, active_step=len(roster) + 1)
 
-    def _rejected_by_hub_guard(self, call: ToolCall) -> bool:
-        """True when this call was ANSWERED with the corrective note instead of
-        being run at all — the Main agent asking for a room tool."""
-        # Hub guard (v3): the MAIN agent never touches a room tool — even if
-        # the model drifts and emits one, it is rejected here, before the
-        # bridge, with a corrective note steering it back to delegation.
-        if (
-            self.agent.main
-            and call.name not in AGENT_TOOL_NAMES
-            and call.name != BATCH_TOOL_NAME
-        ):
-            self.messages.append(
-                tool_message(
-                    f"You have no tool named '{call.name}' — you are the Main "
-                    "agent and never act directly. Delegate with one of your "
-                    "ask_*_agent tools, or answer the user.",
-                    call.name,
-                    call.id,
-                )
+    def _rejected_by_catalog_guard(self, call: ToolCall) -> bool:
+        """True when this call was ANSWERED with a corrective note instead of
+        being run at all: a call the ACTIVE agent does not own.
+
+        Two directions, one rule. The MAIN agent never touches a room tool — it
+        delegates. A WORKER never delegates: no ask_* tool is in any worker's
+        box, so a delegation emitted by one is a name the model invented.
+
+        Only the first direction was guarded, and the second was HONOURED:
+        `_arm_for` dispatches on the tool NAME alone, so a worker's invented
+        `ask_file_agent` reached `_delegation`, found no launched task (the
+        fan-out only launches for the hub) and ran the child INLINE — built from
+        `worker_base_messages`, which is seeded EMPTY for a worker. That is a
+        whole nested assistant with no system prompt, no room context and no
+        rules, whose answer rejoined the thread as a genuine specialist report.
+        Nothing bounded the nesting either: that child could do it again.
+
+        The same call spelled `ask_agents` fell through to `_batch`, which
+        answered a worker with `EMPTY_PLAN_NOTE` — a lecture on how to format a
+        task list, for a tool it does not have. The plain truth is what the Main
+        agent already gets in the mirror-image case.
+        """
+        delegation = call.name in AGENT_TOOL_NAMES or call.name == BATCH_TOOL_NAME
+        if self.agent.main and not delegation:
+            note = (
+                f"You have no tool named '{call.name}' — you are the Main "
+                "agent and never act directly. Delegate with one of your "
+                "ask_*_agent tools, or answer the user."
             )
-            return True
-        return False
+        elif delegation and not self.agent.main:
+            note = (
+                f"You have no tool named '{call.name}' — you are the "
+                f"{self.agent.label} and cannot hand work to another agent. "
+                "Do this task with your own tools, or report what you found "
+                "and what is missing."
+            )
+        else:
+            return False
+        self.messages.append(tool_message(note, call.name, call.id))
+        return True
 
     def _set_catalog(self, tools: list[dict[str, Any]]) -> None:
         """Adopt a rebuilt catalog, keeping the spill reader offered.
@@ -1775,8 +2088,15 @@ class _ToolPass:
         if new_tools is not None:
             self._set_catalog(new_tools)
         await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
-        if ok:
-            self.seen.add(key)
+        # Remembered WHATEVER came back, like a delegation and unlike a room
+        # tool. Every way this can fail is permanent for the turn: `GROUPS` is a
+        # constant, the agent's own group does not change, and `served_specs` is
+        # derived once in `prepare` — so none of the three refusals can start
+        # succeeding in a later round. Recorded only on success, an identical
+        # repeat was never a duplicate, so the round never counted as a stall,
+        # the no-progress gate that is supposed to end it never fired, and a
+        # model that kept asking burned rounds to the turn-wide backstop.
+        self.seen.add(key)
         self.progress.append(f"request_tools(group={group}) -> {'ok' if ok else 'error'}")
         self.messages.append(tool_message(result, call.name, call.id))
         return True
@@ -1823,8 +2143,7 @@ class _ToolPass:
         if ok:
             self.reports_so_far.append(("specialists", report))
         await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
-        if ok:
-            self.seen.add(key)
+        self._memoise_delegation(key)
         self.progress.append(
             f"{BATCH_TOOL_NAME}({self.delegator.plan_sizes.get(call.id, 0)} tasks)"
             + (" -> reports received" if ok else " -> no reports")
@@ -1836,6 +2155,20 @@ class _ToolPass:
             return False
         return True
 
+    def _memoise_delegation(self, key: str) -> None:
+        """Remember this delegation WHATEVER came back.
+
+        The opposite of a room tool, whose failure may well be transient and is
+        deliberately left out of `seen` so a later round can retry it (SPEC
+        §3.2). Re-running a specialist is not a retry of one call, it is a whole
+        child loop — real waiting, and real money on a cloud room — and the
+        outcome it already gave is sitting in the thread right above, which is
+        exactly what `duplicate_call_note` points the model at while inviting a
+        DIFFERENT instruction. A changed instruction changes `ToolCall.key`, so
+        only the byte-identical repeat is suppressed.
+        """
+        self.seen.add(key)
+
     async def _delegation(self, call: ToolCall, key: str) -> bool:
         """One ask_*_agent call: collect the specialist and record what it left."""
         # Hub v3: the Main agent asked a specialist. Resolved and executed
@@ -1846,6 +2179,30 @@ class _ToolPass:
         instruction = str(
             (call.arguments or {}).get("instruction") or self.state.get("question", "")
         )
+        # ...unless this room has no such specialist. The batch path has always
+        # refused that; this one dispatched it to `resolve_worker`'s DEFAULT
+        # worker instead, so "ask the Web agent what the weather is" in a
+        # web-off room was answered out of the user's own files under the File
+        # agent's label. Same note as the batch path, and no worker runs.
+        refusal = self.delegator.unavailable(normalize_domain_key(call.name))
+        if refusal is not None:
+            self.delegator.register_unavailable(
+                call.name, instruction, self.delegator.batch
+            )
+            await _emit_pipeline(
+                self.deps, self.delegator.pipeline, _active_step(self.delegator.pipeline)
+            )
+            await self.deps.emit({"t": "step_status", "ok": False, "node": self.node})
+            # Memoised like any other delegation: this one cannot start
+            # succeeding later in the turn, so a byte-identical repeat is answered
+            # from the note already in the thread rather than re-refused every
+            # round until the backstop.
+            self._memoise_delegation(key)
+            self.progress.append(
+                f"{call.name}({instruction[:60]}) -> no such specialist"
+            )
+            self.messages.append(tool_message(refusal, call.name, call.id))
+            return True
         report, ok, worker_cancelled, worker_refs = await self._child_outcome(
             call, instruction
         )
@@ -1861,8 +2218,7 @@ class _ToolPass:
                 (self.delegator.launched_label.get(call.id, "specialist"), report)
             )
         await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
-        if ok:
-            self.seen.add(key)
+        self._memoise_delegation(key)
         # Truthful either way: this log is the small model's only record of
         # what actually happened, so it must never claim a report it lacks.
         self.progress.append(
@@ -1891,7 +2247,9 @@ class _ToolPass:
                     served_names=self.delegator.served_names,
                     web_enabled=bool(self.state.get("web_enabled", False)),
                 )
-                fallback = self.delegator.register(worker_id, instruction, 0)
+                fallback = self.delegator.register(
+                    worker_id, instruction, self.delegator.batch
+                )
                 result = await _run_worker(
                     self.state,
                     self.config,
@@ -1921,7 +2279,12 @@ class _ToolPass:
             # The safer behaviour is now the DEFAULT rather than the special
             # case. The Main agent is told, truthfully, and decides.
             who = self.delegator.launched_label.get(call.id, "specialist")
-            return WorkerOutcome(f"The {who} could not finish: {exc}", False, False, [])
+            # `_why`, not the bare exception: this line is handed to the Main
+            # agent and from there to the user, and several of the errors that
+            # reach it str() to "" — "could not finish:" and nothing after it.
+            return WorkerOutcome(
+                f"The {who} could not finish: {_why(exc)}", False, False, []
+            )
 
     async def _room_tool(self, call: ToolCall, key: str) -> bool:
         """One ordinary room tool, through the bridge — the only arm that does."""
@@ -1968,13 +2331,24 @@ class _ToolPass:
         """The node's state update. ``tools`` is the one conditional key: it
         appears only if a mid-round `request_tools` rebuilt the offered catalog.
         """
-        # A round of only repeats means the model is stuck: force a tool-less
-        # synthesis next round instead of spinning to the round backstop.
-        force_synthesis = bool(self.state.get("force_synthesis", False)) or self.all_dup
+        # A round of only repeats learned nothing. That USED to end the turn on
+        # the spot, which punished a model for one wasted round — re-reading a
+        # file it just wrote, polling a job, retrying a transient failure are all
+        # legitimate repeats mid-task. What actually distinguishes stuck from
+        # working is whether it KEEPS happening, so count consecutive stalls and
+        # let `config.NO_PROGRESS_ROUNDS` of them be the thing that gives up.
+        # Any round that learns something resets the count to zero.
+        budget = self.deps.turn_stall_budget
+        stalls = (int(self.state.get("stalls", 0)) + 1) if self.all_dup else 0
+        force_synthesis = (
+            bool(self.state.get("force_synthesis", False))
+            or bool(budget and budget > 0 and stalls >= budget)
+        )
 
         updates: dict[str, Any] = {
             "messages": self.messages,
             "seen": self.seen,
+            "stalls": stalls,
             "force_synthesis": force_synthesis,
             "round": self.state.get("round", 0) + 1,
             "calls": [],
@@ -2075,6 +2449,62 @@ def route_after_tools(state: AgentState) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _fallback_answer(final: AgentState, *, cancelled: bool) -> str:
+    """What to say when the hub's loop ended without composing anything.
+
+    There are four cases here and the old code had ONE net for all of them:
+    ``"Done."`` whenever Stop had not been pressed. That is a claim of success
+    made without looking at whether anything succeeded — an empty round, a
+    refused ask and a model that returned nothing all read to the user as a
+    finished job.
+
+    Each of the four gets its own line, and the FOURTH is the reason there are
+    four: a specialist's report is recorded on success only, so a turn whose
+    specialist failed — or was refused by the no-such-specialist guard — has no
+    report, no referent, and is not a turn where nothing ran. It used to be told
+    "nothing was run and nothing was changed" while the step chip beside it was
+    red.
+
+    No model call anywhere in here. The findings baton already holds each
+    specialist's report verbatim, the referent baton holds what was actually
+    written and the action log holds what was attempted, so what happened this
+    turn is a fact the loop already owns.
+    """
+    done = [
+        f"**{label}** — "
+        + (
+            text.split(":", 1)[-1].strip()
+            if text.startswith("Report from the")
+            else text
+        )
+        for label, text in final.get("reports", [])
+    ]
+    if done:
+        # Specialists finished real work and the hub never wrote it up. Handing
+        # back "" threw all of it away and the user saw a turn that did nothing
+        # — the actual harm behind "a crash/Stop discards completed work". Just
+        # as true when nothing was stopped.
+        head = (
+            "Stopped. Here is what had already come back:"
+            if cancelled
+            else "I could not compose an answer, but here is what came back:"
+        )
+        return head + "\n\n" + "\n\n".join(done)
+    if cancelled:
+        # Stopped before anything came back: say nothing rather than invent it.
+        return ""
+    if final.get("referents"):
+        # No report, but the room really did change — the artifacts are the
+        # evidence, so "Done." is the truth here, and only here.
+        return DONE_TEXT
+    if final.get("progress"):
+        # Something WAS run — it just came back with nothing. The action log is
+        # the record of that, and it is written whatever the outcome (a failed
+        # specialist, a refused one, a tool error), unlike `reports`.
+        return NOTHING_USABLE_TEXT
+    return NOTHING_TEXT
+
+
 async def run_agent(req: RunRequest, deps: Deps) -> str:
     """Run one ask to completion. Emits SPEC §4 events through ``deps.emit``.
 
@@ -2099,6 +2529,7 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     # is not a bound. A caller that pre-set one keeps it.
     if deps.turn_round_budget is None:
         deps.turn_round_budget = req.resolved_turn_rounds()
+    deps.turn_stall_budget = req.resolved_turn_stalls()
 
     # The ask lives in `question` (a REQUIRED field); `messages` is optional
     # history. Chat callers ALSO append the ask as the final user turn, but
@@ -2166,6 +2597,7 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
         "messages": messages,
         "seen": set(),
         "force_synthesis": False,
+        "stalls": 0,
         "round": 0,
         "calls": [],
         "pending_images": [],
@@ -2187,27 +2619,11 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
 
     final: AgentState = await graph_for(MAIN_AGENT_ID).ainvoke(initial, config=config)  # type: ignore[arg-type]
 
-    # The ONE final event for the whole pipeline. Don't invent "Done." over a
-    # partial answer the user stopped.
+    # The ONE final event for the whole pipeline. Never invent success over a
+    # turn that produced nothing — see `_fallback_answer`.
     answer = (final.get("final_text", "") or "").strip()
-    if not answer and not deps.cancel.cancelled:
-        answer = DONE_TEXT
-    elif deps.cancel.cancelled:
-        answer = final.get("final_text", "") or ""
-        if not answer.strip():
-            # Stop landed before the hub composed anything, but specialists may
-            # already have finished real work. Handing back "" threw all of it
-            # away and the user saw a turn that did nothing — the actual harm
-            # behind "a crash/Stop discards completed work". No model call: the
-            # findings baton already holds each report verbatim.
-            done = [
-                f"**{label}** — {text.split(':', 1)[-1].strip() if text.startswith('Report from the') else text}"
-                for label, text in final.get("reports", [])
-            ]
-            if done:
-                answer = "Stopped. Here is what had already come back:\n\n" + "\n\n".join(
-                    done
-                )
+    if not answer:
+        answer = _fallback_answer(final, cancelled=deps.cancel.cancelled)
     await deps.emit({"t": "final", "v": answer})
     return answer
 
@@ -2249,11 +2665,11 @@ async def stream_events(req: RunRequest, deps_factory: Callable[[Emit], Deps]):
         except BaseException as exc:  # noqa: BLE001 - any failure must reach the host
             # BaseException, not Exception: a bare `Exception` clause let every
             # BaseException (SystemExit, KeyboardInterrupt, a nested CancelledError)
-            # out through the same silent door as above. `or type(...)` because
-            # str() on several httpx/asyncio errors is the empty string, which would
-            # emit {"t": "error", "v": ""} and tell the user nothing.
+            # out through the same silent door as above. `_why` because str() on
+            # several httpx/asyncio errors is the empty string, which would emit
+            # {"t": "error", "v": ""} and tell the user nothing.
             _log.error("run failed: %s", type(exc).__name__, exc_info=True)
-            await queue.put({"t": "error", "v": str(exc) or type(exc).__name__})
+            await queue.put({"t": "error", "v": _why(exc)})
             if not isinstance(exc, Exception):
                 raise
         finally:

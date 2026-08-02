@@ -59,9 +59,18 @@ const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
 /// pre-run copy so a room with a huge file list can't balloon the workspace; any
 /// matches beyond the cap are skipped (the script can still declare them via
 /// `# room-inputs:`).
-const MAX_AUTO_MATERIALIZE: usize = 20;
+pub(crate) const MAX_AUTO_MATERIALIZE: usize = 20;
 /// Grace between SIGTERM and SIGKILL when killing the process group.
 const KILL_GRACE: Duration = Duration::from_secs(5);
+/// How long to wait for the stdout/stderr readers to reach EOF after the script
+/// exits, before reporting the tails we have.
+const READER_FLUSH_GRACE: Duration = Duration::from_secs(2);
+/// Total wall-clock budget for one script node, as a multiple of the script's
+/// own timeout. The auto-heal loop re-runs the whole script once per missing
+/// package, and each attempt used to get the FULL timeout again with no overall
+/// cap — eight rounds of a 10-minute script held the single background slot for
+/// an hour and a half while everything else waited.
+const TOTAL_TIMEOUT_MULTIPLE: u64 = 2;
 
 // ---------------------------------------------------------------- manifest
 
@@ -109,6 +118,27 @@ pub fn script_lang_of(name: &str) -> Option<ScriptLang> {
         "js" => Some(ScriptLang::Js),
         _ => None,
     }
+}
+
+/// Resolve a `script_run` node's `file` (a stored file id, OR a name) to
+/// (id, real name, bytes).
+///
+/// The ONE resolver. Consent stamping, the manual consent card and the executor
+/// each grew their own copy, and because a name resolves to "the newest file
+/// with a matching name" they could disagree the moment a similarly named file
+/// arrived between approving a script and running it — the run then parked with
+/// "isn't approved on this Mac yet" for a script just approved.
+pub(crate) fn resolve_script_file(
+    conn: &Connection,
+    file: &str,
+) -> Result<(String, String, Vec<u8>), String> {
+    // An exact id first, then a fuzzy name match (the agent passes names).
+    let id = match db::get_file_bytes_named(conn, file) {
+        Ok(_) => file.to_string(),
+        Err(_) => db::find_file_like(conn, file)?.0,
+    };
+    let (name, bytes) = db::get_file_bytes_named(conn, &id)?;
+    Ok((id, name, bytes.unwrap_or_default()))
 }
 
 /// SHA-256 (hex) of the script's raw bytes — the content-addressed consent key
@@ -435,13 +465,18 @@ pub fn sweep_script_workspaces<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
-/// Create `script-runs/<job_id>/` at mode 0700, plus a `tmp/` for TMPDIR.
+/// Create `script-runs/<job_id>-<step_id>/` at mode 0700, plus a `tmp/` for
+/// TMPDIR. The STEP is part of the name, not just the job: two script steps of
+/// one workflow can be ready in the same wave and run side by side, and a
+/// workspace named after the job alone meant the second one's "start clean"
+/// wiped the first one's inputs and outputs mid-run.
 fn make_workspace<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     job_id: &str,
+    step_id: usize,
 ) -> Result<PathBuf, String> {
-    let dir = script_runs_root(app)?.join(job_id);
-    // Start clean (a resumed job reuses the same id).
+    let dir = script_runs_root(app)?.join(format!("{job_id}-{step_id}"));
+    // Start clean (a resumed step reuses the same directory name).
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
@@ -483,18 +518,46 @@ fn materialize_inputs(
     Ok(out)
 }
 
-/// Room-file names that appear VERBATIM (exact-name substring) in the script
-/// text, in the room's listing order, capped at `cap`. Pure — no I/O, and no
-/// dedup against declared inputs (the caller handles that). Empty names never
-/// match. This lets `pd.read_csv('ETF Tracker — AI Full Stack.csv')` find its
-/// file even when the script declared no `# room-inputs:`.
+/// Shortest room-file name that may auto-materialize by being MENTIONED, and
+/// the rule that it must look like a file name. Without them a room file called
+/// "s" or "df" appeared inside almost any program text and was copied into
+/// every script's workspace — where the script writing its own `df` would
+/// overwrite it.
+const MIN_REFERENCE_NAME: usize = 4;
+
+/// Whether `name` occurs in `text` as a whole token — not glued to more name
+/// characters on either side, so `data.csv` does not match `mydata.csv.bak`.
+fn mentions_file_name(text: &str, name: &str) -> bool {
+    let boundary = |c: char| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
+    text.match_indices(name).any(|(at, _)| {
+        // `at` and `at + name.len()` are char boundaries: they bound a match of
+        // a valid &str inside a valid &str.
+        let before = text[..at].chars().next_back().is_none_or(boundary);
+        let after = text[at + name.len()..].chars().next().is_none_or(boundary);
+        before && after
+    })
+}
+
+/// Room-file names that appear VERBATIM in the script text, in the room's
+/// listing order, capped at `cap`. Pure — no I/O, and no dedup against declared
+/// inputs (the caller handles that). This lets
+/// `pd.read_csv('ETF Tracker — AI Full Stack.csv')` find its file even when the
+/// script declared no `# room-inputs:`.
+///
+/// A name only qualifies if it reads like a file name — at least
+/// `MIN_REFERENCE_NAME` characters, carrying an extension, and appearing as a
+/// whole token. A script can still reach anything else by declaring it in
+/// `# room-inputs:`.
 pub(crate) fn referenced_room_files(text: &str, room_files: &[String], cap: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for name in room_files {
-        if name.is_empty() || out.iter().any(|n| n == name) {
+        if out.iter().any(|n| n == name) {
             continue;
         }
-        if text.contains(name.as_str()) {
+        if name.chars().count() < MIN_REFERENCE_NAME || extraction::extension_of(name).is_empty() {
+            continue;
+        }
+        if mentions_file_name(text, name) {
             out.push(name.clone());
             if out.len() >= cap {
                 break;
@@ -607,11 +670,12 @@ pub async fn execute_script_in_workspace(
     // sidecar_lifecycle BufReader-on-a-thread pattern).
     let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut readers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     if let Some(o) = child.stdout.take() {
-        spawn_ring_reader(o, out_buf.clone());
+        readers.push(spawn_ring_reader(o, out_buf.clone()));
     }
     if let Some(e) = child.stderr.take() {
-        spawn_ring_reader(e, err_buf.clone());
+        readers.push(spawn_ring_reader(e, err_buf.clone()));
     }
 
     let start = Instant::now();
@@ -631,8 +695,15 @@ pub async fn execute_script_in_workspace(
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
 
-    // Give the reader threads a beat to flush the final chunk.
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // WAIT for the reader threads to hit EOF rather than guessing at a delay:
+    // the assistant is told to quote a script's output as the answer, so a last
+    // line lost on a loaded machine is a wrong answer. Bounded, because a
+    // lingering grandchild can hold the pipe open after the script itself
+    // exited — then the tail we already have is what there is.
+    let flush_by = Instant::now() + READER_FLUSH_GRACE;
+    while readers.iter().any(|h| !h.is_finished()) && Instant::now() < flush_by {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let stdout_tail = tail_string(&out_buf);
     let stderr_tail = tail_string(&err_buf);
     Ok(ExecOut {
@@ -666,7 +737,10 @@ fn kill_group(pgid: u32, signal: &str) {
         .status();
 }
 
-fn spawn_ring_reader<Rd: Read + Send + 'static>(mut rd: Rd, buf: Arc<Mutex<Vec<u8>>>) {
+fn spawn_ring_reader<Rd: Read + Send + 'static>(
+    mut rd: Rd,
+    buf: Arc<Mutex<Vec<u8>>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         loop {
@@ -683,7 +757,7 @@ fn spawn_ring_reader<Rd: Read + Send + 'static>(mut rd: Rd, buf: Arc<Mutex<Vec<u
                 }
             }
         }
-    });
+    })
 }
 
 fn tail_string(buf: &Arc<Mutex<Vec<u8>>>) -> String {
@@ -747,8 +821,13 @@ pub fn import_outputs(
     }
 
     // 2. Any NEW file the script created (present after exit, not materialized,
-    //    not a declared output) — additive, capped (20 files / 64 MB).
+    //    not a declared output) — additive, capped (20 files / 64 MB). The cap
+    //    counts only these UNDECLARED extras: charging a script's own promised
+    //    outputs against the allowance for surprises left a script that declares
+    //    many outputs with no room for any, dropping them with a message that
+    //    read like a limit hit for no reason.
     let mut new_bytes: u64 = 0;
+    let mut new_count: usize = 0;
     if let Ok(entries) = std::fs::read_dir(ws) {
         // Deterministic order so the cap drops the same files across runs.
         let mut names: Vec<String> = entries
@@ -764,12 +843,13 @@ pub fn import_outputs(
             handled.insert(name.clone());
             let path = ws.join(&name);
             let len = path.metadata().map(|m| m.len()).unwrap_or(0);
-            if imported.len() >= MAX_NEW_FILES || new_bytes + len > MAX_IMPORT_BYTES {
+            if new_count >= MAX_NEW_FILES || new_bytes + len > MAX_IMPORT_BYTES {
                 skipped.push(format!("{name}: skipped (new-file import cap reached)"));
                 continue;
             }
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
             new_bytes += bytes.len() as u64;
+            new_count += 1;
             let meta = write_output(conn, &name, &bytes, cause)?;
             imported.push(meta);
         }
@@ -865,6 +945,7 @@ pub struct ScriptRunReport {
 pub(crate) async fn run_script_process<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     job_id: &str,
+    step_id: usize,
     room_path: &str,
     script_file_id: &str,
     consented_sha256: &str,
@@ -904,7 +985,7 @@ pub(crate) async fn run_script_process<R: tauri::Runtime>(
     let runner = resolve_interpreter(&manifest)?;
 
     // (c) Workspace + materialize inputs (record hashes for modified detection).
-    let ws = make_workspace(app, job_id)?;
+    let ws = make_workspace(app, job_id, step_id)?;
     let safe_script = safe_name(&script_name);
     let materialized = {
         let state = app.state::<AppState>();
@@ -982,6 +1063,9 @@ async fn run_and_import<R: tauri::Runtime>(
     use tauri::Manager;
     // uv is detected by its `run` argv prefix; only it can install on the fly.
     let is_uv = runner.argv_prefix.first().map(|s| s == "run").unwrap_or(false);
+    // One budget for the FIRST attempt plus every heal retry together.
+    let deadline = Instant::now()
+        + Duration::from_secs(manifest.timeout_secs.saturating_mul(TOTAL_TIMEOUT_MULTIPLE));
     let mut out =
         execute_script_in_workspace(ws, runner, safe_script, manifest.timeout_secs, cancel, stdin).await?;
 
@@ -1000,6 +1084,12 @@ async fn run_and_import<R: tauri::Runtime>(
             if healed.contains(&missing) {
                 break; // we added it last round and it's still missing → can't heal
             }
+            // No time left in the overall budget — stop healing and report the
+            // failure we have rather than holding the slot for another attempt.
+            let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+            if left < MIN_TIMEOUT_SECS {
+                break;
+            }
             healed.push(missing);
             let mut argv = runner.argv_prefix.clone();
             for pkg in &healed {
@@ -1010,7 +1100,7 @@ async fn run_and_import<R: tauri::Runtime>(
                 program: runner.program.clone(),
                 argv_prefix: argv,
             };
-            out = execute_script_in_workspace(ws, &healed_runner, safe_script, manifest.timeout_secs, cancel, stdin).await?;
+            out = execute_script_in_workspace(ws, &healed_runner, safe_script, left, cancel, stdin).await?;
         }
     }
 
@@ -1262,6 +1352,108 @@ mod tests {
         let many: Vec<String> = (0..30).map(|i| format!("f{i}.csv")).collect();
         let uses = many.join(" ");
         assert_eq!(referenced_room_files(&uses, &many, 5).len(), 5, "capped at 5");
+    }
+
+    #[test]
+    fn two_script_steps_of_one_job_get_separate_workspaces() {
+        // Two script steps of one workflow can be ready in the same wave and
+        // run side by side. Named after the JOB alone they shared a directory,
+        // and setting one up starts by deleting whatever is there — so the
+        // second erased the first one's inputs and outputs while it was still
+        // working, and the step failed for no visible reason.
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let handle = app.handle().clone();
+        let job = format!("job-{}", Uuid::new_v4());
+
+        let first = make_workspace(&handle, &job, 0).unwrap();
+        std::fs::write(first.join("step0-output.csv"), b"mine").unwrap();
+        let second = make_workspace(&handle, &job, 1).unwrap();
+        assert_ne!(first, second, "one workspace per STEP, not per job");
+        assert!(
+            first.join("step0-output.csv").is_file(),
+            "the sibling step's files must survive"
+        );
+        assert!(second.join("tmp").is_dir());
+
+        // A RESUMED step still reuses its own directory and starts clean.
+        std::fs::write(second.join("stale.txt"), b"old").unwrap();
+        let again = make_workspace(&handle, &job, 1).unwrap();
+        assert_eq!(again, second);
+        assert!(!again.join("stale.txt").exists(), "a re-run starts clean");
+
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn a_very_short_or_extensionless_name_is_not_auto_materialized() {
+        // A room file called "s" or "df" appears inside almost any program, so
+        // it was copied into every script's workspace — and a script writing
+        // its own `df` then overwrote the user's file. A name only qualifies if
+        // it reads like a file name AND appears as a whole token.
+        let text = "import pandas as pd\ndf = pd.read_csv('prices.csv')\ns = df.sum()\n";
+        let room = vec![
+            "df".to_string(),
+            "s".to_string(),
+            "a.py".to_string(),
+            "prices.csv".to_string(),
+        ];
+        let hit = referenced_room_files(text, &room, 20);
+        assert_eq!(hit, vec!["prices.csv".to_string()], "got: {hit:?}");
+
+        // Whole-token matching: a name glued to more name characters is not a
+        // reference to that file.
+        assert!(referenced_room_files(
+            "open('mydata.csv.bak')",
+            &["data.csv".to_string()],
+            20
+        )
+        .is_empty());
+        // …and the real reference still resolves.
+        assert_eq!(
+            referenced_room_files("open('data.csv')", &["data.csv".to_string()], 20),
+            vec!["data.csv".to_string()]
+        );
+        // A short name can still be reached by DECLARING it (`# room-inputs:`),
+        // which is a different path entirely.
+        assert!(referenced_room_files("df", &["df".to_string()], 20).is_empty());
+    }
+
+    #[test]
+    fn declared_outputs_do_not_eat_the_allowance_for_undeclared_extras() {
+        // The 20-file cap exists for files the script did NOT promise. Counting
+        // its declared outputs against it left a script that declares many
+        // outputs with no room for any, dropped with a message that read like a
+        // limit hit for no reason.
+        let conn = db::mem();
+        let ws = tmp_ws();
+        let declared: Vec<String> = (0..MAX_NEW_FILES)
+            .map(|i| format!("declared{i:03}.csv"))
+            .collect();
+        for name in &declared {
+            std::fs::write(ws.join(name), b"x").unwrap();
+        }
+        std::fs::write(ws.join("surprise.txt"), b"y").unwrap();
+        let manifest = ScriptManifest {
+            interpreter: ScriptLang::Py,
+            deps: vec![],
+            inputs: vec![],
+            outputs: declared.clone(),
+            timeout_secs: 600,
+            shortcut: Shortcut::None,
+        };
+        let (imported, skipped) =
+            import_outputs(&conn, &ws, &manifest, &[], "s.py", "c").unwrap();
+        assert_eq!(
+            imported.len(),
+            MAX_NEW_FILES + 1,
+            "every declared output plus the undeclared extra: {skipped:?}"
+        );
+        assert!(imported.iter().any(|m| m.name == "surprise.txt"));
+        assert!(skipped.is_empty(), "nothing was dropped: {skipped:?}");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

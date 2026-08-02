@@ -84,15 +84,21 @@ cp -R dist/arcelle-sidecar "$STAGE/arcelle-sidecar"
 # RUN it locally and to prove the recipe; scripts/release.sh re-signs the same
 # tree with the Developer ID for notarization (a strictly more-trusted identity,
 # same flags), so what notarizes is what we validated here.
+# A failure here is fatal (set -e): an unsigned or half-signed bundle only shows
+# up much later, as the sidecar refusing to launch on a user's Mac.
 codesign --force --deep --options runtime \
   --entitlements sidecar-entitlements.plist \
-  --sign - "$STAGE/arcelle-sidecar/arcelle-sidecar" 2>/dev/null || true
+  --sign - "$STAGE/arcelle-sidecar/arcelle-sidecar"
+
+# Prove the shipped bundle carries no LangGraph Studio / dev tooling — the code
+# that cloudpickles conversation threads to PLAINTEXT files in the CWD. This is
+# the enforcement of that guarantee, so it runs on every build (the build venv
+# already has PyInstaller, which the check reads the archive with).
+"$VENV/bin/python" devtools/verify_bundle_clean.py \
+  "$STAGE/arcelle-sidecar/arcelle-sidecar"
 
 echo
 echo "Built + staged: $(cd "$STAGE" && pwd)/arcelle-sidecar/arcelle-sidecar"
 echo "Smoke-test it with:  ./dist/arcelle-sidecar/arcelle-sidecar --port 0"
-echo "RELEASE: deep-sign the staged dir with the Developer ID + hardened runtime:"
-echo "  codesign --force --deep --options runtime \\"
-echo "    --entitlements sidecar/sidecar-entitlements.plist \\"
-echo "    --sign \"Developer ID Application: …\" \\"
-echo "    src-tauri/resources/sidecar/arcelle-sidecar"
+echo "The ad-hoc signature above is for local runs; scripts/release.sh re-signs"
+echo "the same staged tree with the Developer ID for notarization."

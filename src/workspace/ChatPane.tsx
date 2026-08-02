@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RoomInfo } from "../api";
+import type { AskActiveAgent, AskPlanStep } from "../apiTypes";
 import {
   CheckIcon,
   DownloadIcon,
@@ -18,7 +19,8 @@ import {
 import ChatAnnotatedImage from "../viewers/ChatAnnotatedImage";
 import MarkdownView from "../viewers/MarkdownView";
 import { HandoffMarker } from "./TokenBudgetBar";
-import { AgentGraph } from "./AgentGraph";
+import { AgentGraph, type AgentTiming } from "./AgentGraph";
+import { uniqueFileName } from "./composer";
 import {
   annotationTarget,
   isCloudEngine,
@@ -31,6 +33,17 @@ import DeleteControl from "./DeleteControl";
 import Composer from "./ComposerPane";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+
+/** One finished turn's agent diagram, kept so it can be read after the answer
+ * lands: which helpers ran, what each did, and how long it took. */
+interface PastGraph {
+  plan: AskPlanStep[];
+  active: AskActiveAgent | null;
+  agentSteps: Record<string, { label: string; ok: boolean }[]>;
+  steps: { label: string; ok: boolean }[];
+  lane: string;
+  timings: { current: Record<string, AgentTiming> };
+}
 
 /** Pane 3: the chat header, onboarding banners, the message transcript (with
  * receipts/undo/regenerate/save), the streaming placeholder, the "worth
@@ -48,9 +61,79 @@ export default function ChatPane({
   const modelReady = isModelReady(ai, model);
   // PRIV-1: two-step confirm for the "send real details this once" valve.
   const [confirmReal, setConfirmReal] = useState(false);
+  // Inline rewrite of one of your own messages (null when nothing is open).
+  const [editDraft, setEditDraft] = useState<{ id: string; text: string } | null>(
+    null,
+  );
   const lastAssistantId = [...messages]
     .reverse()
     .find((m) => m.role === "assistant")?.id;
+
+  // The privacy receipt and the "worth remembering?" card describe the turn
+  // that just finished IN THIS conversation. They belong to the window, so
+  // switching conversations used to carry them along and pin a claim about one
+  // chat under another. A remount (the AI pane's tabs) must NOT clear them,
+  // hence the ref rather than a bare [activeChatId] effect.
+  const shownChat = useRef(s.activeChatId);
+  useEffect(() => {
+    if (shownChat.current === s.activeChatId) return;
+    shownChat.current = s.activeChatId;
+    s.setAskPrivacy(null);
+    s.setMemSuggestion(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.activeChatId]);
+
+  // The agent diagram is the only record of which helpers ran and for how
+  // long, and it used to exist only while the answer was being written.
+  // Keep the last roster and its clocks, and re-attach them to the answer.
+  const liveTimings = useRef<Record<string, AgentTiming>>({});
+  const lastGraph = useRef<Omit<PastGraph, "timings"> | null>(null);
+  const wasAsking = useRef(false);
+  const [graphByMsg, setGraphByMsg] = useState<Record<string, PastGraph>>({});
+  useEffect(() => {
+    // Only a turn that DELEGATED has a diagram worth keeping; a lone Main
+    // agent draws a single chip, which the finished message already shows.
+    if (s.agentPlan && s.agentPlan.length > 1) {
+      lastGraph.current = {
+        plan: s.agentPlan,
+        active: s.activeAgent,
+        agentSteps: s.agentSteps,
+        steps: s.steps,
+        lane: s.lane,
+      };
+    }
+  }, [s.agentPlan, s.activeAgent, s.agentSteps, s.steps, s.lane]);
+  useEffect(() => {
+    const was = wasAsking.current;
+    wasAsking.current = s.asking;
+    if (s.asking) {
+      if (!was) liveTimings.current = {};
+      return;
+    }
+    const graph = lastGraph.current;
+    lastGraph.current = null;
+    // Only a turn that just ENDED files a graph, and only against an answer
+    // that has none — a stopped turn must not overwrite the previous answer's.
+    if (!was || !graph || !lastAssistantId || graphByMsg[lastAssistantId]) return;
+    const now = performance.now();
+    const frozen: Record<string, AgentTiming> = {};
+    for (const [key, t] of Object.entries(liveTimings.current)) {
+      frozen[key] = { start: t.start, end: t.end ?? now };
+    }
+    liveTimings.current = {};
+    setGraphByMsg((g) => ({
+      ...g,
+      [lastAssistantId]: { ...graph, timings: { current: frozen } },
+    }));
+  }, [s.asking, lastAssistantId, graphByMsg]);
+
+  const submitEdit = () => {
+    const draft = editDraft;
+    if (!draft) return;
+    setEditDraft(null);
+    void a.editAndResend(draft.id, draft.text);
+  };
+
   return (
     <div className="chat" aria-label="Chat">
       <div className="chat-head">
@@ -84,6 +167,7 @@ export default function ChatPane({
         <button
           className="subtle btn-ic"
           title="Rename this chat"
+          aria-label="Rename this chat"
           disabled={s.asking || !s.activeChatId || s.renaming}
           onClick={a.startRename}
         >
@@ -93,12 +177,21 @@ export default function ChatPane({
           ＋ New
         </button>
         <button
+          className="subtle"
+          title="Copy this whole conversation as text"
+          disabled={messages.length === 0}
+          onClick={a.copyConversation}
+        >
+          Copy chat
+        </button>
+        <button
           className={`subtle btn-ic${s.autoSpeak ? " accent" : ""}`}
           title={
             s.autoSpeak
               ? "Auto-speak is on — answers are read aloud (voice: Settings → Spoken voice)"
               : "Speak answers aloud as they stream"
           }
+          aria-label="Read answers aloud"
           aria-pressed={s.autoSpeak}
           onClick={a.toggleAutoSpeak}
         >
@@ -111,6 +204,7 @@ export default function ChatPane({
               ? "Hands-free is on — the mic re-arms after each answer"
               : "Hands-free: re-arm the mic after each answer to keep talking"
           }
+          aria-label="Hands-free — re-arm the mic after each answer"
           aria-pressed={s.handsFree}
           onClick={a.toggleHandsFree}
         >
@@ -312,7 +406,22 @@ export default function ChatPane({
               </span>
               {m.role === "assistant" ? "Room AI" : "You"}
             </div>
-            {m.role === "assistant" &&
+            {/* The turn's own diagram when this session drew one (helpers,
+                their steps and their clocks stay readable afterwards); the
+                flat strip persisted on the message otherwise — that is all a
+                room reopened later still has. */}
+            {m.role === "assistant" && graphByMsg[m.id] ? (
+              <AgentGraph
+                plan={graphByMsg[m.id].plan}
+                active={graphByMsg[m.id].active}
+                agentSteps={graphByMsg[m.id].agentSteps}
+                steps={graphByMsg[m.id].steps}
+                lane={graphByMsg[m.id].lane}
+                timings={graphByMsg[m.id].timings}
+                live={false}
+              />
+            ) : (
+              m.role === "assistant" &&
               !!m.effects?.agents?.length && (
                 <div
                   className="agent-strip past"
@@ -330,7 +439,8 @@ export default function ChatPane({
                     </span>
                   ))}
                 </div>
-              )}
+              )
+            )}
             <div className="msg-content" dir="auto">
               {m.role === "assistant" ? (
                 <>
@@ -397,10 +507,66 @@ export default function ChatPane({
                     </div>
                   )}
                 </>
+              ) : editDraft?.id === m.id ? (
+                <div className="composer-card">
+                  <textarea
+                    className="composer-input"
+                    value={editDraft.text}
+                    autoFocus
+                    rows={3}
+                    dir="auto"
+                    onChange={(e) =>
+                      setEditDraft({ id: m.id, text: e.target.value })
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        submitEdit();
+                      }
+                      if (e.key === "Escape") {
+                        e.stopPropagation();
+                        setEditDraft(null);
+                      }
+                    }}
+                  />
+                  <span className="save-form">
+                    <button className="subtle" onClick={submitEdit}>
+                      Send again
+                    </button>
+                    <button
+                      className="subtle"
+                      onClick={() => setEditDraft(null)}
+                    >
+                      Cancel
+                    </button>
+                  </span>
+                </div>
               ) : (
                 text
               )}
             </div>
+            {/* Your own messages were the only rows in the app with no
+                actions at all — a sent question could not be copied, let
+                alone corrected. */}
+            {m.role === "user" && !editDraft && !m.id.startsWith("pending-") && (
+              <div className="msg-footer">
+                <button
+                  className="subtle"
+                  title="Copy this message"
+                  onClick={() => a.copyMessage(m)}
+                >
+                  Copy
+                </button>
+                <button
+                  className="subtle"
+                  title="Change this question and ask again — everything after it is removed"
+                  disabled={s.asking}
+                  onClick={() => setEditDraft({ id: m.id, text: m.content })}
+                >
+                  Edit & resend
+                </button>
+              </div>
+            )}
             {m.role === "assistant" && (
               <div className="msg-footer">
                 {m.sources.length > 0 && (
@@ -481,7 +647,18 @@ export default function ChatPane({
                 ) : (
                   <button
                     className="subtle"
-                    onClick={() => s.setSaveDraft({ id: m.id, name: "AI note.md" })}
+                    // A name no file is using yet: "AI note.md", "AI note 2.md"
+                    // … Three answers called the same thing left the source
+                    // chip able to open only the newest of them.
+                    onClick={() =>
+                      s.setSaveDraft({
+                        id: m.id,
+                        name: uniqueFileName(
+                          "AI note.md",
+                          s.files.map((f) => f.name),
+                        ),
+                      })
+                    }
                   >
                     Save to room
                   </button>
@@ -509,6 +686,13 @@ export default function ChatPane({
                 agentSteps={s.agentSteps}
                 steps={s.steps}
                 lane={s.lane}
+                // The LIVE graph is the only thing that ever measures, so it
+                // has to stamp into the store this pane freezes onto the
+                // finished answer. Left to its own internal ref, every clock
+                // died with the streaming bubble and every archived diagram
+                // was handed an empty store — roster, nodes and steps, but
+                // never a single duration.
+                timings={liveTimings}
               />
             )}
             {(s.lane || s.steps.length > 0) && (

@@ -105,6 +105,52 @@ async def test_native_context_length_caches_a_successful_lookup(
     assert calls == 1  # the second call was served from cache — no second request
 
 
+async def test_a_swapped_model_is_noticed_rather_than_remembered_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The entry used to be kept for the life of the process. Re-pull a model,
+    or swap it for another quantisation under the same name, and every request
+    for the rest of the session was still sized off the OLD window — and so was
+    the token bar's ceiling."""
+    model_limits._CACHE.clear()
+    length = 262_144
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"models": [{"model": "qwen3.5:4b", "details": {"context_length": length}}]},
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_with(handler))
+    monkeypatch.setattr(model_limits, "_CACHE_TTL_SECONDS", 0.0)
+    assert await model_limits.native_context_length("qwen3.5:4b", "http://h:1") == 262_144
+    length = 32_768
+    assert await model_limits.native_context_length("qwen3.5:4b", "http://h:1") == 32_768
+
+
+async def test_a_failed_refresh_keeps_the_length_it_last_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expiry must not turn a known window into an unknown one: the last real
+    answer beats sending the caller to a made-up display default."""
+    model_limits._CACHE.clear()
+    up = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not up:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(
+            200,
+            json={"models": [{"model": "qwen3.5:4b", "details": {"context_length": 262144}}]},
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_with(handler))
+    monkeypatch.setattr(model_limits, "_CACHE_TTL_SECONDS", 0.0)
+    assert await model_limits.native_context_length("qwen3.5:4b", "http://h:1") == 262_144
+    up = False
+    assert await model_limits.native_context_length("qwen3.5:4b", "http://h:1") == 262_144
+
+
 # --------------------------------------------------------------------------- #
 # Live bytes-per-token calibration
 #

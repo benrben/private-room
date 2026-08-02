@@ -20,6 +20,10 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
   const [boxes, setBoxes] = useState<ImageBox[]>([]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
+  // An image the engine can't decode (empty, truncated, wrong extension) used
+  // to show only a broken-image glyph, with the zoom buttons and the "mark
+  // something" bar still live over nothing at all.
+  const [imgDead, setImgDead] = useState(!dataB64);
 
   // Zoom: "fit" scales to the pane (the default); a number is a fraction of
   // the image's natural size. The AI boxes are %-positioned, so they ride
@@ -44,6 +48,10 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
   const [pullPercent, setPullPercent] = useState<number | null>(null);
   const [pullErr, setPullErr] = useState("");
   const [pullDone, setPullDone] = useState(false);
+
+  useEffect(() => {
+    setImgDead(!dataB64);
+  }, [dataB64]);
 
   // ---- decide whether to offer the vision helper (doesn't block the bar) ----
   useEffect(() => {
@@ -120,6 +128,18 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
   }
 
   // Reuse the existing pull_model flow + its pull-progress events.
+  const unlistenPullRef = useRef<(() => void) | null>(null);
+  // Leaving the picture mid-download must at least drop the event listener —
+  // the pull itself runs in the backend and keeps going (see the note in the
+  // offer below).
+  useEffect(
+    () => () => {
+      unlistenPullRef.current?.();
+      unlistenPullRef.current = null;
+    },
+    [],
+  );
+
   async function getVisionHelper() {
     if (!visionModel || pulling) return;
     setPulling(true);
@@ -133,6 +153,7 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
         setPullPercent(e.payload.percent);
       },
     );
+    unlistenPullRef.current = unlisten;
     try {
       await api.pullModel(visionModel);
       setPullDone(true);
@@ -141,9 +162,23 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
       setPullErr(String(e));
     } finally {
       unlisten();
+      unlistenPullRef.current = null;
       setPulling(false);
       setPullPercent(null);
     }
+  }
+
+  if (imgDead) {
+    // Every other viewer names a decode failure plainly; this one used to leave
+    // a broken-image icon and a working "ask AI to mark it" bar over nothing.
+    return (
+      <div className="empty-hint">
+        This picture couldn’t be shown — the file appears to be empty, damaged,
+        or in a format this Mac can’t decode. The original is still stored in
+        the room: export it from the toolbar above to inspect it, or import the
+        picture again to replace it.
+      </div>
+    );
   }
 
   return (
@@ -207,7 +242,13 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
           }}
         >
           <span style={{ color: "var(--text-dim)" }}>
-            Download the vision helper (~3&nbsp;GB) for accurate marking
+            {/* No invented figure: the size of the build Ollama actually
+                fetches isn't known here, and the old "~3 GB" was neither
+                checked nor right. Name the model instead — the progress bar
+                below reports the real download as it runs. */}
+            Download the vision helper (<code>{visionModel}</code>) for accurate
+            marking — a large one-time download that keeps running until it
+            finishes, even if you leave this picture.
           </span>
           <button className="primary" onClick={getVisionHelper} disabled={pulling}>
             {pulling ? "Downloading…" : "Download"}
@@ -288,6 +329,7 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
           src={`data:${mime};base64,${dataB64}`}
           alt={name}
           onLoad={(e) => setNatW(e.currentTarget.naturalWidth)}
+          onError={() => setImgDead(true)}
         />
         {boxes.map((b, i) => {
           const color = BOX_COLORS[i % BOX_COLORS.length];

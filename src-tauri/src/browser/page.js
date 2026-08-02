@@ -606,20 +606,40 @@
     return text.trim();
   }
 
+  function isHighSurrogate(c) {
+    return c >= 0xd800 && c <= 0xdbff;
+  }
+  function isLowSurrogate(c) {
+    return c >= 0xdc00 && c <= 0xdfff;
+  }
+
   function read(args) {
     args = args || {};
     var mode = args.mode === "full" ? "full" : "main";
     var body = readMarkdown(mode);
     var offset = Math.max(0, Number(args.offset) || 0);
-    var slice = body.slice(offset, offset + READ_MAX);
+    // Never cut through a surrogate pair: half an emoji decodes to a
+    // replacement character, and if the cut lands there the whole chunk can
+    // come back as garbage.
+    var start = Math.min(offset, body.length);
+    if (start > 0 && start < body.length && isLowSurrogate(body.charCodeAt(start))) start--;
+    var end = Math.min(body.length, start + READ_MAX);
+    if (end < body.length && end - 1 > start && isHighSurrogate(body.charCodeAt(end - 1))) end--;
+    var slice = body.slice(start, end);
     return {
       ok: true,
       url: location.href,
       title: document.title || "",
       mode: mode,
-      offset: offset,
+      offset: start,
+      // Where the NEXT read must start, counted in the same units this sliced
+      // with. The Rust side used to work it out by counting CHARACTERS in the
+      // returned text, which is a different count from JavaScript's UTF-16
+      // code units the moment an emoji is involved — so the continuation mark
+      // came back short and the next chunk repeated text already read.
+      nextOffset: start + slice.length,
       total: body.length,
-      truncated: offset + slice.length < body.length,
+      truncated: start + slice.length < body.length,
       text: slice,
     };
   }
@@ -674,13 +694,61 @@
 
   // ------------------------------------------------------------------- find
 
+  /** The elements the CURRENT numbering refers to, rebuilt from the registry
+   *  without touching it. Anything that has gone away or been re-laid-out is
+   *  dropped by the same staleness rule `resolve` uses, and anything a fresh
+   *  snapshot would no longer offer is dropped by the same visibility rule
+   *  `snapshot` uses — so a dead number can never be reported as live. */
+  function currentElements() {
+    var ns = [];
+    registry.forEach(function (_weak, n) {
+      ns.push(n);
+    });
+    ns.sort(function (a, b) {
+      return a - b;
+    });
+    var out = [];
+    for (var i = 0; i < ns.length; i++) {
+      var n = ns[i];
+      var weak = registry.get(n);
+      var el = weak ? weak.deref() : null;
+      if (!el || !el.isConnected || el.getAttribute("data-arcelle-mark") !== String(n)) continue;
+      // Staleness alone is not the whole door a snapshot puts an element
+      // through. A control that was visible when the marks were laid down and
+      // has since been hidden (a menu that closed, a tab panel that switched)
+      // or disabled by client-side validation is still marked and still
+      // connected — and offering it here handed the model a ref that `act`
+      // resolves and clicks, answering "clicked e7" for a control nobody can
+      // see. `snapshot` rejects both; so must the numbering it left behind.
+      if (isDisabled(el) || !isVisible(el)) continue;
+      var entry = { ref: "e" + n, role: roleFor(el), label: labelFor(el), region: regionFor(el) };
+      var st = stateFor(el);
+      if (st !== undefined) entry.state = st;
+      out.push(entry);
+    }
+    return out;
+  }
+
   function find(args) {
     var needle = clean((args && args.text) || "").toLowerCase();
     if (!needle) return { ok: false, error: "find needs text to look for." };
-    var snap = snapshot({ badges: false });
+    // Search the numbering that is ALREADY out there. `find` used to take a
+    // fresh snapshot, and a snapshot clears every mark and bumps the
+    // generation — so the cheap "which control is called X" tool silently
+    // cancelled every ref the model had been handed a moment earlier, and the
+    // next click came back "e7 is gone" on a page nothing had changed on.
+    var elements = currentElements();
+    var gen = generation;
+    if (elements.length === 0) {
+      // Nothing numbered yet (or the page moved on): now a snapshot is the
+      // only way to answer, and there are no live refs left to invalidate.
+      var snap = snapshot({ badges: false });
+      elements = snap.elements;
+      gen = snap.generation;
+    }
     var hits = [];
-    for (var i = 0; i < snap.elements.length; i++) {
-      var e = snap.elements[i];
+    for (var i = 0; i < elements.length; i++) {
+      var e = elements[i];
       if ((e.label || "").toLowerCase().indexOf(needle) >= 0) hits.push(e);
     }
     // Nothing among the interactive marks? Report visible page text hits so
@@ -697,7 +765,7 @@
     return {
       ok: true,
       url: location.href,
-      generation: snap.generation,
+      generation: gen,
       matches: hits,
       textOccurrences: textHits,
     };
@@ -1092,6 +1160,28 @@
     });
   }
 
+  /** How many sizeable video/3D areas are on screen.
+   *
+   *  `WKWebView`'s snapshot API composites the DOM, not the media layers: a
+   *  playing `<video>` and a WebGL canvas come back as EMPTY rectangles in a
+   *  screenshot, with no error and no clue that anything is missing. Counting
+   *  them here is what lets `browse_look` say so, instead of leaving the model
+   *  to describe a playing video as "nothing there". */
+  function mediaAreas() {
+    var n = 0;
+    try {
+      var nodes = document.querySelectorAll("video, canvas");
+      for (var i = 0; i < nodes.length; i++) {
+        var r = nodes[i].getBoundingClientRect();
+        // Big enough to be a picture, and actually in the viewport a
+        // screenshot would cover. A tracking pixel drawn on a 1×1 canvas is
+        // not something the model would have described anyway.
+        if (r.width >= 64 && r.height >= 64 && r.bottom > 0 && r.top < window.innerHeight) n++;
+      }
+    } catch (e) {}
+    return n;
+  }
+
   // ------------------------------------------------------------------ entry
 
   /** The single synchronous entry point. Total by construction: any throw
@@ -1121,6 +1211,7 @@
             title: document.title || "",
             ready: document.readyState,
             canGoBack: history.length > 1,
+            mediaAreas: mediaAreas(),
             doc: DOC_ID,
           };
         default:

@@ -1,7 +1,8 @@
 //! ADD-33: run one answer through the local Python/LangGraph agent sidecar.
 //!
-//! This is the alternative to the native `agent_loop`, selected by the
-//! `agent_engine` setting. The sidecar is the BRAIN only: it decides which tools
+//! This is the app's ONLY answering path — the native `agent_loop` it was once
+//! an alternative to is deleted, and the `agent_engine` setting that chose
+//! between them is gone. The sidecar is the BRAIN only: it decides which tools
 //! to call and when, but every tool executes back in THIS process through the
 //! token-guarded loopback MCP bridge ([`crate::room_mcp`] with
 //! [`ToolScope::LocalEngine`]). Decryption and file access never leave Rust.
@@ -82,13 +83,25 @@ impl SidecarError {
 /// return one actionable line; otherwise None. Shared by `SidecarError::sentinel`
 /// AND the workflow node-error funnel, so an `agent_run`/`generate` failure reads
 /// the same clear message no matter which path surfaced it.
+/// The phrases that actually mean "the provider refused this because of your
+/// allowance". A bare "quota" used to be one of them, which threw the real
+/// message away whenever the word appeared for any other reason — a disk quota,
+/// a file named `quota.xlsx`, a connector's own wording — and sent the user
+/// chasing a billing problem that did not exist.
+const EMPTY_GENERATION_HINTS: &[&str] = &[
+    "usage limit",
+    "reached your",
+    "no generation chunks",
+    "quota exceeded",
+    "quota exhausted",
+    "out of quota",
+    "insufficient_quota",
+    "insufficient quota",
+];
+
 pub(crate) fn humanize_empty_generation(msg: &str) -> Option<String> {
     let e = msg.to_lowercase();
-    if e.contains("usage limit")
-        || e.contains("reached your")
-        || e.contains("no generation chunks")
-        || e.contains("quota")
-    {
+    if EMPTY_GENERATION_HINTS.iter().any(|hint| e.contains(hint)) {
         Some(
             "The AI model returned nothing. If this room uses a cloud model, it may \
              have hit its usage limit — switch to an on-device model in Settings → \
@@ -100,17 +113,35 @@ pub(crate) fn humanize_empty_generation(msg: &str) -> Option<String> {
     }
 }
 
-/// The per-request budget for a single gateway POST. Every endpoint here is
-/// ONE model generation, and 600s is generous for one.
-const SIDECAR_TIMEOUT: Duration = Duration::from_secs(600);
+/// The per-request budget for a single gateway POST.
+///
+/// This said "every endpoint here is ONE model generation, and 600s is generous
+/// for one". That reasoning holds for Ollama and is FALSE for a cloud coding
+/// CLI: engine parity means any of these endpoints can be answered by
+/// `claude-cli`/`codex-cli`, where one "generation" is a whole agentic session
+/// that reads files and drives its own tool loop. 600s cut those off mid-work
+/// and the caller replayed the whole step.
+///
+/// Raised rather than removed, and it is no longer the primary guard. The
+/// sidecar now bounds its own work by LIVENESS (`external_llm.EXTERNAL_IDLE_SECS`
+/// kills a CLI that goes silent, never one that is merely slow) and cancels
+/// in-flight work when this client disconnects, so a wedge is caught there,
+/// close to the evidence. What is left here is an outer backstop against a
+/// sidecar that stops answering altogether — sized far above any real run, so
+/// tripping it means something is broken, not that the work was ambitious.
+/// The user's own escape hatch is Stop, which reaches the CLI subprocess.
+/// Shared with the Phase-1 gateway (`ollama::client_timeout`), which carries
+/// `/generate`, `/embed` and the structured-output calls for the SAME engines —
+/// one budget, so the two paths cannot drift apart again.
+pub const SIDECAR_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// A CHAIN endpoint's budget. `/wf_node` runs up to seven generations (refine)
 /// or ten (plan_and_map) behind a single POST, so it cannot share the
-/// one-generation budget: a local 4B at 15 tok/s would trip 600s mid-chain and
-/// the whole step would replay. Sized as the one-call budget times the longest
+/// one-generation budget: a local 4B at 15 tok/s would trip mid-chain and the
+/// whole step would replay. Sized as the one-call budget times the longest
 /// chain, rather than removed — an unbounded request would hang the lane
-/// forever if the sidecar wedged.
-pub const SIDECAR_CHAIN_TIMEOUT: Duration = Duration::from_secs(600 * 10);
+/// forever if the sidecar stopped answering.
+pub const SIDECAR_CHAIN_TIMEOUT: Duration = Duration::from_secs(3600 * 10);
 
 /// POST a JSON body to a sidecar FEATURE endpoint and return the parsed JSON.
 /// Ensures the sidecar is up first (no native fallback — a dead sidecar surfaces
@@ -139,6 +170,7 @@ pub async fn sidecar_json_timeout(
         .and_then(|value| value.as_str())
         .map(str::to_string)
     {
+        crate::commands::ensure_provider_catalog(&model).await;
         request_body = crate::commands::inject_provider_runtime(&request_body, &model).map_err(|e| {
             SidecarError { code: "ENGINE_ERROR".into(), error: e, status: 400 }
         })?;
@@ -155,6 +187,9 @@ pub async fn sidecar_json_timeout(
             })
         }
     };
+    // Held for the whole POST so a health probe on another task cannot replace
+    // the sidecar that is answering this one.
+    let _busy = sidecar_lifecycle::busy();
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .build()
@@ -169,15 +204,26 @@ pub async fn sidecar_json_timeout(
         .send()
         .await
         .map_err(|e| SidecarError {
-            // A connect/timeout to a sidecar that just answered its health check is
-            // still an engine-availability failure — classify as OLLAMA_DOWN so the
-            // caller's existing branch fires.
-            code: if e.is_connect() || e.is_timeout() {
+            // A CONNECT failure to a sidecar that just answered its health check
+            // is an engine-availability failure — classify as OLLAMA_DOWN so the
+            // caller's existing branch fires. A TIMEOUT is not: the request was
+            // accepted and the model just ran long, so it must keep its own
+            // message instead of putting an "Open Ollama" button in front of a
+            // user whose engine is running (or who has no Ollama at all).
+            code: if e.is_connect() {
                 "OLLAMA_DOWN".to_string()
             } else {
                 "ENGINE_ERROR".to_string()
             },
-            error: e.to_string(),
+            error: if e.is_timeout() {
+                format!(
+                    "The AI engine did not answer within {}s. Try a shorter request, \
+                     or a faster model in Settings → Model.",
+                    timeout.as_secs()
+                )
+            } else {
+                e.to_string()
+            },
             status: 0,
         })?;
     let status = resp.status();
@@ -231,6 +277,7 @@ pub async fn generate_stream(
         .and_then(|value| value.as_str())
         .map(str::to_string)
     {
+        crate::commands::ensure_provider_catalog(&model).await;
         request_body = crate::commands::inject_provider_runtime(&request_body, &model)
             .map_err(|e| SidecarError {
                 code: "ENGINE_ERROR".into(),
@@ -258,6 +305,9 @@ pub async fn generate_stream(
         Ok(b) => b,
         Err(e) => return Err(sentinel("OLLAMA_DOWN", &e)),
     };
+    // Held for the stream's whole duration: a missed health probe on another task
+    // must not SIGTERM the sidecar that is streaming this answer.
+    let _busy = sidecar_lifecycle::busy();
     // The sidecar reaches Ollama but can't START it: ensure the local daemon is up
     // and hold the guard for the stream's whole duration (idle watcher won't sleep
     // it mid-answer). Engine parity: an external CLI model never touches Ollama,
@@ -269,8 +319,8 @@ pub async fn generate_stream(
             Err(e) => return Err(sentinel("OLLAMA_DOWN", &e)),
         },
     };
-    // No request timeout: a stream delivers tokens incrementally and the shared
-    // 600s cap would abort a long answer mid-way.
+    // No request timeout: a stream delivers tokens incrementally, so the shared
+    // whole-request cap would abort a long answer mid-way.
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| sentinel("ENGINE_ERROR", &e.to_string()))?;
@@ -361,9 +411,17 @@ pub async fn generate_stream(
 /// (ADD-31/ADD-32): a Studio authoring a whole page, or a whole-file pass running
 /// one Job-tier call per window, runs for minutes and Stop must abandon it
 /// promptly. The feature endpoints are single blocking POSTs with no cancel token,
-/// so on Stop we DROP the in-flight request (dropping the reqwest future closes the
-/// connection, which stops Ollama) and return `Ok(None)` — the caller treats `None`
-/// as a stopped step. A completed body is `Ok(Some(value))`.
+/// so on Stop we DROP the in-flight request and return `Ok(None)` — the caller
+/// treats `None` as a stopped step. A completed body is `Ok(Some(value))`.
+///
+/// Honest about what that buys: the CALLER stops waiting, the SIDECAR does not
+/// stop working. This docstring used to claim the drop "closes the connection,
+/// which stops Ollama"; measured against the pinned uvicorn/starlette (see
+/// [`sidecar_json_cancellable_run`]) a non-streaming handler ran on for seconds
+/// past a hard disconnect, so the generation this step started still finishes
+/// and still holds the single local-model slot. Endpoints that take a `run_id`
+/// use the `_run` variant below, which DELIVERS Stop; the ones reached through
+/// here (`/generate_doc`, the file-pass windows) have no `run_id` to cancel yet.
 pub async fn sidecar_json_cancellable(
     path: &str,
     body: &serde_json::Value,
@@ -421,7 +479,8 @@ pub async fn sidecar_json_cancellable_run(
                     // stop it. Best-effort — if the POST fails the chain
                     // finishes, which is the pre-existing behaviour, not worse.
                     if let Ok(base) = sidecar_lifecycle::ensure_up().await {
-                        let _ = cancel_run(&base, run_id).await;
+                        let _busy = sidecar_lifecycle::busy();
+                        let _ = deliver_cancel(&base, run_id).await;
                     }
                     return Ok(None);
                 }
@@ -516,6 +575,9 @@ pub async fn run_via_sidecar(
         Ok(b) => b,
         Err(e) => return SidecarOutcome::Unavailable(e),
     };
+    // Held for the whole run: this is the streaming answer a missed health probe
+    // used to kill, and every tool call it makes re-enters `ensure_up`.
+    let _busy = sidecar_lifecycle::busy();
 
     // The sidecar reaches Ollama but can't START it: ensure the local daemon is up
     // and hold the guard for the run's duration. No tool has run yet, so a down or
@@ -610,6 +672,12 @@ pub async fn run_via_sidecar(
     } else {
         None
     };
+    // The catalog cache is in-memory, so after a restart a room already set to
+    // an OpenRouter model knew nothing about it: tools were offered to
+    // text-only models and no context window was declared. Fill it once, here,
+    // before the config is built.
+    crate::commands::ensure_provider_catalog(model).await;
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
     let body = serde_json::json!({
         "model": model,
         "max_context": max_context,
@@ -631,7 +699,12 @@ pub async fn run_via_sidecar(
         "web_enabled": web_enabled,
         "mcp_routes": mcp_route_count,
         "advisors": advisor_names,
-        "run_id": bridge.token,
+        // A fresh opaque id, NOT the bridge token. The token is the bearer
+        // credential that lets the sidecar reach this room's tools; the run id
+        // is a public handle echoed back in `/cancel` bodies and read straight
+        // off the request. They had no reason to be the same value, and reusing
+        // one carried the secret into places that only need a name.
+        "run_id": run_id,
     });
     // PRIV-1: attach the room policy for a non-local model (the sidecar's chat
     // seam + live guard engage on it) — unless the user opened the door for
@@ -643,7 +716,27 @@ pub async fn run_via_sidecar(
     };
     let body = match crate::commands::inject_provider_runtime(&body, model) {
         Ok(body) => body,
-        Err(e) => return SidecarOutcome::Unavailable(e),
+        // A misconfigured provider (no model chosen, key gone from Keychain)
+        // fails HERE — after the loopback MCP bridge is already listening. This
+        // arm used to return straight out, leaking the bridge's bound port and
+        // its accept task for the rest of the session, and throwing away work
+        // the turn had already done (image preparation, `vision_chat`) because
+        // the sink was never merged back. Same teardown as the `start` failure
+        // arm above.
+        //
+        // `EngineError`, not `Unavailable`: nothing is wrong with the sidecar —
+        // the room is pointed at a provider model with no key or no model
+        // chosen. `Unavailable` is rewritten upstream into "the agent sidecar
+        // could not start", which sent users to debug a Python install over a
+        // disconnected API key.
+        Err(e) => {
+            bridge.stop();
+            if let Some(nested) = consulted_room_bridge {
+                nested.stop();
+            }
+            *effects = sink.lock().await.clone();
+            return SidecarOutcome::EngineError(e);
+        }
     };
 
     let streamed = stream_run(&base, &body, window, &cancel, headless).await;
@@ -814,7 +907,8 @@ async fn stream_run(
                 None => break, // stream ended
             },
             _ = wait_for_cancel(cancel) => {
-                let _ = cancel_run(base, &run_id).await; // best-effort
+                // Checked, and retried once if the sidecar did not confirm it.
+                let _ = deliver_cancel(base, &run_id).await;
                 return StreamResult::Cancelled(final_text, last_usage, last_plan);
             }
         };
@@ -827,7 +921,7 @@ async fn stream_run(
                 continue;
             }
             if cancel.load(Ordering::SeqCst) {
-                let _ = cancel_run(base, &run_id).await; // best-effort
+                let _ = deliver_cancel(base, &run_id).await;
                 return StreamResult::Cancelled(final_text, last_usage, last_plan);
             }
             let ev: serde_json::Value = match serde_json::from_slice(line) {
@@ -1013,18 +1107,72 @@ async fn wait_for_cancel(cancel: &Arc<AtomicBool>) {
     }
 }
 
+/// POST one `/cancel` and READ THE ANSWER.
+///
+/// This used to `send()` and return `Ok(())` without looking at the status or
+/// the body, so a Stop that never arrived — or one the sidecar did not
+/// recognise — was indistinguishable from a Stop that landed. On a multi-step
+/// run that means the UI shows "stopped" while the graph keeps spending the
+/// single local-model slot for several more steps.
 async fn cancel_run(base: &str, run_id: &str) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(1500))
         .build()
         .map_err(|e| e.to_string())?;
-    client
+    let resp = client
         .post(format!("{base}/cancel"))
         .json(&serde_json::json!({ "run_id": run_id }))
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    Ok(())
+    let status = resp.status().as_u16();
+    let body = resp.json::<serde_json::Value>().await.ok();
+    cancel_verdict(status, body.as_ref())
+}
+
+/// Did the sidecar accept the Stop? Its contract is
+/// `{"ok": true, "known": <bool>}`, where `known` is false for a `run_id` the
+/// run registry never had — i.e. the Stop reached the service but stopped
+/// nothing. A non-2xx means it never reached the registry at all.
+///
+/// An absent `known` is treated as accepted on purpose: a 2xx from `/cancel` is
+/// the contract's success marker, and inventing a failure for a body shape we
+/// merely do not recognise would make every Stop report a phantom problem.
+fn cancel_verdict(status: u16, body: Option<&serde_json::Value>) -> Result<(), String> {
+    if !(200..300).contains(&status) {
+        return Err(format!("the AI service refused the Stop (status {status})"));
+    }
+    match body.and_then(|b| b.get("known")).and_then(|k| k.as_bool()) {
+        Some(false) => Err("the AI service did not recognise the run".to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Deliver Stop and confirm it was accepted, retrying once.
+///
+/// One retry, not none: `known == false` is also what a Stop that RACED the
+/// run's registration looks like (the host can POST `/cancel` while the sidecar
+/// is still entering the handler that registers the run), and that one is
+/// genuinely retryable. If the second attempt still is not confirmed the run
+/// really may keep going, so say so on stderr rather than swallowing it — the
+/// callers below tear their side down either way, because the user asked to
+/// stop and the answer is already abandoned.
+async fn deliver_cancel(base: &str, run_id: &str) -> Result<(), String> {
+    let first = match cancel_run(base, run_id).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    match cancel_run(base, run_id).await {
+        Ok(()) => Ok(()),
+        Err(second) => {
+            eprintln!(
+                "[arcelle] Stop was not accepted for run {run_id} ({first}; then {second}) \
+                 — the AI service may still be finishing this step."
+            );
+            Err(second)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1057,6 +1205,36 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_the_sidecar_did_not_recognise_is_not_an_accepted_stop() {
+        // `/cancel` answers `{"ok": true, "known": <bool>}` and `known` is false
+        // for a run the registry never had — the Stop landed on the service and
+        // stopped nothing. Reading only the transport (the old behaviour) made
+        // that identical to a Stop that worked, so a multi-step run kept
+        // spending the local-model slot behind a UI that said "stopped".
+        let accepted = serde_json::json!({ "ok": true, "known": true });
+        assert!(cancel_verdict(200, Some(&accepted)).is_ok());
+
+        let unknown = serde_json::json!({ "ok": true, "known": false });
+        let err = cancel_verdict(200, Some(&unknown)).unwrap_err();
+        assert!(err.contains("did not recognise"), "{err:?}");
+
+        // A refusal by the service itself is a failed delivery too, whatever the
+        // body says.
+        let err = cancel_verdict(503, Some(&accepted)).unwrap_err();
+        assert!(err.contains("503"), "{err:?}");
+        assert!(cancel_verdict(500, None).is_err());
+    }
+
+    #[test]
+    fn a_cancel_reply_without_the_known_field_is_taken_as_accepted() {
+        // Forward-compat: 2xx is the contract's success marker. A body we do not
+        // recognise must not manufacture a phantom "Stop failed" on every Stop.
+        assert!(cancel_verdict(200, None).is_ok());
+        assert!(cancel_verdict(204, Some(&serde_json::json!({ "ok": true }))).is_ok());
+        assert!(cancel_verdict(200, Some(&serde_json::json!("done"))).is_ok());
+    }
+
+    #[test]
     fn error_sentinels_survive_the_migration() {
         // The `{code}` → legacy-sentinel mapping the callers still match on.
         let down = SidecarError {
@@ -1084,6 +1262,38 @@ mod tests {
             other.sentinel(Some("gemma3:4b")),
             "Local AI error (500): boom"
         );
+    }
+
+    #[test]
+    fn only_a_real_allowance_message_is_rewritten_as_a_usage_limit() {
+        // The hint list is deliberately narrow: a bare "quota" used to match, so
+        // a disk-quota error or a file called quota.xlsx sent the user chasing a
+        // billing problem that did not exist. Both directions are pinned because
+        // this funnel REPLACES the engine's own message.
+        for real in [
+            "You have reached your usage limit",
+            "No generation chunks were returned",
+            "insufficient_quota",
+            "QUOTA EXCEEDED",
+        ] {
+            let out = humanize_empty_generation(real).unwrap_or_default();
+            assert!(out.contains("usage limit"), "{real:?} → {out:?}");
+        }
+        for unrelated in [
+            "could not write report.xlsx: disk quota reached",
+            "the connector returned 500",
+            "",
+        ] {
+            assert_eq!(humanize_empty_generation(unrelated), None, "{unrelated:?}");
+        }
+        // And the rewrite only applies to unclassified engine errors — the two
+        // sentinels callers branch on must survive it verbatim.
+        let down = SidecarError {
+            code: "OLLAMA_DOWN".into(),
+            error: "quota exceeded".into(),
+            status: 503,
+        };
+        assert_eq!(down.sentinel(None), "OLLAMA_DOWN");
     }
 
     #[test]

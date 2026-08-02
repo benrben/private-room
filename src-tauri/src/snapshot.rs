@@ -6,35 +6,14 @@
 //! Hardware-composited layers (`<video>`, WebGL) render blank in these
 //! snapshots (WebKit limitation); video frames go through the driver's
 //! canvas `media_frame` path instead.
-
-/// Anything that can hand a closure the platform WKWebView on the main
-/// thread. Both `WebviewWindow` (the app's own window) and `Webview` (BROWSE-1's
-/// child browser webview) expose the identical `with_webview`, so the capture
-/// body below is written once against this instead of twice against the two
-/// concrete types.
-pub trait PlatformWebviewHost {
-    fn with_platform_webview<F>(&self, f: F) -> Result<(), String>
-    where
-        F: FnOnce(tauri::webview::PlatformWebview) + Send + 'static;
-}
-
-impl PlatformWebviewHost for tauri::WebviewWindow {
-    fn with_platform_webview<F>(&self, f: F) -> Result<(), String>
-    where
-        F: FnOnce(tauri::webview::PlatformWebview) + Send + 'static,
-    {
-        self.with_webview(f).map_err(|e| e.to_string())
-    }
-}
-
-impl PlatformWebviewHost for tauri::Webview {
-    fn with_platform_webview<F>(&self, f: F) -> Result<(), String>
-    where
-        F: FnOnce(tauri::webview::PlatformWebview) + Send + 'static,
-    {
-        self.with_webview(f).map_err(|e| e.to_string())
-    }
-}
+//!
+//! This used to carry a `PlatformWebviewHost` trait with two impls, so the
+//! capture body could serve either a `WebviewWindow` (the app window) or a
+//! `Webview` (BROWSE-1's child browser). Both remaining callers now pass a
+//! `Webview` — the agent's `view_screenshot` goes through `crate::main_webview`,
+//! because `get_webview_window("main")` returns None once the child browser
+//! exists — so the abstraction had one live side and one dead one, and this
+//! takes the concrete type directly.
 
 /// Capture ANY hosted webview as PNG bytes. Must be callable from any
 /// thread EXCEPT the main thread: the WKWebView call itself is dispatched to
@@ -45,7 +24,7 @@ impl PlatformWebviewHost for tauri::Webview {
 /// loop to fire — so main-thread callers get an error instead of a hang.
 /// The agent loop calls this from a tokio worker thread, which is fine.
 #[cfg(target_os = "macos")]
-pub fn capture_png(window: &impl PlatformWebviewHost) -> Result<Vec<u8>, String> {
+pub fn capture_png(webview: &tauri::Webview) -> Result<Vec<u8>, String> {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -68,8 +47,8 @@ pub fn capture_png(window: &impl PlatformWebviewHost) -> Result<Vec<u8>, String>
 
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
 
-    window
-        .with_platform_webview(move |platform_webview| {
+    webview
+        .with_webview(move |platform_webview| {
             // This closure runs on the main thread (Tauri guarantee), so we
             // can talk to the MainThreadOnly WebKit classes directly.
             let outcome = (|| -> Result<(), String> {
@@ -157,6 +136,6 @@ pub fn capture_png(window: &impl PlatformWebviewHost) -> Result<Vec<u8>, String>
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn capture_png(_window: &impl PlatformWebviewHost) -> Result<Vec<u8>, String> {
+pub fn capture_png(_webview: &tauri::Webview) -> Result<Vec<u8>, String> {
     Err("Screenshots are only supported on macOS.".into())
 }

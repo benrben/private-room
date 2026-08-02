@@ -41,11 +41,28 @@ export default function NodeStar({
   if (n.summary) tipLines.push(n.summary);
   // Generous invisible hit target so small stars are clickable.
   const hit = Math.max(r * 1.6, 11 / view.k);
+  // Reachable by Tab and named for a screen reader — without this the map is
+  // empty space to anyone who can't use a mouse.
+  const label = [
+    isFile ? n.name : `Memory: ${n.name}`,
+    isFile ? n.folder || "Top level" : null,
+    `${deg} connection${deg === 1 ? "" : "s"}`,
+    openable ? "press Enter to open" : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  const activate = () => {
+    setFocus(n.id);
+    if (openable) onOpenFile?.(n.id);
+  };
   return (
     <g
       className={`room-map-node ${isFile ? "is-file" : "is-memory"}`}
       transform={`translate(${n.x} ${n.y})`}
       style={{ cursor: openable ? "pointer" : "default" }}
+      role="button"
+      tabIndex={0}
+      aria-label={label}
       onMouseEnter={(ev) => {
         setHovered(n.id);
         setFocus(n.id); // sticky: label + neighbours persist
@@ -56,10 +73,21 @@ export default function NodeStar({
         setHovered(null);
         setTip(null);
       }}
-      onClick={() => {
+      onFocus={() => {
+        setHovered(n.id);
         setFocus(n.id);
-        if (openable) onOpenFile?.(n.id);
       }}
+      onBlur={() => {
+        setHovered(null);
+        setTip(null);
+      }}
+      onKeyDown={(ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          activate();
+        }
+      }}
+      onClick={activate}
     >
       <circle r={hit} fill="transparent" />
       {isFile ? (

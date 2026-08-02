@@ -101,6 +101,32 @@ export default function ViewerPane({
         (fo) => fo.id === s.files.find((f) => f.id === openFile.id)?.folderId,
       )?.name
     : undefined;
+  // The trail must name what is ON SCREEN. With nothing open the "files" area
+  // renders the room's home page (or the sealed-room empty state), so saying
+  // "Files" described a list the user wasn't looking at.
+  const areaCrumb =
+    area === "files" && !s.showWorkflows && !s.showScripts && !s.showMap
+      ? "Home"
+      : AREA_CRUMBS[area];
+  // BROWSE-1: the page is a NATIVE webview floating above everything this app
+  // draws, so any modal, approval card or palette is invisible and unclickable
+  // underneath it. Park the page (BrowserView shrinks it to 1×1) whenever one
+  // of them is up — not just for the browse-consent card it was written for,
+  // which left connector/edit/script approvals waiting behind the page forever.
+  const overlayShowing =
+    s.browseConsents.length > 0 ||
+    s.mcpApprovals.length > 0 ||
+    s.editApprovals.length > 0 ||
+    s.scriptApprovals.length > 0 ||
+    s.showSearch ||
+    s.showSettings ||
+    s.showShortcuts ||
+    s.showFeedback ||
+    s.showAddLink ||
+    s.aiPrompt !== null ||
+    s.studioPrompt !== null ||
+    s.compare !== null ||
+    s.ctxMenu !== null;
   return (
     <section className="viewer" aria-label="Workspace">
       <div className="editor-breadcrumb-bar">
@@ -116,7 +142,7 @@ export default function ViewerPane({
               </span>
             </>
           ) : (
-            <span className="crumb-title">{AREA_CRUMBS[area]}</span>
+            <span className="crumb-title">{areaCrumb}</span>
           )}
         </div>
         <div className="pane-actions">
@@ -141,8 +167,59 @@ export default function ViewerPane({
       {openFile ? (
         <>
           <div className="viewer-head">
-            <span className="viewer-title">{openFile.content.name}</span>
+            {/* Renaming used to exist ONLY in the library's right-click menu,
+                so the file you were actually looking at could not be renamed
+                without hunting for its row. Same handler, same commit rules. */}
+            {s.renamingFile?.id === openFile.id &&
+            s.renamingFile.where === "viewer" ? (
+              <input
+                className="file-rename-input"
+                autoFocus
+                dir="auto"
+                aria-label="Rename this file"
+                value={s.renamingFile.name}
+                onChange={(e) =>
+                  s.setRenamingFile({
+                    id: openFile.id,
+                    name: e.target.value,
+                    where: "viewer",
+                  })
+                }
+                onBlur={a.commitRenameFile}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") a.commitRenameFile();
+                  if (e.key === "Escape") s.setRenamingFile(null);
+                }}
+              />
+            ) : (
+              <span className="viewer-title">{openFile.content.name}</span>
+            )}
             <span className="viewer-actions">
+              <button
+                className="subtle btn-ic"
+                title="Rename this file"
+                onClick={() =>
+                  // `where` keeps this box and the library row's box off the
+                  // screen at the same time — they share one state slot, and
+                  // two autoFocus inputs cancel each other on the first blur.
+                  s.setRenamingFile({
+                    id: openFile.id,
+                    name: openFile.content.name,
+                    where: "viewer",
+                  })
+                }
+              >
+                <PencilIcon size={13} /> Rename
+              </button>
+              {a.editModeOf(openFile.content) === "editor" && (
+                <button
+                  className="subtle btn-ic"
+                  title="Make a second copy of this file in the room, so you can branch it"
+                  onClick={() => void a.duplicateOpenFile()}
+                >
+                  <PlusIcon size={13} /> Duplicate
+                </button>
+              )}
               {cloudViewable && (
                 <button
                   className={`subtle btn-ic${cloudView ? " cloudview-on" : ""}`}
@@ -463,7 +540,7 @@ export default function ViewerPane({
         </div>
       ) : area === "browser" ? (
         <BrowserView
-          parked={s.browseConsents.length > 0}
+          parked={overlayShowing}
           // BROWSE-3: ＋ on a result imports it AND pins it to the composer, so
           // the page's text is in the very next turn rather than only findable
           // by a later search.
@@ -504,7 +581,7 @@ export default function ViewerPane({
           </div>
         </div>
       ) : frontPageView ? (
-        <FrontPage page={frontPageView} s={s} a={a} />
+        <FrontPage page={frontPageView} s={s} a={a} layout={layout} />
       ) : (
         <div className="viewer-empty">
           <div className="viewer-empty-icon">
@@ -535,7 +612,7 @@ export default function ViewerPane({
             </button>
             <button
               className="qa-btn"
-              onClick={() => s.composerRef.current?.focus()}
+              onClick={() => a.focusComposer(layout)}
             >
               <SendIcon size={14} /> Ask the room
             </button>

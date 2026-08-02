@@ -15,8 +15,11 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
     if (!open) return;
     function onKey(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
+      // Bail BEFORE stopping: the @-file list's own Escape lives on the
+      // textarea, and a window-level capture stop never lets the key reach it
+      // (same bug as AiActionModal — one shared shape, one shared fix).
+      if (s.studioAc) return;
       e.stopPropagation();
-      if (s.studioAc) return; // the autocomplete's own Escape closes it first
       s.setStudioPrompt(null);
     }
     window.addEventListener("keydown", onKey, true);

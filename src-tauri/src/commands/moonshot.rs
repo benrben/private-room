@@ -104,9 +104,6 @@ pub async fn ensure_embed_model(
     Ok(())
 }
 
-// ---- self-contained HTML templates (studios) --------------------------------
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

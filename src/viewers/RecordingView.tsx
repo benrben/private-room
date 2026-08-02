@@ -3,6 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, RecMeta, RecSegment, RecWord } from "../api";
 import { PlayIcon, PauseIcon, StopIcon } from "../icons";
 import { liveSttOn, micMuted, noteLiveStt, setMicMuted } from "../workspace/liveRec";
+import { cutShiftBefore } from "./recTiming";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 const SCREEN_CAPTURE_SETTINGS_URL =
@@ -48,6 +49,10 @@ export interface RecordingViewProps {
   onStop: () => Promise<void>;
 }
 
+/** Suggestions only — every language box in this view is free text, because
+ * the engine translates into anything. A fixed dropdown for LIVE translation
+ * while the after-the-fact box accepted any language meant you could get Greek
+ * afterwards but not as it happened. */
 const LANGS = [
   "English", "עברית (Hebrew)", "Español (Spanish)", "Français (French)",
   "Deutsch (German)", "العربية (Arabic)", "Русский (Russian)", "中文 (Chinese)",
@@ -396,6 +401,45 @@ export default function RecordingView({
   // ---- playback (skips deleted spans) ------------------------------------
   const src = mediaToken && !isLive ? `roommedia://localhost/${mediaToken}` : null;
 
+  /**
+   * Jump the playhead out of, or over, a deleted span.
+   *
+   * timeupdate only fires about four times a second, so checking there alone
+   * played roughly a quarter-second of deleted audio before the skip. Arm a
+   * timer for the exact moment the next cut starts instead; the timeupdate
+   * check below stays as a safety net (a stalled or re-buffered element can
+   * drift past the scheduled instant).
+   */
+  const skipTimerRef = useRef(0);
+  function armCutSkip() {
+    window.clearTimeout(skipTimerRef.current);
+    const el = mediaRef.current;
+    if (!el || el.paused || cuts.length === 0) return;
+    const cs = el.currentTime * 100;
+    const inside = cuts.find((c) => cs >= c.t0 && cs < c.t1);
+    if (inside) {
+      el.currentTime = inside.t1 / 100 + 0.01; // the seek re-arms us
+      return;
+    }
+    let next: { t0: number; t1: number } | null = null;
+    for (const c of cuts) {
+      if (c.t0 > cs && (!next || c.t0 < next.t0)) next = c;
+    }
+    if (!next) return;
+    const jumpTo = next.t1 / 100 + 0.01;
+    const ms = (((next.t0 - cs) / 100) * 1000) / (el.playbackRate || 1);
+    skipTimerRef.current = window.setTimeout(
+      () => {
+        const e = mediaRef.current;
+        if (e) e.currentTime = jumpTo;
+      },
+      Math.max(0, ms),
+    );
+  }
+  useEffect(() => () => window.clearTimeout(skipTimerRef.current), []);
+  // A deleted span added or removed while the file is open re-arms the timer.
+  useEffect(armCutSkip, [cuts]);
+
   function onTime() {
     const el = mediaRef.current;
     if (!el) return;
@@ -422,6 +466,31 @@ export default function RecordingView({
   }
 
   // ---- transcript selection → delete -------------------------------------
+  /**
+   * Watch the SELECTION, not the mouse. Hanging the delete bar off mouseup
+   * meant a selection made with the keyboard (or Select All, or a screen
+   * reader) never woke it up, so a keyboard-only user could read a transcript
+   * but never edit the recording through it. Coalesced to one check per frame:
+   * selectionchange fires continuously during a drag.
+   */
+  useEffect(() => {
+    let raf = 0;
+    const onSel = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        captureSelection();
+      });
+    };
+    document.addEventListener("selectionchange", onSel);
+    return () => {
+      document.removeEventListener("selectionchange", onSel);
+      if (raf) cancelAnimationFrame(raf);
+    };
+    // captureSelection reads only refs and setState.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function captureSelection() {
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !listRef.current) {
@@ -504,6 +573,88 @@ export default function RecordingView({
     }
   }
 
+  /** The phrases that survive the transcript edits, in order — the shared
+   * source for both exports below. Deleted words never leave the app.
+   *
+   * `shifted` re-times them onto the SHORTENED timeline of the edited copy.
+   * Subtitles need that: they caption only the surviving words, so the only
+   * audio they line up with is the one with the cut spans actually removed —
+   * against the original file every cue after the first cut runs late. */
+  function keptPhrases(
+    shifted = false,
+  ): { t0: number; t1: number; speaker: string; text: string }[] {
+    const out: { t0: number; t1: number; speaker: string; text: string }[] = [];
+    const at = (t: number) => (shifted ? t - cutShiftBefore(cuts, t) : t);
+    for (const seg of segments) {
+      const kept = seg.words.length ? seg.words.filter((w) => !w.del) : null;
+      const text = kept ? kept.map((w) => w.w).join(" ") : seg.text;
+      if (!text.trim()) continue;
+      out.push({
+        t0: at(kept?.length ? kept[0].t0 : seg.t0),
+        t1: at(kept?.length ? kept[kept.length - 1].t1 : seg.t1),
+        speaker: speakerName(seg.speaker),
+        text: text.trim(),
+      });
+    }
+    return out;
+  }
+
+  /** Centiseconds → "hh:mm:ss,mmm" (SubRip). */
+  function srtStamp(cs: number): string {
+    const ms = Math.max(0, Math.round(cs * 10));
+    const h = Math.floor(ms / 3_600_000);
+    const m = Math.floor((ms % 3_600_000) / 60_000);
+    const s = Math.floor((ms % 60_000) / 1000);
+    const pad = (n: number, w = 2) => String(n).padStart(w, "0");
+    return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms % 1000, 3)}`;
+  }
+
+  /** Save the transcript into the room as its own file — pressing a button,
+   * not typing a chat command. `.txt` reads as a plain transcript; `.srt` is
+   * the subtitle file players and video editors take. */
+  async function exportTranscript(kind: "text" | "srt") {
+    if (busy) return;
+    // Subtitles belong to the edited copy (see keptPhrases); the plain
+    // transcript keeps the original file's timeline, which is also the one the
+    // player above scrubs on.
+    const phrases = keptPhrases(kind === "srt" && cuts.length > 0);
+    if (phrases.length === 0) {
+      pushToast("info", "There is nothing transcribed to export yet.");
+      return;
+    }
+    const body =
+      kind === "srt"
+        ? phrases
+            .map(
+              (p, i) =>
+                `${i + 1}\n${srtStamp(p.t0)} --> ${srtStamp(
+                  Math.max(p.t1, p.t0 + 50),
+                )}\n${p.speaker}: ${p.text}\n`,
+            )
+            .join("\n")
+        : phrases
+            .map((p) => `[${formatTimestamp(p.t0)}] ${p.speaker}: ${p.text}`)
+            .join("\n");
+    const stamp = new Date().toISOString().slice(0, 10);
+    setBusy(true);
+    try {
+      const f = await api.saveGeneratedFile(
+        `Transcript ${stamp}.${kind === "srt" ? "srt" : "txt"}`,
+        body,
+      );
+      pushToast(
+        "success",
+        kind === "srt" && cuts.length > 0
+          ? `Saved "${f.name}" into this room — timed for the edited copy, not the original.`
+          : `Saved "${f.name}" into this room.`,
+      );
+    } catch (e) {
+      pushToast("error", String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function exportClean() {
     if (busy) return;
     setBusy(true);
@@ -557,8 +708,13 @@ export default function RecordingView({
     }
   }
 
-  async function toggleLiveLang(lang: string) {
-    setLiveLang(lang);
+  /** The live-translate language actually in force, so typing in the box
+   * doesn't clear the translations already on screen on every keystroke. */
+  const appliedLiveLangRef = useRef("");
+  async function commitLiveLang() {
+    const lang = liveLang.trim();
+    if (lang === appliedLiveLangRef.current) return;
+    appliedLiveLangRef.current = lang;
     setLiveTranslations({});
     if (isLive) {
       try {
@@ -575,6 +731,14 @@ export default function RecordingView({
   // overwrite the edit on its next flush.
   const canEdit = !isLive;
   const hasWords = segments.some((s) => s.words.length > 0);
+  // Audio already in the file — a recording with sound but no transcript lines
+  // (live transcription off, or a silent stretch) is still CONTINUED, never
+  // started over, and the button must not suggest otherwise. Length is the only
+  // honest signal: the backend hands this viewer a media token for EVERY
+  // recording file, including one whose stored audio is a bare WAV header, so
+  // OR-ing it in made "Start recording" unreachable and left the button
+  // contradicting the empty-state panel right below it.
+  const hasAudio = durationCs > 0;
   // mediaToken too: a corrupted (unparseable) meta reads as durationCs 0,
   // and re-transcribe is the rescue tool for exactly that file.
   const canRetranscribe = !isLive && (durationCs > 0 || !!mediaToken);
@@ -582,6 +746,10 @@ export default function RecordingView({
   // One "still speaking…" ghost per lane. A ghost whose speaker matches the
   // last turn renders inside it (the same voice, mid-sentence); the rest —
   // including everything when there are no finals yet — stand alone.
+  // `speaker` is the machine LABEL, exactly as on a finished turn, so the ghost
+  // is drawn through speakerName() too — otherwise renaming "You" left the
+  // line being spoken right now under the old name, the same person appearing
+  // twice in one transcript.
   const ghosts = (["mic", "sys"] as const).flatMap((lane) => {
     const text = partials[lane];
     return text ? [{ lane, speaker: lane === "mic" ? "You" : "Meeting", text }] : [];
@@ -592,12 +760,28 @@ export default function RecordingView({
 
   return (
     <div className="rec-view">
+      {/* Shared suggestions for BOTH language boxes (live and after the fact);
+          neither is limited to this list. */}
+      <datalist id="rec-langs">
+        {LANGS.map((l) => (
+          <option key={l} value={l} />
+        ))}
+      </datalist>
       {/* header: controls + meters */}
       <div className="rec-head">
         {status === "idle" && (
           <>
-            <button className="primary rec-btn" onClick={() => void start()}>
-              <span className="rec-dot" /> {segments.length ? "Continue recording" : "Start recording"}
+            <button
+              className="primary rec-btn"
+              onClick={() => void start()}
+              title={
+                segments.length || hasAudio
+                  ? "Keep recording into this file — nothing already recorded is lost"
+                  : undefined
+              }
+            >
+              <span className="rec-dot" />{" "}
+              {segments.length || hasAudio ? "Continue recording" : "Start recording"}
             </button>
             <label className="rec-opt" title="Hear whatever the Mac plays — Google Meet, Zoom, Teams, Slack calls, videos">
               <input
@@ -624,14 +808,24 @@ export default function RecordingView({
             </span>
             <button
               className={`rec-mute ${micIsMuted ? "muted" : ""}`}
+              // Only promise the Mac's audio when it is actually being
+              // captured: with the checkbox off (or the lane failed), muting
+              // the mic means NOTHING is being recorded, and saying otherwise
+              // hands the user an empty recording and a reassurance.
               title={
                 micIsMuted
                   ? "Unmute the microphone"
-                  : "Mute the microphone (the Mac's audio keeps recording)"
+                  : withSystem && !sysNote
+                    ? "Mute the microphone (the Mac's audio keeps recording)"
+                    : "Mute the microphone — the Mac's audio is not being recorded, so nothing at all will be captured while muted"
               }
+              aria-label={
+                micIsMuted ? "Unmute the microphone" : "Mute the microphone"
+              }
+              aria-pressed={micIsMuted}
               onClick={toggleMicMute}
             >
-              🎙
+              <span aria-hidden="true">🎙</span>
             </button>
             <span className="rec-meters" title="Microphone / Mac audio levels">
               <span
@@ -693,14 +887,24 @@ export default function RecordingView({
               Live transcription
             </label>
           )}
-          <label className="rec-opt" title="Translate each phrase as it lands (on this Mac)">
+          <label
+            className="rec-opt"
+            title="Translate each phrase as it lands (on this Mac) — any language, the same as the Translate box below"
+          >
             Live translate
-            <select value={liveLang} onChange={(e) => void toggleLiveLang(e.target.value)}>
-              <option value="">off</option>
-              {LANGS.map((l) => (
-                <option key={l} value={l}>{l}</option>
-              ))}
-            </select>
+            <input
+              list="rec-langs"
+              placeholder="off"
+              value={liveLang}
+              onChange={(e) => setLiveLang(e.target.value)}
+              onBlur={() => void commitLiveLang()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void commitLiveLang();
+                }
+              }}
+            />
           </label>
         </span>
       </div>
@@ -741,19 +945,33 @@ export default function RecordingView({
           className="rec-player"
           src={src}
           controls
-          onTimeUpdate={onTime}
+          onTimeUpdate={() => {
+            onTime();
+            armCutSkip();
+          }}
+          onPlay={armCutSkip}
+          onSeeked={armCutSkip}
+          onRateChange={armCutSkip}
+          onPause={() => window.clearTimeout(skipTimerRef.current)}
         />
       )}
 
       {/* transcript */}
-      <div className="rec-transcript" ref={listRef} onMouseUp={captureSelection}>
+      <div
+        className="rec-transcript"
+        ref={listRef}
+        tabIndex={0}
+        aria-label="Transcript — select words here to delete them from the recording"
+        onMouseUp={captureSelection}
+      >
         {segments.length === 0 && !partials.mic && !partials.sys && (
           <div className="empty-hint rec-empty">
             {status === "idle" ? (
               <>
                 <p><strong>This file records and understands speech — live.</strong></p>
                 <p>
-                  Press <em>Start recording</em>: your words (and, if you leave the checkbox on,
+                  Press <em>{hasAudio ? "Continue recording" : "Start recording"}</em>: your
+                  words (and, if you leave the checkbox on,
                   whatever the Mac plays — a Google Meet, Zoom, Teams or Slack call) appear here
                   as text while people are still speaking, with speakers told apart.
                 </p>
@@ -833,7 +1051,7 @@ export default function RecordingView({
           <div key={g.lane} className="rec-turn ghost">
             <div className="rec-turn-head">
               <span className="rec-stamp">…</span>
-              <span className="rec-speaker">{g.speaker}</span>
+              <span className="rec-speaker">{speakerName(g.speaker)}</span>
             </div>
             <div className="rec-turn-body" dir="auto">
               <span className="rec-seg ghost" dir="auto">{g.text}</span>
@@ -871,11 +1089,6 @@ export default function RecordingView({
                   if (e.key === "Enter") void runTranslate();
                 }}
               />
-              <datalist id="rec-langs">
-                {LANGS.map((l) => (
-                  <option key={l} value={l} />
-                ))}
-              </datalist>
               <button className="subtle" disabled={busy || !translateTo.trim()} onClick={() => void runTranslate()}>
                 {translating ? `Translating ${translating.done}/${translating.total}…` : "Translate"}
               </button>
@@ -916,6 +1129,30 @@ export default function RecordingView({
                   : "Re-transcribe"}
               </button>
             ))}
+          {segments.length > 0 && !isLive && (
+            <>
+              <button
+                className="subtle"
+                disabled={busy}
+                title="Save the transcript into this room as a plain text file — timestamps are this recording's own"
+                onClick={() => void exportTranscript("text")}
+              >
+                Export transcript
+              </button>
+              <button
+                className="subtle"
+                disabled={busy}
+                title={
+                  cuts.length > 0
+                    ? "Save subtitles (.srt) into this room — timed for the edited copy, since they caption only the words you kept"
+                    : "Save subtitles (.srt) into this room — for a video editor or a player"
+                }
+                onClick={() => void exportTranscript("srt")}
+              >
+                Export subtitles
+              </button>
+            </>
+          )}
           {hasWords && (
             <>
               <button
@@ -951,6 +1188,8 @@ export default function RecordingView({
     // every rec_start (the actions layer syncs the module mirror).
     setLiveStt(true);
     setMicIsMuted(false);
-    await onStart(fileId, { systemAudio: withSystem, liveTranslate: liveLang || null });
+    const lang = liveLang.trim();
+    appliedLiveLangRef.current = lang;
+    await onStart(fileId, { systemAudio: withSystem, liveTranslate: lang || null });
   }
 }

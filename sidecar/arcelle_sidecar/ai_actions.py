@@ -14,7 +14,8 @@ Three features land here, faithful to their Rust originals:
   return the recovered markdown. Rust propagates an engine failure
   (``chat_structured(...)?``), so a model error raises :class:`.llm.LlmError` and
   the route surfaces it; a reply with no usable markdown becomes an
-  ``EMPTY_RESULT`` error carrying the exact "nothing usable" message.
+  ``EMPTY_RESULT`` error whose advice matches the action's SCOPE (a room-scope
+  action has no single file to blame).
 
 * :func:`memory_suggestion` — ``memory_suggestion`` (D6). Judge whether one durable
   fact is worth saving. The Rust path SWALLOWS any model failure
@@ -44,6 +45,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from . import llm
+from .budget import truncate_bytes
 from .config import KEEP_ALIVE_WARM, ProviderConfig
 from .messages import system_message, user_message
 from .model_text import prime_schema, recover_json, strip_think_spans
@@ -362,16 +364,6 @@ def _str_array(obj: dict[str, Any], key: str) -> list[str]:
     return [x.strip() for x in v if isinstance(x, str) and x.strip()]
 
 
-def _clamp_bytes(s: str, max_bytes: int) -> str:
-    """agent.rs ``clamp_bytes``: truncate to at most ``max_bytes`` UTF-8 bytes
-    without splitting a char (``decode(errors='ignore')`` drops the partial tail,
-    exactly like the Rust ``floor_boundary``)."""
-    data = s.encode("utf-8")
-    if len(data) <= max_bytes:
-        return s
-    return data[:max_bytes].decode("utf-8", errors="ignore")
-
-
 def _title_from_name(name: str) -> str:
     """docs_html.rs ``title_from_name``: drop the extension ("a.md" -> "a"); a
     leading-dot or extension-less name is returned whole."""
@@ -397,6 +389,15 @@ _MARKDOWN_SCHEMA: dict[str, Any] = {
     "required": ["markdown"],
 }
 
+#: Output-token ceiling (``num_predict``) for an action, the same runaway guard
+#: the PASS job carries (file_pass.PASS_DOC_PREDICT). Not a quality limit: Rust
+#: clamps the gathered material to ~12 KB before posting (studios.rs
+#: ``gather_scope_text``/``gather_files_text``), so even a full translation lands
+#: far below this. Without it a degenerate repetition loop on a small local model
+#: generates until it fills the whole payload-fitted window — which can be 128k —
+#: and the menu simply appears to hang.
+ACTION_PREDICT: int = 8_192
+
 
 async def run_ai_action(
     action: str,
@@ -412,8 +413,9 @@ async def run_ai_action(
 
     ``instructions`` overrides the action's default prompt; ``question`` carries the
     research follow-up OR the translate target language. Raises :class:`ActionError`
-    for an unknown action, a missing target language, or an empty result; raises
-    :class:`.llm.LlmError` on an engine failure (both surfaced by the route)."""
+    for an unknown action, a missing question or target language, or an empty
+    result; raises :class:`.llm.LlmError` on an engine failure (both surfaced by
+    the route)."""
     spec = _ACTION_BY_ID.get(action)
     if spec is None:
         raise ActionError("UNKNOWN_ACTION", f'"{action}" isn\'t a known AI action.')
@@ -431,6 +433,11 @@ async def run_ai_action(
         user = f"{instr}\n\nTarget language: {ask}\n\n{base}"
     elif ask is None and spec.needs_language:
         raise ActionError("NEEDS_LANGUAGE", "Pick a target language first.")
+    elif ask is None and spec.needs_question:
+        # The backstop translate already had: research WITHOUT its question used
+        # to run anyway, and the model — told to "answer the question" with no
+        # question in the prompt — invents one and answers that.
+        raise ActionError("NEEDS_QUESTION", "Ask a question first.")
     else:
         user = f"{instr}\n\n{base}"
 
@@ -442,6 +449,7 @@ async def run_ai_action(
         messages,
         base_url,
         temperature=0.3,
+        num_predict=ACTION_PREDICT,
         keep_alive=KEEP_ALIVE_WARM,
         format=_MARKDOWN_SCHEMA,
         privacy=privacy,
@@ -461,6 +469,7 @@ async def run_ai_action(
             [system_message(spec.system), user_message(user)],
             base_url,
             temperature=0.3,
+            num_predict=ACTION_PREDICT,
             keep_alive=KEEP_ALIVE_WARM,
             privacy=privacy,
             provider=provider,
@@ -470,9 +479,16 @@ async def run_ai_action(
             _str_field(obj, "markdown") if obj else strip_think_spans(plain).strip()
         )
     if not markdown:
+        # A room-scope action reads the WHOLE room, so "try a different file"
+        # sends the user hunting for a file to blame that does not exist.
+        advice = (
+            "try again, or add more material to this room"
+            if spec.scope == "room"
+            else "try a different file"
+        )
         raise ActionError(
             "EMPTY_RESULT",
-            "The model didn't return anything usable — try a different file.",
+            f"The model didn't return anything usable — {advice}.",
             status=422,
         )
     return markdown
@@ -517,7 +533,7 @@ async def memory_suggestion(
             system_message(_MEMORY_SYSTEM),
             user_message(
                 "User asked:\n{}\n\nAssistant answered:\n{}".format(
-                    _clamp_bytes(user_text, 2000), _clamp_bytes(assistant_text, 2000)
+                    truncate_bytes(user_text, 2000), truncate_bytes(assistant_text, 2000)
                 )
             ),
         ],
@@ -586,7 +602,7 @@ async def suggest_file_meta(
     if len(text.strip()) < 80:
         return echo()
 
-    snippet = _clamp_bytes(text, 2000)
+    snippet = truncate_bytes(text, 2000)
     messages = prime_schema(
         [
             system_message(_FILE_META_SYSTEM),
@@ -621,6 +637,7 @@ async def suggest_file_meta(
 
 
 __all__ = [
+    "ACTION_PREDICT",
     "AI_ACTIONS",
     "AiActionSpec",
     "ActionError",

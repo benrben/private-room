@@ -18,6 +18,20 @@ const MAX_COMPOSE_SOURCE_PROMPT_PER_FILE: usize = 12_000;
 const MAX_COMPOSE_SOURCE_SNAPSHOT_CHARS: usize = 500_000;
 const MAX_COMPOSE_SOURCE_SNAPSHOT_TOTAL_CHARS: usize = 4_000_000;
 
+/// What Save/Enable say when the skill was deleted out from under the editor.
+/// `UPDATE … WHERE id=?` matching no rows is a SUCCESS in SQLite, so without an
+/// explicit existence check both reported "saved" and kept nothing.
+const SKILL_GONE: &str = "That skill no longer exists — it was deleted.";
+
+/// Resolve a skill by id, or fail with [`SKILL_GONE`]. The existence guard Save
+/// and Enable/Disable both run before writing — a plain UPDATE would report
+/// success while changing nothing.
+fn require_skill(conn: &Connection, id: &str) -> Result<db::Skill, String> {
+    db::find_skill(conn, id)?
+        .filter(|s| s.id == id)
+        .ok_or_else(|| SKILL_GONE.to_string())
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillResourceMeta {
@@ -220,6 +234,25 @@ fn validate_skill_fields(
     Ok(name)
 }
 
+/// A skill scoped to an id no worker has is invisible forever: never offered to
+/// a specialist, never surfaced to the user. Before this, one mistyped character
+/// ("file.read") produced exactly that, silently. Refuse with the real list so
+/// the author — model or person — can correct it in one round (2026-07-28).
+/// Empty is the GENERAL case every agent sees, so it stays allowed. EVERY seam
+/// that accepts an owner runs this: the model's `save_skill` and a folder
+/// import, which used to take any string a SKILL.md happened to contain.
+fn validate_skill_agent(agent: &str) -> Result<(), String> {
+    let agent = agent.trim();
+    if agent.is_empty() || super::agent::SKILL_AGENT_IDS.contains(&agent) {
+        return Ok(());
+    }
+    Err(format!(
+        "agent must be one of: {} — or omit it for a skill any agent may \
+         use. Got {agent:?}; nothing was saved.",
+        super::agent::SKILL_AGENT_IDS.join(", ")
+    ))
+}
+
 pub(crate) fn normalize_skill_path(raw: &str) -> Result<String, String> {
     let raw = raw.trim().replace('\\', "/");
     if raw.is_empty() || raw.len() > 240 {
@@ -384,17 +417,7 @@ pub(crate) fn agent_save_skill(
     let instructions = args["instructions"].as_str().unwrap_or_default();
     // Which sub-agent this procedure belongs to; omitted = GENERAL.
     let agent_owner = args["agent"].as_str().unwrap_or_default().trim();
-    // A skill scoped to an id no worker has is invisible forever: never offered
-    // to a specialist, never surfaced to the user. Before this, one mistyped
-    // character ("file.read") produced exactly that, silently. Refuse with the
-    // real list so the model can correct itself in one round (2026-07-28).
-    if !agent_owner.is_empty() && !super::agent::SKILL_AGENT_IDS.contains(&agent_owner) {
-        return Err(format!(
-            "agent must be one of: {} — or omit it for a skill any agent may \
-             use. Got {agent_owner:?}; nothing was saved.",
-            super::agent::SKILL_AGENT_IDS.join(", ")
-        ));
-    }
+    validate_skill_agent(agent_owner)?;
     let name = validate_skill_fields(raw_name, description, instructions)?;
     let source_names: Vec<String> = args["source_files"]
         .as_array()
@@ -420,13 +443,18 @@ pub(crate) fn agent_save_skill(
         let instructions = instructions_with_source_links(instructions, &sources);
         validate_skill_fields(&name, description, &instructions)?;
         if let Some(existing) = db::find_skill(&room.conn, &name)? {
+            // Honor the specialist this save named. Pinning `existing.agent`
+            // silently dropped it while the reply said the skill was updated,
+            // so the assistant could never see — or correct — the miss. An
+            // omitted `agent` still means "leave the binding alone".
+            let owner = if agent_owner.is_empty() { existing.agent.as_str() } else { agent_owner };
             db::update_skill(
                 &room.conn,
                 &existing.id,
                 &name,
                 description.trim(),
                 &instructions,
-                &existing.agent,
+                owner,
             )?;
             db::set_skill_enabled(&room.conn, &existing.id, false)?;
             for source in &sources {
@@ -703,10 +731,14 @@ pub fn update_skill(
 ) -> Result<(), String> {
     let name = validate_skill_fields(&name, &description, &instructions)?;
     state.with_room(|room| {
+        // `UPDATE … WHERE id=?` matches no rows and still succeeds, so a skill
+        // deleted while its editor was open reported "Saved" and kept nothing.
+        // Read it first and fail honestly instead.
+        let existing = require_skill(&room.conn, &id)?;
         // None = "leave the binding alone" (the editor form may not send it).
         let owner = match &agent {
             Some(a) => a.trim().to_string(),
-            None => db::get_skill(&room.conn, &id).map(|s| s.agent).unwrap_or_default(),
+            None => existing.agent,
         };
         db::update_skill(
             &room.conn,
@@ -735,7 +767,12 @@ pub fn set_skill_enabled(
             db::set_skill_enabled(&room.conn, &id, true)
         })?;
     } else {
-        state.with_room(|room| db::set_skill_enabled(&room.conn, &id, false))?;
+        state.with_room(|room| {
+            // Same no-rows-is-success trap as `update_skill`: turning off a skill
+            // that was already deleted must not report success.
+            require_skill(&room.conn, &id)?;
+            db::set_skill_enabled(&room.conn, &id, false)
+        })?;
     }
     emit_skills_changed(&window);
     Ok(())
@@ -869,6 +906,12 @@ pub fn import_skill_folder(
     let skill_md = std::fs::read_to_string(root.join("SKILL.md"))
         .map_err(|_| "That folder has no readable SKILL.md.".to_string())?;
     let (name, description, agent, instructions) = parse_skill_md(&skill_md)?;
+    // The import seam validates `agent:` exactly like the model's `save_skill`
+    // does. A typo in a hand-written or hand-edited SKILL.md used to import
+    // fine, list fine and enable fine, and then be offered to no agent at all
+    // — with nothing anywhere saying why.
+    validate_skill_agent(&agent)
+        .map_err(|e| format!("SKILL.md names an agent no assistant has. {e}"))?;
     let mut files = Vec::new();
     let mut total = 0usize;
     collect_folder_files(&root, &root, &mut files, &mut total)?;
@@ -983,9 +1026,18 @@ pub async fn compose_skill(
         ))
     })?;
     let models = ollama::list_models().await.unwrap_or_default();
-    let model = room_model
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| default_resolved_model(&None, &models));
+    let model = match room_model.filter(|m| !m.trim().is_empty()) {
+        // The room's chosen engine is used as-is (an external CLI needs no local
+        // models installed at all).
+        Some(m) => m,
+        // Nothing chosen and nothing installed: guessing a name here only turned
+        // a stopped daemon into a raw engine error the user can't act on. Say
+        // what every other AI feature says instead.
+        None if models.is_empty() => {
+            return Err("The local AI (Ollama) isn't running — start it and try again.".into());
+        }
+        None => default_resolved_model(&None, &models),
+    };
     let base = skill_compose_prompt(request, &sources);
     let mut last_err = String::new();
     for attempt in 0..2 {
@@ -1091,6 +1143,34 @@ pub async fn compose_skill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_agent_owner_is_refused_however_the_skill_arrives() {
+        // parse_skill_md is deliberately permissive — it reports what the file
+        // says — so this gate is the only thing between one mistyped character
+        // and a skill that lists, enables, and is then offered to nobody.
+        let md = "---\nname: review\ndescription: \"d\"\nagent: file.read\n---\n\nBody\n";
+        let (_, _, agent, _) = parse_skill_md(md).unwrap();
+        assert_eq!(agent, "file.read", "the parser passes the typo through");
+        let err = validate_skill_agent(&agent).unwrap_err();
+        assert!(err.contains("files.read"), "the real list is named: {err}");
+        // A real id, and the omitted GENERAL case, both import unchanged.
+        assert!(validate_skill_agent("files.read").is_ok());
+        assert!(validate_skill_agent("  ").is_ok());
+    }
+
+    #[test]
+    fn saving_a_deleted_skill_is_refused_not_reported_as_saved() {
+        let conn = db::open_in_memory_schema();
+        let id = db::create_skill(&conn, "review", "d", "i", false, "user", "").unwrap();
+        // Present: Save and Enable/Disable proceed.
+        assert_eq!(require_skill(&conn, &id).unwrap().name, "review");
+        // Deleted while the editor was open: `UPDATE … WHERE id=?` matches no
+        // rows and still succeeds, so the guard is the only thing that catches it.
+        db::delete_skill(&conn, &id).unwrap();
+        assert!(db::update_skill(&conn, &id, "review", "d", "i2", "").is_ok(), "the raw UPDATE still 'succeeds'");
+        assert_eq!(require_skill(&conn, &id).err().as_deref(), Some(SKILL_GONE));
+    }
 
     #[test]
     fn skill_md_round_trip_keeps_portable_contract() {

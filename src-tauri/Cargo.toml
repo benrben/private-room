@@ -154,6 +154,27 @@ security-framework-sys = "2"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 
+# Release settings for the binary users actually install.
+#
+# `strip`: without it the shipped binary carries every debug symbol and thousands
+# of absolute build-machine paths (/Users/<name>/… and the whole source-tree
+# layout, plus every dependency's checkout path). For an app whose promise is
+# privacy that is an avoidable leak, and it roughly doubles the download.
+# The handful of paths that survive stripping — `file!()` baked into panic
+# messages — are rewritten by the --remap-path-prefix flags scripts/release.sh
+# exports. (Cargo's own `trim-paths` would do that here, but it is still
+# unstable as of cargo 1.95.)
+[profile.release]
+strip = "symbols"
+
+# Arithmetic overflow panics instead of wrapping, matching the `test` profile —
+# otherwise a number bug behaves one way in the 688-test suite and another way
+# for users. Scoped to our own crates: the release profile applies to every
+# dependency too, and the checks sit in the inner loops of tract-onnx (speaker
+# embeddings run over hours of audio) and the image decoders.
+[profile.release.package.arcelle]
+overflow-checks = true
+
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

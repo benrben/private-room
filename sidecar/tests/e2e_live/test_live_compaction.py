@@ -25,6 +25,7 @@ designs ceilinged at 100% and could not discriminate anything.
 
 from __future__ import annotations
 
+import os
 import random
 
 import pytest
@@ -54,7 +55,7 @@ NEW_HANDOFF_BYTES = 200_000              # commands::HISTORY_HANDOFF_MAX
 #: it ever saw them (measured 2026-07-27: 32 rounds, 890 s, 16 delegations,
 #: `search_room` x14, final answer "not included in this room's content").
 #: Holding it equal for both arms is what makes the comparison a comparison.
-TURN_ROUNDS = int(__import__("os").environ.get("COMPACT_TURN_ROUNDS", "8"))
+TURN_ROUNDS = int(os.environ.get("COMPACT_TURN_ROUNDS", "8"))
 
 QUESTION = (
     "What are the CURRENT monthly rent, deposit, service charge and parking fee? "
@@ -117,13 +118,20 @@ def _score(answer: str, truth: dict[str, int]) -> float:
     return got / len(truth)
 
 
-@pytest.mark.parametrize("trial", range(int(__import__("os").environ.get("COMPACT_TRIALS", "3"))))
+#: How many independent conversations each arm answers. `test_ranking_summary`
+#: below is the one that VERDICTS, over all of them together, so it needs to
+#: know how many it should have seen.
+TRIALS = int(os.environ.get("COMPACT_TRIALS", "3"))
+
+
+@pytest.mark.parametrize("trial", range(TRIALS))
 async def test_compaction_beats_the_old_truncating_path(trial: int, monkeypatch):
     """The whole fix, end to end: more history handed over AND compacted.
 
-    Asserted per trial only as 'new is not worse'; the aggregate ranking is
-    printed and checked in `test_ranking_summary`, because a single live trial
-    on a 2B is too noisy to carry a hard threshold.
+    This test ASSERTS NOTHING about the answers. It runs the three arms on one
+    conversation, prints them, and leaves the three scores in `_RESULTS`; the
+    verdict is `test_ranking_summary`, over every trial at once, because a
+    single live trial on a 2B is far too noisy to carry a threshold.
     """
     rng = random.Random(9000 + trial)
     convo, truth = _conversation(rng, 120)
@@ -184,8 +192,18 @@ _ERRORS: list[tuple[int, str, str]] = []
 
 
 def test_ranking_summary():
-    """Ranks the two paths over every trial above. Runs last (collection order)."""
-    assert _RESULTS, "no trials recorded — run the parametrised test in the same session"
+    """THE verdict: ranks the three paths over every trial above.
+
+    Runs last (collection order) and reads the scores the trials left behind, so
+    it is only meaningful on a COMPLETE set — deselecting trials, or running this
+    alone, would rank the arms on a sample that never happened. Hence the count
+    check rather than a bare non-empty one.
+    """
+    assert len(_RESULTS) == TRIALS, (
+        f"{len(_RESULTS)} of {TRIALS} trials recorded — this is the verdict for the "
+        "whole set, so run the parametrised test in the same session without "
+        "deselecting any trial"
+    )
     n = len(_RESULTS)
     old = sum(r[1] for r in _RESULTS) / n
     raw = sum(r[2] for r in _RESULTS) / n

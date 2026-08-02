@@ -33,6 +33,10 @@ import {
 import { AutocompleteState } from "./composer";
 import { OpenFile, Toast, WorkArea } from "./types";
 
+/** How many messages may stack in the corner at once. Errors no longer expire,
+ * so without a cap a run of failures would paper over the whole window. */
+const MAX_TOASTS = 5;
+
 /** All of Workspace's state + refs, plus the toast primitives that nearly every
  * handler needs. Split out of Workspace.tsx verbatim; the shell threads this to
  * the action factories, the effects hook, and the pane components. */
@@ -82,6 +86,12 @@ export function useWorkspaceState(_info: RoomInfo) {
     "idle" | "preparing" | "recording" | "busy"
   >("idle");
   const [dictOwner, setDictOwner] = useState<string | null>(null);
+  // The hands-free re-arm listener is registered once at mount, so it cannot
+  // read `dictState` directly — and it MUST read it: arming while a dictation
+  // the user started themselves is in flight lands in `dictateTo`'s toggle
+  // branch and STOPS them mid-sentence.
+  const dictStateRef = useRef(dictState);
+  dictStateRef.current = dictState;
   const recorderRef = useRef<MediaRecorder | null>(null);
   const dictChunksRef = useRef<Blob[]>([]);
   // Streaming dictation (Metal wave): the active session's stop function
@@ -160,7 +170,16 @@ export function useWorkspaceState(_info: RoomInfo) {
   const ctxMenuRef = useRef(false);
   const ctxMenuElRef = useRef<HTMLDivElement>(null);
   const moveMenuElRef = useRef<HTMLDivElement>(null);
-  const [renamingFile, setRenamingFile] = useState<{ id: string; name: string } | null>(null);
+  // The ONE open rename box. `where` says which surface opened it: the library
+  // shows a row for the open file too, so without it the viewer's Rename and
+  // the row's Rename both draw an autoFocus input bound to this same slot —
+  // React focuses both in one commit, the second focus blurs the first, and
+  // that blur commits (i.e. cancels) the rename the moment it opens.
+  const [renamingFile, setRenamingFile] = useState<{
+    id: string;
+    name: string;
+    where?: "viewer" | "library";
+  } | null>(null);
   const [fileFilter, setFileFilter] = useState("");
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
@@ -183,9 +202,18 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResults | null>(null);
+  // Why the last search returned nothing to show ("" = it ran fine). Results
+  // are cleared alongside it, so a failed query can never leave the previous
+  // query's hits on screen looking current.
+  const [searchError, setSearchError] = useState("");
   const [searchSel, setSearchSel] = useState(0);
+  // The keyboard-shortcuts sheet (⌘/ or "?", the palette, the room menu).
+  const [showShortcuts, setShowShortcuts] = useState(false);
   const chatRef = useRef<HTMLDivElement>(null);
-  const initRef = useRef(false);
+  /** Has this room's one-shot seeding run? Only the LOADS are guarded by it —
+   * the backend subscriptions must be re-made on every mount (see effects.ts).
+   * A real unlock builds a fresh state, so a reopened room seeds again. */
+  const seededRef = useRef(false);
   const toastSeq = useRef(0);
   const openFileRef = useRef<OpenFile | null>(null);
   openFileRef.current = openFile;
@@ -204,7 +232,6 @@ export function useWorkspaceState(_info: RoomInfo) {
   const showSettingsRef = useRef(false);
   showSettingsRef.current = showSettings;
   const exportWarnedRef = useRef(false);
-  const confirmTimer = useRef<number | undefined>(undefined);
   const autolockRef = useRef<string>("15");
   const lastActivityRef = useRef<number>(Date.now());
   const askingRef = useRef(false);
@@ -341,11 +368,22 @@ export function useWorkspaceState(_info: RoomInfo) {
   const pushToast = useCallback(
     (kind: Toast["kind"], text: string, action?: Toast["action"]) => {
       const id = ++toastSeq.current;
-      setToasts((t) => [...t, { id, kind, text, action }]);
-      const ttl = kind === "error" ? 9000 : 5000;
+      // Errors WAIT to be dismissed. They are this app's only report that
+      // something failed, and there is no log to go back to — deleting one on
+      // a timer means a user who looked away is simply never told.
+      setToasts((t) => {
+        const next = [...t, { id, kind, text, action }];
+        if (next.length <= MAX_TOASTS) return next;
+        // Over the cap, drop the oldest self-dismissing message first so a
+        // burst of successes can never push an error off the screen.
+        const oldestChatty = next.findIndex((x) => x.kind !== "error");
+        const victim = oldestChatty >= 0 ? oldestChatty : 0;
+        return next.filter((_, i) => i !== victim);
+      });
+      if (kind === "error") return;
       window.setTimeout(
         () => setToasts((t) => t.filter((x) => x.id !== id)),
-        ttl,
+        5000,
       );
     },
     [],
@@ -364,7 +402,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     steps, setSteps, lane, setLane, agentPlan, setAgentPlan,
     activeAgent, setActiveAgent, agentSteps, setAgentSteps,
     undoByMsg, setUndoByMsg, editedRef,
-    toasts, setToasts, dictState, setDictState, dictOwner, setDictOwner,
+    toasts, setToasts, dictState, setDictState, dictStateRef, dictOwner, setDictOwner,
     recorderRef, dictChunksRef, dictStreamRef, dictPartial, setDictPartial,
     dragOver, setDragOver, renaming, setRenaming,
     renameDraft, setRenameDraft, pullingModel, setPullingModel,
@@ -395,9 +433,10 @@ export function useWorkspaceState(_info: RoomInfo) {
     renamingFolder, setRenamingFolder,
     creatingFolder, setCreatingFolder, editingMemory, setEditingMemory,
     showSearch, setShowSearch, searchQuery, setSearchQuery,
-    searchResults, setSearchResults, searchSel, setSearchSel,
-    chatRef, initRef, toastSeq, openFileRef, showSearchRef, showSettingsRef,
-    exportWarnedRef, confirmTimer, autolockRef, lastActivityRef,
+    searchResults, setSearchResults, searchError, setSearchError,
+    searchSel, setSearchSel, showShortcuts, setShowShortcuts,
+    chatRef, seededRef, toastSeq, openFileRef, showSearchRef, showSettingsRef,
+    exportWarnedRef, autolockRef, lastActivityRef,
     askingRef, prevAskingRef, askIdRef, recheckTimer, prevModelRef,
     userPickedModelRef, showMemoryIntro, setShowMemoryIntro,
     showMap, setShowMap, showMapRef, showHelp, setShowHelp,

@@ -262,15 +262,68 @@ pub async fn regenerate_leash_token(
 
 // ---- D10: the Closet (remote Ollama URL) ------------------------------------
 
+/// D10: what the Closet field accepts, and the exact value to store — `""` means
+/// "clear the override, use this Mac". Before this, ANY string was saved happily:
+/// a typo or a bare `192.168.1.20:11434` went in, and afterwards every AI feature
+/// in the room failed with a transport error that never mentioned the address.
+/// A missing scheme is the common case and is repaired rather than refused —
+/// Ollama speaks plain http — but anything that cannot be an origin is rejected
+/// with the reason, at the moment the person can still fix it.
+fn normalize_ollama_url(raw: &str) -> Result<String, String> {
+    const SHAPE: &str = "use something like http://192.168.1.20:11434";
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(format!("A server address cannot contain spaces — {SHAPE}."));
+    }
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => ("http".to_string(), trimmed),
+    };
+    if scheme != "http" && scheme != "https" {
+        return Err(format!(
+            "The address must start with http:// or https:// — {SHAPE}."
+        ));
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Split an optional :port off the end; an IPv6 literal keeps its brackets.
+    let (host, port) = match authority.rfind(':') {
+        Some(i) if !authority[i + 1..].contains(']') => {
+            (&authority[..i], Some(&authority[i + 1..]))
+        }
+        _ => (authority, None),
+    };
+    let host_ok = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']' | ':'));
+    let port_ok = match port {
+        Some(p) => p.parse::<u16>().is_ok_and(|p| p > 0),
+        None => true,
+    };
+    if !host_ok || !port_ok {
+        return Err(format!("\"{trimmed}\" is not a server address — {SHAPE}."));
+    }
+    Ok(format!("{scheme}://{}", rest.trim_end_matches('/')))
+}
+
 /// D10: point Ollama at a remote base URL ("closet supercomputer") and persist it
 /// for this room, or clear it when empty. The override applies immediately and is
-/// re-applied on the next unlock via `apply_ollama_override`.
+/// re-applied on the next unlock via `apply_ollama_override`. The address is
+/// checked and normalized FIRST, so a rejected one never reaches the override or
+/// the room's settings — the app keeps working against this Mac.
 #[tauri::command]
 pub fn set_ollama_url(state: State<'_, AppState>, url: String) -> Result<(), String> {
-    let trimmed = url.trim().to_string();
-    ollama::set_base_url_override(if trimmed.is_empty() { None } else { Some(trimmed.clone()) });
+    let normalized = normalize_ollama_url(&url)?;
+    ollama::set_base_url_override(if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.clone())
+    });
     if let Some(room) = state.room.lock().unwrap().as_ref() {
-        db::set_setting(&room.conn, "remote_ollama_url", &trimmed)?;
+        db::set_setting(&room.conn, "remote_ollama_url", &normalized)?;
     }
     Ok(())
 }
@@ -336,5 +389,42 @@ mod tests {
         // A rotated token is what the next read returns.
         db::set_setting(&conn, "leash_token", "rotated").unwrap();
         assert_eq!(leash_identity(&conn).unwrap().1, "rotated");
+    }
+
+    #[test]
+    fn closet_address_is_checked_before_it_is_saved() {
+        // Kept as typed (bar a trailing slash), so what Settings shows back is
+        // exactly what requests use.
+        assert_eq!(
+            normalize_ollama_url(" http://192.168.1.20:11434/ ").unwrap(),
+            "http://192.168.1.20:11434"
+        );
+        assert_eq!(
+            normalize_ollama_url("https://box.local/ollama").unwrap(),
+            "https://box.local/ollama"
+        );
+        assert_eq!(normalize_ollama_url("http://[::1]:11434").unwrap(), "http://[::1]:11434");
+        // The common miss — no scheme — is repaired, not refused.
+        assert_eq!(
+            normalize_ollama_url("192.168.1.20:11434").unwrap(),
+            "http://192.168.1.20:11434"
+        );
+        // Blank clears the override.
+        assert_eq!(normalize_ollama_url("   ").unwrap(), "");
+        // Everything that cannot be reached is refused HERE, where the person
+        // can still fix it, instead of surfacing later as a transport error in
+        // every AI feature that never names the address.
+        for bad in [
+            "ftp://box:11434",
+            "htp://box",
+            "http://",
+            "http://:11434",
+            "http://box:notaport",
+            "http://box:0",
+            "http://box:99999",
+            "my closet box",
+        ] {
+            assert!(normalize_ollama_url(bad).is_err(), "{bad} should be refused");
+        }
     }
 }

@@ -37,11 +37,17 @@ lane can never fire for a Hebrew-speaking user.
 
 The hint lists are product behaviour. If you change one here, change the Rust in
 the same commit or the two engines drift. They are also PUBLIC (they lost their
-leading underscore on 2026-07-30): ``manager.py`` scores the sibling workers of
-``app.ui`` and ``jobs.run`` on ``UI_HINTS`` / ``JOB_HINTS`` rather than
-duplicating them in the registry, and ``agents.py`` cites them by name. An
-underscore that another module imports across the boundary is a lie about the
-name's reach — this vocabulary is part of what the module ships.
+leading underscore on 2026-07-30): ``manager.py`` scores ``jobs.run`` against
+its sibling on ``JOB_HINTS`` rather than duplicating the list in the registry,
+and ``agents.py`` cites them by name. An underscore that another module imports
+across the boundary is a lie about the name's reach — this vocabulary is part of
+what the module ships.
+
+``UI_HINTS`` used to be named here as a second such consumer. It never was one:
+``app`` is a single-member domain, so ``manager.resolve_worker`` returns
+``app.ui`` before any scoring runs and the row that claimed to wire it in was
+dead (removed 2026-08-01). Inside this module the list is very much alive — it
+is what :func:`wants_ui_tools` matches on, and it is parity-locked to agent.rs.
 """
 
 from __future__ import annotations
@@ -161,7 +167,14 @@ NAV_INTENT: tuple[str, ...] = (
     "take me to",
     "load the page",
     "load up",
-    "surf",
+    # ANCHORED (2026-08-01). A bare "surf" is a substring of "surface", and this
+    # gate wins outright ahead of all scoring — so "what is the surface
+    # temperature of Mars" was a navigation instruction and the Browser agent
+    # had to guess an address for a plain web question. The verb only ever
+    # appears as "surf the web" / "surf reddit" / "surfing", all of which the
+    # two anchored forms below still catch.
+    "surf ",
+    "surfing",
     "on the browser",
     "in the browser",
     "use the browser",
@@ -293,11 +306,26 @@ def wants_mcp_management_tools(question: str) -> bool:
     return _any_hint(question, MCP_MANAGEMENT_HINTS)
 
 
-def lane_label(*, ui: bool, write: bool, web_enabled: bool) -> str:
+#: The two workers whose whole job is the internet, and what the chip should say
+#: while each one holds the turn. Keyed off the ACTIVE agent because the routing
+#: booleans cannot tell these apart: `web_enabled` only means the room ALLOWS the
+#: web, so a live search read "Answering (web available)" and a room whose
+#: question also tripped the write hints read "Working on your files" while the
+#: app was in fact clicking through pages. The label's whole job is making an odd
+#: answer explainable, and those two were the odd answers.
+_WEB_AGENT_LABELS: dict[str, str] = {
+    "chat.web": "Searching the web",
+    "chat.browse": "Browsing the web",
+}
+
+
+def lane_label(*, ui: bool, write: bool, web_enabled: bool, agent_id: str = "") -> str:
     """The lane shown to the user, so an odd answer is explainable (Python-only —
     no agent.rs counterpart).
 
-    Purely cosmetic. Order matters: UI wins over write, write over web.
+    Purely cosmetic. Order matters: the internet workers win outright (they are
+    named by the ACTIVE agent, which is more specific than any hint match), then
+    UI over write, write over web.
 
     Takes the RESOLVED routing booleans (not the raw question) so the chip always
     matches the catalog the model was actually offered. In the Rust these are the
@@ -305,6 +333,8 @@ def lane_label(*, ui: bool, write: bool, web_enabled: bool) -> str:
     the host can override routing (SPEC §5), and the label must follow the override
     or the user sees "Using the app" while the UI tools were withheld.
     """
+    if agent_id in _WEB_AGENT_LABELS:
+        return _WEB_AGENT_LABELS[agent_id]
     if ui:
         return "Using the app"
     if write:

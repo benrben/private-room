@@ -1,4 +1,9 @@
-import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import {
+  useEffect,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type RefObject,
+} from "react";
 import { api } from "../api";
 import {
   CheckIcon,
@@ -12,7 +17,7 @@ import {
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import DiffPreview from "../viewers/DiffPreview";
-import { languageForFile } from "../viewers/monacoSetup";
+import { languageForFile } from "../viewers/languages";
 import { LayoutApi } from "../shell/useLayout";
 import { toggleTheme } from "../theme";
 
@@ -86,6 +91,63 @@ function CaptureDock({ s }: { s: WSState }) {
   );
 }
 
+/** Roving keyboard focus for a pop-up menu built from plain buttons.
+ *
+ * The file "•••" menu could be OPENED from the keyboard and then not used: it
+ * took no focus and answered no arrow keys, which put Rename, Move to… and
+ * Remove — which exist nowhere else — out of reach for keyboard and
+ * screen-reader users. Same behaviour the QuickActions menu already has. */
+function useMenuKeys(
+  open: boolean,
+  onClose: () => void,
+  ref: RefObject<HTMLDivElement | null>,
+  /** Anything that changes the menu's ITEM LIST while it stays open. Arming
+   * "Remove from room" swaps that one menuitem for a Delete/Keep pair: the
+   * focused button unmounts, and since every item is `tabIndex={-1}` focus
+   * falls to document.body — where no arrow key reaches the menu div that
+   * carries the handler, so neither Delete nor Keep can be reached from the
+   * keyboard. Re-running the focus effect on the change puts focus back on the
+   * item now occupying that slot. */
+  revision?: unknown,
+) {
+  const [focusIdx, setFocusIdx] = useState(0);
+  useEffect(() => {
+    if (open) setFocusIdx(0);
+  }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    const items = ref.current?.querySelectorAll<HTMLElement>(
+      '[role="menuitem"]:not(:disabled)',
+    );
+    items?.[Math.min(focusIdx, (items.length || 1) - 1)]?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, focusIdx, revision]);
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const count =
+      ref.current?.querySelectorAll('[role="menuitem"]:not(:disabled)').length ??
+      0;
+    if (count === 0) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setFocusIdx((i) => (i + 1) % count);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setFocusIdx((i) => (i - 1 + count) % count);
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      setFocusIdx(0);
+    } else if (e.key === "End") {
+      e.preventDefault();
+      setFocusIdx(count - 1);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      onClose();
+    }
+  };
+  return { onKeyDown };
+}
+
 /** One executable palette command (searched alongside room content). */
 type PaletteAction = {
   id: string;
@@ -120,17 +182,122 @@ function buildPaletteActions(
     { id: "go-workflows", label: "Open Workflows", hint: "Pipelines, schedules, run history", run: () => a.openWorkflows() },
     { id: "go-scripts", label: "Open Scripts", hint: "Runnable .py/.js room files", run: () => a.openScripts() },
     { id: "go-memory", label: "Open Memory & scratch pad", hint: "Durable context, visible and editable", run: () => a.revealMemory() },
+    // The palette used to omit three whole areas the rail shows, so anyone who
+    // navigated this way concluded the app didn't have them.
+    { id: "go-skills", label: "Open Skills", hint: "Reusable instructions the AI can load", run: () => { leaveAreas(); s.setArea("skills"); } },
+    { id: "go-connectors", label: "Open Connectors", hint: "MCP tools this room may use", run: () => { leaveAreas(); s.setArea("connectors"); } },
+    { id: "go-browser", label: "Open the private browser", hint: "Read the web with no history kept", run: () => a.revealBrowser() },
     { id: "focus-editor", label: "Focus the editor", hint: "Hide both side panes", run: () => layout?.toggleFocus("center") },
     { id: "reset-layout", label: "Reset the three-pane layout", hint: "Restore the balanced default", run: () => layout?.resetLayout() },
     { id: "theme", label: "Switch theme", hint: "Dark ⇄ light", run: () => toggleTheme() },
     { id: "checkpoint", label: "Save a checkpoint", hint: "A room-wide recovery point", run: () => { api.createRoomCheckpoint("").then((m) => s.pushToast("success", `Saved checkpoint “${m.name}”.`)).catch((e) => s.pushToast("error", String(e))); } },
     { id: "export-all", label: "Export all files…", hint: "Plain copies outside the room", disabled: s.files.length === 0, run: () => a.exportAllFiles() },
     { id: "settings", label: "Room settings", hint: "Models, privacy, voice, connections (⌘,)", run: () => s.setShowSettings(true) },
+    { id: "shortcuts", label: "Keyboard shortcuts", hint: "Every shortcut in one sheet (⌘/)", run: () => s.setShowShortcuts(true) },
     { id: "feedback", label: "Send feedback…", hint: "Draft locally, then open GitHub", run: () => s.setShowFeedback(true) },
     { id: "lock", label: "Lock this room", hint: "Close and return to the gate (⌘L)", run: () => void a.handleLock() },
   ];
   if (!layout) return acts.filter((x) => x.id !== "focus-editor" && x.id !== "reset-layout");
   return acts;
+}
+
+/** Every keyboard shortcut this app answers, grouped the way the user meets
+ * them. The app had over a dozen and no way to learn one except hovering the
+ * right button; this sheet is the list. Keep it in step with the real handlers:
+ * effects.ts (app), Workspace.tsx (tabs), useLayout.ts (panes), chatActions.ts
+ * (composer), CodeEditor.tsx (save), PdfView.tsx (zoom). */
+const SHORTCUTS: { group: string; rows: [string, string][] }[] = [
+  {
+    group: "Around the room",
+    rows: [
+      ["⌘K  /  ⌘F", "Search this room, or run a command"],
+      ["⌘N", "New chat"],
+      ["⌘,", "Room settings"],
+      ["⌘J", "Pinned workflows"],
+      ["⌘/", "This list"],
+      ["⌘L", "Lock the room"],
+      ["Esc", "Close the menu, sheet, or open file"],
+    ],
+  },
+  {
+    group: "Tabs",
+    rows: [
+      ["⌘W", "Close the current tab"],
+      ["⌘⇧]  /  ⌘⇧[", "Next / previous tab"],
+      ["⌥⌘1 – ⌥⌘9", "Jump to a tab by position (⌥⌘9 = last)"],
+    ],
+  },
+  {
+    group: "Panes",
+    rows: [
+      ["⌘1 / ⌘2 / ⌘3", "Show or hide the Library, workspace, and AI panes"],
+      ["Esc", "Leave a focused pane"],
+    ],
+  },
+  {
+    group: "Writing",
+    rows: [
+      ["Enter", "Send the message"],
+      ["⇧Enter", "New line instead of sending"],
+      ["@  /  #  /  /", "Mention a file, run a command, pick a prompt"],
+      ["⌘S", "Save the file you are editing"],
+      ["⌘Enter", "Run the prompt in a Studio or AI-action window"],
+    ],
+  },
+  {
+    group: "Reading a PDF",
+    rows: [["⌘+ / ⌘- / ⌘0", "Zoom in, out, or fit the width"]],
+  },
+];
+
+/** The keyboard-shortcuts sheet. Reuses the settings modal's frame so it is
+ * dismissed exactly like every other sheet in the app. */
+function ShortcutsSheet({ onClose }: { onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      onClose();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+  return (
+    <div
+      className="settings-backdrop"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="settings" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+        <div className="settings-head">
+          <span className="badge-label">Keyboard shortcuts</span>
+          <button className="subtle btn-ic" title="Close" onClick={onClose}>
+            <CloseIcon size={12} />
+          </button>
+        </div>
+        <div className="settings-body">
+          {SHORTCUTS.map((sec) => (
+            <section key={sec.group}>
+              <div className="group-heading">{sec.group}</div>
+              {sec.rows.map(([keys, what]) => (
+                <div
+                  key={keys + what}
+                  className="brief-row info"
+                  // The row style is shared with Home's brief, which spaces its
+                  // rows from the list wrapper this sheet doesn't have.
+                  style={{ marginBottom: 6 }}
+                >
+                  <span className="brief-text">{what}</span>
+                  <kbd>{keys}</kbd>
+                </div>
+              ))}
+            </section>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /** Host of a URL, for the consent card's "on <site>" phrasing. Falls back to
@@ -184,6 +351,25 @@ export default function Overlays({
       act.run();
     }
   };
+  const ctxKeys = useMenuKeys(
+    s.ctxMenu !== null,
+    () => s.setCtxMenu(null),
+    s.ctxMenuElRef,
+    // Arming/disarming the delete confirm is the one thing that rewrites this
+    // menu's items while it is open.
+    s.confirmDelete,
+  );
+  const moveKeys = useMenuKeys(
+    s.moveMenuFor !== null,
+    () => s.setMoveMenuFor(null),
+    s.moveMenuElRef,
+  );
+  // The highlight has to drag the list along with it: arrow-keying past the
+  // fold otherwise leaves you pressing Enter on a row you cannot see. Same
+  // treatment the composer's own suggestion list already has.
+  const keepVisible = (idx: number) => (el: HTMLButtonElement | null) => {
+    if (idx === s.searchSel) el?.scrollIntoView({ block: "nearest" });
+  };
   const onPaletteKey = (e: ReactKeyboardEvent<HTMLInputElement>) => {
     if (e.key === "ArrowDown") {
       e.preventDefault();
@@ -199,6 +385,9 @@ export default function Overlays({
   return (
     <>
       <CaptureDock s={s} />
+      {s.showShortcuts && (
+        <ShortcutsSheet onClose={() => s.setShowShortcuts(false)} />
+      )}
       {pendingScript && (
         // Wave 5 (Idea 13): the script-run consent card. Same data-agent-blocked
         // surface as the MCP/edit cards — the UI-driving agent must never approve
@@ -406,13 +595,16 @@ export default function Overlays({
           <div
             ref={s.ctxMenuElRef}
             className="ctx-menu"
+            role="menu"
+            aria-label={`Actions for ${s.ctxMenu.file.name}`}
+            onKeyDown={ctxKeys.onKeyDown}
             style={{ top: s.ctxMenu.y, left: s.ctxMenu.x }}
           >
-            <button className="ctx-item" onClick={() => { a.viewFile(s.ctxMenu!.file.id); s.setCtxMenu(null); }}>Open</button>
-            <button className="ctx-item" onClick={() => { a.toggleAttach(s.ctxMenu!.file); s.setCtxMenu(null); }}>{s.attachments.some((x) => x.id === s.ctxMenu!.file.id) ? "Detach from chat" : "Attach to chat"}</button>
-            <button className="ctx-item" onClick={() => { s.setRenamingFile({ id: s.ctxMenu!.file.id, name: s.ctxMenu!.file.name }); s.setCtxMenu(null); }}>Rename…</button>
-            <button className="ctx-item" onClick={() => { s.setMoveMenuFor({ id: s.ctxMenu!.file.id, x: s.ctxMenu!.x, y: s.ctxMenu!.y }); s.setCtxMenu(null); }}>Move to…</button>
-            <button className="ctx-item" onClick={() => { a.exportOne(s.ctxMenu!.file.id, s.ctxMenu!.file.name); s.setCtxMenu(null); }}>Export a copy…</button>
+            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.viewFile(s.ctxMenu!.file.id); s.setCtxMenu(null); }}>Open</button>
+            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.toggleAttach(s.ctxMenu!.file); s.setCtxMenu(null); }}>{s.attachments.some((x) => x.id === s.ctxMenu!.file.id) ? "Detach from chat" : "Attach to chat"}</button>
+            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { s.setRenamingFile({ id: s.ctxMenu!.file.id, name: s.ctxMenu!.file.name, where: "library" }); s.setCtxMenu(null); }}>Rename…</button>
+            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { s.setMoveMenuFor({ id: s.ctxMenu!.file.id, x: s.ctxMenu!.x, y: s.ctxMenu!.y }); s.setCtxMenu(null); }}>Move to…</button>
+            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.exportOne(s.ctxMenu!.file.id, s.ctxMenu!.file.name); s.setCtxMenu(null); }}>Export a copy…</button>
             {(s.aiActionDefs ?? []).some((x) => x.scope === "file") && (
               <>
                 <div className="ctx-sep" />
@@ -422,6 +614,8 @@ export default function Overlays({
                   .map((x) => (
                     <button
                       key={x.id}
+                      role="menuitem"
+                      tabIndex={-1}
                       className="ctx-item"
                       title={x.description}
                       onClick={() => {
@@ -440,8 +634,16 @@ export default function Overlays({
               // ADD-25: the agent driver must not be able to click ✓ on a
               // removal it didn't earn.
               <div className="ctx-confirm" data-agent-blocked>
-                <span className="ctx-confirm-q">Remove from room?</span>
+                {/* Say what actually happens: this is not a trash can. The
+                    file, every earlier version of it and its transcript go
+                    together, and only a room-wide checkpoint rollback (which
+                    undoes everything else too) brings them back. */}
+                <span className="ctx-confirm-q">
+                  Delete permanently, with its history?
+                </span>
                 <button
+                  role="menuitem"
+                  tabIndex={-1}
                   className="ctx-item danger btn-ic"
                   onClick={() => {
                     const id = s.ctxMenu!.file.id;
@@ -450,14 +652,21 @@ export default function Overlays({
                     a.removeFile(id);
                   }}
                 >
-                  <CheckIcon size={13} /> Remove
+                  <CheckIcon size={13} /> Delete
                 </button>
-                <button className="ctx-item btn-ic" onClick={a.cancelConfirm}>
+                <button
+                  role="menuitem"
+                  tabIndex={-1}
+                  className="ctx-item btn-ic"
+                  onClick={a.cancelConfirm}
+                >
                   <CloseIcon size={13} /> Keep
                 </button>
               </div>
             ) : (
               <button
+                role="menuitem"
+                tabIndex={-1}
                 className="ctx-item danger"
                 onClick={() => a.askConfirm(`ctx-remove-${s.ctxMenu!.file.id}`)}
               >
@@ -477,6 +686,9 @@ export default function Overlays({
           <div
             ref={s.moveMenuElRef}
             className="ctx-menu"
+            role="menu"
+            aria-label="Move to a folder"
+            onKeyDown={moveKeys.onKeyDown}
             style={{ top: s.moveMenuFor.y, left: s.moveMenuFor.x }}
           >
             <div className="ctx-heading">Move to…</div>
@@ -485,6 +697,8 @@ export default function Overlays({
               return (
                 <>
                   <button
+                    role="menuitem"
+                    tabIndex={-1}
                     className="ctx-item"
                     disabled={!mf || mf.folderId === null}
                     onClick={() => { a.moveFile(s.moveMenuFor!.id, null); s.setMoveMenuFor(null); }}
@@ -494,6 +708,8 @@ export default function Overlays({
                   {s.folders.map((fo) => (
                     <button
                       key={fo.id}
+                      role="menuitem"
+                      tabIndex={-1}
                       className="ctx-item"
                       disabled={mf?.folderId === fo.id}
                       onClick={() => { a.moveFile(s.moveMenuFor!.id, fo.id); s.setMoveMenuFor(null); }}
@@ -540,6 +756,14 @@ export default function Overlays({
               onKeyDown={onPaletteKey}
             />
             <div className="search-results">
+              {/* A failed search clears its results, so this is the only thing
+                  on screen — the previous query's hits never linger under a
+                  query that never ran. */}
+              {s.searchError && (
+                <div className="search-empty" role="alert">
+                  This room could not be searched: {s.searchError}
+                </div>
+              )}
               {s.searchQuery.trim() &&
                 searchResults &&
                 totalItems === 0 && (
@@ -568,6 +792,7 @@ export default function Overlays({
                   {searchResults.files.map((f, i) => (
                     <button
                       key={f.id}
+                      ref={keepVisible(i)}
                       className={`search-result ${s.searchSel === i ? "sel" : ""}`}
                       onMouseEnter={() => s.setSearchSel(i)}
                       onClick={() =>
@@ -597,6 +822,7 @@ export default function Overlays({
                     return (
                       <button
                         key={m.messageId}
+                        ref={keepVisible(idx)}
                         className={`search-result ${s.searchSel === idx ? "sel" : ""}`}
                         onMouseEnter={() => s.setSearchSel(idx)}
                         onClick={() =>
@@ -626,6 +852,7 @@ export default function Overlays({
                     return (
                       <button
                         key={m.id}
+                        ref={keepVisible(idx)}
                         className={`search-result ${s.searchSel === idx ? "sel" : ""}`}
                         onMouseEnter={() => s.setSearchSel(idx)}
                         onClick={() =>
@@ -654,6 +881,7 @@ export default function Overlays({
                     return (
                       <button
                         key={act.id}
+                        ref={keepVisible(idx)}
                         className={`search-result action ${s.searchSel === idx ? "sel" : ""}`}
                         disabled={act.disabled}
                         onMouseEnter={() => s.setSearchSel(idx)}

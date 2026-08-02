@@ -54,6 +54,26 @@ struct ScriptBrief {
     manifest: ScriptManifest,
 }
 
+/// The room files this run would decrypt into the workspace: the ones the
+/// script DECLARES, plus every room file whose exact name appears in its text
+/// (the auto-materialize rule in `script_run`). The card used to list only the
+/// declared ones, so it could show none while twenty documents were copied out
+/// of the room — the whole point of the card is that it describes what happens.
+fn readable_room_files(conn: &Connection, declared: &[String], text: &str) -> Vec<String> {
+    let mut out = declared.to_vec();
+    let Ok(files) = db::list_files(conn) else {
+        return out;
+    };
+    let names: Vec<String> = files.into_iter().map(|f| f.name).collect();
+    for name in referenced_room_files(text, &names, MAX_AUTO_MATERIALIZE) {
+        // A declared input is matched fuzzily by name, so compare loosely.
+        if !out.iter().any(|d| d.eq_ignore_ascii_case(&name)) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// The human command line the run would execute, e.g. "uv run --no-project x.py".
 fn interpreter_line(runner: &Runner, script_name: &str) -> String {
     let prog = std::path::Path::new(&runner.program)
@@ -187,19 +207,11 @@ pub(crate) async fn approve_workflow_scripts(
         let NodeKind::ScriptRun { file, .. } = &node.kind else {
             continue;
         };
-        // Resolve `file` (a stored id, or a name) to (name, bytes) — the same
-        // resolution the consent-stamping + executor use.
+        // The ONE resolver, shared with the consent-stamping + executor.
         let resolved: Option<(String, Vec<u8>)> = state.with_room(|room| {
-            if let Ok((name, bytes)) = db::get_file_bytes_named(&room.conn, file) {
-                Ok(Some((name, bytes.unwrap_or_default())))
-            } else if let Ok((id, _)) = db::find_file_like(&room.conn, file) {
-                match db::get_file_bytes_named(&room.conn, &id) {
-                    Ok((name, bytes)) => Ok(Some((name, bytes.unwrap_or_default()))),
-                    Err(_) => Ok(None),
-                }
-            } else {
-                Ok(None)
-            }
+            Ok(resolve_script_file(&room.conn, file)
+                .ok()
+                .map(|(_id, name, bytes)| (name, bytes)))
         })?;
         // An unresolvable script (or a non-.py/.js file) is left to the executor to
         // surface honestly — no consent card for a file we can't run.
@@ -214,8 +226,10 @@ pub(crate) async fn approve_workflow_scripts(
         // Resolve the runtime first — an actionable "install uv/python" error is
         // better raised before the consent card than after (mirrors `run_script`).
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let manifest = parse_script_manifest(&name, &text);
+        let mut manifest = parse_script_manifest(&name, &text);
         let runner = resolve_interpreter(&manifest)?;
+        manifest.inputs =
+            state.with_room(|room| Ok(readable_room_files(&room.conn, &manifest.inputs, &text)))?;
         let brief = ScriptBrief {
             name: name.clone(),
             sha: sha.clone(),
@@ -289,8 +303,11 @@ pub struct ScriptInfo {
     pub shortcut: String,
     /// True when this exact content is approved on this Mac.
     pub approved: bool,
-    /// True when the script ran/scheduled before but its current content is not
-    /// approved (edited since) — drives the "Needs review" ribbon.
+    /// True when the script has been run (so an auto-workflow exists) but its
+    /// CURRENT content is not remembered on this Mac — an "Allow once" run and
+    /// an edit after "Always allow" both land here, and this flag cannot tell
+    /// them apart. It drives the "Needs review" ribbon, which is honest for
+    /// both; the ribbon's tooltip must therefore NOT claim the script changed.
     pub changed_since_approval: bool,
     pub workflow_id: Option<String>,
     pub schedule: Option<db::Schedule>,
@@ -355,8 +372,10 @@ pub fn list_scripts(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
             // shared error. A non-failure — or a *different* error — ends it.
             let mut consecutive_failures = 0u32;
             let mut last_error: Option<String> = None;
+            // 'error' is the only failure status a run row is ever given
+            // (running | done | error) — there is no separate "failed".
             for r in &runs {
-                if r.status != "error" && r.status != "failed" {
+                if r.status != "error" {
                     break;
                 }
                 let this_err = r.error.clone().unwrap_or_default();
@@ -510,9 +529,15 @@ pub(crate) async fn agent_run_script(
     }
 }
 
-/// Everything the script printed, read back from the run's stored artifacts.
+/// Everything the script PRINTED, read back from the run's stored artifacts.
 /// A script auto-workflow is one `script_run` node, so step 0 holds it; the
 /// loop keeps working if that ever grows a second step.
+///
+/// An import-mode `script_run` stores the whole run RECORD as its result — exit
+/// code, every imported file, and only then the printed output. Handing that
+/// blob to a model told to "quote these values exactly" is wrong twice over:
+/// it isn't the answer, and the clamp can cut the answer off the end entirely.
+/// Pull the stdout tail out of the record instead.
 fn script_output(state: &AppState, job_id: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     for step in 0..4 {
@@ -520,13 +545,60 @@ fn script_output(state: &AppState, job_id: &str) -> String {
         else {
             break;
         };
-        let text = serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|v| v["result"].as_str().map(str::to_string))
-            .unwrap_or_default();
+        let text = printed_output(&raw);
         if !text.trim().is_empty() {
             parts.push(text.trim().to_string());
         }
+    }
+    parts.join("\n")
+}
+
+/// What one stored step artifact means by "output". An import-mode `script_run`
+/// records the whole run REPORT as its result, so the printed text is the
+/// report's `stdoutTail`; a transform-mode step's result already IS the stdout.
+///
+/// The stdout is not the WHOLE answer, though: an import-mode script's point is
+/// the files it wrote. Quoting the raw report JSON at the model was wrong, but
+/// so was dropping it — a script that writes chart.png and prints nothing came
+/// back as "it finished successfully and printed nothing", so the assistant
+/// could neither name what it produced nor relay why an output was skipped. The
+/// printed text leads; the record's short, human parts follow it.
+fn printed_output(raw_artifact: &str) -> String {
+    let result = serde_json::from_str::<serde_json::Value>(raw_artifact)
+        .ok()
+        .and_then(|v| v["result"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let Some(report) = serde_json::from_str::<serde_json::Value>(&result)
+        .ok()
+        .filter(|r| r.get("stdoutTail").and_then(|s| s.as_str()).is_some())
+    else {
+        // Not a run record — a transform step's result already IS the stdout.
+        return result;
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(tail) = report["stdoutTail"].as_str().map(str::trim) {
+        if !tail.is_empty() {
+            parts.push(tail.to_string());
+        }
+    }
+    let created: Vec<&str> = report["imported"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|f| f["name"].as_str()).collect())
+        .unwrap_or_default();
+    if !created.is_empty() {
+        parts.push(format!("Created: {}", created.join(", ")));
+    }
+    // Why a declared output did NOT arrive (not written, over the size cap, the
+    // new-file import cap) — the user needs to hear these.
+    let notes: Vec<&str> = report["skipped"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    for n in notes {
+        parts.push(format!("Note: {n}"));
+    }
+    if report["exitCode"].as_i64().unwrap_or(0) != 0 {
+        parts.push(format!("Exit code: {}", report["exitCode"]));
     }
     parts.join("\n")
 }
@@ -598,11 +670,16 @@ pub(crate) async fn run_script_inner(
 
     let already = read_script_approvals(&app).iter().any(|f| f == &sha);
     if !already {
+        // The card must name every room file this run would decrypt into the
+        // workspace, not just the declared ones.
+        let mut shown = manifest.clone();
+        shown.inputs =
+            state.with_room(|room| Ok(readable_room_files(&room.conn, &shown.inputs, &text)))?;
         let brief = ScriptBrief {
             name: name.clone(),
             sha: sha.clone(),
             interpreter_line: interpreter_line(&runner, &name),
-            manifest: manifest.clone(),
+            manifest: shown,
         };
         if !script_run_approved(&app, state, window, &brief).await {
             return Err("This script was not approved to run.".into());
@@ -672,6 +749,77 @@ mod tests {
         let huge = clamp_script_output("loud.py", &"x".repeat(20_000));
         assert!(huge.len() < 5_000);
         assert!(huge.ends_with("(output truncated)"));
+    }
+
+    #[test]
+    fn the_agent_gets_what_the_script_printed_not_the_run_record() {
+        // An import-mode script_run stores the whole run REPORT as its result —
+        // exit code, every imported file, and the printed output LAST. Handing
+        // that to a model told to "quote these values exactly" is wrong twice:
+        // it isn't the answer, and the 4000-char clamp can cut the answer off
+        // the end entirely.
+        let report = serde_json::json!({
+            "exitCode": 0,
+            "imported": [{ "id": "f1", "name": "out.csv" }],
+            "skipped": [],
+            "stdoutTail": "book.md: 1715 words\n",
+            "stderrTail": "",
+        });
+        let artifact =
+            serde_json::json!({ "result": serde_json::to_string(&report).unwrap() }).to_string();
+        let out = printed_output(&artifact);
+        assert!(out.starts_with("book.md: 1715 words"), "{out}");
+        assert!(!out.contains("exitCode"), "{out}");
+        assert!(!out.contains("stdoutTail"), "{out}");
+
+        // A transform-mode step's result already IS the stdout.
+        let piped = serde_json::json!({ "result": "just the output" }).to_string();
+        assert_eq!(printed_output(&piped), "just the output");
+        // Anything unreadable yields nothing rather than a blob.
+        assert_eq!(printed_output("not json"), "");
+    }
+
+    #[test]
+    fn the_assistant_is_told_which_files_the_script_created() {
+        // Narrowing the tool result to the stdout was right — the raw report
+        // JSON was the wrong thing to quote — but it went one step too far. An
+        // import-mode run's POINT is the files it wrote: a script that writes
+        // chart.png and prints nothing came back as "it finished successfully
+        // and printed nothing", so the assistant could not name what it made
+        // and never relayed why a declared output was dropped.
+        let report = serde_json::json!({
+            "exitCode": 0,
+            "imported": [{ "id": "f1", "name": "chart.png" }, { "id": "f2", "name": "data.csv" }],
+            "skipped": ["notes.txt: the script did not write this declared output"],
+            "stdoutTail": "",
+            "stderrTail": "",
+        });
+        let artifact =
+            serde_json::json!({ "result": serde_json::to_string(&report).unwrap() }).to_string();
+        let out = printed_output(&artifact);
+        assert!(out.contains("chart.png") && out.contains("data.csv"), "{out}");
+        assert!(out.contains("did not write this declared output"), "{out}");
+        // A silent, file-producing run is no longer "printed nothing".
+        let told = clamp_script_output("make-chart.py", &out);
+        assert!(!told.contains("printed nothing"), "{told}");
+        assert!(told.contains("chart.png"), "{told}");
+
+        // Printed text still LEADS — it is the answer when there is one.
+        let with_stdout = serde_json::json!({
+            "exitCode": 2,
+            "imported": [{ "id": "f1", "name": "out.csv" }],
+            "skipped": [],
+            "stdoutTail": "42 rows\n",
+            "stderrTail": "",
+        });
+        let out = printed_output(
+            &serde_json::json!({ "result": serde_json::to_string(&with_stdout).unwrap() })
+                .to_string(),
+        );
+        assert!(out.starts_with("42 rows"), "{out}");
+        assert!(out.contains("Created: out.csv"), "{out}");
+        // A non-zero exit is visible; a clean one is not worth a line.
+        assert!(out.contains("Exit code: 2"), "{out}");
     }
 
     #[test]

@@ -139,19 +139,107 @@ def test_cmdline_rejects_unknown_engine() -> None:
         build_cmdline("gemini-cli", None, None)
 
 
+# The model string is read from the ROOM FILE, which can arrive from someone
+# else; it is interpolated into a `zsh -ilc` command line, so a slug carrying
+# shell syntax must be refused before it gets there — not quoted, not ignored.
+@pytest.mark.parametrize(
+    "submodel",
+    [
+        "opus'; touch /tmp/pwned; '",
+        "opus $(touch /tmp/pwned)",
+        "opus`touch /tmp/pwned`",
+        "opus | sh",
+    ],
+)
+def test_cmdline_refuses_a_model_name_carrying_shell_syntax(submodel: str) -> None:
+    with pytest.raises(ValueError):
+        build_cmdline("claude-cli", submodel, None)
+    with pytest.raises(ValueError):
+        external_llm.build_agent_cmdline("claude-cli", submodel, None)
+
+
+def test_cmdline_refuses_an_effort_carrying_shell_syntax() -> None:
+    with pytest.raises(ValueError):
+        build_cmdline("codex-cli", "gpt-5.6-sol", "high'; touch /tmp/pwned; '")
+    with pytest.raises(ValueError):
+        external_llm.build_agent_cmdline("codex-cli", "gpt-5.6-sol", "high\"x")
+
+
+def test_cmdline_accepts_the_real_catalog_slugs() -> None:
+    # The guard must not cost a legitimate room its model.
+    for submodel in ("opus", "gpt-5.6-sol", "claude-opus-4-1-20250805", "o3_mini"):
+        assert submodel in build_cmdline("claude-cli", submodel, "xhigh")
+
+
+@pytest.mark.asyncio
+async def test_a_doctored_model_name_never_reaches_a_shell(monkeypatch) -> None:
+    spawned: list = []
+
+    async def fake_exec(*argv, **kwargs):
+        spawned.append(argv)
+        return _FakeProc(b"")
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(llm.LlmError) as exc:
+        await external_llm.generate_external(
+            "claude-cli::opus'; touch /tmp/pwned; '",
+            [{"role": "user", "content": "hi"}],
+        )
+    assert exc.value.code == "ENGINE_ERROR"
+    assert not spawned
+
+
 # ---------------------------------------------------------------- subprocess
+
+
+class _FakeStdin:
+    """The write half of the prompt pipe."""
+
+    def __init__(self, proc: "_FakeProc") -> None:
+        self._proc = proc
+
+    def write(self, payload: bytes) -> None:
+        self._proc.stdin_payload = payload
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _FakeReader:
+    """A pipe that hands over its bytes once, then reports EOF.
+
+    ``read`` rather than ``communicate``: the engine seam drains the pipes
+    incrementally now so that SILENCE — not elapsed time — is what stops a CLI
+    (see ``external_llm.EXTERNAL_IDLE_SECS``), and a double that only answered
+    ``communicate`` would be testing an interface production no longer uses.
+    """
+
+    def __init__(self, payload: bytes, chunks: int = 1) -> None:
+        size = max(1, -(-len(payload) // chunks)) if payload else 1
+        self._parts = [payload[i : i + size] for i in range(0, len(payload), size)]
+
+    async def read(self, _n: int = -1) -> bytes:
+        return self._parts.pop(0) if self._parts else b""
 
 
 class _FakeProc:
     def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
-        self._out = stdout
-        self._err = stderr
         self.returncode = returncode
         self.stdin_payload: bytes | None = None
+        self.killed = False
+        self.stdin = _FakeStdin(self)
+        self.stdout = _FakeReader(stdout)
+        self.stderr = _FakeReader(stderr)
 
-    async def communicate(self, payload: bytes | None = None):
-        self.stdin_payload = payload
-        return self._out, self._err
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int | None:
+        return self.returncode
 
 
 @pytest.mark.asyncio
@@ -169,7 +257,10 @@ async def test_generate_external_pipes_prompt_and_strips_output(monkeypatch) -> 
     assert out == "the answer"
     assert seen["argv"][0] == "zsh"
     assert seen["argv"][1] == "-ilc"
-    assert seen["argv"][2] == "claude -p --model 'opus'"
+    # The CLI invocation is unchanged; it is only preceded by the fence that
+    # separates the login shell's own chatter from the engine's reply.
+    assert seen["argv"][2].endswith("claude -p --model 'opus'")
+    assert seen["argv"][2].startswith("printf ")
 
 
 @pytest.mark.asyncio
@@ -186,44 +277,201 @@ async def test_generate_external_raises_sentinel_on_failure(monkeypatch) -> None
     assert "quota exhausted" in exc.value.message
 
 
+# `zsh -ilc` runs the user's interactive startup files, so anything they echo
+# lands on our pipes ahead of the engine's own output.
+_BANNER = b"Welcome back!\nnvm: version manager loaded\n"
+
+
+def _shell_output(payload: bytes) -> bytes:
+    """What the pipe really carries: the startup banner, the fence, the reply."""
+    return _BANNER + external_llm._OUTPUT_FENCE.encode() + b"\n" + payload
+
+
+@pytest.mark.asyncio
+async def test_shell_startup_output_is_not_part_of_the_answer(monkeypatch) -> None:
+    async def fake_exec(*argv, **kwargs):
+        return _FakeProc(_shell_output(b"the answer\n"))
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    out = await external_llm.generate_external(
+        "claude-cli", [{"role": "user", "content": "hi"}]
+    )
+    assert out == "the answer"
+
+
+@pytest.mark.asyncio
+async def test_a_stderr_banner_does_not_replace_the_real_failure(monkeypatch) -> None:
+    async def fake_exec(*argv, **kwargs):
+        return _FakeProc(
+            _shell_output(b""),
+            _shell_output(b"credit balance too low"),
+            returncode=1,
+        )
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(llm.LlmError) as exc:
+        await external_llm.generate_external(
+            "claude-cli", [{"role": "user", "content": "hi"}]
+        )
+    assert exc.value.message == "claude-cli failed: credit balance too low"
+
+
+def test_output_without_the_fence_is_left_alone() -> None:
+    # The fence never ran (a shell that died before it): attribute nothing.
+    assert external_llm.strip_shell_banner(b"plain reply\n") == "plain reply\n"
+
+
+class _SilentReader:
+    """A pipe that never delivers a byte and never reaches EOF — the wedge."""
+
+    async def read(self, _n: int = -1) -> bytes:
+        await asyncio.sleep(3600)
+        return b""
+
+
 class _HangingProc:
-    """A CLI subprocess that never returns from ``communicate`` — the wedge case
-    the timeout guard exists for. ``kill``/``wait`` are cheap so the reap is fast."""
+    """A CLI subprocess that produces NOTHING and never exits — the wedge case
+    the liveness guard exists for. ``kill``/``wait`` are cheap so the reap is
+    fast."""
 
     def __init__(self) -> None:
         self.returncode: int | None = None
         self.killed = False
-
-    async def communicate(self, payload: bytes | None = None):
-        await asyncio.sleep(3600)  # hangs until the wait_for timeout cancels it
-        return b"", b""
+        self.stdin = _FakeStdin(self)  # type: ignore[arg-type]
+        self.stdout = _SilentReader()
+        self.stderr = _SilentReader()
+        self.stdin_payload: bytes | None = None
 
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
 
     async def wait(self) -> int | None:
+        if self.returncode is None:
+            await asyncio.sleep(3600)
+        return self.returncode
+
+
+class _ChattyProc:
+    """A CLI that works far longer than any old wall-clock ceiling but keeps
+    emitting NDJSON events — the healthy long run that must NOT be killed."""
+
+    def __init__(self, beats: int, gap: float, result: bytes) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+        self.stdin = _FakeStdin(self)  # type: ignore[arg-type]
+        self.stdin_payload: bytes | None = None
+        self.stderr = _FakeReader(b"")
+        self._beats = beats
+        self._gap = gap
+        self._result = result
+        self.stdout = self
+
+    async def read(self, _n: int = -1) -> bytes:
+        if self._beats > 0:
+            self._beats -= 1
+            await asyncio.sleep(self._gap)
+            return b'{"type":"assistant","message":{}}\n'
+        if self._result:
+            out, self._result = self._result, b""
+            return out
+        self.returncode = 0
+        return b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int | None:
+        while self.returncode is None:
+            await asyncio.sleep(self._gap / 2)
         return self.returncode
 
 
 @pytest.mark.asyncio
-async def test_generate_external_times_out_and_kills_the_process(monkeypatch) -> None:
+async def test_a_silent_cli_is_stopped_and_reported(monkeypatch) -> None:
     proc = _HangingProc()
 
     async def fake_exec(*argv, **kwargs):
         return proc
 
     monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
-    # Shrink the ceiling so a wedged CLI trips the guard fast instead of hanging.
-    monkeypatch.setattr(external_llm, "EXTERNAL_TIMEOUT_SECS", 0.1)
+    # Shrink the budget so a wedged CLI trips the guard fast instead of hanging.
+    monkeypatch.setattr(external_llm, "EXTERNAL_IDLE_SECS", 0.1)
 
     with pytest.raises(llm.LlmError) as exc:
         await external_llm.generate_external(
             "claude-cli", [{"role": "user", "content": "hi"}]
         )
     assert exc.value.code == "ENGINE_ERROR"
-    assert "timed out" in exc.value.message
+    assert "no output" in exc.value.message
     assert proc.killed  # the guard stopped the wedged subprocess
+
+
+@pytest.mark.asyncio
+async def test_a_working_cli_is_never_killed_for_taking_too_long(monkeypatch) -> None:
+    """The whole point of the liveness deadline.
+
+    This run takes 10x the idle budget end to end — under the old wall-clock
+    ceiling it died and was reported to the user as an engine failure. Because
+    it keeps emitting events it must now finish and answer. A domain agent's
+    single spawn is a whole agentic session; duration was never evidence of
+    anything.
+    """
+    proc = _ChattyProc(beats=10, gap=0.05, result=_shell_output(b"done\n"))
+
+    async def fake_exec(*argv, **kwargs):
+        return proc
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(external_llm, "EXTERNAL_IDLE_SECS", 0.2)
+
+    out = await external_llm.generate_external(
+        "claude-cli", [{"role": "user", "content": "hi"}]
+    )
+    assert out == "done"
+    assert not proc.killed
+
+
+def test_the_idle_budget_can_be_raised_without_a_rebuild(monkeypatch) -> None:
+    monkeypatch.delenv(external_llm.EXTERNAL_IDLE_ENV, raising=False)
+    monkeypatch.delenv(external_llm.EXTERNAL_TIMEOUT_ENV, raising=False)
+    assert external_llm.external_idle_secs() == external_llm.EXTERNAL_IDLE_SECS
+    monkeypatch.setenv(external_llm.EXTERNAL_IDLE_ENV, "1800")
+    assert external_llm.external_idle_secs() == 1800.0
+    # Nonsense and non-positive values keep the default rather than disabling it.
+    monkeypatch.setenv(external_llm.EXTERNAL_IDLE_ENV, "soon")
+    assert external_llm.external_idle_secs() == external_llm.EXTERNAL_IDLE_SECS
+    monkeypatch.setenv(external_llm.EXTERNAL_IDLE_ENV, "0")
+    assert external_llm.external_idle_secs() == external_llm.EXTERNAL_IDLE_SECS
+
+
+def test_the_pre_liveness_env_name_still_works(monkeypatch) -> None:
+    # Someone who set the old override when it meant "total run time" keeps a
+    # working setting; it now means idle time, which is strictly more generous.
+    monkeypatch.delenv(external_llm.EXTERNAL_IDLE_ENV, raising=False)
+    monkeypatch.setenv(external_llm.EXTERNAL_TIMEOUT_ENV, "2400")
+    assert external_llm.external_idle_secs() == 2400.0
+    # The current name wins when both are set.
+    monkeypatch.setenv(external_llm.EXTERNAL_IDLE_ENV, "600")
+    assert external_llm.external_idle_secs() == 600.0
+
+
+@pytest.mark.asyncio
+async def test_the_raised_idle_budget_is_the_one_actually_applied(monkeypatch) -> None:
+    proc = _HangingProc()
+
+    async def fake_exec(*argv, **kwargs):
+        return proc
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv(external_llm.EXTERNAL_IDLE_ENV, "0.2")
+
+    with pytest.raises(llm.LlmError) as exc:
+        await external_llm.generate_external(
+            "claude-cli", [{"role": "user", "content": "hi"}]
+        )
+    assert "no output for 0.2s" in exc.value.message
 
 
 # ---------------------------------------------------------------- llm seams
@@ -314,12 +562,66 @@ TOOLS = [
 
 
 def test_agent_cmdline_asks_for_the_machine_readable_envelope() -> None:
-    # Mirrors external.rs: the envelope is what carries real usage back.
+    # Mirrors external.rs: the envelope is what carries real usage back. It is
+    # asked for in its STREAMED form (`--verbose` is mandatory with it) so the
+    # process emits an event per turn — the heartbeat the liveness deadline
+    # measures. The plain envelope prints once, after the run is already over.
     claude = external_llm.build_agent_cmdline("claude-cli", None, None)
-    assert claude.startswith("claude -p --output-format json")
+    assert claude.startswith("claude -p --output-format stream-json --verbose")
     assert external_llm.build_agent_cmdline("claude-cli", "opus", "xhigh").endswith(
         "--model 'opus' --effort 'xhigh'"
     )
+
+
+def test_the_streamed_envelope_parses_exactly_like_the_plain_one() -> None:
+    """The switch to `stream-json` must cost the answer path nothing."""
+    plain = json.dumps(
+        {
+            "type": "result",
+            "result": "the answer",
+            "usage": {"input_tokens": 2, "cache_read_input_tokens": 100},
+            "modelUsage": {"claude-opus-5": {"inputTokens": 2, "contextWindow": 1_000_000}},
+        }
+    )
+    streamed = "\n".join(
+        [
+            json.dumps({"type": "system", "subtype": "init", "tools": []}),
+            json.dumps({"type": "rate_limit_event"}),
+            json.dumps({"type": "assistant", "message": {"content": []}}),
+            plain,
+        ]
+    )
+    assert external_llm.parse_claude_json_result(plain) == (
+        "the answer",
+        102,
+        1_000_000,
+    )
+    assert external_llm.parse_claude_json_result(streamed) == (
+        "the answer",
+        102,
+        1_000_000,
+    )
+
+
+def test_a_streamed_failure_still_reports_the_real_reason() -> None:
+    # The diagnosis rides the terminal event, not the whole buffer — reading
+    # only the buffer would restore the empty "claude-cli failed: " message.
+    streamed = "\n".join(
+        [
+            json.dumps({"type": "system", "subtype": "init"}),
+            json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "result": "Credit balance is too low",
+                    "terminal_reason": "quota_exhausted",
+                }
+            ),
+        ]
+    )
+    reason = external_llm.cli_failure_reason(streamed, "")
+    assert "Credit balance is too low" in reason
+    assert "quota_exhausted" in reason
 
 
 def test_agent_cmdline_shuts_off_the_clis_own_toolset() -> None:
@@ -335,6 +637,17 @@ def test_agent_cmdline_shuts_off_the_clis_own_toolset() -> None:
     assert "--sandbox read-only" in codex
     assert "--disable shell_tool" in codex
     assert codex.endswith(" -")
+
+
+def test_the_creativity_slider_is_not_kept_where_it_cannot_be_used() -> None:
+    # Neither CLI has a temperature knob, so the room's Creativity value has
+    # nowhere to go. It is still ACCEPTED (this seam matches the local
+    # ChatModel signature) but not stored — a kept attribute only made the
+    # slider look connected in a Claude Code / Codex room.
+    m = _model("claude-cli::opus::high", temperature=0.9)
+    assert not hasattr(m, "temperature")
+    for build in (external_llm.build_agent_cmdline, external_llm.build_cmdline):
+        assert "temperature" not in build(m.engine, m.submodel, m.effort)
 
 
 def test_catalog_renders_every_served_tool_by_name() -> None:

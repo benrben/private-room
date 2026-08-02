@@ -64,6 +64,23 @@ function newNode(idx: number): WorkflowNode {
   };
 }
 
+/** The outcome label a NEW edge off `from` must carry, or undefined when `from`
+ * isn't a branch source. Every edge leaving a condition/route has to name its
+ * outcome — an unlabelled one is live whichever way the step went, so the step
+ * stops choosing and every path runs. Picks the first outcome not already wired. */
+function branchFor(from: WorkflowNode | undefined, existing: WorkflowEdge[]): string | undefined {
+  if (!from) return undefined;
+  const options =
+    from.kind === "condition"
+      ? ["then", "else"]
+      : from.kind === "route" && Array.isArray(from.labels)
+        ? (from.labels as string[])
+        : [];
+  if (options.length === 0) return undefined;
+  const used = new Set(existing.map((e) => e.branch ?? ""));
+  return options.find((b) => !used.has(b)) ?? options[0];
+}
+
 export function WorkflowDetail({ s, a, workflow }: Props) {
   const [def, setDef] = useState<WorkflowDef>(workflow.definition);
   const [name, setName] = useState(workflow.name);
@@ -83,6 +100,21 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
       JSON.stringify(binding) !== JSON.stringify(workflow.binding),
     [name, emoji, def, binding, workflow],
   );
+  // The saved form itself — NOT its timestamp. Pin/Unpin/Deactivate bump
+  // `updatedAt` without touching a single edited field, and re-seeding on the
+  // timestamp threw away whatever was in the editor (those buttons sit right
+  // next to Save). Keyed on the content, they no longer disturb the form, while
+  // a real save or an outside edit still re-seeds it.
+  const savedForm = useMemo(
+    () =>
+      JSON.stringify([
+        workflow.name,
+        workflow.emoji || "⚙️",
+        workflow.definition,
+        workflow.binding,
+      ]),
+    [workflow],
+  );
   const [schedule, setSchedule] = useState<Schedule | null>(null);
   const [showSched, setShowSched] = useState(false);
   // Where to place the schedule popover: the Schedule button's rect at open
@@ -96,7 +128,8 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
 
-  // Re-seed from the store when the selected workflow (or its saved form) changes.
+  // Re-seed from the store when the selected workflow, or its saved form,
+  // changes.
   useEffect(() => {
     setDef(workflow.definition);
     setName(workflow.name);
@@ -104,7 +137,8 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
     setBinding(workflow.binding);
     setExtsText(extsOf(workflow.binding));
     /* dirty is derived from a diff */
-  }, [workflow.id, workflow.updatedAt]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workflow.id, savedForm]);
 
   // Load schedule + run history; refresh when the workflows list changes (a run
   // finishing emits workflows-changed → the list refreshes → we re-fetch).
@@ -152,8 +186,11 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
     /* dirty is derived from a diff */
   }
   /** Add a step. With `afterId`, splice it in right after that node — rewiring
-   * that node's successors through the new step (branch labels are dropped since
-   * the new step is a plain generate node). Without it, append at the tail. */
+   * that node's successors through the new step. A condition/route picks ONE
+   * path, so rewiring all of its outcomes through a single plain step would
+   * silently un-branch it: there the new step is spliced into the FIRST outcome
+   * only, leaving the others wired as they were. Without `afterId`, append at
+   * the tail. */
   function addNode(afterId?: string | null) {
     setDef((d) => {
       const n = newNode(d.nodes.length);
@@ -162,7 +199,15 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
         const edges = last ? [...d.edges, { from: last.id, to: n.id }] : d.edges;
         return { ...d, nodes: [...d.nodes, n], edges };
       }
+      const after = d.nodes.find((x) => x.id === afterId);
       const successors = d.edges.filter((e) => e.from === afterId);
+      if (after && (after.kind === "condition" || after.kind === "route")) {
+        const spliced = successors[0];
+        const edges: WorkflowEdge[] = spliced
+          ? [...d.edges.map((e) => (e === spliced ? { ...e, to: n.id } : e)), { from: n.id, to: spliced.to }]
+          : [...d.edges, { from: afterId, to: n.id, branch: branchFor(after, successors) }];
+        return { ...d, nodes: [...d.nodes, n], edges };
+      }
       const rest = d.edges.filter((e) => e.from !== afterId);
       const edges: WorkflowEdge[] = [
         ...rest,
@@ -175,11 +220,14 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   }
   /** Add a PARALLEL branch: a new step wired from `afterId` WITHOUT rewiring its
    * existing successors, so `afterId` now fans out to two children (the engine
-   * runs independent branches concurrently on the cloud/CPU lanes). */
+   * runs independent branches concurrently on the cloud/CPU lanes). Off a
+   * condition/route the new edge takes the next free outcome label instead. */
   function addBranchNode(afterId: string) {
     setDef((d) => {
       const n = newNode(d.nodes.length);
-      return { ...d, nodes: [...d.nodes, n], edges: [...d.edges, { from: afterId, to: n.id }] };
+      const after = d.nodes.find((x) => x.id === afterId);
+      const branch = branchFor(after, d.edges.filter((e) => e.from === afterId));
+      return { ...d, nodes: [...d.nodes, n], edges: [...d.edges, { from: afterId, to: n.id, branch }] };
     });
     /* dirty is derived from a diff */
   }
@@ -191,6 +239,22 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   async function saveAndActivate() {
     await save();
     await a.setWorkflowStatus(workflow.id, "active");
+  }
+
+  /** Back to the library. The form lives only in this component and Save is off
+   * while the def is still incomplete — which is most of the time mid-edit — so
+   * leaving used to drop the work silently. Ask instead. */
+  async function leave() {
+    if (dirty) {
+      const ok = await confirm(
+        valid
+          ? "Leave without saving your changes to this workflow?"
+          : "This workflow has unsaved changes, and they can't be saved until the listed problems are fixed. Leave and lose them?",
+        { title: "Unsaved changes", kind: "warning" },
+      );
+      if (!ok) return;
+    }
+    s.setWfDetailId(null);
   }
 
   function toggleKind(k: string) {
@@ -215,7 +279,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   return (
     <div className="wf-page">
       <div className="viewer-head">
-        <button className="subtle btn-ic" onClick={() => s.setWfDetailId(null)}>
+        <button className="subtle btn-ic" onClick={() => void leave()}>
           ← Library
         </button>
         <div className="wf-icon-pick" style={{ position: "relative" }}>

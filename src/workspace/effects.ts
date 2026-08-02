@@ -6,6 +6,7 @@ import { api, RoomInfo } from "../api";
 import { configureMic, stopMicTap } from "./liveRec";
 import { handleAgentUiRequest } from "../agent/driver";
 import { annotationTarget } from "./markup";
+import { MEMORY_INTRO_SEEN } from "./constants";
 import * as voice from "./voice";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -27,45 +28,63 @@ export function useWorkspaceEffects(
   // fire long after mount go through this ref to reach the latest actions.
   const aRef = useRef(a);
   aRef.current = a;
+  // TWO halves, deliberately guarded differently. The one-shot LOADS run once
+  // per room (creating the first conversation twice would leave two empty
+  // chats); the SUBSCRIPTIONS are re-made on every mount and torn down by this
+  // effect's own cleanup. They used to share one mount-once guard, which made
+  // the app deaf in dev: StrictMode mounts, unmounts (cleanup unlistened
+  // everything) and mounts again, and the second mount re-subscribed to
+  // nothing — no streaming answers, no refreshes, no approvals.
   useEffect(() => {
-    if (s.initRef.current) return;
-    s.initRef.current = true;
-    getCurrentWindow()
-      .setTitle(`${info.name} — Arcelle`)
-      .catch(() => {});
-    api.listFiles().then(s.setFiles);
-    api.listFolders().then(s.setFolders).catch(() => {});
-    api.listMemories().then(s.setMemories);
-    // Wave 1b (idea 5): seed the auto-save ref; re-read when Settings closes
-    // (a.refreshMemAutoSave) so the off-switch applies without a room reopen.
-    api
-      .getSetting("memory_auto_save")
-      .then((v) => {
-        s.memAutoSaveRef.current = v === "1";
-      })
-      .catch(() => {});
-    api.listChatCommands().then(s.setCommands).catch(() => {});
-    void a.loadAiActions();
-    // Wave 4a: load the room's workflows once — one source of truth for the
-    // page, the top-bar pins, and the file-header Actions menu.
-    void a.refreshWorkflows();
-    // Wave 5 (Idea 13): load the room's scripts once — one source of truth for
-    // the Scripts page, the file-header Run button, and the shortcut bars.
-    void a.refreshScripts();
-    void a.refreshSkills();
-    a.refreshAi();
-    a.loadFrontPage(true);
-    api.warmModel().catch(() => {});
-    api.listChats().then(async (cs) => {
-      if (cs.length === 0) {
-        const c = await api.createChat();
-        s.setChats([c]);
-        s.setActiveChatId(c.id);
-      } else {
-        s.setChats(cs);
-        s.setActiveChatId(cs[0].id);
-      }
-    });
+    // A failed read used to be silent, so a room that could not be read looked
+    // exactly like a room that had lost everything — say so instead, and name
+    // what is missing.
+    const readFailed = (what: string) => (e: unknown) =>
+      s.pushToast("error", `Could not read this room's ${what}: ${String(e)}`);
+    if (!s.seededRef.current) {
+      s.seededRef.current = true;
+      getCurrentWindow()
+        .setTitle(`${info.name} — Arcelle`)
+        .catch(() => {});
+      // The reads that FILL the room.
+      api.listFiles().then(s.setFiles).catch(readFailed("files"));
+      api.listFolders().then(s.setFolders).catch(readFailed("folders"));
+      api.listMemories().then(s.setMemories).catch(readFailed("memories"));
+      // Wave 1b (idea 5): seed the auto-save ref; re-read when Settings closes
+      // (a.refreshMemAutoSave) so the off-switch applies without a room reopen.
+      api
+        .getSetting("memory_auto_save")
+        .then((v) => {
+          s.memAutoSaveRef.current = v === "1";
+        })
+        .catch(() => {});
+      api.listChatCommands().then(s.setCommands).catch(() => {});
+      void a.loadAiActions();
+      // Wave 4a: load the room's workflows once — one source of truth for the
+      // page, the top-bar pins, and the file-header Actions menu.
+      void a.refreshWorkflows();
+      // Wave 5 (Idea 13): load the room's scripts once — one source of truth
+      // for the Scripts page, the file-header Run button, and the shortcut
+      // bars.
+      void a.refreshScripts();
+      void a.refreshSkills();
+      a.refreshAi();
+      a.loadFrontPage(true);
+      api.warmModel().catch(() => {});
+      api
+        .listChats()
+        .then(async (cs) => {
+          if (cs.length === 0) {
+            const c = await api.createChat();
+            s.setChats([c]);
+            s.setActiveChatId(c.id);
+          } else {
+            s.setChats(cs);
+            s.setActiveChatId(cs[0].id);
+          }
+        })
+        .catch(readFailed("conversations"));
+    }
     const unlisten = api.onAskDelta((delta) => {
       s.setStreamText((t) => t + delta);
       // Idea 3: feed the spoken voice (no-ops when auto-speak is off).
@@ -328,10 +347,20 @@ export function useWorkspaceEffects(
           s.armTimerRef.current = window.setTimeout(arm, 150);
           return;
         }
+        // The composer mic stays live while an answer streams, so the user may
+        // ALREADY be dictating when this turn's audio finishes. `dictateTo`
+        // would then take its toggle branch and STOP them mid-sentence — the
+        // opposite of arming. Their own recording outranks the re-arm; the
+        // next turn's audio-done fires this listener again.
+        if (s.dictStateRef.current !== "idle") return;
         aRef.current.dictateTo("composer", (text) => void aRef.current.send(text));
       };
       arm();
     });
+    // Read-aloud has no on-device fallback voice: a sentence that cannot be
+    // synthesized is dropped. Without this the app just went quiet, which
+    // reads as "the app is mute", not "this needs a connection".
+    voice.setVoiceProblemListener((message) => s.pushToast("error", message));
     if (info.synced) {
       api
         .getSetting("hlt6_sync_dismissed")
@@ -379,8 +408,8 @@ export function useWorkspaceEffects(
       }
     });
     const unlistenFiles = api.onRoomFilesChanged(() => {
-      api.listFiles().then(s.setFiles);
-      api.listFolders().then(s.setFolders).catch(() => {});
+      api.listFiles().then(s.setFiles).catch(readFailed("files"));
+      api.listFolders().then(s.setFolders).catch(readFailed("folders"));
       a.loadFrontPage(false);
       // Wave 5: scripts ARE files — a new/edited/imported script updates the
       // index (and a script that just ran wrote its outputs here).
@@ -462,11 +491,11 @@ export function useWorkspaceEffects(
     return () => {
       // Idea 3: the voice singleton outlives the Workspace by design — this
       // cleanup is the catch-all "no lock path may keep speaking decrypted
-      // content" stop (autolock and handleLock also cancel explicitly,
-      // because under StrictMode's dev double-invoke the initRef guard means
-      // this cleanup never runs for the second, real mount).
+      // content" stop (autolock and handleLock also cancel explicitly, since
+      // they run without unmounting the Workspace).
       voice.cancelAll();
       voice.setTurnAudioDoneListener(null);
+      voice.setVoiceProblemListener(null);
       if (s.armTimerRef.current !== null) {
         window.clearTimeout(s.armTimerRef.current);
         s.armTimerRef.current = null;
@@ -511,7 +540,14 @@ export function useWorkspaceEffects(
 
   useEffect(() => {
     if (s.activeChatId) {
-      api.getMessages(s.activeChatId).then(s.setMessages);
+      api
+        .getMessages(s.activeChatId)
+        .then(s.setMessages)
+        .catch((e) =>
+          // An empty conversation and an unreadable one look identical —
+          // never let the second pass for the first.
+          s.pushToast("error", `Could not read this conversation: ${String(e)}`),
+        );
     } else {
       s.setMessages([]);
     }
@@ -584,8 +620,7 @@ export function useWorkspaceEffects(
       const slept = gap > 45_000;
       if (idle >= limitMs || (slept && gap >= limitMs)) {
         // Silence speech at the call site as well as in handleLock/unmount:
-        // this timer calls onLock() directly, bypassing both, and the
-        // unmount cleanup is unreliable under StrictMode (initRef guard).
+        // this timer calls onLock() directly, bypassing both.
         voice.cancelAll();
         onLock();
       }
@@ -596,8 +631,6 @@ export function useWorkspaceEffects(
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onLock]);
-
-  useEffect(() => () => window.clearTimeout(s.confirmTimer.current), [s.confirmTimer]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -648,6 +681,11 @@ export function useWorkspaceEffects(
         e.preventDefault();
         a.handleLock();
       } else if (k === "f" || k === "k") {
+        // ⌘F belongs to whatever is showing when that thing can search inside
+        // itself: the PDF viewer claims it in the capture phase (find in this
+        // document) and the room-wide search must not open on top of it.
+        // ⌘K is always the palette.
+        if (k === "f" && e.defaultPrevented) return;
         e.preventDefault();
         s.setSearchSel(0);
         s.setShowSearch(true);
@@ -658,6 +696,10 @@ export function useWorkspaceEffects(
         // Wave 4a: toggle the top-bar pinned-workflows menu (no-op if none).
         e.preventDefault();
         s.setQaMenuOpen((o) => !o);
+      } else if (k === "/") {
+        // The shortcuts sheet — the app's own list of these keys.
+        e.preventDefault();
+        s.setShowShortcuts((o) => !o);
       }
     }
     window.addEventListener("keydown", onKey);
@@ -670,6 +712,7 @@ export function useWorkspaceEffects(
     const q = s.searchQuery.trim();
     if (!q) {
       s.setSearchResults(null);
+      s.setSearchError("");
       return;
     }
     let stale = false;
@@ -679,9 +722,17 @@ export function useWorkspaceEffects(
         .then((r) => {
           if (stale) return;
           s.setSearchResults(r);
+          s.setSearchError("");
           s.setSearchSel(0);
         })
-        .catch(() => {});
+        .catch((e) => {
+          if (stale) return;
+          // The previous query's hits must not stay on screen under a query
+          // that never ran — you would act on results for something else.
+          s.setSearchResults(null);
+          s.setSearchError(String(e));
+          s.setSearchSel(0);
+        });
     }, 200);
     return () => {
       stale = true;
@@ -713,16 +764,19 @@ export function useWorkspaceEffects(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.moveMenuFor]);
 
+  // Whether the memory introduction has been seen is a fact about THIS ROOM,
+  // so it lives in the room's own settings. It used to be a localStorage key
+  // built from the room's file name: renaming the file brought the intro back,
+  // and two rooms with the same file name shared one marker.
   useEffect(() => {
-    try {
-      if (!localStorage.getItem(`memoryIntroSeen:${info.name}`)) {
-        s.setShowMemoryIntro(true);
-      }
-    } catch {
-      /* ignore */
-    }
+    api
+      .getSetting(MEMORY_INTRO_SEEN)
+      .then((v) => {
+        if (v !== "1") s.setShowMemoryIntro(true);
+      })
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [info.name]);
+  }, [info.path]);
 
   useEffect(() => {
     const prev = s.prevModelRef.current;

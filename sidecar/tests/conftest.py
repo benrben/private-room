@@ -122,7 +122,7 @@ class FakeChatModel:
         calls = list(rnd.calls) if tools else []
         # No real engine behind this fake — every test exercises the
         # char-estimate fallback path unless a test overrides `stream` itself.
-        usage = RoundUsage(input_tokens=None, output_tokens=None, max_context=8192, is_real=False)
+        usage = RoundUsage(input_tokens=None, max_context=8192, is_real=False)
         return rnd.content, calls, usage
 
 
@@ -165,7 +165,6 @@ def make_request(
     web_enabled: bool = False,
     max_rounds: int | None = None,
     turn_max_rounds: int | None = None,
-    mcp_routes: int = 0,
     advisors: list[str] | None = None,
     routing: dict[str, bool] | None = None,
     run_id: str = "run-1",
@@ -190,7 +189,6 @@ def make_request(
         web_enabled=web_enabled,
         max_rounds=max_rounds,
         turn_max_rounds=turn_max_rounds,
-        mcp_routes=mcp_routes,
         advisors=advisors or [],
         run_id=run_id,
     )

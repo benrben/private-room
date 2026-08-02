@@ -22,12 +22,18 @@ from .agents import (
     get_agent,
     reachable_members,
 )
-from .routing import JOB_HINTS, UI_HINTS, wants_navigation
+from .routing import JOB_HINTS, wants_navigation
 
 #: Registry agents whose vocabulary lives in routing.py (the Rust-parity
 #: lists stay the single source of truth — do not duplicate them in agents.py).
+#:
+#: ``jobs.run`` is the only real row: it has a SIBLING (``jobs.workflows``) to
+#: be scored against. ``app.ui`` sat here too, with a matching "wired in
+#: manager.py" comment on its spec, but ``app`` is a single-member domain —
+#: ``resolve_worker`` returns ``members[0]`` before any scoring runs, so
+#: UI_HINTS was never once consulted here. Removed 2026-08-01; the list itself
+#: is untouched, it is what ``routing.wants_ui_tools`` matches on.
 _ROUTING_HINTED: dict[str, tuple[str, ...]] = {
-    "app.ui": UI_HINTS,
     "jobs.run": JOB_HINTS,
 }
 

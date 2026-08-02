@@ -59,18 +59,25 @@ pub struct CheckpointList {
 
 // --------------------------------------------------------------- timestamps
 //
-// The app has no chrono dependency; the rest of the app stores timestamps as
-// SQLite CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS", UTC). Checkpoint metadata
-// lives in a JSON sidecar, not the DB, so produce the SAME format here — the
-// frontend's `formatWhen` then renders checkpoint dates exactly like Time
-// Machine version dates.
+// The app has no chrono dependency; every timestamp the DB writes comes from
+// `strftime('%Y-%m-%dT%H:%M:%SZ','now')` (see db/schema.rs) — ISO 8601 with the
+// trailing Z that says it is UTC. Checkpoint metadata lives in a JSON sidecar
+// rather than the DB, so produce that SAME format here.
+//
+// It used to emit SQLite's older "YYYY-MM-DD HH:MM:SS" under a comment claiming
+// that matched the rest of the app. It did not, and a checkpoint date shown by
+// any screen that did not know to append the Z rendered in the wrong hour —
+// which is why the checkpoints screen carries a private copy of `formatWhen`
+// with an "append Z" patch-up. That patch-up passes an already-ISO string
+// straight through, so it keeps working unchanged and can now be replaced by
+// the shared `composer.formatWhen`.
 
 fn format_epoch(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 /// Howard Hinnant's days-since-epoch → civil (y, m, d) algorithm.
@@ -227,6 +234,70 @@ fn prune_auto_checkpoints(dir: &str, keep: usize) {
     let _ = write_manifest(dir, &manifest);
 }
 
+// --------------------------------------------------------------- disk space
+//
+// A checkpoint is a SECOND FULL COPY of the room and a rollback stages a THIRD
+// alongside it, so on a nearly-full disk the copy dies part-way through and the
+// user sees SQLite's "database or disk is full". Check first and say so in
+// words instead.
+
+/// Bytes free on the volume holding `path`, or None when it cannot be told.
+/// std has no free-space API and the app has no libc dependency, so ask `df`
+/// — the same "shell out to a system tool" the extraction/STT paths already do.
+/// `-P` pins the POSIX one-line-per-filesystem format; `-k` makes the blocks
+/// 1024 bytes, so the Available column is column 3.
+fn free_bytes(path: &str) -> Option<u64> {
+    let out = std::process::Command::new("/bin/df")
+        .args(["-Pk", path])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let blocks: u64 = text
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    blocks.checked_mul(1024)
+}
+
+/// Refuse before writing when `need` bytes (plus a little headroom) will not
+/// fit on `dir`'s volume. Silent when free space can't be determined — a
+/// missing `df` must never block a checkpoint that would have worked.
+fn check_room_for(dir: &str, need: u64, what: &str) -> Result<(), String> {
+    /// Leave the volume some air: SQLite's journal, the manifest, and whatever
+    /// else the Mac is doing while a multi-GB copy runs.
+    const HEADROOM: u64 = 256 * 1024 * 1024;
+    let Some(free) = free_bytes(dir) else { return Ok(()) };
+    let needed = need.saturating_add(HEADROOM);
+    if free >= needed {
+        return Ok(());
+    }
+    let mb = |n: u64| n as f64 / (1024.0 * 1024.0);
+    Err(format!(
+        "Not enough free disk space {what}: a full copy of this room needs about {:.0} MB \
+         (with room to work) and only {:.0} MB is free. Free some space — deleting an old \
+         checkpoint is the quickest way — and try again.",
+        mb(needed),
+        mb(free),
+    ))
+}
+
+/// How many bytes a full copy of this room would take, as SQLite sees it.
+/// `VACUUM INTO` writes a COMPACTED copy, so this is an upper bound.
+fn room_size_bytes(conn: &Connection) -> u64 {
+    let pragma = |name: &str| -> u64 {
+        conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(0)
+    };
+    pragma("page_count").saturating_mul(pragma("page_size"))
+}
+
 // --------------------------------------------------------------- create core
 
 /// Write a full SQLCipher copy of `conn` into `dir` as a new checkpoint, append
@@ -245,13 +316,18 @@ pub(crate) fn write_checkpoint(
     // Self-heal the dir FIRST — before creating the new payload — so reconcile
     // can't mistake our fresh `.roomck` for an orphan and double-count it.
     let mut manifest = reconcile(dir);
+    check_room_for(dir, room_size_bytes(conn), "to save a checkpoint")?;
     let id = Uuid::new_v4().to_string();
     let tmp = format!("{dir}/{id}.tmp");
     let final_path = checkpoint_file_path(dir, &id);
     // VACUUM INTO refuses an existing destination — a fresh uuid never clashes,
     // but clear any stale tmp defensively.
     let _ = std::fs::remove_file(&tmp);
-    db::vacuum_into(conn, &tmp)?;
+    db::vacuum_into(conn, &tmp).inspect_err(|_| {
+        // A copy that died part-way (out of space, unplugged drive) must not
+        // leave a multi-GB `.tmp` behind for reconcile to sweep much later.
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     std::fs::rename(&tmp, &final_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("Could not save the checkpoint: {e}")
@@ -293,6 +369,11 @@ pub(crate) fn create_checkpoint_core(
 /// path. Pure (no `AppState`) so it is unit-testable. The caller MUST have torn
 /// down the open connection first — this only touches the filesystem.
 pub(crate) fn perform_swap(room_path: &str, ck_path: &str) -> Result<(), String> {
+    // The staged copy sits beside the room until the rename, so the volume
+    // briefly holds the room AND the checkpoint twice. Say so before starting
+    // rather than dying half-way through with a raw copy error.
+    let ck_size = std::fs::metadata(ck_path).map(|m| m.len()).unwrap_or(0);
+    check_room_for(room_path, ck_size, "to roll back")?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let _ = std::fs::remove_file(format!("{room_path}{suffix}"));
     }
@@ -311,6 +392,15 @@ pub(crate) fn perform_swap(room_path: &str, ck_path: &str) -> Result<(), String>
 /// GB-scale) `VACUUM INTO` runs on the async runtime rather than tying up
 /// command dispatch; the room-lock hold during the copy is unavoidable while
 /// the copy sources the live connection.
+///
+/// `block_in_place` because the body is *blocking* work, not async work: an
+/// `async fn` that simply calls `VACUUM INTO` pins one of the runtime's few
+/// worker threads for the whole multi-GB copy, and every other async command
+/// (including plain `.await` points elsewhere) queues behind it. This hands the
+/// thread back to the scheduler for the duration. It is not `spawn_blocking`
+/// because that needs a `'static` body and `State<'_, AppState>` is borrowed —
+/// moving to a task would mean adding an `AppHandle` parameter to a settled
+/// command signature.
 #[tauri::command]
 pub async fn create_room_checkpoint(
     state: State<'_, AppState>,
@@ -319,7 +409,8 @@ pub async fn create_room_checkpoint(
     if state.rolling_back() {
         return Err(ROLLBACK_BUSY.into());
     }
-    create_checkpoint_core(state.inner(), &name, false)
+    let state = state.inner();
+    tokio::task::block_in_place(|| create_checkpoint_core(state, &name, false))
 }
 
 /// Idea 9: the room's checkpoints, newest first, plus the total on-disk size.
@@ -467,6 +558,55 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(checkpoints_dir(path));
         let _ = std::fs::remove_file(format!("{path}.recovery"));
+    }
+
+    /// A timestamp the app writes: ISO 8601, UTC, e.g. "2026-08-01T09:14:02Z".
+    fn is_app_timestamp(s: &str) -> bool {
+        s.len() == 20 && s.as_bytes()[10] == b'T' && s.ends_with('Z')
+    }
+
+    #[test]
+    fn checkpoint_timestamps_match_every_other_timestamp_in_the_app() {
+        // The manifest used to write SQLite's older "YYYY-MM-DD HH:MM:SS", with
+        // no Z, so a checkpoint date shown anywhere that didn't carry its own
+        // patch-up rendered in the wrong hour.
+        assert_eq!(format_epoch(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_epoch(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert!(is_app_timestamp(&now_timestamp()));
+        // The date-only helper (default checkpoint names) is unaffected.
+        assert_eq!(format_epoch(1_700_000_000).chars().take(10).collect::<String>(), "2023-11-14");
+        let today = now_date();
+        assert_eq!(today.len(), 10, "{today}");
+        assert!(!today.contains('T'), "{today}");
+        // And it is the same shape the DB stamps rows with.
+        let conn = Connection::open_in_memory().unwrap();
+        let from_db: String = conn
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| r.get(0))
+            .unwrap();
+        assert!(is_app_timestamp(&from_db));
+    }
+
+    #[test]
+    fn a_checkpoint_refuses_before_it_fills_the_disk() {
+        // Nothing used to check the disk, so a checkpoint on a nearly-full
+        // volume died part-way through with SQLite's "database or disk is full".
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let free = free_bytes(&dir).expect("df reports free space on this Mac");
+        assert!(free > 0);
+        // A copy that fits goes ahead…
+        if free > 2 * 1024 * 1024 * 1024 {
+            assert!(check_room_for(&dir, 1024, "to save a checkpoint").is_ok());
+        }
+        // …one that cannot possibly fit is refused in words, before any bytes
+        // are written…
+        let err = check_room_for(&dir, free + 1, "to save a checkpoint").unwrap_err();
+        assert!(err.contains("Not enough free disk space"), "{err}");
+        assert!(err.contains("to save a checkpoint"), "{err}");
+        // …and a path we can't measure never blocks a checkpoint that would
+        // have worked.
+        assert!(check_room_for("/no/such/volume", u64::MAX, "to roll back").is_ok());
+        // The size we compare against is the room's own page budget.
+        assert!(room_size_bytes(&db::open_in_memory_schema()) > 0);
     }
 
     #[test]

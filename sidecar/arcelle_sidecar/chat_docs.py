@@ -191,7 +191,10 @@ async def extract_fields(
 ) -> dict[str, str]:
     """knowledge.rs cmd_extract, one document. One string property per requested
     field (all required) so the reply is a JSON object keyed by the field names;
-    each field maps to its value or ``"(not found)"``, in the requested order."""
+    each field maps to its value or ``"(not found)"``, in the requested order.
+
+    A reply that is not a readable JSON OBJECT raises :class:`.llm.LlmError`
+    rather than answering ``"(not found)"`` for everything — see below."""
     props: dict[str, Any] = {f: {"type": "string"} for f in fields}
     schema = {"type": "object", "properties": props, "required": list(fields)}
     field_lines = "\n".join(fields)
@@ -212,7 +215,19 @@ async def extract_fields(
     try:
         parsed = json.loads(reply.strip())
     except (ValueError, TypeError):
-        parsed = {}
+        parsed = None
+    if not isinstance(parsed, dict):
+        # An UNREADABLE answer is not the same as a document that lacks the
+        # fields. Defaulting every column to "(not found)" here looks exactly
+        # like a searched-and-absent result, so the user concludes their file
+        # doesn't hold what it does. Surface it instead: knowledge.rs cmd_extract
+        # already has the honest branch for a window that errored — it calls
+        # `note_unread()` ("this window went unread") and lets a LATER window of
+        # the same file still answer the field.
+        raise llm.LlmError(
+            "UNREADABLE_REPLY",
+            "The model's reply wasn't usable JSON, so this text went unread.",
+        )
     values: dict[str, str] = {}
     for f in fields:
         val = value_str(parsed, f)

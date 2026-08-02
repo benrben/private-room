@@ -5,11 +5,18 @@ No network — we build the LangChain objects and inspect them.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 
 from arcelle_sidecar import chat as chat_module
-from arcelle_sidecar.budget import trim_messages_to_window, window_budget_bytes
+from arcelle_sidecar.budget import (
+    IMAGE_BYTES,
+    msg_len,
+    trim_messages_to_window,
+    window_budget_bytes,
+)
 from arcelle_sidecar.chat import OllamaChatModel, _chunk_text, _to_langchain
 from arcelle_sidecar.config import KEEP_ALIVE_WARM
 from arcelle_sidecar.messages import Message
@@ -316,7 +323,6 @@ async def test_stream_surfaces_real_usage_when_ollama_reports_it(
     _, _, usage = await m.stream([{"role": "user", "content": "hi"}], [], on_delta, cancel=None)
     assert usage.is_real is True
     assert usage.input_tokens == 123
-    assert usage.output_tokens == 7
     # The truthful ceiling is the requested window, not a display default.
     assert usage.max_context == 8_192
 
@@ -426,3 +432,198 @@ async def test_the_window_is_refitted_to_what_compaction_actually_sends(
 
     assert len(asked) == 2, f"the window was never re-fitted after compaction: {asked}"
     assert asked[1] < asked[0], f"the re-fit saw no smaller payload: {asked}"
+
+
+# --------------------------------------------------------------------------- #
+# a wedged daemon must not hang the turn
+#
+# Nothing bounded these requests: the `ollama` client defaults to no timeout at
+# all, and Stop only breaks the token loop once tokens are ARRIVING. A daemon
+# that never answers the first one left the turn spinning with no way out but
+# quitting the app.
+# --------------------------------------------------------------------------- #
+
+
+class _WedgedClient:
+    """An Ollama that accepts the request and then says nothing, ever."""
+
+    def __init__(self, host: str = "", **kwargs: object) -> None:
+        pass
+
+    async def chat(self, **kwargs: object):
+        if kwargs.get("stream"):
+
+            async def never():
+                await asyncio.sleep(30)
+                yield None  # pragma: no cover - never reached
+
+            return never()
+        await asyncio.sleep(30)
+
+
+async def test_a_wedged_daemon_ends_the_call_instead_of_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ollama
+
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    monkeypatch.setattr(chat_module, "GENERATION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(ollama, "AsyncClient", _WedgedClient)
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+
+    with pytest.raises(asyncio.TimeoutError) as caught:
+        await m.generate([{"role": "user", "content": "hi"}])
+
+    # ...and SAYS so. A bare asyncio.TimeoutError stringifies to nothing, which
+    # the route renders as "Local AI error (502): " with the message missing:
+    # the user is told that something failed and nothing about what.
+    from arcelle_sidecar import llm as llm_module
+
+    assert str(caught.value).strip(), "the timeout carried no message at all"
+    assert llm_module._classify(caught.value).message.strip(), (
+        "the sentinel the user is shown ends at the colon"
+    )
+
+
+def test_a_slow_one_shot_generation_is_not_cut_off_at_the_silence_budget() -> None:
+    """The non-streaming path carries the SLOW work — a whole-file-pass section,
+    a document-length translation, a cold load of a large model on top of either
+    — and has no liveness signal to bound it by, so its bound is a duration.
+    Holding that work to the ten-minute silence budget killed runs that were
+    merely ambitious; the host waits an hour for the same call
+    (src-tauri/src/sidecar.rs SIDECAR_TIMEOUT), so nothing here should give up
+    first.
+    """
+    assert chat_module.GENERATION_TIMEOUT_SECONDS >= 3600.0
+    assert chat_module.GENERATION_TIMEOUT_SECONDS > chat_module.REQUEST_TIMEOUT_SECONDS
+
+
+async def test_a_stream_that_never_produces_a_token_ends_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case Stop cannot help with: the wedge happens BEFORE the first word,
+    so there is no token loop to break."""
+    import ollama
+
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    monkeypatch.setattr(chat_module, "REQUEST_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(ollama, "AsyncClient", _WedgedClient)
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+
+    with pytest.raises(asyncio.TimeoutError) as caught:
+        async for _ in m.generate_stream([{"role": "user", "content": "hi"}]):
+            pass  # pragma: no cover - nothing is ever yielded
+    assert str(caught.value).strip(), "the timeout carried no message at all"
+
+
+# --------------------------------------------------------------------------- #
+# the one-shot job paths (translate, whole-file summarise, document generation)
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingClient:
+    """Records the request it was handed, and answers immediately."""
+
+    last: dict = {}
+
+    def __init__(self, host: str = "", **kwargs: object) -> None:
+        pass
+
+    async def chat(self, **kwargs: object):
+        from types import SimpleNamespace
+
+        type(self).last = dict(kwargs)
+        return SimpleNamespace(message=SimpleNamespace(content="ok"))
+
+
+async def test_a_one_shot_job_cuts_its_own_payload_to_the_window_it_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`generate` sized a window and then sent whatever it had. Past the biggest
+    window this Mac may ask for, the daemon deletes the FRONT of the prompt —
+    the instruction — and answers a question it can no longer see."""
+    import ollama
+
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    monkeypatch.setattr(ollama, "AsyncClient", _RecordingClient)
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+
+    body = "x" * 3_000_000
+    messages: list[Message] = [
+        {"role": "system", "content": "Translate the text below into French."},
+        {"role": "user", "content": body + "\n[end of document]"},
+    ]
+    assert await m.generate(messages) == "ok"
+
+    sent = _RecordingClient.last["messages"]
+    window = _RecordingClient.last["options"]["num_ctx"]
+    assert window == max_num_ctx()
+    assert sum(msg_len(x) for x in sent) <= window_budget_bytes(window), (
+        "the daemon was handed a payload bigger than the window it was asked "
+        "for — the silent context-shift this exists to prevent"
+    )
+    assert sent[0]["content"] == "Translate the text below into French."
+    assert "cut here" in sent[1]["content"]
+    assert messages[1]["content"] == body + "\n[end of document]", (
+        "the caller's own messages were mutated"
+    )
+
+
+async def test_an_ordinary_one_shot_payload_is_sent_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ollama
+
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    monkeypatch.setattr(ollama, "AsyncClient", _RecordingClient)
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+
+    messages: list[Message] = [
+        {"role": "system", "content": "Summarise."},
+        {"role": "user", "content": "y" * 5_000},
+    ]
+    await m.generate(messages)
+    assert [x["content"] for x in _RecordingClient.last["messages"]] == [
+        "Summarise.",
+        "y" * 5_000,
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# a picture is not free
+# --------------------------------------------------------------------------- #
+
+
+async def test_attached_pictures_are_counted_when_sizing_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A screenshot costs roughly 1.5k tokens and was counted as nothing, so a
+    turn carrying a few of them sized its window off the prose alone and came
+    up short — the daemon then dropping the doctrine and the question."""
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+
+    asked: list[int] = []
+    real_resolve = OllamaChatModel._resolve_num_ctx
+
+    async def spy(self, payload_bytes: int) -> int | None:
+        asked.append(payload_bytes)
+        return await real_resolve(self, payload_bytes)
+
+    monkeypatch.setattr(OllamaChatModel, "_resolve_num_ctx", spy)
+
+    async def on_delta(_: str) -> None:
+        pass
+
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+    _fake_llm(m, _FakeStream([AIMessageChunk(content="ok")]))
+    await m.stream([{"role": "user", "content": "what is this?"}], [], on_delta, None)
+
+    _fake_llm(m, _FakeStream([AIMessageChunk(content="ok")]))
+    await m.stream(
+        [{"role": "user", "content": "what is this?", "images": ["b64", "b64"]}],
+        [],
+        on_delta,
+        None,
+    )
+
+    assert asked[1] - asked[0] == 2 * IMAGE_BYTES

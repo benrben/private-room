@@ -32,8 +32,27 @@ if codesign -dv "$APP" 2>&1 | grep -q "TeamIdentifier=[A-Z0-9]"; then
   exit 0
 fi
 
-# The helper binary keeps its own ad-hoc signature; only the bundle's main
-# signature (the one TCC reads) needs the stable requirement.
+# Nested code first: the bundle's own signature seals everything inside it, so
+# anything signed AFTER the bundle invalidates it. The crate builds a second
+# binary (the offline `roomai` CLI) and the bundler copies every [[bin]] into
+# Contents/MacOS/, so sign whatever is in there besides the app's own
+# executable. No entitlements: the CLI only decrypts a local file — it needs
+# none of the app's TCC exceptions, and handing them out is not free.
+MAIN="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
+  "$APP/Contents/Info.plist" 2>/dev/null || echo "arcelle")"
+for bin in "$APP"/Contents/MacOS/*; do
+  if [ ! -f "$bin" ] || [ "$(basename "$bin")" = "$MAIN" ]; then
+    continue
+  fi
+  echo "signing nested binary: $(basename "$bin")"
+  codesign --force --sign - \
+    --identifier "${IDENT}.$(basename "$bin")" \
+    --options runtime \
+    "$bin"
+done
+
+# Only the bundle's main signature (the one TCC reads) needs the stable
+# requirement.
 codesign --force --sign - \
   --identifier "$IDENT" \
   --options runtime \
@@ -41,7 +60,10 @@ codesign --force --sign - \
   --requirements "=designated => identifier \"$IDENT\"" \
   "$APP"
 
-codesign --verify --strict "$APP"
+# --deep so the verify covers the nested binaries and the sidecar bundle too;
+# without it a broken nested signature passes this script and only surfaces as
+# macOS refusing to launch the app.
+codesign --verify --strict --deep "$APP"
 codesign -d -r- "$APP" 2>&1 | grep -F "identifier \"$IDENT\"" >/dev/null \
   || { echo "designated requirement not embedded" >&2; exit 1; }
 echo "signed: $APP"

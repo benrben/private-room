@@ -129,16 +129,6 @@ export function ChatBubbleIcon(p: IconProps) {
   );
 }
 
-export function KeyIcon(p: IconProps) {
-  return (
-    <Stroke {...p}>
-      <circle cx="8.5" cy="8.5" r="4.5" />
-      <path d="M11.7 11.7L20 20" />
-      <path d="M16.5 16.5l2.3-2.3" />
-    </Stroke>
-  );
-}
-
 export function DatabaseIcon(p: IconProps) {
   return (
     <Stroke {...p}>

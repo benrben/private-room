@@ -61,16 +61,38 @@ and/or CI secret (`TAURI_SIGNING_PRIVATE_KEY` /
 > `plugins.updater.pubkey`, commit it, and ship a release built from that
 > config. Keep the private key out of git.
 
-### Voice model
+### On-device models
 
-Release builds bundle the Whisper voice model (~574 MB, gitignored). Fetch it
-into place once per machine, or the bundle step fails on the missing resource:
+Release builds bundle **three** model files (see `bundle.resources` in
+`src-tauri/tauri.conf.json`). All three are gitignored — too big to commit —
+so fetch them into place once per machine, or the bundle step fails on the
+first missing resource:
+
+| File | Bytes | What it does |
+|---|---|---|
+| `ggml-large-v3-turbo-q5_0.bin` | 574,041,195 | Whisper transcription + dictation |
+| `nemo_en_titanet_small.onnx` | 40,257,283 | TitaNet speaker embeddings (diarization) |
+| `ggml-silero-v5.1.2.bin` | 885,098 | Silero voice-activity detection |
 
 ```sh
 mkdir -p src-tauri/resources/models
 curl -L -o src-tauri/resources/models/ggml-large-v3-turbo-q5_0.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+curl -L -o src-tauri/resources/models/nemo_en_titanet_small.onnx \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx
+curl -L -o src-tauri/resources/models/ggml-silero-v5.1.2.bin \
+  https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
 ```
+
+> The TitaNet URL's `speaker-recongition-models` is sherpa-onnx's own typo in
+> the release tag, not one here. Check the byte counts with `ls -l` after the
+> fetch — a truncated download stays silent until a recording comes back with
+> no speakers.
+>
+> **Do not swap the TitaNet file or its runtime independently.** tract was
+> validated bit-exact against onnxruntime *for this graph only* — it silently
+> mis-executed a different speaker model — so the model and the runtime move
+> together or not at all (see `src-tauri/src/recording/diarize/titanet.rs`).
 
 ---
 
@@ -89,18 +111,36 @@ export APPLE_NOTARY_PROFILE="private-room"
 
 ## 2. Every release
 
-1. **Bump the version** in all five places (keep them in sync):
+1. **Bump the version** in all five hand-edited places (keep them in sync):
    - `package.json` → `version`
    - `src-tauri/tauri.conf.json` → `version`
    - `src-tauri/Cargo.toml` → `[package] version`
    - `sidecar/pyproject.toml` → `version` (the sidecar's `/health` reports it)
    - `sidecar/arcelle_sidecar/__init__.py` → `__version__`
+
+   Then **regenerate the two lock files**, which also carry the version and are
+   written by their toolchains, not by hand:
+   ```sh
+   cargo build --manifest-path src-tauri/Cargo.toml   # src-tauri/Cargo.lock → [[package]] arcelle
+   (cd sidecar && uv lock)                            # sidecar/uv.lock  → [[package]] arcelle-sidecar
+   ```
+   Skipping these is easy to miss and self-inflicting: v0.14.0 shipped with
+   `sidecar/uv.lock` still saying `0.13.0`, and the next person to run `uv` got
+   a mystery diff. Step 3 below catches it.
 2. **Update `CHANGELOG.md`** — the release notes come from it.
-3. **Merge to `main`, tag, push:**
+3. **Run the preflight** — version agreement across all seven files, a
+   changelog entry for this version, then the type-check and every test suite:
+   ```sh
+   npm run preflight               # everything (a few minutes)
+   scripts/preflight.sh --checks   # versions + changelog only, no suites
+   ```
+   It is a gate, not a formality: a mismatch or a red suite exits non-zero.
+   Run it before you tag — `release.sh` builds and publishes, it does not test.
+4. **Merge to `main`, tag, push:**
    ```sh
    git tag v<version> && git push origin main v<version>
    ```
-4. **Run the release script:**
+5. **Run the release script:**
    ```sh
    RELEASE_NOTES="$(cat /path/to/notes.md)" scripts/release.sh
    ```

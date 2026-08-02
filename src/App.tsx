@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+// Aliased: this component already owns a `confirm` (the create screen's
+// second password field), and the local name would shadow the import.
+import { confirm as askConfirm, message } from "@tauri-apps/plugin-dialog";
 import {
   api,
   RoomInfo,
@@ -217,8 +220,25 @@ export default function App() {
     loadRecent();
   }
 
+  // One click used to wipe every shortcut with no confirmation, no undo and
+  // nothing said if it failed — and a room in a folder you don't remember then
+  // has to be hunted down by hand.
   async function clearRecent() {
-    await api.clearRecent();
+    const ok = await askConfirm(
+      `Forget all ${recent.length} recent room${recent.length === 1 ? "" : "s"}? ` +
+        "This clears the shortcuts on this screen only — every room file stays " +
+        "exactly where it is, and you can open one again with “Open Room…”.",
+      { title: "Clear the recent list", kind: "warning", okLabel: "Clear list" },
+    ).catch(() => false);
+    if (!ok) return;
+    try {
+      await api.clearRecent();
+    } catch (e) {
+      await message(`The recent list couldn't be cleared.\n\n${String(e)}`, {
+        title: "Clear the recent list",
+        kind: "error",
+      }).catch(() => {});
+    }
     loadRecent();
   }
 
@@ -231,7 +251,7 @@ export default function App() {
 
   async function chooseOpen() {
     const path = await api.chooseOpenPath({
-      title: "Open a Arcelle",
+      title: "Open an Arcelle Room",
       multiple: false,
       filters: ROOM_FILTER,
     });

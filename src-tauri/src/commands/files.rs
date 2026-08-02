@@ -1,11 +1,34 @@
 use super::*;
 
+/// A room stores a file as one SQLite blob, and SQLite's hard ceiling on a
+/// single blob is ~1 GB. There is deliberately no smaller cap on importing (it
+/// was removed by request), but this one is real: past it the write can only
+/// fail, and reading the file into memory first is how a huge disk image or raw
+/// video used to make the app disappear with no message at all.
+pub(crate) const MAX_IMPORT_BYTES: u64 = 1_000_000_000;
+
 #[tauri::command]
-pub fn import_files(
+pub async fn import_files(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<ImportReport, String> {
+    // Fail fast, with the same wording as before, when there is no room at all.
+    if state.room.lock().unwrap().is_none() {
+        return Err("No room is open.".into());
+    }
+    // Reading, extracting and indexing every dropped file used to run on the
+    // main thread, so the window froze from the first file to the last and the
+    // "Importing 2 of 5" counter it emits could never reach the screen.
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || import_files_blocking(&handle, paths))
+        .await
+        .map_err(|e| format!("The import could not be started: {e}"))?
+}
+
+fn import_files_blocking(app: &tauri::AppHandle, paths: Vec<String>) -> Result<ImportReport, String> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
     let guard = state.room.lock().unwrap();
     let room = guard.as_ref().ok_or("No room is open.")?;
     let room_path = room.path.clone();
@@ -35,16 +58,40 @@ pub fn import_files(
                 serde_json::json!({ "done": i, "total": total, "name": file_name }),
             );
         }
-        // No size cap on imports (removed by request). We still surface a clean
-        // error if the file can't be stat'd (missing / no permission); the only
-        // hard ceiling now is SQLite's ~1 GB per-blob limit, which fails at
-        // storage with its own message.
-        if let Err(e) = std::fs::metadata(&path) {
-            errors.push(format!("{file_name}: {e}"));
-            continue;
+        // No arbitrary size cap on imports (removed by request) — but the
+        // ~1 GB per-blob ceiling is checked HERE rather than a gigabyte of
+        // reading later, so a huge file is refused in plain language instead of
+        // failing deep down with "string or blob too big" (or taking the app
+        // with it on the way). A file that can't be stat'd (missing / no
+        // permission) still surfaces its own clean error.
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() > MAX_IMPORT_BYTES => {
+                errors.push(format!(
+                    "{file_name} is {} MB — larger than the {} MB limit for a room file.",
+                    meta.len() / (1024 * 1024),
+                    MAX_IMPORT_BYTES / (1024 * 1024)
+                ));
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                errors.push(format!("{file_name}: {e}"));
+                continue;
+            }
         }
         match std::fs::read(&path) {
             Ok(bytes) => {
+                // Nothing used to check whether these exact bytes were already
+                // here, so a repeated drag-and-drop stored the file again,
+                // doubled the space it takes and showed the same document twice
+                // to the user AND to the model. (Memories have had this check
+                // since they were built.)
+                if let Some((_, existing)) = db::file_with_same_bytes(&room.conn, &bytes) {
+                    errors.push(format!(
+                        "{file_name}: already in this room as \"{existing}\" — not added again."
+                    ));
+                    continue;
+                }
                 let mime = mime_guess::from_path(&path)
                     .first_or_octet_stream()
                     .essence_str()
@@ -370,6 +417,103 @@ pub fn list_files(state: State<'_, AppState>) -> Result<Vec<FileMeta>, String> {
 
 pub(crate) const MAX_VIEWER_BYTES: usize = 50 * 1024 * 1024;
 
+/// Ceiling on a file whose RAW bytes are handed over as editable text (csv,
+/// markdown, html, code). That text crosses IPC unclipped — it has to, because
+/// a clipped buffer saved back would truncate the file — so the ceiling is the
+/// only guard. csv and markdown used to have none at all, which is how opening
+/// a large exported spreadsheet hung the window.
+pub(crate) const MAX_RAW_TEXT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Text files are read as UTF-8. Bytes that aren't valid UTF-8 come back from
+/// `from_utf8_lossy` with every unreadable byte turned into U+FFFD, so writing
+/// that text back would permanently replace the file's accented letters with
+/// boxes. Every in-place write path checks first and refuses with this.
+pub(crate) fn non_utf8_error(name: &str) -> String {
+    format!(
+        "\"{name}\" is not saved as UTF-8 text, so editing it here would replace its \
+         accented characters with □. Re-save it as UTF-8 first, or save a corrected \
+         copy as a new file."
+    )
+}
+
+/// Where a file's text comes from.
+///
+/// There is deliberately no "no text" case: `classify_file` sees only a name,
+/// a MIME type and a length, so it can never know whether a file HAS text —
+/// "the stored text is None" answers that, and both readers already handle it
+/// (the viewer falls back to the binary card, the compare view to "no text to
+/// compare"). A third variant only ever encoded a guess, and guessing it for
+/// oversized images is what hid a large scan's OCR text from the viewer.
+pub(crate) enum TextSource {
+    /// The stored bytes ARE the text (csv, markdown, html, code).
+    Raw,
+    /// Text was read OUT of a binary format (pdf, docx, xlsx, pptx, OCR, STT).
+    Extracted,
+}
+
+/// What a file looks like to the app: which viewer opens it, where its text
+/// comes from, whether that text round-trips (so it can be edited in place),
+/// and whether the viewer needs the raw bytes.
+///
+/// This is the ONE table behind BOTH `get_file_content` (the viewer) and
+/// `content_text` (the version-compare view). They used to keep two hand-written
+/// copies of these rules, kept in step only by a comment asking future editors
+/// to match them — and they had already drifted, which is why comparing two
+/// versions of a spreadsheet always said there was nothing to compare.
+pub(crate) struct FileView {
+    pub kind: &'static str,
+    pub text: TextSource,
+    pub editable: bool,
+    pub needs_bytes: bool,
+}
+
+pub(crate) fn classify_file(name: &str, mime: &str, len: usize) -> FileView {
+    let ext = extraction::extension_of(name);
+    let view = |kind, text, editable, needs_bytes| FileView { kind, text, editable, needs_bytes };
+    // Images: the picture itself, plus whatever OCR read off it (ADD-14) — the
+    // recognized text was being computed, indexed and then withheld from the
+    // viewer, so it could never be seen, copied or corrected.
+    if extraction::is_image(mime) {
+        return if len <= MAX_VIEWER_BYTES {
+            view("image", TextSource::Extracted, false, true)
+        } else {
+            // Too big to hand the picture over base64 — drop the RAW BYTES, not
+            // the text. A 60 MB TIFF scan of a map or a poster that OCR read
+            // successfully opened as a read-only text preview before the
+            // refactor; sending it down the binary branch put its recognized
+            // text (still stored and still indexed) out of reach of the viewer
+            // and of "Copy all text".
+            view("text", TextSource::Extracted, false, false)
+        };
+    }
+    match ext.as_str() {
+        // PDF/DOCX/XLSX carry their extracted text too, so the viewer can offer
+        // "edit as text" and the compare view has something to diff.
+        "pdf" if len <= MAX_VIEWER_BYTES => return view("pdf", TextSource::Extracted, false, true),
+        "docx" if len <= MAX_VIEWER_BYTES => return view("docx", TextSource::Extracted, false, true),
+        "xlsx" | "xls" if len <= MAX_VIEWER_BYTES => {
+            return view("sheet", TextSource::Extracted, false, true)
+        }
+        "csv" | "tsv" if len <= MAX_RAW_TEXT_BYTES => return view("csv", TextSource::Raw, true, false),
+        "md" | "markdown" if len <= MAX_RAW_TEXT_BYTES => {
+            return view("markdown", TextSource::Raw, true, false)
+        }
+        // HTML runs live in a sandboxed preview iframe (the "runner"); the raw
+        // source is editable text that round-trips, so Edit drops to Monaco.
+        "html" | "htm" if len <= MAX_RAW_TEXT_BYTES => {
+            return view("html", TextSource::Raw, true, false)
+        }
+        _ => {}
+    }
+    // Files whose bytes ARE text: viewable and safely editable in place.
+    if extraction::is_text_extension(&ext) && len <= MAX_RAW_TEXT_BYTES {
+        return view("code", TextSource::Raw, true, false);
+    }
+    // Everything else (pptx, MarkItDown output, an oversized pdf or csv):
+    // read-only preview of whatever text we managed to extract.
+    view("text", TextSource::Extracted, false, false)
+}
+
 /// Clip huge extracted text at a char boundary for preview/edit payloads.
 /// Lifted out of `get_file_content` (Idea 11) so the version-compare command
 /// shapes its payload identically — both sides are clipped the same way, so a
@@ -388,14 +532,11 @@ pub(crate) fn clip_preview(mut t: String) -> String {
 
 /// The text representation `get_file_content` exposes for a file's bytes,
 /// factored out so the Idea 11 compare view can shape BOTH the stored version
-/// and the current file the SAME way. Mirrors get_file_content's kind/text
-/// branching (including its 10 MB raw-text size gates), so the two diff sides
-/// pick the same representation for the same bytes — for md/csv/code that is
-/// the RAW bytes' text (extract_text early-returns it verbatim, no whitespace
-/// normalization), for html the raw source, and for pdf/docx/pptx the extracted
-/// text. Every branch runs through `clip_preview` so truncation is symmetric.
-/// None = a kind with no comparable text (images, spreadsheets, un-extractable
-/// binaries) → the modal shows "no text to compare".
+/// and the current file the SAME way. Both sides go through `classify_file`, so
+/// the two diff panes can never pick different representations for the same
+/// bytes. Every branch runs through `clip_preview` so truncation is symmetric.
+/// None = there is genuinely no text (an image with no OCR, an unreadable
+/// binary) → the modal shows "no text to compare".
 pub(crate) fn content_text(
     name: &str,
     mime: &str,
@@ -407,25 +548,10 @@ pub(crate) fn content_text(
     if stt::media_kind(mime, &ext).is_some() {
         return extracted.map(clip_preview);
     }
-    if extraction::is_image(mime) {
-        return None;
+    match classify_file(name, mime, bytes.len()).text {
+        TextSource::Raw => Some(clip_preview(String::from_utf8_lossy(bytes).into_owned())),
+        TextSource::Extracted => extracted.map(clip_preview),
     }
-    match ext.as_str() {
-        "pdf" | "docx" => return extracted.map(clip_preview),
-        "xlsx" | "xls" => return None,
-        "csv" | "tsv" | "md" | "markdown" => {
-            return Some(clip_preview(String::from_utf8_lossy(bytes).into_owned()));
-        }
-        "html" | "htm" if bytes.len() <= 10 * 1024 * 1024 => {
-            return Some(clip_preview(String::from_utf8_lossy(bytes).into_owned()));
-        }
-        _ => {}
-    }
-    if extraction::is_text_extension(&ext) && bytes.len() <= 10 * 1024 * 1024 {
-        return Some(clip_preview(String::from_utf8_lossy(bytes).into_owned()));
-    }
-    // Binary formats with extracted text (pptx, markitdown): read-only preview.
-    extracted.map(clip_preview)
 }
 
 #[tauri::command]
@@ -485,49 +611,27 @@ pub fn get_file_content(
         media_token: None,
     };
 
-    if extraction::is_image(&mime) && bytes.len() <= MAX_VIEWER_BYTES {
-        return Ok(content("image", false, None, true));
-    }
-    match ext.as_str() {
-        // PDF/DOCX carry their extracted text too, so the viewer can offer
-        // "edit as text" (saved as a new copy — the binary can't round-trip).
-        "pdf" if bytes.len() <= MAX_VIEWER_BYTES => {
-            return Ok(content("pdf", false, extracted.map(clip), true))
-        }
-        "docx" if bytes.len() <= MAX_VIEWER_BYTES => {
-            return Ok(content("docx", false, extracted.map(clip), true))
-        }
-        "xlsx" | "xls" if bytes.len() <= MAX_VIEWER_BYTES => {
-            return Ok(content("sheet", false, None, true))
-        }
-        "csv" | "tsv" => {
+    let view = classify_file(&name, &mime, bytes.len());
+    match view.text {
+        // The bytes ARE the text: handed over whole (never clipped — a clipped
+        // buffer saved back would truncate the file), which is what
+        // MAX_RAW_TEXT_BYTES in `classify_file` bounds.
+        TextSource::Raw => {
             let text = String::from_utf8_lossy(&bytes).into_owned();
-            return Ok(content("csv", true, Some(text), false));
+            // Bytes that aren't UTF-8 came back with U+FFFD in place of every
+            // unreadable one; saving that would destroy the original encoding's
+            // accented letters for good, so the file is preview-only.
+            let editable = view.editable && std::str::from_utf8(&bytes).is_ok();
+            Ok(content(view.kind, editable, Some(text), view.needs_bytes))
         }
-        "md" | "markdown" => {
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            return Ok(content("markdown", true, Some(text), false));
-        }
-        // HTML runs live in a sandboxed preview iframe (the "runner"); the raw
-        // source is editable text that round-trips, so Edit drops to Monaco.
-        "html" | "htm" if bytes.len() <= 10 * 1024 * 1024 => {
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            return Ok(content("html", true, Some(text), false));
-        }
-        _ => {}
+        TextSource::Extracted => match extracted {
+            Some(text) => Ok(content(view.kind, view.editable, Some(clip(text)), view.needs_bytes)),
+            // No text was read out of it after all (an image awaiting OCR keeps
+            // its viewer; anything else falls back to the binary card).
+            None if view.needs_bytes => Ok(content(view.kind, false, None, true)),
+            None => Ok(content("binary", false, None, false)),
+        },
     }
-    // Files whose bytes ARE text: viewable and safely editable in place.
-    if extraction::is_text_extension(&ext) && bytes.len() <= 10 * 1024 * 1024 {
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        return Ok(content("code", true, Some(text), false));
-    }
-    // Binary formats we could still read text out of (pptx, markitdown output):
-    // preview the extracted text read-only — editing it can't round-trip.
-    if let Some(text) = extracted {
-        let text = clip(text);
-        return Ok(content("text", false, Some(text), false));
-    }
-    Ok(content("binary", false, None, false))
 }
 
 /// The single write path for changing an existing file's bytes. Snapshots the
@@ -547,17 +651,24 @@ pub(crate) fn store_file_bytes(
 
 #[tauri::command]
 pub fn update_file_content(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
     content: String,
 ) -> Result<FileMeta, String> {
-    state.with_room(|room| {
+    let meta = state.with_room(|room| {
         let name = db::get_file_name(&room.conn, &id)?;
         let bytes = content.as_bytes();
         let text = extraction::extract_text(&name, bytes).unwrap_or_else(|| content.clone());
         store_file_bytes(&room.conn, &id, bytes, Some(&text), "You saved")?;
         db::get_file_meta(&room.conn, &id)
-    })
+    })?;
+    // Every OTHER way of changing a file broadcasts this; the plain Save in the
+    // built-in editor did not, so the Library, the Scripts index and the front
+    // page all kept showing what the file used to say.
+    use tauri::Emitter;
+    let _ = app.emit("room-files-changed", ());
+    Ok(meta)
 }
 
 #[tauri::command]
@@ -665,8 +776,39 @@ fn is_missing_captions(err: &str) -> bool {
 /// are refused. An explicit user action, so it works even when the AI's web
 /// tools are off. The saved file (source "web") is indexed and searchable.
 #[tauri::command]
-pub async fn import_link(state: State<'_, AppState>, url: String) -> Result<FileMeta, String> {
-    import_link_impl(state.inner(), &url).await
+pub async fn import_link(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<FileMeta, String> {
+    import_link_and_index(&app, state.inner(), &url).await
+}
+
+/// [`import_link_impl`] PLUS the three things every save path owes the room.
+///
+/// A page saved without them sits un-scanned and un-indexed until something
+/// unrelated triggers a pass — and the privacy redactor's substitution table is
+/// built from what the scan found, so names and identifiers that appear only in
+/// that page can go out to a cloud engine unmasked on the very next turn. That
+/// is exactly the shape of the `save_link` path, where a cloud call usually
+/// follows immediately.
+///
+/// Every caller of `import_link_impl` wants THIS; the inner function only
+/// writes the row.
+pub(crate) async fn import_link_and_index(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    url: &str,
+) -> Result<FileMeta, String> {
+    let meta = import_link_impl(state, url).await?;
+    let room_path = state.with_room(|room| Ok(room.path.clone()))?;
+    schedule_auto_index(app, room_path);
+    schedule_privacy_scan(app.clone());
+    {
+        use tauri::Emitter;
+        let _ = app.emit("room-files-changed", ());
+    }
+    Ok(meta)
 }
 
 /// BROWSE-3: the ＋ button on a search result — save this page into the room as
@@ -774,8 +916,9 @@ pub(crate) fn save_web_markdown(
     Ok(meta)
 }
 
-/// The command's body, callable from the agent's `save_link` tool arm with the
-/// same fetch, the same SEC-5 guard and the same saved shape.
+/// The command's body: fetch the page and write the row. Nothing more —
+/// callers must go through [`import_link_and_index`] so the auto-index and the
+/// privacy scan happen too.
 pub(crate) async fn import_link_impl(state: &AppState, url: &str) -> Result<FileMeta, String> {
     // ADD-19: a YouTube link imports the video's own captions as a timestamped
     // transcript (no video download) instead of the watch page's JS soup.
@@ -801,13 +944,17 @@ pub(crate) async fn import_link_impl(state: &AppState, url: &str) -> Result<File
             link_file_name(&title, &url)
         };
         let content = format!("# {title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
-        db::insert_file(
+        // Record where it came from. The column has existed since BROWSE-2 and
+        // only the binary funnel ever wrote it, so a page saved through "Web
+        // link" (or the agent's save_link) forgot its own address.
+        db::insert_file_from_url(
             &room.conn,
             &name,
             "text/markdown",
             content.as_bytes(),
             Some(&content),
             "web",
+            Some(url),
         )
     })
 }
@@ -842,6 +989,75 @@ mod tests {
         assert_eq!(link_file_name("A/B: c\td", "https://x.com"), "A B c d.md");
         // Empty title falls back to the URL (reserved chars folded), never empty.
         assert_eq!(link_file_name("   ", "https://ex.com/p"), "https ex.com p.md");
+    }
+
+    #[test]
+    fn the_viewer_and_the_compare_view_agree_on_every_kind() {
+        // These rules used to be written out twice, kept in step only by a
+        // comment asking future editors to match them — and they had already
+        // drifted. Both readers now go through `classify_file`, so this pins
+        // the table itself.
+        let sheet = classify_file("budget.xlsx", "application/vnd.ms-excel", 10_000);
+        assert_eq!(sheet.kind, "sheet");
+        // A spreadsheet DOES have comparable text: the compare view used to be
+        // handed None for it, so reviewing an AI's cell edits was impossible.
+        assert!(matches!(sheet.text, TextSource::Extracted));
+        assert_eq!(
+            content_text("budget.xlsx", "application/vnd.ms-excel", b"PK\x03\x04", Some("A1 | 5".into())).as_deref(),
+            Some("A1 | 5")
+        );
+
+        // A scan's recognized text reaches the picture viewer instead of being
+        // computed, indexed and then withheld.
+        let image = classify_file("scan.png", "image/png", 10_000);
+        assert_eq!(image.kind, "image");
+        assert!(image.needs_bytes);
+        assert!(matches!(image.text, TextSource::Extracted));
+
+        // Regression: an image too big for the viewer payload went down the
+        // binary branch with TextSource::None, so a large scan OCR HAD read
+        // opened as "no preview available" and its text — stored and indexed —
+        // could no longer be read or copied. Only the raw bytes are dropped.
+        let huge = classify_file("map.tif", "image/tiff", MAX_VIEWER_BYTES + 1);
+        assert_eq!(huge.kind, "text", "an oversized scan lost its text preview");
+        assert!(!huge.needs_bytes, "the picture itself is still too big to send");
+        assert!(matches!(huge.text, TextSource::Extracted));
+        assert_eq!(
+            content_text(
+                "map.tif",
+                "image/tiff",
+                &vec![0u8; MAX_VIEWER_BYTES + 1],
+                Some("Sheet 3 of 12".into())
+            )
+            .as_deref(),
+            Some("Sheet 3 of 12")
+        );
+
+        // Raw-text kinds are editable; extracted ones never are.
+        for (name, kind) in [("a.csv", "csv"), ("b.md", "markdown"), ("c.html", "html"), ("d.rs", "code")] {
+            let v = classify_file(name, "text/plain", 100);
+            assert_eq!(v.kind, kind);
+            assert!(v.editable, "{name} should be editable in place");
+            assert!(matches!(v.text, TextSource::Raw));
+        }
+        for name in ["a.pdf", "b.docx", "c.pptx"] {
+            assert!(!classify_file(name, "application/octet-stream", 100).editable);
+        }
+    }
+
+    #[test]
+    fn a_huge_csv_or_markdown_file_stops_being_pushed_through_whole() {
+        // Web pages, code and images all had a size gate; csv and markdown had
+        // none, so opening a large export handed the entire file to the screen
+        // in one payload and hung the window.
+        let big = MAX_RAW_TEXT_BYTES + 1;
+        for name in ["export.csv", "notes.md", "page.html", "main.rs"] {
+            let v = classify_file(name, "text/plain", big);
+            assert_eq!(v.kind, "text", "{name} should fall back to a clipped preview");
+            assert!(!v.editable, "{name} must not be editable at this size");
+        }
+        // Just under the gate they are still the real editors.
+        assert_eq!(classify_file("export.csv", "text/csv", MAX_RAW_TEXT_BYTES).kind, "csv");
     }
 
     #[test]

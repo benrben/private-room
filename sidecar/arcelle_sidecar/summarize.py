@@ -32,6 +32,7 @@ the gateway does, letting Rust rebuild the sentinels summarize.rs branches on.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -39,6 +40,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import config
 from .budget import json_chars, msg_len, window_budget_bytes
+# docs_html.rs ``parse_string_list``, one implementation for the whole sidecar.
+# The copy that used to live here silently stopped at 12 items and measured its
+# 80-character line limit in CHARACTERS, so a Hebrew reply was cut at a different
+# point than in ``#add-file`` and a fix to either copy never reached the other.
+from .chat_docs import parse_string_list
 from .llm import LlmError, _classify
 from .messages import Message, ToolCall, canonical_json
 from .model_limits import max_num_ctx, native_context_length, pick_num_ctx
@@ -189,9 +195,24 @@ def strip_markup_blocks(content: str) -> str:
     return out
 
 
+#: Ceiling for a file's one-line description (summarize.rs ``clean_one_liner``).
+ONE_LINER_MAX: int = 200
+
+#: A sentence terminator that really ENDS a sentence — followed by whitespace or
+#: the end of the line, so a version number or "e.g." is not mistaken for one.
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+
+
 def clean_one_liner(raw: str) -> str:
     """summarize.rs ``clean_one_liner``: trim a reply down to one clean sentence —
-    first non-empty line, list markers stripped, capped at 200 chars."""
+    first non-empty line, list markers stripped, capped at ``ONE_LINER_MAX``.
+
+    An over-long line is cut at the last SENTENCE end that still leaves a real
+    description, else at a word boundary with an ellipsis marking the cut. This
+    line is what the generated Room summary prints and what the assistant reads
+    when it lists the room's files, so a hard slice at exactly 200 characters
+    ended it mid-word with nothing showing it had been cut.
+    """
     stripped = strip_markup_blocks(raw)
     line = ""
     for candidate in stripped.split("\n"):
@@ -199,8 +220,18 @@ def clean_one_liner(raw: str) -> str:
         if t:
             line = t
             break
-    line = line.lstrip("-*#> ")
-    return line[:200].strip()
+    line = line.lstrip("-*#> ").strip()
+    if len(line) <= ONE_LINER_MAX:
+        return line
+    head = line[:ONE_LINER_MAX]
+    ends = [m.end() for m in _SENTENCE_END.finditer(head)]
+    # Only take a sentence end that leaves at least half the budget behind —
+    # otherwise a stray "1." near the start would truncate the whole description.
+    if ends and ends[-1] >= ONE_LINER_MAX // 2:
+        return head[: ends[-1]].strip()
+    cut = head.rfind(" ")
+    kept = head[:cut] if cut > 0 else head[: ONE_LINER_MAX - 1]
+    return kept.rstrip(" ,;:-") + "…"
 
 
 def json_str_field(raw: str, key: str) -> str | None:
@@ -213,40 +244,6 @@ def json_str_field(raw: str, key: str) -> str | None:
     if isinstance(obj, dict) and isinstance(obj.get(key), str):
         return obj[key].strip()
     return None
-
-
-def parse_string_list(raw: str) -> list[str]:
-    """docs_html.rs ``parse_string_list``: a JSON string array from a model reply,
-    tolerating leading/trailing prose; falls back to line/bullet splitting. Deduped
-    (case-insensitive), trimmed, capped at 12."""
-    cleaned = strip_think_spans(raw)
-    items: list[str] = []
-    start = cleaned.find("[")
-    if start != -1:
-        try:
-            # Rust reads ONE JSON value starting at '['; json.JSONDecoder.raw_decode
-            # does the same (stops at the end of the first array, ignores a tail).
-            value, _ = json.JSONDecoder().raw_decode(cleaned[start:])
-            if isinstance(value, list):
-                items = [v for v in value if isinstance(v, str)]
-        except ValueError:
-            items = []
-    if not items:
-        for line in cleaned.split("\n"):
-            t = line.strip().lstrip("0123456789-*.) ").strip()
-            if t and len(t) < 80:
-                items.append(t)
-    out: list[str] = []
-    seen: set[str] = set()
-    for s in items:
-        s = s.strip()
-        low = s.lower()
-        if s and low not in seen:
-            seen.add(low)
-            out.append(s)
-        if len(out) >= 12:
-            break
-    return out
 
 
 # --- the read_text tool + its argument parsing (summarize.rs) ---------------
@@ -547,6 +544,33 @@ async def _chat_structured(
 # --- the map step: summarize_one_file (summarize.rs) ------------------------
 
 
+async def _gather_window(client: ModelClient, model: str) -> int:
+    """The largest window ``model`` will actually be given for one file's gather.
+
+    :func:`.model_limits.max_num_ctx` is the RAM ceiling — the biggest window
+    this MAC may ask for. It is NOT what the chosen model gets: every call the
+    gather loop makes goes through :func:`.model_limits.pick_num_ctx`, which
+    clamps that ceiling to the model's own native length. Budgeting the reads
+    off the ceiling alone therefore handed a small-window model roughly double
+    what fits, and an oversized prompt is dropped from the FRONT — the system
+    prompt and the instruction — so the summary came back rambling or empty
+    with no error.
+
+    A non-local engine owns its own window on the remote side and is never
+    sized here, so it keeps the ceiling (unchanged behaviour).
+    """
+    from .external_llm import is_external_model
+
+    ceiling = max_num_ctx()
+    base_url = getattr(client, "base_url", "")
+    if not base_url or getattr(client, "provider", None) is not None:
+        return ceiling
+    if is_external_model(model):
+        return ceiling
+    native = await native_context_length(model, base_url)
+    return min(ceiling, native) if native else ceiling
+
+
 async def summarize_one_file(
     client: ModelClient,
     model: str,
@@ -562,22 +586,39 @@ async def summarize_one_file(
     ``MAX_READS`` extra windows before a final schema-constrained call.
     """
     filtered = smart_filter(text)
+    if not filtered.strip():
+        # Nothing survived the noise filter — a binary blob, a base64 dump, a
+        # failed extraction. Asking "what is this file about?" with NO text
+        # attached leaves the model only the file NAME to guess from, and that
+        # guess was then stored and shown as if it had been read out of the file.
+        # An empty one-liner is a contract Rust already handles: summarize.rs
+        # falls back to the file's mime type when the description is blank.
+        return ""
     data = filtered.encode("utf-8")
     head = read_window(data, 0, READ_WINDOW_DEFAULT, None)
     whole = head.end >= len(data)
     # Deterministic baseline samples for a long file, and a cumulative read
-    # budget derived from the largest window this Mac can actually ask a local
-    # model for. `MAX_READS` alone is NOT a bound: four reads of up to
+    # budget derived from the largest window THIS MODEL will actually be given.
+    # `MAX_READS` alone is NOT a bound: four reads of up to
     # READ_WINDOW_MAX plus the samples is ~264 KB, far past any window, and the
     # daemon's answer to an oversized prompt is to drop the FRONT of it — the
     # system prompt and the instruction. Spend the window on file text, but
     # spend only what there is. All arithmetic is in BYTES.
-    mid = read_window(data, len(data) // 2, 2_000, None)
-    tail = read_window(data, max(0, len(data) - 2_000), 2_000, None)
+    #
+    # Each sample starts at or after the END of the head window and any sample
+    # that lands on an already-taken offset is dropped: just past the 4 KB head
+    # boundary the "middle" and "end" samples both fell INSIDE the head, so the
+    # same passage was sent to the model three times and the file's real tail was
+    # never shown.
+    samples: list[tuple[str, TextWindow]] = []
+    for label, start in (("middle", len(data) // 2), ("end", len(data) - 2_000)):
+        w = read_window(data, max(start, head.end), 2_000, None)
+        if w.nbytes and all(w.offset != prev.offset for _, prev in samples):
+            samples.append((label, w))
     remaining = max(
         0,
-        window_budget_bytes(max_num_ctx())
-        - (head.nbytes + mid.nbytes + tail.nbytes + 8_000),
+        window_budget_bytes(await _gather_window(client, model))
+        - (head.nbytes + sum(w.nbytes for _, w in samples) + 8_000),
     )
 
     if whole:
@@ -601,11 +642,13 @@ async def summarize_one_file(
         )
         # Beginning, middle and end up front, so even a model that never touches
         # read_text summarizes the file's whole shape, not just page one.
+        blocks = "".join(
+            f"Characters {w.offset}-{w.end} ({label}):\n{w.text}\n\n" for label, w in samples
+        )
         user = (
             f"File name: {name}\nType: {mime}\nText length: {head.total} characters\n\n"
             f"Characters 0-{head.end} (beginning):\n{head.text}\n\n"
-            f"Characters {mid.offset}-{mid.end} (middle):\n{mid.text}\n\n"
-            f"Characters {tail.offset}-{tail.end} (end):\n{tail.text}\n\n"
+            f"{blocks}"
             "In one sentence, what is this file about?"
         )
 
@@ -638,7 +681,17 @@ async def summarize_one_file(
                 {"role": "assistant", "content": "", "tool_calls": [c.to_raw() for c in calls]}
             )
             for call in calls:
-                if call.name != "read_text":
+                if reads >= MAX_READS or remaining < READ_WINDOW_MIN:
+                    # The budget ran out part-way through a BATCH of calls. Every
+                    # call still needs its own reply: an OpenAI-compatible
+                    # provider rejects an assistant turn whose tool_calls are not
+                    # all answered (a local Ollama shrugs it off), and the whole
+                    # summary failed. The outer `while` ends the loop after this.
+                    result = (
+                        "The read budget for this file is used up — answer from "
+                        "what you have already read."
+                    )
+                elif call.name != "read_text":
                     result = "Unknown tool: only read_text is available."
                 elif canonical_json(call.arguments) in seen:
                     result = (
@@ -665,8 +718,6 @@ async def summarize_one_file(
                     )
                     result = f"Characters {w.offset}-{w.end} of {w.total}{note}:\n{w.text}"
                 messages.append({"role": "tool", "content": result, "tool_name": call.name})
-                if reads >= MAX_READS or remaining < READ_WINDOW_MIN:
-                    break
         messages.append(
             {
                 "role": "user",
@@ -803,6 +854,7 @@ class CombineSummaryRequest(BaseModel):
 
 __all__ = [
     "MAX_READS",
+    "ONE_LINER_MAX",
     "READ_WINDOW_DEFAULT",
     "READ_WINDOW_MIN",
     "READ_WINDOW_MAX",

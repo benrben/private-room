@@ -32,6 +32,8 @@ class _ScriptedCli:
         self.systems: list[str] = []
         self._argv: tuple = ()
         self.returncode = 0
+        #: This spawn's stdout, built when the prompt is written.
+        self._pending: bytes = b""
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def fake_exec(*argv, **_kwargs):
@@ -42,7 +44,16 @@ class _ScriptedCli:
             external_llm.asyncio, "create_subprocess_exec", fake_exec
         )
 
-    async def communicate(self, payload: bytes | None = None):
+    # The seam drains real pipes now (silence, not elapsed time, is what stops a
+    # CLI — see `external_llm.EXTERNAL_IDLE_SECS`), so this double presents
+    # stdin/stdout/stderr instead of answering `communicate`. It emits the
+    # STREAMED envelope the engine really produces: preamble events, then the
+    # terminal `type: result` line.
+    @property
+    def stdin(self) -> "_ScriptedCli":
+        return self
+
+    def write(self, payload: bytes) -> None:
         cmdline = self._argv[2] if len(self._argv) > 2 else ""
         match = re.search(r"--system-prompt-file '([^']+)'", cmdline)
         # Read it while the call is still in flight — `_run` deletes it after.
@@ -51,11 +62,47 @@ class _ScriptedCli:
         )
         self.prompts.append((payload or b"").decode())
         reply = self.replies.pop(0) if self.replies else ""
-        envelope = {"result": reply, "usage": {"input_tokens": 100}}
-        return json.dumps(envelope).encode(), b""
+        self._pending = (
+            json.dumps({"type": "system", "subtype": "init"}).encode()
+            + b"\n"
+            + json.dumps({"type": "assistant", "message": {"content": []}}).encode()
+            + b"\n"
+            + json.dumps(
+                {"type": "result", "result": reply, "usage": {"input_tokens": 100}}
+            ).encode()
+            + b"\n"
+        )
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    @property
+    def stdout(self) -> "_ScriptedCli":
+        return self
+
+    @property
+    def stderr(self) -> "_Empty":
+        return _Empty()
+
+    async def read(self, _n: int = -1) -> bytes:
+        out, self._pending = self._pending, b""
+        return out
+
+    async def wait(self) -> int:
+        return self.returncode
 
     def kill(self) -> None:  # pragma: no cover - only the Stop path calls this
         pass
+
+
+class _Empty:
+    """A pipe that is immediately at EOF (this CLI writes no stderr)."""
+
+    async def read(self, _n: int = -1) -> bytes:
+        return b""
 
 
 def _tool_call(name: str, **arguments) -> str:

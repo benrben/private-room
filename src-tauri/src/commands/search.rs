@@ -34,12 +34,17 @@ pub fn search_all(state: State<'_, AppState>, query: String) -> Result<SearchRes
             }
         }
     }
+    // Name-only matches carry NO snippet. The row already shows the name (which
+    // is where the match is), so repeating it as the preview line said the same
+    // thing twice — and the overlay hands the snippet to the viewer as the text
+    // to jump to, so a file name sent the viewer looking for words the document
+    // does not contain and nothing was highlighted.
     for (id, name) in db::files_name_like(conn, &needle)? {
         if seen.insert(id.clone()) {
             files.push(FileHit {
-                snippet: name.clone(),
                 id,
                 name,
+                snippet: String::new(),
             });
         }
     }

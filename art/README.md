@@ -12,15 +12,32 @@ as React components in `src/icons.tsx`; the favicon is `public/logo.svg`.
 | `dmg-bg.svg` | `src-tauri/dmg-background.tiff` | render at 660×400 and 1320×800, then `tiffutil -cathidpicheck a.png b.png -out …` |
 | `banner.svg` | `docs/banner.png` (README banner) | render at 2560×1280 |
 
+> `docicon.svg` is currently a byte-for-byte copy of `appicon.svg`, so
+> `document.icns` and `icon.icns` are the same file — a document in Finder
+> looks exactly like the app. That's a placeholder, not a decision: give
+> `docicon.svg` its own artwork (a page behind the keyhole reads better at
+> 16px) and re-run the `iconutil` step above. Git stores the two `.icns` as
+> one blob while they're identical.
+
 `arcelle-30-second-publish-master.mp4` is the 30-second launch video (1080p):
 "your AI tools are excellent" → "the handoff is still your job" → product
 beats → the "Work with context." end card. That end card is the poster frame
 `docs/video-poster.png` (`ffmpeg -ss 29.8 -i <mp4> -frames:v 1 -vf scale=1280:-2`),
 which the README links to the raw mp4; the video is also attached to GitHub
-releases as an asset. It replaced the pre-rebrand 74-second
-`private-room-productivity-witness-protection.mp4`, removed in 8dbcba6 —
-re-generate the poster whenever the master video changes, or the README's
-front-page card goes stale.
+releases as an asset. Re-generate the poster whenever the master video
+changes, or the README's front-page card goes stale.
+
+**Media weight — read before adding another video.** That mp4 replaced the
+pre-rebrand 74-second `private-room-productivity-witness-protection.mp4`,
+deleted from the tree in 8dbcba6. Deleting a file does not remove it from git:
+both videos are in the pack forever (8.5 MB + 6.0 MB), and every `git clone`
+pays for both. With `docs/banner.png` (1.1 MB) and the icons, roughly 16 MB of
+the ~68 MB repo is front-page media. Only a history rewrite (`git filter-repo`,
+or a Git LFS migration) would reclaim it, and that rewrites every commit hash —
+it breaks every existing clone and fork, so it is not worth doing for a working
+repo. So: **new large media goes on the GitHub release as an asset**; keep only
+the poster frame in the tree, and replace a video in place rather than adding a
+second one beside it.
 
 The README badge pills (`docs/badge-*.svg`) are hand-authored SVGs, not
 generated — edit them directly, keeping the pill recipe: `#161a22` fill,

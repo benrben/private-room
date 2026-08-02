@@ -21,6 +21,7 @@
  */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AgentNodeStatus, AskPlanStep, AskActiveAgent } from "../apiTypes";
+import { MAIN_KEY, toBands, toNodes, type GraphNode } from "./agentNodes";
 
 /** Mirror of the sidecar's `agents.REGISTRY` descriptions (agents.py), for the
  * inspector. Duplicated rather than fetched on purpose: the app is offline-first
@@ -34,6 +35,8 @@ const AGENT_DESCRIPTIONS: Record<string, string> = {
   "scripts.run":
     "See and run this room's .py/.js scripts (the user approves each new one).",
   "chat.web": "Find or fetch current information from the internet.",
+  "chat.browse":
+    "Open and operate a web page in the private browser — navigate, read, click and fill in.",
   "app.ui": "See and operate this app's own interface for the user.",
   "jobs.run":
     "Cover an ENTIRE file with a durable background job; report job status.",
@@ -52,9 +55,6 @@ const AGENT_DESCRIPTIONS: Record<string, string> = {
     "Generate flashcards, mind maps or podcast scripts from room content.",
 };
 
-/** The Main agent's node key — fixed by the sidecar (`graph.MAIN_NODE_KEY`). */
-const MAIN_KEY = "main";
-
 const GLYPH: Record<AgentNodeStatus, string> = {
   pending: "○",
   running: "◐",
@@ -68,64 +68,7 @@ const STATUS_WORD: Record<AgentNodeStatus, string> = {
   failed: "failed",
 };
 
-interface GraphNode {
-  key: string;
-  agent: string;
-  label: string;
-  instruction: string;
-  status: AgentNodeStatus;
-  /** null on the hub; children sharing a number were dispatched together. */
-  batch: number | null;
-}
-
-/** Roster + active marker -> nodes.
- *
- * `status` normally comes straight off the entry, because every `ask-plan` is a
- * complete snapshot. The fallback path matters anyway: a frontend newer than the
- * bundled sidecar (routine during development, and possible after a partial
- * update) gets rosters with no status at all, and must still render something
- * truthful from the single active marker alone.
- */
-function toNodes(
-  plan: AskPlanStep[],
-  active: AskActiveAgent | null,
-): GraphNode[] {
-  const activeSteps = new Set(
-    active?.active_steps?.length ? active.active_steps : active ? [active.step] : [],
-  );
-  return plan.map((entry, i) => {
-    const isMain = i === plan.length - 1;
-    const fallback: AgentNodeStatus = activeSteps.has(i + 1)
-      ? "running"
-      : active && i + 1 < active.step
-        ? "done"
-        : "pending";
-    return {
-      key: entry.key ?? (isMain ? MAIN_KEY : `${entry.agent}#${i}`),
-      agent: entry.agent,
-      label: entry.label,
-      instruction: entry.instruction,
-      status: entry.status ?? fallback,
-      // Without backend batching every child reads as one group, which is the
-      // honest degradation: "these were dispatched, grouping unknown".
-      batch: entry.batch ?? (isMain ? null : 0),
-    };
-  });
-}
-
-/** Consecutive children sharing a batch, in roster (call) order. */
-function toBands(children: GraphNode[]): GraphNode[][] {
-  const bands: GraphNode[][] = [];
-  for (const node of children) {
-    const last = bands[bands.length - 1];
-    if (last && last[0].batch === node.batch) last.push(node);
-    else bands.push([node]);
-  }
-  return bands;
-}
-
 function elapsedLabel(ms: number): string {
-  if (ms < 1000) return `${Math.round(ms / 100) / 10}s`;
   if (ms < 60_000) return `${Math.round(ms / 100) / 10}s`;
   const m = Math.floor(ms / 60_000);
   return `${m}m ${Math.round((ms - m * 60_000) / 1000)}s`;
@@ -133,8 +76,9 @@ function elapsedLabel(ms: number): string {
 
 /** Per-node start/end stamps, kept in a ref because they are observations about
  * this render session, not state the backend sends: the protocol says WHAT a
- * node is doing, never for how long. */
-type Timing = { start: number; end?: number };
+ * node is doing, never for how long. The store can be supplied by the caller so
+ * a finished turn's clocks outlive the live bubble that measured them. */
+export type AgentTiming = { start: number; end?: number };
 
 /** One hub->child spoke, in canvas pixels. */
 interface Edge {
@@ -179,6 +123,8 @@ export function AgentGraph({
   agentSteps,
   steps,
   lane,
+  timings: timingStore,
+  live = true,
 }: {
   plan: AskPlanStep[];
   active: AskActiveAgent | null;
@@ -188,8 +134,14 @@ export function AgentGraph({
    * for steps that arrived with no node attribution. */
   steps: { label: string; ok: boolean }[];
   lane: string;
+  /** Where per-node clocks live. Passing one lets the caller keep them after
+   * the turn ends; omitted, the graph keeps its own for as long as it exists. */
+  timings?: { current: Record<string, AgentTiming> };
+  /** False for a finished turn's replay: no clocks are started or stopped and
+   * nothing ticks, so a past graph never re-renders the transcript. */
+  live?: boolean;
 }) {
-  const nodes = useMemo(() => toNodes(plan, active), [plan, active]);
+  const nodes = useMemo(() => toNodes(plan, active, live), [plan, active, live]);
   const main = nodes[nodes.length - 1];
   // Memoised, not sliced inline: this feeds the measuring layout effect's
   // dependencies, and a fresh array identity every render would re-run the
@@ -197,14 +149,16 @@ export function AgentGraph({
   const children = useMemo(() => nodes.slice(0, -1), [nodes]);
   const [selected, setSelected] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
-  const timings = useRef<Record<string, Timing>>({});
+  const ownTimings = useRef<Record<string, AgentTiming>>({});
+  const timings = timingStore ?? ownTimings;
   const [, tick] = useState(0);
 
-  const anyRunning = nodes.some((n) => n.status === "running");
+  const anyRunning = live && nodes.some((n) => n.status === "running");
 
   // Stamp transitions into/out of `running`. Done in an effect rather than
   // during render so a re-render for any other reason cannot restart a clock.
   useEffect(() => {
+    if (!live) return;
     const now = performance.now();
     for (const node of nodes) {
       const t = timings.current[node.key];
@@ -214,7 +168,7 @@ export function AgentGraph({
         t.end = now;
       }
     }
-  }, [nodes]);
+  }, [nodes, live, timings]);
 
   // Only tick while something is actually running — an idle graph must not
   // re-render the chat once a second forever.
@@ -504,7 +458,12 @@ function GraphCanvas({
               ? `waiting on ${runningCount}`
               : main.status === "running"
                 ? lane || "working"
-                : "queued"
+                : // A finished turn's hub is settled to "done" (nothing runs in
+                  // an archived diagram) — saying "queued" under a ✓ would
+                  // contradict the glyph next to it.
+                  main.status === "pending"
+                  ? "queued"
+                  : lane || "answered"
           }
           isHub
         />

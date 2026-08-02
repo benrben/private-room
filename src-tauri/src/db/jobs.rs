@@ -173,6 +173,12 @@ pub fn delete_job(conn: &Connection, id: &str) -> Result<(), String> {
 
 /// ADD-32: save one step's output. INSERT OR REPLACE so a step re-run after a
 /// crash (artifact written, cursor not yet advanced) is idempotent.
+///
+/// The `WHERE EXISTS` clause is load-bearing: a job deleted mid-run (Delete on a
+/// running workflow) keeps going for one more step, and without the guard that
+/// step's artifact would be written under a job id that no longer exists —
+/// invisible rows nothing ever cleans up. A dropped write is exactly right:
+/// there is no longer a job to read it.
 pub fn put_job_artifact(
     conn: &Connection,
     job_id: &str,
@@ -181,7 +187,8 @@ pub fn put_job_artifact(
 ) -> Result<(), String> {
     execute_one(
         conn,
-        "INSERT OR REPLACE INTO job_artifacts(job_id, step_id, content) VALUES(?1, ?2, ?3)",
+        "INSERT OR REPLACE INTO job_artifacts(job_id, step_id, content) \
+         SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ?1)",
         params![job_id, step_id as i64, content],
     )
 }
@@ -193,19 +200,6 @@ pub fn get_job_artifact(conn: &Connection, job_id: &str, step_id: usize) -> Opti
         |r| r.get(0),
     )
     .ok()
-}
-
-/// Fetch several steps' artifacts at once, returned in `step_ids` order.
-/// Missing steps come back as None so the caller can name exactly what's lost.
-pub fn get_job_artifacts(
-    conn: &Connection,
-    job_id: &str,
-    step_ids: &[usize],
-) -> Vec<Option<String>> {
-    step_ids
-        .iter()
-        .map(|&s| get_job_artifact(conn, job_id, s))
-        .collect()
 }
 
 #[cfg(test)]
@@ -247,14 +241,32 @@ mod tests {
             get_job_artifact(&conn, &id, 1).as_deref(),
             Some("notes for window 1 (rerun)")
         );
-        // Batch fetch preserves order and marks the missing step.
-        let got = get_job_artifacts(&conn, &id, &[0, 2, 1]);
-        assert_eq!(got[0].as_deref(), Some("notes for window 0"));
-        assert!(got[1].is_none());
-        assert!(got[2].is_some());
+        // A step that never ran has nothing stored.
+        assert!(get_job_artifact(&conn, &id, 2).is_none());
         // Deleting the job removes its artifacts.
         delete_job(&conn, &id).unwrap();
         assert!(get_job_artifact(&conn, &id, 0).is_none());
+    }
+
+    #[test]
+    fn an_artifact_for_a_deleted_job_is_never_written() {
+        // Delete on a RUNNING workflow removes the row while the job keeps
+        // going for one more step. Whatever that step stores must not land as
+        // an orphan row under a job that no longer exists — nothing would ever
+        // read it, list it, or clean it up.
+        let conn = mem();
+        let id = create_job(&conn, "workflow", "Digest", &serde_json::json!({}), 2).unwrap();
+        put_job_artifact(&conn, &id, 0, "step 0").unwrap();
+        delete_job(&conn, &id).unwrap();
+
+        // The in-flight step's write is accepted (no error surfaces to the
+        // runner) but stores nothing.
+        put_job_artifact(&conn, &id, 1, "step 1 finished after the delete").unwrap();
+        assert!(get_job_artifact(&conn, &id, 1).is_none());
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM job_artifacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "no leftover rows in the room file");
     }
 
     #[test]

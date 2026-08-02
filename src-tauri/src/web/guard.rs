@@ -74,42 +74,14 @@ pub(crate) async fn resolve_public_addr(host: &str, port: u16) -> Result<SocketA
     Ok(addrs[0])
 }
 
-/// Re-check one redirect hop's host. Runs inside reqwest's *synchronous*
-/// redirect policy, so DNS is resolved with the blocking resolver — fine for a
-/// desktop app and the only option the policy API allows. `false` = block.
-pub(crate) fn hop_host_is_public(url: &reqwest::Url) -> bool {
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return false;
-    }
-    let Some(host) = url.host_str().map(|h| h.to_lowercase()) else {
-        return false;
-    };
-    if host == "localhost" || host.ends_with(".local") {
-        return false;
-    }
-    // Same bracket-stripping as check_public_http_url, for IPv6 literals.
-    if let Ok(ip) = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<std::net::IpAddr>()
-    {
-        return is_public_ip(ip);
-    }
-    let port = url.port_or_known_default().unwrap_or(80);
-    match (host.as_str(), port).to_socket_addrs() {
-        Ok(addrs) => {
-            let mut any = false;
-            for a in addrs {
-                any = true;
-                if !is_public_ip(a.ip()) {
-                    return false;
-                }
-            }
-            any
-        }
-        Err(_) => false,
-    }
-}
+// A `hop_host_is_public` used to live here, called from reqwest's synchronous
+// redirect policy. It was strictly weaker than the check the first hop gets:
+// having approved a hop it could not PIN it, so reqwest resolved the redirect
+// target a second time, unpinned, to open the connection — a hostile server
+// could answer the check publicly and the connection privately. `guarded_get`
+// now follows the chain itself and gives every hop the full treatment (literal
+// check, resolve all addresses, pin the connection), so the weaker check has
+// no caller and no reason to exist.
 
 #[cfg(test)]
 mod tests {
@@ -143,8 +115,11 @@ mod tests {
         }
     }
 
+    /// What the removed `hop_host_is_public` used to assert, now asserted of
+    /// the check every redirect hop actually gets: `guarded_get` re-runs
+    /// `check_public_http_url` on each `Location` before resolving it.
     #[test]
-    fn hop_host_check_blocks_private_and_local() {
+    fn every_redirect_target_shape_the_hop_check_blocked_is_still_blocked() {
         for url in [
             "http://192.168.0.1/",
             "http://10.1.2.3/",
@@ -156,12 +131,11 @@ mod tests {
             "http://printer.local/",
             "ftp://example.com/",
         ] {
-            let u = reqwest::Url::parse(url).unwrap();
-            assert!(!hop_host_is_public(&u), "hop should block {url}");
+            assert!(check_public_http_url(url).is_err(), "hop should block {url}");
         }
         // Literal public IPs pass without touching the network.
-        assert!(hop_host_is_public(&reqwest::Url::parse("http://8.8.8.8/").unwrap()));
-        assert!(hop_host_is_public(&reqwest::Url::parse("https://1.1.1.1/").unwrap()));
+        assert!(check_public_http_url("http://8.8.8.8/").is_ok());
+        assert!(check_public_http_url("https://1.1.1.1/").is_ok());
     }
 
     #[tokio::test]

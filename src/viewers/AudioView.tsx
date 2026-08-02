@@ -117,6 +117,11 @@ export default function AudioView({
   // streamed source often reports Infinity until forced (see onMediaMeta).
   const [dur, setDur] = useState<number | null>(null);
   const forcedDurRef = useRef(false);
+  // Where playback is actually meant to be. The duration probe below seeks
+  // past the end and then has to come back — coming back to a hard 0 wiped out
+  // a jump to an AI-quoted moment. It comes back to HERE instead. It also
+  // holds a jump that arrived before the media had loaded its metadata.
+  const resumeAtRef = useRef(0);
 
   const rows = useMemo(() => parseRows(text), [text]);
   // Real speech = a TIMESTAMPED row carrying words. The provenance line
@@ -146,7 +151,23 @@ export default function AudioView({
     setMediaDead(false);
     setDur(null);
     forcedDurRef.current = false;
+    resumeAtRef.current = 0;
   }, [src]);
+
+  /** Move the playhead. Survives both "metadata isn't loaded yet" and the
+   * duration probe, either of which used to silently swallow the jump. */
+  function seekTo(secs: number, play = false) {
+    resumeAtRef.current = secs;
+    const el = mediaRef.current;
+    // Only the POSITION has to wait for metadata. play() is safe on a still-
+    // loading element — the browser queues it — and has to be asked for here,
+    // inside the click that wanted it, or the autoplay policy can refuse it
+    // later. Deferring it with the seek dropped the play intent of a
+    // transcript row clicked in the first moments of the viewer.
+    if (play && el) void el.play().catch(() => {});
+    if (!el || el.readyState === 0) return; // applied by onMediaMeta instead
+    el.currentTime = secs;
+  }
 
   // Decode failure (error event) or a zero-length track both mean "this will
   // never play"; a streaming source may briefly report no duration, so only a
@@ -175,6 +196,10 @@ export default function AudioView({
       }
     } else {
       setDur(d);
+      // A jump that landed before the media was ready applies now.
+      if (resumeAtRef.current > 0 && el.currentTime === 0) {
+        el.currentTime = resumeAtRef.current;
+      }
     }
   }
   function onDurationChange() {
@@ -182,7 +207,9 @@ export default function AudioView({
     if (d != null && Number.isFinite(d) && d > 0) {
       setDur(d);
       if (forcedDurRef.current && mediaRef.current) {
-        mediaRef.current.currentTime = 0;
+        // Back to where the listener actually wants to be — snapping to a
+        // hard 0 here threw away a jump to a quoted moment.
+        mediaRef.current.currentTime = resumeAtRef.current;
         forcedDurRef.current = false;
       }
     }
@@ -200,15 +227,15 @@ export default function AudioView({
     setActiveIdx(idx);
     const el = listRef.current?.children[idx] as HTMLElement | undefined;
     el?.scrollIntoView({ block: "center" });
-    if (rows[idx].seconds != null && mediaRef.current) {
-      mediaRef.current.currentTime = rows[idx].seconds!;
-    }
+    const secs = rows[idx].seconds;
+    if (secs != null) seekTo(secs);
+    // seekTo is a stable closure over refs only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target?.quote, rows]);
 
   function seek(row: Row, idx: number) {
-    if (row.seconds == null || !mediaRef.current) return;
-    mediaRef.current.currentTime = row.seconds;
-    void mediaRef.current.play().catch(() => {});
+    if (row.seconds == null) return;
+    seekTo(row.seconds, true);
     setActiveIdx(idx);
   }
 
@@ -253,38 +280,43 @@ export default function AudioView({
           onDurationChange={onDurationChange}
         />
       )}
-      {dur != null && (
-        // Transcript readiness is a first-class state, named right under the
-        // player — scanning it must never require reading the empty-hint prose.
-        <div className="audio-meta">
-          <span>
-            Length {fmtDur(dur)}
-            {" · "}
-            {busy
-              ? "Transcribing on this Mac…"
-              : hasSpeech
-                ? "Transcript ready"
-                : rows.length > 0
-                  ? "No speech detected"
-                  : "No transcript yet"}
-          </span>
-          {!mediaDead && (
-            <button
-              className="btn-ic audio-retranscribe"
-              disabled={busy}
-              onClick={() => void retranscribe()}
-              title={
-                hasSpeech
-                  ? "Run the on-device transcriber again, replacing this transcript"
-                  : "Run the on-device transcriber on this file"
-              }
-            >
-              <RefreshIcon size={12} className={busy ? "spin" : undefined} />
-              {busy ? "Transcribing…" : hasSpeech ? "Re-transcribe" : "Transcribe"}
-            </button>
+      {/* Transcript readiness is a first-class state, named right under the
+          player — scanning it must never require reading the empty-hint prose.
+          The strip is ALWAYS drawn: hiding it until a length was known also
+          hid the Transcribe button on every file whose duration the decoder
+          can't work out, leaving no way to run the transcriber at all. */}
+      <div className="audio-meta">
+        <span>
+          {dur != null && (
+            <>
+              Length {fmtDur(dur)}
+              {" · "}
+            </>
           )}
-        </div>
-      )}
+          {busy
+            ? "Transcribing on this Mac…"
+            : hasSpeech
+              ? "Transcript ready"
+              : rows.length > 0
+                ? "No speech detected"
+                : "No transcript yet"}
+        </span>
+        {!mediaDead && (
+          <button
+            className="btn-ic audio-retranscribe"
+            disabled={busy}
+            onClick={() => void retranscribe()}
+            title={
+              hasSpeech
+                ? "Run the on-device transcriber again, replacing this transcript"
+                : "Run the on-device transcriber on this file"
+            }
+          >
+            <RefreshIcon size={12} className={busy ? "spin" : undefined} />
+            {busy ? "Transcribing…" : hasSpeech ? "Re-transcribe" : "Transcribe"}
+          </button>
+        )}
+      </div>
       {retranscribeErr && <div className="gate-error">{retranscribeErr}</div>}
       {hasSpeech ? (
         <div className="audio-transcript" ref={listRef}>

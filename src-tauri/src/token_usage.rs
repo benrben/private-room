@@ -1,129 +1,58 @@
-//! Token-budget bar accounting for the external-CLI chat path (claude-cli /
-//! codex-cli as the room's primary engine). The Ollama path (local + `:cloud`)
-//! never touches this module — that categorization happens sidecar-side, in
-//! `usage.py`, since the sidecar is the only thing that sees the messages
-//! actually sent per round. `run_external` is one opaque call from Rust's
-//! perspective (Claude/Codex run their own internal tool loop), so this
-//! module categorizes the whole guarded message list once per turn, not per
-//! round — the best available approximation for these engines.
+//! Token-budget bar accounting for the ONE thing the host still computes: the
+//! placeholder snapshot shown immediately after a context handoff.
 //!
-//! Mirrors `sidecar/arcelle_sidecar/usage.py` rule for rule; keep the two in
-//! sync (same drift-risk precedent as `routing.py` vs `agent.rs`'s hint lists).
+//! Every real turn's usage is categorized SIDECAR-side, in `usage.py` — it is
+//! the only thing that sees the messages actually sent per round, and it scales
+//! its char estimate to the engine's own reported totals. This module used to
+//! carry a full Rust twin of that categorization (five buckets keyed off a
+//! hand-copied list of file/skill tool names someone had to keep in step with
+//! `usage.py`, plus a real-total scaling branch) from the era when a
+//! command-line cloud tool ran the room directly. That path is gone: the only
+//! caller left is `handoff_chat`, which has exactly one message and no engine
+//! usage at all, so all of it was unreachable.
+//!
+//! A handoff runs no LLM "ask" turn, so no `ask-token-usage` event fires on its
+//! own and the bar would keep showing the PRE-handoff numbers until the user
+//! asks something. This builds the interim snapshot out of the only thing
+//! actually known — the recap the next turn starts from — and flags it
+//! estimated, which the bar renders as "~".
 
-use crate::ollama;
-use std::collections::BTreeMap;
-
-//: chars/token — identical to usage.py's `CHARS_PER_TOKEN`.
+/// chars/token — the cold-start floor, identical to `usage.py`'s
+/// `CHARS_PER_TOKEN`. Deliberately low (undercounting bytes-per-token
+/// overstates tokens, the safe direction): the app's MEASURED ratio lives in
+/// the sidecar's process-global calibration (`model_limits.bytes_per_token`),
+/// which the host cannot read.
 pub(crate) const CHARS_PER_TOKEN: u64 = 3;
 
-//: The built-in tools whose results are literal file text/excerpts
-//: (agent.rs BUILTIN_TOOL_NAMES / room_mcp.rs).
-const FILE_TOOL_NAMES: &[&str] = &["open_file", "search_room"];
-
-//: Agent Skill CRUD/resource tools (routing.py::SKILL_TOOL_NAMES, mirrored).
-const SKILL_TOOL_NAMES: &[&str] = &[
-    "list_skills",
-    "read_skill",
-    "read_skill_resource",
-    "save_skill",
-    "write_skill_resource",
-    "delete_skill_resource",
-    "delete_skill",
-    "run_skill_script",
-];
-
-//: The 5 fixed breakdown categories, in the same order the frontend legend
-//: and segment stack use. Never reordered.
+/// The 5 fixed breakdown categories, in the same order the frontend legend and
+/// segment stack use. Never reordered.
 pub(crate) const CATEGORIES: &[&str] = &["system", "history", "tools", "skills", "files"];
 
-fn msg_len(m: &ollama::ChatMessage) -> usize {
-    let mut n = m.content.len();
-    if let Some(tc) = &m.tool_calls {
-        n += tc.to_string().len();
-    }
-    n
-}
-
-/// Bucket every message's byte length into one of the 5 categories. Unlike
-/// the sidecar's per-round version, there is no "tools offered this round"
-/// figure to seed `tools` with here (a single `run_external` call hides its
-/// own internal tool-calling rounds from Rust) — `tools` only accumulates
-/// actual tool-result message bytes.
-pub(crate) fn categorize_messages(messages: &[ollama::ChatMessage]) -> BTreeMap<&'static str, u64> {
-    let mut totals: BTreeMap<&'static str, u64> =
-        CATEGORIES.iter().map(|c| (*c, 0u64)).collect();
-    for m in messages {
-        let n = msg_len(m) as u64;
-        let bucket = match m.role.as_str() {
-            "system" => "system",
-            "tool" => {
-                let name = m.tool_name.as_deref().unwrap_or("");
-                if SKILL_TOOL_NAMES.contains(&name) {
-                    "skills"
-                } else if FILE_TOOL_NAMES.contains(&name) {
-                    "files"
-                } else {
-                    "tools"
-                }
-            }
-            "user" if m.images.as_ref().is_some_and(|v| !v.is_empty()) => "files",
-            _ => "history",
-        };
-        *totals.get_mut(bucket).unwrap() += n;
-    }
-    totals
-}
-
-/// The `AskTokenUsage` JSON value (apiTypes.ts) — snake_case, matching the
-/// sidecar-emitted shape exactly (see `sidecar/arcelle_sidecar/usage.py::
-/// build_usage_event`, which this mirrors). `real_total` is the engine's own
-/// reported prompt-token count for this turn, when available (`None` when
-/// the engine reported nothing, e.g. a parse failure) — the char-based
-/// per-category estimate is scaled to it when present, else shown as-is.
-pub(crate) fn build_usage_value(
-    real_total: Option<u64>,
-    max_context: u32,
-    breakdown_chars: &BTreeMap<&'static str, u64>,
-) -> serde_json::Value {
-    let est_breakdown: BTreeMap<&str, u64> = breakdown_chars
+/// The post-handoff `AskTokenUsage` value (apiTypes.ts) — snake_case, matching
+/// the sidecar-emitted shape exactly (see `usage.py::build_usage_event`).
+///
+/// The recap IS the whole conversation the next turn will start from, so it is
+/// the `history` category. Everything else that turn will carry (system prompt,
+/// skills preamble, memories, tool results) does not exist yet, so those
+/// categories are honestly zero and the snapshot is `estimated` end to end —
+/// the next real turn replaces it with the sidecar's measured numbers.
+pub(crate) fn handoff_usage_value(recap: &str, max_context: u32) -> serde_json::Value {
+    let history = recap.len() as u64 / CHARS_PER_TOKEN;
+    let breakdown: serde_json::Map<String, serde_json::Value> = CATEGORIES
         .iter()
-        .map(|(k, v)| (*k, v / CHARS_PER_TOKEN))
+        .map(|c| {
+            let tokens = if *c == "history" { history } else { 0 };
+            (
+                (*c).to_string(),
+                serde_json::json!({ "tokens": tokens, "estimated": true }),
+            )
+        })
         .collect();
-    let est_total: u64 = est_breakdown.values().sum();
-
-    let (breakdown_map, total_tokens, estimated) = match real_total {
-        Some(real) if est_total > 0 => {
-            let map: serde_json::Map<String, serde_json::Value> = est_breakdown
-                .iter()
-                .map(|(k, v)| {
-                    let scaled = ((*v as f64) * (real as f64) / (est_total as f64)).round() as u64;
-                    (
-                        (*k).to_string(),
-                        serde_json::json!({ "tokens": scaled, "estimated": true }),
-                    )
-                })
-                .collect();
-            (map, real, false)
-        }
-        _ => {
-            let map: serde_json::Map<String, serde_json::Value> = est_breakdown
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        (*k).to_string(),
-                        serde_json::json!({ "tokens": v, "estimated": true }),
-                    )
-                })
-                .collect();
-            (map, real_total.unwrap_or(est_total), real_total.is_none())
-        }
-    };
-
     serde_json::json!({
-        "total_tokens": total_tokens,
+        "total_tokens": history,
         "max_context": max_context,
-        "estimated": estimated,
-        "breakdown": breakdown_map,
+        "estimated": true,
+        "breakdown": breakdown,
     })
 }
 
@@ -131,67 +60,30 @@ pub(crate) fn build_usage_value(
 mod tests {
     use super::*;
 
-    fn tool_msg(name: &str, content: &str) -> ollama::ChatMessage {
-        let mut m = ollama::ChatMessage::new("tool", content);
-        m.tool_name = Some(name.to_string());
-        m
-    }
-
     #[test]
-    fn categorize_messages_buckets_by_role_and_tool_name() {
-        let messages = vec![
-            ollama::ChatMessage::new("system", "sys"),        // -> system
-            ollama::ChatMessage::new("user", "hello"),        // -> history
-            ollama::ChatMessage::new("assistant", "hi"),      // -> history
-            tool_msg("search_room", "found stuff"),           // -> files
-            tool_msg("open_file", "file text"),                // -> files
-            tool_msg("list_skills", "skill catalog"),          // -> skills
-            tool_msg("edit_file", "edit result"),              // -> tools (neither file nor skill tool)
-        ];
-        let totals = categorize_messages(&messages);
-        assert_eq!(totals["system"], 3);
-        assert_eq!(totals["history"], 5 + 2); // "hello" + "hi"
-        assert_eq!(totals["files"], "found stuff".len() as u64 + "file text".len() as u64);
-        assert_eq!(totals["skills"], "skill catalog".len() as u64);
-        assert_eq!(totals["tools"], "edit result".len() as u64);
-    }
-
-    #[test]
-    fn categorize_messages_buckets_image_bearing_user_turns_as_files() {
-        let mut m = ollama::ChatMessage::new("user", "[capture]");
-        m.images = Some(vec!["b64".to_string()]);
-        let totals = categorize_messages(&[m]);
-        assert_eq!(totals["files"], "[capture]".len() as u64);
-        assert_eq!(totals["history"], 0);
-    }
-
-    #[test]
-    fn build_usage_value_scales_estimate_to_a_real_total() {
-        let mut chars: BTreeMap<&'static str, u64> = BTreeMap::new();
-        chars.insert("system", 30); // -> 10 est tokens
-        chars.insert("history", 60); // -> 20 est tokens
-        chars.insert("tools", 0);
-        chars.insert("skills", 0);
-        chars.insert("files", 0);
-        // est_total = 30 tokens; real total is double that -> each category doubles.
-        let v = build_usage_value(Some(60), 8192, &chars);
-        assert_eq!(v["total_tokens"], 60);
-        assert_eq!(v["estimated"], false);
-        assert_eq!(v["breakdown"]["system"]["tokens"], 20);
-        assert_eq!(v["breakdown"]["history"]["tokens"], 40);
+    fn handoff_snapshot_charges_the_recap_to_history_only() {
+        let v = handoff_usage_value("123456789", 8192);
+        assert_eq!(v["total_tokens"], 3); // 9 bytes / 3
         assert_eq!(v["max_context"], 8192);
+        assert_eq!(v["estimated"], true);
+        assert_eq!(v["breakdown"]["history"]["tokens"], 3);
+        // Nothing else exists yet — those categories must not be invented.
+        for c in ["system", "tools", "skills", "files"] {
+            assert_eq!(v["breakdown"][c]["tokens"], 0, "{c}");
+            assert_eq!(v["breakdown"][c]["estimated"], true, "{c}");
+        }
     }
 
     #[test]
-    fn build_usage_value_falls_back_to_the_raw_estimate_with_no_real_total() {
-        let mut chars: BTreeMap<&'static str, u64> = BTreeMap::new();
-        chars.insert("system", 9); // -> 3 est tokens
-        for k in ["history", "tools", "skills", "files"] {
-            chars.insert(k, 0);
+    fn handoff_snapshot_keeps_every_legend_category() {
+        // The frontend stacks segments in CATEGORY_ORDER; a missing key would
+        // silently drop a segment, so the shape is pinned.
+        let v = handoff_usage_value("", 1);
+        let map = v["breakdown"].as_object().unwrap();
+        assert_eq!(map.len(), CATEGORIES.len());
+        for c in CATEGORIES {
+            assert!(map.contains_key(*c), "missing {c}");
         }
-        let v = build_usage_value(None, 8192, &chars);
-        assert_eq!(v["estimated"], true);
-        assert_eq!(v["total_tokens"], 3);
-        assert_eq!(v["breakdown"]["system"]["tokens"], 3);
+        assert_eq!(v["total_tokens"], 0);
     }
 }

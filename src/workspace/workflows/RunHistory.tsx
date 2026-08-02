@@ -160,13 +160,18 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
       return;
     }
     setOpenRun(run.id);
-    if (!artifacts[run.id] && run.jobId) {
-      const jobId = run.jobId;
-      const steps = await Promise.all(
-        Array.from({ length: Math.max(nodeCount, 1) }, (_, i) => api.getJobStepArtifact(jobId, i).catch(() => null)),
-      );
-      setArtifacts((a) => ({ ...a, [run.id]: steps }));
+    if (artifacts[run.id]) return;
+    const jobId = run.jobId;
+    // A run with no job never recorded anything — record that as an ANSWER, so
+    // the empty-state line below is only ever shown once the fetch is settled.
+    if (!jobId) {
+      setArtifacts((a) => ({ ...a, [run.id]: [] }));
+      return;
     }
+    const steps = await Promise.all(
+      Array.from({ length: Math.max(nodeCount, 1) }, (_, i) => api.getJobStepArtifact(jobId, i).catch(() => null)),
+    );
+    setArtifacts((a) => ({ ...a, [run.id]: steps }));
   }
 
   if (runs.length === 0) {
@@ -190,6 +195,10 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
     <div className="run-history">
       {shown.map((r, idx) => {
         const expanded = openRun === r.id;
+        // `undefined` = the artifacts are still being fetched. Treating that as
+        // an empty list flashed "No step artifacts recorded" over every run the
+        // moment it was opened.
+        const steps = artifacts[r.id];
         return (
           <div key={r.id} className="run-row">
             <button
@@ -212,11 +221,14 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
             )}
             {expanded && (
               <div>
-                {(artifacts[r.id] ?? []).map((a, i) =>
-                  a == null ? null : <StepRow key={i} index={i} raw={a} fallback={nodes?.[i]} />,
-                )}
-                {(artifacts[r.id] ?? []).every((a) => a == null) && (
+                {steps === undefined ? (
+                  <div className="run-step caption">Loading this run's steps…</div>
+                ) : steps.every((a) => a == null) ? (
                   <div className="run-step caption">No step artifacts recorded.</div>
+                ) : (
+                  steps.map((a, i) =>
+                    a == null ? null : <StepRow key={i} index={i} raw={a} fallback={nodes?.[i]} />,
+                  )
                 )}
               </div>
             )}

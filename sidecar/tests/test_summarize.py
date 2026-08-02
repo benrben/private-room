@@ -9,6 +9,7 @@ Three layers, all in-process (no network, no Ollama, no weights):
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -81,6 +82,27 @@ def test_clean_one_liner() -> None:
     assert summarize.clean_one_liner("- A lease agreement.\nExtra") == "A lease agreement."
     assert summarize.clean_one_liner("\n\n  The résumé.  ") == "The résumé."
     assert summarize.clean_one_liner("```boxes\n{junk}\n```\nThe map.") == "The map."
+
+
+def test_clean_one_liner_cut_stops_at_a_sentence_or_a_word() -> None:
+    # This line is the Room summary's file list AND what the assistant reads when
+    # listing files, so a hard slice at exactly 200 ended it mid-word, unmarked.
+    first = "A " + "long " * 30 + "lease agreement."  # ends well inside 200
+    over = first + " " + "And then a second sentence that pushes it past the cap. " * 4
+    cut = summarize.clean_one_liner(over)
+    assert len(cut) <= summarize.ONE_LINER_MAX
+    assert cut.endswith(".") and not cut.endswith("…")
+    assert cut == first  # cut at the sentence end, no ellipsis needed
+
+    # No sentence end in reach -> word boundary + a visible ellipsis.
+    runon = "supercalifragilistic " * 30
+    cut2 = summarize.clean_one_liner(runon)
+    assert len(cut2) <= summarize.ONE_LINER_MAX
+    assert cut2.endswith("…")
+    assert cut2.rstrip("…").endswith("supercalifragilistic")  # never mid-word
+
+    # A short line is untouched (no ellipsis, no cut).
+    assert summarize.clean_one_liner("A lease.") == "A lease."
 
 
 def test_strip_think_spans() -> None:
@@ -250,6 +272,116 @@ async def test_summarize_long_file_degrades_when_model_lacks_tool_support() -> N
     assert len(fake.generate_seen) == 1  # final call still ran
 
 
+async def test_summarize_all_noise_file_is_not_described_from_its_name() -> None:
+    # Everything is stripped by smart_filter (a base64 dump, a binary blob). The
+    # model used to be asked "what is this file about?" with NO text attached,
+    # so it guessed from the file NAME and the guess was stored as the file's
+    # description. An empty one-liner is the honest answer; summarize.rs already
+    # falls back to the mime type when the description is blank.
+    junk = "\n".join(
+        f"{i}QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODk="
+        for i in range(20)
+    )
+    assert summarize.smart_filter(junk).strip() == ""
+    fake = FakeModelClient()
+    out = await summarize.summarize_one_file(
+        fake, "m", "Q3 revenue report.bin", "application/octet-stream", junk, "30m"
+    )
+    assert out == ""
+    assert fake.generate_seen == [] and fake.tool_calls_seen == []  # no model call
+
+
+async def test_summarize_samples_never_repeat_the_head_window() -> None:
+    # Just past the 4 KB head, the "middle" and "end" samples both landed INSIDE
+    # the head, so the same passage was sent three times and the file's real tail
+    # was never shown.
+    text = "".join(f"Sentence number {i} about the quarterly report.\n" for i in range(90))
+    total = len(text.encode("utf-8"))
+    assert summarize.READ_WINDOW_DEFAULT < total < 2 * summarize.READ_WINDOW_DEFAULT
+    fake = FakeModelClient(tool_rounds=[("", [])], generates=['{"summary":"A report."}'])
+    await summarize.summarize_one_file(fake, "m", "r.txt", "text/plain", text, "30m")
+    user = fake.tool_calls_seen[0]["messages"][1]["content"]
+    spans = [(int(a), int(b)) for a, b in re.findall(r"Characters (\d+)-(\d+) \(", user)]
+    assert spans[0][0] == 0, "the first sample is still the head"
+    assert all(nxt[0] >= cur[1] for cur, nxt in zip(spans, spans[1:])), spans
+    assert spans[-1][1] == total, "the file's tail is still covered"
+
+
+async def test_summarize_answers_every_tool_call_when_the_budget_runs_out() -> None:
+    # A model that asks for several windows at once used to leave the calls past
+    # the read budget with NO tool reply. A local Ollama shrugs that off; an
+    # OpenAI-compatible provider rejects the turn and the summary fails.
+    text = _long_text_with_manifest()
+    batch = [
+        ToolCall(name="read_text", arguments={"offset": i * 500, "limit": 300}, id=f"c{i}")
+        for i in range(summarize.MAX_READS + 2)
+    ]
+    fake = FakeModelClient(
+        tool_rounds=[("", batch)],
+        generates=['{"summary":"A log file."}'],
+    )
+    await summarize.summarize_one_file(fake, "m", "big.log", "text/plain", text, "30m")
+    sent = fake.generate_seen[0]["messages"]
+    requested = sum(len(m.get("tool_calls") or []) for m in sent if m.get("role") == "assistant")
+    answered = sum(1 for m in sent if m.get("role") == "tool")
+    assert requested == len(batch)
+    assert answered == requested, "every tool call must carry a reply"
+    assert any("read budget for this file is used up" in m["content"] for m in sent if m.get("role") == "tool")
+
+
+class _LocalModelClient(FakeModelClient):
+    """A scripted fake that LOOKS local: it carries the Ollama base_url, so the
+    gather budget can resolve the model's own native window."""
+
+    base_url = "http://127.0.0.1:11434"
+
+
+async def test_the_gather_budget_follows_the_model_not_the_mac(monkeypatch: Any) -> None:
+    """`max_num_ctx()` is the biggest window this MAC may ask for; `pick_num_ctx`
+    then clamps every actual call to the model's own native length. Budgeting the
+    reads off the RAM ceiling alone gave a small-window model roughly double what
+    fits, and an oversized prompt loses its FRONT — the system prompt and the
+    instruction — so the summary came back rambling or empty with no error."""
+
+    async def _tiny(model: str, base_url: str) -> int | None:
+        return 8_192
+
+    monkeypatch.setattr(summarize, "native_context_length", _tiny)
+    assert await summarize._gather_window(_LocalModelClient(), "m") == 8_192
+    # Nothing local to size — no base_url, a provider client, or a cloud CLI —
+    # keeps the ceiling, which is what those engines got before.
+    assert await summarize._gather_window(FakeModelClient(), "m") == summarize.max_num_ctx()
+    via_provider = _LocalModelClient()
+    via_provider.provider = object()  # type: ignore[attr-defined]
+    assert await summarize._gather_window(via_provider, "m") == summarize.max_num_ctx()
+    assert await summarize._gather_window(_LocalModelClient(), "claude-cli") == summarize.max_num_ctx()
+
+
+async def test_a_small_window_model_reads_less_of_a_long_file(monkeypatch: Any) -> None:
+    text = _long_text_with_manifest()
+
+    def _scripted(cls: Any) -> Any:
+        return cls(
+            tool_rounds=[("", [_tc(offset=5_000, limit=summarize.READ_WINDOW_MAX)]), ("", [])],
+            generates=['{"summary":"A log file."}'],
+        )
+
+    async def _tiny(model: str, base_url: str) -> int | None:
+        return 8_192
+
+    monkeypatch.setattr(summarize, "native_context_length", _tiny)
+    small = _scripted(_LocalModelClient)
+    await summarize.summarize_one_file(small, "m", "big.log", "text/plain", text, "30m")
+    ceiling = _scripted(FakeModelClient)  # no base_url -> the RAM ceiling, as before
+    await summarize.summarize_one_file(ceiling, "m", "big.log", "text/plain", text, "30m")
+
+    def _read_bytes(fake: Any) -> int:
+        tool_msgs = [m for m in fake.generate_seen[0]["messages"] if m.get("role") == "tool"]
+        return len(tool_msgs[0]["content"].encode("utf-8"))
+
+    assert _read_bytes(small) < _read_bytes(ceiling)
+
+
 async def test_summarize_long_file_propagates_ollama_down() -> None:
     text = _long_text_with_manifest()
     fake = FakeModelClient(tool_rounds=[LlmError("OLLAMA_DOWN", "refused")])
@@ -322,7 +454,9 @@ def patch_model(monkeypatch: pytest.MonkeyPatch):
 
     def install(fake: FakeModelClient) -> None:
         monkeypatch.setattr(
-            summarize, "OllamaModelClient", lambda base_url, privacy=None: fake
+            summarize,
+            "OllamaModelClient",
+            lambda base_url, privacy=None, provider=None: fake,
         )
 
     return install

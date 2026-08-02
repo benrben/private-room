@@ -23,6 +23,24 @@ export default function TabStrip({
   const [dragging, setDragging] = useState<string>("");
   const stripRef = useRef<HTMLDivElement>(null);
 
+  /** Roving focus: a `role="tablist"` owes Left/Right (and Home/End) — without
+   * them the strip claims to be a tab strip that keyboard users can't move
+   * through. Focus moves first, then the shell decides whether the switch is
+   * allowed (it can refuse on unsaved edits). */
+  const focusTab = (index: number) => {
+    const nodes =
+      stripRef.current?.querySelectorAll<HTMLElement>('[role="tab"]');
+    nodes?.[index]?.focus();
+  };
+
+  const arrowTo = (from: number, delta: number) => {
+    const count = tabs.tabs.length;
+    if (count < 2) return;
+    const to = (from + delta + count) % count;
+    focusTab(to);
+    tabs.activate(tabs.tabs[to].id);
+  };
+
   if (!tabs.tabs.length) return null;
 
   return (
@@ -52,6 +70,18 @@ export default function TabStrip({
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
                 tabs.activate(tab.id);
+                return;
+              }
+              if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+                e.preventDefault();
+                arrowTo(index, e.key === "ArrowRight" ? 1 : -1);
+                return;
+              }
+              if (e.key === "Home" || e.key === "End") {
+                e.preventDefault();
+                const to = e.key === "Home" ? 0 : tabs.tabs.length - 1;
+                focusTab(to);
+                tabs.activate(tabs.tabs[to].id);
               }
             }}
             onAuxClick={(e) => {

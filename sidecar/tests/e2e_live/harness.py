@@ -47,9 +47,20 @@ BASE_SYSTEM = (
 
 
 def skip_unless_live() -> None:
-    """Module-level opt-in gate. Env first (cheap), daemon+model second."""
+    """Module-level opt-in gate. Env first (cheap), daemon+model second.
+
+    Each skip here silences a WHOLE FILE, and the reasons say so: the run
+    summary counts one skip per module, so "4 skipped" is four FILES of
+    live-model tests, not four tests. Read at a glance that is easy to
+    mistake for a rounding error rather than the entire live tier.
+    """
     if not os.environ.get("ARCELLE_E2E"):
-        pytest.skip("live e2e is opt-in: set ARCELLE_E2E=1", allow_module_level=True)
+        pytest.skip(
+            "live e2e: this WHOLE FILE was skipped (one skip = one file, not one "
+            "test). Opt in with ARCELLE_E2E=1 — it needs a live model and minutes "
+            "of model time, so the fast suite never runs it.",
+            allow_module_level=True,
+        )
     try:
         tags = httpx.get(f"{OLLAMA}/api/tags", timeout=3.0).json()
         served = any(
@@ -60,7 +71,9 @@ def skip_unless_live() -> None:
         served = False
     if not served:
         pytest.skip(
-            f"Ollama at {OLLAMA} does not serve {E2E_MODEL}", allow_module_level=True
+            f"live e2e: this WHOLE FILE was skipped — Ollama at {OLLAMA} does not "
+            f"serve {E2E_MODEL} (override with ARCELLE_E2E_MODEL)",
+            allow_module_level=True,
         )
 
 
@@ -199,7 +212,7 @@ async def run_ask(
         "run_id": "e2e",
     }
     if turn_max_rounds is not None:
-        # The whole-ask round ceiling (config.TURN_ROUND_BUDGET). A test that
+        # The whole-ask runaway net (config.TURN_ROUND_BACKSTOP). A test that
         # deliberately starves the model needs this, or the starved run spends
         # its time delegating in circles instead of answering — measured at 32
         # rounds and 890 s before the bound existed.

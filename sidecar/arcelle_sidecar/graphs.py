@@ -18,9 +18,9 @@ plain tool-calling loop) and DISTINCT where it is not.
 
 The invariant that makes this safe
 ----------------------------------
-SPEC §3.2's guarantees — the tool-less final round, only-successful-calls are
-memoised, an all-duplicate round forces synthesis, cancellation between rounds
-AND between tool calls, blank-becomes-"Done."-but-never-when-cancelled — are
+SPEC §3.2's guarantees — the tool-less final round, only-successful-room-calls
+are memoised, an all-duplicate round forces synthesis, cancellation between
+rounds AND between tool calls, a blank answer never read back as success — are
 properties of the NODE FUNCTIONS in :mod:`.graph`, not of the wiring. Every
 template below composes those same functions. A new template therefore cannot
 quietly drop an invariant: to break one you would have to write a new node, not
@@ -169,6 +169,51 @@ CLAIM_UNSUPPORTED = (
     "write tools ran but no file or artifact was recorded — the write did not "
     "land, so do not tell the user anything was saved or changed."
 )
+
+#: The re-offer note `stage_catalog` leaves when the model skipped a stage.
+#:
+#: Unlike `CLAIM_UNSUPPORTED` — a fact about the turn, which stays true — this
+#: one is an ORDER TO CALL A TOOL, and nothing in `corrections` expires on its
+#: own: `graph.call_model` re-injects the whole list every round. So the chain's
+#: closing round, which offers ZERO tools by design, still carried "call
+#: fetch_page now", and a 4B answered "I will now fetch the page" instead of
+#: writing the answer. One template, so the retirement below can recognise it.
+STAGE_MISSED_NOTE = (
+    "You have not called {tool} yet, and this task is not finished without it. "
+    "Call it now, then answer from what it returns."
+)
+
+
+def _live_corrections(state: AgentState) -> list[str]:
+    """The corrections still true — i.e. minus the tool orders already obeyed.
+
+    Only :data:`STAGE_MISSED_NOTE` retires: it is the one correction that tells
+    the model to CALL something, so calling it is what makes the note false. A
+    ground-truth correction about what the tools DID stays in the list, because
+    it stays true — the model has to restate its answer, not run anything.
+    """
+    obeyed = {STAGE_MISSED_NOTE.format(tool=t) for t in state.get("attempted", set())}
+    return [c for c in state.get("corrections", []) if c not in obeyed]
+
+
+def _without_tool_orders(state: AgentState) -> list[str]:
+    """The corrections minus EVERY order to call something, obeyed or not.
+
+    `_live_corrections` retires an order once the tool has been called, which is
+    the right predicate while there are still tools to call. It is the wrong one
+    for the tool-less round: the note exists precisely BECAUSE the tool was not
+    called, so the single case that round has to be rid of is the one that
+    survives that filter. Here the round itself makes every such order
+    impossible, so all of them go — and only they do, because a ground-truth
+    correction stays true with or without a catalog.
+
+    The candidate set is exact: `stage_catalog` is the only writer of
+    `STAGE_MISSED_NOTE` and only ever formats it with one of this agent's own
+    stages.
+    """
+    stages = get_agent(state.get("agent_id", "")).flow.stages
+    orders = {STAGE_MISSED_NOTE.format(tool=s) for s in stages}
+    return [c for c in state.get("corrections", []) if c not in orders]
 
 
 def narrowed(state: AgentState, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -500,9 +545,8 @@ async def stage_catalog(state: AgentState) -> dict[str, Any]:
             "full_tools": box,
             "stage_retried": True,
             "corrections": [
-                f"You have not called {want_again} yet, and this task is not "
-                f"finished without it. Call it now, then answer from what it "
-                f"returns."
+                *_live_corrections(state),
+                STAGE_MISSED_NOTE.format(tool=want_again),
             ],
         }
     want = stages[idx]
@@ -514,6 +558,25 @@ async def stage_catalog(state: AgentState) -> dict[str, Any]:
     keep = set(spec.flow.keep) | {want}
     this_stage = [t for t in box if (t.get("function") or {}).get("name") in keep]
     return {"tools": narrowed(state, this_stage), "stage": idx + 1, "full_tools": box}
+
+
+def _stage_re_offer_due(state: AgentState) -> bool:
+    """A staged verb was never actually called, and the one re-offer is unspent.
+
+    Read by BOTH stage routers, which is the point. `stage` counts stages
+    OFFERED, and ANY tool call advances the chain: `chat.web` keeps
+    `search_room` and the download verbs offered alongside every stage
+    (`flow.keep`), so a round that searched the ROOM consumed the "search the
+    web" stage — the chain moved on to `fetch_page`, `web_search` was never
+    offered again, and the Web agent could finish a web task having never
+    touched the web. Only the declined-stage exit checked for that, and the exit
+    taken after a tool ran is the one that case takes.
+    """
+    stages = get_agent(state.get("agent_id", "")).flow.stages
+    attempted: set[str] = set(state.get("attempted", set()))
+    return any(s not in attempted for s in stages) and not state.get(
+        "stage_retried", False
+    )
 
 
 def route_after_stage_model(state: AgentState) -> str:
@@ -538,17 +601,14 @@ def route_after_stage_model(state: AgentState) -> str:
     if state.get("force_synthesis", False):
         # The forced tool-less answer round. Not a declined stage.
         return "synthesize"
-    spec = get_agent(state.get("agent_id", ""))
-    stages = spec.flow.stages
     # Stages the model has not been OFFERED yet.
-    if state.get("stage", 0) < len(stages):
+    if state.get("stage", 0) < len(get_agent(state.get("agent_id", "")).flow.stages):
         return "stage_catalog"
     # Every stage was offered, and the model answered without calling one of
     # them. That is the skip this shape exists to prevent, so re-offer the
     # missed verb ONCE — bounded by `stage_retried`, so a model that declines
     # twice gets to answer rather than looping.
-    attempted: set[str] = set(state.get("attempted", set()))
-    if any(s not in attempted for s in stages) and not state.get("stage_retried", False):
+    if _stage_re_offer_due(state):
         return "stage_catalog"
     return "synthesize"
 
@@ -565,6 +625,13 @@ def route_after_stage_tools(state: AgentState) -> str:
         return "synthesize"
     spec = get_agent(state.get("agent_id", ""))
     if state.get("stage", 0) < len(spec.flow.stages):
+        return "stage_catalog"
+    # Every stage was OFFERED, but a side tool spent one of them: `stage` counts
+    # offers, and a `flow.keep` verb advances the chain exactly as the staged one
+    # does. Same single re-offer the declined-stage exit gets
+    # (`_stage_re_offer_due`) — without it the chain could close with its own
+    # verb never called.
+    if _stage_re_offer_due(state):
         return "stage_catalog"
     return "force_final"
 
@@ -586,7 +653,7 @@ async def check_result(state: AgentState) -> dict[str, Any]:
     markers = spec.flow.failure_markers
     cap = spec.flow.repair_cap
     if not markers or cap <= 0:
-        return {"checked": True, "repair_needed": False}
+        return {"repair_needed": False}
 
     last = ""
     for msg in reversed(state.get("messages", [])):
@@ -596,7 +663,7 @@ async def check_result(state: AgentState) -> dict[str, Any]:
     if not any(m.lower() in last for m in markers):
         # The latest attempt came back clean — whatever earlier passes cost, the
         # thing works now, so stop.
-        return {"checked": True, "repair_needed": False}
+        return {"repair_needed": False}
 
     # A failure marker is still present. Spend a pass if one is left.
     #
@@ -606,12 +673,17 @@ async def check_result(state: AgentState) -> dict[str, Any]:
     # what `repair_cap` said. Verified before the fix: scripts.run (cap 1),
     # skills.author (cap 2) and jobs.workflows (cap 2) produced byte-identical
     # runs. Two agents declared a budget of two and were silently given one.
+    #
+    # `checked` and `repaired` went on being written on every branch after the
+    # counter replaced the latch, and nothing anywhere read either one (removed
+    # 2026-08-01). `repairs` is the whole gate: it bounds the loop, and it is
+    # what the visit count is measured against.
     repairs = state.get("repairs", 0)
     if repairs >= cap:
         # Out of passes. Report the failure honestly rather than loop — looping
         # a 4B on a broken script is how it starts inventing output.
-        return {"checked": True, "repair_needed": False, "repaired": True}
-    return {"checked": True, "repair_needed": True, "repairs": repairs + 1}
+        return {"repair_needed": False}
+    return {"repair_needed": True, "repairs": repairs + 1}
 
 
 def route_after_check(state: AgentState) -> str:
@@ -742,17 +814,27 @@ def _react(g: StateGraph) -> StateGraph:
     return g
 
 
-async def _force_final(state: AgentState) -> dict[str, Any]:  # noqa: ARG001
+async def _force_final(state: AgentState) -> dict[str, Any]:
     """End the tool phase: the next model round is the tool-less one.
 
-    Reads nothing, but `state` STAYS: LangGraph passes the state positionally, so
-    the shortest honest signature a node can have is one parameter. Verified
-    against langgraph 1.2.9 — a zero-argument node raises
-    ``TypeError: takes 0 positional arguments but 1 was given`` at invoke time,
-    i.e. it compiles clean and dies on the first real turn. Hence the scoped
-    ARG001 suppression rather than a smaller signature.
+    ...and retire EVERY correction that ORDERED a tool call, because that round
+    has no tools to obey it with. This node is the ONLY door from the chain's
+    tool phase into its answer round, which is what makes it the right place:
+    `stage_catalog` is not visited again once every stage has been offered.
+
+    It used to filter with `_live_corrections`, which drops an order only once
+    the tool HAS been called — and the order is raised only because it was NOT,
+    so it survived in exactly the case this is here to fix: the model spends the
+    re-offer round on a `flow.keep` side tool, `route_after_stage_tools` sends
+    it here, and the tool-less answer round is still told "call web_search now".
+    A 4B answers "I will now search the web" instead of writing the answer.
+
+    `state` was formerly unread and kept only because LangGraph passes it
+    positionally (a zero-argument node raises ``TypeError: takes 0 positional
+    arguments but 1 was given`` at invoke time, verified against langgraph
+    1.2.9). It is read now.
     """
-    return {"force_synthesis": True}
+    return {"force_synthesis": True, "corrections": _without_tool_orders(state)}
 
 
 # `_oneshot` lived here and is DELETED (2026-07-25). It allowed EXACTLY ONE

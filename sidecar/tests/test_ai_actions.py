@@ -8,6 +8,8 @@ error/degrade behaviour the Rust originals had (an engine failure propagates for
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +19,15 @@ from ollama import ResponseError
 
 from arcelle_sidecar import ai_actions, llm
 from arcelle_sidecar.server import create_app
+
+#: The app-side twin of the action table. It owns the menu (title, description,
+#: order) and posts `action` + the resolved `instructions`; this module owns the
+#: system prompts. `default_prompt` is the one field written out in BOTH, so the
+#: last test in this file is what stops the two from drifting.
+_RUST = (
+    Path(__file__).resolve().parents[2]
+    / "src-tauri" / "src" / "commands" / "moonshot" / "ai_actions.rs"
+)
 
 
 # --- fakes (same shape as test_llm) -----------------------------------------
@@ -79,6 +90,33 @@ def test_catalog_is_the_fourteen_actions_in_menu_order() -> None:
         assert a.needs_language == (a.id == "translate")
         assert a.default_prompt.strip()
         assert a.system.strip()
+
+
+def test_catalog_matches_the_rust_menu_table() -> None:
+    """Adding an action means editing BOTH tables; nothing compared them before.
+
+    The frontend menu is built from the Rust table and every run is dispatched by
+    `id` into this one, so a new entry on one side only either offers the user an
+    action the engine rejects (UNKNOWN_ACTION) or hides one that works. The
+    `default_prompt` wording is compared too — it is sent as `instructions`, so a
+    silent edit on one side changes what actually runs while this file still
+    documents the old wording.
+    """
+    if not _RUST.exists():  # pragma: no cover - only outside the repo checkout
+        pytest.skip("the Rust host is not part of this checkout")
+    src = _RUST.read_text()
+    table = re.search(r"pub\(crate\) const AI_ACTIONS: &\[AiActionSpec\] = &\[(.*?)\n\];", src, re.S)
+    assert table, "the AI_ACTIONS table moved — update this parity check"
+    entries = re.findall(r"AiActionSpec \{(.*?)\n    \},", table.group(1), re.S)
+    assert len(entries) == len(ai_actions.AI_ACTIONS)
+    for body, spec in zip(entries, ai_actions.AI_ACTIONS, strict=True):
+        text = dict(re.findall(r'(\w+): "(.*?)",', body))
+        flags = dict(re.findall(r"(\w+): (true|false),", body))
+        assert text["id"] == spec.id
+        assert text["scope"] == spec.scope
+        assert text["default_prompt"] == spec.default_prompt
+        assert (flags["needs_question"] == "true") is spec.needs_question
+        assert (flags["needs_language"] == "true") is spec.needs_language
 
 
 # --- /ai_action -------------------------------------------------------------
@@ -184,6 +222,36 @@ async def test_ai_action_translate_without_language_errors(fake_client: type[Fak
     assert "chat" not in fake_client.calls  # no model call
 
 
+async def test_ai_action_research_without_a_question_errors(fake_client: type[FakeAsyncClient]) -> None:
+    # The backstop translate already had: without it the model is told to "answer
+    # the question" with no question in the prompt, and invents one.
+    fake_client.script["chat"] = RuntimeError("must not be called")
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/ai_action",
+            json={"model": "m", "action": "research", "text": "room text", "base_url": "http://h:1"},
+        )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "Ask a question first.", "code": "NEEDS_QUESTION"}
+    assert "chat" not in fake_client.calls  # no model call
+
+
+async def test_ai_action_caps_output_tokens(fake_client: type[FakeAsyncClient]) -> None:
+    # A runaway guard, not a quality limit: Rust clamps the gathered material to
+    # ~12 KB, so a real action lands far below this — but an uncapped degenerate
+    # repetition loop on a small local model fills the whole (payload-fitted,
+    # up to 128k) window and the menu just appears to hang.
+    fake_client.script["chat"] = _reply('{"markdown": "ok"}')
+    app = create_app()
+    async with client_for(app) as c:
+        await c.post(
+            "/ai_action",
+            json={"model": "m", "action": "translate", "text": "t", "question": "French", "base_url": "http://h:1"},
+        )
+    assert fake_client.calls["chat"]["options"]["num_predict"] == ai_actions.ACTION_PREDICT
+
+
 async def test_ai_action_unknown_action_errors(fake_client: type[FakeAsyncClient]) -> None:
     app = create_app()
     async with client_for(app) as c:
@@ -203,6 +271,25 @@ async def test_ai_action_empty_markdown_is_nothing_usable(fake_client: type[Fake
     assert resp.status_code == 422
     assert resp.json() == {
         "error": "The model didn't return anything usable — try a different file.",
+        "code": "EMPTY_RESULT",
+    }
+
+
+async def test_ai_action_room_scope_empty_result_does_not_blame_a_file(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # compare/timeline/themes/gaps/research read the WHOLE room, so "try a
+    # different file" sent the user hunting for a file that does not exist.
+    fake_client.script["chat"] = _reply('{"markdown": ""}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/ai_action",
+            json={"model": "m", "action": "themes", "text": "t", "base_url": "http://h:1"},
+        )
+    assert resp.status_code == 422
+    assert resp.json() == {
+        "error": "The model didn't return anything usable — try again, or add more material to this room.",
         "code": "EMPTY_RESULT",
     }
 

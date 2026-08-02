@@ -26,6 +26,9 @@ export default function HtmlView({ source, name }: Props) {
   const [url, setUrl] = useState("");
   const [failed, setFailed] = useState(false);
   const [opening, setOpening] = useState(false);
+  // "Opening…" flicking back to normal with nothing else on screen reads as
+  // success; a failure has to say so.
+  const [openErr, setOpenErr] = useState<string | null>(null);
 
   // Stage the page and load it from roomdoc://; if staging fails, fall back to
   // a sandboxed srcDoc so at least static content still shows.
@@ -51,10 +54,13 @@ export default function HtmlView({ source, name }: Props) {
   async function openInBrowser() {
     if (opening) return;
     setOpening(true);
+    setOpenErr(null);
     try {
       await api.openHtmlInBrowser(name ?? "preview", source);
-    } catch {
-      /* best-effort — the in-app preview still works */
+    } catch (e) {
+      setOpenErr(
+        `Couldn't hand this page to your browser — ${String(e)}. The in-app preview below still works.`,
+      );
     } finally {
       setOpening(false);
     }
@@ -78,6 +84,11 @@ export default function HtmlView({ source, name }: Props) {
           </button>
         </span>
       </div>
+      {openErr && (
+        <div className="gate-error" role="alert">
+          {openErr}
+        </div>
+      )}
       {url ? (
         <iframe
           key={url}

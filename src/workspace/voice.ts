@@ -99,6 +99,10 @@ let lastChunkEnd = 0;
 let onTurnAudioDone: (() => void) | null = null;
 /** Per-message play state callback (Play/Stop button label). */
 let onManualState: ((playing: boolean) => void) | null = null;
+/** Where a sentence that could not be synthesized is reported (a toast). */
+let onVoiceProblem: ((message: string) => void) | null = null;
+/** One report per turn, not one per dropped sentence. */
+let problemReported = false;
 
 /** Cached procedurally-generated impulse responses, keyed `${secs}:${decay}`.
  * Tied to the AudioContext (buffers belong to it). */
@@ -156,6 +160,7 @@ export function beginTurn(): void {
   deltasFed = false;
   turnEnded = false;
   streamedTurn = true;
+  problemReported = false;
   overrides = null;
 }
 
@@ -242,6 +247,7 @@ export function speakText(
   epoch += 1;
   turnEpoch = epoch;
   streamedTurn = false;
+  problemReported = false;
   if (
     opts?.archetype !== undefined ||
     opts?.params ||
@@ -273,6 +279,27 @@ let overrides: {
 
 export function setTurnAudioDoneListener(cb: (() => void) | null): void {
   onTurnAudioDone = cb;
+}
+
+/** Where a synthesis failure is reported (effects.ts turns it into a toast).
+ * There is NO on-device fallback voice: a sentence that cannot be synthesized
+ * is dropped, and without this the app simply went quiet and looked mute. */
+export function setVoiceProblemListener(
+  cb: ((message: string) => void) | null,
+): void {
+  onVoiceProblem = cb;
+}
+
+/** At most once per turn — one answer that cannot be spoken is ONE problem,
+ * not one per sentence. */
+function reportVoiceProblem(): void {
+  if (problemReported) return;
+  problemReported = true;
+  onVoiceProblem?.(
+    navigator.onLine
+      ? "Couldn't read that aloud — the voice service didn't answer. The answer is still on screen."
+      : "Couldn't read that aloud — reading answers aloud needs an internet connection. The answer is still on screen.",
+  );
 }
 
 function activeArchetype(): VoiceArchetype {
@@ -321,7 +348,12 @@ function extractSentences(force: boolean): void {
     work = work.slice(0, fenceIdx);
   }
 
-  const re = /[.!?…]+[\s"')\]]*/g;
+  // Sentence enders, Western AND CJK: 。！？ are the full stop / bang / query
+  // of Chinese and Japanese, and their closing quotes and brackets are the
+  // trailing punctuation that belongs to the sentence just cut. Without them
+  // those scripts never split at all and the whole answer arrives as one
+  // over-long chunk the synthesizer refuses (see emit).
+  const re = /[.!?…。！？]+[\s"')\]」』）】》〉”’]*/g;
   let cut = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(work))) {
@@ -335,13 +367,16 @@ function extractSentences(force: boolean): void {
   }
   let rest = work.slice(cut);
 
-  // Force-flush a runaway sentence at ~300 chars, cutting on a comma or space.
+  // Force-flush a runaway sentence at ~300 chars, cutting on the nearest
+  // mid-sentence break — and on the character count when there is none, which
+  // is the normal case in CJK (no spaces, and a clause can run without any
+  // punctuation). Bailing out there used to leave the chunk to grow past the
+  // synthesizer's limit, where it was dropped without a sound.
   while (rest.length + carry.length > FORCE_FLUSH_CHARS) {
-    const window = rest.slice(0, FORCE_FLUSH_CHARS);
-    const at = Math.max(window.lastIndexOf(","), window.lastIndexOf(" "));
-    if (at <= 0) break;
-    emit(rest.slice(0, at + 1));
-    rest = rest.slice(at + 1);
+    const cutAt = breakPoint(rest.slice(0, FORCE_FLUSH_CHARS));
+    if (cutAt <= 0) break;
+    emit(rest.slice(0, cutAt));
+    rest = rest.slice(cutAt);
   }
 
   if (force) {
@@ -354,11 +389,41 @@ function extractSentences(force: boolean): void {
   }
 }
 
-/** Queue one cut chunk, merging short ones forward until ~60 chars. */
+/** Mid-sentence break characters. `、，；：` are the ideographic and fullwidth
+ * forms: Chinese and Japanese write no spaces, so without them a long clause
+ * offers nowhere to cut. */
+const SOFT_BREAKS = ",;: 、，；：";
+
+/** Where to cut a chunk that has outgrown FORCE_FLUSH_CHARS: just past the
+ * last break character in `window`, or the end of the window itself when it
+ * holds none. Non-zero for any non-empty window, so callers can loop on it. */
+function breakPoint(window: string): number {
+  let at = -1;
+  for (const ch of SOFT_BREAKS) at = Math.max(at, window.lastIndexOf(ch));
+  return at > 0 ? at + 1 : window.length;
+}
+
+/** Queue one cut chunk, merging short ones forward until ~60 chars. One
+ * sentence can still be longer than the synthesizer's per-call limit
+ * (MAX_SPEAK_CHARS = 1,000 in speak_text_neural, which rejects an oversize
+ * chunk — and `pump` skips a rejected chunk without a word), so anything past
+ * the force-flush size is split here as well. */
 function emit(raw: string): void {
-  const s = stripForSpeech(raw);
+  let s = stripForSpeech(raw);
   if (!s) return;
-  carry = carry ? `${carry} ${s}` : s;
+  while (s.length > FORCE_FLUSH_CHARS) {
+    const cutAt = breakPoint(s.slice(0, FORCE_FLUSH_CHARS));
+    if (cutAt <= 0) break;
+    queueChunk(s.slice(0, cutAt));
+    s = s.slice(cutAt).trimStart();
+  }
+  queueChunk(s);
+}
+
+/** Merge one piece into the carry, flushing once it is worth speaking. */
+function queueChunk(piece: string): void {
+  if (!piece) return;
+  carry = carry ? `${carry} ${piece}` : piece;
   if (carry.length >= MIN_CHUNK_CHARS) flushCarry();
 }
 
@@ -389,7 +454,10 @@ async function pump(): Promise<void> {
         // not synthesis-side.
         b64 = await api.speakTextNeural(text, activeNeuralVoiceId());
       } catch {
-        continue; // offline / sidecar down: skip this sentence, try the next
+        // Offline / sidecar down: skip this sentence and try the next — but
+        // say so, once. Silence is indistinguishable from a broken app.
+        reportVoiceProblem();
+        continue;
       }
       if (epoch !== myEpoch) return;
       const c = ctx;

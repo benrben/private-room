@@ -199,6 +199,33 @@ def test_marginalia_snippet_cannot_steal_the_next_results_blurb(monkeypatch: Any
     assert [h["snippet"] for h in hits] == [None, "Two's description."]
 
 
+def test_marginalia_keeps_articles_that_merely_mention_marginalia(monkeypatch: Any) -> None:
+    """Self-links are matched on the HOST. Matching the bare word anywhere in the
+    URL threw away exactly the pages this engine is best at finding."""
+    html = """
+      <h2><a href="https://blog.example/marginalia-in-medieval-books">Marginalia in books</a></h2>
+      <h2><a href="https://search.marginalia.nu/site/blog.example">Site info</a></h2>
+      <h2><a href="https://old-search.marginalia.nu/settings">Settings</a></h2>
+    """
+    monkeypatch.setattr(w, "_get", lambda *a, **k: FakeResponse(text=html))
+    hits = w.marginalia("marginalia")
+    assert [h["url"] for h in hits] == ["https://blog.example/marginalia-in-medieval-books"]
+
+
+def test_collect_excludes_by_host_not_by_substring() -> None:
+    html = """
+      <a href="https://engine.com/settings">Engine settings page</a>
+      <a href="https://www.engine.com/about">Engine about page</a>
+      <a href="https://notengine.com/story">A real story elsewhere</a>
+      <a href="https://good.com/why-engine.com-matters">A piece about engine.com</a>
+    """
+    hits = w._collect(anchors(html), "eng", k=10, exclude="engine.com")
+    assert [h["url"] for h in hits] == [
+        "https://notengine.com/story",
+        "https://good.com/why-engine.com-matters",
+    ]
+
+
 def test_wikipedia_parses_opensearch(monkeypatch: Any) -> None:
     payload = [
         "bank of israel",
@@ -376,6 +403,58 @@ def test_all_engines_dead_returns_empty_not_an_error() -> None:
     assert w.search("page", engines=[engine("e1"), engine("e2")]) == []
 
 
+# ── failed vs. found nothing ────────────────────────────────────────────────────
+
+
+def dead_engine(name: str) -> Any:
+    """An engine that cannot reach the network at all."""
+
+    @w._fails_soft
+    def run(query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        raise requests.ConnectionError("no route to host")
+
+    run.__name__ = name
+    return run
+
+
+def test_an_engine_that_found_nothing_is_not_reported_as_failed() -> None:
+    """An empty answer is an answer: no instant answer, no Wikipedia page. Reporting
+    that as a failure would make every ordinary search look broken."""
+    payload = w.timed_search("page", engines=[engine("e1"), engine("e2", "https://a.com/p")])
+    assert payload["failed"] == []
+
+
+def test_a_search_with_nothing_reachable_says_the_engines_failed() -> None:
+    """Offline is not 'no results'. With every engine unreachable the payload has no
+    hits AND names all of them, so the results page can say the search failed instead
+    of blaming the user's wording."""
+    payload = w.timed_search("page", engines=[dead_engine("e1"), dead_engine("e2")])
+    assert payload["hits"] == []
+    assert payload["failed"] == ["e1", "e2"]
+
+
+def test_a_blocked_engine_is_named_even_when_the_others_answer(monkeypatch: Any) -> None:
+    """A bot-block (HTTP 403) is a failure too, and it stays visible next to the hits
+    the surviving engines did find."""
+    monkeypatch.setattr(w, "_get", lambda *a, **k: FakeResponse(status=403))
+    payload = w.timed_search("page", engines=[w.mojeek, engine("e2", "https://a.com/p")])
+    assert [h["url"] for h in payload["hits"]] == ["https://a.com/p"]
+    assert payload["failed"] == ["mojeek"]
+
+
+def test_failed_engines_are_named_in_run_order() -> None:
+    payload = w.timed_search(
+        "page", engines=[dead_engine("e1"), engine("e2", "https://a.com/p"), dead_engine("e3")]
+    )
+    assert payload["failed"] == ["e1", "e3"]
+
+
+def test_the_polite_sequential_path_reports_failures_too() -> None:
+    hits, _collected, failed = w._ranked("q", 5, engines=[dead_engine("e1")], delay=0.01)
+    assert hits == []
+    assert failed == ["e1"]
+
+
 def test_default_engines_are_the_seven_fixed_ones() -> None:
     """The provider is not configurable — this set IS the provider."""
     assert [e.__name__ for e in w.DEFAULT_ENGINES] == [
@@ -469,6 +548,18 @@ async def test_web_search_route_has_no_resolve_dates_knob(monkeypatch: Any) -> N
     assert seen == {}
 
 
+def test_no_entry_point_can_fetch_a_result_url() -> None:
+    """The knob and the fetch behind it are GONE, not merely unreachable.
+
+    A developer-only `--dates` command line shipped inside the app and sat one
+    line from a live path: it fetched every result page from Python — around the
+    Rust SSRF guard that refuses local and private addresses, whole, with no size
+    limit. Deleted 2026-08-01; this pins that nothing grew it back."""
+    assert "resolve_dates" not in inspect.signature(w.search).parameters
+    assert not hasattr(w, "_page_date"), "the unguarded full-page fetch is back"
+    assert not hasattr(w, "main"), "the developer CLI is back"
+
+
 def test_parallel_fanout_matches_sequential_exactly():
     """The engines run concurrently, but the merge must see them in
     DEFAULT_ENGINES order — that order decides each page's 'source' and the
@@ -492,8 +583,9 @@ def test_parallel_fanout_matches_sequential_exactly():
     ]
 
     started = _time.monotonic()
-    hits, collected = w._ranked("q", 10, engines=engines)
+    hits, collected, failed = w._ranked("q", 10, engines=engines)
     elapsed = _time.monotonic() - started
+    assert failed == []  # slow is not broken; all three answered
 
     # Three 0.15s engines: sequential would be >=0.45s, parallel ~0.15s.
     assert elapsed < 0.40, f"engines did not run concurrently ({elapsed:.2f}s)"
@@ -506,6 +598,16 @@ def test_parallel_fanout_matches_sequential_exactly():
     assert page["engines"] == ["a", "b"]
     # …and 'b' still fills in the snippet 'a' did not have.
     assert page["snippet"] == "from b"
+
+
+def test_the_fanout_pool_is_shared_between_searches():
+    """Every search used to build seven threads — and, through them, seven fresh
+    requests.Sessions — and bin them a second later. One pool serves every search
+    now, so it must still be alive and usable once a search is over."""
+    pool = w._pool()
+    w.search("q", engines=[engine("e1", "https://a.com/p"), engine("e2", "https://b.com/p")])
+    assert w._pool() is pool, "a second search built itself a new pool"
+    assert pool.submit(int, "7").result() == 7, "the shared pool was shut down after a search"
 
 
 def test_delay_still_serializes_for_the_polite_cli_path():
@@ -545,13 +647,59 @@ def test_a_slow_engine_cannot_own_the_search():
     fast.__name__, glacial.__name__ = "fast", "glacial"
 
     started = _time.monotonic()
-    hits, _collected = w._ranked("q", 10, engines=[glacial, fast], budget=0.4)
+    hits, _collected, failed = w._ranked("q", 10, engines=[glacial, fast], budget=0.4)
     elapsed = _time.monotonic() - started
 
     assert elapsed < 2.0, f"the budget did not cut the slow engine off ({elapsed:.2f}s)"
     urls = [h["url"] for h in hits]
     assert "https://fast.example/1" in urls
     assert "https://slow.example/1" not in urls
+    # An engine we gave up waiting for did not answer — say so, don't count it as
+    # an engine that looked and found nothing.
+    assert failed == ["glacial"]
+
+
+def test_an_engine_that_never_started_is_not_blamed_on_the_network(monkeypatch):
+    """The pool is shared between searches, so another search's straggler can
+    still be holding a thread when this one fans out. An engine that sat in the
+    QUEUE and never opened a socket must not be named as one that could not
+    answer: 'failed' reads as "the search never happened, you are offline", and
+    two overlapping searches are not an outage.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    release = threading.Event()
+
+    def hogging(query, **kwargs):
+        release.wait(5)  # stands in for another search's hung engine
+        return []
+
+    def queued(query, **kwargs):  # pragma: no cover - the pool has no thread for it
+        return []
+
+    hogging.__name__, queued.__name__ = "hogging", "queued"
+
+    busy = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(w, "_POOL", busy)
+    try:
+        _hits, _collected, failed = w._ranked(
+            "q", 10, engines=[hogging, queued], budget=0.3
+        )
+    finally:
+        release.set()
+        busy.shutdown(wait=True)
+
+    assert failed == ["hogging"], (
+        f"an engine that never ran was reported as unreachable: {failed}"
+    )
+
+
+def test_the_shared_pool_has_room_for_more_than_one_search_at_a_time():
+    """A straggler holds its thread for the whole fan-out budget. At two searches'
+    worth of threads, two overlapping slow searches took every slot and a third
+    search never started an engine at all."""
+    assert w._MAX_WORKERS >= 3 * len(w.DEFAULT_ENGINES)
 
 
 def test_connect_timeout_is_bounded_separately_from_read():
@@ -562,12 +710,32 @@ def test_connect_timeout_is_bounded_separately_from_read():
     assert w._timeout(3) == (3, 3)
 
 
+def test_no_engine_may_wait_longer_than_the_whole_fanout():
+    """A read budget past the fan-out's own budget buys nothing: the fusion has
+    already given up and thrown the answer away by the time it lands."""
+    assert w._timeout(60) == (5.0, w.FANOUT_BUDGET)
+
+
+def test_marginalia_asks_for_no_more_time_than_the_fanout_allows(monkeypatch):
+    """Regression: marginalia asked for a 25s read inside a 22s search, so a
+    merely-slow marginalia could never contribute — it only held a connection."""
+    seen = {}
+
+    def spy(url, **kwargs):
+        seen.update(kwargs)
+        return FakeResponse(text="")
+
+    monkeypatch.setattr(w, "_get", spy)
+    w.marginalia("q")
+    assert seen["timeout"] <= w.FANOUT_BUDGET
+
+
 def test_duckduckgo_does_not_retry_a_host_it_cannot_reach(monkeypatch):
     """A challenge page is worth retrying; an unreachable host is not. Retrying
     a connect timeout three times was most of a 19s search."""
     calls = []
 
-    def unreachable(query, k):
+    def unreachable(query, k, read=20.0):
         calls.append(1)
         raise requests.ConnectTimeout("no route")
 
@@ -580,7 +748,7 @@ def test_duckduckgo_still_retries_an_intermittent_challenge(monkeypatch):
     """The retry exists for DDG's intermittent HTTP 202 — keep it working."""
     attempts = []
 
-    def flaky(query, k):
+    def flaky(query, k, read=20.0):
         attempts.append(1)
         if len(attempts) < 2:
             return []  # challenge page: empty, but reachable
@@ -591,3 +759,24 @@ def test_duckduckgo_still_retries_an_intermittent_challenge(monkeypatch):
     hits = w.duckduckgo("q")
     assert len(attempts) == 2
     assert hits and hits[0]["url"] == "https://ddg.example/1"
+
+
+def test_duckduckgo_stops_retrying_once_the_search_budget_is_gone(monkeypatch):
+    """The retries share the fan-out's budget. Three 20s attempts plus their pauses
+    is 64s of a 22s search: every one of those late answers was discarded."""
+    import time as _time
+
+    reads = []
+
+    def slow(query, k, read=20.0):
+        reads.append(read)
+        _time.sleep(0.2)
+        return []  # challenge page: retryable, but there is no time left to retry in
+
+    monkeypatch.setattr(w, "_ddg_attempt", slow)
+    started = _time.monotonic()
+    assert w.duckduckgo("q", tries=3, budget=0.1) == []
+    assert len(reads) == 1, "a second attempt was made after the budget was spent"
+    assert reads[0] <= 0.1, "an attempt was given more time than the search had left"
+    # ...and it did not sit through the 2s retry pause on the way to giving up.
+    assert _time.monotonic() - started < 1.0

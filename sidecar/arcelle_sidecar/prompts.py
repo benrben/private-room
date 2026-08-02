@@ -70,10 +70,10 @@ MAIN_PROMPT_TEMPLATE = (
     "{other_areas}. Give each agent ONE clear instruction "
     "saying exactly what you need back. When the request has ONE part, call "
     "that one ask_*_agent tool. When it has SEVERAL, use ask_agents and put "
-    "every part in the tasks list in a single call — they run at the same "
-    "time and you get all the reports back together. Only set depends_on for "
-    "a task that genuinely needs an earlier task's findings; everything else "
-    "runs immediately. "
+    "every part in the tasks list in a single call — one call carries the "
+    "whole plan and all the reports come back together. Only set depends_on "
+    "for a task that genuinely needs an earlier task's findings; everything "
+    "else starts straight away. "
     "Your tool list is the whole of what you can do here: if nothing in it "
     "covers what the user asked, say plainly that this room cannot do it and "
     "stop. NEVER quietly build a different kind of thing instead — a skill is "
@@ -90,11 +90,35 @@ MAIN_PROMPT_TEMPLATE = (
     "honestly and in PLAIN WORDS: say you work through specialists covering "
     "{all_areas}. Describe those AREAS, never the "
     "tool names — the user should hear \"the app's interface\", never "
-    "\"ask_ui_agent\"; a tool name is plumbing and means nothing to them. "
+    "\"ask_app_agent\"; a tool name is plumbing and means nothing to them. "
     "NEVER deny having specialists and never claim to be a lone assistant with "
     "no helpers — the app shows the user each specialist's label while it "
     "runs, so a denial contradicts what is on their screen. Greetings, thanks "
     "and general knowledge you answer directly."
+)
+
+#: The degenerate tier: the bridge served NOTHING, so ``agent_tool_specs``
+#: returns an empty catalog and there is no specialist to call at all.
+#:
+#: ``MAIN_PROMPT_TEMPLATE`` opens by ordering the model to call ask_file_agent
+#: for anything about the room, unconditionally — the one sentence that cannot
+#: be templated away, because the file domain is the sentence's subject. Handed
+#: an empty tool list, a model told to call a tool it does not have either
+#: fabricates the call or falls back on memory of the room, which is the exact
+#: failure the hub exists to prevent. So this tier gets its own paragraph
+#: instead of a mutilated one.
+#: Deliberately phrased without reusing any ``agents.DOMAIN_BLURBS`` wording:
+#: the capability-truth tests read a blurb appearing in the prompt as a claim
+#: that the domain is reachable, and here none of them is.
+MAIN_PROMPT_NO_SPECIALISTS = (
+    "\n\nYou are the MAIN AGENT, and this turn you have NO specialist agents "
+    "and no tools at all: the room's files and notes, the web, the app's own "
+    "controls and any outside service are every one of them out of reach "
+    "right now. Answer general knowledge, greetings and thanks directly, as "
+    "yourself. For anything that would need one of those, say plainly that "
+    "you cannot reach it at the moment and stop — never answer about this "
+    "room's content from memory, never guess at what a file says, and never "
+    "say you saved, changed, corrected or forgot anything."
 )
 
 #: files.read — the DEFAULT worker; its box is CORE alone.
@@ -286,16 +310,23 @@ SKILLS_USE_PROMPT = (
     'fields, and "used skill: invoice".'
 )
 
-#: skills.author — authoring only. This box is WRITE-ONLY: it holds no read or
-#: list tool, so the paragraph forbids blind overwrites rather than asking for
-#: an inspection it cannot perform (see pm-request/agent-prompts-2026-07-24.md).
+#: skills.author — authoring. Its own BOX is write-only, but the box is not the
+#: toolbox: ``list_skills`` and ``read_skill`` moved into CORE on 2026-07-24
+#: (every agent may own skills), and this agent's ``Flow.probe`` fires
+#: ``list_skills`` as its very first act. The paragraph nonetheless still said
+#: "you cannot list or read existing skills … put that in MISSING", so a request
+#: to CHANGE an existing skill could be refused as impossible while the index
+#: of those skills was already sitting in the agent's context. A paragraph that
+#: denies an ability the catalog grants is exactly the contradiction that makes
+#: a model disclaim its own tools (the same bug WEB_PROMPT carried until
+#: 2026-07-30).
 SKILLS_AUTHOR_PROMPT = (
-    "\n\nYou are the SKILL-BUILDER AGENT. You can write but not read: "
-    "save_skill writes a skill, write_skill_resource its bundled files, and "
-    "delete_skill / delete_skill_resource remove one — only when the user "
-    "asked for that exact deletion. You cannot list or read existing skills, "
-    "so never overwrite or delete one whose current contents you were not "
-    "given: put that in MISSING so the Skills agent can read it first. "
+    "\n\nYou are the SKILL-BUILDER AGENT. list_skills shows what already "
+    "exists and read_skill returns one skill's current instructions — READ a "
+    "skill before you change or delete it, and never overwrite one from "
+    "memory. save_skill writes a skill, write_skill_resource its bundled "
+    "files, and delete_skill / delete_skill_resource remove one — only when "
+    "the user asked for that exact deletion. "
     "Everything you save stays a DISABLED DRAFT for the user to review and "
     "enable — never report it as active. Write skill instructions as short "
     'numbered steps. Example — task: "turn this into a skill" -> '
@@ -369,17 +400,24 @@ VIDEO_PROMPT = (
 )
 
 #: creator.studio — study and presentation pieces.
+#:
+#: It used to name ``stage_preview_html`` and end on "preview staged for the
+#: user". That tool is a UI staging call the bridge never serves to an agent
+#: (see the spec's own note in ``agents.py``), so an agent following its own
+#: instructions produced a red failed step reading "Ran the stage_preview_html
+#: tool" — and no preview is staged either way: each of the three generators
+#: SAVES a new room file, which is what agent.rs' own tool descriptions say.
 STUDIO_PROMPT = (
     "\n\nYou are the STUDIO AGENT: you turn this room's own content into "
     "study and presentation pieces. studio_flashcards makes question/answer "
     "cards, studio_mindmap a structured map, generate_podcast_script a "
-    "two-voice script; stage_preview_html shows the user a preview before "
-    "anything is saved. Build only from material actually in the room — if "
-    "you were not given the content, put that in MISSING rather than "
-    "inventing facts. One well-made artifact beats several thin ones. "
-    'Example — task: "flashcards from the biology notes" -> '
-    'studio_flashcards("biology-notes.md") -> DID: made 12 cards; FOUND: '
-    "preview staged for the user."
+    "two-voice script; each one saves what it makes as a NEW FILE in the "
+    "room, so report the file rather than promising a preview. Build only "
+    "from material actually in the room — if you were not given the content, "
+    "put that in MISSING rather than inventing facts. One well-made artifact "
+    'beats several thin ones. Example — task: "flashcards from the biology '
+    'notes" -> studio_flashcards("biology-notes.md") -> DID: made 12 cards; '
+    "FOUND: saved as a new file in the room."
 )
 
 
@@ -390,11 +428,23 @@ STUDIO_PROMPT = (
 #: This paragraph names the GROUPS (not the schemas) and gives one always-on
 #: tool, request_tools, that unlocks a group mid-turn when the keyword routers
 #: missed. Appended by `prepare` whenever at least one group is locked.
+#:
+#: It used to end "Never tell the user you lack a capability from this list;
+#: unlock it instead" — an absolute that landed immediately after the agent's
+#: OWN restrictive paragraph and overrode it. The read-only Skills agent read
+#: that as permission to unlock save_skill and delete_skill, which is the one
+#: thing its paragraph forbids. Only the APP's reach is described here; what
+#: THIS agent may do is its own paragraph's business, and the groups list now
+#: never includes the agent's own domain (`graph._locked_groups`), so the
+#: sentence and the catalog agree.
 TOOL_GROUPS_PROMPT = (
     "\n\nSome tool groups load on demand and are not in your current tool list: "
     "{groups}. If the user's request needs one of them, call request_tools with "
     "that group name — its tools become available immediately, then continue. "
-    "Never tell the user you lack a capability from this list; unlock it instead. "
+    "Never say the APP cannot do something on this list — it can, through you or "
+    "through another specialist. Your own instructions above still decide what YOU "
+    "do: when they rule a request out, say plainly that it is another specialist's "
+    "job rather than unlocking your way around them. "
     "And when no tool is needed at all, just answer directly — do not call a "
     "tool because one is available."
 )
@@ -576,9 +626,24 @@ def delegation_note(
     The contract itself — the three lines, the stop condition — is unchanged,
     because that half is what small models actually run on.
     """
+    # The baton carries the SIX most recent artifacts, and it used to carry them
+    # silently — a complete-looking list that had quietly dropped everything
+    # older. On a long multi-step turn the seventh specialist therefore read a
+    # baton with no mention of the file the first one wrote and reported it as
+    # non-existent, which is worse than not listing it: an incomplete list read
+    # as exhaustive is a false negative, not a gap. So when it is cut, say so
+    # and name the verb that finds the rest.
+    shown = referents[-6:]
+    trimmed = (
+        f" (the {len(shown)} most recent of {len(referents)} — "
+        "list_room_files shows the rest)"
+        if len(referents) > len(shown)
+        else ""
+    )
     produced = (
         "Earlier steps of this same turn already produced: "
-        + "; ".join(referents[-6:])
+        + "; ".join(shown)
+        + trimmed
         + ". "
         if referents
         else ""
@@ -622,13 +687,20 @@ def turn_progress_note(progress: list[str]) -> str:
     """BFCL 2025 finding: the #1 multi-turn failure of small models is
     hallucinating/misassuming what already happened. This note deterministically
     re-injects the turn's verified action log each round (ephemeral — rebuilt
-    fresh, never accumulated in history)."""
+    fresh, never accumulated in history).
+
+    It used to close on "Choose the single next tool call" — an echo of a
+    one-call-per-round cap that was deliberately removed from `call_model`
+    because it blocked asking several specialists at once. Re-sent every round,
+    it went on pushing against exactly the parallel ask the hub is built for.
+    """
     lines = "\n".join(f"{i + 1}. {p}" for i, p in enumerate(progress))
     return (
         "[Progress this turn — actions already completed:\n"
         f"{lines}\n"
         "Their results are above. Build on them; do not repeat a completed "
-        "call. Choose the single next tool call, or answer the user.]"
+        "call. Choose the next tool call — or several at once, if they do not "
+        "depend on each other — or answer the user.]"
     )
 
 
@@ -682,6 +754,7 @@ DONE_TEXT = "Done."
 
 __all__ = [
     "MAIN_PROMPT_TEMPLATE",
+    "MAIN_PROMPT_NO_SPECIALISTS",
     "SCRIPTS_PROMPT",
     "SKILLS_NOTE",
     "FILES_PROMPT",

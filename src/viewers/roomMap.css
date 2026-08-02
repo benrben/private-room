@@ -34,6 +34,20 @@
 .room-map-svg:active {
   cursor: grabbing;
 }
+/* Light mode: the ink canvas and its labels are the only surfaces in the app
+   that hard-code a dark palette — without these the map stays a black slab in
+   the middle of a white window. */
+:root[data-theme="light"] .room-map-svg {
+  background:
+    radial-gradient(130% 100% at 50% 42%, rgba(101, 68, 154, 0.1), transparent 68%),
+    #f3f1f6;
+}
+
+/* Keyboard focus on a star (stars are role="button", tabbable). */
+.room-map-node:focus-visible {
+  outline: 2px solid var(--accent, #8b7cf6);
+  outline-offset: 2px;
+}
 
 /* ---- persistent on-canvas labels (screen space, constant size) ---- */
 .rm-label-bg {
@@ -58,6 +72,21 @@
 }
 .rm-label-text.is-memory {
   fill: #bfe4d3;
+}
+:root[data-theme="light"] .rm-label-bg {
+  fill: rgba(255, 255, 255, 0.9);
+  stroke: rgba(101, 68, 154, 0.24);
+}
+:root[data-theme="light"] .rm-label-bg.is-focus {
+  fill: #ffffff;
+  stroke: rgba(101, 68, 154, 0.6);
+}
+:root[data-theme="light"] .rm-label-text {
+  fill: #353139;
+  stroke: rgba(255, 255, 255, 0.75);
+}
+:root[data-theme="light"] .rm-label-text.is-memory {
+  fill: #2f7c58;
 }
 
 /* ---- pan/zoom controls, top-right of the canvas ---- */
@@ -123,6 +152,71 @@
   margin-top: 2px;
   color: var(--text-dim, #b8b8c4);
   font-size: 11px;
+}
+
+/* ---- failure panel: plain words + a retry, never a bare exception ---- */
+.room-map-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-dim, #b8b8c4);
+}
+.room-map-error-detail {
+  max-width: 460px;
+  font-size: 11px;
+  color: var(--faint, #928d9a);
+  word-break: break-word;
+}
+
+/* ---- plain-list alternative to the canvas (keyboard / screen reader) ---- */
+.rm-listtoggle {
+  margin-left: auto;
+}
+.room-map-list {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  padding: 10px 14px;
+}
+.room-map-list ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.room-map-list li {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-soft, rgba(255, 255, 255, 0.06));
+}
+.rm-list-name {
+  padding: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, #ececf2);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.rm-list-name:hover:not(:disabled) {
+  color: var(--accent, #8b7cf6);
+}
+.rm-list-name:disabled {
+  cursor: default;
+}
+.rm-list-folder {
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--faint, #928d9a);
+}
+.rm-list-links {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-dim, #b8b8c4);
 }
 
 @media (prefers-reduced-motion: reduce) {

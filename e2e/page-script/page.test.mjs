@@ -7,8 +7,9 @@
  * What is covered here is what would otherwise only fail in a real WKWebView,
  * where a mistake looks like "the page isn't ready" rather than a stack trace:
  * mark ordering and the cap, the password fence, ref staleness, label
- * resolution, markdown extraction, low-signal detection, and the totality
- * contract with the Rust bridge (never throw, always return a value).
+ * resolution, markdown extraction, what Save page and Save selection hand
+ * back, low-signal detection, and the totality contract with the Rust bridge
+ * (never throw, always return a value).
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -16,7 +17,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { El, install, currentDocument } from "./dom-stub.mjs";
+import { El, install, currentDocument, setSelection } from "./dom-stub.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SOURCE = readFileSync(join(here, "../../src-tauri/src/browser/page.js"), "utf8");
@@ -330,6 +331,124 @@ test("read paginates with offset and says so", () => {
   assert.notEqual(second.text, first.text);
 });
 
+/** The page script's own slice size, read from the source so the fixtures below
+ *  can put an emoji exactly on the boundary without going stale. */
+const READ_MAX = Number(/var READ_MAX = (\d+)/.exec(SOURCE)[1]);
+
+test("successive reads tile the document exactly and never cut an emoji in half", () => {
+  // The boundary is placed ON the high half of a surrogate pair: half an emoji
+  // decodes to a replacement character, and the Rust side used to work the
+  // continuation out by counting CHARACTERS in the returned text — a different
+  // count from JavaScript's UTF-16 code units the moment an emoji is involved,
+  // so the next chunk repeated text already read.
+  const { api, doc } = fresh();
+  const body = "a".repeat(READ_MAX - 1) + "😀" + "b".repeat(5000);
+  const article = new El("article", {}, [new El("p", { __text: body })]);
+  article.rect = { top: 0, left: 0, width: 600, height: 400 };
+  doc.body.appendChild(article);
+
+  let offset = 0;
+  let joined = "";
+  let total = null;
+  for (let guard = 0; guard < 20; guard++) {
+    const chunk = api.call("read", { offset });
+    assert.equal(chunk.ok, true);
+    assert.equal(chunk.offset, offset, "read must resume exactly where it was told to");
+    assert.equal(
+      chunk.nextOffset,
+      chunk.offset + chunk.text.length,
+      "nextOffset must be in the units read() sliced with",
+    );
+    const last = chunk.text.charCodeAt(chunk.text.length - 1);
+    assert.ok(!(last >= 0xd800 && last <= 0xdbff), "a chunk ended on half an emoji");
+    total = chunk.total;
+    joined += chunk.text;
+    if (!chunk.truncated) break;
+    assert.ok(chunk.nextOffset > offset, "read must make progress");
+    offset = chunk.nextOffset;
+  }
+  assert.equal(joined.length, total, "the chunks must tile the document — no gap, no repeat");
+  assert.equal(joined, body, "…and tile it into the document that was there");
+});
+
+test("read resuming inside an emoji backs up onto the whole character", () => {
+  const { api, doc } = fresh();
+  const article = new El("article", {}, [
+    new El("p", { __text: "Hello 😀 world." }),
+    new El("p", { __text: "Second paragraph." }),
+    new El("p", { __text: "Third paragraph so the root heuristic picks this block." }),
+  ]);
+  article.rect = { top: 0, left: 0, width: 600, height: 400 };
+  doc.body.appendChild(article);
+
+  const whole = api.call("read", {});
+  const emojiAt = whole.text.indexOf("😀");
+  assert.ok(emojiAt > 0, "the fixture must actually contain the emoji");
+
+  // An offset one short — what a character count hands back — lands on the LOW
+  // half of the pair.
+  const resumed = api.call("read", { offset: emojiAt + 1 });
+  assert.equal(resumed.offset, emojiAt, "the offset must back up onto the pair");
+  assert.ok(
+    resumed.text.startsWith("😀"),
+    `resumed on ${JSON.stringify(resumed.text.slice(0, 4))}`,
+  );
+});
+
+/* --------------------------------------------------- capture (Save page…) */
+
+test("capture hands back the page as markdown AND as html", () => {
+  // What `browse_save` writes into the room. It is the only page op with no
+  // visible failure mode: a broken capture saves a file that LOOKS fine and is
+  // missing the page, so the shape is pinned here rather than discovered by a
+  // user opening what they saved a week later.
+  const { api, doc } = fresh();
+  const article = new El("article", {}, [
+    new El("h1", { __text: "The Title" }),
+    new El("p", { __text: "First paragraph with detail." }),
+    new El("p", { __text: "Second paragraph." }),
+    new El("p", { __text: "Third paragraph so the root heuristic picks this block." }),
+  ]);
+  article.rect = { top: 0, left: 0, width: 600, height: 400 };
+  doc.body.appendChild(article);
+
+  const out = api.call("capture", {});
+  assert.equal(out.ok, true);
+  assert.equal(out.what, "page");
+  assert.equal(out.url, "https://example.com/page");
+  assert.equal(out.title, "Test Page");
+  assert.match(out.text, /# The Title/);
+  assert.match(out.text, /First paragraph with detail\./);
+  assert.match(out.html, /^<!doctype html>\n<html>/);
+  assert.match(out.html, /<h1>The Title<\/h1>/, "the saved html is the real document");
+  assert.equal(out.truncated, false);
+});
+
+test("capture of a selection returns just that text, trimmed, and no html", () => {
+  const { api, doc } = fresh();
+  doc.body.appendChild(new El("p", { __text: "the whole page" }));
+  setSelection("   the part I highlighted  ");
+
+  const out = api.call("capture", { what: "selection" });
+  assert.equal(out.ok, true);
+  assert.equal(out.what, "selection");
+  assert.equal(out.text, "the part I highlighted");
+  assert.equal(out.html, "", "a selection is text — saving the whole document would be a lie");
+});
+
+test("capture of an empty selection refuses instead of saving the page", () => {
+  const { api, doc } = fresh();
+  doc.body.appendChild(new El("p", { __text: "the whole page" }));
+  setSelection("   ");
+
+  const out = api.call("capture", { what: "selection" });
+  assert.equal(out.ok, false);
+  assert.match(out.error, /Nothing is selected/);
+  // Silently falling back to the whole page is the failure worth naming: the
+  // user asked for a quote and would have been handed the article.
+  assert.equal(out.text, undefined);
+});
+
 test("find returns matching refs and counts page-text occurrences separately", () => {
   const { api, doc } = fresh();
   stack(doc.body, [
@@ -347,6 +466,57 @@ test("find returns matching refs and counts page-text occurrences separately", (
   const none = api.call("find", { text: "zzzz" });
   assert.equal(none.matches.length, 0);
   assert.equal(none.textOccurrences, 0);
+});
+
+test("find answers from the numbering already in the model's hands", () => {
+  // `find` used to re-snapshot, and a snapshot clears every mark and bumps the
+  // generation — so the cheap "which control is called X" tool silently
+  // cancelled every ref the model had just been handed, and the next click came
+  // back "e1 is gone" on a page nothing had changed on. The earlier find test
+  // runs with an EMPTY registry, so it only ever exercised the fallback.
+  const { api, doc } = fresh();
+  const [signIn] = stack(doc.body, [
+    new El("button", { __text: "Sign in" }),
+    new El("button", { __text: "Sign out" }),
+  ]);
+
+  const snap = api.call("snapshot", {});
+  const ref = snap.elements.find((e) => e.label === "Sign in").ref;
+
+  const hits = api.call("find", { text: "sign in" });
+  assert.equal(hits.generation, snap.generation, "find must not bump the generation");
+  assert.equal(hits.matches.length, 1);
+  assert.equal(hits.matches[0].ref, ref, "the ref the model holds must still be the answer");
+  assert.equal(signIn.getAttribute("data-arcelle-mark"), "1", "the marks must survive a find");
+});
+
+test("find does not offer a control that has since been hidden or disabled", () => {
+  // The rebuild drops elements that left the DOM or were re-marked, but it must
+  // apply the visibility door a snapshot applies too: a menu that closed, or a
+  // button client-side validation switched off, is still marked and still
+  // connected — and `act` resolves and clicks it, reporting "clicked e1".
+  const { api, doc } = fresh();
+  const [menu, save] = stack(doc.body, [
+    new El("button", { __text: "Menu item" }),
+    new El("button", { __text: "Menu save" }),
+    // Stays live, so the registry is non-empty and this really is the
+    // currentElements() path rather than the snapshot fallback.
+    new El("button", { __text: "Home" }),
+  ]);
+  api.call("snapshot", {});
+
+  menu.__style = { display: "none", visibility: "visible", opacity: "1" };
+  save.setAttribute("disabled", "true");
+
+  const hits = api.call("find", { text: "menu" });
+  assert.equal(hits.ok, true);
+  assert.deepEqual(
+    hits.matches.map((m) => m.label),
+    [],
+    "a hidden or disabled control is not a live ref",
+  );
+  // …and the ones still on the page are unaffected.
+  assert.equal(api.call("find", { text: "home" }).matches.length, 1);
 });
 
 test("lowSignal fires on canvas-dominant and unlabelled pages, not on normal ones", () => {

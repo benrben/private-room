@@ -1,11 +1,11 @@
 //! ADD-20: Room MCP bridge — the room's agent tools, served over loopback.
 //!
-//! The local model gets file abilities through `agent_loop`'s tool calls;
-//! `claude -p` is a one-shot text pipe and gets none. This bridge closes that
-//! gap the architecturally honest way: a token-guarded, loopback-only MCP
-//! endpoint (streamable HTTP, JSON-RPC) that executes the SAME `exec_tool`
-//! dispatch the local agent uses — decryption stays inside this process; only
-//! tool RESULTS cross the boundary, exactly like chat content already does.
+//! Every engine — the local Python agent hub included — reaches the room's
+//! files through THIS bridge; `claude -p` on its own is a one-shot text pipe
+//! with no abilities at all. A token-guarded, loopback-only MCP endpoint
+//! (streamable HTTP, JSON-RPC) executing the same `exec_tool` dispatch for all
+//! of them — decryption stays inside this process; only tool RESULTS cross the
+//! boundary, exactly like chat content already does.
 //!
 //! Lifetime = one `ask`: started right before the client spawns, stopped when it
 //! returns. A fresh bearer token per run; requests without it are rejected.
@@ -26,9 +26,8 @@
 //!   management, plus `consult_advisor` from a per-turn runtime. The ONE gap
 //!   stays the screen: never `ui_act`/`ui_snapshot`/`view_screenshot`, because
 //!   "any model drives the screen" remains forbidden for a cloud engine.
-//! - `LocalEngine` — the LOCAL Python agent engine, trusted exactly like the
-//!   native `agent_loop`: the full local tool set plus the optional per-turn
-//!   Advisor capability.
+//! - `LocalEngine` — the LOCAL Python agent engine, the most trusted tier:
+//!   the full local tool set plus the optional per-turn Advisor capability.
 //! - `ExternalAgent` (Wave 1a) — an external agent the user explicitly opted
 //!   in per room (Claude Code, Codex, Claude Desktop on the Leash's full
 //!   tier): the file tools plus the job tools, `local_generate`, and the
@@ -71,7 +70,7 @@ pub enum ToolScope {
     /// code serves nested advisor bridges, and widening `CloudAdvisor` would
     /// have handed job tools to every consulted advisor too.
     CloudEngine,
-    /// The LOCAL Python agent engine (ADD-33). Trusted like `agent_loop`: built-in
+    /// The LOCAL Python agent engine (ADD-33), the most trusted tier: built-in
     /// tools PLUS the UI/perception tools and the whole-file-pass job tools, plus
     /// the room's connected MCP servers. A per-turn AdvisorRuntime may add
     /// `consult_advisor` for the top-level model only.
@@ -159,6 +158,41 @@ impl ToolScope {
 /// effects are correctly discarded — nothing downstream reads them for a cloud
 /// answer). A `tokio` mutex so a guard may be held across `exec_tool`'s awaits.
 pub(crate) type EffectsSink = std::sync::Arc<tokio::sync::Mutex<commands::ToolEffects>>;
+
+/// CHG-33: the bridge-lifetime "web search is failing, stop hammering it" brake.
+///
+/// `ToolEffects::web_search_throttled` is where a hard `web_search` failure
+/// raises it, and for the LocalEngine scope that flag rides the run-scoped
+/// [`EffectsSink`], so it survives the whole answer. EVERY other scope — a
+/// consulted advisor, an external agent, a headless workflow turn — gets a
+/// THROWAWAY `ToolEffects` per `tools/call`, so the flag was dropped before the
+/// next call could read it and the model retried the same dead endpoint every
+/// round. Holding it here fixes that without giving those scopes a run-scoped
+/// sink (which would also switch on the per-turn edit-approval cadence).
+///
+/// Stored as "when it last failed" rather than a bare bool because the Leash's
+/// external-agent bridge lives for the whole session: refusing every search for
+/// hours because one was rate-limited is its own bug.
+type WebThrottle = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
+
+/// How long a hard web-search failure keeps the brake on.
+const WEB_THROTTLE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Is the brake currently on (and not yet expired)?
+fn web_throttled(throttle: &WebThrottle) -> bool {
+    throttle
+        .lock()
+        .ok()
+        .and_then(|at| *at)
+        .is_some_and(|at| at.elapsed() < WEB_THROTTLE_COOLDOWN)
+}
+
+/// Raise the brake, starting a fresh cooldown.
+fn note_web_throttled(throttle: &WebThrottle) {
+    if let Ok(mut at) = throttle.lock() {
+        *at = Some(std::time::Instant::now());
+    }
+}
 
 /// A top-level model's permission and runtime state for `consult_advisor`.
 ///
@@ -332,6 +366,10 @@ pub async fn start(
     let tok = token.clone();
     let tool_ran = Arc::new(AtomicBool::new(false));
     let tool_ran_task = tool_ran.clone();
+    // CHG-33: one brake per BRIDGE, owned by the accept task and cloned into
+    // each connection — so it lives exactly as long as the bridge serves, which
+    // is one answer for a per-ask bridge and the session for the Leash's.
+    let web_throttle_task: WebThrottle = Arc::new(std::sync::Mutex::new(None));
     let privacy_bypass = opts.privacy_bypass;
     let advisor = opts.advisor;
     let lanes = opts.lanes;
@@ -350,12 +388,13 @@ pub async fn start(
                     let tok = tok.clone();
                     let effects = effects.clone();
                     let tool_ran = tool_ran_task.clone();
+                    let web_throttle = web_throttle_task.clone();
                     let rx = conn_rx.clone();
                     let advisor = advisor.clone();
                     tauri::async_runtime::spawn(async move {
                         let _ = handle_conn(
-                            stream, app, tok, web_enabled, lanes, scope, effects, tool_ran, rx,
-                            privacy_bypass, advisor,
+                            stream, app, tok, web_enabled, lanes, scope, effects, tool_ran,
+                            web_throttle, rx, privacy_bypass, advisor,
                         )
                         .await;
                     });
@@ -421,6 +460,7 @@ async fn handle_conn(
     scope: ToolScope,
     effects: Option<EffectsSink>,
     tool_ran: Arc<AtomicBool>,
+    web_throttle: WebThrottle,
     shutdown: tokio::sync::watch::Receiver<bool>,
     privacy_bypass: bool,
     advisor: Option<AdvisorRuntime>,
@@ -429,6 +469,7 @@ async fn handle_conn(
         let app = app.clone();
         let effects = effects.clone();
         let tool_ran = tool_ran.clone();
+        let web_throttle = web_throttle.clone();
         let advisor = advisor.clone();
         async move {
             dispatch_jsonrpc(
@@ -439,6 +480,7 @@ async fn handle_conn(
                 scope,
                 effects.as_ref(),
                 &tool_ran,
+                &web_throttle,
                 privacy_bypass,
                 advisor.as_ref(),
             )
@@ -578,6 +620,7 @@ async fn dispatch_jsonrpc(
     scope: ToolScope,
     effects: Option<&EffectsSink>,
     tool_ran: &AtomicBool,
+    web_throttle: &WebThrottle,
     privacy_bypass: bool,
     advisor: Option<&AdvisorRuntime>,
 ) -> (u16, Vec<u8>) {
@@ -591,6 +634,22 @@ async fn dispatch_jsonrpc(
         // Notifications (e.g. notifications/initialized) need no body.
         return (202, Vec::new());
     }
+    // The room's per-agent web switches are read PER REQUEST rather than
+    // captured when the bridge started. An external agent (Claude Code, Codex,
+    // Claude Desktop) holds ONE connection for the whole session, so a bridge
+    // that answered `tools/list` at connect time kept serving the web and
+    // browser tools for the rest of it: flipping either switch in Settings
+    // changed nothing until the room was closed, with no hint it had not taken.
+    // Intersected with what the caller asked for, so a caller that deliberately
+    // narrowed the catalog (a workflow node) keeps its narrowing.
+    let lanes = {
+        use tauri::Manager;
+        let live = commands::open_room_web_lanes(&app.state::<commands::AppState>());
+        commands::WebLanes {
+            search: lanes.search && live.search,
+            browse: lanes.browse && live.browse,
+        }
+    };
     let result = match method {
         "initialize" => Ok(serde_json::json!({
             "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),
@@ -610,6 +669,7 @@ async fn dispatch_jsonrpc(
                 scope,
                 effects,
                 tool_ran,
+                web_throttle,
                 privacy_bypass,
                 advisor,
             )
@@ -808,9 +868,19 @@ fn mcp_proxy_tools() -> Vec<serde_json::Value> {
                 },
                 "required": ["tool", "arguments"]
             },
+            // NOT `destructiveHint: true`. Every connector call in the room now
+            // goes through this ONE proxy, so a blanket destructive label is a
+            // claim about tools it knows nothing about — including a read-only
+            // lookup. A non-interactive `codex exec` (approval_policy=never)
+            // cannot get confirmation for a destructive tool, so it refused
+            // every connector call a Codex-engine room made, which by the app's
+            // own rules left that room with no connectors at all. The honest
+            // marking is "an action, reaching the outside world, not repeatable"
+            // — the per-connector approval gate stays authoritative, and it is
+            // Arcelle's, not the client's.
             "annotations": {
                 "readOnlyHint": false,
-                "destructiveHint": true,
+                "destructiveHint": false,
                 "idempotentHint": false,
                 "openWorldHint": true
             }
@@ -1037,6 +1107,7 @@ async fn tool_call(
     scope: ToolScope,
     effects_sink: Option<&EffectsSink>,
     tool_ran: &AtomicBool,
+    web_throttle: &WebThrottle,
     privacy_bypass: bool,
     advisor: Option<&AdvisorRuntime>,
 ) -> Result<serde_json::Value, String> {
@@ -1301,6 +1372,12 @@ async fn tool_call(
             // the in-room agent sees) instead of a slower local vision-model
             // description.
             effects.vision_chat = matches!(scope, ToolScope::ExternalAgent);
+            // CHG-33: seed the web-search brake from the BRIDGE, not from this
+            // throwaway. Without it a failed search raised the flag, the
+            // `ToolEffects` carrying it was dropped at the end of this call,
+            // and the model searched again — every round, forever.
+            let was_throttled = web_throttled(web_throttle);
+            effects.web_search_throttled = was_throttled;
             let outcome = commands::exec_tool(
                 &state,
                 &window,
@@ -1312,6 +1389,9 @@ async fn tool_call(
                 advisor.and_then(|runtime| runtime.room_bridge.as_deref()),
             )
             .await;
+            if effects.web_search_throttled && !was_throttled {
+                note_web_throttled(web_throttle);
+            }
             let images: Vec<String> = effects.pending_images.drain(..).collect();
             (outcome, images)
         }
@@ -1389,6 +1469,39 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_web_search_brake_outlives_one_tool_call_but_not_the_session() {
+        let brake: WebThrottle = Arc::new(std::sync::Mutex::new(None));
+        assert!(!web_throttled(&brake));
+        note_web_throttled(&brake);
+        // Survives — the whole point: the throwaway `ToolEffects` a sink-less
+        // scope builds per call used to drop this before the next search.
+        assert!(web_throttled(&brake));
+
+        // …and expires, so the Leash's session-long bridge is not left refusing
+        // every search because one failed hours ago.
+        *brake.lock().unwrap() =
+            Some(std::time::Instant::now() - WEB_THROTTLE_COOLDOWN - std::time::Duration::from_secs(1));
+        assert!(!web_throttled(&brake));
+    }
+
+    #[test]
+    fn a_connector_call_is_not_advertised_as_destructive() {
+        // One proxy now fronts EVERY connector, so a blanket destructive label
+        // is a claim about tools it knows nothing about — and a non-interactive
+        // `codex exec` refuses anything it cannot get confirmation for, which
+        // left a Codex-engine room unable to call any connector at all.
+        let run = mcp_proxy_tools()
+            .into_iter()
+            .find(|t| t["name"] == MCP_RUN_TOOL)
+            .expect("run tool");
+        assert_eq!(run["annotations"]["destructiveHint"], false);
+        // Still honestly an action that reaches the outside world.
+        assert_eq!(run["annotations"]["readOnlyHint"], false);
+        assert_eq!(run["annotations"]["idempotentHint"], false);
+        assert_eq!(run["annotations"]["openWorldHint"], true);
+    }
 
     #[test]
     fn mcp_proxy_catalog_is_stable_and_searchable() {

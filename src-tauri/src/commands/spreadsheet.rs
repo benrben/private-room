@@ -1,5 +1,12 @@
 use super::*;
 
+/// A spreadsheet's own ceilings: columns run A..XFD (three letters, 16 384) and
+/// rows stop at 1 048 576. Enforced BEFORE the accumulator runs — a long run of
+/// letters used to multiply its way past `usize`, producing a meaningless index
+/// that then took the app down when the grid was resized to reach it.
+const MAX_A1_COL_LETTERS: usize = 3;
+const MAX_A1_ROW: usize = 1_048_576;
+
 /// "B7" → zero-based (row, col). None when it isn't A1 notation.
 pub(crate) fn parse_a1(cell: &str) -> Option<(usize, usize)> {
     let cell = cell.trim().to_uppercase();
@@ -8,12 +15,18 @@ pub(crate) fn parse_a1(cell: &str) -> Option<(usize, usize)> {
     if letters.is_empty() || digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
+    if letters.len() > MAX_A1_COL_LETTERS {
+        return None;
+    }
     let col = letters
         .chars()
         .fold(0usize, |acc, c| acc * 26 + (c as usize - 'A' as usize + 1))
         - 1;
+    // `parse` already refuses a number too large for `usize`; the row ceiling
+    // refuses one that merely LOOKS valid but would grow the grid until the
+    // app runs out of memory.
     let row: usize = digits.parse().ok()?;
-    if row == 0 {
+    if row == 0 || row > MAX_A1_ROW {
         return None;
     }
     Some((row - 1, col))
@@ -68,8 +81,46 @@ pub(crate) fn parse_delim(text: &str, delim: char) -> Vec<Vec<String>> {
 }
 
 pub(crate) fn serialize_delim(rows: &[Vec<String>], delim: char) -> String {
+    serialize_delim_styled(rows, delim, DelimStyle::default())
+}
+
+/// The line-ending conventions of an existing delimited file, so editing one
+/// cell doesn't rewrite every other line.
+///
+/// Re-serializing a CRLF file as LF, or adding a newline the file never had,
+/// changes literally every line as far as a colleague or a version-control tool
+/// is concerned — for a one-cell edit.
+#[derive(Clone, Copy)]
+pub(crate) struct DelimStyle {
+    newline: &'static str,
+    trailing_newline: bool,
+}
+
+impl Default for DelimStyle {
+    fn default() -> Self {
+        Self { newline: "\n", trailing_newline: true }
+    }
+}
+
+/// Read the conventions off the file we are about to rewrite.
+pub(crate) fn delim_style(text: &str) -> DelimStyle {
+    DelimStyle {
+        newline: if text.contains("\r\n") { "\r\n" } else { "\n" },
+        // An empty file gets the usual trailing newline; otherwise match it.
+        trailing_newline: text.is_empty() || text.ends_with('\n'),
+    }
+}
+
+pub(crate) fn serialize_delim_styled(
+    rows: &[Vec<String>],
+    delim: char,
+    style: DelimStyle,
+) -> String {
     let mut out = String::new();
-    for row in rows {
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push_str(style.newline);
+        }
         let line: Vec<String> = row
             .iter()
             .map(|f| {
@@ -81,7 +132,9 @@ pub(crate) fn serialize_delim(rows: &[Vec<String>], delim: char) -> String {
             })
             .collect();
         out.push_str(&line.join(&delim.to_string()));
-        out.push('\n');
+    }
+    if style.trailing_newline && !rows.is_empty() {
+        out.push_str(style.newline);
     }
     out
 }
@@ -104,7 +157,11 @@ pub(crate) fn set_cell_in_bytes(
     match ext.as_str() {
         "csv" | "tsv" => {
             let delim = if ext == "tsv" { '\t' } else { ',' };
-            let mut rows = parse_delim(&String::from_utf8_lossy(bytes), delim);
+            // Bytes that aren't UTF-8 read back as replacement characters, and
+            // writing them out would destroy the file's accented letters for
+            // good. Refuse rather than corrupt (Wave: encoding safety).
+            let text = std::str::from_utf8(bytes).map_err(|_| non_utf8_error(name))?;
+            let mut rows = parse_delim(text, delim);
             if rows.len() <= row {
                 rows.resize(row + 1, Vec::new());
             }
@@ -112,7 +169,9 @@ pub(crate) fn set_cell_in_bytes(
                 rows[row].resize(col + 1, String::new());
             }
             rows[row][col] = value.to_string();
-            let out = serialize_delim(&rows, delim);
+            // Keep the file's own line endings and final-newline convention, so
+            // a one-cell edit reads as a one-line change everywhere else.
+            let out = serialize_delim_styled(&rows, delim, delim_style(text));
             Ok((out.clone().into_bytes(), Some(out)))
         }
         "xlsx" => {
@@ -186,6 +245,16 @@ mod tests {
         assert_eq!(parse_a1("7B"), None);
         assert_eq!(parse_a1("B0"), None);
         assert_eq!(parse_a1(""), None);
+        // Excel's real ceilings: XFD1 is the last column, one more letter is
+        // not a cell. It used to overflow the accumulator into a huge index
+        // and take the app down instead of being refused.
+        assert_eq!(parse_a1("XFD1"), Some((0, 16_383)));
+        assert_eq!(parse_a1("AAAA1"), None);
+        assert_eq!(parse_a1(&format!("{}1", "A".repeat(200))), None);
+        // …and the row ceiling, for a number that parses but can't be a row.
+        assert_eq!(parse_a1("A1048576"), Some((1_048_575, 0)));
+        assert_eq!(parse_a1("A1048577"), None);
+        assert_eq!(parse_a1("A99999999999999999999999"), None);
         assert!(is_a1_range("B2:D5"));
         assert!(is_a1_range("B2"));
         assert!(!is_a1_range("B2:"));
@@ -215,6 +284,32 @@ mod tests {
         rows[r][c] = "x".into();
         let out = serialize_delim(&rows, ',');
         assert!(out.lines().nth(3).unwrap().ends_with(",,,x"));
+    }
+
+    #[test]
+    fn csv_edit_keeps_the_files_own_line_endings() {
+        // A one-cell edit used to convert CRLF to LF and bolt on a final
+        // newline, so every line of the file read as changed.
+        let crlf = "a,b\r\n1,2";
+        let (bytes, _) = set_cell_in_bytes("t.csv", crlf.as_bytes(), None, "B2", "9").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a,b\r\n1,9");
+        // An LF file with a trailing newline keeps both.
+        let lf = "a,b\n1,2\n";
+        let (bytes, _) = set_cell_in_bytes("t.csv", lf.as_bytes(), None, "B2", "9").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a,b\n1,9\n");
+    }
+
+    #[test]
+    fn csv_edit_refuses_non_utf8_bytes_instead_of_mangling_them() {
+        // 0xE9 is "é" in latin-1. Read lossily it becomes U+FFFD, and writing
+        // that back would destroy the character permanently.
+        let latin1 = b"nom,ville\nRen\xE9,Nancy\n";
+        let err = set_cell_in_bytes("t.csv", latin1, None, "B2", "Paris").unwrap_err();
+        assert!(err.contains("UTF-8"), "got: {err}");
+        // Valid UTF-8 with the same character still edits fine.
+        let utf8 = "nom,ville\nRené,Nancy\n";
+        let (bytes, _) = set_cell_in_bytes("t.csv", utf8.as_bytes(), None, "B2", "Paris").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "nom,ville\nRené,Paris\n");
     }
 
     #[test]

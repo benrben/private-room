@@ -261,11 +261,22 @@ fn derive_installs(s: &serde_json::Value) -> Option<(InstallSpec, Option<Install
 /// The remote endpoint install, if the record declares one.
 fn derive_remote(s: &serde_json::Value) -> Option<InstallSpec> {
     let r = s["remotes"].as_array().and_then(|a| a.first())?;
-    let url = r["url"].as_str()?;
+    let url = r["url"].as_str().filter(|u| is_installable_endpoint(u))?;
     Some(InstallSpec::Http {
         url: url.to_string(),
         header_keys: named_keys(&r["headers"]),
     })
+}
+
+/// Is this an endpoint we can actually install and show? Registry records are
+/// unchecked third-party text, and a listing whose `url` is missing its scheme
+/// (or isn't http(s) at all) is not installable — worse, the details drawer
+/// parses it with `new URL(...)`, so one malformed catalogue entry took the
+/// whole window blank. Skipping the record is the honest outcome.
+fn is_installable_endpoint(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .map(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
+        .unwrap_or(false)
 }
 
 fn remote_transport(s: &serde_json::Value) -> String {
@@ -363,22 +374,44 @@ async fn fetch_icon(client: &reqwest::Client, url: &str) -> Option<String> {
     ))
 }
 
+/// How many icon hosts we are willing to be talking to at the same instant.
+///
+/// Unbounded was one connection per listing — a 200-result browse opened 200
+/// simultaneous connections to 200 different companies, each of which sees the
+/// user's IP. This is the app's only fan-out to strangers, so it goes in small
+/// waves instead.
+const ICON_CONCURRENCY: usize = 6;
+
 /// Replace each entry's raw icon URL with an inlined `data:` URI (or clear it).
-/// All fetches run concurrently through the same opted-in registry client, so
+/// Fetches run in bounded waves through the same opted-in registry client, so
 /// the webview never contacts an icon host and the CSP stays intact.
 async fn inline_icons(client: &reqwest::Client, entries: &mut [CatalogEntry]) {
-    let fetches = entries.iter().map(|e| {
-        let url = e.icon.clone();
-        async move {
-            match url {
-                Some(u) => fetch_icon(client, &u).await,
-                None => None,
+    inline_icons_with(entries, |url| async move { fetch_icon(client, &url).await }).await;
+}
+
+/// The wave loop itself, over an injected fetch — so the bound that keeps this
+/// off 200 strangers at once, and the wave-by-wave write-back that has to keep
+/// each icon with its own listing, are both testable without a network.
+async fn inline_icons_with<F, Fut>(entries: &mut [CatalogEntry], fetch: F)
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    for wave in entries.chunks_mut(ICON_CONCURRENCY) {
+        let fetch = &fetch;
+        let fetches = wave.iter().map(|e| {
+            let url = e.icon.clone();
+            async move {
+                match url {
+                    Some(u) => fetch(u).await,
+                    None => None,
+                }
             }
+        });
+        let results = futures_util::future::join_all(fetches).await;
+        for (e, data) in wave.iter_mut().zip(results) {
+            e.icon = data;
         }
-    });
-    let results = futures_util::future::join_all(fetches).await;
-    for (e, data) in entries.iter_mut().zip(results) {
-        e.icon = data;
     }
 }
 
@@ -646,6 +679,92 @@ mod tests {
     fn undeployable_records_are_skipped_not_fatal() {
         // 5 entries, the last has neither packages nor remotes → dropped → 4.
         assert_eq!(normalize_servers(&sample()).len(), 4);
+    }
+
+    #[test]
+    fn malformed_remote_urls_never_reach_the_drawer() {
+        // The details drawer parses `install.url` with `new URL(...)`, so a
+        // registry entry missing its scheme used to blank the whole window.
+        assert!(is_installable_endpoint("https://mcp.example.com/mcp"));
+        assert!(is_installable_endpoint("http://mcp.example.com"));
+        assert!(!is_installable_endpoint("mcp.example.com/mcp")); // no scheme
+        assert!(!is_installable_endpoint("/mcp"));
+        assert!(!is_installable_endpoint(""));
+        assert!(!is_installable_endpoint("javascript:alert(1)"));
+        assert!(!is_installable_endpoint("https://")); // no host
+
+        let payload = serde_json::json!({"servers": [
+            // Remote-only with a broken url → the whole record is skipped.
+            {"server": {"name": "com.bad/only-remote",
+                "remotes": [{"type": "streamable-http", "url": "mcp.bad.com/mcp"}]}},
+            // Broken remote but a good local package → installs locally.
+            {"server": {"name": "com.bad/has-local",
+                "packages": [{"registryType": "pypi", "identifier": "ok-mcp"}],
+                "remotes": [{"url": "not a url"}]}},
+        ]});
+        let entries = normalize_servers(&payload);
+        assert_eq!(entries.len(), 1, "the unusable remote-only record is dropped");
+        assert_eq!(entries[0].id, "com.bad/has-local");
+        assert!(!entries[0].remote);
+        assert!(
+            entries[0].alt_install.is_none(),
+            "a malformed remote must not be offered as the cloud alternative"
+        );
+    }
+
+    #[tokio::test]
+    async fn icon_fetches_go_out_in_bounded_waves() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // The one place the app contacts many strangers at once: a 200-result
+        // browse must not open 200 simultaneous connections to 200 different
+        // companies, each of which then sees the user's IP.
+        assert!(ICON_CONCURRENCY >= 1 && ICON_CONCURRENCY <= 8);
+        let listings = 3 * ICON_CONCURRENCY + 1; // several full waves and a stub
+        let payload = serde_json::json!({
+            "servers": (0..listings)
+                .map(|i| serde_json::json!({"server": {
+                    "name": format!("io.example/s{i}"),
+                    "icons": [{"src": format!("https://icons.example.com/{i}.png")}],
+                    "packages": [{"registryType": "npm", "identifier": format!("s{i}")}],
+                }}))
+                .collect::<Vec<_>>()
+        });
+        let mut entries = normalize_servers(&payload);
+        assert_eq!(entries.len(), listings);
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let seen = live.clone();
+        let high = peak.clone();
+        inline_icons_with(&mut entries, move |url| {
+            let seen = seen.clone();
+            let high = high.clone();
+            async move {
+                let now = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                high.fetch_max(now, Ordering::SeqCst);
+                // Stay in flight long enough for the rest of the wave to start.
+                tokio::task::yield_now().await;
+                seen.fetch_sub(1, Ordering::SeqCst);
+                Some(format!("data:image/png;{url}"))
+            }
+        })
+        .await;
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            ICON_CONCURRENCY,
+            "a whole wave goes out together, and never more than one wave"
+        );
+        // Each listing keeps ITS OWN icon: a mis-paired chunk/zip write-back
+        // would silently hand every card the wrong company's logo.
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(
+                e.icon.as_deref(),
+                Some(format!("data:image/png;https://icons.example.com/{i}.png").as_str()),
+                "entry {i} was given another listing's icon"
+            );
+        }
     }
 
     #[tokio::test]

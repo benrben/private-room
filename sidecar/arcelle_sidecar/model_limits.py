@@ -23,6 +23,7 @@ per-model table needed.
 from __future__ import annotations
 
 import os
+import time
 
 import httpx
 
@@ -184,11 +185,20 @@ def pick_num_ctx(payload_bytes: int, native_ctx: int | None) -> int:
         return native_ctx
     return chosen
 
-#: (base_url, model) -> native context length, cached for the process
-#: lifetime (an installed model's own catalog entry doesn't change
-#: mid-session). Only successful lookups are cached — a transient failure
-#: retries next time rather than locking in "unknown" forever.
-_CACHE: dict[tuple[str, str], int] = {}
+#: (base_url, model) -> (when it was read, native context length). Cached
+#: because the lookup is an HTTP round trip on the hot path of every local
+#: call, and EXPIRING because a model does change under its own name: re-pull
+#: `qwen3.5:4b`, or swap it for a different quantisation, and the catalog says
+#: something new while the process keeps sizing every request — and the token
+#: bar's ceiling — off the length it read at startup. Only successful lookups
+#: are cached; a transient failure retries next time rather than locking in
+#: "unknown" forever.
+_CACHE: dict[tuple[str, str], tuple[float, int]] = {}
+
+#: How long a cached native length stays fresh. Short enough that a swapped
+#: model is picked up within a few turns, long enough that a burst of rounds
+#: costs one `/api/tags` call between them.
+_CACHE_TTL_SECONDS: float = 300.0
 
 
 async def native_context_length(model: str, base_url: str) -> int | None:
@@ -196,25 +206,30 @@ async def native_context_length(model: str, base_url: str) -> int | None:
 
     `None` when the model isn't listed, reports nothing, or the daemon can't
     be reached — callers use their explicit override, if any, then a display
-    fallback.
+    fallback. A stale cached length is preferred to `None` when the refresh
+    itself fails: it was true five minutes ago, and `None` sends the caller to
+    a made-up display default.
     """
     key = (base_url, model)
-    if key in _CACHE:
-        return _CACHE[key]
+    cached = _CACHE.get(key)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _CACHE_TTL_SECONDS:
+        return cached[1]
+    stale = cached[1] if cached is not None else None
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{base_url}/api/tags")
             resp.raise_for_status()
             data = resp.json()
     except Exception:  # noqa: BLE001 - best-effort; caller has a fallback
-        return None
+        return stale
     for m in data.get("models", []):
         if m.get("model") == model or m.get("name") == model:
             length = (m.get("details") or {}).get("context_length")
             if isinstance(length, int) and length > 0:
-                _CACHE[key] = length
+                _CACHE[key] = (now, length)
                 return length
-    return None
+    return stale
 
 
 __all__ = [

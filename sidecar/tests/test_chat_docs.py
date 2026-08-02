@@ -121,9 +121,41 @@ async def test_extract_missing_field_becomes_not_found(fake_client: type[FakeAsy
     assert resp.json()["values"] == {"revenue": "$5M", "CEO": "(not found)", "HQ": "(not found)"}
 
 
-async def test_extract_non_json_reply_all_not_found(fake_client: type[FakeAsyncClient]) -> None:
-    # A non-JSON reply parses to {} -> every field "(not found)" (unwrap_or_default).
+async def test_extract_unreadable_reply_is_an_error_not_all_not_found(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # An unreadable answer used to parse to {} and fill every column with
+    # "(not found)" — indistinguishable from a file that was searched and really
+    # doesn't hold the field. It is reported instead, so knowledge.rs's
+    # `note_unread()` branch runs and a later window can still answer.
     fake_client.script["chat"] = _chat_reply("sorry, I couldn't read that")
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/knowledge_extract",
+            json={"model": "m", "base_url": "http://h:1", "fields": ["a", "b"], "document": "d"},
+        )
+    assert resp.status_code == 502
+    assert resp.json()["code"] == "UNREADABLE_REPLY"
+
+
+async def test_extract_non_object_json_is_also_unreadable(fake_client: type[FakeAsyncClient]) -> None:
+    # A JSON ARRAY parses fine but has no field keys, so it produced the same
+    # all-"(not found)" row as garbage. It is just as unread.
+    fake_client.script["chat"] = _chat_reply('["a", "b"]')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/knowledge_extract",
+            json={"model": "m", "base_url": "http://h:1", "fields": ["a", "b"], "document": "d"},
+        )
+    assert resp.status_code == 502
+    assert resp.json()["code"] == "UNREADABLE_REPLY"
+
+
+async def test_extract_empty_object_is_still_a_real_not_found(fake_client: type[FakeAsyncClient]) -> None:
+    # "{}" IS a readable answer — the model looked and found nothing.
+    fake_client.script["chat"] = _chat_reply("{}")
     app = create_app()
     async with client_for(app) as c:
         resp = await c.post(

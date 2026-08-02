@@ -24,9 +24,15 @@ pub struct StagedMedia {
     pub seq: u64,
 }
 
-/// Keep at most this many staged media entries alive (each can be hundreds of
-/// MB of decrypted video). Opening a new file evicts the oldest.
+/// Keep at most this many staged media entries alive. Opening a new file
+/// evicts the oldest.
 const MAX_STAGED: usize = 4;
+
+/// …and at most this many BYTES across all of them. Counting entries alone
+/// was no limit at all: four large videos are four large videos, and they sat
+/// in memory together. The newest entry is always kept, however big — it is
+/// the one the viewer is about to play.
+const MAX_STAGED_BYTES: usize = 1_500_000_000;
 
 /// Stage decrypted media bytes; returns the token the viewer plays via
 /// `roommedia://localhost/<token>`.
@@ -34,14 +40,16 @@ pub(crate) fn stage_media_bytes(streams: &MediaStreams, bytes: Vec<u8>, mime: &s
     let seq = streams.next.fetch_add(1, Ordering::Relaxed);
     let token = format!("{seq}-{}", Uuid::new_v4());
     let mut map = streams.map.lock().unwrap();
-    while map.len() >= MAX_STAGED {
-        let oldest = map
-            .iter()
-            .min_by_key(|(_, m)| m.seq)
-            .map(|(k, _)| k.clone());
+    let staged = bytes.len();
+    loop {
+        let held: usize = map.values().map(|m| m.bytes.len()).sum();
+        if map.len() < MAX_STAGED && held.saturating_add(staged) <= MAX_STAGED_BYTES {
+            break;
+        }
+        let oldest = map.iter().min_by_key(|(_, m)| m.seq).map(|(k, _)| k.clone());
         match oldest {
             Some(k) => map.remove(&k),
-            None => break,
+            None => break, // nothing left to evict: the newest entry stands
         };
     }
     map.insert(
@@ -252,5 +260,28 @@ mod tests {
         drop(map);
         clear_media(&s);
         assert!(s.map.lock().unwrap().is_empty());
+    }
+
+    /// Counting entries is not a memory limit — a few big videos together are
+    /// still a few big videos. The byte budget evicts oldest-first until the
+    /// new one fits, and the newest is always playable however large it is.
+    #[test]
+    fn staging_is_capped_by_bytes_not_only_by_count() {
+        let s = MediaStreams::default();
+        let big = MAX_STAGED_BYTES / 2 + 1;
+        let a = stage_media_bytes(&s, vec![0u8; big], "video/mp4");
+        let b = stage_media_bytes(&s, vec![0u8; big], "video/mp4");
+        {
+            let map = s.map.lock().unwrap();
+            assert!(!map.contains_key(&a), "the byte budget never evicted anything");
+            assert!(map.contains_key(&b), "the newest entry must stay playable");
+            assert!(map.values().map(|m| m.bytes.len()).sum::<usize>() <= MAX_STAGED_BYTES);
+        }
+        // An entry bigger than the whole budget is still served — evicting it
+        // would leave the viewer with nothing to play.
+        let huge = stage_media_bytes(&s, vec![0u8; MAX_STAGED_BYTES + 1], "video/mp4");
+        let map = s.map.lock().unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&huge));
     }
 }

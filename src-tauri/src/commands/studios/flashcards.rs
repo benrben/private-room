@@ -116,10 +116,14 @@ pub(crate) fn render_flashcards_html(title: &str, cards: &[StudioCard]) -> Strin
         cards.len(),
         if cards.len() == 1 { "" } else { "s" }
     );
-    FLASHCARDS_TEMPLATE
-        .replace("__TITLE__", &html_escape(title))
-        .replace("__COUNT__", &count)
-        .replace("__CARDS__", &cards_html)
+    fill_template(
+        FLASHCARDS_TEMPLATE,
+        &[
+            ("__TITLE__", &html_escape(title)),
+            ("__COUNT__", &count),
+            ("__CARDS__", &cards_html),
+        ],
+    )
 }
 
 pub(crate) const FLASHCARDS_TEMPLATE: &str = r####"<!doctype html>
@@ -187,5 +191,18 @@ mod tests {
         assert!(!html.contains("</script> injected"));
         assert!(html.contains("Hint: a hint"));
         assert!(html.contains("1 card"));
+    }
+
+    #[test]
+    fn a_file_named_after_a_template_slot_does_not_corrupt_the_page() {
+        // The title is substituted first; chained `.replace()` then filled the
+        // slot the title itself spelled, dumping the whole deck into <title>.
+        let cards = vec![StudioCard { q: "Q".into(), a: "A".into(), hint: String::new() }];
+        let html = render_flashcards_html("__CARDS__", &cards);
+        assert!(html.contains("<title>__CARDS__ — Flashcards</title>"), "title stays literal");
+        let head = html.split("</title>").next().unwrap();
+        assert!(!head.contains("<label"), "the deck must not be spliced into the title");
+        // The deck lands in the deck, exactly once.
+        assert_eq!(html.matches("class=\"card\"").count(), 1);
     }
 }

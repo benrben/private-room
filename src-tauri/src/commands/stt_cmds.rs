@@ -72,6 +72,9 @@ pub async fn stt_download_model(
 
     let dest = stt_model_path(&app)?;
     if dest.exists() || bundled_stt_model(&app).is_some() {
+        // Nothing to download — but a .part left behind by a download the
+        // user quit out of would otherwise sit there for good.
+        let _ = std::fs::remove_file(dest.with_extension("bin.part"));
         return Ok(());
     }
     if STT_DOWNLOADING.swap(true, Ordering::SeqCst) {
@@ -116,13 +119,59 @@ pub async fn stt_download_model(
     result
 }
 
+/// Delete the downloaded model — and actually give the disk space back.
+///
+/// whisper.cpp mmaps the weights and the context is kept warm between
+/// dictations ([`stt::CTX`]), so unlinking the file while it is still open
+/// removed the name and nothing else: the several hundred megabytes stayed
+/// held until the app quit. Dropping the warm context first releases the
+/// mapping; the next transcription simply reloads (the bundled copy, or
+/// nothing, which is the point of deleting it).
+///
+/// A transcription in flight HOLDS that context — the whole duration of a
+/// background file job or a live phrase decode — and the release can only be
+/// attempted, never waited for (blocking here would freeze the app). One
+/// attempt therefore used to report success while freeing nothing at all, so
+/// when the first try loses the race a small watcher finishes the job the
+/// moment the decode lets go.
 #[tauri::command]
 pub fn stt_delete_model(app: tauri::AppHandle) -> Result<(), String> {
     let path = stt_model_path(&app)?;
+    free_deleted_model(path.clone());
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
+    // A download interrupted by quitting leaves a .part behind that nothing
+    // ever swept up — 574 MB of nothing in the app's folder. "Free the space"
+    // must free that too.
+    let _ = std::fs::remove_file(path.with_extension("bin.part"));
     Ok(())
+}
+
+/// How long the watcher keeps offering to release a deleted model's mapping.
+/// Long enough for the transcription that holds it (a long import decodes for
+/// minutes), and it gives up rather than living forever.
+const FREE_MODEL_TRIES: usize = 300;
+const FREE_MODEL_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Give a deleted model's mmap back — now if the context is free, otherwise as
+/// soon as the transcription holding it finishes. Returns immediately either
+/// way: this runs on a command thread, and waiting for a decode would freeze
+/// the app for as long as the file is long.
+fn free_deleted_model(path: std::path::PathBuf) {
+    if stt::unload_model(&path) {
+        return;
+    }
+    std::thread::spawn(move || {
+        for _ in 0..FREE_MODEL_TRIES {
+            std::thread::sleep(FREE_MODEL_EVERY);
+            // Downloaded again in the meantime: that mapping is wanted, and
+            // dropping it would only cost the next transcription a reload.
+            if path.exists() || stt::unload_model(&path) {
+                return;
+            }
+        }
+    });
 }
 
 /// Transcribe recorded audio (mic dictation / talk-to-file): base64 bytes in,
@@ -153,8 +202,11 @@ pub async fn transcribe_audio(
 /// ADD-18: transcribe one imported recording on the STT worker lane — the
 /// audio/video twin of `run_ocr_job`. On success the timestamped transcript is
 /// stored as the file's extracted text (prefixed so the AI knows provenance),
-/// making it searchable/quotable. Failures are silent: the file just keeps
-/// having no text, exactly like before this feature.
+/// making it searchable/quotable. The file keeps having no text when anything
+/// goes wrong, exactly like before this feature — but a file macOS could not
+/// DECODE reports "failed", not "none": a container the converters can't open
+/// is not a silent recording, and telling the user it probably was left them
+/// with no hint that converting the file would fix it.
 pub(crate) fn run_stt_job(app: &tauri::AppHandle, job: JobMeta) {
     use tauri::{Emitter, Manager};
     let Some(model) = stt_effective_model(app) else {
@@ -164,11 +216,17 @@ pub(crate) fn run_stt_job(app: &tauri::AppHandle, job: JobMeta) {
     let Some(kind) = stt::media_kind(&job.mime, &job.ext) else { return };
     let _ = app.emit("stt-progress", (&job.name, "started"));
     let Some(bytes) = read_job_bytes(app, &job) else { return };
-    let text = stt::decode_bytes_to_pcm(&bytes, &job.ext, kind)
+    let text = match stt::decode_bytes_to_pcm(&bytes, &job.ext, kind)
         .and_then(|pcm| stt::transcribe(&model, &pcm, true))
-        .unwrap_or_default();
+    {
+        Ok(text) => text,
+        Err(why) => {
+            let _ = app.emit("stt-progress", (&job.name, format!("failed: {why}")));
+            return;
+        }
+    };
     if text.trim().is_empty() {
-        let _ = app.emit("stt-progress", (&job.name, "none"));
+        let _ = app.emit("stt-progress", (&job.name, "none".to_string()));
         return;
     }
     let full_text = format!("(transcribed from recording)\n{text}");
@@ -330,6 +388,21 @@ enum DictMsg {
 /// the full text so far) outpaces the microphone on Metal. When a decode
 /// falls behind, the drain loop below simply skips to the newest audio.
 const DICT_PARTIAL_STEP_SECS: f64 = 0.7;
+
+/// How much fresh audio to require before the next preview repaint.
+///
+/// Each repaint re-decodes the dictation FROM THE START, so its cost grows
+/// with how long the person has been speaking. At a fixed 0.7 s step a
+/// minutes-long dictation spends every spare cycle redecoding, the Mac runs
+/// hot, and the preview falls further and further behind anyway. Requiring at
+/// least as much new audio as the last decode consumed holds the decoder to
+/// roughly half the machine: the preview updates less often as the dictation
+/// grows, but it stops losing ground. The final text is unaffected — that is
+/// one whole-utterance decode at Stop.
+fn dict_partial_step(rate: u32, last_decode: std::time::Duration) -> usize {
+    let base = (rate as f64 * DICT_PARTIAL_STEP_SECS) as usize;
+    base.max((rate as f64 * last_decode.as_secs_f64()) as usize)
+}
 /// Leak guard, not a UX limit: audio past this is dropped (10 min of speech
 /// in one dictation is a stuck mic, not a user).
 const DICT_MAX_SECS: usize = 600;
@@ -348,9 +421,11 @@ pub fn dict_start(app: tauri::AppHandle, dict: State<'_, DictState>) -> Result<(
 }
 
 /// Same wire format as `rec_push_audio`: ~250 ms of little-endian f32 mic
-/// samples, base64-packed, at the AudioContext's native rate.
+/// samples, base64-packed, at the AudioContext's native rate. `async` for the
+/// same reason: unpacking audio four times a second does not belong on the
+/// thread that paints the window.
 #[tauri::command]
-pub fn dict_push_audio(
+pub async fn dict_push_audio(
     dict: State<'_, DictState>,
     rate: u32,
     data_b64: String,
@@ -410,6 +485,9 @@ fn dict_worker<R: tauri::Runtime>(
     let mut rate: u32 = 16000;
     let mut decoded_len = 0usize;
     let mut last_text = String::new();
+    // How long the previous preview decode took — the budget for the next one
+    // (see `dict_partial_step`).
+    let mut last_decode = std::time::Duration::ZERO;
     let finalize = |native: &[f32], rate: u32,
                     done: std::sync::mpsc::Sender<Result<String, String>>| {
         let pcm = recording::resample_to_16k(native, rate);
@@ -440,13 +518,16 @@ fn dict_worker<R: tauri::Runtime>(
                         Err(_) => break,
                     }
                 }
-                let step = (rate as f64 * DICT_PARTIAL_STEP_SECS) as usize;
+                let step = dict_partial_step(rate, last_decode);
                 if native.len() - decoded_len >= step {
                     decoded_len = native.len();
                     let pcm = recording::resample_to_16k(&native, rate);
+                    let began = std::time::Instant::now();
                     // Partial failures are cosmetic — the final decode at
                     // Stop is the one that must not lose words.
-                    if let Ok(text) = stt::transcribe(&model, &pcm, false) {
+                    let decoded = stt::transcribe(&model, &pcm, false);
+                    last_decode = began.elapsed();
+                    if let Ok(text) = decoded {
                         if text != last_text {
                             last_text = text.clone();
                             let _ = app.emit("dict-partial", text);
@@ -627,6 +708,24 @@ pub(crate) async fn run_dict_pass(model: &str, steps: &[&str], text: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each preview repaint re-decodes the dictation from the start, so its
+    /// cost grows with how long someone has been speaking. A fixed step meant
+    /// a minutes-long dictation spent every cycle redecoding, the Mac ran hot,
+    /// and the preview fell further and further behind anyway.
+    #[test]
+    fn the_dictation_preview_step_grows_with_what_a_decode_costs() {
+        use std::time::Duration;
+        let rate = 48_000u32;
+        let base = (rate as f64 * DICT_PARTIAL_STEP_SECS) as usize;
+        // A decode that outruns the microphone keeps the lively fixed step.
+        assert_eq!(dict_partial_step(rate, Duration::ZERO), base);
+        assert_eq!(dict_partial_step(rate, Duration::from_millis(100)), base);
+        // Once a decode costs more than the step, it buys itself that much
+        // fresh audio — roughly half the machine, never more.
+        assert_eq!(dict_partial_step(rate, Duration::from_secs(3)), rate as usize * 3);
+        assert!(dict_partial_step(rate, Duration::from_secs(30)) > dict_partial_step(rate, Duration::from_secs(3)));
+    }
 
     /// The streaming dictation worker end-to-end against the real model:
     /// audio chunks in → at least one `dict-partial` while "speaking" → the

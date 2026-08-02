@@ -138,10 +138,23 @@ const PRIVATE_URL_FILTERS: &[&str] = &[
     r"^https?://100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.",
     // "this network" 0.0.0.0/8
     r"^https?://0\.",
-    // IPv6 loopback and unique-local/link-local literals
+    // IETF protocol assignments 192.0.0.0/24
+    r"^https?://192\.0\.0\.",
+    // Benchmarking 198.18.0.0/15
+    r"^https?://198\.(18|19)\.",
+    // Multicast 224.0.0.0/4, reserved 240.0.0.0/4 and the broadcast address —
+    // everything from 224 up, which is what the guard's `o[0] >= 224` means.
+    r"^https?://(22[4-9]|2[34][0-9]|25[0-5])\.",
+    // IPv6 loopback, unspecified, and unique-local/link-local literals
     r"^https?://\[::1\]",
+    r"^https?://\[::\]",
     r"^https?://\[f[cd]",
     r"^https?://\[fe[89ab]",
+    // IPv4-mapped IPv6 literals. The guard classifies these by the IPv4 they
+    // embed, so `[::ffff:127.0.0.1]` is a loopback address written the long
+    // way; a url-filter cannot reach inside the mapping, so the whole (never
+    // legitimately used) form is blocked rather than half of it.
+    r"^https?://\[::ffff:",
 ];
 
 /// The JSON WebKit compiles. Apple's format: an array of
@@ -181,7 +194,7 @@ fn domain_filter(domain: &str) -> String {
 /// Identifier the compiled list is cached under inside WebKit's store. Bump
 /// the suffix whenever the rules change, or WebKit serves the previously
 /// compiled list from its cache and edits here silently do nothing.
-pub const RULE_LIST_ID: &str = "arcelle-browse-v1";
+pub const RULE_LIST_ID: &str = "arcelle-browse-v2";
 
 #[cfg(test)]
 mod tests {
@@ -243,12 +256,27 @@ mod tests {
         }
     }
 
-    /// Every URL the navigation guard rejects should also be matched by at
-    /// least one private-range filter. Checked with a real regex engine so the
-    /// filters are verified as patterns, not just as substrings.
+    /// The two protection layers must agree, and this is what makes the claim
+    /// in `PRIVATE_URL_FILTERS`' doc comment true.
+    ///
+    /// It used to be a hand-picked list of eleven addresses, which is why four
+    /// whole families the navigation guard rejects had NO sub-resource rule:
+    /// the IETF block 192.0.0.0/24, the benchmarking block 198.18.0.0/15,
+    /// everything from 224 up (multicast, reserved, broadcast), and the IPv6
+    /// unspecified and IPv4-mapped literals. A page could reach a service on
+    /// this Mac simply by spelling its address one of those ways. Asserted
+    /// against `check_public_http_url` ITSELF, in BOTH directions, so a family
+    /// added to one layer cannot go missing from the other.
+    ///
+    /// Checked with a real regex engine so the filters are verified as
+    /// patterns, not just as substrings.
     #[test]
-    fn private_filters_match_the_hosts_the_guard_rejects() {
-        let blocked = [
+    fn private_filters_match_exactly_the_hosts_the_guard_rejects() {
+        // IP literals and the two known local names only. A HOSTNAME is
+        // deliberately outside this equivalence: the guard lets `10.example.com`
+        // through (it is a name, not an address) while `^https?://10\.` blocks
+        // it — over-blocking a sub-resource is safe, under-blocking is not.
+        let addresses = [
             "http://localhost:11434/api/delete",
             "http://127.0.0.1/x",
             "https://192.168.1.1/admin",
@@ -259,23 +287,40 @@ mod tests {
             "http://172.16.0.1/",
             "http://172.31.255.254/",
             "http://printer.local/",
+            "http://192.0.0.8/",
+            "http://198.18.0.1/",
+            "http://224.0.0.251/",
+            "http://239.255.255.250/",
+            "http://255.255.255.255/",
             "http://[::1]/",
+            "http://[::]/",
+            "http://[fd00::1]/",
+            "http://[fe80::1]/",
+            "http://[::ffff:192.168.1.1]/",
+            // Public neighbours of every blocked range — these must stay
+            // reachable, or the blocker starts breaking the real web.
+            "https://example.com/page",
+            "http://8.8.8.8/",
+            "http://11.0.0.1/",
+            "http://100.63.1.1/",
+            "http://100.128.1.1/",
+            "http://198.17.0.1/",
+            "http://223.255.255.255/",
         ];
-        for url in blocked {
-            let hit = PRIVATE_URL_FILTERS.iter().any(|f| {
-                // The url-filter subset WebKit accepts is a plain regex for
-                // everything we use here, so `regex`-free matching is enough:
-                // compile with the same semantics via a tiny shim.
-                simple_regex_matches(f, url)
-            });
-            assert!(hit, "no private-range filter matches {url}");
-        }
-        // ...and a public address must NOT be caught by any of them.
-        for url in ["https://example.com/page", "http://100.63.1.1/", "http://11.0.0.1/"] {
-            let hit = PRIVATE_URL_FILTERS
+        for url in addresses {
+            let guard_blocks = crate::web::check_public_http_url(url).is_err();
+            // The url-filter subset WebKit accepts is a plain regex for
+            // everything we use here, so `regex`-free matching is enough:
+            // compile with the same semantics via a tiny shim.
+            let filter_blocks = PRIVATE_URL_FILTERS
                 .iter()
                 .any(|f| simple_regex_matches(f, url));
-            assert!(!hit, "{url} must not be blocked as private");
+            assert_eq!(
+                filter_blocks, guard_blocks,
+                "{url}: the navigation guard blocks={guard_blocks} but the \
+                 sub-resource filters block={filter_blocks} — the two layers are \
+                 one policy at two layers and must agree"
+            );
         }
     }
 

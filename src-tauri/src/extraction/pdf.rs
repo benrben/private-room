@@ -205,47 +205,4 @@ mod tests {
         assert!(!first.contains("31"), "digits mirrored: {first}");
     }
 
-    /// Manual probe: run the app's EXACT extraction on a real PDF and report
-    /// timing + text quality. Usage:
-    ///   PR_PDF=/path/to/file.pdf cargo test --lib real_pdf_extraction -- --ignored --nocapture
-    #[test]
-    #[ignore = "manual probe on a real PDF; set PR_PDF"]
-    fn real_pdf_extraction_probe() {
-        let Ok(path) = std::env::var("PR_PDF") else {
-            eprintln!("SKIP: set PR_PDF=/path/to/file.pdf");
-            return;
-        };
-        let bytes = std::fs::read(&path).expect("readable file");
-        eprintln!("file: {path} ({} bytes)", bytes.len());
-        let t = std::time::Instant::now();
-        let text = extract_pdf(&bytes);
-        let secs = t.elapsed().as_secs_f32();
-        match text {
-            None => eprintln!("EXTRACTION FAILED after {secs:.1}s (panic or parse error)"),
-            Some(t) => {
-                let total = t.chars().count();
-                let alnum = t.chars().filter(|c| c.is_alphanumeric()).count();
-                let hebrew = t.chars().filter(|c| ('\u{0590}'..='\u{05FF}').contains(c)).count();
-                eprintln!(
-                    "extracted {total} chars in {secs:.1}s — {alnum} alphanumeric, {hebrew} hebrew"
-                );
-                let sample: String = t.chars().skip(total / 2).take(400).collect();
-                eprintln!("--- sample from the middle ---\n{sample}\n---");
-                // PR_FIND: report occurrences of a term, marks-stripped, with
-                // context — verifies a word is actually reachable by search.
-                if let Ok(term) = std::env::var("PR_FIND") {
-                    let stripped: String = t.chars().filter(|c| !is_heb_mark(*c)).collect();
-                    let hits: Vec<usize> =
-                        stripped.match_indices(&term).map(|(i, _)| i).take(10).collect();
-                    eprintln!("\"{term}\": {} occurrence(s) (marks stripped)", hits.len());
-                    for i in hits.iter().take(3) {
-                        let s = stripped[..*i].chars().rev().take(30).collect::<String>();
-                        let pre: String = s.chars().rev().collect();
-                        let post: String = stripped[*i..].chars().take(40).collect();
-                        eprintln!("  …{pre}⟨{post}⟩…");
-                    }
-                }
-            }
-        }
-    }
 }

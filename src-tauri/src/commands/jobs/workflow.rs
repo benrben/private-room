@@ -119,11 +119,15 @@ pub enum NodeKind {
         #[serde(default = "default_save_mode")]
         mode: String,
     },
-    /// A deterministic branch. `op` = contains | not_contains | is_empty |
-    /// not_empty | new_files_since_last_run. Its artifact records branch then|else.
+    /// A deterministic branch over the JOINED live input. `op` = contains |
+    /// not_contains | is_empty | not_empty | new_files_since_last_run. Its
+    /// artifact records branch then|else.
+    ///
+    /// There is deliberately no `input` field: the subject is always the live
+    /// upstream text, so the empty `input: ""` the step editor used to write was
+    /// shown by no screen, read by no code, and saved into every workflow file.
+    /// Unknown keys are ignored on load, so old definitions still parse.
     Condition {
-        #[serde(default)]
-        input: String,
         op: String,
         #[serde(default)]
         value: Option<String>,
@@ -371,13 +375,84 @@ pub fn def_uses_run_input(def: &WorkflowDef) -> bool {
     def.nodes.iter().any(node_uses_run_input)
 }
 
+/// Upper bounds on a definition. The assistant writes workflows itself, so a
+/// runaway one would save and queue with no warning at all; these are far above
+/// anything a real workflow needs and exist only to make "runaway" visible.
+const MAX_NODES: usize = 60;
+const MAX_EDGES: usize = 240;
+/// Longest a single node's free text (prompt / instruction / objective) may be.
+const MAX_NODE_TEXT: usize = 20_000;
+
+/// The free text a node carries, for the length cap. Templates only — never a
+/// name, id or op.
+fn node_text_fields(kind: &NodeKind) -> Vec<&str> {
+    match kind {
+        NodeKind::Generate { prompt, .. } => vec![prompt.as_str()],
+        NodeKind::AgentRun { question } => vec![question.as_str()],
+        NodeKind::Vote { prompt, .. } => vec![prompt.as_str()],
+        NodeKind::Route { prompt, .. } => vec![prompt.as_str()],
+        NodeKind::Refine { prompt, rubric, .. } => vec![prompt.as_str(), rubric.as_str()],
+        NodeKind::PlanAndMap { objective, .. } => vec![objective.as_str()],
+        NodeKind::FilePass { instruction, .. } => vec![instruction.as_str()],
+        NodeKind::ForEachFile { instruction, .. } => vec![instruction.as_str()],
+        _ => Vec::new(),
+    }
+}
+
+/// How hard to check a definition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rigor {
+    /// Everything — the gate on save/update and the canvas's live check. A new
+    /// or edited definition must satisfy every rule we know.
+    Saving,
+    /// Only the rules that have ALWAYS been enforced — the gate on starting a
+    /// run. Rules learned after a workflow was written are advice for its
+    /// author, not grounds to stop it dead: nothing migrates old definitions,
+    /// and a SCHEDULED start that fails is invisible (scheduler.rs just
+    /// advances `next_run_at` — no run row, no error, no notification), so a
+    /// newly-strict rule at run time reads as an automation that quietly
+    /// stopped months after the user set it up. Each grandfathered rule below
+    /// says what the old behaviour was; all of them still block a SAVE, which
+    /// is where the user is looking.
+    Running,
+}
+
 /// Validate a definition, returning a list of model-fixable sentences (empty =
 /// valid). Checks unknown kinds, per-kind params, duplicate/dangling ids, edge
-/// refs, branch legality, and a Kahn topo sort that NAMES a cycle.
+/// refs, branch legality, size limits, and a Kahn topo sort that NAMES a cycle.
+/// The SAVE-time gate — see `validate_runnable` for the run-time one.
 pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
+    validate_inner(def, Rigor::Saving)
+}
+
+/// The RUN-time gate: everything structural (unknown kinds and selectors,
+/// dangling edges, illegal branch labels, cycles), minus the rules a definition
+/// written by an earlier version could not have known about. See `Rigor`.
+pub fn validate_runnable(def: &WorkflowDef) -> Result<(), Vec<String>> {
+    validate_inner(def, Rigor::Running)
+}
+
+fn validate_inner(def: &WorkflowDef, rigor: Rigor) -> Result<(), Vec<String>> {
+    let saving = rigor == Rigor::Saving;
     let mut errs: Vec<String> = Vec::new();
     if def.nodes.is_empty() {
         errs.push("The workflow has no nodes — add at least one step.".into());
+        return Err(errs);
+    }
+    // Size caps: authoring guard-rails ("make runaway visible"), so they bite
+    // when a workflow is written. A big one already saved still runs.
+    if saving && def.nodes.len() > MAX_NODES {
+        errs.push(format!(
+            "The workflow has {} steps — the limit is {MAX_NODES}. Split it into smaller workflows.",
+            def.nodes.len()
+        ));
+        return Err(errs);
+    }
+    if saving && def.edges.len() > MAX_EDGES {
+        errs.push(format!(
+            "The workflow has {} connections — the limit is {MAX_EDGES}.",
+            def.edges.len()
+        ));
         return Err(errs);
     }
     // Unique ids.
@@ -391,7 +466,28 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                 n.id
             ));
         }
+        // Same guard-rail shape as the size caps: a long prompt saved before
+        // this limit existed (a pasted spec or rubric) still runs.
+        if saving {
+            for t in node_text_fields(&n.kind) {
+                if t.chars().count() > MAX_NODE_TEXT {
+                    errs.push(format!(
+                        "Node '{}' has instructions longer than {MAX_NODE_TEXT} characters — shorten them.",
+                        n.id
+                    ));
+                    break;
+                }
+            }
+        }
     }
+    // Which nodes have something upstream to read (dangling edges excluded —
+    // they're reported separately and connect nothing).
+    let has_incoming: HashSet<&str> = def
+        .edges
+        .iter()
+        .filter(|e| ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()))
+        .map(|e| e.to.as_str())
+        .collect();
     // Per-kind param checks.
     let mut condition_ids: HashSet<&str> = HashSet::new();
     // route nodes are branch sources like condition, but their branch labels are
@@ -418,6 +514,19 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                 {
                     errs.push(format!(
                         "Node '{}' selects by name but has no pattern.",
+                        n.id
+                    ));
+                }
+                // A full-file pass reads ONE file end to end. Pointed at "all"
+                // it silently read only the newest — so someone asking for
+                // "read all my files thoroughly" got one file. Say so instead.
+                // Grandfathered at run time: the step editor still offers "All
+                // files" here, so saved workflows carry it, and they have
+                // always read the newest — `run_file_pass_node` now names the
+                // file it read and counts the ones it didn't.
+                if saving && select.kind == "all" && matches!(n.kind, NodeKind::FilePass { .. }) {
+                    errs.push(format!(
+                        "Node '{}' (file_pass) reads ONE file, so \"all files\" would read only the newest — use a for_each_file step to cover every file, or select newest/name_like/run_input.",
                         n.id
                     ));
                 }
@@ -451,7 +560,7 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                     ));
                 }
             }
-            NodeKind::Condition { op, .. } => {
+            NodeKind::Condition { op, value } => {
                 condition_ids.insert(n.id.as_str());
                 if !CONDITION_OPS.contains(&op.as_str()) {
                     errs.push(format!(
@@ -459,6 +568,35 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
                         n.id,
                         op,
                         CONDITION_OPS.join(", ")
+                    ));
+                }
+                // An empty "contains" needle matches EVERY text, so the branch
+                // is decided before it is asked — always then, always else.
+                // Grandfathered at run time: that is a pointless workflow, not
+                // a broken one, and it has always taken the same branch.
+                if saving
+                    && matches!(op.as_str(), "contains" | "not_contains")
+                    && value.as_deref().unwrap_or("").trim().is_empty()
+                {
+                    errs.push(format!(
+                        "Node '{}' checks whether the text contains something but no text was given — type what to look for.",
+                        n.id
+                    ));
+                }
+                // The subject is the joined upstream result, so a text check
+                // with nothing wired into it reads an empty string forever.
+                // Grandfathered at run time for the same reason as the empty
+                // needle: constant, but it has always been constant.
+                if saving
+                    && matches!(
+                        op.as_str(),
+                        "contains" | "not_contains" | "is_empty" | "not_empty"
+                    )
+                    && !has_incoming.contains(n.id.as_str())
+                {
+                    errs.push(format!(
+                        "Node '{}' checks the text coming into it, but nothing runs before it — connect a step to it, or use new_files_since_last_run.",
+                        n.id
                     ));
                 }
             }
@@ -609,8 +747,9 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
         }
     }
     // Edge refs + branch legality. A branch label must be then|else and may only
-    // come off a condition node. (An unwired branch simply dead-ends — skip
-    // propagation handles it — so both branches are NOT required.)
+    // come off a condition node, and every edge OFF a condition/route must carry
+    // one. (An unwired branch simply dead-ends — skip propagation handles it —
+    // so both branches are NOT required.)
     for e in &def.edges {
         if !ids.contains(e.from.as_str()) {
             errs.push(format!("An edge starts from unknown node '{}'.", e.from));
@@ -618,12 +757,36 @@ pub fn validate_definition(def: &WorkflowDef) -> Result<(), Vec<String>> {
         if !ids.contains(e.to.as_str()) {
             errs.push(format!("An edge points to unknown node '{}'.", e.to));
         }
+        // A branch source's outgoing edges MUST each say which outcome they
+        // follow: an unlabelled one is live no matter which way the step went,
+        // so a route with unlabelled exits runs every handler at once and pays
+        // for all of them. The step editor's "Runs after" checkboxes create
+        // exactly these, and nothing flagged it.
+        //
+        // Grandfathered at run time: this is precisely the edge the old "add a
+        // step after this one" path and the still-shipping "Runs after"
+        // checkbox produce, so refusing to START on it would stop workflows the
+        // app itself wrote — silently, on a schedule. Fanning every branch is
+        // what those definitions have always done.
+        let from_condition = condition_ids.contains(e.from.as_str());
+        let from_route = route_labels.contains_key(e.from.as_str());
+        if saving && e.branch.is_none() && (from_condition || from_route) {
+            errs.push(if from_condition {
+                format!(
+                    "Edge {}→{} leaves a condition without saying which outcome it follows — set its branch to 'then' or 'else'.",
+                    e.from, e.to
+                )
+            } else {
+                format!(
+                    "Edge {}→{} leaves a route without saying which label it follows — set its branch to one of route '{}'s labels, or every branch runs at once.",
+                    e.from, e.to, e.from
+                )
+            });
+        }
         if let Some(b) = &e.branch {
             // A branch edge comes off a condition (then|else) OR a route (one of
             // its own labels). Skip-propagation matches the artifact branch string
             // to the edge branch either way, so both fan the graph the same.
-            let from_condition = condition_ids.contains(e.from.as_str());
-            let from_route = route_labels.contains_key(e.from.as_str());
             if from_condition {
                 if !["then", "else"].contains(&b.as_str()) {
                     errs.push(format!(
@@ -780,7 +943,10 @@ pub fn compile_workflow(
     room_model: &Option<String>,
     models: &[String],
 ) -> Result<Vec<Step>, Vec<String>> {
-    validate_definition(def)?;
+    // The RUN-time gate: a definition already on disk must still start. Every
+    // save path validates strictly first (`validate_with_binding`), so an
+    // authoring mistake is still caught where it can be fixed.
+    validate_runnable(def)?;
     let order = topo_order(def).map_err(|c| vec![format!("cycle through {}", c.join(" → "))])?;
     // node id -> step index (dense, topo order).
     let step_of: HashMap<&str, usize> = order
@@ -924,6 +1090,12 @@ fn emit_workflow_node<R: tauri::Runtime>(
 }
 
 /// Interpolate `{{input}}`, `{{files}}`, `{{date}}` in a template. Room-pinned.
+///
+/// `{{input}}` is substituted LAST, deliberately. It carries model output and
+/// file text, so expanding it first meant a document (or an AI reply) that
+/// happened to contain the marker `{{files}}` had the room's whole file
+/// inventory pasted into the next step's prompt — a template placeholder is a
+/// thing the WORKFLOW AUTHOR writes, never something upstream text can conjure.
 fn interpolate<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     room_path: &str,
@@ -931,7 +1103,7 @@ fn interpolate<R: tauri::Runtime>(
     inputs: &str,
 ) -> String {
     use tauri::Manager;
-    let mut out = template.replace("{{input}}", inputs);
+    let mut out = template.to_string();
     if out.contains("{{files}}") {
         let files = {
             let state = app.state::<AppState>();
@@ -965,7 +1137,7 @@ fn interpolate<R: tauri::Runtime>(
         };
         out = out.replace("{{date}}", &date);
     }
-    out
+    out.replace("{{input}}", inputs)
 }
 
 /// Resolve a file selector to (id, name, mime) rows (room-pinned).
@@ -1011,8 +1183,9 @@ fn resolve_files<R: tauri::Runtime>(
              ORDER BY created_at DESC LIMIT 1",
             [],
         )?,
-        // Same 50-file cap as the other bulk selectors; a file_pass node still
-        // takes only the first row, i.e. the newest file.
+        // Same 50-file cap as the other bulk selectors. A file_pass node reads
+        // ONE file, so `all` is rejected on it at validation (use for_each_file
+        // to cover every file) — every other reader here uses the whole list.
         "all" => query_files(
             conn,
             "SELECT id, name, coalesce(mime_type,'') FROM files \
@@ -1022,12 +1195,12 @@ fn resolve_files<R: tauri::Runtime>(
         "name_like" => {
             let pat = format!(
                 "%{}%",
-                sel.pattern.clone().unwrap_or_default().to_lowercase()
+                like_escape(&sel.pattern.clone().unwrap_or_default().to_lowercase())
             );
             query_files(
                 conn,
                 "SELECT id, name, coalesce(mime_type,'') FROM files \
-                 WHERE lower(name) LIKE ?1 \
+                 WHERE lower(name) LIKE ?1 ESCAPE '\\' \
                  ORDER BY created_at DESC LIMIT 20",
                 [pat],
             )?
@@ -1058,6 +1231,20 @@ fn resolve_files<R: tauri::Runtime>(
         _ => Vec::new(),
     };
     Ok(rows)
+}
+
+/// Escape a user-typed "name contains" fragment for SQL LIKE. `_` and `%` are
+/// wildcards down there, so an unescaped `q3_report` also matched `q3-report`
+/// and `q3xreport` — a workflow running on files the user never meant.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn query_files<P: rusqlite::Params>(
@@ -1286,9 +1473,22 @@ fn apply_merge(mode: &str, separator: &Option<String>, inputs: &[String]) -> Str
 // owns. Their assertions moved verbatim into
 // `sidecar/tests/test_wf_nodes.py::test_route_label_pick_is_robust` and
 // `::test_extract_schema_requires_each_field`.
-/// Execute one workflow step. Generic over the runtime so the mock-app harness
-/// can drive the deterministic nodes; the agent_run arm is injected via
-/// `agent_run` so the executor core stays mock-drivable. Room-pinned throughout.
+/// How one step ended, for the pipeline diagram.
+enum NodeReport {
+    /// Every incoming edge was dead — the step wrote its `{skipped:true}`
+    /// artifact and did nothing.
+    Skipped,
+    /// The step ran; the string is its result, for the node's peek.
+    Done(String),
+}
+
+/// Execute one workflow step and mark the node on the live pipeline diagram.
+///
+/// The badge is decided HERE and nowhere else. The work itself is full of `?`
+/// paths — a room closed mid-run, a Stop inside a per-file loop, a store that
+/// failed — and each one used to return straight past the diagram, so the box
+/// either lost its badge when the run ended or span forever. One funnel means a
+/// step that broke is always the box that turns red.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
@@ -1300,9 +1500,51 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
     published: &std::sync::Mutex<Option<FileMeta>>,
     agent_run: &AgentRunFn,
 ) -> Result<(), String> {
-    use tauri::Manager;
     let node: WorkflowNode = serde_json::from_value(step.params["node"].clone())
         .map_err(|_| "this workflow step is unreadable".to_string())?;
+    emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "running", None);
+    match run_workflow_node(
+        app, job_id, room_path, plan, step, cancel, published, agent_run, &node,
+    )
+    .await
+    {
+        Ok(NodeReport::Skipped) => {
+            emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "skipped", None);
+            Ok(())
+        }
+        Ok(NodeReport::Done(result)) => {
+            let peek = if result.is_empty() { None } else { Some(result.as_str()) };
+            emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "done", peek);
+            Ok(())
+        }
+        Err(e) => {
+            // Single funnel for EVERY node kind — clean an empty-generation /
+            // cloud-quota failure into one actionable line here, so agent_run
+            // (which passes its error through raw) reads the same as generate.
+            let e = crate::sidecar::humanize_empty_generation(&e).unwrap_or(e);
+            emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "error", Some(&e));
+            Err(e)
+        }
+    }
+}
+
+/// The step's actual work. Generic over the runtime so the mock-app harness can
+/// drive the deterministic nodes; the agent_run arm is injected via `agent_run`
+/// so the executor core stays mock-drivable. Room-pinned throughout. Emits
+/// nothing — its caller owns the diagram.
+#[allow(clippy::too_many_arguments)]
+async fn run_workflow_node<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    job_id: &str,
+    room_path: &str,
+    plan: &WorkflowPlan,
+    step: &Step,
+    cancel: &Arc<AtomicBool>,
+    published: &std::sync::Mutex<Option<FileMeta>>,
+    agent_run: &AgentRunFn,
+    node: &WorkflowNode,
+) -> Result<NodeReport, String> {
+    use tauri::Manager;
     let model = step.params["model"].as_str().map(|s| s.to_string());
     let incoming: Vec<(usize, Option<String>)> = step.params["incoming"]
         .as_array()
@@ -1316,8 +1558,6 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 .collect()
         })
         .unwrap_or_default();
-
-    emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "running", None);
 
     // Liveness: gather live parents' results (a MISSING/skipped parent, or a
     // branch mismatch, is not live). A non-root node with no live incoming edge
@@ -1360,8 +1600,7 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 },
             )?;
         }
-        emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "skipped", None);
-        return Ok(());
+        return Ok(NodeReport::Skipped);
     }
 
     let inputs_joined = live_inputs.join("\n\n");
@@ -1428,17 +1667,38 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                     let Some(full) = full.filter(|t| !t.trim().is_empty()) else {
                         continue;
                     };
-                    match summarize_one_file(&model, name, mime, &full, KEEP_ALIVE_WARM).await {
-                        Ok(liner) if !liner.is_empty() => {
-                            let state = app.state::<AppState>();
-                            let guard = state.room.lock().unwrap();
-                            if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
-                                let _ = db::set_file_ai_summary(&r.conn, id, &liner);
-                            }
+                    // The SHARED sentinel policy (jobs.rs::summarize_one_liner),
+                    // not a second copy of it: a file the model can't describe
+                    // is marked with the '' sentinel so it leaves the
+                    // missing-summary set instead of costing one pointless
+                    // model call every time this workflow ticks, and a file
+                    // that simply fails no longer aborts the whole run and
+                    // strands every later file without a description.
+                    let cache = |liner: &str| {
+                        let state = app.state::<AppState>();
+                        let guard = state.room.lock().unwrap();
+                        if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+                            let _ = db::set_file_ai_summary(&r.conn, id, liner);
+                        }
+                    };
+                    match summarize_one_liner(&model, name, mime, &full).await {
+                        LinerOutcome::Cached(liner) => {
+                            cache(&liner);
                             lines.push(format!("{name}: {liner}"));
                         }
-                        Ok(_) => {}
-                        Err(e) => return Err(e),
+                        LinerOutcome::Stuck => {
+                            cache("");
+                            lines.push(format!("{name}: (no description could be written)"));
+                        }
+                        // The CALL failed (timeout / quota / a 502), which says
+                        // nothing about the file — cache nothing, so this file
+                        // stays in the missing set and the next run retries it.
+                        // Caching the sentinel here would have been permanent:
+                        // every retry selector matches NULL only.
+                        LinerOutcome::Failed(_) => {
+                            lines.push(format!("{name}: (not described this run — trying again next time)"));
+                        }
+                        LinerOutcome::Hard(e) => return Err(e),
                     }
                 }
                 Ok(WfArtifact {
@@ -1512,6 +1772,7 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
             &inputs_joined,
             existing.as_ref(),
             published,
+            &format!("Workflow saved — {}", plan.workflow_name),
         )
         .map(|(result, file_id)| WfArtifact {
             result,
@@ -1542,7 +1803,7 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                 None
             };
             run_script_node(
-                app, job_id, room_path, plan, file, mode, stdin, cancel, published,
+                app, job_id, step.id, room_path, plan, file, mode, stdin, cancel, published,
             )
             .await
         }
@@ -1689,10 +1950,29 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
                     let Some(full) = full.filter(|t| !t.trim().is_empty()) else {
                         continue;
                     };
+                    // One file, one model call — so a long file is CLIPPED to
+                    // the local model's job-tier window. Say so, in the prompt
+                    // and in the section heading: a summary headed with the
+                    // file's name otherwise reads as a summary of the whole
+                    // thing when it only saw the first few pages.
                     let clipped: String = full.chars().take(PER_FILE_CHARS).collect();
-                    let prompt = format!("{instr}\n\nFile: {name}\n\n{clipped}");
+                    let cut = clipped.len() < full.len();
+                    let note = if cut {
+                        format!(
+                            "\n\n(Only the first {PER_FILE_CHARS} characters of this file are \
+                             shown — it is longer. Do not describe it as complete.)"
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let prompt = format!("{instr}\n\nFile: {name}{note}\n\n{clipped}");
                     let r = wf_generate(&m, &prompt, None, cancel).await?;
-                    sections.push(format!("## {name}\n\n{}", r.trim()));
+                    let heading = if cut {
+                        format!("## {name}\n\n_Read the first {PER_FILE_CHARS} characters only._")
+                    } else {
+                        format!("## {name}")
+                    };
+                    sections.push(format!("{heading}\n\n{}", r.trim()));
                 }
                 let result = if sections.is_empty() {
                     "No files had readable text.".into()
@@ -1770,36 +2050,19 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
         }
     };
 
-    match result {
-        Ok(mut artifact) => {
-            artifact.node_label = Some(node.label.clone());
-            artifact.node_kind = Some(node_kind_tag(&node.kind).to_string());
-            {
-                let state = app.state::<AppState>();
-                let guard = state.room.lock().unwrap();
-                let room = guard
-                    .as_ref()
-                    .filter(|r| r.path == room_path)
-                    .ok_or("The room this job belongs to is no longer open.")?;
-                store_wf_artifact(&room.conn, job_id, step.id, &artifact)?;
-            }
-            let peek = if artifact.result.is_empty() {
-                None
-            } else {
-                Some(artifact.result.as_str())
-            };
-            emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "done", peek);
-            Ok(())
-        }
-        Err(e) => {
-            // Single funnel for EVERY node kind — clean an empty-generation /
-            // cloud-quota failure into one actionable line here, so agent_run
-            // (which passes its error through raw) reads the same as generate.
-            let e = crate::sidecar::humanize_empty_generation(&e).unwrap_or(e);
-            emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "error", Some(&e));
-            Err(e)
-        }
+    let mut artifact = result?;
+    artifact.node_label = Some(node.label.clone());
+    artifact.node_kind = Some(node_kind_tag(&node.kind).to_string());
+    {
+        let state = app.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        let room = guard
+            .as_ref()
+            .filter(|r| r.path == room_path)
+            .ok_or("The room this job belongs to is no longer open.")?;
+        store_wf_artifact(&room.conn, job_id, step.id, &artifact)?;
     }
+    Ok(NodeReport::Done(artifact.result))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1821,6 +2084,11 @@ async fn run_file_pass_node<R: tauri::Runtime>(
         &plan.input_file_id,
         &plan.prev_run_at,
     )?;
+    // A full-file pass reads ONE file end to end. `all` is rejected at
+    // validation for this node kind, but a narrowing selector can still match
+    // several — name the one that was read and how many were left, rather than
+    // dropping the rest in silence.
+    let matched = files.len();
     let Some((id, name, _mime)) = files.into_iter().next() else {
         return Ok(WfArtifact {
             result: "No file matched — nothing to read.".into(),
@@ -1843,8 +2111,17 @@ async fn run_file_pass_node<R: tauri::Runtime>(
     if let Some(m) = meta {
         *published.lock().unwrap() = Some(m);
     }
+    let result = if matched > 1 {
+        format!(
+            "{summary}\n\nRead \"{name}\" only — {} other matching file(s) were not read. \
+             A full-file pass covers one file; use a \"for each file\" step to cover them all.",
+            matched - 1
+        )
+    } else {
+        summary
+    };
     Ok(WfArtifact {
-        result: summary,
+        result,
         file_id,
         ..Default::default()
     })
@@ -1859,6 +2136,7 @@ async fn run_file_pass_node<R: tauri::Runtime>(
 async fn run_script_node<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     job_id: &str,
+    step_id: usize,
     room_path: &str,
     plan: &WorkflowPlan,
     file: &str,
@@ -1868,33 +2146,31 @@ async fn run_script_node<R: tauri::Runtime>(
     published: &std::sync::Mutex<Option<FileMeta>>,
 ) -> Result<WfArtifact, String> {
     use tauri::Manager;
-    // Resolve the node's `file` (a stored file id, or a name) to a file id.
-    let file_id = {
+    // Resolve the node's `file` (a stored file id, or a name) through the ONE
+    // resolver the consent stamping and the consent card also use.
+    let (file_id, bytes) = {
         let state = app.state::<AppState>();
         let guard = state.room.lock().unwrap();
         let room = guard
             .as_ref()
             .filter(|r| r.path == room_path)
             .ok_or("The room this job belongs to is no longer open.")?;
-        // An exact id first, then a fuzzy name match (the same resolution the
-        // consent-stamping used at enqueue).
-        if room
-            .conn
-            .query_row("SELECT 1 FROM files WHERE id = ?1", [file], |_| Ok(()))
-            .is_ok()
-        {
-            file.to_string()
-        } else {
-            db::find_file_like(&room.conn, file)?.0
-        }
+        let (id, _name, bytes) = resolve_script_file(&room.conn, file)?;
+        (id, bytes)
     };
-    let consent = plan
-        .script_consents
-        .get(&file_id)
-        .cloned()
-        .unwrap_or_default();
+    let consent = plan.script_consents.get(&file_id).cloned().or_else(|| {
+        // A NAME resolves to the newest matching file, so a similarly named
+        // file arriving between approval and run can move the id out from under
+        // the stamped consent. Consent is content-addressed, so a byte-exact
+        // match against a hash this very plan stamped as approved IS the same
+        // approval — anything else still parks.
+        let sha = script_fingerprint(&bytes);
+        plan.script_consents.values().find(|s| **s == sha).cloned()
+    });
+    let consent = consent.unwrap_or_default();
     let report =
-        run_script_process(app, job_id, room_path, &file_id, &consent, stdin, cancel).await?;
+        run_script_process(app, job_id, step_id, room_path, &file_id, &consent, stdin, cancel)
+            .await?;
     // Publish the first imported output so a MANUAL run can auto-open it.
     if let Some(first) = report.imported.first() {
         *published.lock().unwrap() = Some(first.clone());
@@ -1926,8 +2202,60 @@ async fn run_script_node<R: tauri::Runtime>(
     })
 }
 
+/// Longest a saved file's name may be, before the extension. The template runs
+/// through `interpolate`, so `{{input}}` can drop a whole model reply into it.
+const MAX_SAVE_NAME_CHARS: usize = 120;
+
+/// Flatten and bound a save_file name: one line, no path separators, and short
+/// enough to be a file name rather than a pasted paragraph.
+fn clean_save_name(raw: &str) -> String {
+    let flat: String = raw
+        .chars()
+        .map(|c| if c.is_control() || c == '/' || c == '\\' { ' ' } else { c })
+        .collect();
+    let mut name: String = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.chars().count() > MAX_SAVE_NAME_CHARS {
+        name = name.chars().take(MAX_SAVE_NAME_CHARS).collect::<String>();
+        name = name.trim_end().to_string();
+    }
+    if name.is_empty() {
+        name = "Workflow output".into();
+    }
+    name
+}
+
+/// Append `body` INSIDE an existing HTML document rather than gluing a whole
+/// second page onto the end of the first — which left stranded footers mid-page
+/// and the formatting restarting after a few runs.
+fn append_into_html(old: &str, name: &str, body: &str) -> String {
+    let fragment = format!("\n<hr/>\n{}\n", body.trim());
+    // The offset must index the ORIGINAL, so the case-folded copy we search has
+    // to be byte-for-byte the same length. `to_lowercase()` is NOT: 'İ' (U+0130)
+    // grows a byte, 'ẞ' (U+1E9E) shrinks one — a page carrying either spliced
+    // the next block a few bytes off, into the middle of the closing tag, and
+    // enough of them ran the index past the end (a panic, under the room lock).
+    // The markers are pure ASCII, and `to_ascii_lowercase` only rewrites ASCII
+    // bytes in place, so every offset it reports is valid in `old`.
+    let folded = old.to_ascii_lowercase();
+    // Splice before the LAST closing marker the generated document ends with.
+    for marker in ["</main>", "</body>"] {
+        if let Some(at) = folded.rfind(marker) {
+            let mut out = String::with_capacity(old.len() + fragment.len());
+            out.push_str(&old[..at]);
+            out.push_str(&fragment);
+            out.push_str(&old[at..]);
+            return out;
+        }
+    }
+    // Not a document we recognise (an empty or hand-written file) — build one.
+    html_document(name, &format!("{}\n{fragment}", old.trim()))
+}
+
 /// Write the workflow's output as a room file. Idempotent: if this node already
-/// created a file (recorded in its artifact), overwrite that file id.
+/// created a file (recorded in its artifact), overwrite that file id. Every
+/// overwrite is snapshotted first (`store_file_bytes`), so a scheduled run can
+/// never destroy a page the user edited — Time Machine restores it.
+#[allow(clippy::too_many_arguments)]
 fn save_file_node<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     room_path: &str,
@@ -1937,9 +2265,10 @@ fn save_file_node<R: tauri::Runtime>(
     inputs: &str,
     existing: Option<&WfArtifact>,
     published: &std::sync::Mutex<Option<FileMeta>>,
+    cause: &str,
 ) -> Result<(String, String), String> {
     use tauri::{Emitter, Manager};
-    let name_raw = interpolate(app, room_path, name_template, inputs);
+    let name_raw = clean_save_name(&interpolate(app, room_path, name_template, inputs));
     let ext = if format == "md" { "md" } else { "html" };
     let name = if name_raw.to_lowercase().ends_with(&format!(".{ext}")) {
         name_raw
@@ -1961,7 +2290,7 @@ fn save_file_node<R: tauri::Runtime>(
         // Idempotent re-run: overwrite the recorded file.
         if let Some(prev) = existing.and_then(|a| a.file_id.clone()) {
             if db::get_file_extracted_text(&room.conn, &prev).is_some() {
-                db::update_file_content(&room.conn, &prev, content.as_bytes(), Some(&content))?;
+                store_file_bytes(&room.conn, &prev, content.as_bytes(), Some(&content), cause)?;
                 db::get_file_meta(&room.conn, &prev)?
             } else {
                 db::insert_file(
@@ -1989,13 +2318,13 @@ fn save_file_node<R: tauri::Runtime>(
                     let joined = if ext == "md" {
                         format!("{old}\n\n{inputs}")
                     } else {
-                        format!("{old}\n{}", html_document(&name, inputs))
+                        append_into_html(&old, &name, inputs)
                     };
-                    db::update_file_content(&room.conn, &fid, joined.as_bytes(), Some(&joined))?;
+                    store_file_bytes(&room.conn, &fid, joined.as_bytes(), Some(&joined), cause)?;
                     db::get_file_meta(&room.conn, &fid)?
                 }
                 Some(fid) => {
-                    db::update_file_content(&room.conn, &fid, content.as_bytes(), Some(&content))?;
+                    store_file_bytes(&room.conn, &fid, content.as_bytes(), Some(&content), cause)?;
                     db::get_file_meta(&room.conn, &fid)?
                 }
                 None => db::insert_file(
@@ -2158,6 +2487,8 @@ pub(crate) fn spawn_workflow_job(
             let guard = state.room.lock().unwrap();
             if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
                 let _ = db::set_job_status(&r.conn, &job_id, "running", None);
+                // A resumed run's row was left 'paused' — put it back live.
+                let _ = db::set_workflow_run_status_by_job(&r.conn, &job_id, "running");
             }
         }
         let steps = plan.steps.clone();
@@ -2195,7 +2526,10 @@ pub(crate) fn spawn_workflow_job(
         let exec_app = app.clone();
         let exec_job = job_id.clone();
         let exec_room = room_path.clone();
-        let exec_plan = plan.clone();
+        // Shared, not copied: the executor only READS the plan, and a workflow
+        // plan carries the whole definition — cloning it once per step made a
+        // big workflow pay for its own size on every node.
+        let exec_plan = Arc::new(plan.clone());
         let exec_cancel = cancel.clone();
         let exec_pub = published.clone();
         let exec_agent = agent_run.clone();
@@ -2268,8 +2602,13 @@ pub(crate) fn spawn_workflow_job(
                     RunOutcome::Error(e) => ("error", Some(e.as_str())),
                 };
                 let _ = db::set_job_status(&r.conn, &job_id, status, err);
-                // Close the workflow_runs row for a terminal outcome.
-                if !matches!(outcome, RunOutcome::Paused) {
+                // Close the workflow_runs row for a terminal outcome. A PAUSE
+                // is not terminal — the run can still be resumed — but it must
+                // stop reading as 'running', or the history line keeps a live
+                // green dot forever with nothing to explain it.
+                if matches!(outcome, RunOutcome::Paused) {
+                    let _ = db::set_workflow_run_status_by_job(&r.conn, &job_id, "paused");
+                } else {
                     let run_status = if matches!(outcome, RunOutcome::Done) {
                         "done"
                     } else {
@@ -2323,21 +2662,9 @@ pub(crate) fn stamp_script_consents(
     let mut out = std::collections::HashMap::new();
     for node in &def.nodes {
         if let NodeKind::ScriptRun { file, .. } = &node.kind {
-            // Resolve `file` (a stored id, or a name) to a file id + bytes.
-            let resolved: Option<(String, Vec<u8>)> =
-                if let Ok((name, bytes)) = db::get_file_bytes_named(conn, file) {
-                    let _ = name;
-                    Some((file.clone(), bytes.unwrap_or_default()))
-                } else if let Ok((id, _)) = db::find_file_like(conn, file) {
-                    let bytes = db::get_file_bytes(conn, &id)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    Some((id, bytes))
-                } else {
-                    None
-                };
-            if let Some((id, bytes)) = resolved {
+            // The ONE resolver — the executor and the consent card use it too,
+            // so the three can no longer disagree about which file this is.
+            if let Ok((id, _name, bytes)) = resolve_script_file(conn, file) {
                 let sha = script_fingerprint(&bytes);
                 if approved.contains(&sha) {
                     out.insert(id, sha);
@@ -2348,10 +2675,14 @@ pub(crate) fn stamp_script_consents(
     out
 }
 
-/// The previous run's start time (for since_last_run / new_files_since_last_run).
+/// The last SUCCESSFUL run's start time (for since_last_run /
+/// new_files_since_last_run). Only a run that finished counts: measuring from a
+/// failed or stopped attempt would move the window past files that attempt
+/// never processed, so they would be skipped for good with nothing to show it.
 fn previous_run_at(conn: &Connection, workflow_id: &str) -> Option<String> {
     conn.query_row(
-        "SELECT started_at FROM workflow_runs WHERE workflow_id = ?1 ORDER BY started_at DESC LIMIT 1",
+        "SELECT started_at FROM workflow_runs WHERE workflow_id = ?1 AND status = 'done' \
+         ORDER BY started_at DESC LIMIT 1",
         [workflow_id],
         |r| r.get::<_, String>(0),
     )
@@ -2416,7 +2747,7 @@ pub(crate) async fn start_workflow_run(
     }
     if full {
         return if trigger == "manual" {
-            Err("Too many jobs are queued — try again once some finish.".into())
+            Err(queue::QUEUE_FULL.into())
         } else {
             Ok(String::new())
         };
@@ -2809,9 +3140,14 @@ pub async fn set_workflow_schedule(
     Ok(())
 }
 
-/// True if this workflow already has a job in flight (running/queued/paused) —
-/// the guard against duplicate/pile-up runs. Mirrors delete_workflow's status
-/// check over the workflow's run rows.
+/// True if this workflow already has a job in flight (running or queued) — the
+/// guard against duplicate/pile-up runs.
+///
+/// A PAUSED job is deliberately not in flight: it makes no progress on its own,
+/// so counting it here parked the workflow forever — every scheduled tick
+/// skipped silently and Run answered "already running or queued" for a job that
+/// was never going to move. The parked job stays resumable from the Activity
+/// panel either way.
 fn has_inflight_run(conn: &Connection, workflow_id: &str) -> bool {
     let Ok(runs) = db::list_workflow_runs(conn, workflow_id) else {
         return false;
@@ -2820,7 +3156,7 @@ fn has_inflight_run(conn: &Connection, workflow_id: &str) -> bool {
         r.job_id
             .as_ref()
             .and_then(|jid| db::get_job(conn, jid).ok())
-            .map(|j| matches!(j.status.as_str(), "running" | "queued" | "paused"))
+            .map(|j| matches!(j.status.as_str(), "running" | "queued"))
             .unwrap_or(false)
     })
 }
@@ -3619,7 +3955,8 @@ fn clamp_test_report(s: String) -> String {
 /// with it as a free `probe` (see `agents.py`), so an authoring task gets the
 /// grammar on its first round, in full, exactly when it is about to be used.
 pub const WORKFLOW_NODE_REFERENCE: &str = "\n\n## Node reference (for save_workflow / update_workflow)\n\
-`definition` is {version, nodes, edges}; edges are [{from, to, branch?}].\n\
+`definition` is {version, nodes, edges}; edges are [{from, to, branch?}]. Every edge OUT of a condition or a \
+route MUST carry `branch` (then|else for a condition, one of the route's own labels); no other edge may.\n\
 MODEL nodes: generate {prompt, model} · summarize_file {select} · file_pass {select, instruction, mode} · \
 for_each_file {select, instruction} (runs on EACH selected file) · agent_run {question} · \
 extract {fields:[...]} (structured JSON out of {{input}}) · route {prompt, labels:[...]} (tags input with one \
@@ -3630,7 +3967,8 @@ DETERMINISTIC nodes (no model): transform {op:append|prepend|replace|upper|lower
 merge {mode:concat|dedupe_lines|numbered} (join parallel branches) · http_fetch {url} · \
 script_run {file, mode:import|transform} (runs a room .py/.js; transform pipes {{input}}→stdin→stdout) · \
 save_file {name_template, format, mode} · condition {op, value}.\n\
-`select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input.\n\
+`select` types: newest | all | name_like (+pattern) | missing_summary | since_last_run | run_input — except \
+file_pass, which reads ONE file and rejects `all` (use for_each_file to cover every file).\n\
 Parallelism = several edges out of one node, re-joined by a merge. Prompts support {{input}} (upstream \
 results), {{files}} (file list), {{date}}. Give every node a short `label` (2-4 words in the user's \
 language, e.g. \"Write the digest\") so the canvas reads as plain steps, not kind names.\n\
@@ -4035,7 +4373,9 @@ mod tests {
             "nodes": [
                 { "id": "save", "kind": "save_file", "name_template": "o" },
                 { "id": "gen", "kind": "generate", "prompt": "p", "model": "local" },
-                { "id": "cond", "kind": "condition", "op": "not_empty" }
+                // A ROOM-reading condition, so it is legitimately a first step
+                // (a text check with nothing upstream is a validation error).
+                { "id": "cond", "kind": "condition", "op": "new_files_since_last_run" }
             ],
             "edges": [ { "from": "cond", "to": "gen", "branch": "then" }, { "from": "gen", "to": "save" } ]
         }));
@@ -4206,6 +4546,328 @@ mod tests {
             ]
         }));
         assert!(validate_definition(&ok).is_ok());
+    }
+
+    #[test]
+    fn an_unlabelled_exit_from_a_branch_step_is_rejected() {
+        // An edge with no branch is live whichever way the step went, so a
+        // route with unlabelled exits runs EVERY handler at once and pays for
+        // all of them. The step editor's "Runs after" checkboxes create exactly
+        // these, and saving reported no problem.
+        let route = parse(serde_json::json!({
+            "nodes": [
+                { "id": "r", "kind": "route", "labels": ["a", "b"] },
+                { "id": "g", "kind": "generate", "prompt": "x" },
+                { "id": "h", "kind": "generate", "prompt": "y" }
+            ],
+            "edges": [
+                { "from": "r", "to": "g", "branch": "a" },
+                { "from": "r", "to": "h" }
+            ]
+        }));
+        let errs = validate_definition(&route).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("r→h") && e.contains("which label")),
+            "{errs:?}"
+        );
+        // Same rule off a condition.
+        let cond = parse(serde_json::json!({
+            "nodes": [
+                { "id": "s", "kind": "transform", "op": "trim" },
+                { "id": "c", "kind": "condition", "op": "not_empty" },
+                { "id": "g", "kind": "generate", "prompt": "x" }
+            ],
+            "edges": [ { "from": "s", "to": "c" }, { "from": "c", "to": "g" } ]
+        }));
+        let errs = validate_definition(&cond).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("c→g") && e.contains("which outcome")),
+            "{errs:?}"
+        );
+        // A plain (non-branching) step's unlabelled edges are still fine.
+        assert!(validate_definition(&linear_def()).is_ok());
+    }
+
+    #[test]
+    fn a_text_condition_needs_both_a_needle_and_something_to_read() {
+        // An empty "contains" box matches EVERY text, so the branch is decided
+        // before it is asked; and a text check with nothing wired into it reads
+        // an empty string forever. Neither was flagged when saving.
+        let empty_needle = parse(serde_json::json!({
+            "nodes": [
+                { "id": "s", "kind": "transform", "op": "trim" },
+                { "id": "c", "kind": "condition", "op": "contains", "value": "  " }
+            ],
+            "edges": [ { "from": "s", "to": "c" } ]
+        }));
+        let errs = validate_definition(&empty_needle).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("what to look for")), "{errs:?}");
+
+        let nothing_upstream = parse(serde_json::json!({
+            "nodes": [ { "id": "c", "kind": "condition", "op": "not_empty" } ],
+            "edges": []
+        }));
+        let errs = validate_definition(&nothing_upstream).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("nothing runs before it")), "{errs:?}");
+
+        // new_files_since_last_run reads the ROOM, not the pipeline — it is
+        // legitimately a first step and needs no value.
+        let first_step = parse(serde_json::json!({
+            "nodes": [ { "id": "c", "kind": "condition", "op": "new_files_since_last_run" } ],
+            "edges": []
+        }));
+        assert!(validate_definition(&first_step).is_ok());
+    }
+
+    #[test]
+    fn a_full_file_pass_may_not_be_pointed_at_all_files() {
+        // The editor let you point a file_pass at "all files"; it then kept the
+        // single newest match and dropped the rest in silence, so "read all my
+        // files thoroughly" read one file. Name the step that covers them all.
+        let def = parse(serde_json::json!({
+            "nodes": [ { "id": "p", "kind": "file_pass", "select": { "type": "all" },
+                         "instruction": "read it" } ],
+            "edges": []
+        }));
+        let errs = validate_definition(&def).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("for_each_file") && e.contains("newest")),
+            "{errs:?}"
+        );
+        // for_each_file over "all" is exactly the right shape and stays valid.
+        let each = parse(serde_json::json!({
+            "nodes": [ { "id": "e", "kind": "for_each_file", "select": { "type": "all" },
+                         "instruction": "summarize it" } ],
+            "edges": []
+        }));
+        assert!(validate_definition(&each).is_ok());
+    }
+
+    #[test]
+    fn a_runaway_definition_is_refused() {
+        // The assistant writes workflows itself, so a runaway one used to save
+        // and queue with no warning at all.
+        let nodes: Vec<serde_json::Value> = (0..MAX_NODES + 1)
+            .map(|i| serde_json::json!({ "id": format!("n{i}"), "kind": "transform", "op": "trim" }))
+            .collect();
+        let huge = parse(serde_json::json!({ "nodes": nodes, "edges": [] }));
+        let errs = validate_definition(&huge).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("steps")), "{errs:?}");
+
+        // A single node's instructions are bounded too.
+        let long = parse(serde_json::json!({
+            "nodes": [ { "id": "g", "kind": "generate", "prompt": "x".repeat(MAX_NODE_TEXT + 1) } ],
+            "edges": []
+        }));
+        let errs = validate_definition(&long).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("longer than")), "{errs:?}");
+        // Right at the limit is still fine.
+        let ok = parse(serde_json::json!({
+            "nodes": [ { "id": "g", "kind": "generate", "prompt": "x".repeat(MAX_NODE_TEXT) } ],
+            "edges": []
+        }));
+        assert!(validate_definition(&ok).is_ok());
+    }
+
+    #[test]
+    fn a_workflow_saved_before_these_rules_existed_still_runs() {
+        // Every rule above is checked on SAVE, and `compile_workflow` runs on
+        // every START. So the moment they landed, definitions the app itself
+        // wrote stopped being startable — and a SCHEDULED start reports nothing
+        // (scheduler.rs advances next_run_at and moves on: no run row, no
+        // error), so a months-old automation just stopped firing.
+        //
+        // The rules stay; they just apply where the author can act on them.
+        let grandfathered = [
+            // An unlabelled exit from a condition — what the "Runs after"
+            // checkbox and the old add-a-step-after path both write.
+            serde_json::json!({
+                "nodes": [
+                    { "id": "s", "kind": "transform", "op": "trim" },
+                    { "id": "c", "kind": "condition", "op": "not_empty" },
+                    { "id": "g", "kind": "generate", "prompt": "x" }
+                ],
+                "edges": [ { "from": "s", "to": "c" }, { "from": "c", "to": "g" } ]
+            }),
+            // …and from a route.
+            serde_json::json!({
+                "nodes": [
+                    { "id": "r", "kind": "route", "labels": ["a", "b"] },
+                    { "id": "g", "kind": "generate", "prompt": "x" }
+                ],
+                "edges": [ { "from": "r", "to": "g" } ]
+            }),
+            // A file_pass on "All files" — still an option in the dropdown.
+            serde_json::json!({
+                "nodes": [ { "id": "p", "kind": "file_pass", "select": { "type": "all" },
+                             "instruction": "read it" } ],
+                "edges": []
+            }),
+            // A condition with an empty needle, and one with nothing upstream.
+            serde_json::json!({
+                "nodes": [
+                    { "id": "s", "kind": "transform", "op": "trim" },
+                    { "id": "c", "kind": "condition", "op": "contains", "value": "" }
+                ],
+                "edges": [ { "from": "s", "to": "c" } ]
+            }),
+            serde_json::json!({
+                "nodes": [ { "id": "c", "kind": "condition", "op": "not_empty" } ],
+                "edges": []
+            }),
+            // A prompt longer than the (new) per-node text cap.
+            serde_json::json!({
+                "nodes": [ { "id": "g", "kind": "generate",
+                             "prompt": "x".repeat(MAX_NODE_TEXT + 1) } ],
+                "edges": []
+            }),
+        ];
+        for (i, raw) in grandfathered.iter().enumerate() {
+            let def = parse(raw.clone());
+            assert!(
+                validate_definition(&def).is_err(),
+                "#{i}: saving must still refuse it — that is where it gets fixed"
+            );
+            assert!(
+                validate_runnable(&def).is_ok(),
+                "#{i}: an already-saved workflow must still start: {:?}",
+                validate_runnable(&def).unwrap_err()
+            );
+            assert!(
+                compile_workflow(&def, &None, &[]).is_ok(),
+                "#{i}: starting a run compiles through validate_runnable"
+            );
+        }
+        // A runaway node count is an authoring guard-rail too.
+        let nodes: Vec<serde_json::Value> = (0..MAX_NODES + 1)
+            .map(|i| serde_json::json!({ "id": format!("n{i}"), "kind": "transform", "op": "trim" }))
+            .collect();
+        let huge = parse(serde_json::json!({ "nodes": nodes, "edges": [] }));
+        assert!(validate_definition(&huge).is_err());
+        assert!(validate_runnable(&huge).is_ok());
+
+        // What run-time leniency does NOT cover: a definition that cannot be
+        // executed at all is still refused, at both gates.
+        let structural = [
+            // An unknown selector, an illegal branch label, a dangling edge…
+            serde_json::json!({
+                "nodes": [ { "id": "s", "kind": "summarize_file", "select": { "type": "sideways" } } ],
+                "edges": []
+            }),
+            serde_json::json!({
+                "nodes": [
+                    { "id": "c", "kind": "condition", "op": "new_files_since_last_run" },
+                    { "id": "g", "kind": "generate", "prompt": "x" }
+                ],
+                "edges": [ { "from": "c", "to": "g", "branch": "maybe" } ]
+            }),
+            serde_json::json!({
+                "nodes": [ { "id": "g", "kind": "generate", "prompt": "x" } ],
+                "edges": [ { "from": "g", "to": "ghost" } ]
+            }),
+            // …and a cycle.
+            serde_json::json!({
+                "nodes": [
+                    { "id": "a", "kind": "transform", "op": "trim" },
+                    { "id": "b", "kind": "transform", "op": "trim" }
+                ],
+                "edges": [ { "from": "a", "to": "b" }, { "from": "b", "to": "a" } ]
+            }),
+        ];
+        for (i, raw) in structural.iter().enumerate() {
+            let def = parse(raw.clone());
+            assert!(validate_definition(&def).is_err(), "structural #{i}");
+            assert!(
+                validate_runnable(&def).is_err(),
+                "structural #{i}: a def that cannot run must never start"
+            );
+        }
+    }
+
+    #[test]
+    fn the_node_reference_agrees_with_the_validator() {
+        // The model authors workflows from this text and is then bounced by
+        // `validate_definition`. Two rules were added without touching the
+        // spec, so a model that followed it exactly spent one of its two
+        // attempts on a rule it was never told about.
+        let r = WORKFLOW_NODE_REFERENCE;
+        assert!(r.contains("MUST carry `branch`"), "the branch rule is not in the spec");
+        assert!(r.contains("rejects `all`"), "the file_pass/`all` rule is not in the spec");
+        // And the spec's own worked example must pass the gate it documents.
+        let example = r
+            .split_once("Example: ")
+            .expect("the reference carries a worked example")
+            .1;
+        let v: serde_json::Value =
+            serde_json::from_str(example.trim()).expect("the example must be valid JSON");
+        let def = parse(v["definition"].clone());
+        assert!(
+            validate_definition(&def).is_ok(),
+            "the reference's own example does not validate: {:?}",
+            validate_definition(&def).unwrap_err()
+        );
+    }
+
+    #[test]
+    fn a_name_contains_filter_is_not_a_wildcard() {
+        // `_` and `%` are wildcards to SQL LIKE, so filtering for q3_report also
+        // matched q3-report and q3xreport — a workflow running on files the
+        // user never meant. The escaped pattern only matches a literal.
+        assert_eq!(like_escape("q3_report"), "q3\\_report");
+        assert_eq!(like_escape("50%"), "50\\%");
+        assert_eq!(like_escape("a\\b"), "a\\\\b");
+        assert_eq!(like_escape("plain name.pdf"), "plain name.pdf");
+    }
+
+    #[test]
+    fn a_saved_file_name_cannot_be_a_pasted_model_reply() {
+        // The name template runs through `interpolate`, so {{input}} can drop a
+        // whole answer — newlines, slashes and all — into a file name.
+        let long = "word ".repeat(200);
+        let cleaned = clean_save_name(&long);
+        assert!(cleaned.chars().count() <= MAX_SAVE_NAME_CHARS);
+        assert_eq!(clean_save_name("Digest\n2026/07\\18"), "Digest 2026 07 18");
+        assert_eq!(clean_save_name("   "), "Workflow output");
+        // An ordinary name is untouched.
+        assert_eq!(clean_save_name("Morning digest 2026-08-01"), "Morning digest 2026-08-01");
+    }
+
+    #[test]
+    fn appending_to_an_html_page_stays_one_document() {
+        // Gluing a whole second document onto the end left stranded footers
+        // mid-page and the formatting restarting after a few runs.
+        let old = html_document("Digest", "<p>first</p>");
+        let joined = append_into_html(&old, "Digest", "<p>second</p>");
+        assert_eq!(joined.matches("<!doctype html>").count(), 1);
+        assert_eq!(joined.matches("</main>").count(), 1);
+        assert!(joined.contains("<p>first</p>") && joined.contains("<p>second</p>"));
+        // The new block lands INSIDE the document, before the footer.
+        let at_second = joined.find("<p>second</p>").unwrap();
+        assert!(at_second < joined.find("</main>").unwrap());
+        // A file that isn't a document we recognise becomes one.
+        let built = append_into_html("loose text", "Digest", "<p>next</p>");
+        assert!(built.starts_with("<!doctype html>"));
+        assert!(built.contains("loose text") && built.contains("<p>next</p>"));
+    }
+
+    #[test]
+    fn appending_survives_text_that_changes_length_when_lowercased() {
+        // The splice point is an offset into the case-folded copy, so that copy
+        // must be the same LENGTH as the original. `to_lowercase()` isn't:
+        // 'İ' (U+0130) grows a byte, 'ẞ' (U+1E9E) shrinks one — so a page whose
+        // accumulated content carried either had the next block spliced a few
+        // bytes off, into the middle of the closing tag, and enough of them ran
+        // the index past the end (a panic, under the room lock).
+        for shifty in ["İstanbul İzmir İçel", "STRAẞE ẞ ẞ ẞ ẞ"] {
+            let old = html_document("Digest", &format!("<p>{shifty}</p>"));
+            let joined = append_into_html(&old, "Digest", "<p>second</p>");
+            // The block goes in exactly AT `</main>`, nowhere near it.
+            let at = old.rfind("</main>").expect("fixture is a generated page");
+            let expected = format!("{}\n<hr/>\n<p>second</p>\n{}", &old[..at], &old[at..]);
+            assert_eq!(joined, expected, "{shifty}: spliced at the wrong offset");
+            assert_eq!(joined.matches("</main>").count(), 1, "{shifty}");
+            assert!(joined.contains(shifty), "{shifty}: old content was cut");
+        }
     }
 
     #[test]
@@ -4450,6 +5112,97 @@ mod tests {
                 { "from": "join",  "to": "out" }
             ]
         }))
+    }
+
+    #[test]
+    fn upstream_text_cannot_conjure_a_template_placeholder() {
+        // Placeholders are what the workflow AUTHOR writes. Substituting
+        // {{input}} FIRST meant a document — or an AI reply — that happened to
+        // contain the marker {{files}} had the room's whole file inventory
+        // pasted into the next step's prompt.
+        use tauri::Manager;
+        let room_path = "mem://wf-interpolate";
+        let app = wf_app(room_path);
+        let handle = app.handle().clone();
+        {
+            let state = handle.state::<AppState>();
+            let guard = state.room.lock().unwrap();
+            db::insert_file(
+                &guard.as_ref().unwrap().conn,
+                "quarterly-plan.md",
+                "text/markdown",
+                b"body",
+                Some("body"),
+                "upload",
+            )
+            .unwrap();
+        }
+        let hostile = "the model wrote: {{files}}";
+        let out = interpolate(&handle, room_path, "Continue from:\n{{input}}", hostile);
+        assert!(out.contains("{{files}}"), "the marker is left as literal text");
+        assert!(
+            !out.contains("quarterly-plan.md"),
+            "upstream text must not expand into the file inventory: {out}"
+        );
+        // A placeholder the TEMPLATE itself carries still resolves.
+        let real = interpolate(&handle, room_path, "Files:\n{{files}}\n\n{{input}}", "x");
+        assert!(real.contains("quarterly-plan.md"));
+        assert!(real.ends_with("x"));
+    }
+
+    #[test]
+    fn a_paused_run_neither_blocks_the_next_one_nor_reads_as_running() {
+        // Stopping a workflow (or quitting mid-run) parks its job. Counting a
+        // parked job as "in flight" left the workflow stuck for good: every
+        // scheduled tick skipped silently and Run answered "already running or
+        // queued" for a job that was never going to move on its own.
+        let conn = db::mem();
+        let wf = db::create_workflow(&conn, "Digest", "", "", &serde_json::json!({}), "user",
+            &serde_json::json!({"scope": "general"})).unwrap();
+        let job = db::create_job(&conn, "workflow", "Workflow — Digest",
+            &serde_json::json!({}), 3).unwrap();
+        db::create_workflow_run(&conn, &wf, &job, "manual", None).unwrap();
+
+        db::set_job_status(&conn, &job, "running", None).unwrap();
+        assert!(has_inflight_run(&conn, &wf), "a live run blocks a duplicate");
+        db::set_job_status(&conn, &job, "queued", None).unwrap();
+        assert!(has_inflight_run(&conn, &wf), "so does a queued one");
+
+        // Parked: resumable from the Activity panel, but not in flight.
+        db::set_job_status(&conn, &job, "paused", None).unwrap();
+        db::set_workflow_run_status_by_job(&conn, &job, "paused").unwrap();
+        assert!(!has_inflight_run(&conn, &wf), "a parked run must not block forever");
+        let runs = db::list_workflow_runs(&conn, &wf).unwrap();
+        assert_eq!(runs[0].status, "paused", "and its history line says so");
+        assert!(runs[0].finished_at.is_none(), "it is still resumable");
+    }
+
+    #[test]
+    fn the_new_files_window_only_moves_on_a_run_that_finished() {
+        // "Files added since the last run" measured from the last ATTEMPT, so
+        // files that arrived before a failed or stopped run were quietly never
+        // picked up again.
+        let conn = db::mem();
+        let wf = db::create_workflow(&conn, "Digest", "", "", &serde_json::json!({}), "user",
+            &serde_json::json!({"scope": "general"})).unwrap();
+        assert_eq!(previous_run_at(&conn, &wf), None, "never run → the whole room is new");
+
+        let ok = db::create_job(&conn, "workflow", "w", &serde_json::json!({}), 1).unwrap();
+        db::create_workflow_run(&conn, &wf, &ok, "schedule", None).unwrap();
+        db::finish_workflow_run_by_job(&conn, &ok, "done", None).unwrap();
+        let after_success = previous_run_at(&conn, &wf).expect("a finished run sets the window");
+
+        // A LATER run that failed must not move the window past it.
+        let bad = db::create_job(&conn, "workflow", "w", &serde_json::json!({}), 1).unwrap();
+        db::create_workflow_run(&conn, &wf, &bad, "schedule", None).unwrap();
+        db::finish_workflow_run_by_job(&conn, &bad, "error", Some("the model was down")).unwrap();
+        assert_eq!(previous_run_at(&conn, &wf).as_deref(), Some(after_success.as_str()));
+
+        // Nor a parked one.
+        let stopped = db::create_job(&conn, "workflow", "w", &serde_json::json!({}), 1).unwrap();
+        db::create_workflow_run(&conn, &wf, &stopped, "manual", None).unwrap();
+        db::set_workflow_run_status_by_job(&conn, &stopped, "paused").unwrap();
+        assert_eq!(previous_run_at(&conn, &wf).as_deref(), Some(after_success.as_str()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

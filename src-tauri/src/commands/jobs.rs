@@ -41,22 +41,24 @@ pub use download::*;
 
 /// Where a step runs — decides how many may run at once. Local-model work is
 /// serial because only one model is resident; CPU and cloud work fan out.
+///
+/// There is deliberately NO transcription lane: speech-to-text runs entirely
+/// outside the job system (`recording.rs`'s own decoder thread), so a `Whisper`
+/// variant only ever cost `plan_dispatch` a slot it reserved for nobody.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lane {
     LocalLlm,
-    Whisper,
     Cpu,
     Cloud,
 }
 
 impl Lane {
-    /// Concurrent slots per lane. Local model and Whisper are serial (RAM and a
-    /// single resident model); CPU threads and remote cloud calls overlap.
+    /// Concurrent slots per lane. Local-model work is serial (RAM and a single
+    /// resident model); CPU threads and remote cloud calls overlap.
     pub fn slots(self) -> usize {
         match self {
             Lane::LocalLlm => 1,
-            Lane::Whisper => 1,
             Lane::Cpu => 4,
             Lane::Cloud => 4,
         }
@@ -84,7 +86,7 @@ pub struct Step {
 pub fn plan_dispatch(steps: &[Step], done: &HashSet<usize>, running: &HashSet<usize>) -> Vec<usize> {
     // Slots left per lane after accounting for what's already running.
     let mut free: std::collections::HashMap<Lane, usize> = std::collections::HashMap::new();
-    for lane in [Lane::LocalLlm, Lane::Whisper, Lane::Cpu, Lane::Cloud] {
+    for lane in [Lane::LocalLlm, Lane::Cpu, Lane::Cloud] {
         free.insert(lane, lane.slots());
     }
     for s in steps.iter().filter(|s| running.contains(&s.id)) {
@@ -274,6 +276,10 @@ pub(crate) fn quiesce_stale_jobs(conn: &Connection) {
         // review #3 — demoting queued here made pump_on_open a dead no-op).
         for j in jobs.iter().filter(|j| j.status == "running") {
             let _ = db::set_job_status(conn, &j.id, "paused", None);
+            // A workflow's run row must stop reading as 'running' too, or its
+            // history line keeps a live green dot for a job that is parked.
+            // Harmless for the other job kinds — they have no run row.
+            let _ = db::set_workflow_run_status_by_job(conn, &j.id, "paused");
         }
     }
 }
@@ -284,6 +290,73 @@ pub(crate) fn quiesce_stale_jobs(conn: &Connection) {
 /// scheduler (which reads `files_missing_summary`, NULL-only) leaves it alone.
 fn has_liner(f: &db::SummaryFile) -> bool {
     f.ai_summary.as_deref().is_some_and(|s| !s.trim().is_empty())
+}
+
+/// The progress line for a deep-summary / indexing job.
+///
+/// `done` counts FINISHED files, so it opens at 0 — "Summarizing file 0 of 17"
+/// reads wrong and then stays a step behind the file actually being read. Name
+/// the file in flight, 1-based, exactly like `pass_progress_label` and the
+/// workflow tick already do.
+fn summary_progress_label(auto: bool, done: usize, total: usize) -> String {
+    if done >= total {
+        "Finishing…".to_string()
+    } else if auto {
+        format!("Indexing file {} of {}…", done + 1, total)
+    } else {
+        format!("Summarizing file {} of {}…", done + 1, total)
+    }
+}
+
+/// What caching ONE file's one-liner produced.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LinerOutcome {
+    /// A real one-liner to cache.
+    Cached(String),
+    /// The model ANSWERED and its answer was empty — this file is one nothing
+    /// can be said about. The caller caches the '' SENTINEL so the file leaves
+    /// the missing set and no scheduled pass burns a model call on it every
+    /// tick; a manual run still retries it, because `has_liner` counts '' as
+    /// missing.
+    Stuck,
+    /// The call did not complete: a timeout, a 502, a cloud quota rejection.
+    /// This says NOTHING about the file, so NOTHING is cached — `ai_summary`
+    /// stays NULL and the next pass (scheduled or manual) tries it again. The
+    /// sentinel here would have been permanent: both retry selectors
+    /// (`files_missing_summary` and the workflow's `missing_summary`) match
+    /// only NULL, so one bad afternoon on the network would have left up to 50
+    /// files described as nothing, forever, with only a manual "Summarize room"
+    /// to clear them.
+    Failed(String),
+    /// A hard failure (server down / model gone) — the caller must park, not
+    /// write a sentinel: nothing is wrong with this particular file.
+    Hard(String),
+}
+
+/// The sentinel policy as a pure decision over what the model call returned, so
+/// it is testable without a model. See `LinerOutcome` for why an empty ANSWER
+/// and a failed CALL must not land in the same bucket.
+pub(crate) fn classify_liner(reply: Result<String, String>) -> LinerOutcome {
+    match reply {
+        Ok(liner) if !liner.trim().is_empty() => LinerOutcome::Cached(liner),
+        Ok(_) => LinerOutcome::Stuck,
+        Err(e) if e == "OLLAMA_DOWN" || e.starts_with("MODEL_MISSING") => LinerOutcome::Hard(e),
+        Err(e) => LinerOutcome::Failed(e),
+    }
+}
+
+/// The ONE place the one-liner sentinel policy lives. `spawn_deep_summary` (the
+/// auto-index job) and the workflow engine's `summarize_file` node both go
+/// through here, per auto_index.rs's integration decision — the alternative was
+/// two copies that drift, which is exactly how the workflow copy ended up
+/// retrying an undescribable file every 30 minutes forever.
+pub(crate) async fn summarize_one_liner(
+    model: &str,
+    name: &str,
+    mime: &str,
+    text: &str,
+) -> LinerOutcome {
+    classify_liner(summarize_one_file(model, name, mime, text, KEEP_ALIVE_WARM).await)
 }
 
 /// Build the deep-summary plan for the room's CURRENT files: one step per file,
@@ -433,27 +506,24 @@ fn spawn_deep_summary(
                             let _ = db::set_file_ai_summary(&r.conn, &f.id, liner);
                         }
                     };
-                    match summarize_one_file(&model, &f.name, &f.mime, &full, KEEP_ALIVE_WARM).await {
-                        Ok(liner) if !liner.is_empty() => {
+                    // A hard error (server down / model gone) parks the job; a
+                    // stuck file just leaves this file uncached (or
+                    // sentinel-marked on an auto run); a call that FAILED
+                    // (timeout / quota / 502) is cached neither way, so the
+                    // next pass retries it.
+                    match summarize_one_liner(&model, &f.name, &f.mime, &full).await {
+                        LinerOutcome::Cached(liner) => {
                             mark(&liner);
                             Ok(())
                         }
-                        Ok(_) => {
+                        LinerOutcome::Stuck => {
                             if auto {
                                 mark("");
                             }
                             Ok(())
                         }
-                        // A hard error (server down / model gone) parks the job;
-                        // a one-off failure just leaves this file uncached (or
-                        // sentinel-marked on an auto run).
-                        Err(e) if e == "OLLAMA_DOWN" || e.starts_with("MODEL_MISSING") => Err(e),
-                        Err(_) => {
-                            if auto {
-                                mark("");
-                            }
-                            Ok(())
-                        }
+                        LinerOutcome::Failed(_) => Ok(()),
+                        LinerOutcome::Hard(e) => Err(e),
                     }
                 }
             },
@@ -472,11 +542,7 @@ fn spawn_deep_summary(
                 emit_progress(
                     &window,
                     &job_id,
-                    &if auto {
-                        format!("Indexing file {done} of {total}…")
-                    } else {
-                        format!("Summarizing file {done} of {total}…")
-                    },
+                    &summary_progress_label(auto, done, total),
                     done,
                     total,
                 );
@@ -612,7 +678,7 @@ pub(crate) async fn start_deep_summary_inner(
         }
         // Wave 4a: too many jobs already waiting — refuse rather than pile up.
         if queue::at_capacity(&room.conn) {
-            return Err("Too many background jobs are already waiting — let some finish first.".into());
+            return Err(queue::QUEUE_FULL.into());
         }
         let id = db::create_job(&room.conn, "deep_summary", title, &plan, total)?;
         Ok((id, room.path.clone()))
@@ -767,7 +833,7 @@ pub(crate) async fn start_studio_job_inner(
     });
     let (job_id, room_path) = state.with_room(|room| {
         if queue::at_capacity(&room.conn) {
-            return Err("Too many background jobs are already waiting — let one finish first.".into());
+            return Err(queue::QUEUE_FULL.into());
         }
         let id = db::create_job(&room.conn, "studio", title, &plan, 1)?;
         Ok((id, room.path.clone()))
@@ -924,7 +990,7 @@ pub(crate) async fn begin_file_pass(
             return Err("The room changed while starting this pass.".into());
         }
         if queue::at_capacity(&room.conn) {
-            return Err("Too many background jobs are already waiting — let some finish first.".into());
+            return Err(queue::QUEUE_FULL.into());
         }
         db::create_job(&room.conn, "file_pass", &title, &plan_json, steps.len() as i64)
     })?;
@@ -1182,11 +1248,11 @@ mod tests {
 
     #[test]
     fn different_lanes_run_in_parallel() {
-        // A CPU decode, a Whisper transcribe, and a local digest are all ready
-        // and on different lanes → all three start together.
+        // A CPU decode, a cloud call, and a local digest are all ready and on
+        // different lanes → all three start together.
         let steps = vec![
             step(0, Lane::Cpu, &[]),
-            step(1, Lane::Whisper, &[]),
+            step(1, Lane::Cloud, &[]),
             step(2, Lane::LocalLlm, &[]),
         ];
         let d = plan_dispatch(&steps, &HashSet::new(), &HashSet::new());
@@ -1227,6 +1293,19 @@ mod tests {
         assert!(plan_is_stuck(&broken, &done, &HashSet::new()));
         // A healthy plan mid-run is NOT stuck.
         assert!(!plan_is_stuck(&steps, &HashSet::new(), &[0].into_iter().collect()));
+    }
+
+    #[test]
+    fn the_summary_progress_card_names_the_file_being_read() {
+        // It counted FINISHED files, so it opened with "Summarizing file 0 of
+        // 17" and stayed a step behind — the same label the other passes were
+        // already fixed for.
+        assert_eq!(summary_progress_label(false, 0, 17), "Summarizing file 1 of 17…");
+        assert_eq!(summary_progress_label(false, 16, 17), "Summarizing file 17 of 17…");
+        assert_eq!(summary_progress_label(true, 0, 3), "Indexing file 1 of 3…");
+        // Past the end there is no file in flight to name.
+        assert_eq!(summary_progress_label(false, 17, 17), "Finishing…");
+        assert!(!summary_progress_label(false, 0, 17).contains("file 0"));
     }
 
     #[test]
@@ -1885,6 +1964,44 @@ mod tests {
 
         assert_eq!(files.iter().take_while(|f| has_liner(f)).count(), 1);
         assert_eq!(files.iter().filter(|f| has_liner(f)).count(), 2);
+    }
+
+    #[test]
+    fn a_failed_call_is_not_a_file_that_cannot_be_described() {
+        // The '' sentinel is PERMANENT — both retry selectors
+        // (`files_missing_summary` and the workflow's `missing_summary`) match
+        // `ai_summary IS NULL` only. So it may be written for exactly one
+        // reason: the model answered and said nothing. A timeout, a 502, a
+        // cloud quota rejection says nothing about the file, and lumping those
+        // in with Stuck marked up to 50 files per run as undescribable forever.
+        assert_eq!(
+            classify_liner(Ok("A budget spreadsheet.".into())),
+            LinerOutcome::Cached("A budget spreadsheet.".into())
+        );
+        // The model ANSWERED, emptily → sentinel-worthy.
+        assert_eq!(classify_liner(Ok(String::new())), LinerOutcome::Stuck);
+        assert_eq!(classify_liner(Ok("  \n ".into())), LinerOutcome::Stuck);
+        // The server / model is gone → park the whole job, cache nothing.
+        assert_eq!(
+            classify_liner(Err("OLLAMA_DOWN".into())),
+            LinerOutcome::Hard("OLLAMA_DOWN".into())
+        );
+        assert_eq!(
+            classify_liner(Err("MODEL_MISSING:qwen3.5:4b".into())),
+            LinerOutcome::Hard("MODEL_MISSING:qwen3.5:4b".into())
+        );
+        // Everything else is a failed CALL — retryable, never a sentinel.
+        for e in [
+            "HTTP 502 from the model server",
+            "request timed out",
+            "quota exceeded for this key",
+        ] {
+            assert_eq!(
+                classify_liner(Err(e.into())),
+                LinerOutcome::Failed(e.into()),
+                "a transient failure must not read as an undescribable file"
+            );
+        }
     }
 
     #[test]

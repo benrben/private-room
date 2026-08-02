@@ -156,8 +156,31 @@ class _Digester(Protocol):
 #: Digest cache, keyed by the content hash of the exact messages digested. A
 #: conversation's older half is stable across the rounds of a turn AND across
 #: turns, so the same chunk is digested once per session rather than per round.
-#: Process-lifetime — the sidecar is per-user and short-lived.
+#:
+#: BOUNDED, because nothing outside this module clears it: closing a room,
+#: switching rooms and deleting the chat all leave every digest of every
+#: conversation resident, and each one is a paragraph of the user's own content.
+#: Oldest-first eviction keeps the working set (the chunks of the conversation
+#: being had right now) and drops the ones a finished room left behind.
 _CACHE: dict[str, str] = {}
+
+#: Entries kept before the oldest is evicted. A long conversation contributes
+#: one entry per full 18 KB chunk, so this is several very long chats.
+_CACHE_MAX_ENTRIES: int = 64
+
+
+def _cache_get(key: str) -> str | None:
+    """The cached digest, moved to the young end so use keeps it alive."""
+    value = _CACHE.pop(key, None)
+    if value is not None:
+        _CACHE[key] = value
+    return value
+
+
+def _cache_put(key: str, digest: str) -> None:
+    _CACHE[key] = digest
+    while len(_CACHE) > _CACHE_MAX_ENTRIES:
+        _CACHE.pop(next(iter(_CACHE)))
 
 
 def _key(messages: list[Message]) -> str:
@@ -175,7 +198,7 @@ def fit_budget_bytes(
     reserved_bytes: int = 0,
     spend: float = SPEND_FRACTION,
 ) -> int | None:
-    """Bytes of conversation we are willing to send for this window.
+    """Bytes of one request we are willing to spend for this window.
 
     ``None`` (no window known) means no budget is imposed — the same contract
     :func:`.budget.trim_messages_to_window` has, so an engine whose window we
@@ -184,12 +207,22 @@ def fit_budget_bytes(
     ``spend`` deliberately defaults to less than the whole window. Filling it
     measurably hurt the smallest engine; a cloud engine passes
     :data:`CLOUD_SPEND_FRACTION` instead, which is nearly all of it.
+
+    ``reserved_bytes`` (the serialized tool catalog) is NOT subtracted here.
+    Every consumer of this number — :func:`compact_to_budget`,
+    :func:`.budget.fit_oversized_results`,
+    :func:`.budget.trim_messages_to_window` — is handed the same figure and adds
+    it to the PAYLOAD side of the comparison, which is where it is accounted.
+    Taking it off here as well charged the catalog twice on all three engines,
+    so every room started compacting a few KB earlier than it had to. The
+    argument stays in the signature because the three call sites pass it
+    positionally alongside the spend fraction.
     """
     if num_ctx is None:
         return None
     from .budget import window_budget_bytes
 
-    return max(0, int(window_budget_bytes(num_ctx) * spend) - reserved_bytes)
+    return max(0, int(window_budget_bytes(num_ctx) * spend))
 
 
 def digest_chunk_bytes(window_tokens: int | None, *, cloud: bool) -> int:
@@ -309,9 +342,10 @@ async def compact_to_budget(
         recent = chunks.pop() + recent
 
     parts: list[str] = []
+    failed = 0
     for chunk in chunks:
         key = _key(chunk)
-        cached = _CACHE.get(key)
+        cached = _cache_get(key)
         if cached is None:
             text = "\n".join(
                 f"{m.get('role')}: {m.get('content') or ''}" for m in chunk
@@ -320,9 +354,25 @@ async def compact_to_budget(
                 cached = (await digest(text)).strip()
             except Exception:  # noqa: BLE001 - a failed digest must not fail the turn
                 cached = ""
-            _CACHE[key] = cached
+            # A FAILURE IS NOT CACHED. Filing "" under this chunk's hash used to
+            # retire that stretch of the conversation permanently — one flaky
+            # call and the model never saw those turns again for the rest of the
+            # session, with nothing anywhere saying so. Leaving it uncached costs
+            # a retry next round, which is what a transient failure deserves.
+            if cached:
+                _cache_put(key, cached)
         if cached:
             parts.append(cached)
+        else:
+            failed += 1
+
+    if failed and parts:
+        # Some stretches made it and some did not. Say so: an answer built on a
+        # transcript with a hole in it should be able to explain the hole.
+        parts.append(
+            f"[{failed} earlier stretch(es) of this conversation could not be "
+            "summarised and are missing from the above]"
+        )
 
     if not parts:
         # Digesting failed outright. Returning the input unchanged is right on a
@@ -336,7 +386,12 @@ async def compact_to_budget(
 
 
 def clear_cache() -> None:
-    """Drop the digest cache (tests; and a room close in a long-lived process)."""
+    """Drop the digest cache outright (tests, and a room close).
+
+    The cache is bounded (:data:`_CACHE_MAX_ENTRIES`) so it cannot grow without
+    limit on its own; this is the immediate drop for a caller that knows the
+    content is finished with.
+    """
     _CACHE.clear()
 
 

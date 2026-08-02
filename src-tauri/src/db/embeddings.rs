@@ -75,18 +75,64 @@ pub fn set_chunk_embedding(conn: &Connection, id: &str, blob: &[u8]) -> Result<(
     )
 }
 
-/// CHG-15: every chunk's (rowid, embedding blob) — NO text. The brute-force
+/// CHG-15: hand every chunk's (rowid, embedding blob) to `visit` one row at a
+/// time, straight out of SQLite's own row buffer — NO text. The brute-force
 /// cosine pass scores over just these, so only the ~24 winners' text is ever
-/// copied (via `chunks_by_rowids`). Previously this JOINed `c.text` for every
-/// embedded chunk on every question — tens of MB of discarded String allocation
-/// under the room mutex on a large room. The rowid keys the keyword/vector blend.
-pub fn chunk_embedding_vectors(conn: &Connection) -> Result<Vec<(i64, Vec<u8>)>, String> {
-    query_rows(
-        conn,
-        "SELECT rowid, embedding FROM chunks WHERE embedding IS NOT NULL",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
+/// copied (via `chunks_by_rowids`). The rowid keys the keyword/vector blend.
+///
+/// It used to JOIN `c.text` for every embedded chunk on every question — tens of
+/// MB of discarded String allocation under the room mutex — and then, once that
+/// was fixed, still copied EVERY blob into a `Vec<(i64, Vec<u8>)>` before
+/// scoring a single one, with `blob_to_embedding` allocating a second
+/// `Vec<f32>` per chunk on top. On a room holding a couple of long books that
+/// is tens of megabytes allocated, walked once and dropped, on every question,
+/// with the room locked the whole time. Streaming (with `cosine_similarity_blob`
+/// scoring off the borrowed bytes) allocates nothing per chunk and keeps peak
+/// memory flat however large the room grows. The scan is still linear in chunk
+/// count — only an approximate-nearest-neighbour index would change that.
+///
+/// Rows whose `embedding` is not a blob are skipped, matching
+/// `blob_to_embedding`'s "silently skip rather than mis-score" contract.
+pub fn for_each_chunk_embedding(
+    conn: &Connection,
+    mut visit: impl FnMut(i64, &[u8]),
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT rowid, embedding FROM chunks WHERE embedding IS NOT NULL")
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let rowid: i64 = row.get(0).map_err(|e| e.to_string())?;
+        if let Ok(rusqlite::types::ValueRef::Blob(blob)) = row.get_ref(1) {
+            visit(rowid, blob);
+        }
+    }
+    Ok(())
+}
+
+/// Cosine similarity between a query vector and an embedding STILL IN its
+/// little-endian BLOB form — the same maths, and the same accumulation order,
+/// as `cosine_similarity`, without decoding the blob into a `Vec<f32>` first.
+/// A blob that is not a whole number of f32s, or that is a different width from
+/// the query, scores 0.0 — exactly what `blob_to_embedding` + `cosine_similarity`
+/// did for those rows.
+pub fn cosine_similarity_blob(query: &[f32], blob: &[u8]) -> f32 {
+    if query.is_empty() || blob.len() % 4 != 0 || blob.len() / 4 != query.len() {
+        return 0.0;
+    }
+    let mut dot = 0f32;
+    let mut na = 0f32;
+    let mut nb = 0f32;
+    for (x, c) in query.iter().zip(blob.chunks_exact(4)) {
+        let y = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 /// CHG-15: fetch (rowid, file name, chunk text) for a specific set of chunk
@@ -176,6 +222,15 @@ mod tests {
         assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
     }
 
+    /// The whole embedded set, collected off the streaming scan — what
+    /// `chunk_embedding_vectors` used to return before the retrieval pass
+    /// stopped materializing it.
+    fn collect_vectors(conn: &Connection) -> Vec<(i64, Vec<u8>)> {
+        let mut out = Vec::new();
+        for_each_chunk_embedding(conn, |rowid, blob| out.push((rowid, blob.to_vec()))).unwrap();
+        out
+    }
+
     #[test]
     fn embedding_backfill_columns_work() {
         // ADD-13: chunks start with NULL embedding; storing a blob makes them
@@ -184,16 +239,67 @@ mod tests {
         add_file(&conn, "a.txt", "The office holiday party is on Friday.");
         let missing = chunks_missing_embedding(&conn, 10).unwrap();
         assert_eq!(missing.len(), 1);
-        assert!(chunk_embedding_vectors(&conn).unwrap().is_empty());
+        assert!(collect_vectors(&conn).is_empty());
         let blob = embedding_to_blob(&[0.1, 0.2, 0.3]);
         set_chunk_embedding(&conn, &missing[0].0, &blob).unwrap();
         assert!(chunks_missing_embedding(&conn, 10).unwrap().is_empty());
-        assert_eq!(chunk_embedding_vectors(&conn).unwrap().len(), 1);
+        assert_eq!(collect_vectors(&conn).len(), 1);
         // CHG-15: hydrating the winning rowids returns the chunk text.
-        let vecs = chunk_embedding_vectors(&conn).unwrap();
+        let vecs = collect_vectors(&conn);
         let rowids: Vec<i64> = vecs.iter().map(|(r, _)| *r).collect();
         let hydrated = chunks_by_rowids(&conn, &rowids).unwrap();
         assert_eq!(hydrated.len(), 1);
         assert!(hydrated[0].2.contains("holiday party"));
+    }
+
+    #[test]
+    fn streaming_scan_scores_exactly_like_the_materializing_one() {
+        // The vector pass used to copy every blob out of SQLite and decode each
+        // into a Vec<f32> before scoring one of them — tens of MB per question
+        // on a big room. Streaming must score identically, row for row.
+        let conn = mem();
+        let vectors = [
+            vec![1.0f32, 0.0, 0.0],
+            vec![0.5, 0.5, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        for (i, v) in vectors.iter().enumerate() {
+            add_file(&conn, &format!("f{i}.txt"), &format!("chunk number {i}"));
+            let missing = chunks_missing_embedding(&conn, 10).unwrap();
+            set_chunk_embedding(&conn, &missing[0].0, &embedding_to_blob(v)).unwrap();
+        }
+        let q = [1.0f32, 0.0, 0.0];
+        let mut streamed: Vec<(i64, f32)> = Vec::new();
+        for_each_chunk_embedding(&conn, |rowid, blob| {
+            streamed.push((rowid, cosine_similarity_blob(&q, blob)))
+        })
+        .unwrap();
+        let materialized: Vec<(i64, f32)> = collect_vectors(&conn)
+            .into_iter()
+            .map(|(rowid, blob)| {
+                let emb = blob_to_embedding(&blob).unwrap();
+                (rowid, cosine_similarity(&q, &emb))
+            })
+            .collect();
+        assert_eq!(streamed.len(), 3);
+        assert_eq!(streamed, materialized);
+    }
+
+    #[test]
+    fn blob_cosine_matches_decoded_cosine_including_the_skip_cases() {
+        // Same maths, same accumulation order, same "safe 0.0" for anything
+        // that blob_to_embedding would have refused to decode.
+        let q = vec![0.3f32, -0.7, 1.25, 0.0];
+        let v = vec![-0.1f32, 0.4, 2.0, 3.5];
+        let decoded = cosine_similarity(&q, &v);
+        assert_eq!(cosine_similarity_blob(&q, &embedding_to_blob(&v)), decoded);
+        // Truncated / foreign blobs and width mismatches score 0.0 rather than
+        // being mis-scored against a shorter vector.
+        assert_eq!(cosine_similarity_blob(&q, &[1, 2, 3]), 0.0);
+        assert_eq!(cosine_similarity_blob(&q, &[]), 0.0);
+        assert_eq!(cosine_similarity_blob(&q, &embedding_to_blob(&[1.0, 2.0])), 0.0);
+        assert_eq!(cosine_similarity_blob(&[], &embedding_to_blob(&v)), 0.0);
+        // A zero-magnitude stored vector is "no signal", not a NaN.
+        assert_eq!(cosine_similarity_blob(&q, &embedding_to_blob(&[0.0; 4])), 0.0);
     }
 }

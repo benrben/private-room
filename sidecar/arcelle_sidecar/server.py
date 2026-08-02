@@ -18,11 +18,12 @@ and a log line is a copy of them that outlives the run (SPEC §6).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import (
@@ -44,6 +45,7 @@ from . import summarize as summarize_feature
 from . import tts as tts_mod
 from .chat import ChatModel, OllamaChatModel
 from .config import (
+    CLOUD_WORKER_PARALLEL,
     CancelRequest,
     CapabilitiesRequest,
     DeleteRequest,
@@ -64,12 +66,23 @@ from .config import (
     WebSearchRequest,
 )
 from .external_llm import ExternalChatModel, is_external_model
-from .graph import CancelToken, Deps, Emit, Event, stream_events
+from .graph import CancelToken, Deps, Emit, stream_events
 from .mcp_client import McpClient
 from .messages import compact_json
 from .provider_api import OpenAICompatibleChatModel
 
 log = logging.getLogger("arcelle_sidecar")
+
+#: Ceiling on one incoming request body. Only programs already on this Mac can
+#: reach the port, so this is hardening, not a live defence: the biggest real
+#: body is a base64 image or a file-pass window, orders of magnitude under this,
+#: and holding an unbounded one whole in memory on a machine already running a
+#: multi-GB model is the failure worth refusing. Enforced on the declared
+#: ``Content-Length``, which is what every caller of ours sends.
+MAX_REQUEST_BYTES: int = 128 << 20
+
+#: How often a one-shot handler checks whether its caller is still there.
+_HANGUP_POLL_SECS = 0.25
 
 #: A factory so tests can inject a scripted model instead of a real Ollama.
 ChatModelFactory = Callable[[RunRequest], ChatModel]
@@ -110,6 +123,88 @@ def _default_mcp(req: RunRequest) -> McpClient | None:
     return McpClient(req.mcp.url, req.mcp.token)
 
 
+class BodyLimitMiddleware:
+    """Refuse a request whose declared body is past :data:`MAX_REQUEST_BYTES`.
+
+    Raw ASGI rather than a Starlette ``BaseHTTPMiddleware``: it reads the scope
+    headers and either answers 413 itself or steps aside completely, so the
+    NDJSON streams (``/run``, ``/pull``, ``/generate_stream``) keep the exact
+    send path they have today.
+    """
+
+    def __init__(self, app: Any, max_bytes: int = MAX_REQUEST_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and self._too_big(scope):
+            body = compact_json(
+                {"error": "request body too large", "code": "BODY_TOO_LARGE"}
+            ).encode("utf-8")
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 413,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
+
+    def _too_big(self, scope: Any) -> bool:
+        for name, value in scope.get("headers") or []:
+            if name == b"content-length":
+                try:
+                    return int(value) > self.max_bytes
+                except ValueError:
+                    return False
+        return False
+
+
+class ClientGone(Exception):
+    """The caller hung up while a one-shot handler was still working."""
+
+
+T = TypeVar("T")
+
+
+async def until_hangup(request: Request, work: Awaitable[T]) -> T:
+    """Await ``work``, abandoning it if the caller disconnects.
+
+    Stop, for the one-shot endpoints, is the host dropping the HTTP request:
+    their bodies carry no ``run_id`` for ``/cancel`` to find. uvicorn hands us
+    the disconnect and then simply waits — measured against the pinned uvicorn
+    0.51 / starlette 0.52, a non-streaming handler keeps running seconds past a
+    hard disconnect (the same measurement that put ``/wf_node`` in the
+    :class:`RunRegistry`). For a model call that means the local engine keeps
+    generating an answer nobody will read, holding the one resident-model slot
+    the next job is queued behind. Cancelling the task closes the HTTP
+    connection to the engine, which is how the generation actually stops.
+
+    Raises :class:`ClientGone` when it did; :func:`create_app` turns that into
+    a 499 body there is nobody left to read.
+    """
+    task = asyncio.ensure_future(work)
+    try:
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=_HANGUP_POLL_SECS)
+            if done:
+                return task.result()
+            if await request.is_disconnected():
+                raise ClientGone
+    finally:
+        # Also the path where this handler is itself cancelled: the work must
+        # never outlive the request that asked for it.
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+
 class RunRegistry:
     """Live runs, so /cancel can find one. Entries die with the run."""
 
@@ -141,8 +236,17 @@ def create_app(
     mcp_factory: McpFactory = _default_mcp,
 ) -> FastAPI:
     app = FastAPI(title="Arcelle agent sidecar", version=__version__)
+    app.add_middleware(BodyLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
     registry = RunRegistry()
     app.state.registry = registry
+
+    @app.exception_handler(ClientGone)
+    async def _client_gone(_request: Request, _exc: ClientGone) -> JSONResponse:
+        # The socket is already gone; this exists so the abandoned handler ends
+        # as a normal response instead of a 500 traceback in the log.
+        return JSONResponse(
+            {"error": "caller hung up", "code": "CLIENT_GONE"}, status_code=499
+        )
 
     @app.get("/health")
     async def health() -> HealthResponse:
@@ -199,9 +303,12 @@ def create_app(
         # rather than throughput — and each of them inflates the payload the
         # others fit their window to. `wf_nodes.NodeDeps.parallel` already makes
         # exactly this call for the workflow lanes. A cloud engine has no
-        # resident model, so it fans out unbounded.
+        # resident model, so it really does fan out — but not unbounded: a plan
+        # with twenty tasks opened twenty PAID conversations at once, which is a
+        # rate-limit wall and a cost spike, not twenty-way speed
+        # (`config.CLOUD_WORKER_PARALLEL`).
         worker_parallel = (
-            None
+            CLOUD_WORKER_PARALLEL
             if (req.provider is not None or privacy_mod.is_nonlocal_model(req.model))
             else 1
         )
@@ -265,19 +372,22 @@ def create_app(
         return {"embeddings": vectors}
 
     @app.post("/generate")
-    async def generate(req: GenerateRequest) -> Any:
+    async def generate(req: GenerateRequest, request: Request) -> Any:
         try:
-            text = await llm.generate(
-                req.model,
-                req.messages,
-                req.base_url,
-                temperature=req.temperature,
-                num_ctx=req.num_ctx,
-                keep_alive=req.keep_alive,
-                format=req.format,
-                images=req.images,
-                privacy=req.privacy,
-                provider=req.provider,
+            text = await until_hangup(
+                request,
+                llm.generate(
+                    req.model,
+                    req.messages,
+                    req.base_url,
+                    temperature=req.temperature,
+                    num_ctx=req.num_ctx,
+                    keep_alive=req.keep_alive,
+                    format=req.format,
+                    images=req.images,
+                    privacy=req.privacy,
+                    provider=req.provider,
+                ),
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -424,13 +534,16 @@ def create_app(
 
 
     @app.post("/label")
-    async def label(req: LabelRequest) -> Any:
+    async def label(req: LabelRequest, request: Request) -> Any:
         # D4 front-page suggestions. There is no room-GRAPH AI labeling to serve
         # here — graph.rs build_room_graph is model-free by design.
         try:
-            questions = await features.front_page_labels(
-                req.model, req.room_name, req.files, req.base_url,
-                privacy=req.privacy, provider=req.provider
+            questions = await until_hangup(
+                request,
+                features.front_page_labels(
+                    req.model, req.room_name, req.files, req.base_url,
+                    privacy=req.privacy, provider=req.provider
+                ),
             )
         except llm.LlmError:
             # Front page is resilient: any engine failure yields no suggestions,
@@ -439,40 +552,46 @@ def create_app(
         return {"questions": questions}
 
     @app.post("/feedback_draft")
-    async def feedback_draft(req: FeedbackDraftRequest) -> Any:
+    async def feedback_draft(req: FeedbackDraftRequest, request: Request) -> Any:
         try:
-            draft = await features.feedback_draft(
-                req.model, req.text, req.base_url,
-                privacy=req.privacy, provider=req.provider
+            draft = await until_hangup(
+                request,
+                features.feedback_draft(
+                    req.model, req.text, req.base_url,
+                    privacy=req.privacy, provider=req.provider
+                ),
             )
         except llm.LlmError as exc:
             return exc.response()
         return draft
 
     @app.post("/vision_locate")
-    async def vision_locate(req: VisionLocateRequest) -> Any:
+    async def vision_locate(req: VisionLocateRequest, request: Request) -> Any:
         # vision.rs locate_in_image: prepare the image, ground the query with the
         # boxes schema via the Phase-1 /generate path, parse to normalized boxes.
         # An engine failure surfaces as 502 {error, code} exactly like /generate —
         # the Rust caller rebuilds OLLAMA_DOWN / MODEL_MISSING:<model> for the UI.
         try:
-            boxes = await vision.vision_locate(
-                req.model,
-                req.image_b64,
-                req.query,
-                req.base_url,
-                temperature=req.temperature,
-                num_ctx=req.num_ctx,
-                keep_alive=req.keep_alive,
-                privacy=req.privacy,
-                provider=req.provider,
+            boxes = await until_hangup(
+                request,
+                vision.vision_locate(
+                    req.model,
+                    req.image_b64,
+                    req.query,
+                    req.base_url,
+                    temperature=req.temperature,
+                    num_ctx=req.num_ctx,
+                    keep_alive=req.keep_alive,
+                    privacy=req.privacy,
+                    provider=req.provider,
+                ),
             )
         except llm.LlmError as exc:
             return exc.response()
         return {"boxes": boxes}
 
     @app.post("/knowledge_extract")
-    async def knowledge_extract(req: KnowledgeExtractRequest) -> Any:
+    async def knowledge_extract(req: KnowledgeExtractRequest, request: Request) -> Any:
         # knowledge.rs cmd_extract (mode="fields") / cmd_add_file "for each"
         # (mode="list"). Both are STRUCTURED calls reproducing chat_structured
         # (schema-in-prompt priming + recover_json). An engine failure surfaces as
@@ -483,49 +602,58 @@ def create_app(
         # best-effort behavior.)
         try:
             if req.mode == "list":
-                items = await chat_docs.enumerate_names(
+                items = await until_hangup(
+                    request,
+                    chat_docs.enumerate_names(
+                        req.model,
+                        req.base_url,
+                        req.subject,
+                        req.conversation,
+                        temperature=req.temperature,
+                        keep_alive=req.keep_alive,
+                        privacy=req.privacy,
+                        provider=req.provider,
+                    ),
+                )
+                return {"items": items}
+            values = await until_hangup(
+                request,
+                chat_docs.extract_fields(
                     req.model,
                     req.base_url,
-                    req.subject,
-                    req.conversation,
+                    req.fields,
+                    req.document,
                     temperature=req.temperature,
                     keep_alive=req.keep_alive,
                     privacy=req.privacy,
                     provider=req.provider,
-                )
-                return {"items": items}
-            values = await chat_docs.extract_fields(
-                req.model,
-                req.base_url,
-                req.fields,
-                req.document,
-                temperature=req.temperature,
-                keep_alive=req.keep_alive,
-                privacy=req.privacy,
-                provider=req.provider,
+                ),
             )
         except llm.LlmError as exc:
             return exc.response()
         return {"values": values}
 
     @app.post("/generate_doc")
-    async def generate_doc(req: GenerateDocRequest) -> Any:
+    async def generate_doc(req: GenerateDocRequest, request: Request) -> Any:
         # knowledge.rs cmd_add_file document body (DOC_SYS). A PLAIN chat turn —
         # returns the raw HTML body; Rust checks emptiness and wraps it. An engine
         # failure surfaces as 502 {error, code} like /generate.
         try:
-            text = await chat_docs.generate_doc(
-                req.model,
-                req.base_url,
-                mode=req.mode,
-                topic=req.topic,
-                context=req.context,
-                item=req.item,
-                history=req.history,
-                temperature=req.temperature,
-                keep_alive=req.keep_alive,
-                privacy=req.privacy,
-                provider=req.provider,
+            text = await until_hangup(
+                request,
+                chat_docs.generate_doc(
+                    req.model,
+                    req.base_url,
+                    mode=req.mode,
+                    topic=req.topic,
+                    context=req.context,
+                    item=req.item,
+                    history=req.history,
+                    temperature=req.temperature,
+                    keep_alive=req.keep_alive,
+                    privacy=req.privacy,
+                    provider=req.provider,
+                ),
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -544,45 +672,53 @@ def create_app(
     # skipped, merge -> verbatim concat, compose -> raw notes) exactly like Rust.
 
     @app.post("/file_pass_map")
-    async def file_pass_map(req: file_pass.FilePassMapRequest) -> Any:
+    async def file_pass_map(req: file_pass.FilePassMapRequest, request: Request) -> Any:
         try:
-            return await file_pass.run_map(
-                model=req.model,
-                base_url=req.base_url,
-                mode=req.mode,
-                file_name=req.file_name,
-                instruction=req.instruction,
-                part=req.part,
-                total=req.total,
-                start=req.start,
-                end=req.end,
-                text_len=req.text_len,
-                thread=req.thread,
-                window_text=req.window_text,
-                keep_alive=req.keep_alive,
-                privacy=req.privacy,
-                provider=req.provider,
+            return await until_hangup(
+                request,
+                file_pass.run_map(
+                    model=req.model,
+                    base_url=req.base_url,
+                    mode=req.mode,
+                    file_name=req.file_name,
+                    instruction=req.instruction,
+                    part=req.part,
+                    total=req.total,
+                    start=req.start,
+                    end=req.end,
+                    text_len=req.text_len,
+                    thread=req.thread,
+                    window_text=req.window_text,
+                    keep_alive=req.keep_alive,
+                    privacy=req.privacy,
+                    provider=req.provider,
+                ),
             )
         except llm.LlmError as exc:
             return exc.response()
 
     @app.post("/file_pass_section")
-    async def file_pass_section(req: file_pass.FilePassSectionRequest) -> Any:
+    async def file_pass_section(
+        req: file_pass.FilePassSectionRequest, request: Request
+    ) -> Any:
         # The sectioned path: compose ONE ordered section from a group of windows'
         # notes. Publish concatenates the sections, so no call holds the whole file.
         try:
-            return await file_pass.run_section(
-                model=req.model,
-                base_url=req.base_url,
-                instruction=req.instruction,
-                file_name=req.file_name,
-                section=req.section,
-                total=req.total,
-                sections=req.sections,
-                missing=req.missing,
-                keep_alive=req.keep_alive,
-                privacy=req.privacy,
-                provider=req.provider,
+            return await until_hangup(
+                request,
+                file_pass.run_section(
+                    model=req.model,
+                    base_url=req.base_url,
+                    instruction=req.instruction,
+                    file_name=req.file_name,
+                    section=req.section,
+                    total=req.total,
+                    sections=req.sections,
+                    missing=req.missing,
+                    keep_alive=req.keep_alive,
+                    privacy=req.privacy,
+                    provider=req.provider,
+                ),
             )
         except llm.LlmError as exc:
             return exc.response()
@@ -673,34 +809,45 @@ def create_app(
     #                   never raises LlmError up here.
 
     @app.post("/ai_action")
-    async def ai_action(req: ai_actions.AiActionRequest) -> Any:
+    async def ai_action(req: ai_actions.AiActionRequest, request: Request) -> Any:
         try:
-            markdown = await ai_actions.run_ai_action(
-                action=req.action,
-                text=req.text,
-                model=req.model,
-                base_url=req.base_url,
-                instructions=req.instructions,
-                question=req.question,
-                privacy=req.privacy,
-                provider=req.provider,
+            markdown = await until_hangup(
+                request,
+                ai_actions.run_ai_action(
+                    action=req.action,
+                    text=req.text,
+                    model=req.model,
+                    base_url=req.base_url,
+                    instructions=req.instructions,
+                    question=req.question,
+                    privacy=req.privacy,
+                    provider=req.provider,
+                ),
             )
         except (ai_actions.ActionError, llm.LlmError) as exc:
             return exc.response()
         return {"markdown": markdown}
 
     @app.post("/memory_suggestion")
-    async def memory_suggestion(req: ai_actions.MemorySuggestionRequest) -> Any:
-        return await ai_actions.memory_suggestion(
-            req.model, req.user_text, req.assistant_text, req.base_url,
-            privacy=req.privacy, provider=req.provider
+    async def memory_suggestion(
+        req: ai_actions.MemorySuggestionRequest, request: Request
+    ) -> Any:
+        return await until_hangup(
+            request,
+            ai_actions.memory_suggestion(
+                req.model, req.user_text, req.assistant_text, req.base_url,
+                privacy=req.privacy, provider=req.provider
+            ),
         )
 
     @app.post("/suggest_file_meta")
-    async def suggest_file_meta(req: ai_actions.FileMetaRequest) -> Any:
-        return await ai_actions.suggest_file_meta(
-            req.model, req.current_name, req.text, req.base_url,
-            privacy=req.privacy, provider=req.provider
+    async def suggest_file_meta(req: ai_actions.FileMetaRequest, request: Request) -> Any:
+        return await until_hangup(
+            request,
+            ai_actions.suggest_file_meta(
+                req.model, req.current_name, req.text, req.base_url,
+                privacy=req.privacy, provider=req.provider
+            ),
         )
 
     # --- privacy scanner (PRIV-2) -------------------------------------------
@@ -711,14 +858,17 @@ def create_app(
     # placeholders; the mechanical door (privacy.py) enforces them at send time.
 
     @app.post("/privacy_scan")
-    async def privacy_scan(req: PrivacyScanRequest) -> Any:
+    async def privacy_scan(req: PrivacyScanRequest, request: Request) -> Any:
         try:
-            entities = await privacy_scan_mod.scan_text(
-                req.text,
-                model=req.model,
-                base_url=req.base_url,
-                concepts=req.concepts,
-                known=req.known,
+            entities = await until_hangup(
+                request,
+                privacy_scan_mod.scan_text(
+                    req.text,
+                    model=req.model,
+                    base_url=req.base_url,
+                    concepts=req.concepts,
+                    known=req.known,
+                ),
             )
         except ValueError as exc:
             # A non-local scan model is refused outright: scanning private text
@@ -745,8 +895,9 @@ def create_app(
                 status_code=400,
                 content={"error": "web_search needs a query.", "code": "BAD_REQUEST"},
             )
-        # websearch.timed_search is BLOCKING (requests, seven engines in sequence,
-        # ~3-5s warm). On the event loop it would stall every other lane including
+        # websearch.timed_search is BLOCKING (requests, and its own thread pool
+        # across the engines, ~3-5s warm) and bounds itself with its own overall
+        # deadline. On the event loop it would stall every other lane including
         # /health, which the Rust lifecycle manager reads to decide the sidecar is
         # alive — so it runs in a worker thread, always. It returns the whole
         # response body: hits plus 'merged'/'tookMs' telemetry.
@@ -774,39 +925,49 @@ def create_app(
     # and degrades a file to name-and-type on any other error, exactly as before.
 
     @app.post("/summarize_file")
-    async def summarize_file(req: summarize_feature.SummarizeFileRequest) -> Any:
-        client = (
-            summarize_feature.OllamaModelClient(req.base_url, req.privacy, req.provider)
-            if req.provider is not None
-            else summarize_feature.OllamaModelClient(req.base_url, req.privacy)
+    async def summarize_file(
+        req: summarize_feature.SummarizeFileRequest, request: Request
+    ) -> Any:
+        # `provider` is optional on the client and defaults to None, so a room on
+        # an API provider and a room on plain Ollama build the SAME client here.
+        client = summarize_feature.OllamaModelClient(
+            req.base_url, req.privacy, req.provider
         )
         try:
-            summary = await summarize_feature.summarize_one_file(
-                client, req.model, req.name, req.mime, req.text, req.keep_alive
+            summary = await until_hangup(
+                request,
+                summarize_feature.summarize_one_file(
+                    client, req.model, req.name, req.mime, req.text, req.keep_alive
+                ),
             )
         except llm.LlmError as exc:
             return exc.response()
         return {"summary": summary}
 
     @app.post("/combine_summary")
-    async def combine_summary(req: summarize_feature.CombineSummaryRequest) -> Any:
-        client = (
-            summarize_feature.OllamaModelClient(req.base_url, req.privacy, req.provider)
-            if req.provider is not None
-            else summarize_feature.OllamaModelClient(req.base_url, req.privacy)
+    async def combine_summary(
+        req: summarize_feature.CombineSummaryRequest, request: Request
+    ) -> Any:
+        client = summarize_feature.OllamaModelClient(
+            req.base_url, req.privacy, req.provider
         )
         try:
-            purpose, questions = await summarize_feature.combine_summary(
-                client, req.model, req.room_name, req.memories, req.file_lines
+            purpose, questions = await until_hangup(
+                request,
+                summarize_feature.combine_summary(
+                    client, req.model, req.room_name, req.memories, req.file_lines
+                ),
             )
         except llm.LlmError as exc:
             return exc.response()
         return {"purpose": purpose, "questions": questions}
 
     @app.post("/handoff_summary")
-    async def handoff_summary(req: handoff.HandoffSummaryRequest) -> Any:
+    async def handoff_summary(
+        req: handoff.HandoffSummaryRequest, request: Request
+    ) -> Any:
         try:
-            summary = await handoff.summarize_for_handoff(req)
+            summary = await until_hangup(request, handoff.summarize_for_handoff(req))
         except llm.LlmError as exc:
             return exc.response()
         return {"summary": summary}
@@ -814,10 +975,14 @@ def create_app(
     return app
 
 
-def make_event_line(event: Event) -> str:  # pragma: no cover - helper for hosts
-    return compact_json(event) + "\n"
-
-
 app: Any = create_app()
 
-__all__ = ["create_app", "app", "RunRegistry", "make_event_line"]
+__all__ = [
+    "BodyLimitMiddleware",
+    "ClientGone",
+    "MAX_REQUEST_BYTES",
+    "RunRegistry",
+    "app",
+    "create_app",
+    "until_hangup",
+]

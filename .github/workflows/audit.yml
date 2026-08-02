@@ -1,0 +1,46 @@
+name: Dependency audit
+
+# A scheduled vulnerability scan of the three dependency trees. Dependabot
+# raises upgrade PRs; this tells you when something you already ship has a
+# published advisory, including on a week when nothing changed.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  pull_request:
+    paths:
+      - package-lock.json
+      - src-tauri/Cargo.lock
+      - sidecar/uv.lock
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Advisory data only — no build, so this needs no macOS toolchain.
+      # `--omit=dev` on purpose: what ships to users is the runtime tree. The
+      # dev tree (wdio → mocha → serialize-javascript) carries advisories that
+      # only ever run on a developer's own machine, and a permanently red job
+      # is a job everyone ignores. Dev advisories still surface as Dependabot
+      # PRs. `xlsx` is a tarball URL and is invisible to npm audit either way;
+      # see .github/dependabot.yml.
+      - name: npm audit (runtime dependencies)
+        run: npm audit --omit=dev --audit-level=high
+
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --file src-tauri/Cargo.lock
+
+      - uses: astral-sh/setup-uv@v5
+      - name: pip-audit
+        working-directory: sidecar
+        run: |
+          uv export --no-dev --no-emit-project --no-hashes -o requirements.audit.txt
+          uvx pip-audit -r requirements.audit.txt

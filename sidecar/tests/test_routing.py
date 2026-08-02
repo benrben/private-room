@@ -22,6 +22,7 @@ from arcelle_sidecar.routing import (
     lane_label,
     wants_job_tools,
     wants_mcp_management_tools,
+    wants_navigation,
     wants_skill_tools,
     wants_ui_tools,
     wants_write_tools,
@@ -358,6 +359,49 @@ def test_wants_job_tools_stays_quiet(question: str) -> None:
     assert wants_job_tools(question) is False
 
 
+# --- wants_navigation (NAV_INTENT) ------------------------------------------
+#
+# This one is not a catalog widener like the `wants_*` predicates above: a hit
+# here wins the web domain OUTRIGHT, ahead of all sibling scoring
+# (`manager.resolve_worker`). So a false positive costs a real answer — the ask
+# goes to the Browser agent, which has no search tool and must guess an address
+# — rather than merely offering one more schema.
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "surf the web for espresso reviews",
+        "surf reddit for me",
+        "let's go surfing on hacker news",
+        "go to google and search for espresso machines",
+        "visit nytimes.com",
+        "כנס לאתר של הבנק",
+    ],
+)
+def test_wants_navigation_fires_on_a_destination(question: str) -> None:
+    assert wants_navigation(question) is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # THE bug: the bare stem "surf" matched inside "surface", and this gate
+        # overrides everything, so an ordinary web question became "open a
+        # website" and the Browser agent had to invent an address.
+        "what is the surface temperature of Mars",
+        "compare the surface area of the two plots",
+        "resurface the driveway — what does that cost",
+        # The line the gate must not cross either way: a site NAME with no
+        # navigation verb is still a search.
+        "google the tallest building",
+        "what's the latest news about the election",
+    ],
+)
+def test_wants_navigation_stays_quiet_without_a_destination(question: str) -> None:
+    assert wants_navigation(question) is False
+
+
 # --- lane_label -------------------------------------------------------------
 
 
@@ -367,6 +411,25 @@ def test_lane_label_precedence() -> None:
     assert lane_label(ui=False, write=True, web_enabled=False) == "Working on your files"
     assert lane_label(ui=False, write=False, web_enabled=True) == "Answering (web available)"
     assert lane_label(ui=False, write=False, web_enabled=False) == "Answering"
+
+
+def test_lane_label_names_the_web_workers() -> None:
+    """The chip had no wording about the internet at all: while the app was
+    actually searching or clicking through pages it read "Answering (web
+    available)" — or, if the question also tripped the write hints, "Working on
+    your files". Both are the odd answers the chip exists to explain. The web
+    workers are named by the ACTIVE agent, which no routing boolean can tell
+    apart, so they win over every hint match."""
+    assert lane_label(ui=False, write=False, web_enabled=True, agent_id="chat.web") == (
+        "Searching the web"
+    )
+    assert lane_label(ui=False, write=True, web_enabled=True, agent_id="chat.browse") == (
+        "Browsing the web"
+    )
+    # Every other agent keeps the four booleans-only wordings, unchanged.
+    assert lane_label(ui=False, write=True, web_enabled=True, agent_id="files.read") == (
+        "Working on your files"
+    )
 
 
 def test_lane_label_follows_the_host_override_not_the_question() -> None:

@@ -141,37 +141,36 @@ export function WorkflowLibrary({ s, a }: Props) {
     api.workflowTemplates().then(setTemplates).catch(() => {});
   }, []);
 
-  // Fetch each workflow's schedule for its badge/countdown.
+  // Each card's schedule badge/countdown and last-run dot, fetched in ONE sweep
+  // per list change instead of two independent ones. Refreshes with the
+  // workflows list (a finished run emits workflows-changed), but every sweep
+  // after the first waits a moment first, so a burst — save, then activate,
+  // then the event — collapses into one sweep instead of re-fetching every
+  // workflow's schedule AND run history three times over. The first sweep is
+  // immediate: the badges belong on the first paint.
+  const sweptRef = useRef(false);
   useEffect(() => {
+    if (visible.length === 0) return;
     let live = true;
-    Promise.all(
-      visible.map((w) =>
-        api.getWorkflowSchedule(w.id).then((sc) => [w.id, sc] as const).catch(() => [w.id, null] as const),
-      ),
-    ).then((pairs) => {
-      if (live) setSchedules(Object.fromEntries(pairs));
-    });
+    const timer = window.setTimeout(() => {
+      sweptRef.current = true;
+      void Promise.all(
+        visible.map(async (w) => {
+          const [schedule, runs] = await Promise.all([
+            api.getWorkflowSchedule(w.id).catch(() => null),
+            api.getWorkflowRuns(w.id).catch(() => [] as WorkflowRun[]),
+          ]);
+          return [w.id, schedule, runs[0] ?? null] as const;
+        }),
+      ).then((rows) => {
+        if (!live) return;
+        setSchedules(Object.fromEntries(rows.map(([id, sc]) => [id, sc])));
+        setLastRuns(Object.fromEntries(rows.map(([id, , run]) => [id, run])));
+      });
+    }, sweptRef.current ? 150 : 0);
     return () => {
       live = false;
-    };
-  }, [visible]);
-
-  // Fetch each workflow's most recent run for its last-run status dot. Refreshes
-  // with the workflows list (a finished run emits workflows-changed).
-  useEffect(() => {
-    let live = true;
-    Promise.all(
-      visible.map((w) =>
-        api
-          .getWorkflowRuns(w.id)
-          .then((runs) => [w.id, runs[0] ?? null] as const)
-          .catch(() => [w.id, null] as const),
-      ),
-    ).then((pairs) => {
-      if (live) setLastRuns(Object.fromEntries(pairs));
-    });
-    return () => {
-      live = false;
+      window.clearTimeout(timer);
     };
   }, [visible]);
 

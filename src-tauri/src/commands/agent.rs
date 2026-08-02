@@ -66,11 +66,28 @@ pub(crate) fn closest_snippet(extracted: &str, quote: &str) -> Option<String> {
     Some(extracted[h[si].0..h[ei - 1].1].to_string())
 }
 
+/// The spreadsheet grid's column ceiling: columns run A..XFD, so 16 384 of them.
+///
+/// `parse_a1` owns the row ceiling and the letter-count guard; the column VALUE
+/// is the one thing it does not bound, and three letters are enough to name a
+/// column no sheet has (`ZZZ` is 18 278).
+pub(crate) const MAX_SHEET_COLS: usize = 16_384;
+
 /// Validate every cell reference up front so a bad one fails before any write.
+///
+/// Not cosmetic: a write GROWS the sheet until it reaches the cell, with no
+/// bound of its own, so an out-of-grid reference costs blank rows or columns by
+/// the thousand for what is always a typo.
 fn validate_cell_refs(updates: &[(String, String)]) -> Result<(), String> {
     for (cell, _) in updates {
-        if parse_a1(cell).is_none() {
+        let Some((_row, col)) = parse_a1(cell) else {
             return Err(format!("\"{cell}\" is not a cell — use A1 notation like B7."));
+        };
+        if col >= MAX_SHEET_COLS {
+            return Err(format!(
+                "\"{cell}\" is outside the spreadsheet grid — a sheet has at most \
+                 {MAX_SHEET_COLS} columns, A to XFD. Nothing was changed."
+            ));
         }
     }
     Ok(())
@@ -243,10 +260,17 @@ pub async fn ask(
     // transform verbs ("save that translated…") fall through to the engine.
     if attachments.is_empty() && is_pure_save_reference(&question) {
         let prev = state.with_room(|room| db::list_messages(&room.conn, &chat_id))?;
-        let prev = prev
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant" && m.kind.is_none() && !m.content.trim().is_empty());
+        // `is_failure_notice` is the app's own check for "this assistant row is
+        // one of OUR notices, not an answer" — and this path, which turns the
+        // previous reply into a FILE, was the one place that never asked it. A
+        // turn that failed left the user with a document containing only the
+        // error text and the words "Saved your previous answer".
+        let prev = prev.iter().rev().find(|m| {
+            m.role == "assistant"
+                && m.kind.is_none()
+                && !m.content.trim().is_empty()
+                && !is_failure_notice(&m.content)
+        });
         if let Some(prev) = prev {
             use tauri::Manager;
             let name =
@@ -286,7 +310,7 @@ pub async fn ask(
     let mut effects = ToolEffects::default();
     // ADD-25: perception tools attach pixels only when the chat model can
     // read them; otherwise they fall back to a local vision-model description.
-    effects.vision_chat = is_vision_chat_model(&model);
+    effects.vision_chat = chat_model_sees_images(&model).await;
 
     // Phase 2 (unlocked): answer — through a cloud CLI if selected, or the
     // local model with full app-control tools.
@@ -494,7 +518,16 @@ fn gather_context_and_save_question(
         // read_skill for full instructions, then read_skill_resource as needed.
         // Keeping this in the per-turn user message preserves the stable system
         // prefix (and therefore Ollama's KV cache) when skills change.
-        let available_skills = db::list_skills(conn, true)?;
+        // 2026-07-24: a skill may belong to ONE sub-agent, and `list_skills`
+        // (the tool a specialist calls) honours that. This per-turn preamble
+        // goes to the MAIN assistant, so it must honour it too — otherwise a
+        // skill scoped to, say, `media.transcribe` was still listed to (and
+        // openable by) the main assistant on every single turn. An unowned
+        // skill is GENERAL and stays visible to everyone.
+        let available_skills: Vec<_> = db::list_skills(conn, true)?
+            .into_iter()
+            .filter(|s| s.agent.trim().is_empty())
+            .collect();
         let explicit_skill = match explicit_skill_name {
             Some(name) => {
                 let skill = db::find_skill(conn, name)?
@@ -954,7 +987,10 @@ pub(crate) async fn stream_answer(
             state,
             model,
             question,
-            chat_messages.clone(),
+            // Moved, not cloned: `chat_messages` is owned here and never read
+            // again, and it carries the whole conversation, the quoted file
+            // text and any base64 photos — megabytes duplicated per ask.
+            chat_messages,
             temperature,
             effects,
             web_enabled,
@@ -1020,8 +1056,15 @@ pub(crate) async fn stream_answer(
                 // we surface a clear error — there is NO native Rust LLM path to
                 // drop to (the native `agent_loop` is deleted). Log the underlying
                 // reason so a broken Python install is debuggable.
+                // Carry the REASON to the user, not just to a hidden log. The
+                // app writes no log of its own, so "the agent sidecar could not
+                // start" was, in practice, the whole diagnosis available for a
+                // broken Python install, a busy port and a crash on import
+                // alike (`sidecar_lifecycle::unavailable` now supplies which).
                 eprintln!("agent sidecar unavailable: {reason}");
-                Err("AI engine unavailable — the agent sidecar could not start.".to_string())
+                Err(format!(
+                    "AI engine unavailable — the agent sidecar could not start ({reason})."
+                ))
             }
             SidecarOutcome::EngineError(error) => {
                 eprintln!("agent model/provider failed: {error}");
@@ -1153,7 +1196,21 @@ pub async fn handoff_chat(state: State<'_, AppState>, chat_id: String) -> Result
         .collect();
 
     // Phase 2 (unlocked): the summarization call — any engine, same as `ask`.
+    //
+    // The recap BECOMES the model's entire memory of this conversation, because
+    // `db::recent_messages` truncates at the marker. Nothing used to check it
+    // was real text, so a model that returned nothing — or only a `<think>`
+    // span, which `handoff_summary` now strips — silently wiped the context and
+    // left a marker with no delete button. An empty recap is a failed handoff,
+    // not a handoff.
     let summary = ollama::handoff_summary(&model, messages, temperature).await?;
+    if summary.trim().is_empty() {
+        return Err(
+            "The model returned an empty summary, so the conversation was left \
+             untouched. Try again, or switch models in Settings → Model."
+                .into(),
+        );
+    }
 
     // Token-budget bar: no LLM "ask" turn happens as part of a handoff, so no
     // `ask-token-usage` event fires on its own — build a snapshot for the new,
@@ -1172,9 +1229,7 @@ pub async fn handoff_chat(state: State<'_, AppState>, chat_id: String) -> Result
             .await
             .unwrap_or(128_000)
     };
-    let marker_msg = ollama::ChatMessage::new("assistant", summary.clone());
-    let breakdown = crate::token_usage::categorize_messages(std::slice::from_ref(&marker_msg));
-    let usage_value = crate::token_usage::build_usage_value(None, max_context, &breakdown);
+    let usage_value = crate::token_usage::handoff_usage_value(&summary, max_context);
 
     // Phase 3 (locked): persist the marker, with that snapshot as its effects.
     let guard = state.room.lock().unwrap();
@@ -1680,8 +1735,7 @@ pub(crate) fn external_agent_tools_specs() -> Vec<serde_json::Value> {
             "prompt": {"type": "string", "description": "The full, self-contained prompt"},
             "system": {"type": "string", "description": "Optional system instruction"},
             "schema": {"type": "object", "description": "Optional JSON Schema — the reply is constrained to match it"},
-            "temperature": {"type": "number"},
-            "long": {"type": "boolean", "description": "true to allow a big-context call for large prompts (slower prefill)"}},
+            "temperature": {"type": "number"}},
             "required": ["prompt"]}}})]
 }
 
@@ -2148,6 +2202,11 @@ pub(crate) fn missing_required_arg(tool: &str, args: &serde_json::Value) -> Opti
 ///   and invited invented values.
 /// * `additionalProperties` is kept only when it is `false` — one token that
 ///   stops a small model inventing fields. A permissive object is noise.
+/// * the recursion is SCHEMA-AWARE (see [`SCHEMA_MAP_KEYWORDS`]). It used to
+///   descend into `properties` as if it were another schema, so a connector
+///   argument literally NAMED `title`, `example` or `examples` was deleted
+///   while `required` still demanded it — that is every GitHub issue/PR,
+///   Notion page, Linear, Jira and Todoist create call.
 pub(crate) fn slim_schema(v: &mut serde_json::Value) {
     match v {
         serde_json::Value::Object(map) => {
@@ -2213,7 +2272,18 @@ pub(crate) fn slim_schema(v: &mut serde_json::Value) {
                     }
                 }
             }
-            for (_, child) in map.iter_mut() {
+            for (k, child) in map.iter_mut() {
+                // A "map of subschemas" keyword's KEYS are names the connector
+                // chose, not JSON-Schema keywords: descend one level further
+                // so the stripping above never runs against them.
+                if SCHEMA_MAP_KEYWORDS.contains(&k.as_str()) {
+                    if let serde_json::Value::Object(children) = child {
+                        for (_, sub) in children.iter_mut() {
+                            slim_schema(sub);
+                        }
+                    }
+                    continue;
+                }
                 slim_schema(child);
             }
         }
@@ -2225,6 +2295,17 @@ pub(crate) fn slim_schema(v: &mut serde_json::Value) {
         _ => {}
     }
 }
+
+/// JSON-Schema keywords whose VALUE is a map of NAME → subschema rather than a
+/// subschema itself. [`slim_schema`] must not apply keyword stripping to these
+/// containers — their keys are the connector's own argument/definition names.
+const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "dependentSchemas",
+    "$defs",
+    "definitions",
+];
 
 /// Snapshot the connected MCP tools, namespaced `server_tool` and deduped
 /// against the built-in tool names and each other. Schemas are still slimmed
@@ -2645,25 +2726,38 @@ pub(crate) async fn exec_tool(
             // CHG-2: accept a batch of {cell, value} in one call so filling a
             // column doesn't burn one inference round per cell. Fall back to the
             // legacy single top-level cell/value for older prompts.
-            let value_of = |v: &serde_json::Value| -> String {
-                v.as_str()
-                    .map(str::to_string)
-                    // Models sometimes send numbers as JSON numbers.
-                    .unwrap_or_else(|| v.to_string().trim_matches('"').to_string())
+            // `None` for a missing/`null` value. Only the CELL used to be
+            // checked: an absent value stringified to the literal text "null",
+            // was written into the sheet, and the turn reported success.
+            let value_of = |v: &serde_json::Value| -> Option<String> {
+                match v {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    // Models sometimes send numbers/booleans as JSON scalars.
+                    other => Some(other.to_string()),
+                }
+            };
+            let missing_value = |cell: &str| {
+                format!(
+                    "{cell} has no value — pass updates: [{{\"cell\": \"{cell}\", \"value\": \
+                     \"…\"}}] (use \"\" to clear a cell). Nothing was changed."
+                )
             };
             let mut updates: Vec<(String, String)> = Vec::new();
             if let Some(arr) = args["updates"].as_array() {
                 for u in arr {
                     let cell = u["cell"].as_str().unwrap_or_default().trim().to_uppercase();
                     if !cell.is_empty() {
-                        updates.push((cell, value_of(&u["value"])));
+                        let value = value_of(&u["value"]).ok_or_else(|| missing_value(&cell))?;
+                        updates.push((cell, value));
                     }
                 }
             }
             if updates.is_empty() {
                 let cell = args["cell"].as_str().unwrap_or_default().trim().to_uppercase();
                 if !cell.is_empty() {
-                    updates.push((cell, value_of(&args["value"])));
+                    let value = value_of(&args["value"]).ok_or_else(|| missing_value(&cell))?;
+                    updates.push((cell, value));
                 }
             }
             if updates.is_empty() {
@@ -3494,13 +3588,6 @@ pub(crate) async fn exec_tool(
             }
             messages.push(ollama::ChatMessage::new("user", prompt));
             let temperature = args["temperature"].as_f64();
-            // `long` buys the Job-tier window: an external agent's big prompt
-            // must not be silently truncated at the interactive chat window.
-            let tier = if args["long"].as_bool().unwrap_or(false) {
-                ollama::CtxTier::Job
-            } else {
-                ollama::CtxTier::Chat
-            };
             if args["schema"].is_object() {
                 ollama::chat_structured(
                     &model,
@@ -3512,8 +3599,18 @@ pub(crate) async fn exec_tool(
                 )
                 .await
             } else {
-                let raw = ollama::generate(&model, messages, temperature, KEEP_ALIVE_WARM, None, tier)
-                    .await?;
+                // The context window is decided by payload-fitted `num_ctx`
+                // sidecar-side; the `tier` argument here changes nothing, so
+                // the tool no longer offers a `long` switch that did nothing.
+                let raw = ollama::generate(
+                    &model,
+                    messages,
+                    temperature,
+                    KEEP_ALIVE_WARM,
+                    None,
+                    ollama::CtxTier::Chat,
+                )
+                .await?;
                 Ok(strip_think_spans(&raw).trim().to_string())
             }
         }
@@ -3562,17 +3659,6 @@ pub(crate) async fn exec_tool(
         }
         other => match routes.iter().find(|r| r.catalog_name == other) {
             Some(route) => {
-                // SEC-1b: consent is tied to the moment data actually leaves the
-                // room. Ask the user before invoking a connector's tool, unless
-                // they chose "always allow" for it earlier this session.
-                if !mcp_call_approved(state, window, route, args).await {
-                    return Ok(format!(
-                        "The user declined to run the \"{}\" tool from \"{}\", so it did \
-                         not run and nothing left this room. Answer from what you already \
-                         have, and tell the user you skipped that connected tool.",
-                        route.tool_name, route.server_name
-                    ));
-                }
                 // PRIV: extend the mechanical redaction door to the OUTBOUND
                 // remote seam. A remote connector is a non-local destination, so
                 // mask the room's known entities in the args before they leave,
@@ -3589,6 +3675,13 @@ pub(crate) async fn exec_tool(
                 // the agent has full approval to act, so it also sends real
                 // arguments. Turning auto mode OFF restores masking along with
                 // the per-call consent card. None when the entity map is empty.
+                //
+                // Computed BEFORE the consent card on purpose. The card used to
+                // be built from the model's raw arguments while the masked copy
+                // was what actually left the room, so in a room with protected
+                // words the user approved "look up Dana Cohen" and the connector
+                // was asked about "[Person A]" — an empty result neither they
+                // nor the agent could explain. What is shown is now what is sent.
                 let auto_mode = state
                     .mcp_auto_approve
                     .load(std::sync::atomic::Ordering::SeqCst);
@@ -3604,6 +3697,17 @@ pub(crate) async fn exec_tool(
                     }
                     None => args.clone(),
                 };
+                // SEC-1b: consent is tied to the moment data actually leaves the
+                // room. Ask the user before invoking a connector's tool, unless
+                // they chose "always allow" for it earlier this session.
+                if !mcp_call_approved(state, window, route, &sent).await {
+                    return Ok(format!(
+                        "The user declined to run the \"{}\" tool from \"{}\", so it did \
+                         not run and nothing left this room. Answer from what you already \
+                         have, and tell the user you skipped that connected tool.",
+                        route.tool_name, route.server_name
+                    ));
+                }
                 let result = route
                     .client
                     .lock()
@@ -3755,6 +3859,29 @@ pub(crate) fn tail_bytes(s: &str, max: usize) -> &str {
     &s[cut..]
 }
 
+/// Would this installed model process the pixels ON THIS MAC?
+///
+/// The describe pass in [`perceive_image`] promises exactly that, and
+/// `is_external_engine` alone does not deliver it: it returns false for Ollama
+/// `:cloud` models BY DESIGN (they are served from Ollama's machines, not this
+/// one), and a name like `qwen3-vl:235b-cloud` matches every VL pattern we look
+/// for. So a Mac with no local VL build but a vision-capable `:cloud` entry
+/// installed would have sent decrypted screenshot bytes off the machine on the
+/// one path that says they never leave it.
+/// Strict on purpose — it is deciding whether decrypted pixels stay on the
+/// machine, so anything that merely LOOKS hosted is excluded: Ollama also tags
+/// its cloud entries `<size>-cloud` (`gpt-oss:120b-cloud`, `qwen3-vl:235b-cloud`),
+/// which `is_cloud_model`'s exact `:cloud` suffix does not catch. The cost of a
+/// false exclusion is one honest "install a local vision model"; the cost of a
+/// false inclusion is the user's screenshot leaving the Mac.
+pub(crate) fn runs_on_this_mac(model: &str) -> bool {
+    if is_external_engine(model) || is_cloud_model(model) {
+        return false;
+    }
+    let tag = model.rsplit(':').next().unwrap_or_default();
+    !tag.ends_with("-cloud")
+}
+
 /// ADD-25: hand a captured image (screenshot / video frame) to the model.
 /// Vision-capable chat model → queue the pixels; the room bridge attaches them as
 /// a user message right after this tool result. Text-only chat model → a
@@ -3781,17 +3908,26 @@ pub(crate) async fn perceive_image(
     // dedicated grounding VL model; otherwise any local vision-capable chat
     // model (qwen3.5, gemma3, llava…). Refuse if there's no genuine on-device
     // vision model: a text-only model just parrots the schema back
-    // (`{"properties":{"description":{}}}`), and an external engine would leak
-    // pixels this path promises never leave the Mac.
-    let vmodel = models
+    // (`{"properties":{"description":{}}}`), and an external engine — or an
+    // Ollama `:cloud` entry, which is served from someone else's machine — would
+    // leak pixels this path promises never leave the Mac (`runs_on_this_mac`).
+    let mut vmodel = models
         .iter()
+        .filter(|m| runs_on_this_mac(m))
         .find(|m| m.contains("qwen2.5vl") || m.contains("qwen2.5-vl") || m.contains("qwen3-vl"))
-        .or_else(|| {
-            models
-                .iter()
-                .find(|m| !is_external_engine(m) && is_vision_chat_model(m))
-        })
         .cloned();
+    if vmodel.is_none() {
+        // No dedicated VL build installed: ASK each local model whether it can
+        // see, instead of scanning names. A multimodal model whose name matches
+        // none of the known patterns used to be skipped here, and the user was
+        // told to install a vision model they already had.
+        for m in &models {
+            if runs_on_this_mac(m) && chat_model_sees_images(m).await {
+                vmodel = Some(m.clone());
+                break;
+            }
+        }
+    }
     let Some(vmodel) = vmodel else {
         return Err(
             "This room's chat model can't see images, and no local vision model is installed to \
@@ -4071,6 +4207,25 @@ mod tests {
         // A local connector never leaves this Mac, either way.
         assert!(!masks_outbound_args(false, false));
         assert!(!masks_outbound_args(false, true));
+    }
+
+    #[test]
+    fn the_describe_pass_only_ever_picks_a_model_that_runs_here() {
+        // `perceive_image` promises the pixels of a screenshot or video frame
+        // never leave the Mac. `is_external_engine` alone does not keep that
+        // promise: it returns false for Ollama `:cloud` models by design, and a
+        // `:cloud` VL entry matches every name pattern the picker looks for.
+        assert!(runs_on_this_mac("qwen2.5vl:7b"));
+        assert!(runs_on_this_mac("gemma3:12b"));
+        // Served from Ollama's machines — the pixels would leave this one. Both
+        // spellings count: the bare `:cloud` tag AND the `<size>-cloud` form
+        // `is_cloud_model` misses, which is the one a VL name pattern matches.
+        assert!(!runs_on_this_mac("minimax-m3:cloud"));
+        assert!(!runs_on_this_mac("qwen3-vl:235b-cloud"));
+        assert!(!runs_on_this_mac("gpt-oss:120b-cloud"));
+        // …as would an external engine.
+        assert!(!runs_on_this_mac("claude-cli::opus"));
+        assert!(!runs_on_this_mac("openrouter::vendor/vision-agent"));
     }
 
     #[test]
@@ -4393,9 +4548,12 @@ mod tests {
         let f = &specs[0]["function"];
         assert_eq!(f["name"], "local_generate");
         assert_eq!(f["parameters"]["required"], serde_json::json!(["prompt"]));
-        for p in ["prompt", "system", "schema", "temperature", "long"] {
+        for p in ["prompt", "system", "schema", "temperature"] {
             assert!(f["parameters"]["properties"][p].is_object(), "missing param {p}");
         }
+        // The `long` switch is gone: it selected a CtxTier the request builder
+        // ignores, so it advertised a capability the app could not deliver.
+        assert!(f["parameters"]["properties"]["long"].is_null());
         // The content-perception subset is exactly view_media_frame.
         let media = media_tools_specs();
         assert_eq!(media.len(), 1);
@@ -4749,6 +4907,50 @@ mod tests {
     }
 
     #[test]
+    fn slim_never_deletes_an_argument_called_title_example_or_examples() {
+        // The recursion used to treat `properties` as another schema, so the
+        // keyword strip ran against the connector's own ARGUMENT NAMES. Every
+        // GitHub issue/PR, Notion page, Linear, Jira and Todoist create call
+        // lost its `title` while `required` still demanded it, so the model
+        // either omitted it or invented one.
+        let mut s = serde_json::json!({
+            "type": "object",
+            "title": "CreateIssue",
+            "properties": {
+                "title": {"type": "string", "description": "Issue title"},
+                "example": {"type": "string"},
+                "examples": {"type": "array", "items": {"type": "string"}},
+                "x-ray": {"type": "string"},
+                "body": {"type": "string"}
+            },
+            "required": ["title", "body"]
+        });
+        slim_schema(&mut s);
+        // The schema's OWN `title` keyword is still vendor noise and goes…
+        assert!(s.get("title").is_none());
+        // …but the arguments named after keywords survive intact.
+        assert_eq!(s["properties"]["title"]["description"], "Issue title");
+        for arg in ["title", "example", "examples", "x-ray", "body"] {
+            assert!(s["properties"][arg].is_object(), "lost argument {arg}");
+        }
+        assert_eq!(s["required"], serde_json::json!(["title", "body"]));
+    }
+
+    #[test]
+    fn slim_treats_defs_and_pattern_properties_as_name_maps_too() {
+        let mut s = serde_json::json!({
+            "$defs": {"title": {"type": "string", "title": "T"}},
+            "patternProperties": {"^x-": {"type": "string", "title": "P"}}
+        });
+        slim_schema(&mut s);
+        // The named entries survive; the keyword INSIDE each one is stripped.
+        assert_eq!(s["$defs"]["title"]["type"], "string");
+        assert!(s["$defs"]["title"].get("title").is_none());
+        assert_eq!(s["patternProperties"]["^x-"]["type"], "string");
+        assert!(s["patternProperties"]["^x-"].get("title").is_none());
+    }
+
+    #[test]
     fn slim_is_idempotent() {
         // Routes are rebuilt per turn; slimming an already-slim schema must not
         // keep chewing (an ellipsis on an ellipsis, a note on a note).
@@ -4963,6 +5165,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_cell_reference_past_the_grid_is_refused_before_any_write() {
+        // A write GROWS the sheet until it reaches the cell, with no bound of
+        // its own: `A5000000` saved five million blank rows and a bigger one
+        // took the app down with nothing saved and no message.
+        // The grid's own far corner is still writable.
+        let ok = [("A1".into(), "x".into()), ("XFD1048576".into(), "y".into())];
+        assert!(validate_cell_refs(&ok).is_ok());
+
+        // Nothing past it is, whichever axis overshoots.
+        for bad in ["A1048577", "XFE1", "ZZZ1", "A99999999999", "AAAAA1"] {
+            assert!(
+                validate_cell_refs(&[(bad.into(), "x".into())]).is_err(),
+                "{bad} was accepted"
+            );
+        }
+        // The COLUMN ceiling is this function's own: `parse_a1` bounds the row
+        // and the letter count, and `XFE`/`ZZZ` pass both while naming a column
+        // no sheet has.
+        let err = validate_cell_refs(&[("XFE1".into(), "x".into())]).unwrap_err();
+        assert!(err.contains("outside the spreadsheet grid"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        // A non-reference still fails with its own, different message.
+        let err = validate_cell_refs(&[("row seven".into(), "x".into())]).unwrap_err();
+        assert!(err.contains("is not a cell"), "{err}");
     }
 
     /// The notices and the predicate that recognises them live in one place so

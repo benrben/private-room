@@ -2,11 +2,11 @@
 
 **Purpose:** the exhaustive test surface for a user-acceptance agent. Every button, control, menu entry, keyboard shortcut, passive behavior, and background capability in the app, with the path to reach it, the expected outcome, and preconditions. Standard: *not one single feature missed*.
 
-**Built:** 2026-07-20, against version **0.4.1 plus the uncommitted working tree** (Whisper **Metal** dictation, neural-voice picker, new dictation/recording commands). Sources: a 7-agent full-code sweep of the current tree, cross-checked against the 1,587-item feature audit of 2026-07-18. Items marked **(uncommitted)** exist only in the working tree.
+**Built:** 2026-07-20 against 0.4.1. **Revised 2026-08-01 against version 0.14.0** — everything below is shipped and committed; there is no "working tree only" tier any more. Sources: a 7-agent full-code sweep, cross-checked against the 1,587-item feature audit of 2026-07-18 and the 0.5.0→0.14.0 release notes.
 
-**How to use each item:** exercise the control via the stated path, observe the stated outcome, and only then check it off. If a precondition can't be met in the test environment, mark the item *blocked-precondition* rather than skipping silently. File references (`file.tsx:12`) are for debugging failures, not part of the test.
+**How to use each item:** exercise the control via the stated path, observe the stated outcome, and only then check it off. If a precondition can't be met in the test environment, mark the item *blocked-precondition* rather than skipping silently. File references (`file.tsx:12`) are for debugging failures, not part of the test — paths are relative to `src/` (or `src-tauri/src/` for `.rs`) and are re-checked at each revision, so report one that lands on unrelated code.
 
-**Icons, not glyphs (uncommitted):** the UI no longer uses native emoji or typographic symbols. Where an item below writes a trailing `✓` (e.g. "Saved ✓", "Copied ✓", "Installed ✓"), an inline `✓/✕` confirm pair, or a playback `▶`/`◼`/`●`, the app now renders a monochrome **line icon** (check / close / play / stop / pause) beside the word — verify the icon, not the character. Likewise workflow/template "emoji" are line icons from one family.
+**Icons, not glyphs:** the UI does not use native emoji or typographic symbols. Where an item below writes a trailing `✓` (e.g. "Saved ✓", "Copied ✓", "Installed ✓"), an inline `✓/✕` confirm pair, or a playback `▶`/`◼`/`●`, the app renders a monochrome **line icon** (check / close / play / stop / pause) beside the word — verify the icon, not the character. Likewise workflow/template "emoji" are line icons from one family.
 
 **Global preconditions to arrange before starting:**
 - macOS with the app installed (after a local build, run `scripts/macsign.sh` or TCC permission grants die).
@@ -24,8 +24,8 @@
 - [ ] Theme applied before first paint — reload in dark and light; no color flash (`main.tsx:8`, `theme.ts:26`; default dark, stored in `localStorage["prTheme"]`).
 - [ ] Silent launch auto-update check — with a newer GitHub release: native confirm "Update available — Install & relaunch"; OK → download + relaunch; Cancel → nothing. Offline/up-to-date → completely silent (`updater.ts:16-38`).
 - [ ] Session restore on WebKit reload — reload frontend while a room is open → lands back in workspace, not the gate (`App.tsx:110-122`).
-- [ ] `.roomai` Finder double-click, app closed → app launches to that file's Unlock gate (`lib.rs:293-307`).
-- [ ] `.roomai` double-click while a *different* room is open → current room closes first, new room's Unlock gate shown (`App.tsx:126-142`).
+- [ ] `.arcelle` (and `.roomai`) Finder double-click, app closed → app launches to that file's Unlock gate; BOTH extensions are registered (`tauri.conf.json:31`, `lib.rs:397-410`). Test each one.
+- [ ] A room file double-clicked while a *different* room is open → current room closes first, new room's Unlock gate shown (`App.tsx:126-142`).
 - [ ] Checkpoint rollback → full workspace remount (every pane rebuilt, Settings closed) (`App.tsx:147-155`).
 - [ ] Window: title "Arcelle", default 1180×780, min 900×600; no tray, no custom menu (`tauri.conf.json:12-21`).
 - [ ] Window title resets to "Arcelle" on lock (`App.tsx:441,459`).
@@ -36,7 +36,7 @@
 
 - [ ] Intro assurances render: "Offline by default", "No account needed", "One file, fully encrypted" (`StartScreen.tsx:26-34`).
 - [ ] "Create New Room" → Create screen (`StartScreen.tsx:36`).
-- [ ] "Open Room…" → native dialog filtered to `.roomai`; pick → Unlock gate; cancel → stays (`StartScreen.tsx:39`).
+- [ ] "Open Room…" → native dialog filtered to **`.arcelle` AND `.roomai`** under one "Arcelle Workspace" type — new rooms save as `.arcelle`, legacy `.roomai` stays openable; pick → Unlock gate; cancel → stays (`StartScreen.tsx:39`, `App.tsx:256`, `rooms/constants.ts:15-17`).
 - [ ] "Try a demo room" → Create screen pre-seeded with Demo template + name "Demo Room" (`StartScreen.tsx:40`).
 - [ ] Recent-rooms list absent when empty; appears after opening a room; auto-refreshes on each Start mount (`StartScreen.tsx:44`, `App.tsx:159`).
 - [ ] Recent row shows name, full path, "Opened {relative time}"; click → Unlock gate (`StartScreen.tsx:50-61`).
@@ -79,12 +79,14 @@
 
 ## 6. Activity rail (left edge, top-level navigation)
 
-- [ ] Pane toggles with pressed state: Library (⌘1), Workspace (⌘2), AI & Studio (⌘3) (`ActivityRail.tsx:66-99`).
-- [ ] AI & Studio toggle shows an amber attention dot when a job is running or an approval is waiting (`ActivityRail.tsx:98`, `Workspace.tsx:107`).
-- [ ] Area buttons with current-state highlight: Room home, Room Map, Recordings, Workflows, Scripts, Memory & scratch pad (`ActivityRail.tsx:103-118`).
-- [ ] "Search room (⌘K)" button opens the search/command palette (`ActivityRail.tsx:106-114`).
-- [ ] "Focus the editor" (zen) hides both side panes; click again restores (`ActivityRail.tsx:121-130`).
-- [ ] "Room settings (⌘,)" opens Settings (`ActivityRail.tsx:131-139`).
+- [ ] Pane toggles with pressed state: Library (⌘1), Workspace (⌘2), AI (⌘3) (`ActivityRail.tsx:117-149`).
+- [ ] AI toggle shows an amber attention dot when a job is running or an approval is waiting (`ActivityRail.tsx:148`, `Workspace.tsx:107`).
+- [ ] Area buttons with current-state highlight — **exactly nine**, in this order, with "Search" wedged after the first: Room home · *Search* · Room Map · Recordings · Workflows · Scripts · **Skills** · Memory & scratch pad · **Connectors** · **Private browser** (`ActivityRail.tsx:32-66,153-167`). Every one must open its area; a rail entry that lands on an empty pane is a failure, not an empty room.
+- [ ] Each area button carries a stable `data-area` attribute (`home`/`map`/`recordings`/`workflows`/`scripts`/`skills`/`memory`/`connectors`/`browser`) — the capture harness and the GH #2 e2e both select on it (`ActivityRail.tsx:214`).
+- [ ] Collapsed rail shows the ≤9-char short label under each icon ("Record", "Connect", "Browser"); expanded shows the full one (`ActivityRail.tsx:32-66` `short`).
+- [ ] "Search room (⌘K)" button opens the search/command palette (`ActivityRail.tsx:154-164`).
+- [ ] "Focus the editor" (zen) hides both side panes; click again restores; label flips Focus/Unfocus (`ActivityRail.tsx:170-183`).
+- [ ] "Room settings (⌘,)" opens Settings (`ActivityRail.tsx:184-193`).
 - [ ] **GH #2** Expand/Collapse toggle at the top widens the rail to ~184 px with FULL labels ("Connectors", not "Connect"); collapses back; persists per room (`ActivityRail.tsx`, `useLayout.ts` railExpanded). *e2e: `gh2-sidebar-expand.e2e.mjs`*
 
 ## 7. Three-pane layout
@@ -128,7 +130,8 @@
 
 ## 10. Library pane (sidebar)
 
-- [ ] Header shows the area label + live count (files/workflows/scripts/recordings/memories); focus-pane and collapse-pane buttons (`Sidebar.tsx:53-131`).
+- [ ] Header shows the area label + live count badge — files · workflows · scripts · **skills** · recordings · memories · **connectors**; focus-pane and collapse-pane buttons (`Sidebar.tsx:82-122`).
+- [ ] The **browser** area draws NO count badge at all (not a "0"): it has no list to count, and a hard 0 there would read as "empty", which is untrue (`Sidebar.tsx:79-96`).
 - [ ] Browse / AI sources tabs (file areas only); AI sources tab badges the attachment count (`Sidebar.tsx:137-156`).
 - [ ] Import progress strip "Importing X of Y" during multi-file imports (`Sidebar.tsx:162-169`).
 - [ ] File filter input + × clear; placeholder differs for Recordings (`Sidebar.tsx:173-192`).
@@ -154,7 +157,7 @@
 
 ## 12. File context menu (right-click / ⋯)
 
-- [ ] Open · Attach/Detach (label follows state) · Rename… · Move to… (submenu: "No folder" + each folder, current disabled, "No folders yet" empty state) · Export a copy… (`Overlays.tsx:328-423`).
+- [ ] Open · Attach/Detach (label follows state) · Rename… · Move to… (submenu: "No folder" + each folder, current disabled, "No folders yet" empty state) · Export a copy… (`Overlays.tsx:574-589`; Move-to submenu `Overlays.tsx:661-708`).
 - [ ] "AI actions · this file" section: one chip per file-scoped AI action, tooltip = description → opens the AI-action modal scoped to that file (`Overlays.tsx:333-354`).
 - [ ] "Remove from room": two-step ✓ Remove / ✕ Keep; armed confirm is `data-agent-blocked`; removing also detaches, closes its viewer, cancels a live rec on it (`Overlays.tsx:355-383`, `fileActions.ts:279-287`).
 
@@ -210,6 +213,10 @@
 
 **Recording (`RecordingView.tsx`)** — see §22 for capture; viewer-side:
 - [ ] Speaker-grouped transcript with colored speaker chips ("You" = accent); per-turn RTL/LTR (`RecordingView.tsx:290-315,660-721`).
+- [ ] **0.14.0 — split by voice.** Two people answering each other WITHOUT a pause must end up on separate chips: the offline pass clusters each phrase's 1.5 s sub-windows, gives every word its nearest window's voice, and cuts the phrase wherever consecutive words disagree (`recording/diarize.rs:1436-1448` `split_by_voice`). Record a deliberate interruption/overlap and check the turn is split, not merged under one label. *cargo: `tests/diar_bench.rs`*
+- [ ] **0.14.0 — no phantom speakers.** A single-speaker clip, and a clip with music/noise/keyboard, must NOT sprout extra "Speaker N" chips; the participant count stays auto-discovered (`max_speakers` is 0 = auto, never a hand-set cap) (`recording.rs:1059-1069,2689`).
+- [ ] The voice pass runs wherever the full audio is at hand — Stop, Pause, and Re-transcribe — and the user's speaker NAMES ride through it via the label overlay, not the segments (`recording.rs:1042-1063,1135`).
+- [ ] Recording lanes stay walls: a mic turn and a Mac-audio turn are never merged into one voice even when they sound alike.
 - [ ] **GH #5** Click a speaker chip → inline input → naming them renames EVERY line that voice said (one map entry, not a per-line edit); Enter commits, Escape abandons, an empty name restores the engine's label (`RecordingView.tsx` SpeakerChip, `rec_set_speaker_name`). *e2e: `gh5-speaker-names.e2e.mjs`*
 - [ ] **GH #5** Names survive closing and reopening the recording, are carried into "Export edited copy", appear in the translated file and in the searchable transcript text; the chip's COLOUR stays keyed to the machine label (`recording.rs` display_speaker). *cargo: `recording::tests::speaker_names_*`*
 - [ ] **GH #5** Re-transcribe warns that voices are re-numbered when names exist, so the user re-checks them afterwards (`RecordingView.tsx` retranscribe confirm).
@@ -329,7 +336,18 @@
 - [ ] Privacy receipt after cloud turns: "N private detail(s) hidden…" / "Shielded — nothing private needed hiding" / "Real details were shared this once" (+ "N image(s) kept on this Mac") (`ChatPane.tsx:497-515`).
 - [ ] "Ask again with real details (this once)" valve (`data-agent-blocked`): two-step with "Yes, this once" (danger) / Cancel (`ChatPane.tsx:516-545`).
 - [ ] Memory-suggestion card (`data-agent-blocked`): "Worth remembering?" — Save to memory / Ignore / Always save (turns on auto-save; auto-saved turns show a "Forget" undo toast) (`ChatPane.tsx:548-580`).
-- [ ] Anti-fabrication: an answer claiming an edit/highlight that no tool performed gets a visible appended correction (`agent.rs:312-320`).
+- [ ] Anti-fabrication: an answer claiming an edit/highlight that no tool performed gets a visible appended correction (`agent.rs:367-381`, `claims_unbacked_action`).
+
+**Token-budget bar & hand-off (0.10.0, `TokenBudgetBar.tsx`)**
+- [ ] Nothing renders until the first turn's usage snapshot arrives; after one ask a segmented bar appears under the messages (`TokenBudgetBar.tsx:33-47`).
+- [ ] The fill is the REAL ratio (used ÷ the model's context window); the near/at/over signal is a colour-only ring — ok < 75 % → warn ≥ 75 % → danger ≥ 92 % — and never changes the width (`TokenBudgetBar.tsx:22-27`).
+- [ ] Hover title reads "N / M tokens used this turn — click for a breakdown" (`TokenBudgetBar.tsx:64`).
+- [ ] Click opens the breakdown popover: the 5 fixed categories in a fixed order and fixed colours — System prompt · Conversation history · Tool results · Skill-injected content · File reads & attachments (`TokenBudgetBar.tsx:9-16`). Escape closes it (`TokenBudgetBar.tsx:36-44`).
+- [ ] An engine that reports no exact count is marked estimated, with the tooltip "Estimated total — this engine reports no exact token count" — never presented as measured (`TokenBudgetBar.tsx:89`).
+- [ ] The numbers are real: several long turns in a row visibly grow the bar, and a fresh chat resets it.
+- [ ] **Hand off** button beside the bar: title "Summarize this conversation and continue with a smaller context"; disabled while a turn is in flight or a hand-off is already running; label flips to "Summarizing…" with a spinning refresh icon (`TokenBudgetBar.tsx:134-146`).
+- [ ] After a hand-off the message list gains a centred **divider** — not a chat bubble — with an expandable recap of what was carried over, and the next turn's bar is visibly smaller (`TokenBudgetBar.tsx:150-167`, `ChatPane.tsx:372-378`, message `kind: "handoff"`).
+- [ ] The divider survives reload (persisted as a message with `kind: "handoff"`, `handoff_chat`).
 
 **Composer (`ComposerPane.tsx`)**
 - [ ] Import-tidy batch card ("N new files could be renamed and filed." — Tidy up / Review / ×) and per-file Apply/Dismiss chips (`ComposerPane.tsx:42-96`).
@@ -354,18 +372,18 @@
 
 **Spoken answers (`voice.ts`, `voiceActions.ts`)**
 - [ ] Auto-speak reads the streaming answer sentence-by-sentence; external-CLI engines (no delta stream) speak the persisted answer at turn end (`voice.ts:164-242`).
-- [ ] **(uncommitted)** Neural is the ONLY engine: Edge TTS "Andrew" default, +22 % rate / −2 Hz, ~−16 LUFS; offline/sidecar-down → that sentence is skipped (no on-device fallback voice exists) (`voice.ts`).
+- [ ] **0.14.0** Neural is the ONLY engine: Edge TTS "Andrew" default, +22 % rate / −2 Hz, ~−16 LUFS; offline/sidecar-down → that sentence is skipped (no on-device fallback voice exists) (`voice.ts`).
 - [ ] Archetype DSP (Demon/Ghost/Wraith/Ancient/Custom) shapes the decoded WAV in the webview; manual ▶ Play uses a clean chain when archetype is off (`voice.ts`).
 - [ ] New turn / Stop / lock / auto-lock cancel all audio immediately (`voice.ts:182-259`).
 - [ ] Hands-free: after the streamed answer's audio fully finishes, the mic re-arms and the next dictation auto-sends (no self-capture of the tail) (`voice.ts:315-317,724-734`).
 
-**Dictation — streaming, on-device (`recordingActions.ts`)** *(uncommitted rewrite: live partial streaming; Whisper now Metal-accelerated)*
+**Dictation — streaming, on-device (`recordingActions.ts`)** *(0.5.0: live partial streaming; Whisper is Metal-accelerated)*
 - [ ] Composer mic: streamed dictation; final transcript appended to the question; STT model missing → error toast with "Open Settings" (`recordingActions.ts:98-210`).
 - [ ] Live partials paint during dictation where a surface subscribes (`dict-partial` events).
 - [ ] Dictation shaping: `dict_translate` + `dict_mode` applied to the final text; shaping failure keeps the exact transcript + info toast (`recordingActions.ts:151-180`).
 - [ ] Other dictation owners: journal ("Speak a journal entry" → appends to `Journal {date}.md`, created under a "Journal" folder), open-file dictation (ViewerPane), memory draft (MemoryView); one shared mic — other owners' buttons disable while one records (`recordingActions.ts:224-262,196-210`).
 - [ ] Voice note (MediaRecorder path): imports `Voice note {stamp}` + toast "transcript is being written…" (`recordingActions.ts:25-89,212-222`).
-- [ ] Dictation speed sanity: with Metal STT (uncommitted) decode should be far faster than realtime; Quit during/after dictation must not crash (Metal context unload on exit, `stt.rs unload_ctx`).
+- [ ] Dictation speed sanity: with Metal STT decode should be far faster than realtime; Quit during/after dictation must not crash (Metal context unload on exit, `stt.rs unload_ctx`).
 
 **Live recording — capture layer (`recordingActions.ts`, `liveRec.ts`; viewer UI in §15)**
 - [ ] Start: guards a second session (info toast + opens the live one); mic acquired first; mic denied → Mac-audio-only continues with explanatory error toast (`recordingActions.ts:269-314`).
@@ -436,11 +454,45 @@
 - [ ] Dependencies self-install via uv (declared PEP-723 or on-the-fly self-healing) — verify a script with an undeclared import still runs (`0.3.0 changelog`).
 - [ ] Outputs come back as versioned room files (undo via Time Machine).
 
+## 26b. Skills area (rail → Skills)
+
+**Library (`skills/SkillsView.tsx:331-468`)**
+- [ ] Hero explains the portable-folder model — `SKILL.md` plus optional `scripts/`, `references/`, `assets/`, `agents/`; enabled skills appear in chat under `/` (`SkillsView.tsx:332-343`).
+- [ ] "Ask the skill builder": prompt box + source-file chips; the file picker filters by name, shows an empty state, and picked files are copied into the draft as snapshots (`SkillsView.tsx:345-438`).
+- [ ] Toolbar: live "N skill(s) in this room" count, "Import folder", "New skill" (`SkillsView.tsx:440-444`).
+- [ ] Empty state "No skills yet" with the build/import options — verify it, then verify the grid replaces it once one exists (`SkillsView.tsx:446-451`).
+- [ ] Skill card: name, description, "N resources · {user|agent|import}", and an **Enabled** / **Draft** pill; click opens the editor (`SkillsView.tsx:452-467`).
+
+**Editor (`skills/SkillsView.tsx:471-566`)**
+- [ ] Kicker reads "New skill" / "AI-authored draft" / "Agent Skill" by origin; Enable toggle titled "Only enabled skills are advertised to the assistant" (`SkillsView.tsx:482-495`).
+- [ ] Name / Description / Instructions fields save back; Delete is a two-step confirm that removes every bundled resource (`SkillsView.tsx:496-514`).
+- [ ] Resource sidebar: add by path (`references/policy.md`), the folder-convention hint, and a resource editor; a binary asset shows "Binary asset. Export the folder to inspect it…" instead of garbage text (`SkillsView.tsx:521-561`).
+- [ ] Export a skill folder and re-import it: the round trip is lossless (`export_skill_folder` / `import_skill_folder`).
+- [ ] A skill bound to one domain agent (`agent:` frontmatter) is offered only to that agent; `agent: ""` stays general.
+
+## 26c. Connectors area (rail → Connectors)
+
+Connectors moved OUT of Settings in 0.13.0 and are a first-class product area — there is no "add a connector" form inside Settings any more (`ConnectorsView.tsx:7-9`).
+
+- [ ] Header explains local-vs-remote and that Arcelle asks before either starts (`ConnectorsView.tsx:35-42`).
+- [ ] "Auto-approve connector tools" switch: OFF by default; ON means the assistant runs connector tools without asking **and remote connectors receive real values instead of placeholders** — verify the copy says both (`ConnectorsView.tsx:43-61`, `get_mcp_auto_approve`/`set_mcp_auto_approve`).
+- [ ] "Installed" list appears only when at least one connector is configured; each row: status dot, name, Local/Remote badge, status text ("N of M tools on" / "connecting…" / "off" / the error), on-off toggle, remove (`ConnectorsView.tsx:65-146`).
+- [ ] Per-connector "Tools (N/M)" disclosure: each tool has its own switch; turning one off persists in the tool prefs and the assistant can no longer reach it (`ConnectorsView.tsx:118-144`, `mcp_get_tool_prefs`/`mcp_set_tool_enabled`).
+- [ ] Connector error line renders under the list (`ConnectorsView.tsx:147`).
+- [ ] Marketplace heading is "Marketplace" with nothing installed and "Add more" once something is (`ConnectorsView.tsx:154-157`).
+- [ ] Marketplace opt-in: before browsing, an explicit "Turn on registry browsing" gate explains that listing connectors fetches the public MCP registry over the internet (`McpMarketplace.tsx:143-150`, `mcp_registry_optin_status`).
+- [ ] Marketplace search box; each card shows the registry title (falling back to the slug), publisher, a verified marker, Local/Remote, and an "Installed" badge for ones already present; servers without an icon get a monogram tile (`McpMarketplace.tsx:171-260`).
+- [ ] Detail drawer: description, transport switch when the record offers both a local package and a remote endpoint (local is the default), secret fields for declared env/header keys, Install (`McpMarketplace.tsx:383-490`).
+- [ ] "Advanced: paste or edit the raw config" disclosure — the `mcpServers` JSON used by Claude Desktop/Cursor, with the leaves-this-room warning, and "Save & Connect" (`ConnectorsView.tsx:164-184`).
+
 ## 27. Settings
 
 **Shell**
 - [ ] Opens from rail ⌘, / room menu / palette; backdrop + Esc close (Esc swallowed inside Custom-instructions and MCP JSON textareas); X close; focus trap; whole backdrop `data-agent-blocked` — the UI-driving agent can never operate Settings (`Settings.tsx:195-215`, `useFocusTrap.ts`).
-- [ ] Nav: 14 jump buttons in 5 groups (AI & behavior / Voice & dictation / Privacy & recovery / Connections / History & storage); smooth-scroll; note label≠heading cases ("Online search"→"Online features", "Connectors (MCP)"→"Connections (MCP)", "Room server"→"Room as a tool (MCP server)") (`Settings.tsx:220-262`).
+- [ ] Nav is a **page picker, not a jump list**: exactly **6 buttons**, one per group, `aria-current="page"` on the open one; only that page's sections are rendered (`Settings.tsx:38-79,283-295`).
+- [ ] The 6 pages hold **16 sections**, all reachable: **AI & behavior** (Model · Behavior · Room role · AI helpers · AI advisors) · **Voice** (Spoken voice · Microphone) · **Privacy & recovery** (Cloud privacy · Lock & password · Recovery key) · **Connections** (AI providers · Online search · Remote AI · Room server) · **History & storage** (Checkpoints) · **App** (Updates & version) (`Settings.tsx:38-79`).
+- [ ] Nav label ≠ section heading in four places — verify both strings: "Online search"→**Online features**, "Room server"→**Room as a tool (MCP server)**, "Lock & password"→**Privacy**, "AI advisors"→**AI advisors (advanced)**.
+- [ ] Deep-link: the status-bar trust chip opens Settings on the *Privacy & recovery* page scrolled to Cloud privacy — a section id resolves to its own page, never a blank one (`Settings.tsx:82-116`).
 - [ ] Reachability: with the room offline, Settings → Online features is still the ONLY place internet access is configured — no second search-engine setting exists anywhere (the provider dropdown was removed 2026-07-30).
 - [ ] On close, workspace re-reads web access, autolock, privacy, memory auto-save (`SettingsModals.tsx:44-50`).
 
@@ -462,10 +514,10 @@
 - [ ] "Ask before the AI edits files": Off / Once per answer / Every edit (immediate; drives the edit-approval card) (`BehaviorSection.tsx:121-139`).
 
 **Spoken voice**
-- [ ] **(uncommitted)** No engine picker — a permanent red data-boundary banner states that spoken-sentence text goes to Microsoft's Edge TTS service (`VoiceSection.tsx`).
-- [ ] **(uncommitted)** Voice select is DYNAMIC — the full live Edge catalog (~320 voices, nothing bundled) fetched on Settings mount via `/tts/voices`; grouped: Default (Andrew) → "Multilingual — reads any language" → per-language optgroups (Intl.DisplayNames); count shown in the label; offline → saved voice kept + "couldn't load" hint; a saved id missing from the catalog renders as "saved voice" instead of jumping to Default (`VoiceSection.tsx`, `tts.py list_neural_voices`).
+- [ ] **0.14.0** No engine picker — a permanent red data-boundary banner states that spoken-sentence text goes to Microsoft's Edge TTS service (`VoiceSection.tsx`).
+- [ ] **0.14.0** Voice select is DYNAMIC — the full live Edge catalog (~320 voices, nothing bundled) fetched on Settings mount via `/tts/voices`; grouped: Default (Andrew) → "Multilingual — reads any language" → per-language optgroups (Intl.DisplayNames); count shown in the label; offline → saved voice kept + "couldn't load" hint; a saved id missing from the catalog renders as "saved voice" instead of jumping to Default (`VoiceSection.tsx`, `tts.py list_neural_voices`).
 - [ ] Archetype segmented: Plain / Demon / Ghost / Wraith / Ancient / Custom; presets load slider defaults; touching any slider flips to Custom (`VoiceSection.tsx`).
-- [ ] **(uncommitted)** Sliders: reverb + distortion only (the on-device pitch/rate sliders left with the engine) (`VoiceSection.tsx`).
+- [ ] **0.14.0** Sliders: reverb + distortion only (the on-device pitch/rate sliders left with the engine) (`VoiceSection.tsx`).
 - [ ] Preview/Stop preview speaks the fixed phrase with LIVE unsaved settings (needs network) (`VoiceSection.tsx`).
 - [ ] Save applies to the live voice without reopening the room; "Saved ✓" (`VoiceSection.tsx`).
 
@@ -480,7 +532,7 @@
 - [ ] Honest-limits note present (`CloudPrivacySection.tsx:269-273`).
 
 **Privacy**
-- [ ] Auto-lock select Off/5/15/60 min (immediate; default 15) — verify idle room locks; live recording and active speech count as activity (`PrivacySection.tsx:79-88`, `effects.ts:452-510`).
+- [ ] Auto-lock select Off/5/15/60 min (immediate; default 15) — verify idle room locks; live recording and active speech count as activity (`PrivacySection.tsx:79-88`, `effects.ts:555-612`).
 - [ ] Change password (current/new/repeat, ≥ 8 + match) → "Password changed ✓"; re-keys checkpoints; issues a NEW recovery code via one-time sheet (Copy/Print/Done); failure warning if recovery re-issue fails (`PrivacySection.tsx:93-166`).
 - [ ] Touch ID toggle stores/deletes the Keychain entry; unlock screen follows (`PrivacySection.tsx:168-192`).
 - [ ] Duplicate room: choose destination + optional new password → "Duplicated ✓" (`PrivacySection.tsx:199-226`).
@@ -489,6 +541,15 @@
 **Checkpoints**
 - [ ] Create (optional name, Enter works) → "Saved checkpoint '…'"; count + disk usage; > 1 GB warning (`CheckpointsSection.tsx:77-112`).
 - [ ] Rows: auto-vs-manual dot, name, time + size; Roll back (two-step inline confirm, `data-agent-blocked`; disabled while jobs/recording/streaming with explanatory title; takes a "Before rollback" copy; remounts the room) ; Delete (`CheckpointsSection.tsx:113-170`).
+
+**AI providers (0.12.0)** — Settings → Connections → AI providers (`AiProvidersSection.tsx:67-118`)
+- [ ] Section explains that keys live in the macOS Keychain, never in the room file, and that model catalogs/capabilities are read live from the provider (`AiProvidersSection.tsx:70-74`).
+- [ ] OpenRouter card, disconnected: "Not connected" state, password-masked key field (`aria-label="OpenRouter API key"`), Connect disabled until the field is non-blank; Enter submits (`AiProvidersSection.tsx:88-105`).
+- [ ] Connect with a bad key → an error message in the card, still "Not connected"; the button label passes through "Checking…" (`AiProvidersSection.tsx:56-64,101-104`).
+- [ ] Connect with a good key → "Connected" with a check icon, the card gains its connected styling, and the field is replaced by **Disconnect** (`AiProvidersSection.tsx:80-90`).
+- [ ] Connected → the engine-model picker's **Cloud** tab lists the live OpenRouter catalog with per-model capability badges and prices; picking one runs the room on it (`list_engine_models`, `EngineModelPicker.tsx`).
+- [ ] Only the models your OpenRouter preferences / privacy settings / guardrails allow are listed — the closing hint says so (`AiProvidersSection.tsx:111-114`).
+- [ ] Disconnect removes the Keychain entry and the Cloud tab loses the catalog (`disconnect_ai_provider`).
 
 **Online features**
 - [ ] "Let this room reach the internet" checkbox — the single master switch; NO provider dropdown, NO endpoint field, no key (removed 2026-07-30, replaced by the built-in fused multi-engine search); Save → "Saved ✓"; off removes web tools from the model (`OnlineSection.tsx`).
@@ -504,9 +565,9 @@
 **AI advisors**
 - [ ] Hidden behind cloud-CLI detection ("No cloud AI CLIs… detected" otherwise); "Enable AI advisors" (immediate) → local model may delegate one hard subtask per question; sub-checkbox "Let a Claude advisor use this room's tools" (`AdvisorsSection.tsx:39-76`).
 
-**Connections (MCP)**
-- [ ] Guided add (Name/Command/Arguments → "Add to config" merges JSON); "Advanced: edit the raw JSON" collapsible; "Save & Connect" spawns and reports; per-server live status rows (connected "N tools: …" / connecting / disabled / failed); error line (`McpSection.tsx:50-112`).
-- [ ] SEC-1 dialog on opening a room with authored MCP config: "This room wants to start programs" listing name+command — Keep off / Allow ("Starting…") (`SettingsModals.tsx:55-96`).
+**Connectors (MCP) — NOT in Settings**
+- [ ] Settings has **no** connector page at all: no "Connections (MCP)" nav entry, no guided Name/Command/Arguments form, no raw-JSON box. Everything moved to the Connectors area in the rail (§26c) in 0.13.0. Finding one in Settings is a failure (`Settings.tsx:38-78` has no `set-mcp` section).
+- [ ] SEC-1 dialog on opening a room with authored MCP config: "This room wants to start programs" listing name+command — Keep off / Allow ("Starting…") (`SettingsModals.tsx:55-96`). This one IS still in the Settings layer.
 
 **Remote AI**
 - [ ] Remote Ollama URL (blank = this Mac) + Save; model calls route over LAN, files stay local (`RemoteAiSection.tsx:26-42`).
@@ -518,7 +579,9 @@
 - [ ] Port-17872-taken temporary-port warning; files-tier "dies when you lock" note; files-tier "Allow cloud AI clients" toggle with warning (`RoomServerSection.tsx:143-199`).
 
 **Room role**
-- [ ] Radio list persists immediately; **known caveat: write-only — no observable effect on answers** (test that selection persists, not behavior) (`RoleSection.tsx:18-55`).
+- [ ] Radio list persists immediately (`room_role` setting) (`RoleSection.tsx:18-55`, `useRoles.ts:15-23`).
+- [ ] The role CHANGES ANSWERS: its instructions are read back per turn and injected into the system prompt just before response style + custom instructions (`agent.rs:509,728-738`). Pick **Tutor**, ask a question → step-by-step explanation with a comprehension check; switch to **Critic**, ask the same → weaknesses and gaps. (This was write-only before 0.12.0; it is not any more.)
+- [ ] The plain "Assistant" role has empty instructions and injects nothing — the system prompt is byte-identical to having no role, so Ollama's KV cache is not invalidated (`roles.rs:94-97`).
 
 **AI helpers**
 - [ ] Vision helper: "Installed ✓" or Download button; Semantic search: "On ✓" or "Turn on semantic search" (pull + backfill index); shared progress bar; whole section replaced by "Ollama is not running…" when down (`HelpersSection.tsx:36-101`).
@@ -526,8 +589,8 @@
 **Recovery key**
 - [ ] "Create a recovery key" → one-time sheet (Copy / Print / Done); invalidates nothing until created; unlock screen gains the recovery path (`RecoverySection.tsx:29-77`).
 
-**Updates & version (App)** *(uncommitted)*
-- [ ] Nav group "App" → "Updates & version" jumps to the section; shows "Current version v0.5.1" from `getVersion()` (`AboutSection.tsx:28-36`).
+**Updates & version (App)**
+- [ ] Nav group "App" → "Updates & version" jumps to the section; shows the running version ("Current version v0.14.0" at the time of writing) from `getVersion()` (`AboutSection.tsx:28-36`).
 - [ ] "Check for updates" (up-to-date case): button → "Checking…" → green "You're on the latest version." with a check icon; no relaunch (`AboutSection.tsx:38-52`).
 - [ ] "Check for updates" (newer release exists): status "Version vX is available." + a replace/relaunch warning; button becomes primary "Download & install vX" (`AboutSection.tsx:99-118`).
 - [ ] "Download & install" → progress bar "Downloading… N%" → "Installing… the app will relaunch." → signature-verified install + relaunch into the new version (`AboutSection.tsx:54-77`).
@@ -570,8 +633,14 @@ Test each by asking the agent in plain language and observing the stated outcome
 **Third-party MCP tools**
 - [ ] A question needing a connected server's tool → per-call consent card (server, tool, args) with Allow once / Always (per-server, per-session) / Don't allow; decline returns a polite no-data-left message; 180 s timeout declines.
 
+**Cloud advisors (`consult_advisor`)** — this tool IS reachable; it is served through the room bridge whenever Settings → AI advisors is on and a recognised CLI (`claude-cli`/`codex-cli`) is installed (`room_mcp.rs:226-232,1189-1240`, `agent.rs:1705-1724`).
+- [ ] Advisors OFF (default): asking to "consult a cloud advisor" fires no tool — the spec is not offered at all, so nothing leaves the Mac (`commands.rs:768-772`).
+- [ ] Advisors ON + a CLI installed: a genuinely hard question delegates ONE subtask; the advisor's written answer is folded into the reply.
+- [ ] Advisors ON but only *unrecognised* CLI ids present: the tool is withheld entirely rather than advertised with an empty `advisor` enum (`agent.rs:1705-1715`).
+- [ ] The per-turn cap is 1 (`MAX_ADVISOR_CALLS`): a second consult in the same turn is refused with "You have already consulted an advisor this turn." and the counter saturates rather than wrapping (`room_mcp.rs:1227-1240`).
+- [ ] Sub-option "Let a Claude advisor use this room's tools" ON → the advisor gets a *restricted nested* bridge; that nested bridge never re-serves `consult_advisor` (no recursion) (`room_mcp.rs:1328-1330`).
+
 **Deliberate negatives**
-- [ ] `consult_advisor` is not reachable: asking to "consult a cloud advisor" must NOT fire a tool (Settings toggle persists but has no behavioral effect — expected).
 - [ ] `local_generate` is never available in-room chat (Leash full-tier only).
 
 ## 29. Agent embodiment (UI-driving)
@@ -582,7 +651,7 @@ Test each by asking the agent in plain language and observing the stated outcome
 - [ ] "What do you see on screen?" → `view_screenshot` native window capture (DOM fallback), described locally — no pixels leave the Mac (`agent.rs:1841,2419`).
 - [ ] "Look at the video at 12:34" → `view_media_frame` grabs the presented frame via `roommedia://` (`driver.ts:559-637`).
 
-## 29b. Private browser (BROWSE-1 + BROWSE-2 downloads/saves, uncommitted)
+## 29b. Private browser (BROWSE-1 in 0.13.0; BROWSE-2 downloads/saves and BROWSE-3 search in 0.14.0)
 
 **Preconditions:** Online features ON in Settings (the `browse_*` tools are gated on it); a room with at least one private entity in the privacy map for the consent items.
 
@@ -667,18 +736,21 @@ Test each by asking the agent in plain language and observing the stated outcome
 - [ ] Cross-verify with a file's Cloud view + Settings entity map: the same entities are blacked out.
 
 **Global behaviors (beyond §1)**
-- [ ] Quit teardown: unloads the Whisper Metal context (Quit must not crash), stops an Ollama daemon *we* started (never a user-started one), stops the sidecar, sweeps decrypted previews, removes leash.json (`lib.rs:274-291`).
+- [ ] Quit teardown: unloads the Whisper Metal context (Quit must not crash), stops an Ollama daemon *we* started (never a user-started one), stops the sidecar, sweeps decrypted previews, removes leash.json (`lib.rs:374-397`, `RunEvent::Exit`).
 - [ ] Orphan protection (0.4.1): kill -9 the app → sidecar exits within seconds (watches its parent).
 - [ ] Scanner yields to chat (0.4.1): during a privacy scan, sending a chat message pauses scanning between files ("Paused while you chat") and it resumes after.
 - [ ] Live privacy guard hard-capped at 8 s and skipped during scans — chat can never stall behind it (0.4.1).
 - [ ] Sidecar `/health` reports the real app version (0.4.1).
 - [ ] `roommedia://` streams room audio/video with range support; `roomdoc://` serves sandboxed HTML with a no-network CSP.
-- [ ] Idle auto-lock: set 1 min → idle room seals to the gate; playing speech, live recording, or an in-flight ask counts as activity; sleep-gap > 45 s detected (`effects.ts:452-510`).
+- [ ] Idle auto-lock: set 1 min → idle room seals to the gate; playing speech, live recording, or an in-flight ask counts as activity; sleep-gap > 45 s detected (`effects.ts:555-612`).
 - [ ] KNOWN GAP: no single-instance guard — a second launch opens a second instance; record behavior, don't fail the run on it.
 - [ ] Startup sweeps: leftover browser previews and script workspaces cleaned (`lib.rs:26,269`).
 
 **QA harness — how the UA agent drives the app**
-- [ ] Browser harness (UI-only, no Rust): `npm run build && node qa/make-qa.mjs && npx vite preview` → open `dist/qa.html`. `qa-mock.js` stubs Tauri IPC with fixtures (8 files, chats, workflows, scripts, jobs, privacy entities). Hooks: `#gate` hash → onboarding screens; `window.__qaEmit(event, payload)` fires backend events; counters `__qaAsks`/`__qaAskLog`/`__qaSpeaks`/`__qaTranscribes`/`__qaMicGrants`; synthetic oscillator mic lets dictation run headless.
+- [ ] Browser harness (UI-only, no Rust): `npm run build && node qa/make-qa.mjs && npx vite preview` → open `dist/qa.html`. `qa-mock.js` stubs Tauri IPC with fixtures (8 files, chats, workflows, scripts, jobs, skills, connectors, browser tabs/journal, AI providers, roles, privacy entities). Hooks: `#gate` hash → onboarding screens; `window.__qaEmit(event, payload)` fires backend events; counters `__qaAsks`/`__qaAskLog`/`__qaSpeaks`/`__qaDictStops`/`__qaMicGrants`; synthetic oscillator mic lets dictation run headless.
+- [ ] Visual states: `?qa_state=empty|loading|error` on `qa.html` re-shapes READ commands only, so the shell still mounts and the state lands inside the pane. It must reach Home, Settings, the recording pane, Connectors and the Browser too — those loaders are not named `list_*`/`get_*` and are listed explicitly (`qa-mock.js:28-56` `EXTRA_READS`).
+- [ ] **The mock must not lie by omission**: `window.__qaUnhandled` is `{command: callCount}` for every command with no fixture — it returns a bare `[]`/null, which paints a pane blank while the run stays green. After a QA pass, read it; a pane you were checking that appears there was never really tested (`qa-mock.js:58-71` `noteUnhandled`).
+- [ ] `node qa/check-mock-coverage.mjs` (add `--list` for names) compares the mock's command table against `generate_handler!` in `src-tauri/src/lib.rs` and against every `invoke("…")` in `src/`. It **exits 1** on drift — the frontend calling a command the host doesn't register, or the mock faking one that no longer exists — and prints the fixture-coverage number otherwise. Run it after any command rename; commands have been renamed here before (`save_page` → `browse_save`), and a stale mock hides exactly that.
 - [ ] Real-backend e2e (`npm run e2e`): WDIO + tauri-driver + mock Ollama — Linux/Windows only (no WebDriver on macOS WKWebView).
 - [ ] On macOS, full-fidelity UA = the real app (build, `scripts/macsign.sh`, real Ollama) driven manually or via the computer-use QA loop; the browser harness covers UI structure/flows.
 

@@ -99,6 +99,28 @@ pub(crate) fn safe_scope_name(label: &str) -> String {
     }
 }
 
+/// Fill a built-in page template's `__SLOT__` placeholders in ONE left-to-right
+/// pass. Chained `.replace()` calls rescan what earlier ones substituted, so a
+/// file named `__CARDS__` (pasted in first as the title) had the whole deck
+/// spliced into its own `<title>`. Substituted text is never re-examined here.
+pub(crate) fn fill_template(template: &str, slots: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    loop {
+        let hit = slots
+            .iter()
+            .filter_map(|(key, value)| rest.find(key).map(|at| (at, *key, *value)))
+            .min_by_key(|(at, _, _)| *at);
+        let Some((at, key, value)) = hit else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(value);
+        rest = &rest[at + key.len()..];
+    }
+}
+
 /// Write an HTML document to a temp file and open it in the user's real browser,
 /// where interactive/JS pages render fully — the in-app WKWebView sandbox won't
 /// run a page's own inline scripts. This is a deliberate, user-triggered action
@@ -147,15 +169,34 @@ pub fn cleanup_browser_previews() {
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join("arcelle-preview"));
 }
 
+/// How many staged preview pages the store holds. Each is a whole HTML document
+/// kept in memory, so the store stays bounded.
+pub(crate) const PREVIEW_MAX: usize = 24;
+
 /// Stage a self-contained HTML page for the isolated in-app preview and return a
-/// token; the frontend loads it via `roomdoc://localhost/<token>`. Old entries
-/// are dropped so the store can't grow without bound.
+/// token; the frontend loads it via `roomdoc://localhost/<token>`. Full store →
+/// the OLDEST entry is evicted; clearing the whole map instead took the page the
+/// user still had open down with it.
 #[tauri::command]
 pub fn stage_preview_html(previews: State<'_, HtmlPreviews>, html: String) -> String {
+    stage_preview_html_core(previews.inner(), html)
+}
+
+/// The body of [`stage_preview_html`], over a plain `&HtmlPreviews` so the
+/// eviction rule is testable without a Tauri `State`.
+pub(crate) fn stage_preview_html_core(previews: &HtmlPreviews, html: String) -> String {
     let token = previews.next.fetch_add(1, Ordering::Relaxed).to_string();
     let mut map = previews.map.lock().unwrap();
-    if map.len() >= 24 {
-        map.clear();
+    // Tokens come from a monotonic counter, so the smallest number is the oldest.
+    while map.len() >= PREVIEW_MAX {
+        let Some(oldest) = map
+            .keys()
+            .min_by_key(|k| k.parse::<u64>().unwrap_or(u64::MAX))
+            .cloned()
+        else {
+            break;
+        };
+        map.remove(&oldest);
     }
     map.insert(token.clone(), html);
     token
@@ -472,12 +513,42 @@ pub(crate) async fn run_studio_core(
     save_and_open(window, state, &name, "text/html", &content, "generated")
 }
 
-// ---- AI actions -------------------------------------------------------------
-//
-// A generic, menu-driven cousin of the Studio commands. Same plumbing (lock the
-// room, gather scope/@-ref text, resolve the local model, emit so the UI opens
-// the result), but every action produces a plain Markdown file instead of a
-// bespoke HTML studio. The set of actions is data, not code: each is a spec with
-// its own system prompt, so adding one is a single row. File-scope actions read
-// the mentioned files (or the whole room); room-scope actions synthesize across
-// the room. `research` is the only action that folds in a user question.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fill_template_never_rescans_what_it_substituted() {
+        // A file named after one of the template's own slots used to splice the
+        // later slot's content into the title (chained `.replace()` rescans).
+        let out = fill_template(
+            "<title>__TITLE__</title><div>__CARDS__</div>",
+            &[("__TITLE__", "__CARDS__"), ("__CARDS__", "<b>deck</b>")],
+        );
+        assert_eq!(out, "<title>__CARDS__</title><div><b>deck</b></div>");
+    }
+
+    #[test]
+    fn fill_template_fills_every_occurrence_and_leaves_unknown_slots() {
+        let out = fill_template(
+            "__A__ and __A__ and __MISSING__",
+            &[("__A__", "x")],
+        );
+        assert_eq!(out, "x and x and __MISSING__");
+    }
+
+    #[test]
+    fn stage_preview_drops_the_oldest_not_the_whole_store() {
+        let previews = HtmlPreviews::default();
+        let tokens: Vec<String> = (0..PREVIEW_MAX + 3)
+            .map(|i| stage_preview_html_core(&previews, format!("<p>{i}</p>")))
+            .collect();
+        let map = previews.map.lock().unwrap();
+        // The store is bounded, and the NEWEST pages are the ones still in it —
+        // the previous sweep cleared everything, so the page the user had open
+        // vanished with the rest.
+        assert_eq!(map.len(), PREVIEW_MAX);
+        assert!(map.contains_key(tokens.last().unwrap()));
+        assert!(!map.contains_key(&tokens[0]), "the oldest entry is the one dropped");
+    }
+}

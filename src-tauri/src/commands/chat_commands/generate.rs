@@ -318,6 +318,45 @@ pub(crate) async fn cmd_to_sheet(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     })
 }
 
+/// How many chunks in a row may fail before a chunked pass stops trying. One bad
+/// slice is a slice; three in a row is the engine (Ollama stopped, model gone,
+/// model wedged) — and every further attempt costs a full
+/// `COMMAND_STEP_TIMEOUT_SECS` while the step chip pretends to make progress.
+pub(crate) const CHUNK_GIVE_UP_AFTER: usize = 3;
+
+/// Best-effort bookkeeping for a chunked pass: a slice the model failed on is
+/// skipped rather than aborting the run, but the first error is KEPT so a global
+/// failure can be reported with the cause the engine actually gave instead of a
+/// generic "returned nothing".
+#[derive(Default)]
+pub(crate) struct ChunkFailures {
+    first: Option<String>,
+    run: usize,
+}
+
+impl ChunkFailures {
+    /// Record a failed chunk. `true` means the run of failures is long enough
+    /// that the engine, not the slice, is the problem — stop retrying it.
+    pub(crate) fn note(&mut self, err: String) -> bool {
+        self.first.get_or_insert(err);
+        self.run += 1;
+        self.run >= CHUNK_GIVE_UP_AFTER
+    }
+
+    /// A chunk came back fine, so the failures so far were local ones.
+    pub(crate) fn ok(&mut self) {
+        self.run = 0;
+    }
+
+    /// What to say when the pass produced nothing at all: the engine's own
+    /// message ("The local AI (Ollama) isn't running…") is actionable, the
+    /// generic one is not.
+    pub(crate) fn nothing_saved(self) -> String {
+        self.first
+            .unwrap_or_else(|| "The model returned nothing to save.".into())
+    }
+}
+
 pub(crate) async fn cmd_translate(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     use tauri::Emitter;
     let file_id = ctx
@@ -347,6 +386,8 @@ pub(crate) async fn cmd_translate(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
     let chunks: Vec<String> = chars.chunks(3000).map(|c| c.iter().collect()).collect();
     let total = chunks.len();
     let mut out = String::new();
+    let mut done = 0usize;
+    let mut failures = ChunkFailures::default();
     for (i, chunk) in chunks.iter().enumerate() {
         if ctx.cancelled() {
             break;
@@ -354,7 +395,12 @@ pub(crate) async fn cmd_translate(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
         let _ = ctx
             .window
             .emit("ask-step", format!("Translating part {}/{}", i + 1, total));
-        let piece = ctx
+        // One bad piece must not cost the user the twenty already translated:
+        // skip it and report it, the same best-effort contract `map_windows`
+        // gives every other full-ops command. But a RUN of failures is the
+        // engine, not the piece — keep the first error to report and stop
+        // spending a five-minute timeout per chunk on a dead model.
+        let piece = match ctx
             .ask_quiet(
                 &format!(
                     "You translate text into {lang}. Output ONLY the translation, preserving \
@@ -363,12 +409,40 @@ pub(crate) async fn cmd_translate(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
                 chunk.clone(),
                 Some(0.2),
             )
-            .await?;
+            .await
+        {
+            Ok(piece) => piece,
+            Err(e) => {
+                ctx.note_unread();
+                if failures.note(e) {
+                    break;
+                }
+                continue;
+            }
+        };
+        failures.ok();
         out.push_str(piece.trim());
         out.push('\n');
+        done = i + 1;
     }
     if out.trim().is_empty() {
-        return Err("The model returned nothing to save.".into());
+        // Nothing survived: surface what the engine actually said ("The local AI
+        // (Ollama) isn't running…") rather than the generic line, which sent the
+        // user looking for a content problem that wasn't there.
+        return Err(failures.nothing_saved());
+    }
+    // A translation that ended early is a PARTIAL document — whether the user
+    // stopped it or the model quit on us. Say so inside the file, so a
+    // half-translated note can't be mistaken for the finished one.
+    if done < total {
+        let why = if ctx.cancelled() {
+            format!("Stopped after part {done} of {total}")
+        } else {
+            format!("The model stopped working after part {done} of {total}")
+        };
+        out.push_str(&format!(
+            "\n\n---\n\n_{why} — the rest of \"{name}\" is not translated._\n"
+        ));
     }
     let base = name.rsplit_once('.').map(|(b, _)| b).unwrap_or(&name);
     let fname = format!("{base} ({lang}).md");
@@ -523,4 +597,49 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         sources: source_names,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod chunked_pass_tests {
+    use super::*;
+
+    const DOWN: &str = "The local AI (Ollama) isn't running — start it and try again.";
+
+    #[test]
+    fn a_global_failure_is_reported_with_the_engines_own_message() {
+        // Ollama down: every chunk fails the same way and nothing is translated.
+        // Telling the user "the model returned nothing to save" points them at a
+        // content problem that doesn't exist — the actionable cause is right there
+        // in the error the engine already gave.
+        let mut f = ChunkFailures::default();
+        f.note(DOWN.into());
+        f.note(DOWN.into());
+        assert_eq!(f.nothing_saved(), DOWN);
+    }
+
+    #[test]
+    fn a_pass_that_never_failed_keeps_the_generic_message() {
+        // The model answered, just with nothing usable — that IS a content
+        // problem, and the old wording is the right one.
+        assert_eq!(
+            ChunkFailures::default().nothing_saved(),
+            "The model returned nothing to save."
+        );
+    }
+
+    #[test]
+    fn a_run_of_failures_gives_up_but_one_bad_slice_does_not() {
+        // One awkward chunk in the middle of a long document must not abort the
+        // run (the best-effort contract), but a wedged engine must not be retried
+        // once per chunk at five minutes a go.
+        let mut f = ChunkFailures::default();
+        for _ in 0..CHUNK_GIVE_UP_AFTER - 1 {
+            assert!(!f.note("boom".into()), "a short run is still best-effort");
+        }
+        f.ok();
+        for _ in 0..CHUNK_GIVE_UP_AFTER - 1 {
+            assert!(!f.note("boom".into()), "a success resets the run");
+        }
+        assert!(f.note("boom".into()), "an unbroken run means the engine is gone");
+    }
 }

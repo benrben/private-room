@@ -635,6 +635,12 @@ pub(crate) async fn run_external(
     };
 
     let tmp_dir = std::env::temp_dir().join(format!("arcelle-cli-{}", Uuid::new_v4()));
+    // Removed on EVERY exit from here, not just the happy one. The single
+    // cleanup line at the end of the success path was skipped by each `?`
+    // between here and it — a failed `--mcp-config` write, an unknown engine, a
+    // panicking blocking task — leaving decrypted attachment images and the
+    // room bridge's bearer token sitting in a shared temp folder indefinitely.
+    let _work_dir_guard = TempWorkDir(tmp_dir.clone());
     let mut image_paths: Vec<String> = Vec::new();
     for m in messages {
         if let Some(images) = &m.images {
@@ -815,14 +821,40 @@ pub(crate) async fn run_external(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Decrypted content must not linger on disk.
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // Decrypted content must not linger on disk — `_work_dir_guard` removes the
+    // directory as this function returns, however it returns.
     // PRIV-1: put the real values back into the reply — the cloud only ever
     // saw the placeholders; the user reads a normal answer. Usage numbers
     // carry no room content, so they ride through untouched.
     match (&policy, result) {
         (Some(p), Ok((text, usage))) => Ok((p.redactor.restore(&text), usage)),
         (_, r) => r,
+    }
+}
+
+/// The cloud CLI's scratch directory, removed when it goes out of scope.
+///
+/// It holds DECRYPTED attachment images and, for Claude, the `--mcp-config`
+/// file carrying the room bridge's bearer token, so "clean it up if nothing
+/// went wrong" is not good enough: `Drop` runs on every `?`, on the unknown-
+/// engine return and on a panic. The removal is also CHECKED — a failure used
+/// to be swallowed by `let _ =`, so a directory that could not be removed left
+/// no trace anywhere that it was still there.
+struct TempWorkDir(std::path::PathBuf);
+
+impl Drop for TempWorkDir {
+    fn drop(&mut self) {
+        if !self.0.exists() {
+            return; // nothing was ever written (no images, no bridge config)
+        }
+        let removed = std::fs::remove_dir_all(&self.0).is_ok() && !self.0.exists();
+        if !removed {
+            eprintln!(
+                "[external] could NOT remove the cloud-CLI scratch directory {} — it may still \
+                 hold decrypted attachments and the room bridge token",
+                self.0.display()
+            );
+        }
     }
 }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Awaitable, Callable
 
 import pytest
@@ -19,12 +20,21 @@ from conftest import (
     specs,
 )
 
-from arcelle_sidecar.agents import BATCH_TOOL_NAME
+from arcelle_sidecar.agents import BATCH_TOOL_NAME, reachable_domain_keys
 from arcelle_sidecar.chat import RoundUsage
 from arcelle_sidecar.mcp_client import ToolSpec
 
-from arcelle_sidecar.config import AGENT_ROUND_BACKSTOP, TURN_ROUND_BUDGET
+from arcelle_sidecar.config import (
+    AGENT_ROUND_BACKSTOP,
+    CLOUD_WORKER_PARALLEL,
+    NO_PROGRESS_ROUNDS,
+    TURN_ROUND_BACKSTOP,
+)
 from arcelle_sidecar.graph import (
+    NOTHING_TEXT,
+    NOTHING_USABLE_TEXT,
+    PROGRESS_ELIDED,
+    PROGRESS_NOTE_LINES,
     ROUND_BUDGET_STEP,
     CancelToken,
     Deps,
@@ -281,6 +291,40 @@ async def test_request_tools_unlocks_the_jobs_lane_mid_turn() -> None:
     assert "start_file_pass" in unlock_result["content"]
 
 
+async def test_a_read_only_agent_cannot_unlock_its_own_domain() -> None:
+    """`skills.use` is read-and-run by its own paragraph; `save_skill` and
+    `delete_skill` belong to its authoring sibling. The hatch is for a lane the
+    keyword routers MISSED, so the agent's own group is neither offered nor
+    granted — otherwise "never say you lack a capability from this list" read as
+    permission to unlock straight past the one rule that agent has."""
+    chat = FakeChatModel(
+        [
+            Round(content="r0", calls=[call("request_tools", group="skills")]),
+            Round(content="done"),
+        ]
+    )
+    mcp = FakeMCP()
+    out = await drive_worker(
+        make_request("delete the onboarding skill", max_rounds=9),
+        chat,
+        mcp,
+        agent_id="skills.use",
+    )
+    # Never advertised...
+    system = out.chat.seen_messages[0][0].get("content") or ""
+    assert "skills (" not in system, system
+    # ...and refused when asked for anyway. The write tools never appear.
+    assert "delete_skill" not in out.chat.offered_names[1]
+    assert "save_skill" not in out.chat.offered_names[1]
+    assert not {"save_skill", "delete_skill"} & {c[0] for c in mcp.calls}
+    refusals = [
+        m["content"]
+        for m in out.messages
+        if m.get("role") == "tool" and "another specialist" in (m.get("content") or "")
+    ]
+    assert refusals, [m.get("content") for m in out.messages if m.get("role") == "tool"]
+
+
 async def test_request_tools_rejects_an_unknown_group() -> None:
     chat = FakeChatModel(
         [
@@ -438,6 +482,78 @@ async def test_turn_progress_note_is_reinjected_ephemerally_for_small_models() -
     for seen in out.chat.seen_messages[1:]:
         notes = [m for m in seen if "Progress this turn" in (m.get("content") or "")]
         assert len(notes) == 1
+
+
+async def test_the_progress_note_is_bounded_but_the_log_itself_is_not() -> None:
+    """The note is rebuilt and re-sent EVERY round, and the budget protects a
+    note from trimming — so an unbounded one grows all turn and is paid for out
+    of the same window as the tool RESULTS it summarises. On a long turn the
+    fitter starts dropping the file contents and search hits to keep the
+    one-line recap of them. The log in state stays whole; only the copy the
+    model is charged for is bounded."""
+    n = PROGRESS_NOTE_LINES + 6
+    chat = FakeChatModel(
+        [
+            *(
+                Round(content=f"r{i}", calls=[call("search_room", query=f"q{i}")])
+                for i in range(n)
+            ),
+            Round(content="done"),
+        ]
+    )
+    out = await drive_worker(
+        make_request(max_rounds=n + 2, routing=WRITE_ON), chat, FakeMCP()
+    )
+    note = next(
+        m
+        for m in reversed(out.chat.seen_messages[-1])
+        if "Progress this turn" in (m.get("content") or "")
+    )
+    lines = [ln for ln in note["content"].splitlines() if ln[:1].isdigit()]
+    assert len(lines) == PROGRESS_NOTE_LINES, f"the note was unbounded: {len(lines)}"
+    assert "q0" not in note["content"], "the oldest steps are still being re-sent"
+    assert f"q{n - 1}" in note["content"], "the RECENT steps are what a 4B loses"
+    # ...and nothing was thrown away: the turn's own log still holds every step.
+    assert len(out.state["progress"]) == n
+
+
+async def test_a_trimmed_progress_note_says_it_was_trimmed() -> None:
+    """The note numbers whatever it is handed from 1, under a heading that reads
+    like the turn's COMPLETE action list. So the tail alone told the model that
+    actions 9-20 were actions 1-12, with nothing saying otherwise — and a model
+    that reads the list as complete re-issues an older call. The duplicate guard
+    catches that, so the cost is a wasted round rather than a wrong answer; one
+    honest line inside the same budget removes it."""
+    n = PROGRESS_NOTE_LINES + 6
+    chat = FakeChatModel(
+        [
+            *(
+                Round(content=f"r{i}", calls=[call("search_room", query=f"q{i}")])
+                for i in range(n)
+            ),
+            Round(content="done"),
+        ]
+    )
+    out = await drive_worker(
+        make_request(max_rounds=n + 2, routing=WRITE_ON), chat, FakeMCP()
+    )
+    note = next(
+        m
+        for m in reversed(out.chat.seen_messages[-1])
+        if "Progress this turn" in (m.get("content") or "")
+    )
+    shown = [ln for ln in note["content"].splitlines() if ln[:1].isdigit()]
+    # Still exactly the budget — the marker takes one of those lines, it does
+    # not add a thirteenth.
+    assert len(shown) == PROGRESS_NOTE_LINES
+    dropped = n - (PROGRESS_NOTE_LINES - 1)
+    assert PROGRESS_ELIDED.format(n=dropped) in note["content"], (
+        f"the trimmed log was presented as complete: {note['content']}"
+    )
+    # A short turn is complete, so it says nothing of the kind.
+    short = out.chat.seen_messages[2][-1]
+    assert "Progress this turn" in (short.get("content") or "")
+    assert "earlier actions" not in short["content"]
 
 
 async def test_cloud_models_get_no_progress_note_and_keep_parallel_calls() -> None:
@@ -642,7 +758,7 @@ async def test_a_rogue_call_on_the_tool_less_round_is_never_executed() -> None:
             self.offered.append(list(tools))
             self.seen_messages.append([dict(m) for m in messages])
             self.n += 1
-            usage = RoundUsage(input_tokens=None, output_tokens=None, max_context=8192, is_real=False)
+            usage = RoundUsage(input_tokens=None, max_context=8192, is_real=False)
             return "text", [ToolCall(name="write_file", arguments={"name": "x"}, id="rogue")], usage
 
     mcp = FakeMCP()
@@ -735,18 +851,37 @@ async def test_duplicate_call_is_suppressed_with_the_exact_note() -> None:
     )
 
 
-async def test_an_all_duplicate_round_forces_a_tool_less_synthesis() -> None:
+async def test_one_wasted_round_does_not_end_the_turn() -> None:
+    """The point of the progress gate: a single repeat is a model correcting
+    itself, not a model stuck. It used to force synthesis on the spot."""
     dup = [call("search_room", query="rent")]
     chat = FakeChatModel(
         [
             Round(content="r0", calls=list(dup)),
-            Round(content="r1", calls=list(dup)),  # all duplicates -> stuck
-            Round(content="the answer"),  # must be tool-less
+            Round(content="r1", calls=list(dup)),  # stall #1 — survivable
+            Round(content="r2", calls=[call("search_room", query="deposit")]),
+            Round(content="the answer"),
         ]
     )
     out = await drive_worker(make_request(web_enabled=True, max_rounds=20, routing=WRITE_ON), chat)
-    assert out.chat.n == 3
-    assert out.chat.offered_names[2] == []
+    # Still armed on the round after the repeat — that is the whole change.
+    assert out.chat.offered_names[2] != []
+    assert out.final == "the answer"
+
+
+async def test_a_run_of_no_progress_rounds_forces_a_tool_less_synthesis() -> None:
+    """…and a model that keeps repeating itself still gets stopped."""
+    dup = [call("search_room", query="rent")]
+    rounds = [Round(content="r0", calls=list(dup))]
+    rounds += [
+        Round(content=f"stall{i}", calls=list(dup)) for i in range(NO_PROGRESS_ROUNDS)
+    ]
+    rounds.append(Round(content="the answer"))  # must be tool-less
+    chat = FakeChatModel(rounds)
+    out = await drive_worker(make_request(web_enabled=True, max_rounds=20, routing=WRITE_ON), chat)
+    # The first round works, then NO_PROGRESS_ROUNDS stalls, then the disarmed
+    # round — so the tool-less one lands exactly at that index.
+    assert out.chat.offered_names[NO_PROGRESS_ROUNDS + 1] == []
     assert out.final == "the answer"
 
 
@@ -806,6 +941,98 @@ async def test_a_failed_call_is_not_memoised_and_may_retry() -> None:
     assert not any("Duplicate call" in (m.get("content") or "") for m in out.messages)
     # A failing round is not an all-duplicate round, so no forced synthesis.
     assert out.chat.n == 3
+
+
+async def test_a_dropped_connection_is_a_tool_failure_not_a_dead_loop() -> None:
+    """`McpClient.call_tool` catches its OWN protocol errors "so the round can
+    still make progress" — but only those. A dropped connection or a timed-out
+    request raised httpx straight through the tool loop, killing the specialist
+    mid-task and putting raw transport text in the answer. The room refusing and
+    the socket refusing are the same thing to the model: a result it can read.
+    """
+
+    class _DropsTheSocket(FakeMCP):
+        async def call_tool(self, name, arguments):  # type: ignore[no-untyped-def]
+            self.calls.append((name, dict(arguments)))
+            raise ConnectionResetError("connection reset by peer")
+
+    chat = FakeChatModel(
+        [
+            Round(content="r0", calls=[call("open_file", name="lease.pdf")]),
+            Round(content="I could not open the lease."),
+        ]
+    )
+    mcp = _DropsTheSocket()
+    out = await drive_worker(make_request(routing=WRITE_ON), chat, mcp)
+
+    assert out.final == "I could not open the lease.", "the loop died with the socket"
+    errors = [
+        m for m in out.messages if m.get("role") == "tool" and "Tool error" in m["content"]
+    ]
+    assert errors and "connection reset by peer" in errors[0]["content"], errors
+    assert any(e.get("ok") is False for e in out.of("step_status"))
+
+
+async def test_the_tool_catalog_is_retried_once_before_the_turn_is_lost() -> None:
+    """`list_tools` is the FIRST thing every loop does, before any work — a
+    transient hiccup there used to end the ask with raw JSON-RPC text and no
+    retry, and the user had to notice and ask again by hand."""
+
+    class _FlakyOnce(FakeMCP):
+        async def list_tools(self):  # type: ignore[no-untyped-def]
+            self.list_calls += 1
+            if self.list_calls == 1:
+                raise ConnectionResetError("connection reset by peer")
+            return list(self.tools)
+
+    mcp = _FlakyOnce()
+    chat = FakeChatModel([Round(content="The rent is 1200.")])
+    out = await drive_worker(make_request(routing=WRITE_ON), chat, mcp)
+    assert mcp.list_calls == 2, "the catalog was never retried"
+    assert out.final == "The rent is 1200."
+
+
+async def test_a_catalog_that_stays_down_is_reported_in_words_not_swallowed() -> None:
+    """Twice down is not transient. Say so — carrying on with an EMPTY catalog
+    would be worse than stopping: an agent with no tools does not announce it,
+    it answers from memory."""
+
+    class _AlwaysDown(FakeMCP):
+        async def list_tools(self):  # type: ignore[no-untyped-def]
+            self.list_calls += 1
+            raise TimeoutError()  # str() == ""
+
+    with pytest.raises(RuntimeError) as exc:
+        await drive_worker(make_request(routing=WRITE_ON), FakeChatModel([]), _AlwaysDown())
+    assert "this room's tools could not be loaded" in str(exc.value)
+    assert "TimeoutError" in str(exc.value), "no reason at all was given"
+
+
+async def test_both_catalog_failures_are_recorded_even_though_one_is_shown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The sentence the user reads carries the RETRY's reason — `_why` never
+    returns "", so the `or _why(first)` fallback that used to be in it could
+    never be reached. The first attempt's reason is real information all the
+    same (`ConnectionRefusedError` then `TimeoutError` is a bridge going down
+    mid-turn), so it goes where a diagnosis is read: the log."""
+
+    class _DownTwiceDifferently(FakeMCP):
+        async def list_tools(self):  # type: ignore[no-untyped-def]
+            self.list_calls += 1
+            if self.list_calls == 1:
+                raise ConnectionRefusedError("the bridge refused the connection")
+            raise TimeoutError()  # str() == ""
+
+    with caplog.at_level(logging.ERROR, logger="arcelle_sidecar.graph"):
+        with pytest.raises(RuntimeError) as exc:
+            await drive_worker(
+                make_request(routing=WRITE_ON), FakeChatModel([]), _DownTwiceDifferently()
+            )
+    assert "TimeoutError" in str(exc.value), "the retry's reason is the one shown"
+    assert any("the bridge refused the connection" in r.getMessage() for r in caplog.records), (
+        "the first attempt's reason was thrown away"
+    )
 
 
 async def test_step_status_reports_failure() -> None:
@@ -945,22 +1172,196 @@ async def test_cancel_between_rounds_short_circuits_call_model() -> None:
     assert events == []  # not even a "round" event
 
 
+async def test_a_loop_stays_quiet_while_a_sibling_holds_the_live_answer_area() -> None:
+    """There is exactly ONE live answer area, and a `round` event BLANKS it.
+
+    A hub round dispatches its whole batch at once and every child streamed into
+    that same area: the user watched fragments of three specialists shuffled
+    together and repeatedly erased, and read-aloud spoke the jumble. Whoever
+    claims it first holds it for the round; the rest stay quiet — and still do
+    all of their work, which is what the assertions below pin.
+    """
+    events: list[dict[str, Any]] = []
+
+    async def emit(e: dict[str, Any]) -> None:
+        events.append(e)
+
+    async def round_for(deps: Deps, node: str) -> dict[str, Any]:
+        state = {
+            "round": 0,
+            "max_rounds": 9,
+            "messages": [],
+            "tools": [],
+            "force_synthesis": False,
+            "node_key": node,
+        }
+        return await call_model(state, {"configurable": {"deps": deps}})  # type: ignore[arg-type]
+
+    deps = Deps(
+        chat=FakeChatModel([Round(content="the sibling's words")] * 3),  # type: ignore[arg-type]
+        emit=emit,
+        cancel=CancelToken(),
+        mcp=FakeMCP(),  # type: ignore[arg-type]
+    )
+    assert deps.claim_live("main") is True, "an idle area must be claimable"
+
+    out = await round_for(deps, "files.read#0")
+    assert [e for e in events if e["t"] in ("round", "delta")] == [], (
+        "a second loop wrote into an area another one was already using"
+    )
+    assert out["final_text"] == "the sibling's words", "its work must still land"
+    # Its own round still costs what it costs — the bar must not under-report.
+    assert [e for e in events if e["t"] == "usage"], "the round went uncounted"
+
+    # The holder finishes; the area is free and the next loop may speak.
+    deps.release_live("main")
+    events.clear()
+    await round_for(deps, "files.read#0")
+    assert [e["t"] for e in events if e["t"] in ("round", "delta")] == ["round", "delta"]
+    assert all(e["node"] == "files.read#0" for e in events if e["t"] == "round")
+
+
+async def test_the_live_area_is_handed_back_even_when_the_round_blows_up() -> None:
+    """A lease nobody releases is a muted UI for the rest of the turn."""
+
+    class _Boom:
+        async def stream(self, messages, tools, on_delta, cancel=None):  # type: ignore[no-untyped-def]
+            raise RuntimeError("the engine fell over")
+
+    async def emit(e: dict[str, Any]) -> None:
+        return None
+
+    deps = Deps(chat=_Boom(), emit=emit, cancel=CancelToken(), mcp=FakeMCP())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError):
+        await call_model(
+            {"round": 0, "max_rounds": 9, "messages": [], "tools": [], "node_key": "a#0"},  # type: ignore[arg-type]
+            {"configurable": {"deps": deps}},
+        )
+    assert deps.claim_live("b#1") is True, "the crashed loop kept the area forever"
+
+
+async def test_the_usage_bar_counts_the_ephemeral_notes_it_actually_sent() -> None:
+    """The turn-progress and correction notes ride the request as user turns,
+    so they cost real context — but the breakdown was built from `messages`,
+    which is the thread WITHOUT them. On an engine that reports its own token
+    count only the colours were off; on one that does not, the number the user
+    reads was lower than what was actually sent."""
+    events: list[dict[str, Any]] = []
+
+    async def emit(e: dict[str, Any]) -> None:
+        events.append(e)
+
+    async def run(state: dict[str, Any]) -> int:
+        events.clear()
+        chat = FakeChatModel([Round(content="ok")])
+        deps = Deps(chat=chat, emit=emit, cancel=CancelToken(), mcp=FakeMCP())  # type: ignore[arg-type]
+        await call_model(state, {"configurable": {"deps": deps}})  # type: ignore[arg-type]
+        return next(e for e in events if e["t"] == "usage")["total_tokens"]
+
+    base: dict[str, Any] = {
+        "round": 1,
+        "max_rounds": 9,
+        "messages": [{"role": "user", "content": "what does the lease say"}],
+        "tools": [],
+        "force_synthesis": False,
+        "small_model": True,
+    }
+    plain = await run(dict(base))
+    with_note = await run(
+        {**base, "corrections": ["write tools ran but no artifact was recorded"] * 8}
+    )
+    assert with_note > plain, (
+        f"the notes were sent but not counted ({with_note} vs {plain})"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # final text
 # --------------------------------------------------------------------------- #
 
 
-async def test_blank_final_becomes_done() -> None:
+async def test_a_turn_that_produced_nothing_does_not_claim_it_is_done() -> None:
+    """`Done.` used to be the net for EVERY blank answer, chosen without
+    looking at whether anything had happened. Nothing ran, nothing changed and
+    the model said nothing — so the one thing the app must not do is report
+    success. (Updated 2026-08-01; this test asserted `Done.` here.)"""
     chat = FakeChatModel([Round(content=""), Round(content="")])
     out = await drive(make_request(), chat)
-    assert out.final == "Done."
-    assert out.of("final")[0]["v"] == "Done."
+    assert out.final == NOTHING_TEXT
+    assert out.of("final")[0]["v"] == NOTHING_TEXT
 
 
-async def test_whitespace_only_final_becomes_done() -> None:
+async def test_whitespace_only_final_is_treated_as_no_answer() -> None:
     chat = FakeChatModel([Round(content="   \n "), Round(content="   \n ")])
     out = await drive(make_request(), chat)
+    assert out.final == NOTHING_TEXT
+
+
+async def test_a_blank_answer_over_real_work_still_says_done() -> None:
+    """The one case `Done.` is true: the model produced no words, but the room
+    really did change — the referent baton is the evidence."""
+
+    class _WritesThenGoesQuiet(_ByCatalogChat):
+        async def stream(self, messages, tools, on_delta, cancel=None):  # type: ignore[no-untyped-def]
+            names = {t["function"]["name"] for t in tools}
+            usage = RoundUsage(
+                input_tokens=None, max_context=8192, is_real=False
+            )
+            who = self._who(names)
+            turn = self.turns.get(who, 0)
+            self.turns[who] = turn + 1
+            if who == "main" and turn == 0 and names:
+                return "", [call("ask_file_agent", instruction="save the notes")], usage
+            if who != "main" and turn == 0 and names:
+                return "", [call("create_file", name="notes.md", content="x")], usage
+            return "", [], usage  # nobody ever writes a word
+
+    out = await drive(make_request("save the notes"), _WritesThenGoesQuiet())  # type: ignore[arg-type]
     assert out.final == "Done."
+
+
+async def test_a_blank_answer_over_finished_reports_hands_them_back() -> None:
+    """The specialists worked and the hub never wrote it up. Their reports are
+    already in the findings baton verbatim, so throwing them away and saying
+    "Done." was losing real work AND claiming credit for it."""
+
+    class _HubGoesQuiet(_ByCatalogChat):
+        async def stream(self, messages, tools, on_delta, cancel=None):  # type: ignore[no-untyped-def]
+            names = {t["function"]["name"] for t in tools}
+            if self._who(names) == "main" and self.turns.get("main", 0) > 0:
+                self.turns["main"] += 1
+                usage = RoundUsage(
+                    input_tokens=None, max_context=8192, is_real=False
+                )
+                return "", [], usage  # the hub never writes anything up
+            return await super().stream(messages, tools, on_delta, cancel)
+
+    out = await drive(
+        make_request("what does the lease say"),
+        _HubGoesQuiet(batch=[{"agent": "file", "instruction": "read the lease"}]),  # type: ignore[arg-type]
+    )
+    assert "here is what came back" in out.final
+    assert "file did its part" in out.final
+
+
+async def test_a_turn_whose_specialist_failed_does_not_claim_nothing_ran() -> None:
+    """The fourth case. A specialist's report is recorded on SUCCESS only, so a
+    turn that dispatched one, had it refused, and then wrote no words had no
+    report and no referent — and fell into the "nothing was run and nothing was
+    changed" net, which the user read beside a red step chip and a failed node
+    in the roster. Two untruths for the price of one."""
+    chat = FakeChatModel(
+        [
+            # web is OFF in this room, so there is no Web specialist to ask.
+            Round(content="", calls=[call("ask_web_agent", instruction="the rate")]),
+            Round(content=""),  # ...and the hub never writes anything up
+        ]
+    )
+    out = await drive(make_request("what is the central-bank rate?"), chat)
+    assert out.final == NOTHING_USABLE_TEXT
+    assert out.final != NOTHING_TEXT
+    # ...and the roster the user is looking at really does show the failure.
+    assert any(e["t"] == "step_status" and not e["ok"] for e in out.events)
 
 
 async def test_blank_final_stays_blank_when_cancelled() -> None:
@@ -1127,7 +1528,7 @@ class _NeverStops:
         cancel: Any = None,
     ) -> tuple[str, list[ToolCall], RoundUsage]:
         self.rounds += 1
-        usage = RoundUsage(input_tokens=None, output_tokens=None, max_context=8192, is_real=False)
+        usage = RoundUsage(input_tokens=None, max_context=8192, is_real=False)
         names = [t["function"]["name"] for t in tools]
         if "ask_file_agent" in names:
             return "", [call("ask_file_agent", instruction=f"find clause {self.rounds}")], usage
@@ -1199,7 +1600,7 @@ async def test_a_healthy_turn_never_trips_the_budget() -> None:
 def test_the_shipped_default_leaves_room_for_a_full_fan_out() -> None:
     """Six specialists at eight rounds each, plus the hub's own, is 52. The
     default must sit above that or it would be cutting real work short."""
-    assert TURN_ROUND_BUDGET > 6 * 8 + 4
+    assert TURN_ROUND_BACKSTOP > 6 * 8 + 4
 
 
 class _BarrierMCP(FakeMCP):
@@ -1273,7 +1674,7 @@ class _ByCatalogChat:
         self.seen_by_worker.setdefault(who, []).append([dict(m) for m in messages])
         turn = self.turns.get(who, 0)
         self.turns[who] = turn + 1
-        usage = RoundUsage(input_tokens=None, output_tokens=None, max_context=8192, is_real=False)
+        usage = RoundUsage(input_tokens=None, max_context=8192, is_real=False)
 
         main_open = (
             [call("ask_agents", tasks=self.batch)]
@@ -1382,6 +1783,49 @@ async def test_ask_agents_runs_independent_tasks_in_one_parallel_wave() -> None:
         assert f"Task {i} —" in batch_msgs[0]["content"]
 
 
+async def test_only_one_loop_at_a_time_streams_into_the_live_answer_area() -> None:
+    """There is exactly ONE live answer area in the UI, and a `round` event
+    BLANKS it before the deltas that follow.
+
+    A hub round dispatches its whole batch at once, and every child streamed
+    into that same area: the user watched fragments of three specialists
+    shuffled together and repeatedly erased, and read-aloud spoke the jumble.
+    Whoever claims the area first holds it for its round; the rest stay quiet
+    and are still visible as step chips and roster nodes.
+    """
+    class _Streaming(_ByCatalogChat):
+        """A round that SUSPENDS, the way a real streaming engine does. The
+        plain double never awaits anything, so its siblings can only ever run
+        one-at-a-time and the interleaving under test cannot happen."""
+
+        async def stream(self, messages, tools, on_delta, cancel=None):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(0)
+            return await super().stream(messages, tools, on_delta, cancel)
+
+    out = await drive(
+        make_request("compare my rent to the market", web_enabled=True),
+        _Streaming(),  # the 3-way per-domain fan-out  # type: ignore[arg-type]
+        mcp=_BarrierMCP(width=3),  # nothing proceeds until all three overlap
+    )
+
+    # Every `round`/`delta` names the loop it came from, so a consumer can
+    # attribute the words rather than assume whose they are...
+    live = [e for e in out.events if e["t"] in ("round", "delta")]
+    assert all(e.get("node") for e in live)
+    # ...and inside one live block — a `round` and the deltas it precedes —
+    # there is only ever ONE of them.
+    owner = ""
+    for e in live:
+        if e["t"] == "round":
+            owner = e["node"]
+        else:
+            assert e["node"] == owner, (
+                f"{e['node']}'s words landed in {owner}'s live block: {e['v']!r}"
+            )
+    # ...and the user's actual answer is unaffected.
+    assert out.final == "The rent is 1200."
+
+
 async def test_ask_agents_holds_a_dependent_task_until_its_deps_report() -> None:
     """`depends_on` has to actually gate, and the dependency's findings have to
     travel — otherwise it is decoration and the dependent agent re-does the
@@ -1440,7 +1884,7 @@ async def test_a_later_round_specialist_gets_the_earlier_rounds_findings() -> No
             names = {t["function"]["name"] for t in tools}
             who = self._who(names)
             usage = RoundUsage(
-                input_tokens=None, output_tokens=None, max_context=8192, is_real=False
+                input_tokens=None, max_context=8192, is_real=False
             )
             if who == "main":
                 turn = self.turns.get("main", 0)
@@ -1490,7 +1934,7 @@ async def test_a_delegation_that_returns_nothing_is_reported_as_failed() -> None
             names = {t["function"]["name"] for t in tools}
             if self._who(names) != "main":
                 usage = RoundUsage(
-                    input_tokens=None, output_tokens=None, max_context=8192, is_real=False
+                    input_tokens=None, max_context=8192, is_real=False
                 )
                 return "", [], usage
             return await super().stream(messages, tools, on_delta, cancel)
@@ -1506,6 +1950,111 @@ async def test_a_delegation_that_returns_nothing_is_reported_as_failed() -> None
     assert any(e["status"] == "failed" for e in kids), (
         f"the roster shows no failed node: {[e['status'] for e in kids]}"
     )
+
+
+async def test_a_specialist_this_room_lacks_is_refused_on_the_direct_path_too() -> None:
+    """The batch dispatcher has always refused a domain the room cannot serve.
+    The direct `ask_*_agent` path checked nothing and just called
+    `resolve_worker`, which falls back to the DEFAULT worker when every member
+    of a domain is unreachable — so a weather question in a web-off room was
+    answered out of the user's own documents, labelled "File agent"."""
+
+    class _AsksForWeb(_ByCatalogChat):
+        async def stream(self, messages, tools, on_delta, cancel=None):  # type: ignore[no-untyped-def]
+            names = {t["function"]["name"] for t in tools}
+            usage = RoundUsage(
+                input_tokens=None, max_context=8192, is_real=False
+            )
+            who = self._who(names)
+            turn = self.turns.get(who, 0)
+            self.turns[who] = turn + 1
+            self.seen_messages.append([dict(m) for m in messages])
+            if who == "main" and turn == 0 and names:
+                # A domain that is NOT in this room's catalog — a small model
+                # naming a specialist it remembers from another room.
+                return "", [call("ask_web_agent", instruction="the weather")], usage
+            return "I cannot check the weather in this room.", [], usage
+
+    chat = _AsksForWeb()
+    out = await drive(make_request("what's the weather", web_enabled=False), chat)  # type: ignore[arg-type]
+
+    tools = [m for m in out.messages if m.get("role") == "tool"]
+    assert any("no 'web' specialist" in (m.get("content") or "") for m in tools), (
+        f"the phantom domain was dispatched instead of refused: {tools}"
+    )
+    assert "MISSING" in tools[0]["content"]
+    # No worker ran at all: the File agent was never handed the web question.
+    assert set(chat.turns) == {"main"}, chat.turns
+    # ...and it is in the live picture as the failed node it is (finding 416).
+    roster = out.of("plan")[-1]["v"]
+    kids = [e for e in roster if e["key"] != "main"]
+    assert [e["status"] for e in kids] == ["failed"], roster
+
+
+async def test_an_impossible_batch_task_is_drawn_as_a_failed_node() -> None:
+    """It was reported in TEXT and silently absent from the diagram — so the
+    picture showed a turn that never asked for the thing the user asked for."""
+    out = await drive(
+        make_request("compare my rent to the market", web_enabled=False),
+        _ByCatalogChat(  # type: ignore[arg-type]
+            batch=[
+                {"agent": "file", "instruction": "read the lease"},
+                {"agent": "web", "instruction": "check the market rate"},
+            ]
+        ),
+    )
+    roster = out.of("plan")[-1]["v"]
+    kids = [e for e in roster if e["key"] != "main"]
+    assert len(kids) == 2, f"the impossible task is missing from the roster: {kids}"
+    assert sorted(e["status"] for e in kids) == ["done", "failed"], kids
+
+
+async def test_a_repeated_delegation_is_answered_from_the_first_outcome() -> None:
+    """Even when the first one came back EMPTY.
+
+    Memoisation was gated on `ok`, which is the right rule for a room tool — a
+    failed call may be transient, so SPEC §3.2 leaves it out of `seen` and lets
+    a later round retry it. A delegation is not one call: re-running it spends a
+    whole child loop, which is real waiting and, on a cloud room, real money.
+    The empty report is already in the thread, and `duplicate_call_note` points
+    the model at it while inviting a DIFFERENT instruction — which, having its
+    own `ToolCall.key`, still runs.
+    """
+
+    class _AsksTwice(_ByCatalogChat):
+        #: Rounds where a FILE worker was actually handed its own box — i.e. how
+        #: many times the specialist was run. A tool-less round carries no
+        #: catalog at all, so `_who` cannot tell those apart.
+        worker_runs = 0
+
+        async def stream(self, messages, tools, on_delta, cancel=None):  # type: ignore[no-untyped-def]
+            names = {t["function"]["name"] for t in tools}
+            usage = RoundUsage(
+                input_tokens=None, max_context=8192, is_real=False
+            )
+            who = self._who(names)
+            turn = self.turns.get(who, 0)
+            self.turns[who] = turn + 1
+            self.seen_messages.append([dict(m) for m in messages])
+            if who != "main":
+                if "search_room" in names:
+                    self.worker_runs += 1
+                return "", [], usage  # the specialist reports nothing
+            if turn < 2 and names:
+                return "", [call("ask_file_agent", instruction="read the lease")], usage
+            return "I could not read the lease.", [], usage
+
+    chat = _AsksTwice()
+    out = await drive(make_request("what does the lease say"), chat)  # type: ignore[arg-type]
+
+    assert chat.worker_runs == 1, (
+        f"the empty specialist was re-run from scratch ({chat.worker_runs}x)"
+    )
+    assert any(
+        "Duplicate call" in (m.get("content") or "")
+        for m in out.messages
+        if m.get("role") == "tool"
+    ), "the repeat was not answered from the first outcome"
 
 
 async def test_one_crashing_specialist_does_not_kill_the_whole_ask() -> None:
@@ -1534,6 +2083,50 @@ async def test_one_crashing_specialist_does_not_kill_the_whole_ask() -> None:
     )
     # ...and the healthy siblings' reports still arrived.
     assert sum(1 for m in tools if "Report from the" in (m.get("content") or "")) >= 2
+
+
+async def test_a_crash_with_no_message_is_still_reported_with_a_reason() -> None:
+    """"failed:" with nothing after it is not a report.
+
+    `str()` on several of the errors that actually reach these paths — the
+    asyncio timeout, a bare httpx transport error — is the EMPTY STRING, and
+    both delegation paths interpolated the exception raw. The line then travels
+    to the Main agent and from there to the user, saying nothing at all.
+    """
+
+    class _SilentBoom(_ByCatalogChat):
+        async def stream(self, messages, tools, on_delta, cancel=None):  # type: ignore[no-untyped-def]
+            names = {t["function"]["name"] for t in tools}
+            if self._who(names) == "web":
+                raise asyncio.TimeoutError()  # str() == ""
+            return await super().stream(messages, tools, on_delta, cancel)
+
+    # The direct ask_*_agent path...
+    out = await drive(
+        make_request("compare my rent to the market", web_enabled=True),
+        _SilentBoom(),  # type: ignore[arg-type]
+    )
+    tools = [m for m in out.messages if m.get("role") == "tool"]
+    crash = next(m for m in tools if "could not finish" in (m.get("content") or ""))
+    assert crash["content"].rstrip().endswith("TimeoutError"), (
+        f"the crash was reported with no reason at all: {crash['content']!r}"
+    )
+
+    # ...and the batch path, which formats its own failure line.
+    out = await drive(
+        make_request("compare my rent to the market", web_enabled=True),
+        _SilentBoom(  # type: ignore[arg-type]
+            batch=[
+                {"agent": "file", "instruction": "read the lease"},
+                {"agent": "web", "instruction": "check the market rate"},
+            ]
+        ),
+    )
+    tools = [m for m in out.messages if m.get("role") == "tool"]
+    batch_msg = next(m for m in tools if m.get("tool_name") == "ask_agents")
+    assert "failed: TimeoutError" in batch_msg["content"], (
+        f"the failed task carries no reason: {batch_msg['content']!r}"
+    )
 
 
 async def test_a_failing_task_does_not_strand_its_siblings() -> None:
@@ -1594,7 +2187,7 @@ async def test_a_partial_batch_is_memoised_and_its_findings_reach_the_next_round
                 return await super().stream(messages, tools, on_delta, cancel)
             self.seen_by_worker.setdefault("main", []).append([dict(m) for m in messages])
             usage = RoundUsage(
-                input_tokens=None, output_tokens=None, max_context=8192, is_real=False
+                input_tokens=None, max_context=8192, is_real=False
             )
             turn = self.turns.get("main", 0)
             self.turns["main"] = turn + 1
@@ -1801,8 +2394,10 @@ async def test_a_local_room_serializes_its_children() -> None:
 
 
 async def test_a_cloud_room_still_fans_out() -> None:
-    """The bound is a LOCAL concession. A cloud engine holds no resident model,
-    so bounding it would throw away the whole point of the parallel hub."""
+    """The bound of 1 is a LOCAL concession — a cloud engine holds no resident
+    model, and serializing it would throw away the whole point of the parallel
+    hub. It is bounded all the same (`config.CLOUD_WORKER_PARALLEL`): unbounded
+    meant a twenty-task plan opened twenty PAID conversations at once."""
     peak = {"now": 0, "max": 0}
 
     class _Tracking(_ByCatalogChat):
@@ -1828,12 +2423,13 @@ async def test_a_cloud_room_still_fans_out() -> None:
         emit=emit,
         cancel=CancelToken(),
         mcp=FakeMCP(),
-        worker_parallel=None,  # cloud
+        worker_parallel=CLOUD_WORKER_PARALLEL,  # cloud (server.py)
     )
     from arcelle_sidecar.graph import run_agent
 
     await run_agent(make_request("compare my rent", web_enabled=True), deps)
     assert peak["max"] > 1, "the cloud fan-out was serialized"
+    assert peak["max"] <= CLOUD_WORKER_PARALLEL, "the cloud fan-out is unbounded again"
 
 
 async def test_the_token_bar_denominator_is_per_call_not_per_instance() -> None:
@@ -1877,7 +2473,7 @@ async def test_stop_keeps_the_work_that_already_finished() -> None:
                 turn = self.turns.get("main", 0)
                 self.turns["main"] = turn + 1
                 usage = RoundUsage(
-                    input_tokens=None, output_tokens=None, max_context=8192, is_real=False
+                    input_tokens=None, max_context=8192, is_real=False
                 )
                 if turn == 0:
                     return "", [call("ask_file_agent", instruction="read the lease")], usage
@@ -1948,6 +2544,11 @@ def _delegator(
         referents_at_launch=[],
         carryover=(),
         served_names=set(BUILTIN_TOOL_NAMES),
+        # Derived exactly as `for_round` derives it: the guard and the catalog
+        # the model chose from must read the same list.
+        live_domain_keys=reachable_domain_keys(
+            web_enabled=web_enabled, served_names=set(BUILTIN_TOOL_NAMES)
+        ),
     )
 
 
@@ -1995,6 +2596,49 @@ async def test_the_delegator_holds_a_wave_until_its_dependency_reported(
     # Waves are legible in the roster — that is what the batch number is for.
     assert [e["batch"] for e in d.pipeline] == [0, 1]
     assert [e["status"] for e in d.pipeline] == ["done", "done"]
+
+
+async def test_two_plans_in_one_round_do_not_share_a_later_band(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The batch number is the ONE fact that says "these ran at the same time".
+
+    It used to be `round batch + wave index`, so two `ask_agents` calls emitted
+    in the same round had their SECOND waves drawn as one group however far
+    apart they actually ran. Only the opening waves genuinely start together —
+    that is what a round dispatching both plans at once means — so those keep
+    the round's band and every later wave takes its own.
+    """
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        await asyncio.sleep(0)
+        return WorkerOutcome(f"FOUND: {instruction}", True, False, [])
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+
+    d = _delegator()
+    chain = [
+        {"agent": "file", "instruction": "first", "depends_on": []},
+        {"agent": "web", "instruction": "second", "depends_on": [0]},
+    ]
+    await asyncio.gather(
+        d.run_plan([dict(t) for t in chain]), d.run_plan([dict(t) for t in chain])
+    )
+
+    bands = {e["instruction"]: e["batch"] for e in d.pipeline}
+    firsts = [e["batch"] for e in d.pipeline if e["instruction"] == "first"]
+    seconds = [e["batch"] for e in d.pipeline if e["instruction"] == "second"]
+    assert firsts == [d.batch, d.batch], f"the opening waves did not run together: {bands}"
+    assert len(set(seconds)) == 2, f"two unrelated later waves share a band: {bands}"
+    assert d.batch not in seconds, "a later wave was drawn inside the opening band"
 
 
 async def test_the_delegator_keeps_a_batch_alive_when_one_task_blows_up(
@@ -2217,7 +2861,7 @@ def _tool_texts(p: _ToolPass) -> list[str]:
 
 async def test_the_pass_answers_a_duplicate_from_the_memo_without_re_running_it() -> None:
     """CHG-3 / SPEC §3.2: an exact repeat gets the note, not a second execution
-    — and a round of ONLY repeats is what sets `force_synthesis`."""
+    — and a round of ONLY repeats COUNTS a stall rather than ending the turn."""
     repeat = call("open_file", name="lease.pdf")
     mcp = FakeMCP()
     p = _pass(seen={repeat.key()}, mcp=mcp)
@@ -2227,7 +2871,65 @@ async def test_the_pass_answers_a_duplicate_from_the_memo_without_re_running_it(
     assert mcp.calls == [], "the duplicate was re-executed"
     assert _tool_texts(p) == [duplicate_call_note("open_file")]
     assert p.all_dup, "the round was nothing but a repeat"
-    assert p.to_updates([])["force_synthesis"] is True
+    updates = p.to_updates([])
+    assert updates["stalls"] == 1
+    assert updates["force_synthesis"] is False, "one repeat must not end the turn"
+
+
+async def test_the_stall_count_reaching_its_budget_forces_synthesis() -> None:
+    repeat = call("open_file", name="lease.pdf")
+    p = _pass(seen={repeat.key()}, mcp=FakeMCP())
+    p.state["stalls"] = NO_PROGRESS_ROUNDS - 1  # one short of the budget
+
+    await p.run([repeat])
+
+    updates = p.to_updates([])
+    assert updates["stalls"] == NO_PROGRESS_ROUNDS
+    assert updates["force_synthesis"] is True
+
+
+async def test_a_refused_request_tools_is_remembered_like_a_refused_delegation() -> None:
+    """A refusal that can NEVER succeed has to count as a duplicate the second
+    time, or the termination policy never fires.
+
+    `GROUPS` is a constant, an agent's own group does not change, and
+    `served_specs` is derived once in `prepare` — so all three ways
+    `_unlock_group` can refuse are permanent for the turn. Recorded on success
+    only, the identical repeat re-ran the refusal, cleared `all_dup`, and a model
+    that kept asking burned rounds to the turn-wide backstop instead of tripping
+    the no-progress gate. The delegation side already memoises its
+    no-such-specialist refusal for exactly this reason."""
+    from arcelle_sidecar.prompts import duplicate_call_note
+
+    # `jobs.run` owns the `jobs` group, so asking for it is refused — and the
+    # enum does not even offer it, so the model had to invent the value.
+    own = call("request_tools", group="jobs")
+    p = _pass(agent_id="jobs.run")
+    await p.run([own])
+    refusal = _tool_texts(p)
+    assert refusal and "belong to another specialist" in refusal[0]
+    assert not p.all_dup, "the FIRST ask did tell the model something new"
+    assert own.key() in p.seen, "a refusal that cannot change was not remembered"
+
+    # The identical ask again: answered from the memo, and the round is a stall.
+    again = _pass(agent_id="jobs.run", seen=p.seen)
+    await again.run([call("request_tools", group="jobs")])
+    assert _tool_texts(again) == [duplicate_call_note("request_tools")]
+    assert again.all_dup
+    assert again.to_updates([])["stalls"] == 1
+
+
+async def test_a_productive_round_resets_the_stall_count() -> None:
+    """Consecutive is the operative word — progress wipes the slate."""
+    p = _pass(seen=set(), mcp=FakeMCP())
+    p.state["stalls"] = NO_PROGRESS_ROUNDS - 1
+
+    await p.run([call("open_file", name="lease.pdf")])  # a NEW call
+
+    assert not p.all_dup
+    updates = p.to_updates([])
+    assert updates["stalls"] == 0
+    assert updates["force_synthesis"] is False
 
 
 async def test_the_pass_only_memoises_a_call_that_actually_worked() -> None:
@@ -2290,6 +2992,41 @@ async def test_the_hub_guard_corrects_the_main_agent_instead_of_acting() -> None
     assert "you are the Main" in _tool_texts(p)[0]
     assert "ask_*_agent" in _tool_texts(p)[0]
     assert p.seen == set(), "a rejected call must not be memoised"
+
+
+async def test_a_worker_that_invents_a_delegation_is_refused_not_obeyed() -> None:
+    """The mirror of the hub guard, and it was missing.
+
+    `_arm_for` dispatches on the tool NAME alone, so a worker's invented
+    `ask_file_agent` reached `_delegation`, found no launched task (only the hub
+    fans out) and ran the child INLINE — off `worker_base_messages`, which is
+    seeded EMPTY for a worker. A whole nested assistant with no system prompt,
+    no room context and no rules, whose answer rejoined the thread as a genuine
+    specialist report; and nothing bounded the nesting.
+    """
+    p = _pass(agent_id="files.read")
+
+    await p.run([call("ask_file_agent", instruction="read the lease")])
+
+    assert p.delegator.pipeline == [], "a phantom child claimed a roster slot"
+    texts = _tool_texts(p)
+    assert len(texts) == 1
+    assert "You have no tool named 'ask_file_agent'" in texts[0]
+    assert "cannot hand work to another agent" in texts[0]
+    assert p.seen == set(), "a rejected call must not be memoised"
+
+
+async def test_a_worker_asking_for_the_plan_tool_is_told_it_has_none() -> None:
+    """It used to get `EMPTY_PLAN_NOTE` — a lecture on how to format a task list
+    for a tool it does not have. The Main agent gets the plain truth in the
+    mirror-image case; so does a worker now."""
+    p = _pass(agent_id="files.read")
+
+    await p.run([call(BATCH_TOOL_NAME, tasks=[{"agent": "web", "instruction": "x"}])])
+
+    texts = _tool_texts(p)
+    assert texts and EMPTY_PLAN_NOTE not in texts[0], texts
+    assert f"You have no tool named '{BATCH_TOOL_NAME}'" in texts[0]
 
 
 async def test_captured_pixels_come_back_as_a_user_turn_right_after_the_result() -> None:

@@ -166,8 +166,10 @@ pub(crate) async fn write_room_summary(
     // Reduce: purpose paragraph + suggested questions. CHG-24: run the reduce on
     // ONLY the summarized files' one-liners — the beyond-cap name-only tail is
     // for the deterministic "## Files" section and is appended AFTER, so it
-    // never crowds the 8K context the model actually needs here.
-    let _ = window.emit("summarize-progress", "Writing the summary…");
+    // never crowds the 8K context the model actually needs here. (Progress for
+    // this step rides `job-progress` from the deep-summary job that drives it —
+    // there was a second `summarize-progress` emit here that nothing, in Rust or
+    // in the frontend, ever listened for.)
     let (purpose, questions) = combine_summary(model, &room_name, &memories, &file_lines).await?;
 
     if capped {

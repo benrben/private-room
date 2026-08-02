@@ -12,6 +12,10 @@ import { api } from "../api";
 let ctx: AudioContext | null = null;
 let stream: MediaStream | null = null;
 let teardown: (() => void) | null = null;
+/** Pending first-frame probe (see attachMicTap). Held in module state so it
+ * can be cancelled: a probe left over from a finished recording would fire
+ * against the NEXT one and tear down a perfectly healthy tap. */
+let firstFrameTimer: number | null = null;
 let muted = false;
 let liveStt = true;
 let voiceProcessing = true;
@@ -246,9 +250,20 @@ export async function attachMicTap(mic: MediaStream): Promise<void> {
   // First-frame acknowledgement: a worklet that loaded but never produces a
   // quantum (seen with throttled WebViews) would otherwise record silence
   // forever. No frame within 2 s → rebuild on the ScriptProcessor fallback.
-  window.setTimeout(() => {
+  // Cancelled by stopMicTap and by rebuildOnFallback, so it can only ever
+  // judge the tap it was armed for.
+  clearFirstFrameProbe();
+  firstFrameTimer = window.setTimeout(() => {
+    firstFrameTimer = null;
     if (!gotFrame && teardown) rebuildOnFallback();
   }, 2000);
+}
+
+function clearFirstFrameProbe(): void {
+  if (firstFrameTimer !== null) {
+    window.clearTimeout(firstFrameTimer);
+    firstFrameTimer = null;
+  }
 }
 
 /** Tear down whatever tap is running and rebuild it on the ScriptProcessor
@@ -256,6 +271,9 @@ export async function attachMicTap(mic: MediaStream): Promise<void> {
  * dies after load (processorerror) or never delivers a first frame. */
 function rebuildOnFallback(): void {
   if (!ctx || !stream || !teardown) return;
+  // The tap is being replaced — whatever the pending probe was watching for
+  // is moot, and the fallback it would rebuild to is what we build here.
+  clearFirstFrameProbe();
   teardown();
   const source = ctx.createMediaStreamSource(stream);
   const sink = makeSink(ctx.sampleRate, (r, b64) => api.recPushAudio(r, b64));
@@ -323,6 +341,7 @@ export async function createPcmTap(
 }
 
 export function stopMicTap(): void {
+  clearFirstFrameProbe();
   teardown?.();
   teardown = null;
   stream?.getTracks().forEach((t) => t.stop());

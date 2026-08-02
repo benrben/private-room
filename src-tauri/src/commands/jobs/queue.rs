@@ -15,9 +15,17 @@ use super::*;
 /// Cap on queued rows so a runaway scheduler can't pile up unbounded work.
 pub(crate) const MAX_QUEUED: usize = 10;
 
-/// True when the queue is at capacity — a new job should be refused.
+/// The ONE sentence every "the queue is full" refusal uses. It is one situation
+/// — deep summary, studio, file pass, download and workflow all hit the same
+/// cap — so it must not read like three different problems.
+pub(crate) const QUEUE_FULL: &str =
+    "Too many background jobs are already waiting — let some finish first.";
+
+/// True when the queue is at capacity — a new job should be refused. A queue
+/// that cannot be READ counts as full: guessing "there's room" would let the
+/// cap silently stop protecting the room the moment the DB is unhappy.
 pub(crate) fn at_capacity(conn: &Connection) -> bool {
-    queued_count(conn) >= MAX_QUEUED
+    queued_count(conn).map(|n| n >= MAX_QUEUED).unwrap_or(true)
 }
 
 /// Reserve the running slot iff free (compare-and-swap None → Some).
@@ -31,18 +39,24 @@ pub(crate) fn try_reserve(state: &AppState, job_id: &str) -> bool {
     }
 }
 
-/// How many jobs are waiting in the queue right now (for the "cap" error).
-pub(crate) fn queued_count(conn: &Connection) -> usize {
-    db::unfinished_jobs(conn)
-        .map(|jobs| jobs.iter().filter(|j| j.status == "queued").count())
-        .unwrap_or(0)
+/// How many jobs are waiting in the queue right now (for the "cap" error). An
+/// unreadable jobs table is an Err, never a confident zero.
+pub(crate) fn queued_count(conn: &Connection) -> Result<usize, String> {
+    db::unfinished_jobs(conn).map(|jobs| jobs.iter().filter(|j| j.status == "queued").count())
 }
 
-/// Whether starting a job spawned a durable runner (whose epilogue will free the
-/// slot) or finished synchronously (the slot is already freed here).
+/// How starting a job from its row ended.
 enum Started {
+    /// A durable runner is driving; it holds the slot and its epilogue pumps.
     Runner,
+    /// Finished synchronously (the slot is already freed here) — pump the next.
     Immediate,
+    /// Could not start; the row is marked 'error' and the slot freed, so the
+    /// pump moves on to the next row.
+    Poisoned,
+    /// Could not start AND could not record that — re-picking this row would
+    /// spin the pump at full speed forever, so the pump must stop.
+    Stuck,
 }
 
 /// Submit a freshly-created (or re-queued) job. Starts it now if the slot is
@@ -57,8 +71,11 @@ pub(crate) async fn submit(
     if try_reserve(state, &job_id) {
         // Only a spawned RUNNER holds the slot; anything else (finished-sync or
         // a poisoned row that freed the slot) means we pump the next waiter.
-        if !matches!(start_job_from_row(&app, window, &job_id).await, Ok(Started::Runner)) {
-            pump(&app, window).await;
+        // `Stuck` means the room couldn't even record the failure — pumping
+        // would just re-pick the same row, so stop.
+        match start_job_from_row(&app, window, &job_id).await {
+            Started::Runner | Started::Stuck => {}
+            Started::Immediate | Started::Poisoned => pump(&app, window).await,
         }
     }
     Ok(())
@@ -85,25 +102,53 @@ pub(crate) async fn pump(app: &tauri::AppHandle, window: &tauri::Window) {
     use tauri::Manager;
     loop {
         let state = app.state::<AppState>();
-        if state.running_job.lock().unwrap().is_some() {
+        if !slot_free_for_this_room(&state) {
             return; // slot busy — the running job's epilogue will pump next
         }
-        let next: Option<String> = state
-            .with_room(|room| {
-                let jobs = db::unfinished_jobs(&room.conn)?;
-                Ok(jobs.into_iter().find(|j| j.status == "queued").map(|j| j.id))
-            })
-            .ok()
-            .flatten();
+        // A failed READ is not "nothing is waiting": treat it as a stop, never
+        // as an empty queue, so a transient DB error can't silently retire the
+        // queue for the rest of the session (the next finish_and_pump retries).
+        let Ok(next) = state.with_room(|room| {
+            let jobs = db::unfinished_jobs(&room.conn)?;
+            Ok(jobs.into_iter().find(|j| j.status == "queued").map(|j| j.id))
+        }) else {
+            return;
+        };
         let Some(job_id) = next else { return };
         if !try_reserve(&state, &job_id) {
             return; // someone reserved between the check and here
         }
         match start_job_from_row(app, window, &job_id).await {
-            Ok(Started::Runner) => return, // a runner holds the slot; its epilogue pumps next
-            Ok(Started::Immediate) => continue, // finished synchronously — try the next row
-            Err(()) => continue,           // poisoned row — already 'error' + slot freed
+            Started::Runner => return, // a runner holds the slot; its epilogue pumps next
+            Started::Stuck => return,  // couldn't record the failure — don't spin on it
+            Started::Immediate | Started::Poisoned => continue, // try the next row
         }
+    }
+}
+
+/// True when the single heavy-work slot is available to the OPEN room. A slot
+/// still held by a job of a room that has since been closed or swapped would
+/// otherwise block the new room's queue for as long as the cancelled job takes
+/// to notice — minutes, inside a slow model call. A job id the current room has
+/// never heard of cannot be running against it, so that claim is released here.
+fn slot_free_for_this_room(state: &AppState) -> bool {
+    let holder = state.running_job.lock().unwrap().clone();
+    let Some(holder) = holder else { return true };
+    match state.with_room(|room| Ok(db::get_job(&room.conn, &holder).is_ok())) {
+        // The open room owns the running job — genuinely busy.
+        Ok(true) => false,
+        // The open room has no such job: the slot belongs to a room that is
+        // gone. Its own epilogue's `finish_and_pump` becomes a no-op, which is
+        // exactly right — its writes were already room-pinned.
+        Ok(false) => {
+            let mut g = state.running_job.lock().unwrap();
+            if g.as_deref() == Some(holder.as_str()) {
+                *g = None;
+            }
+            true
+        }
+        // No room open — there is nothing to pump anyway.
+        Err(_) => false,
     }
 }
 
@@ -117,23 +162,23 @@ pub(crate) fn pump_on_open(app: &tauri::AppHandle) {
     });
 }
 
-/// The single dispatcher: rebuild a job row's plan and spawn its runner. `Runner`
-/// = a durable runner is now driving (slot stays held, its epilogue frees it);
-/// `Immediate` = finished synchronously (slot freed here); `Err(())` = could not
-/// start (already 'error', slot freed) so the pump moves on to the next row.
+/// The single dispatcher: rebuild a job row's plan and spawn its runner. See
+/// `Started` for what each outcome obliges the caller to do.
 async fn start_job_from_row(
     app: &tauri::AppHandle,
     window: &tauri::Window,
     job_id: &str,
-) -> Result<Started, ()> {
+) -> Started {
     use tauri::Manager;
     let state = app.state::<AppState>();
     let read = state.with_room(|room| Ok((db::get_job(&room.conn, job_id)?, room.path.clone())));
     let (job, room_path) = match read {
         Ok(v) => v,
         Err(_) => {
+            // The row itself is unreadable, so it cannot be marked 'error'
+            // either — re-picking it would loop, so stop the pump.
             free_slot(&state, job_id);
-            return Err(());
+            return Started::Stuck;
         }
     };
     let cancel = Arc::new(AtomicBool::new(false));
@@ -154,21 +199,30 @@ async fn start_job_from_row(
         _ => Err("This job kind can't be started.".into()),
     };
     match started {
-        Ok(true) => Ok(Started::Runner),
+        Ok(true) => Started::Runner,
         Ok(false) => {
             // Finished without a runner (e.g. an auto-index with nothing to do):
             // drop the flag and free the slot so the pump continues.
             state.job_cancels.lock().unwrap().remove(job_id);
             free_slot(&state, job_id);
-            Ok(Started::Immediate)
+            Started::Immediate
         }
         Err(e) => {
             // Poisoned row: mark it 'error' (Sidebar shows Retry), drop the flag,
-            // free the slot, and let the caller pump the next queued row.
-            let _ = state.with_room(|room| db::set_job_status(&room.conn, job_id, "error", Some(&e)));
+            // free the slot, and let the caller pump the next queued row. If the
+            // room refused that write the row is STILL 'queued', so continuing
+            // would re-pick it immediately and spin at full processor speed —
+            // report Stuck instead and leave the queue for the next pump.
+            let marked = state
+                .with_room(|room| db::set_job_status(&room.conn, job_id, "error", Some(&e)))
+                .is_ok();
             state.job_cancels.lock().unwrap().remove(job_id);
             free_slot(&state, job_id);
-            Err(())
+            if marked {
+                Started::Poisoned
+            } else {
+                Started::Stuck
+            }
         }
     }
 }
@@ -360,15 +414,58 @@ mod tests {
     #[test]
     fn queued_count_and_cap() {
         let conn = db::mem();
-        assert_eq!(queued_count(&conn), 0);
+        assert_eq!(queued_count(&conn).unwrap(), 0);
         for i in 0..3 {
             db::create_job(&conn, "workflow", &format!("w{i}"), &serde_json::json!({}), 1).unwrap();
         }
-        assert_eq!(queued_count(&conn), 3);
+        assert_eq!(queued_count(&conn).unwrap(), 3);
         assert!(3 < MAX_QUEUED);
+        assert!(!at_capacity(&conn));
         // A running job is not counted as queued.
         let running = db::create_job(&conn, "workflow", "r", &serde_json::json!({}), 1).unwrap();
         db::set_job_status(&conn, &running, "running", None).unwrap();
-        assert_eq!(queued_count(&conn), 3);
+        assert_eq!(queued_count(&conn).unwrap(), 3);
+    }
+
+    #[test]
+    fn an_unreadable_queue_counts_as_full_rather_than_empty() {
+        // The cap is a protection: if the jobs table can't be read we must NOT
+        // guess "there's room" — that is exactly when a runaway scheduler would
+        // pile work up unchecked.
+        let conn = Connection::open_in_memory().unwrap(); // no `jobs` table
+        assert!(queued_count(&conn).is_err());
+        assert!(at_capacity(&conn), "an unreadable queue must refuse new work");
+    }
+
+    #[test]
+    fn the_slot_is_released_when_its_holder_belongs_to_another_room() {
+        // Switching rooms leaves `running_job` claimed by the old room's job
+        // until that job notices the cancel — which can be minutes inside a
+        // model call. The new room's queue must not wait on it.
+        let state = AppState::default();
+        *state.room.lock().unwrap() = Some(Room {
+            conn: db::mem(),
+            path: "mem://new-room".into(),
+            name: "new".into(),
+            password: "pw".into(),
+        });
+        // A job of the room that IS open holds the slot → genuinely busy.
+        let mine = state
+            .with_room(|room| db::create_job(&room.conn, "workflow", "w", &serde_json::json!({}), 1))
+            .unwrap();
+        assert!(try_reserve(&state, &mine));
+        assert!(!slot_free_for_this_room(&state));
+        assert_eq!(state.running_job.lock().unwrap().as_deref(), Some(mine.as_str()));
+
+        // A job id this room has never heard of cannot be running against it.
+        *state.running_job.lock().unwrap() = Some("job-from-the-previous-room".into());
+        assert!(slot_free_for_this_room(&state));
+        assert!(state.running_job.lock().unwrap().is_none(), "the stale claim is dropped");
+
+        // With no room open there is nothing to pump, so the slot stays as-is.
+        *state.running_job.lock().unwrap() = Some("whatever".into());
+        *state.room.lock().unwrap() = None;
+        assert!(!slot_free_for_this_room(&state));
+        assert_eq!(state.running_job.lock().unwrap().as_deref(), Some("whatever"));
     }
 }

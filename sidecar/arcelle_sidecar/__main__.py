@@ -11,9 +11,12 @@ An 0.0.0.0 bind would put the user's room contents on their LAN (SPEC §6).
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import os
+import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -22,6 +25,52 @@ import uvicorn
 
 from . import LOOPBACK_HOST, __version__
 from .server import create_app
+
+#: The log levels uvicorn accepts, quietest first.
+LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
+
+#: Raise the log level without a rebuild. The host spawns us with no
+#: ``--log-level``, so while chasing a problem in an INSTALLED app this env var
+#: is the only way to get more than warnings out of the stderr log
+#: (``sidecar_lifecycle::stderr_log_path``); the app passes its own environment
+#: through to us. An unrecognised value is ignored rather than fatal — a typo
+#: here must never stop the AI service from starting.
+LOG_LEVEL_ENV = "ARCELLE_SIDECAR_LOG_LEVEL"
+
+
+def _kill_descendants() -> None:
+    """SIGKILL everything we spawned, deepest first.
+
+    Our children are ``zsh -ilc claude …`` / ``codex exec …``
+    (:mod:`.external_llm`): real cloud turns billing the user's quota. Nothing
+    on our exit paths reaps them — :func:`os._exit` below skips every
+    Python-level cleanup, and a plain SIGTERM from the host unwinds uvicorn but
+    not a subprocess the event loop was awaiting — so without this they outlive
+    us as orphans and run an answer nobody will read to completion.
+
+    Best effort throughout: this is teardown, and a failure here must not
+    replace a clean exit with a traceback.
+    """
+    frontier = [os.getpid()]
+    descendants: list[int] = []
+    while frontier:
+        try:
+            listed = subprocess.run(
+                ["/usr/bin/pgrep", "-P", str(frontier.pop())],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        children = [int(pid) for pid in listed.split() if pid.isdigit()]
+        descendants.extend(children)
+        frontier.extend(children)
+    for pid in reversed(descendants):  # leaves before the shells that own them
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def _watch_parent() -> None:
@@ -35,8 +84,14 @@ def _watch_parent() -> None:
     """
     while True:
         if os.getppid() == 1:
+            _kill_descendants()
             os._exit(0)
         time.sleep(2.0)
+
+
+def _default_log_level() -> str:
+    want = os.environ.get(LOG_LEVEL_ENV, "").strip().lower()
+    return want if want in LOG_LEVELS else "warning"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -49,9 +104,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--log-level",
-        default="warning",
-        choices=["critical", "error", "warning", "info", "debug"],
-        help="uvicorn log level (default: warning — the sidecar never logs message content)",
+        default=_default_log_level(),
+        choices=list(LOG_LEVELS),
+        help=(
+            f"uvicorn log level (default: warning, or ${LOG_LEVEL_ENV} when set — "
+            "the sidecar never logs message content)"
+        ),
     )
     p.add_argument("--version", action="version", version=__version__)
     return p.parse_args(argv)
@@ -76,6 +134,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"SIDECAR_PORT={bound_port}", flush=True)
 
     threading.Thread(target=_watch_parent, daemon=True, name="parent-watch").start()
+    # The ordinary quit path: the host SIGTERMs us, uvicorn unwinds, and this
+    # runs before the interpreter goes. `_watch_parent` calls it itself because
+    # `os._exit` skips atexit entirely.
+    atexit.register(_kill_descendants)
 
     config = uvicorn.Config(
         create_app(),

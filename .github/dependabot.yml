@@ -1,0 +1,42 @@
+version: 2
+
+# Dependency updates + vulnerability alerts for all three ecosystems. Weekly and
+# grouped, so this is one PR per ecosystem to review, not a stream of noise.
+#
+# Note the blind spot it cannot cover: `xlsx` is fetched from the SheetJS CDN by
+# URL (package.json), because the copy on the npm registry is abandoned at
+# 0.18.5 with known CVEs. Dependabot and `npm audit` do not see tarball-URL
+# dependencies — that one has to be watched by hand at
+# https://cdn.sheetjs.com/, and package-lock.json pins its integrity hash.
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: uv
+    directory: /sidecar
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

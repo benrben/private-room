@@ -235,13 +235,16 @@ pub async fn locate_in_image(
     state: State<'_, AppState>,
     file_id: String,
     query: String,
-    #[allow(unused_variables)] img_width: f64,
-    #[allow(unused_variables)] img_height: f64,
 ) -> Result<Vec<ImageBox>, String> {
     // Rust keeps: the DB read (original file bytes) and the vision-model pick. The
     // prepare_image (transcode + 1000×1000 stretch), grounding prompt, boxes schema,
     // structured call and coordinate parse all now live in the sidecar's
     // /vision_locate — so we send the ORIGINAL bytes and it does the canvas work.
+    // The viewer's measured `imgWidth`/`imgHeight` went with that move: boxes come
+    // back in 0–1000 coordinates, so nothing here depends on the on-screen size.
+    // They were kept as declared-but-ignored arguments for a while; the payload may
+    // still carry them (Tauri ignores keys no argument claims) but they are gone
+    // from the signature so nobody plumbs a value through expecting it to matter.
     let (explicit, bytes) = state.with_room(|room| {
         let bytes = db::get_file_bytes(&room.conn, &file_id)?;
         let bytes = bytes.ok_or("File has no stored content.")?;

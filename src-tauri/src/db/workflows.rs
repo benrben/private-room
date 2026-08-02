@@ -237,6 +237,22 @@ pub fn create_workflow_run(
     Ok(id)
 }
 
+/// Re-label an OPEN run without closing it — the pause path. A run whose job
+/// was parked (Stop, or a quit mid-run) is neither running nor finished, and
+/// leaving it 'running' made the history line show a green live dot forever and
+/// made every later run look like a duplicate.
+pub fn set_workflow_run_status_by_job(
+    conn: &Connection,
+    job_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    execute_one(
+        conn,
+        "UPDATE workflow_runs SET status = ?2 WHERE job_id = ?1 AND finished_at IS NULL",
+        params![job_id, status],
+    )
+}
+
 /// Close a run by its driving job id — the terminal epilogue knows the job id,
 /// not the run id.
 pub fn finish_workflow_run_by_job(
@@ -336,15 +352,6 @@ pub fn get_schedule(conn: &Connection, workflow_id: &str) -> Result<Option<Sched
         conn,
         &format!("SELECT {SCHED_COLS} FROM schedules WHERE workflow_id = ?1"),
         [workflow_id],
-        row_to_schedule,
-    )
-}
-
-pub fn list_schedules(conn: &Connection) -> Result<Vec<Schedule>, String> {
-    query_rows(
-        conn,
-        &format!("SELECT {SCHED_COLS} FROM schedules"),
-        [],
         row_to_schedule,
     )
 }
@@ -472,12 +479,22 @@ mod tests {
         assert_eq!(list_workflow_runs(&conn, &id).unwrap().len(), 1);
         assert!(get_schedule(&conn, &id).unwrap().is_some());
 
+        // Pausing re-labels the OPEN run without closing it, so a later resume
+        // can still finish it properly.
+        set_workflow_run_status_by_job(&conn, "job1", "paused").unwrap();
+        let paused = list_workflow_runs(&conn, &id).unwrap();
+        assert_eq!(paused[0].status, "paused");
+        assert!(paused[0].finished_at.is_none(), "a pause is not a finish");
+
         finish_workflow_run_by_job(&conn, "job1", "done", None).unwrap();
         let runs = list_workflow_runs(&conn, &id).unwrap();
         assert_eq!(runs[0].id, run);
         assert_eq!(runs[0].status, "done");
         assert!(runs[0].finished_at.is_some());
         assert_eq!(runs[0].input_file_id.as_deref(), Some("file1"));
+        // A finished run is closed for good — a stray pause can't reopen it.
+        set_workflow_run_status_by_job(&conn, "job1", "paused").unwrap();
+        assert_eq!(list_workflow_runs(&conn, &id).unwrap()[0].status, "done");
 
         delete_workflow(&conn, &id).unwrap();
         assert!(get_workflow(&conn, &id).is_err());
@@ -506,7 +523,11 @@ mod tests {
         // upsert REPLACES (one schedule per workflow), and disabling hides it.
         upsert_schedule(&conn, &id, "daily", "09:00", false, true, Some("2000-01-01T00:00:00Z"))
             .unwrap();
-        assert_eq!(list_schedules(&conn).unwrap().len(), 1);
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM schedules", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "one schedule row per workflow");
+        assert_eq!(get_schedule(&conn, &id).unwrap().unwrap().kind, "daily");
         assert!(due_schedules(&conn, "2030-01-01T00:00:00Z").unwrap().is_empty());
 
         // A future next_run_at is not yet due.

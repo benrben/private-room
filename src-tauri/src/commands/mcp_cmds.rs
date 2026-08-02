@@ -146,10 +146,15 @@ pub fn set_mcp_auto_approve(app: tauri::AppHandle, state: State<'_, AppState>, o
 /// so it is unit-testable. `refresh_mcp` (the spawner) and `pending_mcp_for`
 /// (the dialog) both route through this, so they can never disagree about
 /// whether a config is allowed to run.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum McpGate {
-    /// No enabled servers — spawn nothing, show no dialog.
-    Nothing,
+    /// Nothing to start — no enabled servers. `servers` still carries whatever
+    /// parsed (disabled entries), so the list can be registered as Disabled
+    /// without parsing the config a second time.
+    Nothing(Vec<(String, mcp::ServerConfig)>),
+    /// The stored config could not be read at all. NOT the same as "there is
+    /// nothing here": treating a hand-edited or half-written config as empty
+    /// left the Connectors page blank with no warning, so this is surfaced.
+    Unreadable(String),
     /// Enabled servers whose exact config is already approved — start them.
     Start(Vec<(String, mcp::ServerConfig)>),
     /// Enabled servers whose fingerprint is NOT approved — spawn nothing and
@@ -163,10 +168,10 @@ pub(crate) enum McpGate {
 pub(crate) fn mcp_gate(config_json: &str, approved: &std::collections::HashSet<String>) -> McpGate {
     let servers = match mcp::parse_config(config_json) {
         Ok(s) => s,
-        Err(_) => return McpGate::Nothing,
+        Err(e) => return McpGate::Unreadable(e),
     };
     if !servers.iter().any(|(_, c)| !c.disabled) {
-        return McpGate::Nothing;
+        return McpGate::Nothing(servers);
     }
     let fingerprint = mcp_fingerprint(config_json);
     if approved.contains(&fingerprint) {
@@ -199,7 +204,7 @@ pub(crate) fn pending_mcp_for(app: &tauri::AppHandle, conn: &Connection) -> Opti
                 })
                 .collect(),
         }),
-        McpGate::Start(_) | McpGate::Nothing => None,
+        McpGate::Start(_) | McpGate::Nothing(_) | McpGate::Unreadable(_) => None,
     }
 }
 
@@ -238,18 +243,76 @@ pub(crate) fn refresh_mcp(app: &tauri::AppHandle) {
     // surfaces the approval dialog via RoomInfo.pendingMcp and calls approve_mcp
     // on "Allow". This is the SAME decision pending_mcp_for shows the user.
     let approved: std::collections::HashSet<String> = read_mcp_approvals(app).into_iter().collect();
-    if let Some(McpGate::NeedsApproval { .. }) =
-        config_json.as_deref().map(|j| mcp_gate(j, &approved))
-    {
-        return;
-    }
-    // Approved, or only-disabled/no config: register the parsed servers (disabled
-    // ones simply show as Disabled; enabled+approved ones connect).
-    let servers = config_json
-        .as_deref()
-        .and_then(|j| mcp::parse_config(j).ok())
-        .unwrap_or_default();
+    // The gate already parsed the config; reuse ITS list instead of parsing the
+    // same JSON a second time on every room open.
+    let servers = match config_json.as_deref().map(|j| mcp_gate(j, &approved)) {
+        Some(McpGate::NeedsApproval { .. }) => return,
+        // Approved, or only-disabled: register the parsed servers (disabled ones
+        // simply show as Disabled; enabled+approved ones connect).
+        Some(McpGate::Start(servers)) | Some(McpGate::Nothing(servers)) => servers,
+        // An unreadable config is NOT an empty one. Surface it as a failed row
+        // so the Connectors page says why it looks empty instead of pretending
+        // the room has no connectors at all.
+        Some(McpGate::Unreadable(why)) => {
+            show_unreadable_mcp_config(app, &why);
+            return;
+        }
+        None => Vec::new(),
+    };
     start_mcp_connections(app.clone(), servers);
+}
+
+/// The name of the notice row that stands in for the connector list when the
+/// room's stored config can't be parsed. Not a connector — `agent_mcp_name`
+/// rejects the space, so no real connector can ever be called this.
+pub(crate) const UNREADABLE_CONFIG_ROW: &str = "connector setup";
+
+/// The ONE explanation given for a room whose stored connector setup can't be
+/// read — used both for the notice row and for anything the user tries to do
+/// while it is showing, so the same problem never produces a second, vaguer
+/// message.
+pub(crate) fn unreadable_config_message(why: &str) -> String {
+    format!(
+        "This room's connector setup could not be read ({why}). \
+         No connectors were started — fix the JSON under Advanced, then Save & Connect."
+    )
+}
+
+/// Err when the room's stored connector config can't be parsed. Nothing on the
+/// Connectors page is a real connector in that state — the single row is a
+/// notice — so enable/remove must refuse with the explanation rather than act.
+/// `remove_server_from_config` in particular SUCCEEDS on a config that merely
+/// lacks `mcpServers`, which rewrote it, approved its fingerprint and left the
+/// list silently empty again: the exact failure the notice row was added for.
+fn require_readable_config(config: &str) -> Result<(), String> {
+    if config.trim().is_empty() {
+        return Ok(());
+    }
+    mcp::parse_config(config)
+        .map(|_| ())
+        .map_err(|why| unreadable_config_message(&why))
+}
+
+/// Replace the connector list with ONE failed row explaining that the room's
+/// stored connector setup could not be read. The Connectors page renders a
+/// failed row's `error`, so this is the warning the silent-empty case never gave.
+fn show_unreadable_mcp_config(app: &tauri::AppHandle, why: &str) {
+    use tauri::{Emitter, Manager as _};
+    let state = app.state::<AppState>();
+    {
+        let mut mgr = state.mcp.lock().unwrap();
+        mgr.generation += 1;
+        mgr.servers = vec![mcp::Server {
+            name: UNREADABLE_CONFIG_ROW.into(),
+            status: mcp::Status::Failed,
+            error: Some(unreadable_config_message(why)),
+            tools: Vec::new(),
+            remote: false,
+            client: None,
+            config_key: String::new(),
+        }];
+    }
+    let _ = app.emit("mcp-status", state.mcp.lock().unwrap().statuses());
 }
 
 pub(crate) fn start_mcp_connections(
@@ -257,34 +320,67 @@ pub(crate) fn start_mcp_connections(
     servers: Vec<(String, mcp::ServerConfig)>,
 ) {
     use tauri::{Emitter, Manager as _};
-    let generation = {
+    // Only servers that actually need dialling are (re)connected. An enabled
+    // server whose transport config is identical to a LIVE connection is
+    // carried over untouched — flipping one connector's switch (or adding,
+    // removing or signing into another) used to tear down and restart every
+    // connector in the room: seconds of everything reading "connecting…", and
+    // each one losing whatever session it held.
+    let (generation, to_connect) = {
         let state = app.state::<AppState>();
         let mut mgr = state.mcp.lock().unwrap();
         mgr.generation += 1;
+        // Anything left in `previous` at the end of this block is dropped, which
+        // is what stops a removed or retargeted server's child process.
+        let mut previous: std::collections::HashMap<String, mcp::Server> =
+            std::mem::take(&mut mgr.servers)
+                .into_iter()
+                .map(|s| (s.name.clone(), s))
+                .collect();
+        let mut to_connect: Vec<(String, mcp::ServerConfig)> = Vec::new();
         mgr.servers = servers
             .iter()
-            .map(|(name, cfg)| mcp::Server {
-                name: name.clone(),
-                status: if cfg.disabled {
-                    mcp::Status::Disabled
-                } else {
-                    mcp::Status::Connecting
-                },
-                error: None,
-                tools: Vec::new(),
-                remote: cfg.transport.is_remote(),
-                client: None,
+            .map(|(name, cfg)| {
+                let key = mcp::config_key(cfg);
+                if !cfg.disabled {
+                    let live = previous.remove(name).filter(|p| {
+                        p.status == mcp::Status::Connected
+                            && p.client.is_some()
+                            && p.config_key == key
+                    });
+                    if let Some(live) = live {
+                        return live;
+                    }
+                    to_connect.push((name.clone(), cfg.clone()));
+                }
+                mcp::Server {
+                    name: name.clone(),
+                    status: if cfg.disabled {
+                        mcp::Status::Disabled
+                    } else {
+                        mcp::Status::Connecting
+                    },
+                    error: None,
+                    tools: Vec::new(),
+                    remote: cfg.transport.is_remote(),
+                    client: None,
+                    config_key: key,
+                }
             })
             .collect();
-        mgr.generation
+        (mgr.generation, to_connect)
     };
     let _ = app.emit(
         "mcp-status",
         app.state::<AppState>().mcp.lock().unwrap().statuses(),
     );
-    for (name, cfg) in servers.into_iter().filter(|(_, c)| !c.disabled) {
+    for (name, cfg) in to_connect {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
+            // A stored OAuth token expires — often within the hour. Renew it
+            // before dialling, so a connector the user signed into keeps
+            // working instead of presenting a dead pass forever.
+            let cfg = refreshed_oauth_config(&app, &name, cfg).await;
             let result = mcp::Client::connect(&cfg).await;
             let state = app.state::<AppState>();
             {
@@ -294,6 +390,10 @@ pub(crate) fn start_mcp_connections(
                     return;
                 }
                 if let Some(entry) = mgr.servers.iter_mut().find(|s| s.name == name) {
+                    // Record what we ACTUALLY dialled — a renewed bearer makes
+                    // the live config differ from the one we were handed, and a
+                    // stale key here would force a needless reconnect next time.
+                    entry.config_key = mcp::config_key(&cfg);
                     match result {
                         Ok((client, tools)) => {
                             entry.status = mcp::Status::Connected;
@@ -316,6 +416,27 @@ pub(crate) fn start_mcp_connections(
 }
 
 // ---------------------------------------------------------------- chat / AI
+
+/// How much of a connector call's arguments the consent card shows. The card
+/// scrolls (`.approve-args`), so this can be generous — 400 characters cut a
+/// document-sized call down to its opening line.
+const MCP_ARG_PREVIEW_MAX: usize = 2000;
+
+/// What the consent card shows for a connector call's arguments. Truncation is
+/// MARKED and counted: an unmarked slice makes a call carrying a whole document
+/// look identical to a trivial one, so "Allow" could approve material that was
+/// never on screen. Pure — unit-tested.
+pub(crate) fn preview_args(args: &serde_json::Value, max: usize) -> String {
+    let raw = args.to_string();
+    let total = raw.chars().count();
+    if total <= max {
+        return raw;
+    }
+    let shown: String = raw.chars().take(max).collect();
+    format!(
+        "{shown}\n\n… showing the first {max} of {total} characters. Allowing sends ALL of it."
+    )
+}
 
 #[allow(clippy::too_many_arguments)]
 /// SEC-1b: prompt the frontend to approve one MCP tool call, tying consent to
@@ -354,7 +475,7 @@ pub(crate) async fn mcp_call_approved(
     let id = Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel::<McpDecision>();
     state.mcp_pending.lock().unwrap().insert(id.clone(), tx);
-    let preview: String = args.to_string().chars().take(400).collect();
+    let preview = preview_args(args, MCP_ARG_PREVIEW_MAX);
     let _ = window.emit(
         "mcp-approve-request",
         serde_json::json!({
@@ -462,15 +583,115 @@ pub async fn mcp_oauth_authorize(
     Ok(state.mcp.lock().unwrap().statuses())
 }
 
-/// Whether a remote connector has a stored, non-expired OAuth token — drives
-/// the "Signed in" vs "Connect account" state in the marketplace drawer.
+/// Whether a remote connector's account is still connected — drives the
+/// "Signed in" vs "Connect account" state in the marketplace drawer. An expiring
+/// token still counts as signed in when it can be renewed silently
+/// (`refreshed_oauth_config` does that on the next connect); only a token that
+/// is gone or unrenewable sends the user back through the browser.
 #[tauri::command]
 pub fn mcp_oauth_status(state: State<'_, AppState>, server: String) -> Result<bool, String> {
     state.with_room(|room| {
         Ok(super::mcp_oauth::load_tokens(&room.conn, &server)
-            .map(|t| !super::mcp_oauth::needs_refresh(&t))
+            .map(|t| !super::mcp_oauth::needs_refresh(&t) || super::mcp_oauth::can_refresh(&t))
             .unwrap_or(false))
     })
+}
+
+/// Renew this connector's stored OAuth token when it is at (or near) expiry,
+/// persist it, merge the fresh bearer into the room's connector config, and
+/// return the config the connect should actually use.
+///
+/// The renewal step existed but nothing ran it, so roughly an hour after signing
+/// in a connector kept presenting a dead pass and every call failed until the
+/// user signed in again by hand. Re-approving the rewritten config matches what
+/// signing in already does (the user's own sign-in authorized this connector —
+/// SEC-1). On any problem the original config is returned unchanged: a failed
+/// renewal must not stop a connect that may still work.
+async fn refreshed_oauth_config(
+    app: &tauri::AppHandle,
+    name: &str,
+    cfg: mcp::ServerConfig,
+) -> mcp::ServerConfig {
+    use tauri::Manager as _;
+    if !cfg.transport.is_remote() {
+        return cfg;
+    }
+    // Pin the room this token belongs to. The renewal below is a network call
+    // that can run to the OAuth client's 30 s timeout, and this whole function
+    // runs on a background connect task — lock this room and unlock another in
+    // that window and a bare `with_room` would resolve to the NEW room, filing
+    // room A's access AND refresh token in room B's settings. Same room-path +
+    // epoch convention `AppState::room_epoch` documents.
+    let (room_path, epoch, stored) = {
+        let state = app.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        let Some(room) = guard.as_ref() else { return cfg };
+        (
+            room.path.clone(),
+            state.room_epoch(),
+            super::mcp_oauth::load_tokens(&room.conn, name),
+        )
+    };
+    let Some(stored) = stored else { return cfg };
+    let Some(outcome) = super::mcp_oauth::refresh_if_expiring(&stored).await else {
+        return cfg;
+    };
+    let fresh = match outcome {
+        Ok(fresh) => fresh,
+        // Offline, or the auth server was unreachable: the sign-in may be fine.
+        // Leave it alone and try again on the next connect.
+        Err(e) if !e.is_rejected() => return cfg,
+        Err(_) => {
+            // The provider REFUSED the refresh token — revoked, or expired. No
+            // later connect can renew it, so record that instead of letting the
+            // drawer keep reporting a greyed-out "Signed in": that button is the
+            // only way to re-authorize, and without this the user's only way out
+            // was removing the connector and adding it again.
+            let state = app.state::<AppState>();
+            let guard = state.room.lock().unwrap();
+            if let Some(room) = guard.as_ref() {
+                if room.path == room_path && state.room_epoch() == epoch {
+                    let dead = super::mcp_oauth::mark_refresh_rejected(&stored);
+                    let _ = super::mcp_oauth::save_tokens(&room.conn, name, &dead);
+                }
+            }
+            return cfg;
+        }
+    };
+    let merged = {
+        let state = app.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        let Some(room) = guard.as_ref() else { return cfg };
+        // The room moved while we were renewing: this token is not this room's
+        // to write. Drop it and let the connect proceed on the config we were
+        // handed — the old room renews again the next time it is opened.
+        if room.path != room_path || state.room_epoch() != epoch {
+            return cfg;
+        }
+        // The token is saved BEFORE the config merge on purpose: a refresh often
+        // rotates the refresh token, so the old one may already be dead and
+        // dropping the fresh set would force the user back through the browser.
+        // A merge that then fails (the connector was removed mid-refresh) just
+        // leaves an unused token behind, which `mcp_oauth_sign_out` clears.
+        (|| {
+            super::mcp_oauth::save_tokens(&room.conn, name, &fresh)?;
+            let config = db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default();
+            let json = merge_bearer(&config, name, &fresh.access_token)?;
+            db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
+            Ok::<String, String>(json)
+        })()
+    };
+    let Ok(merged) = merged else { return cfg };
+    add_mcp_approval(app, &mcp_fingerprint(&merged));
+    mcp::parse_config(&merged)
+        .ok()
+        .and_then(|servers| {
+            servers
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, c)| c)
+        })
+        .unwrap_or(cfg)
 }
 
 /// Forget a remote connector's OAuth token and strip its bearer header.
@@ -503,6 +724,224 @@ const AGENT_SECRET_KEYS: &[&str] = &[
     "token",
     "oauth",
 ];
+
+/// What the agent-facing views print where a credential would otherwise be.
+const REDACTED_ARG: &str = "[redacted]";
+
+/// Words that mark a command-line flag as carrying a credential, so the value
+/// it introduces is masked too: `--api-key sk-…`, `--token=…`, `API_KEY=…`.
+const CREDENTIAL_WORDS: &[&str] = &[
+    "key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "credential",
+    "credentials",
+    "auth",
+    "bearer",
+];
+
+/// Does this flag name promise a credential value? Kebab, snake and camel all
+/// spell the same words (`--api-key`, `API_KEY`, `--apiKey`, `--accessToken`).
+fn is_credential_flag(name: &str) -> bool {
+    let name = name.trim_start_matches('-').to_ascii_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| CREDENTIAL_WORDS.contains(&word))
+        || CREDENTIAL_WORDS.iter().any(|word| name.ends_with(word))
+}
+
+/// A bare value that reads like a credential even with nothing naming it: a
+/// known vendor prefix, a JWT, or a long opaque run of token characters. Paths,
+/// URLs and package specs are deliberately excluded — they carry no secret and
+/// they are how the model recognises a connector.
+fn looks_like_secret(value: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "sk-",
+        "sk_",
+        "pk_",
+        "rk_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xapp-",
+        "AKIA",
+        "ASIA",
+        "AIza",
+        "hf_",
+        "shpat_",
+        "glpat-",
+        "npm_",
+        "dop_v1_",
+    ];
+    let value = value.trim();
+    if value.len() >= 12 && PREFIXES.iter().any(|p| value.starts_with(p)) {
+        return true;
+    }
+    // A JWT: three dotted base64url segments, always starts `eyJ`.
+    if value.starts_with("eyJ") && value.split('.').count() == 3 {
+        return true;
+    }
+    value.len() >= 24
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '='))
+        && value.chars().any(|c| c.is_ascii_digit())
+        && value.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Mask credentials typed straight into a local connector's command line. The
+/// named secret FIELDS were covered, but a key given as `--api-key sk-…` went to
+/// the model word for word — and in a cloud room that leaves the Mac.
+fn redact_cli_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut mask_next = false;
+    for arg in args {
+        if mask_next {
+            mask_next = false;
+            out.push(REDACTED_ARG.to_string());
+            continue;
+        }
+        match arg.split_once('=') {
+            // `--api-key=…` / `API_KEY=…`, and any `name=<opaque token>`.
+            Some((name, value))
+                if !value.is_empty() && (is_credential_flag(name) || looks_like_secret(value)) =>
+            {
+                out.push(format!("{name}={REDACTED_ARG}"));
+            }
+            // `--api-key` on its own: the credential is the NEXT argument.
+            _ if arg.starts_with('-') && !arg.contains('=') && is_credential_flag(arg) => {
+                mask_next = true;
+                out.push(arg.clone());
+            }
+            _ if looks_like_secret(arg) => out.push(REDACTED_ARG.to_string()),
+            _ => out.push(arg.clone()),
+        }
+    }
+    out
+}
+
+/// The same masking over an `args` array as it sits in the config JSON.
+/// Non-string entries (a config written elsewhere) pass through untouched.
+fn redact_json_args(args: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let flat: Vec<String> = args
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    redact_cli_args(&flat)
+        .into_iter()
+        .zip(args)
+        .map(|(masked, original)| match original.as_str() {
+            Some(_) => serde_json::Value::String(masked),
+            None => original.clone(),
+        })
+        .collect()
+}
+
+/// Undo the read-side masking on a write: an argument the model echoed back as
+/// `[redacted]` is restored from the stored connector, so saving a connector the
+/// model merely read can never overwrite the user's real key with the
+/// placeholder text (and the destination still compares equal, so
+/// `same_destination` keeps the sign-in).
+///
+/// Paired by VALUE, not by position. `agent_read_mcp` shows the masked args, so
+/// read → tweak → save is the natural flow and the model may insert, drop or
+/// reorder an argument on the way back; matching by index then either stored the
+/// literal `[redacted]` (past the end of the old array) or substituted an
+/// unrelated old argument. Re-masking the stored args reproduces exactly what
+/// the model was shown, and each placeholder takes an as-yet-unused old argument
+/// that masked to the same text — preferring the one whose PRECEDING argument
+/// matches (`--api-key` vs `--token`), then the same index. A placeholder that
+/// pairs with nothing is left alone for `reject_surviving_placeholders`.
+fn restore_redacted_args(
+    old: &serde_json::Map<String, serde_json::Value>,
+    incoming: &mut serde_json::Value,
+) {
+    let Some(previous) = old.get("args").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let previous = previous.clone();
+    let masked = redact_json_args(&previous);
+    let Some(args) = incoming
+        .get_mut("args")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    // What the model handed back, before any restoring — the tie-break reads the
+    // argument BEFORE a placeholder, which must be the incoming one.
+    let handed_back: Vec<Option<String>> = args
+        .iter()
+        .map(|a| a.as_str().map(str::to_string))
+        .collect();
+    let mut used = vec![false; masked.len()];
+    for i in 0..args.len() {
+        let Some(placeholder) = args[i]
+            .as_str()
+            .filter(|s| s.ends_with(REDACTED_ARG))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let candidates: Vec<usize> = (0..masked.len())
+            .filter(|&j| !used[j] && masked[j].as_str() == Some(placeholder.as_str()))
+            .collect();
+        let pick = if candidates.len() < 2 {
+            candidates.first().copied()
+        } else {
+            let before = i.checked_sub(1).and_then(|p| handed_back[p].clone());
+            candidates
+                .iter()
+                .copied()
+                .find(|&j| {
+                    before.is_some()
+                        && j > 0
+                        && masked[j - 1].as_str().map(str::to_string) == before
+                })
+                .or_else(|| candidates.iter().copied().find(|&j| j == i))
+                .or_else(|| candidates.first().copied())
+        };
+        if let Some(j) = pick {
+            used[j] = true;
+            args[i] = previous[j].clone();
+        }
+    }
+}
+
+/// Refuse a save whose `args` still contain the masking placeholder. It stands
+/// for a credential the room hides from the assistant, so storing it verbatim
+/// would erase the user's real key — irrecoverably, and while also reading as a
+/// retarget (which drops the connector's env/headers and its sign-in). Reached
+/// when the model invented a placeholder for a connector that never had one, or
+/// mangled the args badly enough that nothing stored pairs with it.
+fn reject_surviving_placeholders(incoming: &serde_json::Value) -> Result<(), String> {
+    let Some(args) = incoming.get("args").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    if args
+        .iter()
+        .any(|a| a.as_str().is_some_and(|s| s.ends_with(REDACTED_ARG)))
+    {
+        return Err(format!(
+            "One argument is still \"{REDACTED_ARG}\" and no stored value matches it. That \
+             placeholder stands for a credential hidden from you, and saving it would erase the \
+             real one — re-read the connector and save it with its arguments in the same order, \
+             or ask the user to set the credential in Connectors."
+        ));
+    }
+    Ok(())
+}
 
 fn agent_mcp_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
@@ -541,9 +980,15 @@ fn redact_agent_mcp_config(config: &serde_json::Value) -> serde_json::Value {
             if map.remove(*key).is_some() {
                 map.insert(
                     (*key).to_string(),
-                    serde_json::Value::String("[redacted]".into()),
+                    serde_json::Value::String(REDACTED_ARG.into()),
                 );
             }
+        }
+        // A key typed into the command line is as much a credential as one in
+        // `env`, and `args` is not one of the named fields.
+        if let Some(args) = map.get("args").and_then(serde_json::Value::as_array) {
+            let masked = redact_json_args(args);
+            map.insert("args".to_string(), serde_json::Value::Array(masked));
         }
     }
     safe
@@ -581,6 +1026,9 @@ pub(crate) fn agent_list_mcps(state: &AppState) -> Result<String, String> {
         .map(|(name, cfg)| {
             let transport = match &cfg.transport {
                 mcp::Transport::Stdio { command, args, .. } => {
+                    // Same rule as read_mcp: describe what it runs, never the
+                    // key someone typed onto the end of it.
+                    let args = redact_cli_args(args);
                     let args = if args.is_empty() {
                         String::new()
                     } else {
@@ -647,30 +1095,79 @@ pub(crate) fn agent_save_mcp(
         let servers = root["mcpServers"].as_object_mut().expect("checked above");
         let existed = servers.get(&name).is_some();
         // Preserve already-stored credentials while refusing new secret values
-        // from model context. A connector edit must never erase a user's token.
+        // from model context — but ONLY while the connector still points at the
+        // same place. Carrying them over an edit that changes the url (or the
+        // command) would hand the user's saved key to a NEW destination, and
+        // the Connectors list shows just a name and a switch, so turning it back
+        // on would send the key somewhere nobody was warned about. A same-target
+        // edit must still never erase a user's token.
+        const CARRIED: [&str; 3] = ["headers", "env", "bearer_token_env_var"];
+        let mut retargeted = false;
+        let mut had_credentials = false;
         if let Some(old) = servers.get(&name).and_then(serde_json::Value::as_object) {
-            if let Some(new) = incoming.as_object_mut() {
-                for key in ["headers", "env", "bearer_token_env_var"] {
-                    if let Some(value) = old.get(key) {
-                        new.insert(key.to_string(), value.clone());
+            // read_mcp showed `[redacted]` where a command-line key was; writing
+            // that back verbatim would replace the user's real key with the
+            // placeholder (and read as a retarget). Put the original back first.
+            restore_redacted_args(old, &mut incoming);
+            had_credentials = CARRIED.iter().any(|k| old.contains_key(*k));
+            let same = incoming
+                .as_object()
+                .is_some_and(|new| same_destination(old, new));
+            retargeted = !same;
+            if same {
+                if let Some(new) = incoming.as_object_mut() {
+                    for key in CARRIED {
+                        if let Some(value) = old.get(key) {
+                            new.insert(key.to_string(), value.clone());
+                        }
                     }
                 }
             }
         }
+        // Whatever the model did to the args, the placeholder itself is never a
+        // value worth storing — including on a brand-new connector, where there
+        // is no old entry to restore from.
+        reject_surviving_placeholders(&incoming)?;
         incoming["disabled"] = serde_json::Value::Bool(true);
         servers.insert(name.clone(), incoming);
         let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
         mcp::parse_config(&json)?;
+        // A retargeted connector's stored sign-in belongs to the OLD endpoint;
+        // leaving it would let the connect-time refresh re-attach it to the new
+        // one behind the user's back.
+        let had_signin = super::mcp_oauth::load_tokens(&room.conn, &name).is_some();
+        if retargeted {
+            super::mcp_oauth::clear_tokens(&room.conn, &name)?;
+        }
         db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
-        Ok((json, existed))
+        Ok((json, existed, retargeted && (had_credentials || had_signin)))
     })?;
-    let servers = mcp::parse_config(&json.0)?;
+    let (json, existed, dropped_credentials) = json;
+    let servers = mcp::parse_config(&json)?;
     start_mcp_connections(window.app_handle().clone(), servers);
+    let dropped = if dropped_credentials {
+        " Its saved credentials and sign-in were NOT carried over, because this edit changed where the connector points."
+    } else {
+        ""
+    };
     Ok(format!(
-        "{} connector \"{}\" as disabled. Review it in Connectors, add any credentials there, then explicitly enable and approve it before it can run or reach the network.",
-        if json.1 { "Updated" } else { "Saved" },
+        "{} connector \"{}\" as disabled.{dropped} Review it in Connectors, add any credentials there, then explicitly enable and approve it before it can run or reach the network.",
+        if existed { "Updated" } else { "Saved" },
         name
     ))
+}
+
+/// Does an edited connector still reach the same place? Compares only the fields
+/// that decide WHERE a call goes: the endpoint (`url`, and the `type` that marks
+/// it remote) for a remote connector, the `command` and `args` for a local one.
+/// Pure — unit-tested.
+fn same_destination(
+    old: &serde_json::Map<String, serde_json::Value>,
+    new: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    ["url", "type", "command", "args"]
+        .iter()
+        .all(|k| old.get(*k) == new.get(*k))
 }
 
 pub(crate) fn agent_delete_mcp(
@@ -755,6 +1252,7 @@ pub fn mcp_set_server_enabled(
 ) -> Result<Vec<mcp::ServerStatus>, String> {
     let json = state.with_room(|room| {
         let config = db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default();
+        require_readable_config(&config)?;
         let json = set_server_disabled(&config, &server, !enabled)?;
         db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
         Ok(json)
@@ -770,8 +1268,13 @@ pub fn mcp_remove_server(
     server: String,
 ) -> Result<Vec<mcp::ServerStatus>, String> {
     let json = state.with_room(|room| {
-        let _ = super::mcp_oauth::clear_tokens(&room.conn, &server);
         let config = db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default();
+        // Before touching anything: an unreadable config has no connectors to
+        // remove, and removing "nothing" from it would still rewrite it, approve
+        // it and erase the warning row — as well as clearing a real connector's
+        // saved sign-in on the way past.
+        require_readable_config(&config)?;
+        let _ = super::mcp_oauth::clear_tokens(&room.conn, &server);
         let json = remove_server_from_config(&config, &server)?;
         db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
         Ok(json)
@@ -956,15 +1459,83 @@ mod tests {
     #[test]
     fn mcp_gate_nothing_when_only_disabled_servers() {
         // SEC-1 (c): a config with only disabled servers is Nothing — no dialog,
-        // no spawn — even though its fingerprint is not approved.
+        // no spawn — even though its fingerprint is not approved. The parsed
+        // list still rides along so the UI can show them as Disabled without a
+        // second parse.
         let cfg = r#"{"mcpServers":{"web":{"command":"uvx","args":["ddg"],"disabled":true}}}"#;
         let none: std::collections::HashSet<String> = std::collections::HashSet::new();
-        assert!(matches!(mcp_gate(cfg, &none), McpGate::Nothing));
+        match mcp_gate(cfg, &none) {
+            McpGate::Nothing(servers) => {
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0].0, "web");
+                assert!(servers[0].1.disabled);
+            }
+            _ => panic!("only-disabled config must be Nothing"),
+        }
         // An empty server map is likewise Nothing.
         assert!(matches!(
             mcp_gate(r#"{"mcpServers":{}}"#, &none),
-            McpGate::Nothing
+            McpGate::Nothing(_)
         ));
+    }
+
+    #[test]
+    fn unreadable_config_is_reported_not_silently_empty() {
+        // An unreadable connector setup used to be indistinguishable from "there
+        // is nothing here": nothing started and the Connectors page just looked
+        // empty. The gate now says WHY, and refresh_mcp turns that into a
+        // visible failed row.
+        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+        match mcp_gate("{ half-written", &none) {
+            McpGate::Unreadable(why) => assert!(!why.is_empty(), "the reason must be reported"),
+            _ => panic!("a config that cannot be parsed must be Unreadable, never Nothing"),
+        }
+        // A config from elsewhere whose server entry has neither command nor url.
+        assert!(matches!(
+            mcp_gate(r#"{"mcpServers":{"x":{"args":[]}}}"#, &none),
+            McpGate::Unreadable(_)
+        ));
+        // Valid-but-empty is still Nothing, not an error.
+        assert!(matches!(
+            mcp_gate(r#"{"mcpServers":{}}"#, &none),
+            McpGate::Nothing(_)
+        ));
+    }
+
+    #[test]
+    fn the_notice_row_is_not_a_connector_you_can_switch_off_or_delete() {
+        // The Connectors page draws the "couldn't read your connector setup" row
+        // like any other connector, so it comes with an On switch and a trash
+        // button. Neither has a connector behind it — acting on them must repeat
+        // the SAME explanation, not a second vaguer one, and must not touch the
+        // stored config.
+        let broken = "{ half-written";
+        let err = require_readable_config(broken).unwrap_err();
+        assert_eq!(
+            err,
+            unreadable_config_message(&mcp::parse_config(broken).unwrap_err()),
+            "the row and its buttons must tell the same story"
+        );
+        assert!(err.contains("fix the JSON under Advanced"), "and stay actionable");
+
+        // The dangerous shape: valid JSON with no `mcpServers`. Removing the
+        // notice row from THAT succeeds silently, which rewrote the config,
+        // re-approved it and left the page looking empty again — the very thing
+        // the row exists to prevent.
+        let no_servers = r#"{"servers":{"x":{}}}"#;
+        assert!(
+            remove_server_from_config(no_servers, UNREADABLE_CONFIG_ROW).is_ok(),
+            "unguarded, deleting the notice looks like a success"
+        );
+        assert!(require_readable_config(no_servers).is_err());
+
+        // A readable config — including a room that has never had one — is
+        // untouched by the guard.
+        assert!(require_readable_config(r#"{"mcpServers":{}}"#).is_ok());
+        assert!(require_readable_config("").is_ok());
+        assert!(require_readable_config("   ").is_ok());
+        // And no real connector can collide with the notice row's name.
+        assert!(agent_mcp_name(UNREADABLE_CONFIG_ROW).is_err());
     }
 
     #[test]
@@ -1121,6 +1692,203 @@ mod tests {
                 "{key} leaked into an agent save"
             );
         }
+    }
+
+    #[test]
+    fn agent_connector_views_mask_a_key_typed_onto_the_command_line() {
+        // The named secret fields were covered; a key handed to a local
+        // connector as an ARGUMENT went to the model verbatim.
+        let raw = serde_json::json!({
+            "command": "npx",
+            "args": [
+                "-y", "@vendor/mcp-server",
+                "--api-key", "sk-live-4kQm2p8Z1x7BvT0nRw",
+                "--auth-token=9f2Ab7Qz3Lm8Xt1Rv6Kd0Ny",
+                "--db=/tmp/notes.db", "--port", "8080"
+            ]
+        });
+        let shown = redact_agent_mcp_config(&raw).to_string();
+        assert!(
+            !shown.contains("sk-live-4kQm2p8Z1x7BvT0nRw"),
+            "a key given as the value of --api-key still reached the model"
+        );
+        assert!(
+            !shown.contains("9f2Ab7Qz3Lm8Xt1Rv6Kd0Ny"),
+            "a key given as --auth-token=… still reached the model"
+        );
+        // Everything that merely describes the connector survives — the model
+        // still has to be able to tell one connector from another.
+        for kept in ["npx", "@vendor/mcp-server", "--api-key", "/tmp/notes.db", "8080"] {
+            assert!(shown.contains(kept), "{kept} should still be visible");
+        }
+    }
+
+    #[test]
+    fn command_line_masking_knows_a_key_from_an_ordinary_argument() {
+        let redact = |args: &[&str]| {
+            redact_cli_args(&args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+        };
+        // Bare opaque values: vendor prefixes, JWTs, long token runs.
+        assert_eq!(redact(&["ghp_1a2b3c4d5e6f7g8h9i0j"]), ["[redacted]"]);
+        assert_eq!(redact(&["A1b2C3d4E5f6G7h8I9j0K1l2M3"]), ["[redacted]"]);
+        assert_eq!(
+            redact(&["eyJhbGciOi.eyJzdWIiOiIxIn0.dBjftJeZ4CVP"]),
+            ["[redacted]"]
+        );
+        // Ordinary arguments are left alone, however long.
+        for plain in [
+            "@modelcontextprotocol/server-filesystem",
+            "/Users/me/Documents/notes",
+            "--transport",
+            "stdio",
+            "--port=8080",
+            "mcp-server-sqlite@0.1.2",
+        ] {
+            assert_eq!(redact(&[plain]), [plain], "{plain} was masked needlessly");
+        }
+        // Only the value after a credential flag is taken, and only once.
+        assert_eq!(
+            redact(&["--token", "abcdef", "--verbose"]),
+            ["--token", "[redacted]", "--verbose"]
+        );
+    }
+
+    #[test]
+    fn saving_a_connector_read_through_the_mask_keeps_the_real_key() {
+        // The model reads a connector (masked), edits something harmless, and
+        // saves it back. The placeholder must NOT land in the stored config,
+        // and the connector must not read as retargeted (which would drop the
+        // user's sign-in).
+        let old: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{"command":"npx","args":["srv","--api-key","sk-live-4kQm2p8Z1x7BvT0nRw"]}"#,
+        )
+        .unwrap();
+        let mut incoming =
+            serde_json::json!({"command":"npx","args":["srv","--api-key","[redacted]"]});
+        restore_redacted_args(&old, &mut incoming);
+        assert_eq!(incoming["args"][2], "sk-live-4kQm2p8Z1x7BvT0nRw");
+        assert!(
+            same_destination(&old, incoming.as_object().unwrap()),
+            "a round trip through the mask must not read as a retarget"
+        );
+        // The `--flag=[redacted]` spelling is restored the same way.
+        let old2: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"command":"npx","args":["--token=9f2Ab7Qz3Lm8Xt1Rv6Kd0Ny"]}"#)
+                .unwrap();
+        let mut incoming2 = serde_json::json!({"command":"npx","args":["--token=[redacted]"]});
+        restore_redacted_args(&old2, &mut incoming2);
+        assert_eq!(incoming2["args"][0], "--token=9f2Ab7Qz3Lm8Xt1Rv6Kd0Ny");
+    }
+
+    #[test]
+    fn a_reshuffled_args_list_still_restores_the_right_key() {
+        // The model read the masked args, then added, dropped and reordered
+        // arguments before saving. Restoring by INDEX put the literal
+        // "[redacted]" — or a neighbouring flag — where the user's key was.
+        let key = "sk-live-4kQm2p8Z1x7BvT0nRw";
+        let old: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&format!(
+                r#"{{"command":"npx","args":["srv","--api-key","{key}"]}}"#
+            ))
+            .unwrap();
+
+        // An argument inserted before the pair: the placeholder is now past the
+        // end of the stored array.
+        let mut inserted = serde_json::json!(
+            {"command":"npx","args":["--verbose","srv","--api-key","[redacted]"]}
+        );
+        restore_redacted_args(&old, &mut inserted);
+        assert_eq!(inserted["args"][3], key);
+
+        // A leading argument dropped: index 1 in the stored array is the FLAG.
+        let mut dropped = serde_json::json!({"command":"npx","args":["--api-key","[redacted]"]});
+        restore_redacted_args(&old, &mut dropped);
+        assert_eq!(dropped["args"][1], key);
+
+        // Two credentials, swapped: each placeholder must follow its own flag.
+        let token = "9f2Ab7Qz3Lm8Xt1Rv6Kd0Ny";
+        let two: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&format!(
+            r#"{{"command":"npx","args":["--api-key","{key}","--token","{token}"]}}"#
+        ))
+        .unwrap();
+        let mut swapped = serde_json::json!(
+            {"command":"npx","args":["--token","[redacted]","--api-key","[redacted]"]}
+        );
+        restore_redacted_args(&two, &mut swapped);
+        assert_eq!(swapped["args"][1], token);
+        assert_eq!(swapped["args"][3], key);
+    }
+
+    #[test]
+    fn a_placeholder_that_matches_nothing_stops_the_save() {
+        // Last line of defence: the word "[redacted]" is never a real argument.
+        // Storing it replaces a credential the user cannot get back, and makes
+        // the entry read as a retarget, which also clears their sign-in.
+        let old: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"command":"npx","args":["srv"]}"#).unwrap();
+        let mut invented =
+            serde_json::json!({"command":"npx","args":["srv","--api-key","[redacted]"]});
+        restore_redacted_args(&old, &mut invented);
+        assert!(
+            reject_surviving_placeholders(&invented).is_err(),
+            "a placeholder with nothing behind it must not be stored"
+        );
+        // A brand-new connector has no stored args at all.
+        assert!(reject_surviving_placeholders(
+            &serde_json::json!({"command":"npx","args":["--token=[redacted]"]})
+        )
+        .is_err());
+        // A restored (or never-masked) save goes through untouched.
+        assert!(reject_surviving_placeholders(
+            &serde_json::json!({"command":"npx","args":["srv","--api-key","sk-live-4kQm2p8Z"]})
+        )
+        .is_ok());
+        assert!(reject_surviving_placeholders(
+            &serde_json::json!({"type":"http","url":"https://api.vendor.com/mcp"})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn consent_card_says_when_arguments_are_cut_short() {
+        // Short calls are shown whole, byte for byte.
+        let small = serde_json::json!({"q": "weather"});
+        assert_eq!(preview_args(&small, MCP_ARG_PREVIEW_MAX), small.to_string());
+        // A document-sized call must NOT read like a trivial one: the card says
+        // it was cut, by how much, and that Allow sends all of it.
+        let big = serde_json::json!({"doc": "x".repeat(5000)});
+        let raw = big.to_string();
+        let shown = preview_args(&big, 100);
+        let head = |s: &str| s.chars().take(100).collect::<String>();
+        assert_eq!(head(&shown), head(&raw), "the shown part is verbatim");
+        assert!(shown.contains("first 100 of"));
+        assert!(shown.contains("Allowing sends ALL of it"));
+        // The count is of the WHOLE payload, not the slice.
+        assert!(shown.contains(&raw.chars().count().to_string()));
+    }
+
+    #[test]
+    fn agent_edit_keeps_credentials_only_when_the_target_is_unchanged() {
+        let old: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"type":"http","url":"https://api.vendor.com/mcp"}"#).unwrap();
+        let same: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"type":"http","url":"https://api.vendor.com/mcp","disabled":true}"#)
+                .unwrap();
+        assert!(
+            same_destination(&old, &same),
+            "a cosmetic edit must not drop the user's token"
+        );
+        // Same name, new endpoint → the saved sign-in must NOT travel with it.
+        let moved: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"type":"http","url":"https://evil.example/mcp"}"#).unwrap();
+        assert!(!same_destination(&old, &moved));
+        // Local connectors are pinned on what they RUN, args included.
+        let local: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"command":"uvx","args":["ddg"]}"#).unwrap();
+        let relocated: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"command":"uvx","args":["something-else"]}"#).unwrap();
+        assert!(same_destination(&local, &local.clone()));
+        assert!(!same_destination(&local, &relocated));
     }
 
     #[test]

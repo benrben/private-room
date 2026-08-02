@@ -9,10 +9,19 @@ network, no Ollama and no weights.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
 
-from .budget import json_chars, msg_len, trim_messages_to_window
+import httpx
+
+from .budget import (
+    IMAGE_BYTES,
+    fit_to_window,
+    json_chars,
+    msg_len,
+    trim_messages_to_window,
+)
 from .compaction import (
     CLOUD_SPEND_FRACTION,
     compact_to_budget,
@@ -27,15 +36,73 @@ from .privacy import PrivacyPolicy, guard_outbound, is_nonlocal_model
 #: Called with each streamed text delta.
 DeltaSink = Callable[[str], Awaitable[None]]
 
+#: How long a local call may wait on a SILENT daemon, in seconds. Nothing used
+#: to bound these requests at all: the `ollama` client defaults to no timeout,
+#: and Stop only breaks the token loop once tokens are arriving — so a daemon
+#: that wedges before the first one (a model that will not load, a stuck GPU)
+#: hung the turn with no way out but quitting the app. Generous, because a cold
+#: load of a large local model is genuinely slow; the point is that the wait
+#: ENDS, with an engine error the caller can report, rather than never.
+#:
+#: A bound on SILENCE, not on duration: it is applied per streamed chunk and per
+#: read, so a reply that keeps arriving may take as long as it likes.
+REQUEST_TIMEOUT_SECONDS: float = 600.0
+
+#: The same limit for the LangChain path, which owns its httpx client: applied
+#: per read rather than to the whole generation, so a long answer that keeps
+#: streaming is never cut off.
+REQUEST_TIMEOUT = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10.0)
+
+#: How long a NON-streaming generation may take in total. This is the one path
+#: with no liveness signal — nothing comes back until the whole answer exists —
+#: so the only bound available is a duration, and it must not decide on the
+#: caller's behalf that slow work has failed. The work behind it is the slow
+#: kind: a whole-file-pass section, a document-length translation (8192 output
+#: tokens), a cold load of a large model on top of either — minutes to tens of
+#: minutes on a local model. Ten minutes killed those mid-work.
+#:
+#: Sized at the HOST's own budget for one generation
+#: (``src-tauri/src/sidecar.rs`` ``SIDECAR_TIMEOUT``, 3600s), so the sidecar
+#: never gives up on work the host is still waiting for, and a wedge on a chain
+#: endpoint (whose host budget is ten hours) still ends here.
+GENERATION_TIMEOUT_SECONDS: float = 3600.0
+
+
+def _minutes(seconds: float) -> str:
+    count = max(1, round(seconds / 60))
+    return "1 minute" if count == 1 else f"{count} minutes"
+
+
+async def _bounded(awaitable: Any, seconds: float, what: str) -> Any:
+    """``asyncio.wait_for`` with an error a human can read.
+
+    A bare ``asyncio.TimeoutError`` stringifies to the EMPTY STRING, and
+    ``llm._classify`` has no branch for it (it is neither an httpx timeout nor a
+    ConnectionError), so it fell through to ``ENGINE_ERROR`` with no message and
+    the user was shown "Local AI error (502): " and nothing after the colon.
+    Say what actually happened instead.
+    """
+    try:
+        return await asyncio.wait_for(awaitable, seconds)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"The local model {what} after {_minutes(seconds)}. It may still be "
+            "loading, or the Ollama server may be stuck — try again, or pick a "
+            "smaller model."
+        ) from exc
+
 
 @dataclass(slots=True)
 class RoundUsage:
     """One round's token accounting, for the chat token-budget bar.
 
-    ``input_tokens``/``output_tokens`` are the engine's own report (Ollama's
-    ``prompt_eval_count``/``eval_count``, surfaced by ``langchain_ollama`` as
+    ``input_tokens`` is the engine's own report (Ollama's
+    ``prompt_eval_count``, surfaced by ``langchain_ollama`` as
     ``usage_metadata``) when available; ``None`` when the engine reported
     nothing, in which case the caller falls back to a char-length estimate.
+    The reply's own token count is deliberately NOT carried: the bar bills
+    what went IN (``usage.build_usage_event``), and a field nothing reads is
+    a field that quietly rots.
     ``max_context`` is the window the call actually ran in: the payload-fitted
     ``num_ctx`` the app requested for a local model (see
     ``model_limits.pick_num_ctx``), or the model's advertised native length
@@ -43,7 +110,6 @@ class RoundUsage:
     """
 
     input_tokens: int | None
-    output_tokens: int | None
     max_context: int
     is_real: bool
 
@@ -191,14 +257,14 @@ class OllamaChatModel:
     ) -> int:
         """Estimated prompt cost of a one-shot call, in bytes of text.
 
-        Images don't ride the text context as base64 — each costs roughly a
-        vision-encoder budget (~1.5k tokens for the models this app ships),
-        counted here at the byte equivalent.
+        ``images`` are the ones passed at the request's top level (they are hung
+        on the last user turn at send time); images already inline on a message
+        are counted by ``msg_len``, so nothing is charged twice.
         """
         return (
             sum(msg_len(m) for m in messages)
             + (json_chars(format) if format else 0)
-            + 4_500 * len(images or [])
+            + IMAGE_BYTES * len(images or [])
         )
 
     async def _resolve_num_ctx(self, payload_bytes: int) -> int | None:
@@ -239,6 +305,9 @@ class OllamaChatModel:
             "model": self.model,
             "base_url": self.base_url,
             "keep_alive": self.keep_alive,
+            # The agent loop's rounds run through here, so this is where a
+            # wedged daemon hangs the user's turn (see REQUEST_TIMEOUT).
+            "client_kwargs": {"timeout": REQUEST_TIMEOUT},
         }
         if num_ctx is not None:
             kwargs["num_ctx"] = num_ctx
@@ -269,7 +338,19 @@ class OllamaChatModel:
         from ollama import AsyncClient
 
         options: dict[str, Any] = {}
-        num_ctx = await self._resolve_num_ctx(self._payload_bytes(messages, format, images))
+        # What the payload costs BESIDES the messages: the grammar and any
+        # top-level images. Both ride the same window, and neither can be cut,
+        # so they are reserved rather than trimmed.
+        reserved = self._payload_bytes([], format, images)
+        num_ctx = await self._resolve_num_ctx(
+            sum(msg_len(m) for m in messages) + reserved
+        )
+        # A job's payload can be bigger than the biggest window this Mac may ask
+        # for — a whole-file pass section, a translation of a long document. Cut
+        # it here, visibly, instead of letting the daemon delete the front of the
+        # prompt (the instruction) and return a plausible answer to a question it
+        # can no longer see.
+        send, _ = fit_to_window(messages, num_ctx, reserved)
         if num_ctx is not None:
             options["num_ctx"] = num_ctx
         if self.num_predict is not None:
@@ -279,14 +360,25 @@ class OllamaChatModel:
         # ollama.rs:505 — only qwen3 non-instruct models accept (and need) the flag.
         think = False if ("qwen3" in self.model and "instruct" not in self.model) else None
         client = AsyncClient(host=self.base_url)
-        resp = await client.chat(
-            model=self.model,
-            messages=attach_images(messages, images),
-            format=format,
-            options=options,
-            keep_alive=self.keep_alive,
-            think=think,
-            stream=False,
+        # Bounded (see GENERATION_TIMEOUT_SECONDS): a non-streaming call returns
+        # nothing until the whole answer exists, so a daemon that never answers
+        # held this await open for the life of the process. Bounded at the
+        # HOST's own one-generation budget rather than the silence budget — the
+        # jobs on this path (a file-pass section, a long translation) are
+        # legitimately slow, and cutting one off mid-work is the failure this
+        # bound is not for.
+        resp = await _bounded(
+            client.chat(
+                model=self.model,
+                messages=attach_images(send, images),
+                format=format,
+                options=options,
+                keep_alive=self.keep_alive,
+                think=think,
+                stream=False,
+            ),
+            GENERATION_TIMEOUT_SECONDS,
+            "never answered",
         )
         return resp.message.content or ""
 
@@ -321,13 +413,21 @@ class OllamaChatModel:
         # the whole num_predict on hidden reasoning and returns empty content.
         think = False if ("qwen3" in self.model and "instruct" not in self.model) else None
         client = AsyncClient(host=self.base_url)
-        resp = await client.chat(
-            model=self.model,
-            messages=msgs,
-            options=options,
-            keep_alive=self.keep_alive,
-            think=think,
-            stream=False,
+        # The silence budget, not the generation one: a digest is bookkeeping
+        # with a 400-token ceiling on its output, so ten minutes of nothing is a
+        # wedge. A failed digest never fails the turn — `compact_to_budget`
+        # catches it and the conversation goes out uncompacted.
+        resp = await _bounded(
+            client.chat(
+                model=self.model,
+                messages=msgs,
+                options=options,
+                keep_alive=self.keep_alive,
+                think=think,
+                stream=False,
+            ),
+            REQUEST_TIMEOUT_SECONDS,
+            "never answered",
         )
         return resp.message.content or ""
 
@@ -353,7 +453,14 @@ class OllamaChatModel:
         from ollama import AsyncClient
 
         options: dict[str, Any] = {}
-        num_ctx = await self._resolve_num_ctx(self._payload_bytes(messages, format, images))
+        reserved = self._payload_bytes([], format, images)
+        num_ctx = await self._resolve_num_ctx(
+            sum(msg_len(m) for m in messages) + reserved
+        )
+        # Same last-resort fit as `generate`: an oversized one-shot payload is
+        # cut here, with a marker, rather than by the daemon, silently, from the
+        # front.
+        send, _ = fit_to_window(messages, num_ctx, reserved)
         if num_ctx is not None:
             options["num_ctx"] = num_ctx
         if self.num_predict is not None:
@@ -363,16 +470,33 @@ class OllamaChatModel:
         # ollama.rs:505 — only qwen3 non-instruct models accept (and need) the flag.
         think = False if ("qwen3" in self.model and "instruct" not in self.model) else None
         client = AsyncClient(host=self.base_url)
-        stream = await client.chat(
-            model=self.model,
-            messages=attach_images(messages, images),
-            format=format,
-            options=options,
-            keep_alive=self.keep_alive,
-            think=think,
-            stream=True,
+        stream = await _bounded(
+            client.chat(
+                model=self.model,
+                messages=attach_images(send, images),
+                format=format,
+                options=options,
+                keep_alive=self.keep_alive,
+                think=think,
+                stream=True,
+            ),
+            REQUEST_TIMEOUT_SECONDS,
+            "never started answering",
         )
-        async for part in stream:
+        # Bounded per CHUNK, not for the whole answer: a reply that keeps
+        # arriving may take as long as it likes, but a daemon that stops
+        # answering mid-stream — or never starts — ends the wait with an error
+        # instead of a spinner nothing can cancel.
+        chunks = stream.__aiter__()
+        while True:
+            try:
+                part = await _bounded(
+                    chunks.__anext__(),
+                    REQUEST_TIMEOUT_SECONDS,
+                    "stopped answering mid-reply",
+                )
+            except StopAsyncIteration:
+                break
             delta = part.message.content or ""
             if delta:
                 yield delta
@@ -551,13 +675,10 @@ class OllamaChatModel:
                 observe_token_ratio(sent_bytes, meta.get("input_tokens") or 0)
             return RoundUsage(
                 input_tokens=meta.get("input_tokens"),
-                output_tokens=meta.get("output_tokens"),
                 max_context=max_context,
                 is_real=True,
             )
-        return RoundUsage(
-            input_tokens=None, output_tokens=None, max_context=max_context, is_real=False
-        )
+        return RoundUsage(input_tokens=None, max_context=max_context, is_real=False)
 
 
 __all__ = ["ChatModel", "OllamaChatModel", "DeltaSink", "Cancellable", "RoundUsage"]

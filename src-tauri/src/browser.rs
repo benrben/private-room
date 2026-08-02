@@ -108,6 +108,12 @@ pub const PAGE_JS: &str = include_str!("browser/page.js");
 /// [`call_async`] has its own, larger budget.
 const EVAL_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// What [`eval_json`] answers when a round trip runs out of time. Named because
+/// [`readiness_from_probe_error`] has to tell it apart from "the document
+/// answered nothing at all": `EVAL_TIMEOUT` is longer than the smallest
+/// readiness budget, so one stuck probe outlasts the whole wait on its own.
+const EVAL_TIMED_OUT: &str = "The page did not answer in time.";
+
 /// Poll interval while waiting on an async page ticket.
 const POLL_INTERVAL: Duration = Duration::from_millis(60);
 
@@ -142,9 +148,6 @@ pub struct BrowserState {
     /// Last bounds the frontend reported, so the webview can be (re)created at
     /// the right place without another round trip.
     pub bounds: Mutex<Option<Bounds>>,
-    /// This session's journal. Flushed to the room DB on every append so a
-    /// crash cannot lose the record, and read back by the Journal view.
-    pub journal: Mutex<Vec<JournalEntry>>,
     /// Open pages, in strip order.
     tabs: Mutex<Vec<Page>>,
     /// The page that is SHOWING — positioned at `bounds` while every other one
@@ -284,13 +287,22 @@ pub fn close_tab(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
         wv.close().map_err(|e| e.to_string())?;
     }
     let state = app.state::<BrowserState>();
+    // Closing a BACKGROUND tab must not move the user. The heir rule answers
+    // "what shows now that the visible page is gone" — running it for a tab
+    // that was not showing swapped the page in front of the user for its
+    // neighbour, while the strip still highlighted the tab they were on, and
+    // clicking that tab did nothing because Rust already believed it was
+    // active.
+    let closed_the_visible_page = *state.active.lock().unwrap() == id;
     let mut tabs = state.tabs.lock().unwrap();
     let at = tabs.iter().position(|p| p.id == id);
     tabs.retain(|p| p.id != id);
     let remaining: Vec<String> = tabs.iter().map(|p| p.id.clone()).collect();
     let heir = heir_after(&remaining, at);
     drop(tabs);
-    *state.active.lock().unwrap() = heir;
+    if closed_the_visible_page {
+        *state.active.lock().unwrap() = heir;
+    }
     drop(state);
     reposition(app);
     Ok(())
@@ -298,7 +310,12 @@ pub fn close_tab(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
 
 /// Where the ACTIVE page currently is, from our own record.
 pub fn active_url(app: &tauri::AppHandle) -> Option<String> {
-    let id = active_id(app)?;
+    recorded_url(app, &active_id(app)?)
+}
+
+/// One page's own record of where it was last sent. `None` while the tab is
+/// still being built — `new_tab` pushes the `Page` only after `create` returns.
+fn recorded_url(app: &tauri::AppHandle, id: &str) -> Option<String> {
     let state = app.state::<BrowserState>();
     let tabs = state.tabs.lock().unwrap();
     tabs.iter().find(|p| p.id == id).map(|p| p.url.clone())
@@ -389,9 +406,23 @@ pub fn ensure(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
     new_tab(app, url).map(|_| ())
 }
 
+/// Where every page starts before its blocker is on. Fetches nothing, so the
+/// gap between "the webview exists" and "the content rules are attached" costs
+/// no unblocked requests. See [`create`].
+const START_BLANK: &str = "about:blank";
+
 /// Build one page's child webview. Callers own the tab bookkeeping.
 fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| format!("Invalid URL: {url}"))?;
+    // Validated up front so an unusable address fails before a webview exists.
+    reqwest::Url::parse(url).map_err(|_| format!("Invalid URL: {url}"))?;
+    // THE BLOCKER RACE: a webview built pointing at its destination starts
+    // loading the instant it exists, and the content rule list can only be
+    // attached AFTER that (it needs the webview's user-content controller,
+    // which the webview owns). Every new page and tab therefore had a window —
+    // the opening requests of the load — with no tracker and no private-range
+    // blocking, while the shield chip already read "Private". Start parked on
+    // `about:blank`, which fetches nothing, and navigate once the rules are on.
+    let parsed = reqwest::Url::parse(START_BLANK).map_err(|e| e.to_string())?;
     let window = crate::main_window(app).ok_or_else(|| "The app window is gone.".to_string())?;
     let state = app.state::<BrowserState>();
     // The agent can open a page from any area, so there may be no cached rect
@@ -419,7 +450,6 @@ fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
     // Captured so the hook knows WHICH page moved: this closure is built per
     // webview, so the id is a constant for its lifetime.
     let nav_id = id.to_string();
-    let rules_id = id.to_string();
     let builder = tauri::webview::WebviewBuilder::new(
         label_of(id),
         tauri::WebviewUrl::External(parsed),
@@ -462,9 +492,37 @@ fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
     // for "the active webview" here attached the blocker to the previous page
     // (which already had it) and left every new page — including the very first
     // one — with no tracker or private-range blocking at all, while the shield
-    // chip still read "Private".
-    attach_rules(app, &rules_id);
+    // chip still read "Private". The real destination is loaded from inside the
+    // attach, so the blocker is never a step behind the page.
+    attach_rules_then_go(app, id, url);
     Ok(())
+}
+
+/// Send a page that is parked on [`START_BLANK`] to where it was actually
+/// asked to go. A no-op for a genuinely blank new tab.
+fn go_after_rules(app: &tauri::AppHandle, id: &str, url: &str) {
+    if !should_go_after_rules(url, recorded_url(app, id).as_deref()) {
+        return;
+    }
+    let Some(wv) = webview_of(app, id) else { return };
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        let _ = wv.navigate(parsed);
+    }
+}
+
+/// Is the DEFERRED navigation still the one to fire?
+///
+/// `url` is the destination captured when the page was built, and the blocker
+/// compiles asynchronously. A second address entered during that window
+/// navigates the page directly and returns, so firing unconditionally snapped
+/// the page back to the first one. On the agent path that is worse than a
+/// visual jump: `browse_open` journals the second page, waits for it, and then
+/// describes the first — the fabrication this module exists to prevent.
+///
+/// `recorded` is the page's own record ([`recorded_url`]); `None` means we are
+/// still inside `create`, where nothing can have superseded us yet.
+fn should_go_after_rules(url: &str, recorded: Option<&str>) -> bool {
+    url != START_BLANK && recorded.is_none_or(|current| current == url)
 }
 
 /// Close EVERY page — room close and app quit, the two paths that are meant to
@@ -512,10 +570,35 @@ fn is_recordable_url(url: &reqwest::Url) -> bool {
     matches!(url.scheme(), "http" | "https")
 }
 
+/// Schemes that hand a link to ANOTHER app rather than load a web page:
+/// `mailto:`, `tel:` and friends. The private browser does not open them (it
+/// has no other app to hand them to), but they are an ordinary thing to click
+/// on an ordinary page — a "contact us" link is not an attempt to reach this
+/// Mac, and reporting it as one made an everyday click look like a security
+/// incident, in a red banner and in the permanent journal.
+///
+/// Deliberately a short, named list. `file:`, `data:` and `javascript:` at top
+/// level are NOT ordinary and keep the loud path.
+fn is_app_link_scheme(scheme: &str) -> bool {
+    matches!(
+        scheme,
+        "mailto" | "tel" | "sms" | "facetime" | "facetime-audio" | "callto" | "webcal"
+    )
+}
+
 fn navigation_allowed(app: &tauri::AppHandle, url: &reqwest::Url) -> bool {
     // `about:blank` is the webview's own idle state, never a destination.
     if url.scheme() == "about" {
         return true;
+    }
+    if is_app_link_scheme(url.scheme()) {
+        journal(
+            app,
+            "open",
+            url.as_str(),
+            "This link opens another app, which the private browser does not do — nothing was loaded.",
+        );
+        return false;
     }
     let ok = crate::web::check_public_http_url(url.as_str()).is_ok();
     if !ok {
@@ -566,14 +649,46 @@ fn download_allowed(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent
                     .unwrap_or("download"),
             );
             let dir = staging_dir();
-            if std::fs::create_dir_all(&dir).is_err() {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                // Refusing here cancels the download with no other trace, so
+                // clicking the link simply appeared to do nothing. Say why.
+                journal(
+                    app,
+                    "download",
+                    url.as_str(),
+                    &format!("Download could not be started: {e}"),
+                );
+                let _ = tauri::Emitter::emit(
+                    app,
+                    "browser-download",
+                    serde_json::json!({
+                        "url": url.as_str(), "name": name, "ok": false,
+                        "error": format!("The download could not be prepared: {e}"),
+                    }),
+                );
                 return false;
             }
             let staged = dir.join(format!("{}-{}", uuid::Uuid::new_v4(), name));
-            app.state::<BrowserState>().downloads.lock().unwrap().insert(
-                url.to_string(),
+            let claimed = stage_download(
+                &mut app.state::<BrowserState>().downloads.lock().unwrap(),
+                url.as_str(),
                 StagedDownload { path: staged.clone(), name: name.clone() },
             );
+            if !claimed {
+                // The SAME address is already downloading. macOS's `Finished`
+                // event carries only the URL, so a second staging slot under
+                // the same key is indistinguishable from the first: the first
+                // download to finish used to import the SECOND one's file
+                // while it was still being written, and the second then
+                // reported its file missing. Refuse the duplicate instead.
+                journal(
+                    app,
+                    "download",
+                    url.as_str(),
+                    &format!("Already downloading {name} — the duplicate was ignored."),
+                );
+                return false;
+            }
             journal(app, "download", url.as_str(), &format!("Downloading {name}"));
             *destination = staged;
             true
@@ -608,6 +723,21 @@ fn download_allowed(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent
     }
 }
 
+/// Claim the staging slot for `url`. `false` when one is already in flight for
+/// that exact address — see the `Requested` arm for why a second slot cannot
+/// safely share the key.
+fn stage_download(
+    downloads: &mut HashMap<String, StagedDownload>,
+    url: &str,
+    staged: StagedDownload,
+) -> bool {
+    if downloads.contains_key(url) {
+        return false;
+    }
+    downloads.insert(url.to_string(), staged);
+    true
+}
+
 /// Import a finished download into the room off the main thread (this is
 /// reached from inside wry's delegate callback), then tell the user — and the
 /// journal — exactly what arrived, or why it did not.
@@ -633,6 +763,13 @@ fn import_finished_download(app: &tauri::AppHandle, url: String, staged: StagedD
 // Journal
 // ---------------------------------------------------------------------------
 
+/// Record one agent action.
+///
+/// The room DB is the ONLY copy. A parallel in-memory `Vec` used to be kept
+/// here and carefully trimmed to 500 entries, but nothing ever read it — the
+/// Journal view reads `browser_journal`, which queries the room — and it was
+/// not emptied on room close, so the last 500 lines of browsing outlived the
+/// locked room in memory.
 pub fn journal(app: &tauri::AppHandle, kind: &str, url: &str, detail: &str) {
     let entry = JournalEntry {
         at: now_iso(),
@@ -640,15 +777,6 @@ pub fn journal(app: &tauri::AppHandle, kind: &str, url: &str, detail: &str) {
         url: url.to_string(),
         detail: detail.to_string(),
     };
-    if let Some(state) = app.try_state::<BrowserState>() {
-        let mut j = state.journal.lock().unwrap();
-        j.push(entry.clone());
-        // Bound the in-memory copy; the DB keeps the full record.
-        if j.len() > 500 {
-            let excess = j.len() - 500;
-            j.drain(0..excess);
-        }
-    }
     // Persist into the room when one is open. A closed room is not an error:
     // the browser can be open on the start screen with nothing to write to.
     if let Some(state) = app.try_state::<crate::commands::AppState>() {
@@ -696,7 +824,7 @@ pub async fn eval_json(
 
     let raw = tokio::time::timeout(EVAL_TIMEOUT, rx)
         .await
-        .map_err(|_| "The page did not answer in time.".to_string())?
+        .map_err(|_| EVAL_TIMED_OUT.to_string())?
         .map_err(|_| "The browser closed while the page was answering.".to_string())?;
 
     if raw.is_empty() {
@@ -704,15 +832,7 @@ pub async fn eval_json(
         // arrive empty. The page script is written to never throw, so this
         // means the script is not present yet (still loading, or a document
         // that refused it).
-        // Deliberately does NOT say "try again". The tools already wait for
-        // readiness themselves (`wait_ready`), so if this is reached the page
-        // is genuinely refusing to run the script — and an invitation to retry
-        // is what turned one failure into a twenty-round loop in live QA.
-        return Err(
-            "This page will not run the assistant's page script, so it cannot be read or \
-             operated. Nothing was done — tell the user this page can't be driven."
-                .into(),
-        );
+        return Err(SCRIPT_REFUSED.into());
     }
     serde_json::from_str(&raw).map_err(|e| format!("The page answered with something unreadable: {e}"))
 }
@@ -755,19 +875,88 @@ fn mark_superseded(app: &tauri::AppHandle) {
     }
 }
 
+/// What a page that will not run the assistant's script is told, wherever we
+/// find out.
+///
+/// Deliberately does NOT say "try again". The tools already wait for readiness
+/// themselves ([`wait_ready`]), so by the time this is reached the page is
+/// genuinely refusing — and an invitation to retry is what turned one failure
+/// into a twenty-round loop in live QA.
+const SCRIPT_REFUSED: &str =
+    "This page will not run the assistant's page script, so it cannot be read or \
+     operated. Nothing was done — tell the user this page can't be driven.";
+
+/// What the readiness probe learned about the page we are waiting for.
+#[derive(Debug, PartialEq, Eq)]
+enum Readiness {
+    /// The page script is up on the document we asked for.
+    Ready,
+    /// Not yet — the normal state for the first few hundred milliseconds after
+    /// a navigation, and while the document being left is still answering.
+    Loading,
+    /// The document has FINISHED loading and the script is not there. A PDF,
+    /// or a site whose policy strips injected scripts. Waiting out the rest of
+    /// the budget cannot change this, and reporting it as "the page did not
+    /// finish loading" is simply untrue.
+    Refused,
+}
+
+/// `record_is_blank` is [`is_blank`]: does our own record say this tab has not
+/// been anywhere? It is the only way to tell the two meanings of a blank page
+/// apart — see the `Ready` arm.
+fn classify_ready(v: &serde_json::Value, record_is_blank: bool) -> Readiness {
+    if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
+        // A page still parked on the blank START document answers exactly like
+        // a real one, so "the script is up" is not the same question as "the
+        // page we asked for is up". It only counts when the tab is genuinely
+        // meant to be blank; otherwise the real document is still on its way
+        // and returning here would snapshot `about:blank`.
+        let on_blank = v.get("url").and_then(|u| u.as_str()) == Some(START_BLANK);
+        return if on_blank && !record_is_blank {
+            Readiness::Loading
+        } else {
+            Readiness::Ready
+        };
+    }
+    if v.get("refused").and_then(|r| r.as_bool()) == Some(true) {
+        return Readiness::Refused;
+    }
+    Readiness::Loading
+}
+
 /// Is the page script live on the document we are actually waiting for?
 ///
 /// Deliberately non-erroring: "not ready" is the normal state for the first few
-/// hundred milliseconds after a navigation, not a failure to report.
-async fn probe_ready(app: &tauri::AppHandle) -> bool {
-    let Some(wv) = webview(app) else { return false };
+/// hundred milliseconds after a navigation, not a failure to report. `None`
+/// means the document answered NOTHING at all — a page running no JavaScript
+/// (a PDF), or one whose document has not committed yet.
+async fn probe_ready(app: &tauri::AppHandle) -> Option<Readiness> {
+    let wv = webview(app)?;
+    // `refused` is asked of the DOCUMENT, not of our script, so it still
+    // answers on a page that refused the script. The superseded arm keeps its
+    // own guard: the page being navigated AWAY from is complete and DOES have
+    // the script, so it can never look refused.
     const READY_JS: &str = r#"((window.__arcelleBrowse && !window.__arcelleSuperseded)
         ? window.__arcelleBrowse.call("ping", {})
-        : { ok: false })"#;
+        : { ok: false, refused: !window.__arcelleBrowse && document.readyState === "complete" })"#;
     match eval_json(&wv, READY_JS).await {
-        Ok(v) => v.get("ok").and_then(|o| o.as_bool()) == Some(true),
-        Err(_) => false,
+        Ok(v) => Some(classify_ready(&v, is_blank(app))),
+        Err(e) => readiness_from_probe_error(&e),
     }
+}
+
+/// How a FAILED readiness probe should be read.
+///
+/// `None` is "the document answered nothing, and never will" — the PDF case,
+/// which [`wait_ready`] is right to report as refused. A probe that ran out of
+/// time is a different page: its JavaScript thread is blocked (a very long
+/// task, or a blocking dialog wry never dismisses), which is exactly
+/// `Loading`. Reading it as `None` reported a merely busy page with
+/// [`SCRIPT_REFUSED`] — worded to stop the model retrying — instead of "the
+/// page did not finish loading", and one stuck probe was enough to do it
+/// because `EVAL_TIMEOUT` outlasts the smallest readiness budget.
+fn readiness_from_probe_error(err: &str) -> Option<Readiness> {
+    (err == EVAL_TIMED_OUT).then_some(Readiness::Loading)
 }
 
 /// Wait until the injected page script answers.
@@ -782,13 +971,30 @@ async fn probe_ready(app: &tauri::AppHandle) -> bool {
 /// Readiness is deterministic code, exactly like `settle`: a model must never
 /// be asked to decide whether a page has loaded, and must never be handed a
 /// transient not-ready as if it were a real failure.
+/// A page that refuses the script does NOT get the full budget. It used to:
+/// every tool waited the whole 12 seconds (25 for `browse_open`) on a PDF or a
+/// strict site and then reported "the page did not finish loading", which was
+/// both slow and the wrong reason. The truthful message already existed in
+/// `eval_json` — this is the path that reaches it again.
 pub async fn wait_ready(app: &tauri::AppHandle, budget: Duration) -> Result<(), String> {
     let started = Instant::now();
+    // Has the page given ANY sign it might yet become ready — an answer of
+    // "still loading", or a probe that never came back because its JavaScript
+    // thread is busy? If every probe came back with nothing at all, the
+    // document has no script for us and never will, and saying "still loading"
+    // after the budget would be a guess.
+    let mut could_still_load = false;
     loop {
-        if probe_ready(app).await {
-            return Ok(());
+        match probe_ready(app).await {
+            Some(Readiness::Ready) => return Ok(()),
+            Some(Readiness::Refused) => return Err(SCRIPT_REFUSED.to_string()),
+            Some(Readiness::Loading) => could_still_load = true,
+            None => {}
         }
         if started.elapsed() > budget {
+            if !could_still_load {
+                return Err(SCRIPT_REFUSED.to_string());
+            }
             return Err(format!(
                 "The page did not finish loading within {}s. It may be very slow, or it may have refused to load.",
                 budget.as_secs()
@@ -887,33 +1093,42 @@ pub async fn call_async(
 // macOS specifics: rule list + the ephemerality assertion
 // ---------------------------------------------------------------------------
 
-/// Compile the content rule list and attach it to the live webview.
+/// Compile the content rule list, attach it to the live webview, and only THEN
+/// send the page to `url`.
 ///
 /// WebKit compiles asynchronously and caches by identifier, so this is cheap
 /// after the first call in a process. Failure is non-fatal but IS journalled —
 /// a browser whose blocker silently failed to load must not look identical to
-/// one where it is working.
+/// one where it is working — and the page is still loaded: a blocker that
+/// could not compile must not turn into a browser that cannot open a page.
 #[cfg(target_os = "macos")]
-pub fn attach_rules(app: &tauri::AppHandle, id: &str) {
+fn attach_rules_then_go(app: &tauri::AppHandle, id: &str, url: &str) {
     use objc2_foundation::{MainThreadMarker, NSString};
     use objc2_web_kit::{WKContentRuleList, WKContentRuleListStore, WKWebView};
 
     let Some(wv) = webview_of(app, id) else { return };
-    let app = app.clone();
-    let _ = wv.with_webview(move |platform| unsafe {
-        let Some(mtm) = MainThreadMarker::new() else { return };
+    let owned = app.clone();
+    let go_id = id.to_string();
+    let go_url = url.to_string();
+    let attached = wv.with_webview(move |platform| unsafe {
+        let Some(mtm) = MainThreadMarker::new() else {
+            go_after_rules(&owned, &go_id, &go_url);
+            return;
+        };
         let Some(store) = WKContentRuleListStore::defaultStore(mtm) else {
-            journal(&app, "blocker", "", "Content blocker unavailable on this system.");
+            journal(&owned, "blocker", "", "Content blocker unavailable on this system.");
+            go_after_rules(&owned, &go_id, &go_url);
             return;
         };
         let ptr = platform.inner() as *mut WKWebView;
         if ptr.is_null() {
+            go_after_rules(&owned, &go_id, &go_url);
             return;
         }
         let webview: &WKWebView = &*ptr;
         let controller = webview.configuration().userContentController();
 
-        let app2 = app.clone();
+        let app2 = owned.clone();
         let handler = block2::RcBlock::new(
             move |list: *mut WKContentRuleList, err: *mut objc2_foundation::NSError| {
                 if !list.is_null() {
@@ -932,6 +1147,9 @@ pub fn attach_rules(app: &tauri::AppHandle, id: &str) {
                         &format!("Content blocking FAILED to load: {msg}"),
                     );
                 }
+                // Whether the blocker loaded or not, the page must go
+                // somewhere — but never BEFORE this point.
+                go_after_rules(&app2, &go_id, &go_url);
             },
         );
         store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
@@ -940,20 +1158,51 @@ pub fn attach_rules(app: &tauri::AppHandle, id: &str) {
             Some(&handler),
         );
     });
+    // `with_webview` never ran, so nothing above will navigate for us.
+    if attached.is_err() {
+        go_after_rules(app, id, url);
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn attach_rules(_app: &tauri::AppHandle, _id: &str) {}
+fn attach_rules_then_go(app: &tauri::AppHandle, id: &str, url: &str) {
+    go_after_rules(app, id, url);
+}
 
-/// Assert, against the LIVE webview, that its website data store is
+/// Assert, against EVERY live webview, that its website data store is
 /// non-persistent. This is a real check rather than a restatement of
 /// `incognito(true)` because the failure mode is silent: supplying a custom
 /// `WKWebViewConfiguration` makes wry ignore `incognito` and fall back to the
 /// default, persistent store — a browser that looks private and is not.
+///
+/// Every OPEN page is asked, not only the one showing: the shield chip speaks
+/// for the whole browser, and a background tab that had somehow acquired a
+/// persistent store would be exactly as bad as the visible one.
 #[cfg(target_os = "macos")]
 pub async fn verify_ephemeral(app: &tauri::AppHandle) -> Result<bool, String> {
+    let ids: Vec<String> = app
+        .state::<BrowserState>()
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
+    if ids.is_empty() {
+        return Err("The browser isn't open.".to_string());
+    }
+    for id in ids {
+        if !verify_one_ephemeral(app, &id).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+async fn verify_one_ephemeral(app: &tauri::AppHandle, id: &str) -> Result<bool, String> {
     use objc2_web_kit::WKWebView;
-    let wv = webview(app).ok_or("The browser isn't open.")?;
+    let wv = webview_of(app, id).ok_or("The browser isn't open.")?;
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
     let tx = Mutex::new(Some(tx));
     wv.with_webview(move |platform| unsafe {
@@ -1173,6 +1422,154 @@ mod tests {
         );
     }
 
+    /// A page that has FINISHED loading and still has no page script will
+    /// never get one, so the wait must end there with the truthful reason
+    /// rather than burning the whole budget and then blaming the load.
+    #[test]
+    fn a_finished_document_with_no_script_is_refused_not_still_loading() {
+        assert_eq!(
+            classify_ready(&serde_json::json!({ "ok": true, "url": "https://example.com/" }), false),
+            Readiness::Ready
+        );
+        assert_eq!(
+            classify_ready(&serde_json::json!({ "ok": false, "refused": true }), false),
+            Readiness::Refused
+        );
+        // Mid-navigation: no script yet, document not complete.
+        assert_eq!(
+            classify_ready(&serde_json::json!({ "ok": false, "refused": false }), false),
+            Readiness::Loading
+        );
+        // The page we are navigating AWAY from answers the superseded arm with
+        // a bare `{ok:false}` — it must never be read as a refusal.
+        assert_eq!(
+            classify_ready(&serde_json::json!({ "ok": false }), false),
+            Readiness::Loading
+        );
+    }
+
+    /// Every page now starts parked on `about:blank` so its blocker is on
+    /// before a single request leaves. That start document runs the page
+    /// script and answers `ping` perfectly, so readiness has to distinguish
+    /// "still on the way to the page you asked for" from "this tab really is
+    /// a blank new tab" — otherwise `browse_open` would snapshot about:blank.
+    #[test]
+    fn the_blank_start_page_is_not_mistaken_for_the_page_that_was_asked_for() {
+        let blank = serde_json::json!({ "ok": true, "url": START_BLANK });
+        assert_eq!(classify_ready(&blank, false), Readiness::Loading);
+        // …and an empty new tab, which our record agrees is blank, IS ready —
+        // otherwise every tool on a fresh tab would spin out its whole budget.
+        assert_eq!(classify_ready(&blank, true), Readiness::Ready);
+    }
+
+    /// Clicking "email us" is an ordinary click, not an attempt to reach this
+    /// Mac. It used to raise the private-address warning and write the same
+    /// into the permanent journal.
+    #[test]
+    fn app_links_are_not_treated_as_private_address_attempts() {
+        for scheme in ["mailto", "tel", "sms", "facetime", "webcal"] {
+            assert!(is_app_link_scheme(scheme), "{scheme} is an ordinary link");
+        }
+        // …and the schemes that ARE worth a warning keep it.
+        for scheme in ["file", "data", "javascript", "http", "https"] {
+            assert!(!is_app_link_scheme(scheme), "{scheme} must keep the loud path");
+        }
+    }
+
+    /// macOS's `Finished` download event carries only the URL, so two staged
+    /// downloads under one key are indistinguishable: the first to finish
+    /// imported the second's still-being-written file, and the second reported
+    /// its own file missing.
+    #[test]
+    fn a_second_download_of_the_same_address_cannot_displace_the_first() {
+        let mut downloads: HashMap<String, StagedDownload> = HashMap::new();
+        let staged = |p: &str| StagedDownload {
+            path: PathBuf::from(p),
+            name: "report.pdf".to_string(),
+        };
+        assert!(stage_download(&mut downloads, "https://x/report.pdf", staged("/tmp/a")));
+        assert!(
+            !stage_download(&mut downloads, "https://x/report.pdf", staged("/tmp/b")),
+            "the duplicate must be refused, not overwrite the in-flight one"
+        );
+        assert_eq!(downloads["https://x/report.pdf"].path, PathBuf::from("/tmp/a"));
+        // A different address is unaffected, and the SAME one is downloadable
+        // again once the first finished and released its slot.
+        assert!(stage_download(&mut downloads, "https://x/other.pdf", staged("/tmp/c")));
+        downloads.remove("https://x/report.pdf");
+        assert!(stage_download(&mut downloads, "https://x/report.pdf", staged("/tmp/d")));
+    }
+
+    /// The blocker cannot be attached before the webview exists, so the page
+    /// must not be pointed at its destination until it has been. Pinned as a
+    /// source scan: both halves compile fine independently, and getting them
+    /// the wrong way round silently reopens the unblocked window.
+    #[test]
+    fn a_page_is_parked_on_blank_until_its_blocker_is_attached() {
+        let src = include_str!("browser.rs");
+        let create = src
+            .split("fn create(app: &tauri::AppHandle")
+            .nth(1)
+            .expect("create exists");
+        // Just the function body, up to the one after it.
+        let body = create
+            .split("\nfn go_after_rules")
+            .next()
+            .expect("go_after_rules follows create");
+        assert!(
+            body.contains("WebviewUrl::External(parsed)")
+                && body.contains("reqwest::Url::parse(START_BLANK)"),
+            "create must build the webview on the blank start page"
+        );
+        assert!(
+            body.contains("attach_rules_then_go"),
+            "create must route the real navigation through the blocker attach"
+        );
+        assert_eq!(START_BLANK, "about:blank");
+    }
+
+    /// Parking every page on `about:blank` moved the real navigation into the
+    /// blocker's async compile handler, which fires with the URL captured when
+    /// the page was BUILT. A second address entered during the compile window
+    /// navigates the page directly and returns, so firing regardless snapped it
+    /// back — and `browse_open` would journal the second page, wait for it, and
+    /// then describe the first.
+    #[test]
+    fn a_navigation_issued_while_the_blocker_compiles_is_not_overwritten() {
+        // Nothing moved: the deferred navigation is still the right one.
+        assert!(should_go_after_rules("https://a.example/", Some("https://a.example/")));
+        // No record yet — still inside `create`, which pushes the tab after it
+        // returns. Refusing here would leave every new page on `about:blank`.
+        assert!(should_go_after_rules("https://a.example/", None));
+        // The page was sent somewhere else while the rules compiled: that
+        // navigation wins, and this one must not undo it.
+        assert!(!should_go_after_rules("https://a.example/", Some("https://b.example/")));
+        // A genuinely blank new tab stays blank either way.
+        assert!(!should_go_after_rules(START_BLANK, None));
+        assert!(!should_go_after_rules(START_BLANK, Some(START_BLANK)));
+    }
+
+    /// A probe that never came back found a page whose JS thread is busy, not a
+    /// document without a script. Telling them apart matters because one stuck
+    /// probe outlasts the whole readiness budget on its own, and the refused
+    /// message is deliberately worded to stop the model retrying.
+    #[test]
+    fn a_readiness_probe_that_timed_out_is_a_busy_page_not_an_undriveable_one() {
+        assert!(
+            EVAL_TIMEOUT > READY_BUDGET_NAV,
+            "if a probe could no longer outlast a budget this distinction would be moot"
+        );
+        assert_eq!(readiness_from_probe_error(EVAL_TIMED_OUT), Some(Readiness::Loading));
+        // A document that answered NOTHING really has no script for us.
+        assert_eq!(readiness_from_probe_error(SCRIPT_REFUSED), None);
+        assert_eq!(readiness_from_probe_error("The browser closed while the page was answering."), None);
+        // …and the message must stay the one `eval_json` actually produces.
+        assert!(
+            include_str!("browser.rs").contains("map_err(|_| EVAL_TIMED_OUT.to_string())"),
+            "eval_json must report its timeout through the constant probe_ready matches on"
+        );
+    }
+
     /// The readiness probe is the fix for the live-QA loop, and it is pure
     /// string JS that no compiler checks. Both guards must be in it: without
     /// `__arcelleBrowse` it would call into nothing; without
@@ -1203,6 +1600,34 @@ mod tests {
         for op in ["\"snapshot\"", "\"read\"", "\"find\"", "\"begin\"", "\"take\"", "\"info\""] {
             assert!(PAGE_JS.contains(op), "page script is missing op {op}");
         }
+    }
+
+    /// Three page-script contracts the Rust side reads by name. Each compiles
+    /// fine on both sides independently and only breaks at runtime, on a live
+    /// page, as wrong output rather than an error.
+    #[test]
+    fn the_page_script_reports_what_the_rust_side_reads_off_it() {
+        // `format_read` continues from the page's own count. Recounting in
+        // Rust `char`s disagreed with JavaScript's UTF-16 code units by one per
+        // emoji, and the next chunk repeated text already read.
+        assert!(
+            PAGE_JS.contains("nextOffset:"),
+            "read() must report where to carry on from, in its own units"
+        );
+        // …and it must not cut a surrogate pair in half.
+        assert!(PAGE_JS.contains("isHighSurrogate") && PAGE_JS.contains("isLowSurrogate"));
+        // `browse_look` warns about layers a screenshot cannot composite.
+        assert!(
+            PAGE_JS.contains("mediaAreas: mediaAreas()"),
+            "info() must count the video/3D areas a screenshot returns blank"
+        );
+        // `find` must reuse the CURRENT numbering: a snapshot clears every mark
+        // and bumps the generation, so re-scanning inside the cheap lookup
+        // silently invalidated every ref the model was just handed.
+        assert!(
+            PAGE_JS.contains("currentElements"),
+            "find() must search the live registry, not re-snapshot the page"
+        );
     }
 
     /// The async-ticket contract's document half (owner report 2026-07-30).

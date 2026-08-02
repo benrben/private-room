@@ -1,4 +1,8 @@
-/* ---------- empty-state illustrations ---------- */
+/* ---------- empty-state illustrations ----------
+   Surfaces and strokes come from the theme tokens (--panel-2 / --line /
+   --muted), never fixed hex: hard-coded near-blacks turned these into black
+   blobs on a near-white light-mode panel. Only the violet accent and its
+   glows stay literal — they are the same in both themes. */
 
 /** Empty viewer: an open door with violet light spilling out. */
 export function EmptyViewerArt() {
@@ -34,13 +38,13 @@ export function EmptyViewerArt() {
       {/* arch frame */}
       <path
         d="M78 150V80a32 32 0 0 1 64 0v70"
-        stroke="#8b93a7"
+        stroke="var(--muted)"
         strokeWidth="2.5"
         strokeLinecap="round"
       />
       <path
         d="M64 150h92"
-        stroke="#8b93a7"
+        stroke="var(--muted)"
         strokeWidth="2.5"
         strokeLinecap="round"
       />
@@ -48,12 +52,12 @@ export function EmptyViewerArt() {
       {/* door panel, swung open */}
       <path
         d="M82 150l-30 12V70l30 8v72z"
-        fill="#1c212c"
-        stroke="#262d3b"
+        fill="var(--panel-2)"
+        stroke="var(--line)"
         strokeWidth="2"
         strokeLinejoin="round"
       />
-      <circle cx="58" cy="116" r="2.4" fill="#8b93a7" />
+      <circle cx="58" cy="116" r="2.4" fill="var(--muted)" />
 
       {/* sparkles */}
       <path
@@ -66,7 +70,7 @@ export function EmptyViewerArt() {
       {/* plant */}
       <path
         d="M182 150v-12m0 4c0-5 3-8 7-9m-7 4c0-4-2.5-6.5-6-7"
-        stroke="#8b93a7"
+        stroke="var(--muted)"
         strokeWidth="1.8"
         strokeLinecap="round"
       />
@@ -90,7 +94,7 @@ export function EmptyChatArt() {
       {/* dashed orbit */}
       <path
         d="M28 118a62 62 0 0 1 46-74"
-        stroke="#262d3b"
+        stroke="var(--line)"
         strokeWidth="2"
         strokeLinecap="round"
         strokeDasharray="1 9"
@@ -116,8 +120,8 @@ export function EmptyChatArt() {
       {/* chat bubble */}
       <path
         d="M124 26h44a10 10 0 0 1 10 10v18a10 10 0 0 1-10 10h-24l-12 12v-12h-8a10 10 0 0 1-10-10V36a10 10 0 0 1 10-10z"
-        fill="#1c212c"
-        stroke="#8b93a7"
+        fill="var(--panel-2)"
+        stroke="var(--muted)"
         strokeWidth="2"
         strokeLinejoin="round"
       />

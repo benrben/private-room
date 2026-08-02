@@ -95,16 +95,56 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// The per-request budget for one gateway call. Named so the timeout message
+/// can quote the real number instead of a hardcoded one that drifts.
+///
+/// This is the SAME budget the other sidecar gateway uses
+/// ([`crate::sidecar::SIDECAR_TIMEOUT`]), read from it rather than restated: both
+/// carry generations for the same engines, so a claude-cli room whose one
+/// "generation" is a whole agentic session must not be cut off after ten minutes
+/// on `/generate` while `/summarize` gets an hour. Two independent constants had
+/// already drifted once.
+fn client_timeout() -> Duration {
+    crate::sidecar::SIDECAR_TIMEOUT
+}
+
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(client_timeout())
         .build()
         .map_err(|e| e.to_string())
 }
 
+/// The budget for a METADATA read (`/capabilities`) — `/api/show` underneath,
+/// which loads no model. Kept small and separate from the generation budget: an
+/// unreachable sidecar must not stall a Settings badge (or the pre-answer vision
+/// check) for the length of a whole agentic session, and the caller treats a
+/// failure as "unknown" rather than an error.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn metadata_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(METADATA_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Classify a transport failure on the Rust→sidecar hop.
+///
+/// A TIMEOUT is not "the local AI isn't running": the request was accepted and
+/// the model simply took longer than the per-call budget. Reporting it as
+/// `OLLAMA_DOWN` put an "Open Ollama" button in front of users whose daemon was
+/// running fine (and, in a cloud-model room, who may not have Ollama installed
+/// at all) while dropping the only fact that helps — how long we waited.
 fn map_send_err(e: reqwest::Error) -> String {
-    if e.is_connect() || e.is_timeout() {
+    if e.is_connect() {
         "OLLAMA_DOWN".to_string()
+    } else if e.is_timeout() {
+        format!(
+            "The AI engine did not answer within {}s. Try a shorter request, or a \
+             faster model in Settings → Model.",
+            client_timeout().as_secs()
+        )
     } else {
         format!("Local AI request failed: {e}")
     }
@@ -128,6 +168,9 @@ async fn sidecar_post(
     model: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let base = crate::sidecar_lifecycle::ensure_up().await?;
+    // Held for the whole POST: a concurrent `ensure_up` must not replace the
+    // sidecar that is answering THIS request just because a health probe missed.
+    let _busy = crate::sidecar_lifecycle::busy();
     // PRIV-1: the room's redaction rules must ride along for a cloud/CLI model,
     // exactly as they do on the other gateway (`sidecar.rs::sidecar_json`). Without
     // this, `privacy.guard_outbound` sidecar-side sees `policy is None` and returns
@@ -137,7 +180,13 @@ async fn sidecar_post(
     // own injection below is unaffected.
     let body = crate::commands::inject_policy(body).unwrap_or_else(|| body.clone());
     let body = match model {
-        Some(model) => crate::commands::inject_provider_runtime(&body, model)?,
+        Some(model) => {
+            // What an API-provider model can do is learned only while fetching
+            // the catalog, and that cache is in-memory — so after a restart it
+            // was empty and every model read as "unknown". Fill it once here.
+            crate::commands::ensure_provider_catalog(model).await;
+            crate::commands::inject_provider_runtime(&body, model)?
+        }
         None => body,
     };
     let resp = client()?
@@ -402,7 +451,13 @@ pub(crate) async fn handoff_summary(
     });
     let body = crate::commands::inject_policy(&body).unwrap_or(body);
     let value = sidecar_post("/handoff_summary", &body, Some(model)).await?;
-    Ok(value["summary"].as_str().unwrap_or_default().to_string())
+    // The recap replaces the conversation the model can see, so a `<think>`
+    // span leaked by a thinking-capable model (or a `:cloud` proxy passing one
+    // through) must never become the memory itself. `strip_think_spans` can
+    // legitimately leave nothing behind — the caller treats an empty recap as a
+    // failed handoff rather than saving it.
+    let summary = value["summary"].as_str().unwrap_or_default();
+    Ok(strip_think_spans(summary).trim().to_string())
 }
 
 /// Remove the `<think>…</think>` reasoning spans a model leaks into its visible
@@ -496,20 +551,57 @@ pub async fn warm(model: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Download a model from the Ollama registry, reporting progress. No request
-/// timeout — pulls are multi-gigabyte.
+/// How long a download may go without receiving a single byte before it is
+/// abandoned. Not a cap on the transfer — pulls are multi-gigabyte and can
+/// legitimately run for an hour on a slow line.
+const PULL_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// What a pull that the user stopped returns. A sentence, not a sentinel: it is
+/// shown as-is, and nothing branches on it.
+pub const PULL_CANCELLED: &str = "The download was cancelled.";
+
+/// Download a model from the Ollama registry, reporting progress. No overall
+/// request timeout — pulls are multi-gigabyte — but a stalled one is dropped
+/// (see [`PULL_STALL_TIMEOUT`]) instead of hanging until the app is quit.
+///
+/// Uncancellable by construction — the caller has nothing to stop it with. Use
+/// [`pull_cancellable`] wherever a Stop button exists.
 pub async fn pull(
     model: &str,
+    on_progress: impl FnMut(&str, Option<f64>),
+) -> Result<(), String> {
+    pull_cancellable(model, &Arc::new(AtomicBool::new(false)), on_progress).await
+}
+
+/// Like [`pull`], but abandons the transfer as soon as `cancel` is set.
+///
+/// A vision helper is ~3 GB, so "start it and then wait however long it takes"
+/// is not an acceptable contract on a metered or slow line. Setting the flag
+/// drops the byte stream (which closes the connection) and returns
+/// [`PULL_CANCELLED`]; the flag is polled between chunks so a download that has
+/// gone quiet — verifying a digest, say — still stops within ~150ms rather than
+/// only when the next progress line happens to arrive.
+pub async fn pull_cancellable(
+    model: &str,
+    cancel: &Arc<AtomicBool>,
     mut on_progress: impl FnMut(&str, Option<f64>),
 ) -> Result<(), String> {
     use futures_util::StreamExt;
 
+    if cancel.load(Ordering::SeqCst) {
+        return Err(PULL_CANCELLED.to_string());
+    }
+
     // The sidecar streams the download as ndjson progress lines (so the UI bar
     // still updates); ensure it is up, then read those lines exactly as we used to
-    // read Ollama's own `/api/pull` stream. Not the shared `client()`: a pull must
-    // run without its 600s timeout.
+    // read Ollama's own `/api/pull` stream. Not the shared `client()`: a pull is
+    // measured in gigabytes and must run without any whole-request timeout (the
+    // between-chunks stall guard below is what ends a dead one).
     let _daemon = wake_daemon().await?;
     let base = crate::sidecar_lifecycle::ensure_up().await?;
+    // A multi-gigabyte pull is exactly the long-running request a missed health
+    // probe must not be allowed to kill.
+    let _busy = crate::sidecar_lifecycle::busy();
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| e.to_string())?;
@@ -527,8 +619,42 @@ pub async fn pull(
     }
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Download interrupted: {e}"))?;
+    loop {
+        // A pull deliberately runs without a request timeout (it is measured in
+        // gigabytes), which used to mean a registry that simply stopped sending
+        // left the download hanging with nothing able to end it but quitting the
+        // app. Bound the GAP between chunks instead of the whole transfer, so a
+        // slow-but-alive download is never cut off and a dead one is.
+        //
+        // The wait polls `cancel` alongside the stream (`next` is cancel-safe,
+        // so nothing is lost when the timer arm wins) — otherwise Stop would sit
+        // unobserved for up to the stall timeout on a quiet download.
+        let waited = std::time::Instant::now();
+        let next = loop {
+            tokio::select! {
+                biased;
+                next = stream.next() => break next,
+                _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(PULL_CANCELLED.to_string());
+                    }
+                    if waited.elapsed() >= PULL_STALL_TIMEOUT {
+                        return Err(format!(
+                            "The download stopped receiving data for {} minutes and was \
+                             cancelled. Check your connection and try again.",
+                            PULL_STALL_TIMEOUT.as_secs() / 60
+                        ));
+                    }
+                }
+            }
+        };
+        let chunk = match next {
+            Some(c) => c.map_err(|e| format!("Download interrupted: {e}"))?,
+            None => break,
+        };
+        if cancel.load(Ordering::SeqCst) {
+            return Err(PULL_CANCELLED.to_string());
+        }
         buf.extend_from_slice(&chunk);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -611,7 +737,8 @@ pub async fn capabilities(model: &str) -> Vec<String> {
     let Ok(base) = crate::sidecar_lifecycle::ensure_up().await else {
         return Vec::new();
     };
-    let Ok(client) = client() else { return Vec::new() };
+    let _busy = crate::sidecar_lifecycle::busy();
+    let Ok(client) = metadata_client() else { return Vec::new() };
     let body = serde_json::json!({ "model": model, "base_url": resolved_base_url() });
     let Ok(resp) = client
         .post(format!("{base}/capabilities"))
@@ -656,6 +783,37 @@ mod tests {
         // ...and an empty/whitespace-only string clears it too (same as None).
         set_base_url_override(Some("   ".to_string()));
         assert_eq!(resolved_base_url(), base_url());
+    }
+
+    // A 3 GB download the user already stopped must not open a connection at
+    // all. The rest of the cancel path (mid-stream) needs a live stream, but
+    // this arm is the one that proves the flag is honored before any network.
+    #[tokio::test]
+    async fn a_pull_that_is_already_cancelled_never_starts() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut progressed = false;
+        let err = pull_cancellable("qwen2.5vl", &cancel, |_, _| progressed = true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, PULL_CANCELLED);
+        assert!(!progressed, "a cancelled pull reports no progress");
+    }
+
+    // Both sidecar gateways carry generations for the SAME engines, and one
+    // "generation" from a cloud CLI is a whole agentic session. When this path
+    // kept its own 600s while `sidecar.rs` was raised to an hour, a long
+    // `/generate` in a claude-cli room was abandoned at ten minutes and the
+    // caller replayed the step — the exact failure the raise removed elsewhere.
+    #[test]
+    fn both_sidecar_gateways_share_one_generation_budget() {
+        assert_eq!(client_timeout(), crate::sidecar::SIDECAR_TIMEOUT);
+        // …and the sidecar's own liveness guard (EXTERNAL_IDLE_SECS = 900s) must
+        // stay INSIDE the client budget, or the outer cap trips before the inner
+        // one it backs up.
+        assert!(client_timeout() > Duration::from_secs(900));
+        // A metadata read keeps its own small budget: it loads no model, and a
+        // Settings badge must not hang for the length of an agentic session.
+        assert!(METADATA_TIMEOUT < client_timeout());
     }
 
     #[test]

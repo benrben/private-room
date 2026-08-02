@@ -1,8 +1,11 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// @ts-expect-error process is a nodejs global
-const host = process.env.TAURI_DEV_HOST;
+// `tauri dev --host` injects TAURI_DEV_HOST. Read through globalThis so this
+// file type-checks (`npm run typecheck`) whether or not @types/node happens to
+// be resolvable — it is only a transitive dependency here.
+const host = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+  .process?.env?.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({

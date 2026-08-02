@@ -1,0 +1,41 @@
+Arcelle — proprietary licence
+Copyright (c) 2025-2026 Ben Reich. All rights reserved.
+
+This source tree and the applications built from it (the "Software") are
+proprietary. No licence, express or implied, is granted to any person or
+organisation other than the rights described below.
+
+Permitted
+---------
+1. Use of an official released build of the Software, obtained from
+   https://github.com/benrben/private-room/releases, on any Mac you own or
+   control, for any purpose, personal or commercial.
+2. Reading this source tree, and building it locally, for the sole purposes of
+   evaluating it, verifying its privacy and security claims, and reporting
+   defects.
+
+Not permitted without prior written permission from the copyright holder
+-----------------------------------------------------------------------
+3. Copying, publishing, distributing, sublicensing or selling the Software or
+   any part of this source tree, in source or binary form.
+4. Creating or distributing derivative works, forks or modified builds.
+5. Removing or altering this notice, the copyright notices, or the signing and
+   update-verification code.
+
+Third-party components
+----------------------
+The Software bundles third-party open-source components (Rust crates, Python
+packages and npm packages) which remain under their own licences. Those
+licences govern those components; nothing here restricts rights you hold under
+them.
+
+No warranty
+-----------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Contact: benrben4@gmail.com

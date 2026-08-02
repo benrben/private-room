@@ -1,0 +1,31 @@
+/* ------------------------------------------------------------------ *
+ * Spreadsheet grid extras owned by SheetView (the base table rules live
+ * in src/styles/viewer-formats.css). Two things the grid can't do without:
+ * a visible focus ring, so arrow-key navigation isn't invisible, and a
+ * mark on cells that hold a formula rather than a typed value.
+ * ------------------------------------------------------------------ */
+
+/* A declined commit (a formula typed into a viewer that can only save values)
+   has to be visible, or the cell silently keeps its old content. */
+.sheet-notice {
+  color: var(--warn, var(--text));
+}
+
+.sheet-scroll td:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* A formula cell shows its RESULT; the corner mark says the value is
+   computed, and the cell's tooltip spells the formula out. */
+.sheet-scroll td.cell-formula {
+  position: relative;
+}
+.sheet-scroll td.cell-formula::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  border-top: 5px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  border-left: 5px solid transparent;
+}

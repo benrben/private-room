@@ -174,6 +174,38 @@ pub(crate) struct TokenSet {
     /// The token endpoint, stored so a refresh is self-contained (no re-discovery).
     #[serde(default)]
     pub token_endpoint: Option<String>,
+    /// Set once the provider REFUSED this refresh token — the user revoked the
+    /// app, or the grant expired. A silent renewal can never succeed again, so
+    /// the sign-in indicator must stop reading "Signed in" and offer the browser
+    /// again. Cleared by signing in (a fresh set never carries it).
+    #[serde(default)]
+    pub refresh_rejected: bool,
+}
+
+/// Why a token request failed. A provider that REJECTS it (any non-2xx —
+/// `invalid_grant` after the user revoked the app, an expired refresh token) is
+/// final: retrying renews nothing. A transport failure is NOT final — the Mac
+/// may simply be offline, and treating that as a dead sign-in would push the
+/// user through the browser for a connector that still works.
+#[derive(Debug)]
+pub(crate) enum TokenError {
+    Rejected(String),
+    Unreachable(String),
+}
+
+impl TokenError {
+    /// True when the sign-in itself is over, not just this attempt.
+    pub(crate) fn is_rejected(&self) -> bool {
+        matches!(self, Self::Rejected(_))
+    }
+}
+
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(m) | Self::Unreachable(m) => f.write_str(m),
+        }
+    }
 }
 
 fn token_key(server: &str) -> String {
@@ -205,6 +237,76 @@ fn now_secs() -> u64 {
 /// True when the access token is missing or within 60s of expiry.
 pub(crate) fn needs_refresh(t: &TokenSet) -> bool {
     t.access_token.is_empty() || (t.expires_at != 0 && t.expires_at <= now_secs() + 60)
+}
+
+/// True when an expiring token can be renewed without the user: we kept a
+/// refresh token, the token endpoint and the registered client id at sign-in —
+/// and the provider has not already refused that refresh token. Having the
+/// pieces on file is not the same as them still working, and a connector whose
+/// sign-in was revoked has to say so or the only way back is deleting it.
+pub(crate) fn can_refresh(t: &TokenSet) -> bool {
+    let filled = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.is_empty());
+    !t.refresh_rejected
+        && filled(&t.refresh_token)
+        && filled(&t.token_endpoint)
+        && filled(&t.client_id)
+}
+
+/// The stored set marked un-renewable, for persisting after the provider refused
+/// the refresh token. The rest is kept: it still records which account this was,
+/// and signing in replaces the whole set anyway. A transport failure must NEVER
+/// reach here — see [`TokenError`].
+pub(crate) fn mark_refresh_rejected(t: &TokenSet) -> TokenSet {
+    TokenSet {
+        refresh_rejected: true,
+        ..t.clone()
+    }
+}
+
+/// Fold a refresh response into the stored set. RFC 6749 §6 lets the server
+/// omit `refresh_token` (the old one stays valid), and the token endpoint we
+/// discovered at sign-in never comes back in the response — keeping both is
+/// what makes the NEXT refresh self-contained too. Pure — unit-tested.
+pub(crate) fn merge_refreshed(stored: &TokenSet, mut fresh: TokenSet) -> TokenSet {
+    if fresh.refresh_token.is_none() {
+        fresh.refresh_token = stored.refresh_token.clone();
+    }
+    if fresh.token_endpoint.is_none() {
+        fresh.token_endpoint = stored.token_endpoint.clone();
+    }
+    if fresh.client_id.is_none() {
+        fresh.client_id = stored.client_id.clone();
+    }
+    fresh
+}
+
+/// Renew a stored token that is at (or near) expiry, returning the token set to
+/// persist. `None` means "nothing to do": the token is still good, or there is
+/// nothing to renew it with and the user has to sign in again by hand.
+pub(crate) async fn refresh_if_expiring(
+    stored: &TokenSet,
+) -> Option<Result<TokenSet, TokenError>> {
+    if !needs_refresh(stored) || !can_refresh(stored) {
+        return None;
+    }
+    let endpoint = stored.token_endpoint.as_deref()?;
+    let client_id = stored.client_id.as_deref()?;
+    let refresh_token = stored.refresh_token.as_deref()?;
+    Some(
+        refresh_tokens(endpoint, client_id, refresh_token)
+            .await
+            .and_then(|fresh| {
+                if fresh.access_token.is_empty() {
+                    // A 200 with no token is not a renewal — merging it would
+                    // write an empty `Bearer` header over the working one. The
+                    // endpoint answered, so retrying gains nothing.
+                    return Err(TokenError::Rejected(
+                        "the refresh response carried no access token".to_string(),
+                    ));
+                }
+                Ok(merge_refreshed(stored, fresh))
+            }),
+    )
 }
 
 // -------------------------------------------------------- async HTTP steps
@@ -292,18 +394,19 @@ async fn exchange_code(
         ("client_id", client_id),
         ("code_verifier", verifier),
     ];
-    post_token(token_endpoint, &form, client_id).await
+    post_token(token_endpoint, &form, client_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
-/// Refresh an expired access token (RFC 6749 §6). Foundation for the
-/// refresh-on-connect follow-up — a stored `token_endpoint` + `client_id` +
-/// `refresh_token` is all it needs, so no re-discovery.
-#[allow(dead_code)]
+/// Refresh an expired access token (RFC 6749 §6). A stored `token_endpoint` +
+/// `client_id` + `refresh_token` is all it needs, so no re-discovery. Driven by
+/// [`refresh_if_expiring`], which every connector connect runs first.
 pub(crate) async fn refresh_tokens(
     token_endpoint: &str,
     client_id: &str,
     refresh_token: &str,
-) -> Result<TokenSet, String> {
+) -> Result<TokenSet, TokenError> {
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
@@ -316,21 +419,26 @@ async fn post_token(
     endpoint: &str,
     form: &[(&str, &str)],
     client_id: &str,
-) -> Result<TokenSet, String> {
-    let resp = http()?
+) -> Result<TokenSet, TokenError> {
+    let resp = http()
+        .map_err(TokenError::Unreachable)?
         .post(endpoint)
         .form(form)
         .send()
         .await
-        .map_err(|e| format!("token request failed: {e}"))?;
+        .map_err(|e| TokenError::Unreachable(format!("token request failed: {e}")))?;
     let status = resp.status();
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        // A reply we can't read is not a refusal — don't retire a sign-in for it.
+        .map_err(|e| TokenError::Unreachable(e.to_string()))?;
     if !status.is_success() {
         let msg = v["error_description"]
             .as_str()
             .or_else(|| v["error"].as_str())
             .unwrap_or("token request rejected");
-        return Err(msg.to_string());
+        return Err(TokenError::Rejected(msg.to_string()));
     }
     Ok(parse_token_response(&v, client_id))
 }
@@ -347,6 +455,8 @@ pub(crate) fn parse_token_response(v: &serde_json::Value, client_id: &str) -> To
         expires_at,
         client_id: Some(client_id.to_string()),
         token_endpoint: None,
+        // A set the provider just issued is renewable by definition.
+        refresh_rejected: false,
     }
 }
 
@@ -614,6 +724,110 @@ mod tests {
     }
 
     #[test]
+    fn expiring_token_is_renewable_and_the_refresh_folds_in() {
+        // Everything a silent renewal needs was stored at sign-in.
+        let mut t = TokenSet {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: now_secs() + 10, // inside the 60s window
+            client_id: Some("cid".into()),
+            token_endpoint: Some("https://auth.example.com/token".into()),
+            refresh_rejected: false,
+        };
+        assert!(needs_refresh(&t));
+        assert!(can_refresh(&t), "an expiring token with a refresh token is not dead");
+        // Missing any one piece means the user really does have to sign in again.
+        for strip in 0..3 {
+            let mut broken = t.clone();
+            match strip {
+                0 => broken.refresh_token = None,
+                1 => broken.token_endpoint = None,
+                _ => broken.client_id = None,
+            }
+            assert!(!can_refresh(&broken));
+        }
+        // A refresh response omits the endpoint (and often the refresh token);
+        // both must survive so the NEXT renewal is self-contained too.
+        let fresh = parse_token_response(
+            &serde_json::json!({"access_token": "at2", "expires_in": 3600}),
+            "cid",
+        );
+        assert!(fresh.token_endpoint.is_none());
+        let merged = merge_refreshed(&t, fresh);
+        assert_eq!(merged.access_token, "at2");
+        assert_eq!(merged.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(
+            merged.token_endpoint.as_deref(),
+            Some("https://auth.example.com/token")
+        );
+        assert!(!needs_refresh(&merged));
+        // A rotated refresh token replaces the old one.
+        let rotated = parse_token_response(
+            &serde_json::json!({"access_token": "at3", "refresh_token": "rt2"}),
+            "cid",
+        );
+        assert_eq!(merge_refreshed(&t, rotated).refresh_token.as_deref(), Some("rt2"));
+        // A token that is still good is left alone.
+        t.expires_at = now_secs() + 3600;
+        assert!(!needs_refresh(&t));
+    }
+
+    #[test]
+    fn a_revoked_signin_stops_reading_as_renewable() {
+        // Having a refresh token, endpoint and client id on file is not the same
+        // as them still WORKING. Once the provider refuses the refresh token the
+        // drawer must stop saying "Signed in" with a greyed-out button — that
+        // button is the only way to re-authorize, so leaving it inert left the
+        // user with nothing but removing the connector and adding it again.
+        let live = TokenSet {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: now_secs() + 10,
+            client_id: Some("cid".into()),
+            token_endpoint: Some("https://auth.example.com/token".into()),
+            refresh_rejected: false,
+        };
+        assert!(needs_refresh(&live) && can_refresh(&live));
+
+        let dead = mark_refresh_rejected(&live);
+        assert!(!can_refresh(&dead), "a refused grant is not renewable");
+        // What `mcp_oauth_status` computes: signed in = still good, or renewable.
+        let signed_in = |t: &TokenSet| !needs_refresh(t) || can_refresh(t);
+        assert!(signed_in(&live));
+        assert!(!signed_in(&dead), "the sign-in button has to become usable");
+        // Nothing else is thrown away — the account is still identifiable, and
+        // signing in again replaces the whole set.
+        assert_eq!(dead.refresh_token, live.refresh_token);
+        assert_eq!(dead.token_endpoint, live.token_endpoint);
+        // The flag survives the store, and older tokens (written before it
+        // existed) read back as renewable rather than failing to parse.
+        let conn = db::open_in_memory_schema();
+        save_tokens(&conn, "vendor", &dead).unwrap();
+        assert!(!can_refresh(&load_tokens(&conn, "vendor").unwrap()));
+        db::set_setting(
+            &conn,
+            "oauth:legacy",
+            r#"{"access_token":"at","refresh_token":"rt","expires_at":1,
+                "client_id":"cid","token_endpoint":"https://auth.example.com/token"}"#,
+        )
+        .unwrap();
+        assert!(can_refresh(&load_tokens(&conn, "legacy").unwrap()));
+    }
+
+    #[test]
+    fn only_a_refusal_retires_a_signin_not_a_flaky_network() {
+        // Being offline is not a revoked account: retiring the sign-in for a
+        // transport failure would push the user through the browser for a
+        // connector that still works perfectly.
+        assert!(TokenError::Rejected("invalid_grant".into()).is_rejected());
+        assert!(!TokenError::Unreachable("token request failed: dns error".into()).is_rejected());
+        assert_eq!(
+            TokenError::Rejected("invalid_grant".into()).to_string(),
+            "invalid_grant"
+        );
+    }
+
+    #[test]
     fn token_store_round_trips() {
         let conn = db::open_in_memory_schema();
         assert!(load_tokens(&conn, "github").is_none());
@@ -623,6 +837,7 @@ mod tests {
             expires_at: 123,
             client_id: Some("cid".into()),
             token_endpoint: Some("https://auth.example.com/token".into()),
+            refresh_rejected: false,
         };
         save_tokens(&conn, "github", &t).unwrap();
         assert_eq!(load_tokens(&conn, "github").unwrap(), t);

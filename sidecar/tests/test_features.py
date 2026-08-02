@@ -240,3 +240,36 @@ def test_parse_or_fallback_matches_rust() -> None:
     )
     # A \r\n line ending is stripped like Rust str::lines().
     assert features._parse_or_fallback("x", "carriage\r\nreturn")[0] == "carriage"
+
+
+# --- framed replies (the cloud-model compensation every other caller has) ----
+
+
+def test_both_parsers_recover_a_framed_reply_like_every_other_caller() -> None:
+    """These two were the last strict ``json.loads`` in the sidecar.
+
+    A model that honours Ollama's ``format`` returns bare JSON and neither
+    parser ever noticed; the ones that ignore it — notably ``:cloud`` models —
+    wrap the object in a ```` ```json ```` fence or lead with a ``<think>``
+    span, which a strict parse rejects. `model_text.recover_json` is the shared
+    compensation (chat_docs, ai_actions, external_llm all run it); without it
+    the front page silently showed NO starter questions on those models, and
+    the feedback form silently used the user's first line as the issue title.
+    """
+    fenced = '```json\n{"questions": ["What is the rent?", "When is it due?"]}\n```'
+    assert features._parse_questions(fenced) == ["What is the rent?", "When is it due?"]
+    thought = '<think>the files look like a lease</think>{"questions": ["Who signed it?"]}'
+    assert features._parse_questions(thought) == ["Who signed it?"]
+
+    assert features._parse_or_fallback(
+        '```json\n{"title": "Export does nothing", "body": "## What happened\\n\\nx"}\n```',
+        "the export button doesnt work",
+    ) == ("Export does nothing", "## What happened\n\nx")
+
+    # A reply with no JSON in it at all still degrades exactly as before —
+    # recovery must not turn "unusable" into a wrong answer.
+    assert features._parse_questions("I could not think of any") == []
+    assert features._parse_or_fallback("sorry, no", "the thing broke") == (
+        "the thing broke",
+        "## What happened\n\nthe thing broke",
+    )

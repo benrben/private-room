@@ -1,13 +1,9 @@
 import { RoomInfo } from "../api";
 
-export type RoomRole = {
-  id: string;
-  name: string;
-  blurb: string;
-  instructions: string;
-  prompts: string[];
-  commands: string[];
-};
+// The persona shape belongs to the backend contract (apiTypes.ts), which is
+// what `listRoles` actually returns — re-exported here so the gate keeps its
+// single import, without a third hand-written copy that could drift.
+export type { RoomRole } from "../apiTypes";
 
 export type Screen =
   | { kind: "start" }

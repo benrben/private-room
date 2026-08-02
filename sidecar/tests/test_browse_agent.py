@@ -72,11 +72,18 @@ def test_the_browser_runs_the_see_then_act_shape_with_a_free_snapshot() -> None:
     assert spec.flow.probe == "browse_snapshot"
 
 
-def test_the_browser_is_not_read_only() -> None:
-    """browse_do submits forms on the open web. Claiming read-only would put
-    it in the safe lane and skip gates that exist for actions."""
-    assert _spec("chat.browse").read_only is False
-    assert _spec("chat.web").read_only is True
+def test_the_browser_holds_the_verbs_that_act_on_the_open_web() -> None:
+    """This used to assert ``spec.read_only is False``.
+
+    That flag was removed 2026-08-01: nothing in the running app ever read it,
+    so it was decoration shaped like a safety switch — a spec could be marked
+    read-only and still be handed browse_do, and no code path would notice.
+    The thing the old test was really about is checked here instead, against
+    the box the loop actually offers: the acting verbs are present, so this
+    agent is not a reader whatever any label says.
+    """
+    box = set(_spec("chat.browse").tools)
+    assert {"browse_do", "browse_save"} <= box
 
 
 def test_the_browser_cannot_be_unlocked_mid_turn() -> None:
@@ -303,6 +310,11 @@ _SEARCH_ONLY = {"web_search", "fetch_page"}
         "take me to my bank",
         "open up amazon and add it to the cart",
         "head over to the docs",
+        # The anchored replacements for the stems that used to over-match
+        # ("surf" inside "surface", "form" inside "information") must still
+        # catch what they were there for.
+        "surf reddit and tell me what's on the front page",
+        "fill in the form on that page and submit it",
         # Hebrew must work for the same reason every other hint list carries it:
         # these are plain substring tests, so a Hebrew ask needs Hebrew hints.
         "לך לגוגל ותחפש מסעדות",
@@ -326,6 +338,15 @@ def test_navigation_intent_always_reaches_the_browser(ask: str) -> None:
         "search the web for espresso machines",
         "what is the weather tomorrow",
         "look up the current price of gold",
+        # Two ordinary questions that ORDINARY WORDS handed to the browser
+        # (2026-08-01). "surface" contains the NAV_INTENT stem "surf", which
+        # overrides all scoring; "information" contains chat.browse's hint
+        # "form", which then won the longest-hint tie-break against "web".
+        # Both sent a question with no destination in it to the agent that
+        # cannot search and has to guess an address.
+        "what is the surface temperature of Mars",
+        "search the web for information about lithium batteries",
+        "find information online about the new tax rules",
     ],
 )
 def test_lookups_without_a_destination_still_search(ask: str) -> None:

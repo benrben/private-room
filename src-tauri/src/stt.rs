@@ -14,6 +14,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+// The "[m:ss]" transcript stamp — ONE implementation for the whole app. The
+// player, search and the AI all parse this exact shape, so a live recording's
+// stamps and an imported file's must not be able to drift apart.
+use crate::recording::format_stamp as format_ts;
+
 /// Whisper large-v3-turbo, 5-bit quantized: the Hebrew-capable sweet spot
 /// (~574 MB download, ~1 GB working set, fast on Metal).
 pub const MODEL_FILE: &str = "ggml-large-v3-turbo-q5_0.bin";
@@ -111,47 +116,17 @@ pub fn decode_bytes_to_pcm(bytes: &[u8], ext: &str, kind: MediaKind) -> Result<V
     result
 }
 
-/// Minimal RIFF/WAVE reader for exactly what afconvert emits (PCM 16-bit LE,
-/// 16 kHz, any channel count): walk chunks to `fmt `/`data`, average channels
-/// to mono, scale to f32 in [-1, 1].
+/// Read exactly what afconvert emits (PCM 16-bit LE, 16 kHz, any channel
+/// count) into mono f32. The RIFF walk itself lives in
+/// [`crate::recording::decode_wav`] — ONE parser for both the recorder's own
+/// files and imported ones, so a fix or a bounds guard added to it reaches
+/// both.
 fn parse_wav_to_mono_f32(path: &Path) -> Result<Vec<f32>, String> {
     let mut buf = Vec::new();
     std::fs::File::open(path)
         .and_then(|mut f| f.read_to_end(&mut buf))
         .map_err(|e| e.to_string())?;
-    if buf.len() < 44 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
-        return Err("not a WAV file".into());
-    }
-    let mut channels: usize = 1;
-    let mut pos = 12;
-    let mut data: Option<(usize, usize)> = None;
-    while pos + 8 <= buf.len() {
-        let id = &buf[pos..pos + 4];
-        let size = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        let body = pos + 8;
-        if id == b"fmt " && body + 4 <= buf.len() {
-            channels = u16::from_le_bytes(buf[body + 2..body + 4].try_into().unwrap()) as usize;
-            channels = channels.max(1);
-        } else if id == b"data" {
-            data = Some((body, size.min(buf.len().saturating_sub(body))));
-            break;
-        }
-        pos = body + size + (size & 1); // chunks are word-aligned
-    }
-    let (start, size) = data.ok_or("WAV has no data chunk")?;
-    let frame = 2 * channels;
-    let frames = size / frame;
-    let mut pcm = Vec::with_capacity(frames);
-    for i in 0..frames {
-        let mut acc = 0f32;
-        for c in 0..channels {
-            let off = start + i * frame + c * 2;
-            let s = i16::from_le_bytes([buf[off], buf[off + 1]]);
-            acc += f32::from(s);
-        }
-        pcm.push(acc / (channels as f32) / 32768.0);
-    }
-    Ok(pcm)
+    crate::recording::decode_wav(&buf)
 }
 
 // ---------------------------------------------------------------- engine
@@ -173,21 +148,35 @@ pub fn unload_ctx() {
     }
 }
 
-fn format_ts(centis: i64) -> String {
-    let s = (centis / 100).max(0);
-    let (h, rem) = (s / 3600, s % 3600);
-    let (m, sec) = (rem / 60, rem % 60);
-    if h > 0 {
-        format!("[{h}:{m:02}:{sec:02}]")
-    } else {
-        format!("[{m}:{sec:02}]")
+/// Release the warm context when it is the copy loaded from `path` — what
+/// "delete the model and give the space back" actually needs, since unlinking
+/// an mmapped file frees nothing while the mapping is open.
+///
+/// `false` means "come back later": a transcription holds the context right
+/// now (a background file job runs for minutes), and nothing else will drop it
+/// afterwards — the context stays warm until the app quits or a DIFFERENT model
+/// replaces it, so a single silent attempt leaked the weights for the rest of
+/// the session. `true` means there is nothing left to do: either the mapping is
+/// gone, or the warm context belongs to another model and must stay.
+pub fn unload_model(path: &Path) -> bool {
+    let Ok(mut guard) = CTX.try_lock() else { return false };
+    if guard.as_ref().is_some_and(|(key, _)| Path::new(key) == path) {
+        *guard = None;
     }
+    true
 }
+
 
 /// Transcribe mono 16 kHz samples. Language is auto-detected (Hebrew included).
 /// With `timestamps`, each Whisper segment becomes a "[m:ss] …" line — the
 /// contract the audio viewer's clickable transcript reads. Blocking and heavy:
 /// callers run it on a background thread, never the UI or an async executor.
+///
+/// Whisper's inventions are filtered exactly as the live recording engine
+/// filters them: bracketed noise markers ([`is_junk_segment`]) always, and the
+/// stock silence phrases ([`is_stock_hallucination`]) when the model itself
+/// wasn't confident. This is the whole-file path — imports, voice messages,
+/// dictation — so what it keeps is what search and the AI read as spoken.
 ///
 /// Deliberately NO translate task here: the shipped model is a *-turbo
 /// distilled Whisper, which was not trained on translation and silently emits
@@ -231,6 +220,14 @@ pub fn transcribe(model_path: &Path, pcm: &[f32], timestamps: bool) -> Result<St
         // silent clip otherwise decodes to a lone "." or "[BLANK_AUDIO]" and gets
         // stored as a real (misleading) transcript. An all-junk clip → "".
         if is_junk_segment(&text) {
+            continue;
+        }
+        // …and the stock phrases whisper invents over silence and music
+        // ("Thank you.", "Subtitles by the Amara.org community"), on the same
+        // terms as the live path: only when the model itself wasn't sure.
+        // Imported audio/video, voice messages and dictation all come through
+        // here, and a sentence nobody said must not reach search or the AI.
+        if is_stock_hallucination(&text) && segment_mean_p(&seg) < STOCK_MAX_CONFIDENCE {
             continue;
         }
         if timestamps {
@@ -307,6 +304,36 @@ fn is_junk_segment(text: &str) -> bool {
         || (trimmed.starts_with('(') && trimmed.ends_with(')'))
         || (trimmed.starts_with('*') && trimmed.ends_with('*'));
     bracketed || trimmed.chars().all(|c| !c.is_alphanumeric())
+}
+
+/// Below this mean token probability a stock phrase is the model guessing at
+/// noise, not something anyone said. A real spoken "thank you" scores far
+/// higher and stays. Shared by the live path and the whole-file path so an
+/// imported recording, a voice message and a live meeting all strip the same
+/// invented sentences.
+const STOCK_MAX_CONFIDENCE: f32 = 0.5;
+
+/// How sure the model was of one segment's tokens (mean of their
+/// probabilities) — the signal [`is_stock_hallucination`] is only ever
+/// consulted together with. 0.0 for a segment with no scored tokens.
+fn segment_mean_p(seg: &whisper_rs::WhisperSegment<'_>) -> f32 {
+    let mut sum = 0f32;
+    let mut n = 0usize;
+    for j in 0..seg.n_tokens() {
+        let Some(tok) = seg.get_token(j) else { continue };
+        // Specials ("[_BEG_]", "<|endoftext|>") are not words and carry no
+        // evidence about the text.
+        if tok.to_bytes().is_ok_and(|b| b.starts_with(b"[_") || b.starts_with(b"<|")) {
+            continue;
+        }
+        sum += tok.token_data().p;
+        n += 1;
+    }
+    if n > 0 {
+        sum / n as f32
+    } else {
+        0.0
+    }
 }
 
 /// The classic Whisper hallucinations: phrases the model emits from noise,
@@ -493,7 +520,7 @@ pub fn transcribe_segments(
         // dressed as text. A REAL "thank you" decodes confidently and stays —
         // this pair of conditions is what the old unconditional confidence
         // floor got wrong in both directions.
-        if is_stock_hallucination(&text) && mean_p < 0.5 {
+        if is_stock_hallucination(&text) && mean_p < STOCK_MAX_CONFIDENCE {
             continue;
         }
         // The REFERENCE silence rule (openai / faster-whisper / whisper.cpp
@@ -550,6 +577,26 @@ mod tests {
         assert_eq!(media_kind("video/mp4", "mp4"), Some(MediaKind::Video));
         assert_eq!(media_kind("application/pdf", "pdf"), None);
         assert_eq!(media_kind("image/png", "png"), None);
+    }
+
+    /// "Free the space" has to be able to tell whether the mapping actually
+    /// went away. The exit-path unload swallows a busy context on purpose, so
+    /// deleting the model while a transcription held it reported success and
+    /// freed nothing at all — for the rest of the session.
+    #[test]
+    fn unload_model_says_when_a_decode_still_holds_the_weights() {
+        let model = std::path::Path::new("/nonexistent/whisper-model.bin");
+        // Nothing warm — or somebody else's model warm — is nothing to do.
+        assert!(unload_model(model), "an idle context read as busy");
+
+        let held = CTX.lock().expect("stt context poisoned");
+        assert!(
+            !unload_model(model),
+            "a transcription holding the weights read as freed, and the \
+             megabytes stay held until the app quits"
+        );
+        drop(held);
+        assert!(unload_model(model));
     }
 
     #[test]

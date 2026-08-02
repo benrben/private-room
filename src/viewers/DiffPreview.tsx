@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import monaco from "./monacoSetup";
+import monaco, { monacoTheme, watchMonacoTheme } from "./monacoSetup";
 
 interface Props {
   before: string;
@@ -20,7 +20,7 @@ export default function DiffPreview({ before, after, clipped, language }: Props)
     if (!hostRef.current) return;
     const wide = hostRef.current.clientWidth >= 720;
     const editor = monaco.editor.createDiffEditor(hostRef.current, {
-      theme: "vs-dark",
+      theme: monacoTheme(),
       readOnly: true,
       renderSideBySide: wide,
       automaticLayout: true,
@@ -41,6 +41,9 @@ export default function DiffPreview({ before, after, clipped, language }: Props)
     // Mount-once: the parent keys each card by request id.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Follow the app's light/dark switch instead of staying black in light mode.
+  useEffect(watchMonacoTheme, []);
 
   return (
     <div className="diff-preview">

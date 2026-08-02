@@ -29,7 +29,6 @@ import type {
   WorkflowTemplate,
   WorkflowNodeEvent,
   ScriptInfo,
-  ScriptManifest,
   ScriptApproveRequest,
   SkillSummary,
   SkillBundle,
@@ -95,6 +94,14 @@ export const api = {
   touchIdDisable: (path: string) => invoke<void>("touchid_disable", { path }),
   touchIdOpen: (path: string) => invoke<RoomInfo>("touchid_open", { path }),
   roomInfo: () => invoke<RoomInfo | null>("room_info"),
+  /** Rename the open room. The name lives in the room's own encrypted `meta`
+   *  table, not in the file path — renaming the `.roomai` in Finder changes
+   *  nothing — so this command is the only way to change it. It writes both
+   *  copies (the room's `meta` and the recents entry for this path) and returns
+   *  the refreshed RoomInfo; feed that straight back into the shell's `info` so
+   *  the top bar updates without a reopen. The name is trimmed; empty or over
+   *  120 characters is rejected, as is a rename during a checkpoint rollback. */
+  renameRoom: (name: string) => invoke<RoomInfo>("rename_room", { name }),
   takePendingOpen: () => invoke<string | null>("take_pending_open"),
   importFiles: (paths: string[]) => invoke<ImportReport>("import_files", { paths }),
   listFiles: () => invoke<FileMeta[]>("list_files"),
@@ -188,7 +195,6 @@ export const api = {
   // webview, so these only drive its chrome — position, navigation, takeover,
   // and the room-side journal of what the agent did.
   browserNavigate: (url: string) => invoke<string>("browser_navigate", { url }),
-  browserClose: () => invoke<void>("browser_close"),
   /** Open another page. Pass "" for an empty tab. Returns its id. */
   browserNewTab: (url: string) => invoke<string>("browser_new_tab", { url }),
   /** Show one page and park the rest — no webview is created or destroyed, so
@@ -304,26 +310,22 @@ export const api = {
     invoke<McpServerStatus[]>("mcp_remove_server", { server }),
   // Per-connector tool opt-outs: `{ server: [disabled tool names] }`. Toggling a
   // tool off keeps the connector but hides that tool from the assistant.
-  mcpGetToolPrefs: async (): Promise<Record<string, string[]>> => {
-    try {
-      return JSON.parse(await invoke<string>("mcp_get_tool_prefs")) as Record<string, string[]>;
-    } catch {
-      return {};
-    }
-  },
+  // Both REJECT when the backend (or the JSON) fails. They used to answer `{}`,
+  // which reads as "nothing is turned off" — so a failed toggle redrew every
+  // switched-off tool as ON while the file on disk still said otherwise.
+  mcpGetToolPrefs: async (): Promise<Record<string, string[]>> =>
+    JSON.parse(await invoke<string>("mcp_get_tool_prefs")) as Record<
+      string,
+      string[]
+    >,
   mcpSetToolEnabled: async (
     server: string,
     tool: string,
     enabled: boolean,
-  ): Promise<Record<string, string[]>> => {
-    try {
-      return JSON.parse(
-        await invoke<string>("mcp_set_tool_enabled", { server, tool, enabled }),
-      ) as Record<string, string[]>;
-    } catch {
-      return {};
-    }
-  },
+  ): Promise<Record<string, string[]>> =>
+    JSON.parse(
+      await invoke<string>("mcp_set_tool_enabled", { server, tool, enabled }),
+    ) as Record<string, string[]>,
   // Wave 2 (Idea 6): answer a diff-preview approval ("once" | "turn" | "deny").
   resolveEditApproval: (id: string, decision: "once" | "turn" | "deny") =>
     invoke<void>("resolve_edit_approval", { id, decision }),
@@ -343,12 +345,6 @@ export const api = {
     instructions?: string,
     refs?: string[],
   ) => invoke<string>("start_studio_job", { kind, scope, instructions, refs }),
-  /** ADD-32: start a whole-file pass — reads the ENTIRE file window by window
-   *  in a durable background job and saves the result as a new room file.
-   *  mode "merge" folds notes into one document; "stitch" joins transformed
-   *  parts in order. Returns the job id; progress → job-progress. */
-  startFilePass: (file: string, instruction: string, mode?: "merge" | "stitch") =>
-    invoke<string>("start_file_pass", { file, instruction, mode }),
   /** Pause a running job — it checkpoints and parks as 'paused'. */
   cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
   /** Continue a paused/errored job from its checkpoint. */
@@ -356,7 +352,6 @@ export const api = {
   deleteJob: (id: string) => invoke<void>("delete_job", { id }),
   // ---- Wave 4a (Idea 2): LLM graph workflows ----
   listWorkflows: () => invoke<Workflow[]>("list_workflows"),
-  getWorkflow: (id: string) => invoke<Workflow>("get_workflow", { id }),
   getWorkflowSchedule: (id: string) =>
     invoke<Schedule | null>("get_workflow_schedule", { id }),
   workflowTemplates: () => invoke<WorkflowTemplate[]>("workflow_templates"),
@@ -403,9 +398,6 @@ export const api = {
   // ---- Wave 5 (Idea 13): runnable & schedulable scripts ----
   /** Every `.py`/`.js` room file as a script, with status/last-run/schedule. */
   listScripts: () => invoke<ScriptInfo[]>("list_scripts"),
-  /** The parsed manifest for one script (viewer header / consent card). */
-  getScriptManifest: (fileId: string) =>
-    invoke<ScriptManifest>("get_script_manifest", { fileId }),
   /** Run a script now. May raise a consent card first; returns the job id.
    *  Progress arrives via job-progress; the run is a hidden auto-workflow. */
   runScript: (fileId: string) => invoke<string>("run_script", { fileId }),
@@ -422,10 +414,39 @@ export const api = {
   // ---- Portable Agent Skills (separate from ordinary room files) ----
   listSkills: () => invoke<SkillSummary[]>("list_skills"),
   getSkill: (id: string) => invoke<SkillBundle>("get_skill", { id }),
-  createSkill: (name: string, description: string, instructions: string) =>
-    invoke<string>("create_skill", { name, description, instructions }),
-  updateSkill: (id: string, name: string, description: string, instructions: string) =>
-    invoke<void>("update_skill", { id, name, description, instructions }),
+  /** `agent` binds the skill to one domain agent (`SkillBundle.skill.agent`);
+   *  "" or omitted = general, offered to every agent. It must be a real agent id
+   *  (the SKILL_AGENT_IDS list — "files.read", "chat.web", …), never free text:
+   *  an id nobody answers to binds the skill to no agent at all, so it lists and
+   *  enables and is then offered to nobody. Any picker wired up here has to send
+   *  an id from that list. */
+  createSkill: (
+    name: string,
+    description: string,
+    instructions: string,
+    agent?: string,
+  ) =>
+    invoke<string>("create_skill", {
+      name,
+      description,
+      instructions,
+      agent: agent ?? null,
+    }),
+  /** Omitting `agent` leaves the existing binding alone — pass "" to clear it. */
+  updateSkill: (
+    id: string,
+    name: string,
+    description: string,
+    instructions: string,
+    agent?: string,
+  ) =>
+    invoke<void>("update_skill", {
+      id,
+      name,
+      description,
+      instructions,
+      agent: agent ?? null,
+    }),
   setSkillEnabled: (id: string, enabled: boolean) =>
     invoke<void>("set_skill_enabled", { id, enabled }),
   deleteSkill: (id: string) => invoke<void>("delete_skill", { id }),
@@ -495,7 +516,7 @@ export const api = {
   handoffContext: (chatId: string) => invoke<Message>("handoff_chat", { chatId }),
   /** Run a prebuilt "#name" workflow. `refs` are @-pinned file ids; `raw` is
    *  the full line the user typed (saved verbatim as the user message). Streams
-   *  the same ask-delta/ask-step/ask-notice events as `ask`. */
+   *  the same ask-delta/ask-step events as `ask`. */
   runCommand: (
     chatId: string,
     command: string,
@@ -512,21 +533,24 @@ export const api = {
   // ADD-18: store an in-room voice note; transcribes in the background.
   importAudioBytes: (name: string, b64: string) =>
     invoke<FileMeta>("import_audio_bytes", { name, b64 }),
+  /** Ask the vision model where `query` is in an image; boxes come back in
+   *  0-1000 coordinates, so nothing here depends on the on-screen size.
+   *  The old measured `imgWidth`/`imgHeight` are GONE from the command — it is
+   *  `locate_in_image(fileId, query)` now (vision.rs), and the sidecar stretches
+   *  the original bytes itself. The two trailing parameters survive only so the
+   *  last caller that still measures the element keeps compiling: they are
+   *  ignored here and nothing is sent for them. Don't measure to fill them in,
+   *  and drop them from any new call. */
   locateInImage: (
     fileId: string,
     query: string,
-    imgWidth: number,
-    imgHeight: number,
-  ) =>
-    invoke<ImageBox[]>("locate_in_image", { fileId, query, imgWidth, imgHeight }),
+    _legacyImgWidth?: number,
+    _legacyImgHeight?: number,
+  ) => invoke<ImageBox[]>("locate_in_image", { fileId, query }),
   // ---- ADD-18: on-device dictation & transcription (Whisper built in) ----
   sttStatus: () => invoke<SttStatus>("stt_status"),
   sttDownloadModel: () => invoke<void>("stt_download_model"),
   sttDeleteModel: () => invoke<void>("stt_delete_model"),
-  /** Transcribe recorded audio bytes on-device. Rejects with STT_MODEL_MISSING
-   *  when the dictation model hasn't been downloaded yet (Settings → AI). */
-  transcribeAudio: (dataB64: string, ext: string, timestamps: boolean) =>
-    invoke<string>("transcribe_audio", { dataB64, ext, timestamps }),
   /** Re-run on-device transcription for a stored audio/video file, replacing its
    *  transcript. Queues on the same STT lane as import; progress arrives via the
    *  usual `stt-progress` events. Rejects for non-media files. */
@@ -608,8 +632,7 @@ export const api = {
   onAskDelta: (cb: (delta: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-delta", (e) => cb(e.payload)),
   // CHG-5: structured turn events. `ask-step` fires when a tool runs;
-  // `ask-round` fires when a new model round starts (clear the live text);
-  // `ask-notice` carries a user-facing warning (e.g. UX-4 truncation).
+  // `ask-round` fires when a new model round starts (clear the live text).
   // Two payload shapes reach this event: the sidecar sends {label, node} so a
   // step can be attributed to the agent that ran it, while the many other
   // emitters (chat commands, ai_actions, the native agent paths) send a bare
@@ -643,6 +666,10 @@ export const api = {
     ),
   onAskRound: (cb: () => void): Promise<UnlistenFn> =>
     listen("ask-round", () => cb()),
+  /** DEAD PLUMBING — nothing in the host or the AI service emits "ask-notice"
+   *  (grep: this listener and effects.ts are its only mentions). Delete this
+   *  together with the effects.ts subscription; kept for now only so the
+   *  workspace's teardown list keeps compiling. */
   onAskNotice: (cb: (text: string) => void): Promise<UnlistenFn> =>
     listen<string>("ask-notice", (e) => cb(e.payload)),
   // PRIV-1: what the privacy door did on this turn ("N details hidden"), or
@@ -814,11 +841,8 @@ export const api = {
     invoke<FeedbackDraft>("feedback_draft", { text }),
   appDiag: () => invoke<AppDiag>("app_diag"),
 
-  // ADD-26: download a YouTube video into the room (yt-dlp on first use).
-  importYoutubeVideo: (url: string) =>
-    invoke<ImportReport>("import_youtube_video", { url }),
-  /** BROWSE-2: the same download for ANY yt-dlp-supported site (yt-dlp
-   *  fetched on first use). Emits the same ytdlp-progress events. */
+  /** ADD-26 / BROWSE-2: download a video or audio page into the room via
+   *  yt-dlp (fetched on first use), YouTube included. Emits ytdlp-progress. */
   importMediaUrl: (url: string) =>
     invoke<ImportReport>("import_media_url", { url }),
   onYtdlpProgress: (
@@ -867,37 +891,12 @@ export const frontPageSuggestions = () =>
 
 export const studioPrompts = () => invoke<StudioPrompts>("studio_prompts");
 
-/** D5: build a self-contained flashcard deck (.html); opens in HtmlView.
- *  `instructions` is the user-edited prompt; `refs` are file ids from any
- *  @-mentioned files/folders (omit to use the current scope / whole room). */
-export const studioFlashcards = (
-  scope?: string,
-  instructions?: string,
-  refs?: string[],
-  opId?: string,
-) => invoke<FileMeta>("studio_flashcards", { scope, instructions, refs, opId });
-
-/** D5: build a self-contained mind map (.html). */
-export const studioMindmap = (
-  scope?: string,
-  instructions?: string,
-  refs?: string[],
-  opId?: string,
-) => invoke<FileMeta>("studio_mindmap", { scope, instructions, refs, opId });
-
-/** D12: render a two-host podcast script (.html); script only, no audio. */
-export const generatePodcastScript = (
-  scope?: string,
-  instructions?: string,
-  refs?: string[],
-  opId?: string,
-) =>
-  invoke<FileMeta>("generate_podcast_script", {
-    scope,
-    instructions,
-    refs,
-    opId,
-  });
+/* The one-shot Studio builders (`studio_flashcards`, `studio_mindmap`,
+ * `generate_podcast_script`) and the whole-file pass (`start_file_pass`) have
+ * no front-end wrapper on purpose: the screens run them as durable background
+ * jobs through `api.startStudioJob` / the jobs panel, and the assistant reaches
+ * the one-shot commands as tools. A wrapper here would only be a second, unused
+ * way in. */
 
 /** D6: does this chat's last exchange hold a fact worth remembering? */
 export const memorySuggestion = (chatId: string) =>
@@ -946,10 +945,16 @@ export const hasRecoveryKey = (path: string) =>
 export const openRoomWithRecovery = (path: string, code: string) =>
   invoke<RoomInfo>("open_room_with_recovery", { path, code });
 
+/** The app's one human file size. Carries on past MB — a 2 GB recording used to
+ * read "2048.0 MB". */
 export function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  const KB = 1024;
+  const MB = KB * 1024;
+  const GB = MB * 1024;
+  if (bytes < KB) return `${bytes} B`;
+  if (bytes < MB) return `${(bytes / KB).toFixed(1)} KB`;
+  if (bytes < GB) return `${(bytes / MB).toFixed(1)} MB`;
+  return `${(bytes / GB).toFixed(1)} GB`;
 }
 
 export type FileKind =

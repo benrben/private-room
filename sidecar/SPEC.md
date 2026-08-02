@@ -96,7 +96,7 @@ substring matches (hint lists include Hebrew stems). Erring toward YES is safe.
   the main thread. A hub guard rejects any direct room-tool call from the
   main agent before it reaches the bridge. Delegation is NOT capped by count —
   `MAX_WORKER_CALLS` was deleted with the rest of the per-agent budgets. The
-  bound is `config.TURN_ROUND_BUDGET` (64): a whole-ask ceiling on model
+  bound is `config.TURN_ROUND_BACKSTOP` (400): a whole-ask runaway net on model
   rounds, spent by every loop in the tree through `Deps.spend_round`, because
   `max_rounds` bounds ONE loop and every delegated child starts a fresh one at
   round 0. Exhausting it aborts nothing — every remaining round is served

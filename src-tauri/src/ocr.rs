@@ -75,9 +75,56 @@ mod mac {
     /// Render PDFs at 2x the point size so small scanned type is legible to the
     /// recognizer.
     const PDF_RENDER_SCALE: f64 = 2.0;
-    /// Bound work on huge documents; OCR runs in the background but a 500-page
-    /// scan shouldn't spin forever. The rest of the file is left un-OCR'd.
-    const MAX_PDF_PAGES: usize = 50;
+    /// Bound work on huge documents; OCR runs in the background, but it should
+    /// not read a library. Whatever this cuts is REPORTED in the text — the old
+    /// 50-page limit meant a 200-page scan looked like it had worked while
+    /// three quarters of it was missing from search and from every answer.
+    const MAX_PDF_PAGES: usize = 500;
+    /// Ceiling on one rasterized page. 40 MP is ~160 MB for the RGBA bitmap,
+    /// and the tight repack plus the PNG encode each cost about as much again.
+    /// The old guard was per-dimension (20 000 × 20 000), which allowed a
+    /// 1.6 GB allocation and then two more copies of it. A poster- or map-sized
+    /// page is rendered at a reduced scale rather than skipped outright.
+    const MAX_PAGE_PIXELS: f64 = 40_000_000.0;
+    /// Ceiling on EITHER edge of a rasterized page. Area alone bounds neither
+    /// side: a page whose media box declares 250 000 000 × 0.001 pt has a
+    /// trivial area, so the area cap leaves the scale at 2.0 and CoreGraphics is
+    /// asked for a 500 000 000 × 1 bitmap — 2 GB it then fills with white,
+    /// followed by another 2 GB for the tight repack. The bytes are
+    /// attacker-supplied: OCR runs on any text-less PDF that arrives by import
+    /// or by download.
+    const MAX_PAGE_EDGE: f64 = 20_000.0;
+
+    /// Bitmap size (and the scale that produced it) for one page's media box,
+    /// or `None` when there is nothing drawable. Pure, so both caps are
+    /// testable without a PDF.
+    fn page_raster_size(page_w: f64, page_h: f64) -> Option<(usize, usize, f64)> {
+        let mut scale = PDF_RENDER_SCALE;
+        let pixels = page_w * page_h * scale * scale;
+        if pixels > MAX_PAGE_PIXELS {
+            scale *= (MAX_PAGE_PIXELS / pixels).sqrt();
+        }
+        // Then clamp each edge on its own, so a degenerate media box can't slip
+        // an enormous single dimension past the area cap.
+        for edge in [page_w, page_h] {
+            if edge * scale > MAX_PAGE_EDGE {
+                scale = MAX_PAGE_EDGE / edge;
+            }
+        }
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        let edge_px = MAX_PAGE_EDGE as usize;
+        // `.min` rather than a bare check: rounding up can leave the product a
+        // hair over the clamp, and clipping a sub-pixel is better than refusing
+        // a legitimately poster-sized page.
+        let width = ((page_w * scale).ceil() as usize).min(edge_px);
+        let height = ((page_h * scale).ceil() as usize).min(edge_px);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        Some((width, height, scale))
+    }
 
     /// OCR an image's encoded bytes (PNG/JPEG/HEIC/TIFF/… — anything CoreImage
     /// can decode) via a data-backed Vision request handler.
@@ -100,7 +147,8 @@ mod mac {
         let cf_data = CFData::from_bytes(bytes);
         let provider = CGDataProvider::with_cf_data(Some(&cf_data))?;
         let doc = CGPDFDocument::with_provider(Some(&provider))?;
-        let pages = CGPDFDocument::number_of_pages(Some(&doc)).min(MAX_PDF_PAGES);
+        let total_pages = CGPDFDocument::number_of_pages(Some(&doc));
+        let pages = total_pages.min(MAX_PDF_PAGES);
         if pages == 0 {
             return None;
         }
@@ -119,21 +167,28 @@ mod mac {
             }
         }
         if out.trim().is_empty() {
-            None
-        } else {
-            Some(out)
+            return None;
         }
+        // Say so when the rest of the document was left unread, so neither the
+        // reader nor the model treats a partial scan as the whole file.
+        if total_pages > pages {
+            out.push_str(&format!(
+                "\n\n[only the first {pages} of {total_pages} pages of this scan were read]"
+            ));
+        }
+        Some(out)
     }
 
     /// Draw one PDF page onto a white RGBA bitmap and hand back PNG bytes.
     fn render_pdf_page_png(doc: &CGPDFDocument, page_number: usize) -> Option<Vec<u8>> {
         let page: CFRetained<CGPDFPage> = CGPDFDocument::page(Some(doc), page_number)?;
         let media: CGRect = CGPDFPage::box_rect(Some(&page), CGPDFBox::MediaBox);
-        let width = (media.size.width * PDF_RENDER_SCALE).ceil() as usize;
-        let height = (media.size.height * PDF_RENDER_SCALE).ceil() as usize;
-        if width == 0 || height == 0 || width > 20_000 || height > 20_000 {
-            return None;
-        }
+        let page_w = media.size.width.max(0.0);
+        let page_h = media.size.height.max(0.0);
+        // Scale DOWN an unusually large page rather than refusing it: the point
+        // of the 2x render is legibility, and half the legibility of a poster
+        // still reads far better than nothing at all.
+        let (width, height, scale) = page_raster_size(page_w, page_h)?;
 
         let color_space = CGColorSpace::new_device_rgb()?;
         let bits_per_component = 8usize;
@@ -175,7 +230,7 @@ mod mac {
             CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(width as f64, height as f64)),
         );
         // Map PDF user space (origin at the media box, unscaled) into the bitmap.
-        CGContext::scale_ctm(Some(ctx_ref), PDF_RENDER_SCALE, PDF_RENDER_SCALE);
+        CGContext::scale_ctm(Some(ctx_ref), scale, scale);
         CGContext::translate_ctm(Some(ctx_ref), -media.origin.x, -media.origin.y);
         CGContext::draw_pdf_page(Some(ctx_ref), Some(&page));
 
@@ -201,14 +256,54 @@ mod mac {
         Some(png)
     }
 
-    /// Configure a text-recognition request (English + Hebrew, accurate level),
-    /// run it against `handler`, and collect the best candidate per text block.
+    /// Scripts worth offering the recognizer, in priority order. Only English
+    /// and Hebrew used to be requested, so a scan in Russian, Chinese, Japanese
+    /// or Arabic came back completely empty, and a French or German page was
+    /// read AS English — which mangles its accented words.
+    ///
+    /// These are language PREFIXES, matched against whatever this Mac reports
+    /// as supported; the device's own identifiers are what gets passed back.
+    /// Handing Vision a code it doesn't know makes it refuse the entire
+    /// request, which is exactly how "OCR found nothing" happens silently.
+    const WANTED_LANGUAGE_PREFIXES: &[&str] = &[
+        "en", "he", "fr", "de", "es", "it", "pt", "nl", "ru", "uk", "ar", "ars", "zh", "yue",
+        "ja", "ko", "th", "vi", "pl", "tr",
+    ];
+
+    /// The subset of [`WANTED_LANGUAGE_PREFIXES`] this Mac actually supports,
+    /// as its own identifiers, in our priority order.
+    fn available_languages(request: &VNRecognizeTextRequest) -> Vec<Retained<NSString>> {
+        let Ok(supported) = (unsafe { request.supportedRecognitionLanguagesAndReturnError() })
+        else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = supported.iter().map(|s| s.to_string()).collect();
+        let mut chosen: Vec<String> = Vec::new();
+        for want in WANTED_LANGUAGE_PREFIXES {
+            for id in &ids {
+                let base = id.split('-').next().unwrap_or(id);
+                if base == *want && !chosen.contains(id) {
+                    chosen.push(id.clone());
+                }
+            }
+        }
+        chosen.iter().map(|id| NSString::from_str(id)).collect()
+    }
+
+    /// Configure a text-recognition request (accurate level, every script this
+    /// Mac can read), run it against `handler`, and collect the best candidate
+    /// per text block.
     fn run_recognition(handler: &VNImageRequestHandler) -> Option<String> {
         let request = VNRecognizeTextRequest::new();
         request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
         request.setUsesLanguageCorrection(true);
-        let langs = NSArray::from_retained_slice(&[NSString::from_str("en"), NSString::from_str("he")]);
-        request.setRecognitionLanguages(&langs);
+        // Let Vision work out which script it is looking at rather than being
+        // told it is always English; the list below is the priority hint.
+        request.setAutomaticallyDetectsLanguage(true);
+        let langs = available_languages(&request);
+        if !langs.is_empty() {
+            request.setRecognitionLanguages(&NSArray::from_retained_slice(&langs));
+        }
 
         let request_ref: &VNRequest = &request;
         let requests = NSArray::from_slice(&[request_ref]);
@@ -231,6 +326,45 @@ mod mac {
             None
         } else {
             Some(lines.join("\n"))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{page_raster_size, MAX_PAGE_EDGE, MAX_PAGE_PIXELS, PDF_RENDER_SCALE};
+
+        #[test]
+        fn a_degenerate_media_box_cannot_ask_for_a_gigabyte_bitmap() {
+            // Regression: the per-dimension guard was replaced by an area cap
+            // alone, and area bounds NEITHER side. /MediaBox [0 0 250000000
+            // 0.001] has an area of 250 000 pt², so the cap left the scale at
+            // 2.0 and the render asked CoreGraphics for 500 000 000 × 1 — a
+            // 2 GB context, plus another 2 GB for `vec![0u8; w*h*4]`.
+            for (w, h) in [(250_000_000.0, 0.001), (0.001, 250_000_000.0)] {
+                let (width, height, _) = page_raster_size(w, h).expect("still renderable");
+                assert!(width as f64 <= MAX_PAGE_EDGE, "width {width} unbounded");
+                assert!(height as f64 <= MAX_PAGE_EDGE, "height {height} unbounded");
+                assert!(
+                    (width * height) as f64 <= MAX_PAGE_PIXELS,
+                    "{width}×{height} past the area cap"
+                );
+            }
+        }
+
+        #[test]
+        fn ordinary_and_poster_pages_still_render() {
+            // A4 at 72dpi: rendered at the full 2x, untouched by either cap.
+            let (w, h, scale) = page_raster_size(595.0, 842.0).expect("A4 renders");
+            assert_eq!(scale, PDF_RENDER_SCALE);
+            assert_eq!((w, h), (1190, 1684));
+            // A wall-sized plan: scaled DOWN by the area cap, not refused.
+            let (w, h, scale) = page_raster_size(5000.0, 7000.0).expect("poster renders");
+            assert!(scale < PDF_RENDER_SCALE && scale > 0.0, "scale {scale}");
+            // Rounding each edge UP can put the product a pixel-row over.
+            assert!((w * h) as f64 <= MAX_PAGE_PIXELS + (w + h) as f64, "{w}×{h}");
+            // Nothing drawable at all.
+            assert!(page_raster_size(0.0, 0.0).is_none());
+            assert!(page_raster_size(f64::MAX, f64::MAX).is_none());
         }
     }
 }

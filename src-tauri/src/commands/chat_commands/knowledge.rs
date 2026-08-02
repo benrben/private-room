@@ -66,6 +66,12 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     let lower = a.to_lowercase();
     if let Some(pos) = lower.find("for each") {
         let subject = a[pos + "for each".len()..].trim().trim_start_matches(':').trim();
+        // Full ops: reduce the conversation ONCE, up front. It was attached whole
+        // to the enumeration call and then again to every per-file call — twenty
+        // files meant twenty copies of the chat, and on a small local model the
+        // instruction fell out of the window behind it. A chat that already fits
+        // one call is passed through untouched, so the common case is unchanged.
+        let history = ctx.digest(ctx.history, "Reading the conversation").await;
         // Enumerate: the one genuinely fuzzy step. MIGRATION Phase 3: the prompt,
         // schema and `parse_string_list` (dedupe, no cap — a 20-item list makes 20
         // files) live in the sidecar's /knowledge_extract mode:list, which returns
@@ -76,7 +82,7 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
             "base_url": ollama::resolved_base_url(),
             "mode": "list",
             "subject": subject,
-            "conversation": ctx.history,
+            "conversation": history,
             "temperature": 0.0,
             "keep_alive": KEEP_ALIVE_WARM,
         });
@@ -111,7 +117,7 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
                 "base_url": ollama::resolved_base_url(),
                 "mode": "each",
                 "item": item,
-                "history": ctx.history,
+                "history": history,
                 "temperature": 0.4,
                 "keep_alive": KEEP_ALIVE_WARM,
             });
@@ -300,20 +306,29 @@ fn tabular_field_rows(name: &str, text: &str, fields: &[String]) -> Option<Vec<V
     Some(rows)
 }
 
+/// Strip the trailing "from"/"in"/"of" the UI leaves behind after removing the
+/// @tokens — but only as a WHOLE WORD. `trim_end_matches` matches the bare
+/// letters anywhere at the end, which turned the last requested field "margin"
+/// into "marg", "origin" into "orig" and "proof" into "pro", so the sheet came
+/// back with a mangled column the model could never fill.
+fn strip_trailing_preposition(args: &str) -> &str {
+    let s = args.trim_end();
+    for word in ["from", "in", "of"] {
+        if let Some(rest) = s.strip_suffix(word) {
+            if rest.is_empty() || rest.ends_with(char::is_whitespace) {
+                return rest.trim_end();
+            }
+        }
+    }
+    s
+}
+
 pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     use tauri::Emitter;
     if ctx.refs.is_empty() {
         return Err("Add files with @ — e.g. #extract revenue, CEO from @a.pdf @b.pdf".into());
     }
-    // Strip a trailing "from"/"in"/"of" the UI leaves after removing @tokens.
-    let fields_str = ctx
-        .args
-        .trim()
-        .trim_end_matches(|c: char| c.is_whitespace())
-        .trim_end_matches("from")
-        .trim_end_matches("in")
-        .trim_end_matches("of")
-        .trim();
+    let fields_str = strip_trailing_preposition(ctx.args.trim());
     let fields: Vec<String> = fields_str
         .split(',')
         .map(|f| f.trim().to_string())
@@ -451,6 +466,20 @@ mod tests {
         let csv = "product,revenue\nWidget A,2398.80\n";
         // Same content, non-tabular extension → not treated as a table.
         assert!(tabular_field_rows("notes.md", csv, &s(&["product", "revenue"])).is_none());
+    }
+
+    #[test]
+    fn trailing_preposition_only_strips_a_whole_word() {
+        // The UI leaves the preposition behind after removing the @tokens.
+        assert_eq!(strip_trailing_preposition("revenue, CEO from"), "revenue, CEO");
+        assert_eq!(strip_trailing_preposition("revenue in "), "revenue");
+        assert_eq!(strip_trailing_preposition("share of"), "share");
+        // …but a field that merely ENDS in those letters keeps them.
+        assert_eq!(strip_trailing_preposition("gross margin"), "gross margin");
+        assert_eq!(strip_trailing_preposition("country of origin"), "country of origin");
+        assert_eq!(strip_trailing_preposition("burden of proof"), "burden of proof");
+        // Nothing but the preposition leaves nothing (the caller then errors).
+        assert_eq!(strip_trailing_preposition("from"), "");
     }
 
     #[test]

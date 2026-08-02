@@ -36,12 +36,57 @@ impl Drop for LiveSession {
 /// The engine can finish WITHOUT a command (3-hour ceiling, room closed under
 /// it). Its session entry would then sit stale, telling the next rec_start "a
 /// recording is already running" forever — so every reader clears it lazily.
+/// Both terminal states count: a session whose final write FAILED is just as
+/// over as one that saved, and refusing every later recording would be a
+/// second failure on top of the first.
 fn clear_finished(session: &mut Option<LiveSession>) {
-    if session
-        .as_ref()
-        .is_some_and(|l| l.handle.shared.status.lock().unwrap().as_str() == "saved")
-    {
+    if session.as_ref().is_some_and(|l| {
+        matches!(l.handle.shared.status.lock().unwrap().as_str(), "saved" | "failed")
+    }) {
         *session = None;
+    }
+}
+
+/// A long recording job's Stop flag (rebuild, translate). Registered in the
+/// SAME cancel registry chat's Stop uses (`AppState::cancels`), keyed by the
+/// recording's own file id — so `cancel_ask(fileId)` stops one with no new
+/// command to invoke, and the two places that already flip every flag in that
+/// registry (`close_room`, `teardown_open_room`) stop it too: a rebuild used
+/// to keep grinding for minutes against a room that was being torn down, and
+/// then fail on the write.
+///
+/// The entry is removed on every return path, but only when it is still the
+/// one THIS job registered. A second long job on the same recording replaces
+/// it, and an unconditional remove would then delete the newer job's flag —
+/// leaving it unstoppable and the registry claiming work that has finished
+/// (every room-busy check in the app reads that map by emptiness).
+struct RecStop<'a> {
+    state: &'a AppState,
+    key: String,
+    flag: Arc<AtomicBool>,
+}
+
+impl<'a> RecStop<'a> {
+    fn register(state: &'a AppState, key: &str) -> Self {
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Ok(mut m) = state.cancels.lock() {
+            m.insert(key.to_string(), flag.clone());
+        }
+        RecStop { state, key: key.to_string(), flag }
+    }
+
+    fn stopped(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for RecStop<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.state.cancels.lock() {
+            if m.get(&self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flag)) {
+                m.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -72,8 +117,22 @@ pub struct RecFile {
     pub meta: RecMeta,
 }
 
-fn parse_meta(json: Option<String>) -> RecMeta {
-    json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+/// A file's recording metadata. No row at all is a plain audio file (or a
+/// brand-new recording) — an empty meta is the honest answer. A row that
+/// cannot be READ is something else entirely, and used to look identical:
+/// callers saw an empty transcript, and Resume then wrote that emptiness over
+/// the stored one with no version snapshot to undo it. So it is an error.
+fn parse_meta(json: Option<String>) -> Result<RecMeta, String> {
+    match json {
+        None => Ok(RecMeta::default()),
+        Some(j) => serde_json::from_str(&j).map_err(|e| {
+            format!(
+                "This recording's transcript data can't be read ({e}). \
+                 Its audio is intact — use History to restore an earlier version, \
+                 or rebuild the transcript from the audio."
+            )
+        }),
+    }
 }
 
 /// Start recording — either a brand-new recording file or resuming an
@@ -121,7 +180,7 @@ pub fn rec_start(
         // Resume an existing recording file where it left off.
         Some(id) => {
             let (name, _mime, bytes, _text) = db::get_file_full(&room.conn, &id)?;
-            let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+            let meta = parse_meta(db::get_rec_meta(&room.conn, &id))?;
             let base = match bytes {
                 Some(b) if !b.is_empty() => recording::decode_wav(&b)
                     .map_err(|e| format!("This file can't be continued: {e}"))?,
@@ -208,8 +267,12 @@ fn spawn_qa_sys_feeder(tx: std::sync::mpsc::Sender<EngineMsg>, wav_path: String)
 /// Microphone PCM from the WebView's AudioWorklet: little-endian f32 samples,
 /// base64-packed (~250 ms per call). `rate` is the AudioContext's real rate;
 /// the engine resamples to 16 kHz.
+///
+/// `async` on purpose: a synchronous Tauri command runs on the thread that
+/// paints the window, and this one fires four times a second for the whole
+/// recording. Unpacking audio has no business there.
 #[tauri::command]
-pub fn rec_push_audio(
+pub async fn rec_push_audio(
     rec: State<'_, RecState>,
     rate: u32,
     data_b64: String,
@@ -280,6 +343,11 @@ pub fn rec_set_live_stt(rec: State<'_, RecState>, on: bool) -> Result<(), String
 /// transcript goes to version history ("Re-transcribed"). Progress arrives as
 /// `rec-retranscribe` events {fileId, doneCs, totalCs}, ending at
 /// doneCs == totalCs.
+///
+/// Stoppable: a rebuild of a long meeting runs for many minutes, so it holds a
+/// [`RecStop`] flag keyed by the recording's file id — `cancel_ask(fileId)`
+/// ends it, and so does closing the room. Nothing is written until it
+/// finishes, so a stopped rebuild leaves the transcript exactly as it was.
 #[tauri::command]
 pub async fn rec_retranscribe(
     app: tauri::AppHandle,
@@ -297,15 +365,42 @@ pub async fn rec_retranscribe(
     if !rec.retranscribing.lock().unwrap().insert(id.clone()) {
         return Err("This recording is already being re-transcribed.".into());
     }
-    let out = rec_retranscribe_inner(&app, &state, id.clone()).await;
+    let stop = RecStop::register(state.inner(), &id);
+    let out = rec_retranscribe_inner(&app, &state, id.clone(), stop.flag.clone()).await;
     rec.retranscribing.lock().unwrap().remove(&id);
     out
+}
+
+/// Fold the speaker names as they are ON DISK NOW into the ones the rebuild
+/// produced (GH #5).
+///
+/// Only what was typed SINCE the rebuild started may come back. The rest of the
+/// stored map is the pre-rebuild one, and the rebuild has already moved every
+/// name onto the label its voice ended up with (`diarize::move_names`) — so
+/// re-adding `{"Speaker 2": "Dana"}` on top of the rebuilt `{"Speaker 1":
+/// "Dana"}` puts one person on two speakers, which is the very symptom GH #5 is
+/// about. An entry counts as typed since when the snapshot did not already hold
+/// that exact name for that label, and it is added only where the rebuild left
+/// the label unnamed: a name the rebuild placed itself is the one that follows
+/// the voice.
+fn merge_typed_since(
+    rebuilt: &mut std::collections::BTreeMap<String, String>,
+    prior: &std::collections::BTreeMap<String, String>,
+    current: std::collections::BTreeMap<String, String>,
+) {
+    for (label, name) in current {
+        if prior.get(&label) == Some(&name) || rebuilt.contains_key(&label) {
+            continue;
+        }
+        rebuilt.insert(label, name);
+    }
 }
 
 async fn rec_retranscribe_inner(
     app: &tauri::AppHandle,
     state: &State<'_, AppState>,
     id: String,
+    stop: Arc<AtomicBool>,
 ) -> Result<RecMeta, String> {
     use tauri::Emitter;
     // Model resolution exactly like rec_start; the diarize weights ride along.
@@ -315,11 +410,11 @@ async fn rec_retranscribe_inner(
     recording::install_diarize_model(app);
     recording::install_vad_model(app);
 
-    let (samples, cuts, max_speakers) = state.with_room(|room| {
+    let (samples, prior) = state.with_room(|room| {
         let (_name, _mime, bytes, _text) = db::get_file_full(&room.conn, &id)?;
         let samples = recording::decode_wav(&bytes.unwrap_or_default())?;
-        let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
-        Ok((samples, meta.cuts, meta.max_speakers))
+        let prior = parse_meta(db::get_rec_meta(&room.conn, &id))?;
+        Ok((samples, prior))
     })?;
     if samples.is_empty() {
         return Err("This recording has no audio yet.".into());
@@ -327,18 +422,33 @@ async fn rec_retranscribe_inner(
 
     let progress_app = app.clone();
     let progress_id = id.clone();
-    let meta = tauri::async_runtime::spawn_blocking(move || {
-        recording::retranscribe(&model, &samples, cuts, max_speakers, |done_cs, total_cs| {
-            let _ = progress_app.emit(
-                "rec-retranscribe",
-                serde_json::json!({ "fileId": progress_id, "doneCs": done_cs, "totalCs": total_cs }),
-            );
-        })
+    // The names as they were when the rebuild started — the yardstick for
+    // spotting a rename typed while it ran (see `merge_typed_since`).
+    let prior_names = prior.speaker_names.clone();
+    let mut meta = tauri::async_runtime::spawn_blocking(move || {
+        recording::retranscribe(
+            &model,
+            &samples,
+            &prior,
+            |done_cs, total_cs| {
+                let _ = progress_app.emit(
+                    "rec-retranscribe",
+                    serde_json::json!({ "fileId": progress_id, "doneCs": done_cs, "totalCs": total_cs }),
+                );
+            },
+            move || stop.load(Ordering::SeqCst),
+        )
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
 
     state.with_room(|room| {
+        // A rename that landed WHILE this rebuild was running would otherwise
+        // be overwritten by the snapshot it started from — the names typed
+        // since are the newest ones, so they win (GH #5).
+        if let Ok(current) = parse_meta(db::get_rec_meta(&room.conn, &id)) {
+            merge_typed_since(&mut meta.speaker_names, &prior_names, current.speaker_names);
+        }
         // Same bytes, new transcript — through the single snapshotting write
         // path, so the old transcript stays recoverable via History.
         let bytes = db::get_file_bytes(&room.conn, &id)?.unwrap_or_default();
@@ -355,21 +465,36 @@ async fn rec_retranscribe_inner(
     Ok(meta)
 }
 
-/// Stop and save. Waits for the tail phrases to finish transcribing (the
-/// engine drains its decoder before flushing), so the returned meta is final.
+/// Stop and save. Waits for the tail phrases to finish transcribing and for
+/// the whole-recording speaker pass (the engine drains its decoder before
+/// flushing), so the returned meta is final.
+///
+/// There is deliberately NO wall-clock deadline here. The work at the end of
+/// a stop grows with the recording's length — a long meeting's speaker pass
+/// alone runs for minutes — and the old two-minute cap turned that into
+/// "Saving the recording timed out." on recordings that were saving perfectly
+/// and finished moments later. The wait ends when the engine answers or when
+/// the engine is gone; `rec-save-progress` events name the phase throughout.
 #[tauri::command]
 pub async fn rec_stop(rec: State<'_, RecState>) -> Result<RecMeta, String> {
-    let done_rx = {
+    let (done_rx, shared) = {
         let mut guard = rec.session.lock().unwrap();
         let live = guard.take().ok_or("No live recording.")?;
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let _ = live.handle.tx.send(EngineMsg::Stop { done: done_tx });
-        done_rx
+        (done_rx, live.handle.shared.clone())
     };
     tauri::async_runtime::spawn_blocking(move || {
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(120))
-            .map_err(|_| "Saving the recording timed out.".to_string())?
+        match done_rx.recv() {
+            Ok(result) => result,
+            // The engine is gone without answering: it stopped itself first
+            // (the 3-hour ceiling, or the room closing under it) and left its
+            // verdict behind. Reporting a timeout for a recording that saved
+            // fine is exactly what that used to look like.
+            Err(_) => shared.outcome.lock().unwrap().clone().unwrap_or_else(|| {
+                Err("The recording engine stopped before it could save.".to_string())
+            }),
+        }
     })
     .await
     .map_err(|e| e.to_string())?
@@ -399,7 +524,7 @@ pub fn rec_live_status(rec: State<'_, RecState>) -> Option<RecLive> {
 pub fn rec_get(state: State<'_, AppState>, id: String) -> Result<RecFile, String> {
     state.with_room(|room| {
         let name = db::get_file_name(&room.conn, &id)?;
-        let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+        let meta = parse_meta(db::get_rec_meta(&room.conn, &id))?;
         Ok(RecFile { name, meta })
     })
 }
@@ -428,7 +553,7 @@ pub fn rec_set_speaker_name(
     // A name long enough to blow out the transcript prefix is a paste accident.
     let name = name.trim().chars().take(60).collect::<String>();
     state.with_room(|room| {
-        let mut meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+        let mut meta = parse_meta(db::get_rec_meta(&room.conn, &id))?;
         if meta.segments.is_empty() {
             return Err("That recording has no transcript yet.".into());
         }
@@ -478,7 +603,7 @@ pub fn rec_delete_range(
         return Err("This recording is being re-transcribed — wait for it to finish.".into());
     }
     state.with_room(|room| {
-        let mut meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+        let mut meta = parse_meta(db::get_rec_meta(&room.conn, &id))?;
         for seg in &mut meta.segments {
             for w in &mut seg.words {
                 if w.t0 < t1 && w.t1 > t0 {
@@ -502,6 +627,11 @@ pub fn rec_delete_range(
 
 /// Render the edits into a new file: cut spans removed from the audio,
 /// timestamps re-flowed, deleted words gone. The original stays untouched.
+///
+/// The room lock is held only to READ the recording and again to write the
+/// copy. Decoding, splicing and re-encoding a multi-hour WAV in between used
+/// to happen under that lock, which froze every other thing the room does —
+/// files, chat, search — for as long as it took.
 #[tauri::command]
 pub fn rec_export_clean(
     app: tauri::AppHandle,
@@ -509,15 +639,17 @@ pub fn rec_export_clean(
     id: String,
 ) -> Result<FileMeta, String> {
     use tauri::Emitter;
-    let guard = state.room.lock().unwrap();
-    let room = guard.as_ref().ok_or("No room is open.")?;
-    let (name, _mime, bytes, _text) = db::get_file_full(&room.conn, &id)?;
-    let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+    let (name, bytes, meta) = state.with_room(|room| {
+        let (name, _mime, bytes, _text) = db::get_file_full(&room.conn, &id)?;
+        let meta = parse_meta(db::get_rec_meta(&room.conn, &id))?;
+        Ok((name, bytes, meta))
+    })?;
     if meta.cuts.is_empty() && meta.segments.iter().all(|s| s.words.iter().all(|w| !w.del)) {
         return Err("No edits to apply — delete something from the transcript first.".into());
     }
     let samples = recording::decode_wav(&bytes.unwrap_or_default())?;
     let spliced = recording::splice_out(&samples, &meta.cuts);
+    drop(samples);
 
     // Re-flow the surviving segments onto the shortened timeline.
     let mut new_meta = RecMeta {
@@ -568,15 +700,24 @@ pub fn rec_export_clean(
     let stem = name.trim_end_matches(".wav");
     let new_name = format!("{stem} (edited).wav");
     let transcript = recording::transcript_text(&new_meta);
-    let file = db::insert_file(
-        &room.conn,
-        &new_name,
-        "audio/wav",
-        &recording::encode_wav(&spliced),
-        Some(&transcript),
-        "recording",
-    )?;
-    db::set_rec_meta(&room.conn, &file.id, &serde_json::to_string(&new_meta).map_err(|e| e.to_string())?)?;
+    let wav = recording::encode_wav(&spliced);
+    drop(spliced);
+    let file = state.with_room(|room| {
+        let file = db::insert_file(
+            &room.conn,
+            &new_name,
+            "audio/wav",
+            &wav,
+            Some(&transcript),
+            "recording",
+        )?;
+        db::set_rec_meta(
+            &room.conn,
+            &file.id,
+            &serde_json::to_string(&new_meta).map_err(|e| e.to_string())?,
+        )?;
+        Ok(file)
+    })?;
     let _ = app.emit("room-files-changed", ());
     Ok(file)
 }
@@ -585,6 +726,11 @@ pub fn rec_export_clean(
 /// saved as a sibling Markdown file with the timestamps and speakers kept
 /// (Whisper *-turbo can't translate — see stt.rs — so the LLM does, batch by
 /// batch, with `rec-translate-progress` events along the way).
+///
+/// Stoppable between batches, like the rebuild: a [`RecStop`] flag keyed by the
+/// recording's file id, so `cancel_ask(fileId)` (and closing the room) ends a
+/// translation that would otherwise hold the local model for many minutes. The
+/// document is written only at the end, so stopping leaves no half file behind.
 #[tauri::command]
 pub async fn rec_translate(
     window: tauri::Window,
@@ -599,7 +745,7 @@ pub async fn rec_translate(
     }
     let (name, lines) = state.with_room(|room| {
         let name = db::get_file_name(&room.conn, &id)?;
-        let meta = parse_meta(db::get_rec_meta(&room.conn, &id));
+        let meta = parse_meta(db::get_rec_meta(&room.conn, &id))?;
         let lines: Vec<String> = meta
             .segments
             .iter()
@@ -624,7 +770,15 @@ pub async fn rec_translate(
     const BATCH: usize = 12;
     let total = lines.len().div_ceil(BATCH);
     let mut translated: Vec<String> = Vec::with_capacity(lines.len());
+    // Lines the model failed to return a translation for — kept in the
+    // original language rather than dropped, and counted so the document can
+    // say so instead of quietly being short.
+    let mut untranslated = 0usize;
+    let stop = RecStop::register(state.inner(), &id);
     for (i, batch) in lines.chunks(BATCH).enumerate() {
+        if stop.stopped() {
+            return Err("Stopped — no translated file was saved.".into());
+        }
         let _ = window.emit(
             "rec-translate-progress",
             serde_json::json!({ "fileId": id, "done": i, "total": total }),
@@ -650,12 +804,14 @@ pub async fn rec_translate(
         .await?;
         let out = strip_think_spans(&out);
         let got: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        if got.len() == batch.len() {
-            translated.extend(got.iter().map(|s| s.to_string()));
-        } else {
-            // The model broke the line contract — keep whatever it said, the
-            // words matter more than the shape.
-            translated.extend(got.iter().map(|s| s.to_string()));
+        // The model broke the one-line-per-line contract by coming up short.
+        // Whatever it did not translate keeps its ORIGINAL line: a turn that
+        // silently disappears from the translated document is worse than one
+        // that appears untranslated, and nothing warned about it before.
+        translated.extend(got.iter().map(|s| s.to_string()));
+        if got.len() < batch.len() {
+            untranslated += batch.len() - got.len();
+            translated.extend(batch[got.len()..].iter().cloned());
         }
     }
     let _ = window.emit(
@@ -665,8 +821,16 @@ pub async fn rec_translate(
 
     let stem = name.trim_end_matches(".wav");
     let out_name = format!("{stem} — {language}.md");
+    let note = if untranslated > 0 {
+        format!(
+            " {untranslated} line(s) came back untranslated and are kept in the original \
+             language — translate the file again to retry them._"
+        )
+    } else {
+        "_".into()
+    };
     let content = format!(
-        "# {stem} — {language}\n\n_Translated on this Mac from the recording's transcript._\n\n{}\n",
+        "# {stem} — {language}\n\n_Translated on this Mac from the recording's transcript.{note}\n\n{}\n",
         translated.join("\n\n")
     );
     let meta = state.with_room(|room| {
@@ -675,4 +839,113 @@ pub async fn rec_translate(
     let _ = window.emit("room-files-changed", ());
     let _ = window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
     Ok(meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A recording with no meta row is a plain audio file — empty is the
+    /// right answer. A meta row that cannot be READ is damage, and it used to
+    /// look identical: the viewer showed "no transcript", and Resume then
+    /// wrote that emptiness over the stored one with nothing to undo it.
+    #[test]
+    fn unreadable_meta_is_an_error_not_an_empty_transcript() {
+        assert_eq!(parse_meta(None).expect("no row is not damage").duration_cs, 0);
+
+        let good = r#"{"durationCs":900,"segments":[],"cuts":[],"maxSpeakers":0}"#;
+        assert_eq!(parse_meta(Some(good.into())).unwrap().duration_cs, 900);
+
+        for damaged in ["", "{", "not json at all", r#"{"durationCs":"soon"}"#] {
+            let err = parse_meta(Some(damaged.into()))
+                .expect_err("damaged meta silently became an empty transcript");
+            assert!(err.contains("can't be read"), "{err}");
+            assert!(err.contains("History"), "the message must say how to get it back: {err}");
+        }
+    }
+
+    fn names(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(l, n)| (l.to_string(), n.to_string())).collect()
+    }
+
+    /// GH #5. The rebuild moved "Dana" from Speaker 2 onto Speaker 1 (that is
+    /// where her voice ended up). Merging the stored map back in wholesale put
+    /// the old pair back beside the new one, so ONE person showed up as two
+    /// named speakers — in the viewer, in the stored transcript, and in every
+    /// translated document made from it.
+    #[test]
+    fn a_rebuild_does_not_re_add_the_pre_rebuild_speaker_name() {
+        let mut rebuilt = names(&[("Speaker 1", "Dana")]);
+        let prior = names(&[("Speaker 2", "Dana")]);
+        // Nobody renamed anything while the rebuild ran: disk == the snapshot.
+        merge_typed_since(&mut rebuilt, &prior, prior.clone());
+        assert_eq!(
+            rebuilt,
+            names(&[("Speaker 1", "Dana")]),
+            "the pre-rebuild pair came back — Dana is now two speakers"
+        );
+    }
+
+    /// …but the reason that merge exists still holds: a name typed WHILE the
+    /// rebuild was running is newer than the snapshot it started from.
+    #[test]
+    fn a_rename_typed_during_the_rebuild_survives_it() {
+        let mut rebuilt = names(&[("Speaker 1", "Dana")]);
+        let prior = names(&[("Speaker 2", "Dana")]);
+        let current = names(&[
+            ("Speaker 2", "Dana Levi"), // corrected mid-rebuild
+            ("Speaker 3", "Yossi"),     // named for the first time mid-rebuild
+        ]);
+        merge_typed_since(&mut rebuilt, &prior, current);
+        assert_eq!(rebuilt.get("Speaker 3").map(String::as_str), Some("Yossi"));
+        assert_eq!(rebuilt.get("Speaker 2").map(String::as_str), Some("Dana Levi"));
+        // The label the rebuild named itself is the one that followed the
+        // voice, so it is not overwritten by the stale map.
+        assert_eq!(rebuilt.get("Speaker 1").map(String::as_str), Some("Dana"));
+    }
+
+    /// A rebuild or a translation registers its Stop flag in the shared cancel
+    /// registry under the recording's file id, so the Stop that already exists
+    /// (`cancel_ask`) reaches it and closing the room ends it.
+    #[test]
+    fn a_long_recording_job_is_stoppable_through_the_shared_registry() {
+        let state = AppState::default();
+        let id = "rec-1".to_string();
+        {
+            let stop = RecStop::register(&state, &id);
+            assert!(!stop.stopped());
+            // What cancel_ask / close_room do to every flag in the registry.
+            state.cancels.lock().unwrap().get(&id).expect("not registered").store(true, Ordering::SeqCst);
+            assert!(stop.stopped(), "the job never saw the Stop");
+        }
+        assert!(
+            state.cancels.lock().unwrap().is_empty(),
+            "a finished job left the room looking busy forever"
+        );
+    }
+
+    /// Two long jobs on the SAME recording: the first one's guard must not
+    /// delete the second one's flag. Unconditional removal would leave the
+    /// newer job unstoppable, and — worse — the reverse case leaks an entry,
+    /// which every room-busy check (checkpoints, rollback, the summary filler)
+    /// reads as work still in flight.
+    #[test]
+    fn a_finished_job_only_clears_its_own_stop_flag() {
+        let state = AppState::default();
+        let id = "rec-1".to_string();
+        let second = {
+            let first = RecStop::register(&state, &id);
+            let second = RecStop::register(&state, &id);
+            drop(first);
+            assert!(
+                state.cancels.lock().unwrap().contains_key(&id),
+                "the older job's guard unregistered the newer job"
+            );
+            state.cancels.lock().unwrap().get(&id).unwrap().store(true, Ordering::SeqCst);
+            assert!(second.stopped());
+            second
+        };
+        drop(second);
+        assert!(state.cancels.lock().unwrap().is_empty(), "the registry leaked an entry");
+    }
 }
