@@ -22,7 +22,9 @@ fn leash_json(port: u16, token: &str, scope: &str, room: &str) -> serde_json::Va
 }
 
 /// The fixed discovery path. Home dir via tauri's resolver (no `dirs` crate).
-fn discovery_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+fn discovery_file<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<std::path::PathBuf, String> {
     use tauri::Manager;
     let home = app.path().home_dir().map_err(|e| e.to_string())?;
     Ok(home.join(".arcelle").join("leash.json"))
@@ -62,7 +64,7 @@ fn write_discovery_at(path: &std::path::Path, value: &serde_json::Value) -> Resu
 
 /// Remove the discovery record (stop / teardown / app exit). Best-effort and
 /// idempotent — a missing file is fine.
-pub(crate) fn remove_discovery(app: &tauri::AppHandle) {
+pub(crate) fn remove_discovery<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Ok(path) = discovery_file(app) {
         let _ = std::fs::remove_file(path);
     }

@@ -18,11 +18,17 @@ export function makeStudioActions(
 
   // ---- ADD-30: durable background jobs (the sidebar cards) ----
 
-  /** Reload the cards: every job that isn't finished. */
+  /** Reload the cards: EVERY job, finished ones included.
+   *
+   * Finished jobs used to be dropped here, which meant Activity could only ever
+   * be a live manager — the moment work completed it vanished, and the room kept
+   * no visible record that it had ever run. Decision #12 asks for both, so the
+   * finished rows come through and `groupActivity` files them under history.
+   * Callers that mean "is something in flight" must say so; see
+   * `startDeepSummary` below, and `runningJobCount`. */
   async function refreshJobs() {
     try {
-      const all = await api.listJobs();
-      s.setJobs(all.filter((j) => j.status !== "done"));
+      s.setJobs(await api.listJobs());
     } catch {
       /* room closing — the panel just stays as it was */
     }
@@ -37,7 +43,13 @@ export function makeStudioActions(
     // Never a silent no-op: if a summary job already exists, act on it instead
     // of ignoring the click. An in-flight one is surfaced; a paused/errored one
     // is resumed rather than duplicated.
-    const existing = s.jobs.find((j) => j.kind === "deep_summary");
+    // Only an UNFINISHED summary job is a reason not to start a new one. Now
+    // that `refreshJobs` keeps history, a summary that finished last week is in
+    // this list too — resuming that instead of summarizing would be a click
+    // that appears to do nothing.
+    const existing = s.jobs.find(
+      (j) => j.kind === "deep_summary" && j.status !== "done",
+    );
     if (existing) {
       if (existing.status === "running" || existing.status === "queued") {
         s.pushToast("info", "Already summarizing — see the card in the sidebar.");
@@ -214,6 +226,9 @@ export function makeStudioActions(
     const { refIds } = resolveRefs(p.text, s.files, s.folders);
     const combined = [...(p.refs ?? []), ...refIds];
     const refs = combined.length ? Array.from(new Set(combined)) : null;
+    // The id Stop will use. Minted here, like a Studio build's, so the host can
+    // register the run's cancel flag under it before the model call starts.
+    const opId = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     await runGuarded(
       s,
       async () => {
@@ -222,22 +237,48 @@ export function makeStudioActions(
           refs,
           instructions: p.text,
           question: p.def.needsQuestion || p.def.needsLanguage ? p.question : null,
+          opId,
         });
         s.setFiles(await api.listFiles());
         s.setAiPrompt(null);
       },
       {
-        begin: () => s.setAiBusy(true),
-        finish: () => s.setAiBusy(false),
+        begin: () => {
+          s.setAiBusy(true);
+          s.setAiOpId(opId);
+          s.setAiStopping(false);
+        },
+        finish: () => {
+          s.setAiBusy(false);
+          s.setAiOpId(null);
+          s.setAiStopping(false);
+        },
         openOllamaApp,
       },
     );
   }
 
+  /** Stop a running AI action. The host drops the request, which is what
+   *  actually ends the generation (the AI service abandons the work when its
+   *  caller disconnects), and nothing is saved. The run's own error path closes
+   *  the modal, so this only marks the button as pressed. */
+  async function stopAiAction() {
+    const opId = s.aiOpId;
+    if (!opId || s.aiStopping) return;
+    s.setAiStopping(true);
+    try {
+      await api.cancelAsk(opId);
+    } catch (e) {
+      // A Stop that did not land must not look like one that did.
+      s.setAiStopping(false);
+      s.pushToast("error", `Couldn't stop it: ${String(e)}`);
+    }
+  }
+
   return {
     openStudioPrompt, runStudio, studioAcItems,
     acceptMention, runStudioFromModal, loadAiActions, openAiAction,
-    runAiActionFromModal,
+    runAiActionFromModal, stopAiAction,
     refreshJobs, startDeepSummary, pauseJob, resumeJob, dismissJob,
   };
 }

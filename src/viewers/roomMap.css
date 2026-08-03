@@ -175,8 +175,14 @@
 }
 
 /* ---- plain-list alternative to the canvas (keyboard / screen reader) ---- */
+/* First of the trailing toolbar buttons — it carries the auto margin that
+   pushes the whole group right. A SECOND `margin-left: auto` would split the
+   free space and leave a gap between the two buttons. */
 .rm-listtoggle {
   margin-left: auto;
+}
+.rm-toolbtn {
+  margin-left: 6px;
 }
 .room-map-list {
   position: absolute;
@@ -217,6 +223,88 @@
   margin-top: 2px;
   font-size: 12px;
   color: var(--text-dim, #b8b8c4);
+}
+.rm-list-kinds {
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.rm-list-kind {
+  color: var(--faint, #928d9a);
+}
+
+/* ---- typed links: one hue per relationship ----
+   Custom properties, not hex literals in the TS, because the canvas is ink-dark
+   by default and near-white under the light theme (.room-map-svg above) — a
+   fixed amber at 0.2 stroke-opacity is invisible on the white one. Each pair is
+   the same hue, darkened and saturated for the light canvas. */
+.room-map {
+  --rm-edge-derived: #e0a33a;
+  --rm-edge-page: #3aa8a0;
+  --rm-edge-mentions: #8b7cf6;
+  --rm-edge-cited: #8b95a6;
+  --rm-edge-site: #3aa8a0;
+  --rm-edge-similar: #8b7cf6;
+}
+:root[data-theme="light"] .room-map {
+  --rm-edge-derived: #a35f00;
+  --rm-edge-page: #00706a;
+  --rm-edge-mentions: #5b3fd6;
+  --rm-edge-cited: #4c5566;
+  --rm-edge-site: #00706a;
+  --rm-edge-similar: #5b3fd6;
+}
+
+/* ---- density control: which kinds of link to draw ----
+   A NEW class: `.room-map-legend` (misc-moonshot.css) is a decorative, non-
+   interactive panel with `pointer-events: none`, which would make every toggle
+   here unclickable. */
+.rm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 6px 12px 8px;
+  border-bottom: 1px solid var(--line-soft, rgba(255, 255, 255, 0.06));
+}
+.rm-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  font-size: 11px;
+  color: var(--text-dim, #b8b8c4);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.rm-legend-item:hover:not(:disabled) {
+  border-color: var(--border-subtle, rgba(255, 255, 255, 0.12));
+}
+/* Switched off reads as switched off, not as merely unemphasised. */
+.rm-legend-item[aria-pressed="false"] {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+.rm-legend-item:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+.rm-legend-count {
+  color: var(--faint, #928d9a);
+  font-variant-numeric: tabular-nums;
+}
+.rm-legend-strength {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim, #b8b8c4);
+}
+.rm-legend-strength input {
+  width: 90px;
 }
 
 @media (prefers-reduced-motion: reduce) {

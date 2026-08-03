@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
-import { api } from "../api";
+import { api, formatSize } from "../api";
 import type { PrivacyPreview } from "../apiTypes";
 
-/** Estimated wire size of the text a cloud model would receive. */
-function fmtSize(chars: number): string {
-  const kb = chars / 1024;
-  if (kb < 1) return `${chars} characters`;
-  if (kb < 1024) return `~${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
-  return `~${(kb / 1024).toFixed(1)} MB`;
+/** Wire size of the text a cloud model would receive, in BYTES.
+ *
+ * It used to count JavaScript string length — UTF-16 code units — and call the
+ * result KB. Every non-Latin script pays 2–3 bytes per character in UTF-8, so a
+ * Hebrew, Arabic, Russian or Chinese document shown as "40 KB" was really 80 KB
+ * or more. This screen exists to be believed about what leaves the Mac, so the
+ * headline number is measured, not guessed. Still "~": the sentence that
+ * actually travels is this text inside a request, not this text alone. */
+function encodedSize(text: string): string {
+  return `~${formatSize(new TextEncoder().encode(text).length)}`;
 }
 
 /** PRIV-1 — the reader's "blocked version": this file's text exactly as a
@@ -67,7 +71,7 @@ export default function CloudView({ fileId }: { fileId: string }) {
   if (!preview) {
     return <div className="cloudview-empty">Preparing the cloud view…</div>;
   }
-  const size = fmtSize(preview.text.length);
+  const size = encodedSize(preview.text);
   const raw = doorOn === false;
   return (
     <div className={`cloudview${raw ? " cloudview-raw" : ""}`}>

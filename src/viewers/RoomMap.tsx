@@ -14,6 +14,7 @@ import {
   NAME_MAX,
 } from "./roomMap/constants";
 import { nodeRadius } from "./roomMap/layout";
+import { EDGE_KINDS, EDGE_STYLE, styleFor, edgeRank, type EdgeFilter } from "./roomMap/edges";
 import { useRoomGraph } from "./roomMap/useRoomGraph";
 import { usePanZoom } from "./roomMap/usePanZoom";
 import Edge from "./roomMap/Edge";
@@ -64,6 +65,17 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
   // Sticky selection: survives mouse-leave so its label + neighbour labels
   // persist without needing hover. Cleared by clicking empty canvas / reset.
   const [focus, setFocus] = useState<string | null>(null);
+  // Density control. A typed graph without a filter is still a hairball, so the
+  // reader can switch a kind off and raise the strength bar. Nothing starts
+  // hidden: in a room with no web saves and no full passes the fact types are
+  // all empty, and defaulting the one inferred kind OFF would open the map as a
+  // field of unconnected dots — which reads as broken, not as honest.
+  const [hidden, setHidden] = useState<string[]>([]);
+  const [minWeight, setMinWeight] = useState(0);
+  const filter = useMemo<EdgeFilter>(() => ({ hidden, minWeight }), [hidden, minWeight]);
+  // Open by default: six kinds of line are only readable with a key on screen,
+  // and the key IS the control.
+  const [showLegend, setShowLegend] = useState(true);
 
   const stageRef = useRef<HTMLDivElement>(null);
   const sizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
@@ -87,13 +99,15 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
     reload,
     size,
     cappedEdges,
+    visibleEdges,
+    edgeCounts,
     fileNodeCount,
     atFileLimit,
     degree,
     adjacency,
     topNode,
     nonce,
-  } = useRoomGraph({ stageRef, sizeRef, userAdjustedRef, layoutRef, setView, setFocus });
+  } = useRoomGraph({ filter, stageRef, sizeRef, userAdjustedRef, layoutRef, setView, setFocus });
 
   const focusId = focus ?? topNode;
   const focusNeighbors = focusId ? adjacency.get(focusId) ?? null : null;
@@ -181,22 +195,44 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
   // The same graph as plain text: every file, its folder and what it links to.
   // The canvas is mouse-only by nature, so this is the keyboard / screen-reader
   // route to the exact same information.
+  // The same graph as plain text, links GROUPED BY KIND — now that a line can
+  // mean six different things, a list that only said "linked to X" would be
+  // strictly less informative than the canvas it stands in for.
   const listRows = useMemo(() => {
     const byId = new Map((graph?.nodes ?? []).map((n) => [n.id, n]));
+    const perNode = new Map<string, Map<string, string[]>>();
+    const note = (from: string, to: string, kind: string) => {
+      const kinds = perNode.get(from) ?? new Map<string, string[]>();
+      perNode.set(from, kinds);
+      const names = kinds.get(kind) ?? [];
+      kinds.set(kind, names);
+      names.push(byId.get(to)?.name ?? to);
+    };
+    for (const e of visibleEdges) {
+      note(e.a, e.b, e.kind);
+      note(e.b, e.a, e.kind);
+    }
     return (graph?.nodes ?? [])
       .filter((n) => n.kind === "file")
-      .map((n) => ({
-        id: n.id,
-        name: n.name,
-        folder: n.folder || "Top level",
-        links: [...(adjacency.get(n.id) ?? [])]
-          .map((id) => byId.get(id)?.name ?? id)
-          .sort((a, b) => a.localeCompare(b)),
-      }))
-      .sort(
-        (a, b) => b.links.length - a.links.length || a.name.localeCompare(b.name),
-      );
-  }, [graph, adjacency]);
+      .map((n) => {
+        const kinds = perNode.get(n.id) ?? new Map<string, string[]>();
+        const groups = [...kinds.entries()]
+          .sort((x, y) => edgeRank(x[0]) - edgeRank(y[0]))
+          .map(([kind, names]) => ({
+            kind,
+            label: styleFor(kind).label,
+            names: [...names].sort((a, b) => a.localeCompare(b)),
+          }));
+        return {
+          id: n.id,
+          name: n.name,
+          folder: n.folder || "Top level",
+          groups,
+          total: groups.reduce((sum, g) => sum + g.names.length, 0),
+        };
+      })
+      .sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+  }, [graph, visibleEdges]);
 
   return (
     <div className="room-map" style={{ position: "relative", width: "100%", height: "100%" }}>
@@ -217,14 +253,29 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
             }
           >
             · {atFileLimit ? "newest " : ""}
-            {fileNodeCount} file{fileNodeCount === 1 ? "" : "s"} · {cappedEdges.length} link
-            {cappedEdges.length === 1 ? "" : "s"}
+            {fileNodeCount} file{fileNodeCount === 1 ? "" : "s"} · {visibleEdges.length} link
+            {visibleEdges.length === 1 ? "" : "s"}
+            {/* Say what is being withheld. A count that silently shrank when a
+                kind was switched off would read as links disappearing. */}
+            {cappedEdges.length > visibleEdges.length &&
+              ` (${cappedEdges.length - visibleEdges.length} hidden)`}
           </span>
         )}
         {graph && !showEmpty && (
           <button
             type="button"
             className="subtle rm-listtoggle"
+            aria-pressed={showLegend}
+            title="Choose which kinds of link the map shows"
+            onClick={() => setShowLegend((v) => !v)}
+          >
+            Links
+          </button>
+        )}
+        {graph && !showEmpty && (
+          <button
+            type="button"
+            className="subtle rm-toolbtn"
             aria-pressed={listView}
             title="Show the same files and connections as a plain, keyboard-reachable list"
             onClick={() => setListView((v) => !v)}
@@ -233,6 +284,68 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
           </button>
         )}
       </div>
+
+      {/* Density control. Not `.room-map-legend` — that class carries
+          `pointer-events: none`, so its toggles would be unclickable. */}
+      {graph && !showEmpty && showLegend && (
+        <div className="rm-legend" role="group" aria-label="Link kinds">
+          {EDGE_KINDS.map((kind) => {
+            const style = EDGE_STYLE[kind];
+            const count = edgeCounts[kind] ?? 0;
+            const on = !hidden.includes(kind);
+            return (
+              <button
+                key={kind}
+                type="button"
+                className="rm-legend-item"
+                aria-pressed={on}
+                disabled={count === 0}
+                title={
+                  count === 0
+                    ? `Nothing in this room is linked this way — ${style.lead.toLowerCase()}`
+                    : style.lead
+                }
+                onClick={() =>
+                  setHidden((cur) =>
+                    cur.includes(kind) ? cur.filter((k) => k !== kind) : [...cur, kind],
+                  )
+                }
+              >
+                <svg width="18" height="8" aria-hidden="true">
+                  {/* `stroke` via `style`, not the presentation attribute: the
+                      value is a var() custom property, and a presentation
+                      attribute is the weakest thing in the cascade — the same
+                      trap that made every edge on the map render as one violet
+                      hairline. An inline declaration cannot be outranked. */}
+                  <line
+                    x1="1"
+                    y1="4"
+                    x2="17"
+                    y2="4"
+                    style={{ stroke: style.color, strokeWidth: 1.6 * style.widthMul }}
+                    strokeDasharray={style.dash ?? undefined}
+                  />
+                </svg>
+                {style.label}
+                <span className="rm-legend-count">{count}</span>
+              </button>
+            );
+          })}
+          <label className="rm-legend-strength">
+            Strength
+            <input
+              type="range"
+              min={0}
+              max={0.9}
+              step={0.1}
+              value={minWeight}
+              onChange={(e) => setMinWeight(Number(e.target.value))}
+              title="Hide the weakest links"
+            />
+            <span className="rm-legend-count">{Math.round(minWeight * 100)}%</span>
+          </label>
+        </div>
+      )}
 
       <div className="room-map-stage" ref={stageRef}>
         {status && <div className="viewer-status">{status}</div>}
@@ -268,9 +381,18 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
                   </button>
                   <span className="rm-list-folder">{row.folder}</span>
                   <div className="rm-list-links">
-                    {row.links.length === 0
-                      ? "No connections found"
-                      : `Linked to: ${row.links.join(", ")}`}
+                    {row.groups.length === 0 ? (
+                      "No connections found"
+                    ) : (
+                      <ul className="rm-list-kinds">
+                        {row.groups.map((g) => (
+                          <li key={g.kind}>
+                            <span className="rm-list-kind">{g.label}:</span>{" "}
+                            {g.names.join(", ")}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 </li>
               ))}
@@ -286,6 +408,28 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
               viewBox={`0 0 ${size.w} ${size.h}`}
               onWheel={onWheel}
             >
+              {/* Arrowheads for the directed kinds. `userSpaceOnUse` means the
+                  marker is measured in the zoomed group's world units, so the
+                  size has to be divided by the scale or the heads balloon as
+                  you zoom out. */}
+              <defs>
+                {EDGE_KINDS.filter((k) => EDGE_STYLE[k].directed).map((k) => (
+                  <marker
+                    key={k}
+                    id={`rm-arrow-${k}`}
+                    viewBox="0 0 10 10"
+                    refX="9"
+                    refY="5"
+                    markerWidth={7 / view.k}
+                    markerHeight={7 / view.k}
+                    markerUnits="userSpaceOnUse"
+                    orient="auto"
+                  >
+                    <path d="M0,1 L10,5 L0,9 z" style={{ fill: EDGE_STYLE[k].color }} />
+                  </marker>
+                ))}
+              </defs>
+
               {/* Backdrop: the only surface that pans / deselects. */}
               <rect
                 x={0}
@@ -302,23 +446,25 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
               <g transform={`translate(${view.x} ${view.y}) scale(${view.k})`}>
                 {/* edges first, under the stars */}
                 {layout &&
-                  layout.edges.map((se, i) => {
-                    const a = layout.nodes[se.ai];
-                    const b = layout.nodes[se.bi];
-                    return (
+                  layout.edges.map((se, i) =>
+                    // A filtered-out link is not drawn AND does not pull on the
+                    // layout (runTick skips it) — but it stays in the array, so
+                    // switching a kind back on is a repaint, not a re-seed.
+                    se.hidden ? null : (
                       <Edge
                         key={`e${i}`}
                         se={se}
-                        a={a}
-                        b={b}
+                        a={layout.nodes[se.ai]}
+                        b={layout.nodes[se.bi]}
                         view={view}
                         hovered={hovered}
                         focusId={focusId}
+                        degree={degree}
                         showTip={showTip}
                         setTip={setTip}
                       />
-                    );
-                  })}
+                    ),
+                  )}
 
                 {/* nodes on top */}
                 {layout &&

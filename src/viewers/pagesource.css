@@ -1,0 +1,36 @@
+/* The provenance strip above a saved web page. Same quiet register as the
+   encoding strip directly above it — a saved article should look like the
+   article, not like a form. */
+.page-source {
+  /* `.viewer-body.fill` is a flex column whose other child takes the rest of
+     the height; the strip keeps its own and is never squashed by it. */
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  padding: 0.3rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.page-source-fact {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: baseline;
+  min-width: 0;
+}
+.page-source-label {
+  color: var(--faint, var(--muted));
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+/* A URL is the one field that can be arbitrarily long; it gets to shrink. */
+.page-source-url {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 28rem;
+  user-select: text;
+}

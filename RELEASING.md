@@ -176,9 +176,11 @@ afterwards without rebuilding:
    sign it, write `latest.json`, upload both:
    ```sh
    gh release download v<version> -p "Arcelle.app.tar.gz"
-   npm run tauri signer sign -- --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
-     ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+--password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"} \
-     Arcelle.app.tar.gz
+   # The key travels in the environment only — never as an argument. `ps` shows
+   # every process's command line to anything running as you, and `npm run`
+   # echoes the command (key included) to the terminal and to any log.
+   TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD-}" \
+     npm run tauri signer sign -- Arcelle.app.tar.gz
    # build latest.json from the .sig (version, notes, pub_date, url — see
    # the template block in scripts/release.sh), then:
    gh release upload v<version> --clobber Arcelle.app.tar.gz latest.json

@@ -1,0 +1,33 @@
+/* The macOS-drawn fallback preview. Shown for the formats nothing in this app
+   parses — .key/.pages/.numbers, legacy .doc/.ppt, RAW, PSD, 3D models — and
+   under the extracted text when there is some. */
+.ql-view {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+}
+.ql-figure {
+  margin: 0;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+.ql-figure img {
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 2px 14px rgb(0 0 0 / 0.12);
+}
+.ql-figure figcaption {
+  max-width: 34rem;
+  text-align: center;
+}
+/* When there IS extracted text, it leads and the picture follows under a rule. */
+.ql-view > :not(.ql-figure):not(.empty-hint) {
+  border-bottom: 1px solid var(--border);
+}

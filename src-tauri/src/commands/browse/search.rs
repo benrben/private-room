@@ -79,7 +79,21 @@ pub async fn browser_search(
     state: tauri::State<'_, AppState>,
     query: String,
 ) -> Result<BrowserSearchResult, String> {
-    require_web_enabled(&state)?;
+    run_search(&app, &state, &query).await
+}
+
+/// The search itself, without the command wrapper.
+///
+/// Split out for `browse_open`: the Browser agent searches through THIS, so a
+/// query the agent types and a query the user types share one gate, one cache
+/// and one set of engines. Anything else would mean the agent looking at a
+/// different web than the person watching it.
+pub(crate) async fn run_search(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    query: &str,
+) -> Result<BrowserSearchResult, String> {
+    require_web_enabled(state)?;
     let query = query.trim().to_string();
     if query.is_empty() {
         return Err("Type something to search for.".into());
@@ -102,6 +116,9 @@ pub async fn browser_search(
             hits,
             took_ms: 0,
             cached: true,
+            // A cache hit replays hits that were actually found; whichever engines
+            // were blocked when it was stored is not news about this search.
+            failed: Vec::new(),
         },
         None => {
             let page = crate::web::search_for_browser(&query).await?;
@@ -116,7 +133,7 @@ pub async fn browser_search(
     // search belongs in the same ledger as an opened page: it is the moment a
     // query left this Mac.
     if !page.cached {
-        browser::journal(&app, "search", "", &format!("Searched for \"{query}\""));
+        browser::journal(app, "search", "", &format!("Searched for \"{query}\""));
     }
     Ok(BrowserSearchResult {
         query,
@@ -124,6 +141,43 @@ pub async fn browser_search(
         summary_available: has_model,
         page,
     })
+}
+
+/// How many results the Browser agent is shown. The page draws a dozen; the
+/// agent is choosing ONE address to open, and a list it has to scroll past is
+/// context spent on options it will not take.
+const AGENT_HITS: usize = 6;
+
+/// How much of a result's snippet the agent reads. Enough to tell two results
+/// apart, not enough to answer from — the answer comes from the page.
+const AGENT_SNIPPET_CHARS: usize = 180;
+
+/// The results as the Browser agent reads them (BROWSE-3c).
+///
+/// Deliberately shaped as a NEXT STEP rather than as an answer. A model handed
+/// a list of snippets will answer from the snippets — which is how a browser
+/// agent ends up reporting a search engine's summary of a page as if it had
+/// read the page. So each line leads with the address to open, and the closing
+/// line names the tool that opens it.
+pub(crate) fn format_hits_for_agent(result: &BrowserSearchResult) -> String {
+    if result.page.hits.is_empty() {
+        return format!(
+            "No results across seven engines for \"{}\". Try different words — do NOT open a search engine to try again by hand.",
+            result.query
+        );
+    }
+    let mut out = format!("Searched the room's own engines for \"{}\":\n", result.query);
+    for (i, hit) in result.page.hits.iter().take(AGENT_HITS).enumerate() {
+        out.push_str(&format!("{}. {} — {}\n", i + 1, hit.title.trim(), hit.url));
+        if let Some(snippet) = hit.snippet.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            out.push_str(&format!("   {}\n", clip(snippet, AGENT_SNIPPET_CHARS)));
+        }
+    }
+    out.push_str(
+        "Pick the one that answers the task and browse_open its URL, then browse_read it. \
+         These snippets are the engines' words, not the page's — never report them as what a page says.",
+    );
+    out
 }
 
 /// One result's preview, as the page consumes it. Images arrive as data URLs
@@ -362,7 +416,6 @@ pub async fn browser_search_summary(
         Some(0.2),
         crate::commands::models::KEEP_ALIVE_WARM,
         None,
-        crate::ollama::CtxTier::Chat,
     )
     .await?;
     // A thinking model puts its private reasoning in `<think>…</think>` before
@@ -457,6 +510,85 @@ mod tests {
         // Something the checker refuses is still a usable key rather than a
         // panic or a silent collapse to the empty string.
         assert_eq!(cache_key("not a url"), "not a url");
+    }
+
+    fn result_of(query: &str, hits: Vec<crate::web::WebHit>) -> BrowserSearchResult {
+        BrowserSearchResult {
+            query: query.to_string(),
+            previews_enabled: true,
+            summary_available: true,
+            page: crate::web::SearchPage {
+                merged: hits.len() as u32,
+                hits,
+                took_ms: 12,
+                cached: false,
+                failed: Vec::new(),
+            },
+        }
+    }
+
+    fn hit(title: &str, url: &str, snippet: Option<&str>) -> crate::web::WebHit {
+        crate::web::WebHit {
+            title: title.to_string(),
+            url: url.to_string(),
+            engines: vec!["duckduckgo".to_string()],
+            date: None,
+            snippet: snippet.map(str::to_string),
+            score: 1.0,
+        }
+    }
+
+    /// The agent's whole next move is `browse_open <one of these>`, so every
+    /// line it reads has to carry an address it can pass straight back.
+    #[test]
+    fn the_agents_result_names_an_address_per_line() {
+        let text = format_hits_for_agent(&result_of(
+            "tallest building in europe",
+            vec![
+                hit("Lakhta Center", "https://en.wikipedia.org/wiki/Lakhta_Center", Some("462 m")),
+                hit("Tallest in Europe", "https://example.org/list", None),
+            ],
+        ));
+        assert!(text.contains("1. Lakhta Center — https://en.wikipedia.org/wiki/Lakhta_Center"));
+        assert!(text.contains("462 m"));
+        // A hit with no snippet still gets its line; it just has no second one.
+        assert!(text.contains("2. Tallest in Europe — https://example.org/list"));
+        assert!(text.contains("browse_open"));
+    }
+
+    #[test]
+    fn the_agent_is_shown_a_shortlist_not_the_whole_page() {
+        let hits: Vec<_> = (0..12)
+            .map(|i| hit(&format!("Result {i}"), &format!("https://example.com/{i}"), None))
+            .collect();
+        let text = format_hits_for_agent(&result_of("q", hits));
+        assert!(text.contains("https://example.com/5"));
+        assert!(!text.contains("https://example.com/6"));
+    }
+
+    /// These two phrases are load-bearing ACROSS the language boundary: the
+    /// sidecar's `chat.browse` spec lists them in `Flow.probe_unless`
+    /// (sidecar/arcelle_sidecar/agents.py) to know that a `browse_open` ran
+    /// without leaving a page behind it, and therefore not to fire the free
+    /// `browse_snapshot` that could only fail. Reword them here and the probe
+    /// silently starts failing again — so this test is the tripwire.
+    #[test]
+    fn the_agents_result_carries_the_phrases_the_sidecar_gates_its_probe_on() {
+        let found = format_hits_for_agent(&result_of("q", vec![hit("T", "https://e.com", None)]));
+        assert!(found.to_lowercase().contains("searched the room's own engines"));
+
+        let empty = format_hits_for_agent(&result_of("q", vec![]));
+        assert!(empty.to_lowercase().contains("no results across seven engines"));
+    }
+
+    /// Nothing found is a dead end for the SEARCH, not an invitation to go
+    /// drive google.com by hand — which is exactly what a model does next
+    /// unless the result says otherwise.
+    #[test]
+    fn an_empty_search_tells_the_agent_not_to_go_hunting() {
+        let empty = format_hits_for_agent(&result_of("asdfqwer", vec![]));
+        assert!(empty.contains("asdfqwer"));
+        assert!(empty.to_lowercase().contains("do not open a search engine"));
     }
 
     /// The summary sits directly above the real results. A thinking model's

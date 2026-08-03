@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Capability for the main window. allow-destroy is load-bearing: registering a JS close-requested listener makes Tauri prevent every native close and hand it to JS, and core:default does not grant destroy — without it the red button stops closing the window at all.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-set-title",
+    "core:window:allow-destroy",
     "opener:default",
     {
       "identifier": "opener:allow-open-url",

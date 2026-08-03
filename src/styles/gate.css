@@ -136,6 +136,17 @@
   margin-top: 2px;
 }
 
+/* A room whose file is no longer where we left it. Dimmed rather than hidden
+   or disabled: it is still the row you click to go and find it again. */
+.recent-row.missing .recent-name,
+.recent-row.missing .recent-path {
+  opacity: 0.55;
+}
+
+.recent-missing {
+  color: var(--warn, var(--text-dim));
+}
+
 .recent-open {
   flex: 1;
   min-width: 0;
@@ -349,7 +360,9 @@
   font-weight: 600;
 }
 
-/* password strength meter (create form only) */
+/* Password strength meter. Unscoped on purpose: Settings → Lock & password
+   reuses the same component for Change password and for the duplicate's
+   password, so the guidance is identical wherever a password is chosen. */
 /* Always laid out so the confirm field below it never jumps when the meter
    appears; `.reserved` (no password yet) hides it while keeping its space. */
 .pw-feedback.reserved {

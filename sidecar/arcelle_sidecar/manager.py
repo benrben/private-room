@@ -108,6 +108,16 @@ def _rank(q: str, spec: AgentSpec) -> tuple[int, bool, int]:
     )
 
 
+#: :func:`_rank` under a public name, for :mod:`.planner`.
+#:
+#: The planner ranks the WHOLE registry with the same key this module ranks
+#: siblings with, so a hint cannot be worth one thing when the plan picks a
+#: domain and another when the domain picks its worker — a second scorer beside
+#: this one is precisely the drift the shared vocabulary lists exist to prevent.
+#: ``q`` must already be lowercased (see :func:`_hits`).
+rank_worker = _rank
+
+
 def resolve_worker(
     tool: str,
     instruction: str,
@@ -177,5 +187,6 @@ def resolve_worker(
 
 
 __all__ = [
+    "rank_worker",
     "resolve_worker",
 ]

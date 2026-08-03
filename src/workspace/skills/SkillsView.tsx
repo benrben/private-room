@@ -17,7 +17,15 @@ import { WSState } from "../state";
 import { WSActions } from "../actions";
 
 type Props = { s: WSState; a: WSActions };
-type SkillDraft = { name: string; description: string; instructions: string };
+type SkillDraft = {
+  name: string;
+  description: string;
+  instructions: string;
+  /** The one specialist this skill is offered to. "" = every agent (general).
+   * It was invisible here before: an imported skill's owner could not be seen
+   * and could not be corrected without hand-editing the folder. */
+  agent: string;
+};
 
 const STARTER = `# Purpose
 
@@ -50,6 +58,9 @@ export default function SkillsView({ s, a }: Props) {
   const [resourceDirty, setResourceDirty] = useState(false);
   const [newResourcePath, setNewResourcePath] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // The host's roster of valid owners — asked for, never written down here, so
+  // the picker can only offer ids the save would accept.
+  const [agentIds, setAgentIds] = useState<string[]>([]);
   const composeRef = useRef<HTMLTextAreaElement>(null);
 
   const selected = s.selectedSkillId;
@@ -62,6 +73,7 @@ export default function SkillsView({ s, a }: Props) {
         name: next.skill.name,
         description: next.skill.description,
         instructions: next.skill.instructions,
+        agent: next.skill.agent ?? "",
       });
       setIsNew(false);
       setDirty(false);
@@ -83,6 +95,13 @@ export default function SkillsView({ s, a }: Props) {
     // `load` is intentionally keyed only by the selected id.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected]);
+
+  useEffect(() => {
+    api
+      .skillAgentIds()
+      .then(setAgentIds)
+      .catch(() => setAgentIds([]));
+  }, []);
 
   useEffect(() => {
     const ta = composeRef.current;
@@ -118,7 +137,7 @@ export default function SkillsView({ s, a }: Props) {
   function startNew() {
     s.setSelectedSkillId(null);
     setBundle(null);
-    setDraft({ name: "", description: "", instructions: STARTER });
+    setDraft({ name: "", description: "", instructions: STARTER, agent: "" });
     setIsNew(true);
     setDirty(true);
     setResource(null);
@@ -135,12 +154,12 @@ export default function SkillsView({ s, a }: Props) {
     setBusy(true);
     try {
       if (isNew) {
-        const id = await api.createSkill(draft.name, draft.description, draft.instructions);
+        const id = await api.createSkill(draft.name, draft.description, draft.instructions, draft.agent);
         await a.refreshSkills();
         s.setSelectedSkillId(id);
         s.pushToast("success", "Skill draft created — review it, then enable it.");
       } else if (bundle) {
-        await api.updateSkill(bundle.skill.id, draft.name, draft.description, draft.instructions);
+        await api.updateSkill(bundle.skill.id, draft.name, draft.description, draft.instructions, draft.agent);
         await a.refreshSkills();
         await load(bundle.skill.id);
         s.pushToast("success", "SKILL.md saved.");
@@ -179,10 +198,27 @@ export default function SkillsView({ s, a }: Props) {
     const path = Array.isArray(picked) ? picked[0] : picked;
     if (!path) return;
     try {
-      const id = await api.importSkillFolder(path);
+      // A name clash used to be a flat refusal, so the only way to install a
+      // newer version of a skill was to delete the old one — which also threw
+      // away every file you had hand-edited inside it. Ask instead.
+      const clash = await api.skillImportConflict(path);
+      let replace = false;
+      if (clash) {
+        replace = await confirm(
+          `This room already has a skill called "${clash}". Replace it with this folder? Its SKILL.md and files are overwritten, and any file not in the folder is removed. Its enabled setting is kept.`,
+          { title: "Replace this skill?", kind: "warning", okLabel: "Replace" },
+        );
+        if (!replace) return;
+      }
+      const id = await api.importSkillFolder(path, replace);
       await a.refreshSkills();
       s.setSelectedSkillId(id);
-      s.pushToast("success", "Skill imported as a disabled draft for review.");
+      s.pushToast(
+        "success",
+        replace
+          ? `Replaced ${clash} with the imported folder.`
+          : "Skill imported as a disabled draft for review.",
+      );
     } catch (e) {
       s.pushToast("error", String(e));
     }
@@ -501,6 +537,36 @@ export default function SkillsView({ s, a }: Props) {
             <span>Description <small>the trigger: what it does and when to use it</small></span>
             <textarea rows={3} value={draft.description} placeholder="Review commercial contracts for risk. Use when…" onChange={(e) => patchDraft("description", e.target.value)} />
           </label>
+          {/* The owning specialist. It travels in SKILL.md frontmatter and was
+              invisible here, so an imported skill bound to one agent looked
+              identical to a general one and could only be corrected by
+              hand-editing the folder and re-importing. The options come from
+              the host's own roster, so this can never offer an id the save
+              would reject. */}
+          <label className="skill-field">
+            <span>
+              Offered to <small>which specialist may use this skill</small>
+            </span>
+            <select
+              value={draft.agent}
+              onChange={(e) => patchDraft("agent", e.target.value)}
+            >
+              <option value="">Every assistant (general)</option>
+              {agentIds.map((id) => (
+                <option key={id} value={id}>
+                  {id}
+                </option>
+              ))}
+              {/* A skill imported before this list existed can carry an owner
+                  the roster no longer has. Show it rather than silently
+                  re-labelling the skill as general on the next save. */}
+              {draft.agent && !agentIds.includes(draft.agent) && (
+                <option value={draft.agent}>
+                  {draft.agent} (not a specialist this app has)
+                </option>
+              )}
+            </select>
+          </label>
           <label className="skill-field skill-instructions">
             <span>SKILL.md instructions <small>loaded only after this skill triggers</small></span>
             <textarea spellCheck={false} value={draft.instructions} onChange={(e) => patchDraft("instructions", e.target.value)} />
@@ -533,7 +599,7 @@ export default function SkillsView({ s, a }: Props) {
               return (
                 <button key={r.path} className={`skill-resource-row ${resource?.path === r.path ? "active" : ""}`} onClick={() => void chooseResource(r.path)}>
                   <FolderIcon size={14} />
-                  <span><strong>{label.name}</strong><small>{label.folder} · {r.kind} · {Math.max(1, Math.ceil(r.sizeBytes / 1024))} KB</small></span>
+                  <span><strong>{label.name}</strong><small>{label.folder} · {r.kind} · {formatSize(r.sizeBytes)}</small></span>
                 </button>
               );
             })}

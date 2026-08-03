@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import logging
+import os
 from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
 import httpx
@@ -30,6 +32,7 @@ from . import (
     __version__,
     ai_actions,
     chat_docs,
+    compaction,
     features,
     file_pass,
     handoff,
@@ -60,11 +63,14 @@ from .config import (
     PrivacyScanRequest,
     PullRequest,
     RunRequest,
+    AgentSupportRequest,
+    SpecialistsRequest,
     TtsRequest,
     VisionLocateRequest,
     WarmRequest,
     WebSearchRequest,
 )
+from .agents import agent_roster, reachable_agent_ids, specialist_roster
 from .external_llm import ExternalChatModel, is_external_model
 from .graph import CancelToken, Deps, Emit, stream_events
 from .mcp_client import McpClient
@@ -80,6 +86,15 @@ log = logging.getLogger("arcelle_sidecar")
 #: multi-GB model is the failure worth refusing. Enforced on the declared
 #: ``Content-Length``, which is what every caller of ours sends.
 MAX_REQUEST_BYTES: int = 128 << 20
+
+#: Environment variable carrying the shared secret the Rust host hands us at
+#: spawn. See :class:`TokenAuthMiddleware`.
+TOKEN_ENV = "ARCELLE_SIDECAR_TOKEN"
+
+#: The one route that answers without the token: the host's own liveness probe,
+#: which runs before anything is configured and reveals nothing but "yes, and
+#: this is my version".
+_OPEN_PATHS = frozenset({"/health"})
 
 #: How often a one-shot handler checks whether its caller is still there.
 _HANGUP_POLL_SECS = 0.25
@@ -165,6 +180,62 @@ class BodyLimitMiddleware:
         return False
 
 
+class TokenAuthMiddleware:
+    """Require the host's bearer token on everything but ``/health``.
+
+    The port is loopback-only, but loopback on a Mac is not a boundary: every
+    other program running as this user could drive the agent — start runs,
+    generate text, search the web, delete downloaded models — and the app's two
+    other local services (the room MCP bridge and ``hub_mcp``) have always
+    demanded a fresh token, so this one was the odd one out.
+
+    The secret is generated per app process and handed to us in the environment
+    at spawn (:data:`TOKEN_ENV`); it is never logged and never written to disk.
+    An EMPTY or absent variable leaves the port open, which is how a developer
+    running ``python -m arcelle_sidecar`` by hand and every test in this repo
+    reaches it — the Rust host always sets it, so a shipped app is never in that
+    state.
+
+    Raw ASGI for the same reason as :class:`BodyLimitMiddleware`: it answers 401
+    itself or steps aside completely, leaving the NDJSON streams' send path
+    untouched.
+    """
+
+    def __init__(self, app: Any, token: str) -> None:
+        self.app = app
+        self.token = token
+        self._expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and not self._allowed(scope):
+            body = compact_json({"error": "unauthorized", "code": "NO_TOKEN"}).encode(
+                "utf-8"
+            )
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
+
+    def _allowed(self, scope: Any) -> bool:
+        if scope.get("path") in _OPEN_PATHS:
+            return True
+        for name, value in scope.get("headers") or []:
+            if name == b"authorization":
+                # compare_digest, not ==: the reply timing of a loopback socket
+                # is a poor oracle, but this costs nothing.
+                return hmac.compare_digest(value, self._expected)
+        return False
+
+
 class ClientGone(Exception):
     """The caller hung up while a one-shot handler was still working."""
 
@@ -218,14 +289,16 @@ class RunRegistry:
     def release(self, run_id: str) -> None:
         self._tokens.pop(run_id, None)
 
-    def cancel(self, run_id: str) -> bool:
-        """True if we knew the run. A no-op for an unknown id — the ask may have
-        already finished (same contract as the Rust ``cancel_ask``)."""
+    def cancel(self, run_id: str) -> list[str] | None:
+        """What this Stop actually stopped — the run and every specialist under
+        it (``CancelToken.cancel`` walks the tree). ``None`` for an unknown id;
+        an EMPTY list means we knew the run and it was already stopped, which is
+        not the same thing and must not be reported as if it were. A no-op for
+        an unknown id, same contract as the Rust ``cancel_ask``."""
         token = self._tokens.get(run_id)
         if token is None:
-            return False
-        token.cancel()
-        return True
+            return None
+        return token.cancel()
 
     def __len__(self) -> int:  # pragma: no cover - introspection
         return len(self._tokens)
@@ -234,9 +307,16 @@ class RunRegistry:
 def create_app(
     chat_factory: ChatModelFactory = _default_chat_model,
     mcp_factory: McpFactory = _default_mcp,
+    token: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Arcelle agent sidecar", version=__version__)
     app.add_middleware(BodyLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
+    # Added AFTER the body limit so it runs BEFORE it (Starlette wraps
+    # outermost-last): an unauthorized caller is turned away without us reading
+    # its Content-Length, let alone its body.
+    token = os.environ.get(TOKEN_ENV, "") if token is None else token
+    if token:
+        app.add_middleware(TokenAuthMiddleware, token=token)
     registry = RunRegistry()
     app.state.registry = registry
 
@@ -280,7 +360,7 @@ def create_app(
                     # busy local model (e.g. the background document scan) can
                     # queue this call for minutes — after 8s the turn proceeds
                     # with the exact rules alone, which never need a model.
-                    findings = await asyncio.wait_for(
+                    scan = await asyncio.wait_for(
                         privacy_scan_mod.scan_text(
                             req.question,
                             model=guard_model,
@@ -291,8 +371,11 @@ def create_app(
                         timeout=8.0,
                     )
                     taken = {p for _, p in policy.rules}
+                    # A partial guard scan is still worth its rules: one typed
+                    # message is one chunk, so `complete` is almost always true
+                    # here, and a rule found is a rule enforced either way.
                     policy.add_rules(
-                        privacy_scan_mod.mint_ephemeral_rules(findings, taken)
+                        privacy_scan_mod.mint_ephemeral_rules(scan.entities, taken)
                     )
                 except Exception:  # noqa: BLE001 - guard is best-effort by design
                     log.warning("privacy live guard unavailable; exact rules still apply")
@@ -322,22 +405,35 @@ def create_app(
                 worker_parallel=worker_parallel,
             )
 
+        def stamped(event: dict[str, Any]) -> bytes:
+            """Name the run every line belongs to.
+
+            Owner replacement #4 (2026-08-03): the host turns these lines into
+            window events that a specific conversation paints, so each one has
+            to say which run produced it — including the ones emitted by a
+            delegated sub-agent, which travel on this same stream. One place,
+            because every exit below (the graph's events, the privacy receipt,
+            a transport failure) is equally a line the host will attribute.
+
+            An id, nothing else: the host owns the chat id and never tells us
+            which conversation a run belongs to.
+            """
+            return (compact_json({**event, "run_id": req.run_id}) + "\n").encode("utf-8")
+
         async def body() -> AsyncIterator[bytes]:
             try:
                 async for event in stream_events(req, deps_factory):
-                    yield (compact_json(event) + "\n").encode("utf-8")
+                    yield stamped(event)
                 if engaged and policy is not None:
                     # After the final event: what the door actually did, for the
                     # chat indicator ("N details hidden from the cloud model").
-                    yield (
-                        compact_json({"t": "privacy", "v": policy.report.as_payload()})
-                        + "\n"
-                    ).encode("utf-8")
+                    yield stamped({"t": "privacy", "v": policy.report.as_payload()})
             except httpx.HTTPError as exc:
-                # The bridge died mid-run: tell the host so it can fall back to
-                # the native engine instead of hanging.
+                # The bridge died mid-run: tell the host so it can surface the
+                # failure instead of hanging. There is no native engine behind
+                # this one to fall back to — it was deleted with agent_loop.
                 log.warning("room bridge transport failure: %s", type(exc).__name__)
-                yield (compact_json({"t": "error", "v": str(exc)}) + "\n").encode("utf-8")
+                yield stamped({"t": "error", "v": str(exc)})
             finally:
                 registry.release(req.run_id)
                 if mcp is not None:
@@ -351,8 +447,30 @@ def create_app(
 
     @app.post("/cancel")
     async def cancel(req: CancelRequest) -> JSONResponse:
-        known = registry.cancel(req.run_id)
-        return JSONResponse({"ok": True, "known": known})
+        stopped = registry.cancel(req.run_id)
+        # `stopped` names the run and the specialists under it — static agent
+        # labels, never room content. `known` keeps its old meaning and shape so
+        # the host's `cancel_delivered` check is untouched.
+        return JSONResponse(
+            {"ok": True, "known": stopped is not None, "stopped": stopped or []}
+        )
+
+    @app.post("/forget")
+    async def forget() -> Any:
+        """Drop everything this process still holds about the room that closed.
+
+        The service outlives every room: one process serves whichever room is
+        open, so its in-memory state has to be told when a room goes away. The
+        compaction cache is that state — boiled-down summaries of the room's own
+        conversation, which survived lock, room-switch and chat deletion alike
+        and broke the "close the room and nothing survives" promise.
+
+        Answers a COUNT, never content, and the host treats a missing service as
+        nothing to forget rather than a failure (`rooms.rs` teardown).
+        """
+        dropped = compaction.cache_size()
+        compaction.clear_cache()
+        return {"ok": True, "dropped": dropped}
 
     # --- LLM gateway (MIGRATION Phase 1) ------------------------------------
     #
@@ -457,6 +575,35 @@ def create_app(
         # Never fails: unknown capabilities == none (ollama.rs contract).
         caps = await llm.capabilities(req.model, req.base_url)
         return {"capabilities": caps}
+
+    @app.post("/agents")
+    async def agents(req: SpecialistsRequest) -> Any:
+        # The composer's `*` menu. Derived from the same `reachable_domain_keys`
+        # the turn's own catalog is built from — the menu may never offer a
+        # specialist the room could not actually dispatch to, which is the whole
+        # reason the host asks us instead of keeping its own list.
+        return {
+            "agents": specialist_roster(
+                web_enabled=req.web_enabled,
+                served_names=set(req.served_names),
+            )
+        }
+
+    @app.post("/agent_support")
+    async def agent_support(req: AgentSupportRequest) -> Any:
+        # The agent half of the published provider x agent matrix. The host
+        # declares what each ENGINE can do and which tool names each bridge
+        # TIER serves; only this side knows which workers those names add up
+        # to, and it answers with the same `worker_reachable` predicate a live
+        # turn uses. So the matrix is derived on both sides and neither keeps a
+        # written-down copy that could rot.
+        return {
+            "agents": agent_roster(),
+            "tiers": {
+                name: reachable_agent_ids(set(tools), web_enabled=req.web_enabled)
+                for name, tools in req.tiers.items()
+            },
+        }
 
     @app.post("/context_length")
     async def context_length(req: CapabilitiesRequest) -> Any:
@@ -743,7 +890,10 @@ def create_app(
         a seven-call refine would burn six more generations on the GPU after
         the user pressed Stop, holding ``Lane::LocalLlm``'s single slot.
         """
-        token = CancelToken()
+        # Labelled for the `/cancel` reply: this run is one workflow STEP, not a
+        # chat answer, and a Stop that reports the wrong thing is worse than one
+        # that reports a count.
+        token = CancelToken("this workflow step")
         registry.register(req.run_id, token)
         try:
             deps = wf_nodes.NodeDeps(
@@ -860,7 +1010,7 @@ def create_app(
     @app.post("/privacy_scan")
     async def privacy_scan(req: PrivacyScanRequest, request: Request) -> Any:
         try:
-            entities = await until_hangup(
+            scan = await until_hangup(
                 request,
                 privacy_scan_mod.scan_text(
                     req.text,
@@ -878,7 +1028,14 @@ def create_app(
             )
         except llm.LlmError as exc:
             return exc.response()
-        return {"entities": entities}
+        # `complete` is load-bearing: the host records a scan row (= "this file
+        # is protected") only for a pass that reached the end of the document.
+        return {
+            "entities": scan.entities,
+            "complete": scan.complete,
+            "chunksFailed": scan.chunks_failed,
+            "capped": scan.capped,
+        }
 
     # --- web search ---------------------------------------------------------
     #
@@ -982,6 +1139,8 @@ __all__ = [
     "ClientGone",
     "MAX_REQUEST_BYTES",
     "RunRegistry",
+    "TOKEN_ENV",
+    "TokenAuthMiddleware",
     "app",
     "create_app",
     "until_hangup",

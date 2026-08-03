@@ -1,27 +1,43 @@
 use std::io::Read;
 
+mod article;
 mod chunking;
+mod data;
 mod docx;
 mod html;
+mod legacy;
 mod pdf;
+mod pdf_quality;
 mod pptx;
 mod window;
 mod xlsx;
 
+pub use article::*;
 pub use chunking::*;
+pub(crate) use data::*;
 pub use window::*;
 pub use docx::*;
 pub use html::*;
+pub(crate) use legacy::*;
 pub(crate) use pdf::*;
+pub use pdf_quality::*;
 pub(crate) use pptx::*;
 pub(crate) use xlsx::*;
 
 const TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "json", "csv", "tsv", "log", "xml", "yml", "yaml", "toml", "ini",
-    "rs", "py", "js", "jsx", "ts", "tsx", "java", "c", "h", "cpp", "hpp", "cs", "go", "rb",
-    "php", "swift", "kt", "sh", "zsh", "bash", "sql", "r", "m", "scala", "lua", "pl", "css",
-    "scss", "less", "vue", "svelte", "tex", "org", "rst",
+    "txt", "md", "markdown", "json", "jsonl", "ndjson", "csv", "tsv", "log", "xml", "yml",
+    "yaml", "toml", "ini", "rs", "py", "js", "jsx", "ts", "tsx", "java", "c", "h", "cpp", "hpp",
+    "cs", "go", "rb", "php", "swift", "kt", "sh", "zsh", "bash", "sql", "r", "m", "scala", "lua",
+    "pl", "css", "scss", "less", "vue", "svelte", "tex", "org", "rst", "diff", "patch",
+    "dockerfile", "graphql", "gql", "proto", "properties", "env", "gitignore", "cfg", "conf",
 ];
+
+/// The text extensions, for the format registry's "what can this app open?"
+/// listing. Kept behind a function so the table itself stays private and there
+/// is still exactly one copy of it.
+pub fn text_extensions() -> &'static [&'static str] {
+    TEXT_EXTENSIONS
+}
 
 pub fn extension_of(name: &str) -> String {
     std::path::Path::new(name)
@@ -66,6 +82,13 @@ pub(crate) fn fold_edit_char(c: char) -> FoldOut {
         // Zero-widths: must precede the whitespace guard (U+200B is NOT
         // White_Space in Unicode, and U+FEFF is a BOM/no-break marker).
         '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => FoldOut::Drop,
+        // NUL is never document content, and the docx matcher uses it as its
+        // PARAGRAPH separator — a sentinel whose map entry is `usize::MAX`
+        // precisely because nothing may ever match it. NUL is not `is_whitespace`
+        // in Rust, so a needle carrying one used to survive `collapse_ws`, match
+        // a separator, and index `edits[usize::MAX]`: a panic instead of the
+        // plain "text not found" every other unmatched edit reports.
+        '\u{0}' => FoldOut::Drop,
         // Curly / modifier apostrophes → straight single quote.
         '\u{2018}' | '\u{2019}' | '\u{02BC}' => FoldOut::Char('\''),
         // Curly double quotes → straight double quote.
@@ -84,12 +107,184 @@ pub(crate) fn fold_edit_char(c: char) -> FoldOut {
     }
 }
 
+/// Decode a text file's bytes into a String, honouring its encoding.
+///
+/// This was `String::from_utf8_lossy`, which silently turns every byte a legacy
+/// encoding uses into U+FFFD. A Turkish ISO-8859-9 file therefore imported as a
+/// wall of "" — unreadable in the viewer, unsearchable in the index and
+/// useless to the model, with nothing anywhere saying why (live QA 2026-08-03,
+/// rated 1/5).
+///
+/// Order matters. A BOM is a FACT, so it wins outright. Valid UTF-8 is next and
+/// is near-certain: arbitrary legacy bytes almost never form a valid UTF-8
+/// sequence by accident. Only when both fail is the encoding actually detected.
+///
+/// Detection is `chardetng` — Firefox's detector, by the author of `encoding_rs`.
+/// A hand-rolled scoring heuristic was written first and REJECTED: single-byte
+/// encodings map the same byte to a different letter in each, so "is this a
+/// letter sitting next to other letters" cannot separate Turkish from Central
+/// European. It read the Turkish fixture as windows-1250 and produced "đ ý ţ" —
+/// confidently wrong, which is worse than a visible "" because nothing on
+/// screen admits it is wrong. Proper detection needs language models, not
+/// character classes.
+pub(crate) fn decode_text_bytes(bytes: &[u8]) -> String {
+    decode_text_detail(bytes).text
+}
+
+/// How a text file's encoding was arrived at.
+///
+/// The viewer says this out loud, because the four cases are NOT equally
+/// trustworthy: a BOM and valid UTF-8 are facts about the bytes, a detection is
+/// a guess that single-byte encodings make genuinely ambiguous, and a choice is
+/// the human overruling that guess. A strip that only ever said "windows-1254"
+/// would present the guess as a fact.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EncodingSource {
+    /// A byte-order mark named the encoding.
+    Bom,
+    /// The bytes are valid UTF-8, so nothing was guessed.
+    Utf8,
+    /// `chardetng` guessed it.
+    Detected,
+    /// The user picked it in the viewer, overruling the guess.
+    Chosen,
+}
+
+/// A decoded text file, with the provenance of the encoding that produced it.
+pub struct DecodedText {
+    pub text: String,
+    /// The encoding's WHATWG name (`UTF-8`, `windows-1254`, …) — what
+    /// `encoding_rs` calls it, so it always matches a `for_label` round-trip.
+    pub encoding: &'static str,
+    pub source: EncodingSource,
+    /// Some bytes had no meaning in this encoding and became U+FFFD. The text
+    /// on screen is therefore NOT the file: saving it would write those
+    /// replacement characters over the originals, so the editor stays shut.
+    pub lossy: bool,
+}
+
+/// `decode_text_bytes`, keeping the encoding it settled on. See that function
+/// for why the order is BOM → UTF-8 → detect.
+pub(crate) fn decode_text_detail(bytes: &[u8]) -> DecodedText {
+    // 1. A byte-order mark states the encoding outright.
+    // `for_bom` hands back the encoding and the BOM's LENGTH — skip those bytes
+    // so the mark itself never lands in the text as U+FEFF.
+    if let Some((enc, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        let (text, lossy) = enc.decode_without_bom_handling(&bytes[bom_len..]);
+        return DecodedText {
+            text: text.into_owned(),
+            encoding: enc.name(),
+            source: EncodingSource::Bom,
+            lossy,
+        };
+    }
+    // 2. Valid UTF-8 is taken as UTF-8, no guessing.
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return DecodedText {
+            text: s.to_string(),
+            encoding: encoding_rs::UTF_8.name(),
+            source: EncodingSource::Utf8,
+            lossy: false,
+        };
+    }
+    // 3. Detect. Fed a bounded prefix — the detector wants a sample, not the
+    //    whole file, and a book-length import should not be scanned twice.
+    const SAMPLE: usize = 64 * 1024;
+    let sample = &bytes[..bytes.len().min(SAMPLE)];
+    // `Iso2022JpDetection::Deny`: ISO-2022-JP is an escape-sequence encoding, and
+    // the crate's own guidance is to deny it anywhere the decoded text could be
+    // treated as markup. Room text reaches an HTML viewer, so deny.
+    let mut detector =
+        chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+    detector.feed(sample, sample.len() == bytes.len());
+    // `Utf8Detection::Deny` — UTF-8 is already ruled out above, and letting the
+    // detector answer UTF-8 here would only reinstate the lossy read.
+    let enc = detector.guess(None, chardetng::Utf8Detection::Deny);
+    let (text, lossy) = enc.decode_without_bom_handling(bytes);
+    DecodedText {
+        text: text.into_owned(),
+        encoding: enc.name(),
+        source: EncodingSource::Detected,
+        lossy,
+    }
+}
+
+/// Decode the same bytes as a NAMED encoding, for the viewer's override.
+///
+/// `None` when `encoding_rs` doesn't know the label — the picker is built from
+/// `encoding_choices()` so that can't happen from the UI, but a label arriving
+/// over IPC is still input, and answering "here is your file in some other
+/// encoding" would be a lie.
+///
+/// BOM handling is deliberately OFF: the point of the override is that the user
+/// overrules what the bytes appear to say, and `decode` would silently hand back
+/// UTF-8 for a BOM'd file while we reported the chosen name.
+pub(crate) fn decode_text_as(bytes: &[u8], label: &str) -> Option<DecodedText> {
+    let enc = encoding_rs::Encoding::for_label(label.as_bytes())?;
+    let (text, lossy) = enc.decode_without_bom_handling(bytes);
+    Some(DecodedText {
+        text: text.into_owned(),
+        encoding: enc.name(),
+        source: EncodingSource::Chosen,
+        lossy,
+    })
+}
+
+/// The encodings the viewer offers, as (label, human title).
+///
+/// Deliberately a short hand-picked list rather than every label in the
+/// Encoding Standard: a menu of 200 aliases is not a choice anyone can make.
+/// Every entry is resolved through `Encoding::for_label` before it is offered
+/// (a test enforces that none of them is unknown or a duplicate of another),
+/// so the picker can never offer an encoding this decoder cannot actually read.
+const ENCODING_CHOICES: &[(&str, &str)] = &[
+    ("utf-8", "Unicode (UTF-8)"),
+    ("utf-16le", "Unicode (UTF-16, little-endian)"),
+    ("utf-16be", "Unicode (UTF-16, big-endian)"),
+    ("windows-1252", "Western European (Windows 1252)"),
+    ("iso-8859-15", "Western European (ISO-8859-15)"),
+    ("macintosh", "Western European (Mac Roman)"),
+    ("windows-1250", "Central European (Windows 1250)"),
+    ("iso-8859-2", "Central European (ISO-8859-2)"),
+    // The Turkish pair are the same encoding in the Encoding Standard, which is
+    // why the title names both: a file labelled ISO-8859-9 is read as
+    // windows-1254 and the strip would otherwise look like it ignored the pick.
+    ("windows-1254", "Turkish (Windows 1254 / ISO-8859-9)"),
+    ("windows-1251", "Cyrillic (Windows 1251)"),
+    ("koi8-r", "Cyrillic (KOI8-R)"),
+    ("iso-8859-5", "Cyrillic (ISO-8859-5)"),
+    ("windows-1253", "Greek (Windows 1253)"),
+    ("windows-1255", "Hebrew (Windows 1255)"),
+    ("windows-1256", "Arabic (Windows 1256)"),
+    ("windows-1257", "Baltic (Windows 1257)"),
+    ("windows-1258", "Vietnamese (Windows 1258)"),
+    ("shift_jis", "Japanese (Shift_JIS)"),
+    ("euc-jp", "Japanese (EUC-JP)"),
+    ("gbk", "Simplified Chinese (GBK)"),
+    ("gb18030", "Simplified Chinese (GB18030)"),
+    ("big5", "Traditional Chinese (Big5)"),
+    ("euc-kr", "Korean (EUC-KR)"),
+];
+
+/// The offer list, canonicalised: each entry's name is what `decode_text_as`
+/// will report back for it, so the strip's "read as X" and the menu's selected
+/// row are the same string.
+pub(crate) fn encoding_choices() -> Vec<(&'static str, &'static str)> {
+    ENCODING_CHOICES
+        .iter()
+        .filter_map(|(label, title)| {
+            encoding_rs::Encoding::for_label(label.as_bytes()).map(|enc| (enc.name(), *title))
+        })
+        .collect()
+}
+
 /// Extract readable text from a file's bytes, best-effort. Returns None for
 /// formats we can't read (images, unknown binaries).
 pub fn extract_text(name: &str, bytes: &[u8]) -> Option<String> {
     let ext = extension_of(name);
     if TEXT_EXTENSIONS.contains(&ext.as_str()) {
-        return Some(String::from_utf8_lossy(bytes).into_owned());
+        return Some(decode_text_bytes(bytes));
     }
     // Every reader below parses UNTRUSTED bytes with a third-party crate
     // (pdf-extract, umya-spreadsheet, zip). Import runs these on
@@ -103,13 +298,51 @@ pub fn extract_text(name: &str, bytes: &[u8]) -> Option<String> {
         "docx" => extract_docx(bytes),
         "xlsx" => extract_xlsx(bytes),
         "pptx" => extract_pptx(bytes),
-        "html" | "htm" => Some(strip_html(&String::from_utf8_lossy(bytes))),
+        // Same decoder as plain text: a legacy-encoded HTML page is exactly as
+        // common as a legacy-encoded .txt, and `strip_html` cannot recover a
+        // character that was already replaced before it ran.
+        //
+        // The ARTICLE first (Readability scoring), because a saved page is
+        // indexed and read back as whatever this returns, and a page whose menu
+        // and footer are in the index answers searches with its own navigation.
+        // `strip_html` stays the fallback: it is what a page with no scorable
+        // article — a link list, a form, a shell — still has.
+        "html" | "htm" => {
+            let text = decode_text_bytes(bytes);
+            Some(match read_page(&text, None).article {
+                Some(article) => article.text,
+                None => strip_html(&text),
+            })
+        }
         // Two formats that used to import fine and then be unreadable to both
         // search and the assistant unless the optional MarkItDown CLI happened
         // to be installed. Both are cheap to read natively: an EPUB is a zip of
         // XHTML, and RTF is plain ASCII with control words.
         "epub" => extract_epub(bytes),
         "rtf" => extract_rtf(&String::from_utf8_lossy(bytes)),
+        // The pre-2007 Office formats, read natively. Until now these were
+        // reachable ONLY through an optional MarkItDown install, which for a
+        // shipped Mac app meant a .doc imported with no text at all — invisible
+        // to search, to RAG and to the model, with nothing saying why.
+        "doc" => extract_legacy_doc(name, bytes),
+        "ppt" => extract_legacy_ppt(bytes),
+        "xls" | "ods" => extract_legacy_spreadsheet(bytes, &ext),
+        // Apple's iWork bundles — the last of the "imports fine, then the
+        // assistant cannot read a word of it" formats. Their real payload is
+        // IWA (compressed protobuf), which is not worth a parser here; what IS
+        // worth reading is the PDF preview iWork writes into the same bundle,
+        // which the PDF reader already handles. A bundle saved without one
+        // yields None — honestly nothing, not a guess.
+        "pages" | "key" | "numbers" => extract_iwork(bytes),
+        // Formats the registry newly claims. Each one derives READABLE text
+        // rather than letting its raw source into the index: a notebook's
+        // prose instead of escaped JSON, a message's body instead of base64,
+        // a subtitle's words instead of its timecodes.
+        "ipynb" => extract_ipynb(bytes),
+        "eml" => extract_eml(&String::from_utf8_lossy(bytes)),
+        "srt" | "vtt" => extract_subtitles(&String::from_utf8_lossy(bytes)),
+        "svg" => extract_svg(&String::from_utf8_lossy(bytes)),
+        "zip" => extract_zip_listing(bytes),
         _ => None,
     })
     .map(|t| normalize_whitespace(&t))
@@ -190,6 +423,45 @@ pub(crate) fn extract_epub(bytes: &[u8]) -> Option<String> {
         out.push('\n');
     }
     (!out.trim().is_empty()).then_some(out)
+}
+
+/// The PDF preview inside an iWork bundle (.pages/.key/.numbers), if it has one.
+///
+/// Modern iWork documents are a zip whose document body is IWA — Snappy-framed
+/// protobuf with an undocumented schema — so there is no cheap honest way to
+/// read the text itself. But "Include preview in document" (on by default for
+/// anything shared or saved from iCloud) writes a full PDF rendering of the
+/// document into the same zip, and that is ordinary text.
+///
+/// Matched by SUFFIX rather than by an exact path: the entry sits at
+/// `QuickLook/Preview.pdf` in a flat bundle and at `<name>/QuickLook/Preview.pdf`
+/// in a package one, and the two spellings are the same file.
+fn iwork_preview_entry(names: &[String]) -> Option<&String> {
+    names
+        .iter()
+        .find(|n| n.to_ascii_lowercase().ends_with("quicklook/preview.pdf"))
+}
+
+/// Text of an iWork bundle, via its PDF preview. `None` when the bundle carries
+/// no preview — there is nothing to read, and saying so is the whole point.
+pub(crate) fn extract_iwork(bytes: &[u8]) -> Option<String> {
+    let names = zip_entry_names(bytes);
+    let entry = iwork_preview_entry(&names)?;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut file = archive.by_name(entry).ok()?;
+    // Same decompression-bomb ceiling every other Office part gets.
+    if file.size() > MAX_ZIP_ENTRY_BYTES {
+        return None;
+    }
+    let mut pdf = Vec::new();
+    std::io::Read::take(&mut file, MAX_ZIP_ENTRY_BYTES + 1)
+        .read_to_end(&mut pdf)
+        .ok()?;
+    if pdf.len() as u64 > MAX_ZIP_ENTRY_BYTES {
+        return None;
+    }
+    extract_pdf(&pdf)
 }
 
 /// Reading order from the book's OPF package: `<itemref idref="…">` in the
@@ -536,19 +808,107 @@ pub(crate) fn xml_paras_to_text(xml: &str, para_close: &str) -> String {
     strip_tags(&xml.replace(para_close, &format!("{para_close}\n")))
 }
 
-/// Decode the handful of entities every extractor needs.
+/// The named entities worth carrying: the five XML ones plus the typographic
+/// punctuation real prose is full of. Anything outside this table and outside
+/// the numeric forms is left exactly as written, which is the honest outcome —
+/// a literal `&foo;` in the text is visibly not decoded, where a guess would be
+/// silently wrong.
+const NAMED_ENTITIES: &[(&str, &str)] = &[
+    ("lt", "<"),
+    ("gt", ">"),
+    ("quot", "\""),
+    ("apos", "'"),
+    ("amp", "&"),
+    ("nbsp", " "),
+    ("mdash", "—"),
+    ("ndash", "–"),
+    ("hellip", "…"),
+    ("lsquo", "‘"),
+    ("rsquo", "’"),
+    ("ldquo", "“"),
+    ("rdquo", "”"),
+    ("bull", "•"),
+    ("middot", "·"),
+    ("times", "×"),
+    ("copy", "©"),
+    ("reg", "®"),
+    ("trade", "™"),
+    ("deg", "°"),
+    ("euro", "€"),
+    ("pound", "£"),
+    ("laquo", "«"),
+    ("raquo", "»"),
+];
+
+/// The longest `&…;` we will look at. Long enough for every name above and for
+/// a hex reference; short enough that a bare `&` in prose scans a few chars and
+/// gives up rather than swallowing half a paragraph looking for a `;`.
+const MAX_ENTITY_LEN: usize = 12;
+
+/// Decode HTML entities in extracted text.
 ///
-/// `&amp;` is decoded LAST, and that ordering is load-bearing: decoding it
-/// first turns `&amp;lt;` into `&lt;` and then into `<`, stripping one layer
-/// too many from any document that quotes HTML as an example.
+/// Single pass, deliberately. The previous version was a chain of `.replace()`
+/// calls over seven entities, which had two problems. It handled no NUMERIC
+/// references at all, so `&#8212;` — the em dash, which python.org and most
+/// documentation generators emit for every dash in prose — survived into the
+/// saved file as literal text; live QA 2026-08-03 saved a Python docs page and
+/// got a wall of `&#8212;`. And chained replacement made decoding order
+/// load-bearing: `&amp;` had to run LAST or `&amp;lt;` decoded twice, down to a
+/// bare `<`, corrupting any document that quotes HTML as an example.
+///
+/// Scanning once fixes both: each `&…;` is examined in the ORIGINAL text and
+/// replaced exactly once, so double-decoding is structurally impossible and
+/// ordering stops mattering.
 pub(crate) fn decode_basic_entities(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
+    // Nothing to do, and the overwhelmingly common case for non-HTML sources.
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        // The `;` must be close by; `char_indices` so a multi-byte char in the
+        // scan window can never produce a mid-character split.
+        let semi = after
+            .char_indices()
+            .take_while(|(i, _)| *i <= MAX_ENTITY_LEN)
+            .find(|(_, c)| *c == ';')
+            .map(|(i, _)| i);
+        let Some(semi) = semi else {
+            // A bare `&` — emit it and carry on from just after it, so the next
+            // `find` cannot rediscover this same one and loop forever.
+            out.push('&');
+            rest = after;
+            continue;
+        };
+        let body = &after[..semi];
+        let decoded = if let Some(digits) = body.strip_prefix('#') {
+            let code = match digits.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => digits.parse::<u32>().ok(),
+            };
+            code.and_then(char::from_u32).map(String::from)
+        } else {
+            NAMED_ENTITIES
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(body))
+                .map(|(_, ch)| (*ch).to_string())
+        };
+        match decoded {
+            Some(text) => out.push_str(&text),
+            // Unrecognized: keep it verbatim, `&` and `;` included.
+            None => {
+                out.push('&');
+                out.push_str(body);
+                out.push(';');
+            }
+        }
+        rest = &after[semi + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Collapse whitespace runs per line and squeeze blank-line runs to one.
@@ -623,6 +983,206 @@ mod tests {
     }
 
     #[test]
+    fn turkish_iso_8859_9_survives_import_instead_of_becoming_replacement_chars() {
+        // Live QA 2026-08-03 rated this 1/5: a Turkish fixture imported as a wall
+        // of U+FFFD, because `from_utf8_lossy` destroys legacy bytes before
+        // anything can interpret them.
+        let turkish = "Türkçe karakterler: ğ ı ş İ Ğ Ş ö ü ç";
+        let (bytes, _, had_errors) = encoding_rs::WINDOWS_1254.encode(turkish);
+        assert!(!had_errors, "fixture must be representable in the Turkish page");
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "fixture must NOT be valid UTF-8, or the test proves nothing"
+        );
+
+        let out = decode_text_bytes(&bytes);
+        assert!(!out.contains('\u{FFFD}'), "no replacement chars: {out:?}");
+        // The Turkish-specific letters are the ones windows-1252 gets wrong
+        // (ğ -> ð, ı -> ý), so they are the real assertion.
+        for ch in ['ğ', 'ı', 'ş', 'İ', 'Ğ', 'Ş'] {
+            assert!(out.contains(ch), "lost {ch:?} in {out:?}");
+        }
+    }
+
+    #[test]
+    fn a_chosen_encoding_overrules_the_detector() {
+        // The detector is a guess, and single-byte encodings are genuinely
+        // ambiguous — the same bytes ARE Turkish and ARE Cyrillic. So the user
+        // gets to say which, and the answer has to come back re-read from the
+        // ORIGINAL bytes rather than re-interpreted from the guessed string.
+        let turkish = "Türkçe: ğ ı ş İ";
+        let (bytes, _, _) = encoding_rs::WINDOWS_1254.encode(turkish);
+
+        let auto = decode_text_detail(&bytes);
+        assert_eq!(auto.source, EncodingSource::Detected);
+        assert_eq!(auto.encoding, "windows-1254");
+        assert!(!auto.lossy);
+        assert_eq!(auto.text, turkish);
+
+        let cyrillic = decode_text_as(&bytes, "windows-1251").expect("a known label");
+        assert_eq!(cyrillic.source, EncodingSource::Chosen);
+        assert_eq!(cyrillic.encoding, "windows-1251");
+        assert_ne!(cyrillic.text, auto.text, "the override must change the reading");
+        assert!(
+            cyrillic.text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c)),
+            "expected Cyrillic letters: {:?}",
+            cyrillic.text
+        );
+
+        // Choosing back is the escape hatch from a wrong pick.
+        let back = decode_text_as(&bytes, "iso-8859-9").expect("an alias of windows-1254");
+        assert_eq!(back.encoding, "windows-1254", "the label is canonicalised");
+        assert_eq!(back.text, turkish);
+    }
+
+    #[test]
+    fn an_encoding_the_decoder_does_not_know_is_refused() {
+        // Never "here is your file in some other encoding": the label arrives
+        // over IPC, so it is input, not a promise.
+        assert!(decode_text_as(b"hello", "klingon-1").is_none());
+    }
+
+    #[test]
+    fn every_offered_encoding_is_one_the_decoder_can_actually_use() {
+        let offered = encoding_choices();
+        assert_eq!(offered.len(), ENCODING_CHOICES.len(), "a label was dropped as unknown");
+        let mut seen: Vec<&str> = Vec::new();
+        for (name, title) in &offered {
+            assert!(
+                !seen.contains(name),
+                "{name} is offered twice (two labels for one encoding): {title}"
+            );
+            seen.push(name);
+            // What the picker offers must be exactly what a decode reports back,
+            // or the strip and the menu disagree about the same file.
+            let round = decode_text_as(b"abc", name).expect("offered labels must decode");
+            assert_eq!(round.encoding, *name);
+        }
+        assert!(seen.contains(&"UTF-8"), "UTF-8 must always be offerable");
+    }
+
+    #[test]
+    fn bytes_that_do_not_fit_the_encoding_are_reported_as_lossy() {
+        // A truncated multi-byte sequence has no meaning in UTF-8, so it decodes
+        // to U+FFFD. Saving that string would write the replacement over the
+        // real bytes — the viewer needs to know, so `lossy` is carried out
+        // rather than silently swallowed.
+        let hit = decode_text_as(&[b'a', 0xC3, b'(', b'b'], "utf-8").expect("a known label");
+        assert!(hit.lossy);
+        assert!(hit.text.contains('\u{FFFD}'));
+        let clean = decode_text_as(b"plain", "windows-1252").expect("a known label");
+        assert!(!clean.lossy);
+    }
+
+    #[test]
+    fn utf8_and_boms_are_never_guessed_at() {
+        // Valid UTF-8 must pass through untouched — the guesser only ever runs
+        // once UTF-8 has already failed.
+        let utf8 = "Ünicode — ümlauts, em-dash, ✓ and 日本語";
+        assert_eq!(decode_text_bytes(utf8.as_bytes()), utf8);
+
+        // A BOM is a fact, not a hint.
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice("héllo".as_bytes());
+        assert_eq!(decode_text_bytes(&with_bom), "héllo");
+
+        // Built byte-by-byte on purpose: `encoding_rs` cannot ENCODE to UTF-16
+        // (per the Encoding Standard its `encode` emits UTF-8 for those), so
+        // asking it for UTF-16LE bytes silently hands back UTF-8 and the test
+        // would be checking that a UTF-8 payload mislabelled by a BOM decodes to
+        // mojibake — which it correctly does.
+        let mut le = vec![0xFF, 0xFE]; // UTF-16LE BOM
+        for unit in "héllo".encode_utf16() {
+            le.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_text_bytes(&le), "héllo");
+
+        // Plain ASCII is unambiguous and must not be disturbed.
+        assert_eq!(decode_text_bytes(b"plain ascii"), "plain ascii");
+        assert_eq!(decode_text_bytes(b""), "");
+    }
+
+    #[test]
+    fn an_imported_html_page_is_indexed_as_its_article() {
+        // What lands in `extracted_text` is what search finds and what the
+        // model reads back, so a saved page whose menu and footer were indexed
+        // answered searches with its own navigation.
+        let page = "<html><head><title>T</title></head><body>\
+            <nav>Subscribe now Sections Newsletter</nav>\
+            <article><p>The wardens counted eleven nests in the lower marsh this season, \
+            eleven more than the year the herons left, and the trust has not yet decided \
+            what to say about it in public.</p>\
+            <p>A second paragraph, so the scorer has more than one node to weigh before \
+            it decides which part of this page is the article.</p></article>\
+            <footer>Privacy policy. All rights reserved.</footer></body></html>";
+        let text = extract_text("saved.html", page.as_bytes()).expect("html has text");
+        assert!(text.contains("eleven nests"), "{text}");
+        assert!(!text.contains("Subscribe now"), "chrome reached the index: {text}");
+        assert!(!text.contains("Privacy policy"), "chrome reached the index: {text}");
+
+        // A page with no article to score still yields its text — the fallback
+        // is `strip_html`, not silence.
+        let list = "<html><body><nav>menu</nav><ul><li><a href=\"/a\">Alpha</a></li>\
+                    <li><a href=\"/b\">Beta</a></li></ul></body></html>";
+        let text = extract_text("links.htm", list.as_bytes()).expect("still has text");
+        assert!(text.contains("Alpha") && text.contains("Beta"), "{text}");
+    }
+
+    #[test]
+    fn csv_text_reaches_search_exactly_as_written() {
+        // The grid had a quoted `"=SUM(A1:A2)"` read as a formula because
+        // SheetJS unquotes before it classifies. Search and RAG take a
+        // different route — the raw text, with no CSV parse at all — and this
+        // pins that: no unquoting, no whitespace normalization, no reflow. A
+        // reader searching for the literal cell must be able to find it.
+        let csv = "label,note\r\ntotal,\"=SUM(A1:A2)\"\r\nx,\"he said \"\"hi\"\", ok\"\r\n";
+        assert_eq!(extract_text("t.csv", csv.as_bytes()).unwrap(), csv);
+        assert_eq!(extract_text("t.tsv", csv.as_bytes()).unwrap(), csv);
+    }
+
+    #[test]
+    fn numeric_entities_decode_instead_of_reaching_the_reader() {
+        // Live QA 2026-08-03: a saved python.org docs page rendered as a wall of
+        // literal `&#8212;`. Documentation generators emit numeric references for
+        // ordinary punctuation, and the old chained-`replace` decoder knew none
+        // of them.
+        assert_eq!(decode_basic_entities("a &#8212; b"), "a — b");
+        assert_eq!(decode_basic_entities("it&#8217;s"), "it’s");
+        assert_eq!(decode_basic_entities("hex &#x2014; dash"), "hex — dash");
+        assert_eq!(decode_basic_entities("&#X2014;"), "—");
+        // Named typographic entities too.
+        assert_eq!(decode_basic_entities("a &mdash; b &hellip;"), "a — b …");
+    }
+
+    #[test]
+    fn one_pass_decoding_cannot_strip_a_layer_too_many() {
+        // The ordering hazard the old chain documented: decoding `&amp;` before
+        // `&lt;` turned `&amp;lt;` into `<`, silently corrupting any document
+        // that quotes HTML as an example. Scanning once makes it impossible.
+        assert_eq!(decode_basic_entities("&amp;lt;"), "&lt;");
+        assert_eq!(decode_basic_entities("&amp;amp;"), "&amp;");
+        assert_eq!(decode_basic_entities("&lt;div&gt;"), "<div>");
+    }
+
+    #[test]
+    fn unknown_and_malformed_entities_are_left_exactly_as_written() {
+        // Guessing would be silently wrong; leaving it is visibly not decoded.
+        assert_eq!(decode_basic_entities("&notareal;"), "&notareal;");
+        assert_eq!(decode_basic_entities("&#99999999;"), "&#99999999;");
+        // A bare ampersand in prose, including one followed much later by a
+        // semicolon — the scan window must give up rather than swallow the gap.
+        assert_eq!(decode_basic_entities("Tom & Jerry"), "Tom & Jerry");
+        assert_eq!(
+            decode_basic_entities("a & b, then something long; done"),
+            "a & b, then something long; done"
+        );
+        // Trailing ampersand: must terminate, not spin.
+        assert_eq!(decode_basic_entities("ends with &"), "ends with &");
+        // Multi-byte text inside the scan window must not split a character.
+        assert_eq!(decode_basic_entities("& — é ; ok"), "& — é ; ok");
+    }
+
+    #[test]
     fn reads_an_epub_in_reading_order() {
         // E-books imported fine and were then unreadable to both search and
         // the assistant unless the optional MarkItDown CLI happened to exist.
@@ -653,6 +1213,51 @@ mod tests {
         let one = text.find("Chapter one body").expect("chapter one missing");
         let two = text.find("Chapter two body").expect("chapter two missing");
         assert!(one < two, "spine order ignored: {text}");
+    }
+
+    #[test]
+    fn an_iwork_bundle_is_read_through_its_pdf_preview_or_not_at_all() {
+        use std::io::Write;
+        fn bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            {
+                let mut writer = zip::ZipWriter::new(&mut cursor);
+                let options = zip::write::SimpleFileOptions::default();
+                for (name, body) in entries {
+                    writer.start_file(*name, options).unwrap();
+                    writer.write_all(body).unwrap();
+                }
+                writer.finish().unwrap();
+            }
+            cursor.into_inner()
+        }
+
+        // Both bundle spellings name the same file, and neither the IWA payload
+        // nor the thumbnail may be mistaken for it.
+        let flat = bundle(&[
+            ("Index/Document.iwa", b"\x00binary"),
+            ("preview.jpg", b"\xff\xd8jpeg"),
+            ("QuickLook/Preview.pdf", b"%PDF-1.4 stub"),
+        ]);
+        let names = zip_entry_names(&flat);
+        assert_eq!(iwork_preview_entry(&names).map(String::as_str), Some("QuickLook/Preview.pdf"));
+        let packaged = bundle(&[("Lease.pages/QuickLook/Preview.pdf", b"%PDF-1.4 stub")]);
+        let names = zip_entry_names(&packaged);
+        assert_eq!(
+            iwork_preview_entry(&names).map(String::as_str),
+            Some("Lease.pages/QuickLook/Preview.pdf")
+        );
+
+        // A bundle saved WITHOUT a preview has nothing readable in it, and the
+        // honest answer is None — never the raw IWA bytes, which would put
+        // compressed protobuf into the search index as if it were prose.
+        let no_preview = bundle(&[("Index/Document.iwa", b"\x00binary")]);
+        assert!(iwork_preview_entry(&zip_entry_names(&no_preview)).is_none());
+        assert_eq!(extract_text("Lease.pages", &no_preview), None);
+        assert_eq!(extract_text("Deck.key", &no_preview), None);
+        assert_eq!(extract_text("Budget.numbers", &no_preview), None);
+        // …and so does a preview that is not a readable PDF: no text is no text.
+        assert_eq!(extract_text("Lease.pages", &flat), None);
     }
 
     #[test]

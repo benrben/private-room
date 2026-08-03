@@ -57,7 +57,16 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
           <span className="script-lang">{sc.lang}</span>
         </span>
         {sc.changedSinceApproval && (
-          <span className="script-ribbon" title="This script changed since it was approved — review and run it to re-approve.">
+          // `changedSinceApproval` means "this exact content is not remembered
+          // on this Mac" — and it CANNOT tell an "Allow once" run apart from an
+          // edit after "Always allow" (see the Rust field's doc comment). So the
+          // tooltip must not claim the script changed: approving a script just
+          // this once left it permanently ribboned as though someone had edited
+          // a file they never touched.
+          <span
+            className="script-ribbon"
+            title="This script's current content isn't remembered on this Mac — running it will ask for approval again. That is normal after an “Allow once” run, and it is also what an edit looks like."
+          >
             Needs review
           </span>
         )}
@@ -105,15 +114,18 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
             <button
               className="subtle btn-ic"
               disabled={!!live}
+              // Same restraint as the ribbon: the flag does not know whether
+              // anyone edited anything, so neither the label nor the tooltip
+              // may say so.
               title={
                 sc.changedSinceApproval
-                  ? "You edited the script — run the fixed version"
+                  ? "Run this script's current content — it will ask for approval first"
                   : "Run again"
               }
               onClick={() => void a.runScript(sc.fileId)}
             >
               <PlayIcon size={12} />{" "}
-              {sc.changedSinceApproval ? "Run fixed version" : "Run again"}
+              {sc.changedSinceApproval ? "Run current version" : "Run again"}
             </button>
           </div>
         </div>
@@ -143,13 +155,25 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
       </div>
 
       <div className="script-row-actions">
+        {/* An unapproved script has ALWAYS been blocked — `run_script_inner`
+            refuses to execute content whose hash is not approved on this Mac,
+            and raises the consent card naming the interpreter, the declared
+            manifest and every room file the run would decrypt. What was wrong
+            was the BUTTON: labelled "Run", it promised execution that could not
+            happen, so the review gate read as broken rather than as working.
+            Live QA reported it twice as "unreviewed scripts can still run".
+            The gate is unchanged; the button now says what it actually does. */}
         <button
           className="subtle btn-ic"
-          title="Run this script now — outputs are saved into the room"
+          title={
+            sc.approved
+              ? "Run this script now — outputs are saved into the room"
+              : "This version has not been approved — opens the review card; nothing runs until you approve it"
+          }
           disabled={!!live}
           onClick={() => void a.runScript(sc.fileId)}
         >
-          <PlayIcon size={13} /> Run
+          <PlayIcon size={13} /> {sc.approved ? "Run" : "Review script"}
         </button>
         {/* Scheduling requires an approved script (the executor parks a scheduled
             run whose content isn't approved on this Mac). */}

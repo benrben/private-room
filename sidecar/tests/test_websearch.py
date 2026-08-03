@@ -9,6 +9,7 @@ green suite that quietly returns nothing.
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import Any
 
 import httpx
@@ -83,6 +84,32 @@ def test_fails_soft_turns_any_exception_into_no_results() -> None:
         raise RuntimeError("selectors rotted")
 
     assert boom("q") == []
+
+
+def test_a_failing_engine_never_logs_the_query(caplog: Any) -> None:
+    """SPEC §6. `requests` puts the whole request URL in its message, so an
+    `exc_info=True` traceback here wrote the user's search words into the
+    sidecar's unencrypted stderr log on every network blip."""
+    secret = "my-divorce-lawyer"
+
+    @w._fails_soft
+    def unreachable(query: str) -> list[dict[str, Any]]:
+        raise ConnectionError(
+            f"HTTPSConnectionPool(host='www.mojeek.com', port=443): "
+            f"Max retries exceeded with url: /search?q={secret}"
+        )
+
+    with caplog.at_level(logging.DEBUG, logger=w._log.name):
+        assert unreachable(secret) == []
+    for record in caplog.records:
+        rendered = record.getMessage() + (record.exc_text or "")
+        assert secret not in rendered, rendered
+    # The diagnosis this log exists for survives: which engine, and which KIND
+    # of failure (a rotted selector is not a dead network).
+    assert any(
+        "unreachable" in r.getMessage() and "ConnectionError" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
 
 
 # ── _collect ────────────────────────────────────────────────────────────────────

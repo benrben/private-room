@@ -85,29 +85,27 @@ def test_message_conversion_preserves_images_and_stringifies_tool_arguments() ->
 
 
 @pytest.mark.asyncio
-async def test_stream_retries_with_arcelle_write_tools_when_connector_schema_is_rejected(monkeypatch) -> None:
+async def test_a_rejected_catalog_is_never_re_sent_without_the_unrecognised_tools(
+    monkeypatch,
+) -> None:
+    """The replacement for `…retries_with_arcelle_write_tools…`.
+
+    That test pinned a retry which narrowed the catalog to a hardcoded name
+    allowlist, and its fixture invented a catalog entry called `connector_bad`
+    to justify it. No such entry exists: connected MCP servers are served
+    through the `search_mcp_tools` / `run_mcp_tool` proxy pair and their
+    individual schemas never enter a model request (`room_mcp.rs::served_tools`).
+
+    So the narrowing could only ever delete OUR tools, and the allowlist had
+    gone stale — it was missing every `browse_*` tool, which is the whole
+    Browser agent. What the retry actually produced was an agent quietly
+    stripped of its catalog, or, when nothing matched, a bare provider error.
+    """
     requests: list[dict] = []
-    success = "\n".join(
-        [
-            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_write","function":{"name":"write_file","arguments":"{\\"name\\":\\"note.md\\",\\"content\\":\\"done\\"}"}}]}}]}',
-            'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2}}',
-            "data: [DONE]",
-            "",
-        ]
-    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
-        if len(requests) == 1:
-            return httpx.Response(
-                400,
-                json={"error": {"message": "invalid tool schema"}},
-            )
-        return httpx.Response(
-            200,
-            text=success,
-            headers={"content-type": "text/event-stream"},
-        )
+        return httpx.Response(400, json={"error": {"message": "invalid tool schema"}})
 
     real_client = httpx.AsyncClient
     transport = httpx.MockTransport(handler)
@@ -121,21 +119,21 @@ async def test_stream_retries_with_arcelle_write_tools_when_connector_schema_is_
         pass
 
     model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
-    text, calls, usage = await model.stream(
-        [{"role": "user", "content": "hello"}],
-        [
-            {"type": "function", "function": {"name": "write_file", "parameters": {}}},
-            {"type": "function", "function": {"name": "connector_bad", "parameters": {}}},
-        ],
-        on_delta,
-    )
+    with pytest.raises(provider_api.ProviderApiError, match="invalid tool schema"):
+        await model.stream(
+            [{"role": "user", "content": "hello"}],
+            [
+                {"type": "function", "function": {"name": "write_file", "parameters": {}}},
+                {"type": "function", "function": {"name": "browse_open", "parameters": {}}},
+            ],
+            on_delta,
+        )
 
-    assert "tools" in requests[0]
-    assert [t["function"]["name"] for t in requests[1]["tools"]] == ["write_file"]
-    assert text == ""
-    assert calls[0].name == "write_file"
-    assert calls[0].arguments == {"name": "note.md", "content": "done"}
-    assert usage.is_real is True
+    assert len(requests) == 1, "one attempt — no second, narrowed catalog"
+    assert [t["function"]["name"] for t in requests[0]["tools"]] == [
+        "write_file",
+        "browse_open",
+    ]
 
 
 def test_write_request_fails_clearly_when_selected_model_has_no_tools() -> None:
@@ -304,3 +302,455 @@ def test_repeated_streamed_tool_name_is_not_duplicated() -> None:
     current = provider_api._merge_stream_piece("", "write_file")
     current = provider_api._merge_stream_piece(current, "write_file")
     assert current == "write_file"
+
+
+def test_an_unknown_context_window_still_gets_a_budget() -> None:
+    """The hole every other guard was built to close.
+
+    "Unknown window means no budget" made `compact_to_budget` return
+    immediately and `fit_oversized_results` never run — so one heavy
+    `browse_read` reached the provider intact and the turn came back as a bare
+    provider error. The token bar already assumed 128k for the same unknown, so
+    the bar showed a denominator that nothing enforced.
+    """
+    from arcelle_sidecar.provider_api import DEFAULT_PROVIDER_CONTEXT
+
+    assert DEFAULT_PROVIDER_CONTEXT > 0
+    # A real budget comes out of it, rather than the None that skips fitting.
+    from arcelle_sidecar.compaction import CLOUD_SPEND_FRACTION, fit_budget_bytes
+
+    assert fit_budget_bytes(None, 0, CLOUD_SPEND_FRACTION) is None, (
+        "an unknown window still yields no budget — this is the hole"
+    )
+    budget = fit_budget_bytes(DEFAULT_PROVIDER_CONTEXT, 0, CLOUD_SPEND_FRACTION)
+    assert budget is not None and budget > 0
+
+
+# --- What the user is actually told when a routed backend fails ---------------
+#
+# OpenRouter does not pass an upstream failure through. It substitutes the fixed
+# string "Provider returned error" and files the real cause under `metadata`.
+# Reading only `error.message` therefore surfaced the one sentence in the whole
+# payload that carries no information, which is what reached the agent's
+# failure box verbatim.
+
+
+def test_an_openrouter_wrapper_error_reveals_the_upstream_reason() -> None:
+    payload = {
+        "error": {
+            "message": "Provider returned error",
+            "code": 429,
+            "metadata": {
+                "provider_name": "OpenAI",
+                "raw": json.dumps(
+                    {"error": {"message": "Rate limit reached for gpt-4o", "type": "rate_limit"}}
+                ),
+            },
+        }
+    }
+    text = provider_api._error_message(httpx.Response(429, json=payload))
+    assert "Rate limit reached for gpt-4o" in text, "the actual cause must survive"
+    assert "OpenAI" in text, "and the backend that produced it"
+    assert "429" in text
+
+
+def test_an_upstream_error_that_is_not_json_is_shown_as_written() -> None:
+    payload = {
+        "error": {
+            "message": "Provider returned error",
+            "code": 502,
+            "metadata": {"provider_name": "Together", "raw": "upstream connect timeout"},
+        }
+    }
+    text = provider_api._error_message(httpx.Response(502, json=payload))
+    assert "upstream connect timeout" in text
+    assert "Together" in text
+
+
+def test_a_moderation_refusal_names_the_categories() -> None:
+    payload = {
+        "error": {
+            "message": "Provider returned error",
+            "code": 403,
+            "metadata": {"reasons": ["violence", "self-harm"]},
+        }
+    }
+    text = provider_api._error_message(httpx.Response(403, json=payload))
+    assert "violence" in text and "self-harm" in text
+
+
+def test_an_error_with_no_metadata_at_least_gains_its_status_code() -> None:
+    # Nothing can be recovered here, but "(HTTP 401)" still separates a rejected
+    # key from a rate limit from a dead endpoint — the bare message did not.
+    payload = {"error": {"message": "Provider returned error"}}
+    text = provider_api._error_message(httpx.Response(401, json=payload))
+    assert text == "Provider returned error (HTTP 401)"
+
+
+def test_a_status_code_already_in_the_message_is_not_repeated() -> None:
+    payload = {"error": {"message": "provider returned HTTP 500", "code": 500}}
+    text = provider_api._error_message(httpx.Response(500, json=payload))
+    assert text.count("500") == 1
+
+
+def test_a_body_that_is_not_json_still_reports_the_status() -> None:
+    text = provider_api._error_message(httpx.Response(503, text="<html>bad gateway</html>"))
+    assert text == "provider returned HTTP 503"
+
+
+def test_a_giant_upstream_error_is_clipped_for_the_failure_box() -> None:
+    payload = {
+        "error": {
+            "message": "Provider returned error",
+            "metadata": {"raw": "x" * 5000},
+        }
+    }
+    text = provider_api._error_message(httpx.Response(400, json=payload))
+    assert len(text) <= provider_api.MAX_ERROR_DETAIL_CHARS
+    assert text.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_wrapper_error_also_reveals_the_upstream_reason(monkeypatch) -> None:
+    # The streaming path had its own copy of the message-only extraction, so
+    # fixing the non-streaming one alone would have left every chat turn — the
+    # common case — still reporting nothing.
+    error = {
+        "error": {
+            "message": "Provider returned error",
+            "code": 400,
+            "metadata": {
+                "provider_name": "Anthropic",
+                "raw": json.dumps({"error": {"message": "max_tokens exceeds model limit"}}),
+            },
+        }
+    }
+    body = f"data: {json.dumps(error)}\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        provider_api.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+
+    async def on_delta(_value: str) -> None:
+        pass
+
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+    with pytest.raises(provider_api.ProviderApiError, match="max_tokens exceeds model limit"):
+        await model.stream([{"role": "user", "content": "hello"}], [], on_delta)
+
+
+# --- A tool catalog is never silently shrunk ---------------------------------
+#
+# A 400 used to narrow the catalog to a hardcoded 44-name allowlist. 19 of the
+# room's 62 tools were missing from it — every `browse_*` tool among them — so
+# the Browser agent's whole catalog vanished on the retry, and agents whose
+# tools were only partly listed carried on with a smaller catalog nobody told
+# them about. See the note at the top of provider_api.py.
+
+
+def _four_hundred(monkeypatch, *, body: str = '{"error":{"message":"bad tools"}}'):
+    """Make every provider call answer 400, and record what was sent."""
+    sent: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(400, text=body, headers={"content-type": "application/json"})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        provider_api.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    return sent
+
+
+def _tool(name: str) -> dict:
+    return {
+        "type": "function",
+        "function": {"name": name, "description": name, "parameters": {"type": "object"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_catalog_is_reported_not_quietly_shrunk(monkeypatch) -> None:
+    sent = _four_hundred(monkeypatch)
+
+    async def on_delta(_v: str) -> None:
+        pass
+
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+    tools = [_tool("browse_open"), _tool("open_file"), _tool("web_search")]
+    with pytest.raises(provider_api.ProviderApiError) as err:
+        await model.stream([{"role": "user", "content": "hi"}], tools, on_delta)
+
+    assert len(sent) == 1, "the catalog must not be re-sent in a mutilated form"
+    assert len(sent[0]["tools"]) == 3, "every tool the agent was given was offered"
+    text = str(err.value)
+    assert "3 tool definitions" in text, text
+    assert "different model" in text, "the message has to be actionable"
+
+
+@pytest.mark.asyncio
+async def test_the_browser_agents_catalog_survives_a_rejection(monkeypatch) -> None:
+    # The exact shape that used to collapse to nothing: an agent whose tools are
+    # ALL browse_*. None were on the allowlist, so the narrowed set was empty,
+    # the retry was skipped, and the user saw only "Provider returned error".
+    sent = _four_hundred(monkeypatch)
+
+    async def on_delta(_v: str) -> None:
+        pass
+
+    browse = [
+        _tool(n)
+        for n in ("browse_open", "browse_read", "browse_look", "browse_do", "browse_save")
+    ]
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+    with pytest.raises(provider_api.ProviderApiError) as err:
+        await model.stream([{"role": "user", "content": "hi"}], browse, on_delta)
+
+    assert [t["function"]["name"] for t in sent[0]["tools"]] == [
+        "browse_open", "browse_read", "browse_look", "browse_do", "browse_save",
+    ]
+    assert "browse_open" in str(err.value), "the message names what was offered"
+
+
+@pytest.mark.asyncio
+async def test_a_400_with_no_tools_keeps_the_plain_provider_message(monkeypatch) -> None:
+    sent = _four_hundred(monkeypatch, body='{"error":{"message":"context too long"}}')
+
+    async def on_delta(_v: str) -> None:
+        pass
+
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+    with pytest.raises(provider_api.ProviderApiError) as err:
+        await model.stream([{"role": "user", "content": "hi"}], [], on_delta)
+    assert "context too long" in str(err.value)
+    assert "tool definitions" not in str(err.value), "no catalog, no catalog advice"
+    assert sent and "tools" not in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_every_tool_in_the_shipped_catalog_reaches_the_provider(monkeypatch) -> None:
+    """The seam that had a third, unchecked copy of "the tool list".
+
+    Agent boxes are pinned against the catalog snapshot
+    (`test_dataset_build.test_the_catalog_snapshot_covers_every_box`), and the
+    snapshot is pinned against Rust. This layer answered to neither: it carried
+    its own frozenset, drifted 19 tools behind, and silently dropped whatever it
+    did not recognise. Pinning it against the SAME catalog closes the loop, so a
+    tool added tomorrow cannot go missing here alone.
+    """
+    import pathlib
+
+    catalog_path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "devtools" / "dataset" / "tool_catalog.json"
+    )
+    catalog = json.loads(catalog_path.read_text())
+    tools = [_tool(entry["name"]) for entry in catalog]
+    assert len(tools) > 50, "sanity: the catalog should be the whole room"
+
+    sent = _four_hundred(monkeypatch)
+
+    async def on_delta(_v: str) -> None:
+        pass
+
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+    with pytest.raises(provider_api.ProviderApiError):
+        await model.stream([{"role": "user", "content": "hi"}], tools, on_delta)
+
+    offered = {t["function"]["name"] for t in sent[0]["tools"]}
+    missing = {entry["name"] for entry in catalog} - offered
+    assert not missing, f"tools never reached the provider: {sorted(missing)}"
+
+
+# --- Every declared tool call gets a reply -----------------------------------
+#
+# Live failure, 2026-08-02, Browser agent on OpenRouter routed to Azure:
+#   "Provider returned error (HTTP 400) — Azure said: No tool output found for
+#    function call call_6_0."
+# The page had already been opened and read. `_Round.run` breaks out of the
+# call loop on Stop or a cancelled child, so calls declared after the break are
+# never answered, and the NEXT request is rejected in full.
+
+
+def test_a_tool_call_left_unanswered_is_given_a_reply() -> None:
+    converted = provider_api._messages_for_api(
+        [
+            {"role": "user", "content": "open the page"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_6_0", "type": "function",
+                     "function": {"name": "browse_open", "arguments": {}}},
+                    {"id": "call_6_1", "type": "function",
+                     "function": {"name": "browse_read", "arguments": {}}},
+                ],
+            },
+            {"role": "tool", "content": "opened", "tool_name": "browse_open",
+             "tool_call_id": "call_6_0"},
+        ]
+    )
+    tool_ids = [m["tool_call_id"] for m in converted if m["role"] == "tool"]
+    assert tool_ids == ["call_6_0", "call_6_1"], "the abandoned call needs a reply too"
+    filler = next(m for m in converted if m.get("tool_call_id") == "call_6_1")
+    assert filler["content"] == provider_api.UNANSWERED_TOOL_NOTE
+    assert filler["name"] == "browse_read", "named, so the model knows which tool"
+
+
+def test_the_exact_live_failure_shape_no_result_at_all() -> None:
+    # The harshest version: the round broke before ANY call was answered.
+    converted = provider_api._messages_for_api(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_6_0", "type": "function",
+                     "function": {"name": "browse_look", "arguments": {}}},
+                ],
+            },
+        ]
+    )
+    assert [m["role"] for m in converted] == ["assistant", "tool"]
+    assert converted[1]["tool_call_id"] == "call_6_0"
+
+
+def test_a_fully_answered_round_is_left_exactly_as_it_was() -> None:
+    original = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "a", "type": "function",
+                 "function": {"name": "open_file", "arguments": {}}},
+                {"id": "b", "type": "function",
+                 "function": {"name": "search_room", "arguments": {}}},
+            ],
+        },
+        {"role": "tool", "content": "1", "tool_name": "open_file", "tool_call_id": "a"},
+        {"role": "tool", "content": "2", "tool_name": "search_room", "tool_call_id": "b"},
+        {"role": "user", "content": "thanks"},
+    ]
+    converted = provider_api._messages_for_api(original)
+    assert len(converted) == 4, "no filler where none is needed"
+    assert [m["role"] for m in converted] == ["assistant", "tool", "tool", "user"]
+
+
+def test_a_later_round_is_not_swallowed_by_an_earlier_ones_backfill() -> None:
+    # The scan must stop at the first non-tool message, or a second round's
+    # assistant turn would be consumed as though it answered the first.
+    converted = provider_api._messages_for_api(
+        [
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "r1", "type": "function",
+                             "function": {"name": "browse_open", "arguments": {}}}]},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "r2", "type": "function",
+                             "function": {"name": "browse_read", "arguments": {}}}]},
+        ]
+    )
+    assert [m["role"] for m in converted] == ["assistant", "tool", "assistant", "tool"]
+    assert converted[1]["tool_call_id"] == "r1"
+    assert converted[3]["tool_call_id"] == "r2"
+
+
+# --- Anonymous tool calls ------------------------------------------------------
+#
+# THE live root cause, 2026-08-02. The graph fires deterministic calls of its own
+# (`probe`, `perceive`) which carry no id, because Ollama pairs results to calls
+# positionally. An OpenAI-compatible provider pairs by `tool_call_id` alone, so
+# the request went out as:
+#     assistant[calls:-]  tool[for:browse_snapshot]
+# and Azure answered "No tool output found for function call call_7_0" — its own
+# index for the call we left anonymous.
+
+
+def test_a_graph_fired_call_with_no_id_is_still_answerable() -> None:
+    converted = provider_api._messages_for_api(
+        [
+            {"role": "user", "content": "open it"},
+            # No "id" — exactly what `ToolCall.to_raw()` emits for a synthesized call.
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"type": "function",
+                     "function": {"name": "browse_snapshot", "arguments": {}}}
+                ],
+            },
+            {"role": "tool", "content": "3 controls", "tool_name": "browse_snapshot"},
+        ]
+    )
+    declared = converted[1]["tool_calls"][0]["id"]
+    assert declared, "an anonymous call is unanswerable — it must be given an id"
+    assert converted[2]["tool_call_id"] == declared, (
+        "the result must carry the SAME id, not the tool's name"
+    )
+    assert converted[2]["tool_call_id"] != "browse_snapshot"
+
+
+def test_minted_ids_are_stable_across_identical_requests() -> None:
+    # A retry, or a re-fit after compaction, must not reshape the conversation.
+    convo = [
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"type": "function",
+                         "function": {"name": "browse_look", "arguments": {}}}]},
+        {"role": "tool", "content": "ok", "tool_name": "browse_look"},
+    ]
+    first = provider_api._messages_for_api(convo)
+    second = provider_api._messages_for_api(convo)
+    assert first[0]["tool_calls"][0]["id"] == second[0]["tool_calls"][0]["id"]
+
+
+def test_two_anonymous_calls_in_one_turn_get_distinct_ids() -> None:
+    converted = provider_api._messages_for_api(
+        [
+            {"role": "assistant", "content": "",
+             "tool_calls": [
+                 {"type": "function", "function": {"name": "browse_look", "arguments": {}}},
+                 {"type": "function", "function": {"name": "browse_read", "arguments": {}}},
+             ]},
+            {"role": "tool", "content": "a", "tool_name": "browse_look"},
+            {"role": "tool", "content": "b", "tool_name": "browse_read"},
+        ]
+    )
+    ids = [c["id"] for c in converted[0]["tool_calls"]]
+    assert len(set(ids)) == 2, ids
+    assert [m["tool_call_id"] for m in converted[1:]] == ids
+
+
+def test_a_real_provider_id_is_never_replaced() -> None:
+    converted = provider_api._messages_for_api(
+        [
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "call_bgrfaE2GPFMXVjztoqc9MU2j", "type": "function",
+                             "function": {"name": "browse_open", "arguments": {}}}]},
+            {"role": "tool", "content": "ok", "tool_name": "browse_open",
+             "tool_call_id": "call_bgrfaE2GPFMXVjztoqc9MU2j"},
+        ]
+    )
+    assert converted[0]["tool_calls"][0]["id"] == "call_bgrfaE2GPFMXVjztoqc9MU2j"
+    assert converted[1]["tool_call_id"] == "call_bgrfaE2GPFMXVjztoqc9MU2j"
+
+
+def test_the_skeleton_names_shapes_without_leaking_content() -> None:
+    skeleton = provider_api._message_skeleton(
+        [
+            {"role": "system", "content": "SECRET PROMPT"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "x"}]},
+            {"role": "tool", "content": "SECRET RESULT", "tool_call_id": "x"},
+        ]
+    )
+    assert skeleton == "system assistant[calls:x] tool[for:x]"
+    assert "SECRET" not in skeleton

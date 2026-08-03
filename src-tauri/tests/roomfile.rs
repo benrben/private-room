@@ -1,10 +1,40 @@
 use arcelle_lib::db;
 use arcelle_lib::extraction;
 
+/// A scratch directory that cleans itself up on the way out — INCLUDING when
+/// the test panics.
+///
+/// These directories used to be named after the process id and deleted on the
+/// test's last line, so any failure left one behind. `db::create_room` refuses
+/// to write over an existing file ("A file already exists at this location"),
+/// so the NEXT run — pids are recycled — failed with an error about the leftover
+/// rather than about the code under test, and sent whoever was debugging in
+/// completely the wrong direction. A uuid makes two runs independent; `Drop`
+/// makes a failing run clean up after itself.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(prefix: &str) -> Self {
+        let dir = std::env::temp_dir()
+            .join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+    fn join(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Best-effort: a cleanup failure must never mask the real verdict.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn roomai_lifecycle_and_encryption() {
-    let dir = std::env::temp_dir().join(format!("roomai-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new("roomai-test");
     let path = dir.join("test.roomai");
     let path_str = path.to_string_lossy().to_string();
 
@@ -46,14 +76,11 @@ fn roomai_lifecycle_and_encryption() {
         })
         .unwrap();
     assert_eq!(text, "the launch code is 4242");
-
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn migrates_old_rooms_into_sessions() {
-    let dir = std::env::temp_dir().join(format!("roomai-migrate-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new("roomai-migrate");
     let path = dir.join("old.roomai");
     let path_str = path.to_string_lossy().to_string();
 
@@ -97,8 +124,6 @@ fn migrates_old_rooms_into_sessions() {
         )
         .unwrap();
     assert_eq!(agent, "agent", "the skills table was not created with `agent`");
-
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The other half of the same migration: a room whose `skills` table PREDATES
@@ -106,8 +131,7 @@ fn migrates_old_rooms_into_sessions() {
 /// existing rows must survive it as GENERAL skills (empty owner).
 #[test]
 fn adds_the_agent_column_to_a_legacy_skills_table() {
-    let dir = std::env::temp_dir().join(format!("roomai-skills-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new("roomai-skills");
     let path = dir.join("legacy-skills.roomai");
     let path_str = path.to_string_lossy().to_string();
 
@@ -147,8 +171,55 @@ fn adds_the_agent_column_to_a_legacy_skills_table() {
         .query_row("SELECT count(*) FROM skills", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1);
+}
 
-    std::fs::remove_dir_all(&dir).unwrap();
+/// A room whose `jobs` table predates `parked_reason`. The guarded ALTER has to
+/// run before ANY job read, because `list_jobs`/`get_job` now select the column
+/// by name — miss it and an old room cannot show its Activity panel at all. The
+/// job it already had must come back untouched, and with a NULL reason: nothing
+/// interrupted it that this room ever recorded, and inventing a sentence for it
+/// would be a claim about a lock that may never have happened.
+#[test]
+fn adds_the_parked_reason_column_to_a_legacy_jobs_table() {
+    let dir = Scratch::new("roomai-jobs");
+    let path = dir.join("legacy-jobs.roomai");
+    let path_str = path.to_string_lossy().to_string();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "key", "pw").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES('format','roomai'),('name','legacy');
+             CREATE TABLE messages(
+               id TEXT PRIMARY KEY, role TEXT NOT NULL, content TEXT NOT NULL,
+               sources TEXT,
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+             CREATE TABLE jobs(
+               id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+               plan TEXT NOT NULL, state TEXT NOT NULL DEFAULT '{}',
+               cursor INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL DEFAULT 'queued', error TEXT,
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+               updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+             INSERT INTO jobs(id, kind, title, plan, cursor, total, status)
+               VALUES('j1','file_pass','Full pass — book.pdf','{}',4,11,'paused');",
+        )
+        .unwrap();
+    }
+
+    let conn = db::open_room(&path_str, "pw").unwrap();
+    let job = db::get_job(&conn, "j1").unwrap();
+    assert_eq!(job.status, "paused");
+    assert_eq!(job.cursor, 4, "the old checkpoint survives the migration");
+    assert_eq!(
+        job.parked_reason, None,
+        "an old row must not be given an interruption nobody recorded"
+    );
+    // Re-opening is a no-op: the duplicate-column error is the idempotence check.
+    drop(conn);
+    let conn = db::open_room(&path_str, "pw").unwrap();
+    assert_eq!(db::list_jobs(&conn).unwrap().len(), 1);
 }
 
 #[test]

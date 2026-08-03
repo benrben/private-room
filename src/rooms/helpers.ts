@@ -2,6 +2,21 @@ export function fileNameOf(path: string): string {
   return path.split("/").pop() ?? path;
 }
 
+/** What the save sheet should suggest for a duplicate of `roomName` — the base
+ * name only, no extension.
+ *
+ * The sheet used to offer "Copy of room" for every room, so duplicating two
+ * different rooms produced two files with the same generic name while the app
+ * had known both real names the whole time. `/` and `:` are stripped because
+ * macOS shows a `/` in a file name as `:` and vice versa, and a room called
+ * "Q3/Q4 plan" would otherwise suggest a name Finder renders as a different
+ * one. A room with no usable name at all falls back to the old wording rather
+ * than suggesting an empty file name. */
+export function duplicateFileName(roomName: string): string {
+  const clean = (roomName ?? "").replace(/[/:]/g, " ").replace(/\s+/g, " ").trim();
+  return clean ? `Copy of ${clean}` : "Copy of room";
+}
+
 export type Strength = { score: 0 | 1 | 2 | 3; label: string; level: "weak" | "okay" | "strong" };
 
 // Simple, library-free estimate: length plus the mix of character kinds

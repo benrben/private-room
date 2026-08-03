@@ -418,24 +418,47 @@ pub(crate) fn plan_single_edit(
     }])
 }
 
-fn multi_occurrence_error(old_text: &str, n: usize, real_name: &str) -> String {
-    format!(
-        "\"{}\" appears {n} times in \"{real_name}\". Include more surrounding text to \
-         pick one, or pass all: true to replace every occurrence.",
-        clamp_bytes(old_text.to_string(), 80)
-    )
+/// The ambiguity error, worded for the tool that will read it.
+///
+/// `all_offered` is whether the CALLING TOOL actually has an `all` field.
+/// `edit_file` does; `edit_files` (the batch) does not, and advising it there
+/// sent the model round a retry that came back with the identical error before
+/// it fell back to the advice that works. Same reason the fuzzy branch below
+/// has its own message.
+fn multi_occurrence_error(
+    old_text: &str,
+    n: usize,
+    real_name: &str,
+    all_offered: bool,
+) -> String {
+    let quote = clamp_bytes(old_text.to_string(), 80);
+    if all_offered {
+        format!(
+            "\"{quote}\" appears {n} times in \"{real_name}\". Include more surrounding text to \
+             pick one, or pass all: true to replace every occurrence."
+        )
+    } else {
+        format!(
+            "\"{quote}\" appears {n} times in \"{real_name}\". Include more surrounding text in \
+             old_text so it identifies exactly one place — edit_files has no all option; use \
+             edit_file for a replace-every-occurrence change."
+        )
+    }
 }
 
 /// Pure over bytes: compute the new bytes for one file's content, no writes. The
 /// uniqueness guard fires for BOTH the text branch and the docx branch. Shared by
 /// the single edit, the batch executor (over chained working bytes), and the
 /// diff-preview gate (proposed bytes without writing).
+/// `all` is `None` when the calling tool has NO `all` field at all (the batch
+/// `edit_files`), which is different from a caller that has one and left it
+/// off — only the second can be told to pass it.
 pub(crate) fn compute_edit_bytes(
     real_name: &str,
     bytes: &[u8],
     old_text: &str,
     new_text: &str,
-    all: bool,
+    all: Option<bool>,
 ) -> Result<(Vec<u8>, usize, EditMethod), EditError> {
     let ext = extraction::extension_of(real_name);
     match ext.as_str() {
@@ -445,9 +468,9 @@ pub(crate) fn compute_edit_bytes(
             // text branch has: >1 without `all` is discarded, not silently applied.
             let (new_bytes, count) = extraction::docx_replace_text(bytes, old_text, new_text)
                 .map_err(|e| EditError::new(e, "not_found"))?;
-            if count > 1 && !all {
+            if count > 1 && all != Some(true) {
                 return Err(EditError::new(
-                    multi_occurrence_error(old_text, count, real_name),
+                    multi_occurrence_error(old_text, count, real_name, all.is_some()),
                     "ambiguous",
                 ));
             }
@@ -487,7 +510,7 @@ pub(crate) fn compute_edit_bytes(
             if exact == 1 {
                 Ok((content.replace(old_text, new_text).into_bytes(), 1, EditMethod::Exact))
             } else if exact > 1 {
-                if all {
+                if all == Some(true) {
                     Ok((
                         content.replace(old_text, new_text).into_bytes(),
                         exact,
@@ -495,7 +518,7 @@ pub(crate) fn compute_edit_bytes(
                     ))
                 } else {
                     Err(EditError::new(
-                        multi_occurrence_error(old_text, exact, real_name),
+                        multi_occurrence_error(old_text, exact, real_name, all.is_some()),
                         "ambiguous",
                     ))
                 }
@@ -570,7 +593,8 @@ pub(crate) fn compute_edit(
     let bytes = db::get_file_bytes(conn, &id)
         .map_err(|e| EditError::new(e, "wrong_type"))?
         .ok_or_else(|| EditError::new("File has no stored content.", "wrong_type"))?;
-    let (new_bytes, count, method) = compute_edit_bytes(&real_name, &bytes, old_text, new_text, all)?;
+    let (new_bytes, count, method) =
+        compute_edit_bytes(&real_name, &bytes, old_text, new_text, Some(all))?;
     Ok((id, real_name, new_bytes, count, method))
 }
 
@@ -757,7 +781,9 @@ pub(crate) fn plan_batch(conn: &Connection, ops: &[BatchOp]) -> Result<Vec<Plann
                 }
                 let cur = entry.bytes.as_deref().unwrap();
                 let (new_bytes, _count, _method) =
-                    compute_edit_bytes(&entry.real_name, cur, old_text, new_text, false)
+                    // None, not Some(false): `edit_files` has no `all` field
+                    // to pass, so the error must not tell the model to pass one.
+                    compute_edit_bytes(&entry.real_name, cur, old_text, new_text, None)
                         .map_err(|e| format!("Edit {} of {n} ({}): {}", i + 1, entry.real_name, e.message))?;
                 entry.bytes = Some(new_bytes);
                 entry.dirty = true;
@@ -944,6 +970,30 @@ mod tests {
         assert_eq!(ok.method, EditMethod::ExactAll);
         assert_eq!(ok.count, 2);
         assert_eq!(current_bytes(&conn, &id), b"cost is 7. cost is 7. done.");
+    }
+
+    #[test]
+    fn a_batch_ambiguity_never_advises_an_option_edit_files_does_not_have() {
+        // `edit_files` has no `all` field, so "pass all: true" is advice the
+        // model cannot act on: it retries, gets the identical error, and only
+        // then falls back to adding surrounding text. Steer it there first.
+        let conn = db::open_in_memory_schema();
+        seed_text_file(&conn, "n.md", "cost is 5. cost is 5. done.");
+        let err = plan_batch(
+            &conn,
+            &[BatchOp::Edit {
+                name: "n.md".into(),
+                old_text: "cost is 5".into(),
+                new_text: "cost is 7".into(),
+            }],
+        )
+        .err()
+        .expect("an ambiguous batch edit must not plan a write");
+        assert!(!err.contains("all: true"), "must not advise all: {err}");
+        assert!(err.contains("edit_file"), "must name the tool that can: {err}");
+        // The single-file tool still offers it, because it still honours it.
+        let single = run_edit_file(&conn, "n.md", "cost is 5", "cost is 7", false).unwrap_err();
+        assert!(single.message.contains("all: true"), "{}", single.message);
     }
 
     #[test]

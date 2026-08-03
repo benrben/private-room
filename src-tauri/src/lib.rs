@@ -1,20 +1,27 @@
 mod biometrics;
 pub mod browser;
+pub mod cancel;
 mod commands;
 pub mod db;
 pub mod extraction;
+pub mod formats;
 pub mod mcp;
+pub mod media_probe;
 mod model_limits;
+pub mod obs;
 mod ocr;
 mod ollama;
 mod ollama_lifecycle;
+pub mod quicklook;
 pub mod recording;
 mod room_mcp;
 mod sidecar;
 mod sidecar_lifecycle;
 pub(crate) mod snapshot;
 pub mod stt;
+pub mod textutil;
 mod token_usage;
+pub mod turn;
 pub mod web;
 
 use commands::AppState;
@@ -58,6 +65,11 @@ pub(crate) fn main_webview<R: tauri::Runtime>(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // FIRST, before anything can make a decision worth recording: the host's own
+    // event log (`obs`). It writes beside the sidecar's stderr mirror so "the
+    // logs" is one folder, and it is quiet by default — `ARCELLE_LOG` turns the
+    // detail up.
+    obs::init(env!("CARGO_PKG_VERSION"));
     // Sweep decrypted "Open in browser" previews left behind by a crashed or
     // force-quit session before anything else runs.
     commands::cleanup_browser_previews();
@@ -69,6 +81,8 @@ pub fn run() {
         .manage(AppState::default())
         .manage(commands::HtmlPreviews::default())
         .manage(commands::MediaStreams::default())
+        .manage(commands::PeakCache::default())
+        .manage(commands::SlideCache::default())
         .manage(commands::AgentUi::default())
         // BROWSE-1: the private browser area's state (takeover flag, last
         // bounds, this session's agent journal).
@@ -143,17 +157,35 @@ pub fn run() {
             commands::close_room,
             commands::room_info,
             commands::rename_room,
+            commands::take_rec_recovery_error,
             commands::take_pending_open,
             commands::import_files,
             commands::list_files,
             commands::get_file_content,
+            commands::decode_file_text,
+            commands::audio_peaks,
+            commands::probe_video_meta,
+            commands::video_trim,
+            commands::save_video_frame,
+            commands::quicklook_preview,
+            commands::slide_preview,
+            commands::office_html,
             commands::update_file_content,
+            commands::update_docx_text,
             commands::set_cell,
-            commands::delete_file,
+            commands::trash_file,
+            commands::list_trashed_files,
+            commands::restore_file,
+            commands::delete_file_permanently,
+            commands::empty_trash,
             commands::save_generated_file,
             commands::open_scratch_pad,
             commands::import_link,
             commands::list_file_versions,
+            commands::file_versions_kept,
+            commands::pin_file_version,
+            commands::delete_file_version,
+            commands::get_file_provenance,
             commands::restore_file_version,
             commands::get_file_version,
             commands::export_file,
@@ -165,6 +197,7 @@ pub fn run() {
             commands::list_room_checkpoints,
             commands::delete_room_checkpoint,
             commands::rollback_room_checkpoint,
+            commands::list_stranded_checkpoints,
             commands::list_recent,
             commands::remove_recent,
             commands::clear_recent,
@@ -195,6 +228,9 @@ pub fn run() {
             commands::mcp_status,
             commands::approve_mcp,
             commands::resolve_mcp_call,
+            // Download-on-first-use runtimes (uv / node) for local connectors.
+            commands::mcp_runtime_for_command,
+            commands::mcp_provision_runtime,
             commands::mcp_registry_search,
             commands::mcp_registry_optin_status,
             commands::set_mcp_registry_optin,
@@ -207,9 +243,17 @@ pub fn run() {
             commands::mcp_set_tool_enabled,
             commands::get_mcp_auto_approve,
             commands::set_mcp_auto_approve,
+            commands::get_mcp_outbound_unmask,
+            commands::set_mcp_outbound_unmask,
+            commands::get_mcp_connector_powers,
+            commands::set_mcp_connector_power,
             commands::resolve_edit_approval,
             commands::ai_status,
             commands::model_capabilities,
+            commands::engine_capabilities,
+            commands::engine_preflight,
+            commands::engine_support_matrix,
+            commands::grounding_model_for_room,
             commands::list_engine_models,
             commands::list_ai_providers,
             commands::connect_ai_provider,
@@ -228,12 +272,14 @@ pub fn run() {
             commands::import_audio_bytes,
             commands::ask,
             commands::cancel_ask,
+            commands::list_specialists,
             commands::handoff_chat,
             commands::run_command,
             commands::list_chat_commands,
             commands::locate_in_image,
             commands::stt_status,
             commands::stt_download_model,
+            commands::stt_cancel_download,
             commands::stt_delete_model,
             commands::transcribe_audio,
             commands::retranscribe_file,
@@ -262,6 +308,7 @@ pub fn run() {
             commands::set_room_server,
             commands::regenerate_leash_token,
             commands::set_ollama_url,
+            commands::test_ollama_url,
             commands::get_ollama_url,
             commands::list_roles,
             // ADD-23..26: plain-text effects + media streaming + agent UI
@@ -269,6 +316,7 @@ pub fn run() {
             commands::resolve_agent_ui,
             commands::import_youtube_video,
             commands::import_media_url,
+            commands::cancel_media_download,
             commands::start_download_job,
             // ADD-27: live Recording file (streaming transcription, editing,
             // translate). ADD-28: feedback → GitHub issue.
@@ -282,6 +330,7 @@ pub fn run() {
             commands::rec_set_live_stt,
             commands::rec_get,
             commands::rec_delete_range,
+            commands::rec_correct_range,
             commands::rec_set_speaker_name,
             commands::rec_export_clean,
             commands::rec_translate,
@@ -330,6 +379,8 @@ pub fn run() {
             commands::save_skill_resource,
             commands::delete_skill_resource,
             commands::import_skill_folder,
+            commands::skill_import_conflict,
+            commands::skill_agent_ids,
             commands::export_skill_folder,
             commands::compose_skill,
             // Idea 3: supernatural voice — neural synthesis via the sidecar.
@@ -350,33 +401,92 @@ pub fn run() {
             commands::browser_clear_journal,
             commands::browser_verify_private,
             commands::browser_save_page,
+            // Item #18: the reading view, and the keyboard's way back out.
+            commands::browser_page_text,
+            commands::browser_focus_app,
             // BROWSE-3: the address bar's search half.
             commands::browser_search,
             commands::browser_preview,
             commands::browser_peek,
             commands::browser_search_summary,
             commands::import_search_result,
+            // Owner replacement #1: point the user at the log folder.
+            obs::reveal_logs,
+            commands::set_unsaved_edits,
         ])
+        // Where the window was, and how big. Noted from the event rather than
+        // written per event: dragging emits hundreds, and the file is written
+        // once on the way out (see RunEvent::Exit).
+        .on_window_event(|window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+            ) && window.label() == MAIN_WINDOW
+            {
+                commands::note_geometry(window);
+            }
+        })
         .setup(|app| {
+            // …and put it back, unless the screen it was on has gone away —
+            // restoring onto an unplugged monitor opens the window where it
+            // cannot be seen, dragged or closed.
+            commands::restore_geometry(app.handle());
             // Wave 5 (Idea 13): sweep orphaned script-run workspaces left by a
             // crash before anything runs (the quiesce_stale_jobs spirit).
             commands::sweep_script_workspaces(app.handle());
-            // Connectors → Auto-approve: hydrate the in-memory "auto mode" flag
-            // from its per-Mac file so the choice survives a restart (default ON).
+            // Publish the downloaded-runtime PATH prefix for the connector
+            // launcher, which has no AppHandle to work it out for itself. Do it
+            // BEFORE any connector can start, or a runtime downloaded in an
+            // earlier session is on no PATH this session's children see.
+            commands::refresh_path_prefix(app.handle());
+            // Connectors: hydrate the two independent connector powers from
+            // their per-Mac files so each choice survives a restart. Both
+            // default OFF — a missing file is a NO, never an assumed yes.
             {
-                let auto = commands::read_mcp_auto_approve(app.handle());
-                app.state::<AppState>()
-                    .mcp_auto_approve
-                    .store(auto, std::sync::atomic::Ordering::SeqCst);
+                let state = app.state::<AppState>();
+                state.mcp_auto_approve.store(
+                    commands::read_mcp_auto_approve(app.handle()),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                state.mcp_outbound_unmask.store(
+                    commands::read_mcp_outbound_unmask(app.handle()),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                // …and the per-connector answers that override them. Absent
+                // file = empty map = every connector follows the two switches,
+                // which is exactly what an install upgrading from the
+                // global-only pair should do: it keeps what it had and gains
+                // nothing.
+                *state.mcp_connector_powers.lock().unwrap() =
+                    commands::read_mcp_connector_powers(app.handle());
             }
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, _event| {
+            // ⌘Q is the one exit that raises no window CLOSE request, so the
+            // window's own unsaved-edits guard (Workspace.tsx) never sees it and
+            // an open Monaco buffer used to go out with the process. This is the
+            // only hook that does see it. Held ONCE — `hold_quit_for_unsaved`
+            // latches — so a window that cannot answer still quits on the second
+            // press, and the window finishes the quit itself with `exit()`
+            // (which carries a code, and is therefore never re-held).
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = &_event {
+                if commands::hold_quit_for_unsaved(*code) {
+                    api.prevent_exit();
+                    if let Some(window) = main_window(_app) {
+                        let _ = window.emit("quit-requested", ());
+                    }
+                }
+            }
             // ADD-29: never leak a background `ollama serve` WE started — stop it
             // (and only it) as the app exits. A no-op for an external daemon.
             if let tauri::RunEvent::Exit = _event {
+                // Where the window ended up. Best-effort and first: it must
+                // never be able to fail a quit, and it must not depend on the
+                // window still existing by the time teardown gets here.
+                commands::save_geometry(_app);
                 // Metal wave: the warm Whisper context must drop BEFORE ggml's
                 // atexit teardown, or its resident GPU buffers turn Quit into
                 // a ggml_metal_device_free assert (a crash report).

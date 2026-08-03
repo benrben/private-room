@@ -328,6 +328,38 @@ pub fn set_ollama_url(state: State<'_, AppState>, url: String) -> Result<(), Str
     Ok(())
 }
 
+/// D10: save the remote-Ollama address and then actually TRY it, reporting what
+/// happened in one sentence.
+///
+/// The field checked the SHAPE of what you typed and nothing else, so a
+/// perfectly-formed address for a machine that is off, or that isn't running
+/// Ollama, was accepted with a cheerful "Saved" — and every AI feature then said
+/// "the local AI isn't running", which is a true sentence about the wrong
+/// computer. Saves first, on purpose, so what is tested is what is active (the
+/// same order `web_search_test` uses).
+#[tauri::command]
+pub async fn test_ollama_url(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<String, String> {
+    set_ollama_url(state, url)?;
+    let where_ = crate::ollama::resolved_base_url();
+    match crate::ollama::list_models().await {
+        // Reachable but empty is NOT success dressed up: a machine with no
+        // models answers nothing, and saying "connected" would be the same lie
+        // one boundary further out.
+        Ok(models) if models.is_empty() => Ok(format!(
+            "Reached {where_}, but it has no models installed — nothing there can answer yet."
+        )),
+        Ok(models) => Ok(format!(
+            "\u{2713} Reached {where_} — {} model{} available.",
+            models.len(),
+            if models.len() == 1 { "" } else { "s" }
+        )),
+        Err(e) => Err(format!("Could not reach {where_}: {e}")),
+    }
+}
+
 /// D10: the room's saved remote-Ollama URL (empty = use the local default).
 #[tauri::command]
 pub fn get_ollama_url(state: State<'_, AppState>) -> Result<String, String> {

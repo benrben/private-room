@@ -140,11 +140,11 @@
       "openWorldHint": true,
       "readOnlyHint": true
     },
-    "description": "Open a web page in the room's private browser and return the page's interactive elements. The browser keeps nothing — no history, cookies or cache. Use this when the user asks you to visit, check or look something up on a specific site. Example: {\"url\": \"https://example.com\"}",
+    "description": "Open a web page in the room's private browser and return the page's interactive elements — or, when you pass plain words instead of an address, search the room's own seven engines and return the ranked results to open. The browser keeps nothing — no history, cookies or cache. Never navigate to google.com or another search engine to search: this tool IS the search. Examples: {\"url\": \"https://example.com\"} · {\"url\": \"tallest building in europe\"}",
     "inputSchema": {
       "properties": {
         "url": {
-          "description": "Full http(s) URL to open",
+          "description": "A full http(s) URL or bare domain to open, OR plain words to search for when no site is named",
           "type": "string"
         }
       },
@@ -189,7 +189,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Save the CURRENT page into the room as files: a readable Markdown copy (searchable) plus the exact HTML. Captures the live page as rendered, logins and scripts included — works where fetch_page can't. what=selection saves only the text the user has selected on the page.",
+    "description": "Save the CURRENT page into the room as files: the readable article as Markdown (searchable) plus a formatted HTML copy, both under the metadata the page declares — site, author, publication date. Captures the live page as rendered, logins and scripts included — works where fetch_page can't. what=selection saves only the text the user has selected on the page.",
     "inputSchema": {
       "properties": {
         "what": {

@@ -19,7 +19,8 @@ pub async fn generate_podcast_script(
     refs: Option<Vec<String>>,
     op_id: Option<String>,
 ) -> Result<FileMeta, String> {
-    run_studio(&window, &state, podcast_spec(), scope, instructions, refs, op_id).await
+    // A Studio button in the UI: its own root, nobody's child.
+    run_studio(&window, &state, podcast_spec(), scope, instructions, refs, op_id, None).await
 }
 
 /// The podcast-script artifact spec for the shared `run_studio` pipeline.

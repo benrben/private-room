@@ -257,3 +257,54 @@
     opacity: 0;
   }
 }
+
+/* The slow-lock note. The seal is silent by design; this only appears once the
+   ritual is over and the room is STILL closing (stopping recordings, waiting on
+   jobs, compacting the file), which is exactly when a dark still screen starts
+   reading as a hung app. It fades in on its own so it never competes with the
+   keyhole animation. */
+.seal-note {
+  position: absolute;
+  left: 50%;
+  top: calc(50% + 110px);
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(420px, 80vw);
+  text-align: left;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  opacity: 0;
+  animation: seal-note-in 0.3s var(--seal-ease) forwards;
+}
+.seal-note-spinner {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: seal-note-spin 0.9s linear infinite;
+}
+@keyframes seal-note-in {
+  to {
+    opacity: 1;
+  }
+}
+@keyframes seal-note-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .seal-note {
+    opacity: 1;
+    animation: none;
+  }
+  .seal-note-spinner {
+    animation: none;
+    border-top-color: var(--border);
+  }
+}

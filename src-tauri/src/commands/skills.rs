@@ -253,6 +253,49 @@ fn validate_skill_agent(agent: &str) -> Result<(), String> {
     ))
 }
 
+/// Every owner a skill may be bound to, for the Skills screen's picker.
+///
+/// The list is `SKILL_AGENT_IDS` itself, not a copy of it: a picker built from a
+/// hand-written list would be the third place the roster lives and the first to
+/// go stale, and offering an id the validator rejects is exactly the silent
+/// invisible skill that validator exists to prevent. The general case (any
+/// agent) is the empty string and is not in this list — it is not an agent.
+#[tauri::command]
+pub fn skill_agent_ids() -> Vec<String> {
+    super::agent::SKILL_AGENT_IDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Which owner a save should STORE, having checked it is a real agent.
+///
+/// `incoming` is what the caller sent: `None` means "leave the binding alone",
+/// which is how the Settings editor saves a skill without touching its owner,
+/// and `Some("")` clears it back to the general case. `existing` is the current
+/// binding, for the `None` path (`None` itself on a create).
+///
+/// AUDIT defect 111: `create_skill` and `update_skill` took an owner and handed
+/// it to the DB unchecked, so the doc comment above — "EVERY seam that accepts
+/// an owner runs this" — was false for the two Settings-side commands. Nothing
+/// reached it while the editor sent three arguments, but `api.ts` now advertises
+/// `agent` as supported ("pass \"\" to clear it"), so the first picker wired up
+/// there would happily store a typo'd owner and produce exactly the silent
+/// invisible skill the gate exists to prevent. One function, so the two commands
+/// cannot drift apart again — and it is testable without a room.
+fn skill_owner_to_store(
+    incoming: Option<&str>,
+    existing: Option<&str>,
+) -> Result<String, String> {
+    let owner = match incoming {
+        Some(a) => a.trim().to_string(),
+        // Untouched: the stored value was validated when it was stored.
+        None => return Ok(existing.unwrap_or_default().to_string()),
+    };
+    validate_skill_agent(&owner)?;
+    Ok(owner)
+}
+
 pub(crate) fn normalize_skill_path(raw: &str) -> Result<String, String> {
     let raw = raw.trim().replace('\\', "/");
     if raw.is_empty() || raw.len() > 240 {
@@ -541,7 +584,13 @@ pub(crate) fn agent_write_skill_resource(
 /// Agent-side delete helpers deliberately resolve by name/id first, so a model
 /// cannot accidentally target a similarly named resource. They share the UI's
 /// encrypted database operations and notify the Skills view immediately.
-pub(crate) fn agent_delete_skill(
+///
+/// Audit #505 (second half): like `delete_mcp`, this is unrecoverable — there
+/// is no trash for a skill, and its bundled resources go with it — and it is
+/// reachable from anything the agent READ, so a document saying "delete the
+/// weekly-report skill" was enough. The user's click is the undo. Standing
+/// consent to run connector tools does not reach `confirm_destructive`.
+pub(crate) async fn agent_delete_skill(
     window: &tauri::Window,
     state: &AppState,
     args: &serde_json::Value,
@@ -553,6 +602,17 @@ pub(crate) fn agent_delete_skill(
     let skill = state.with_room(|room| {
         db::find_skill(&room.conn, key)?.ok_or_else(|| format!("No skill named \"{key}\" exists."))
     })?;
+    if !super::mcp_cmds::confirm_destructive(
+        state,
+        window,
+        "skill",
+        &skill.name,
+        "Its instructions and every bundled resource go with it. There is no undo.",
+    )
+    .await
+    {
+        return Err(super::mcp_cmds::DELETE_DECLINED.into());
+    }
     state.with_room(|room| db::delete_skill(&room.conn, &skill.id))?;
     emit_skills_changed(window);
     Ok(format!(
@@ -703,7 +763,7 @@ pub fn create_skill(
     agent: Option<String>,
 ) -> Result<String, String> {
     let name = validate_skill_fields(&name, &description, &instructions)?;
-    let owner = agent.unwrap_or_default();
+    let owner = skill_owner_to_store(agent.as_deref(), None)?;
     let id = state.with_room(|room| {
         db::create_skill(
             &room.conn,
@@ -712,7 +772,7 @@ pub fn create_skill(
             instructions.trim(),
             false,
             "user",
-            owner.trim(),
+            &owner,
         )
     })?;
     emit_skills_changed(&window);
@@ -735,11 +795,9 @@ pub fn update_skill(
         // deleted while its editor was open reported "Saved" and kept nothing.
         // Read it first and fail honestly instead.
         let existing = require_skill(&room.conn, &id)?;
-        // None = "leave the binding alone" (the editor form may not send it).
-        let owner = match &agent {
-            Some(a) => a.trim().to_string(),
-            None => existing.agent,
-        };
+        // None = "leave the binding alone" (the editor form may not send it);
+        // anything else is checked before it can be stored.
+        let owner = skill_owner_to_store(agent.as_deref(), Some(&existing.agent))?;
         db::update_skill(
             &room.conn,
             &id,
@@ -893,11 +951,20 @@ fn collect_folder_files(
     Ok(())
 }
 
+/// Import a skill folder. `replace` = "this is an UPDATE of the skill of that
+/// name": keep the existing skill's id (so its enabled state and anything
+/// pointing at it survive), overwrite SKILL.md and every resource the folder
+/// carries, and drop the resources it no longer has.
+///
+/// Without it, a name clash was simply refused. The only way to install a newer
+/// version of a skill was to delete the old one first — which also destroyed
+/// any file you had hand-edited inside it, with no warning that it would.
 #[tauri::command]
 pub fn import_skill_folder(
     window: tauri::Window,
     state: State<'_, AppState>,
     path: String,
+    replace: Option<bool>,
 ) -> Result<String, String> {
     let root = PathBuf::from(path);
     if !root.is_dir() {
@@ -915,28 +982,83 @@ pub fn import_skill_folder(
     let mut files = Vec::new();
     let mut total = 0usize;
     collect_folder_files(&root, &root, &mut files, &mut total)?;
+    let replace = replace.unwrap_or(false);
     let id = state.with_room(|room| {
-        let id = db::create_skill(
+        import_into(
             &room.conn,
             &name,
             &description,
             &instructions,
-            false,
-            "import",
             &agent,
-        )?;
-        for (path, bytes) in &files {
-            if let Err(e) =
-                db::upsert_skill_resource(&room.conn, &id, path, skill_resource_kind(path), bytes)
-            {
-                let _ = db::delete_skill(&room.conn, &id);
-                return Err(e);
-            }
-        }
-        Ok(id)
+            &files,
+            replace,
+        )
     })?;
     emit_skills_changed(&window);
     Ok(id)
+}
+
+/// The body of [`import_skill_folder`] over a plain connection — pure, so the
+/// replace path's invariants (the id survives, the enabled state survives,
+/// files the folder dropped are gone) are unit-testable without a room.
+pub(crate) fn import_into(
+    conn: &Connection,
+    name: &str,
+    description: &str,
+    instructions: &str,
+    agent: &str,
+    files: &[(String, Vec<u8>)],
+    replace: bool,
+) -> Result<String, String> {
+    // An UPDATE of a skill that is already here, when the caller asked for one.
+    // `find_skill` matches by name case-insensitively, the same way every other
+    // lookup does.
+    let existing = if replace { db::find_skill(conn, name)? } else { None };
+    if let Some(old) = existing {
+        db::update_skill(conn, &old.id, name, description, instructions, agent)?;
+        for (path, bytes) in files {
+            db::upsert_skill_resource(conn, &old.id, path, skill_resource_kind(path), bytes)?;
+        }
+        // Files the new folder no longer carries go too — a replace that left
+        // them behind would leave the skill half old, half new, with nothing on
+        // screen saying which halves.
+        let incoming: HashSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        for r in db::list_skill_resources(conn, &old.id)? {
+            if !incoming.contains(r.path.as_str()) {
+                db::delete_skill_resource(conn, &old.id, &r.path)?;
+            }
+        }
+        return Ok(old.id);
+    }
+    let id = db::create_skill(conn, name, description, instructions, false, "import", agent)?;
+    for (path, bytes) in files {
+        if let Err(e) = db::upsert_skill_resource(conn, &id, path, skill_resource_kind(path), bytes)
+        {
+            let _ = db::delete_skill(conn, &id);
+            return Err(e);
+        }
+    }
+    Ok(id)
+}
+
+/// Does this room already have a skill named after this folder's SKILL.md? The
+/// Skills screen asks BEFORE importing, so a re-import can offer "Replace" (see
+/// [`import_skill_folder`]'s `replace`) instead of failing on the name clash.
+/// A folder with no readable SKILL.md answers `None`, and the import itself
+/// then reports the real problem.
+#[tauri::command]
+pub fn skill_import_conflict(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Option<String>, String> {
+    let root = PathBuf::from(path);
+    let Ok(skill_md) = std::fs::read_to_string(root.join("SKILL.md")) else {
+        return Ok(None);
+    };
+    let Ok((name, _, _, _)) = parse_skill_md(&skill_md) else {
+        return Ok(None);
+    };
+    state.with_room(|room| Ok(db::find_skill(&room.conn, &name)?.map(|s| s.name)))
 }
 
 #[tauri::command]
@@ -955,12 +1077,17 @@ pub fn export_skill_folder(
     if !base.is_dir() {
         return Err("Choose an existing destination folder.".into());
     }
-    let root = base.join(&skill.name);
+    // AUDIT 22: the export seam cleans the name it was handed, exactly like
+    // `export_file`/`export_all` do. Every name that arrives through the app is
+    // already `validate_skill_name`'d, but the SEC-1 threat model is a room file
+    // whose AUTHOR is hostile: a skill row written straight into a `.roomai`
+    // can be called `../../Library/LaunchAgents/x`, and `base.join` on that
+    // would create a folder — and write into it — outside the folder the user
+    // picked. Nothing else between the DB row and the filesystem checks.
+    let folder = super::safety::safe_export_name(&skill.name);
+    let root = base.join(&folder);
     if root.exists() {
-        return Err(format!(
-            "A folder named \"{}\" already exists there.",
-            skill.name
-        ));
+        return Err(format!("A folder named \"{folder}\" already exists there."));
     }
     std::fs::create_dir(&root).map_err(|e| e.to_string())?;
     let write_result = (|| -> Result<(), String> {
@@ -1144,6 +1271,39 @@ pub async fn compose_skill(
 mod tests {
     use super::*;
 
+    /// AUDIT 22 at the skills export seam. Every name the APP accepts is
+    /// `validate_skill_name`'d, but SEC-1's attacker is the room file's author:
+    /// a `.roomai` can carry a skill row named `../../…` that no code path of
+    /// ours ever validated. `export_skill_folder` joins that name onto the
+    /// folder the user picked, so without cleaning it the export would create
+    /// a directory — and write SKILL.md into it — outside that folder.
+    #[test]
+    fn a_skill_folder_export_can_never_escape_the_chosen_folder() {
+        let base = PathBuf::from("/tmp/chosen");
+        for hostile in [
+            "../../Library/LaunchAgents/eviI",
+            "/etc/cron.d/x",
+            "a/b/c",
+            "..",
+            "   ",
+        ] {
+            let folder = super::super::safety::safe_export_name(hostile);
+            let root = base.join(&folder);
+            assert_eq!(
+                root.parent(),
+                Some(base.as_path()),
+                "{hostile:?} escaped as {root:?}"
+            );
+            assert!(!folder.is_empty(), "{hostile:?} produced an empty folder name");
+        }
+        // An ordinary skill name is untouched — the cleaning must not rename
+        // every export.
+        assert_eq!(
+            super::super::safety::safe_export_name("lease-review"),
+            "lease-review"
+        );
+    }
+
     #[test]
     fn an_unknown_agent_owner_is_refused_however_the_skill_arrives() {
         // parse_skill_md is deliberately permissive — it reports what the file
@@ -1159,16 +1319,54 @@ mod tests {
         assert!(validate_skill_agent("  ").is_ok());
     }
 
+    /// AUDIT defect 111. `validate_skill_agent`'s doc says EVERY seam that
+    /// accepts an owner runs it, and the two Settings-side commands did not:
+    /// `create_skill` and `update_skill` took the owner and handed it straight
+    /// to the DB. The old test above calls the validator directly and could
+    /// never have caught that, because neither command went through it. This
+    /// pins the shared decision the two commands now share.
+    #[test]
+    fn the_settings_side_save_refuses_an_owner_no_agent_answers_to() {
+        // A typo'd id: refused, with the real list, before anything is stored.
+        let err = skill_owner_to_store(Some("file.read"), None).unwrap_err();
+        assert!(err.contains("files.read"), "the real list is named: {err}");
+        // …including on an UPDATE, where a bad owner would otherwise replace a
+        // binding that was valid.
+        assert!(skill_owner_to_store(Some("file.read"), Some("chat.web")).is_err());
+        // A real id is stored, trimmed.
+        assert_eq!(
+            skill_owner_to_store(Some(" files.read "), None).unwrap(),
+            "files.read"
+        );
+        // "" clears the binding back to the general case, which is allowed.
+        assert_eq!(skill_owner_to_store(Some(""), Some("chat.web")).unwrap(), "");
+        // None leaves the existing binding alone — the editor form's own save,
+        // which must not have to know or resend the owner.
+        assert_eq!(
+            skill_owner_to_store(None, Some("chat.web")).unwrap(),
+            "chat.web"
+        );
+        assert_eq!(skill_owner_to_store(None, None).unwrap(), "");
+    }
+
     #[test]
     fn saving_a_deleted_skill_is_refused_not_reported_as_saved() {
         let conn = db::open_in_memory_schema();
         let id = db::create_skill(&conn, "review", "d", "i", false, "user", "").unwrap();
         // Present: Save and Enable/Disable proceed.
         assert_eq!(require_skill(&conn, &id).unwrap().name, "review");
-        // Deleted while the editor was open: `UPDATE … WHERE id=?` matches no
-        // rows and still succeeds, so the guard is the only thing that catches it.
+        // Deleted while the editor was open. `UPDATE … WHERE id=?` matches no
+        // rows, and SQLite calls that success — this used to be asserted here as
+        // a fact of life, with `require_skill` the ONLY thing standing between
+        // it and a "Saved" that kept nothing. The write itself now refuses too
+        // (AUDIT 175), so a caller that skips the command-layer guard — a script,
+        // a future command, the assistant's own tool — cannot reopen the hole.
         db::delete_skill(&conn, &id).unwrap();
-        assert!(db::update_skill(&conn, &id, "review", "d", "i2", "").is_ok(), "the raw UPDATE still 'succeeds'");
+        assert_eq!(
+            db::update_skill(&conn, &id, "review", "d", "i2", "").err().as_deref(),
+            Some(SKILL_GONE),
+            "the raw UPDATE must not report success for a row that is gone"
+        );
         assert_eq!(require_skill(&conn, &id).err().as_deref(), Some(SKILL_GONE));
     }
 
@@ -1252,5 +1450,61 @@ mod tests {
             unique_source_path("מחירון 2026.xlsx", &mut used),
             "references/source-files/2026-xlsx-2.md"
         );
+    }
+
+    /// AUDIT 510. A re-import used to be refused on the name clash, so the only
+    /// way to install a newer version of a skill was to delete the old one —
+    /// which also destroyed every file you had hand-edited inside it. `replace`
+    /// re-imports OVER it: same id, same enabled state, the folder's files win,
+    /// and files the folder no longer carries go.
+    #[test]
+    fn a_replace_import_updates_in_place_instead_of_refusing() {
+        let conn = crate::db::mem();
+        let first: Vec<(String, Vec<u8>)> = vec![
+            ("references/policy.md".into(), b"v1 policy".to_vec()),
+            ("scripts/old.py".into(), b"print(1)".to_vec()),
+        ];
+        let id = import_into(&conn, "review", "d", "Body v1", "", &first, false).unwrap();
+        db::set_skill_enabled(&conn, &id, true).unwrap();
+
+        // Without `replace` the clash is still refused — nothing is overwritten
+        // by accident.
+        let err = import_into(&conn, "review", "d", "Body v2", "", &first, false)
+            .expect_err("a clashing import was accepted silently");
+        assert!(err.contains("already exists"), "{err}");
+
+        let second: Vec<(String, Vec<u8>)> = vec![
+            ("references/policy.md".into(), b"v2 policy".to_vec()),
+            ("references/new.md".into(), b"added".to_vec()),
+        ];
+        let again = import_into(&conn, "review", "d2", "Body v2", "", &second, true).unwrap();
+        assert_eq!(again, id, "replace must keep the skill's id");
+
+        let skill = db::get_skill(&conn, &id).unwrap();
+        assert_eq!(skill.instructions, "Body v2");
+        assert_eq!(skill.description, "d2");
+        assert!(skill.enabled, "replace must not silently disable the skill");
+
+        let paths: Vec<String> = db::list_skill_resources(&conn, &id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(paths, vec!["references/new.md", "references/policy.md"]);
+        let policy = db::get_skill_resource(&conn, &id, "references/policy.md").unwrap();
+        assert_eq!(policy.content, b"v2 policy".to_vec());
+    }
+
+    /// AUDIT 511. The Skills screen's owner picker must only ever be able to
+    /// offer ids the save itself accepts, so it is fed the host's own roster.
+    #[test]
+    fn the_owner_picker_roster_is_exactly_what_the_validator_accepts() {
+        for id in skill_agent_ids() {
+            assert!(
+                validate_skill_agent(&id).is_ok(),
+                "the picker offers {id}, which the save would refuse"
+            );
+        }
+        assert_eq!(skill_agent_ids().len(), super::agent::SKILL_AGENT_IDS.len());
     }
 }

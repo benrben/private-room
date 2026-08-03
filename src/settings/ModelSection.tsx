@@ -16,12 +16,15 @@ interface Props {
   setPullName: (v: string) => void;
   pulling: boolean;
   pull: () => void;
+  stopPull: () => void;
+  stoppingPull: boolean;
   pullStatus: string;
   pullPercent: number | null;
   stt: SttStatus | null;
   removeStt: () => void;
   sttPercent: number | null;
   downloadStt: () => void;
+  cancelStt: () => void;
   sttErr: string;
   dictTranslate: boolean;
   onDictTranslateChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -46,12 +49,15 @@ export default function ModelSection({
   setPullName,
   pulling,
   pull,
+  stopPull,
+  stoppingPull,
   pullStatus,
   pullPercent,
   stt,
   removeStt,
   sttPercent,
   downloadStt,
+  cancelStt,
   sttErr,
   dictTranslate,
   onDictTranslateChange,
@@ -76,6 +82,9 @@ export default function ModelSection({
                   ai={ai}
                   model={model}
                   onSelect={onModelChange}
+                  // Settings is the inventory: embedding models stay listed here
+                  // so they can be seen and deleted, but cannot be chosen to chat.
+                  manage
                   localEmptyHint={
                     ai.running ? undefined : "Ollama is not running — start it to manage local models."
                   }
@@ -175,6 +184,14 @@ export default function ModelSection({
               <button className="btn-ic" onClick={pull} disabled={pulling || !pullName.trim()}>
                 <DownloadIcon size={14} /> {pulling ? "Downloading…" : "Download"}
               </button>
+              {/* A multi-gigabyte download had no way out but quitting the app.
+                  The backend's cancel flag was already there and tested; this is
+                  the button that reaches it. */}
+              {pulling && (
+                <button className="subtle" onClick={stopPull} disabled={stoppingPull}>
+                  {stoppingPull ? "Stopping…" : "Stop"}
+                </button>
+              )}
             </div>
             {(pullStatus || pullPercent != null) && (
               <div className="pull-progress">
@@ -207,6 +224,7 @@ export default function ModelSection({
                 <button
                   className="subtle btn-ic"
                   title="Delete the dictation model from disk"
+                  aria-label="Delete the dictation model from disk"
                   onClick={removeStt}
                 >
                   <TrashIcon size={13} />
@@ -221,6 +239,11 @@ export default function ModelSection({
                   />
                 </div>
                 <span>Downloading voice model — {sttPercent ?? 0}%</span>
+                {/* 574 MB over a slow line is many minutes, and there was no
+                    way out of it but quitting the app. */}
+                <button className="subtle btn-ic" onClick={cancelStt}>
+                  Stop
+                </button>
               </div>
             ) : (
               <button className="btn-ic" onClick={downloadStt}>

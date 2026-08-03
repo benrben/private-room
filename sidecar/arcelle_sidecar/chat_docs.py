@@ -247,8 +247,13 @@ async def enumerate_names(
     provider: Any | None = None,
 ) -> list[str]:
     """knowledge.rs cmd_add_file "for each" — enumerate the ``subject`` as short
-    names from the conversation, guaranteed a JSON string array. Uncapped: the
-    user gets a file per item they named, however many that is."""
+    names from the conversation, guaranteed a JSON string array.
+
+    Uncapped HERE on purpose — enumerating is the fuzzy step and cutting the
+    list at this end would hide from the caller how long it really was. The cap
+    that keeps a hundred-item list from filling the room lives with the loop
+    that writes the files (``knowledge.rs`` ``MAX_FAN_OUT_FILES``), where the
+    overflow can be counted and named in the answer."""
     schema = {"type": "array", "items": {"type": "string"}}
     messages = [
         system_message(LIST_NAMES_SYSTEM),

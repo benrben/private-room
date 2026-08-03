@@ -8,6 +8,7 @@ import {
 } from "../api";
 import { CheckIcon, ChevronDownIcon } from "../icons";
 import { isRemoteModel } from "./markup";
+import { isEmbeddingModel } from "./localModel";
 
 interface Props {
   ai: AiStatus;
@@ -28,6 +29,11 @@ interface Props {
    * models — e.g. Settings uses this for "Ollama is not running" so the
    * message stays accurate. Cloud engines never depend on Ollama running. */
   localEmptyHint?: React.ReactNode;
+  /** Settings' inventory mode: list every installed model, including the ones
+   * that cannot chat (embeddings), so they can be seen and deleted — they render
+   * disabled rather than selectable. The composer's pill omits this and gets a
+   * list where everything shown is a valid pick. */
+  manage?: boolean;
 }
 
 /** Local/Cloud toggle + (for Cloud) a list of detected cloud engines that
@@ -42,6 +48,7 @@ export default function EngineModelPicker({
   onModelsLoaded: recordLifted,
   renderLocalExtra,
   localEmptyHint,
+  manage = false,
 }: Props) {
   const [ownModels, setOwnModels] = useState<Record<string, ExternalModelInfo[]>>({});
   const engineModels = liftedModels ?? ownModels;
@@ -61,8 +68,19 @@ export default function EngineModelPicker({
   // under "On this Mac". Split the raw Ollama list so each tab shows only its
   // own; the two were previously conflated, which listed cloud models (badged
   // "Cloud") inside the "On this Mac" tab.
-  const localModels = ai.models.filter((m) => !isRemoteModel(m));
-  const remoteModels = ai.models.filter((m) => isRemoteModel(m));
+  // An embedding-only model (nomic-embed-text, bge-*) answers /api/embed but not
+  // /api/chat. `bestLocalModel` and Rust's `best_default` have always refused to
+  // FALL BACK to one, but this menu still listed them, so semantic search's own
+  // pull put a model in the picker that fails every turn it is chosen for with
+  // "does not support chat" (HTTP 400, live QA 2026-08-03).
+  //
+  // Settings lists them anyway — that is where you see and delete what is
+  // installed — but as a disabled row, never a pick. The composer's pill has no
+  // such job, so there they are simply absent.
+  const chatable = ai.models.filter((m) => !isEmbeddingModel(m));
+  const listed = manage ? ai.models : chatable;
+  const localModels = listed.filter((m) => !isRemoteModel(m));
+  const remoteModels = listed.filter((m) => isRemoteModel(m));
   const hasCloud = ai.external.length > 0 || remoteModels.length > 0;
 
   const [tier, setTier] = useState<"local" | "cloud">(
@@ -90,7 +108,19 @@ export default function EngineModelPicker({
       !engine ||
       !ai.external.includes(engine) ||
       (engine !== "openrouter" && engineModels[engine])
-    ) return;
+    ) {
+      // Nothing to fetch — but a PREVIOUS fetch may still own the spinner. Its
+      // `finally` deliberately skips the reset once its cleanup has run
+      // (`cancelled`), on the assumption that the next effect run sets the flag
+      // afresh. This early return breaks that assumption: collapsing the menu
+      // (or re-opening it on a cached engine) lands here without touching
+      // `loadingEngine`, so it stayed pinned to the engine that was open, every
+      // `!loadingEngine` guard below stayed false, and the picker showed
+      // "Checking…" forever with no way back. Live QA 2026-08-03 could not
+      // restart its provider matrix because of exactly this.
+      setLoadingEngine(null);
+      return;
+    }
     let cancelled = false;
     setLoadingEngine(engine);
     setLoadError(null);
@@ -156,24 +186,38 @@ export default function EngineModelPicker({
           {localModels.length === 0 && (
             <div className="settings-hint">{localEmptyHint ?? "No models installed yet."}</div>
           )}
-          {localModels.map((m) => (
-            // A sibling row div, not one big <button>: renderLocalExtra (Settings'
-            // delete button) must never nest inside the row's own select button.
-            <div key={m} className="model-menu-row">
-              <button
-                type="button"
-                className={`model-menu-item${m === model ? " sel" : ""}`}
-                aria-pressed={m === model}
-                onClick={() => onSelect(m)}
-              >
-                <span className="model-dot local" />
-                <span className="model-menu-name">{modelLabel(m) ?? m}</span>
-                <span className="model-menu-tier">Local</span>
-                {m === model && <CheckIcon size={14} />}
-              </button>
-              {renderLocalExtra?.(m)}
-            </div>
-          ))}
+          {localModels.map((m) => {
+            // Only reachable in `manage` mode — the composer's list never
+            // contains one. Disabled, and SAID to be, so the row reads as
+            // "installed, but not for this" rather than as a dead button.
+            const embedOnly = isEmbeddingModel(m);
+            return (
+              // A sibling row div, not one big <button>: renderLocalExtra (Settings'
+              // delete button) must never nest inside the row's own select button.
+              <div key={m} className="model-menu-row">
+                <button
+                  type="button"
+                  className={`model-menu-item${m === model ? " sel" : ""}`}
+                  aria-pressed={m === model}
+                  disabled={embedOnly}
+                  title={
+                    embedOnly
+                      ? "Used for semantic search only — this model cannot hold a chat"
+                      : undefined
+                  }
+                  onClick={() => onSelect(m)}
+                >
+                  <span className="model-dot local" />
+                  <span className="model-menu-name">{modelLabel(m) ?? m}</span>
+                  <span className="model-menu-tier">
+                    {embedOnly ? "Search only" : "Local"}
+                  </span>
+                  {m === model && !embedOnly && <CheckIcon size={14} />}
+                </button>
+                {renderLocalExtra?.(m)}
+              </div>
+            );
+          })}
         </div>
       )}
 

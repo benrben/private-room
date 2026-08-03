@@ -52,6 +52,22 @@ export default function CloudPrivacySection() {
     }
   };
 
+  /** Hand the room back to the app-wide default. Flipping the room switch
+   * writes an explicit per-room choice, and there used to be no way to unwrite
+   * it: the panel said "this room has its own choice" forever, and changing
+   * the default below then did nothing here. The backend has always accepted
+   * "default" (`set_privacy_room`); nothing offered it. */
+  const followDefault = async () => {
+    if (!status) return;
+    try {
+      await api.setPrivacyRoom("default");
+      setErr(null);
+      reload();
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
+
   const toggleGlobal = async () => {
     if (!status) return;
     try {
@@ -123,11 +139,44 @@ export default function CloudPrivacySection() {
             : "OFF — cloud models can see everything in this room."}
         </span>
       </div>
+      {status?.roomSetting && (
+        <p className="settings-hint cpv-inline-hint">
+          This room has its own choice.{" "}
+          <button type="button" className="linkish" onClick={followDefault}>
+            Follow the app default instead
+          </button>
+          {status.globalDefaultOn ? " (currently on)." : " (currently off)."}
+        </p>
+      )}
       {!effectiveOn && (
         <p className="cpv-off-warning">
           The door is open: questions, documents and tool results go to cloud
           models with real names and details. Your stored blackouts are kept
           and enforcement resumes the moment you switch back on.
+        </p>
+      )}
+      {/* The switch above governs every seam this section describes EXCEPT the
+          outbound remote-connector one, which is deliberately switch-blind. So
+          the warning right above this is complete for models and wrong for
+          connectors, and this is the panel a user checks first when a lookup
+          comes back empty — the 2026-07-24 misdiagnosis in miniature. Both
+          notes read off `connectorArgsMasked`, the backend's own account of
+          what that seam is doing, rather than restating the switch. */}
+      {status && !effectiveOn && status.connectorArgsMasked && (
+        <p className="cpv-seam-note">
+          One exception, and this switch does not control it: a{" "}
+          <b>remote connector</b> is still sent placeholders instead of the
+          items below, even with the door open. If a connector lookup comes
+          back empty or off-target, check that first — it is Connectors →
+          “Send remote connectors real values” that decides it.
+        </p>
+      )}
+      {status && status.entities.length > 0 && !status.connectorArgsMasked && (
+        <p className="cpv-seam-note">
+          {effectiveOn ? "Even with the door shut, one" : "One"} seam sends
+          real values: a <b>remote connector</b> receives the items below as
+          themselves, because Connectors → “Send remote connectors real values”
+          is on. The switch above does not govern that seam either way.
         </p>
       )}
       <div className="settings-toggle-row" data-agent-blocked="true">
@@ -225,6 +274,12 @@ export default function CloudPrivacySection() {
         onChange={(e) => {
           conceptsDirty.current = true;
           setConceptDraft(e.target.value);
+        }}
+        onKeyDown={(e) => {
+          // This box only saves on blur, so letting Escape reach the modal
+          // closed Settings and threw the typing away. Same guard as
+          // BehaviorSection's two textareas, for the same reason.
+          if (e.key === "Escape") e.stopPropagation();
         }}
         onBlur={saveConcepts}
         placeholder={"my health\nmy family"}

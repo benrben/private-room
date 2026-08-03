@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { confirm as askConfirm } from "@tauri-apps/plugin-dialog";
 import { api, type AiProviderStatus } from "../api";
 import { CheckIcon, CloseIcon } from "../icons";
 
@@ -45,8 +46,19 @@ export default function AiProvidersSection({
     }
   }
 
+  /** Disconnecting DELETES the key from the Keychain and switches the room off
+   * its cloud model — irreversible in one click (the key is not recoverable
+   * from the app, only from OpenRouter), while every other destructive button
+   * on this screen asks first. So this one asks too. */
   async function disconnect() {
     if (busy) return;
+    const ok = await askConfirm(
+      "This deletes your OpenRouter API key from the Keychain — the app cannot " +
+        "get it back, you would have to paste it again. Any room using an " +
+        "OpenRouter model switches back to the local one.",
+      { title: "Disconnect OpenRouter", kind: "warning", okLabel: "Disconnect" },
+    ).catch(() => false);
+    if (!ok) return;
     setBusy(true);
     setMessage("");
     try {

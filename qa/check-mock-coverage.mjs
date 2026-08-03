@@ -65,9 +65,21 @@ function walk(dir, out = []) {
   return out;
 }
 
+// Any `module::name` entry in the handler list, not just `commands::` — the host
+// registers commands from other modules too (`obs::reveal_logs`), and hard-coding
+// one module reported every one of them as frontend-side drift.
+//
+// Comments are stripped FIRST, and no trailing comma is required. Requiring one
+// would silently drop whichever command happens to be last in the list (Rust
+// does not need a trailing comma there), and that is the entry a person adding a
+// command is most likely to be touching — a drift checker that goes quiet on the
+// newest line is worse than none.
 const rust = new Set(
-  [...handlerBody(fs.readFileSync(path.join(root, "src-tauri/src/lib.rs"), "utf8"))
-    .matchAll(/commands::(\w+)/g)].map((m) => m[1]),
+  [
+    ...handlerBody(fs.readFileSync(path.join(root, "src-tauri/src/lib.rs"), "utf8"))
+      .replace(/\/\/[^\n]*/g, "")
+      .matchAll(/(?:\w+::)+(\w+)/g),
+  ].map((m) => m[1]),
 );
 
 const frontend = new Set();
@@ -86,9 +98,27 @@ for (const extra of ["ask", "run_command"]) {
   if (mockSrc.includes(`cmd === "${extra}"`)) mocked.add(extra);
 }
 
+// `EXTRA_READS` in qa-mock.js is the hand-written list of loaders whose NAME
+// does not start with `list_`/`get_`/… — it is what makes `?qa_state=` reach
+// Home, Settings, the recording pane, Connectors and the Browser. It is a
+// second hand-written command list, so it drifts the same way the fixture table
+// does, and a stale name there is SILENT: the rule simply never fires and that
+// pane's empty/loading/failed looks stop being captured. (The audit found
+// exactly one such orphan; nothing was checking.)
+const extraReads = new Set(
+  [
+    ...(mockSrc.match(/const EXTRA_READS = new Set\(\[([\s\S]*?)\]\);/)?.[1] ?? "").matchAll(
+      /"([a-z0-9_]+)"/g,
+    ),
+  ].map((m) => m[1]),
+);
+
 const sorted = (set) => [...set].sort();
 const missingInRust = sorted(frontend).filter((c) => !rust.has(c));
 const staleInMock = sorted(mocked).filter((c) => !rust.has(c));
+// A read-rule name must be a real command AND one the app actually calls: a
+// registered-but-uncalled name is just as dead a rule as an invented one.
+const staleReadRule = sorted(extraReads).filter((c) => !rust.has(c) || !frontend.has(c));
 const uncovered = sorted(frontend).filter((c) => !mocked.has(c));
 
 const pct = ((frontend.size - uncovered.length) / frontend.size) * 100;
@@ -111,5 +141,21 @@ if (staleInMock.length) {
     `\nDRIFT — qa-mock.js fakes ${staleInMock.length} command(s) that no longer exist:\n  ${staleInMock.join("\n  ")}`,
   );
 }
+if (!extraReads.size) {
+  failed = true;
+  console.error(
+    "\nDRIFT — qa-mock.js has no EXTRA_READS set any more (or it was reshaped): " +
+      "`?qa_state=` silently stops reaching Home, Settings, recording, connectors and the browser.",
+  );
+}
+if (staleReadRule.length) {
+  failed = true;
+  console.error(
+    `\nDRIFT — qa-mock.js EXTRA_READS names ${staleReadRule.length} command(s) the app never invokes, so the rule can never fire:\n  ${staleReadRule.join("\n  ")}`,
+  );
+}
 if (failed) process.exit(1);
-console.log("\nNo drift: every invoked command exists, every fixture names a real command.");
+console.log(
+  `\nNo drift: every invoked command exists, every fixture names a real command, ` +
+    `all ${extraReads.size} EXTRA_READS rules can fire.`,
+);

@@ -489,6 +489,44 @@ button.primary.running:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* ART-1: who wrote this version, under the cause. Its own line rather than an
+   inline suffix — the cause is what happened, this is who did it, and on a row
+   that ellipsises the attribution must not be the half that gets cut. Rendered
+   only when the room recorded it, so its presence is itself the signal. */
+.tm-prov {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The head of the chain: what made the state currently on screen. Sits above
+   the version list, separated, so "Now" reads as the present and not as the
+   newest saved version (which it is not — a version is a state that has been
+   REPLACED). */
+.tm-now {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+.tm-now-label {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.tm-now .tm-prov {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text);
+}
 .tm-time {
   flex-shrink: 0;
   font-size: 11px;
@@ -534,6 +572,36 @@ button.primary.running:disabled {
   font-size: 11px;
   padding: 3px 7px;
   border-radius: 7px;
+}
+
+/* "Kept": this version sits OUTSIDE the rolling window, so it survives any
+   number of later saves. A badge rather than an icon — it is a promise about
+   what will not happen, and that has to be readable at rest. */
+.tm-kept {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: var(--accent-ghost);
+  vertical-align: baseline;
+}
+.tm-size {
+  font-variant-numeric: tabular-nums;
+}
+/* The rolling window, stated. Always visible under the list — the whole point
+   is that the limit stops being something you discover by losing a version. */
+.tm-retention {
+  margin-top: 6px;
+  padding: 8px 10px 2px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
 }
 
 /* The version currently loaded reads as the live, accented point. */

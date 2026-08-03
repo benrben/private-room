@@ -287,6 +287,129 @@ async def test_the_free_snapshot_waits_until_a_page_actually_exists() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# BROWSE-3c: searching without a search engine
+# --------------------------------------------------------------------------- #
+
+
+def test_the_browser_is_told_to_search_with_its_own_tool_not_with_google() -> None:
+    """The agent is picked whenever a destination is NAMED — which is not the
+    same as an address being KNOWN. Holding no search verb, its only move was
+    to open google.com and hunt for the search box: a page built to defeat
+    automation, in a browser carrying no cookies to look human with. So the
+    prompt has to name the real move AND close the workaround by name, because
+    a model trained on the open web reaches for a search engine by reflex.
+    """
+    prompt = _spec("chat.browse").prompt.lower()
+    assert "plain words" in prompt
+    assert "browse_open" in prompt
+    for engine in ("google.com", "bing.com", "duckduckgo.com"):
+        assert engine in prompt, f"the prompt never rules out {engine}"
+    assert "never open" in prompt
+    # A site's OWN search box is a normal control — the rule must not read as
+    # "never touch a search field", or the agent stops being able to use a shop.
+    assert "browse_do" in prompt
+
+
+@pytest.mark.asyncio
+async def test_a_search_does_not_fire_the_free_snapshot_against_no_page() -> None:
+    """BROWSE-3c reopened the hole `probe_after` was dug for.
+
+    `browse_open` with plain words SEARCHES: it satisfies "browse_open was
+    attempted" while leaving no page at all. Without `probe_unless` the free
+    `browse_snapshot` fires in the gap between the agent receiving its results
+    and choosing one — the guaranteed failure, journalled as an `error` the
+    user reads, right in the middle of the task.
+    """
+    from conftest import FakeChatModel, Round, drive_worker, make_request
+    from arcelle_sidecar.mcp_client import ToolResult, ToolSpec
+    from arcelle_sidecar.messages import ToolCall
+
+    not_open = "The browser isn't open. Use browse_open first."
+    # The host's real wording — see `format_hits_for_agent` in
+    # src-tauri/src/commands/browse/search.rs.
+    hits = (
+        'Searched the room\'s own engines for "tallest building in europe":\n'
+        "1. Lakhta Center — https://en.wikipedia.org/wiki/Lakhta_Center\n"
+        "Pick the one that answers the task and browse_open its URL."
+    )
+    served = [
+        ToolSpec(name=n, description=n, input_schema={"type": "object", "properties": {}})
+        for n in (*BROWSE_TOOL_NAMES, "list_room_files", "search_room", "open_file")
+    ]
+
+    class HostLikeMCP:
+        """Stateful like the Rust host: plain words search and open NOTHING."""
+
+        def __init__(self) -> None:
+            self.opened = False
+            self.calls: list[str] = []
+            self.failed_before_open: list[str] = []
+
+        async def list_tools(self) -> list[ToolSpec]:
+            return list(served)
+
+        async def call_tool(self, name: str, arguments: dict) -> ToolResult:
+            self.calls.append(name)
+            if name == "browse_open":
+                if "://" not in str(arguments.get("url", "")):
+                    return ToolResult(text=hits)  # a search: still no page
+                self.opened = True
+                return ToolResult(text="Lakhta Center — https://en.wikipedia.org/…\ne1 link")
+            if name.startswith("browse_") and not self.opened:
+                self.failed_before_open.append(name)
+                return ToolResult(text=not_open, is_error=True)
+            return ToolResult(text="ok")
+
+        async def aclose(self) -> None:
+            return None
+
+    mcp = HostLikeMCP()
+    chat = FakeChatModel(
+        [
+            Round(calls=[ToolCall(name="browse_open", arguments={"url": "tallest building in europe"})]),
+            Round(
+                calls=[
+                    ToolCall(
+                        name="browse_open",
+                        arguments={"url": "https://en.wikipedia.org/wiki/Lakhta_Center"},
+                    )
+                ]
+            ),
+            Round(content="FOUND: Lakhta Center, 462 m."),
+        ]
+    )
+    await drive_worker(
+        make_request("what is the tallest building in europe", web_enabled=True),
+        chat,
+        mcp,  # type: ignore[arg-type]
+        agent_id="chat.browse",
+    )
+
+    assert mcp.failed_before_open == [], (
+        "the probe fired against a search result, which is not a page: "
+        f"{mcp.failed_before_open}"
+    )
+    assert mcp.calls[0] == "browse_open", mcp.calls
+    # The probe must still pay for itself once a REAL page is open — the gate
+    # is "no page yet", not "browse_open searched once, give up on probing".
+    assert "browse_snapshot" in mcp.calls, mcp.calls
+
+
+def test_the_search_gate_is_pinned_to_the_hosts_actual_wording() -> None:
+    """`probe_unless` matches Rust-authored prose across a language boundary.
+
+    The Rust side pins these same two phrases
+    (`the_agents_result_carries_the_phrases_the_sidecar_gates_its_probe_on`),
+    so a reword goes red on whichever side is edited. The predicate fails OPEN,
+    so drift costs the old failing probe back — never a refusal.
+    """
+    markers = _spec("chat.browse").flow.probe_unless
+    assert "searched the room's own engines" in markers
+    assert "no results across seven engines" in markers
+    assert all(m == m.lower() for m in markers), "matched case-insensitively; keep them lower"
+
+
+# --------------------------------------------------------------------------- #
 # Navigation intent (owner decision 2026-07-30)
 # --------------------------------------------------------------------------- #
 

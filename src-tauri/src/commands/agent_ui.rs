@@ -83,16 +83,72 @@ pub(crate) async fn request_ui(
     }
 }
 
+/// What the caller is told when the request it is answering is no longer
+/// waiting. The frontend matches on nothing here — it shows the sentence — but
+/// it must stay a sentence a person can act on.
+pub(crate) const NO_LONGER_WAITING: &str =
+    "That request had already been given up on, so answering it now did nothing. \
+     Ask again if you still want it.";
+
 /// The frontend driver's answer to an `agent-ui-request`. `payload` may carry
 /// an `error` field when the driver refused (e.g. a consent-protected control).
+///
+/// Answering an id that is NOT pending is an ERROR, not a no-op. A consent card
+/// stays on screen forever while the tool call behind it gives up on its own
+/// budget (`UI_CONSENT_TIMEOUT_SECS`) and is told "nobody approved it". Pressing
+/// Allow afterwards used to return `Ok(())`: the card vanished, the user had
+/// every reason to believe the typing was approved, and nothing ran. Reporting
+/// the truth is the only way the card can say so.
 #[tauri::command]
 pub fn resolve_agent_ui(
     ui: State<'_, AgentUi>,
     id: String,
     payload: serde_json::Value,
 ) -> Result<(), String> {
-    if let Some(tx) = ui.pending.lock().unwrap().remove(&id) {
-        let _ = tx.send(payload);
+    deliver_ui_answer(&ui, &id, payload)
+}
+
+/// The command's body, without the Tauri wrapper, so the expired case is
+/// testable.
+pub(crate) fn deliver_ui_answer(
+    ui: &AgentUi,
+    id: &str,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    let Some(tx) = ui.pending.lock().unwrap().remove(id) else {
+        return Err(NO_LONGER_WAITING.into());
+    };
+    // The receiver can also be gone between the timeout arm and this line — the
+    // same fact, told the same way rather than swallowed.
+    tx.send(payload).map_err(|_| NO_LONGER_WAITING.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn answering_a_request_that_gave_up_reports_it() {
+        let ui = AgentUi::default();
+        // A live request is delivered and reported as delivered.
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+        ui.pending.lock().unwrap().insert("live".into(), tx);
+        assert!(deliver_ui_answer(&ui, "live", serde_json::json!({"approved": true})).is_ok());
+        assert_eq!(rx.try_recv().unwrap()["approved"], true);
+
+        // The same id again: the tool call has moved on, and an Ok here is the
+        // lie the consent card used to tell.
+        let err = deliver_ui_answer(&ui, "live", serde_json::json!({"approved": true}))
+            .expect_err("a spent id must not read as delivered");
+        assert_eq!(err, NO_LONGER_WAITING);
+
+        // Timed out: the pending entry is gone, so Allow reports the truth.
+        assert!(deliver_ui_answer(&ui, "expired", serde_json::json!({"approved": true})).is_err());
+
+        // Receiver dropped without the entry being removed (the tool task died).
+        let (tx2, rx2) = tokio::sync::oneshot::channel::<serde_json::Value>();
+        ui.pending.lock().unwrap().insert("orphan".into(), tx2);
+        drop(rx2);
+        assert!(deliver_ui_answer(&ui, "orphan", serde_json::json!({})).is_err());
     }
-    Ok(())
 }

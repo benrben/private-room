@@ -5,6 +5,19 @@
 (() => {
   const now = new Date();
   const iso = (minAgo) => new Date(now.getTime() - minAgo * 60000).toISOString();
+  /* Unix epoch MILLIS, for the handful of fields the backend sends as a number
+   * rather than as an ISO string (RecentRoom.openedAt). */
+  const epochMs = (minAgo) => now.getTime() - minAgo * 60000;
+  /* Seconds → the "m-ss" stamp `commands/video.rs` puts in a derived file's
+   * name. Mirrored here so the trim/still receipts read the way the real ones
+   * do — a fixture that returned "clip.mp4" would hide the naming entirely. */
+  const stampFor = (secs) => {
+    const s = Math.max(0, Math.round(Number(secs) || 0));
+    const pad = (n) => String(n).padStart(2, "0");
+    return s >= 3600
+      ? `${Math.floor(s / 3600)}-${pad(Math.floor((s % 3600) / 60))}-${pad(s % 60)}`
+      : `${Math.floor(s / 60)}-${pad(s % 60)}`;
+  };
 
   /* VISUAL STATE, chosen with `?qa_state=empty|loading|error` (default: full).
    *
@@ -34,6 +47,10 @@
     "workflow_templates",
     "ai_status",
     "model_capabilities",
+    "engine_capabilities",
+    "engine_preflight",
+    "engine_support_matrix",
+    "grounding_model_for_room",
     "recommended_models",
     "stt_status",
     "privacy_status",
@@ -123,11 +140,34 @@
     { id: "f-apollo", name: "Apollo missions.csv", mimeType: "text/csv", sizeBytes: 8210, source: "upload", hasText: true, createdAt: iso(2100), folderId: "fo-research", partiallyIndexed: false },
     { id: "f-meeting", name: "Product review.m4a", mimeType: "audio/mp4", sizeBytes: 22_000_000, source: "recording", hasText: true, createdAt: iso(60), folderId: null, partiallyIndexed: false },
     { id: "f-script", name: "prepare_release.py", mimeType: "text/x-python", sizeBytes: 1180, source: "upload", hasText: true, createdAt: iso(400), folderId: null, partiallyIndexed: false },
+    // The video viewer's own surface (technical strip, Set start/Set end, Trim,
+    // Save frame) had NO fixture at all, so nothing in this harness could reach
+    // it — the `probe_video_meta` fixture below was unreachable.
+    { id: "f-demo", name: "Kickoff demo.mp4", mimeType: "video/mp4", sizeBytes: 48_000_000, source: "upload", hasText: true, createdAt: iso(45), folderId: null, partiallyIndexed: false },
+    // Two SAVED WEB PAGES, because the viewer's source strip renders from
+    // `files.web_meta` and there was no fixture carrying one — so the strip was
+    // unreachable from this harness even though the UA checklist asks a tester
+    // to look at it. They are a PAIR on purpose: one page declared its site,
+    // author and dates, the other declared nothing but the address, and the
+    // whole promise of the strip is that those two look different (no
+    // "Author: unknown" row on the second).
+    { id: "f-heron", name: "The Heron Returns.md", mimeType: "text/markdown", sizeBytes: 4300, source: "web", hasText: true, createdAt: iso(20), folderId: "fo-research", partiallyIndexed: false },
+    { id: "f-bare", name: "Status page.md", mimeType: "text/markdown", sizeBytes: 900, source: "web", hasText: true, createdAt: iso(18), folderId: null, partiallyIndexed: false },
   ];
 
   const folders = [
     { id: "fo-product", name: "Product" },
     { id: "fo-research", name: "Research" },
+  ];
+
+  /* Trash: the Library pane's third tab. Deliberately seeded with all three
+     actor kinds — a person's delete, an AI's, and one Arcelle did on its own —
+     because the whole reason the actor is recorded is that those must not look
+     alike, and a fixture with only "by you" rows could never show that. */
+  let trashedFiles = [
+    { id: "t-notes", name: "Scratch notes.md", mimeType: "text/markdown", sizeBytes: 1420, trashedAt: iso(30), trashedBy: "user", trashedById: null, folderId: null },
+    { id: "t-draft", name: "Q3 draft.md", mimeType: "text/markdown", sizeBytes: 9800, trashedAt: iso(120), trashedBy: "agent", trashedById: "files.edit/write_file", folderId: "fo-product" },
+    { id: "t-legacy", name: "Room summary.md", mimeType: "text/markdown", sizeBytes: 6100, trashedAt: iso(900), trashedBy: "app", trashedById: "summarize_room", folderId: null },
   ];
 
   const memories = [
@@ -173,6 +213,17 @@
     "f-apollo": { kind: "csv", name: "Apollo missions.csv", mime: "text/csv", editable: true, text: "mission,year,crew\nApollo 7,1968,3\nApollo 8,1968,3\nApollo 11,1969,3\nApollo 13,1970,3\nApollo 17,1972,3", dataB64: null },
     "f-script": { kind: "code", name: "prepare_release.py", mime: "text/x-python", editable: true, text: "# /// script\n# room-inputs: Research/*.md\n# room-outputs: Reports/release-brief.md\n# room-timeout: 120\n# ///\n\nfrom pathlib import Path\nnotes = list(Path('Research').glob('*.md'))\nprint(len(notes))", dataB64: null },
     "f-meeting": { kind: "recording", name: "Product review.m4a", mime: "audio/mp4", editable: false, text: "[00:12] We should keep the document in the center.\n[00:41] And the AI needs to say which sources it used.", dataB64: null, mediaToken: null },
+    // `mediaMeta: null` ON PURPOSE: this is the room that predates the column,
+    // so opening it is what makes the viewer ask for `probe_video_meta`. That
+    // on-open probe is the ONLY way an already-imported video ever fills in.
+    "f-demo": { kind: "video", name: "Kickoff demo.mp4", mime: "video/mp4", editable: false, text: "[00:05] Dana: Thanks for making the time.\n[01:12] Sam: Here's what shipped this week.", dataB64: null, mediaToken: null, mediaMeta: null },
+    // A saved page that declared everything: the strip above the reading shows
+    // Site · Author · Published · Source · Saved, and the file's own header is
+    // a LIST so it does not render as one run-on paragraph.
+    "f-heron": { kind: "markdown", name: "The Heron Returns.md", mime: "text/markdown", editable: true, dataB64: null, webMeta: { title: "The Heron Returns", byline: "Dana Okafor", siteName: "The Marsh Review", published: "2026-03-04T09:12:00Z", lang: "en", sourceUrl: "https://marshreview.example/heron", capturedAt: "2026-08-03T07:20:00Z" }, text: "# The Heron Returns\n\n- Source: https://marshreview.example/heron\n- Site: The Marsh Review\n- Author: Dana Okafor\n- Published: 2026-03-04T09:12:00Z\n- Saved: 2026-08-03\n\nAfter eleven years of absence the grey heron has come back to the lower marsh, and the wardens who counted its going are counting its return with something close to disbelief.\n\n## What the counts show\n\nThree nests, then five, then eleven by the end of the season.\n" },
+    // The same viewer with a page that declared NOTHING but its address: no
+    // Author row, no Published row, and above all no \"unknown\".
+    "f-bare": { kind: "markdown", name: "Status page.md", mime: "text/markdown", editable: true, dataB64: null, webMeta: { title: "Status page", sourceUrl: "https://status.example/", capturedAt: "2026-08-03T07:24:00Z" }, text: "# Status page\n\n- Source: https://status.example/\n- Saved: 2026-08-03\n\nAll systems normal.\n" },
   };
 
   const workflows = [
@@ -184,8 +235,16 @@
     { fileId: "f-script", name: "prepare_release.py", lang: "py", deps: [], inputs: ["Research/*.md"], outputs: ["Reports/release-brief.md"], shortcut: "global", approved: true, changedSinceApproval: false, workflowId: null, schedule: null, lastRun: null },
   ];
 
+  /* One row per Activity SECTION, because the pane is now three of them
+   * (decision #12): work running, work stopped and waiting for you, and the
+   * history of what already happened. With only the running job the parked and
+   * history sections never drew at all, so a capture run could not tell an
+   * empty log from a missing one. `parkedReason` is what a job the APP stopped
+   * carries — it must read differently from a Stop the user chose. */
   const jobs = [
-    { id: "j1", kind: "deep_summary", title: "Room summary", plan: null, state: null, cursor: 3, total: 5, status: "running", error: null, createdAt: iso(2), updatedAt: iso(0) },
+    { id: "j1", kind: "deep_summary", title: "Room summary", plan: null, state: null, cursor: 3, total: 5, status: "running", error: null, parkedReason: null, createdAt: iso(2), updatedAt: iso(0) },
+    { id: "j2", kind: "file_pass", title: "Full pass — Arcelle UX direction.md", plan: null, state: null, cursor: 4, total: 11, status: "paused", error: null, parkedReason: "The room was locked while this was still running.", createdAt: iso(4), updatedAt: iso(3) },
+    { id: "j3", kind: "workflow", title: "Workflow — Morning digest", plan: null, state: null, cursor: 6, total: 6, status: "done", error: null, parkedReason: null, createdAt: iso(6), updatedAt: iso(5) },
   ];
 
   /* Skills area. One of each `createdBy`, one disabled, and one with no
@@ -223,6 +282,16 @@
     { name: "weather", status: "failed", error: "spawn weather-mcp ENOENT", tools: [], remote: false },
   ];
   const mcpToolPrefs = { linear: ["update_issue"] };
+  /* The per-connector overrides of the two connector powers. LIVE STATE, not a
+   * snapshot: the selects on the page write through `set_mcp_connector_power`
+   * below, so QA can see "in force here" actually change. Seeded with one
+   * connector answering each power differently from the (off) switches above —
+   * the whole point of the split is that two connectors need not agree, and a
+   * fixture where they all agree would screenshot as if they still did. */
+  const mcpConnectorPowers = {
+    filesystem: { auto_approve: true },
+    linear: { outbound_unmask: true },
+  };
   const mcpCatalog = [
     { id: "io.github.modelcontextprotocol/filesystem", name: "filesystem", title: "Filesystem", icon: null, description: "Read and write files in directories you choose.", publisher: "modelcontextprotocol", verified: true, remote: false, transport: "stdio", repository: "https://github.com/modelcontextprotocol/servers", install: { kind: "stdio", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem"], envKeys: [] }, altInstall: null },
     { id: "com.linear/linear", name: "linear", title: "Linear", icon: null, description: "Issues, projects and cycles from your Linear workspace.", publisher: "linear.app", verified: true, remote: true, transport: "http", repository: null, install: { kind: "http", url: "https://mcp.linear.app/mcp", headerKeys: ["Authorization"] }, altInstall: null },
@@ -325,7 +394,8 @@
   const recMeta = {
     name: "Product review.m4a",
     meta: {
-      version: 1,
+      // No `version`: the real RecMeta has no such field. Sending one here hid
+      // the divergence from the harness.
       durationCs: 900,
       cuts: [],
       maxSpeakers: 0,
@@ -364,20 +434,78 @@
       `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${hue} 55% 42%)"/><stop offset="1" stop-color="hsl(${hue + 40} 45% 22%)"/></linearGradient></defs><rect width="320" height="180" fill="url(#g)"/><circle cx="240" cy="52" r="46" fill="rgba(255,255,255,.14)"/></svg>`,
     );
 
+  // The open room's identity. Mutable so `rename_room` can actually change it
+  // — the top bar reads the name back from the command's answer, so a fixture
+  // that returned a constant would make a broken rename look like a working one.
+  const roomInfo = {
+    name: "Research Room",
+    path: "/Users/ben/Research Room.roomai",
+    fileCount: files.length,
+    messageCount: 12,
+    synced: false,
+    pendingMcp: null,
+  };
+
   const commands = {
-    room_info: () =>
-      gateMode
-        ? null
-        : { name: "Research Room", path: "/Users/ben/Research Room.roomai", fileCount: files.length, messageCount: 12, synced: false, pendingMcp: null },
+    room_info: () => (gateMode ? null : { ...roomInfo, fileCount: files.length }),
+    rename_room: (a2) => {
+      const name = String(a2?.name ?? "").trim();
+      if (!name) throw new Error("A room needs a name.");
+      if ([...name].length > 120) throw new Error("That name is too long — 120 characters at most.");
+      roomInfo.name = name;
+      return { ...roomInfo, fileCount: files.length };
+    },
+    // Nothing failed: the honest answer is null, and the workspace shows nothing.
+    take_rec_recovery_error: () => null,
     take_pending_open: () => null,
+    // `openedAt` is EPOCH MILLIS, and the key is `openedAt` — the mock used to
+    // send `lastOpened` as an ISO string, so the start screen's "Opened 2 hours
+    // ago" line was never drawn in a QA screenshot and never reviewed.
+    // `missing` is what marks a room whose file has gone.
     list_recent: () =>
       gateMode
         ? [
-            { path: "/Users/ben/Research Room.roomai", name: "Research Room", lastOpened: iso(60) },
-            { path: "/Users/ben/Journal.roomai", name: "Journal", lastOpened: iso(2000) },
+            { path: "/Users/ben/Research Room.roomai", name: "Research Room", openedAt: epochMs(60), missing: false },
+            // One MISSING on purpose: the "File not found" row is a state the
+            // start screen can now draw, and a fixture where it never appears
+            // means it is never reviewed.
+            { path: "/Users/ben/Journal.roomai", name: "Journal", openedAt: epochMs(2000), missing: true },
           ]
         : [],
     list_files: () => files,
+    // ---- Trash / undo ----
+    list_trashed_files: () => trashedFiles,
+    trash_file: (a2) => {
+      const i = files.findIndex((f) => f.id === a2?.id);
+      if (i < 0) throw new Error("That file is not in this room.");
+      const [gone] = files.splice(i, 1);
+      trashedFiles = [
+        { id: gone.id, name: gone.name, mimeType: gone.mimeType, sizeBytes: gone.sizeBytes, trashedAt: new Date().toISOString(), trashedBy: "user", trashedById: null, folderId: gone.folderId },
+        ...trashedFiles,
+      ];
+      return null;
+    },
+    restore_file: (a2) => {
+      const i = trashedFiles.findIndex((f) => f.id === a2?.id);
+      if (i < 0) throw new Error("That file is not in the trash.");
+      const [back] = trashedFiles.splice(i, 1);
+      const meta = { id: back.id, name: back.name, mimeType: back.mimeType, sizeBytes: back.sizeBytes, source: "upload", hasText: true, createdAt: iso(500), folderId: back.folderId, partiallyIndexed: false };
+      files.unshift(meta);
+      return meta;
+    },
+    delete_file_permanently: (a2) => {
+      const i = trashedFiles.findIndex((f) => f.id === a2?.id);
+      if (i < 0) throw new Error("Only a file already in the trash can be deleted permanently.");
+      trashedFiles.splice(i, 1);
+      return null;
+    },
+    // Returns the number ACTUALLY destroyed, so QA can check that an empty
+    // trash reports "already empty" instead of a cheerful success.
+    empty_trash: () => {
+      const n = trashedFiles.length;
+      trashedFiles = [];
+      return n;
+    },
     // BROWSE-3: the browser's search half.
     browser_search: (a2) => ({
       hits: searchHits,
@@ -430,8 +558,90 @@
       { name: "summary", summary: "Summarize the attached files", usage: "#summary" },
       { name: "minutes", summary: "Meeting minutes from a transcript", usage: "#minutes" },
     ],
-    ai_status: () => ({ running: true, installed: true, models: ["qwen3.5:4b"], defaultModel: "qwen3.5:4b", external: ["claude-cli"] }),
+    // The composer's "*" menu. Two of the six domains, deliberately: the
+    // harness room is a local-engine room with the web ON, and a roster that
+    // listed every domain would let a UI test pass against a menu the real
+    // `reachable_domain_keys` would never produce.
+    list_specialists: () => [
+      { key: "file", tool: "ask_file_agent", label: "File agent", area: "this room's own content", description: "Ask the File agent to work with this room's content." },
+      { key: "web", tool: "ask_web_agent", label: "Web agent", area: "the internet and browsing sites", description: "Ask the Web agent about anything on the internet." },
+    ],
+    ai_status: () => ({ running: true, installed: true, models: ["qwen3.5:4b"], defaultModel: "qwen3.5:4b", external: ["claude-cli"], remoteRelay: false }),
     model_capabilities: () => [{ model: "qwen3.5:4b", tools: true, vision: false }],
+    // The room's engine as ONE declared capability record. Mirrors the mock's
+    // own `ai_status` (a local tool-only model), so Settings shows a coherent
+    // room rather than a capability answer that contradicts the model list.
+    engine_capabilities: () => ({
+      engine: "ollama",
+      label: "Ollama (this Mac)",
+      model: "qwen3.5:4b",
+      local: true,
+      streaming: "yes",
+      toolCalling: "yes",
+      vision: "no",
+      structuredOutput: "yes",
+      chat: "yes",
+      contextWindow: 131072,
+      tier: "local-engine",
+      imageReaches: true,
+    }),
+    // PREFLIGHT for the room's engine, and it must AGREE with
+    // `engine_capabilities` above: that record says `vision: "no"`, so the real
+    // command returns `blocked` with the `capability` code, not "ready". The
+    // fixture said "ready" to keep the vision Download button on screen, which
+    // hid a real bug — Settings was keying off `status` alone and dropped the
+    // button for every blocked verdict, including this one. The code is what
+    // decides: `capability` keeps the download offer, `privacy-door` replaces
+    // it. Flip this to `privacy-door` to exercise the other branch.
+    engine_preflight: () => ({
+      status: "blocked",
+      code: "capability",
+      reason:
+        "Ollama (this Mac) cannot look at an image — the room is set to qwen3.5:4b. " +
+        "Choose a different model in Settings → Model.",
+    }),
+    // The published provider x agent matrix. The real one is derived from the
+    // host's capability table plus the sidecar's agent registry; the harness has
+    // neither, so this fixture stands in for a two-provider Mac. `agentsKnown`
+    // is true here on purpose — the "sidecar unreachable" half of the section
+    // is exercised by simply removing this fixture.
+    engine_support_matrix: () => ({
+      agentsKnown: true,
+      agentsError: null,
+      agents: [
+        { id: "files.read", label: "File agent" },
+        { id: "chat.web", label: "Web agent" },
+        { id: "app.ui", label: "App agent" },
+      ],
+      providers: [
+        {
+          engine: "ollama", label: "Ollama (this Mac)", model: "", local: true,
+          streaming: "yes", toolCalling: "unknown", vision: "unknown",
+          structuredOutput: "yes", chat: "unknown", contextWindow: null,
+          tier: "local-engine", imageReaches: true,
+          available: true, agents: ["files.read", "chat.web", "app.ui"],
+        },
+        {
+          engine: "claude-cli", label: "Claude Code", model: "", local: false,
+          streaming: "no", toolCalling: "yes", vision: "no",
+          structuredOutput: "no", chat: "unknown", contextWindow: null,
+          tier: "cloud-engine", imageReaches: false,
+          available: true, agents: ["files.read", "chat.web", "app.ui"],
+        },
+        {
+          engine: "openrouter", label: "OpenRouter", model: "", local: false,
+          streaming: "yes", toolCalling: "unknown", vision: "unknown",
+          structuredOutput: "unknown", chat: "unknown", contextWindow: null,
+          tier: "cloud-engine", imageReaches: false,
+          available: false, agents: ["files.read", "chat.web", "app.ui"],
+        },
+      ],
+    }),
+    // Which model would mark an image for this room; null = nothing can, which
+    // is what this mock room (one tool-only model) honestly reflects — so the
+    // viewer's vision offer and the Settings helper row both show their
+    // "nothing can see" state under the harness.
+    grounding_model_for_room: () => null,
     get_setting: (a2) => settings[a2?.key] ?? null,
     set_setting: (a2) => { if (a2) settings[a2.key] = a2.value; return null; },
     // PRIV-1: the cloud-privacy gatekeeper (stubbed: door on, one sample entity).
@@ -445,6 +655,7 @@
       concepts: ["my health"],
       pendingFiles: 0,
       scanning: false,
+      connectorArgsMasked: true,
     }),
     set_privacy_room: () => null,
     set_privacy_global: () => null,
@@ -468,7 +679,30 @@
     // Connectors area (and the marketplace inside it).
     mcp_status: () => mcpServers,
     mcp_get_config: () => JSON.stringify({ mcpServers: {} }, null, 2),
+    // The two connector powers are separate switches and both ship OFF, so the
+    // harness must see two independent falses — not one answer reused.
     get_mcp_auto_approve: () => false,
+    get_mcp_outbound_unmask: () => false,
+    // …and the setters, which the harness omitted: without them the switch
+    // flips optimistically, `invoke` answers null, and the reload-on-failure
+    // path never runs — so QA could not tell a working switch from one whose
+    // command name had drifted.
+    set_mcp_auto_approve: () => null,
+    set_mcp_outbound_unmask: () => null,
+    get_mcp_connector_powers: () => JSON.stringify(mcpConnectorPowers),
+    set_mcp_connector_power: (a2) => {
+      const name = (a2 && a2.server) || "";
+      const power = (a2 && a2.power) || "";
+      const entry = { ...(mcpConnectorPowers[name] ?? {}) };
+      // `null` clears the override back to "follow the switch above" — an
+      // ABSENT key, never a false, which is the distinction the whole
+      // per-connector layer rests on.
+      if (a2 && (a2.value === true || a2.value === false)) entry[power] = a2.value;
+      else delete entry[power];
+      if (Object.keys(entry).length) mcpConnectorPowers[name] = entry;
+      else delete mcpConnectorPowers[name];
+      return JSON.stringify(mcpConnectorPowers);
+    },
     mcp_get_tool_prefs: () => JSON.stringify(mcpToolPrefs),
     mcp_registry_optin_status: () => true,
     mcp_registry_search: (a2) => {
@@ -476,6 +710,10 @@
       return mcpCatalog.filter((e) => !q || (e.title ?? e.name).toLowerCase().includes(q) || e.description.toLowerCase().includes(q));
     },
     mcp_oauth_status: () => false,
+    // AUDIT 506: the drawer's "Sign out". Answers the fresh status list the
+    // real command returns, so clicking it in the harness exercises the same
+    // path the app does instead of throwing.
+    mcp_oauth_sign_out: () => mcpServers,
     // Skills area.
     list_skills: () => skills,
     get_skill: (a2) => {
@@ -511,9 +749,44 @@
         title: t.url ? t.title : null,
         ready: t.url ? "complete" : null,
         takeover: browserState.takeover,
+        // Item #18: only a real double Escape inside the native page sets
+        // this, and there is no native page here. Present and false, exactly
+        // as Rust reports it, so the view's branch is exercised as a no-op
+        // rather than left undefined.
+        leaveRequested: false,
       };
     },
     browser_tabs: () => browserTabs,
+    /* Item #18: the reading view. The mock has no page to extract, so this
+     * returns the same SHAPE with fixture prose — a list and a table included,
+     * because those are the two structures the extractor was fixed to emit and
+     * the two a screen reader most depends on. `truncated: false` means the
+     * "showing the first N of M" line stays off, which is the honest state for
+     * text this short. */
+    browser_page_text: (a2) => {
+      const t = activeTab();
+      if (!t || !t.url) throw new Error("The browser isn't open — there is no page to read.");
+      const text =
+        `# ${titleFor(t.url).split(" — ")[0]}\n\n` +
+        "The page as text, extracted by the same reader the assistant uses.\n\n" +
+        "- first point\n- second point\n- third point\n\n" +
+        "| column | value |\n| --- | --- |\n| one | 1 |\n| two | 2 |\n\n" +
+        `[A link on the page](${t.url})\n`;
+      return {
+        ok: true,
+        url: t.url,
+        title: t.title,
+        mode: (a2 && a2.mode) === "full" ? "full" : "main",
+        offset: 0,
+        nextOffset: text.length,
+        total: text.length,
+        truncated: false,
+        text,
+      };
+    },
+    // Moving the window's first responder is a native act with no meaning in a
+    // plain browser; the command must still exist or the escape route throws.
+    browser_focus_app: () => null,
     browser_journal: (a2) => browseJournal.slice(0, (a2 && a2.limit) || browseJournal.length),
     browser_verify_private: () => true,
     // Bounds are pushed several times a second by the view's ResizeObserver.
@@ -591,9 +864,14 @@
       const t = activeTab();
       if (!t || !t.url) throw new Error("No page is open.");
       const stem = titleFor(t.url).split(" — ")[0].slice(0, 40) || "page";
+      // The sentence names what was really saved: the ARTICLE when one could be
+      // extracted, and the metadata the page actually declared. The mock has a
+      // page with both, so it says so — a mock that claimed an article for a
+      // page with none would be teaching the harness the wrong sentence.
       return (a2 && a2.what) === "selection"
-        ? `Saved "${stem} (selection).md" into the room.`
-        : `Saved "${stem}.md" (readable copy) and "${stem}.html" (exact HTML) into the room.`;
+        ? `Saved the selected text as "${stem} (selection).md".`
+        : `Saved the readable article as "${stem}.md" (searchable) and "${stem}.html" (formatted). ` +
+            `Kept from the page: Example · by A. Writer · published 2026-01-09.`;
     },
     // The other two buttons on that same strip — Save link and Download video.
     // Faked here because a Save strip where half the buttons throw is not the
@@ -636,7 +914,122 @@
     list_roles: () => roles,
     memory_suggestion: () => ({ worth: true, fact: "Ben prefers release briefs under one page" }),
     get_file_content: (a2) => contents[a2?.id] ?? { kind: "text", name: "unknown", mime: "text/plain", editable: false, text: "(no preview)", dataB64: null },
+    // The viewer's encoding strip. The fixture room's files are all UTF-8, so
+    // the honest answer is the boring one — and `chosen` when the harness picks
+    // an encoding, because the strip must say a pick took effect. The text is
+    // handed back unchanged: this mock has no bytes to re-read, and inventing a
+    // "re-decoded" string would fake the one thing the feature exists to do.
+    decode_file_text: (a2) => ({
+      text: contents[a2?.id]?.text ?? "",
+      encoding: a2?.encoding ?? "UTF-8",
+      source: a2?.encoding ? "chosen" : "utf8",
+      lossy: false,
+      editable: contents[a2?.id]?.editable ?? false,
+      options: [
+        { name: "UTF-8", title: "Unicode (UTF-8)" },
+        { name: "windows-1252", title: "Western European (Windows 1252)" },
+        { name: "windows-1254", title: "Turkish (Windows 1254 / ISO-8859-9)" },
+      ],
+    }),
+    // The waveform's envelope. A synthetic speech-shaped curve rather than a
+    // flat line, so the browser harness exercises the real drawing path
+    // (regions, legend, hover) instead of an empty lane.
+    audio_peaks: () => ({
+      peaks: Array.from({ length: 600 }, (_, i) =>
+        Math.abs(Math.sin(i / 9) * Math.sin(i / 71)) * (i % 97 < 12 ? 0.06 : 1),
+      ),
+      duration: 372,
+      // The curve above crosses the host's noise floor, so this fixture is a
+      // track WITH signal — the "no audio signal" label must not appear here.
+      silent: false,
+    }),
+    // A video that states MOST of itself but not all of it — the interesting
+    // case for the technical strip, because `frameRate: null` is what has to
+    // render as "unknown" rather than as a plausible number.
+    probe_video_meta: () => ({
+      durationSecs: 372,
+      width: 1920,
+      height: 1080,
+      videoCodec: "H.264",
+      frameRate: null,
+      bitrateKbps: 1354,
+      hasAudio: true,
+      audioCodec: "AAC",
+    }),
+    // Trim writes a NEW file and leaves the original alone; the receipt names
+    // the file the room actually stored, so the fixture has to name one too.
+    // Without it the button threw "no fixture" and the whole trim path — the
+    // one the packet exists for — was untestable in this harness.
+    video_trim: (a2) => ({
+      id: `f-trim-${Math.random().toString(36).slice(2, 8)}`,
+      name: `Kickoff demo (trim ${stampFor(a2 && a2.startSecs)} to ${stampFor(a2 && a2.endSecs)}).mp4`,
+      mimeType: "video/mp4",
+      sizeBytes: 6_400_000,
+      source: "generated",
+      hasText: false,
+      createdAt: new Date().toISOString(),
+      folderId: null,
+      partiallyIndexed: false,
+    }),
+    save_video_frame: (a2) => ({
+      id: `f-still-${Math.random().toString(36).slice(2, 8)}`,
+      name: `Kickoff demo @ ${stampFor(a2 && a2.atSecs)}.png`,
+      mimeType: "image/png",
+      sizeBytes: 1_900_000,
+      source: "generated",
+      hasText: false,
+      createdAt: new Date().toISOString(),
+      folderId: null,
+      partiallyIndexed: false,
+    }),
+    // QuickLook is a system service the harness has no access to; "this Mac
+    // can't draw it either" is the honest fixture and the viewer's own
+    // no-preview path is what gets exercised.
+    quicklook_preview: () => null,
+    // In-place .docx save. Mirrors the Rust command's ONE refusal the UI has
+    // to render: paragraphs may be reworded, not added or removed.
+    update_docx_text: (a2) => {
+      const before = (contents[a2?.id]?.text ?? "").split("\n").filter((l) => l.trim());
+      const after = String(a2?.content ?? "").split("\n").filter((l) => l.trim());
+      if (before.length !== after.length) {
+        throw new Error(
+          `This editor can change the wording of a Word file's paragraphs, but not add or remove them — the document has ${before.length} and the edited text has ${after.length}.`,
+        );
+      }
+      if (contents[a2?.id]) contents[a2.id] = { ...contents[a2.id], text: after.join("\n") };
+      return files.find((f) => f.id === a2?.id) ?? files[0];
+    },
     list_file_versions: () => [],
+    // The rolling window the History strip now STATES, plus its per-version
+    // Keep/Delete. The harness only has to answer them; the strip's own empty
+    // case is what this fixture room exercises.
+    file_versions_kept: () => 10,
+    pin_file_version: () => null,
+    delete_file_version: () => null,
+    // The Skills screen's owner picker asks the host for the roster rather than
+    // carrying its own copy.
+    skill_agent_ids: () => [
+      "files.read",
+      "scripts.run",
+      "chat.web",
+      "chat.browse",
+      "app.ui",
+      "jobs.run",
+      "jobs.workflows",
+      "skills.use",
+      "skills.author",
+      "connectors.admin",
+      "connectors.use",
+      "media.transcribe",
+      "media.video",
+      "creator.studio",
+    ],
+    skill_import_conflict: () => null,
+    // ART-1: what produced the open file's current content. `null` is the honest
+    // answer for this fixture room — its files were imported, not generated — so
+    // the History strip shows no attribution line, which is the case that must
+    // look right first.
+    get_file_provenance: () => null,
     get_file_version: () => ({ fileName: "Ideas.md", versionText: "# Workspace model\n\nKeep sources and AI in one view.", currentText: contents["f-ideas"].text }),
     search_all: (a2) => ({
       files: files.filter((f) => f.name.toLowerCase().includes((a2?.query ?? "").toLowerCase())).map((f) => ({ id: f.id, name: f.name, snippet: "…" })),
@@ -651,6 +1044,12 @@
     // empty name clears it, and the segments are never rewritten.
     rec_set_speaker_name: (a2) => {
       const { speaker, name } = a2 ?? {};
+      // The two refusals the real command has and this stand-in used to skip,
+      // so a UI that sent either was "passing" under QA.
+      if (!String(speaker ?? "").trim()) throw new Error("No speaker selected.");
+      if (recMeta.meta.segments.length === 0) {
+        throw new Error("That recording has no transcript yet.");
+      }
       if (!recMeta.meta.segments.some((s) => s.speaker === speaker)) {
         throw new Error(`Nobody in this recording is labelled "${speaker}".`);
       }
@@ -661,7 +1060,17 @@
       recMeta.meta = { ...recMeta.meta, speakerNames: names };
       return recMeta.meta;
     },
-    room_graph: () => ({ nodes: files.slice(0, 6).map((f, i) => ({ id: f.id, name: f.name, kind: "file", links: i % 3 })), edges: [{ from: "f-direction", to: "f-ideas", why: "shared concepts" }, { from: "f-direction", to: "f-review", why: "cited" }] }),
+    // Typed links, in the REAL GraphEdge shape (a/b/weight/kind/directed/shared)
+    // — this used to mock a {from,to,why} shape the app has never sent, so the
+    // map rendered nothing under QA and nobody could tell.
+    room_graph: () => ({
+      nodes: files.slice(0, 6).map((f) => ({ id: f.id, name: f.name, kind: "file" })),
+      edges: [
+        { a: "f-direction", b: "f-ideas", weight: 1, kind: "derived", directed: true, shared: [] },
+        { a: "f-direction", b: "f-review", weight: 0.7, kind: "cited", directed: false, shared: ["cited together in 2 answers"] },
+        { a: "f-ideas", b: "f-review", weight: 0.45, kind: "similar", directed: false, shared: ["roadmap", "quarter"] },
+      ],
+    }),
     studio_prompts: () => ({ flashcards: "Make flashcards", mindmap: "Make a mind map", podcast: "Write a podcast script" }),
     ai_action_prompts: () => [],
     warm_model: () => null,
@@ -677,12 +1086,18 @@
     // and builds the GitHub URL from them) — a bare string used to leave
     // `repo` undefined and the modal's primary button permanently dead.
     app_diag: () => ({ version: "0.11.0-qa", os: "macOS 26.3", arch: "aarch64", repo: "benrben/private-room" }),
+    // Owner replacement #1: Settings → Updates & version reveals the log folder.
+    // The mock returns the path the real command returns without touching Finder.
+    reveal_logs: () => "/var/folders/qa/T",
     feedback_draft: (a2) => ({
       title: (a2?.text ?? "").slice(0, 48) || "Untitled issue",
       body: `## What happened\n\n${a2?.text ?? ""}`,
     }),
     list_room_checkpoints: () => ({ entries: [{ id: "ck1", name: "Checkpoint — Jul 18", createdAt: iso(1440), sizeBytes: 18_000_000, auto: false }], totalBytes: 18_000_000 }),
     stt_status: () => ({ installed: true, downloading: false, sizeMb: 620 }),
+    // Nothing is downloading under QA, and the honest answer to "stop it" is
+    // that there was nothing to stop.
+    stt_cancel_download: () => false,
     room_server_status: () => ({ running: false, url: "", config: "", scope: "files", stable: false, allowCloud: false }),
     // The Settings picker's live catalog (dynamic in the real app — a tiny
     // fixed sample here keeps the grouped select renderable offline).
@@ -807,6 +1222,13 @@
       if (cmd.startsWith("list_")) return noteUnhandled(cmd, []);
       if (cmd === "ask" || cmd === "run_command") {
         window.__qaAsks = (window.__qaAsks || 0) + 1;
+        // Owner replacement #4: the host wraps every ask-* event in
+        // { runId, chatId, v } so a conversation can reject events that are not
+        // its own. The mock has to speak the same wire — with bare payloads the
+        // composer treats them as belonging to nobody, and a QA run that
+        // switched chats would show exactly the bug this replaced.
+        const turn = { runId: args?.askId ?? null, chatId: args?.chatId ?? null };
+        const askEmit = (event, v) => window.__qaEmit(event, { ...turn, v });
         (window.__qaAskLog = window.__qaAskLog || []).push(args?.question ?? args?.text ?? "?");
         // Dispatch-first agent visibility: roster + active-agent walk, so the
         // agent strip (done/active/queued chips) is exercised in browser QA.
@@ -831,9 +1253,9 @@
           const all = [...kids, ...extra];
           const running = all.map((e, i) => (e.status === "running" ? i + 1 : 0)).filter(Boolean);
           const plan = [...all, MAIN(running.length ? "pending" : "running")];
-          window.__qaEmit("ask-plan", plan);
+          askEmit("ask-plan", plan);
           const step = running[0] ?? plan.length;
-          window.__qaEmit("ask-agent", {
+          askEmit("ask-agent", {
             id: plan[step - 1].agent, label: plan[step - 1].label,
             step, total: plan.length, active_steps: running.length ? running : [step],
           });
@@ -844,29 +1266,29 @@
         // draw and must still render the plain one-chip strip it always did.
         if (window.__qaSolo) {
           at(80, () => {
-            window.__qaEmit("ask-plan", [MAIN("running")]);
-            window.__qaEmit("ask-agent", { id: "chat.answer", label: "Main agent", step: 1, total: 1, active_steps: [1] });
+            askEmit("ask-plan", [MAIN("running")]);
+            askEmit("ask-agent", { id: "chat.answer", label: "Main agent", step: 1, total: 1, active_steps: [1] });
           });
-          at(150, () => window.__qaEmit("ask-delta", "Answering directly. "));
+          at(150, () => askEmit("ask-delta", "Answering directly. "));
           return new Promise((resolve) =>
             setTimeout(() => resolve({ id: "msg-solo", role: "assistant", content: "Answering directly.", sources: [], createdAt: new Date().toISOString(), effects: null }), Number(window.__qaTurnMs) || 4200));
         }
         at(80, () => {
-          window.__qaEmit("ask-plan", [MAIN("running")]);
-          window.__qaEmit("ask-agent", { id: "chat.answer", label: "Main agent", step: 1, total: 1, active_steps: [1] });
+          askEmit("ask-plan", [MAIN("running")]);
+          askEmit("ask-agent", { id: "chat.answer", label: "Main agent", step: 1, total: 1, active_steps: [1] });
         });
         // The batch is dispatched: three children light up together.
         at(500, () => {
           snap(["running", "running", "running"]);
-          for (const k of KIDS) window.__qaEmit("ask-step", { label: `Asked the ${k.label}`, node: "main" });
+          for (const k of KIDS) askEmit("ask-step", { label: `Asked the ${k.label}`, node: "main" });
         });
         // Their tool traffic interleaves — each step names the node that ran it.
-        at(700, () => window.__qaEmit("ask-step", { label: "Searched the room", node: "files.read#0" }));
-        at(820, () => window.__qaEmit("ask-step", { label: "Searched the web", node: "chat.web#1" }));
-        at(900, () => window.__qaEmit("ask-step-status", { ok: true, node: "files.read#0" }));
-        at(980, () => window.__qaEmit("ask-step", { label: "Checked job status", node: "jobs.run#2" }));
-        at(1100, () => window.__qaEmit("ask-step", { label: "Opened Lease.pdf", node: "files.read#0" }));
-        at(1200, () => window.__qaEmit("ask-step-status", { ok: false, node: "chat.web#1" }));
+        at(700, () => askEmit("ask-step", { label: "Searched the room", node: "files.read#0" }));
+        at(820, () => askEmit("ask-step", { label: "Searched the web", node: "chat.web#1" }));
+        at(900, () => askEmit("ask-step-status", { ok: true, node: "files.read#0" }));
+        at(980, () => askEmit("ask-step", { label: "Checked job status", node: "jobs.run#2" }));
+        at(1100, () => askEmit("ask-step", { label: "Opened Lease.pdf", node: "files.read#0" }));
+        at(1200, () => askEmit("ask-step-status", { ok: false, node: "chat.web#1" }));
         // Out-of-order completion: the Jobs agent finishes first, the Web agent
         // fails, the File agent is still working. This frame is the feature.
         at(1400, () => snap(["running", "running", "done"]));
@@ -876,7 +1298,7 @@
         at(2900, () => {
           const later = N("connectors.use", "Connector agent", "send the summary to Slack", "running", 1, "connectors.use#3");
           snap(["done", "failed", "done"], [later]);
-          window.__qaEmit("ask-step", { label: "Asked the Connector agent", node: "main" });
+          askEmit("ask-step", { label: "Asked the Connector agent", node: "main" });
         });
         at(3600, () =>
           snap(["done", "failed", "done"], [
@@ -884,15 +1306,15 @@
           ]),
         );
         // Pretend a short streamed answer, so Send visibly works in QA.
-        setTimeout(() => window.__qaEmit("ask-delta", "Thinking about your sources… "), 150);
-        setTimeout(() => window.__qaEmit("ask-delta", "here is a grounded answer."), 450);
+        setTimeout(() => askEmit("ask-delta", "Thinking about your sources… "), 150);
+        setTimeout(() => askEmit("ask-delta", "here is a grounded answer."), 450);
         // Token-budget bar QA: a live per-turn snapshot, growing a bit each ask
         // so repeated sends visibly fill the bar.
         window.__qaTurns = (window.__qaTurns || 0) + 1;
         const base = 4200 + window.__qaTurns * 900;
         setTimeout(
           () =>
-            window.__qaEmit("ask-token-usage", {
+            askEmit("ask-token-usage", {
               round: 0,
               total_tokens: base,
               max_context: 24576,

@@ -14,13 +14,14 @@ pub(crate) fn note_mime(name: &str) -> String {
 
 /// Save a generated text file into the room (Markdown by default). Reused by
 /// several commands. Emits nothing — the caller decides what to open/announce.
+///
+/// ART-1: this goes through the staging funnel like every other generated write,
+/// so a note that is regenerated becomes a new VERSION of itself rather than a
+/// second indistinguishable row, and an interrupted generation leaves nothing
+/// behind. Callers that know their provenance (or hold a cancel flag) build the
+/// [`Artifact`] themselves and commit it; this is the plain case.
 pub(crate) fn create_note(conn: &Connection, name: &str, content: &str) -> Result<FileMeta, String> {
-    let name = if extraction::extension_of(name).is_empty() {
-        format!("{name}.md")
-    } else {
-        name.to_string()
-    };
-    db::insert_file(conn, &name, &note_mime(&name), content.as_bytes(), Some(content), "generated")
+    Artifact::note(name, content).commit(conn).map(|w| w.meta)
 }
 
 // ---- Wave 1b (idea 10): the canonical shared scratch pad -------------------
@@ -68,21 +69,25 @@ pub fn open_scratch_pad(state: State<'_, AppState>) -> Result<FileMeta, String> 
 /// two events must both fire — the file appears in the sidebar AND jumps into
 /// the viewer. Taking the room lock only for the insert keeps it off the await
 /// paths the callers run on.
+/// ART-1: `art` carries the write itself — name, mime, body, provenance and the
+/// run's cancel flag. Generated output is named after its SOURCE, so a second
+/// run produces the same name as the first; two files called "Flashcards -
+/// clean-code.html" with different decks in them cannot be told apart in the
+/// library (live QA 2026-08-03). The funnel answers that by making the re-run a
+/// new VERSION of the same file — the earlier deck stays reachable in History
+/// instead of becoming an indistinguishable twin. `db::available_name` still
+/// covers the other case: a generated name that collides with a file a PERSON
+/// put in the room, which must never be versioned over.
 pub(crate) fn save_and_open(
     window: &tauri::Window,
     state: &State<'_, AppState>,
-    name: &str,
-    mime: &str,
-    content: &str,
-    source: &str,
-) -> Result<FileMeta, String> {
+    art: Artifact<'_>,
+) -> Result<Written, String> {
     use tauri::Emitter;
-    let meta = state.with_room(|room| {
-        db::insert_file(&room.conn, name, mime, content.as_bytes(), Some(content), source)
-    })?;
+    let written = state.with_room(|room| art.commit(&room.conn))?;
     let _ = window.emit("room-files-changed", ());
-    let _ = window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
-    Ok(meta)
+    let _ = window.emit("agent-open-file", serde_json::json!({ "id": written.meta.id }));
+    Ok(written)
 }
 
 // ---- HTML-first output (the app defaults generated documents to HTML) ----

@@ -322,8 +322,28 @@ fn http() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Every address in this flow that the CONNECTOR chose, checked before we go
+/// anywhere near it.
+///
+/// The sign-in flow is the one place the app follows addresses a remote server
+/// hands it: the `WWW-Authenticate` challenge names the protected-resource
+/// metadata document, that document names an authorization server, and that
+/// server's own metadata names the authorize, token and registration
+/// endpoints. A hostile (or merely compromised) connector could therefore point
+/// any of them at `http://127.0.0.1:…` or a `192.168.x.x` box and use this Mac
+/// as a probe of its own network — the classic SSRF shape, and the reason
+/// `web::check_public_http_url` exists for every other outbound fetch. Applied
+/// at the three funnels that actually leave the machine, so a new discovery
+/// step cannot forget it.
+fn checked_endpoint(url: &str) -> Result<(), String> {
+    crate::web::check_public_http_url(url)
+        .map(|_| ())
+        .map_err(|_| format!("{url} is a local or private-network address — refused."))
+}
+
 /// Fetch a JSON metadata document.
 async fn fetch_json(url: &str) -> Result<serde_json::Value, String> {
+    checked_endpoint(url)?;
     let resp = http()?
         .get(url)
         .header("Accept", "application/json")
@@ -356,6 +376,7 @@ pub(crate) async fn discover(prm_url: &str) -> Result<AuthServerMeta, String> {
 
 /// RFC 7591 dynamic client registration for a public + PKCE client.
 async fn register_client(endpoint: &str, redirect_uri: &str) -> Result<String, String> {
+    checked_endpoint(endpoint)?;
     let body = serde_json::json!({
         "client_name": "Arcelle",
         "redirect_uris": [redirect_uri],
@@ -420,6 +441,10 @@ async fn post_token(
     form: &[(&str, &str)],
     client_id: &str,
 ) -> Result<TokenSet, TokenError> {
+    // Unreachable, not Rejected: a refused address says nothing about whether
+    // the stored refresh token is still good, and `mark_refresh_rejected` must
+    // not retire a live sign-in over it.
+    checked_endpoint(endpoint).map_err(TokenError::Unreachable)?;
     let resp = http()
         .map_err(TokenError::Unreachable)?
         .post(endpoint)
@@ -617,6 +642,36 @@ pub(crate) async fn authorize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SSRF: every address in the sign-in flow past the user's own server URL
+    /// is chosen by the connector, so a private one must be refused before any
+    /// request is made — the same rule every other outbound fetch follows.
+    #[test]
+    fn discovery_and_token_endpoints_refuse_private_addresses() {
+        for url in [
+            "http://127.0.0.1:11434/.well-known/oauth-authorization-server",
+            "http://localhost:8080/token",
+            "http://192.168.1.20/register",
+            "http://[::1]:9000/token",
+            "http://router.local/authorize",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            let err = checked_endpoint(url).unwrap_err();
+            assert!(err.contains("private-network"), "should refuse {url}: {err}");
+        }
+        assert!(checked_endpoint("https://auth.example.com/token").is_ok());
+    }
+
+    /// A refused endpoint must never be read as the provider REFUSING the
+    /// refresh token: that retires the sign-in and forces the user back through
+    /// the browser for something the server never said.
+    #[tokio::test]
+    async fn a_private_token_endpoint_is_unreachable_not_rejected() {
+        let err = refresh_tokens("http://127.0.0.1:9/token", "cid", "rt")
+            .await
+            .unwrap_err();
+        assert!(!err.is_rejected(), "must not retire the sign-in: {err}");
+    }
 
     #[test]
     fn pkce_pair_is_well_formed() {

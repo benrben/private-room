@@ -2,8 +2,10 @@ import {
   useEffect,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
   type RefObject,
 } from "react";
+import { useFocusTrap } from "../settings/useFocusTrap";
 import { api } from "../api";
 import {
   CheckIcon,
@@ -20,6 +22,7 @@ import DiffPreview from "../viewers/DiffPreview";
 import { languageForFile } from "../viewers/languages";
 import { LayoutApi } from "../shell/useLayout";
 import { toggleTheme } from "../theme";
+import { SCRIPT_POWERS, SCRIPT_WORKSPACE_NOTE } from "./scriptTrust";
 
 /** Human name for whoever owns the shared dictation mic right now. */
 const CAPTURE_OWNER_LABEL: Record<string, string> = {
@@ -148,6 +151,58 @@ function useMenuKeys(
   return { onKeyDown };
 }
 
+/** AUDIT 540: one keyboard-correct frame for the four consent cards.
+ *
+ * They render over a LIVE workspace — the Lock button is one of the things
+ * sitting behind them — and moved focus nowhere at all. Tab walked straight out
+ * of the card onto that chrome, and Escape reached the app-level handler, which
+ * closed the FILE underneath instead of answering the question in front of you.
+ * Settings has done this correctly the whole time (`useFocusTrap`); this puts
+ * the four cards on the same frame.
+ *
+ * Escape DECLINES. It is the only answer that is safe to give by accident, and
+ * a consent card whose Escape did nothing would leave a keyboard user with no
+ * way out at all now that Tab no longer escapes it.
+ *
+ * Mounted per REQUEST (`key`), so the next card in the queue is a fresh
+ * component and the trap's move-focus-in effect runs again for it.
+ */
+function ApproveCard({
+  onDecline,
+  label,
+  wide,
+  children,
+}: {
+  onDecline: () => void;
+  label: string;
+  wide?: boolean;
+  children: ReactNode;
+}) {
+  const { modalRef, onModalKeyDown } = useFocusTrap(onDecline);
+  return (
+    <div className="approve-backdrop" data-agent-blocked>
+      <div
+        ref={modalRef}
+        tabIndex={-1}
+        onKeyDown={(e) => {
+          // The app-level Escape handler (effects.ts) closes the open FILE.
+          // This card is in front of that file and asking its own question, so
+          // the answer must not carry past it — that mis-routing is half of
+          // what made these cards unusable from the keyboard.
+          if (e.key === "Escape") e.stopPropagation();
+          onModalKeyDown(e);
+        }}
+        className={`approve-card${wide ? " approve-card-wide" : ""}`}
+        role="alertdialog"
+        aria-modal="true"
+        aria-label={label}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
 /** One executable palette command (searched alongside room content). */
 type PaletteAction = {
   id: string;
@@ -272,7 +327,12 @@ function ShortcutsSheet({ onClose }: { onClose: () => void }) {
       <div className="settings" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
         <div className="settings-head">
           <span className="badge-label">Keyboard shortcuts</span>
-          <button className="subtle btn-ic" title="Close" onClick={onClose}>
+          <button
+            className="subtle btn-ic"
+            title="Close"
+            aria-label="Close keyboard shortcuts"
+            onClick={onClose}
+          >
             <CloseIcon size={12} />
           </button>
         </div>
@@ -392,15 +452,18 @@ export default function Overlays({
         // Wave 5 (Idea 13): the script-run consent card. Same data-agent-blocked
         // surface as the MCP/edit cards — the UI-driving agent must never approve
         // its own script. The two honest sentences state the real trust class.
-        <div className="approve-backdrop" data-agent-blocked>
-          <div className="approve-card" role="alertdialog" aria-modal="true">
+        <ApproveCard
+          key={pendingScript.id}
+          label="Run a script from this room?"
+          onDecline={() => a.resolveScriptApproval(pendingScript, "deny")}
+        >
+          <>
             <div className="approve-title">
               <ScriptIcon size={17} /> Run a script from this room?
             </div>
             <p className="approve-body">
               <strong>{pendingScript.name}</strong> is a real program:{" "}
-              <strong>it can reach the internet.</strong> While it runs, the files it uses are
-              placed in a temporary folder outside the room's encryption.
+              <strong>{SCRIPT_POWERS}</strong> {SCRIPT_WORKSPACE_NOTE}
             </p>
             <pre className="approve-args">{pendingScript.interpreterLine}</pre>
             {pendingScript.deps.length > 0 && (
@@ -444,14 +507,55 @@ export default function Overlays({
                 Don't run
               </button>
             </div>
-          </div>
-        </div>
+          </>
+        </ApproveCard>
       )}
-      {pendingApproval && (
+      {pendingApproval?.confirm && (
+        // Audit #505: an agent-initiated DELETION. Its own card, because the
+        // tool-call one below asks the wrong question (nothing is being run,
+        // and nothing may be "always allowed" — there is no trash for a
+        // connector, so this card IS the undo). Same data-agent-blocked
+        // surface: the agent must never click its own confirmation.
+        <ApproveCard
+          key={pendingApproval.id}
+          label={`Delete the ${pendingApproval.tool} “${pendingApproval.server}”?`}
+          onDecline={() => a.resolveMcpApproval(pendingApproval, "deny")}
+        >
+          <>
+            <div className="approve-title">
+              <ShieldIcon size={17} /> Delete the {pendingApproval.tool}{" "}
+              &ldquo;{pendingApproval.server}&rdquo;?
+            </div>
+            <p className="approve-body">
+              The AI asked to delete this {pendingApproval.tool}.{" "}
+              {pendingApproval.confirm}
+            </p>
+            <div className="approve-actions">
+              <button
+                className="danger"
+                onClick={() => a.resolveMcpApproval(pendingApproval, "once")}
+              >
+                Delete it
+              </button>
+              <button
+                className="primary"
+                onClick={() => a.resolveMcpApproval(pendingApproval, "deny")}
+              >
+                Keep it
+              </button>
+            </div>
+          </>
+        </ApproveCard>
+      )}
+      {pendingApproval && !pendingApproval.confirm && (
         // ADD-25: consent surface — the agent must never be able to click its
         // own tool-call approval ("Allow"), so the driver can't see it.
-        <div className="approve-backdrop" data-agent-blocked>
-          <div className="approve-card" role="alertdialog" aria-modal="true">
+        <ApproveCard
+          key={pendingApproval.id}
+          label="Allow a connected tool to run?"
+          onDecline={() => a.resolveMcpApproval(pendingApproval, "deny")}
+        >
+          <>
             <div className="approve-title">
               <GlobeIcon size={17} /> Allow a connected tool to run?
             </div>
@@ -484,8 +588,8 @@ export default function Overlays({
                 Don't allow
               </button>
             </div>
-          </div>
-        </div>
+          </>
+        </ApproveCard>
       )}
       {pendingBrowse && (
         // BROWSE-1: the OUTBOUND door — room content about to be typed into a
@@ -497,17 +601,26 @@ export default function Overlays({
         // The browser's native webview is parked to 1x1 while this is open
         // (BrowserView) — it floats above the whole window, so a modal cannot
         // otherwise be seen.
-        <div className="approve-backdrop" data-agent-blocked>
-          <div className="approve-card" role="alertdialog" aria-modal="true">
+        <ApproveCard
+          key={pendingBrowse.id}
+          label="Type this into the page?"
+          onDecline={() => a.resolveBrowseConsent(pendingBrowse, false)}
+        >
+          <>
             <div className="approve-title">
               <ShieldIcon size={17} /> Type this into the page?
             </div>
             <p className="approve-body">
-              The assistant wants to type something from this room into{" "}
+              The assistant wants to type this into{" "}
               <strong>{pendingBrowse.field}</strong> on{" "}
-              <strong>{hostOf(pendingBrowse.url)}</strong>. It matches
-              information you asked to keep private. Once it is typed, that site
-              has it.
+              <strong>{hostOf(pendingBrowse.url)}</strong>.{" "}
+              {pendingBrowse.entities.length > 0
+                ? "It matches information you asked to keep private."
+                : /* No entity map for this room, so the door matched nothing —
+                     and "nothing matched" is not "nothing private". Saying
+                     which of the two happened is the whole point of the card. */
+                  "This room has no list of protected details, so Arcelle cannot check it against one."}{" "}
+              Once it is typed, that site has it.
             </p>
             <pre className="approve-args">{pendingBrowse.text}</pre>
             {pendingBrowse.entities.length > 0 && (
@@ -529,15 +642,20 @@ export default function Overlays({
                 Don't
               </button>
             </div>
-          </div>
-        </div>
+          </>
+        </ApproveCard>
       )}
       {pendingEdit && (
         // Wave 2 (Idea 6): the diff-preview approval card. Same data-agent-blocked
         // consent surface as the MCP card — the UI-driving agent must never be
         // able to approve its own edit.
-        <div className="approve-backdrop" data-agent-blocked>
-          <div className="approve-card approve-card-wide" role="alertdialog" aria-modal="true">
+        <ApproveCard
+          key={pendingEdit.id}
+          wide
+          label="Apply this change?"
+          onDecline={() => a.resolveEditApproval(pendingEdit, "deny")}
+        >
+          <>
             <div className="approve-title">
               Apply {pendingEdit.files.length > 1 ? "these changes" : "this change"} to{" "}
               {pendingEdit.files.length === 1 ? (
@@ -586,8 +704,8 @@ export default function Overlays({
                 Don't apply
               </button>
             </div>
-          </div>
-        </div>
+          </>
+        </ApproveCard>
       )}
       {s.ctxMenu && (
         <>
@@ -634,12 +752,15 @@ export default function Overlays({
               // ADD-25: the agent driver must not be able to click ✓ on a
               // removal it didn't earn.
               <div className="ctx-confirm" data-agent-blocked>
-                {/* Say what actually happens: this is not a trash can. The
-                    file, every earlier version of it and its transcript go
-                    together, and only a room-wide checkpoint rollback (which
-                    undoes everything else too) brings them back. */}
+                {/* Say what actually happens. This IS a trash can now: the
+                    file leaves the library, the counts and the AI's search,
+                    and waits in Library → Trash with its versions and its
+                    transcript intact until someone destroys it there. The
+                    wording this replaced ("Delete permanently, with its
+                    history?") described the pre-trash behaviour and would now
+                    be a false warning. */}
                 <span className="ctx-confirm-q">
-                  Delete permanently, with its history?
+                  Move to the trash?
                 </span>
                 <button
                   role="menuitem"
@@ -652,7 +773,7 @@ export default function Overlays({
                     a.removeFile(id);
                   }}
                 >
-                  <CheckIcon size={13} /> Delete
+                  <CheckIcon size={13} /> Move to trash
                 </button>
                 <button
                   role="menuitem"

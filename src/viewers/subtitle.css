@@ -1,0 +1,33 @@
+/* Subtitles as a timed transcript: the stamp is a column you read past,
+   not a line between every sentence. */
+.srt-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.srt-bar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.srt-list { flex: 1; overflow: auto; margin: 0; padding: 0.5rem 0.75rem 3rem; list-style: none; }
+.srt-cue { display: flex; gap: 0.65rem; align-items: flex-start; padding: 0.2rem 0; }
+.srt-time {
+  flex: none;
+  width: 4rem;
+  padding-top: 0.15rem;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--accent);
+}
+.srt-text { flex: 1; min-width: 0; line-height: 1.5; white-space: pre-wrap; }
+textarea.srt-text {
+  resize: vertical;
+  background: transparent;
+  color: inherit;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 0.15rem 0.3rem;
+  font: inherit;
+}
+textarea.srt-text:hover { border-color: var(--border); }
+textarea.srt-text:focus { border-color: var(--accent); outline: none; }

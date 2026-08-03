@@ -4,9 +4,14 @@ import {
 } from "react";
 import { api, FileTarget, memorySuggestion, Message } from "../api";
 import {
+  AutocompleteItem,
   fileToBase64,
   hoistSkill,
+  hoistTag,
   parseComposer,
+  specialistErrorMessage,
+  specialistItems,
+  specialistNote,
   tokenAtCaret,
   uniqueFileName,
 } from "./composer";
@@ -16,19 +21,12 @@ import { HELP_COMMAND } from "./constants";
 import * as voice from "./voice";
 import { WSState } from "./state";
 
-/** The chat the UI is showing RIGHT NOW. A turn's callbacks close over the `s`
- * of the render that started it, so they cannot ask which conversation is on
- * screen minutes later — and painting a finished turn's messages into whatever
- * chat the user has since switched to is exactly the bug this prevents.
- * `makeChatActions` runs on every Workspace render, which keeps this current. */
-const liveChat: { id: string | null } = { id: null };
-
 /** Edit-approval ids already declined by a turn teardown. `setEditApprovals`'
  * updater is allowed to run more than once for one update (StrictMode, a
  * re-entrant render), so the decline it fires has to be idempotent. */
 const declinedApprovals = new Set<string>();
 
-/** Chat sessions + the AI-turn flow + the composer's #, @, and / autocomplete. Cross-hook
+/** Chat sessions + the AI-turn flow + the composer's #, @, / and * autocomplete. Cross-hook
  * deps threaded from the shell: files' viewFile (openSource), recording's
  * openOllamaApp/downloadModel/refreshAi (turn error remediation), misc's
  * playSealSound (lock ritual). onLock is the App-level lock. */
@@ -44,7 +42,6 @@ export function makeChatActions(
   },
 ) {
   const { viewFile, openOllamaApp, downloadModel, refreshAi, playSealSound } = deps;
-  liveChat.id = s.activeChatId;
 
   async function newChat() {
     try {
@@ -79,21 +76,19 @@ export function makeChatActions(
     const askId = crypto.randomUUID();
     await runGuarded(s, () => run(askId), {
       begin: () => {
-        s.askIdRef.current = askId;
-        s.setAsking(true);
-        s.setAskPrivacy(null);
-        s.setStreamText("");
-        s.setSteps([]);
-        s.setLane("");
-        s.setAgentPlan(null);
-        s.setActiveAgent(null);
-        s.setAgentSteps({});
+        // Owner replacement #4: register the run BEFORE the question is sent,
+        // so this chat already knows which run id its events will carry — an
+        // event naming any other run (a straggler from the turn before, another
+        // chat's answer) is dropped rather than painted. Registering also
+        // clears whatever the previous turn left in this chat's slot.
+        s.beginRun(chatId, askId);
+        s.setAskPrivacy(chatId, null);
         s.setMemSuggestion(null);
         s.editedRef.current = new Set();
         declinedApprovals.clear();
         // Idea 3: a new turn silences the old answer and opens a fresh voice
         // epoch (stale synthesis/decodes can never schedule audio into it).
-        voice.beginTurn();
+        voice.beginTurn(chatId);
         s.setSpeakingMsgId(null);
       },
       // A user-pressed Stop is not a failure: no toast, and the model state is
@@ -113,7 +108,6 @@ export function makeChatActions(
       },
       openOllamaApp,
       finish: async () => {
-        s.askIdRef.current = null;
         // EVERY reload below can fail (a locked/compacting room, a dropped
         // IPC). None of them may strand the composer on "Stop": the busy flags
         // are lowered in this function's own `finally`, whatever happens.
@@ -123,7 +117,7 @@ export function makeChatActions(
           // chats mid-answer used to repaint the OLD transcript under the NEW
           // header; the answer is filed correctly either way, and the chat-switch
           // effect loads the right messages.
-          if (liveChat.id === chatId) s.setMessages(msgs);
+          if (s.activeChatIdRef.current === chatId) s.setMessages(msgs);
           const lastMsg = msgs[msgs.length - 1];
           // Idea 3: flush the voice's sentence remainder. The fallback text
           // covers external CLI engines (they emit no ask-delta — the pipeline
@@ -163,7 +157,7 @@ export function makeChatActions(
                   } catch {
                     /* auto-save must never disturb the finished answer */
                   }
-                } else if (liveChat.id === chatId) {
+                } else if (s.activeChatIdRef.current === chatId) {
                   // The card belongs to THIS conversation. If the user has moved
                   // on, dropping it is right — it would otherwise appear pinned
                   // under a chat that never asked the question.
@@ -188,13 +182,10 @@ export function makeChatActions(
             `The answer finished but this chat couldn't be reloaded: ${e}`,
           );
         } finally {
-          s.setAsking(false);
-          s.setStreamText("");
-          s.setSteps([]);
-          s.setLane("");
-          s.setAgentPlan(null);
-          s.setActiveAgent(null);
-          s.setAgentSteps({});
+          // The run is over: its registration and its whole live overlay go
+          // together, in this chat's slot alone. No other conversation's
+          // in-flight turn is touched.
+          s.endRun(chatId);
           // Wave 2 (Idea 6): the run is over (finished OR stopped — this is
           // runGuarded's `finally`). Decline any diff-preview card still queued: the
           // tools/call task that awaits it is gone, so applying now would mutate a
@@ -269,7 +260,31 @@ export function makeChatActions(
       if (/^#help\s*$/i.test(raw)) s.setQuestion("");
       return;
     }
-    const parsed = parseComposer(raw, s.commands, s.skills, s.files, s.folders);
+    const parsed = parseComposer(
+      raw,
+      s.commands,
+      s.skills,
+      s.files,
+      s.folders,
+      s.specialists,
+    );
+    if (parsed.specialistError) {
+      s.pushToast(
+        "error",
+        specialistErrorMessage(parsed.specialistError, s.specialists),
+      );
+      return;
+    }
+    if (parsed.tagConflict) {
+      // Refused rather than resolved: all three tokens are read from the first
+      // position, so any order we picked would drop one of them without saying
+      // so — and the user would watch a turn run as if they had not typed it.
+      s.pushToast(
+        "error",
+        "A message can name a specialist (*), a skill (/) or an action (#) — not two of them.",
+      );
+      return;
+    }
     if (parsed.commandError) {
       const names = s.commands.map((c) => `#${c.name}`).join(", ");
       s.pushToast(
@@ -291,7 +306,14 @@ export function makeChatActions(
     // names a file first has its skill hoisted to the front — otherwise it was
     // accepted and then quietly ignored. Sending and showing the same text
     // keeps the transcript honest about what was actually asked.
-    const outgoing = parsed.skill ? hoistSkill(raw, parsed.skill) : raw;
+    // Same hoist for the "*" tag, which the sidecar also reads from the first
+    // token (`agents.tagged_specialist`). The two never coexist — `tagConflict`
+    // above refuses that message rather than choosing between them.
+    const outgoing = parsed.skill
+      ? hoistSkill(raw, parsed.skill)
+      : parsed.specialist
+        ? hoistTag(raw, parsed.specialist)
+        : raw;
     const optimistic: Message = {
       id: `pending-${Date.now()}`,
       role: "user",
@@ -316,16 +338,30 @@ export function makeChatActions(
     }
   }
 
-  // ---- "#"/"@"/"/" autocomplete ----
+  // ---- "#"/"@"/"/"/"*" autocomplete ----
 
-  function autocompleteItems(): {
-    key: string;
-    label: string;
-    hint: string;
-    insert: string;
-    usage?: string;
-  }[] {
+  /** The room's specialists, for the "*" menu. Re-read every time the menu
+   * opens rather than only at room open: the roster follows the room's engine
+   * and its web switch, and a menu that offers a specialist the turn would
+   * then refuse is exactly the claim this app may not make. */
+  async function refreshSpecialists() {
+    try {
+      s.setSpecialists(await api.listSpecialists());
+      s.setSpecialistsError("");
+    } catch (e) {
+      // The previous roster is NOT kept: it may be why the lookup failed (the
+      // room's engine changed). Unknown is the honest state, and the menu says
+      // so with the reason attached.
+      s.setSpecialists(null);
+      s.setSpecialistsError(String(e));
+    }
+  }
+
+  function autocompleteItems(): AutocompleteItem[] {
     if (!s.ac) return [];
+    if (s.ac.kind === "agent") {
+      return specialistItems(s.specialists ?? [], s.ac.query);
+    }
     if (s.ac.kind === "cmd") {
       return [...s.commands, HELP_COMMAND]
         .filter((c) => c.name.startsWith(s.ac!.query))
@@ -370,16 +406,26 @@ export function makeChatActions(
     return [...folderItems, ...fileItems].slice(0, 10);
   }
 
+  /** What the "*" menu shows INSTEAD of rows when it has none — "" otherwise,
+   * and "" for every other menu (they close when they have nothing, because
+   * "no file matches" is not a claim about what this room can do). */
+  function autocompleteNote(): string {
+    if (!s.ac || s.ac.kind !== "agent") return "";
+    return specialistNote(s.specialists, s.specialistsError, s.ac.query);
+  }
+
   function refreshAutocomplete(value: string, caret: number) {
     const tok = tokenAtCaret(value, caret);
+    // Opening the "*" menu is the moment its roster has to be current.
+    if (tok?.kind === "agent" && s.ac?.kind !== "agent") void refreshSpecialists();
     s.setAc(tok ? { kind: tok.kind, query: tok.query, start: tok.start, index: 0 } : null);
   }
 
-  function insertComposerToken(token: "@" | "#" | "/") {
+  function insertComposerToken(token: "@" | "#" | "/" | "*") {
     const cur = s.question;
     let next: string;
     let caret: number;
-    if (token === "#" || token === "/") {
+    if (token === "#" || token === "/" || token === "*") {
       const body = cur.replace(/^\s+/, "");
       next = `${token}${body}`;
       caret = 1;
@@ -417,6 +463,23 @@ export function makeChatActions(
 
   function onComposerKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
     const items = autocompleteItems();
+    // Escape closes an OPEN palette, whether or not it has rows to move
+    // through. The "*" menu can be open on an honest note alone ("this room
+    // has no specialists"), and a popover the keyboard cannot dismiss is a
+    // trap — this used to sit inside the rows-only branch below.
+    if (s.ac && e.key === "Escape") {
+      // The palette swallows Escape completely — nothing else (viewer
+      // close, app-level handlers) may react to the same keypress.
+      e.preventDefault();
+      e.stopPropagation();
+      e.nativeEvent.stopImmediatePropagation();
+      s.setAc(null);
+      // A bare trigger token was only there to open the palette; closing
+      // the palette takes it with it so the composer is back where it was.
+      if (["#", "@", "/", "*"].includes(s.question.trim())) s.setQuestion("");
+      s.composerRef.current?.focus();
+      return;
+    }
     if (s.ac && items.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -433,20 +496,6 @@ export function makeChatActions(
         acceptAutocomplete(items[Math.min(s.ac.index, items.length - 1)].insert);
         return;
       }
-      if (e.key === "Escape") {
-        // The palette swallows Escape completely — nothing else (viewer
-        // close, app-level handlers) may react to the same keypress.
-        e.preventDefault();
-        e.stopPropagation();
-        e.nativeEvent.stopImmediatePropagation();
-        s.setAc(null);
-        // A bare trigger token was only there to open the palette; closing
-        // the palette takes it with it so the composer is back where it was.
-        if (["#", "@", "/"].includes(s.question.trim()))
-          s.setQuestion("");
-        s.composerRef.current?.focus();
-        return;
-      }
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -460,8 +509,25 @@ export function makeChatActions(
     // leftover sentence buffer, and no in-flight synthesis lands late.
     voice.cancelAll();
     s.setSpeakingMsgId(null);
-    const id = s.askIdRef.current;
-    if (id) api.cancelAsk(id).catch(() => {});
+    // The run belonging to THIS conversation — Stop stops the answer the user
+    // is looking at, never a turn running in a chat they have moved away from.
+    const id = s.runIdOf(s.activeChatId);
+    if (!id) return;
+    // Owner replacement #3: Stop reaches the whole tree under the run — a
+    // Studio build, a file pass. When it stopped more than the answer itself,
+    // SAY which, because those are the ones that would otherwise have finished
+    // and put a file in the library after the user had stopped everything.
+    // The answer's own "(stopped)" marker covers the plain case, so a single
+    // stopped run stays quiet.
+    api
+      .cancelAsk(id)
+      .then((report) => {
+        const also = report.stopped.slice(1);
+        if (also.length > 0) {
+          s.pushToast("info", `Stopped ${also.join(", ")} too.`);
+        }
+      })
+      .catch(() => {});
   }
 
   async function handleLock() {
@@ -469,11 +535,17 @@ export function makeChatActions(
     // OTHER lock path is covered too: the autolock call site and the
     // workspace unmount cleanup (effects.ts) both cancel as well.
     voice.cancelAll();
-    if (s.askingRef.current && s.askIdRef.current) {
-      try {
-        await api.cancelAsk(s.askIdRef.current);
-      } catch {
-        /* ignore — we're locking anyway */
+    // EVERY run, not just the one on screen: locking closes the room under all
+    // of them, so a turn left running in another conversation would keep
+    // writing into a room that is being sealed.
+    const running = Object.values(s.runs).map((t) => t.runId);
+    if (running.length > 0) {
+      for (const id of running) {
+        try {
+          await api.cancelAsk(id);
+        } catch {
+          /* ignore — we're locking anyway */
+        }
       }
       await new Promise((r) => window.setTimeout(r, 250));
     }
@@ -498,7 +570,7 @@ export function makeChatActions(
       async () => {
         const marker = await api.handoffContext(chatId);
         s.setMessages(await api.getMessages(chatId));
-        if (marker.effects?.usage) s.setTokenUsage(marker.effects.usage);
+        if (marker.effects?.usage) s.setChatUsage(chatId, marker.effects.usage);
       },
       {
         begin: () => s.setHandoffStarting(true),
@@ -553,7 +625,32 @@ export function makeChatActions(
     if (idx < 0) return;
     // Validate BEFORE anything is deleted — a typo'd #command must not cost
     // the user the tail of their conversation.
-    const parsed = parseComposer(text, s.commands, s.skills, s.files, s.folders);
+    //
+    // The roster goes in for the same reason it does on send: a rewrite IS a
+    // send, and a "*banana" typed here went out unrefused while the identical
+    // typo in the composer was stopped — one message, two answers.
+    const parsed = parseComposer(
+      text,
+      s.commands,
+      s.skills,
+      s.files,
+      s.folders,
+      s.specialists,
+    );
+    if (parsed.specialistError) {
+      s.pushToast(
+        "error",
+        specialistErrorMessage(parsed.specialistError, s.specialists),
+      );
+      return;
+    }
+    if (parsed.tagConflict) {
+      s.pushToast(
+        "error",
+        "A message can name a specialist (*), a skill (/) or an action (#) — not two of them.",
+      );
+      return;
+    }
     if (parsed.commandError) {
       const names = s.commands.map((c) => `#${c.name}`).join(", ");
       s.pushToast(
@@ -569,7 +666,14 @@ export function makeChatActions(
       );
       return;
     }
-    const outgoing = parsed.skill ? hoistSkill(text, parsed.skill) : text;
+    // Both first-token tags are hoisted here exactly as they are on send —
+    // the backend reads each from the FIRST token, so a rewrite that buries one
+    // behind an @reference would run an ordinary turn with nothing saying so.
+    const outgoing = parsed.skill
+      ? hoistSkill(text, parsed.skill)
+      : parsed.specialist
+        ? hoistTag(text, parsed.specialist)
+        : text;
     let removed = true;
     try {
       // Newest first, so an interrupted run never leaves an answer stranded
@@ -745,6 +849,7 @@ export function makeChatActions(
 
   return {
     newChat, removeChat, runTurn, askOnce, askAgainWithRealDetails, send, autocompleteItems,
+    autocompleteNote, refreshSpecialists,
     refreshAutocomplete, insertComposerToken, acceptAutocomplete,
     onComposerKeyDown, stopAsk, handleLock, regenerate, editAndResend,
     copyMessage, copyConversation,

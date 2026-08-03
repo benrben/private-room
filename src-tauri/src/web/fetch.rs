@@ -227,7 +227,15 @@ pub async fn fetch_readable(url: &str) -> Result<(String, String, Vec<u8>), Stri
     let body = decode_body(&raw, &content_type);
     let title = html_title(&body).unwrap_or_else(|| url.to_string());
     let text = if content_type.contains("html") || body.trim_start().starts_with('<') {
-        extraction::strip_html(&body)
+        // The article, when the page has one — the same Readability pass the
+        // browser's Save uses, so a page saved from a link and the same page
+        // saved from the browser produce the same reading. `strip_html` stays
+        // the fallback for everything with no scorable article (a link list, a
+        // form, a feed), which is exactly what it was always good at.
+        match extraction::read_page(&body, Some(url)).article {
+            Some(article) => article.text,
+            None => extraction::strip_html(&body),
+        }
     } else {
         body
     };
@@ -773,15 +781,18 @@ fn icon_href(html: &str) -> Option<String> {
     None
 }
 
-/// The five entities that actually show up in `content=` attributes. Not a
-/// general unescaper — a title with `&#8212;` in it is cosmetically wrong, not
-/// broken, and a full entity table is not worth carrying for that.
+/// Entities in a `content=`/`href=` attribute value, decoded by the SAME
+/// single-pass reader the page body uses.
+///
+/// This was a private five-entity `.replace()` chain, and it was wrong in both
+/// directions. It undid `&amp;` FIRST, so `&amp;lt;` became `&lt;` and then `<`
+/// — one layer too many, silently, on any card whose title quotes markup. And
+/// it knew no numeric references at all, so a browser result card showed a raw
+/// `&#8212;` while the very same page's body (which goes through
+/// `decode_basic_entities`) read fine. One decoder means the card and the page
+/// can no longer disagree about the same characters.
 fn html_unescape(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
+    crate::extraction::decode_basic_entities(s)
 }
 
 /// Resolve a possibly-relative asset URL against the page it came from, and
@@ -883,6 +894,21 @@ mod preview_tests {
         assert_eq!(p.description.as_deref(), Some("Who spoke & when."));
         assert_eq!(p.title.as_deref(), Some("Speaker diarisation"));
         assert!(p.text.contains("Body text here."));
+    }
+
+    #[test]
+    fn a_result_card_decodes_the_same_entities_the_page_body_does() {
+        // Regression: the card had its own five-entity `.replace()` chain that
+        // undid `&amp;` FIRST — so `&amp;lt;` lost a layer and became `<` — and
+        // knew no numeric references, so a card showed a literal `&#8212;`
+        // while the same page's body read fine.
+        let page = r#"<html><head>
+            <meta property="og:title" content="Python 3.13 &#8212; what&#8217;s new">
+            <meta name="description" content="Escaping &amp;lt;div&amp;gt; in prose">
+          </head><body>x</body></html>"#;
+        let p = preview_from_html("https://example.com/", page);
+        assert_eq!(p.title.as_deref(), Some("Python 3.13 — what’s new"));
+        assert_eq!(p.description.as_deref(), Some("Escaping &lt;div&gt; in prose"));
     }
 
     /// A page with no og:title still gets a title — the results page would

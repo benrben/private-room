@@ -90,11 +90,34 @@ impl ToolScope {
             ToolScope::CloudEngine | ToolScope::LocalEngine | ToolScope::ExternalAgent => true,
         }
     }
-    /// The app-driving/screen-observing tools: the local engine's alone. This
-    /// is the one thing `CloudEngine` does NOT inherit — a cloud engine is
-    /// still a cloud engine, and the user's screen never leaves the machine.
-    fn include_ui_tools(self) -> bool {
-        matches!(self, ToolScope::LocalEngine)
+    /// The app-driving/screen-observing tools (`ui_snapshot`, `ui_act`,
+    /// `view_screenshot`).
+    ///
+    /// Owner decision 2026-08-03: EVERY provider gets full control, the app's
+    /// interface included — the room's own cloud CLI was the main agent while
+    /// being the one engine that could not press a button, which is the gap
+    /// live QA kept reporting as "Claude Code says it cannot see Arcelle".
+    ///
+    /// This does NOT send the user's screen to a cloud provider, and the reason
+    /// is structural rather than a promise. All three tools hand their pixels to
+    /// `perceive_image`, which attaches a frame to the conversation only when
+    /// `effects.vision_chat` is set — and `chat_model_sees_images` leaves that
+    /// false for a `claude-cli`/`codex-cli`/API model. So a cloud engine's
+    /// screenshot is described by a LOCAL vision model and only that TEXT
+    /// crosses, through the redaction door like any other tool result. Exactly
+    /// the mechanism `include_media_perception` already relies on for a room
+    /// video's frames; this extends the same guarantee to the screen.
+    ///
+    /// A merely CONSULTED advisor is still excluded: driving the app is an
+    /// action, not advice — the same line `include_browse_tools` draws.
+    ///
+    /// `pub(crate)` so the tier decision in `sidecar::bridge_scope_for` can be
+    /// pinned against the thing it protects, rather than against a scope name.
+    pub(crate) fn include_ui_tools(self) -> bool {
+        matches!(
+            self,
+            ToolScope::LocalEngine | ToolScope::CloudEngine | ToolScope::ExternalAgent
+        )
     }
     /// The whole-file-pass job tools: hours of local compute, so only an engine
     /// the user chose to run this room (local or a cloud CLI) or an explicitly
@@ -117,7 +140,7 @@ impl ToolScope {
     /// room's own cloud engine having less than an opted-in external agent
     /// would be backwards. No pixels leave for a cloud engine: `perceive_image`
     /// attaches the frame only when `effects.vision_chat` is set, which
-    /// `is_vision_chat_model` leaves false for a `claude-cli`/`codex-cli`
+    /// `chat_model_sees_images` leaves false for a `claude-cli`/`codex-cli`
     /// model — so a LOCAL vision model describes the frame and only that TEXT
     /// crosses, through the redaction door like any other tool result.
     fn include_media_perception(self) -> bool {
@@ -147,6 +170,33 @@ impl ToolScope {
     fn include_mcp_management_tools(self) -> bool {
         matches!(self, ToolScope::LocalEngine | ToolScope::CloudEngine)
     }
+    /// The tier's name for the host log. A `&'static str`, so the observability
+    /// layer's privacy boundary is satisfied by construction rather than by
+    /// trusting a caller to pass something safe.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ToolScope::CloudAdvisor { include_mcp: true } => "CloudAdvisor+mcp",
+            ToolScope::CloudAdvisor { include_mcp: false } => "CloudAdvisor",
+            ToolScope::CloudEngine => "CloudEngine",
+            ToolScope::LocalEngine => "LocalEngine",
+            ToolScope::ExternalAgent => "ExternalAgent",
+        }
+    }
+}
+
+/// Record the catalog this bridge is about to advertise.
+///
+/// THE event owner replacement #1 was ordered for. An engine handed an empty
+/// tool bridge does not report "my bridge is empty" — it rationalises, and the
+/// rationalisation becomes the bug report (the `set(keys)`-drained-generator
+/// incident of 2026-07-30 cost days for exactly this reason). The count and the
+/// names now exist in a file the model cannot narrate over.
+fn log_catalog(scope: ToolScope, tools: &[serde_json::Value], turn: Option<&crate::turn::TurnId>) {
+    let names: Vec<String> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect();
+    crate::obs::tool_catalog(scope.label(), &names, turn);
 }
 
 /// ADD-33: a run-scoped accumulator for tool side-effects (`wrote`, `annotation`,
@@ -316,6 +366,21 @@ pub struct StartOpts {
     /// The room's per-agent web switches (Settings → Online features). Defaults
     /// to both ON, so a caller that does not care keeps today's catalog.
     pub lanes: commands::WebLanes,
+    /// The ASK's Stop flag, for a per-turn bridge. A `tools/call` that arrives
+    /// after Stop is refused before it executes (see `dispatch_jsonrpc`).
+    ///
+    /// Owner decision 2026-08-03: cancelling a parent must block artifact
+    /// writes, not merely sever their delivery. `serve_conn` already declines to
+    /// return a result once the bridge is shutting down, but by then the write
+    /// has happened — the code says so itself ("the dispatch's side effects have
+    /// already happened"). This flag is what makes the refusal land BEFORE the
+    /// side effect. `None` for persistent/nested bridges, which have no ask.
+    pub cancel: Option<Arc<AtomicBool>>,
+    /// Owner replacement #4: the run/chat this bridge serves. A tool call
+    /// dispatched here emits its step chip under the SAME identity as the
+    /// deltas around it, so the conversation that asked is the only one that
+    /// paints it. `None` for a persistent/nested bridge, which has no ask.
+    pub turn: Option<crate::turn::TurnId>,
 }
 
 /// Bind loopback and serve MCP until `stop()`. `scope` fixes what the bridge
@@ -373,6 +438,8 @@ pub async fn start(
     let privacy_bypass = opts.privacy_bypass;
     let advisor = opts.advisor;
     let lanes = opts.lanes;
+    let run_cancel = opts.cancel;
+    let turn = opts.turn;
     let task = tauri::async_runtime::spawn(async move {
         // Each connection watches the same shutdown channel, so `stop()`
         // severs LIVE keep-alive connections too — not just future accepts (a
@@ -391,10 +458,12 @@ pub async fn start(
                     let web_throttle = web_throttle_task.clone();
                     let rx = conn_rx.clone();
                     let advisor = advisor.clone();
+                    let run_cancel = run_cancel.clone();
+                    let turn = turn.clone();
                     tauri::async_runtime::spawn(async move {
                         let _ = handle_conn(
                             stream, app, tok, web_enabled, lanes, scope, effects, tool_ran,
-                            web_throttle, rx, privacy_bypass, advisor,
+                            web_throttle, rx, privacy_bypass, advisor, run_cancel, turn,
                         )
                         .await;
                     });
@@ -464,6 +533,8 @@ async fn handle_conn(
     shutdown: tokio::sync::watch::Receiver<bool>,
     privacy_bypass: bool,
     advisor: Option<AdvisorRuntime>,
+    run_cancel: Option<Arc<AtomicBool>>,
+    turn: Option<crate::turn::TurnId>,
 ) -> Result<(), String> {
     let dispatch = move |body: Vec<u8>| {
         let app = app.clone();
@@ -471,6 +542,8 @@ async fn handle_conn(
         let tool_ran = tool_ran.clone();
         let web_throttle = web_throttle.clone();
         let advisor = advisor.clone();
+        let run_cancel = run_cancel.clone();
+        let turn = turn.clone();
         async move {
             dispatch_jsonrpc(
                 &app,
@@ -483,6 +556,8 @@ async fn handle_conn(
                 &web_throttle,
                 privacy_bypass,
                 advisor.as_ref(),
+                run_cancel.as_ref(),
+                turn.as_ref(),
             )
             .await
         }
@@ -520,6 +595,16 @@ where
                 None => return Ok(()), // peer closed between requests
             },
         };
+        let request = match request {
+            Ok(request) => request,
+            // An oversized request is refused with 413 and the connection is
+            // dropped: the framing is only trustworthy up to the head, so
+            // there is no safe way to skip past a body we refused to read.
+            Err(OversizeRequest) => {
+                let _ = write_response(&mut stream, 413, b"{}").await;
+                return Ok(());
+            }
+        };
         if !authorize(&request.head, &token) {
             write_response(&mut stream, 401, b"{}").await?;
             continue;
@@ -546,6 +631,23 @@ struct FramedRequest {
     body: Vec<u8>,
 }
 
+/// The peer declared (or is sending) more than [`MAX_REQUEST_BODY`].
+struct OversizeRequest;
+
+/// Ceiling on ONE JSON-RPC request body, in bytes.
+///
+/// The head block was already capped, but the BODY was read to whatever
+/// `Content-Length` claimed — and the bearer token is only checked afterwards,
+/// on the parsed head. Anything already running on this Mac could therefore
+/// open the loopback port, declare a 100 GB body and push bytes into a `Vec`
+/// until the app died, without ever knowing the token. The cap runs BEFORE the
+/// first body byte is read, so a declared-huge request costs nothing.
+///
+/// 16 MiB is far above any real call: the largest thing that legitimately
+/// arrives here is a tool call carrying a base64 image, and the sidecar's own
+/// result caps sit well below this.
+const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
+
 /// Read one request off the wire: the head, then EXACTLY Content-Length body
 /// bytes (HTTP framing — the body has no self-delimiter, so a short read here
 /// would splice the next request's bytes onto this one). `Ok(None)` means the
@@ -553,7 +655,7 @@ struct FramedRequest {
 async fn read_framed_request(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
-) -> Result<Option<FramedRequest>, String> {
+) -> Result<Option<Result<FramedRequest, OversizeRequest>>, String> {
     let head_end = loop {
         if let Some(pos) = find_head_end(buf) {
             break pos;
@@ -573,6 +675,10 @@ async fn read_framed_request(
     let content_len = header_value(&head, "content-length")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    // Refused on the DECLARATION, before a single body byte is buffered.
+    if content_len > MAX_REQUEST_BODY {
+        return Ok(Some(Err(OversizeRequest)));
+    }
     while buf.len() < body_start + content_len {
         let mut chunk = [0u8; 4096];
         let n = stream.read(&mut chunk).await.map_err(|e| e.to_string())?;
@@ -580,10 +686,15 @@ async fn read_framed_request(
             return Err("truncated body".into());
         }
         buf.extend_from_slice(&chunk[..n]);
+        // A lying Content-Length (or a pipelined flood behind a small one)
+        // cannot grow the buffer past the cap either.
+        if buf.len() > body_start + MAX_REQUEST_BODY {
+            return Ok(Some(Err(OversizeRequest)));
+        }
     }
     let body = buf[body_start..body_start + content_len].to_vec();
     buf.drain(..body_start + content_len);
-    Ok(Some(FramedRequest { head, body }))
+    Ok(Some(Ok(FramedRequest { head, body })))
 }
 
 /// The request carries the run's bearer token, or it is rejected. The compare
@@ -623,6 +734,8 @@ async fn dispatch_jsonrpc(
     web_throttle: &WebThrottle,
     privacy_bypass: bool,
     advisor: Option<&AdvisorRuntime>,
+    run_cancel: Option<&Arc<AtomicBool>>,
+    turn: Option<&crate::turn::TurnId>,
 ) -> (u16, Vec<u8>) {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -657,9 +770,26 @@ async fn dispatch_jsonrpc(
             "serverInfo": { "name": "arcelle", "version": env!("CARGO_PKG_VERSION") }
         })),
         "ping" => Ok(serde_json::json!({})),
-        "tools/list" => Ok(serde_json::json!({
-            "tools": served_tools(app, web_enabled, lanes, scope, advisor)
-        })),
+        "tools/list" => {
+            let tools = served_tools(app, web_enabled, lanes, scope, advisor);
+            log_catalog(scope, &tools, turn);
+            Ok(serde_json::json!({ "tools": tools }))
+        }
+        // Stop lands BEFORE the side effect, not after it. Everything else the
+        // bridge answers (initialize / ping / tools/list) stays served even on a
+        // cancelled run: refusing `tools/list` would report an EMPTY CATALOG,
+        // which the Main agent now surfaces as "the room tool bridge served 0
+        // tools" — turning a clean user Stop into what looks like a wiring
+        // failure. Only the call that would actually write is refused.
+        "tools/call" if run_cancel.is_some_and(|c| c.load(Ordering::SeqCst)) => {
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Stopped by the user — this tool was not run.",
+                }],
+                "isError": true,
+            }))
+        }
         "tools/call" => {
             tool_call(
                 app,
@@ -672,6 +802,8 @@ async fn dispatch_jsonrpc(
                 web_throttle,
                 privacy_bypass,
                 advisor,
+                run_cancel,
+                turn,
             )
             .await
         }
@@ -1039,6 +1171,82 @@ fn scoped_specs(web_enabled: bool, scope: ToolScope) -> Vec<serde_json::Value> {
     list
 }
 
+/// The BUILT-IN tool names one tier may ever be served, for the published
+/// provider × agent matrix.
+///
+/// No room-specific lanes and no per-turn advisor: the matrix answers "what can
+/// this class of engine EVER do here", which is a property of the tier, not of
+/// whichever room happens to be open. The sidecar turns these names into the set
+/// of workers its own registry considers reachable, which is what makes the
+/// matrix derived rather than written down.
+///
+/// The connector proxy pair IS included, gated on `include_mcp` exactly as the
+/// bridge gates it. It is not part of `scoped_specs` because the live bridge
+/// only adds it once a connector is actually installed — but "this room has no
+/// connector yet" is a fact about the ROOM, and leaving the pair out made the
+/// published matrix say the Connector agent (whose whole box is
+/// `search_mcp_tools`/`run_mcp_tool`) works with NO provider at all, on every
+/// row, forever. A tier that may serve connectors can reach that agent; a tier
+/// that may not (a consulted advisor without the sub-option) cannot, and that
+/// is the distinction this reports.
+pub(crate) fn tier_tool_names(web_enabled: bool, scope: ToolScope) -> Vec<String> {
+    let mut specs = scoped_specs(web_enabled, scope);
+    if scope.include_mcp() {
+        specs.extend(mcp_proxy_tools());
+    }
+    specs
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect()
+}
+
+/// The tool names THIS ROOM's bridge would serve right now, for `scope`.
+///
+/// [`tier_tool_names`] answers a question about a class of engine; this one
+/// answers it about the room that is actually open, so it applies the room's
+/// per-agent web lanes and its connected MCP servers exactly as a turn would.
+/// The composer's `*` specialist menu is built from these names (the sidecar
+/// turns them into its reachable domains): a lane the user switched off has to
+/// remove that specialist from the MENU too, or the menu offers a turn the room
+/// would then refuse.
+///
+/// No per-turn advisor is passed — `consult_advisor` belongs to no agent's box,
+/// so it cannot make a specialist reachable or unreachable either way.
+pub(crate) fn room_tool_names(
+    app: &tauri::AppHandle,
+    web_enabled: bool,
+    lanes: commands::WebLanes,
+    scope: ToolScope,
+) -> Vec<String> {
+    use tauri::Manager;
+    let state = app.state::<commands::AppState>();
+    let routes = if scope.include_mcp() {
+        commands::mcp_routes(&state)
+    } else {
+        Vec::new()
+    };
+    room_tool_names_with(web_enabled, lanes, scope, &routes)
+}
+
+/// [`room_tool_names`] against routes the caller already has — the handle-free
+/// half, so the invariant the menu rests on (a lane the user switched off
+/// removes its tools from the menu too) is pinnable in a unit test.
+pub(crate) fn room_tool_names_with(
+    web_enabled: bool,
+    lanes: commands::WebLanes,
+    scope: ToolScope,
+    routes: &[commands::McpRoute],
+) -> Vec<String> {
+    names_of(&served_tools_with(web_enabled, lanes, scope, None, routes))
+}
+
+fn names_of(tools: &[serde_json::Value]) -> Vec<String> {
+    tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect()
+}
+
 /// The full list served over the bridge for `scope`: the pure tier catalog
 /// (`scoped_specs`) plus the stable search/run proxy when connected room MCP
 /// tools exist. Individual third-party schemas are returned on demand by the
@@ -1096,6 +1304,26 @@ fn served_tools_with(
     list
 }
 
+/// Which Stop flag one dispatched tool carries down to its own commit gate.
+///
+/// Owner replacement #3: the arrival check in `dispatch_jsonrpc` refuses a
+/// `tools/call` that STARTS after the Stop; this is the other half — the flag a
+/// call already in flight hands to `Artifact::cancel_maybe`, to the scratch-pad
+/// rewrite and to the `run_script` wait, so the write is gated at the moment it
+/// commits. The advisor runtime's flag and the bridge's `run_cancel` are the
+/// SAME ask's flag when both exist (`prepare_advisor_runtime` is handed it);
+/// the fallback matters because `prepare_advisor_runtime` returns `None` for
+/// every room with no Advisor configured, which is most of them — and that left
+/// `exec_tool` holding `None` and every commit gate below it inert.
+fn tool_cancel_for(
+    advisor: Option<&AdvisorRuntime>,
+    run_cancel: Option<&Arc<AtomicBool>>,
+) -> Option<Arc<AtomicBool>> {
+    advisor
+        .map(|runtime| runtime.cancel.clone())
+        .or_else(|| run_cancel.cloned())
+}
+
 /// Execute one tool through the room's own dispatch. Tool errors come back as
 /// MCP `isError` results (the model can react), not JSON-RPC failures.
 #[allow(clippy::too_many_arguments)]
@@ -1110,8 +1338,19 @@ async fn tool_call(
     web_throttle: &WebThrottle,
     privacy_bypass: bool,
     advisor: Option<&AdvisorRuntime>,
+    // Owner replacement #3, the commit half: this bridge's ASK Stop flag. The
+    // arrival check in `dispatch_jsonrpc` refuses a call that starts after the
+    // Stop, but a call already in flight has to carry the flag DOWN to the
+    // funnel that writes — `Artifact::cancel_maybe`, the pad rewrite, the
+    // `run_script` wait. Before this it was fed `advisor.cancel`, which only
+    // exists when the room has an Advisor configured: in every ordinary room
+    // `exec_tool` got `None` and the "a Stop lands BEFORE the commit" comment
+    // on `create_file` was describing a gate that could not fire.
+    run_cancel: Option<&Arc<AtomicBool>>,
+    turn: Option<&crate::turn::TurnId>,
 ) -> Result<serde_json::Value, String> {
     use tauri::Manager;
+    let tool_cancel = tool_cancel_for(advisor, run_cancel);
     // PRIV-1: a CLOUD-bound bridge (a consulted advisor or an external CLI
     // agent) is part of the door — the client sends placeholders in its tool
     // arguments (restore them so the room tools see real values) and every
@@ -1341,8 +1580,9 @@ async fn tool_call(
                 &mut effects,
                 &routes,
                 &HashSet::new(),
-                advisor.map(|runtime| runtime.cancel.clone()),
+                tool_cancel.clone(),
                 advisor.and_then(|runtime| runtime.room_bridge.as_deref()),
+                turn,
             )
             .await;
             // MIGRATION Phase 2b (perception bridge): a UI/perception tool
@@ -1385,8 +1625,9 @@ async fn tool_call(
                 &mut effects,
                 &routes,
                 &HashSet::new(),
-                advisor.map(|runtime| runtime.cancel.clone()),
+                tool_cancel.clone(),
                 advisor.and_then(|runtime| runtime.room_bridge.as_deref()),
+                turn,
             )
             .await;
             if effects.web_search_throttled && !was_throttled {
@@ -1400,6 +1641,14 @@ async fn tool_call(
         Ok(text) => (text, false),
         Err(msg) => (msg, true),
     };
+    // Owner replacement #1, at `debug` because it fires per tool call: WHICH
+    // tool the engine reached for and whether it worked. Off by default; this is
+    // what you turn on when a turn is doing something inexplicable. The tool's
+    // ARGUMENTS are room content (a filename, a query, a passage) and never
+    // appear — only its name, its verdict and the size of what came back.
+    // `call.name` rather than the requested name: for an `mcp_call` proxy those
+    // differ, and the one worth recording is the tool that actually ran.
+    crate::obs::tool_dispatched(scope.label(), &call.name, is_error, text.len(), turn);
     // Real values out of the room tools → placeholders for the cloud client,
     // and no pixels at all (an image can't be redacted, so it doesn't leave).
     let (text, images) = match &cloud_policy {
@@ -1469,6 +1718,66 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate `dispatch_jsonrpc` applies: only `tools/call` is refused after
+    /// Stop, and only when the run actually carries a flag.
+    fn refuses(method: &str, cancel: Option<&AtomicBool>) -> bool {
+        matches!(method, "tools/call") && cancel.is_some_and(|c| c.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn a_stopped_run_refuses_tool_calls_but_still_answers_tools_list() {
+        // Owner decision 2026-08-03 (#7): Stop must block the WRITE, not just
+        // sever its delivery. `serve_conn` only declined to return the result,
+        // by which point the file had already been written — the code said so
+        // itself ("the dispatch's side effects have already happened").
+        let flag = AtomicBool::new(false);
+        assert!(!refuses("tools/call", Some(&flag)), "a live run runs its tools");
+
+        flag.store(true, Ordering::SeqCst);
+        assert!(refuses("tools/call", Some(&flag)), "a stopped run does not");
+
+        // …but the catalog is STILL served. Refusing `tools/list` would report an
+        // empty catalog, which the Main agent now surfaces as "the room tool
+        // bridge served 0 tools" — dressing a clean user Stop up as a wiring
+        // failure, the exact misdiagnosis that made the v0.15.0 agent report
+        // read as a capability regression.
+        for m in ["initialize", "ping", "tools/list"] {
+            assert!(!refuses(m, Some(&flag)), "{m} must still be answered");
+        }
+
+        // A bridge with no ask behind it (persistent Leash server, nested
+        // advisor bridge) is never gated by someone else's Stop.
+        assert!(!refuses("tools/call", None), "no ask, no gate");
+    }
+
+    #[test]
+    fn a_tool_call_in_flight_carries_the_asks_stop_flag_to_its_commit_gate() {
+        // The arrival gate above only refuses a call that STARTS after the Stop.
+        // A `create_file` already running has to reach `Artifact::cancel_maybe`
+        // holding a real flag, or "a Stop lands BEFORE the commit" is a comment
+        // about nothing. It used to be fed `advisor.cancel` alone — and
+        // `prepare_advisor_runtime` returns None whenever the room has no
+        // Advisor configured, so in an ordinary room the funnel got `None` and
+        // committed the artifact the user had already stopped.
+        let ask = Arc::new(AtomicBool::new(false));
+
+        let carried = tool_cancel_for(None, Some(&ask)).expect("no flag reached the commit gate");
+        assert!(Arc::ptr_eq(&carried, &ask), "a different flag than the ask's");
+        ask.store(true, Ordering::SeqCst);
+        assert!(carried.load(Ordering::SeqCst), "the Stop did not reach the write");
+
+        // An Advisor room is unchanged: its runtime holds this same ask's flag.
+        let runtime = AdvisorRuntime::new(vec!["claude-cli".into()], ask.clone(), None);
+        assert!(Arc::ptr_eq(
+            &tool_cancel_for(Some(&runtime), None).expect("advisor flag"),
+            &ask
+        ));
+
+        // A persistent Leash bridge has no ask behind it — and must not be
+        // handed someone else's.
+        assert!(tool_cancel_for(None, None).is_none());
+    }
 
     #[test]
     fn the_web_search_brake_outlives_one_tool_call_but_not_the_session() {
@@ -1719,6 +2028,22 @@ mod tests {
         //   CloudAdvisor  26 tools  ~4.2k    CloudEngine    46 tools  ~7.3k
         //   ExternalAgent 43 tools  ~7.0k    LocalEngine    49 tools  ~7.8k
         //
+        // RE-MEASURED 2026-08-03, after `include_ui_tools` was opened to the
+        // cloud and external tiers (owner decision: every provider gets full
+        // control, the interface included):
+        //   CloudAdvisor  4,267    CloudEngine   9,450
+        //   ExternalAgent 9,161    LocalEngine   9,297
+        //
+        // The three UI tools cost ~350 tokens, and CloudEngine/ExternalAgent
+        // budgets are raised to cover exactly that (+9,100 -> 9,900, 8,800 ->
+        // 9,600) — NOT to create new headroom. Two things are worth noticing in
+        // those numbers: the tiers have crept much closer to their ceilings than
+        // the 2026-07-28 note suggests, and CloudEngine is now the LARGEST
+        // catalog, because it carries `view_media_frame` from
+        // `include_media_perception` on top of the screen tools the local tier
+        // gets through this gate. The next wave that grows any tier should spend
+        // its effort shrinking descriptions rather than raising these again.
+        //
         // This is the BRIDGE catalog — what a cloud CLI or external agent sees
         // whole. An in-room worker is narrowed to its box first (`toolbox_for`
         // in the sidecar), so it never carries all of this; the tiers that do
@@ -1729,9 +2054,9 @@ mod tests {
         // measuring the window it eats.
         for (scope, budget) in [
             (ToolScope::CloudAdvisor { include_mcp: true }, 5_300usize),
-            (ToolScope::CloudEngine, 9_100),
+            (ToolScope::CloudEngine, 9_900),
             (ToolScope::LocalEngine, 9_700),
-            (ToolScope::ExternalAgent, 8_800),
+            (ToolScope::ExternalAgent, 9_600),
         ] {
             let tokens = approx_tokens(&scoped_specs(true, scope));
             assert!(
@@ -1834,6 +2159,36 @@ mod tests {
         assert!(ct_eq(b"", b""));
     }
 
+    /// The published provider × agent matrix asks this function what a tier may
+    /// ever serve, and the sidecar turns the answer into a list of AGENTS. So a
+    /// tool name missing here is not a cosmetic gap: it prints as a hard "✕" in
+    /// a table shown to the user.
+    ///
+    /// The Connector agent's whole box is the proxy pair, which the live bridge
+    /// only attaches once a connector exists. That is a fact about the ROOM, not
+    /// about the tier — and omitting it made every provider's row claim the
+    /// Connector agent works nowhere. Pinned in both directions: a tier that may
+    /// serve connectors offers the pair, a consulted advisor without the
+    /// sub-option does not.
+    #[test]
+    fn a_tier_that_may_serve_connectors_says_so_in_the_matrix() {
+        for scope in [
+            ToolScope::LocalEngine,
+            ToolScope::CloudEngine,
+            ToolScope::ExternalAgent,
+            ToolScope::CloudAdvisor { include_mcp: true },
+        ] {
+            let names = tier_tool_names(true, scope);
+            assert!(
+                names.iter().any(|n| n == MCP_SEARCH_TOOL)
+                    && names.iter().any(|n| n == MCP_RUN_TOOL),
+                "{scope:?} may serve connectors, so the matrix must see the proxy pair"
+            );
+        }
+        let advisor = tier_tool_names(true, ToolScope::CloudAdvisor { include_mcp: false });
+        assert!(!advisor.iter().any(|n| n == MCP_RUN_TOOL));
+    }
+
     /// Write the FULL served catalog — every tool, with its real description
     /// and inputSchema — to a checked-in JSON snapshot.
     ///
@@ -1890,6 +2245,50 @@ mod tests {
     /// catalog) does the rest. So what has to be true here is exactly "the tools
     /// are gone, and ONLY those tools" — plus, critically, that `tools/call`
     /// agrees with `tools/list`, since both go through `served_tools_with`.
+    /// Owner replacement #1. The failure this exists for: a bridge that served
+    /// an empty catalog produced no evidence of having done so, and the only
+    /// account of it came from the model — which invented a reason instead of
+    /// reporting the emptiness. The catalog now lands in the host log with its
+    /// tier, its size and its names, none of which a model can narrate over.
+    #[test]
+    fn the_catalog_an_engine_is_served_is_recorded_with_its_tier() {
+        use commands::WebLanes;
+        let served = |scope| served_tools_with(true, WebLanes::ALL, scope, None, &[]);
+        let turn = crate::turn::TurnId::new("run42", "chat7");
+
+        let local = served(ToolScope::LocalEngine);
+        let (_, log) = crate::obs::capture(|| {
+            log_catalog(ToolScope::LocalEngine, &local, Some(&turn))
+        });
+        assert!(log.contains("tools.catalog run=run42 chat=chat7"), "{log}");
+        assert!(log.contains("scope=LocalEngine"), "{log}");
+        assert!(log.contains(&format!("served={}", local.len())), "{log}");
+        // The names, not just the count: "23 tools" would not have caught a
+        // bridge that served the wrong TIER's 23 tools.
+        for n in ["open_file", "web_search"] {
+            assert!(log.contains(n), "{n} missing from the recorded catalog: {log}");
+        }
+
+        // The tier is part of the record, and every tier has a distinct name —
+        // the two cloud tiers differ only by a sub-option and used to be one.
+        let mut labels = std::collections::HashSet::new();
+        for scope in [
+            ToolScope::CloudAdvisor { include_mcp: true },
+            ToolScope::CloudAdvisor { include_mcp: false },
+            ToolScope::CloudEngine,
+            ToolScope::LocalEngine,
+            ToolScope::ExternalAgent,
+        ] {
+            assert!(labels.insert(scope.label()), "{:?} shares a label", scope);
+        }
+
+        // An EMPTY catalog is the whole point: it must read as empty, not as
+        // silence. (No scope really serves nothing, so this is asserted on the
+        // recorder directly.)
+        let (_, log) = crate::obs::capture(|| log_catalog(ToolScope::CloudEngine, &[], None));
+        assert!(log.contains("scope=CloudEngine served=0 names=[]"), "{log}");
+    }
+
     #[test]
     fn each_web_lane_can_be_switched_off_independently() {
         use commands::WebLanes;
@@ -1899,7 +2298,16 @@ mod tests {
                 .filter_map(|t| t["name"].as_str().map(str::to_string))
                 .collect()
         };
-        let search_tools = ["web_search", "fetch_page"];
+        // The download verbs are part of the Web agent's box (the sidecar boxes
+        // them on `chat.web` alone), so they belong to the SEARCH lane. While
+        // they did not, "Web agent off" still left the room able to save a
+        // link, download a file and download a video — and left the agent
+        // itself reachable, because its box still intersected the catalog.
+        let search_tools: Vec<&str> = ["web_search", "fetch_page"]
+            .into_iter()
+            .chain(commands::DOWNLOAD_TOOL_NAMES.iter().copied())
+            .collect();
+        let search_tools = search_tools.as_slice();
         let both = names(WebLanes::ALL);
         for n in search_tools.iter().chain(commands::BROWSE_TOOL_NAMES.iter()) {
             assert!(both.contains(&n.to_string()), "{n} missing with both lanes on");
@@ -1948,6 +2356,10 @@ mod tests {
         use commands::WebLanes;
         for (lanes, blocked) in [
             (WebLanes { search: false, browse: true }, "web_search"),
+            // The download verbs are the Web agent's too: unadvertised AND
+            // unexecutable, or "Web agent off" is a claim the room breaks.
+            (WebLanes { search: false, browse: true }, "save_link"),
+            (WebLanes { search: false, browse: true }, "download_media"),
             (WebLanes { search: true, browse: false }, "browse_open"),
         ] {
             let served = served_tools_with(true, lanes, ToolScope::LocalEngine, None, &[]);
@@ -1959,6 +2371,41 @@ mod tests {
             );
             assert!(lanes.blocks(blocked), "{blocked} must be reported as lane-blocked");
         }
+    }
+
+    /// The composer's `*` specialist menu is built from the names this room's
+    /// bridge would ACTUALLY serve, not from the tier's ceiling.
+    ///
+    /// Why that distinction is the whole point: the sidecar decides which
+    /// specialists exist by intersecting each agent's box with the served
+    /// names. Fed `tier_tool_names` (pure tier truth) the menu would keep
+    /// offering the Web and Browser agents in a room whose owner had switched
+    /// those lanes off — and tagging one would then be refused by the very
+    /// turn the menu promised. Same predicate, same answer, both directions.
+    #[test]
+    fn the_specialist_menu_sees_the_rooms_own_lanes_not_the_tiers_ceiling() {
+        use commands::WebLanes;
+        let ceiling = tier_tool_names(true, ToolScope::LocalEngine);
+        assert!(ceiling.iter().any(|n| n == "web_search"));
+        assert!(ceiling.iter().any(|n| n == "browse_open"));
+
+        let both = room_tool_names_with(true, WebLanes::ALL, ToolScope::LocalEngine, &[]);
+        assert!(both.iter().any(|n| n == "web_search"));
+        assert!(both.iter().any(|n| n == "browse_open"));
+
+        let off = room_tool_names_with(
+            true,
+            WebLanes { search: false, browse: false },
+            ToolScope::LocalEngine,
+            &[],
+        );
+        assert!(
+            !off.iter().any(|n| n == "web_search" || n == "browse_open"),
+            "a switched-off lane still reaches the specialist menu: {off:?}"
+        );
+        // The room's own content tools are untouched — the menu must not lose
+        // the File specialist because the internet lanes are off.
+        assert!(off.iter().any(|n| n == "search_room"));
     }
 
     /// BROWSE-1: the private browser rides the room's single internet switch.
@@ -1999,18 +2446,6 @@ mod tests {
                 "a consulted advisor must never be able to drive the browser"
             );
         }
-    }
-
-    /// Diagnostic: print exactly what a LocalEngine room with the internet ON
-    /// is served, so the sidecar's `served_names` can be reproduced offline.
-    #[test]
-    #[ignore]
-    fn dump_local_engine_served_names() {
-        let names: Vec<String> = scoped_specs(true, ToolScope::LocalEngine)
-            .into_iter()
-            .filter_map(|t| t["name"].as_str().map(str::to_string))
-            .collect();
-        println!("SERVED={}", serde_json::to_string(&names).unwrap());
     }
 
     #[test]
@@ -2134,12 +2569,19 @@ mod tests {
                 "{name} missing from external tier"
             );
         }
-        // …and NEVER the UI-driving/screen tools or consult_advisor (the two
-        // intentional gaps from in-room parity — see the module doc).
+        // …and the screen tools too, as of 2026-08-03 (owner: every provider
+        // gets full control). `perceive_image` still withholds the pixels from a
+        // non-vision model, so this grants the ABILITY TO ACT, not a view of the
+        // user's screen.
+        for name in ["ui_act", "ui_snapshot", "view_screenshot"] {
+            assert!(
+                ext.iter().any(|t| t["name"] == name),
+                "{name} missing from external tier"
+            );
+        }
+        // …and NEVER connector CRUD or consult_advisor: configuring connectors
+        // can start local programs, and advice is not the external tier's job.
         for name in [
-            "ui_act",
-            "ui_snapshot",
-            "view_screenshot",
             "consult_advisor",
             "list_mcps",
             "save_mcp",
@@ -2202,12 +2644,20 @@ mod tests {
     }
 
     #[test]
-    fn cloud_engine_matches_the_local_tier_except_the_screen() {
+    fn cloud_engine_matches_the_local_tier_exactly() {
         // Owner decision 2026-07-25: a cloud CLI chosen as the ROOM'S engine is
         // the main agent, so it does what the local engine does. Live QA found
         // the opposite — it shared the consulted-advisor tier, so no jobs,
         // workflows, scripts, studio or transcription reached it and the model
         // silently substituted a disabled draft skill for a requested workflow.
+        //
+        // 2026-08-03 the LAST gap closed too: the screen tools. The owner's rule
+        // is that every provider gets full control, the interface included, and
+        // the privacy reason for the old carve-out does not survive contact with
+        // how the tools actually work — `view_screenshot`/`ui_snapshot` hand
+        // their pixels to `perceive_image`, which withholds the frame from a
+        // non-vision cloud model and has a LOCAL model describe it instead. The
+        // screen never left the Mac before this change and still does not.
         let engine = scoped_specs(false, ToolScope::CloudEngine);
         let local = scoped_specs(false, ToolScope::LocalEngine);
         // The room's own engine always sees its connected connectors.
@@ -2226,12 +2676,9 @@ mod tests {
             .collect();
         assert_eq!(
             missing,
-            vec![
-                "ui_act".to_string(),
-                "ui_snapshot".to_string(),
-                "view_screenshot".to_string(),
-            ],
-            "the cloud engine's gap from the local tier must stay exactly the screen"
+            Vec::<String>::new(),
+            "the room's own cloud engine must now match the local tier exactly — \
+             a tool the local engine has and this one does not is a regression"
         );
         // The domains live QA lost, spelled out.
         for name in [
@@ -2257,13 +2704,21 @@ mod tests {
                 "{name} missing from the cloud-engine tier"
             );
         }
-        // …and the screen still never leaves the machine.
-        for name in ["ui_act", "ui_snapshot", "view_screenshot", "local_generate"] {
+        // The screen tools are the room engine's too now, and the screen still
+        // never leaves the machine — `perceive_image` withholds the frame from a
+        // non-vision cloud model and a LOCAL model describes it instead.
+        for name in ["ui_act", "ui_snapshot", "view_screenshot"] {
             assert!(
-                !engine.iter().any(|t| t["name"] == name),
-                "{name} leaked to the cloud-engine tier"
+                engine.iter().any(|t| t["name"] == name),
+                "{name} missing from the cloud-engine tier"
             );
         }
+        // `local_generate` stays out: it exists so an EXTERNAL orchestrator can
+        // reach the local model. The room's own engine IS the model.
+        assert!(
+            !engine.iter().any(|t| t["name"] == "local_generate"),
+            "local_generate leaked to the cloud-engine tier"
+        );
         // The split is the whole point: a merely CONSULTED advisor keeps the
         // narrow tier it always had.
         let advisor = scoped_specs(false, ToolScope::CloudAdvisor { include_mcp: true });
@@ -2273,6 +2728,58 @@ mod tests {
                 "{name} leaked to a consulted advisor"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_is_refused_before_it_is_read_and_before_the_token() {
+        // The head block was capped; the BODY was read to whatever
+        // Content-Length claimed, and the bearer token is only checked
+        // afterwards. Anything already running on this Mac could declare a
+        // 100 GB body — with no token at all — and push bytes into a Vec until
+        // the app ran out of memory.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let saw = dispatched.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = serve_conn(stream, "tok".into(), rx, move |_body: Vec<u8>| {
+                let saw = saw.clone();
+                async move {
+                    saw.store(true, Ordering::SeqCst);
+                    (200u16, b"{}".to_vec())
+                }
+            })
+            .await;
+        });
+        // No Authorization header at all, and a declared body far past the cap.
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_BODY + 1
+        );
+        let mut conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        conn.write_all(head.as_bytes()).await.unwrap();
+        // Deliberately send only a token amount of the promised body: the
+        // refusal must come from the DECLARATION, not from reading it all.
+        conn.write_all(&[b'x'; 64]).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read(&mut buf),
+        )
+        .await
+        .expect("an oversized request must be answered, not absorbed")
+        .unwrap();
+        assert!(
+            std::str::from_utf8(&buf[..n]).unwrap().starts_with("HTTP/1.1 413"),
+            "expected 413, got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+        assert!(
+            !dispatched.load(Ordering::SeqCst),
+            "an unauthenticated oversized request must never reach the dispatcher"
+        );
     }
 
     #[tokio::test]
@@ -2367,3 +2874,5 @@ mod tests {
         assert_eq!(ec[0]["text"], "boom");
     }
 }
+
+

@@ -1,15 +1,22 @@
 use super::*;
 
-/// ADD-6: memories whose content contains `needle` (already lowercased) —
-/// (memory id, content).
+/// ADD-6: memories containing every word of `needle` (already lowercased), in
+/// any order — (memory id, content). The words are taken LITERALLY; see
+/// `files_name_like` for why all three of `search_all`'s queries have to agree
+/// about both of those rules.
 pub fn memories_like(conn: &Connection, needle: &str) -> Result<Vec<(String, String)>, String> {
-    query_rows(
-        conn,
-        "SELECT id, content FROM memories WHERE lower(content) LIKE '%' || ?1 || '%'
+    let terms = search_terms(needle);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT id, content FROM memories WHERE 1=1{}
          ORDER BY created_at DESC LIMIT 30",
-        [needle],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
+        like_all_clause("content", &terms, 1),
+    );
+    query_rows(conn, &sql, rusqlite::params_from_iter(terms), |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
 }
 
 /// Wave 1b (idea 5): `category` is one of preference|fact|project|instruction
@@ -76,6 +83,27 @@ pub fn update_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_memory_search_takes_like_wildcards_literally() {
+        // The sibling of `files_name_like`'s test: all three of `search_all`'s
+        // queries have to agree about what the same needle means.
+        let conn = mem();
+        add_memory(&conn, "the deposit is 50% of rent", None).unwrap();
+        add_memory(&conn, "50 pounds a week", None).unwrap();
+        add_memory(&conn, "file a_b is the master", None).unwrap();
+        add_memory(&conn, "file axb is a copy", None).unwrap();
+
+        let hits = memories_like(&conn, "50%").unwrap();
+        assert_eq!(hits.len(), 1, "`%` still wildcarded: {hits:?}");
+        assert!(hits[0].1.contains("50% of rent"));
+
+        let hits = memories_like(&conn, "a_b").unwrap();
+        assert_eq!(hits.len(), 1, "`_` still wildcarded: {hits:?}");
+        assert!(hits[0].1.contains("a_b"));
+
+        assert_eq!(memories_like(&conn, "pounds").unwrap().len(), 1);
+    }
 
     #[test]
     fn memory_update_persists() {

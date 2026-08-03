@@ -6,7 +6,7 @@ import { Props, WorkArea } from "./workspace/types";
 import { useTabs, tabId, type Tab } from "./workspace/tabs";
 import TabStrip from "./shell/TabStrip";
 import { areaLabel } from "./shell/ActivityRail";
-import { displayName } from "./workspace/composer";
+import { fileLabel } from "./workspace/composer";
 import { FilesIcon, GlobeIcon } from "./icons";
 import { api } from "./api";
 import { useWorkspaceState } from "./workspace/state";
@@ -16,6 +16,7 @@ import Overlays from "./workspace/Overlays";
 import TopBar from "./workspace/TopBar";
 import StudioModal from "./workspace/StudioModal";
 import CompareModal from "./workspace/CompareModal";
+import UnsavedEditsDialog from "./workspace/UnsavedEditsDialog";
 import AiActionModal from "./workspace/AiActionModal";
 import FeedbackModal from "./workspace/FeedbackModal";
 import SettingsModals from "./workspace/SettingsModals";
@@ -29,14 +30,14 @@ import Splitter from "./shell/Splitter";
 import StatusBar from "./shell/StatusBar";
 import ErrorBoundary from "./shell/ErrorBoundary";
 import { pendingApprovalCount, runningJobCount } from "./shell/activity";
-import { shouldRestoreFocus } from "./shell/tabsync";
-import { isCloudEngine } from "./workspace/markup";
+import { pageToReassert, shouldRestoreFocus } from "./shell/tabsync";
+import { isCloudRoute } from "./workspace/markup";
 
 /** The room workspace. A thin shell: state in useWorkspaceState, handlers in
  * useWorkspaceActions, backend-event wiring in useWorkspaceEffects — composed
  * into the full-window frame: top bar / activity rail / resizable three-pane
  * grid (Library | workspace | AI) / status bar. */
-export default function Workspace({ info, onLock }: Props) {
+export default function Workspace({ info, onLock, onRenamed }: Props) {
   const s = useWorkspaceState(info);
   const actions = useWorkspaceActions(s, info, onLock);
 
@@ -66,7 +67,10 @@ export default function Workspace({ info, onLock }: Props) {
 
   const a: WSActions = { ...actions, handleLock };
   useWorkspaceEffects(s, a, info, onLock);
-  const layout = useLayout(info.name);
+  // The PATH, not the name: the saved-layout key is a digest of it, so no room
+  // name lands in plain browser storage and two same-named rooms in different
+  // folders stop sharing (and overwriting) one layout.
+  const layout = useLayout(info.path);
 
   // ...and the same question on the way out of the app. Closing the window is
   // the one exit that never passes through the lock path, so it asks here.
@@ -88,13 +92,16 @@ export default function Workspace({ info, onLock }: Props) {
         if (!go) return;
         s.editorDirtyRef.current = false;
       }
-      // `destroy()` is the documented move, but it needs
-      // core:window:allow-destroy and this app's capability grants only
-      // core:default (+ set-title) — the ACL rejects it and the window simply
-      // stops closing. Quitting the process is the same thing for a
-      // single-window app (closing the last window exits it anyway) and runs
-      // the same RunEvent::Exit teardown, so it is the fallback. Both denied
-      // has to be loud: a red button that does nothing is the worst outcome.
+      // Answered — so the ⌘Q door below must not ask the same question again
+      // on the way through `RunEvent::ExitRequested`.
+      await api.setUnsavedEdits(false).catch(() => {});
+      // `destroy()` is the documented move and now has its grant
+      // (core:window:allow-destroy in capabilities/default.json — core:default
+      // does NOT include it, and without it the ACL rejected the call and the
+      // window simply stopped closing). Quitting the process is the same thing
+      // for a single-window app and runs the same RunEvent::Exit teardown, so
+      // it stays as the fallback. Both denied has to be loud: a red button that
+      // does nothing is the worst outcome.
       await win
         .destroy()
         .catch(() => exit(0))
@@ -111,6 +118,49 @@ export default function Workspace({ info, onLock }: Props) {
     // time, and because the removal is asynchronous the outgoing listener is
     // still live while the incoming one is added, which is two "Unsaved edits"
     // dialogs on one close.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ⌘Q raises NO window close request on macOS (the menu's Quit goes through
+  // NSApplication terminate:, and tao only emits CloseRequested from
+  // windowShouldClose:), so the guard above never sees it and the buffer went
+  // out with the process. Rust holds that quit instead — but the handler is
+  // synchronous and cannot ask, so it needs the answer in advance.
+  //
+  // Polled rather than pushed from each mutation site: `editorDirtyRef` is a
+  // ref written from eight places (typing, saving, discarding, locking, the
+  // viewer unmounting), and a guard that is only as good as the site that
+  // forgot to call it is not a guard. One IPC per CHANGE, never per tick.
+  useEffect(() => {
+    let sent: boolean | null = null;
+    const push = () => {
+      const dirty = s.editModeRef.current && s.editorDirtyRef.current;
+      if (dirty === sent) return;
+      sent = dirty;
+      void api.setUnsavedEdits(dirty).catch(() => {});
+    };
+    push();
+    const timer = window.setInterval(push, 400);
+    // ...and the question itself, asked here because only this window knows
+    // how to ask it. Whoever answers OWNS the quit: Rust holds it once.
+    const unlisten = api.onQuitRequested(async () => {
+      const go = await confirm(
+        "This file has edits you haven't saved yet. Quitting Arcelle loses them.",
+        { title: "Unsaved edits", kind: "warning", okLabel: "Quit and discard" },
+      ).catch(() => true);
+      if (!go) return;
+      s.editorDirtyRef.current = false;
+      await api.setUnsavedEdits(false).catch(() => {});
+      await exit(0).catch(() => {});
+    });
+    return () => {
+      window.clearInterval(timer);
+      void unlisten.then((fn) => fn()).catch(() => {});
+      // Leaving the room takes the editor with it — a stale "dirty" would hold
+      // the next quit for a buffer that no longer exists.
+      void api.setUnsavedEdits(false).catch(() => {});
+    };
+    // Mount-once: reads refs only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -164,38 +214,50 @@ export default function Workspace({ info, onLock }: Props) {
     [a, s],
   );
 
-  /** Monaco holds ONE buffer — the tab that is showing. Switching away unmounts
-   * it, so an unsaved edit would go with it. Same guard the stale-file banner
-   * and the Run button already use, rather than a second rule to learn. */
-  const unsavedEdits = useCallback(() => {
-    if (!s.editMode || !s.editorDirtyRef.current) return false;
-    s.pushToast("info", "Save your edits first — or undo them — before switching tabs.");
-    return true;
-  }, [s]);
+  /** Monaco holds ONE buffer — the tab that is showing. Anything that unmounts
+   * it takes the unsaved edit with it, so every such exit comes through here.
+   *
+   * This used to REFUSE, with a toast: "Save your edits first — or undo them —
+   * before switching tabs." That named a problem and offered no way out of it,
+   * and it only covered the tab strip; pressing Close on the viewer walked
+   * straight past and dropped the buffer with no warning at all. Now there is
+   * one question with three real answers, and `proceed` is the interrupted
+   * action, replayed. */
+  const guardLeave = a.guardLeave;
 
   const activateTab = useCallback(
     (id: string) => {
-      if (id !== tabs.activeId && unsavedEdits()) return;
-      tabs.activate(id);
+      if (id === tabs.activeId) return;
+      guardLeave("Switching tabs", () => tabs.activate(id));
     },
-    [tabs, unsavedEdits],
+    [tabs, guardLeave],
   );
 
-  const closeTab = useCallback(
+  const doCloseTab = useCallback(
     (id: string) => {
-      if (id === tabs.activeId && unsavedEdits()) return;
-      const tab = tabs.tabs.find((t) => t.id === id);
+      const tab = tabsRef.current.tabs.find((t) => t.id === id);
       if (tab?.kind === "page") void api.browserCloseTab(tab.ref).catch(() => {});
       // Closing the tab must close what it was SHOWING, or the file stays on
       // screen with no tab pointing at it — and the watcher below would hand
       // it a new tab on the next file-list refresh.
-      if (tab?.kind === "file" && tab.ref === s.openFile?.id) s.setOpenFile(null);
+      if (tab?.kind === "file" && tab.ref === s.openFileRef.current?.id) s.setOpenFile(null);
       // Forget that this tab's state was applied: re-opening the same id later
       // has to put the app back into it, not skip as a no-op switch.
       if (appliedRef.current === id) appliedRef.current = "";
       tabs.close(id);
     },
-    [tabs, unsavedEdits, s],
+    [tabs, s],
+  );
+
+  const closeTab = useCallback(
+    (id: string) => {
+      if (id !== tabs.activeId) {
+        doCloseTab(id);
+        return;
+      }
+      guardLeave("Closing this tab", () => doCloseTab(id));
+    },
+    [tabs.activeId, doCloseTab, guardLeave],
   );
 
   // Pages the USER asked for (⌘T, the ＋ button) that the tab strip has not
@@ -208,15 +270,16 @@ export default function Workspace({ info, onLock }: Props) {
     // A new page shows the Browser area, which closes the open file and takes
     // Monaco's buffer with it. Same guard as the strip, ⌘W and ⌥⌘1–9 — ⌘T and
     // the ＋ button were the one pair that walked straight past it.
-    if (unsavedEdits()) return;
-    void api
-      .browserNewTab("")
-      .then((id) => {
-        localPagesRef.current.add(id);
-        tabs.open("page", id, "New page");
-      })
-      .catch((e) => s.pushToast("error", String(e)));
-  }, [tabs, s, unsavedEdits]);
+    guardLeave("Opening a new page", () => {
+      void api
+        .browserNewTab("")
+        .then((id) => {
+          localPagesRef.current.add(id);
+          tabs.open("page", id, "New page");
+        })
+        .catch((e) => s.pushToast("error", String(e)));
+    });
+  }, [tabs, s, guardLeave]);
 
   // The strip mirrors what Rust actually has open, in both directions: a page
   // the AGENT opened earns a tab, a page that went away loses one, and titles
@@ -258,6 +321,17 @@ export default function Workspace({ info, onLock }: Props) {
       // it as the assistant's would leave the user's own new page unfocused.
       if (shouldRestoreFocus(adopted, localPagesRef.current, showingLives))
         tabs.activate(tabs.activeId);
+      // Each live tab also says whether IT is the page on screen, and that was
+      // simply dropped. Rust picks an heir whenever the visible page goes away
+      // on its own, so the strip can end up highlighting one page while another
+      // is shown — and clicking the highlight does nothing, because
+      // `browser_select_tab` only fires on a real tab CHANGE and Rust already
+      // believes that page is active. Put the user's own choice back.
+      const reassert = pageToReassert(
+        live,
+        showing?.kind === "page" ? showing.ref : null,
+      );
+      if (reassert) void api.browserSelectTab(reassert).catch(() => {});
     };
     void sync();
     const timer = window.setInterval(() => void sync(), area === "browser" ? 1200 : 5000);
@@ -271,10 +345,9 @@ export default function Workspace({ info, onLock }: Props) {
   // Rail click = focus-or-open, which is what makes an area STAY open.
   const openArea = useCallback(
     (next: Exclude<WorkArea, "files">) => {
-      if (unsavedEdits()) return;
-      tabs.open("area", next, areaLabel(next));
+      guardLeave("Opening this area", () => tabs.open("area", next, areaLabel(next)));
     },
-    [tabs, unsavedEdits],
+    [tabs, guardLeave],
   );
 
   // Every existing `setOpenFile` call site — citations, agent opens, the
@@ -294,11 +367,11 @@ export default function Workspace({ info, onLock }: Props) {
     if (tabbedFileRef.current === openFileId) {
       // Same file, refreshed list: the only thing that can have changed is its
       // name (a rename), so keep the strip honest without touching focus.
-      tabs.retitle(tabId("file", openFileId), displayName(name));
+      tabs.retitle(tabId("file", openFileId), fileLabel(name, s.files));
       return;
     }
     tabbedFileRef.current = openFileId;
-    tabs.open("file", openFileId, displayName(name));
+    tabs.open("file", openFileId, fileLabel(name, s.files));
     // `tabs` is stable per render by identity of its callbacks; keying on the
     // file id is what makes this fire once per open rather than every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -387,8 +460,7 @@ export default function Workspace({ info, onLock }: Props) {
         const digit = /^Digit([1-9])$/.exec(e.code);
         if (!digit) return;
         e.preventDefault();
-        if (unsavedEdits()) return;
-        tabs.activateIndex(Number(digit[1]) - 1);
+        guardLeave("Switching tabs", () => tabs.activateIndex(Number(digit[1]) - 1));
         return;
       }
       if (e.key === "w" && tabs.activeId) {
@@ -400,14 +472,12 @@ export default function Workspace({ info, onLock }: Props) {
       // the unshifted characters meant these never fired at all.
       if (e.shiftKey && (e.key === "]" || e.key === "}")) {
         e.preventDefault();
-        if (unsavedEdits()) return;
-        tabs.step(1);
+        guardLeave("Switching tabs", () => tabs.step(1));
         return;
       }
       if (e.shiftKey && (e.key === "[" || e.key === "{")) {
         e.preventDefault();
-        if (unsavedEdits()) return;
-        tabs.step(-1);
+        guardLeave("Switching tabs", () => tabs.step(-1));
         return;
       }
       // ⌘T — the promise the ＋ button's tooltip has always made.
@@ -418,7 +488,7 @@ export default function Workspace({ info, onLock }: Props) {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [tabs, closeTab, unsavedEdits, newBrowserPage, s.webOn]);
+  }, [tabs, closeTab, guardLeave, newBrowserPage, s.webOn]);
 
   const tabIcon = useCallback(
     (tab: Tab) =>
@@ -441,9 +511,11 @@ export default function Workspace({ info, onLock }: Props) {
     <div className="workspace">
       <Overlays s={s} a={a} layout={layout} />
       <Toasts toasts={s.toasts} dismissToast={s.dismissToast} />
-      <TopBar s={s} a={a} info={info} layout={layout} />
+      <TopBar s={s} a={a} info={info} layout={layout} onRenamed={onRenamed} />
 
       <StudioModal s={s} a={a} />
+      {/* Every exit that unmounts the editor asks this before it happens. */}
+      <UnsavedEditsDialog s={s} />
       <CompareModal s={s} a={a} />
       <AiActionModal s={s} a={a} />
       {/* Mounted only while open: the draft fields are local state, so
@@ -514,7 +586,7 @@ export default function Workspace({ info, onLock }: Props) {
       <StatusBar
         layout={layout}
         fileCount={s.files.length}
-        cloud={isCloudEngine(s.model)}
+        cloud={isCloudRoute(s.model, s.ai)}
         engineLabel={a.engineLabelOf(s.model)}
         protectedOn={s.privacyOn}
         onOpenPrivacy={() => {

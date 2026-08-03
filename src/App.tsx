@@ -24,6 +24,7 @@ import {
   SEAL_UNLOCK_MS,
 } from "./rooms/constants";
 import { prefersReducedMotion } from "./rooms/helpers";
+import { forgetSavedLayout, forgetSavedLayouts } from "./shell/useLayout";
 import { StartScreen } from "./screens/StartScreen";
 import { CreateScreen } from "./screens/CreateScreen";
 import { UnlockScreen } from "./screens/UnlockScreen";
@@ -34,6 +35,40 @@ import {
 } from "./screens/SealOverlay";
 import "./App.css";
 import "./seal.css";
+
+/** What the unlock gate says when an open fails.
+ *
+ * Every unlock path funnels through here — typed password, Touch ID, and the
+ * recovery code — because they used to disagree: the typed path turned
+ * `WRONG_PASSWORD` into a sentence while Touch ID printed that bare internal
+ * code straight onto the lock screen, and anything the host had not classified
+ * (a damaged room, a read-only disk, a file another copy of the app holds
+ * open) arrived as raw SQLite text.
+ *
+ * The pass-through rule is deliberate: the host's own messages are written as
+ * sentences ("File not found.", "This file is not an Arcelle project.", the
+ * classified first-read failures), and engine text is not — it is lower-case
+ * and unpunctuated. So a message that reads like one of ours is shown as-is,
+ * and anything else becomes a calm fallback with the detail left in the
+ * console. A new host sentence therefore needs no change here; a new engine
+ * error cannot leak. */
+export function unlockMessage(raw: string): string {
+  const msg = raw.replace(/^Error:\s*/, "").trim();
+  if (msg.includes("WRONG_PASSWORD")) return "That password didn't work. Try again.";
+  if (/readonly|read-only/i.test(msg))
+    return "This room is on a read-only disk, so it can't be opened. Copy it somewhere you can write to and try again.";
+  if (/malformed|not a database|corrupt/i.test(msg))
+    return "This room file looks damaged. Try a checkpoint or a backup copy of it.";
+  if (/database is locked|unable to open database/i.test(msg))
+    return "This room couldn't be opened. Check that it's on a connected drive and not already open in another copy of Arcelle.";
+  if (/PRAGMA|sqlcipher|rekey|ATTACH/i.test(msg))
+    return "This room couldn't be unlocked. Check the password and try again.";
+  // One of the app's own sentences, or something we don't recognise at all.
+  const looksLikeOurs = /^[A-Z"“]/.test(msg) && /[.!?]$/.test(msg);
+  return looksLikeOurs && msg.length < 300
+    ? msg
+    : "This room couldn't be opened. Check that the file is on a connected drive and not damaged.";
+}
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>({ kind: "start" });
@@ -49,6 +84,8 @@ export default function App() {
   // Mirrors `entering`: true while the "sealing shut" lock ritual plays over
   // the workspace, before the gate returns.
   const [locking, setLocking] = useState(false);
+  // True once the seal animation has finished and the close is STILL running.
+  const [lockSlow, setLockSlow] = useState(false);
   const [recent, setRecent] = useState<RecentRoom[]>([]);
   const [roomName, setRoomName] = useState("");
   const [templateKey, setTemplateKey] = useState("blank");
@@ -217,6 +254,9 @@ export default function App() {
 
   async function removeRecent(path: string) {
     await api.removeRecent(path);
+    // The room's saved pane layout is the other thing this Mac remembers about
+    // it, outside the encrypted file. Forgetting the shortcut forgets that too.
+    forgetSavedLayout(path);
     loadRecent();
   }
 
@@ -226,13 +266,17 @@ export default function App() {
   async function clearRecent() {
     const ok = await askConfirm(
       `Forget all ${recent.length} recent room${recent.length === 1 ? "" : "s"}? ` +
-        "This clears the shortcuts on this screen only — every room file stays " +
-        "exactly where it is, and you can open one again with “Open Room…”.",
+        "This clears the shortcuts on this screen and the pane layouts saved for " +
+        "them — every room file stays exactly where it is, and you can open one " +
+        "again with “Open Room…”.",
       { title: "Clear the recent list", kind: "warning", okLabel: "Clear list" },
     ).catch(() => false);
     if (!ok) return;
     try {
       await api.clearRecent();
+      // Nothing used to clear the per-room saved layouts, so "forget all recent
+      // rooms" left a list of them behind on this Mac.
+      forgetSavedLayouts();
     } catch (e) {
       await message(`The recent list couldn't be cleared.\n\n${String(e)}`, {
         title: "Clear the recent list",
@@ -321,7 +365,10 @@ export default function App() {
     if (navEpochRef.current !== epoch) return; // gate moved on — create nothing
     setBusy(true);
     try {
-      const info = await api.createRoom(path, password);
+      // The typed name is the room's name, not just a filename suggestion —
+      // saving "Journal" as "stuff.arcelle" used to leave the room called
+      // "stuff" everywhere. Blank still falls back to the file's name.
+      const info = await api.createRoom(path, password, roomName.trim() || undefined);
       if (navEpochRef.current !== epoch) return; // stale: don't seed or enter
       // The room is now open. Seed the chosen template and role through
       // ordinary APIs before entering. Everything created here is normal,
@@ -404,13 +451,7 @@ export default function App() {
       // The gate speaks plainly; the raw engine error goes to the console
       // for debugging, never to the person standing at the door.
       console.error("unlock failed:", msg);
-      setError(
-        msg.includes("WRONG_PASSWORD")
-          ? "That password didn't work. Try again."
-          : /PRAGMA|sqlcipher|rekey|ATTACH/i.test(msg)
-            ? "This room couldn't be unlocked. Check the password and try again."
-            : msg,
-      );
+      setError(unlockMessage(msg));
     } finally {
       setBusy(false);
     }
@@ -446,7 +487,10 @@ export default function App() {
       if (navEpochRef.current !== epoch) return; // stale: the gate moved on
       enterRoom(info);
     } catch (e) {
-      setError(String(e));
+      // Same funnel as the typed password: this path used to print the bare
+      // `WRONG_PASSWORD` sentinel (a stale Keychain entry) onto the gate.
+      console.error("touch id unlock failed:", String(e));
+      setError(unlockMessage(String(e)));
     } finally {
       setBusy(false);
     }
@@ -469,16 +513,26 @@ export default function App() {
     // animation duration (~460ms). A failed close abandons the ritual and
     // leaves the user in the room, exactly as before.
     setLocking(true);
+    // The close is not instant: it stops recordings, waits for running jobs and
+    // may compact the room file. On a big room that outlasts the ritual, and
+    // the veil says nothing — so once the animation is over and we are still
+    // waiting, the overlay explains itself instead of reading as a freeze.
+    setLockSlow(false);
+    const slowTimer = window.setTimeout(() => setLockSlow(true), SEAL_LOCK_MS);
     try {
       await api.closeRoom();
     } catch (e) {
+      window.clearTimeout(slowTimer);
+      setLockSlow(false);
       setLocking(false);
       throw e;
     }
+    window.clearTimeout(slowTimer);
     // Drop the room name from the title bar once locked (CHG-9).
     getCurrentWindow().setTitle("Arcelle").catch(() => {});
     window.setTimeout(() => {
       setLocking(false);
+      setLockSlow(false);
       // As above: a navigation during the ritual (another room's gate) wins.
       if (navEpochRef.current === epoch) goTo({ kind: "start" });
     }, SEAL_LOCK_MS);
@@ -491,8 +545,13 @@ export default function App() {
           key={`${screen.info.path}:${roomEpoch}`}
           info={screen.info}
           onLock={handleLock}
+          // A rename hands back the refreshed record. Swapped in place rather
+          // than through `goTo`, which resets the gate's fields and would be a
+          // navigation — the path is unchanged, so the workspace keeps its key
+          // and nothing remounts.
+          onRenamed={(info) => setScreen({ kind: "workspace", info })}
         />
-        {locking && <SealLockingOverlay />}
+        {locking && <SealLockingOverlay slow={lockSlow} />}
       </>
     );
   }

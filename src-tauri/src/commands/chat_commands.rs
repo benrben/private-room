@@ -110,6 +110,11 @@ pub(crate) struct CmdCtx<'a> {
     history: &'a str,
     temperature: Option<f64>,
     cancel: Arc<AtomicBool>,
+    /// Owner replacement #4: the run/chat this command's events belong to.
+    /// Every `ask-step`/`ask-delta` a command emits goes out through `step`
+    /// below, so a `#command` running in one conversation can never paint into
+    /// another one the user has since opened.
+    pub(crate) turn: crate::turn::TurnId,
     /// Windows of the source a pass could not read (the model errored or timed
     /// out on them). Full ops means the whole source is READ — when a slice of it
     /// wasn't, the reply says so instead of quietly covering less.
@@ -152,8 +157,14 @@ const COMMAND_STREAM_IDLE_CLI_SECS: u64 = 960;
 
 /// How long a streamed step may go with no token before it counts as stalled,
 /// for the engine actually answering.
+///
+/// Reads the DECLARED record rather than testing the model's name: "cannot
+/// stream" is a property of the transport, and `is_cli_engine` was that property
+/// spelled as the two engine ids that happened to have it when this was written.
+/// A third non-streaming engine would have inherited the five-minute ceiling and
+/// killed every long answer with stall advice that does not apply.
 fn stream_idle_secs(model: &str) -> u64 {
-    if is_cli_engine(model) {
+    if crate::commands::declared_for(model).streaming == crate::commands::Support::No {
         COMMAND_STREAM_IDLE_CLI_SECS
     } else {
         COMMAND_STREAM_IDLE_SECS
@@ -165,6 +176,17 @@ fn stream_idle_secs(model: &str) -> u64 {
 /// showed) before we hang up on its behalf. A model that has gone quiet never
 /// gets another chunk, which is how Stop came to be ignored entirely.
 const COMMAND_STOP_GRACE_MS: u64 = 1_500;
+
+/// What one QUIET command step hands on to the rest of the command.
+///
+/// Quiet steps are the ones nobody reads before they are used: #translate saves
+/// its result as a new FILE, #extract folds it into a table, #compare feeds it
+/// to the next step. A thinking model's `<think>…</think>` preamble therefore
+/// ends up inside the user's document rather than on screen where they could
+/// see what it was. The streamed steps have stripped it since the beginning.
+pub(crate) fn quiet_step_text(raw: &str) -> String {
+    ollama::strip_think_spans(raw).trim().to_string()
+}
 
 /// The watchdog half of [`CmdCtx::ask_streaming`], split out so the Stop and
 /// stall paths can be exercised without a window. Drives `fut` while sampling
@@ -213,6 +235,11 @@ impl CmdCtx<'_> {
         self.cancel.load(Ordering::SeqCst)
     }
 
+    /// One step chip, stamped with this command's run and chat.
+    pub(crate) fn step(&self, label: impl Into<String>) {
+        self.turn.step(self.window, label);
+    }
+
     /// Record that one window of the source could not be read.
     fn note_unread(&self) {
         self.unread.fetch_add(1, Ordering::SeqCst);
@@ -220,12 +247,12 @@ impl CmdCtx<'_> {
 
     /// One model call streamed live into the chat (for answers the user reads).
     async fn ask_streaming(&self, system: &str, user: String) -> Result<String, String> {
-        use tauri::Emitter;
         let messages = vec![
             ollama::ChatMessage::new("system", system),
             ollama::ChatMessage::new("user", user),
         ];
         let window = self.window;
+        let turn = self.turn.clone();
         // MIGRATION Phase 2a: streamed through the sidecar `/generate_stream`
         // (no tools, no `format`); the per-token `ask-delta` events are unchanged.
         let body = ollama::plain_generate_body(
@@ -233,7 +260,6 @@ impl CmdCtx<'_> {
             &messages,
             self.temperature,
             KEEP_ALIVE_WARM,
-            ollama::CtxTier::Chat,
         );
         // The sidecar only samples the cancel flag as each chunk arrives, so a
         // model that goes quiet swallows Stop, and one that stalls outright never
@@ -253,7 +279,7 @@ impl CmdCtx<'_> {
             move |d| {
                 *seen.lock().unwrap() = std::time::Instant::now();
                 mirror.lock().unwrap().push_str(d);
-                let _ = window.emit("ask-delta", d);
+                turn.emit(window, "ask-delta", d);
             },
         );
         watch_stream(
@@ -282,7 +308,6 @@ impl CmdCtx<'_> {
             temp,
             KEEP_ALIVE_WARM,
             Some(self.cancel.clone()),
-            ollama::CtxTier::Chat,
         );
         // A quiet step streams no tokens, so a stalled model would otherwise
         // freeze the command's step chip until the shared 10-minute HTTP
@@ -296,7 +321,13 @@ impl CmdCtx<'_> {
         )
         .await
         {
-            Ok(res) => res,
+            // A thinking model puts its private reasoning in `<think>…</think>`
+            // ahead of the answer, and a quiet step's text is not read by a
+            // human before it is used — #translate writes it straight into a NEW
+            // FILE, #extract folds it into a table. The streamed steps have
+            // stripped it since the beginning; this one funnels every quiet step
+            // in every command, so it is the one place to do it.
+            Ok(res) => res.map(|text| quiet_step_text(&text)),
             Err(_) => Err("The model took too long to respond. Try a shorter \
                            selection, or switch to a faster model in Settings."
                 .into()),
@@ -341,7 +372,6 @@ impl CmdCtx<'_> {
         user: impl Fn(&str) -> String,
         temp: Option<f64>,
     ) -> Vec<String> {
-        use tauri::Emitter;
         let windows = cmd_windows(source);
         let total = windows.len();
         let mut out = Vec::new();
@@ -350,9 +380,7 @@ impl CmdCtx<'_> {
                 break;
             }
             if total > 1 {
-                let _ = self
-                    .window
-                    .emit("ask-step", format!("{label} ({}/{})", i + 1, total));
+                self.step(format!("{label} ({}/{})", i + 1, total));
             }
             match self.ask_quiet(system, user(w), temp).await {
                 Ok(piece) if !piece.trim().is_empty() => out.push(piece.trim().to_string()),
@@ -563,6 +591,7 @@ pub async fn run_command(
         history: &history_text,
         temperature,
         cancel: cancel.clone(),
+        turn: crate::turn::TurnId::new(&ask_id, &chat_id),
         unread: AtomicUsize::new(0),
     };
 
@@ -653,6 +682,30 @@ mod full_ops_tests {
             // partition_windows may overshoot to a seam; the overlap bounds it.
             assert!(w.len() <= CMD_WINDOW_CHARS + CMD_WINDOW_OVERLAP);
         }
+    }
+}
+
+#[cfg(test)]
+mod quiet_step_tests {
+    use super::*;
+
+    /// A thinking model's private monologue must not reach a #command's output.
+    ///
+    /// The quiet steps are the ones nobody reads first: #translate SAVES its
+    /// result as a new file, #extract folds it into a table. Only the streamed
+    /// steps were stripping `<think>`, so a reasoning model's preamble was
+    /// written into the user's document as if it were the translation.
+    #[test]
+    fn a_quiet_step_never_carries_the_models_reasoning() {
+        assert_eq!(
+            quiet_step_text("<think>The user wants French. Careful with the idiom.</think>\nBonjour le monde."),
+            "Bonjour le monde."
+        );
+        // Unterminated: everything after the opening tag is reasoning, and
+        // returning it would be worse than returning nothing.
+        assert_eq!(quiet_step_text("<think>still thinking about it"), "");
+        // Ordinary prose is untouched, whitespace and all.
+        assert_eq!(quiet_step_text("  Plain answer.  "), "Plain answer.");
     }
 }
 

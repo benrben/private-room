@@ -51,6 +51,32 @@
   flex-direction: column;
 }
 
+/* ViewerRouter wraps EVERY preview in `.viewer-host`, and that class had no
+ * rule of its own — so inside a `fill` body it was an auto-height block sitting
+ * in a flex column. A viewer whose root asks for `height: 100%` then resolved
+ * against auto and got auto back, and the height it was promised never arrived.
+ *
+ * The visible symptom was a `.doc` rendering as a 150px band with the rest of
+ * the pane empty: 150px is an iframe's DEFAULT height, which is what you get
+ * when `flex: 1` has no definite height to divide up. Every viewer in
+ * FILL_HEIGHT_KINDS depended on this working.
+ *
+ * `min-height: 0` on both levels is the part that is easy to miss: a flex item
+ * refuses to shrink below its content by default, so a long document would push
+ * the pane instead of scrolling inside it. */
+.viewer-body.fill > .viewer-host {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.viewer-body.fill > .viewer-host > * {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
 .viewer-actions {
   display: flex;
   align-items: center;

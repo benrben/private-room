@@ -256,7 +256,24 @@ async def vision_locate(
     prompt, run one structured (``format``) vision generation via the Phase-1
     gateway, recover the JSON, and parse the boxes. Errors surface as
     :class:`llm.LlmError` (OLLAMA_DOWN / MODEL_MISSING), same as /generate."""
-    from . import llm
+    from . import llm, privacy as privacy_mod
+
+    # The privacy door strips images bound for a non-local model and only COUNTS
+    # them (``guard_outbound`` -> ``block_images``); the call itself proceeds. On
+    # every other path that is right — the text still gets an answer. Here it is
+    # not: grounding with no image returns no boxes, and no boxes is rendered to
+    # the user as "could not locate that in this image", i.e. a claim about their
+    # picture rather than about their settings. Rust's `grounding_pick` avoids
+    # choosing such a model at all; this is the backstop for any caller that
+    # doesn't, so the failure can never come back as a lie about the image.
+    policy = privacy_mod.policy_from_payload(privacy)
+    if policy is not None and policy.active and privacy_mod.is_nonlocal_model(model):
+        raise llm.LlmError(
+            "ENGINE_ERROR",
+            "This room's privacy door does not let images leave the Mac, so "
+            f"{model} cannot be shown the picture. Mark images with a model that "
+            "runs on this Mac, or turn the door off for this room.",
+        )
 
     data = base64.b64decode(image_b64)
     prepared, w, h = prepare_image(data)

@@ -15,7 +15,7 @@ import {
   WorkflowsIcon,
 } from "../icons";
 import { WorkflowGlyph } from "./workflows/workflowGlyph";
-import { isCloudEngine, isExternalEngine, isModelReady, trustState } from "./markup";
+import { isCloudRoute, isExternalEngine, isModelReady, trustState } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import EngineModelPicker from "./EngineModelPicker";
@@ -31,13 +31,30 @@ export default function TopBar({
   a,
   info,
   layout,
+  onRenamed,
 }: {
   s: WSState;
   a: WSActions;
   info: RoomInfo;
   layout: LayoutApi;
+  onRenamed?: (info: RoomInfo) => void;
 }) {
   const { ai, model } = s;
+  // The room name, while it is being typed. `null` = not renaming. Local to
+  // the bar: nothing else in the app cares about a half-typed name, and the
+  // committed name comes back from the backend as a fresh RoomInfo.
+  const [nameDraft, setNameDraft] = useState<string | null>(null);
+  async function commitRename() {
+    const typed = (nameDraft ?? "").trim();
+    setNameDraft(null);
+    if (!typed || typed === info.name) return;
+    try {
+      onRenamed?.(await api.renameRoom(typed));
+      s.pushToast("success", `This room is now called “${typed}”.`);
+    } catch (e) {
+      s.pushToast("error", `Could not rename this room: ${String(e)}`);
+    }
+  }
   // Wave 5 (Idea 13): the global-scripts shortcut menu open flag (local — it
   // sits beside the pinned-workflows menu in the top bar).
   const [scriptMenuOpen, setScriptMenuOpen] = useState(false);
@@ -77,7 +94,7 @@ export default function TopBar({
       onRun: () => void a.runScript(sc.fileId),
     }));
   const modelReady = isModelReady(ai, model);
-  const cloud = isCloudEngine(model);
+  const cloud = isCloudRoute(model, ai);
   return (
     <header className="pr-topbar">
       <div className="pr-brandmark" aria-label="Arcelle" title={info.path}>
@@ -86,7 +103,34 @@ export default function TopBar({
       <div className="room-identity" title={info.path}>
         <div className="room-identity-text">
           <div className="room-kicker">Arcelle</div>
-          <div className="room-name">{info.name}</div>
+          {/* The room's name lives in its own encrypted `meta`, not in the file
+              path — renaming the .roomai in Finder changes nothing — so this is
+              the only place it can be changed. Inline, the same grammar the
+              file and folder renames use. */}
+          {nameDraft === null ? (
+            <button
+              type="button"
+              className="room-name room-name-btn"
+              title="Rename this room"
+              onClick={() => setNameDraft(info.name)}
+            >
+              {info.name}
+            </button>
+          ) : (
+            <input
+              className="room-name room-name-input"
+              aria-label="Room name"
+              autoFocus
+              value={nameDraft}
+              maxLength={120}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onBlur={() => void commitRename()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void commitRename();
+                if (e.key === "Escape") setNameDraft(null);
+              }}
+            />
+          )}
         </div>
       </div>
       <div className="command-wrap">

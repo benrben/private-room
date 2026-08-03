@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import Waveform, { SpeakerRegion } from "./Waveform";
 import { api, RecMeta, RecSegment, RecWord } from "../api";
 import { PlayIcon, PauseIcon, StopIcon } from "../icons";
 import { liveSttOn, micMuted, noteLiveStt, setMicMuted } from "../workspace/liveRec";
@@ -15,7 +16,9 @@ const SCREEN_CAPTURE_SETTINGS_URL =
  * people speak, with speakers told apart; then edit the recording by editing
  * its text (select words → delete: playback skips them, "Export edited copy"
  * cuts the audio for real) and translate the whole thing into any language.
- * All transcription and translation happen on this Mac.
+ * Transcription always happens on this Mac (Whisper, on-device). Translation —
+ * live and whole-file alike — runs on the ROOM's chosen model, which may be a
+ * cloud one; nothing here may claim otherwise.
  *
  * The capture session itself lives in the backend + a workspace-level mic
  * tap, NOT here — this view attaches to it, so navigating away never stops
@@ -204,10 +207,24 @@ export default function RecordingView({
   const [micNote, setMicNote] = useState<string | null>(null);
   const [showDeleted, setShowDeleted] = useState(false);
   const [selection, setSelection] = useState<{ t0: number; t1: number; words: number } | null>(null);
+  // The correction box, opened from the selection bar. Held apart from
+  // `selection` so opening it cannot be mistaken for having typed anything.
+  const [correcting, setCorrecting] = useState(false);
+  const [correction, setCorrection] = useState("");
+  // Read by `captureSelection`, which the `selectionchange` listener holds from
+  // the first render — a state read there would be permanently `false`.
+  const correctingRef = useRef(false);
+  correctingRef.current = correcting;
   const [translating, setTranslating] = useState<{ done: number; total: number } | null>(null);
   const [retrans, setRetrans] = useState<{ doneCs: number; totalCs: number } | null>(null);
   const [confirmRetrans, setConfirmRetrans] = useState(false);
   const [busy, setBusy] = useState(false);
+  // "Export edited copy" decodes, splices and re-encodes the whole WAV — minutes
+  // on a long meeting. It no longer freezes the room (the work is off the UI
+  // thread), but the button simply greyed out and said nothing, which is what
+  // "the app has hung" looks like. There is no honest percentage to show —
+  // nothing reports one — so the button says what it is doing and no more.
+  const [exporting, setExporting] = useState(false);
   const [activeSeg, setActiveSeg] = useState<string | null>(null);
   // Pre-start choices (also editable mid-flight for live translate).
   const [withSystem, setWithSystem] = useState(true);
@@ -398,8 +415,31 @@ export default function RecordingView({
     return out;
   }, [segments, showDeleted]);
 
+  // The waveform's speaker bands, taken straight off the SEGMENTS rather than
+  // parsed back out of the transcript: this viewer already holds the
+  // structured diarization result, complete with the user's own names for each
+  // voice. Consecutive segments from one speaker merge into a single band, so
+  // a conversation reads as a handful of turns instead of a stripe per phrase.
+  const speakerRegions = useMemo<SpeakerRegion[]>(
+    () =>
+      turns.map((t) => {
+        const last = t.segs[t.segs.length - 1].seg;
+        return {
+          start: t.t0 / 100,
+          end: Math.max(last.t1 ?? t.t0, t.t0 + 1) / 100,
+          // The user's own name for this voice when they gave one — the
+          // legend must match the chips down the transcript.
+          speaker: meta?.speakerNames?.[t.speaker] || t.speaker,
+        };
+      }),
+    [turns, meta?.speakerNames],
+  );
+
   // ---- playback (skips deleted spans) ------------------------------------
   const src = mediaToken && !isLive ? `roommedia://localhost/${mediaToken}` : null;
+  // The waveform drives the same element the transcript and the cut-skipping
+  // do, so there is exactly one playhead.
+  const [mediaEl, setMediaEl] = useState<HTMLAudioElement | null>(null);
 
   /**
    * Jump the playhead out of, or over, a deleted span.
@@ -492,6 +532,13 @@ export default function RecordingView({
   }, []);
 
   function captureSelection() {
+    // While the correction box is open the transcript selection is FROZEN.
+    // Focusing a text input clears the document selection (the box autofocuses,
+    // and clicking into it does the same), so re-reading it here would report
+    // "nothing selected", unmount the whole selection bar, and take the words
+    // being corrected — and whatever had been typed — with it. The feature was
+    // unusable the moment the caret entered the box.
+    if (correctingRef.current) return;
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !listRef.current) {
       setSelection(null);
@@ -509,6 +556,33 @@ export default function RecordingView({
       }
     });
     setSelection(words > 0 ? { t0, t1, words } : null);
+  }
+
+  /** The other half of editing a transcript: RETYPE a span.
+   *
+   * Deleting was the only edit there was, so a misheard name left you choosing
+   * between a wrong transcript and a missing sentence — and this text is what
+   * search, the AI and every export read. Correcting is not deleting: no cut is
+   * added and the audio is untouched, which is why it is a separate button
+   * beside the red one rather than a mode of it. */
+  async function correctSelection() {
+    if (!selection || !correction.trim()) return;
+    try {
+      const updated = await api.recCorrectRange(
+        fileId,
+        selection.t0,
+        selection.t1,
+        correction.trim(),
+      );
+      setMeta(updated);
+      setSelection(null);
+      setCorrection("");
+      setCorrecting(false);
+      window.getSelection()?.removeAllRanges();
+      pushToast("success", "Transcript corrected — the audio is unchanged.");
+    } catch (e) {
+      pushToast("error", String(e));
+    }
   }
 
   async function deleteSelection() {
@@ -656,14 +730,19 @@ export default function RecordingView({
   }
 
   async function exportClean() {
-    if (busy) return;
+    if (busy || exporting) return;
     setBusy(true);
+    setExporting(true);
+    // Said up front, because the work that follows can run for minutes on a
+    // long recording and the only other sign of it is a disabled button.
+    pushToast("info", "Cutting the audio and saving the edited copy — this can take a while.");
     try {
       const f = await api.recExportClean(fileId);
       pushToast("success", `Saved "${f.name}" with your edits applied to the audio.`);
     } catch (e) {
       pushToast("error", String(e));
     } finally {
+      setExporting(false);
       setBusy(false);
     }
   }
@@ -889,7 +968,14 @@ export default function RecordingView({
           )}
           <label
             className="rec-opt"
-            title="Translate each phrase as it lands (on this Mac) — any language, the same as the Translate box below"
+            // Live translation runs on the ROOM's chosen model, exactly like
+            // the Translate box below (recording.rs `room_translation_model`).
+            // This used to say "(on this Mac)", which is the opposite of what
+            // happens in a cloud room: there, every finished sentence of a live
+            // meeting is sent to the provider for as long as the box is set.
+            // The status bar's trust chip says which kind of room this is; the
+            // control must not contradict it.
+            title="Translate each phrase as it lands — any language, on the room's AI model, the same as the Translate box below. In a cloud room that means each sentence is sent to the provider as it lands."
           >
             Live translate
             <input
@@ -941,6 +1027,7 @@ export default function RecordingView({
         <audio
           ref={(el) => {
             mediaRef.current = el;
+            setMediaEl(el);
           }}
           className="rec-player"
           src={src}
@@ -956,12 +1043,21 @@ export default function RecordingView({
         />
       )}
 
+      {/* The conversation's shape, with each speaker's turns drawn over the
+          wave. Diarization has run on this file since v0.14.0 and none of it
+          was visible above the transcript — a bare <audio controls> was the
+          whole picture. Live recording has no waveform: there is no finished
+          file to compute an envelope from yet. */}
+      {src && durationCs > 0 && (
+        <Waveform fileId={fileId} media={mediaEl} regions={speakerRegions} />
+      )}
+
       {/* transcript */}
       <div
         className="rec-transcript"
         ref={listRef}
         tabIndex={0}
-        aria-label="Transcript — select words here to delete them from the recording"
+        aria-label="Transcript — select words here to correct them, or to delete them from the recording"
         onMouseUp={captureSelection}
       >
         {segments.length === 0 && !partials.mic && !partials.sys && (
@@ -977,7 +1073,9 @@ export default function RecordingView({
                 </p>
                 <p>
                   Afterwards, edit the audio by editing the text (select words → delete), run any
-                  AI action on it, or translate the whole thing — everything stays on this Mac.
+                  AI action on it, or translate the whole thing. Speech is recognised on this Mac;
+                  AI actions and translation use the room's model — the trust chip in the status
+                  bar says whether that one is local or in the cloud.
                 </p>
               </>
             ) : (
@@ -1067,10 +1165,61 @@ export default function RecordingView({
           <span>
             {selection.words} word{selection.words > 1 ? "s" : ""} · {formatTimestamp(selection.t0)}–{formatTimestamp(selection.t1)}
           </span>
-          <button className="danger" onClick={() => void deleteSelection()}>
-            Delete from recording
-          </button>
-          <button className="subtle" onClick={() => setSelection(null)}>Keep</button>
+          {correcting ? (
+            <>
+              <input
+                autoFocus
+                className="rec-correct-input"
+                placeholder="What was actually said…"
+                aria-label="Corrected words"
+                value={correction}
+                onChange={(e) => setCorrection(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void correctSelection();
+                  if (e.key === "Escape") {
+                    setCorrecting(false);
+                    setCorrection("");
+                  }
+                }}
+              />
+              <button
+                className="subtle"
+                disabled={!correction.trim()}
+                onClick={() => void correctSelection()}
+              >
+                Save correction
+              </button>
+              <button
+                className="subtle"
+                onClick={() => {
+                  setCorrecting(false);
+                  setCorrection("");
+                }}
+              >
+                Cancel
+              </button>
+            </>
+          ) : (
+            <>
+              {/* Correcting is NOT deleting: no cut, no audio change. It sits
+                  beside the red button because "the transcript is wrong" and
+                  "cut this out of the recording" are different intentions. */}
+              <button
+                className="subtle"
+                title="Retype what this actually says. The audio is untouched."
+                onClick={() => {
+                  setCorrection("");
+                  setCorrecting(true);
+                }}
+              >
+                Fix the words
+              </button>
+              <button className="danger" onClick={() => void deleteSelection()}>
+                Delete from recording
+              </button>
+              <button className="subtle" onClick={() => setSelection(null)}>Keep</button>
+            </>
+          )}
         </div>
       )}
 
@@ -1161,7 +1310,7 @@ export default function RecordingView({
                 title="Save a copy with the deleted words really cut out of the audio"
                 onClick={() => void exportClean()}
               >
-                Export edited copy
+                {exporting ? "Exporting edited copy…" : "Export edited copy"}
               </button>
               <label className="rec-opt">
                 <input

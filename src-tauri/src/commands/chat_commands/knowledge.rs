@@ -1,5 +1,25 @@
 use super::*;
 
+/// How many files one `#add-file for each …` may create.
+///
+/// The fan-out has no preview and no undo: the model's list becomes one
+/// generated file per entry, and removing them is a per-file job in the Files
+/// list. Uncapped, a conversation that happens to contain a long list (a pasted
+/// table, a CSV) filled the room. Generous enough that a real "one per client"
+/// ask still completes in one go, small enough that a runaway list is a nuisance
+/// rather than a cleanup session — and what is left out is always named.
+pub(crate) const MAX_FAN_OUT_FILES: usize = 25;
+
+/// The fan-out list, cut to [`MAX_FAN_OUT_FILES`], plus HOW MANY were left out.
+///
+/// The count is returned rather than dropped so the answer can say what it did
+/// not do — "Created 25 files" for a list of 90 is a true sentence that reads
+/// as a complete one.
+fn cap_fan_out(items: Vec<String>) -> (Vec<String>, usize) {
+    let over = items.len().saturating_sub(MAX_FAN_OUT_FILES);
+    (items.into_iter().take(MAX_FAN_OUT_FILES).collect(), over)
+}
+
 pub(crate) async fn cmd_remember(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     let fact = ctx.args.trim();
     if fact.is_empty() {
@@ -99,13 +119,18 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
                     .into(),
             );
         }
+        // A cap, because there is no undo and no preview: the model's list goes
+        // straight to one generated file per entry, and the only way back is
+        // deleting them one at a time. A conversation that mentions a hundred
+        // things (a table, a pasted CSV) used to produce a hundred files. What
+        // is NOT created is named below rather than silently dropped.
+        let (items, over) = cap_fan_out(items);
         let mut created: Vec<String> = Vec::new();
         for (i, item) in items.iter().enumerate() {
             if ctx.cancelled() {
                 break;
             }
-            let _ = ctx.window.emit(
-                "ask-step",
+            ctx.step(
                 format!("Creating file for {item} ({}/{})", i + 1, items.len()),
             );
             // MIGRATION Phase 3: the DOC_SYS document-body generation lives in the
@@ -132,8 +157,16 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
             let doc = html_titled_doc(&name, item, &body);
             let guard = ctx.state.room.lock().unwrap();
             let Some(room) = guard.as_ref() else { break };
-            if let Ok(meta) = create_note(&room.conn, &name, &doc) {
-                created.push(meta.name);
+            // ART-1: `created` must only ever name files that really landed, so
+            // it is fed from the committed meta — a staged write that failed
+            // validation or lost a cancel race adds nothing to the list.
+            if let Ok(w) = Artifact::note(&name, &doc)
+                .by("#add-file")
+                .during_run(Some(ctx.turn.run_id()))
+                .cancel_with(&ctx.cancel)
+                .commit(&room.conn)
+            {
+                created.push(w.meta.name);
             }
         }
         let _ = ctx.window.emit("room-files-changed", ());
@@ -141,9 +174,20 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
             return Err("Couldn't create any files — the model returned nothing.".into());
         }
         let list = created.iter().map(|n| format!("- {n}")).collect::<Vec<_>>().join("\n");
+        // Empty must read as empty, and a cut list must read as cut: the run
+        // stopping at the cap is not the same as the conversation having had
+        // exactly that many items in it.
+        let capped = if over > 0 {
+            format!(
+                "\n\nStopped at {MAX_FAN_OUT_FILES} files — {over} more were named. \
+                 Ask again naming the ones you still want."
+            )
+        } else {
+            String::new()
+        };
         return Ok(CommandResult {
             content: format!(
-                "Created {} file(s):\n{list}\n\n_Delete any you don't want from the Files list._",
+                "Created {} file(s):\n{list}{capped}\n\n_Delete any you don't want from the Files list._",
                 created.len()
             ),
             sources: created,
@@ -189,9 +233,27 @@ pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         None => html_note_name(&topic),
     };
     let doc = html_titled_doc(&name, &title_from_name(&name), &body);
-    let meta = save_and_open(ctx.window, ctx.state, &name, &note_mime(&name), &doc, "generated")?;
+    // ART-1: staged, cancel-checked at the write, and versioned when the same
+    // document is asked for twice.
+    let written = save_and_open(
+        ctx.window,
+        ctx.state,
+        Artifact::new(&name, &note_mime(&name), &doc)
+            .by("#add-file")
+            .during_run(Some(ctx.turn.run_id()))
+            .from_files(ctx.refs)
+            .cancel_with(&ctx.cancel),
+    )?;
+    let meta = written.meta;
     Ok(CommandResult {
-        content: format!("Created **{}** and opened it.", meta.name),
+        content: if written.versioned {
+            format!(
+                "Rewrote **{}** and opened it — the previous version is in History.",
+                meta.name
+            )
+        } else {
+            format!("Created **{}** and opened it.", meta.name)
+        },
         sources: vec![meta.name],
         ..Default::default()
     })
@@ -236,9 +298,7 @@ pub(crate) async fn cmd_highlight(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
             break;
         }
         if total > 1 {
-            let _ = ctx
-                .window
-                .emit("ask-step", format!("Looking for it ({}/{})", i + 1, total));
+            ctx.step(format!("Looking for it ({}/{})", i + 1, total));
         }
         let Ok(quote) = ctx
             .ask_quiet(QUOTE_SYS, format!("Request: {thing}\n\nDocument:\n{w}"), Some(0.0))
@@ -324,7 +384,6 @@ fn strip_trailing_preposition(args: &str) -> &str {
 }
 
 pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
-    use tauri::Emitter;
     if ctx.refs.is_empty() {
         return Err("Add files with @ — e.g. #extract revenue, CEO from @a.pdf @b.pdf".into());
     }
@@ -346,9 +405,7 @@ pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
         if ctx.cancelled() {
             break;
         }
-        let _ = ctx
-            .window
-            .emit("ask-step", format!("Reading {name} ({}/{})", i + 1, files.len()));
+        ctx.step(format!("Reading {name} ({}/{})", i + 1, files.len()));
         // A CSV/TSV whose columns match the requested fields is read directly —
         // exact, instant, per-row, and model-free (a local model can't pull
         // table columns via the field schema; see tabular_field_rows).
@@ -380,8 +437,7 @@ pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
                 break;
             }
             if total > 1 {
-                let _ = ctx.window.emit(
-                    "ask-step",
+                ctx.step(
                     format!("Reading {name} — part {}/{} ({}/{})", w_i + 1, total, i + 1, files.len()),
                 );
             }
@@ -423,7 +479,16 @@ pub(crate) async fn cmd_extract(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
         rows.push(row);
     }
     let csv = serialize_delim(&rows, ',');
-    let meta = save_and_open(ctx.window, ctx.state, "extract.csv", &note_mime("extract.csv"), &csv, "generated")?;
+    let meta = save_and_open(
+        ctx.window,
+        ctx.state,
+        Artifact::new("extract.csv", &note_mime("extract.csv"), &csv)
+            .by("#extract")
+            .during_run(Some(ctx.turn.run_id()))
+            .from_files(ctx.refs)
+            .cancel_with(&ctx.cancel),
+    )?
+    .meta;
     Ok(CommandResult {
         content: format!(
             "Extracted {} field(s) from {} file(s) into **{}**.",
@@ -480,6 +545,29 @@ mod tests {
         assert_eq!(strip_trailing_preposition("burden of proof"), "burden of proof");
         // Nothing but the preposition leaves nothing (the caller then errors).
         assert_eq!(strip_trailing_preposition("from"), "");
+    }
+
+    /// `#add-file for each …` writes one generated file per item with no
+    /// preview and no undo, so an unbounded list (a pasted table, a CSV) filled
+    /// the room and left a per-file cleanup. The cut is bounded AND counted —
+    /// a silent truncation would read as "that was the whole list".
+    #[test]
+    fn the_fan_out_is_capped_and_says_what_it_left_out() {
+        let small: Vec<String> = (0..3).map(|i| format!("item {i}")).collect();
+        let (kept, over) = cap_fan_out(small.clone());
+        assert_eq!(kept, small, "a short list is untouched");
+        assert_eq!(over, 0, "nothing was left out, so nothing may be claimed");
+
+        let long: Vec<String> = (0..90).map(|i| format!("item {i}")).collect();
+        let (kept, over) = cap_fan_out(long);
+        assert_eq!(kept.len(), MAX_FAN_OUT_FILES);
+        assert_eq!(over, 90 - MAX_FAN_OUT_FILES);
+        // The kept ones are the FIRST ones, in the model's own order.
+        assert_eq!(kept[0], "item 0");
+
+        // Exactly at the cap is not "over".
+        let exact: Vec<String> = (0..MAX_FAN_OUT_FILES).map(|i| format!("i{i}")).collect();
+        assert_eq!(cap_fan_out(exact).1, 0);
     }
 
     #[test]

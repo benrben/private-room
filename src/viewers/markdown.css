@@ -1,0 +1,92 @@
+/* ------------------------------------------------------------------ *
+ * Markdown extras: maths, highlighted code and diagrams.
+ *
+ * The base prose rules live in src/styles/viewer-formats.css; this file
+ * only covers what KaTeX, highlight.js and mermaid add. The highlighter
+ * is themed from the app's own tokens rather than by importing one of
+ * highlight.js's stylesheets, so a note reads the same in light and dark
+ * and never carries a second, conflicting palette.
+ * ------------------------------------------------------------------ */
+
+/* ---- maths ---- */
+/* Display maths scrolls on its own rather than widening the pane — a long
+   equation must never make the whole document scroll sideways. */
+.md-body .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25rem 0;
+}
+.md-body .katex {
+  font-size: 1.05em;
+}
+
+/* ---- fenced code ---- */
+.md-body pre code.hljs {
+  display: block;
+  overflow-x: auto;
+  padding: 0.75rem 0.9rem;
+}
+.md-body code.hljs {
+  background: none;
+  color: inherit;
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: var(--muted);
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-section,
+.hljs-doctag,
+.hljs-type,
+.hljs-name,
+.hljs-strong {
+  color: var(--accent);
+}
+.hljs-string,
+.hljs-title,
+.hljs-attr,
+.hljs-attribute,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-addition {
+  color: var(--ok, #4cc38a);
+}
+.hljs-number,
+.hljs-meta,
+.hljs-built_in,
+.hljs-builtin-name,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-link {
+  color: var(--warn, #e3b341);
+}
+.hljs-deletion {
+  color: var(--danger, #e5646c);
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+
+/* ---- diagrams ---- */
+.md-body .mermaid-figure {
+  display: flex;
+  justify-content: center;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+}
+.md-body .mermaid-figure svg {
+  max-width: 100%;
+  height: auto;
+}
+/* While mermaid's module loads, the source stands in for the diagram —
+   quieter than the fully-styled code block it would otherwise be. */
+.md-body .mermaid-pending {
+  opacity: 0.55;
+}
+.md-body .mermaid-error pre {
+  margin-top: 0.35rem;
+}

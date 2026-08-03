@@ -17,6 +17,32 @@ const YTDLP_URL: &str =
 /// Single-flight guard so two clicks can't download the binary twice.
 static YTDLP_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
+/// The Stop flag for the INTERACTIVE download (the Add-link modal's "Video from
+/// this page", the toolbar's Download video).
+///
+/// `download_media_to_temp` has always been able to be stopped — the agent's
+/// `download_media` job passes its run's flag — but the interactive command
+/// passed `None`, so a video the user started by mistake ran to completion (up
+/// to the whole `MEDIA_DOWNLOAD_BUDGET`) with no way to abandon it short of
+/// quitting the app. Process-global is right here rather than per-call: there
+/// is exactly one interactive download at a time, and the Stop button belongs
+/// to whichever one is running.
+static MEDIA_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Stop the interactive video download that is running now. Idempotent, and
+/// harmless when nothing is downloading — the flag is cleared at the start of
+/// every download, so a stale Stop can never kill the NEXT one.
+#[tauri::command]
+pub fn cancel_media_download() {
+    MEDIA_CANCEL.store(true, Ordering::SeqCst);
+}
+
+/// Arm a fresh download. Separate from the command so the clear-before-start
+/// order is a thing a test can hold onto.
+fn arm_media_cancel() {
+    MEDIA_CANCEL.store(false, Ordering::SeqCst);
+}
+
 /// Hard cap on the fetched downloader. The real binary is ~35 MB; this is
 /// generous headroom and still stops a misbehaving mirror from filling the
 /// disk while the UI says "Getting the video downloader".
@@ -360,10 +386,15 @@ pub async fn import_media_url(
     url: String,
 ) -> Result<ImportReport, String> {
     let url = url.trim().to_string();
-    // Fail fast (and don't fetch anything) when no room is open.
-    state.with_room(|_room| Ok(()))?;
+    // Fail fast (and don't fetch anything) when no room is open — or when the
+    // room's internet switch is off. Downloading a video is as much a network
+    // reach as the browser's address bar, which has been gated since BROWSE-1.
+    crate::commands::require_web_access(state.inner())?;
+    // Clear FIRST: a Stop pressed against a download that already ended must
+    // not cancel the next one before it has fetched a byte.
+    arm_media_cancel();
     let progress = |status: &str, pct: Option<f64>| emit_progress(&window, status, pct);
-    let media = download_media_to_temp(&app, &url, None, &progress).await?;
+    let media = download_media_to_temp(&app, &url, Some(&MEDIA_CANCEL), &progress).await?;
 
     emit_progress(&window, "Sealing the video into the room…", None);
     let name = media
@@ -383,6 +414,23 @@ pub async fn import_media_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_is_armed_per_download_not_left_latched() {
+        // The interactive download used to pass `None` for its cancel flag, so
+        // "Video from this page" could not be abandoned at all. Now it passes
+        // one — and the flag MUST be cleared as each download starts, or a Stop
+        // pressed a moment too late would kill the next download instead.
+        arm_media_cancel();
+        assert!(!MEDIA_CANCEL.load(Ordering::SeqCst));
+        cancel_media_download();
+        assert!(MEDIA_CANCEL.load(Ordering::SeqCst), "Stop must set the flag");
+        arm_media_cancel();
+        assert!(
+            !MEDIA_CANCEL.load(Ordering::SeqCst),
+            "a stale Stop must not cancel the next download"
+        );
+    }
 
     #[test]
     fn progress_lines_parse_and_noise_is_ignored() {

@@ -333,6 +333,26 @@ mod tests {
     }
 
     #[test]
+    fn docx_replace_with_a_nul_in_the_needle_reports_not_found_instead_of_panicking() {
+        // The paragraph separator in the match stream is '\u{0}', mapped to
+        // `usize::MAX` so it can never be part of a match. NUL is not
+        // `char::is_whitespace`, so a needle containing one used to reach
+        // `find_sub` intact, match a separator and index `edits[usize::MAX]`.
+        let bytes = fake_office_zip(
+            "word/document.xml",
+            r#"<w:document><w:p><w:t>One</w:t></w:p><w:p><w:t>Two</w:t></w:p></w:document>"#,
+        );
+        let err = docx_replace_text(&bytes, "One\u{0}Two", "x").expect_err("must not match");
+        assert!(err.to_lowercase().contains("not"), "got: {err}");
+        // A NUL next to text that IS present still edits normally.
+        let (patched, n) =
+            docx_replace_text(&bytes, "\u{0}One", "Uno").expect("nul is dropped, not matched");
+        assert_eq!(n, 1);
+        let text = extract_text("c.docx", &patched).expect("docx text");
+        assert!(text.contains("Uno"), "got: {text}");
+    }
+
+    #[test]
     fn docx_replace_edits_text_and_round_trips() {
         let bytes = fake_office_zip(
             "word/document.xml",

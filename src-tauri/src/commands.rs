@@ -25,7 +25,12 @@ mod search;
 mod mcp_cmds;
 mod mcp_oauth;
 mod mcp_registry;
+// Download-on-first-use runtimes for local connectors (uv / node). Declared
+// here is step 1 of the four this module's header lists; the other three are
+// lib.rs's invoke_handler, mcp.rs's launcher PATH, and the ConnectorsView prompt.
+mod runtimes;
 mod models;
+mod capabilities;
 mod vision;
 mod chat;
 mod retrieval;
@@ -33,12 +38,18 @@ mod agent;
 mod edit_match;
 mod edit_gate;
 mod chat_commands;
+mod artifact;
 mod docs_html;
 mod json;
 mod summarize;
 mod studios;
 mod moonshot;
+mod docx_edit;
 mod media;
+mod video;
+mod office;
+mod peaks;
+mod preview;
 mod agent_ui;
 mod ytdlp;
 mod recording_cmds;
@@ -48,6 +59,10 @@ mod privacy;
 mod scripts;
 mod skills;
 mod speech_cmds;
+/// The ⌘Q door — the one exit no window close request ever reaches.
+mod shell_exit;
+/// Where the window was and how big, remembered between launches.
+mod window_geometry;
 
 pub use browse::*;
 pub use external::*;
@@ -63,7 +78,9 @@ pub use library::*;
 pub use search::*;
 pub use mcp_cmds::*;
 pub use mcp_registry::*;
+pub use runtimes::*;
 pub use models::*;
+pub use capabilities::*;
 pub use vision::*;
 pub use chat::*;
 pub(crate) use retrieval::*;
@@ -71,12 +88,18 @@ pub use agent::*;
 pub(crate) use edit_match::*;
 pub use edit_gate::*;
 pub use chat_commands::*;
+pub(crate) use artifact::*;
 pub(crate) use docs_html::*;
 pub(crate) use json::*;
 pub(crate) use summarize::*;
 pub use studios::*;
 pub use moonshot::*;
+pub use docx_edit::*;
 pub use media::*;
+pub use video::*;
+pub use office::*;
+pub use peaks::*;
+pub use preview::*;
 pub use agent_ui::*;
 pub use ytdlp::*;
 pub use recording_cmds::*;
@@ -86,6 +109,8 @@ pub use privacy::*;
 pub use scripts::*;
 pub use skills::*;
 pub use speech_cmds::*;
+pub use shell_exit::*;
+pub(crate) use window_geometry::{note_geometry, restore_geometry, save_geometry};
 
 pub(crate) const DEFAULT_MODEL: &str = "qwen3.5:4b";
 pub(crate) const MAX_CONTEXT_CHUNKS: usize = 6;
@@ -164,6 +189,28 @@ pub(crate) const HISTORY_HANDOFF_MAX: usize = 200_000;
 pub(crate) fn history_budget_bytes(_model: &str) -> usize {
     HISTORY_HANDOFF_MAX
 }
+
+/// The HAND-OFF's byte budget, which — unlike the agent path's — has to be
+/// sized to the engine's own window.
+///
+/// The agent path can be engine-blind because the sidecar COMPACTS whatever it
+/// receives, on every engine. `handoff_chat` has no such receiver: it flattens
+/// the rows into one prompt and calls the one-shot `handoff_summary` gateway.
+/// Local Ollama still fits that to `num_ctx` itself; a `:cloud` model, an
+/// OpenRouter provider and a cloud CLI trim NOTHING, so once the hand-off's row
+/// bound went from 12 to 200 a long technical chat could overflow the window and
+/// return an engine error or an empty summary — at the exact moment the user
+/// pressed the button to make the conversation smaller.
+///
+/// Two thirds of the window, converted at `token_usage::CHARS_PER_TOKEN` (3,
+/// deliberately LOW, so this overstates tokens — the safe direction). The
+/// remaining third carries the digest instruction and the recap the engine has
+/// to have room to write. `HISTORY_HANDOFF_MAX` still caps it, so a huge window
+/// does not make the first hand-off of a years-old room pathological.
+pub(crate) fn handoff_budget_bytes(max_context: u32) -> usize {
+    let usable = (max_context as usize / 3) * 2;
+    (usable * crate::token_usage::CHARS_PER_TOKEN as usize).min(HISTORY_HANDOFF_MAX)
+}
 /// Injected persistent-memory budget (chars) and per-memory write cap.
 pub(crate) const MAX_MEMORY_INJECT_CHARS: usize = 1_500;
 pub(crate) const MAX_MEMORY_CONTENT_CHARS: usize = 500;
@@ -192,11 +239,24 @@ pub(crate) const DEFAULT_MCP_CONFIG: &str = r#"{
 pub struct AppState {
     pub room: Mutex<Option<Room>>,
     pub pending_open: Mutex<Option<String>>,
+    /// The last unlock's "audio from an interrupted recording could not be
+    /// restored" message, waiting for the workspace to collect it
+    /// (`take_rec_recovery_error`). Parked rather than only emitted, because
+    /// the unlock finishes long before anything is listening for the event —
+    /// see `rooms::report_rec_recovery_failure`. `None` means nothing failed.
+    pub rec_recovery_error: Mutex<Option<String>>,
     pub mcp: Mutex<mcp::Manager>,
     /// ADD-7: one cancel flag per in-flight `ask`, keyed by its `ask_id`.
     /// The entry is inserted when an ask starts and removed when it returns
     /// (success, error, or cancel). `cancel_ask` and `close_room` flip flags.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Owner replacement #3: the same ids, arranged as a TREE (`crate::cancel`).
+    /// `cancels` above says WHETHER an id is stopped; this says what that id
+    /// STARTED, so cancelling a run reaches the studio build, job and file pass
+    /// it spawned instead of leaving them writing artifacts into a room whose
+    /// run the user has already stopped. Weak links: a child is owned by
+    /// whatever runs it, so finished work prunes itself.
+    pub cancel_tree: Mutex<HashMap<String, std::sync::Weak<crate::cancel::Node>>>,
     /// ADD-13: generation stamp for the lazy background embed pass. Each room
     /// unlock bumps it and spawns one loop carrying that stamp; a loop exits
     /// once the stamp moves on (a newer room opened) or the room closes, so at
@@ -217,26 +277,47 @@ pub struct AppState {
     /// user chose "always allow" for, cleared when the room closes.
     pub mcp_pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<McpDecision>>>,
     pub mcp_session_ok: Mutex<HashSet<String>>,
-    /// "Auto mode" for connector tool calls (Connectors → Auto-approve).
+    /// Connectors → "Run connector tools without asking".
     ///
-    /// It opens TWO gates, and both belong in this doc because the pair is what
-    /// makes it a real choice rather than a convenience:
+    /// `mcp_call_approved` returns true without emitting a consent card, so an
+    /// agent's `run_mcp_tool` calls never stall on a prompt nobody is watching
+    /// (a card left unanswered for 180s counts as a decline, which read to the
+    /// model — and the user — as "the connector tool fails every time").
     ///
-    /// 1. `mcp_call_approved` returns true without emitting a consent card, so
-    ///    an agent's `run_mcp_tool` calls never stall on a prompt nobody is
-    ///    watching (a card left unanswered for 180s counts as a decline, which
-    ///    read to the model — and the user — as "the connector tool fails every
-    ///    time").
-    /// 2. `exec_tool` skips the outbound remote-seam redaction, so a REMOTE
-    ///    connector receives the room's real values (`masks_outbound_args`).
-    ///    Masking rewrites the values the connector is asked ABOUT, which broke
-    ///    the lookups outright; full approval means real arguments.
-    ///
-    /// Because (2) genuinely weakens what leaves the Mac, this defaults to OFF
-    /// (`read_mcp_auto_approve`) and the Connectors copy states both effects.
+    /// This flag decides WHO PRESSES THE BUTTON and nothing else. It used to
+    /// carry a second power — unmasking outbound arguments — because the fix for
+    /// silently-redacted args (2026-07-24) was folded into the same switch. The
+    /// owner split them (2026-08-03): "run this without asking me" and "send
+    /// this the user's real data" are different risks, so they are now
+    /// `mcp_outbound_unmask` and this, independent and both OFF by default.
     /// Loaded from disk at startup (`setup`) and persisted per-Mac like
     /// `mcp_approvals.json`, outside any room.
     pub mcp_auto_approve: Arc<AtomicBool>,
+    /// Connectors → "Send remote connectors real values".
+    ///
+    /// `exec_tool` skips the outbound remote-seam redaction, so a REMOTE
+    /// connector receives the room's real values (`masks_outbound_args`).
+    /// Masking rewrites the values the connector is asked ABOUT, which broke
+    /// lookups outright — a room whose entity map holds "NVDA" asked the server
+    /// about `[Person A]` and got nothing back. Turning this on is the cure, and
+    /// it is the half that genuinely weakens what leaves the Mac, which is why
+    /// it is its own switch and defaults to OFF (`read_mcp_outbound_unmask`).
+    ///
+    /// Independent of `mcp_auto_approve` in both directions: unmasked + still
+    /// asking shows the user the REAL arguments on the card before they leave;
+    /// auto-approved + still masked runs unattended with placeholders.
+    pub mcp_outbound_unmask: Arc<AtomicBool>,
+    /// Connectors → the per-connector answers that OVERRIDE the two switches
+    /// above, keyed by server name (owner's decision, 2026-08-03: "split
+    /// connector auto-approve from outbound unmasking; both default off" — per
+    /// connector). A connector with no entry, or an entry with no answer for
+    /// that power, inherits the Mac-wide switch, so an install upgrading from
+    /// the global-only pair keeps exactly the behaviour it had and this map
+    /// starts empty. Both seams resolve through `auto_approve_for` /
+    /// `outbound_unmask_for`, which are the only places the two levels combine.
+    /// Loaded at startup from `mcp_connector_powers.json` and persisted there,
+    /// per-Mac and outside any room like the rest of the consent state.
+    pub mcp_connector_powers: Mutex<std::collections::BTreeMap<String, ConnectorOverride>>,
     /// Wave 2 (Idea 6): per-call diff-preview consent, mirroring `mcp_pending`.
     /// Holds the reply channel for each in-flight edit-approval request (keyed by
     /// request id); the frontend answers via `resolve_edit_approval`. Cleared on
@@ -310,9 +391,30 @@ impl AppState {
         &self,
         f: impl FnOnce(&Room) -> Result<T, String>,
     ) -> Result<T, String> {
-        let guard = self.room.lock().unwrap();
+        let guard = self.room_guard();
         let room = guard.as_ref().ok_or("No room is open.")?;
-        f(room)
+        // Every room read and write in the app comes through here, which makes
+        // it the one place a storage failure can be explained once. See
+        // `humanize_storage_error` — it rewrites only what it can evidence.
+        f(room).map_err(|e| humanize_storage_error(&e, &room.path))
+    }
+
+    /// The open-room lock, surviving a poisoned mutex.
+    ///
+    /// Every command that touches the room passes through this one gate, and
+    /// Rust marks a mutex POISONED for the rest of the process if any thread
+    /// panics while holding it. `lock().unwrap()` then panics in turn — so one
+    /// internal panic anywhere under the room lock turned every later room
+    /// action into a panic, forever: the window stayed up, nothing worked, and
+    /// nothing explained why. There is no recovery code and no restart prompt.
+    ///
+    /// The data behind this lock is an `Option<Room>` — a handle, not a
+    /// multi-step invariant that a panic could leave half-updated — so taking
+    /// the guard back (`into_inner`) is honest here rather than papering over a
+    /// broken state. The panic itself is still a bug; it is just no longer a
+    /// dead app.
+    pub(crate) fn room_guard(&self) -> std::sync::MutexGuard<'_, Option<Room>> {
+        self.room.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Wave 3 (Idea 9): the current room epoch. A background writer captures
@@ -356,6 +458,9 @@ impl Drop for CancelGuard<'_> {
         if let Ok(mut m) = self.state.cancels.lock() {
             m.remove(&self.ask_id);
         }
+        // Owner replacement #3: the tree entry goes with it, so a later run that
+        // reuses nothing but the id cannot be handed a finished run's children.
+        crate::cancel::forget(self.state, &self.ask_id);
     }
 }
 
@@ -407,6 +512,19 @@ pub struct FileVersion {
     pub id: String,
     pub saved_at: String,
     pub cause: String,
+    /// ART-1: what produced this version's content — run id, agent/tool, source
+    /// file ids. `None` means nobody recorded it (an older room, a person's own
+    /// save), which the History strip shows as no attribution at all rather
+    /// than crediting the AI for something it may not have written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::db::Provenance>,
+    /// The user asked to KEEP this one: it is outside the rolling window the
+    /// room prunes on every save (`db::VERSIONS_KEPT`).
+    pub pinned: bool,
+    /// Size of this snapshot's stored bytes. Every version is a whole copy of
+    /// the file, so the History strip can show what history actually costs
+    /// instead of leaving it to be discovered as a bigger room file.
+    pub bytes: i64,
 }
 
 /// Idea 11: a saved version's extracted text next to the file's CURRENT text,
@@ -462,6 +580,31 @@ pub struct FileMeta {
     /// anything that came off this Mac. Lets a file row say "from boi.org.il"
     /// instead of leaving provenance buried in the Markdown body.
     pub origin_url: Option<String>,
+}
+
+/// Trash: one deleted file, as the trash view shows it. Deliberately NOT a
+/// `FileMeta` — a trashed file is not a file in the room, and handing the UI the
+/// same shape invites it to be rendered in a list that is supposed to be
+/// "what's here". Carries no content: name and size are metadata, the bytes
+/// stay in the room and are only ever read again by a restore.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashedFile {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size_bytes: i64,
+    /// When it was deleted (room-local ISO-8601, same clock as `created_at`).
+    pub trashed_at: String,
+    /// WHAT deleted it: `user` | `agent` | `app`. Never blank — an unknown
+    /// actor reads as `unknown`, which is a claim we can stand behind, rather
+    /// than being quietly attributed to the person.
+    pub trashed_by: String,
+    /// WHICH one, when the kind alone isn't the answer: the agent/tool name for
+    /// an `agent` delete, the command for an `app` one. None = not recorded.
+    pub trashed_by_id: Option<String>,
+    /// ADD-16: the folder it will go back to on restore, or None for top level.
+    pub folder_id: Option<String>,
 }
 
 /// ADD-16: one flat folder. Files reference it by `folder_id`.
@@ -565,6 +708,17 @@ pub struct FileContent {
     /// instead of a base64 data URL, so large recordings stream instead of
     /// riding through IPC.
     pub media_token: Option<String>,
+    /// Video only: what the container says it is (duration, display size,
+    /// codec, frame rate, audio track), if it has ever been probed. None means
+    /// "not probed yet" — the viewer asks for a probe rather than showing
+    /// zeros, and every field inside is independently unknown-able.
+    pub media_meta: Option<crate::media_probe::MediaMeta>,
+    /// Saved web pages only: what the page declared about itself (site, author,
+    /// publication date, language) plus where and when the room saved it. None
+    /// means this file did not come from a web page — and a field the page
+    /// never declared is simply absent, so the viewer's provenance strip can
+    /// only ever show what was actually there.
+    pub web_meta: Option<crate::extraction::PageMeta>,
 }
 
 #[derive(Serialize, Clone)]
@@ -578,6 +732,11 @@ pub struct AiStatus {
     pub default_model: String,
     /// Cloud CLIs detected on this Mac ("claude-cli", "codex-cli").
     pub external: Vec<String>,
+    /// Is Ollama being reached on ANOTHER computer (the Closet override)? A
+    /// model name cannot carry this, and the trust chip is derived from the
+    /// name — so a room relaying `qwen3.5:4b` to a LAN box read "Local only —
+    /// nothing leaves the device". The UI ORs this into its cloud test.
+    pub remote_relay: bool,
 }
 
 /// Settings → Online features "Test search": exercise the real search path
@@ -592,21 +751,29 @@ pub async fn web_search_test(state: State<'_, AppState>) -> Result<String, Strin
                     first. (Each room has its own setting.)"
             .into());
     }
-    let hits = web::search_web("wikipedia").await?;
-    match hits.first() {
-        // Individual engines drop out silently when they are blocked, so the
-        // count is the honest signal of how much of the fusion answered.
-        // BROWSE-3: hits are structured now, so the diagnostic reports the real
-        // consensus (how many engines agreed) rather than a formatted sentence.
+    let page = web::search_web("wikipedia").await?;
+    // A diagnostic that hides which engines are down is not a diagnostic. The
+    // fan-out reports them by name, so name them: "Working ✓" while two of seven
+    // engines are 403ing is how a degraded search goes unnoticed for weeks.
+    let blocked = match page.failed.as_slice() {
+        [] => String::new(),
+        names => format!(" Blocked right now: {}.", web::join_names(names)),
+    };
+    match page.hits.first() {
         Some(hit) => Ok(format!(
-            "Working ✓ — {} results. Top hit: {} (found by {})",
-            hits.len(),
+            "Working ✓ — {} results. Top hit: {} (found by {}).{blocked}",
+            page.hits.len(),
             hit.title,
             match hit.engines.len() {
                 0 => "no engine".to_string(),
                 1 => hit.source().to_string(),
                 n => format!("{n} engines"),
             }
+        )),
+        None if !page.failed.is_empty() => Err(format!(
+            "Search did not run — {} could not be reached (blocked, rate limited or too \
+             slow). Try again in a minute.",
+            web::join_names(&page.failed)
         )),
         None => Err("Search ran, but every engine came back empty — you may be offline, \
                      or on a network they all block. Try again in a minute."
@@ -659,6 +826,77 @@ pub(crate) const SYNCED_HOME_FOLDERS: &[&str] = &[
     "Creative Cloud Files",
 ];
 
+/// Say what a storage failure MEANS, in words that name a remedy.
+///
+/// A room lives wherever the user put it: an external disk, a USB stick, a
+/// network share, a nearly-full boot volume. When that volume disappears
+/// mid-session or fills up, every save and every background job starts failing
+/// and what reached the user was the engine's own text — "disk I/O error",
+/// "attempt to write a readonly database", "database or disk is full". None of
+/// those names a cause, and none of them says what to do about it.
+///
+/// EVIDENCE, NOT GUESSWORK. The "your drive is gone" wording is used only after
+/// checking that the room file really has stopped existing; anything this
+/// cannot recognize is passed through completely unchanged, because a confident
+/// wrong diagnosis is worse than jargon. The original message is kept in
+/// brackets either way — it is what a bug report needs.
+///
+/// The room's PATH is deliberately not quoted here: an error string can end up
+/// as a tool result, and a room's file name is room content.
+pub(crate) fn humanize_storage_error(err: &str, room_path: &str) -> String {
+    let lower = err.to_lowercase();
+    let is_storage = lower.contains("disk i/o error")
+        || lower.contains("database or disk is full")
+        || lower.contains("readonly database")
+        || lower.contains("unable to open database")
+        || lower.contains("no space left")
+        // std::io::Error always prints these as "… (os error N)", so the
+        // closing paren is what makes the number a WHOLE number. Matching the
+        // bare "os error 2" also swallowed 20-29 — "Invalid argument (os error
+        // 22)" and "Too many open files (os error 24)" would have been reported
+        // to the user as a disconnected drive, which is the confident wrong
+        // diagnosis the rest of this function exists to avoid.
+        || lower.contains("os error 28)") // ENOSPC
+        || lower.contains("os error 2)"); // ENOENT — the volume went away
+    if !is_storage {
+        return err.to_string();
+    }
+    if !std::path::Path::new(room_path).exists() {
+        return format!(
+            "This room's file can't be reached any more — the drive or folder holding it has \
+             gone away. Reconnect it and try again; nothing else was changed. [{err}]"
+        );
+    }
+    if lower.contains("full") || lower.contains("no space left") || lower.contains("os error 28") {
+        return format!(
+            "The disk holding this room is full, so nothing could be saved. Free some space \
+             and try again. [{err}]"
+        );
+    }
+    format!(
+        "This room's file couldn't be read or written just now — the drive holding it may be \
+         disconnected, full, or read-only. [{err}]"
+    )
+}
+
+/// Is `rest` (a path relative to the home directory) inside this sync folder?
+///
+/// The trailing separator matters: `Dropboxes/room` is not in Dropbox, and the
+/// room file is always INSIDE one of these.
+///
+/// The ` (…)` branch is Dropbox Business and second linked accounts, which name
+/// the folder `Dropbox (Personal)` / `Dropbox (Work)` / `Dropbox (Acme Inc)`
+/// whenever the install predates the macOS File Provider. An exact-name test
+/// left every one of those rooms with no sync warning at all — the layout where
+/// the mix of databases and file sync is MOST likely, since it is the older
+/// client. (Modern installs land under `Library/CloudStorage/`, checked above.)
+fn in_home_sync_folder(rest: &str, folder: &str) -> bool {
+    let Some(tail) = rest.strip_prefix(folder) else {
+        return false;
+    };
+    tail.starts_with('/') || (tail.starts_with(" (") && tail.contains(")/"))
+}
+
 /// True when the room file lives under a known cloud-sync root — databases and
 /// file sync are a dangerous mix, so the UI warns once (HLT-6). Covers iCloud
 /// (`Library/Mobile Documents`), modern `Library/CloudStorage/` (Dropbox,
@@ -672,11 +910,11 @@ pub(crate) fn is_synced_path(path: &str) -> bool {
     if let Ok(home) = std::env::var("HOME") {
         let home = home.trim_end_matches('/');
         if !home.is_empty() {
-            // The trailing separator matters: `~/Dropboxes/room` is not in
-            // Dropbox, and the room file is always INSIDE one of these.
-            return SYNCED_HOME_FOLDERS
-                .iter()
-                .any(|folder| path.starts_with(&format!("{home}/{folder}/")));
+            if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
+                return SYNCED_HOME_FOLDERS
+                    .iter()
+                    .any(|folder| in_home_sync_folder(rest, folder));
+            }
         }
     }
     false
@@ -693,6 +931,29 @@ pub(crate) fn is_synced_path(path: &str) -> bool {
 /// rewrite step, and a room downgraded to an older build still reads as on.
 pub(crate) fn web_access_enabled(conn: &Connection) -> bool {
     matches!(db::get_setting(conn, "web_provider").as_deref(), Some(v) if !v.is_empty() && v != "off")
+}
+
+/// What the room says when its internet switch is off and something tried to
+/// reach the network anyway. One string so every inlet refuses in the same
+/// words and the user is told where the switch is.
+pub(crate) const WEB_OFF_MESSAGE: &str =
+    "This room is offline. Turn on Settings → Online features to fetch from the internet.";
+
+/// [`web_access_enabled`] as a REFUSAL, for the inlets a PERSON drives.
+///
+/// The model's web tools have always been gated at the served catalog, but the
+/// user-facing ones — Add → Web link, the video import, the download job —
+/// reached the internet with the switch off. A room whose settings read "Off —
+/// room stays offline" that still fetches a page on a click is making a false
+/// privacy claim, which is the same reason `browse::require_web_enabled` exists
+/// for the address bar. Same posture, applied to the remaining three inlets.
+pub(crate) fn require_web_access(state: &AppState) -> Result<(), String> {
+    let on = state.with_room(|room| Ok(web_access_enabled(&room.conn)))?;
+    if on {
+        Ok(())
+    } else {
+        Err(WEB_OFF_MESSAGE.into())
+    }
 }
 
 /// The two web LANES a room may independently switch off (owner decision
@@ -734,7 +995,14 @@ impl WebLanes {
 
     /// Is this tool name gated by a lane that is currently off?
     pub(crate) fn blocks(self, name: &str) -> bool {
-        if !self.search && matches!(name, "web_search" | "fetch_page") {
+        // The download verbs ride with search because the Web agent is where
+        // they are boxed — see `DOWNLOAD_TOOL_NAMES`. Without them here, "Web
+        // agent off" left saving a link, downloading a file and downloading a
+        // video all still reachable, and the agent still reachable with them.
+        if !self.search
+            && (matches!(name, "web_search" | "fetch_page")
+                || DOWNLOAD_TOOL_NAMES.contains(&name))
+        {
             return true;
         }
         if !self.browse && browse::is_browse_tool(name) {
@@ -831,6 +1099,70 @@ mod tests {
         // A folder that merely starts with a sync folder's name does not.
         assert!(!is_synced_path(&format!("{home}/Dropboxes/room.roomai")));
         assert!(!is_synced_path(&format!("{home}/Documents/room.roomai")));
+    }
+
+    #[test]
+    fn a_storage_failure_says_what_happened_and_what_to_do() {
+        // The room file is gone (its drive was unplugged): the message has to
+        // name the drive, not the database.
+        let missing = "/Volumes/Nope/room.arcelle";
+        let gone = humanize_storage_error("disk I/O error", missing);
+        assert!(gone.contains("drive or folder holding it has gone away"), "{gone}");
+        // The engine's own words survive for a bug report...
+        assert!(gone.contains("disk I/O error"), "{gone}");
+        // ...and the room's own file name never appears — an error string can
+        // become a tool result, and a file name is room content.
+        assert!(!gone.contains("room.arcelle"), "{gone}");
+
+        // A full disk is a different remedy, and the file is still there.
+        let here = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        let full = humanize_storage_error("database or disk is full", &here);
+        assert!(full.contains("full"), "{full}");
+        assert!(full.contains("Free some space"), "{full}");
+    }
+
+    #[test]
+    fn an_ordinary_error_is_passed_through_untouched() {
+        // Only what can be evidenced is rewritten: a confident wrong diagnosis
+        // is worse than the jargon it replaces.
+        for msg in ["No room is open.", "That file is not in this room.", "cancelled"] {
+            assert_eq!(humanize_storage_error(msg, "/nonexistent/room.arcelle"), msg);
+        }
+        // …including the errno neighbours of ENOENT. `os error 2` as a bare
+        // SUBSTRING also matched 20-29, so an unrelated failure was announced
+        // as an unplugged drive — with the room's file conveniently "gone",
+        // since these paths do not exist.
+        for msg in [
+            "Invalid argument (os error 22)",
+            "Too many open files (os error 24)",
+            "Is a directory (os error 21)",
+        ] {
+            assert_eq!(
+                humanize_storage_error(msg, "/nonexistent/room.arcelle"),
+                msg,
+                "an unrelated errno was diagnosed as a storage failure",
+            );
+        }
+        // The two that ARE storage still land, in their full "(os error N)" form.
+        for msg in ["No such file or directory (os error 2)", "write failed (os error 28)"] {
+            assert_ne!(humanize_storage_error(msg, "/nonexistent/room.arcelle"), msg, "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_dual_account_dropbox_folder_still_warns() {
+        // Dropbox Business / a second linked account names the folder
+        // "Dropbox (Personal)" or "Dropbox (Work)" on pre-File-Provider
+        // installs. An exact "Dropbox/" test reported synced = false for every
+        // room in one — no warning at all, on the OLDER client.
+        let home = std::env::var("HOME").expect("HOME is set on macOS");
+        for folder in ["Dropbox (Personal)", "Dropbox (Work)", "Dropbox (Acme Inc)"] {
+            let path = format!("{home}/{folder}/room.arcelle");
+            assert!(is_synced_path(&path), "{path} must warn");
+        }
+        // Still not a match on the name alone — the room has to be INSIDE it.
+        assert!(!is_synced_path(&format!("{home}/Dropbox (Work)")));
+        assert!(!is_synced_path(&format!("{home}/Dropbox Notes/room.arcelle")));
     }
 
     #[test]

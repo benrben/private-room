@@ -27,6 +27,18 @@ export default function FeedbackModal({ s }: { s: WSState }) {
   const [drafting, setDrafting] = useState(false);
   const [diag, setDiag] = useState<AppDiag | null>(null);
   const [includeDiag, setIncludeDiag] = useState(true);
+  /** AUDIT #548: the error messages this session actually showed.
+   *
+   * Error pop-ups are the app's only failure report and they vanish when
+   * dismissed, so a report could carry the version and nothing else — "it said
+   * something about the model, I think". Captured live by `pushToast`, read
+   * once here so the list can't shift under the checkbox while it is open.
+   *
+   * OFF by default and printed in full below, because an error message can name
+   * a file, and a file name is room content. Nothing about this is automatic:
+   * the user reads the exact lines and decides. */
+  const [recentErrors] = useState(() => [...s.errorLogRef.current].reverse());
+  const [includeErrors, setIncludeErrors] = useState(false);
 
   useEffect(() => {
     void api.appDiag().then(setDiag).catch(() => {});
@@ -35,7 +47,16 @@ export default function FeedbackModal({ s }: { s: WSState }) {
   const diagLine = diag
     ? `Arcelle ${diag.version} · ${diag.os} (${diag.arch})`
     : "";
-  const finalBody = includeDiag && diagLine ? `${body.trim()}\n\n---\n${diagLine}` : body.trim();
+  const errorBlock =
+    includeErrors && recentErrors.length > 0
+      ? `\n\n### Error messages seen this session\n\n${recentErrors
+          .map((e) => `- \`${e.at}\` ${e.text}`)
+          .join("\n")}`
+      : "";
+  const finalBody =
+    (includeDiag && diagLine
+      ? `${body.trim()}\n\n---\n${diagLine}`
+      : body.trim()) + errorBlock;
   const ready = title.trim().length > 0 && body.trim().length > 0;
 
   function close() {
@@ -154,6 +175,31 @@ export default function FeedbackModal({ s }: { s: WSState }) {
           />
           Append version info{diagLine ? ` — ${diagLine}` : ""}
         </label>
+
+        {recentErrors.length > 0 && (
+          <>
+            <label className="rec-opt feedback-diag">
+              <input
+                type="checkbox"
+                checked={includeErrors}
+                onChange={(e) => setIncludeErrors(e.target.checked)}
+              />
+              Append the {recentErrors.length} error message
+              {recentErrors.length === 1 ? "" : "s"} shown this session
+            </label>
+            <p className="studio-prompt-hint">
+              Read them first — an error can name one of your files, and this
+              report goes to a public issue tracker.
+            </p>
+            <ul className="feedback-errors" data-testid="feedback-errors">
+              {recentErrors.map((e) => (
+                <li key={e.at + e.text} dir="auto">
+                  {e.text}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
 
         <div className="studio-prompt-actions">
           <button className="subtle" disabled={drafting} onClick={close}>

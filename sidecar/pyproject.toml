@@ -19,6 +19,13 @@ dependencies = [
     "langgraph>=1.2,<2",
     "langgraph-checkpoint>=4.1,<5",
     "langchain-ollama>=0.2",
+    # The local-model client itself. `llm.py` and `chat.py` import `ollama`
+    # DIRECTLY (AsyncClient / ResponseError), so it is a first-order dependency
+    # of ours — it was only ever present because langchain-ollama happens to
+    # pull it in. The day that transitive edge changes, a fresh `uv sync`
+    # installs cleanly and then every local generation fails on an ImportError
+    # at first use. Declare what we import.
+    "ollama>=0.4",
     "langchain-core>=1.4,<2",
     "fastapi>=0.110",
     # starlette 1.x removed the on_startup kwarg fastapi (< 1.0) still passes;

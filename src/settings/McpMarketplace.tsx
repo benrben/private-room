@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import type { CatalogEntry, InstallSpec, McpServerStatus } from "../api";
+import type { CatalogEntry, InstallSpec, McpServerStatus, RuntimeStatus } from "../api";
 import { CircleCheckIcon } from "../icons";
+import { hostOf, initials, isUsableEndpoint } from "./marketplaceText";
 
 interface Props {
   /** Merge a server entry into the room's mcpServers config and apply it
@@ -36,15 +37,6 @@ function specToEntry(
   if (Object.keys(headers).length) entry.headers = headers;
   return entry;
 }
-
-const initials = (n: string) =>
-  n
-    .replace(/[^A-Za-z0-9 ]/g, "")
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((w) => w[0])
-    .join("")
-    .toUpperCase();
 
 /** A deterministic hue per publisher, so a card's monogram is stable. */
 const hueFor = (s: string) => {
@@ -91,6 +83,11 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<CatalogEntry | null>(null);
+  // Has a fetch ever COMPLETED? Without this the page said "No connectors match
+  // that. Try clearing a filter." before it had started fetching — while the
+  // opt-in status was still being read, and again through the 250 ms debounce —
+  // sending the user hunting for a filter to turn off when nothing was wrong.
+  const [searched, setSearched] = useState(false);
   const debounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -116,6 +113,7 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
     } catch (e) {
       setError(String(e));
     } finally {
+      setSearched(true);
       setLoading(false);
     }
   }
@@ -125,6 +123,24 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
     try {
       await api.setMcpRegistryOptin(true);
       setOptedIn(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  /** Put the app back to air-gapped. Browsing the catalogue is the one time
+   * Arcelle reaches out on its own, and an opt-in with no way back is not a
+   * choice — it was a one-way door, with nothing anywhere in the app to close
+   * it. Clears what was already fetched too, so the page does not keep showing
+   * a catalogue it is no longer allowed to refresh. */
+  async function turnOff() {
+    setError("");
+    try {
+      await api.setMcpRegistryOptin(false);
+      setEntries([]);
+      setSearched(false);
+      setSelected(null);
+      setOptedIn(false);
     } catch (e) {
       setError(String(e));
     }
@@ -143,7 +159,7 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
             To list connectors, Arcelle fetches the public MCP registry over
             the internet — the one time it reaches out on its own. Nothing from
             your room is sent; only the catalog comes back. Installing still asks
-            before anything runs.
+            before anything runs, and you can turn browsing back off at any time.
           </p>
           <button className="primary" onClick={turnOn}>
             Turn on registry browsing
@@ -152,6 +168,12 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
         </div>
       </div>
     );
+  }
+
+  // The opt-in answer has not come back yet: say nothing rather than render an
+  // empty grid that reads as "the registry has no connectors".
+  if (optedIn === null) {
+    return <div className="settings-hint mkt-status">Checking…</div>;
   }
 
   const shown = entries.filter(
@@ -201,6 +223,15 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
             />
             <span className="mkt-sw" /> No API key
           </label>
+          {/* The way back out of the one outbound feature in the app. */}
+          <button
+            type="button"
+            className="subtle mkt-optout"
+            title="Stop Arcelle fetching the public connector registry"
+            onClick={() => void turnOff()}
+          >
+            Turn off browsing
+          </button>
         </div>
       </div>
 
@@ -215,10 +246,17 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
       {loading && !error && (
         <div className="settings-hint mkt-status">Fetching the catalog…</div>
       )}
-      {!loading && !error && shown.length === 0 && (
+      {/* Only once a fetch has actually come back is an empty grid a fact about
+          the catalogue rather than about the app not having asked yet. */}
+      {!loading && !error && searched && shown.length === 0 && (
         <div className="settings-hint mkt-status">
-          No connectors match that. Try clearing a filter.
+          {entries.length === 0
+            ? "The registry returned nothing for that search."
+            : "No connectors match that. Try clearing a filter."}
         </div>
+      )}
+      {!loading && !error && !searched && (
+        <div className="settings-hint mkt-status">Fetching the catalog…</div>
       )}
 
       <div className="mkt-grid">
@@ -295,6 +333,10 @@ function InstallDrawer({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [done, setDone] = useState(installed);
+  // The panel promised "You'll be asked before it starts" and nothing asked:
+  // Install wrote the config, recorded the approval and launched the program in
+  // one click. This is that ask — an explicit second step naming what runs.
+  const [confirming, setConfirming] = useState(false);
   // OAuth (remote only): whether a token is stored, and whether sign-in is busy.
   const [signedIn, setSignedIn] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
@@ -305,6 +347,13 @@ function InstallDrawer({
   // Bumped to orphan an in-flight sign-in the user gave up on, so a stuck
   // browser round-trip never traps the drawer on a spinner.
   const authRun = useRef(0);
+  // A local connector runs through `uvx` or `npx`. On a Mac without them the
+  // install used to "succeed" and the connector then failed with the launcher's
+  // raw "No such file or directory" and no way to fix it from inside the app.
+  // `null` means "not asked yet" — never rendered as "it's fine".
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const [runtimePct, setRuntimePct] = useState(0);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -319,6 +368,52 @@ function InstallDrawer({
       api.mcpOauthStatus(entry.name).then(setSignedIn).catch(() => {});
     }
   }, [isRemote, entry.name, done]);
+
+  // Ask about the command this connector actually needs, whenever it changes
+  // (the local/cloud toggle swaps the whole spec).
+  const command = spec.kind === "stdio" ? spec.command : "";
+  useEffect(() => {
+    if (!command) {
+      setRuntime(null);
+      return;
+    }
+    let live = true;
+    api
+      .mcpRuntimeForCommand(command)
+      .then((r) => live && setRuntime(r))
+      // An unanswered question stays unanswered: showing nothing is honest,
+      // claiming "ready" is not.
+      .catch(() => live && setRuntime(null));
+    return () => {
+      live = false;
+    };
+  }, [command, runtimeBusy]);
+
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    api
+      .onRuntimeProgress((p) => {
+        setRuntimePct(p.total > 0 ? Math.round((p.got / p.total) * 100) : 0);
+      })
+      .then((u) => {
+        un = u;
+      });
+    return () => un?.();
+  }, []);
+
+  async function doProvision() {
+    if (!runtime?.kind) return;
+    setRuntimeBusy(true);
+    setErr("");
+    setRuntimePct(0);
+    try {
+      await api.mcpProvisionRuntime(runtime.kind);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setRuntimeBusy(false);
+    }
+  }
 
   // The sign-in URL arrives once discovery + client registration succeed, just
   // before the browser is asked to open — capture it for this connector.
@@ -344,6 +439,7 @@ function InstallDrawer({
     } catch (e) {
       setErr(String(e));
     } finally {
+      setConfirming(false);
       setBusy(false);
     }
   }
@@ -364,6 +460,27 @@ function InstallDrawer({
     }
   }
 
+  /** AUDIT 506: hand the saved sign-in back.
+   *
+   * `mcp_oauth_sign_out` has worked the whole time — it clears the stored token
+   * AND strips the bearer header — but nothing on screen called it, so the
+   * drawer said "Signed in" forever and the only way to drop a connector's
+   * account was to delete the connector and set it up again from scratch.
+   * `signedIn` is re-read from the backend rather than assumed, so a sign-out
+   * that failed cannot leave the button telling the user it worked. */
+  async function doSignOut() {
+    setAuthBusy(true);
+    setErr("");
+    try {
+      await api.mcpOauthSignOut(entry.name);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setSignedIn(await api.mcpOauthStatus(entry.name).catch(() => false));
+      setAuthBusy(false);
+    }
+  }
+
   /** Stop *waiting* on a sign-in that isn't coming back (a non-standard OAuth
    * server, or the browser was closed). The backend attempt is orphaned — it
    * times out on its own — so the UI is never trapped on the spinner. */
@@ -373,7 +490,11 @@ function InstallDrawer({
     setAuthUrl("");
   }
 
-  const host = spec.kind === "http" ? new URL(spec.url).host : "";
+  // NEVER `new URL(...)` bare here: these addresses come straight off the public
+  // registry unchecked, and one entry missing its "https://" threw during render
+  // and took the whole app window blank.
+  const host = spec.kind === "http" ? hostOf(spec.url) : "";
+  const badEndpoint = spec.kind === "http" && !isUsableEndpoint(spec.url);
 
   return (
     <div className="mkt-scrim" onClick={onClose}>
@@ -439,8 +560,9 @@ function InstallDrawer({
               <div>
                 <b>This connector runs in the cloud.</b> When the assistant calls
                 it, your prompt and the tool's arguments leave your Mac and reach{" "}
-                <b>{host}</b>. Arcelle redacts sensitive spans first and asks
-                again the moment data is about to leave.
+                <b>{host || "an address this catalogue entry did not spell out"}</b>.
+                Arcelle redacts sensitive spans first and asks again the moment
+                data is about to leave.
               </div>
             </div>
           ) : (
@@ -450,7 +572,7 @@ function InstallDrawer({
                 <b>Runs on your Mac.</b> Arcelle starts{" "}
                 <b>{spec.kind === "stdio" ? spec.command : ""}</b> as a local
                 program — it only reaches the internet if the tool itself makes a
-                request. You'll be asked before it starts.
+                request. You confirm below before it starts.
               </div>
             </div>
           )}
@@ -464,6 +586,12 @@ function InstallDrawer({
                 ? spec.url
                 : `${spec.command} ${spec.args.join(" ")}`}
             </div>
+            {badEndpoint && (
+              <div className="gate-error">
+                This registry entry's address is not a usable http(s) URL, so
+                connecting to it could only fail. Nothing was installed.
+              </div>
+            )}
           </div>
 
           {secretKeys.length > 0 && (
@@ -475,8 +603,13 @@ function InstallDrawer({
                 {secretKeys.map((k) => (
                   <label key={k} className="mkt-field">
                     <span>{k}</span>
+                    {/* Masked like the AI-provider key box beside it. The
+                        Connectors screen is not fenced off from the app-driving
+                        agent's "look at the screen" step, so a key shown in the
+                        clear is a key it can read half-way through being typed. */}
                     <input
-                      type="text"
+                      type="password"
+                      autoComplete="off"
                       spellCheck={false}
                       value={secrets[k] ?? ""}
                       placeholder={
@@ -502,23 +635,77 @@ function InstallDrawer({
               View source ↗
             </a>
           )}
+          {/* Only when we ASKED and the answer was "it cannot run". A missing
+              answer shows nothing rather than a reassurance we do not have. */}
+          {runtime && !runtime.available && (
+            <div className="mkt-wall warn" role="status">
+              {ICON.warn}
+              <div>
+                {runtime.note}
+                {runtime.provisionable && (
+                  <>
+                    {" "}
+                    <button
+                      className="subtle"
+                      disabled={runtimeBusy}
+                      onClick={() => void doProvision()}
+                    >
+                      {runtimeBusy
+                        ? `Downloading… ${runtimePct}%`
+                        : `Download ${runtime.kind} for me`}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
           {err && <div className="gate-error">{err}</div>}
         </div>
 
         <div className="mkt-dr-foot">
+          {confirming && !done && (
+            <div className="mkt-wall warn mkt-confirm" role="alert">
+              {ICON.warn}
+              <div>
+                {isRemote ? (
+                  <>
+                    <b>Connect to {host || "this endpoint"} now?</b> Arcelle will
+                    add it to this room and start talking to it straight away.
+                  </>
+                ) : (
+                  <>
+                    <b>Start this program on your Mac now?</b> Arcelle will run{" "}
+                    <code>{spec.kind === "stdio" ? spec.command : ""}</code> as
+                    soon as you confirm.
+                  </>
+                )}{" "}
+                Applying also (re)starts every other enabled connector in this
+                room — including any you have not approved before.
+              </div>
+            </div>
+          )}
           <button
             className={`primary mkt-install btn-ic ${isRemote ? "remote" : ""}`}
-            disabled={busy || done}
-            onClick={doInstall}
+            disabled={busy || done || badEndpoint}
+            onClick={() => (confirming ? void doInstall() : setConfirming(true))}
           >
             {done
               ? (<><CircleCheckIcon size={13} /> Installed</>)
               : busy
                 ? "Installing…"
-                : isRemote
-                  ? "Review & connect"
-                  : "Install to this room"}
+                : confirming
+                  ? isRemote
+                    ? "Yes, connect now"
+                    : "Yes, start it now"
+                  : isRemote
+                    ? "Review & connect"
+                    : "Install to this room"}
           </button>
+          {confirming && !done && !busy && (
+            <button className="subtle" onClick={() => setConfirming(false)}>
+              Not now
+            </button>
+          )}
           {isRemote && done && (
             <div className="mkt-oauth">
               <button
@@ -532,6 +719,19 @@ function InstallDrawer({
                     ? "Waiting for your browser…"
                     : "Connect account (sign in)"}
               </button>
+              {/* AUDIT 506: the way back out. Without it the panel said
+                  "Signed in" forever and dropping a saved account meant
+                  deleting the whole connector and setting it up again. */}
+              {signedIn && (
+                <button
+                  className="btn-ic mkt-oauth-signout"
+                  disabled={authBusy}
+                  onClick={doSignOut}
+                  title="Forget this connector's saved sign-in and remove its token from this room"
+                >
+                  Sign out
+                </button>
+              )}
               {authBusy && (
                 <div className="mkt-oauth-wait">
                   <span className="settings-hint">
@@ -573,7 +773,7 @@ function InstallDrawer({
           <div className="mkt-dr-note">
             {isRemote
               ? "Added to this room only · sign-in opens your browser"
-              : "Added to this room only · you approve before it runs"}
+              : "Added to this room only · you confirm before it runs"}
           </div>
         </div>
       </aside>

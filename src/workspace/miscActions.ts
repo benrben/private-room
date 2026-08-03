@@ -263,6 +263,10 @@ export function makeMiscActions(
       // The message lives in the chat tab — a hit picked while Studio or
       // Activity is showing must bring the conversation forward first.
       s.setAiTab("chat");
+      // The transcript paints only its newest page, so a hit on an older
+      // message has no element to scroll to — ask the pane to widen its page
+      // first, or `revealMessage` polls for two seconds and gives up silently.
+      s.setRevealMsgId(r.messageId);
       revealMessage(r.messageId);
     } else {
       // A memory hit opens the Memory area, where the row can be edited.
@@ -286,7 +290,13 @@ export function makeMiscActions(
    * agent's turn until its timeout rather than failing honestly.
    */
   function resolveBrowseConsent(req: BrowseConsentRequest, approved: boolean) {
-    api.resolveAgentUi(req.id, { approved }).catch(() => {});
+    // A card outlives the tool call waiting on it: the call gives up on its own
+    // budget and is told nobody approved, while the card sits there. Pressing
+    // Allow after that used to succeed silently — card gone, nothing typed, the
+    // user believing they had approved it. The host now says so, and so do we.
+    api.resolveAgentUi(req.id, { approved }).catch((e) => {
+      if (approved) s.pushToast("error", String(e));
+    });
     s.setBrowseConsents((q) => q.filter((r) => r.id !== req.id));
   }
 

@@ -1,5 +1,7 @@
+import { confirm as askConfirm } from "@tauri-apps/plugin-dialog";
 import { RecoveryKeyIcon } from "./RecoveryKeyIcon";
 import { CircleCheckIcon } from "../icons";
+import { useFocusTrap } from "../settings/useFocusTrap";
 
 // Recovery-code reveal after create — shown once, then we enter.
 export function RecoveryModal({
@@ -13,6 +15,31 @@ export function RecoveryModal({
   setRecoveryCopied: (v: boolean) => void;
   onDismiss: () => void;
 }) {
+  /** "Skip for now" used to be byte-for-byte "I saved it": one click and the
+   * only way back into this room without the password was gone, with nothing
+   * said. The code is shown ONCE — there is no reset and no second reveal — so
+   * leaving without it has to be a deliberate second answer. Copying (or
+   * printing) counts as saving it, so the guard only stands in the way of the
+   * user who genuinely has nothing written down. */
+  async function skip() {
+    if (recoveryCopied) {
+      onDismiss();
+      return;
+    }
+    const ok = await askConfirm(
+      "This code is shown once and never again. Without it, forgetting the " +
+        "password means the room can never be opened — not by us, not by anyone. " +
+        "Continue without saving it?",
+      { title: "Skip the recovery code", kind: "warning", okLabel: "Skip anyway" },
+    ).catch(() => false);
+    if (ok) onDismiss();
+  }
+
+  // Escape is a skip, so it goes through the same guard rather than dismissing
+  // a one-time reveal outright. The trap also keeps Tab inside the panel — it
+  // renders over the start screen, whose buttons were reachable behind it.
+  const { modalRef, onModalKeyDown } = useFocusTrap(() => void skip());
+
   return (
     <div
       style={{
@@ -26,9 +53,17 @@ export function RecoveryModal({
         zIndex: 100,
       }}
     >
-      <div style={{ width: "min(420px, 100%)" }}>
+      <div
+        ref={modalRef}
+        tabIndex={-1}
+        onKeyDown={onModalKeyDown}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="recovery-modal-title"
+        style={{ width: "min(420px, 100%)" }}
+      >
         <div className="recovery-sheet">
-          <div className="recovery-sheet-title">
+          <div className="recovery-sheet-title" id="recovery-modal-title">
             <span
               style={{
                 display: "inline-flex",
@@ -68,7 +103,7 @@ export function RecoveryModal({
               I saved it
             </button>
           </div>
-          <button type="button" className="subtle" onClick={onDismiss}>
+          <button type="button" className="subtle" onClick={() => void skip()}>
             Skip for now
           </button>
         </div>

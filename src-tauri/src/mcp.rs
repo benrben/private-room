@@ -264,12 +264,12 @@ impl Client {
         }
     }
 
-    /// Call a tool and flatten its content blocks into plain text.
+    /// Call a tool and normalize its content blocks (text plus any pictures).
     pub async fn call_tool(
         &mut self,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, String> {
+    ) -> Result<ToolOutput, String> {
         match self {
             Client::Stdio(c) => c.call_tool(name, arguments).await,
             Client::Http(c) => c.call_tool(name, arguments).await,
@@ -277,11 +277,44 @@ impl Client {
     }
 }
 
-/// Normalize a `tools/call` result into plain text (or an `Err` when the tool
-/// reported `isError`). Shared by both transports — non-text blocks are noted,
-/// `structuredContent` is a fallback, and empty output becomes `(no output)`.
-fn flatten_call_result(result: &serde_json::Value) -> Result<String, String> {
+/// How many pictures one connector call may hand over. A screenshot tool
+/// answers with one; a contact sheet could answer with forty, and every one of
+/// them costs a vision round.
+const MAX_TOOL_IMAGES: usize = 2;
+
+/// Largest base64 payload accepted for one picture (~3 MB of PNG). Past this a
+/// connector is not sending a screenshot, it is sending a file — and the
+/// conversation it would land in has a context window.
+const MAX_TOOL_IMAGE_B64: usize = 4 * 1024 * 1024;
+
+/// Image MIME types the perception path can actually decode. Anything else is
+/// reported as omitted rather than handed on as pixels that will fail later.
+const TOOL_IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg", "image/jpg", "image/webp"];
+
+/// What one connector tool call produced.
+#[derive(Debug)]
+pub struct ToolOutput {
+    pub text: String,
+    /// Standard base64 (no `data:` prefix) for each usable `image` block, in
+    /// the order the server sent them.
+    pub images: Vec<String>,
+}
+
+/// Normalize a `tools/call` result (or an `Err` when the tool reported
+/// `isError`). Shared by both transports — `structuredContent` is a fallback,
+/// and empty output becomes `(no output)`.
+///
+/// `image` blocks are CARRIED, not dropped. A screenshot tool, a chart renderer
+/// or a map connector answers with a picture, and flattening it to
+/// "[image content omitted]" left the model with nothing to look at — while
+/// Arcelle's own room tools pass pixels over this very protocol (`tool_result`
+/// in `room_mcp`). Bounded on purpose (count, size, MIME): what a connector
+/// sends is not ours to trust, and anything refused is still SAID rather than
+/// silently dropped, so the model never treats a picture it did not get as one
+/// it did.
+fn flatten_call_result(result: &serde_json::Value) -> Result<ToolOutput, String> {
     let mut parts: Vec<String> = Vec::new();
+    let mut images: Vec<String> = Vec::new();
     for block in result["content"].as_array().unwrap_or(&Vec::new()) {
         match block["type"].as_str() {
             Some("text") => {
@@ -289,11 +322,24 @@ fn flatten_call_result(result: &serde_json::Value) -> Result<String, String> {
                     parts.push(t.to_string());
                 }
             }
+            Some("image") => {
+                let mime = block["mimeType"].as_str().unwrap_or("").to_ascii_lowercase();
+                let data = block["data"].as_str().unwrap_or("");
+                if !TOOL_IMAGE_MIMES.contains(&mime.as_str()) {
+                    parts.push(format!("[image omitted: unsupported format \"{mime}\"]"));
+                } else if data.len() > MAX_TOOL_IMAGE_B64 {
+                    parts.push("[image omitted: too large to attach]".to_string());
+                } else if images.len() >= MAX_TOOL_IMAGES {
+                    parts.push("[further images omitted]".to_string());
+                } else {
+                    images.push(data.to_string());
+                }
+            }
             Some(other) => parts.push(format!("[{other} content omitted]")),
             None => {}
         }
     }
-    if parts.is_empty() {
+    if parts.is_empty() && images.is_empty() {
         if let Some(s) = result.get("structuredContent") {
             parts.push(s.to_string());
         }
@@ -306,11 +352,12 @@ fn flatten_call_result(result: &serde_json::Value) -> Result<String, String> {
             text
         });
     }
-    Ok(if text.is_empty() {
-        "(no output)".into()
+    let text = if text.is_empty() && images.is_empty() {
+        "(no output)".to_string()
     } else {
         text
-    })
+    };
+    Ok(ToolOutput { text, images })
 }
 
 /// Collect `tools/list` records (one page) into `Tool`s. Shared by both
@@ -364,7 +411,7 @@ fn lock_tail(tail: &Mutex<String>) -> std::sync::MutexGuard<'_, String> {
 
 /// GUI apps on macOS get a bare PATH, so `npx`/`uvx` from a server config
 /// would not be found. Ask a login shell once, like detect_external does.
-fn login_shell_path() -> &'static str {
+pub(crate) fn login_shell_path() -> &'static str {
     static PATH: OnceLock<String> = OnceLock::new();
     PATH.get_or_init(|| {
         let from_shell = std::process::Command::new("zsh")
@@ -406,6 +453,17 @@ impl StdioClient {
         let path = tokio::task::spawn_blocking(login_shell_path)
             .await
             .map_err(|e| e.to_string())?;
+        // A runtime the app downloaded for this user (`commands::runtimes`)
+        // lives under the app's data folder, which is on no shell PATH — so
+        // without this prefix the download button fetched 45 MB into a folder
+        // nothing ever looked in. First, so a provisioned `uvx`/`npx` wins over
+        // a broken system one.
+        let prefix = crate::commands::cached_path_prefix();
+        let path = if prefix.is_empty() {
+            path.to_string()
+        } else {
+            format!("{prefix}:{path}")
+        };
         let mut child = tokio::process::Command::new(command)
             .args(args)
             .envs(env)
@@ -471,12 +529,12 @@ impl StdioClient {
         Ok((client, tools))
     }
 
-    /// Call a tool and flatten its content blocks into plain text.
+    /// Call a tool and normalize its content blocks (text plus any pictures).
     async fn call_tool(
         &mut self,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, String> {
+    ) -> Result<ToolOutput, String> {
         let args = if arguments.is_object() {
             arguments.clone()
         } else {
@@ -631,7 +689,7 @@ impl HttpClient {
         &mut self,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, String> {
+    ) -> Result<ToolOutput, String> {
         let args = if arguments.is_object() {
             arguments.clone()
         } else {
@@ -897,20 +955,57 @@ mod tests {
 
     #[test]
     fn flattens_tool_result_variants() {
-        // text blocks joined; non-text noted; isError → Err; empty → (no output).
+        // text blocks joined; unknown blocks noted; isError → Err; empty → (no output).
         let ok = serde_json::json!({"content": [{"type": "text", "text": "hello"},
-            {"type": "image", "data": "…"}]});
+            {"type": "audio", "data": "…"}]});
         assert_eq!(
-            flatten_call_result(&ok).unwrap(),
-            "hello\n[image content omitted]"
+            flatten_call_result(&ok).unwrap().text,
+            "hello\n[audio content omitted]"
         );
         let err =
             serde_json::json!({"content": [{"type": "text", "text": "boom"}], "isError": true});
         assert_eq!(flatten_call_result(&err).unwrap_err(), "boom");
         let empty = serde_json::json!({"content": []});
-        assert_eq!(flatten_call_result(&empty).unwrap(), "(no output)");
+        assert_eq!(flatten_call_result(&empty).unwrap().text, "(no output)");
         let structured = serde_json::json!({"content": [], "structuredContent": {"n": 1}});
-        assert_eq!(flatten_call_result(&structured).unwrap(), r#"{"n":1}"#);
+        assert_eq!(flatten_call_result(&structured).unwrap().text, r#"{"n":1}"#);
+    }
+
+    #[test]
+    fn carries_a_connector_image_instead_of_omitting_it() {
+        // A screenshot/chart/map connector answers with a picture, and it used
+        // to be flattened to "[image content omitted]" — the model was handed a
+        // note about an image rather than the image, on the very protocol the
+        // room's own tools use to pass pixels.
+        let shot = serde_json::json!({"content": [
+            {"type": "text", "text": "here you go"},
+            {"type": "image", "data": "AAAA", "mimeType": "image/png"}]});
+        let out = flatten_call_result(&shot).unwrap();
+        assert_eq!(out.images, vec!["AAAA".to_string()]);
+        assert_eq!(out.text, "here you go");
+        // An image ALONE is a real result, not "(no output)".
+        let bare = serde_json::json!({"content": [
+            {"type": "image", "data": "AAAA", "mimeType": "image/jpeg"}]});
+        assert!(flatten_call_result(&bare).unwrap().text.is_empty());
+        assert_eq!(flatten_call_result(&bare).unwrap().images.len(), 1);
+        // The three refusals are SAID, never silent — a model must not treat a
+        // picture it did not get as one it did.
+        let odd = serde_json::json!({"content": [
+            {"type": "image", "data": "AAAA", "mimeType": "image/tiff"}]});
+        let out = flatten_call_result(&odd).unwrap();
+        assert!(out.images.is_empty());
+        assert!(out.text.contains("unsupported format"), "{}", out.text);
+        let huge = serde_json::json!({"content": [
+            {"type": "image", "data": "A".repeat(MAX_TOOL_IMAGE_B64 + 1), "mimeType": "image/png"}]});
+        let out = flatten_call_result(&huge).unwrap();
+        assert!(out.images.is_empty());
+        assert!(out.text.contains("too large"), "{}", out.text);
+        let many: Vec<serde_json::Value> = (0..MAX_TOOL_IMAGES + 2)
+            .map(|_| serde_json::json!({"type": "image", "data": "A", "mimeType": "image/png"}))
+            .collect();
+        let out = flatten_call_result(&serde_json::json!({"content": many})).unwrap();
+        assert_eq!(out.images.len(), MAX_TOOL_IMAGES);
+        assert!(out.text.contains("further images omitted"), "{}", out.text);
     }
 
     #[test]

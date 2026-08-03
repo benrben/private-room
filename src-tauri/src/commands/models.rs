@@ -37,92 +37,121 @@ pub(crate) fn best_local_default(models: &[String]) -> String {
     }
     models
         .iter()
-        .find(|m| !is_embedding_model(m) && !is_external_engine(m) && !is_cloud_model(m))
+        // The MODEL question ("an ordinary Ollama tag, not a relay"), not the
+        // privacy one: with the Closet pointed at another computer every tag
+        // fails `runs_on_this_mac`, and this would have no model left to name.
+        .find(|m| !is_embedding_model(m) && served_by_ollama_engine(m))
         .cloned()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
-/// ADD-25: can this chat model READ an image (screenshot / video frame) fed
-/// into its context? Distinct from grounding accuracy (vision_model below) —
-/// gemma3 describes fine even though it aims boxes badly, and the default
-/// qwen3.5 is multimodal. Text-only chat models get a vision-model describe
-/// pass instead of an attached image.
+/// ADD-25: can this model READ an image (screenshot, video frame, room picture)
+/// fed into its context? Text-only models get a describe pass from a model that
+/// can see, instead of an attached image.
 ///
-/// NAME MATCHING ONLY, and therefore the fallback rather than the answer — see
-/// [`chat_model_sees_images`], which asks the engine. Kept for the moments the
-/// engine says nothing at all (a stopped sidecar must not turn a
-/// known-multimodal model blind mid-session) and for the remaining synchronous
-/// call site in `commands::vision`.
-pub(crate) fn is_vision_chat_model(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    !is_embedding_model(&m)
-        && ["vl", "llava", "vision", "moondream", "minicpm-v", "gemma3", "qwen3.5"]
-            .iter()
-            .any(|k| m.contains(k))
-}
-
-/// ADD-25: can this chat model read an image — ASKED, not guessed.
+/// ASKED, NEVER GUESSED FROM THE NAME. Every engine we speak to publishes this:
+/// Ollama reports a `vision` capability through `/api/show` (metadata only, no
+/// model load), and an API provider's image input rides the same live catalog
+/// the model picker fetches. This used to fall back to matching substrings
+/// ("vl", "llava", "gemma3", …) in the model name, which is a list of the
+/// models that existed when the list was written — so anything newer or simply
+/// named differently read as blind: its images were described to it second-hand
+/// by another model, and "mark this image" refused with "no vision model
+/// installed" while a perfectly capable model was selected.
 ///
-/// Ollama already reports a `vision` capability through `/api/show` (metadata
-/// only, no model load), and an OpenRouter model's input modalities ride the
-/// catalog the picker fetches. Deciding this by matching seven substrings in the
-/// name meant a newly installed multimodal model with an unfamiliar name was
-/// treated as blind: its images were described to it second-hand by another
-/// model, and "mark this image" refused with "no vision model installed".
+/// An engine that answers nothing is UNKNOWN, and unknown is not "yes": in
+/// practice it means the sidecar or Ollama is unreachable, in which case the
+/// vision call this gates was going to fail anyway, and failing on the engine
+/// is a truer message than a guess from a name.
 ///
-/// Order of truth: an API provider's catalog → Ollama's own capability list →
-/// [`is_vision_chat_model`] only when neither answered.
+/// The per-engine facts this used to spell out inline — a cloud CLI having no
+/// image channel at all, a provider model's image input living in the live
+/// catalog — are now DECLARED once in `capabilities.rs` and read from there, so
+/// this and the published support matrix cannot say different things about the
+/// same engine. The collapse of `Support::Unknown` to `false` stays HERE, at
+/// the caller, because that is a decision about this particular question ("may
+/// we hand it pixels?") and not a fact about the engine.
 pub(crate) async fn chat_model_sees_images(model: &str) -> bool {
-    if is_embedding_model(model) {
-        return false;
-    }
-    // A cloud CLI is a separate subprocess with no image channel from here —
-    // its perception tools go through a local vision model instead.
-    if is_cli_engine(model) {
-        return false;
-    }
-    if is_api_provider_model(model) {
-        // The provider capability cache is in-memory and filled only by a
-        // catalog fetch, and the gateways that trigger one all run LATER in the
-        // turn than this call. So the first ask after every launch decided
-        // vision by matching substrings in the slug: a capable model whose name
-        // lacks vl/vision/llava/gemma3/qwen3.5 read as blind for exactly one
-        // turn (its screenshot routed through a local describe pass, or refused
-        // outright), and the second ask was right — the shape of a bug.
-        ensure_provider_catalog(model).await;
-        return provider_model_vision(model).unwrap_or_else(|| is_vision_chat_model(model));
-    }
-    let caps = ollama::capabilities(model).await;
-    if caps.is_empty() {
-        return is_vision_chat_model(model);
-    }
-    caps.iter().any(|c| c == "vision")
+    crate::commands::vision_support(model).await.is_yes()
 }
 
-/// Grounding ("where is X") routes to a Qwen-VL model: measured on a known
-/// target, gemma3 puts boxes in the wrong place while qwen2.5vl is accurate
-/// without qwen3's slow thinking pass.
-pub(crate) fn vision_model(models: &[String], chat_model: &str) -> String {
-    grounding_model(models).unwrap_or_else(|| chat_model.to_string())
-}
-
-/// The installed Qwen-VL grounding model, or None when there isn't one.
+/// Which model draws the boxes for this room's image — ASKED, not guessed.
 ///
-/// Split out from `vision_model` because the fallback is a LIE at the grounding
-/// call site: `vision_model` hands back the chat model, and a text-only chat
-/// model asked to outline a region answers `[]` — which the image viewer renders
-/// as "The AI could not locate that in this image." So a machine with no VL
-/// model installed was told, over and over, that its image did not contain the
-/// thing it plainly contained. Callers that need real grounding must ask THIS
-/// and say something true when it returns None; callers that only need to READ
-/// an image (describe/attach) can keep using `vision_model`, because
-/// `is_vision_chat_model` covers that case.
-pub(crate) fn grounding_model(models: &[String]) -> Option<String> {
-    models
-        .iter()
-        .find(|m| m.contains("qwen2.5vl") || m.contains("qwen2.5-vl"))
-        .or_else(|| models.iter().find(|m| m.contains("qwen3-vl")))
-        .cloned()
+/// This is the pick the whole "it insists on downloading a vision helper" bug
+/// lived in. It used to be a search for three hard-coded Qwen-VL name patterns
+/// inside the LOCAL Ollama list, with a fallback that refused any external
+/// engine outright. So both of these were invisible to it:
+///
+///   * the room's own cloud model — Claude, Gemini, GPT through an API provider
+///     — whose image input is declared in the very catalog the model picker
+///     already fetched; and
+///   * any local multimodal build that isn't one of those three names.
+///
+/// Either way the user was told "no vision model is installed" and shown a
+/// Download button, while a more capable model sat right there, already
+/// selected. Nothing but this pick was missing: the sidecar's `/vision_locate`
+/// has always accepted a `provider`, `sidecar_json`/`sidecar_post` inject one
+/// for any API-provider model, and `provider_api` attaches the image to the
+/// outgoing turn.
+///
+/// Order of truth, capability only:
+///   1. the room's OWN chosen model, when its engine says it takes images AND
+///      an image can actually reach it ([`image_reaches_model`]) — the user
+///      picked it, so it wins;
+///   2. any installed model that REPORTS vision — on-Mac ones only, because by
+///      here the user has expressed no preference and pixels should not leave
+///      the machine on a pick they never made;
+///   3. `None` — and only then is "nothing here can see images" a true thing to
+///      say.
+pub(crate) async fn grounding_pick(models: &[String], chat_model: &str) -> Option<String> {
+    if image_reaches_model(chat_model) && chat_model_sees_images(chat_model).await {
+        return Some(chat_model.to_string());
+    }
+    for m in models {
+        if m == chat_model || !runs_on_this_mac(m) {
+            continue;
+        }
+        if chat_model_sees_images(m).await {
+            return Some(m.clone());
+        }
+    }
+    None
+}
+
+/// Will the PIXELS actually arrive at this model, or does something between
+/// here and it drop them?
+///
+/// Capability is not the whole question. The room's privacy door
+/// (`privacy.guard_outbound`) strips every image out of a request bound for a
+/// non-local model and only COUNTS what it blocked — it does not fail the call.
+/// So a cloud model that genuinely can see, in a room with the door on, gets a
+/// grounding prompt and no picture, answers with nothing, and the viewer renders
+/// that empty answer as "The AI could not locate that in this image" — a false
+/// statement about the user's photograph caused by a setting three screens away.
+///
+/// Picking such a model is therefore wrong even though it is capable: fall
+/// through to a local one, whose pixels the door has no reason to touch, and if
+/// there is none say so plainly. Naming the rule here rather than inside the
+/// pick keeps it findable from the seam it mirrors.
+pub(crate) fn image_reaches_model(model: &str) -> bool {
+    !(!runs_on_this_mac(model) && active_policy().is_some())
+}
+
+/// Which model would mark an image for the OPEN room, or `None` when nothing
+/// can. The viewer's vision offer and Settings → AI helpers both used to
+/// re-derive this in TypeScript from the Ollama model list alone, so a room
+/// running a cloud vision model was told to download a local one it had no use
+/// for. They ask this instead — one answer, the same one the grounding call
+/// itself will use.
+#[tauri::command]
+pub async fn grounding_model_for_room(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let explicit = {
+        let guard = state.room.lock().unwrap();
+        guard.as_ref().and_then(|room| model_setting(&room.conn))
+    };
+    let models = ollama::list_models().await.unwrap_or_default();
+    let chat_model = explicit.unwrap_or_else(|| best_default(&models));
+    Ok(grounding_pick(&models, &chat_model).await)
 }
 
 /// HLT-5: keep the chat model resident this long so follow-up questions are
@@ -194,6 +223,7 @@ pub async fn ai_status(state: State<'_, AppState>) -> Result<AiStatus, String> {
                 models,
                 default_model,
                 external,
+                remote_relay: !ollama_runs_here(),
             })
         }
         Err(_) => Ok(AiStatus {
@@ -202,6 +232,7 @@ pub async fn ai_status(state: State<'_, AppState>) -> Result<AiStatus, String> {
             models: vec![],
             default_model: explicit.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             external,
+            remote_relay: !ollama_runs_here(),
         }),
     }
 }
@@ -233,13 +264,49 @@ pub async fn model_capabilities() -> Result<Vec<ModelCaps>, String> {
 }
 
 /// ADD-10: launch the Ollama app so a first-time user never touches a terminal.
+///
+/// WAITS for `open` to report, instead of `spawn`ing and calling that success.
+/// `spawn` only fails when `open` itself cannot be executed — which never
+/// happens on macOS — so "Unable to find application named 'Ollama'" was
+/// reported to the user as a launch that worked. For anyone with a
+/// command-line-only Ollama there IS no app to open, and the button quietly did
+/// nothing while the "not running" banner stayed up: exactly the unevidenced
+/// success this app doesn't do. `open` returns as soon as it has handed the
+/// launch off, so waiting costs nothing.
 #[tauri::command]
-pub fn open_ollama() -> Result<(), String> {
-    std::process::Command::new("open")
-        .args(["-a", "Ollama"])
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Could not open Ollama: {e}"))
+pub async fn open_ollama() -> Result<(), String> {
+    let out = tauri::async_runtime::spawn_blocking(|| {
+        std::process::Command::new("open")
+            .args(["-a", "Ollama"])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("Could not open Ollama: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(open_ollama_failure(&out.stderr))
+}
+
+/// The sentence for a failed launch. `open`'s own reason when it gave one —
+/// never invented — plus the one thing that actually helps, because the common
+/// case is a real, working Ollama installed without its .app.
+fn open_ollama_failure(stderr: &[u8]) -> String {
+    let detail: String = String::from_utf8_lossy(stderr)
+        .trim()
+        .chars()
+        .take(200)
+        .collect();
+    let head = if detail.is_empty() {
+        "Couldn't open the Ollama app.".to_string()
+    } else {
+        format!("Couldn't open the Ollama app: {detail}")
+    };
+    format!(
+        "{head} If you installed Ollama from the command line there is no app to open — \
+         start it with `ollama serve` in Terminal."
+    )
 }
 
 #[tauri::command]
@@ -282,11 +349,12 @@ pub(crate) fn pull_cancel_key(name: &str) -> String {
 ///
 /// The symptom this exists for — a 3 GB vision helper is unstoppable once
 /// started, with no Cancel, no Pause and no effect from leaving the screen — is
-/// NOT fixed yet: no download surface calls `cancel_ask` with a `pull:` key, so
-/// nothing can reach this. Wiring one Stop button to
-/// `api.cancelAsk('pull:' + name)` on each of the three (Settings → model
-/// download, Settings → helpers, the image viewer's vision-helper offer)
-/// completes it; the Rust half is done and tested.
+/// fixed: every surface that starts a pull now offers a Stop that calls
+/// `api.cancelAsk('pull:' + name)` (Settings → model download, Settings →
+/// helpers, the image viewer's vision-helper offer, and the chat pane's
+/// first-run "Pick a model to download" card). Each keeps the name it started
+/// with in a ref, because the name on screen can change under a running pull;
+/// each also reads [`ollama::PULL_CANCELLED`] as "stopped", never as an error.
 #[tauri::command]
 pub async fn pull_model(
     window: tauri::Window,
@@ -368,27 +436,52 @@ mod tests {
         assert_ne!(pull_cancel_key("a"), pull_cancel_key("b"));
     }
 
-    #[test]
-    fn grounding_model_admits_when_nothing_can_aim() {
-        // Live bug 2026-07-27: `vision_model` falls back to the CHAT model, so a
-        // machine with no VL model installed grounded with a text-only model,
-        // got `[]`, and the viewer told the user "The AI could not locate that
-        // in this image" — a false claim about their picture. `grounding_model`
-        // returns None instead, and locate_in_image turns that into the
-        // NO_VISION_MODEL sentinel + the one-click pull.
-        let none_installed = vec!["qwen3.5:4b".to_string(), "llama3:8b".to_string()];
-        assert_eq!(grounding_model(&none_installed), None);
-        // ...while `vision_model` still (correctly, for READING an image) hands
-        // back the chat model — the two call sites want different answers.
-        assert_eq!(vision_model(&none_installed, "qwen3.5:4b"), "qwen3.5:4b");
+    /// Who may look at an image is decided by CAPABILITY, never by the model's
+    /// name. The old code matched substrings ("vl", "llava", "gemma3", …), which
+    /// is a snapshot of the models that existed when the list was written — so
+    /// anything newer, anything from another vendor, and every cloud model the
+    /// user selected themselves read as blind, and the app answered by demanding
+    /// a download of the one name it did know.
+    ///
+    /// The three answers reachable without an engine are pinned here; the rest
+    /// come from `/api/show` and the provider catalog, which is the whole point.
+    #[tokio::test]
+    async fn vision_is_a_capability_question_not_a_name_question() {
+        // An embedding model never sees, whatever it is called.
+        assert!(!chat_model_sees_images("nomic-embed-text:latest").await);
+        // A cloud CLI is a subprocess with no image channel — regardless of how
+        // capable the model behind it is, we cannot hand it pixels, so a room on
+        // one still needs a local model that can see.
+        assert!(!chat_model_sees_images("claude-cli").await);
+        assert!(!chat_model_sees_images("codex-cli::some-model::high").await);
+        // ...and with nothing installed to fall back to, the pick is None rather
+        // than a name we hope is multimodal.
+        assert_eq!(grounding_pick(&[], "claude-cli").await, None);
+    }
 
-        // A real VL model is picked, and qwen2.5vl wins over qwen3-vl (measured:
-        // qwen3 aims no better and pays for a thinking pass).
-        let both = vec!["qwen3-vl:8b".to_string(), "qwen2.5vl:7b".to_string()];
-        assert_eq!(grounding_model(&both), Some("qwen2.5vl:7b".to_string()));
-        let only_q3 = vec!["qwen3-vl:8b".to_string()];
-        assert_eq!(grounding_model(&only_q3), Some("qwen3-vl:8b".to_string()));
-        assert_eq!(grounding_model(&[]), None);
+    /// Capability is not the whole question: the privacy door strips images out
+    /// of any non-local request and only counts them, so a capable cloud model
+    /// in a door-on room would be handed a grounding prompt with no picture and
+    /// answer with no boxes — which the viewer renders as "could not locate that
+    /// in this image", a false claim about the user's photo. Such a model must
+    /// not be picked at all.
+    #[test]
+    fn a_model_the_door_would_blind_is_not_eligible() {
+        let _guard = policy_test_lock();
+        clear_policy();
+        // Door off: every model can be reached with pixels.
+        assert!(image_reaches_model("openrouter::vendor/sees"));
+        assert!(image_reaches_model("vendor-vl:cloud"));
+        assert!(image_reaches_model("some-local-model"));
+
+        set_active_policy_for_test();
+        // Door on: the two ways out of the Mac are now blind...
+        assert!(!image_reaches_model("openrouter::vendor/sees"));
+        assert!(!image_reaches_model("vendor-vl:cloud"));
+        assert!(!image_reaches_model("claude-cli::x"));
+        // ...while a model running here is untouched by it.
+        assert!(image_reaches_model("some-local-model"));
+        clear_policy();
     }
 
     #[test]
@@ -430,5 +523,19 @@ mod tests {
             "nomic-embed-text:latest".to_string(),
         ];
         assert_eq!(best_local_default(&no_local), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn a_failed_ollama_launch_says_so_and_names_the_command_line_case() {
+        // `spawn` succeeded whatever `open` then reported, so "Unable to find
+        // application named 'Ollama'" reached the user as a working launch and
+        // the "not running" banner just stayed up with nothing to explain it.
+        let msg = open_ollama_failure(b"Unable to find application named 'Ollama'\n");
+        assert!(msg.contains("Unable to find application named 'Ollama'"), "{msg}");
+        assert!(msg.contains("ollama serve"), "the one thing that helps is missing: {msg}");
+        // No reason from `open` is still a failure, and still not silence.
+        let bare = open_ollama_failure(b"");
+        assert!(bare.starts_with("Couldn't open the Ollama app."), "{bare}");
+        assert!(bare.contains("ollama serve"));
     }
 }

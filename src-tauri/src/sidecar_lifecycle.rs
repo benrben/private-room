@@ -43,6 +43,37 @@ fn lc() -> &'static Lifecycle {
     })
 }
 
+/// The shared secret every sidecar this app process spawns is given, and that
+/// every request of ours carries.
+///
+/// The port is loopback-only, but on a Mac loopback is not a boundary: without
+/// this, any other program running as the user could drive the agent — start
+/// runs, generate text, search the web, delete downloaded models. The room MCP
+/// bridge and `hub_mcp` have always demanded a token; the sidecar was the odd
+/// one out. Minted once per app process (two v4 UUIDs = 244 random bits),
+/// handed over in the child's ENVIRONMENT so it never reaches stdout, the
+/// stderr log or disk, and never logged here either.
+pub fn auth_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    })
+}
+
+/// The environment variable the sidecar reads it from (`server.TOKEN_ENV`).
+const TOKEN_ENV: &str = "ARCELLE_SIDECAR_TOKEN";
+
+/// Stamp our token on a sidecar request. EVERY request to the sidecar goes
+/// through here — a call site that forgets it gets a 401 instead of an answer,
+/// so this is the one place the header is spelled.
+pub fn authed(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    rb.header("authorization", format!("Bearer {}", auth_token()))
+}
+
 /// RAII marker for ONE request we have in flight on the sidecar, mirroring
 /// [`crate::ollama_lifecycle::Busy`]. Every caller of [`ensure_up`] takes one and
 /// holds it for the whole duration of its HTTP call — a streaming answer, a
@@ -152,6 +183,15 @@ fn current_base_url() -> Option<String> {
     lc().base_url.lock().ok().and_then(|g| g.clone())
 }
 
+/// The recorded sidecar's base URL, WITHOUT starting one.
+///
+/// [`ensure_up`] is the wrong door for teardown work: locking a room must never
+/// spawn the AI service just to tell it to forget something, and "there is no
+/// sidecar" is the same outcome as "it forgot".
+pub(crate) fn base_url_if_running() -> Option<String> {
+    current_base_url()
+}
+
 /// Stop the sidecar WE spawned, if any, and drop what we knew about it. Used
 /// both on app shutdown and when a recorded sidecar stops answering: a process
 /// that has wedged still owns its port and its memory, so respawning without
@@ -247,6 +287,10 @@ async fn spawn_and_wait() -> Result<String, String> {
         unavailable("no sidecar to launch — no bundled binary in Resources/ and no \
                      ARCELLE_SIDECAR_PYTHON pointing at a Python with the package")
     })?;
+    // The shared secret, handed over out of band. Environment rather than a
+    // second stdout line: the announce line is parsed (and, when a start goes
+    // wrong, read by a human), and a secret has no business there.
+    cmd.env(TOKEN_ENV, auth_token());
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         // NOT `Stdio::null()`. The sidecar's ENTIRE diagnostic channel is stderr:
@@ -459,6 +503,44 @@ mod tests {
         assert_eq!(parse_port_line("SIDECAR_PORT=notaport"), None);
         assert_eq!(parse_port_line("uvicorn running on ..."), None);
         assert_eq!(parse_port_line("PORT=1234"), None);
+    }
+
+    #[test]
+    fn the_sidecar_token_is_a_usable_secret_and_rides_on_every_request() {
+        let tok = auth_token();
+        // Stable for the process — a fresh one per call would 401 against the
+        // sidecar we already spawned with the first.
+        assert_eq!(tok, auth_token());
+        assert!(tok.len() >= 32, "{}", tok.len());
+        // A header value: no whitespace, no newline, nothing to smuggle with.
+        assert!(tok.chars().all(|c| c.is_ascii_alphanumeric()), "{tok}");
+
+        let req = authed(reqwest::Client::new().post("http://127.0.0.1:1/run"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            &format!("Bearer {tok}")
+        );
+    }
+
+    #[test]
+    fn no_sidecar_request_is_sent_without_the_token() {
+        // The sidecar now refuses an unauthenticated caller, so a request site
+        // that skips `authed` is a dead feature — a 401 where an answer was.
+        // This is the guard that finds the NEXT one, at compile time rather
+        // than in front of a user.
+        for (name, src) in [
+            ("sidecar.rs", include_str!("sidecar.rs")),
+            ("ollama.rs", include_str!("ollama.rs")),
+        ] {
+            for (n, line) in src.lines().enumerate() {
+                let hit = line.contains(".post(format!(\"{base}");
+                if hit && !line.contains("authed(") {
+                    panic!("{name}:{} posts to the sidecar unauthenticated: {line}", n + 1);
+                }
+            }
+        }
     }
 
     #[test]

@@ -77,7 +77,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
+import weakref
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, NamedTuple, TypedDict
 
 from langchain_core.runnables import RunnableConfig
@@ -93,10 +94,13 @@ from .agents import (
     agent_tool_specs,
     get_agent,
     group_prompt,
+    group_servable,
     group_tools,
     main_prompt,
     normalize_domain_key,
     reachable_domain_keys,
+    specialist_roster,
+    tagged_specialist,
     toolbox_for,
 )
 from .budget import byte_len, json_chars
@@ -112,6 +116,7 @@ from .messages import (
     tool_message,
     user_message,
 )
+from .planner import build_plan
 from .privacy import is_nonlocal_model
 from .prompts import (
     DONE_TEXT,
@@ -119,6 +124,8 @@ from .prompts import (
     IMAGE_HANDOFF,
     READ_RESULT_TOOL,
     SKILLS_NOTE,
+    TAG_UNAVAILABLE_NOTE,
+    TAGGED_SPECIALIST_NOTE,
     TOOL_GROUP_LABELS,
     TOOL_GROUPS_PROMPT,
     correction_note,
@@ -126,6 +133,7 @@ from .prompts import (
     duplicate_call_note,
     request_tools_spec,
     spill_note,
+    tag_available_clause,
     turn_progress_note,
     unlocked_note,
     with_read_result,
@@ -194,22 +202,68 @@ NOTHING_USABLE_TEXT = (
 
 
 class CancelToken:
-    """The ask's Stop button, seen from inside the loop."""
+    """The ask's Stop button, seen from inside the loop — and one NODE of the
+    run's cancel tree.
 
-    __slots__ = ("_cancelled",)
+    Owner replacement #3 (2026-08-03): cancellation is a hierarchy rooted at the
+    run. Every delegated child loop gets its own token (``Deps.for_child``), so
+    stopping the run stops every specialist under it, while a token cancelled
+    further down stops only its own subtree and leaves its siblings running.
 
-    def __init__(self) -> None:
+    Two mechanisms, deliberately, because they cover different failure modes:
+
+    * :meth:`cancel` walks DOWN, so a caller can be told what it actually
+      stopped (the ``/cancel`` reply, and eventually the user).
+    * :attr:`cancelled` reads UP the parent chain, so a child created DURING or
+      AFTER its parent's walk is stopped anyway. In the host this needs an
+      explicit re-check at birth, because Rust hands raw ``Arc<AtomicBool>``
+      flags to loops that never see the tree; here every reader goes through
+      this property, so the chain alone is enough.
+
+    ``label`` names the work for the user ("the File agent") — never room
+    content, in line with the rest of what leaves this process.
+    """
+
+    __slots__ = ("_cancelled", "_parent", "_kids", "label", "__weakref__")
+
+    def __init__(self, label: str = "this answer", parent: "CancelToken | None" = None) -> None:
         self._cancelled = False
+        self._parent = parent
+        self._kids: list[weakref.ref[CancelToken]] = []
+        self.label = label
 
-    def cancel(self) -> None:
-        self._cancelled = True
+    def child(self, label: str) -> "CancelToken":
+        """A token for work this one starts. Weakly held: a child is owned by
+        the coroutine running it, so a finished specialist prunes itself rather
+        than piling up for the length of a long turn."""
+        kid = CancelToken(label, parent=self)
+        self._kids = [w for w in self._kids if w() is not None]
+        self._kids.append(weakref.ref(kid))
+        return kid
+
+    def cancel(self) -> list[str]:
+        """Stop this node and its whole subtree; return the labels this call
+        actually stopped. Already-cancelled work is not re-reported — it was
+        stopped by the earlier Stop, and saying so twice would be a claim about
+        THIS one that isn't true."""
+        stopped: list[str] = []
+        if not self._cancelled:
+            self._cancelled = True
+            stopped.append(self.label)
+        for ref in list(self._kids):
+            kid = ref()
+            if kid is not None:
+                stopped.extend(kid.cancel())
+        return stopped
 
     @property
     def cancelled(self) -> bool:
-        return self._cancelled
+        if self._cancelled:
+            return True
+        return self._parent is not None and self._parent.cancelled
 
     def __bool__(self) -> bool:  # pragma: no cover - convenience
-        return self._cancelled
+        return self.cancelled
 
 
 class _NullSlot:
@@ -224,6 +278,27 @@ class _NullSlot:
 
 
 _NULL_SLOT = _NullSlot()
+
+
+@dataclass(slots=True)
+class _TurnShared:
+    """The three pieces of ``Deps`` that are per-TURN, not per-loop.
+
+    ``Deps`` used to be one object passed by reference to every loop in the
+    tree, which made "shared" and "copied" the same thing. Giving a delegated
+    child its own cancel token means giving it its own ``Deps``
+    (:meth:`Deps.for_child`) — and a plain copy would silently hand each child
+    its own round counter, its own worker semaphore and its own idea of who
+    holds the live answer area: the turn-wide runaway net would stop counting
+    the turn, the local room's one-model serialization would evaporate, and
+    every child would claim the live area the lease exists to arbitrate. Boxing
+    them here keeps them shared BY REFERENCE across every copy, which is the
+    property those three fields always relied on.
+    """
+
+    rounds_spent: int = 0
+    worker_sem: Any = None
+    live_node: str | None = None
 
 
 @dataclass(slots=True)
@@ -269,10 +344,22 @@ class Deps:
     #: `AgentState.stalls`, because a worker that repeats itself should end its
     #: own loop, not its siblings'. None/0 = the gate is off.
     turn_stall_budget: int | None = NO_PROGRESS_ROUNDS
-    _rounds_spent: int = field(default=0, repr=False, compare=False)
-    _worker_sem: Any = field(default=None, repr=False, compare=False)
-    #: Which loop (`AgentState.node_key`) currently holds the live answer area.
-    _live_node: str | None = field(default=None, repr=False, compare=False)
+    #: The per-TURN state every copy of this object shares — the round counter,
+    #: the worker semaphore and the live-area lease (`_TurnShared`). Shared BY
+    #: REFERENCE, which is what makes `for_child` safe.
+    _shared: _TurnShared = field(default_factory=_TurnShared, repr=False, compare=False)
+
+    def for_child(self, label: str) -> "Deps":
+        """This run's deps as one delegated CHILD sees them: same model, same
+        bridge, same turn budget, same live-area lease — its own cancel token.
+
+        Owner replacement #3. The child inherits its parent's Stop through the
+        token's parent chain, so cancelling the run still reaches every
+        specialist under it; what is new is that the child now HAS a node, which
+        is what a per-specialist Stop (and an honest "what did this Stop
+        actually stop" answer) can be built on.
+        """
+        return replace(self, cancel=self.cancel.child(label))
 
     def spend_round(self) -> bool:
         """Take one round from the TURN's budget; False once it is exhausted.
@@ -281,15 +368,18 @@ class Deps:
         them awaits its own model call, and asyncio gives us a single thread —
         ``+= 1`` between awaits cannot interleave.
         """
-        self._rounds_spent += 1
+        self._shared.rounds_spent += 1
         if not self.turn_round_budget or self.turn_round_budget <= 0:
             return True
-        return self._rounds_spent <= self.turn_round_budget
+        return self._shared.rounds_spent <= self.turn_round_budget
 
     def just_exhausted(self) -> bool:
         """True on the ONE round that first crossed the budget — so the user is
         told once, not once per loop still unwinding."""
-        return bool(self.turn_round_budget) and self._rounds_spent == self.turn_round_budget + 1
+        return (
+            bool(self.turn_round_budget)
+            and self._shared.rounds_spent == self.turn_round_budget + 1
+        )
 
     def claim_live(self, node: str) -> bool:
         """True when THIS loop may stream its round into the live answer area.
@@ -306,23 +396,23 @@ class Deps:
         A LEASE, not a lock: a loop that does not get it simply stays quiet.
         Nothing waits on anything, so this cannot deadlock or reorder events.
         """
-        if self._live_node is None:
-            self._live_node = node
+        if self._shared.live_node is None:
+            self._shared.live_node = node
             return True
-        return self._live_node == node
+        return self._shared.live_node == node
 
     def release_live(self, node: str) -> None:
         """Give the live area back, if this loop is what is holding it."""
-        if self._live_node == node:
-            self._live_node = None
+        if self._shared.live_node == node:
+            self._shared.live_node = None
 
     def worker_slot(self) -> Any:
         """An async context manager bounding concurrent children (or a no-op)."""
         if not self.worker_parallel or self.worker_parallel <= 0:
             return _NULL_SLOT
-        if self._worker_sem is None:
-            self._worker_sem = asyncio.Semaphore(self.worker_parallel)
-        return self._worker_sem
+        if self._shared.worker_sem is None:
+            self._shared.worker_sem = asyncio.Semaphore(self.worker_parallel)
+        return self._shared.worker_sem
 
 
 class AgentState(TypedDict, total=False):
@@ -345,6 +435,15 @@ class AgentState(TypedDict, total=False):
     #: The ACTIVE sub-agent (agents.py registry id) — set per plan step by
     #: run_agent; prepare scopes the catalog and prompt from it.
     agent_id: str
+    #: The name the USER tagged with the composer's ``*`` menu, AS TYPED — ""
+    #: for an ordinary turn. Not necessarily a domain key: a tag can reach us
+    #: naming nothing at all (a headless `agent_run`, or a composer whose
+    #: roster never loaded), and calling the field `tagged_domain` was how that
+    #: case got read as "no tag" and vanished. Read by the HUB only (`prepare`,
+    #: `_Delegator.for_round`), and only ever membership-tested against the
+    #: reachable keys: it narrows which specialists exist for this turn when it
+    #: names one, and is refused BY NAME when it does not.
+    tagged_name: str
     #: This loop's UNIQUE node identity in the turn's agent graph — `"main"`
     #: for the Main agent, `"<agent_id>#<pipeline slot>"` for a worker. The
     #: registry id alone cannot address a node: a round may dispatch two
@@ -574,6 +673,27 @@ def _why(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
+#: Exceptions whose message is already a whole sentence aimed at the user. For
+#: everything else the class name is kept, because it is often the only clue
+#: there is: bare ``'model'`` from a KeyError explains nothing, while
+#: ``KeyError: 'model'`` at least says an internal lookup missed.
+_SELF_EXPLAINING_ERRORS = ("ProviderApiError", "LlmError", "ToolError")
+
+
+def _why_failed(exc: BaseException) -> str:
+    """``_why`` for a failure shown in a UI, where jargon costs the reader.
+
+    Prefixing every reason with its Python class turned a provider's own
+    sentence into "ProviderApiError: …", which reads as an internal fault the
+    user caused. The prefix is dropped only when the message stands alone.
+    """
+    name = type(exc).__name__
+    reason = str(exc).strip()
+    if not reason:
+        return name
+    return reason if name in _SELF_EXPLAINING_ERRORS else f"{name}: {reason}"
+
+
 async def _list_tools(deps: Deps) -> list[Any]:
     """The bridge's catalog, with ONE retry and a sentence the user can act on.
 
@@ -621,6 +741,14 @@ def _locked_groups(
     advisor-scope bridge never serves ui tools — offering an unlockable group
     would teach the model to hallucinate).
 
+    "Servable" is `agents.group_servable`, NOT "was any tool of this group
+    served": on the cloud-CLI tier `app_ui` passes the any-one-of-them test on
+    `view_media_frame` alone (a room video's pixels, served as CONTENT) while
+    the three SCREEN tools stay local-only — so the group was still offered
+    here, a round could be spent unlocking it, and `group_prompt` then briefed
+    the model on ui_snapshot/ui_act. That is the failure `AgentSpec.requires`
+    was added to kill, reached through this entrance instead.
+
     ``own`` is the asking agent's OWN group, and it is never offered. The hatch
     exists for a lane the keyword routers MISSED — a reader that turns out to
     need the jobs tools — not for widening an agent inside its own domain,
@@ -634,7 +762,7 @@ def _locked_groups(
         for g in GROUPS
         if g not in unlocked
         and g != own
-        and (group_tools(g) & served_names)
+        and group_servable(g, served_names)
         and not (group_tools(g) <= current)
     ]
 
@@ -670,12 +798,20 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     served = await _list_tools(deps)
     served_specs = [s.to_ollama() for s in served]
     served_names = {s.get("function", {}).get("name") for s in served_specs}
+    # The specialist the user tagged with `*`, if any — narrows the hub's
+    # catalog to that one domain (`agent_tool_specs(only=…)`), and is ignored
+    # for a worker, which has no ask_*_agent tools to narrow.
+    tagged = str(state.get("tagged_name") or "") if agent.main else ""
     # Hub v3: the MAIN agent's only tools are its specialists — the
     # ask_*_agent catalog (≤6 entries, one per reachable domain). It never
     # sees a room tool; acting is what workers are for. (No request_tools
     # either: the specialists cover every unlockable lane.)
     tools = (
-        agent_tool_specs(web_enabled=web_enabled, served_names=served_names)
+        agent_tool_specs(
+            web_enabled=web_enabled,
+            served_names=served_names,
+            only=tagged or None,
+        )
         if agent.main
         else _select_tools(
             served_specs,
@@ -685,6 +821,59 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             plan_multi=bool(state.get("plan_multi", False)),
         )
     )
+
+    # The degenerate tier, said OUT LOUD. When the bridge serves nothing the
+    # Main agent gets an empty catalog and `MAIN_PROMPT_NO_SPECIALISTS` tells it
+    # to admit it cannot reach the room — which it duly does, in its own words.
+    # Those words are then the ENTIRE diagnosis available, because this app
+    # writes no log of its own, and they describe the model rather than the
+    # fault. Live QA 2026-08-03 read one such answer ("I'm Claude Code running
+    # in a terminal, I can't see the Arcelle room") as a statement about what
+    # the product IS, and filed it as a capability regression. It is not a
+    # capability at all: it is a wiring failure with a confident narrator.
+    #
+    # A step chip cannot be mistaken for the model's opinion, so the cause
+    # travels with the symptom.
+    if agent.main and not tools:
+        await deps.emit(
+            {
+                "t": "step",
+                "v": (
+                    "No specialists available — the room tool bridge served "
+                    f"{len(served_specs)} tools this run"
+                ),
+            }
+        )
+        await deps.emit({"t": "step_status", "ok": False})
+
+    # DISPATCH IS ARCELLE-BUILT, NOT MODEL-DIRECTED (owner decision #2,
+    # 2026-08-03). The same request used to produce twelve specialists, then
+    # five, then none, because the plan was the model's to invent — and
+    # inventing a plan is the multi-turn agency a small model is measurably
+    # worst at. `build_plan` decides it here instead, from the user's words and
+    # from `served_names`/`web_enabled` — the SAME two inputs that just built
+    # the catalog above, which is what keeps prompt and catalog from telling a
+    # harness engine two different stories.
+    #
+    # Only the hub, and only once: `prepare` is the graph's entry node, so a
+    # turn is planned exactly once and no later round can re-plan it.
+    plan = (
+        build_plan(
+            str(state.get("question") or ""),
+            web_enabled=web_enabled,
+            served_names=served_names,
+            tagged=tagged,
+        )
+        if agent.main
+        else None
+    )
+    if plan is not None and plan.steps:
+        # The plan, as a chip, BEFORE the model has done anything with it. The
+        # roster shows which specialists ran; only this says which ones Arcelle
+        # asked for — so a hub that deviates is visible rather than inferred.
+        node = str(state.get("node_key") or MAIN_NODE_KEY)
+        await deps.emit({"t": "step", "v": f"Plan: {plan.summary}", "node": node})
+        await deps.emit({"t": "step_status", "ok": True, "node": node})
 
     messages: list[Message] = [dict(m) for m in state.get("messages", [])]  # type: ignore[misc]
     offered = {s.get("function", {}).get("name") for s in tools}
@@ -724,6 +913,42 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             and paragraph not in (messages[0].get("content") or "")
         ):
             messages[0]["content"] = (messages[0].get("content") or "") + paragraph
+        # The `*` tag, said out loud. Two cases, and they are opposites: the
+        # tagged specialist is the only one in the catalog (so the note is about
+        # what to do when the request does not suit it), or it is not there at
+        # all (so the note is the refusal). The ROSTER is what distinguishes
+        # them, and it is the same roster the composer's menu was drawn from —
+        # so "web with the web off" and "banana" land on the one refusal, which
+        # is also the one message the host's toast gives them.
+        if tagged:
+            roster = specialist_roster(
+                web_enabled=web_enabled, served_names=served_names
+            )
+            live = [entry for entry in roster if entry["key"] == tagged]
+            note = (
+                TAGGED_SPECIALIST_NOTE.format(
+                    label=live[0]["label"], area=live[0]["area"]
+                )
+                if live
+                else TAG_UNAVAILABLE_NOTE.format(
+                    key=tagged,
+                    available=tag_available_clause([e["key"] for e in roster]),
+                )
+            )
+            if note not in (messages[0].get("content") or ""):
+                messages[0]["content"] = (messages[0].get("content") or "") + note
+        # …and the plan Arcelle built, LAST of the hub's paragraphs so it is the
+        # most recent thing in the system message — the same placement the tag
+        # notes get, for the same reason. `Plan.note` is "" for the three cases
+        # that already have their own paragraph (a `*` tag, an empty catalog) or
+        # deliberately have none (the planner abstained in a room whose default
+        # worker is unreachable), so nothing here can contradict them.
+        if plan is not None:
+            plan_paragraph = plan.note
+            if plan_paragraph and plan_paragraph not in (messages[0].get("content") or ""):
+                messages[0]["content"] = (
+                    messages[0].get("content") or ""
+                ) + plan_paragraph
         # Skills sit one layer below the paragraph: the paragraph is who this
         # agent is and rides every turn; a skill is a saved procedure it loads
         # only when one applies. Workers only — the Main agent delegates rather
@@ -942,7 +1167,12 @@ def _unlock_group(
             None,
         )
     names = group_tools(group)
-    if not served_names & names:
+    # The same servability question `_locked_groups` asks, asked the same way:
+    # a group whose load-bearing tools this tier withholds is NOT unlockable,
+    # however many of its incidental tools were served. Answering "here you go"
+    # here would append `group_prompt` — a briefing on tools the model does not
+    # hold — which is the whole failure this gate exists to prevent.
+    if not group_servable(group, served_names):
         # An advisor-scope bridge never serves these — don't pretend otherwise.
         return (f"The {group} tools are not available in this context.", False, None)
 
@@ -1120,6 +1350,24 @@ def _referent_names(tool: str, args: dict[str, Any] | None) -> list[str]:
     return [str(name)[:80]] if name else []
 
 
+def _live_domains(state: AgentState, served_names: set[str]) -> list[str]:
+    """Which specialists exist for THIS turn — reachability, then the `*` tag.
+
+    `reachable_domain_keys` answers "what could this room serve"; the tag is
+    the user's own narrowing on top of it, and the two have to be applied in
+    that order. A tag naming a domain the room cannot serve narrows nothing —
+    it is refused in `prepare` by name instead, because a turn whose whole
+    roster is empty reads to the model as "the bridge is down", which is a
+    different fault with a different answer.
+    """
+    keys = reachable_domain_keys(
+        web_enabled=bool(state.get("web_enabled", False)),
+        served_names=served_names,
+    )
+    tagged = str(state.get("tagged_name") or "")
+    return [tagged] if tagged in keys else keys
+
+
 def _unavailable_note(key: str, available: list[str]) -> str:
     """What the Main agent is told when it asks for a specialist this room lacks.
 
@@ -1136,6 +1384,22 @@ def _unavailable_note(key: str, available: list[str]) -> str:
         "MISSING: tell the user plainly that this room cannot do that part — "
         "do not answer it from memory."
     )
+
+
+#: Ceiling on a report as SHOWN in the agent diagram. The report itself is
+#: never touched — this bounds only the copy that travels to the UI, because a
+#: file-reading specialist can hand back a whole book and the inspector is a
+#: panel in a chat bubble. Generous enough that a normal report arrives whole.
+MAX_SHOWN_REPORT_CHARS = 40_000
+
+
+def _clip_report(text: str) -> str:
+    """A report trimmed for display, saying so when it was."""
+    if len(text) <= MAX_SHOWN_REPORT_CHARS:
+        return text
+    kept = text[:MAX_SHOWN_REPORT_CHARS]
+    dropped = len(text) - MAX_SHOWN_REPORT_CHARS
+    return f"{kept}\n\n… {dropped:,} more characters were reported to the Main agent."
 
 
 class WorkerOutcome(NamedTuple):
@@ -1237,13 +1501,20 @@ async def _run_worker(
     # THIS module — a top-level import would be circular.
     from .graphs import graph_for, recursion_limit_for, worker_report
 
+    # Owner replacement #3: this specialist is a CHILD of the run. It reads the
+    # run's Stop through its token's parent chain exactly as it did when every
+    # loop shared one token, and it now has a node of its own — which is what
+    # makes a Stop reportable per specialist instead of per turn. Held for the
+    # child's lifetime by this frame, so the parent's link prunes itself when
+    # the specialist returns.
+    child_deps = deps.for_child(worker.label)
     # One slot per child. Unbounded on a cloud room; serialized on a local one,
     # where a single resident model means N children are contention, not speed.
     async with deps.worker_slot():
         final: AgentState = await graph_for(worker.id).ainvoke(
             initial,
             config={
-                "configurable": {"deps": deps},
+                "configurable": {"deps": child_deps},
                 # Sized to THIS worker's shape — not every shape spends two
                 # supersteps per round (see recursion_limit_for).
                 "recursion_limit": recursion_limit_for(worker.id, max_rounds),
@@ -1484,11 +1755,11 @@ class _Delegator:
             carryover=carryover,
             served_names=served_names,
             # The same list that built the `agent` enum the model chose from, so
-            # the guard and the catalog cannot disagree.
-            live_domain_keys=reachable_domain_keys(
-                web_enabled=bool(state.get("web_enabled", False)),
-                served_names=served_names,
-            ),
+            # the guard and the catalog cannot disagree — the `*` tag narrows
+            # BOTH or neither (`agent_tool_specs(only=…)`), which is the only
+            # way a tagged turn can refuse a delegation elsewhere by the same
+            # sentence a phantom domain gets.
+            live_domain_keys=_live_domains(state, served_names),
         )
 
     def wave_batch(self, wave_no: int) -> int:
@@ -1536,7 +1807,7 @@ class _Delegator:
         return _unavailable_note(domain_key, self.live_domain_keys)
 
     def register_unavailable(
-        self, tool: str, instruction: str, batch: int
+        self, tool: str, instruction: str, batch: int, refusal: str = ""
     ) -> dict[str, Any]:
         """A roster slot, already marked failed, for a delegation this room
         cannot run.
@@ -1545,9 +1816,17 @@ class _Delegator:
         the user asked for, not choosing one to run. Without this the task was
         simply absent from the live picture — the assistant was told in text and
         said so, but the diagram showed a turn that never asked.
+
+        ``refusal`` rides on the roster entry rather than going out as a
+        ``report`` event, because one of the two callers is synchronous and
+        cannot await an emit. The roster is a complete snapshot on every
+        `plan`, so the reason reaches the UI either way — and a node that never
+        ran is precisely the one whose "why" is otherwise unrecoverable.
         """
         entry = self.register(resolve_worker(tool, instruction), instruction, batch)
         entry["status"] = "failed"
+        if refusal:
+            entry["report"] = refusal
         return entry
 
     async def tracked(
@@ -1582,13 +1861,51 @@ class _Delegator:
             # emit — nothing is draining the queue once the run is torn down.
             entry["status"] = "failed"
             raise
-        except Exception:
+        except Exception as exc:
             entry["status"] = "failed"
+            # Twice: once for the user, once for disk. The report box is the only
+            # thing a user sees, but it lives and dies with the turn's diagram —
+            # so a failure that needs looking into later left NOTHING behind (the
+            # stderr log sat empty through exactly such a failure). The run-level
+            # handler never fires here, because a failed child does not fail the run.
+            _log.warning(
+                "delegation to %s failed: %s", node_key, _why_failed(exc), exc_info=True
+            )
+            await self._emit_report(node_key, _why_failed(exc), ok=False)
             await _emit_pipeline(self.deps, self.pipeline, _active_step(self.pipeline))
             raise
         entry["status"] = "done" if result.ok and not result.cancelled else "failed"
+        await self._emit_report(
+            node_key, result.report, ok=result.ok and not result.cancelled
+        )
         await _emit_pipeline(self.deps, self.pipeline, _active_step(self.pipeline))
         return result
+
+    async def _emit_report(self, node_key: str, text: str, *, ok: bool) -> None:
+        """Hand the UI what this child actually said back to the Main agent.
+
+        WHY THIS EXISTS AS ITS OWN EVENT. A child's words already reach the
+        screen as `delta`s while it holds the live-text lease, and they are
+        wiped by the next `round` — correctly, because that area shows the
+        CURRENT round. The consequence was that a specialist's answer flashed
+        up and vanished, and the only lasting trace was a green tick: the
+        diagram could say a child had "reported back to the Main agent" without
+        being able to show one word of the report.
+
+        Reconstructing it from the delta stream would be the wrong fix twice
+        over — deltas are only emitted by the lease HOLDER (so a child that
+        never held it streams nothing at all), and a failed child's reason
+        never goes through them. This is the report itself: exactly the text
+        that became the Main agent's tool message, success or failure.
+        """
+        await self.deps.emit(
+            {
+                "t": "report",
+                "node": node_key,
+                "v": _clip_report(text),
+                "ok": ok,
+            }
+        )
 
     async def run_plan(self, plan: list[dict[str, Any]]) -> WorkerOutcome:
         """Run one ``ask_agents`` batch wave by wave; one combined report back.
@@ -1655,7 +1972,10 @@ class _Delegator:
                 # is, rather than being silently absent from the diagram while
                 # the assistant is told about it in text.
                 self.register_unavailable(
-                    DOMAIN_KEYS.get(norm or "", ""), str(task_spec["instruction"]), band
+                    DOMAIN_KEYS.get(norm or "", ""),
+                    str(task_spec["instruction"]),
+                    band,
+                    refusal,
                 )
                 continue
             entry, task = self._launch_task(task_spec, norm, band, baton, batch)
@@ -2187,7 +2507,7 @@ class _ToolPass:
         refusal = self.delegator.unavailable(normalize_domain_key(call.name))
         if refusal is not None:
             self.delegator.register_unavailable(
-                call.name, instruction, self.delegator.batch
+                call.name, instruction, self.delegator.batch, refusal
             )
             await _emit_pipeline(
                 self.deps, self.delegator.pipeline, _active_step(self.delegator.pipeline)
@@ -2517,8 +2837,14 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     and the reports are collected in call order. The pipeline roster grows live
     (``_emit_pipeline``); ONE final event per ask.
     """
-    write, ui, jobs, skills, connectors = req.resolved_routing()
-    run_max_rounds = req.resolved_max_rounds(ui, jobs, skills, connectors)
+    # Only `write` is read downstream (the state flag and the lane label). The
+    # other four answers were computed for every question and handed to
+    # `resolved_max_rounds`, which has narrowed nothing per-lane since the
+    # per-lane budgets were removed — its own docstring says so. Four scans of
+    # the question whose results went straight into the bin, which is why this
+    # asks for the ONE lane it reads rather than taking `[0]` of all five.
+    write = req.resolved_write()
+    run_max_rounds = req.resolved_max_rounds()
     # No per-agent budget narrows this any more: the Main agent delegates until
     # it has what it needs, bounded only by the shared runaway backstop.
     max_rounds = run_max_rounds
@@ -2541,6 +2867,16 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     messages: list[Message] = [dict(m) for m in req.messages]  # type: ignore[misc]
     if req.question.strip() and not any(m.get("role") == "user" for m in messages):
         messages.append(user_message(req.question))
+
+    # The composer's `*` tag rides in the question text, exactly as `/skill`
+    # does — one parser, on the side that owns the roster, so the host never
+    # has to keep a second copy of what a specialist is called. The tag is left
+    # in the message the model reads: it is what the user typed, and a
+    # transcript that quietly differs from the box is its own kind of untruth.
+    # Whether the name is one we HAVE is decided in `prepare`, against the
+    # served catalog — not here, where a name that resolved to nothing used to
+    # be dropped on the floor and the turn ran as if it had never been typed.
+    tagged, _ = tagged_specialist(req.question)
 
     main = get_agent(MAIN_AGENT_ID)
     pipeline: list[dict[str, str]] = []
@@ -2587,6 +2923,7 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
         # re-injection. Cloud-class models keep parallel calls, lean prompt.
         "small_model": small_model,
         "agent_id": main.id,
+        "tagged_name": tagged,
         "node_key": MAIN_NODE_KEY,
         "plan_multi": False,
         "unlocked_groups": set(),

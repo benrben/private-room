@@ -137,10 +137,16 @@ pub(crate) fn media_response(
         let map = streams.map.lock().unwrap();
         map.get(token).map(|m| (m.bytes.clone(), m.mime.clone()))
     };
+    // The CORS header belongs on the FAILURE answers too. The frame grab
+    // (`viewers/frameGrab.ts`) requests this scheme as `crossorigin=anonymous`,
+    // and a staged entry can be evicted out from under it (MAX_STAGED is 4) —
+    // without the header, a plain "that clip is no longer staged" arrives at
+    // the page as an opaque CORS failure instead.
+    let allow_origin = || ("Access-Control-Allow-Origin".to_string(), "*".to_string());
     let Some((bytes, mime)) = staged else {
         return (
             404,
-            vec![("Content-Type".into(), "text/plain".into())],
+            vec![("Content-Type".into(), "text/plain".into()), allow_origin()],
             b"media not staged".to_vec(),
         );
     };
@@ -176,7 +182,7 @@ pub(crate) fn media_response(
             }
             None => (
                 416,
-                vec![("Content-Range".into(), format!("bytes */{len}"))],
+                vec![("Content-Range".into(), format!("bytes */{len}")), allow_origin()],
                 Vec::new(),
             ),
         },
@@ -243,8 +249,26 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(k, v)| k == "Content-Range" && v == "bytes */10"));
-        let (status, _, _) = media_response(&s, "no-such-token", None);
+        let (status, headers, _) = media_response(&s, "no-such-token", None);
         assert_eq!(status, 404);
+        // Every answer this handler gives is read by a CORS request (the frame
+        // grab), so a failure must arrive as ITS OWN error rather than as an
+        // opaque cross-origin one. A token evicted mid-session is exactly this
+        // path.
+        for (status, headers) in [
+            (404u16, headers),
+            {
+                let (st, h, _) = media_response(&s, &only_token(&s), Some("bytes=50-60"));
+                (st, h)
+            },
+        ] {
+            assert!(
+                headers
+                    .iter()
+                    .any(|(k, v)| k == "Access-Control-Allow-Origin" && v == "*"),
+                "the {status} answer is not readable by the page that asked"
+            );
+        }
     }
 
     #[test]

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, roomGraph } from "../../api";
 import type { RoomGraph, GraphEdge, SimNode, SimEdge, View } from "./types";
-import { MAX_EDGES, MAX_NODES, AREA_PER_NODE, COOL, GRAPH_MAX_FILES } from "./constants";
+import { MAX_NODES, AREA_PER_NODE, COOL, GRAPH_MAX_FILES } from "./constants";
 import { seedFrom, mulberry32, runTick, computeFit } from "./layout";
+import { rankEdges, filterEdges, countByKind, type EdgeFilter } from "./edges";
 
 interface RoomGraphParams {
+  filter: EdgeFilter;
   stageRef: React.RefObject<HTMLDivElement | null>;
   sizeRef: React.MutableRefObject<{ w: number; h: number }>;
   userAdjustedRef: React.MutableRefObject<boolean>;
@@ -21,7 +23,13 @@ export interface RoomGraphApi {
   error: string | null;
   reload: () => void;
   size: { w: number; h: number };
+  /** Every drawable edge, ranked and capped — the LAYOUT's input. Deliberately
+   * independent of the type filter so a legend toggle can't re-seed the map. */
   cappedEdges: GraphEdge[];
+  /** The subset the reader asked to see — what is drawn and counted. */
+  visibleEdges: GraphEdge[];
+  /** How many edges of each kind exist before filtering, for the legend. */
+  edgeCounts: Record<string, number>;
   fileNodeCount: number;
   /** True when the map is AT the backend's newest-N-files ceiling. It is NOT
    * proof that anything was left out: the payload can't tell a room of exactly
@@ -41,7 +49,10 @@ export interface RoomGraphApi {
 function graphSignature(g: RoomGraph): string {
   return JSON.stringify([
     g.nodes.map((n) => [n.id, n.name, n.kind, n.folder ?? "", n.summary ?? ""]),
-    g.edges.map((e) => [e.a, e.b, e.weight, e.shared]),
+    // `kind` is part of the signature: a rebuild that only retyped an edge
+    // (a full pass finishing turns a "reads alike" guess into a "made from"
+    // fact) changes what the map SAYS, so it has to redraw.
+    g.edges.map((e) => [e.a, e.b, e.weight, e.kind, e.directed, e.shared]),
   ]);
 }
 
@@ -55,6 +66,7 @@ const RELOAD_DEBOUNCE_MS = 400;
  * userAdjusted / layout) and threads pan-zoom's setView + selection's setFocus
  * in, so this hook can re-frame and reset selection on graph/measure changes. */
 export function useRoomGraph({
+  filter,
   stageRef,
   sizeRef,
   userAdjustedRef,
@@ -71,6 +83,10 @@ export function useRoomGraph({
   /** Signature of the graph currently on screen — a re-fetch that matches it
    * is dropped, so an unrelated file write can't reset the view. */
   const sigRef = useRef<string | null>(null);
+  /** The live filter, readable from the layout effect without becoming one of
+   * its dependencies (see the simEdges build below). */
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
   const [reloadNonce, setReloadNonce] = useState(0);
   const reload = useCallback(() => {
     setError(null);
@@ -133,15 +149,22 @@ export function useRoomGraph({
     return () => ro.disconnect();
   }, []);
 
-  // Valid, weight-ranked, capped edges — the only ones we draw/simulate.
-  const cappedEdges = useMemo<GraphEdge[]>(() => {
-    if (!graph) return [];
-    const ids = new Set(graph.nodes.map((n) => n.id));
-    return graph.edges
-      .filter((e) => e.a !== e.b && ids.has(e.a) && ids.has(e.b))
-      .sort((x, y) => y.weight - x.weight)
-      .slice(0, MAX_EDGES);
-  }, [graph]);
+  // Valid edges, ranked by (trust, strength) and capped — the only ones we
+  // simulate. The cap only eats inferred links, so a "made from" fact is never
+  // dropped to make room for a stronger-looking guess.
+  const cappedEdges = useMemo<GraphEdge[]>(
+    () => (graph ? rankEdges(graph.edges, new Set(graph.nodes.map((n) => n.id))) : []),
+    [graph],
+  );
+
+  // What the reader has asked to see. Everything below reads THIS list — what
+  // is drawn, the degree that sizes a star, the neighbour highlight, the count
+  // line — so the map can never claim a connection it isn't showing.
+  const visibleEdges = useMemo(
+    () => filterEdges(cappedEdges, filter),
+    [cappedEdges, filter],
+  );
+  const edgeCounts = useMemo(() => countByKind(cappedEdges), [cappedEdges]);
 
   const fileNodeCount = useMemo(
     () => (graph ? graph.nodes.filter((n) => n.kind === "file").length : 0),
@@ -179,9 +202,14 @@ export function useRoomGraph({
     });
 
     const idx = new Map(sim.map((n, i) => [n.id, i]));
+    // Read the filter through a ref, NOT as a dependency: this effect re-seeds
+    // every node onto the starting circle and restarts the settle animation, so
+    // making it depend on the reader's legend toggles would scatter the map on
+    // every click.
+    const shown = new Set(filterEdges(cappedEdges, filterRef.current));
     const simEdges: SimEdge[] = cappedEdges
       .filter((e) => idx.has(e.a) && idx.has(e.b))
-      .map((e) => ({ ai: idx.get(e.a)!, bi: idx.get(e.b)!, edge: e }));
+      .map((e) => ({ ai: idx.get(e.a)!, bi: idx.get(e.b)!, edge: e, hidden: !shown.has(e) }));
 
     layoutRef.current = { nodes: sim, edges: simEdges };
     // Re-frame only when the reader hasn't grabbed the canvas: a graph change
@@ -216,25 +244,39 @@ export function useRoomGraph({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graph, cappedEdges]);
 
-  // Degree per node (from rendered edges) → star size + label priority.
+  // Hiding a kind is a REPAINT, not a rebuild: flip the flag on the existing
+  // sim edges in place and re-render. Removing them from the array instead
+  // would change the layout effect's input and throw the reader's map away.
+  useEffect(() => {
+    const live = layoutRef.current;
+    if (!live) return;
+    const shown = new Set(visibleEdges);
+    for (const se of live.edges) se.hidden = !shown.has(se.edge);
+    rerender();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleEdges]);
+
+  // Degree per node (from the edges actually SHOWN) → star size + label
+  // priority. Reading the visible set is what keeps a hub from staying fat
+  // after the links that made it a hub were switched off.
   const degree = useMemo(() => {
     const d = new Map<string, number>();
-    for (const e of cappedEdges) {
+    for (const e of visibleEdges) {
       d.set(e.a, (d.get(e.a) ?? 0) + 1);
       d.set(e.b, (d.get(e.b) ?? 0) + 1);
     }
     return d;
-  }, [cappedEdges]);
+  }, [visibleEdges]);
 
   // Adjacency for neighbour highlighting + neighbour labels.
   const adjacency = useMemo(() => {
     const m = new Map<string, Set<string>>();
-    for (const e of cappedEdges) {
+    for (const e of visibleEdges) {
       (m.get(e.a) ?? m.set(e.a, new Set()).get(e.a)!).add(e.b);
       (m.get(e.b) ?? m.set(e.b, new Set()).get(e.b)!).add(e.a);
     }
     return m;
-  }, [cappedEdges]);
+  }, [visibleEdges]);
 
   // The most-connected file — used as a sensible default "selection" so the
   // room reads (hub + neighbours labelled) before the user touches anything.
@@ -259,6 +301,8 @@ export function useRoomGraph({
     reload,
     size,
     cappedEdges,
+    visibleEdges,
+    edgeCounts,
     fileNodeCount,
     atFileLimit: fileNodeCount >= GRAPH_MAX_FILES,
     degree,

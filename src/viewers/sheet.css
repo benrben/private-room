@@ -29,3 +29,63 @@
   border-top: 5px solid color-mix(in srgb, var(--accent) 70%, transparent);
   border-left: 5px solid transparent;
 }
+
+/* ---- virtualized rows -------------------------------------------- *
+ * Only the visible rows are in the DOM; two spacer rows carry the height
+ * of everything above and below so the scrollbar reflects the WHOLE sheet.
+ * `table-layout: fixed` is load-bearing: it makes the <colgroup> widths
+ * (the workbook's own column widths) authoritative instead of letting the
+ * browser re-measure content — which, with a changing set of rows, would
+ * make the columns twitch on every scroll.
+ */
+.sheet-scroll table {
+  table-layout: fixed;
+}
+.sheet-scroll col.sheet-corner-col {
+  width: 3.5rem;
+}
+/* Spacer rows must not inherit any cell chrome. */
+.sheet-scroll tr[aria-hidden] > td {
+  padding: 0;
+  border: 0;
+  background: none;
+}
+/* Fixed layout means overflowing text has to be told what to do. */
+.sheet-scroll td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- edit state ------------------------------------------------------- *
+ * A grid edit commits to the file the moment you leave the cell, so there is
+ * no Save button to carry the "something changed" signal. These do it instead:
+ * the cell keeps a mark, and the bar keeps a count and a way back. */
+
+.sheet-editbar {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.sheet-edits {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.sheet-edits strong {
+  color: var(--text);
+}
+
+/* A cell this session changed. The left bar survives whatever fill the
+   workbook's own style put on the cell — a coloured budget cell would
+   otherwise swallow a background tint. */
+.cell-changed {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.sheet-readonly {
+  color: var(--muted);
+}

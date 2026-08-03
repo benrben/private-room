@@ -20,13 +20,17 @@ Two invariants:
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any
+import logging
+from typing import Any, NamedTuple
 
 from . import llm
 from .messages import system_message, user_message
 from .model_text import recover_json
 from .privacy import is_nonlocal_model
+
+log = logging.getLogger(__name__)
 
 #: Mark categories. ``concept`` is anything matched by a user concept rule.
 CATEGORIES = (
@@ -172,6 +176,24 @@ def _parse_findings(raw: str, chunk: str) -> list[dict[str, str]]:
     return out
 
 
+class ScanResult(NamedTuple):
+    """What a scan found, and whether it got to the end of the document.
+
+    ``complete`` is the honest half. A scan can stop short two ways — a chunk's
+    model call failed, or :data:`MAX_FINDINGS` was reached — and in both cases
+    the tail of the document was never read. Callers must not record a partial
+    scan as a finished one: the file would be listed as protected while its
+    unread remainder goes to a cloud model in full.
+    """
+
+    entities: list[dict[str, str]]
+    complete: bool
+    #: Chunks whose model call failed. Counts only — never the text.
+    chunks_failed: int = 0
+    #: True when the per-scan finding cap cut the pass short.
+    capped: bool = False
+
+
 async def scan_text(
     text: str,
     *,
@@ -179,11 +201,19 @@ async def scan_text(
     base_url: str,
     concepts: list[str] | None = None,
     known: list[str] | None = None,
-) -> list[dict[str, str]]:
+) -> ScanResult:
     """All sensitive strings a local model can find in ``text``.
 
     ``known`` (already-mapped reals) are excluded from the result so callers
     get only NEW entities. Raises ``ValueError`` for a non-local model.
+
+    Best-effort per chunk. A book does not fit one model call, so a long
+    document is dozens of them, and a single failure part-way used to raise —
+    throwing away every entity the earlier chunks had already found, and
+    (because the host reports the failure with the engine's own wording) telling
+    the user the local AI was unreachable when it was a timeout on chunk 90 of
+    200. A failed chunk is now skipped and COUNTED, and the pass reports itself
+    incomplete so nothing downstream can call the file scanned.
     """
     if is_nonlocal_model(model):
         raise ValueError("privacy scan must run on a local model")
@@ -192,23 +222,35 @@ async def scan_text(
     prompt = _scan_prompt(concepts)
 
     found: dict[str, dict[str, str]] = {}
+    failed = 0
     for chunk in _chunks(text):
-        raw = await llm.generate(
-            model,
-            [system_message(prompt), user_message(chunk)],
-            base_url,
-            temperature=0.0,
-            num_predict=NUM_PREDICT,
-            format=SCAN_SCHEMA,
-        )
+        try:
+            raw = await llm.generate(
+                model,
+                [system_message(prompt), user_message(chunk)],
+                base_url,
+                temperature=0.0,
+                num_predict=NUM_PREDICT,
+                format=SCAN_SCHEMA,
+            )
+        except asyncio.CancelledError:
+            # The client hung up (``until_hangup``). Not our failure to absorb.
+            raise
+        except Exception:  # noqa: BLE001 - any engine failure is one bad chunk
+            failed += 1
+            log.warning("privacy scan: chunk failed, continuing")
+            continue
         for finding in _parse_findings(raw, chunk):
             key = finding["text"].casefold()
             if key in known_keys or key in found:
                 continue
             found[key] = finding
             if len(found) >= MAX_FINDINGS:
-                return list(found.values())
-    return list(found.values())
+                # Capped, so the rest of the document was never read. The host
+                # re-scans with these entities in ``known``, so the next pass
+                # finds the NEXT 300 rather than the same ones.
+                return ScanResult(list(found.values()), False, failed, True)
+    return ScanResult(list(found.values()), failed == 0, failed, False)
 
 
 def mint_ephemeral_rules(
@@ -236,6 +278,7 @@ def mint_ephemeral_rules(
 __all__ = [
     "CATEGORIES",
     "SCAN_SCHEMA",
+    "ScanResult",
     "scan_text",
     "mint_ephemeral_rules",
 ]

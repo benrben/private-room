@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api, WorkflowNode, WorkflowRun } from "../../api";
 import { CircleCheckIcon } from "../../icons";
+import { runDotClass } from "./selectors";
 
 type Props = {
   runs: WorkflowRun[];
@@ -184,8 +185,11 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
   const firstErr = runs[0]?.error ?? "";
   let lead = 0;
   for (const r of runs) {
-    const failed = r.status === "error" || r.status === "failed";
-    if (!failed || (r.error ?? "") !== firstErr) break;
+    // "error" is the ONLY failure status a run row is ever written with
+    // (running | queued | paused | done | error — see db/workflows.rs). The old
+    // `|| r.status === "failed"` half could never be true; the same dead check
+    // was already removed from its Rust twin in commands/scripts.rs.
+    if (r.status !== "error" || (r.error ?? "") !== firstErr) break;
     lead++;
   }
   const collapsed = lead >= 2 ? lead : 0;
@@ -207,7 +211,7 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
               aria-expanded={expanded}
               onClick={() => void toggle(r)}
             >
-              <span className={`wf-badge ${r.status === "error" ? "dot-err" : "dot-ok"}`}>{r.status}</span>
+              <span className={`wf-badge ${runDotClass(r.status)}`}>{r.status}</span>
               <span className="run-row-trigger">{r.trigger}</span>
               <span style={{ flex: 1 }}>{fmt(r.startedAt)}</span>
               {r.error && <span style={{ color: "#b33" }}>{r.error}</span>}

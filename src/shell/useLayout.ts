@@ -48,7 +48,72 @@ type Persisted = {
   railExpanded?: boolean;
 };
 
+const LAYOUT_PREFIX = "prLayout:";
+
+/** The saved-layout key for one room.
+ *
+ * Keyed by a DIGEST OF THE ROOM'S PATH, for two reasons that were both bugs:
+ *
+ *   • the key used to be `prLayout:<room name>`, so every room you ever opened
+ *     left its name in plain browser storage, outside the encrypted file, with
+ *     nothing to clear it — not locking, not quitting, not "Clear recent
+ *     rooms". A room name is room content;
+ *   • it was the NAME, so two rooms called "Work" in different folders shared
+ *     one layout and overwrote each other's.
+ *
+ * 64 bits of FNV-1a (two accumulators): enough that two rooms colliding is not
+ * a thing that happens, one-way enough that the key names nothing. */
+export function layoutKey(roomPath: string): string {
+  let a = 0x811c9dc5;
+  let b = 0x01000193;
+  for (let i = 0; i < roomPath.length; i++) {
+    const c = roomPath.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193) >>> 0;
+    b = Math.imul(b ^ c, 0x85ebca6b) >>> 0;
+  }
+  return `${LAYOUT_PREFIX}${a.toString(16).padStart(8, "0")}${b.toString(16).padStart(8, "0")}`;
+}
+
+/** Drop every saved layout — used by "Clear recent rooms", which promises to
+ * forget the rooms you have opened and used to leave this behind. */
+export function forgetSavedLayouts(): void {
+  try {
+    for (const k of Object.keys(localStorage)) {
+      if (k.startsWith(LAYOUT_PREFIX)) localStorage.removeItem(k);
+    }
+  } catch {
+    /* private mode etc. — nothing was stored to forget */
+  }
+}
+
+/** Drop one room's saved layout (removing its shortcut from the start screen). */
+export function forgetSavedLayout(roomPath: string): void {
+  try {
+    localStorage.removeItem(layoutKey(roomPath));
+  } catch {
+    /* nothing stored */
+  }
+}
+
+/** Remove the pre-digest entries, which ARE room names sitting in plain
+ * storage. Run on every load rather than once behind a flag: the point is that
+ * the names go, and there is no honest way to keep them until a flag is set.
+ * The old layout itself is not migrated — the ratios are two drags to redo,
+ * and reading a legacy key would mean matching on the name again. */
+function sweepLegacyLayoutKeys(): void {
+  try {
+    for (const k of Object.keys(localStorage)) {
+      if (k.startsWith(LAYOUT_PREFIX) && !/^prLayout:[0-9a-f]{16}$/.test(k)) {
+        localStorage.removeItem(k);
+      }
+    }
+  } catch {
+    /* private mode etc. */
+  }
+}
+
 function loadPersisted(key: string): Persisted {
+  sweepLegacyLayoutKeys();
   try {
     const raw = localStorage.getItem(key);
     if (!raw) return {};
@@ -64,8 +129,8 @@ export type LayoutApi = ReturnType<typeof useLayout>;
 /** The pane layout state machine: ratios, true collapse, focus/maximize,
  * reset, per-room persistence, ⌘1/2/3, and the narrow single-pane fallback.
  * Collapse is real — hidden panes and their splitters get 0px tracks. */
-export function useLayout(roomName: string) {
-  const storageKey = `prLayout:${roomName}`;
+export function useLayout(roomPath: string) {
+  const storageKey = layoutKey(roomPath);
   const persisted = useRef(loadPersisted(storageKey)).current;
 
   const [ratios, setRatios] = useState<Record<PaneKey, number>>(() => ({

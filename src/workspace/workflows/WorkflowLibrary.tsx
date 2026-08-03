@@ -4,7 +4,7 @@ import { WSState } from "../state";
 import { WSActions } from "../actions";
 import { PlusIcon, SparklesIcon, PinIcon } from "../../icons";
 import { WorkflowGlyph } from "./workflowGlyph";
-import { visibleWorkflows } from "./selectors";
+import { runDotClass, visibleWorkflows } from "./selectors";
 
 type Props = { s: WSState; a: WSActions };
 
@@ -110,16 +110,29 @@ function bindingBadge(w: Workflow): string | null {
   return parts.length ? `On: ${parts.join(", ")}` : "On: files";
 }
 
-/** The colored last-run status dot for a card, or null if it never ran. */
+/** The colored last-run status dot for a card, or null if it never ran.
+ *
+ * The colour comes from `runDotClass`, the same helper the run-history rows
+ * use. This map used to carry its own, and its `?? ["dot-ok", …]` fallback made
+ * GREEN the default for every status not spelled out here — so a run that was
+ * stopped, or that the app quit under (`paused`), and one still waiting to
+ * start (`queued`) both wore the success dot on the card. Only the LABEL is
+ * local now, because these cards say "Ran OK" where the history row prints the
+ * raw status. */
 function lastRunBadge(run: WorkflowRun | null | undefined) {
   if (!run) return null;
-  const map: Record<string, [string, string]> = {
-    done: ["dot-ok", "Ran OK"],
-    error: ["dot-err", "Failed"],
-    running: ["dot-run", "Running"],
+  const labels: Record<string, string> = {
+    done: "Ran OK",
+    error: "Failed",
+    running: "Running",
+    queued: "Waiting",
+    paused: "Stopped",
   };
-  const [cls, label] = map[run.status] ?? ["dot-ok", run.status];
-  return <span className={`wf-badge ${cls}`}>{label}</span>;
+  return (
+    <span className={`wf-badge ${runDotClass(run.status)}`}>
+      {labels[run.status] ?? run.status}
+    </span>
+  );
 }
 
 export function WorkflowLibrary({ s, a }: Props) {

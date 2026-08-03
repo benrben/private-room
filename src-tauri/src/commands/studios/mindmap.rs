@@ -21,7 +21,8 @@ pub async fn studio_mindmap(
     refs: Option<Vec<String>>,
     op_id: Option<String>,
 ) -> Result<FileMeta, String> {
-    run_studio(&window, &state, mindmap_spec(), scope, instructions, refs, op_id).await
+    // A Studio button in the UI: its own root, nobody's child.
+    run_studio(&window, &state, mindmap_spec(), scope, instructions, refs, op_id, None).await
 }
 
 /// The mind-map artifact spec for the shared `run_studio` pipeline.

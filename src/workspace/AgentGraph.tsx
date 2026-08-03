@@ -121,6 +121,7 @@ export function AgentGraph({
   plan,
   active,
   agentSteps,
+  agentReports,
   steps,
   lane,
   timings: timingStore,
@@ -130,6 +131,8 @@ export function AgentGraph({
   active: AskActiveAgent | null;
   /** Tool steps filed under the node that ran them. */
   agentSteps: Record<string, { label: string; ok: boolean }[]>;
+  /** What each specialist reported back, keyed by node. */
+  agentReports?: Record<string, { text: string; ok: boolean }>;
   /** The flat step list — the inspector's fallback for the hub, and the source
    * for steps that arrived with no node attribution. */
   steps: { label: string; ok: boolean }[];
@@ -216,6 +219,16 @@ export function AgentGraph({
   const selectedNode = nodes.find((n) => n.key === selected) ?? null;
   const toggle = (key: string) => setSelected((cur) => (cur === key ? null : key));
 
+  /** What this node reported. The live `ask-report` event is the real answer;
+   * the roster's own `report` covers the one case that never produces an event
+   * — a delegation to a domain this room cannot serve, refused before it ran. */
+  const reportFor = (node: GraphNode): { text: string; ok: boolean } | undefined => {
+    const live = agentReports?.[node.key];
+    if (live) return live;
+    const refused = plan.find((p) => p.key === node.key)?.report;
+    return refused ? { text: refused, ok: false } : undefined;
+  };
+
   const inspectorFor = (node: GraphNode, autoScroll: boolean) => (
     <Inspector
       autoScroll={autoScroll}
@@ -229,6 +242,7 @@ export function AgentGraph({
           : (agentSteps[node.key] ?? [])
       }
       lane={lane}
+      report={reportFor(node)}
       onClose={() => setSelected(null)}
     />
   );
@@ -555,6 +569,7 @@ function Inspector({
   elapsed,
   steps,
   lane,
+  report,
   onClose,
 }: {
   /** Inline only: opening the panel grows the chat bubble, usually past the
@@ -568,6 +583,9 @@ function Inspector({
   elapsed: string | null;
   steps: { label: string; ok: boolean }[];
   lane: string;
+  /** What this agent handed back to the Main agent — the report itself, or the
+   * reason it failed. Undefined for a node that has not reported yet. */
+  report?: { text: string; ok: boolean };
   onClose: () => void;
 }) {
   const children = nodes.slice(0, -1);
@@ -646,15 +664,30 @@ function Inspector({
               <dd>{elapsed}</dd>
             </>
           )}
-          <dt>Report</dt>
+          <dt>{report && !report.ok ? "Why it failed" : "Report"}</dt>
           <dd>
-            {node.status === "done"
-              ? "Reported back to the Main agent"
-              : node.status === "failed"
-                ? "No report — the agent did not finish"
-                : node.status === "running"
-                  ? "Still working"
-                  : "Not started"}
+            {/* THE REPORT ITSELF, not a note saying one happened.
+                A specialist's words reach the screen once, as live text, and
+                the next round wipes them — so a child's answer flashed up and
+                was gone, and a child that FAILED never explained itself at
+                all: this row read "No report — the agent did not finish" and
+                that was the entire account. */}
+            {report ? (
+              <div
+                className={`agraph-report${report.ok ? "" : " failed"}`}
+                dir="auto"
+              >
+                {report.text}
+              </div>
+            ) : node.status === "running" ? (
+              "Still working"
+            ) : node.status === "failed" ? (
+              "No report — the agent did not finish"
+            ) : node.status === "done" ? (
+              "Reported back to the Main agent"
+            ) : (
+              "Not started"
+            )}
           </dd>
         </dl>
       )}

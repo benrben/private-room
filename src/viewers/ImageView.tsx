@@ -1,20 +1,32 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, ImageBox, recommendedModels } from "../api";
-import { BOX_COLORS } from "./util";
+import { BOX_COLORS, ocrBody } from "./util";
+import { fileUrl } from "./useFileBytes";
 
 interface Props {
   fileId: string;
   name: string;
   mime: string;
-  dataB64: string;
+  /** Streaming token for the picture's bytes (roommedia://). */
+  mediaToken?: string | null;
+  /** Legacy base64 payload — honoured if byte delivery is ever switched back. */
+  dataB64?: string | null;
+  /** Whatever OCR read off this picture, as stored on the file. */
+  text?: string | null;
 }
 
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 4;
 const ZOOM_STEP = 0.25;
 
-export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
+export default function ImageView({ fileId, name, mime, mediaToken, dataB64, text }: Props) {
+  const ocrText = ocrBody(text);
+  // Streamed over the room's own URI scheme rather than inlined as base64.
+  // The old data URL was 4/3 the size of the picture and had to cross IPC as
+  // one string, which is why anything over 50 MB lost the image viewer
+  // entirely and opened as its OCR text. A 60 MB TIFF scan is just a picture.
+  const src = dataB64 ? `data:${mime};base64,${dataB64}` : fileUrl(mediaToken);
   const imgRef = useRef<HTMLImageElement>(null);
   const [query, setQuery] = useState("");
   const [boxes, setBoxes] = useState<ImageBox[]>([]);
@@ -23,7 +35,7 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
   // An image the engine can't decode (empty, truncated, wrong extension) used
   // to show only a broken-image glyph, with the zoom buttons and the "mark
   // something" bar still live over nothing at all.
-  const [imgDead, setImgDead] = useState(!dataB64);
+  const [imgDead, setImgDead] = useState(!dataB64 && !mediaToken);
 
   // Zoom: "fit" scales to the pane (the default); a number is a fraction of
   // the image's natural size. The AI boxes are %-positioned, so they ride
@@ -40,6 +52,31 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
     Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round(z * 20) / 20));
   const zoomBy = (d: number) => setZoom(clampZoom(effectiveZoom() + d));
 
+  // Drag to pan. Zooming in was possible before this; MOVING around the
+  // zoomed picture was not, short of hunting for the scrollbars — which on a
+  // trackpad Mac are hidden until you are already scrolling.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const panning = useRef(false);
+  const panFrom = useRef({ x: 0, y: 0, left: 0, top: 0 });
+  function onPanStart(e: React.PointerEvent<HTMLDivElement>) {
+    const el = scrollRef.current;
+    // Only drag the picture itself — not the marker labels drawn over it.
+    if (!el || zoom === "fit" || (e.target as HTMLElement).closest(".img-box")) return;
+    panning.current = true;
+    panFrom.current = { x: e.clientX, y: e.clientY, left: el.scrollLeft, top: el.scrollTop };
+    el.setPointerCapture(e.pointerId);
+  }
+  function onPanMove(e: React.PointerEvent<HTMLDivElement>) {
+    const el = scrollRef.current;
+    if (!panning.current || !el) return;
+    el.scrollLeft = panFrom.current.left - (e.clientX - panFrom.current.x);
+    el.scrollTop = panFrom.current.top - (e.clientY - panFrom.current.y);
+  }
+  function onPanEnd(e: React.PointerEvent<HTMLDivElement>) {
+    panning.current = false;
+    scrollRef.current?.releasePointerCapture?.(e.pointerId);
+  }
+
   // The recommended vision model, set only when it's worth offering to
   // download it (Ollama is up but nothing installed can mark images).
   const [visionModel, setVisionModel] = useState<string | null>(null);
@@ -50,32 +87,30 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
   const [pullDone, setPullDone] = useState(false);
 
   useEffect(() => {
-    setImgDead(!dataB64);
-  }, [dataB64]);
+    setImgDead(!src);
+  }, [src]);
 
   // ---- decide whether to offer the vision helper (doesn't block the bar) ----
+  // ASK THE BACKEND, don't re-derive. This used to scan the local Ollama list
+  // for a name match against the recommended helper — so a room already running
+  // a vision-capable cloud model (or a local one with an unfamiliar name) was
+  // shown a Download button for a model it had no use for, permanently, under
+  // every picture. `groundingModelForRoom` is the same pick the marking call
+  // makes, so the offer appears only when marking genuinely cannot happen.
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const rec = await recommendedModels();
-        const vision = rec.vision?.trim();
-        if (!vision) return;
-        const [st, caps] = await Promise.all([
-          api.aiStatus().catch(() => null),
-          api.modelCapabilities().catch(() => []),
-        ]);
-        if (!alive) return;
-        // Pulling needs Ollama running; and skip if a vision-capable model is
-        // already installed (either flagged by caps or matching the rec name).
-        const running = st?.running ?? false;
-        const installed = st?.models ?? [];
-        const hasVision =
-          caps.some((c) => c.vision) ||
-          installed.some(
-            (m) => m === vision || m.startsWith(vision) || m.replace(/:.*/, "") === vision,
-          );
-        if (running && !hasVision) setVisionModel(vision);
+        const picked = await api.groundingModelForRoom();
+        if (!alive || picked) return;
+        // Nothing can see. Pulling a helper needs Ollama running; without it
+        // the only honest advice is the model picker, which the status line
+        // below gives.
+        const st = await api.aiStatus().catch(() => null);
+        if (!alive || !st?.running) return;
+        const rec = await recommendedModels().catch(() => null);
+        const vision = rec?.vision?.trim();
+        if (alive && vision) setVisionModel(vision);
       } catch {
         // offline or older backend — just don't offer anything
       }
@@ -88,18 +123,15 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
   async function locate(e: React.FormEvent) {
     e.preventDefault();
     const q = query.trim();
-    const img = imgRef.current;
-    if (!q || busy || !img) return;
+    // Still gated on the image being on screen — the boxes are drawn over it —
+    // but its SIZE is no longer measured or sent: the command dropped
+    // imgWidth/imgHeight and the boxes come back in 0-1000 coordinates.
+    if (!q || busy || !imgRef.current) return;
     setBusy(true);
     setStatus("Looking…");
     setBoxes([]);
     try {
-      const found = await api.locateInImage(
-        fileId,
-        q,
-        img.naturalWidth,
-        img.naturalHeight,
-      );
+      const found = await api.locateInImage(fileId, q);
       setBoxes(found);
       setStatus(
         found.length === 0
@@ -113,9 +145,14 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
       // and it comes with the one-click fix already wired below.
       const msg = String(err);
       if (msg.includes("NO_VISION_MODEL")) {
+        // Name the two real fixes. The old text said only "download one below",
+        // which is the wrong advice for anyone whose engine can already see —
+        // switching to a model carrying the `vision` badge in Settings → Model
+        // costs nothing and is usually the better one.
         setStatus(
-          "Marking needs a vision model, and none is installed yet — " +
-            "download one below and try again.",
+          "Marking needs a model that can see images. This room's model can't, " +
+            "and nothing on this Mac can either — pick a model with the “vision” " +
+            "badge in Settings → Model, or download a local helper below.",
         );
         const rec = await recommendedModels().catch(() => null);
         if (rec?.vision?.trim()) setVisionModel(rec.vision.trim());
@@ -129,9 +166,14 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
 
   // Reuse the existing pull_model flow + its pull-progress events.
   const unlistenPullRef = useRef<(() => void) | null>(null);
-  // Leaving the picture mid-download must at least drop the event listener —
-  // the pull itself runs in the backend and keeps going (see the note in the
-  // offer below).
+  /** The model name a running download was started with — what Stop needs.
+   * Kept in a ref because `visionModel` is cleared the moment the pull
+   * succeeds, and Stop must never reach for a name that has already moved. */
+  const pullingNameRef = useRef<string | null>(null);
+  // Leaving the picture mid-download drops the event listener; the pull itself
+  // keeps running in the backend, which is deliberate (it is a large download
+  // and the room is not the only place it is useful) and is what the offer's
+  // wording says. Stop is the way out — it is not the same thing as leaving.
   useEffect(
     () => () => {
       unlistenPullRef.current?.();
@@ -140,8 +182,25 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
     [],
   );
 
+  /** Abandon a running download. `pull_model` registers its cancel flag under
+   * `pull:<model name>` in the SAME registry chat's Stop uses, so this is the
+   * whole wiring — the Rust half has been cancellable (and tested) all along
+   * with no surface calling it, which is why a started download could not be
+   * stopped, paused, or escaped by leaving the picture. */
+  function stopVisionHelper() {
+    const name = pullingNameRef.current;
+    if (!name) return;
+    setPullStatus("stopping…");
+    api.cancelAsk(`pull:${name}`).catch(() => {
+      // Nothing to stop (it just finished, or the flag is already gone). The
+      // pull's own result is the honest answer either way — say nothing here.
+    });
+  }
+
   async function getVisionHelper() {
     if (!visionModel || pulling) return;
+    const name = visionModel;
+    pullingNameRef.current = name;
     setPulling(true);
     setPullErr("");
     setPullStatus("starting…");
@@ -155,14 +214,23 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
     );
     unlistenPullRef.current = unlisten;
     try {
-      await api.pullModel(visionModel);
+      await api.pullModel(name);
       setPullDone(true);
       setVisionModel(null);
     } catch (e) {
-      setPullErr(String(e));
+      // A download YOU stopped is not a failure, and must not be reported in
+      // red as one. Anything else is.
+      const msg = String(e);
+      if (msg.includes("The download was cancelled")) {
+        setPullStatus("Download stopped. Nothing was installed.");
+      } else {
+        setPullErr(msg);
+        setPullStatus("");
+      }
     } finally {
       unlisten();
       unlistenPullRef.current = null;
+      pullingNameRef.current = null;
       setPulling(false);
       setPullPercent(null);
     }
@@ -242,17 +310,29 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
           }}
         >
           <span style={{ color: "var(--text-dim)" }}>
-            {/* No invented figure: the size of the build Ollama actually
-                fetches isn't known here, and the old "~3 GB" was neither
-                checked nor right. Name the model instead — the progress bar
-                below reports the real download as it runs. */}
-            Download the vision helper (<code>{visionModel}</code>) for accurate
-            marking — a large one-time download that keeps running until it
-            finishes, even if you leave this picture.
+            {/* Offered only when the backend says nothing can mark — and framed
+                as one way out, not the way. Switching this room to any model
+                that carries the "vision" badge works just as well and downloads
+                nothing. No invented size figure: the build Ollama actually
+                fetches isn't known here (the old "~3 GB" was neither checked nor
+                right), and the progress bar below reports the real download. */}
+            Nothing here can mark images yet. Either pick a model with the
+            “vision” badge in Settings → Model, or download a local helper
+            (<code>{visionModel}</code>) — a large one-time download. It keeps
+            running if you leave this picture; use Stop to abandon it.
           </span>
           <button className="primary" onClick={getVisionHelper} disabled={pulling}>
             {pulling ? "Downloading…" : "Download"}
           </button>
+          {pulling && (
+            <button
+              className="subtle"
+              onClick={stopVisionHelper}
+              title="Abandon this download — nothing is installed and no partial file is kept"
+            >
+              Stop
+            </button>
+          )}
           {(pullStatus || pullPercent != null) && (
             <div className="pull-progress" style={{ flexBasis: "100%" }}>
               {pullPercent != null && (
@@ -315,7 +395,15 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
           Fit
         </button>
       </div>
-      <div className="img-scroll">
+      <div
+        className="img-scroll"
+        ref={scrollRef}
+        onPointerDown={onPanStart}
+        onPointerMove={onPanMove}
+        onPointerUp={onPanEnd}
+        onPointerCancel={onPanEnd}
+        style={{ cursor: zoom !== "fit" ? (panning.current ? "grabbing" : "grab") : undefined }}
+      >
       <div
         className="img-wrap"
         style={
@@ -326,7 +414,7 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
       >
         <img
           ref={imgRef}
-          src={`data:${mime};base64,${dataB64}`}
+          src={src ?? ""}
           alt={name}
           onLoad={(e) => setNatW(e.currentTarget.naturalWidth)}
           onError={() => setImgDead(true)}
@@ -353,6 +441,29 @@ export default function ImageView({ fileId, name, mime, dataB64 }: Props) {
         })}
       </div>
       </div>
+      {/* The words OCR read off this picture. They were computed, stored and
+          indexed — searchable, and fed to the model — but the viewer was never
+          handed them, so the one person who could tell they were WRONG was the
+          only one who could not see them. Collapsed by default: a picture is
+          still a picture. */}
+      {ocrText && (
+        <details className="img-ocr" open={false}>
+          <summary>
+            Text read from this picture
+            <span className="img-ocr-count">
+              {" "}
+              · {ocrText.length.toLocaleString()} characters
+            </span>
+          </summary>
+          <p className="img-ocr-note">
+            Recognised on this Mac. Machine reading is not perfect — check it
+            against the picture before relying on it.
+          </p>
+          <pre className="img-ocr-text" dir="auto">
+            {ocrText}
+          </pre>
+        </details>
+      )}
     </div>
   );
 }

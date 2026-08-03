@@ -205,19 +205,33 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
           >
             Cancel
           </button>
-          <button
-            className={`primary${running ? " running" : ""}`}
-            disabled={running || !aiPrompt.text.trim() || questionMissing}
-            onClick={() => void a.runAiActionFromModal()}
-          >
-            {running ? (
-              <>
+          {/* A Studio build has had Stop and Resume all along; a Summarize over
+              a whole room — the same work, from the same shelf — had neither,
+              and while it ran this window's Cancel was grey and clicking
+              outside did nothing. So the only honest thing to offer during a
+              run is a way to END it, in the place the Run button was. */}
+          {running ? (
+            <>
+              <span className="studio-prompt-hint" aria-live="polite">
                 <span className="btn-spinner" aria-hidden="true" /> Running…
-              </>
-            ) : (
-              "Run"
-            )}
-          </button>
+              </span>
+              <button
+                className="subtle danger"
+                disabled={s.aiStopping || !s.aiOpId}
+                onClick={() => void a.stopAiAction()}
+              >
+                {s.aiStopping ? "Stopping…" : "Stop"}
+              </button>
+            </>
+          ) : (
+            <button
+              className="primary"
+              disabled={!aiPrompt.text.trim() || questionMissing}
+              onClick={() => void a.runAiActionFromModal()}
+            >
+              Run
+            </button>
+          )}
         </div>
       </div>
     </div>

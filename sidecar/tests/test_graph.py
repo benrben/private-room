@@ -6,6 +6,8 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable
 
+from unittest import mock
+
 import pytest
 from conftest import (
     BUILTIN_TOOL_NAMES,
@@ -20,6 +22,7 @@ from conftest import (
     specs,
 )
 
+from arcelle_sidecar import graph
 from arcelle_sidecar.agents import BATCH_TOOL_NAME, reachable_domain_keys
 from arcelle_sidecar.chat import RoundUsage
 from arcelle_sidecar.mcp_client import ToolSpec
@@ -340,6 +343,47 @@ async def test_request_tools_rejects_an_unknown_group() -> None:
     assert "Unknown tool group" in err["content"]
 
 
+#: A cloud-CLI room's tier: CORE plus `view_media_frame` (a room video's pixels
+#: are CONTENT, so the bridge serves them) and NONE of the three screen tools.
+_CLOUD_TIER = ["list_room_files", "search_room", "open_file", "view_media_frame"]
+
+
+async def test_request_tools_never_offers_a_group_whose_screen_tools_are_withheld() -> None:
+    """`AgentSpec.requires` closed the routing door on the cloud-CLI tier; this
+    is the OTHER door. `app_ui`'s box carries `view_media_frame`, so the old
+    "was any tool of this group served" test passed on it alone and the group
+    was still advertised — a round spent unlocking it, and `group_prompt` then
+    briefing the model on ui_snapshot/ui_act, which it does not hold."""
+    mcp = FakeMCP(tools=specs(_CLOUD_TIER))
+    chat = FakeChatModel([Round(content="ok")])
+    out = await drive_worker(make_request("what is the rent"), chat, mcp)
+    assert "request_tools" not in out.chat.offered_names[0]
+    system = out.chat.seen_messages[0][0].get("content") or ""
+    assert "app_ui" not in system
+    assert "ui_snapshot" not in system
+
+
+async def test_unlocking_app_ui_is_refused_when_only_the_video_tool_was_served() -> None:
+    """Asked for anyway (the enum never offers it), the unlock must refuse —
+    granting it would append UI_PROMPT, which is a briefing on tools this tier
+    does not serve."""
+    mcp = FakeMCP(tools=specs(_CLOUD_TIER))
+    chat = FakeChatModel(
+        [
+            Round(content="r0", calls=[call("request_tools", group="app_ui")]),
+            Round(content="done"),
+        ]
+    )
+    out = await drive_worker(make_request("open the files view", max_rounds=9), chat, mcp)
+    refusal = [m for m in out.messages if m.get("role") == "tool"][0]
+    assert "not available in this context" in refusal["content"]
+    assert [e["ok"] for e in out.of("step_status")] == [False]
+    later_system = out.chat.seen_messages[1][0].get("content") or ""
+    assert "ui_snapshot" not in later_system
+    assert "ui_act" not in later_system
+    assert "ui_snapshot" not in out.chat.offered_names[1]
+
+
 # --------------------------------------------------------------------------- #
 # multi-step plans (dispatch-first, 2026-07-23)
 # --------------------------------------------------------------------------- #
@@ -359,6 +403,67 @@ async def test_greetings_are_answered_by_the_main_agent_directly() -> None:
     assert "ask_file_agent" in offered  # the specialists were available…
     assert "search_room" not in offered  # …but no room tool ever is
     assert out.final == "Hey! How can I help?"
+
+async def test_a_delegation_reports_its_answer_with_its_node_stamp() -> None:
+    """The specialist's report reaches the UI as its own event.
+
+    Its words also stream as `delta`s while it holds the live-text lease, and
+    the next `round` wipes them — so before this, a child's answer flashed onto
+    the screen and vanished, and the diagram could say a child had "reported
+    back" without being able to show a word of what it said.
+    """
+    chat = FakeChatModel(
+        [
+            Round(content="", calls=[call("ask_file_agent", instruction="find the rent")]),
+            Round(content="The contract says the rent is 1200."),
+            Round(content="The rent is 1200."),
+        ]
+    )
+    out = await drive(make_request("what does the contract say about rent"), chat)
+    reports = out.of("report")
+    assert len(reports) == 1, f"expected one report, got {[r for r in reports]}"
+    assert reports[0]["ok"] is True
+    # Stamped with the node, so the UI can file it under the right box — with
+    # siblings running concurrently, arrival order attributes nothing.
+    assert reports[0]["node"] == "files.read#0"
+    # The report ITSELF, not a note that one happened.
+    assert "1200" in reports[0]["v"]
+
+
+async def test_a_crashed_delegation_reports_why_it_failed() -> None:
+    """A failed child used to explain itself nowhere: the panel said "No report
+    — the agent did not finish" and that was the whole account."""
+    boom = RuntimeError("the provider returned an error")
+
+    async def explode(*args: Any, **kwargs: Any) -> Any:
+        raise boom
+
+    chat = FakeChatModel(
+        [
+            Round(content="", calls=[call("ask_file_agent", instruction="find the rent")]),
+            Round(content="I could not check that."),
+        ]
+    )
+    with mock.patch.object(graph, "_run_worker", explode):
+        out = await drive(make_request("what does the contract say about rent"), chat)
+    reports = out.of("report")
+    assert reports, "a crashed delegation reported nothing at all"
+    assert reports[0]["ok"] is False
+    assert "the provider returned an error" in reports[0]["v"], reports[0]["v"]
+
+
+def test_a_report_too_long_to_show_is_clipped_and_says_so() -> None:
+    """A file-reading specialist can hand back a whole book; the inspector is a
+    panel in a chat bubble. The report itself is never touched — only the copy
+    that travels to the UI."""
+    short = "a normal report"
+    assert graph._clip_report(short) == short
+    huge = "x" * (graph.MAX_SHOWN_REPORT_CHARS + 5_000)
+    clipped = graph._clip_report(huge)
+    assert len(clipped) < len(huge)
+    assert clipped.startswith("x" * 100)
+    assert "5,000 more characters" in clipped
+
 
 async def test_main_agent_delegates_to_the_file_agent_and_answers() -> None:
     # The canonical v3 pipeline: Main agent → ask_file_agent → report → Main
@@ -1102,6 +1207,75 @@ async def test_no_images_no_user_message() -> None:
 # --------------------------------------------------------------------------- #
 
 
+async def test_a_delegated_specialist_runs_on_its_own_child_token() -> None:
+    """Owner replacement #3: the run's token is the ROOT of a tree.
+
+    Every loop used to share one token, so cancellation had no shape at all:
+    there was nothing that could be stopped except the whole turn, and nothing
+    that could say WHICH work a Stop had reached. The specialist now gets a node
+    of its own — and must still inherit the run's Stop, which is the half that
+    matters for artifacts.
+    """
+    from arcelle_sidecar.agents import get_agent
+
+    run = CancelToken()
+    chat = FakeChatModel(
+        [
+            Round(content="", calls=[call("ask_file_agent", instruction="find the rent")]),
+            Round(content="The contract says the rent is 1200."),
+            Round(content="The rent is 1200."),
+        ]
+    )
+    out = await drive(make_request("what does the contract say about rent"), chat, cancel=run)
+
+    main_token, worker_token = out.chat.cancels[0], out.chat.cancels[1]
+    assert main_token is run, "the hub must run on the run's own token"
+    assert worker_token is not run, "the specialist is still sharing the run's one token"
+    assert worker_token.label == get_agent("files.read").label
+
+    # The direction that protects the room: the run's Stop reaches the child.
+    assert not worker_token.cancelled
+    run.cancel()
+    assert worker_token.cancelled, "the run's Stop did not reach its specialist"
+
+
+def test_a_child_deps_shares_the_turns_budget_semaphore_and_live_area() -> None:
+    """The regression this refactor could have caused, pinned.
+
+    `for_child` copies `Deps`. Three of its fields are per-TURN and only work
+    because every loop shared one object: the turn-wide round budget (the
+    runaway net), the worker semaphore (one resident model) and the live-area
+    lease (one answer area). A plain copy hands each child its own of each —
+    silently, and only visible as a turn that never hits its net and three
+    specialists writing over each other's words.
+    """
+
+    async def emit(e: dict[str, Any]) -> None:
+        return None
+
+    deps = Deps(
+        chat=FakeChatModel([]),  # type: ignore[arg-type]
+        emit=emit,
+        cancel=CancelToken(),
+        mcp=FakeMCP(),  # type: ignore[arg-type]
+        turn_round_budget=2,
+    )
+    child = deps.for_child("File agent")
+
+    assert deps.spend_round() is True
+    assert child.spend_round() is True
+    assert child.spend_round() is False, "the child got its own copy of the TURN's budget"
+    assert deps.just_exhausted() is True, "the parent cannot see the round that crossed the net"
+
+    assert deps.claim_live("main") is True
+    assert child.claim_live("files.read#0") is False, "two loops held the live area at once"
+
+    # …and the child still reads its own Stop, which is the point of the copy.
+    assert child.cancel is not deps.cancel
+    deps.cancel.cancel()
+    assert child.cancel.cancelled
+
+
 async def test_cancel_during_the_stream_stops_before_any_tool_runs() -> None:
     token = CancelToken()
     chat = FakeChatModel(
@@ -1418,6 +1592,10 @@ async def test_event_sequence() -> None:
         "round",
         "delta",  # the worker's report text
         "usage",
+        # …and the same text again, as the durable copy the diagram keeps. The
+        # `delta`s above are wiped by the next `round`, so without this the
+        # child's answer is on screen for a moment and then nowhere.
+        "report",
         # A child FINISHED: its own roster slot flips to done the moment its
         # sub-loop ends — not when the parent gets round to collecting it, or a
         # fast sibling would keep pulsing until the slowest one returned.
@@ -3299,3 +3477,21 @@ async def test_an_ask_agents_call_does_not_walk_the_active_marker_off_the_roster
     marker = later_events[-1]["v"]
     assert marker["step"] == marker["total"] == 2, f"lit a finished child: {marker}"
     await later.delegator.drain()
+
+
+def test_a_provider_failure_is_reported_without_the_python_class_name() -> None:
+    # The failure box showed "ProviderApiError: Provider returned error", which
+    # reads to a user as an internal fault they caused. A provider's message is
+    # already a whole sentence, so the class prefix is pure noise there.
+    from arcelle_sidecar.provider_api import ProviderApiError
+
+    assert graph._why_failed(ProviderApiError("Rate limit reached")) == "Rate limit reached"
+
+
+def test_an_internal_failure_keeps_the_class_name_because_it_is_the_only_clue() -> None:
+    assert graph._why_failed(KeyError("model")) == "KeyError: 'model'"
+
+
+def test_a_failure_whose_message_is_empty_still_says_something() -> None:
+    # str() on several httpx/asyncio errors is "" — the same trap _why guards.
+    assert graph._why_failed(RuntimeError("")) == "RuntimeError"

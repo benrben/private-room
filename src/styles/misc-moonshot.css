@@ -45,7 +45,7 @@
 
    TIME MACHINE
      .time-machine  .tm-version  .tm-version-dot  .tm-cause  .tm-time
-     .tm-version.current
+     .tm-version.current  .tm-prov  .tm-now  .tm-now-label
    ===================================================================== */
 
 /* ---- THE SEAL: unlock (keyhole bloom + door-open) ---- */
@@ -180,13 +180,15 @@
 .room-map-node.memory {
   fill: var(--text-dim);
 }
+/* Stroke and width are deliberately NOT set here. The Room Map colors each
+   link by what the link MEANS (roomMap/edges.ts), and a rule on this class
+   outranks the presentation attributes the component was setting — so every
+   typed hue and width silently rendered as one violet hairline. Anything this
+   class needs must not be a paint property. (The old `.room-map-edge.active`
+   rule went with it: nothing has ever set `.active`; the component varies
+   stroke-opacity instead.) */
 .room-map-edge {
-  stroke: rgba(139, 124, 246, 0.18);
-  stroke-width: 1;
   fill: none;
-}
-.room-map-edge.active {
-  stroke: rgba(139, 124, 246, 0.55);
 }
 
 /* Floating legend, bottom-left over the canvas. */

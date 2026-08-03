@@ -148,12 +148,20 @@ export function isSpeaking(): boolean {
 
 // ---- turn lifecycle --------------------------------------------------------
 
+/** The conversation that owns the voice pipeline right now, or null when the
+ * turn was opened without one (nothing to distinguish, so everything passes). */
+let turnChat: string | null = null;
+
 /** A new ask begins: silence the old answer, invalidate every in-flight
- * continuation, and open a fresh turn. */
-export function beginTurn(): void {
+ * continuation, and open a fresh turn. `chatId` is the conversation whose turn
+ * this is (owner replacement #4) — there is one voice pipeline, so it belongs
+ * to whichever turn most recently claimed it, and only that turn's deltas may
+ * be spoken. */
+export function beginTurn(chatId: string | null = null): void {
   stopAudio();
   epoch += 1;
   turnEpoch = epoch;
+  turnChat = chatId;
   pending = "";
   carry = "";
   sentenceQueue = [];
@@ -162,6 +170,17 @@ export function beginTurn(): void {
   streamedTurn = true;
   problemReported = false;
   overrides = null;
+}
+
+/** May this chat's stream events drive the voice?
+ *
+ * The pipeline follows the TURN, not the screen. Gating on "is this the chat on
+ * screen" instead would drop the deltas that arrive while the user is looking
+ * elsewhere — and since `feedStreamDelta` accumulates a sentence buffer, the
+ * hole is invisible: the answer would be READ ALOUD with words missing that are
+ * plainly there on the page. */
+export function turnBelongsTo(chatId: string | null): boolean {
+  return turnChat === null || turnChat === chatId;
 }
 
 /** ask-round: the sidecar streams deltas in EVERY round and the round event
@@ -184,10 +203,10 @@ export function roundBoundary(): void {
 }
 
 /** Feed one ask-delta. No-ops when auto-speak is off or the turn is dead.
- * NOTE (cross-wave): this rides the globally-emitted ask-delta stream; if a
- * future headless/agent path ever emits ask-* events, its fix must suppress
- * them at the source or gate the effects.ts listener — otherwise background
- * runs would speak aloud. */
+ * Owner replacement #4: ask-* events name their chat now, and effects.ts only
+ * calls this for the conversation that owns the pipeline (`turnBelongsTo`), so
+ * a headless or background run can no longer speak over the answer the user is
+ * actually listening to. */
 export function feedStreamDelta(delta: string): void {
   if (!autoSpeakOn() || !streamedTurn || turnEpoch !== epoch) return;
   deltasFed = true;
@@ -292,9 +311,19 @@ export function setVoiceProblemListener(
 
 /** At most once per turn — one answer that cannot be spoken is ONE problem,
  * not one per sentence. */
-function reportVoiceProblem(): void {
+function reportVoiceProblem(reason?: string): void {
   if (problemReported) return;
   problemReported = true;
+  // The room's internet switch is its OWN answer, not a service failure: the
+  // host refuses before anything leaves (speech_cmds::SPEECH_OFFLINE_MESSAGE),
+  // and "the voice service didn't answer" would blame the wrong thing and hide
+  // the one-click fix. Matched on the settings path the host names.
+  if (reason && reason.includes("Online features")) {
+    onVoiceProblem?.(
+      "Couldn't read that aloud — spoken answers use an online voice service, and this room's internet switch is off (Settings → Online features). The answer is still on screen.",
+    );
+    return;
+  }
   onVoiceProblem?.(
     navigator.onLine
       ? "Couldn't read that aloud — the voice service didn't answer. The answer is still on screen."
@@ -453,10 +482,11 @@ async function pump(): Promise<void> {
         // whispery archetypes applies in the DSP graph via `master.gain`,
         // not synthesis-side.
         b64 = await api.speakTextNeural(text, activeNeuralVoiceId());
-      } catch {
-        // Offline / sidecar down: skip this sentence and try the next — but
-        // say so, once. Silence is indistinguishable from a broken app.
-        reportVoiceProblem();
+      } catch (e) {
+        // Offline / sidecar down / this room's internet switch off: skip this
+        // sentence and try the next — but say so, once, in the words that fit
+        // what actually happened. Silence is indistinguishable from a broken app.
+        reportVoiceProblem(String(e));
         continue;
       }
       if (epoch !== myEpoch) return;

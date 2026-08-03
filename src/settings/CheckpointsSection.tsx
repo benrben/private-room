@@ -1,4 +1,7 @@
+import { useState } from "react";
+import { formatSize } from "../api";
 import type { CheckpointMeta } from "../api";
+import { formatWhen } from "../workspace/composer";
 
 interface Props {
   checkpoints: CheckpointMeta[];
@@ -21,26 +24,14 @@ interface Props {
   busy: boolean;
 }
 
-function formatBytes(n: number): string {
-  if (n <= 0) return "0 MB";
-  const mb = n / (1024 * 1024);
-  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
-  if (mb >= 1) return `${mb.toFixed(1)} MB`;
-  return `${Math.max(1, Math.round(n / 1024))} KB`;
-}
-
-function formatWhen(iso: string): string {
-  // Checkpoint timestamps are UTC "YYYY-MM-DD HH:MM:SS" (SQLite style); append
-  // Z so they render in the viewer's local zone.
-  const d = new Date(iso.includes("T") ? iso : iso.replace(" ", "T") + "Z");
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+/** Checkpoints written before room_checkpoints.rs switched to ISO carry
+ * SQLite's zone-less "YYYY-MM-DD HH:MM:SS", and the manifest on disk is never
+ * rewritten — so those rows still arrive that way and would otherwise be read
+ * as LOCAL time and shown in the wrong hour. Repair only the shape; the
+ * formatting itself is the app's one `composer.formatWhen`, not a second
+ * near-identical copy of it living here. */
+function asIso(t: string): string {
+  return t.includes("T") ? t : t.replace(" ", "T") + "Z";
 }
 
 const ONE_GB = 1024 * 1024 * 1024;
@@ -64,6 +55,12 @@ export default function CheckpointsSection({
   rollback,
   busy,
 }: Props) {
+  // A checkpoint is a full copy of the room and Delete does NOT go to the
+  // Trash — it is often the only way back after a mistake, and it used to fire
+  // on one click while "Roll back", which is reversible, asked first. Same
+  // inline question as the rollback arm, so the two destructive acts in this
+  // list behave the same way round.
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   return (
     <section id="set-checkpoints">
       <h3>Checkpoints</h3>
@@ -101,7 +98,7 @@ export default function CheckpointsSection({
         <>
           <div className="ckpt-total">
             {checkpoints.length} checkpoint
-            {checkpoints.length === 1 ? "" : "s"} · {formatBytes(totalBytes)} on
+            {checkpoints.length === 1 ? "" : "s"} · {formatSize(totalBytes)} on
             disk
           </div>
           {totalBytes > ONE_GB && (
@@ -112,7 +109,28 @@ export default function CheckpointsSection({
           )}
           <div className="ckpt-list">
             {checkpoints.map((c) =>
-              confirmRollback === c.id ? (
+              confirmDelete === c.id ? (
+                <div key={c.id} className="ckpt-confirm" data-agent-blocked>
+                  <span className="ckpt-confirm-q">
+                    Delete “{c.name}” ({formatSize(c.sizeBytes)})? This copy of
+                    the room is erased for good — it does not go to the Trash.
+                  </span>
+                  <div className="ckpt-confirm-actions">
+                    <button
+                      className="primary"
+                      onClick={() => {
+                        setConfirmDelete(null);
+                        deleteCheckpoint(c.id);
+                      }}
+                    >
+                      Delete
+                    </button>
+                    <button className="subtle" onClick={() => setConfirmDelete(null)}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : confirmRollback === c.id ? (
                 <div key={c.id} className="ckpt-confirm" data-agent-blocked>
                   <span className="ckpt-confirm-q">
                     Roll the whole room back to “{c.name}”? Everything since is
@@ -144,7 +162,7 @@ export default function CheckpointsSection({
                       {c.name}
                     </span>
                     <span className="ckpt-sub">
-                      {formatWhen(c.createdAt)} · {formatBytes(c.sizeBytes)}
+                      {formatWhen(asIso(c.createdAt))} · {formatSize(c.sizeBytes)}
                     </span>
                   </span>
                   <span className="ckpt-actions">
@@ -164,7 +182,7 @@ export default function CheckpointsSection({
                       className="subtle ckpt-action"
                       title="Delete this checkpoint and free its disk space"
                       disabled={rollingBack}
-                      onClick={() => deleteCheckpoint(c.id)}
+                      onClick={() => setConfirmDelete(c.id)}
                     >
                       Delete
                     </button>

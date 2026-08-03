@@ -597,6 +597,32 @@ mod tests {
     }
 
     #[test]
+    fn the_hand_off_is_fitted_to_the_engine_that_has_to_read_it() {
+        // The AGENT path can be engine-blind (the sidecar compacts what it
+        // receives, on every engine). The HAND-OFF cannot: it flattens the rows
+        // into one prompt for a one-shot gateway that nothing trims on a
+        // `:cloud` model, an OpenRouter provider or a cloud CLI. Handing an
+        // 8k-window engine 200 KB came back as an engine error or an empty
+        // summary — from the button whose whole job is to make the
+        // conversation smaller.
+        let small = crate::commands::handoff_budget_bytes(8_192);
+        assert!(small < 20_000, "an 8k window was handed {small} bytes");
+        // A big window is still bounded by the years-old-room backstop.
+        assert_eq!(
+            crate::commands::handoff_budget_bytes(1_000_000),
+            crate::commands::HISTORY_HANDOFF_MAX
+        );
+        // And it really does cut a long technical chat down to that size.
+        let history: Vec<(String, String)> = (0..200)
+            .map(|i| ("user".to_string(), format!("T{i} {}", "z".repeat(2_000))))
+            .collect();
+        let kept = compact_history(history, small);
+        let bytes: usize = kept.iter().map(|(_, c)| c.len()).sum();
+        assert!(bytes <= small, "{bytes} > {small}");
+        assert!(kept.len() < 200, "nothing was dropped, so the fixture proves nothing");
+    }
+
+    #[test]
     fn the_backstop_still_bounds_a_years_old_room() {
         let history: Vec<(String, String)> = (0..400)
             .map(|i| ("user".to_string(), format!("T{i} {}", "z".repeat(2_000))))

@@ -8,12 +8,14 @@ import { confirm, message } from "@tauri-apps/plugin-dialog";
  * per room, because they are about this copy of the app and are read before
  * any room is open:
  *
- *  - `prUpdateCheck = "0"` — never contact GitHub on launch. The check is the
- *    app's one unprompted outbound request. NOTE: nothing in the app writes
- *    this key yet — the checkbox belongs in Settings → Updates & version
- *    (`settings/AboutSection.tsx`) and has never been built, so today the
- *    preference can only be set by hand. A setter with no caller used to live
- *    here and read like the switch existed; it does not.
+ *  - `prUpdateCheck = "0"` — never contact GitHub on launch. This is one of
+ *    the app's two unprompted outbound requests (the other is the connector
+ *    catalogue, which is opt-in), and it fires before any room is unlocked, so
+ *    it needs a switch a person can actually reach: Settings → Updates &
+ *    version renders it (`settings/AboutSection.tsx`) and calls
+ *    `setAutoUpdateCheck` below. Switching it off leaves the manual "Check for
+ *    updates" button working — the objection is to the app reaching out on its
+ *    own, not to updating.
  *  - `prSkippedUpdate = "<version>"` — a version the user said no to. Without
  *    it, declining meant being asked again on every single launch.
  */
@@ -31,6 +33,20 @@ export function autoUpdateCheckEnabled(): boolean {
   } catch {
     return true;
   }
+}
+
+/** Turn the launch check on or off. Returns what is now in force, which is not
+ * always what was asked: with `localStorage` unavailable the write is lost, and
+ * reporting the request back would leave the checkbox claiming a setting the
+ * next launch will not honour. */
+export function setAutoUpdateCheck(enabled: boolean): boolean {
+  try {
+    if (enabled) localStorage.removeItem(AUTO_KEY);
+    else localStorage.setItem(AUTO_KEY, "0");
+  } catch {
+    /* private mode — fall through and answer with what actually reads back */
+  }
+  return autoUpdateCheckEnabled();
 }
 
 function skippedVersion(): string {

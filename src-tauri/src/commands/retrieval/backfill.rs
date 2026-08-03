@@ -67,6 +67,81 @@ pub(crate) fn spawn_reextract_backfill(app: &tauri::AppHandle) {
     });
 }
 
+/// Extensions whose extractor was CORRECTED, and the stamp that records the
+/// room has been swept for them.
+///
+/// A room carries the text its files had when they were imported, so fixing an
+/// extractor does nothing for documents already in the room — and these two
+/// were not merely incomplete, they were WRONG. A `.doc` imported before this
+/// held the font table and mojibake ("Times New Roman / Droid Sans Fallback / …
+/// "); a `.ppt` held the slide master's placeholder prompts and binary noise.
+/// That text was the file's searchable content and what the model was shown.
+///
+/// Bump the stamp when an extractor is corrected again; the pass then re-runs
+/// once per room and never again.
+const REPAIRED_EXTENSIONS: &[&str] = &["doc", "ppt"];
+const REPAIR_STAMP: &str = "legacy_text_repaired_v1";
+
+/// Re-read the files whose extractor was wrong, once per room.
+///
+/// Only files whose text actually CHANGES are written, so a room that was
+/// already correct is untouched — no version churn, no `room-files-changed`
+/// storm, and nothing in History pretending the user edited anything.
+pub(crate) fn spawn_legacy_text_repair(app: &tauri::AppHandle) {
+    use tauri::{Emitter as _, Manager as _};
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let (path, epoch, candidates) = {
+            let state = app.state::<AppState>();
+            let guard = state.room.lock().unwrap();
+            let Some(room) = guard.as_ref() else { return };
+            if db::get_setting(&room.conn, REPAIR_STAMP).is_some() {
+                return;
+            }
+            let all = db::files_with_bytes(&room.conn).unwrap_or_default();
+            let list: Vec<_> = all
+                .into_iter()
+                .filter(|(_, name, _, _)| {
+                    REPAIRED_EXTENSIONS.contains(&extraction::extension_of(name).as_str())
+                })
+                .collect();
+            (room.path.clone(), state.room_epoch(), list)
+        };
+
+        let mut fixed = 0usize;
+        for (id, name, _mime, bytes) in candidates {
+            let Some(text) = extraction::extract_text(&name, &bytes) else { continue };
+            let state = app.state::<AppState>();
+            let guard = state.room.lock().unwrap();
+            let Some(room) = guard.as_ref() else { return };
+            // Same epoch pin as the re-extract pass: a rollback swapped the DB
+            // under us, and these pre-rollback bytes must not land in it.
+            if room.path != path || state.room_epoch() != epoch {
+                return;
+            }
+            // Unchanged text is not an edit.
+            let current = db::get_file_full(&room.conn, &id).ok().and_then(|(_, _, _, t)| t);
+            if current.as_deref() == Some(text.as_str()) {
+                continue;
+            }
+            if db::update_file_content(&room.conn, &id, &bytes, Some(&text)).is_ok() {
+                fixed += 1;
+            }
+        }
+
+        let state = app.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        let Some(room) = guard.as_ref() else { return };
+        if room.path != path || state.room_epoch() != epoch {
+            return;
+        }
+        let _ = db::set_setting(&room.conn, REPAIR_STAMP, "1");
+        if fixed > 0 {
+            let _ = app.emit("room-files-changed", ());
+        }
+    });
+}
+
 pub(crate) fn spawn_embedding_backfill(app: &tauri::AppHandle) {
     use std::sync::atomic::Ordering;
     use tauri::Manager as _;

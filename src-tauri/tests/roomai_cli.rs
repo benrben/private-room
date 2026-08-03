@@ -7,6 +7,37 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_roomai");
 
+/// A scratch directory that cleans itself up on the way out — INCLUDING when
+/// the test panics.
+///
+/// These directories used to be named after the process id and deleted on the
+/// test's last line, so any failure left one behind. `db::create_room` refuses
+/// to write over an existing file ("A file already exists at this location"),
+/// so the NEXT run — pids are recycled — failed with an error about the leftover
+/// rather than about the code under test, and sent whoever was debugging in
+/// completely the wrong direction. A uuid makes two runs independent; `Drop`
+/// makes a failing run clean up after itself.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(prefix: &str) -> Self {
+        let dir = std::env::temp_dir()
+            .join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+    fn join(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Best-effort: a cleanup failure must never mask the real verdict.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn make_room(path: &str, password: &str) {
     let conn = db::create_room(path, password, "clitest").unwrap();
     conn.execute(
@@ -19,8 +50,7 @@ fn make_room(path: &str, password: &str) {
 
 #[test]
 fn cli_verify_info_recover_export() {
-    let dir = std::env::temp_dir().join(format!("roomai-cli-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new("roomai-cli");
     let path = dir.join("cli.roomai");
     let path_str = path.to_string_lossy().to_string();
     make_room(&path_str, "hunter22");
@@ -73,6 +103,4 @@ fn cli_verify_info_recover_export() {
     assert!(out.status.success(), "export failed: {:?}", out);
     let written = std::fs::read(outdir.join("notes.txt")).unwrap();
     assert_eq!(written, b"hello", "exported bytes should match the stored file");
-
-    std::fs::remove_dir_all(&dir).unwrap();
 }

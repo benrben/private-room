@@ -21,7 +21,8 @@ pub async fn studio_flashcards(
     refs: Option<Vec<String>>,
     op_id: Option<String>,
 ) -> Result<FileMeta, String> {
-    run_studio(&window, &state, flashcards_spec(), scope, instructions, refs, op_id).await
+    // A Studio button in the UI: its own root, nobody's child.
+    run_studio(&window, &state, flashcards_spec(), scope, instructions, refs, op_id, None).await
 }
 
 /// The flashcards artifact spec for the shared `run_studio` pipeline.
@@ -141,11 +142,26 @@ html,body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 -apple-sys
 .eyebrow{font-size:.72rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)}
 h1{font-size:1.9rem;margin:.25rem 0 .25rem;letter-spacing:-.02em}
 .sub{color:var(--muted);font-size:.9rem;margin:0 0 1.5rem}
-.deck{display:grid;grid-template-columns:repeat(auto-fill,minmax(15rem,1fr));gap:1rem}
+/* `min(15rem,100%)`, not a bare 15rem: an auto-fill floor wider than the deck
+   still lays out ONE 15rem column, which then runs past the right edge instead
+   of collapsing to a single readable column. The deck is read inside the
+   viewer's iframe, which in a split pane is routinely narrower than that. */
+.deck{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(15rem,100%),1fr));gap:1rem}
 .card{display:block;height:12rem;perspective:1200px;cursor:pointer}
 .card .inner{position:relative;display:block;width:100%;height:100%;transition:transform .5s;transform-style:preserve-3d}
 .card input:checked + .inner{transform:rotateY(180deg)}
-.face{position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);box-shadow:0 12px 30px rgba(24,24,60,.08);padding:1.3rem;display:flex;flex-direction:column;justify-content:center;text-align:center;overflow:auto}
+/* `overflow-wrap:anywhere`: a card can hold a URL, a formula or a German
+   compound, and an unbreakable run wider than the card used to push straight
+   out of it — the face scrolls sideways rather than wrapping, and on the back
+   of a flipped card that text is simply lost. */
+.face{position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);box-shadow:0 12px 30px rgba(24,24,60,.08);padding:1.3rem;display:flex;flex-direction:column;justify-content:flex-start;text-align:center;overflow:auto;overflow-wrap:anywhere}
+/* Centred with auto margins rather than by centring `justify-content`. A
+   centred flex column puts half of any overflow ABOVE the scroll origin, where no
+   scrollbar reaches it: the opening lines of a long answer were clipped and
+   unrecoverable. Auto margins resolve to 0 as soon as the text outgrows the
+   card, so it starts at the top and scrolls the whole way. */
+.face>:first-child{margin-top:auto}
+.face>:last-child{margin-bottom:auto}
 .back{transform:rotateY(180deg);background:var(--surface-2)}
 .tag{font-size:.62rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:.5rem}
 .txt{font-size:1.05rem}
@@ -191,6 +207,42 @@ mod tests {
         assert!(!html.contains("</script> injected"));
         assert!(html.contains("Hint: a hint"));
         assert!(html.contains("1 card"));
+    }
+
+    #[test]
+    fn a_long_card_wraps_inside_its_card_instead_of_escaping_it() {
+        // The three layout rules a deck of real study material depends on. The
+        // deck is a static page with no script and no external stylesheet, so
+        // the only place this can be pinned is the markup it ships.
+        let cards = vec![StudioCard {
+            q: "Explain https://example.com/a/very/long/unbreakable/path?with=query".into(),
+            a: "A long answer, several lines of it, more than a 12rem card can show at once."
+                .into(),
+            hint: String::new(),
+        }];
+        let html = render_flashcards_html("Deck", &cards);
+
+        // 1. The column floor must collapse below the page width — a bare
+        //    `minmax(15rem,1fr)` lays out a 15rem column inside a narrower
+        //    pane and the cards run off the right edge.
+        assert!(
+            html.contains("minmax(min(15rem,100%),1fr)"),
+            "the deck's track floor must not exceed the page width"
+        );
+
+        // 2. Overflow inside a CENTRED flex column starts above the scroll
+        //    origin and cannot be scrolled back to, so the first lines of a
+        //    long answer were unreachable. Auto margins centre without that.
+        assert!(
+            !html.contains("justify-content:center"),
+            "a centred flex column clips the top of its own overflow"
+        );
+        assert!(html.contains(".face>:first-child{margin-top:auto}"));
+        assert!(html.contains(".face>:last-child{margin-bottom:auto}"));
+
+        // 3. An unbreakable run (URL, formula) must wrap rather than push the
+        //    text out of the card.
+        assert!(html.contains("overflow-wrap:anywhere"));
     }
 
     #[test]

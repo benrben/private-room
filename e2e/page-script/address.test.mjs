@@ -20,7 +20,9 @@ const SOURCE = readFileSync(join(here, "../../src/workspace/address.ts"), "utf8"
 const JS = ts.transpileModule(SOURCE, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { classifyAddress } = await import(`data:text/javascript,${encodeURIComponent(JS)}`);
+const { classifyAddress, needsFreshFetch } = await import(
+  `data:text/javascript,${encodeURIComponent(JS)}`,
+);
 
 test("empty input does nothing", () => {
   assert.equal(classifyAddress(""), null);
@@ -118,4 +120,32 @@ test("a sentence with a dot in it is still a search", () => {
 test("a single-label dotted token with a 1-char TLD is a search", () => {
   // "node.js" is a topic, not a host: the TLD rule needs 2+ characters.
   assert.deepEqual(classifyAddress("node.j"), { kind: "search", query: "node.j" });
+});
+
+/* Which toolbar Save the browser owes you (finding #373). */
+
+test("an ordinary page is saved from what is on screen, not re-fetched", () => {
+  // The live page is the only copy that carries your session — re-fetching it
+  // as a stranger saved the sign-in wall under the real page's title.
+  assert.equal(needsFreshFetch("https://example.com/article"), false);
+  assert.equal(needsFreshFetch("https://news.site/2026/08/piece?ref=x"), false);
+  assert.equal(needsFreshFetch("https://app.example.com/dashboard/"), false);
+});
+
+test("a video page and a binary still have to be fetched", () => {
+  // Captions and bytes are not in the rendered DOM, so capture cannot save them.
+  assert.equal(needsFreshFetch("https://www.youtube.com/watch?v=abc"), true);
+  assert.equal(needsFreshFetch("https://youtu.be/abc"), true);
+  assert.equal(needsFreshFetch("https://example.com/report.pdf"), true);
+  assert.equal(needsFreshFetch("https://example.com/sheet.XLSX"), true);
+  assert.equal(needsFreshFetch("https://example.com/photo.jpeg?size=2"), true);
+});
+
+test("a host that merely CONTAINS youtube is not a video page", () => {
+  assert.equal(needsFreshFetch("https://notyoutube.com/watch"), false);
+  assert.equal(needsFreshFetch("https://example.com/youtube.com/post"), false);
+});
+
+test("an unparseable address falls back to the live page", () => {
+  assert.equal(needsFreshFetch("not a url"), false);
 });

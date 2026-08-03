@@ -6,9 +6,13 @@
 // only decrypts a local file and reads or copies out what is already inside.
 //
 // Contract section E. Subcommands: verify / info / recover / export.
-// Secrets come from the environment (ROOMAI_PASSWORD / ROOMAI_RECOVERY) so they
-// never have to sit in shell history; a --password / --code flag is the escape
-// hatch. Exit codes: 0 ok, 1 runtime error, 2 usage.
+// Secrets come from the environment ONLY (ROOMAI_PASSWORD / ROOMAI_RECOVERY).
+// There is deliberately no --password / --code flag: on macOS every process
+// running as you can read another's argv (`ps -ww`, /proc equivalents, any
+// monitoring agent), so a room password typed on the command line is readable
+// by anything on the machine — and lands in shell history besides. The flags
+// used to exist as an "escape hatch"; the environment is the escape hatch.
+// Exit codes: 0 ok, 1 runtime error, 2 usage.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -25,9 +29,10 @@ Usage:
   roomai recover <path>           Open using a recovery code instead of a password.
   roomai export  <path> <outdir>  Write every stored file back out to a folder.
 
-Secrets (kept off the command line unless you opt in):
-  ROOMAI_PASSWORD   password for verify / info / export   (or --password <p>)
-  ROOMAI_RECOVERY   recovery code for recover             (or --code <c>)
+Secrets (environment only — never on the command line, where any other
+program running as you can read them):
+  ROOMAI_PASSWORD   password for verify / info / export
+  ROOMAI_RECOVERY   recovery code for recover
 
 Exit codes: 0 ok, 1 error, 2 usage.
 ";
@@ -38,20 +43,16 @@ Exit codes: 0 ok, 1 error, 2 usage.
 enum Command {
     Verify {
         path: String,
-        password: Option<String>,
     },
     Info {
         path: String,
-        password: Option<String>,
     },
     Recover {
         path: String,
-        code: Option<String>,
     },
     Export {
         path: String,
         outdir: String,
-        password: Option<String>,
     },
     /// No args, `help`, or `-h/--help`. Renders usage and exits 2.
     Help,
@@ -80,14 +81,10 @@ fn run(args: Vec<String>) -> i32 {
             eprint!("{USAGE}");
             return 2;
         }
-        Command::Verify { path, password } => do_verify(&path, password.as_deref()),
-        Command::Info { path, password } => do_info(&path, password.as_deref()),
-        Command::Recover { path, code } => do_recover(&path, code.as_deref()),
-        Command::Export {
-            path,
-            outdir,
-            password,
-        } => do_export(&path, &outdir, password.as_deref()),
+        Command::Verify { path } => do_verify(&path),
+        Command::Info { path } => do_info(&path),
+        Command::Recover { path } => do_recover(&path),
+        Command::Export { path, outdir } => do_export(&path, &outdir),
     };
 
     match result {
@@ -109,46 +106,42 @@ fn parse(mut args: Vec<String>) -> Result<Command, String> {
     match cmd.as_str() {
         "help" | "-h" | "--help" => Ok(Command::Help),
         "verify" | "info" => {
-            let password = take_flag(&mut args, "--password")?;
+            reject_secret_flags(&args)?;
             let path = one_positional(args, &cmd, "<path>")?;
             Ok(if cmd == "verify" {
-                Command::Verify { path, password }
+                Command::Verify { path }
             } else {
-                Command::Info { path, password }
+                Command::Info { path }
             })
         }
         "recover" => {
-            let code = take_flag(&mut args, "--code")?;
+            reject_secret_flags(&args)?;
             let path = one_positional(args, &cmd, "<path>")?;
-            Ok(Command::Recover { path, code })
+            Ok(Command::Recover { path })
         }
         "export" => {
-            let password = take_flag(&mut args, "--password")?;
+            reject_secret_flags(&args)?;
             let (path, outdir) = two_positionals(args, &cmd)?;
-            Ok(Command::Export {
-                path,
-                outdir,
-                password,
-            })
+            Ok(Command::Export { path, outdir })
         }
         other => Err(format!("Unknown command: {other}")),
     }
 }
 
-/// Pull `--flag <value>` out of the argument list, if present. Removes both the
-/// flag and its value so what remains is purely positional.
-fn take_flag(args: &mut Vec<String>, flag: &str) -> Result<Option<String>, String> {
-    match args.iter().position(|a| a == flag) {
-        Some(pos) => {
-            if pos + 1 >= args.len() {
-                return Err(format!("`{flag}` needs a value."));
-            }
-            let value = args.remove(pos + 1);
-            args.remove(pos);
-            Ok(Some(value))
+/// The two flags that used to carry a secret on the command line. Named
+/// explicitly rather than falling through to "Unknown flag" so anyone with an
+/// old script is told WHY it stopped working and what to do instead.
+fn reject_secret_flags(args: &[String]) -> Result<(), String> {
+    for a in args {
+        if a == "--password" || a == "--code" {
+            return Err(format!(
+                "`{a}` is no longer accepted: any program running as you can read \
+                 another process's arguments, so a secret there is not private. \
+                 Set ROOMAI_PASSWORD / ROOMAI_RECOVERY in the environment instead."
+            ));
         }
-        None => Ok(None),
     }
+    Ok(())
 }
 
 /// Reject any leftover token that looks like a flag — catches typos such as
@@ -182,59 +175,68 @@ fn two_positionals(args: Vec<String>, cmd: &str) -> Result<(String, String), Str
 
 // --------------------------------------------------------------- secrets
 
-fn resolve_password(flag: Option<&str>) -> Result<String, String> {
-    if let Some(p) = flag {
-        return Ok(p.to_string());
-    }
+fn resolve_password() -> Result<String, String> {
     match std::env::var("ROOMAI_PASSWORD") {
         Ok(v) if !v.is_empty() => Ok(v),
-        _ => Err("No password. Set ROOMAI_PASSWORD or pass --password <p>.".into()),
+        _ => Err("No password. Set ROOMAI_PASSWORD (never pass it as an argument — \
+                  other programs on this Mac can read a process's arguments)."
+            .into()),
     }
 }
 
-fn resolve_code(flag: Option<&str>) -> Result<String, String> {
-    if let Some(c) = flag {
-        return Ok(c.to_string());
-    }
+fn resolve_code() -> Result<String, String> {
     match std::env::var("ROOMAI_RECOVERY") {
         Ok(v) if !v.is_empty() => Ok(v),
-        _ => Err("No recovery code. Set ROOMAI_RECOVERY or pass --code <c>.".into()),
+        _ => Err("No recovery code. Set ROOMAI_RECOVERY (never pass it as an argument — \
+                  other programs on this Mac can read a process's arguments)."
+            .into()),
     }
 }
 
 // --------------------------------------------------------------- commands
 
-fn do_verify(path: &str, pw_flag: Option<&str>) -> Result<(), String> {
-    let password = resolve_password(pw_flag)?;
-    let conn = db::open_room(path, &password)?;
+/// CHECK, don't touch. `db::open_room` always runs the schema migration and at
+/// least one write, so "verify" used to fail outright on a copy sitting on a
+/// read-only volume — and on a room not opened since the last schema change it
+/// rebuilt the search index while claiming only to be looking.
+fn do_verify(path: &str) -> Result<(), String> {
+    let password = resolve_password()?;
+    let conn = db::open_room_readonly(path, &password)?;
     print_ok(&conn);
     Ok(())
 }
 
-fn do_info(path: &str, pw_flag: Option<&str>) -> Result<(), String> {
-    let password = resolve_password(pw_flag)?;
-    let conn = db::open_room(path, &password)?;
+fn do_info(path: &str) -> Result<(), String> {
+    let password = resolve_password()?;
+    let conn = db::open_room_readonly(path, &password)?;
     print_ok(&conn);
     print_meta_dump(&conn);
     Ok(())
 }
 
-fn do_recover(path: &str, code_flag: Option<&str>) -> Result<(), String> {
-    let code = resolve_code(code_flag)?;
+fn do_recover(path: &str) -> Result<(), String> {
+    let code = resolve_code()?;
     let conn = db::open_with_recovery(path, &code)?;
     print_ok(&conn);
     Ok(())
 }
 
-fn do_export(path: &str, outdir: &str, pw_flag: Option<&str>) -> Result<(), String> {
-    let password = resolve_password(pw_flag)?;
+fn do_export(path: &str, outdir: &str) -> Result<(), String> {
+    let password = resolve_password()?;
     let conn = db::open_room(path, &password)?;
 
     std::fs::create_dir_all(outdir)
         .map_err(|e| format!("Could not create {outdir}: {e}"))?;
 
     let mut stmt = conn
-        .prepare("SELECT name, original_bytes FROM files ORDER BY created_at, rowid")
+        // Trash: an export is "everything in this room", and a deleted file is
+        // not in the room. Exporting it would also be the one way trashed bytes
+        // could reach the plain filesystem — the whole point of keeping them
+        // inside the room is that they never do.
+        .prepare(
+            "SELECT name, original_bytes FROM files WHERE trashed_at IS NULL \
+             ORDER BY created_at, rowid",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -389,30 +391,30 @@ mod tests {
         assert!(parse(argv(&["verify"])).is_err());
     }
 
+    /// A room password on the command line is readable by every other process
+    /// running as you (`ps -ww`), and lands in shell history. The flag that
+    /// accepted one is refused BY NAME in every position, with a message that
+    /// says where to put the secret instead — an old script must not fail with
+    /// a bare "Unknown flag" and must certainly not silently keep working.
     #[test]
-    fn verify_reads_password_flag_in_any_position() {
-        let want = Command::Verify {
-            path: "room.room".into(),
-            password: Some("hunter2".into()),
-        };
-        assert_eq!(
-            parse(argv(&["verify", "room.room", "--password", "hunter2"])).unwrap(),
-            want
-        );
-        assert_eq!(
-            parse(argv(&["verify", "--password", "hunter2", "room.room"])).unwrap(),
-            want
-        );
+    fn a_secret_on_the_command_line_is_refused_by_name() {
+        for argv_ in [
+            argv(&["verify", "room.room", "--password", "hunter2"]),
+            argv(&["verify", "--password", "hunter2", "room.room"]),
+            argv(&["info", "room.room", "--password", "hunter2"]),
+            argv(&["export", "room.room", "out", "--password", "hunter2"]),
+            argv(&["recover", "room.room", "--code", "AAAA-BBBB"]),
+        ] {
+            let err = parse(argv_).expect_err("a secret argument must be refused");
+            assert!(err.contains("ROOMAI_PASSWORD") || err.contains("ROOMAI_RECOVERY"), "{err}");
+        }
     }
 
     #[test]
-    fn verify_without_flag_leaves_password_none() {
+    fn verify_takes_only_a_path() {
         assert_eq!(
             parse(argv(&["verify", "room.room"])).unwrap(),
-            Command::Verify {
-                path: "room.room".into(),
-                password: None,
-            }
+            Command::Verify { path: "room.room".into() }
         );
     }
 
@@ -420,21 +422,15 @@ mod tests {
     fn info_parses() {
         assert_eq!(
             parse(argv(&["info", "room.room"])).unwrap(),
-            Command::Info {
-                path: "room.room".into(),
-                password: None,
-            }
+            Command::Info { path: "room.room".into() }
         );
     }
 
     #[test]
-    fn recover_reads_code_flag() {
+    fn recover_takes_only_a_path() {
         assert_eq!(
-            parse(argv(&["recover", "room.room", "--code", "AAAA-BBBB"])).unwrap(),
-            Command::Recover {
-                path: "room.room".into(),
-                code: Some("AAAA-BBBB".into()),
-            }
+            parse(argv(&["recover", "room.room"])).unwrap(),
+            Command::Recover { path: "room.room".into() }
         );
     }
 
@@ -447,7 +443,6 @@ mod tests {
             Command::Export {
                 path: "room.room".into(),
                 outdir: "out".into(),
-                password: None,
             }
         );
     }
@@ -459,7 +454,8 @@ mod tests {
     }
 
     #[test]
-    fn dangling_flag_value_errors() {
+    fn a_bare_secret_flag_errors_too() {
+        // No value to take, so this must not fall through to "<path>".
         assert!(parse(argv(&["verify", "room.room", "--password"])).is_err());
     }
 

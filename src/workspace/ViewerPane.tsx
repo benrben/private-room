@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { RoomInfo } from "../api";
+import { RoomInfo, formatSize } from "../api";
 import {
   CloseIcon,
   CollapseLeftIcon,
@@ -18,7 +18,7 @@ import {
   TimeMachineIcon,
 } from "../icons";
 import RoomMap from "../viewers/RoomMap";
-import { displayName, formatWhen } from "./composer";
+import { fileLabel, formatWhen, provenanceLine } from "./composer";
 import ViewerRouter from "./ViewerRouter";
 import CloudView from "../viewers/CloudView";
 import FrontPage from "./FrontPage";
@@ -34,6 +34,29 @@ import { WorkflowGlyph } from "./workflows/workflowGlyph";
 import { ScriptsPage } from "./scripts/ScriptsPage";
 import SkillsView from "./skills/SkillsView";
 import { QuickActionsMenu, bindingMatches, QuickAction } from "./QuickActions";
+import type { ViewerKind } from "../api";
+
+/** Viewers that draw their own toolbar and manage their own scrolling, and so
+ * need the full height of the pane rather than sizing to their content.
+ *
+ * This used to be spelled inline as `kind === "code" || kind === "html"`, which
+ * was complete when those were the only two. Every viewer added since has a
+ * bar across the top and a scroll region under it, and one that misses this
+ * set collapses to content height with its toolbar floating above nothing. */
+const FILL_HEIGHT_KINDS = new Set<ViewerKind>([
+  "archive",
+  "book",
+  "code",
+  "html",
+  "json",
+  "log",
+  "sheet",
+  "csv",
+  "slides",
+  "subtitle",
+  "svg",
+  "worddoc",
+]);
 
 /** True when a file name is a runnable script (.py/.js). */
 function isScriptName(name: string): boolean {
@@ -75,11 +98,17 @@ export default function ViewerPane({
   // PRIV-1: the reader's "blocked version" toggle — resets per file.
   const [cloudView, setCloudView] = useState(false);
   useEffect(() => setCloudView(false), [openFile?.id]);
-  const cloudViewable =
-    openFile != null &&
-    !["image", "audio", "video", "recording", "binary"].includes(
-      openFile.content.kind,
-    );
+  // Which version's Delete is armed. Local, not a WSState slot: deleting a
+  // version is the only History action with no undo, so the armed state must
+  // die with the popover rather than survive a file switch.
+  const [confirmDeleteVersion, setConfirmDeleteVersion] = useState<string | null>(
+    null,
+  );
+  useEffect(() => setConfirmDeleteVersion(null), [openFile?.id, s.showHistory]);
+  // "Preview cloud payload" only means something for a file that HAS text a
+  // cloud model would be handed. Asking the kind was a proxy for that and went
+  // stale every time a kind was added; ask the file itself.
+  const cloudViewable = openFile != null && !!openFile.content.text;
   const frontPageView =
     s.fp && (s.fp.fileCount > 0 || s.fp.chatCount > 0 || s.fp.memories.length > 0)
       ? s.fp
@@ -138,7 +167,7 @@ export default function ViewerPane({
               {AREA_CRUMBS[area] !== "Files" ? `${AREA_CRUMBS[area]} / ` : ""}
               {folderName ? `${folderName} / ` : ""}
               <span className="crumb-title">
-                {displayName(openFile.content.name)}
+                {fileLabel(openFile.content.name, s.files)}
               </span>
             </>
           ) : (
@@ -233,24 +262,32 @@ export default function ViewerPane({
                   {cloudView ? "Close preview" : "Preview cloud payload"}
                 </button>
               )}
-              {!cloudView && a.editModeOf(openFile.content) && (
-                <button
-                  className="subtle btn-ic"
-                  title={
-                    a.editModeOf(openFile.content) === "copy"
-                      ? "Edit the extracted text — saving creates a Markdown copy"
-                      : "Switch between preview and editing"
-                  }
-                  onClick={() => s.setEditMode(!s.editMode)}
-                >
-                  {s.editMode ? <EyeIcon size={13} /> : <PencilIcon size={13} />}
-                  {s.editMode
-                    ? "Preview"
-                    : a.editModeOf(openFile.content) === "copy"
-                      ? "Edit as text"
-                      : "Edit"}
-                </button>
-              )}
+              {/* The Edit affordance, named for what it ACTUALLY does. "Edit
+                  as text" used to appear on Word files too, where it produced
+                  a separate Markdown copy and left the document untouched —
+                  the same button word for two opposite outcomes. A .docx now
+                  says "Edit" because it now really is edited. */}
+              {!cloudView &&
+                (() => {
+                  const mode = a.editModeOf(openFile.content);
+                  if (!mode) return null;
+                  const title =
+                    mode === "copy"
+                      ? "Edit the extracted text — saving creates a separate Markdown copy; the original file is unchanged"
+                      : mode === "docx"
+                        ? "Edit this document's text — saving writes it back into the Word file, keeping its styles and layout"
+                        : "Switch between preview and editing";
+                  return (
+                    <button
+                      className="subtle btn-ic"
+                      title={title}
+                      onClick={() => s.setEditMode(!s.editMode)}
+                    >
+                      {s.editMode ? <EyeIcon size={13} /> : <PencilIcon size={13} />}
+                      {s.editMode ? "Preview" : mode === "copy" ? "Edit as text" : "Edit"}
+                    </button>
+                  );
+                })()}
               {/* Wave 5 (Idea 13): a .py/.js file runs from its own header —
                   outputs are saved back into the room, versioned + undoable. */}
               {isScriptName(openFile.content.name) &&
@@ -313,6 +350,17 @@ export default function ViewerPane({
                 </button>
                 {s.showHistory && (
                   <div className="history-pop">
+                    {/* ART-1: what made the state on screen right now. Only
+                        rendered when the room actually recorded it — see
+                        `provenanceLine`, which returns "" otherwise. */}
+                    {provenanceLine(s.headProvenance) && (
+                      <div className="tm-now">
+                        <span className="tm-now-label">Now</span>
+                        <span className="tm-prov">
+                          {provenanceLine(s.headProvenance)}
+                        </span>
+                      </div>
+                    )}
                     {s.versions.length === 0 ? (
                       <div className="history-empty">
                         No earlier versions yet.
@@ -320,7 +368,34 @@ export default function ViewerPane({
                     ) : (
                       <div className="time-machine">
                         {s.versions.map((v) =>
-                          s.confirmRestore === v.id ? (
+                          confirmDeleteVersion === v.id ? (
+                            // No undo behind this one: there is no history of
+                            // the history. Agent-blocked like every other armed
+                            // destructive confirm (ADD-25).
+                            <div key={v.id} className="tm-confirm" data-agent-blocked>
+                              <span className="tm-confirm-q">
+                                Delete this saved version? It cannot be brought
+                                back.
+                              </span>
+                              <div className="tm-confirm-actions">
+                                <button
+                                  className="primary"
+                                  onClick={() => {
+                                    setConfirmDeleteVersion(null);
+                                    void a.deleteVersion(v.id);
+                                  }}
+                                >
+                                  Delete
+                                </button>
+                                <button
+                                  className="subtle"
+                                  onClick={() => setConfirmDeleteVersion(null)}
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : s.confirmRestore === v.id ? (
                             // ADD-25: the agent driver must not be able to
                             // confirm a restore it didn't earn.
                             <div key={v.id} className="tm-confirm" data-agent-blocked>
@@ -352,9 +427,27 @@ export default function ViewerPane({
                             // and an armed Restore (still data-agent-blocked).
                             <div key={v.id} className="tm-version">
                               <span className="tm-version-dot" />
-                              <span className="tm-cause">{v.cause}</span>
+                              <span className="tm-cause">
+                                {v.cause}
+                                {v.pinned && (
+                                  <span className="tm-kept" title="Kept — this version is never dropped to make room">
+                                    Kept
+                                  </span>
+                                )}
+                                {provenanceLine(v.provenance) && (
+                                  <span className="tm-prov">
+                                    {provenanceLine(v.provenance)}
+                                  </span>
+                                )}
+                              </span>
                               <span className="tm-time">
                                 {formatWhen(v.savedAt)}
+                                {v.bytes > 0 && (
+                                  <span className="tm-size">
+                                    {" · "}
+                                    {formatSize(v.bytes)}
+                                  </span>
+                                )}
                               </span>
                               <span className="tm-actions">
                                 <button
@@ -366,15 +459,54 @@ export default function ViewerPane({
                                 </button>
                                 <button
                                   className="subtle tm-action"
+                                  title={
+                                    v.pinned
+                                      ? "Stop keeping this version — it can be dropped again once there are newer ones"
+                                      : "Keep this version — it is never dropped to make room for newer ones"
+                                  }
+                                  onClick={() => void a.pinVersion(v.id, !v.pinned)}
+                                >
+                                  {v.pinned ? "Unkeep" : "Keep"}
+                                </button>
+                                <button
+                                  className="subtle tm-action"
                                   title="Restore this saved version"
                                   onClick={() => s.setConfirmRestore(v.id)}
                                 >
                                   Restore
                                 </button>
+                                {/* Deleting a version is not itself undoable —
+                                    there is no history of the history — so it
+                                    arms, like Restore does. */}
+                                <button
+                                  className="subtle tm-action"
+                                  title="Delete this saved version and free its space"
+                                  data-agent-blocked
+                                  onClick={() => setConfirmDeleteVersion(v.id)}
+                                >
+                                  Delete
+                                </button>
                               </span>
                             </div>
                           ),
                         )}
+                        {/* The rolling window used to be invisible: the
+                            eleventh save silently dropped the oldest version
+                            and nothing on screen had ever mentioned a limit.
+                            State it, with what history costs and how to opt a
+                            version out of it. */}
+                        <div className="tm-retention">
+                          {`Only the ${s.versionsKept} most recent versions are kept — press Keep to hold on to one.`}
+                          {(() => {
+                            const total = s.versions.reduce(
+                              (n, v) => n + (v.bytes || 0),
+                              0,
+                            );
+                            return total > 0
+                              ? ` This file's history uses ${formatSize(total)}.`
+                              : "";
+                          })()}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -455,9 +587,14 @@ export default function ViewerPane({
               >
                 <DownloadIcon size={13} /> Export
               </button>
+              {/* Live QA: typing in a .pptx or .docx and pressing Close threw
+                  the buffer away and returned to Home, with no dialog and no
+                  undo. Every other exit asked; this one didn't. */}
               <button
                 className="subtle btn-ic"
-                onClick={() => s.setOpenFile(null)}
+                onClick={() =>
+                  a.guardLeave("Closing this file", () => s.setOpenFile(null))
+                }
               >
                 <CloseIcon size={12} /> Close
               </button>
@@ -494,9 +631,13 @@ export default function ViewerPane({
             </div>
           )}
           <div
+            // `fill` = this viewer manages its own scrolling and wants the
+            // full height. Naming the two kinds that did was fine when there
+            // were two; every viewer with its own toolbar and scroll region
+            // needs it, and one that doesn't get it collapses to content
+            // height with its toolbar floating above nothing.
             className={`viewer-body ${
-              openFile.content.kind === "code" ||
-              openFile.content.kind === "html" ||
+              FILL_HEIGHT_KINDS.has(openFile.content.kind) ||
               (s.editMode && a.editModeOf(openFile.content) !== "grid")
                 ? "fill"
                 : ""
@@ -515,6 +656,11 @@ export default function ViewerPane({
               saveEditAsCopy={a.saveEditAsCopy}
               onDirtyChange={(d) => {
                 s.editorDirtyRef.current = d;
+              }}
+              // Lets the unsaved-edits dialog's "Save" write the buffer that is
+              // about to be unmounted — only the editor holds that text.
+              registerSave={(fn) => {
+                s.editorSaveRef.current = fn;
               }}
               recording={{
                 live: s.recLive,

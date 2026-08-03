@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, McpServerStatus } from "../api";
+import { api, ConnectorPowers, McpServerStatus } from "../api";
 
 /** Connections section: the mcpServers JSON config, live per-server status, and
  * the guided connector form that merges into that JSON. */
@@ -12,18 +12,28 @@ export function useMcpConfig() {
   const [connName, setConnName] = useState("");
   const [connCmd, setConnCmd] = useState("");
   const [connArgs, setConnArgs] = useState("");
-  // "Auto mode": blanket consent for connector tool calls AND real (unmasked)
-  // arguments to a remote connector — default OFF, so the initial value here
-  // must be `false` or the switch reads ON for a frame before Rust answers and
-  // the user is briefly told their details are already leaving. The real state
-  // lives in Rust; mirror it here. Optimistic set so the switch never lags the
-  // click.
+  // The two independent connector powers (owner's split, 2026-08-03):
+  // `autoApprove` = run connector tools without a consent card; `outboundUnmask`
+  // = let a remote connector receive the room's real values instead of the
+  // privacy door's placeholders. Both default OFF, so the initial value here
+  // must be `false` or a switch reads ON for a frame before Rust answers and the
+  // user is briefly told their details are already leaving. The real state lives
+  // in Rust; mirror it here. Optimistic set so a switch never lags the click.
   const [autoApprove, setAutoApproveState] = useState(false);
+  const [outboundUnmask, setOutboundUnmaskState] = useState(false);
+  // The per-connector answers that OVERRIDE those two (owner's decision:
+  // per connector). Absent = "follow the switch", which is why this is a map of
+  // optional booleans rather than two booleans per connector — an empty map is
+  // an install that has never made a per-connector choice, and it must behave
+  // exactly as it did before this existed.
+  const [connectorPowers, setConnectorPowers] = useState<ConnectorPowers>({});
 
   useEffect(() => {
     api.mcpGetConfig().then(setMcpConfig).catch(() => {});
     api.mcpStatus().then(setMcpStatuses).catch(() => {});
     api.getMcpAutoApprove().then(setAutoApproveState).catch(() => {});
+    api.getMcpOutboundUnmask().then(setOutboundUnmaskState).catch(() => {});
+    api.mcpGetConnectorPowers().then(setConnectorPowers).catch(() => {});
     const unlistenMcp = listen<McpServerStatus[]>("mcp-status", (e) => {
       setMcpStatuses(e.payload);
     });
@@ -70,14 +80,42 @@ export function useMcpConfig() {
     return statuses;
   }
 
-  // Flip "auto mode" — optimistic, then persist. On failure, reload the true
-  // value so the switch never lies about what the backend will do.
+  // Flip one of the two powers — optimistic, then persist. On failure, reload
+  // the true value so the switch never lies about what the backend will do.
+  // Each writes ONLY its own flag; nothing here touches the other.
   async function setAutoApprove(on: boolean) {
     setAutoApproveState(on);
     try {
       await api.setMcpAutoApprove(on);
     } catch {
       api.getMcpAutoApprove().then(setAutoApproveState).catch(() => {});
+    }
+  }
+
+  async function setOutboundUnmask(on: boolean) {
+    setOutboundUnmaskState(on);
+    try {
+      await api.setMcpOutboundUnmask(on);
+    } catch {
+      api.getMcpOutboundUnmask().then(setOutboundUnmaskState).catch(() => {});
+    }
+  }
+
+  // One connector's answer for one power — `null` puts it back to following the
+  // switch above. NOT optimistic: the backend returns the stored map and we show
+  // that, because a per-connector grant is a permission and the page must never
+  // display one the backend rejected or dropped.
+  async function setConnectorPower(
+    server: string,
+    power: "auto_approve" | "outbound_unmask",
+    value: boolean | null,
+  ) {
+    setMcpError("");
+    try {
+      setConnectorPowers(await api.mcpSetConnectorPower(server, power, value));
+    } catch (e) {
+      setMcpError(String(e));
+      api.mcpGetConnectorPowers().then(setConnectorPowers).catch(() => {});
     }
   }
 
@@ -153,6 +191,10 @@ export function useMcpConfig() {
     removeServer,
     autoApprove,
     setAutoApprove,
+    outboundUnmask,
+    setOutboundUnmask,
+    connectorPowers,
+    setConnectorPower,
     installedNames: mcpStatuses.map((s) => s.name),
   };
 }

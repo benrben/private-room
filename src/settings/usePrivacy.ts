@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, hasRecoveryKey } from "../api";
+import { MIN_PASSWORD, ROOM_FILTER } from "../rooms/constants";
+import { duplicateFileName } from "../rooms/helpers";
 
 /** Privacy section (Wave 2): auto-lock, change password, Touch ID unlock,
  * duplicate room, and compact. */
@@ -19,6 +21,9 @@ export function usePrivacy() {
 
   // ADD-11: Touch ID unlock. Needs the open room's path (from room_info).
   const [roomPath, setRoomPath] = useState("");
+  // The open room's own name, so the copy is suggested under it rather than
+  // under a generic "Copy of room" the app already knows is wrong.
+  const [roomName, setRoomName] = useState("");
   const [touchIdOn, setTouchIdOn] = useState(false);
   const [touchIdErr, setTouchIdErr] = useState("");
   // ADD-4: duplicate room.
@@ -43,6 +48,7 @@ export function usePrivacy() {
       .then((info) => {
         if (!info) return;
         setRoomPath(info.path);
+        setRoomName(info.name);
         api.touchIdHas(info.path).then(setTouchIdOn).catch(() => {});
       })
       .catch(() => {});
@@ -61,8 +67,8 @@ export function usePrivacy() {
       setPwError("The new passwords do not match.");
       return;
     }
-    if (pwNew.length < 8) {
-      setPwError("New password must be at least 8 characters.");
+    if (pwNew.length < MIN_PASSWORD) {
+      setPwError(`New password must be at least ${MIN_PASSWORD} characters.`);
       return;
     }
     try {
@@ -83,6 +89,32 @@ export function usePrivacy() {
         setPwError(
           "Your recovery key could not be re-issued and has been revoked — create a new one in Settings → Recovery key.",
         );
+      }
+      // Same doctrine, one boundary further out: a checkpoint whose re-key
+      // failed leaves the password change reporting a clean success while that
+      // restore point quietly stops working. Name them NOW, while the old
+      // password is still fresh in the user's mind — the alternative is finding
+      // out weeks later from a rollback that says the current password is wrong.
+      const stranded = await api.listStrandedCheckpoints().catch(() => []);
+      if (stranded.length > 0) {
+        setPwError(
+          `${stranded.length} restore point${stranded.length === 1 ? "" : "s"} could not be re-locked with the new password (${stranded.join(", ")}). ` +
+            "Only your PREVIOUS password opens them — keep it somewhere safe, or delete them under Settings → Restore points.",
+        );
+      }
+      // The Keychain entry holds the OLD password, so `change_password`
+      // re-saves it behind Touch ID — and when that re-save fails it safely
+      // DELETES the entry instead (safety.rs). Settings kept showing the switch
+      // as on until it was reopened, so the room read as biometric-unlockable
+      // when only typing worked. Ask the Keychain rather than assume either way.
+      if (roomPath) {
+        const still = await api.touchIdHas(roomPath).catch(() => touchIdOn);
+        setTouchIdOn(still);
+        if (touchIdOn && !still) {
+          setTouchIdErr(
+            "Touch ID unlock was turned off: the new password could not be stored behind it. Turn it back on to re-enable it.",
+          );
+        }
       }
       window.setTimeout(() => setPwSaved(false), 2400);
     } catch (e) {
@@ -109,9 +141,12 @@ export function usePrivacy() {
 
   // ADD-4: pick a destination file for the copy.
   async function chooseDupDest() {
+    // The save sheet used to suggest "Copy of room.arcelle" for every room,
+    // even though the app knows this room's name — so two rooms called the same
+    // thing ended up in files called the same generic thing.
     const p = await api.chooseSavePath({
-      defaultPath: "Copy of room.arcelle",
-      filters: [{ name: "Arcelle Workspace", extensions: ["arcelle", "roomai"] }],
+      defaultPath: `${duplicateFileName(roomName)}.arcelle`,
+      filters: ROOM_FILTER,
     });
     if (p) setDupDest(p);
   }
@@ -128,8 +163,8 @@ export function usePrivacy() {
         setDupError("The new passwords do not match.");
         return;
       }
-      if (dupPassword.length < 8) {
-        setDupError("New password must be at least 8 characters.");
+      if (dupPassword.length < MIN_PASSWORD) {
+        setDupError(`New password must be at least ${MIN_PASSWORD} characters.`);
         return;
       }
       newPassword = dupPassword;
@@ -161,6 +196,7 @@ export function usePrivacy() {
   }
 
   return {
+    roomName,
     autolock,
     changeAutolock,
     pwCurrent,

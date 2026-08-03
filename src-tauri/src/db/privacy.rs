@@ -182,30 +182,74 @@ pub fn set_privacy_scan(
     )
 }
 
-/// Files with extracted text whose scan row is missing or stale for the given
-/// rules hash. Returns (id, name, extracted_text) oldest-imported first, so a
-/// long re-scan makes visible progress through the library in a stable order.
+/// The digest stored in `privacy_scans.text_sha256`: sha256 hex of the exact
+/// text that was scanned. ONE definition, because the writer
+/// (`commands::privacy`, after a completed scan) and the staleness reader below
+/// must agree byte for byte — two spellings of "hash the text" that drift mean
+/// either re-scanning everything forever or never re-scanning anything.
+pub fn privacy_text_sha(text: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(text.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Files with extracted text whose scan row is missing, or stale for the given
+/// rules hash, or stale because THE TEXT ITSELF CHANGED since it was scanned.
+/// Returns (id, name, extracted_text) oldest-imported first, so a long re-scan
+/// makes visible progress through the library in a stable order.
+///
+/// THE BUG THIS EXISTS FOR: the scan row has always recorded the digest of the
+/// text it read, and nothing ever compared it again — only the rules hash was
+/// tested. So a file edited (or a recording re-transcribed) after its scan kept
+/// its "this file is protected" row forever: new names, addresses and ID
+/// numbers in it were never found, and went to a cloud model unhidden even
+/// after pressing "Scan now". The stored digest is the only thing that can see
+/// that, so it is now part of the staleness test.
+///
+/// The digest is recomputed rather than compared in SQL (SQLite has no sha256),
+/// which costs one hash of every already-scanned file's text per call. That is
+/// the deliberate trade: this runs on scan starts and on Settings/Home status
+/// reads, not per keystroke, and the alternative — trusting a write-time
+/// invalidation hook — is a promise every future writer of `extracted_text` has
+/// to keep, which is exactly the kind of promise this door does not rely on.
 pub fn files_needing_privacy_scan(
     conn: &Connection,
     rules_sha256: &str,
 ) -> Result<Vec<(String, String, String)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT f.id, f.name, f.extracted_text FROM files f
+            "SELECT f.id, f.name, f.extracted_text, s.rules_sha256, s.text_sha256 FROM files f
              LEFT JOIN privacy_scans s ON s.file_id = f.id
-             WHERE f.extracted_text IS NOT NULL AND length(f.extracted_text) > 0
-               AND (s.file_id IS NULL OR s.rules_sha256 != ?1)
+             WHERE f.trashed_at IS NULL
+               AND f.extracted_text IS NOT NULL AND length(f.extracted_text) > 0
              ORDER BY f.created_at ASC, f.rowid ASC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([rules_sha256], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, text, scanned_rules, scanned_text)| match (scanned_rules, scanned_text) {
+            (Some(rules), Some(digest)) => {
+                rules != rules_sha256 || *digest != privacy_text_sha(text)
+            }
+            // No scan row (or a half-written one): never scanned under any rules.
+            _ => true,
+        })
+        .map(|(id, name, text, _, _)| (id, name, text))
+        .collect())
 }
 
 #[cfg(test)]
@@ -249,10 +293,46 @@ mod tests {
         let conn = db::mem();
         let fid = db::add_file(&conn, "a.txt", "Ben Reich's lease");
         assert_eq!(files_needing_privacy_scan(&conn, "r1").unwrap().len(), 1);
-        set_privacy_scan(&conn, &fid, "t1", "r1").unwrap();
+        set_privacy_scan(&conn, &fid, &privacy_text_sha("Ben Reich's lease"), "r1").unwrap();
         assert!(files_needing_privacy_scan(&conn, "r1").unwrap().is_empty());
         // New rules hash → stale again.
         assert_eq!(files_needing_privacy_scan(&conn, "r2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn editing_a_scanned_file_restales_it() {
+        // The leak this pins: a file scanned once stayed "protected" forever,
+        // so names added to it afterwards reached a cloud model unhidden.
+        let conn = db::mem();
+        let fid = db::add_file(&conn, "a.txt", "nothing private here");
+        set_privacy_scan(&conn, &fid, &privacy_text_sha("nothing private here"), "r1").unwrap();
+        assert!(files_needing_privacy_scan(&conn, "r1").unwrap().is_empty());
+
+        db::set_file_extracted_text(&conn, &fid, "now it names Dana Levi, 054-1234567").unwrap();
+        let pending = files_needing_privacy_scan(&conn, "r1").unwrap();
+        assert_eq!(pending.len(), 1, "an edited file must come back for a re-scan");
+        assert_eq!(pending[0].0, fid);
+        assert_eq!(pending[0].2, "now it names Dana Levi, 054-1234567");
+
+        // Re-scanning the NEW text settles it again (no permanent re-scan loop).
+        set_privacy_scan(
+            &conn,
+            &fid,
+            &privacy_text_sha("now it names Dana Levi, 054-1234567"),
+            "r1",
+        )
+        .unwrap();
+        assert!(files_needing_privacy_scan(&conn, "r1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_half_written_scan_row_is_never_trusted() {
+        // Belt and braces: an empty digest (older row, interrupted write) must
+        // read as "not scanned", never as "scanned and unchanged".
+        let conn = db::mem();
+        let fid = db::add_file(&conn, "a.txt", "text");
+        set_privacy_scan(&conn, &fid, "", "r1").unwrap();
+        assert_eq!(files_needing_privacy_scan(&conn, "r1").unwrap().len(), 1);
     }
 
     #[test]

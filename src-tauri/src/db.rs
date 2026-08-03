@@ -1,4 +1,4 @@
-use crate::commands::{Chat, FileMeta, FileVersion, Folder, Memory, Message};
+use crate::commands::{Chat, FileMeta, FileVersion, Folder, Memory, Message, TrashedFile};
 use crate::extraction;
 use rusqlite::{params, Connection};
 use uuid::Uuid;
@@ -12,6 +12,7 @@ use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use sha2::Sha256;
 
+mod artifacts;
 mod browse;
 mod chats;
 mod embeddings;
@@ -31,6 +32,7 @@ mod versions;
 mod web_cache;
 mod workflows;
 
+pub use artifacts::*;
 pub use browse::*;
 pub use chats::*;
 pub use embeddings::*;
@@ -74,6 +76,15 @@ pub(crate) const FILE_META_COLS: &str = "f.id, f.name, f.mime_type, f.size_bytes
      f.extracted_text, f.created_at, f.folder_id, \
      (SELECT count(*) FROM chunks WHERE file_id = f.id), f.origin_url";
 
+/// Trash: the clause that makes a query mean "files that are in this room".
+/// Written once so the dozens of listing/search/count queries that must exclude
+/// deleted files all say the same thing, and so grepping for `NOT_TRASHED`
+/// finds every one of them.
+///
+/// Assumes the `files` table is aliased `f` — the shape `FILE_META_COLS`
+/// already forces. Queries that don't alias spell the clause out inline.
+pub(crate) const NOT_TRASHED: &str = "f.trashed_at IS NULL";
+
 pub(crate) fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
     let chunk_count: i64 = row.get(8)?;
     Ok(FileMeta {
@@ -98,22 +109,85 @@ pub(crate) fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
 /// nikud/cantillation are stripped first: the FTS tokenizer (unicode61)
 /// treats those combining marks as separators, so pointed words would index
 /// as single-letter fragments no plain query can ever match (קהלת vs קֹהֶלֶת).
+///
+/// Trash: a TRASHED file's chunks are written to `trashed_chunks` instead of
+/// the live index. This is not a detail — the background OCR and transcription
+/// workers finish long after the import that queued them, and a file deleted in
+/// the meantime would otherwise have its freshly extracted text indexed into a
+/// room that is no longer showing the file. Routing here (rather than at the
+/// three call sites) keeps the invariant the retrieval queries depend on —
+/// `chunks` holds only the text of files that are IN the room — true by
+/// construction. It also keeps the stash current, so a restore months later
+/// brings back the text the file actually has, not the text it had when it was
+/// deleted.
 pub(crate) fn insert_chunks(conn: &Connection, file_id: &str, text: Option<&str>) -> Result<(), String> {
     if let Some(text) = text {
-        let text = extraction::strip_hebrew_marks(text);
-        for (seq, chunk) in extraction::chunk_text(&text, CHUNK_TARGET_CHARS)
-            .into_iter()
-            .take(CHUNK_CAP)
-            .enumerate()
-        {
-            conn.execute(
-                "INSERT INTO chunks(id, file_id, seq, text) VALUES (?1, ?2, ?3, ?4)",
-                params![Uuid::new_v4().to_string(), file_id, seq as i64, chunk],
+        // A missing row reads as "not trashed": the only caller that can be in
+        // that position is `insert_file`, which has just written the row.
+        let trashed: bool = conn
+            .query_row(
+                "SELECT trashed_at IS NOT NULL FROM files WHERE id = ?1",
+                [file_id],
+                |r| r.get(0),
             )
-            .map_err(|e| e.to_string())?;
+            .unwrap_or(false);
+        let sql = if trashed {
+            "INSERT INTO trashed_chunks(id, file_id, seq, text) VALUES (?1, ?2, ?3, ?4)"
+        } else {
+            "INSERT INTO chunks(id, file_id, seq, text) VALUES (?1, ?2, ?3, ?4)"
+        };
+        let text = extraction::strip_hebrew_marks(text);
+        // A book-length import is up to CHUNK_CAP rows, and each row also fires
+        // the `chunks_fts_ai` trigger. One autocommitted `execute` per chunk
+        // means one fsync per chunk — seconds of import turned into minutes —
+        // and a crash part-way through left the file HALF-indexed, which reads
+        // as "the search index has this document" while most of it is missing.
+        // A SAVEPOINT (not BEGIN: `commit_plans` and `restore_file_version`
+        // already hold a transaction when they reach here, and SAVEPOINTs nest)
+        // makes the whole chunking one atomic, one-fsync unit, and a prepared
+        // statement is compiled once rather than per row.
+        let sp = format!("chunk_{}", Uuid::new_v4().simple());
+        conn.execute_batch(&format!("SAVEPOINT \"{sp}\"")).map_err(|e| e.to_string())?;
+        let written = (|| -> Result<(), String> {
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            for (seq, chunk) in extraction::chunk_text(&text, CHUNK_TARGET_CHARS)
+                .into_iter()
+                .take(CHUNK_CAP)
+                .enumerate()
+            {
+                stmt.execute(params![
+                    Uuid::new_v4().to_string(),
+                    file_id,
+                    seq as i64,
+                    chunk
+                ])
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                conn.execute_batch(&format!("RELEASE \"{sp}\"")).map_err(|e| e.to_string())?;
+            }
+            Err(e) => {
+                // Roll the partial index back so "indexed" never half-means it.
+                let _ = conn
+                    .execute_batch(&format!("ROLLBACK TO \"{sp}\"; RELEASE \"{sp}\""));
+                return Err(e);
+            }
         }
     }
     Ok(())
+}
+
+/// Drop a file's search chunks from BOTH the live index and the trash stash,
+/// ahead of re-indexing it. Every content rewrite goes through here: clearing
+/// only `chunks` would leave a trashed file's stash holding the text it had
+/// when it was deleted, and a restore would put that stale text back into the
+/// index beside the file's real, newer content.
+pub(crate) fn clear_chunks(conn: &Connection, file_id: &str) -> Result<(), String> {
+    execute_one(conn, "DELETE FROM chunks WHERE file_id = ?1", [file_id])?;
+    execute_one(conn, "DELETE FROM trashed_chunks WHERE file_id = ?1", [file_id])
 }
 
 /// Today's date as YYYY-MM-DD, from SQLite so it matches stored timestamps.
@@ -129,7 +203,7 @@ pub fn current_date(conn: &Connection) -> String {
 /// guessing again. Best-effort; capped so it never bloats the tool result.
 pub(crate) fn file_names_hint(conn: &Connection) -> String {
     let names: Vec<String> = conn
-        .prepare("SELECT name FROM files ORDER BY created_at DESC LIMIT 10")
+        .prepare("SELECT name FROM files WHERE trashed_at IS NULL ORDER BY created_at DESC LIMIT 10")
         .and_then(|mut s| {
             s.query_map([], |r| r.get::<_, String>(0))
                 .map(|rows| rows.filter_map(Result::ok).collect())
@@ -203,4 +277,46 @@ pub(crate) fn temp_room_path() -> String {
         .join(format!("pr-test-{}.room", uuid::Uuid::new_v4()))
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_chunking_leaves_no_half_indexed_file() {
+        // CHG: chunking used to be one autocommitted INSERT per chunk, so a
+        // failure (or a crash) part-way through left the earlier chunks in the
+        // index — the file read as searchable while most of it was missing.
+        let conn = mem();
+        let id = insert_file(&conn, "a.txt", "text/plain", b"x", None, "upload").unwrap().id;
+        // Fail on the 5th chunk, the way an interrupted import would.
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_late BEFORE INSERT ON chunks WHEN NEW.seq = 4 \
+             BEGIN SELECT RAISE(ABORT, 'interrupted'); END;",
+        )
+        .unwrap();
+        let long = "word ".repeat(CHUNK_TARGET_CHARS * 6 / 5);
+        assert!(insert_chunks(&conn, &id, Some(&long)).is_err());
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM chunks WHERE file_id = ?1", [&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "a failed chunking must leave the file un-indexed, not half-indexed");
+    }
+
+    #[test]
+    fn chunking_nests_inside_a_caller_transaction() {
+        // `commit_plans` / `restore_file_version` already hold BEGIN IMMEDIATE
+        // when they reach here, so the batching must be a SAVEPOINT, not BEGIN.
+        let conn = mem();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let id = insert_file(&conn, "b.txt", "text/plain", b"x", None, "upload").unwrap().id;
+        let long = "word ".repeat(CHUNK_TARGET_CHARS * 6 / 5);
+        insert_chunks(&conn, &id, Some(&long)).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM chunks WHERE file_id = ?1", [&id], |r| r.get(0))
+            .unwrap();
+        assert!(n >= 2, "expected several chunks, got {n}");
+    }
 }

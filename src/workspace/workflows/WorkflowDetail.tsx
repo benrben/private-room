@@ -17,13 +17,19 @@ import { PipelineCanvas } from "./PipelineCanvas";
 import { NodeParamSheet } from "./NodeParamSheet";
 import { SchedulePopover } from "./SchedulePopover";
 import { RunHistory } from "./RunHistory";
+import { branchFor } from "./selectors";
 import { WorkflowGlyph, WORKFLOW_ICON_CHOICES } from "./workflowGlyph";
 import { PlayIcon, PinIcon, CalendarClockIcon } from "../../icons";
+import { coveredKinds } from "../../viewers/registry";
 
-const KIND_UNION = [
-  "image", "pdf", "docx", "sheet", "csv", "markdown", "html", "code", "text",
-  "audio", "video", "recording", "binary",
-];
+/** The file kinds a workflow binding can be limited to.
+ *
+ * Read from the viewer registry rather than restated here. This list was a
+ * FOURTH hand-maintained copy of the kind union (with Rust's format table, the
+ * ViewerKind type and the registry itself) and had already gone stale: a
+ * workflow could not be pointed at a presentation, a book, an archive or a
+ * notebook, because those kinds simply weren't offered as buttons. */
+const KIND_UNION = coveredKinds();
 
 type Props = { s: WSState; a: WSActions; workflow: Workflow };
 
@@ -64,23 +70,6 @@ function newNode(idx: number): WorkflowNode {
   };
 }
 
-/** The outcome label a NEW edge off `from` must carry, or undefined when `from`
- * isn't a branch source. Every edge leaving a condition/route has to name its
- * outcome — an unlabelled one is live whichever way the step went, so the step
- * stops choosing and every path runs. Picks the first outcome not already wired. */
-function branchFor(from: WorkflowNode | undefined, existing: WorkflowEdge[]): string | undefined {
-  if (!from) return undefined;
-  const options =
-    from.kind === "condition"
-      ? ["then", "else"]
-      : from.kind === "route" && Array.isArray(from.labels)
-        ? (from.labels as string[])
-        : [];
-  if (options.length === 0) return undefined;
-  const used = new Set(existing.map((e) => e.branch ?? ""));
-  return options.find((b) => !used.has(b)) ?? options[0];
-}
-
 export function WorkflowDetail({ s, a, workflow }: Props) {
   const [def, setDef] = useState<WorkflowDef>(workflow.definition);
   const [name, setName] = useState(workflow.name);
@@ -90,6 +79,8 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   const [extsText, setExtsText] = useState(() => extsOf(workflow.binding));
   const [selected, setSelected] = useState<string | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
+  /** True while the backend validator is deciding — see the effect below. */
+  const [checking, setChecking] = useState(true);
   // Dirty = the form actually differs from the saved workflow, so toggling a
   // value back to its original (e.g. Script mode Import→Pipe→Import) clears Save.
   const dirty = useMemo(
@@ -152,9 +143,29 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   }, [workflow.id, s.workflows]);
 
   // Validate on every edit (single source of truth — the backend validator).
+  //
+  // `checking` exists because "no errors yet" and "no errors" are not the same
+  // thing. `errors` starts empty and the validator is async, so a brand-new draft
+  // — zero nodes, the least valid workflow there is — rendered with Activate
+  // ENABLED until the first result landed, and the same stale-empty window
+  // reopened after every edit. Live QA 2026-08-03 activated an empty workflow
+  // through it. Unknown is not valid; it just isn't known to be invalid yet.
   useEffect(() => {
     let live = true;
-    api.validateWorkflow(def, binding).then((e) => live && setErrors(e)).catch(() => {});
+    setChecking(true);
+    api
+      .validateWorkflow(def, binding)
+      .then((e) => {
+        if (!live) return;
+        setErrors(e);
+        setChecking(false);
+      })
+      .catch((e) => {
+        if (!live) return;
+        // A validator we couldn't reach must not read as a clean bill of health.
+        setErrors([`Couldn't check this workflow: ${String(e)}`]);
+        setChecking(false);
+      });
     return () => {
       live = false;
     };
@@ -164,7 +175,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   const runningJobId = runs.find((r) => r.status === "running")?.jobId ?? null;
   const liveStatus = runningJobId ? s.wfNodeStatus[runningJobId] : undefined;
   const isFileScoped = binding.scope === "file";
-  const valid = errors.length === 0;
+  const valid = !checking && errors.length === 0;
 
   const nodeCount = useMemo(() => def.nodes.length, [def]);
 
@@ -338,7 +349,24 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
               Deactivate
             </button>
           ) : (
-            <button className="primary" disabled={!valid} onClick={() => void saveAndActivate()}>
+            // A disabled button with no reason beside it reads as a broken
+            // button. `title` + aria-disabled also make the blocked state
+            // legible to the accessibility tree, which is how QA inspects this
+            // — reported as "Activate is enabled" when it was disabled with
+            // nothing to say why.
+            <button
+              className="primary"
+              disabled={!valid}
+              aria-disabled={!valid}
+              title={
+                checking
+                  ? "Checking this workflow…"
+                  : errors.length
+                    ? `Can't activate yet — ${errors[0]}`
+                    : "Save and activate this workflow"
+              }
+              onClick={() => void saveAndActivate()}
+            >
               Activate
             </button>
           )}

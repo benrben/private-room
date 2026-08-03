@@ -28,6 +28,7 @@ flag stays as the promotion mechanism for the next one.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -105,6 +106,19 @@ class Flow:
     #: step on every task of a whole feature, and a small model's opening
     #: context poisoned with an error it did not cause.
     probe_after: str = ""
+    #: Substrings in the LAST tool result meaning the precondition tool ran but
+    #: did not establish the precondition, so ``probe`` still must not fire.
+    #:
+    #: THE BUG THIS EXISTS FOR (2026-08-02): BROWSE-3c let `browse_open` take
+    #: plain words and answer with SEARCH RESULTS instead of navigating. That
+    #: satisfies `probe_after` — the tool was attempted — while leaving no page
+    #: at all, which put the guaranteed-failing `browse_snapshot` back exactly
+    #: where `probe_after` had removed it: between the agent receiving its
+    #: results and choosing one.
+    #:
+    #: Fails OPEN like ``blockers``: if the host's wording drifts, the probe
+    #: fires as it did before this field existed, rather than never firing.
+    probe_unless: tuple[str, ...] = ()
     #: Substrings in the probe's result that mean "this cannot be done". The
     #: predicate fails OPEN when none match, so drifting Rust wording degrades
     #: to today's behaviour rather than to a refusal.
@@ -488,7 +502,19 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # `probe_after`: the free snapshot is worth exactly as much as it is on
         # app.ui, but only once a page EXISTS — see `Flow.probe_after` for the
         # guaranteed-failure this gate removes from the opening round.
-        flow=Flow(probe="browse_snapshot", probe_after="browse_open"),
+        # `probe_unless`: BROWSE-3c. A `browse_open` carrying plain words
+        # SEARCHES and leaves no page, so the precondition is "browse_open ran
+        # AND it navigated". These two phrases are the host's, from
+        # `format_hits_for_agent` in src-tauri/src/commands/browse/search.rs —
+        # a Rust test pins them for exactly this reason.
+        flow=Flow(
+            probe="browse_snapshot",
+            probe_after="browse_open",
+            probe_unless=(
+                "searched the room's own engines",
+                "no results across seven engines",
+            ),
+        ),
         template="perceive_act",
         label="Browser agent",
         # BROWSE-2: browse_save rode into BROWSE_TOOL_NAMES; the download verbs
@@ -1108,6 +1134,50 @@ def normalize_domain_key(raw: str) -> str | None:
     return _DOMAIN_ALIASES.get(raw.strip().lower())
 
 
+#: A composer message whose FIRST token is ``*<name>`` — the owner's tag for
+#: "run this specialist" (2026-08-03).
+#:
+#: ``[a-z]`` and nothing else, because this token is typed by a PERSON out of
+#: the ``*`` menu and the menu inserts a domain key. It once read ``[\w.]`` so
+#: that every spelling `normalize_domain_key` accepts (``*ask_web_agent``,
+#: ``*chat.browse``) would match here too — but the host's parser
+#: (``composer.ts parseComposer``) cannot even lex those, so it sent them as
+#: ordinary prose while this side quietly dispatched the Web agent for a turn
+#: the composer had shown as untagged. The alias table is for what a MODEL
+#: emits; it has no business reading a human's first token.
+#:
+#: The tight charset is also what makes the name safe to quote back into the
+#: system message (`prompts.TAG_UNAVAILABLE_NOTE`): a-z cannot carry an
+#: instruction.
+_TAG_RE = re.compile(r"^\s*\*([a-z]+)(?=\s|$)")
+
+
+def tagged_specialist(question: str) -> tuple[str, str]:
+    """``("web", "what is the weather")`` for ``"*web what is the weather"``.
+
+    The FIRST token only, exactly like ``/skill`` (``agent.rs``
+    ``explicit_skill_request``) — a ``*`` mid-sentence is multiplication, a
+    footnote or a bullet, and must stay literal text. ``("", question)`` when
+    there is no tag at all.
+
+    The name comes back AS TYPED and is not checked against anything here. That
+    is the whole judgement: this function used to return ``None`` for a name no
+    domain answers to, which made a typo indistinguishable from an untagged
+    turn — the hub then ran an ordinary turn and nothing, anywhere, told the
+    user their ``*banana`` had gone nowhere. The host refuses that message
+    outright (``composer.ts``, the same refusal ``#cmd`` and ``/skill`` get);
+    when one reaches us anyway — a headless ``agent_run``, or a composer whose
+    roster never loaded — `graph.prepare` names it back and refuses it, by the
+    same sentence a REACHABLE-but-unavailable tag gets. Both are "this room has
+    no such specialist", and the room's served catalog is the only thing that
+    can tell them apart — see :func:`reachable_domain_keys`.
+    """
+    m = _TAG_RE.match(question)
+    if not m:
+        return "", question
+    return m.group(1), question[m.end() :].strip()
+
+
 def reachable_domain_keys(*, web_enabled: bool, served_names: set[str]) -> list[str]:
     """The short domain keys offered this run, in :data:`DOMAIN_KEY_ORDER`.
 
@@ -1123,6 +1193,47 @@ def reachable_domain_keys(*, web_enabled: bool, served_names: set[str]) -> list[
         if reachable_members(members, web_enabled=web_enabled, served_names=served_names)
     }
     return [k for k in DOMAIN_KEY_ORDER if DOMAIN_KEYS[k] in live]
+
+
+def specialist_roster(
+    *, web_enabled: bool, served_names: set[str]
+) -> list[dict[str, str]]:
+    """The reachable specialists as DATA, for the composer's ``*`` menu.
+
+    The owner's ``*`` tag (2026-08-03) lets a user name the specialist a turn
+    goes to, which means the HOST has to draw a menu of them — and a menu is
+    one more thing that can claim a capability the room does not have. So it is
+    generated from :func:`reachable_domain_keys` like every other listing,
+    rather than shipped as a roster the frontend keeps in step by hand: a
+    web-disabled room offers no Web specialist in the menu for exactly the same
+    reason its catalog carries no ``ask_web_agent``.
+
+    ``label`` is the FIRST reachable member's own label, so the menu says
+    "Web agent" in the same words the agent diagram uses for the node that then
+    lights up. ``area`` is the at-a-glance blurb; ``description`` is the full
+    catalog sentence, which is the honest answer to "what does this one do".
+    """
+    out: list[dict[str, str]] = []
+    keys = reachable_domain_keys(web_enabled=web_enabled, served_names=served_names)
+    by_key = {
+        name.removeprefix("ask_").removesuffix("_agent"): (members, description)
+        for name, members, description in AGENT_TOOL_DOMAINS
+    }
+    for key in keys:
+        members, description = by_key[key]
+        live = reachable_members(
+            members, web_enabled=web_enabled, served_names=served_names
+        )
+        out.append(
+            {
+                "key": key,
+                "tool": DOMAIN_KEYS[key],
+                "label": _BY_ID[live[0]].label,
+                "area": DOMAIN_BLURBS[key],
+                "description": description,
+            }
+        )
+    return out
 
 
 #: The ONE argument every delegation carries, per-domain and per batch task
@@ -1228,23 +1339,44 @@ def _batch_tool_spec(keys: list[str]) -> dict:
     )
 
 
-def agent_tool_specs(*, web_enabled: bool, served_names: set[str]) -> list[dict]:
+def agent_tool_specs(
+    *, web_enabled: bool, served_names: set[str], only: str | None = None
+) -> list[dict]:
     """The main agent's tool catalog: one entry per REACHABLE domain.
 
     A domain is reachable when some member worker could actually act — its box
     intersects the served catalog (the File agent's box is CORE, which the
     bridge always serves in agent scope). Web is a room setting.
+
+    ``only`` is the name the USER tagged with ``*`` in the composer, as typed.
+    It NARROWS the reachable set — it can never widen it — so a tag this room
+    cannot serve leaves the catalog exactly as it was and the caller is the one
+    that must say so out loud (`graph.prepare`). A name no domain answers to at
+    all takes that same path, deliberately: "web, in a room with the web off"
+    and "banana" are one answer to the user ("this room has no such
+    specialist"), and only reachability can tell them apart. Narrowing rather
+    than steering by prose is the point: with one specialist in the catalog the
+    hub has no tool with which to reach a different one, so "run the Web agent"
+    cannot quietly become the File agent answering from room content.
+
+    The batch tool goes with it — a fan-out enum of one is a call the model can
+    only get wrong, and the whole turn is already destined for that specialist.
     """
     keys = reachable_domain_keys(web_enabled=web_enabled, served_names=served_names)
+    narrowed = only is not None and only in keys
+    if narrowed:
+        keys = [str(only)]
     live = {DOMAIN_KEYS[k] for k in keys}
     out: list[dict] = [
         _function_spec(name, description, _instruction_only_params())
         for name, _members, description in AGENT_TOOL_DOMAINS
         if name in live
     ]
-    if not out:
+    if not out or narrowed:
         # No reachable specialist means no batch tool either: a fan-out over an
-        # empty roster is a call the model can only get wrong.
+        # empty roster is a call the model can only get wrong. Neither is a
+        # fan-out over the single specialist the user tagged — the enum would
+        # hold one key, and every task in the plan would name it.
         return out
     # `keys` came from reachable_domain_keys above — the enum, its description
     # and the Main agent's prompt therefore list the SAME domains in the SAME
@@ -1329,6 +1461,37 @@ def toolbox_for(agent_id: str, served_names: set[str]) -> set[str]:
     return (set(CORE_TOOLS) | set(spec.tools)) & served_names
 
 
+def agent_roster() -> list[dict[str, str]]:
+    """Every worker, ``{"id", "label"}``, in registry order.
+
+    The published provider × agent matrix's ROW headings. Read straight off
+    :data:`REGISTRY` so a new agent appears in the matrix the moment it exists —
+    a hand-kept list would have been wrong by the next commit. The Main agent is
+    excluded because it runs no tools of its own (``AgentSpec.main``): it is the
+    interlocutor every tier always has, so a column of unbroken yeses would say
+    nothing.
+    """
+    return [{"id": spec.id, "label": spec.label} for spec in REGISTRY if not spec.main]
+
+
+def reachable_agent_ids(served_names: set[str], *, web_enabled: bool) -> list[str]:
+    """Which workers could actually act, given the tools a tier serves.
+
+    The SAME :func:`worker_reachable` predicate the live run uses — not a
+    parallel re-implementation — so the matrix cannot claim an agent a real turn
+    would find empty, or hide one a real turn would offer. That predicate is
+    also what already refuses a box whose ``requires`` tools are missing, which
+    is the whole reason the App agent must not appear for a tier that serves
+    only ``view_media_frame``.
+    """
+    return [
+        spec.id
+        for spec in REGISTRY
+        if not spec.main
+        and worker_reachable(spec, web_enabled=web_enabled, served_names=served_names)
+    ]
+
+
 __all__ = [
     "AGENT_TOOL_DOMAINS",
     "AGENT_TOOL_NAMES",
@@ -1338,6 +1501,8 @@ __all__ = [
     "DOMAIN_KEY_ORDER",
     "AgentSpec",
     "CORE_TOOLS",
+    "agent_roster",
+    "reachable_agent_ids",
     "DEFAULT_AGENT_ID",
     "MAIN_AGENT_ID",
     "GROUPS",
@@ -1353,6 +1518,8 @@ __all__ = [
     "group_prompt",
     "group_servable",
     "reachable_members",
+    "specialist_roster",
+    "tagged_specialist",
     "worker_reachable",
     "group_tools",
     "toolbox_for",

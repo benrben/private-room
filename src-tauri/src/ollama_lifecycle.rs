@@ -97,7 +97,11 @@ fn host_of(base: &str) -> String {
 /// Is the resolved base URL a local daemon we may start/stop? A remote override
 /// (the closet supercomputer) is off-limits — starting a local daemon for it
 /// wastes the user's time and then reports the REMOTE box down anyway.
-fn base_is_local(base: &str) -> bool {
+///
+/// Also the TRANSPORT half of "does this content leave the Mac?"
+/// (`capabilities::ollama_runs_here`): the same question the daemon manager asks
+/// is the one the privacy door has to ask, so there is one answer for both.
+pub(crate) fn base_is_local(base: &str) -> bool {
     let host = host_of(base);
     host == "localhost"
         || host == "0.0.0.0"

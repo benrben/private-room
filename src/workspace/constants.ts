@@ -48,3 +48,38 @@ export const HELP_COMMAND: ChatCommand = {
   summary: "List every command and how to use it",
   usage: "#help",
 };
+
+/** How many chat messages the transcript PAINTS at a time, newest-last.
+ *
+ * Opening a months-old conversation used to mount every row at once — hundreds
+ * of long answers, each with its own Markdown parse, plus inline images and
+ * agent diagrams. This bounds the render only: the whole conversation is
+ * already in memory, so "Show earlier messages" is instant and nothing is ever
+ * missing from what the model is given. Sized so an ordinary conversation is
+ * never paged at all. */
+export const CHAT_PAGE = 60;
+
+/** The newest `shown` of `all`, plus how many older ones are being held back.
+ *
+ * Pure and exported so the paging rule is testable without mounting the pane:
+ * the transcript is newest-LAST, so a page is a tail slice, and "0 hidden" has
+ * to mean the list is whole rather than "we did not check".
+ */
+export function chatPageSlice<T>(all: T[], shown: number): { hidden: number; visible: T[] } {
+  const hidden = Math.max(0, all.length - Math.max(0, shown));
+  return { hidden, visible: hidden > 0 ? all.slice(hidden) : all };
+}
+
+/** The smallest page that still PAINTS the message at `index` (0-based, oldest
+ * first) of a `total`-long, newest-last transcript.
+ *
+ * Search's "jump to this message" scrolls to an element, so the row has to be
+ * mounted before the jump can find it — with a tail page, a hit older than
+ * `CHAT_PAGE` had no element and the jump silently did nothing. Paired with
+ * `chatPageSlice`: `chatPageSlice(all, chatPageToReveal(all.length, i))`
+ * always contains `all[i]`.
+ */
+export function chatPageToReveal(total: number, index: number): number {
+  if (index < 0 || index >= total) return 0;
+  return total - index;
+}

@@ -17,11 +17,29 @@ export interface McpApproval {
   servers: { name: string; command: string }[];
 }
 
-/** A prior saved state of a file (ADD-2). */
+/** ART-1: what produced one state of a generated artifact — ids and names only,
+ * never content. Every field is optional because the room records what it
+ * actually witnessed: a missing `agent` means nobody recorded one, not "unknown
+ * agent". */
+export interface Provenance {
+  runId?: string;
+  agent?: string;
+  tool?: string;
+  sourceFileIds?: string[];
+}
+
+/** A prior saved state of a file (ADD-2). `provenance` is present only where the
+ * app witnessed the write (ART-1) — absent on a person's own saves and on every
+ * version from before provenance was recorded. */
 export interface FileVersion {
   id: string;
   savedAt: string;
   cause: string;
+  provenance?: Provenance;
+  /** Kept on purpose: outside the rolling window the room prunes on each save. */
+  pinned: boolean;
+  /** Bytes this snapshot occupies — every version is a whole copy of the file. */
+  bytes: number;
 }
 
 /** Idea 11: a saved version's extracted text next to the file's current text,
@@ -50,6 +68,10 @@ export interface RecentRoom {
   path: string;
   /** Unix epoch millis of the last open; absent for entries saved earlier. */
   openedAt?: number | null;
+  /** True when nothing is at `path` any more — moved, deleted, or on a drive
+   * that isn't plugged in. Recomputed by `list_recent` on every read, so it is
+   * an answer about right now, not a cached one. */
+  missing?: boolean;
 }
 
 export interface FileMeta {
@@ -66,6 +88,28 @@ export interface FileMeta {
   partiallyIndexed: boolean;
 }
 
+/** Who deleted a file. Recorded at the moment of deletion — `"unknown"` is a
+ * row written before the actor was tracked, and says so rather than being
+ * blamed on the person. */
+export type TrashActorKind = "user" | "agent" | "app" | "unknown";
+
+/** Trash: a deleted file, as the trash view shows it. NOT a `FileMeta` — a
+ * trashed file is not in the room, and giving it the same shape invites it into
+ * a list that means "what's here". */
+export interface TrashedFile {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  /** When it was deleted (ISO-8601, the room's own clock). */
+  trashedAt: string;
+  trashedBy: TrashActorKind;
+  /** Which agent/tool or which command, when the kind alone isn't the answer. */
+  trashedById: string | null;
+  /** The folder it goes back to on restore, or null for the top level. */
+  folderId: string | null;
+}
+
 /** A one-level folder inside the room (ADD-16). */
 export interface Folder {
   id: string;
@@ -77,6 +121,23 @@ export interface ChatCommand {
   name: string;
   summary: string;
   usage: string;
+}
+
+/** One specialist agent this room can dispatch a turn to, for the composer's
+ *  "*name" menu. Derived per room by the sidecar registry (`list_specialists`),
+ *  never a list this frontend keeps: a room with the internet switched off has
+ *  no Web specialist to offer, and the menu has to agree with the turn. */
+export interface Specialist {
+  /** The short key the user types after "*" ("web"). */
+  key: string;
+  /** The `ask_*_agent` tool a turn tagged with this key is narrowed to. */
+  tool: string;
+  /** Its own label, the same words the agent diagram uses ("Web agent"). */
+  label: string;
+  /** One plain-words noun phrase: the area it covers. */
+  area: string;
+  /** The full sentence: what it can actually be asked for. */
+  description: string;
 }
 
 /** Grouped results of a room-wide search (ADD-6). */
@@ -147,6 +208,10 @@ export interface PrivacyStatus {
   concepts: string[];
   pendingFiles: number;
   scanning: boolean;
+  /** Whether remote-connector arguments are masked right now. NOT implied by
+   * `effectiveOn` — that seam is deliberately switch-blind, so the panel is
+   * told rather than left to infer it. */
+  connectorArgsMasked: boolean;
 }
 
 /** PRIV-1: the reader's cloud view — the file exactly as a non-local model
@@ -212,6 +277,25 @@ export interface AskPlanStep {
    * registry id will NOT do: one round can dispatch two `files.read` children,
    * and each needs its own tool-step bucket. */
   key?: string;
+  /** Why a node that never RAN is marked failed — a delegation to a domain
+   * this room cannot serve. It rides on the roster rather than arriving as an
+   * `ask-report` because the sidecar refuses these from a synchronous path
+   * that cannot emit. A node that ran reports through `ask-report` instead. */
+  report?: string;
+}
+
+/** The `ask-report` event: what one specialist handed back to the Main agent.
+ *
+ * The same words stream as `ask-delta` while that child holds the live-text
+ * lease, and the next `ask-round` wipes them — correctly, since that area shows
+ * the current round. This is the durable copy, so the diagram can show what a
+ * child actually said instead of only that it said something. */
+export interface AskReport {
+  /** The `AskPlanStep.key` of the agent that reported. */
+  node: string | null;
+  text: string;
+  /** False when the delegation failed — then `text` is the reason. */
+  ok: boolean;
 }
 
 /** A node's state in the turn's agent graph. Rendered so it never depends on
@@ -239,6 +323,23 @@ export interface AskStep {
   label: string;
   /** The `AskPlanStep.key` of the agent that ran this tool, when known. */
   node?: string | null;
+}
+
+/** Who an `ask-*` event belongs to (owner replacement #4, 2026-08-03).
+ *
+ * Every turn event is broadcast to the whole window, so before this the only
+ * way a listener could tell whose event it was reading was "whatever chat is
+ * mounted right now" — which is why an answer streamed into the wrong
+ * conversation and a brand-new chat showed the previous one's token bar.
+ *
+ * `runId` is the ask id the composer minted and handed to `ask`/`run_command`,
+ * so the chat has the run registered before the first event can arrive and
+ * rejects anything naming a different one — including a late event from a turn
+ * it already finished. Both are null for the handful of emitters that belong to
+ * no conversation at all (the AI-actions menu); see `ownerOf` in effects.ts. */
+export interface AskTurn {
+  runId: string | null;
+  chatId: string | null;
 }
 
 /** PRIV-2: privacy-scan progress events. */
@@ -311,30 +412,158 @@ export interface Memory {
   createdAt: string;
 }
 
+/** A recording's waveform envelope: per-bucket peak amplitude (0–1), plus the
+ * true duration taken from the decoded sample count — which is also how the
+ * viewer learns the length of a streamed container whose own header reports
+ * `Infinity` to the media element. */
+export interface AudioPeaks {
+  peaks: number[];
+  duration: number;
+  /** The envelope never rose above the host's noise floor — the file decoded
+   * and has a length, but there is nothing audible in it. Decided by the host
+   * (`commands::peaks::is_silent`) so the flat lane and the label under it
+   * can't disagree about what silence is. */
+  silent: boolean;
+}
+
+/** One slide of a deck, drawn by macOS Quick Look. */
+export interface SlideImage {
+  /** PNG, base64. */
+  pngB64: string;
+  /** How many slides the deck has — the backend counts them while rendering. */
+  slides: number;
+}
+
+/** A macOS-drawn page image for a file the app can't render itself. */
+export interface QuickLookPreview {
+  /** PNG, base64. */
+  pngB64: string;
+}
+
+/** Every viewer kind the Rust format registry (`src-tauri/src/formats.rs`) can
+ * produce. `src/viewers/registry.tsx` must have an entry for each one — its
+ * own test asserts that, so a kind added on the Rust side fails the UI build
+ * instead of silently landing on the "no preview available" card.
+ *
+ * NOT to be confused with api.ts's `FileKind`, which is the Library's ICON
+ * category ("web", "generated", "file") — a different question about a
+ * different object (a FileMeta row, not an opened file's content). */
+export type ViewerKind =
+  | "image"
+  | "pdf"
+  | "docx"
+  | "worddoc"
+  | "sheet"
+  | "csv"
+  | "slides"
+  | "book"
+  | "archive"
+  | "markdown"
+  | "html"
+  | "svg"
+  | "notebook"
+  | "json"
+  | "subtitle"
+  | "email"
+  | "prose"
+  | "log"
+  | "code"
+  | "text"
+  | "audio"
+  | "video"
+  | "recording"
+  | "binary";
+
 export interface FileContent {
-  kind:
-    | "image"
-    | "pdf"
-    | "docx"
-    | "sheet"
-    | "csv"
-    | "markdown"
-    | "html"
-    | "code"
-    | "text"
-    | "audio"
-    | "video"
-    | "recording"
-    | "binary";
+  kind: ViewerKind;
   name: string;
   mime: string;
   editable: boolean;
   text: string | null;
+  /** Legacy base64 payload. Nothing populates this today — every viewer that
+   * needs raw bytes reads them from `mediaToken` instead. Kept so byte
+   * delivery can be switched back in one place if it ever has to be. */
   dataB64: string | null;
-  /** ADD-24: audio/video only — token for the roommedia:// streaming
-   * protocol (seekable, any size). The viewer plays
-   * `roommedia://localhost/<token>` instead of a base64 data URL. */
+  /** Token for the roommedia:// streaming protocol (Range-capable, any size).
+   * Set for EVERY file whose viewer parses the real bytes — audio and video,
+   * and since the base64 payload was retired, also images, PDFs, Word files,
+   * workbooks, decks, books and archives. The viewer reads
+   * `roommedia://localhost/<token>` instead of receiving a data URL. */
   mediaToken: string | null;
+  /** Video only: what the container itself says. `null` = never probed (the
+   * viewer asks for one); every field inside is independently `null` for
+   * "the file doesn't say", which the viewer must render as unknown rather
+   * than as a plausible default. */
+  mediaMeta: MediaMeta | null;
+  /** Saved web pages only: what the page declared about itself, plus where and
+   * when the room saved it. `null` = this file did not come from a web page,
+   * and every field inside is optional for the stronger reason — a page that
+   * named no author has no author, so the strip shows none rather than
+   * "unknown" (which would read as "we looked it up and it is unknown"). */
+  webMeta: PageMeta | null;
+}
+
+/** What a saved page declared about itself. Mirrors `extraction::PageMeta`
+ * field for field. Absent means the page never said it: nothing here is ever
+ * filled in from somewhere else. */
+export interface PageMeta {
+  title?: string;
+  byline?: string;
+  siteName?: string;
+  published?: string;
+  modified?: string;
+  excerpt?: string;
+  lang?: string;
+  /** The room's own facts, not the page's. */
+  sourceUrl?: string;
+  capturedAt?: string;
+}
+
+/** The technical facts about a video, read from its container by
+ * `media_probe.rs`. Mirrors that struct field for field — and every field is
+ * nullable there for the same reason it is here: a container that never stated
+ * its frame rate has no frame rate to show. */
+export interface MediaMeta {
+  durationSecs: number | null;
+  /** DISPLAY size, with the track's rotation already applied. */
+  width: number | null;
+  height: number | null;
+  videoCodec: string | null;
+  frameRate: number | null;
+  bitrateKbps: number | null;
+  /** `false` is a finding ("this video is silent"), `null` is ignorance. */
+  hasAudio: boolean | null;
+  audioCodec: string | null;
+}
+
+/** One charset the viewer's encoding picker offers. `name` is the WHATWG name
+ * the backend reports back for it, so the menu's selection and the strip's
+ * "read as …" are always the same string. */
+export interface EncodingChoice {
+  name: string;
+  title: string;
+}
+
+/** A plain-text file re-read from its ORIGINAL BYTES (`decode_file_text`).
+ *
+ * Detection is a guess — the same legacy bytes genuinely are Turkish AND are
+ * Cyrillic — so the viewer shows which encoding is in effect and lets a human
+ * overrule it. Overruling re-reads the bytes in Rust; re-interpreting the
+ * already-decoded string could only launder one wrong reading into another. */
+export interface DecodedFileText {
+  text: string;
+  /** WHATWG name of the encoding in effect (`UTF-8`, `windows-1254`, …). */
+  encoding: string;
+  /** How that encoding was arrived at: a fact about the bytes (`bom`, `utf8`),
+   * a guess (`detected`), or the user's own pick (`chosen`). */
+  source: "bom" | "utf8" | "detected" | "chosen";
+  /** Bytes with no meaning in this encoding became U+FFFD — the text on screen
+   * is NOT the file, so it must never be saved back over it. */
+  lossy: boolean;
+  /** Whether this reading may be edited in place (format allows it AND the
+   * decode was clean). */
+  editable: boolean;
+  options: EncodingChoice[];
 }
 
 // ---- ADD-27: the live Recording file ----
@@ -368,7 +597,10 @@ export interface RecCut {
 }
 
 export interface RecMeta {
-  version: number;
+  /* No `version`: the Rust struct dropped it (there is no version dispatch),
+     and a field declared here that the backend never sends is worse than no
+     field — `meta.version < 2` type-checks and is silently false at runtime.
+     `recording.rs`'s round-trip test asserts the key is absent from the wire. */
   durationCs: number;
   segments: RecSegment[];
   cuts: RecCut[];
@@ -426,6 +658,10 @@ export interface AiStatus {
   defaultModel: string;
   /** Cloud CLIs detected on this Mac ("claude-cli", "codex-cli"). */
   external: string[];
+  /** True when this room's Ollama is ANOTHER computer (Settings → the Closet).
+   * The model name cannot carry that fact, so every "does content leave this
+   * Mac?" surface must OR this in — see `workspace/markup.isCloudRoute`. */
+  remoteRelay: boolean;
 }
 
 export const ENGINE_LABELS: Record<string, string> = {
@@ -504,6 +740,82 @@ export interface ModelCaps {
   vision: boolean;
 }
 
+/** One capability answer. `"unknown"` is a real answer, not a missing one: an
+ * engine we could not reach must never be rendered as capable OR incapable —
+ * the same rule the host's `Support` enum states. */
+export type Support = "yes" | "no" | "unknown";
+
+/** The capability questions the host will answer. Closed on purpose — mirrors
+ *  the host's `Capability` enum, so a caller cannot ask for one nothing
+ *  declares an answer for. */
+export type Capability =
+  | "streaming"
+  | "tool_calling"
+  | "vision"
+  | "structured_output"
+  | "chat";
+
+/** The engine's DECLARED capability record (src-tauri/src/commands/
+ *  capabilities.rs). One record per provider, refined per-model where the live
+ *  catalog knows more. Nothing in the UI re-derives these from a model name. */
+export interface EngineCapabilities {
+  engine: string;
+  label: string;
+  model: string;
+  local: boolean;
+  streaming: Support;
+  toolCalling: Support;
+  vision: Support;
+  structuredOutput: Support;
+  chat: Support;
+  contextWindow: number | null;
+  tier: string;
+  /** Would pixels actually ARRIVE? The privacy door strips images out of every
+   *  non-local request, so "can see" and "will receive the picture" are two
+   *  different facts and the UI must not merge them. */
+  imageReaches: boolean;
+}
+
+/** Why a preflight blocked, as a value rather than a sentence — two blocks that
+ *  read alike need different offers, and matching on the prose would re-derive
+ *  a distinction the host's record already made.
+ *   • "capability"  — the engine itself cannot. A different (or newly
+ *     downloaded) model is the fix, so an offer to install one is honest.
+ *   • "privacy-door" — it can, but this room's door removes what it needs. The
+ *     fix is a switch the user owns; offering a download here is noise. */
+export type BlockCode = "capability" | "privacy-door";
+
+/** What a PREFLIGHT check concluded for the room's engine, before a run. */
+export type EnginePreflight =
+  | { status: "ready" }
+  | { status: "unknown"; reason: string }
+  | { status: "blocked"; code: BlockCode; reason: string };
+
+export interface AgentRow {
+  id: string;
+  label: string;
+}
+
+export interface ProviderRow extends EngineCapabilities {
+  /** Installed / connected on THIS Mac right now. */
+  available: boolean;
+  /** Agent ids this provider's tier can reach — derived by the sidecar from its
+   *  own registry, never a list written down here. */
+  agents: string[];
+}
+
+/** The published provider × agent support matrix (owner decision #3). */
+export interface SupportMatrix {
+  agents: AgentRow[];
+  providers: ProviderRow[];
+  /** False when the sidecar could not be reached. The capability columns are
+   *  still true (they are declared in the host); the agent columns are simply
+   *  not known, and the UI says so rather than drawing an empty grid that would
+   *  read as "no agent works anywhere". */
+  agentsKnown: boolean;
+  agentsError: string | null;
+}
+
 /** ADD-18: state of the built-in dictation/transcription engine. The engine
  * (Whisper) is compiled into the app; only the model file downloads on demand. */
 export interface SttStatus {
@@ -575,6 +887,19 @@ export interface McpServerStatus {
   remote: boolean;
 }
 
+/** One connector's answers to the two connector powers (mirrors Rust's
+ * `ConnectorOverride`). A power that is ABSENT means "follow the Mac-wide
+ * switch" — that is a third state, not a `false`, and collapsing it would make
+ * the switch above unable to change anything. */
+export interface ConnectorOverride {
+  auto_approve?: boolean;
+  outbound_unmask?: boolean;
+}
+
+/** Per-connector overrides keyed by connector name. Empty when every connector
+ * follows the two switches. */
+export type ConnectorPowers = Record<string, ConnectorOverride>;
+
 /** What "Install" would write into the room's mcpServers config, from the
  * marketplace. Tagged union on `kind` (mirrors Rust's InstallSpec). */
 export type InstallSpec =
@@ -613,6 +938,12 @@ export interface McpApproveRequest {
   server: string;
   tool: string;
   args: string;
+  /** Audit #505: set when this card is an agent-initiated DELETION, not a tool
+   * call — the sentence naming what goes with it. `server` is then the thing's
+   * name and `tool` is what kind of thing it is. Present means the destructive
+   * card: no "always allow", because standing consent to run connector tools
+   * was never consent to destroy the room's own configuration. */
+  confirm?: string;
 }
 
 /** Wave 2 (Idea 6): one file's before/after in a diff-preview approval card. */
@@ -646,9 +977,10 @@ export type AgentOpenFilePayload =
  * struct derives serde rename_all="camelCase", so fields are camelCase here.
  * ============================================================ */
 
-/** D1: static model recommendations that drive first-run / vision pulls. */
+/** D1: the two SPECIAL models Settings offers to pull. There was a `chat`
+ * list here too, which no screen ever rendered — the first-run chooser has its
+ * own richer roster in `workspace/constants.ts`. */
 export interface RecommendedModels {
-  chat: string[];
   embed: string;
   vision: string;
 }
@@ -662,12 +994,17 @@ export interface GraphNode {
   kind: "file" | "memory";
 }
 
-/** D3: a similarity link between two nodes; `shared` holds up to 3 short
- *  reason strings (overlapping terms, or a shared snippet). */
+/** D3: a TYPED link between two nodes. `kind` says which relationship it is —
+ *  "derived" | "same_page" | "mentions" | "cited" | "same_site" are relations
+ *  the room can prove from what it stored, "similar" is the only inferred one.
+ *  `directed` marks the a → b relations (a produced b, or a names b), and
+ *  `shared` holds up to 3 short pieces of evidence for the link. */
 export interface GraphEdge {
   a: string;
   b: string;
   weight: number;
+  kind: string;
+  directed: boolean;
   shared: string[];
 }
 
@@ -713,6 +1050,21 @@ export interface RoomServerStatus {
   allowCloud: boolean;
 }
 
+/** Whether a local connector's command can run right now, and if not, whether
+ * one download fixes it (`mcp_runtime_for_command`). A connector needing
+ * `uvx`/`npx` on a Mac without them used to fail with the launcher's raw error
+ * and no way to fix it from inside the app. */
+export interface RuntimeStatus {
+  /** The command can run as-is — a downloaded or system runtime satisfies it. */
+  available: boolean;
+  /** The runtime a download would provide ("uv" | "node"), when there is one. */
+  kind: string | null;
+  /** A one-time download would make it available. */
+  provisionable: boolean;
+  /** One plain-words line for the prompt. */
+  note: string;
+}
+
 /** D11: a selectable room persona (tutor, critic, opposing-counsel, …). */
 export interface RoomRole {
   id: string;
@@ -744,6 +1096,10 @@ export interface Job {
   error: string | null;
   /** Wave 4a: set on a workflow's inline child job (hidden from the sidebar). */
   parentJobId?: string | null;
+  /** Why this job stopped when nobody chose to stop it — the room was locked,
+   * or the app closed, while it was still running. Null/absent means the pause
+   * was the user's own Stop, which the card says differently. */
+  parkedReason?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -979,7 +1335,28 @@ export interface BrowserInfo {
   title?: string | null;
   ready?: string | null;
   takeover?: boolean;
+  /** Item #18: the page latched a double Escape — the user is asking for the
+   *  keyboard back. True on exactly one poll; the page clears it as it reports
+   *  it, so acting on it twice is impossible. */
+  leaveRequested?: boolean;
   error?: string;
+}
+
+/** One slice of the current page as text (`browser_page_text`).
+ *
+ * The raw page-script answer, not a formatted string: the reading view follows
+ * `truncated`/`nextOffset` itself so it can say how much of the page it is
+ * actually showing rather than presenting a slice as the whole thing. */
+export interface BrowserPageText {
+  url?: string;
+  title?: string;
+  mode?: "main" | "full";
+  offset?: number;
+  /** Where the NEXT read must start, in the page script's own UTF-16 units. */
+  nextOffset?: number;
+  total?: number;
+  truncated?: boolean;
+  text?: string;
 }
 
 /** One open private-browser page (`browser_tabs`).
@@ -1019,6 +1396,10 @@ export interface BrowserSearchResult {
   tookMs: number;
   /** Served from this Mac's 15-minute cache, no network touched. */
   cached: boolean;
+  /** Engines that could not answer — blocked, rate limited or too slow. A
+   *  thin result set with two engines down is not the same page as a thin
+   *  result set from a whole working fan-out, and only this says which. */
+  failed?: string[];
   query: string;
   /** False when the room turned result previews off: every card keeps its
    *  monogram tile and no result origin is contacted. */
@@ -1056,4 +1437,19 @@ export interface BrowseJournalRow {
   kind: string;
   url: string;
   detail: string;
+}
+
+/** What one Stop actually stopped (`cancel_ask`).
+ *
+ * Owner replacement #3: cancellation is a TREE rooted at the run, so a Stop can
+ * reach a Studio build or a file pass the answer had started. `stopped` names
+ * them, root first, and lists ONLY what this Stop moved from running to
+ * stopped — work that had already finished is not in it, because claiming a
+ * Stop reached it would be untrue. `known: false` means the host no longer had
+ * the run at all (it had just finished), which is not an error but is also not
+ * a Stop that stopped anything.
+ */
+export interface StopReport {
+  stopped: string[];
+  known: boolean;
 }

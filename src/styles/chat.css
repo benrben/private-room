@@ -49,6 +49,14 @@
   background: color-mix(in srgb, var(--amber) 10%, transparent);
 }
 
+/* "Show earlier messages (N older)" — the transcript paints a tail page, so
+   this sits above the oldest row that IS drawn. Centered and quiet: it is a
+   render control, not a turn in the conversation. */
+.chat-load-older {
+  align-self: center;
+  flex: 0 0 auto;
+}
+
 .messages {
   flex: 1;
   overflow-y: auto;
@@ -253,6 +261,28 @@
   color: var(--text);
   background: var(--hover);
   border-color: var(--line);
+}
+
+/* The recovery strip under a turn that produced no answer. Deliberately not a
+   .msg-footer variant: the footer's buttons are transparent until hover, and
+   the one action available after a lost reply must be visible without one. */
+.msg-recover {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 7px 9px;
+  font-size: 11.5px;
+  color: var(--faint);
+  background: var(--hover);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.msg-recover > button.subtle {
+  padding: 3px 10px;
+  font-size: 11.5px;
+  margin-left: auto;
 }
 
 .msg-sources {

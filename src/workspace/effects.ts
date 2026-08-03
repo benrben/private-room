@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
-import { api, RoomInfo } from "../api";
+import { api, AskTurn, RoomInfo } from "../api";
 import { configureMic, stopMicTap } from "./liveRec";
 import { handleAgentUiRequest } from "../agent/driver";
 import { annotationTarget } from "./markup";
@@ -10,6 +10,8 @@ import { MEMORY_INTRO_SEEN } from "./constants";
 import * as voice from "./voice";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import { ownerOf as ownsEvent } from "./runIdentity";
+import { applyRecState } from "./recSession";
 
 /** All of Workspace's effects: the mount-time backend-event wiring (which
  * dispatches agent-open-file → viewFile, agent-annotate → the open viewer, MCP
@@ -49,6 +51,9 @@ export function useWorkspaceEffects(
       // The reads that FILL the room.
       api.listFiles().then(s.setFiles).catch(readFailed("files"));
       api.listFolders().then(s.setFolders).catch(readFailed("folders"));
+      // Trash: read at open like every other room list, so the Library tab
+      // can show a real count from the first paint instead of a hopeful 0.
+      api.listTrashedFiles().then(s.setTrashed).catch(readFailed("trash"));
       api.listMemories().then(s.setMemories).catch(readFailed("memories"));
       // Wave 1b (idea 5): seed the auto-save ref; re-read when Settings closes
       // (a.refreshMemAutoSave) so the off-switch applies without a room reopen.
@@ -59,6 +64,10 @@ export function useWorkspaceEffects(
         })
         .catch(() => {});
       api.listChatCommands().then(s.setCommands).catch(() => {});
+      // The composer's "*" menu. Seeded here so the menu is instant the first
+      // time it opens; `refreshAutocomplete` re-reads it on every open, because
+      // the roster follows the room's engine and its web switch.
+      void a.refreshSpecialists();
       void a.loadAiActions();
       // Wave 4a: load the room's workflows once — one source of truth for the
       // page, the top-bar pins, and the file-header Actions menu.
@@ -85,70 +94,127 @@ export function useWorkspaceEffects(
         })
         .catch(readFailed("conversations"));
     }
-    const unlisten = api.onAskDelta((delta) => {
-      s.setStreamText((t) => t + delta);
-      // Idea 3: feed the spoken voice (no-ops when auto-speak is off).
-      // Cross-wave constraint: ask-delta is a global, unkeyed stream — if a
-      // future headless path (scheduled workflows' agent_run) ever emits it,
-      // that fix must suppress the events at the source or key them, or a
-      // background run would speak aloud here.
-      voice.feedStreamDelta(delta);
+    // ---- the live overlay of a turn in progress -------------------------
+    //
+    // Owner replacement #4 (2026-08-03). Every event below now names the run
+    // and chat that produced it (`crate::turn`), and `ownerOf` turns that into
+    // the conversation whose slot it may write. `applyToRun` then drops
+    // anything the named chat is not actually running — a straggler from a
+    // finished turn, or an event for a run this chat never started.
+    //
+    // What that replaces: these listeners used to write module-wide state, so
+    // "which chat is this for" was answered by "whichever one is mounted".
+    // Start an answer, open another conversation, and the first chat's text,
+    // step chips and agent roster painted into the second one.
+    //
+    // An event with NO ids belongs to no conversation (the AI-actions menu).
+    // It is offered to the chat on screen, which takes it only while it is
+    // itself running something — the one case where "the chat in front of you"
+    // is the honest owner.
+    const ownerOf = (turn: AskTurn) =>
+      ownsEvent(turn, s.activeChatIdRef.current);
+    const unlisten = api.onAskDelta((delta, turn) => {
+      const chat = ownerOf(turn);
+      if (!chat) return;
+      s.applyToRun(chat, turn.runId, (t) => ({ ...t, text: t.text + delta }));
+      // Idea 3: feed the spoken voice (no-ops when auto-speak is off). Gated on
+      // the conversation that OWNS the pipeline, not the one on screen: there
+      // is a single voice turn, and `feedStreamDelta` accumulates a sentence
+      // buffer, so skipping the deltas that arrive while the user is looking
+      // elsewhere would read the answer aloud with words silently missing.
+      if (voice.turnBelongsTo(chat)) voice.feedStreamDelta(delta);
     });
-    const unlistenStep = api.onAskStep(({ label, node }) => {
-      s.setSteps((st) => [...st, { label, ok: true }]);
-      // Also file it under the agent that ran it, for the graph's inspector.
-      // Steps with no node (every non-sidecar emitter) stay flat-list only.
-      if (!node) return;
-      s.setAgentSteps((by) => ({
-        ...by,
-        [node]: [...(by[node] ?? []), { label, ok: true }],
+    const unlistenStep = api.onAskStep(({ label, node }, turn) => {
+      const chat = ownerOf(turn);
+      if (!chat) return;
+      s.applyToRun(chat, turn.runId, (t) => ({
+        ...t,
+        steps: [...t.steps, { label, ok: true }],
+        // Also file it under the agent that ran it, for the graph's inspector.
+        // Steps with no node (every non-sidecar emitter) stay flat-list only.
+        agentSteps: node
+          ? {
+              ...t.agentSteps,
+              [node]: [...(t.agentSteps[node] ?? []), { label, ok: true }],
+            }
+          : t.agentSteps,
       }));
     });
-    const unlistenLane = api.onAskLane((label) => {
-      s.setLane(label);
+    const unlistenLane = api.onAskLane((label, turn) => {
+      const chat = ownerOf(turn);
+      if (chat) s.applyToRun(chat, turn.runId, (t) => ({ ...t, lane: label }));
     });
     // Dispatch-first agent visibility: the roster arrives once per ask; the
     // active-agent marker advances as plan steps start.
-    const unlistenPlan = api.onAskPlan((plan) => {
-      s.setAgentPlan(plan);
+    const unlistenPlan = api.onAskPlan((plan, turn) => {
+      const chat = ownerOf(turn);
+      if (chat) s.applyToRun(chat, turn.runId, (t) => ({ ...t, plan }));
     });
-    const unlistenAgent = api.onAskAgent((agent) => {
-      s.setActiveAgent(agent);
+    const unlistenAgent = api.onAskAgent((agent, turn) => {
+      const chat = ownerOf(turn);
+      if (chat) s.applyToRun(chat, turn.runId, (t) => ({ ...t, agent }));
     });
-    const unlistenStepStatus = api.onAskStepStatus(({ ok, node }) => {
-      if (ok) return;
-      s.setSteps((st) =>
-        st.length ? [...st.slice(0, -1), { ...st[st.length - 1], ok: false }] : st,
-      );
-      // Fail THIS node's last step, not the globally-last one: with siblings
-      // running concurrently the two are frequently different steps.
-      if (!node) return;
-      s.setAgentSteps((by) => {
-        const mine = by[node];
-        if (!mine?.length) return by;
+    const unlistenStepStatus = api.onAskStepStatus(({ ok, node }, turn) => {
+      const chat = ownerOf(turn);
+      if (ok || !chat) return;
+      s.applyToRun(chat, turn.runId, (t) => {
+        const mine = node ? t.agentSteps[node] : undefined;
         return {
-          ...by,
-          [node]: [...mine.slice(0, -1), { ...mine[mine.length - 1], ok: false }],
+          ...t,
+          steps: t.steps.length
+            ? [...t.steps.slice(0, -1), { ...t.steps[t.steps.length - 1], ok: false }]
+            : t.steps,
+          // Fail THIS node's last step, not the globally-last one: with siblings
+          // running concurrently the two are frequently different steps.
+          agentSteps:
+            node && mine?.length
+              ? {
+                  ...t.agentSteps,
+                  [node]: [
+                    ...mine.slice(0, -1),
+                    { ...mine[mine.length - 1], ok: false },
+                  ],
+                }
+              : t.agentSteps,
         };
       });
     });
-    const unlistenRound = api.onAskRound(() => {
-      s.setStreamText("");
+    // What a specialist handed back. Filed under its node so the diagram can
+    // show the report itself, not just a green tick — and, when the child
+    // failed, the reason, which appears nowhere else in the UI.
+    const unlistenReport = api.onAskReport(({ node, text, ok }, turn) => {
+      const chat = ownerOf(turn);
+      if (!node || !chat) return;
+      s.applyToRun(chat, turn.runId, (t) => ({
+        ...t,
+        agentReports: { ...t.agentReports, [node]: { text, ok } },
+      }));
+    });
+    const unlistenRound = api.onAskRound((turn) => {
+      const chat = ownerOf(turn);
+      if (!chat) return;
+      s.applyToRun(chat, turn.runId, (t) => ({ ...t, text: "" }));
       // Idea 3: a new round discards the previous round's text — drop its
       // queued/in-flight audio the same way (spoken deliberation must not
       // outlive the text the user no longer sees).
-      voice.roundBoundary();
+      // Same owner rule as the deltas: dropping a round boundary for a chat the
+      // user has stepped away from would leave the previous round's audio
+      // playing over text that has already been replaced.
+      if (voice.turnBelongsTo(chat)) voice.roundBoundary();
     });
-    const unlistenNotice = api.onAskNotice((text) => {
-      s.pushToast("info", text);
+    // PRIV-1: the door's per-turn receipt ("N details hidden" / bypassed). Filed
+    // against the chat whose turn it describes and shown after that turn ends,
+    // so it lives beside the token bar rather than inside the run record.
+    const unlistenPrivacy = api.onAskPrivacy((p, turn) => {
+      const chat = ownerOf(turn);
+      if (chat) s.setAskPrivacy(chat, p);
     });
-    // PRIV-1: the door's per-turn receipt ("N details hidden" / bypassed).
-    const unlistenPrivacy = api.onAskPrivacy((p) => {
-      s.setAskPrivacy(p);
-    });
-    // Token-budget bar: one live snapshot per completed model round.
-    const unlistenTokenUsage = api.onAskTokenUsage((p) => {
-      s.setTokenUsage(p);
+    // Token-budget bar: one live snapshot per completed model round, for the
+    // conversation that round belongs to. A chat that has run nothing keeps no
+    // entry at all, which is why a new one now reads zero.
+    const unlistenTokenUsage = api.onAskTokenUsage((p, turn) => {
+      const chat = ownerOf(turn);
+      if (chat) s.setChatUsage(chat, p);
     });
     // ADD-31: live import queue. The receipt toast comes from reportImport
     // (which knows names and errors) — this event only drives the strip.
@@ -170,6 +236,10 @@ export function useWorkspaceEffects(
           delete next[p.jobId];
           return next;
         });
+        // AUDIT 262: the Studio step line belongs to a RUN. It must not outlive
+        // one, or a finished deck leaves "a local model can take a few
+        // minutes…" sitting under an idle sidebar.
+        s.setStudioStep("");
         void a.refreshJobs();
         if (p.finished) {
           // The label names what finished ("Summary ready", "Full pass of …").
@@ -189,6 +259,11 @@ export function useWorkspaceEffects(
         }));
       }
     });
+    // AUDIT 262: the Studio's own progress. The backend named every step from
+    // the start and nothing listened — a run that takes minutes on a local
+    // model read "Starting…" the whole way, and the step that says the content
+    // is leaving this Mac was never shown at all.
+    const unlistenStudioStep = api.onStudioStep((text) => s.setStudioStep(text));
     // Wave 4a: per-node run status feeds the pipeline animation; a save/update/
     // delete refreshes the library (esp. an agent-authored draft appearing).
     const unlistenWfNode = api.onWorkflowNode((e) => {
@@ -255,6 +330,11 @@ export function useWorkspaceEffects(
       } else {
         s.pushToast("error", `Download of ${p.name} failed: ${p.error ?? "unknown error"}`);
       }
+    });
+    // AUDIT 169: the same download, still running, already past the size a room
+    // file may be. Told now rather than after the whole file has landed.
+    const unlistenBrowserOversize = api.onBrowserDownloadOversize((p) => {
+      s.pushToast("error", p.detail);
     });
     const unlistenMcpApprove = api.onMcpApproveRequest((req) => {
       s.setMcpApprovals((q) => [...q, req]);
@@ -410,6 +490,10 @@ export function useWorkspaceEffects(
     const unlistenFiles = api.onRoomFilesChanged(() => {
       api.listFiles().then(s.setFiles).catch(readFailed("files"));
       api.listFolders().then(s.setFolders).catch(readFailed("folders"));
+      // A file can leave the library WITHOUT this window asking (a workflow,
+      // a job, the summarizer dropping a legacy file). Re-reading the trash
+      // on the same event is what makes those deletions visible at all.
+      api.listTrashedFiles().then(s.setTrashed).catch(readFailed("trash"));
       a.loadFrontPage(false);
       // Wave 5: scripts ARE files — a new/edited/imported script updates the
       // index (and a script that just ran wrote its outputs here).
@@ -434,22 +518,18 @@ export function useWorkspaceEffects(
       if (r) s.setRecLive({ fileId: r.fileId, status: r.status });
     }).catch(() => {});
     const unlistenRecState = api.onRecState((p) => {
-      if (p.status === "saved") {
-        s.setRecLive(null);
-        // The engine can stop ITSELF (3-hour limit, room closed under it) —
-        // the microphone must never stay open past the session it fed.
-        stopMicTap();
-      } else {
-        s.setRecLive({ fileId: p.fileId, status: p.status });
-      }
-      // The drain readout lives exactly as long as the save does.
-      if (p.status !== "saving") s.setRecSave(null);
-      if (
-        (p.status === "paused" || p.status === "saved") &&
-        s.openFileRef.current?.id === p.fileId
-      ) {
-        void a.viewFile(p.fileId);
-      }
+      // "saved" is not the only terminal status — a final write that failed
+      // ends the session as "failed" (recording.rs `Engine::finish`). Treating
+      // that as still-live left the microphone open for the rest of the app's
+      // life and every "start a recording" affordance disabled. The decision
+      // itself lives in recSession.ts so it can be tested.
+      const next = applyRecState(p, s.openFileRef.current?.id);
+      s.setRecLive(next.live);
+      // The engine can stop ITSELF (3-hour limit, room closed under it) —
+      // the microphone must never stay open past the session it fed.
+      if (next.stopTap) stopMicTap();
+      if (next.clearSave) s.setRecSave(null);
+      if (next.reload) void a.viewFile(p.fileId);
     });
     // Stop→saved drain progress. First event = the audio bytes are durable;
     // startedAt is kept from the first event so the card's clock measures the
@@ -471,9 +551,31 @@ export function useWorkspaceEffects(
       }));
       if (stage === "done") void api.listFiles().then(s.setFiles);
     });
+    // AUDIT 262: the same treatment for a scanned page. `ocr-progress` has
+    // always been emitted and never listened to, so a vision pass that runs for
+    // minutes showed no sign of activity at all.
+    const unlistenOcr = api.onOcrProgress(([name, stage]) => {
+      s.setOcrFiles((f) =>
+        stage === "started"
+          ? f.includes(name)
+            ? f
+            : [...f, name]
+          : f.filter((n) => n !== name),
+      );
+      if (stage === "done") void api.listFiles().then(s.setFiles);
+    });
     const unlistenRecError = api.onRecError((p) => {
       s.pushToast("error", p.message);
     });
+    // The unlock's crash-recovery pass runs before this listener exists, so a
+    // failure it reported would have been emitted into nothing. Collect the
+    // parked message here instead — null (the ordinary case) shows nothing.
+    void api
+      .takeRecRecoveryError()
+      .then((message) => {
+        if (message) s.pushToast("error", message);
+      })
+      .catch(() => {});
     // A capture lane dying must reach the user even when the recording's
     // view is closed (they're usually in Zoom, not here). One toast per
     // outage per source; the view's banner handles the on-screen case.
@@ -506,12 +608,13 @@ export function useWorkspaceEffects(
       unlistenPlan.then((fn) => fn());
       unlistenAgent.then((fn) => fn());
       unlistenStepStatus.then((fn) => fn());
+      unlistenReport.then((fn) => fn());
       unlistenRound.then((fn) => fn());
-      unlistenNotice.then((fn) => fn());
       unlistenPrivacy.then((fn) => fn());
       unlistenTokenUsage.then((fn) => fn());
       unlistenImport.then((fn) => fn());
       unlistenJobs.then((fn) => fn());
+      unlistenStudioStep.then((fn) => fn());
       unlistenWfNode.then((fn) => fn());
       unlistenWfChanged.then((fn) => fn());
       unlistenScriptApprove.then((fn) => fn());
@@ -525,12 +628,14 @@ export function useWorkspaceEffects(
       unlistenMcp.then((fn) => fn());
       unlistenBrowserNav.then((fn) => fn());
       unlistenBrowserDownload.then((fn) => fn());
+      unlistenBrowserOversize.then((fn) => fn());
       unlistenMcpApprove.then((fn) => fn());
       unlistenEditApprove.then((fn) => fn());
       unlistenAgentUi.then((fn) => fn());
       unlistenRecState.then((fn) => fn());
       unlistenRecSave.then((fn) => fn());
       unlistenStt.then((fn) => fn());
+      unlistenOcr.then((fn) => fn());
       unlistenRecSource.then((fn) => fn());
       unlistenRecError.then((fn) => fn());
       window.clearInterval(s.recheckTimer.current);
@@ -539,6 +644,14 @@ export function useWorkspaceEffects(
   }, []);
 
   useEffect(() => {
+    // Nothing to clear on the way in. The live overlay, the token reading and
+    // the privacy receipt are all held per chat now (state.ts `runs`,
+    // `usageByChat`, `privacyByChat`), so opening a conversation simply reads
+    // ITS state: a fresh chat shows an empty bar because it has no run, and a
+    // chat left mid-answer shows the answer still arriving. Before owner
+    // replacement #4 this effect had to wipe a set of globals here, which is
+    // also why the wipe could not distinguish "nothing to show" from "the
+    // previous chat's leftovers".
     if (s.activeChatId) {
       api
         .getMessages(s.activeChatId)

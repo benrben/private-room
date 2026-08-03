@@ -241,16 +241,38 @@ export function BrowserSearch({
   );
 
   if (hits.length === 0) {
+    // An engine that FAILED is not an engine that found nothing. With no
+    // internet every one of them fails, and blaming the user's wording ("try
+    // fewer words") for what is a dead connection sends them rewriting a query
+    // that was never the problem. Only say "nothing matched" when engines
+    // actually answered.
+    const failed = result.failed ?? [];
+    const allFailed = failed.length >= ENGINE_SLOTS.length;
     return (
       <div className="bsearch" onKeyDown={onKeyDown} tabIndex={-1}>
         <SearchHeader result={result} />
         <div className="bsearch-empty">
           <GlobeIcon size={30} />
-          <h2>No results across seven engines</h2>
-          <p>
-            Nothing came back for “{query}”. Try fewer words, or open it as an
-            address if it was one.
-          </p>
+          {allFailed ? (
+            <>
+              <h2>The search couldn't run</h2>
+              <p>
+                None of the {ENGINE_SLOTS.length} engines answered, so nothing
+                was searched for “{query}”. Check your internet connection and
+                try again — this is not about your wording.
+              </p>
+            </>
+          ) : (
+            <>
+              <h2>No results across seven engines</h2>
+              <p>
+                Nothing came back for “{query}”. Try fewer words, or open it as
+                an address if it was one.
+                {failed.length > 0 &&
+                  ` ${failed.length} of ${ENGINE_SLOTS.length} engines (${failed.join(", ")}) didn't answer, so this may be only part of the web.`}
+              </p>
+            </>
+          )}
         </div>
       </div>
     );
@@ -396,6 +418,17 @@ function SearchHeader({ result }: { result: BrowserSearchResult }) {
         )}
         <span className="sep">·</span>
         <span className="privacy">only your query left this Mac</span>
+        {/* Naming the engines that fell out is the difference between "the web
+            is thin on this" and "two of our scrapers are being rate limited
+            right now" — indistinguishable from the result count alone. */}
+        {result.failed && result.failed.length > 0 && (
+          <>
+            <span className="sep">·</span>
+            <span className="bsearch-blocked" title="These engines were blocked, rate limited or too slow, so these results are only part of the web.">
+              {result.failed.join(", ")} unavailable
+            </span>
+          </>
+        )}
         {/* The keys are live as soon as the results are (the page takes focus
             on arrival): say so, because a single-key shortcut nobody is told
             about is not a feature. */}

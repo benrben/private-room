@@ -16,15 +16,22 @@ import {
   TrashIcon,
   WorkflowsIcon,
 } from "../icons";
-import { displayName } from "./composer";
+import { displayName, fileLabel } from "./composer";
 import { isRecordingFile, fileKindLabel } from "../api";
 import DeleteControl from "./DeleteControl";
 import FileRow from "./FileRow";
+import TrashPanel from "./TrashPanel";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkArea } from "./types";
 import { LayoutApi } from "../shell/useLayout";
 import { visibleWorkflows } from "./workflows/selectors";
+import {
+  FILE_SORTS,
+  FILE_SORT_LABELS,
+  sortFiles,
+  type FileSort,
+} from "./fileSort";
 
 const AREA_HEADINGS: Record<WorkArea, string> = {
   files: "Library",
@@ -59,7 +66,10 @@ export default function LibraryPane({
     !filterQ ||
     f.name.toLowerCase().includes(filterQ) ||
     displayName(f.name).toLowerCase().includes(filterQ);
-  const shownFiles = s.files.filter(matchesFilter);
+  // One sorted list feeds every file surface below (the folder tree, the
+  // evidence checkboxes, the recordings list), so they can never disagree
+  // about the order the reader chose.
+  const shownFiles = sortFiles(s.files.filter(matchesFilter), s.fileSort);
   const looseFiles = shownFiles.filter((f) => f.folderId === null);
   const attachedIds = new Set(s.attachments.map((f) => f.id));
   const fileArea = area === "files" || area === "home" || area === "map";
@@ -144,6 +154,22 @@ export default function LibraryPane({
               <span className="count-badge">{s.attachments.length}</span>
             )}
           </button>
+          {/* Trash: a peer of Browse, not a buried menu item. The count is the
+              only place an AI-initiated deletion announces itself, so it is
+              drawn whenever there IS one — and never as a hard 0, which would
+              read as a claim about a list nobody is showing. */}
+          <button
+            className="pane-tab"
+            role="tab"
+            aria-selected={s.libraryTab === "trash"}
+            onClick={() => s.setLibraryTab("trash")}
+            title="Files deleted from this room — restorable until deleted for good"
+          >
+            Trash
+            {s.trashed.length > 0 && (
+              <span className="count-badge">{s.trashed.length}</span>
+            )}
+          </button>
         </div>
       )}
 
@@ -182,6 +208,23 @@ export default function LibraryPane({
               </button>
             )}
           </label>
+          {/* Files were newest-first and nothing else: in a room of a few
+              hundred, the one thing a person knows about a document — its
+              name — was the one order they could not ask for. */}
+          <div className="file-sort">
+            <select
+              aria-label="Sort files"
+              title="Choose how this list is ordered"
+              value={s.fileSort}
+              onChange={(e) => s.setFileSort(e.target.value as FileSort)}
+            >
+              {FILE_SORTS.map((k) => (
+                <option key={k} value={k}>
+                  {FILE_SORT_LABELS[k]}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
       )}
 
@@ -196,6 +239,9 @@ export default function LibraryPane({
       )}
       {fileArea && s.libraryTab === "sources" && (
         <SourcesPanel s={s} a={a} shownFiles={shownFiles} attachedIds={attachedIds} />
+      )}
+      {fileArea && s.libraryTab === "trash" && (
+        <TrashPanel s={s} a={a} filterQ={filterQ} />
       )}
       {area === "recordings" && <RecordingsNav s={s} a={a} shownFiles={shownFiles} />}
       {area === "workflows" && <WorkflowsNav s={s} a={a} />}
@@ -264,9 +310,18 @@ export default function LibraryPane({
                   >
                     <FolderIcon size={14} /> New folder
                   </button>
+                  {/* The one entry in this menu that reaches the internet. The
+                    * command refuses when the room's switch is off; saying so
+                    * here means the room does not look online until you click. */}
                   <button
                     className="pop-item"
                     role="menuitem"
+                    disabled={!s.webOn}
+                    title={
+                      s.webOn
+                        ? undefined
+                        : "This room is offline — turn on Settings → Online features"
+                    }
                     onClick={() => {
                       s.setLinkUrl("");
                       s.setShowAddLink(true);
@@ -277,7 +332,9 @@ export default function LibraryPane({
                     <span className="pop-item-body">
                       Web link
                       <span className="pop-item-sub">
-                        Import a page or a YouTube transcript/video
+                        {s.webOn
+                          ? "Import a page or a YouTube transcript/video"
+                          : "Unavailable while the room is offline"}
                       </span>
                     </span>
                   </button>
@@ -571,7 +628,7 @@ function SourceRow({
       <input
         type="checkbox"
         checked={checked}
-        aria-label={`Use ${displayName(f.name)} in AI answers`}
+        aria-label={`Use ${fileLabel(f.name, s.files)} in AI answers`}
         onChange={() => a.toggleAttach(f)}
       />
       <button
@@ -581,7 +638,7 @@ function SourceRow({
         title={`Open ${f.name}`}
       >
         <div className="source-line">
-          <span className="source-name">{displayName(f.name)}</span>
+          <span className="source-name">{fileLabel(f.name, s.files)}</span>
         </div>
         <div className="source-meta">{fileKindLabel(f)}</div>
       </button>

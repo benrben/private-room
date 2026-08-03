@@ -19,7 +19,13 @@ import type {
   RoomInfo,
   ImportReport,
   FileMeta,
+  TrashedFile,
   FileContent,
+  DecodedFileText,
+  AudioPeaks,
+  MediaMeta,
+  QuickLookPreview,
+  SlideImage,
   Job,
   JobProgress,
   Workflow,
@@ -34,10 +40,13 @@ import type {
   SkillBundle,
   SkillResourceContent,
   BrowserInfo,
+  BrowserPageText,
   BrowserSearchResult,
   ResultPreview,
   BrowseJournalRow,
+  StopReport,
   FileVersion,
+  Provenance,
   VersionContent,
   CheckpointMeta,
   RecentRoom,
@@ -45,12 +54,18 @@ import type {
   Folder,
   SearchResults,
   McpServerStatus,
+  ConnectorPowers,
   CatalogEntry,
   AiStatus,
   ModelCaps,
+  Capability,
+  EngineCapabilities,
+  EnginePreflight,
+  SupportMatrix,
   Chat,
   Message,
   ChatCommand,
+  Specialist,
   ImageBox,
   SttStatus,
   AiActionDef,
@@ -67,6 +82,7 @@ import type {
   FileMetaSuggestion,
   RoomServerStatus,
   RoomRole,
+  RuntimeStatus,
   ExternalModelInfo,
   NeuralVoiceInfo,
   AskPrivacy,
@@ -74,7 +90,9 @@ import type {
   AskTokenUsage,
   AskPlanStep,
   AskActiveAgent,
+  AskReport,
   AskStep,
+  AskTurn,
   PrivacyEntity,
   PrivacyPreview,
   PrivacyScanProgress,
@@ -82,9 +100,42 @@ import type {
   BrowserTab,
 } from "./apiTypes";
 
+/** The wire shape of every `ask-*` event: the payload the listener wants, in
+ * `v`, under the ids of the run and chat that produced it. Built by
+ * `crate::turn` on the host side — see `AskTurn`. */
+interface AskEnvelope<T> {
+  runId: string | null;
+  chatId: string | null;
+  v: T;
+}
+
+/** Subscribe to one identified turn event.
+ *
+ * Every listener gets `(payload, turn)` — never the bare payload — so no call
+ * site can accidentally go back to guessing whose event it is reading. A
+ * payload that arrives WITHOUT an envelope is impossible from this app's own
+ * host (every emitter goes through `crate::turn`), so it is treated as
+ * unowned rather than silently attributed. */
+function askEvent<T>(
+  event: string,
+  cb: (v: T, turn: AskTurn) => void,
+): Promise<UnlistenFn> {
+  return listen<AskEnvelope<T>>(event, (e) => {
+    const wrapped = e.payload as AskEnvelope<T> | null;
+    const owned =
+      wrapped != null && typeof wrapped === "object" && "v" in wrapped;
+    cb(owned ? wrapped.v : (e.payload as unknown as T), {
+      runId: owned ? (wrapped.runId ?? null) : null,
+      chatId: owned ? (wrapped.chatId ?? null) : null,
+    });
+  });
+}
+
 export const api = {
-  createRoom: (path: string, password: string) =>
-    invoke<RoomInfo>("create_room", { path, password }),
+  /** `name` is the name the user TYPED on the Create screen. Omit it and the
+   *  room is named after its file, as it always was. */
+  createRoom: (path: string, password: string, name?: string) =>
+    invoke<RoomInfo>("create_room", { path, password, name: name ?? null }),
   openRoom: (path: string, password: string) =>
     invoke<RoomInfo>("open_room", { path, password }),
   closeRoom: () => invoke<void>("close_room"),
@@ -103,19 +154,94 @@ export const api = {
    *  120 characters is rejected, as is a rename during a checkpoint rollback. */
   renameRoom: (name: string) => invoke<RoomInfo>("rename_room", { name }),
   takePendingOpen: () => invoke<string | null>("take_pending_open"),
+  /** The last unlock's "audio from an interrupted recording could not be
+   *  restored" message, or null when nothing failed — which is the ordinary
+   *  answer. Collected once on workspace mount: the unlock finishes before any
+   *  listener exists, so the backend parks this instead of relying on an event
+   *  arriving after the race. Reading it clears it. */
+  takeRecRecoveryError: () => invoke<string | null>("take_rec_recovery_error"),
   importFiles: (paths: string[]) => invoke<ImportReport>("import_files", { paths }),
   listFiles: () => invoke<FileMeta[]>("list_files"),
   getFileContent: (id: string) => invoke<FileContent>("get_file_content", { id }),
+  /** Re-read a plain-text file's ORIGINAL BYTES, optionally as a named charset.
+   * `encoding: null` answers with the automatic reading — the same one
+   * `getFileContent` returned — which is how the viewer's encoding strip learns
+   * what is in effect without guessing a second time. */
+  decodeFileText: (id: string, encoding: string | null) =>
+    invoke<DecodedFileText>("decode_file_text", { id, encoding }),
+  /** Waveform envelope for a recording, computed on-device. Decoding happens
+   * in Rust (the same path transcription uses) so the webview never pulls a
+   * long meeting through the Web Audio API. */
+  audioPeaks: (id: string, buckets?: number) =>
+    invoke<AudioPeaks>("audio_peaks", { id, buckets: buckets ?? null }),
+  /** Read (and cache) what a video's container actually says — duration,
+   * display size, codec, frame rate, audio track. `null` means the OS would
+   * not open it as media, or opened it and could say nothing; it is a real
+   * answer, not an error. */
+  probeVideoMeta: (id: string) =>
+    invoke<MediaMeta | null>("probe_video_meta", { id }),
+  /** Cut a span out of a video into a NEW room file. The original is never
+   * modified. The clip arrives with no transcript and is queued on the same
+   * on-device transcriber lane an imported video would be. */
+  videoTrim: (id: string, startSecs: number, endSecs: number) =>
+    invoke<FileMeta>("video_trim", { id, startSecs, endSecs }),
+  /** Keep one frame of a video as a PNG file in the room. The pixels are drawn
+   * in the webview (see `viewers/frameGrab.ts`); this only stores them, and
+   * rejects anything that isn't really a PNG. */
+  saveVideoFrame: (id: string, pngB64: string, atSecs: number) =>
+    invoke<FileMeta>("save_video_frame", { id, pngB64, atSecs }),
+  /** Ask macOS to draw a preview of a file this app can't render itself
+   * (.key/.pages/.numbers, legacy .doc/.ppt, RAW, PSD, 3D models). `null` when
+   * this Mac has nothing that can draw it either — a normal answer, not an
+   * error. */
+  quicklookPreview: (id: string) =>
+    invoke<QuickLookPreview | null>("quicklook_preview", { id }),
+  /** One slide of a .pptx, drawn by macOS at full fidelity. Quick Look renders
+   * page one, so the backend hands it a copy of the deck with the wanted slide
+   * moved to the front — every layout, master, theme and image untouched. */
+  slidePreview: (id: string, index: number) =>
+    invoke<SlideImage | null>("slide_preview", { id, index }),
+  /** A legacy .doc/.rtf as formatted HTML, via macOS's own Word importer. */
+  officeHtml: (id: string) => invoke<string | null>("office_html", { id }),
   updateFileContent: (id: string, content: string) =>
     invoke<FileMeta>("update_file_content", { id, content }),
+  /** Save edited text back INTO a .docx, paragraph by paragraph, keeping the
+   * document's styles, tables and images. The user-facing twin of the agent's
+   * `edit_file` docx path — before this, editing a Word file in the app could
+   * only produce a separate Markdown copy. */
+  updateDocxText: (id: string, content: string) =>
+    invoke<FileMeta>("update_docx_text", { id, content }),
   setCell: (id: string, sheet: string | null, cell: string, value: string) =>
     invoke<void>("set_cell", { id, sheet, cell, value }),
-  deleteFile: (id: string) => invoke<void>("delete_file", { id }),
+  // ---- Trash / undo ----
+  // Deleting moves a file to the room's trash: out of every list, count and
+  // search, but recoverable. The bytes never leave the encrypted room — there
+  // is no system-trash hop.
+  trashFile: (id: string) => invoke<void>("trash_file", { id }),
+  listTrashedFiles: () => invoke<TrashedFile[]>("list_trashed_files"),
+  restoreFile: (id: string) => invoke<FileMeta>("restore_file", { id }),
+  /** Irreversible, and only reachable for a file that is ALREADY in the trash. */
+  deleteFilePermanently: (id: string) =>
+    invoke<void>("delete_file_permanently", { id }),
+  /** Returns how many files were actually destroyed. */
+  emptyTrash: () => invoke<number>("empty_trash"),
   // ---- Wave 2: data safety ----
   listFileVersions: (id: string) =>
     invoke<FileVersion[]>("list_file_versions", { id }),
+  /** ART-1: what produced the file's CURRENT content — null when the app never
+   * recorded it (a person's own file, or one written before provenance). */
+  getFileProvenance: (id: string) =>
+    invoke<Provenance | null>("get_file_provenance", { id }),
   restoreFileVersion: (versionId: string) =>
     invoke<void>("restore_file_version", { versionId }),
+  /** How many UNPINNED versions a file keeps before the oldest is dropped. */
+  fileVersionsKept: () => invoke<number>("file_versions_kept"),
+  /** Keep this version forever (outside the rolling window), or stop keeping it. */
+  pinFileVersion: (versionId: string, pinned: boolean) =>
+    invoke<void>("pin_file_version", { versionId, pinned }),
+  /** Delete one saved version. Not undoable — confirm first. */
+  deleteFileVersion: (versionId: string) =>
+    invoke<void>("delete_file_version", { versionId }),
   // Idea 11: read a saved version's text (+ the current text) without restoring.
   getFileVersion: (versionId: string) =>
     invoke<VersionContent>("get_file_version", { versionId }),
@@ -130,6 +256,12 @@ export const api = {
     invoke<void>("delete_room_checkpoint", { id }),
   rollbackRoomCheckpoint: (id: string) =>
     invoke<RoomInfo>("rollback_room_checkpoint", { id }),
+  // The checkpoints a rollback could NOT open with the room's current password.
+  // Asked right after a password change: a `.roomck` whose re-key failed is
+  // still a good copy, just locked under the password just replaced — and
+  // saying nothing meant the user met it weeks later as a rollback error that
+  // blamed the password they were typing.
+  listStrandedCheckpoints: () => invoke<string[]>("list_stranded_checkpoints"),
   exportFile: (id: string, destPath: string) =>
     invoke<void>("export_file", { id, destPath }),
   exportAll: (destDir: string) => invoke<number>("export_all", { destDir }),
@@ -213,6 +345,16 @@ export const api = {
     invoke<BrowseJournalRow[]>("browser_journal", { limit }),
   browserClearJournal: () => invoke<void>("browser_clear_journal"),
   browserVerifyPrivate: () => invoke<boolean>("browser_verify_private"),
+  /** Item #18: the current page as text, for the reading view. The page is a
+   *  native layer the host DOM cannot reach into, so this — the same extractor
+   *  `browse_read` uses — is the only honest way to put its content in front of
+   *  a screen reader. Refuses while the page is parked, rather than returning
+   *  the fragment a 1×1 layout viewport produces. */
+  browserPageText: (mode: "main" | "full", offset: number) =>
+    invoke<BrowserPageText>("browser_page_text", { mode, offset }),
+  /** Item #18: take the window's first responder back from the native page.
+   *  Nothing in JavaScript can do this — they are different native views. */
+  browserFocusApp: () => invoke<void>("browser_focus_app"),
   /** BROWSE-3: the address bar's second half. Text that isn't a URL runs a real
    *  search instead of erroring, and shares the assistant's own 15-minute
    *  cache — searching here warms the model's next lookup, and vice versa. */
@@ -249,6 +391,14 @@ export const api = {
     listen<BrowseJournalRow>("browser-journal", (e) => cb(e.payload)),
   onBrowserNavigated: (cb: (url: string) => void): Promise<UnlistenFn> =>
     listen<string>("browser-navigated", (e) => cb(e.payload)),
+  /** BROWSE-3c: the Browser AGENT searched (it called `browse_open` with plain
+   *  words instead of an address). Carries the same results the address bar
+   *  would have produced, so the user watches the agent search on the page they
+   *  already know rather than being told about it afterwards. */
+  onBrowserSearched: (
+    cb: (result: BrowserSearchResult) => void,
+  ): Promise<UnlistenFn> =>
+    listen<BrowserSearchResult>("browser-searched", (e) => cb(e.payload)),
   /** A navigation was refused by the same guard `fetch_page` uses — a private
    *  or non-web address. Surfaced so a blocked click never looks like a
    *  page that simply failed to load. */
@@ -263,6 +413,20 @@ export const api = {
       "browser-download",
       (e) => cb(e.payload),
     ),
+  /** AUDIT 169: a download that has already grown past the size a room file may
+   *  be, reported WHILE it runs. The size used to be checked only after the
+   *  whole file had arrived, so a 20 GB click filled the disk and was then
+   *  thrown away with an error. Its own event, never `browser-download`: that
+   *  one means the transfer is over. Nothing here can cancel a download in
+   *  flight — tauri's `DownloadEvent` has no such hook — so this warns, and
+   *  says as much rather than implying it stopped anything. */
+  onBrowserDownloadOversize: (
+    cb: (p: { url: string; name: string; bytes: number; detail: string }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ url: string; name: string; bytes: number; detail: string }>(
+      "browser-download-oversize",
+      (e) => cb(e.payload),
+    ),
   setSetting: (key: string, value: string) =>
     invoke<void>("set_setting", { key, value }),
   mcpGetConfig: () => invoke<string>("mcp_get_config"),
@@ -275,15 +439,53 @@ export const api = {
   // SEC-1b: answer a per-call MCP approval prompt ("once" | "always" | "deny").
   resolveMcpCall: (id: string, decision: "once" | "always" | "deny") =>
     invoke<void>("resolve_mcp_call", { id, decision }),
-  // Connectors → Auto-approve ("auto mode"): read/flip blanket consent for
-  // connector tool calls so the agent's run_mcp_tool never stalls on a card.
+  // Connectors → "Run connector tools without asking": read/flip standing
+  // consent so the agent's run_mcp_tool never stalls on a card. This one grants
+  // permission to RUN and nothing else.
   getMcpAutoApprove: () => invoke<boolean>("get_mcp_auto_approve"),
   setMcpAutoApprove: (on: boolean) =>
     invoke<void>("set_mcp_auto_approve", { on }),
+  // Connectors → "Send remote connectors real values": read/flip outbound
+  // unmasking at the privacy door. Separate from the switch above (owner's
+  // split, 2026-08-03) because "run this unattended" and "send this the room's
+  // real data" are different risks; both default off.
+  getMcpOutboundUnmask: () => invoke<boolean>("get_mcp_outbound_unmask"),
+  setMcpOutboundUnmask: (on: boolean) =>
+    invoke<void>("set_mcp_outbound_unmask", { on }),
+  // Connectors → the per-connector answers that override the two switches
+  // above, `{server: {auto_approve?, outbound_unmask?}}`. A power missing for a
+  // connector means "follow the switch"; that is also what every connector says
+  // on an install upgrading from the global-only pair, so nothing is granted by
+  // the upgrade itself.
+  mcpGetConnectorPowers: async (): Promise<ConnectorPowers> =>
+    JSON.parse(await invoke<string>("get_mcp_connector_powers")) as ConnectorPowers,
+  // `value: null` clears the override back to the switch above. Returns the new
+  // map so the UI shows what was stored, not what it hoped for.
+  mcpSetConnectorPower: async (
+    server: string,
+    power: "auto_approve" | "outbound_unmask",
+    value: boolean | null,
+  ): Promise<ConnectorPowers> =>
+    JSON.parse(
+      await invoke<string>("set_mcp_connector_power", { server, power, value }),
+    ) as ConnectorPowers,
   // Marketplace: search the live MCP registry (opt-in gated). Errors when
   // browsing is off so the UI can show the opt-in gate.
   mcpRegistrySearch: (query?: string, limit?: number) =>
     invoke<CatalogEntry[]>("mcp_registry_search", { query, limit }),
+  /** Can this connector's command run, and would one download fix it? */
+  mcpRuntimeForCommand: (command: string) =>
+    invoke<RuntimeStatus>("mcp_runtime_for_command", { command }),
+  /** Fetch a runtime ("uv" | "node") once. Progress via `onRuntimeProgress`. */
+  mcpProvisionRuntime: (kind: string) =>
+    invoke<void>("mcp_provision_runtime", { kind }),
+  onRuntimeProgress: (
+    cb: (p: { kind: string; phase: string; got: number; total: number }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ kind: string; phase: string; got: number; total: number }>(
+      "runtime-progress",
+      (e) => cb(e.payload),
+    ),
   mcpRegistryOptinStatus: () =>
     invoke<boolean>("mcp_registry_optin_status"),
   setMcpRegistryOptin: (enabled: boolean) =>
@@ -465,8 +667,17 @@ export const api = {
     }),
   deleteSkillResource: (skillId: string, path: string) =>
     invoke<void>("delete_skill_resource", { skillId, path }),
-  importSkillFolder: (path: string) =>
-    invoke<string>("import_skill_folder", { path }),
+  /** `replace` re-imports OVER the skill of that name, keeping its id and its
+   *  enabled state. Omitted, a name clash is still refused. */
+  importSkillFolder: (path: string, replace = false) =>
+    invoke<string>("import_skill_folder", { path, replace }),
+  /** The name of the skill this folder would clash with, or null. Ask before
+   *  importing so the clash can offer Replace instead of failing. */
+  skillImportConflict: (path: string) =>
+    invoke<string | null>("skill_import_conflict", { path }),
+  /** Every owner a skill may be bound to ("" — general — is not in the list).
+   *  The host's own roster, so a picker can never offer an id it would reject. */
+  skillAgentIds: () => invoke<string[]>("skill_agent_ids"),
   exportSkillFolder: (id: string, destination: string) =>
     invoke<string>("export_skill_folder", { id, destination }),
   composeSkill: (description: string, fileIds: string[] = []) =>
@@ -474,6 +685,24 @@ export const api = {
   aiStatus: () => invoke<AiStatus>("ai_status"),
   /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
   modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
+  /** The OPEN room's engine, as ONE declared capability record. Nothing in the
+   *  UI should decide behaviour from a model name — ask this instead. */
+  engineCapabilities: () => invoke<EngineCapabilities>("engine_capabilities"),
+  /** PREFLIGHT: can the room's engine do this, asked BEFORE the run so the user
+   *  gets one plain sentence instead of a stream that dies halfway. */
+  enginePreflight: (capability: Capability) =>
+    invoke<EnginePreflight>("engine_preflight", { capability }),
+  /** The published provider × agent matrix, DERIVED from the capability records
+   *  and the sidecar's own agent registry — never hand-maintained. */
+  engineSupportMatrix: () => invoke<SupportMatrix>("engine_support_matrix"),
+  /**
+   * Which model would mark an image for the open room, or null when nothing
+   * can. The ONE source of truth for "can this room see?" — the same pick the
+   * grounding call itself makes, capability-asked rather than name-matched.
+   * Screens used to re-derive it from the local Ollama list, so a room on a
+   * cloud vision model was told to download a local one it had no use for.
+   */
+  groundingModelForRoom: () => invoke<string | null>("grounding_model_for_room"),
   /** Models available for a detected cloud engine ("claude-cli"/"codex-cli"),
    *  for the Cloud picker's second level. */
   listEngineModels: (engine: string) =>
@@ -510,7 +739,10 @@ export const api = {
       askId,
       privacyBypass: privacyBypass ?? null,
     }),
-  cancelAsk: (askId: string) => invoke<void>("cancel_ask", { askId }),
+  /** Stop this run — and everything it had started. Answers with what it
+   *  actually stopped (see `StopReport`), so the UI can say so instead of
+   *  leaving the user to guess from a screen that went quiet. */
+  cancelAsk: (askId: string) => invoke<StopReport>("cancel_ask", { askId }),
   // Context handoff: summarize the chat so far and insert a marker message —
   // every future turn's history then starts from that marker.
   handoffContext: (chatId: string) => invoke<Message>("handoff_chat", { chatId }),
@@ -527,6 +759,10 @@ export const api = {
   ) => invoke<Message>("run_command", { chatId, command, args, refs, raw, askId }),
   /** The catalog of "#name" commands (for autocomplete + help). */
   listChatCommands: () => invoke<ChatCommand[]>("list_chat_commands"),
+  /** The specialists this room can dispatch to, for the composer's "*" menu.
+   *  Rejects (rather than returning []) when the sidecar cannot be reached —
+   *  "no specialists" and "we could not find out" are different answers. */
+  listSpecialists: () => invoke<Specialist[]>("list_specialists"),
   // ADD-8: import a pasted image (base64) as a room file.
   importImageBytes: (name: string, b64: string) =>
     invoke<FileMeta>("import_image_bytes", { name, b64 }),
@@ -535,21 +771,21 @@ export const api = {
     invoke<FileMeta>("import_audio_bytes", { name, b64 }),
   /** Ask the vision model where `query` is in an image; boxes come back in
    *  0-1000 coordinates, so nothing here depends on the on-screen size.
-   *  The old measured `imgWidth`/`imgHeight` are GONE from the command — it is
-   *  `locate_in_image(fileId, query)` now (vision.rs), and the sidecar stretches
-   *  the original bytes itself. The two trailing parameters survive only so the
-   *  last caller that still measures the element keeps compiling: they are
-   *  ignored here and nothing is sent for them. Don't measure to fill them in,
-   *  and drop them from any new call. */
-  locateInImage: (
-    fileId: string,
-    query: string,
-    _legacyImgWidth?: number,
-    _legacyImgHeight?: number,
-  ) => invoke<ImageBox[]>("locate_in_image", { fileId, query }),
+   *  The measured `imgWidth`/`imgHeight` are GONE from both sides — the command
+   *  is `locate_in_image(fileId, query)` (vision.rs) and the sidecar stretches
+   *  the original bytes itself. The two legacy parameters lingered here as
+   *  ignored placeholders while the last caller still measured the element to
+   *  fill them; it no longer does, so there is nothing left to keep. */
+  locateInImage: (fileId: string, query: string) =>
+    invoke<ImageBox[]>("locate_in_image", { fileId, query }),
   // ---- ADD-18: on-device dictation & transcription (Whisper built in) ----
   sttStatus: () => invoke<SttStatus>("stt_status"),
   sttDownloadModel: () => invoke<void>("stt_download_model"),
+  /** Stop a voice-model download in progress. Answers whether there WAS one to
+   *  stop — false means nothing was downloading, and the caller must not claim
+   *  it stopped anything. The download itself then fails with "Download
+   *  stopped." and its part-file is removed. */
+  sttCancelDownload: () => invoke<boolean>("stt_cancel_download"),
   sttDeleteModel: () => invoke<void>("stt_delete_model"),
   /** Re-run on-device transcription for a stored audio/video file, replacing its
    *  transcript. Queues on the same STT lane as import; progress arrives via the
@@ -601,6 +837,9 @@ export const api = {
       refs?: string[] | null;
       instructions?: string | null;
       question?: string | null;
+      /** This run's id, so `cancelAsk(opId)` can Stop it — the same registry
+       *  chat's Stop and a Studio build use. */
+      opId?: string | null;
     },
   ) =>
     invoke<FileMeta>("ai_action", {
@@ -609,6 +848,7 @@ export const api = {
       refs: opts.refs ?? null,
       instructions: opts.instructions ?? null,
       question: opts.question ?? null,
+      opId: opts.opId ?? null,
     }),
 
   // ---- events (@tauri-apps/api/event) ----
@@ -623,62 +863,83 @@ export const api = {
    *  phase one of started | done | none | model-missing. */
   onSttProgress: (cb: (p: [string, string]) => void): Promise<UnlistenFn> =>
     listen<[string, string]>("stt-progress", (e) => cb(e.payload)),
+  /** AUDIT 262: background OCR of a scanned page or image: [fileName, phase],
+   *  phase one of started | done | none. The host emitted this from the first
+   *  build and nothing listened, so a scan that runs for minutes on a local
+   *  vision model showed no sign of activity anywhere in the app. */
+  onOcrProgress: (cb: (p: [string, string]) => void): Promise<UnlistenFn> =>
+    listen<[string, string]>("ocr-progress", (e) => cb(e.payload)),
   onOpenRoomFile: (cb: (path: string) => void): Promise<UnlistenFn> =>
     listen<string>("open-room-file", (e) => cb(e.payload)),
   // Idea 9: the room was rolled back to a checkpoint — the whole workspace
   // remounts against the swapped DB. Payload is the reopened room's info.
   onRoomRolledBack: (cb: (info: RoomInfo) => void): Promise<UnlistenFn> =>
     listen<RoomInfo>("room-rolled-back", (e) => cb(e.payload)),
-  onAskDelta: (cb: (delta: string) => void): Promise<UnlistenFn> =>
-    listen<string>("ask-delta", (e) => cb(e.payload)),
+  // ---- turn events -----------------------------------------------------
+  //
+  // Owner replacement #4 (2026-08-03): every `ask-*` event now arrives in an
+  // identity envelope — `{ runId, chatId, v }` — because a window event is a
+  // broadcast and the listener used to infer ownership from what was mounted.
+  // `askEvent` unwraps `v` and hands the ids alongside it, so every listener
+  // below has the same shape: `(payload, turn)`. The ids can be null: an
+  // emitter that belongs to no conversation says so rather than borrowing one
+  // (crate::turn::emit_unowned).
+  onAskDelta: (
+    cb: (delta: string, turn: AskTurn) => void,
+  ): Promise<UnlistenFn> => askEvent<string>("ask-delta", cb),
   // CHG-5: structured turn events. `ask-step` fires when a tool runs;
   // `ask-round` fires when a new model round starts (clear the live text).
   // Two payload shapes reach this event: the sidecar sends {label, node} so a
   // step can be attributed to the agent that ran it, while the many other
   // emitters (chat commands, ai_actions, the native agent paths) send a bare
   // string. Normalised here so no consumer has to know which one fired.
-  onAskStep: (cb: (step: AskStep) => void): Promise<UnlistenFn> =>
-    listen<string | AskStep>("ask-step", (e) =>
+  onAskStep: (
+    cb: (step: AskStep, turn: AskTurn) => void,
+  ): Promise<UnlistenFn> =>
+    askEvent<string | AskStep>("ask-step", (v, turn) =>
       cb(
-        typeof e.payload === "string"
-          ? { label: e.payload, node: null }
-          : { label: e.payload.label, node: e.payload.node ?? null },
+        typeof v === "string"
+          ? { label: v, node: null }
+          : { label: v.label, node: v.node ?? null },
+        turn,
       ),
     ),
   // ADD-22: the deterministic router's chosen lane ("Answering", "Working on
   // your files", …), shown as a subtle label so an odd answer is explainable.
-  onAskLane: (cb: (label: string) => void): Promise<UnlistenFn> =>
-    listen<string>("ask-lane", (e) => cb(e.payload)),
+  onAskLane: (
+    cb: (label: string, turn: AskTurn) => void,
+  ): Promise<UnlistenFn> => askEvent<string>("ask-lane", cb),
   // Dispatch-first agent visibility: the roster of domain agents handling
   // this ask (once, before work starts) and the currently active one.
-  onAskPlan: (cb: (plan: AskPlanStep[]) => void): Promise<UnlistenFn> =>
-    listen<AskPlanStep[]>("ask-plan", (e) => cb(e.payload)),
-  onAskAgent: (cb: (agent: AskActiveAgent) => void): Promise<UnlistenFn> =>
-    listen<AskActiveAgent>("ask-agent", (e) => cb(e.payload)),
+  onAskPlan: (
+    cb: (plan: AskPlanStep[], turn: AskTurn) => void,
+  ): Promise<UnlistenFn> => askEvent<AskPlanStep[]>("ask-plan", cb),
+  onAskAgent: (
+    cb: (agent: AskActiveAgent, turn: AskTurn) => void,
+  ): Promise<UnlistenFn> => askEvent<AskActiveAgent>("ask-agent", cb),
   // ADD-22: outcome of the most recent tool step, so a failed chip reads failed.
   // `node` (when present) says WHOSE most-recent step this resolves — with
   // parallel children "the most recent step" is ambiguous without it.
   onAskStepStatus: (
-    cb: (p: { ok: boolean; node?: string | null }) => void,
+    cb: (p: { ok: boolean; node?: string | null }, turn: AskTurn) => void,
   ): Promise<UnlistenFn> =>
-    listen<{ ok: boolean; node?: string | null }>("ask-step-status", (e) =>
-      cb(e.payload),
-    ),
-  onAskRound: (cb: () => void): Promise<UnlistenFn> =>
-    listen("ask-round", () => cb()),
-  /** DEAD PLUMBING — nothing in the host or the AI service emits "ask-notice"
-   *  (grep: this listener and effects.ts are its only mentions). Delete this
-   *  together with the effects.ts subscription; kept for now only so the
-   *  workspace's teardown list keeps compiling. */
-  onAskNotice: (cb: (text: string) => void): Promise<UnlistenFn> =>
-    listen<string>("ask-notice", (e) => cb(e.payload)),
+    askEvent<{ ok: boolean; node?: string | null }>("ask-step-status", cb),
+  onAskRound: (cb: (turn: AskTurn) => void): Promise<UnlistenFn> =>
+    askEvent<unknown>("ask-round", (_v, turn) => cb(turn)),
+  /** What a specialist reported back, stamped with its graph slot — the
+   * durable copy of words the live area shows once and then clears. */
+  onAskReport: (
+    cb: (r: AskReport, turn: AskTurn) => void,
+  ): Promise<UnlistenFn> => askEvent<AskReport>("ask-report", cb),
   // PRIV-1: what the privacy door did on this turn ("N details hidden"), or
   // { bypassed: true } when the user shared real details this once.
-  onAskPrivacy: (cb: (p: AskPrivacy) => void): Promise<UnlistenFn> =>
-    listen<AskPrivacy>("ask-privacy", (e) => cb(e.payload)),
+  onAskPrivacy: (
+    cb: (p: AskPrivacy, turn: AskTurn) => void,
+  ): Promise<UnlistenFn> => askEvent<AskPrivacy>("ask-privacy", cb),
   // Token-budget bar: one live usage snapshot per completed model round.
-  onAskTokenUsage: (cb: (p: AskTokenUsage) => void): Promise<UnlistenFn> =>
-    listen<AskTokenUsage>("ask-token-usage", (e) => cb(e.payload)),
+  onAskTokenUsage: (
+    cb: (p: AskTokenUsage, turn: AskTurn) => void,
+  ): Promise<UnlistenFn> => askEvent<AskTokenUsage>("ask-token-usage", cb),
   // PRIV-2: background privacy-scan progress for the Settings section.
   onPrivacyScan: (cb: (p: PrivacyScanProgress) => void): Promise<UnlistenFn> =>
     listen<PrivacyScanProgress>("privacy-scan", (e) => cb(e.payload)),
@@ -779,6 +1040,11 @@ export const api = {
   /** Studio-style edit: delete a [t0,t1) span from transcript + playback. */
   recDeleteRange: (id: string, t0: number, t1: number) =>
     invoke<RecMeta>("rec_delete_range", { id, t0, t1 }),
+  /** …and the other half of editing: RETYPE what a span says. Deleting was the
+   *  only edit there was, so a misheard name meant leaving it wrong or losing
+   *  the sentence. The audio is untouched — this is not a cut. */
+  recCorrectRange: (id: string, t0: number, t1: number, text: string) =>
+    invoke<RecMeta>("rec_correct_range", { id, t0, t1, text }),
   /** GH #5: name a speaker after transcribing ("Speaker 2" → "Dana"). Renames
    * every line they said at once; an empty name restores the machine label. */
   recSetSpeakerName: (id: string, speaker: string, name: string) =>
@@ -840,11 +1106,30 @@ export const api = {
   feedbackDraft: (text: string) =>
     invoke<FeedbackDraft>("feedback_draft", { text }),
   appDiag: () => invoke<AppDiag>("app_diag"),
+  /** Show the folder holding the app's two log files in Finder, and return its
+   *  path so it can be named on screen. The logs hold ids, counts, durations
+   *  and error kinds — never anything from a room — so they are safe to attach
+   *  to a bug report. */
+  revealLogs: () => invoke<string>("reveal_logs"),
+
+  /** Tell Rust whether the open editor holds edits a quit would throw away.
+   *  ⌘Q raises no window close request on macOS, so the window's own guard
+   *  never sees it — the event-loop handler that does is synchronous and
+   *  cannot ask anything, which is why this is pushed rather than pulled. */
+  setUnsavedEdits: (on: boolean) => invoke<void>("set_unsaved_edits", { on }),
+  /** Rust held a ⌘Q so this window can ask about those edits. Whoever listens
+   *  OWNS finishing the quit — Rust will not hold the next one. */
+  onQuitRequested: (cb: () => void): Promise<UnlistenFn> =>
+    listen("quit-requested", () => cb()),
 
   /** ADD-26 / BROWSE-2: download a video or audio page into the room via
    *  yt-dlp (fetched on first use), YouTube included. Emits ytdlp-progress. */
   importMediaUrl: (url: string) =>
     invoke<ImportReport>("import_media_url", { url }),
+  /** Abandon the video download running now. The command itself then rejects
+   *  with "Stopped." — a download you started by mistake used to have no way
+   *  out short of quitting the app. */
+  cancelMediaDownload: () => invoke<void>("cancel_media_download"),
   onYtdlpProgress: (
     cb: (p: { status: string; percent: number | null }) => void,
   ): Promise<UnlistenFn> =>
@@ -928,6 +1213,13 @@ export const regenerateLeashToken = () =>
 export const setOllamaUrl = (url: string) =>
   invoke<void>("set_ollama_url", { url });
 
+/** D10: save the remote-Ollama address and then actually try to reach it.
+ *  Rejects with what went wrong — a well-formed address for a machine that is
+ *  off used to be accepted with "Saved", after which every AI feature blamed
+ *  the LOCAL Ollama. */
+export const testOllamaUrl = (url: string) =>
+  invoke<string>("test_ollama_url", { url });
+
 /** D10: the Ollama base URL currently in effect. */
 export const getOllamaUrl = () => invoke<string>("get_ollama_url");
 
@@ -991,11 +1283,27 @@ export function fileKindLabel(f: FileMeta): string {
   if (m.startsWith("image/")) return "image";
   if (m === "application/pdf") return "PDF";
   const lower = f.name.toLowerCase();
-  if (lower.endsWith(".md")) return "note";
-  if (lower.endsWith(".csv") || lower.endsWith(".xlsx")) return "sheet";
+  if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "note";
+  // .xls / .ods / .tsv were missing here, so a legacy workbook listed as
+  // "File" right beside an .xlsx listed as "Sheet".
+  if ([".csv", ".tsv", ".xlsx", ".xls", ".ods"].some((e) => lower.endsWith(e))) {
+    return "sheet";
+  }
   if (lower.endsWith(".py") || lower.endsWith(".js")) return "script";
-  if (lower.endsWith(".docx")) return "document";
+  if (lower.endsWith(".docx") || lower.endsWith(".doc")) return "document";
   if (lower.endsWith(".html") || lower.endsWith(".htm")) return "HTML";
+  // The formats that gained real viewers: a deck listed as "File" next to a
+  // PDF listed as "PDF" reads as "we don't handle this one".
+  if (lower.endsWith(".pptx") || lower.endsWith(".ppt")) return "presentation";
+  if (lower.endsWith(".epub")) return "book";
+  if (lower.endsWith(".zip")) return "archive";
+  if (lower.endsWith(".ipynb")) return "notebook";
+  if (lower.endsWith(".eml")) return "message";
+  if (lower.endsWith(".srt") || lower.endsWith(".vtt")) return "subtitles";
+  if (lower.endsWith(".svg")) return "drawing";
+  if (lower.endsWith(".json") || lower.endsWith(".jsonl")) return "data";
+  if (lower.endsWith(".log")) return "log";
+  if (lower.endsWith(".txt")) return "text";
   return "file";
 }
 
@@ -1007,9 +1315,14 @@ export function fileKind(f: FileMeta): FileKind {
   const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "pdf") return "pdf";
   if (["doc", "docx"].includes(ext)) return "docx";
-  if (["xls", "xlsx", "csv", "tsv"].includes(ext)) return "sheet";
+  if (["xls", "xlsx", "ods", "csv", "tsv"].includes(ext)) return "sheet";
   if (["md", "markdown"].includes(ext)) return "markdown";
-  if (["txt", "log"].includes(ext)) return "text";
-  if (["html", "htm"].includes(ext)) return "web";
+  if (["txt", "log", "eml", "srt", "vtt"].includes(ext)) return "text";
+  if (["html", "htm", "svg"].includes(ext)) return "web";
+  // Decks, books and notebooks now have real viewers, so they get the
+  // document glyph rather than the blank "unknown file" one. There is no
+  // dedicated icon for each; a document mark is closer than nothing, and the
+  // ROW's label (fileKindLabel) names the format exactly.
+  if (["pptx", "ppt", "epub", "ipynb"].includes(ext)) return "docx";
   return "file";
 }

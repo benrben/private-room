@@ -438,6 +438,17 @@ async def probe(state: AgentState) -> dict[str, Any]:
     after = spec.flow.probe_after
     if after and after not in set(state.get("attempted", set())):
         return {}
+    # ...and not when that tool ran WITHOUT establishing the precondition.
+    # `browse_open` with plain words searches instead of navigating, so it is
+    # "attempted" with no page behind it. See `Flow.probe_unless`.
+    if spec.flow.probe_unless:
+        last = ""
+        for msg in reversed(state.get("messages", [])):
+            if msg.get("role") == "tool":
+                last = (msg.get("content") or "").lower()
+                break
+        if any(marker.lower() in last for marker in spec.flow.probe_unless):
+            return {}
     probe_call = ToolCall(name=name, arguments={})
     # A re-capture is the GRAPH's decision, not the model looping, so it must be
     # exempt from duplicate suppression. `ui_snapshot` takes no arguments, so

@@ -233,6 +233,15 @@
   font-weight: 650;
 }
 
+/* The armed "Erase this record?" question, in the header slot Clear vacated. */
+.browser-journal-confirm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-2, var(--text));
+}
+
 .browser-journal-note,
 .browser-journal-empty {
   margin: 6px 0 12px;
@@ -415,6 +424,9 @@
 
 .bsearch-meta .sep { color: var(--faint); margin: 0 5px; }
 .bsearch-meta .privacy { color: var(--accent-2); }
+/* Degraded, not broken: readable enough to notice, quiet enough not to alarm
+   when five of seven engines answered perfectly well. */
+.bsearch-meta .bsearch-blocked { color: var(--warn, #b7791f); cursor: help; }
 .bsearch-meta .hint {
   color: var(--faint);
   border-bottom: 1px dotted var(--faint);
@@ -858,4 +870,196 @@
 @media (prefers-reduced-motion: reduce) {
   .bsearch-skel,
   .bsearch-fuse i.pending { animation: none; }
+}
+
+/* ---------------------------------------------------- reading view (#18) */
+
+/* The screen-reader running commentary for the whole area. The page is a
+   native layer: it repaints without a single DOM change, so without this a
+   screen-reader user is never told that anything happened. One region for the
+   area, not one per control — see `.agraph-sr`, which this is a copy of. */
+.browser-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  margin: 0;
+}
+
+/* A visually-hidden control that appears where it is when focused. The FIRST
+   focusable thing in the AREA, so the first Tab into the browser offers the
+   reading view before anything else — that is what makes the feature
+   discoverable without detecting a screen reader.
+
+   It sits in `.browser-chrome`, not in `.browser-body`: the native page covers
+   the body's rect exactly and is drawn above every DOM element in this window,
+   so a focus ring down there would be enabled precisely when it is invisible.
+   Absolute inside the chrome so the collapsed state costs no layout — the
+   chrome is a flex row and a 1px in-flow item would shift the whole toolbar by
+   its gap. */
+.browser-chrome {
+  position: relative;
+}
+
+.browser-skip {
+  position: absolute;
+  left: 8px;
+  top: 6px;
+  z-index: 2;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.browser-skip:focus-visible {
+  width: auto;
+  height: auto;
+  clip-path: none;
+  padding: 6px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* A PANEL, never an overlay — the same rule the journal follows and the one
+   thing about this view that must not change. The native page keeps a real
+   (merely narrower) layout viewport beside it, which is what makes the text it
+   reports the whole page rather than a 1px-wide reflow of it. */
+.browser-reader {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+  overflow-y: auto;
+  padding: 16px 20px 40px;
+}
+
+/* Kept a real viewport, not parked: see the note above. */
+.browser-body.reading .browser-stage {
+  flex: 0 0 320px;
+}
+
+.browser-reader-head {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+  margin-bottom: 14px;
+}
+
+.browser-reader-head h1 {
+  margin: 0 0 6px;
+  font-size: 20px;
+  line-height: 1.25;
+}
+
+.browser-reader-head h1:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.browser-reader-where,
+.browser-reader-note {
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-2, var(--text));
+}
+
+.browser-reader-where .sep {
+  margin: 0 6px;
+  opacity: 0.5;
+}
+
+.browser-reader-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.browser-reader-tools .browser-btn {
+  border-color: var(--border);
+}
+
+.browser-reader-body {
+  font-size: 14px;
+  line-height: 1.6;
+  max-width: 72ch;
+}
+
+.browser-reader-body h1,
+.browser-reader-body h2,
+.browser-reader-body h3,
+.browser-reader-body h4 {
+  margin: 20px 0 8px;
+  line-height: 1.3;
+}
+
+.browser-reader-body p,
+.browser-reader-body ul,
+.browser-reader-body ol,
+.browser-reader-body blockquote {
+  margin: 0 0 12px;
+}
+
+.browser-reader-body ul,
+.browser-reader-body ol {
+  padding-left: 22px;
+}
+
+.browser-reader-body li {
+  margin: 3px 0;
+}
+
+.browser-reader-body table {
+  border-collapse: collapse;
+  margin: 0 0 14px;
+  display: block;
+  overflow-x: auto;
+}
+
+.browser-reader-body th,
+.browser-reader-body td {
+  border: 1px solid var(--border);
+  padding: 5px 9px;
+  text-align: left;
+}
+
+.browser-reader-body pre {
+  overflow-x: auto;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-2, var(--panel));
+}
+
+.browser-reader-body a {
+  color: var(--accent);
+}
+
+/* Links in the text are the navigation for a keyboard user, so the focus ring
+   has to be unmissable — this is the one place it does real work. */
+.browser-reader-body a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+.browser-reader-error {
+  padding: 10px 12px;
+  border: 1px solid var(--danger, #b4322f);
+  border-radius: 8px;
+  color: var(--danger, #b4322f);
+}
+
+.browser-reader-more {
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-2, var(--text));
 }

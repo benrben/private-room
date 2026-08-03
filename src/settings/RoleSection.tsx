@@ -4,9 +4,12 @@ interface Props {
   roles: RoomRole[];
   role: string;
   changeRole: (id: string) => void;
+  /** Why the last pick did not stick, or "" — a save that failed must not
+   * leave the radio showing a stance the room is not actually using. */
+  roleError: string;
 }
 
-export default function RoleSection({ roles, role, changeRole }: Props) {
+export default function RoleSection({ roles, role, changeRole, roleError }: Props) {
   return (
     // ROLES — a stance for this room's AI.
     <section id="set-role">
@@ -53,6 +56,7 @@ export default function RoleSection({ roles, role, changeRole }: Props) {
             ) : (
               <p className="settings-hint">Roles aren't available right now.</p>
             )}
+            {roleError && <div className="gate-error">{roleError}</div>}
     </section>
   );
 }

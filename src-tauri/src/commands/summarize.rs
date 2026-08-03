@@ -258,8 +258,11 @@ pub(crate) async fn write_room_summary(
         )?,
     };
     // ADD-22: drop the legacy Markdown summary so only the HTML one remains.
+    // Trashed, not destroyed, and labelled with the command that did it: this
+    // is the app removing a file the user never asked it to remove, which is
+    // precisely the case the trash exists to make visible and undoable.
     if let Some(md_id) = legacy_md_id {
-        let _ = db::delete_file(&room.conn, &md_id);
+        let _ = db::trash_file(&room.conn, &md_id, db::TrashActor::App("summarize_room"));
     }
     let _ = window.emit("room-files-changed", ());
     Ok(meta)

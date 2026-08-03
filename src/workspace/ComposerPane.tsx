@@ -11,7 +11,7 @@ import {
   StopIcon,
 } from "../icons";
 import { displayName } from "./composer";
-import { isCloudEngine, isExternalEngine } from "./markup";
+import { isCloudEngine, isCloudRoute, isExternalEngine } from "./markup";
 import { bestLocalModel } from "./localModel";
 import { RECOMMENDED_MODELS } from "./constants";
 import { WSState } from "./state";
@@ -41,6 +41,13 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
   }, [s.showHelp, s]);
+  // The palette's a11y wiring, computed once for the textarea below: the
+  // popover is rendered inside an IIFE (it has to weigh rows against the
+  // honest empty-state note), and the input needs the same two facts.
+  const acItems = s.ac ? a.autocompleteItems() : [];
+  const acOpen = Boolean(s.ac) && (acItems.length > 0 || Boolean(a.autocompleteNote()));
+  const acActive =
+    s.ac && acItems.length > 0 ? `ac-opt-${Math.min(s.ac.index, acItems.length - 1)}` : undefined;
   return (
     <div className="composer">
       {batchTidy ? (
@@ -100,7 +107,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
           </div>
         ))
       )}
-      {isCloudEngine(s.model) &&
+      {isCloudRoute(s.model, s.ai) &&
         (() => {
           // "Use local" has to land on a model that actually runs on this Mac.
           // `ai.defaultModel` echoes the room's SAVED model setting, which in a
@@ -207,40 +214,71 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
       )}
       <TokenBudgetBar s={s} a={a} />
       <div className={`composer-card${s.asking ? " busy" : ""}`}>
-        {s.ac && a.autocompleteItems().length > 0 && (
-          <div className="ac-popover">
-            {/* The count says how much is below the fold; the key hints make
-                the whole list reachable without the mouse. */}
-            <div className="ac-hint ac-hint-row">
-              <span>
-                {s.ac.kind === "cmd"
-                  ? `${a.autocompleteItems().length} commands`
-                  : s.ac.kind === "skill"
-                    ? `${a.autocompleteItems().length} enabled skills`
-                    : `${a.autocompleteItems().length} files & folders`}
-              </span>
-              <span className="ac-keys">↑↓ choose · Enter run · Esc close</span>
+        {(() => {
+          if (!s.ac) return null;
+          const items = a.autocompleteItems();
+          // The "*" menu stays open on its NOTE alone. Every other palette
+          // closes when it has no rows, and should: "no file matches" is not a
+          // claim about the room, but "this room has no specialists" is, and
+          // an empty menu would leave the user to guess which it meant.
+          const note = a.autocompleteNote();
+          if (items.length === 0 && !note) return null;
+          return (
+            <div className="ac-popover">
+              {/* The count says how much is below the fold; the key hints make
+                  the whole list reachable without the mouse. */}
+              <div className="ac-hint ac-hint-row" id="ac-label">
+                <span>
+                  {s.ac.kind === "cmd"
+                    ? `${items.length} commands`
+                    : s.ac.kind === "skill"
+                      ? `${items.length} enabled skills`
+                      : s.ac.kind === "agent"
+                        ? items.length > 0
+                          ? `${items.length} specialists`
+                          : "Specialists"
+                        : `${items.length} files & folders`}
+                </span>
+                {/* A menu with no rows has nothing to arrow onto — promising
+                    keys that do nothing is the same small lie in miniature. */}
+                <span className="ac-keys">
+                  {items.length > 0 ? "↑↓ choose · Enter run · Esc close" : "Esc close"}
+                </span>
+              </div>
+              {note ? (
+                // `alert` rather than a row: it is a statement about the room,
+                // not something to choose, and a screen reader should say it
+                // when it appears instead of counting it among the options.
+                <div className="ac-hint ac-empty" role="alert">
+                  {note}
+                </div>
+              ) : null}
+              <div id="ac-listbox" role="listbox" aria-labelledby="ac-label">
+                {items.map((it, i) => (
+                  <button
+                    key={it.key}
+                    id={`ac-opt-${i}`}
+                    role="option"
+                    aria-selected={i === s.ac!.index}
+                    className={`ac-item ${i === s.ac!.index ? "active" : ""}`}
+                    ref={(el) => {
+                      // Arrow-keying below the fold must scroll the list with it.
+                      if (i === s.ac!.index) el?.scrollIntoView({ block: "nearest" });
+                    }}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      a.acceptAutocomplete(it.insert);
+                    }}
+                  >
+                    <span className="ac-label">{it.label}</span>
+                    {it.usage && <code className="ac-usage">{it.usage}</code>}
+                    <span className="ac-desc">{it.hint}</span>
+                  </button>
+                ))}
+              </div>
             </div>
-            {a.autocompleteItems().map((it, i) => (
-              <button
-                key={it.key}
-                className={`ac-item ${i === s.ac!.index ? "active" : ""}`}
-                ref={(el) => {
-                  // Arrow-keying below the fold must scroll the list with it.
-                  if (i === s.ac!.index) el?.scrollIntoView({ block: "nearest" });
-                }}
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  a.acceptAutocomplete(it.insert);
-                }}
-              >
-                <span className="ac-label">{it.label}</span>
-                {it.usage && <code className="ac-usage">{it.usage}</code>}
-                <span className="ac-desc">{it.hint}</span>
-              </button>
-            ))}
-          </div>
-        )}
+          );
+        })()}
         {s.showHelp && !s.ac && (
           <div className="ac-popover help-popover">
             <div
@@ -286,6 +324,16 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
           value={s.question}
           rows={3}
           dir="auto"
+          // The palette is a combobox whose input is this box: focus never
+          // leaves it, so the ACTIVE option has to be announced from here
+          // (`aria-activedescendant`) — a role on the list alone would be read
+          // by nobody. Applies to all four menus (#, @, /, *), which is the
+          // point: one palette, one set of semantics.
+          role="combobox"
+          aria-expanded={acOpen}
+          aria-controls={acOpen ? "ac-listbox" : undefined}
+          aria-activedescendant={acActive}
+          aria-autocomplete="list"
           onChange={(e) => {
             s.setQuestion(e.target.value);
             a.refreshAutocomplete(e.target.value, e.target.selectionStart);
@@ -328,6 +376,17 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               onClick={() => a.insertComposerToken("/")}
             >
               <span className="tool-hash">/</span> Skill
+            </button>
+            {/* Never DISABLED on an empty roster, unlike Skill above: the
+                roster may simply not have been read yet, and a greyed-out
+                button would state as fact something we have not established.
+                The menu itself says which of the two it is. */}
+            <button
+              className="tool-chip"
+              title="Send this turn to one specialist agent"
+              onClick={() => a.insertComposerToken("*")}
+            >
+              <span className="tool-hash">*</span> Specialist
             </button>
           </div>
           <div className="composer-tools-right">

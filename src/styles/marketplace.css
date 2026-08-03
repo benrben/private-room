@@ -30,12 +30,17 @@
 .connectors-head .settings-hint {
   max-width: 68ch;
 }
-.connectors-autoapprove {
+/* The two connector powers sit as siblings, deliberately alike: they are
+   separate permissions of equal weight, so neither should read as a sub-setting
+   of the other. */
+.connectors-autoapprove,
+.connectors-unmask {
   margin-top: var(--sp-3);
   max-width: 68ch;
   align-items: flex-start;
 }
-.connectors-autoapprove span:last-child {
+.connectors-autoapprove span:last-child,
+.connectors-unmask span:last-child {
   max-width: 62ch;
 }
 .connectors-h2 {
@@ -91,6 +96,41 @@
 }
 .connector-tools-hint {
   margin: 0 0 var(--sp-2);
+  font-size: 11px;
+}
+/* The two per-connector powers, under the connector's row. Each is a label
+   holding a name, a three-way choice and — on its own line, always — the
+   sentence saying which level is actually in force, so the page never leaves
+   the reader to combine a global switch with a local one. */
+.connector-powers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--sp-1) var(--sp-3);
+  margin: calc(var(--sp-1) * -1) 0 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-top: none;
+  background: var(--panel-2);
+}
+.connector-power {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: var(--sp-1) var(--sp-2);
+  font-size: 11px;
+  color: var(--text);
+  min-width: 0;
+}
+.connector-power-name {
+  white-space: nowrap;
+}
+.connector-power select {
+  min-width: 0;
+  font-size: 11px;
+}
+.connector-power-state {
+  grid-column: 1 / -1;
+  margin: 0;
   font-size: 11px;
 }
 /* A full-width switch row inside the Connectors page (auto-approve). Named

@@ -23,12 +23,20 @@ import { AgentGraph, type AgentTiming } from "./AgentGraph";
 import { uniqueFileName } from "./composer";
 import {
   annotationTarget,
-  isCloudEngine,
+  isCloudRoute,
   isModelReady,
+  lostReplyAdvice,
+  lostReplyNotice,
   patchStreamFences,
   splitMarkupBlocks,
 } from "./markup";
-import { HELP_COMMAND, RECOMMENDED_MODELS } from "./constants";
+import {
+  CHAT_PAGE,
+  chatPageSlice,
+  chatPageToReveal,
+  HELP_COMMAND,
+  RECOMMENDED_MODELS,
+} from "./constants";
 import DeleteControl from "./DeleteControl";
 import Composer from "./ComposerPane";
 import { WSState } from "./state";
@@ -40,6 +48,9 @@ interface PastGraph {
   plan: AskPlanStep[];
   active: AskActiveAgent | null;
   agentSteps: Record<string, { label: string; ok: boolean }[]>;
+  /** What each specialist reported back — kept with the rest of the diagram so
+   * the answer a child gave can still be read after the turn ends. */
+  agentReports: Record<string, { text: string; ok: boolean }>;
   steps: { label: string; ok: boolean }[];
   lane: string;
   timings: { current: Record<string, AgentTiming> };
@@ -78,40 +89,119 @@ export default function ChatPane({
   useEffect(() => {
     if (shownChat.current === s.activeChatId) return;
     shownChat.current = s.activeChatId;
-    s.setAskPrivacy(null);
+    // The privacy receipt is per chat now (owner replacement #4), so it needs
+    // no clearing — it is simply read from the conversation on screen. The
+    // memory-suggestion card is still window-wide and does.
     s.setMemSuggestion(null);
+    // So does the PENDING roster below. It is filed against an answer only when
+    // a turn ends in the chat that produced it, so leaving that chat mid-answer
+    // strands it — and the next NON-delegating turn in that same chat writes no
+    // roster of its own, so it would inherit this one: a diagram of specialists
+    // that never ran, with their steps and reports, under an answer they had
+    // nothing to do with. Diagrams already filed (`graphByMsg`) are untouched.
+    lastGraph.current = null;
+    // A conversation opens on its newest page — see `shownCount`.
+    setShownCount(CHAT_PAGE);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.activeChatId]);
+
+  /** How many of `messages` are actually PAINTED, newest-last.
+   *
+   * There was no limit: switching to a months-old chat mounted every row at
+   * once — hundreds of long answers, each with its own Markdown parse, plus
+   * inline images and agent diagrams — which stalls the pane and holds all of
+   * it in memory for as long as the chat is open, and gets worse the more you
+   * use that chat. Only the render is bounded here; the backend still hands
+   * over the whole conversation, so nothing is lost and "Show earlier
+   * messages" is instant.
+   *
+   * Deliberately NOT a scroll-triggered auto-load: this pane auto-scrolls to
+   * the bottom on every new token, and a top-of-list trigger fights that. */
+  const [shownCount, setShownCount] = useState(CHAT_PAGE);
+  const { hidden: hiddenOlder, visible: shownMessages } = chatPageSlice(
+    messages,
+    shownCount,
+  );
+
+  /* Jumping to a search hit has to survive the page above. `revealMessage`
+   * (miscActions) scrolls to `#msg-<id>` and polls for it, which worked only
+   * because every message used to be mounted; with a tail page, a hit older
+   * than CHAT_PAGE has no element, the poll expires and the search result
+   * silently does nothing. Widen the page far enough to include the row —
+   * the messages are already in memory, so this costs a render, not a load.
+   * Cleared once the row is reachable (or once the loaded conversation is
+   * known not to contain it) so this cannot latch on. */
+  const revealSeen = useRef<unknown>(null);
+  useEffect(() => {
+    const id = s.revealMsgId;
+    if (!id) {
+      revealSeen.current = null;
+      return;
+    }
+    // A hit picked from another conversation arrives in the SAME commit as the
+    // chat switch, so `messages` here is still the old chat's. Remember which
+    // list the request arrived with and only give up once a different one has
+    // been loaded and still does not contain the message.
+    if (revealSeen.current === null) revealSeen.current = messages;
+    const idx = messages.findIndex((m) => m.id === id);
+    if (idx >= 0) {
+      setShownCount((n) => Math.max(n, chatPageToReveal(messages.length, idx)));
+      s.setRevealMsgId(null);
+    } else if (messages !== revealSeen.current) {
+      s.setRevealMsgId(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.revealMsgId, messages]);
 
   // The agent diagram is the only record of which helpers ran and for how
   // long, and it used to exist only while the answer was being written.
   // Keep the last roster and its clocks, and re-attach them to the answer.
   const liveTimings = useRef<Record<string, AgentTiming>>({});
-  const lastGraph = useRef<Omit<PastGraph, "timings"> | null>(null);
+  // The kept roster and the "was a turn running?" reading are both facts about
+  // ONE conversation (owner replacement #4): `s.asking` is per chat now, so
+  // walking away from a running chat also flips it false, and without the chat
+  // id beside them the diagram from the chat being LEFT was filed against the
+  // new chat's last answer.
+  const lastGraph = useRef<
+    { chatId: string | null; graph: Omit<PastGraph, "timings"> } | null
+  >(null);
   const wasAsking = useRef(false);
+  const askingChat = useRef<string | null>(null);
   const [graphByMsg, setGraphByMsg] = useState<Record<string, PastGraph>>({});
   useEffect(() => {
     // Only a turn that DELEGATED has a diagram worth keeping; a lone Main
     // agent draws a single chip, which the finished message already shows.
     if (s.agentPlan && s.agentPlan.length > 1) {
       lastGraph.current = {
-        plan: s.agentPlan,
-        active: s.activeAgent,
-        agentSteps: s.agentSteps,
-        steps: s.steps,
-        lane: s.lane,
+        chatId: s.activeChatId,
+        graph: {
+          plan: s.agentPlan,
+          active: s.activeAgent,
+          agentSteps: s.agentSteps,
+          agentReports: s.agentReports,
+          steps: s.steps,
+          lane: s.lane,
+        },
       };
     }
-  }, [s.agentPlan, s.activeAgent, s.agentSteps, s.steps, s.lane]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.agentPlan, s.activeAgent, s.agentSteps, s.agentReports, s.steps, s.lane]);
   useEffect(() => {
-    const was = wasAsking.current;
+    // A turn ENDED here only if the chat this reading describes is still the
+    // one on screen; otherwise the user simply switched away and nothing
+    // finished.
+    const sameChat = askingChat.current === s.activeChatId;
+    const was = sameChat && wasAsking.current;
     wasAsking.current = s.asking;
+    askingChat.current = s.activeChatId;
     if (s.asking) {
       if (!was) liveTimings.current = {};
       return;
     }
-    const graph = lastGraph.current;
-    lastGraph.current = null;
+    if (!sameChat) return;
+    const kept = lastGraph.current;
+    const graph = kept && kept.chatId === s.activeChatId ? kept.graph : null;
+    if (graph) lastGraph.current = null;
     // Only a turn that just ENDED files a graph, and only against an answer
     // that has none — a stopped turn must not overwrite the previous answer's.
     if (!was || !graph || !lastAssistantId || graphByMsg[lastAssistantId]) return;
@@ -125,7 +215,8 @@ export default function ChatPane({
       ...g,
       [lastAssistantId]: { ...graph, timings: { current: frozen } },
     }));
-  }, [s.asking, lastAssistantId, graphByMsg]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.asking, s.activeChatId, lastAssistantId, graphByMsg]);
 
   const submitEdit = () => {
     const draft = editDraft;
@@ -235,7 +326,7 @@ export default function ChatPane({
       )}
       {/* PRIV-1: OFF must be loud — a room talking to a cloud model with the
           door open says so persistently, not in a setting nobody reopens. */}
-      {isCloudEngine(model) && s.privacyOn === false && (
+      {isCloudRoute(model, s.ai) && s.privacyOn === false && (
         <div className="banner privacy-off-banner" role="alert">
           Privacy is off — cloud models can see everything in this room,
           names and all. Turn it back on in Settings → Cloud privacy.
@@ -285,6 +376,13 @@ export default function ChatPane({
                 {s.pullStatus}
                 {s.pullPercent != null && ` — ${s.pullPercent.toFixed(0)}%`}
               </span>
+              {/* A multi-gigabyte download started here could only be escaped by
+                  quitting the app: the Rust half has been cancellable all along
+                  (`pull:<model>` in the same registry chat's Stop uses) with no
+                  surface calling it. */}
+              <button className="subtle" onClick={() => void a.stopModelPull()}>
+                Stop
+              </button>
             </span>
           ) : (
             <div className="model-pick">
@@ -371,7 +469,18 @@ export default function ChatPane({
             )}
           </div>
         )}
-        {messages.map((m) => {
+        {hiddenOlder > 0 && (
+          // A COUNT, not a vague "more": the number is the honest thing to say,
+          // and it is what tells you whether one press is enough.
+          <button
+            className="subtle chat-load-older"
+            onClick={() => setShownCount((n) => n + CHAT_PAGE)}
+            title="These are already loaded — this only draws them"
+          >
+            Show earlier messages ({hiddenOlder} older)
+          </button>
+        )}
+        {shownMessages.map((m) => {
           // Context handoff: a divider, not a participant turn — render it
           // before any of the ordinary assistant/user branches below (`role`
           // stays `"assistant"` on a marker row, so those checks alone would
@@ -398,6 +507,10 @@ export default function ChatPane({
                 : splitMarkupBlocks(m.content)
               : { text: m.content, boxes: undefined, annotation: undefined };
           const annotVerified = !!annotation?.quote && !annotation?.approx;
+          // Is this row one of Arcelle's own "no answer" notices rather than a
+          // reply? Only then does the recovery strip below appear.
+          const lostReply =
+            m.role === "assistant" ? lostReplyNotice(m.content) : null;
           return (
           <div key={m.id} id={`msg-${m.id}`} className={`msg ${m.role}`}>
             <div className="msg-label">
@@ -415,6 +528,7 @@ export default function ChatPane({
                 plan={graphByMsg[m.id].plan}
                 active={graphByMsg[m.id].active}
                 agentSteps={graphByMsg[m.id].agentSteps}
+                agentReports={graphByMsg[m.id].agentReports}
                 steps={graphByMsg[m.id].steps}
                 lane={graphByMsg[m.id].lane}
                 timings={graphByMsg[m.id].timings}
@@ -567,6 +681,34 @@ export default function ChatPane({
                 </button>
               </div>
             )}
+            {/* A turn that produced no answer used to be a dead end: the
+                notice said "Please try again" and left the user to retype the
+                question. Regenerate could always do it, but it sits unlabelled
+                among Copy/Play/Save and its title reads "Delete this answer
+                and ask again", which is not what someone whose reply was lost
+                is looking for. Offer the action where the failure is, and say
+                first what is actually true of this turn — a write that landed
+                or a job still running makes asking again NOT free.
+                There is no Resume: a run keeps no durable state to resume
+                from (the sidecar releases its registry entry when the stream
+                ends, and the host's delta mirror is a local in `stream_run`),
+                so only Try again is offered rather than a button that would
+                restart the turn while calling itself a resume. */}
+            {m.role === "assistant" &&
+              m.id === lastAssistantId &&
+              lostReply !== null && (
+                <div className="msg-recover">
+                  <span>{lostReplyAdvice(lostReply)}</span>
+                  <button
+                    className="subtle"
+                    title="Delete this notice and run the same question again"
+                    disabled={s.asking}
+                    onClick={() => a.regenerate(m.id)}
+                  >
+                    Try again
+                  </button>
+                </div>
+              )}
             {m.role === "assistant" && (
               <div className="msg-footer">
                 {m.sources.length > 0 && (
@@ -684,6 +826,7 @@ export default function ChatPane({
                 plan={s.agentPlan}
                 active={s.activeAgent}
                 agentSteps={s.agentSteps}
+                agentReports={s.agentReports}
                 steps={s.steps}
                 lane={s.lane}
                 // The LIVE graph is the only thing that ever measures, so it
@@ -716,7 +859,7 @@ export default function ChatPane({
                   <MarkdownView text={patchStreamFences(s.streamText)} />
                   <span className="stream-cursor">▍</span>
                 </>
-              ) : isCloudEngine(model) ? (
+              ) : isCloudRoute(model, s.ai) ? (
                 "Asking your cloud AI — content leaves this Mac…"
               ) : (
                 "Thinking locally…"

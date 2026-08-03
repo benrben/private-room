@@ -74,6 +74,26 @@ pub(crate) async fn resolve_public_addr(host: &str, port: u16) -> Result<SocketA
     Ok(addrs[0])
 }
 
+/// Does this host resolve to an address inside this Mac or the local network?
+///
+/// Deliberately NOT [`resolve_public_addr`]'s error, which also covers "the
+/// name does not resolve at all". The private browser's post-navigation
+/// recheck needs the two apart: a name that cannot be resolved simply fails to
+/// load on its own, and reporting that as a private-address block would put a
+/// red banner and a permanent journal line on nothing at all.
+///
+/// `false` on any lookup failure — this answers one question, and "I could not
+/// find out" is not "yes".
+pub(crate) async fn host_resolves_private(host: &str, port: u16) -> bool {
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => {
+            let addrs: Vec<SocketAddr> = addrs.collect();
+            !addrs.is_empty() && addrs.iter().any(|a| !is_public_ip(a.ip()))
+        }
+        Err(_) => false,
+    }
+}
+
 // A `hop_host_is_public` used to live here, called from reqwest's synchronous
 // redirect policy. It was strictly weaker than the check the first hop gets:
 // having approved a hop it could not PIN it, so reqwest resolved the redirect

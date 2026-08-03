@@ -230,3 +230,74 @@
   padding: 6px 8px;
 }
 
+
+/* ---------------------------------------------------------------- trash tab
+   The Library pane's third tab. Rows are quieter than file rows on purpose:
+   this is not the room's content, it is a record of what left it. */
+.trash-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.trash-note,
+.trash-empty {
+  margin: 8px 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--faint);
+}
+.trash-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 6px 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+.trash-row:hover {
+  background: var(--hover);
+}
+.trash-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.trash-row-name {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trash-row-meta {
+  font-size: 10px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trash-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.trash-footer {
+  margin: 12px 6px 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.trash-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.trash-confirm-actions {
+  display: flex;
+  gap: 6px;
+}

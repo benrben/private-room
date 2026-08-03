@@ -1,6 +1,6 @@
 import { FileMeta, formatSize } from "../api";
 import { DotsIcon, FileTypeIcon, PaperclipIcon } from "../icons";
-import { displayName } from "./composer";
+import { fileLabel } from "./composer";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
@@ -62,7 +62,7 @@ export default function FileRow({
             <FileTypeIcon file={f} />
           </span>
           <span className="file-name" title={f.name}>
-            {displayName(f.name)}
+            {fileLabel(f.name, s.files)}
           </span>
           {f.partiallyIndexed && (
             <span

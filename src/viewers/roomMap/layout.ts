@@ -1,11 +1,16 @@
 import type { SimNode, SimEdge, View } from "./types";
 import { GRAVITY, FIT_PAD, MIN_SCALE, MAX_SCALE } from "./constants";
+import { styleFor } from "./edges";
 
 export const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
-/** Star radius in world units from its (rendered-edge) degree. */
+/** Star radius in world units from its (rendered-edge) degree. The coefficient
+ *  is tuned for the TYPED graph's degrees: the old edge builder gave a 19-file
+ *  room an average degree of 17, so every star sat at the size ceiling and the
+ *  channel said nothing. Sparsified, a well-connected file has ~4 links, and
+ *  the scale has to spread over that range instead. */
 export function nodeRadius(deg: number): number {
-  return 3.5 + Math.min(6, Math.sqrt(deg) * 1.6);
+  return 3.5 + Math.min(6, Math.sqrt(deg) * 2.6);
 }
 
 /** Deterministic per-node jitter so a room always lays out the same way. */
@@ -59,13 +64,21 @@ export function runTick(nodes: SimNode[], edges: SimEdge[], temp: number, k: num
     }
   }
   for (const e of edges) {
+    // A hidden edge exerts no pull. Zeroing it here rather than removing it
+    // from the list is what lets the type filter be a pure render-time choice:
+    // the layout's INPUT never changes, so toggling a kind can't re-seed the
+    // simulation and scatter the map the reader was looking at.
+    if (e.hidden) continue;
     const a = nodes[e.ai];
     const b = nodes[e.bi];
     const ox = a.x - b.x;
     const oy = a.y - b.y;
     const dist = Math.sqrt(ox * ox + oy * oy) || 0.01;
-    // Stronger for higher-confidence edges so related files sit closer.
-    const att = ((dist * dist) / k) * (0.5 + e.edge.weight);
+    // Stronger for higher-confidence edges — and for the kinds that are facts,
+    // so a "made from" pair actually settles adjacent and the map reads as
+    // provenance rather than merely being coloured like it.
+    const att =
+      ((dist * dist) / k) * (0.5 + e.edge.weight) * styleFor(e.edge.kind).springMul;
     const ux = ox / dist;
     const uy = oy / dist;
     dx[e.ai] -= ux * att;

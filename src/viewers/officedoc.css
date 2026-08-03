@@ -1,0 +1,17 @@
+/* A legacy .doc or .rtf, rendered by macOS's own Word importer inside the
+   roomdoc:// sandbox. Everything visual belongs to the document; this is only
+   the frame around it. */
+.odoc-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.odoc-frame {
+  flex: 1;
+  border: 0;
+  background: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  .odoc-frame { background: #17171b; }
+}

@@ -4,10 +4,20 @@ import { CircleCheckIcon } from "../icons";
 interface Props {
   ai: AiStatus | null;
   visionInstalled: boolean;
+  /** The model that would actually mark an image for this room — the room's own
+   *  model when it can see, otherwise a local one. Named in the "Installed" row
+   *  so the answer to "what is looking at my pictures?" is visible, not implied. */
+  groundingModel: string | null;
+  /** PREFLIGHT: why this room cannot mark an image, when the answer is NOT
+   *  "download a vision helper" (today: the privacy door blinding a capable
+   *  cloud model). Null = the download offer is the right advice. */
+  visionBlock: string | null;
   recommended: RecommendedModels | null;
   pullSpecial: (name: string, useEnsureEmbed?: boolean) => void;
   pullingSpecial: string | null;
   pulling: boolean;
+  stopPull: () => void;
+  stoppingPull: boolean;
   embedInstalled: boolean;
   pullPercent: number | null;
   pullStatus: string;
@@ -17,10 +27,14 @@ interface Props {
 export default function HelpersSection({
   ai,
   visionInstalled,
+  groundingModel,
+  visionBlock,
   recommended,
   pullSpecial,
   pullingSpecial,
   pulling,
+  stopPull,
+  stoppingPull,
   embedInstalled,
   pullPercent,
   pullStatus,
@@ -37,14 +51,30 @@ export default function HelpersSection({
             {ai?.running ? (
               <>
                 <label className="settings-label">Vision helper</label>
+                {/* "Installed" now means SOMETHING can mark an image for this
+                    room — which includes the room's own model. It used to mean
+                    "a local model whose name we recognise is present", so a room
+                    on a cloud vision model was told its vision helper was
+                    missing and offered a download it had no use for. Naming the
+                    model that will do the looking makes that checkable. */}
                 {visionInstalled ? (
                   <div className="model-row active">
-                    <span className="btn-ic"><CircleCheckIcon size={13} /> Installed — the AI can see and mark images.</span>
+                    <span className="btn-ic">
+                      <CircleCheckIcon size={13} /> Ready — the AI can see and mark images
+                      {groundingModel ? <> (<code>{groundingModel}</code>)</> : null}.
+                    </span>
                   </div>
+                ) : visionBlock ? (
+                  /* Something here CAN see — a download would fix nothing. The
+                     engine's declared record said what is actually in the way,
+                     so show that sentence instead of the Download button. */
+                  <p className="settings-hint">{visionBlock}</p>
                 ) : (
                   <>
                     <p className="settings-hint">
-                      Lets the AI read and mark up images
+                      Nothing can read or mark images for this room yet. Any
+                      model with the “vision” badge in the Model section does
+                      this — including a cloud one — or download a local helper
                       {recommended ? ` (${recommended.vision})` : ""}.
                     </p>
                     <button
@@ -54,8 +84,7 @@ export default function HelpersSection({
                         recommended && pullSpecial(recommended.vision)
                       }
                     >
-                      <DownloadIcon size={14} /> Download the vision helper (for
-                      image marking)
+                      <DownloadIcon size={14} /> Download a local vision helper
                     </button>
                   </>
                 )}
@@ -98,6 +127,16 @@ export default function HelpersSection({
                       {pullStatus}
                       {pullPercent != null && ` — ${pullPercent.toFixed(0)}%`}
                     </span>
+                    {/* Helpers are the multi-gigabyte ones (a vision model is
+                        ~3 GB), so this is the surface that most needed a way
+                        out. */}
+                    <button
+                      className="subtle"
+                      onClick={stopPull}
+                      disabled={stoppingPull}
+                    >
+                      {stoppingPull ? "Stopping…" : "Stop"}
+                    </button>
                   </div>
                 )}
               </>

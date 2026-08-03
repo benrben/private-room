@@ -35,7 +35,7 @@ export function useWorkspaceActions(
     playSealSound: misc.playSealSound,
   });
   const voice = makeVoiceActions(s);
-  const workflows = makeWorkflowActions(s, { viewFile: files.viewFile });
+  const workflows = makeWorkflowActions(s);
   const scripts = makeScriptActions(s);
   const skills = makeSkillActions(s);
   return { ...files, ...misc, ...recording, ...studio, ...chat, ...voice, ...workflows, ...scripts, ...skills };

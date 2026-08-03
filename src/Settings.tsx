@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ENGINE_LABELS } from "./api";
 import { AlertIcon, CloseIcon, DownloadIcon, EyeIcon, TrashIcon } from "./icons";
 import "./settingsA11y.css";
@@ -16,8 +16,10 @@ import RemoteAiSection from "./settings/RemoteAiSection";
 import RoomServerSection from "./settings/RoomServerSection";
 import RoleSection from "./settings/RoleSection";
 import HelpersSection from "./settings/HelpersSection";
+import SupportMatrixSection from "./settings/SupportMatrixSection";
 import RecoverySection from "./settings/RecoverySection";
 import AboutSection from "./settings/AboutSection";
+import AppearanceSection from "./settings/AppearanceSection";
 import AiProvidersSection from "./settings/AiProvidersSection";
 import { useFocusTrap } from "./settings/useFocusTrap";
 import { useModelManagement } from "./settings/useModelManagement";
@@ -33,54 +35,48 @@ import { useRoles } from "./settings/useRoles";
 import { useRecovery } from "./settings/useRecovery";
 
 /** Settings is split into focused PAGES rather than one long technical scroll.
- * Each group is a page; its `sections` are the anchor ids used by the in-page
- * jump links and by deep-links (the status-bar trust chip → Cloud privacy). */
-const SETTINGS_GROUPS: { key: string; label: string; sections: [string, string][] }[] = [
+ * Each group is a page; `sections` lists the anchor ids it owns, which is what
+ * routes a deep-link (the status-bar trust chip → Cloud privacy) to the right
+ * page. Ids ONLY: each id used to carry a second, human label for in-page jump
+ * links that were never built, so nothing rendered them — and two had already
+ * drifted away from the headings they named ("Lock & password" for a section
+ * titled Privacy, "Online search" for Online features). A label nothing draws
+ * cannot be noticed when it goes wrong, so the headings are the single copy. */
+const SETTINGS_GROUPS: { key: string; label: string; sections: string[] }[] = [
   {
     key: "ai",
     label: "AI & behavior",
     sections: [
-      ["set-model", "Model"],
-      ["set-behavior", "Behavior"],
-      ["set-role", "Room role"],
-      ["set-helpers", "AI helpers"],
-      ["set-advisors", "AI advisors"],
+      "set-model",
+      "set-behavior",
+      "set-role",
+      "set-helpers",
+      "set-support-matrix",
+      "set-advisors",
     ],
   },
   {
     key: "voice",
     label: "Voice",
-    sections: [
-      ["set-voice", "Spoken voice"],
-      ["set-mic", "Microphone"],
-    ],
+    sections: ["set-voice", "set-mic"],
   },
   {
     key: "privacy",
     label: "Privacy & recovery",
-    sections: [
-      ["set-cloud-privacy", "Cloud privacy"],
-      ["set-privacy", "Lock & password"],
-      ["set-recovery", "Recovery key"],
-    ],
+    sections: ["set-cloud-privacy", "set-privacy", "set-recovery"],
   },
   {
     key: "connections",
     label: "Connections",
-    sections: [
-      ["set-ai-providers", "AI providers"],
-      ["set-online", "Online search"],
-      ["set-closet", "Remote AI"],
-      ["set-leash", "Room server"],
-    ],
+    sections: ["set-ai-providers", "set-online", "set-closet", "set-leash"],
   },
-  { key: "history", label: "History & storage", sections: [["set-checkpoints", "Checkpoints"]] },
-  { key: "app", label: "App", sections: [["set-about", "Updates & version"]] },
+  { key: "history", label: "History & storage", sections: ["set-checkpoints"] },
+  { key: "app", label: "App", sections: ["set-appearance", "set-about"] },
 ];
 
 /** section id → the page it lives on, so a deep-link opens the right page. */
 const GROUP_OF_SECTION: Record<string, string> = Object.fromEntries(
-  SETTINGS_GROUPS.flatMap((g) => g.sections.map(([id]) => [id, g.key])),
+  SETTINGS_GROUPS.flatMap((g) => g.sections.map((id) => [id, g.key])),
 );
 
 export default function Settings({
@@ -95,7 +91,26 @@ export default function Settings({
   // Each section owns its state + handlers via a per-concern hook. The shell
   // only threads those returns to the presentational section components and
   // owns cross-hook wiring (Behavior's Save clears the shared model error).
-  const { modalRef, onModalKeyDown } = useFocusTrap(onClose);
+  // CLOSING MUST NOT DESTROY WORK. Most of Settings applies on change, but
+  // five things do not — custom instructions, the creativity slider, the voice
+  // choice, the remote-AI address and the whole internet section — and Escape
+  // or a click on the backdrop closed the modal instantly, taking a paragraph
+  // of carefully written instructions with it and saying nothing. Deliberate
+  // exits (Save, then close) are unaffected; only an exit that would DROP
+  // something now stops to ask.
+  //
+  // Read through a ref because `useFocusTrap` owns the Escape key and has to be
+  // set up before the section hooks that know whether anything is dirty exist.
+  const unsavedRef = useRef(false);
+  const [confirmClose, setConfirmClose] = useState(false);
+  function requestClose() {
+    if (unsavedRef.current) {
+      setConfirmClose(true);
+      return;
+    }
+    onClose();
+  }
+  const { modalRef, onModalKeyDown } = useFocusTrap(requestClose);
 
   // Which settings page is showing. Deep-links (initialSection) open on the page
   // that owns the section; otherwise start on AI & behavior.
@@ -124,6 +139,8 @@ export default function Settings({
     setPullName,
     pulling,
     pull,
+    stopPull,
+    stoppingPull,
     pullStatus,
     pullPercent,
     error,
@@ -136,6 +153,7 @@ export default function Settings({
     sttPercent,
     sttErr,
     downloadStt,
+    cancelStt,
     removeStt,
     dictTranslate,
     dictMode,
@@ -146,6 +164,8 @@ export default function Settings({
     pullingSpecial,
     pullSpecial,
     visionInstalled,
+    groundingModel,
+    visionBlock,
     embedInstalled,
   } = useModelManagement(ai, onModelsChanged);
 
@@ -156,6 +176,7 @@ export default function Settings({
     setInstructions,
     saveTuning,
     saved,
+    tuningDirty,
     responseStyle,
     changeResponseStyle,
     autoIndex,
@@ -166,7 +187,9 @@ export default function Settings({
     changeEditApproval,
   } = useBehaviorSettings(() => setError(""));
 
-  const voiceSettings = useVoiceSettings();
+  // Only the page the user is actually looking at may reach the network: the
+  // voice catalog lives off the Mac, and every Settings page is mounted at once.
+  const voiceSettings = useVoiceSettings(activeGroup === "voice");
 
   const {
     autolock,
@@ -211,6 +234,8 @@ export default function Settings({
     webOn,
     setWebOn,
     webSaved,
+    webDirty,
+    webError,
     webTesting,
     webTestResult,
     saveWebAccess,
@@ -219,12 +244,23 @@ export default function Settings({
     setSearchAgent,
     browseAgent,
     setBrowseAgent,
+    resultPreviews,
+    setResultPreviews,
   } = useOnlineSearch();
 
   const { advisorsOn, advisorToolsOn, onAdvisorsToggle, onAdvisorToolsToggle } =
     useAdvisors();
 
-  const { closetUrl, setClosetUrl, saveOllamaUrl, closetSaved } = useRemoteAi();
+  const {
+    closetUrl,
+    setClosetUrl,
+    closetDirty,
+    saveOllamaUrl,
+    closetSaved,
+    testOllama,
+    closetTesting,
+    closetTestResult,
+  } = useRemoteAi();
 
   const {
     leash,
@@ -240,7 +276,7 @@ export default function Settings({
     copyLeashConfig,
   } = useRoomServer();
 
-  const { roles, role, changeRole } = useRoles();
+  const { roles, role, changeRole, roleError } = useRoles();
 
   const {
     recoveryCode,
@@ -252,10 +288,20 @@ export default function Settings({
     recoveryErr,
   } = useRecovery();
 
+  // Every Save-button section that can hold work the room does not have yet.
+  // Written on each render (idempotent) so the Escape handler above, which was
+  // created before these hooks ran, sees the current answer.
+  const unsaved =
+    tuningDirty || voiceSettings.voiceDirty || webDirty || closetDirty;
+  unsavedRef.current = unsaved;
+  // A section that got saved while the warning was up leaves nothing to warn
+  // about — drop the strip rather than make the user dismiss a stale question.
+  if (confirmClose && !unsaved) setConfirmClose(false);
+
   return (
     // ADD-25: consent surface — the agent UI driver must never see or operate
     // Settings (web/cloud/advisor/room-server switches, password, Touch ID).
-    <div className="settings-backdrop" data-agent-blocked onClick={onClose}>
+    <div className="settings-backdrop" data-agent-blocked onClick={requestClose}>
       <div
         className="settings"
         ref={modalRef}
@@ -272,11 +318,25 @@ export default function Settings({
             className="subtle btn-ic"
             aria-label="Close settings"
             title="Close settings"
-            onClick={onClose}
+            onClick={requestClose}
           >
             <CloseIcon size={14} />
           </button>
         </div>
+        {confirmClose && (
+          <div className="settings-unsaved" role="alert">
+            <span>
+              Some changes on this page haven't been saved yet — closing now
+              would discard them.
+            </span>
+            <button className="subtle" onClick={() => setConfirmClose(false)}>
+              Keep editing
+            </button>
+            <button className="subtle danger" onClick={onClose}>
+              Discard &amp; close
+            </button>
+          </div>
+        )}
         <div className="settings-main">
           {/* One focused page at a time. The rail selects the page; the section
               anchors below (and deep-links) still resolve within the open page. */}
@@ -308,12 +368,15 @@ export default function Settings({
                 setPullName={setPullName}
                 pulling={pulling}
                 pull={pull}
+                stopPull={stopPull}
+                stoppingPull={stoppingPull}
                 pullStatus={pullStatus}
                 pullPercent={pullPercent}
                 stt={stt}
                 removeStt={removeStt}
                 sttPercent={sttPercent}
                 downloadStt={downloadStt}
+                cancelStt={cancelStt}
                 sttErr={sttErr}
                 dictTranslate={dictTranslate}
                 onDictTranslateChange={onDictTranslateChange}
@@ -340,19 +403,29 @@ export default function Settings({
                 editApproval={editApproval}
                 changeEditApproval={changeEditApproval}
               />
-              <RoleSection roles={roles} role={role} changeRole={changeRole} />
+              <RoleSection
+                roles={roles}
+                role={role}
+                changeRole={changeRole}
+                roleError={roleError}
+              />
               <HelpersSection
                 ai={ai}
                 visionInstalled={visionInstalled}
+                groundingModel={groundingModel}
+                visionBlock={visionBlock}
                 recommended={recommended}
                 pullSpecial={pullSpecial}
                 pullingSpecial={pullingSpecial}
                 pulling={pulling}
+                stopPull={stopPull}
+                stoppingPull={stoppingPull}
                 embedInstalled={embedInstalled}
                 pullPercent={pullPercent}
                 pullStatus={pullStatus}
                 DownloadIcon={DownloadIcon}
               />
+              <SupportMatrixSection />
               <AdvisorsSection
                 ai={ai}
                 advisorsOn={advisorsOn}
@@ -446,18 +519,25 @@ export default function Settings({
                 testWebSearch={testWebSearch}
                 saveWebAccess={saveWebAccess}
                 webSaved={webSaved}
+                webDirty={webDirty}
+                webError={webError}
                 webTestResult={webTestResult}
                 AlertIcon={AlertIcon}
                 searchAgent={searchAgent}
                 setSearchAgent={setSearchAgent}
                 browseAgent={browseAgent}
                 setBrowseAgent={setBrowseAgent}
+                resultPreviews={resultPreviews}
+                setResultPreviews={setResultPreviews}
               />
               <RemoteAiSection
                 closetUrl={closetUrl}
                 setClosetUrl={setClosetUrl}
                 saveOllamaUrl={saveOllamaUrl}
                 closetSaved={closetSaved}
+                testOllama={testOllama}
+                closetTesting={closetTesting}
+                closetTestResult={closetTestResult}
                 AlertIcon={AlertIcon}
               />
               <RoomServerSection
@@ -481,6 +561,7 @@ export default function Settings({
             </div>
 
             <div className="settings-page" hidden={activeGroup !== "app"}>
+              <AppearanceSection />
               <AboutSection />
             </div>
 

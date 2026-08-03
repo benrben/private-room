@@ -396,9 +396,27 @@ export function makeRecordingActions(
     if (fileId && s.openFileRef.current?.id === fileId) await viewFile(fileId);
   }
 
+  /** Abandon the running model download. `pull_model` registers its cancel flag
+   *  under `pull:<model name>` in the SAME registry chat's Stop uses, so this is
+   *  the whole wiring. Without it the chat pane's first-run "Pick a model to
+   *  download" card — the biggest download most users ever start here — could
+   *  only be escaped by quitting the app. */
+  async function stopModelPull() {
+    const name = s.pullingModelRef.current;
+    if (!name) return;
+    s.setPullStatus("stopping…");
+    try {
+      await api.cancelAsk(`pull:${name}`);
+    } catch {
+      // Nothing to stop (it just finished, or the flag is already gone). The
+      // pull's own result is the honest answer either way.
+    }
+  }
+
   async function downloadModel(name: string) {
     if (s.pullingModel) return;
     s.setPullingModel(true);
+    s.pullingModelRef.current = name;
     s.setPullError("");
     s.setPullStatus("starting…");
     s.setPullPercent(null);
@@ -406,8 +424,17 @@ export function makeRecordingActions(
       await api.pullModel(name);
       refreshAi();
     } catch (e) {
-      s.setPullError(String(e));
+      // A download YOU stopped is not a failure and must not be shown in red as
+      // one. `ollama::PULL_CANCELLED` is a sentence, so match its wording.
+      const msg = String(e);
+      if (msg.includes("download was cancelled")) {
+        s.setPullStatus("Download stopped. Nothing was installed.");
+      } else {
+        s.setPullError(msg);
+        s.setPullStatus("");
+      }
     } finally {
+      s.pullingModelRef.current = null;
       s.setPullingModel(false);
       s.setPullPercent(null);
     }
@@ -435,23 +462,40 @@ export function makeRecordingActions(
       return;
     }
     window.clearInterval(s.recheckTimer.current);
+    // Ollama's first launch loads a model server and can take well over the 9
+    // seconds this used to allow. Worse, it gave up in SILENCE: the banner went
+    // on saying "not running" with nothing to explain that the app had simply
+    // stopped looking, so the only cure was clicking the same button again.
+    // Wait long enough for a genuine cold start, then SAY that we stopped.
+    const MAX_TRIES = 20; // × 1500ms = 30s
     let tries = 0;
+    const stop = (message?: string) => {
+      window.clearInterval(s.recheckTimer.current);
+      if (message) s.pushToast("info", message);
+    };
     s.recheckTimer.current = window.setInterval(async () => {
       tries++;
       try {
         const st = await api.aiStatus();
         s.setAi(st);
         s.setModel((current) => current || st.defaultModel);
-        if (st.running || tries >= 6) window.clearInterval(s.recheckTimer.current);
+        if (st.running) stop();
+        else if (tries >= MAX_TRIES)
+          stop(
+            "Ollama still isn't answering after 30 seconds. It may still be starting — press Open Ollama again to keep checking.",
+          );
       } catch {
-        if (tries >= 6) window.clearInterval(s.recheckTimer.current);
+        if (tries >= MAX_TRIES)
+          stop(
+            "Couldn't tell whether Ollama started. Press Open Ollama again to check.",
+          );
       }
     }, 1500);
   }
 
   return {
     refreshAi, beginRecording, dictateTo, micState, recordVoiceNote,
-    dictateJournal, dictateIntoFile, downloadModel, pickAndDownload,
+    dictateJournal, dictateIntoFile, downloadModel, pickAndDownload, stopModelPull,
     getOllama, openOllamaApp,
     startLiveRecording, pauseLiveRecording, resumeLiveRecording, stopLiveRecording,
   };

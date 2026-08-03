@@ -17,7 +17,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { El, install, currentDocument, setSelection } from "./dom-stub.mjs";
+import { El, install, currentDocument, setSelection, fireWindow } from "./dom-stub.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SOURCE = readFileSync(join(here, "../../src-tauri/src/browser/page.js"), "utf8");
@@ -220,6 +220,32 @@ test("a ref whose number was reassigned by a newer snapshot is rejected", () => 
   assert.equal(api._internals.registry.size, 1);
 });
 
+test("a ref that went disabled after the snapshot refuses instead of reporting a click", async () => {
+  // The other half of the disabled trap. `snapshot`/`currentElements` never
+  // hand out a disabled control, so the ref was legitimate when issued — a
+  // form that disables Submit while it validates is the ordinary case. The
+  // browser swallows the click; `did: "clicked e1"` was a fabricated result.
+  const { api, doc } = fresh();
+  const [btn] = stack(doc.body, [new El("button", { __text: "Submit" })]);
+  api.call("snapshot", {});
+  btn.disabled = true;
+
+  const value = await drain(api, "act", { actions: [{ click: "e1" }] });
+  assert.equal(value.ok, false);
+  assert.match(value.results[0].error, /is disabled right now/);
+  assert.equal(btn.clicked, 0, "a disabled control must never be reported as clicked");
+
+  // And typing into one, which is the same lie with a different verb.
+  const [input] = stack(doc.body, [new El("input", { type: "text", value: "" })]);
+  api.call("snapshot", {});
+  const ref = "e" + input.getAttribute("data-arcelle-mark");
+  input.disabled = true;
+  const typed = await drain(api, "act", { actions: [{ type: { ref, text: "x" } }] });
+  assert.equal(typed.ok, false);
+  assert.match(typed.results[0].error, /is disabled right now/);
+  assert.equal(input.value, "", "a disabled field must not be written to");
+});
+
 test("clicking a live ref reaches the element", async () => {
   const { api, doc } = fresh();
   const [btn] = stack(doc.body, [new El("button", { __text: "Go" })]);
@@ -311,6 +337,143 @@ test("read extracts headings, paragraphs, lists and absolute links as markdown",
   assert.match(out.text, /First paragraph with detail\./);
   assert.match(out.text, /- one/);
   assert.match(out.text, /\[Next page\]\(https:\/\/example\.com\/next\)/, "relative hrefs resolve");
+});
+
+/* Item #18: the reading view is a blind user's ONLY copy of the page, so it
+ * must not stop five screens down without saying so. `isVisible` rejects
+ * anything more than 4000px below the fold, which is right for the snapshot
+ * (nothing is clicked that far away) and was silently deleting the document
+ * for `read`: the extractor never scrolls, and the reading view deliberately
+ * narrows the page to 320px, which is exactly what makes an article run tens
+ * of thousands of pixels down. Before the fix this returned 5 of 20
+ * paragraphs with `truncated: false`. */
+test("read keeps the whole document, not just the part near the fold", () => {
+  const { api, doc } = fresh();
+  const kids = [];
+  for (let i = 0; i < 20; i++) {
+    const p = new El("p", { __text: `Paragraph number ${i} with plenty of detail here.` });
+    // A real reflow: each paragraph a screen further down, far past the
+    // 4000px band, exactly as a long page at a narrow width lays out.
+    p.rect = { top: i * 1000, left: 0, width: 320, height: 900 };
+    kids.push(p);
+  }
+  const article = new El("article", {}, kids);
+  article.rect = { top: 0, left: 0, width: 320, height: 20000 };
+  doc.body.appendChild(article);
+
+  const out = api.call("read", {});
+  assert.match(out.text, /Paragraph number 19/, "the end of the page must survive");
+  assert.equal(
+    out.text.match(/Paragraph number/g).length,
+    20,
+    "every paragraph, not the first five screens",
+  );
+  // `total` is measured on what was extracted, so a fragment would also report
+  // itself as complete — which is the part that makes this a lie rather than a
+  // limit.
+  assert.equal(out.truncated, false);
+});
+
+/* A clicking rule that is not a reading rule: the SNAPSHOT still spends its
+ * marks near the user. Loosening `read` must not loosen `act`. */
+test("snapshot still ignores controls miles below the fold", () => {
+  const { api, doc } = fresh();
+  const near = new El("button", { __text: "Near" });
+  near.rect = { top: 100, left: 0, width: 80, height: 30 };
+  const far = new El("button", { __text: "Far" });
+  far.rect = { top: 40000, left: 0, width: 80, height: 30 };
+  doc.body.appendChild(near);
+  doc.body.appendChild(far);
+
+  const labels = api.call("snapshot", {}).elements.map((e) => e.label);
+  assert.deepEqual(labels, ["Near"]);
+});
+
+/* Item #18: the read text is what a screen-reader user is shown, so it has to
+ * survive a Markdown renderer as the STRUCTURE it came from. Before this, list
+ * items and table rows were pushed with no newline of their own and joined
+ * with a space, so a three-item list rendered as one item and a table rendered
+ * as a paragraph of pipe characters. The old assertion (`/- one/`) matched
+ * happily throughout. */
+test("read puts every list item on its own line", () => {
+  const { api, doc } = fresh();
+  const article = new El("article", {}, [
+    new El("p", { __text: "First paragraph with detail." }),
+    new El("p", { __text: "Second paragraph." }),
+    new El("p", { __text: "Third paragraph so the root heuristic picks this block." }),
+    new El("ul", {}, [
+      new El("li", { __text: "one" }),
+      new El("li", { __text: "two" }),
+      new El("li", { __text: "three" }),
+    ]),
+  ]);
+  article.rect = { top: 0, left: 0, width: 600, height: 400 };
+  doc.body.appendChild(article);
+
+  const out = api.call("read", {});
+  const lines = out.text.split("\n");
+  assert.ok(lines.includes("- one"), out.text);
+  assert.ok(lines.includes("- two"), out.text);
+  assert.ok(lines.includes("- three"), out.text);
+});
+
+test("read emits a real GFM table, delimiter row and all", () => {
+  const { api, doc } = fresh();
+  const table = new El("table", {}, [
+    new El("tr", {}, [new El("th", { __text: "a" }), new El("th", { __text: "b" })]),
+    new El("tr", {}, [new El("td", { __text: "c" }), new El("td", { __text: "d" })]),
+    new El("tr", {}, [new El("td", { __text: "e" }), new El("td", { __text: "f" })]),
+  ]);
+  const article = new El("article", {}, [
+    new El("p", { __text: "First paragraph with detail." }),
+    new El("p", { __text: "Second paragraph." }),
+    new El("p", { __text: "Third paragraph so the root heuristic picks this block." }),
+    table,
+  ]);
+  article.rect = { top: 0, left: 0, width: 600, height: 400 };
+  doc.body.appendChild(article);
+
+  const lines = api.call("read", {}).text.split("\n");
+  const head = lines.indexOf("| a | b |");
+  assert.ok(head >= 0, lines.join("\n"));
+  // The delimiter row must be the NEXT line, exactly once, or nothing below it
+  // is a cell.
+  assert.equal(lines[head + 1], "| --- | --- |");
+  assert.equal(lines[head + 2], "| c | d |");
+  assert.equal(lines[head + 3], "| e | f |");
+  assert.equal(
+    lines.filter((l) => l.startsWith("| ---")).length,
+    1,
+    "one delimiter row per table, under the first row only",
+  );
+});
+
+/* Item #18: the keyboard's way back out of the native layer. The page is a
+ * sibling native view with its own first responder, so this latch plus the
+ * chrome's existing `info` poll is the whole route home. */
+test("a double Escape latches a leave request that info reports exactly once", () => {
+  const { api } = fresh();
+  assert.equal(api.call("info", {}).leaveRequested, false);
+
+  fireWindow("keydown", { key: "Escape" });
+  fireWindow("keydown", { key: "Escape" });
+  assert.equal(api.call("info", {}).leaveRequested, true);
+  // Read and cleared: a second poll must not hand the keyboard back again.
+  assert.equal(api.call("info", {}).leaveRequested, false);
+});
+
+test("a single Escape is the page's own key, not a request to leave", () => {
+  const { api } = fresh();
+  fireWindow("keydown", { key: "Escape" });
+  assert.equal(api.call("info", {}).leaveRequested, false);
+});
+
+test("two Escapes with another key between them do not ask to leave", () => {
+  const { api } = fresh();
+  fireWindow("keydown", { key: "Escape" });
+  fireWindow("keydown", { key: "a" });
+  fireWindow("keydown", { key: "Escape" });
+  assert.equal(api.call("info", {}).leaveRequested, false);
 });
 
 test("read paginates with offset and says so", () => {

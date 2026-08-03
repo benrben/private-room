@@ -501,3 +501,34 @@
     border-top-color: var(--accent);
   }
 }
+
+/* The specialist's actual report, in its own node's panel.
+ *
+ * The same words already went past as live text and were wiped by the next
+ * round — correctly, since that area shows the CURRENT round. This is the copy
+ * that stays, so "it reported back" can be read rather than taken on trust,
+ * and so a failed child can say why. Reports run from one line to several
+ * pages, hence the scroll box: a long one must not push the composer off the
+ * screen. */
+.agraph-report {
+  max-height: 18rem;
+  overflow: auto;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.82rem;
+  line-height: 1.55;
+  /* The report is prose the model wrote, with its own newlines and indentation
+     — `pre-wrap` keeps both without turning it into a code block. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* A failure reads as one. The left bar carries it rather than the text colour,
+   so the reason itself stays as legible as any other report. */
+.agraph-report.failed {
+  border-color: color-mix(in srgb, var(--danger, #d9534f) 55%, var(--border));
+  box-shadow: inset 3px 0 0 var(--danger, #d9534f);
+}

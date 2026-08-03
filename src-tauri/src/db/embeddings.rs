@@ -58,9 +58,15 @@ pub fn chunks_missing_embedding(
 ) -> Result<Vec<(String, String, String)>, String> {
     query_rows(
         conn,
+        // `f.trashed_at IS NULL` is redundant with trashing MOVING the chunks
+        // out of this table — and stays anyway. Two of the retrieval queries
+        // below cannot express the filter at all (they never touch `files`), so
+        // the move is the real guarantee; where a query does have `f` in scope,
+        // saying it as well costs nothing and means a future change to how the
+        // trash stores chunks cannot quietly leak deleted text into an answer.
         "SELECT c.id, f.name, c.text
          FROM chunks c JOIN files f ON f.id = c.file_id
-         WHERE c.embedding IS NULL LIMIT ?1",
+         WHERE c.embedding IS NULL AND f.trashed_at IS NULL LIMIT ?1",
         [limit as i64],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )
@@ -152,7 +158,7 @@ pub fn chunks_by_rowids(
     let sql = format!(
         "SELECT c.rowid, f.name, c.text
          FROM chunks c JOIN files f ON f.id = c.file_id
-         WHERE c.rowid IN ({placeholders})"
+         WHERE c.rowid IN ({placeholders}) AND f.trashed_at IS NULL"
     );
     let params: Vec<&dyn rusqlite::ToSql> =
         rowids.iter().map(|r| r as &dyn rusqlite::ToSql).collect();
@@ -175,12 +181,53 @@ pub fn search_chunks_fts_ranked(
          FROM chunks_fts
          JOIN chunks c ON c.rowid = chunks_fts.rowid
          JOIN files f ON f.id = c.file_id
-         WHERE chunks_fts MATCH ?1
+         WHERE chunks_fts MATCH ?1 AND f.trashed_at IS NULL
          ORDER BY bm25(chunks_fts)
          LIMIT ?2",
         params![match_expr, limit as i64],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )
+}
+
+/// Room map: the file IDS whose chunks match `match_expr`, best match first and
+/// each file listed once. `exclude` is dropped from the results — a generated
+/// file usually writes its own name into its first line, and a file "mentioning
+/// itself" is not a relation.
+///
+/// Ordered by bm25 rather than left to scan order: the map's frontend only
+/// re-lays-out when the edge list actually changes, so a query that returned
+/// the same links in a different order every rebuild would scramble the layout
+/// for no reason.
+pub fn fts_file_matches(
+    conn: &Connection,
+    match_expr: &str,
+    exclude: &str,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    // Over-fetch chunk hits, then keep the first `limit` DISTINCT files: several
+    // chunks of one file can all match, and `SELECT DISTINCT` cannot be combined
+    // with an `ORDER BY bm25()` the projection doesn't carry.
+    let rows: Vec<String> = query_rows(
+        conn,
+        "SELECT c.file_id
+         FROM chunks_fts
+         JOIN chunks c ON c.rowid = chunks_fts.rowid
+         WHERE chunks_fts MATCH ?1 AND c.file_id <> ?2
+         ORDER BY bm25(chunks_fts)
+         LIMIT ?3",
+        params![match_expr, exclude, (limit * 20).max(20) as i64],
+        |r| r.get(0),
+    )?;
+    let mut out: Vec<String> = Vec::new();
+    for id in rows {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// (file name, chunk text) for the most recently added chunks — the fallback
@@ -189,6 +236,7 @@ pub fn recent_chunks(conn: &Connection, limit: usize) -> Result<Vec<(String, Str
     query_rows(
         conn,
         "SELECT f.name, c.text FROM chunks c JOIN files f ON f.id = c.file_id
+         WHERE f.trashed_at IS NULL
          ORDER BY f.created_at DESC, c.seq ASC LIMIT ?1",
         [limit as i64],
         |r| Ok((r.get(0)?, r.get(1)?)),

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { locateQuoteHebrewAware, makeReceiptBadge } from "./highlight";
-import { base64ToBytes } from "./util";
+import { useFileBytes } from "./useFileBytes";
 import "./pdf.css";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -184,12 +184,18 @@ async function highlightQuoteOnPage(
 }
 
 export default function PdfView({
+  mediaToken,
   dataB64,
   target,
 }: {
-  dataB64: string;
+  /** Streaming token for the file's bytes (roommedia://). */
+  mediaToken?: string | null;
+  /** Legacy base64 payload — honoured if byte delivery is ever switched back. */
+  dataB64?: string | null;
   target?: PdfTarget;
 }) {
+  const { bytes: fileBytes, error: readError, loading: readLoading } =
+    useFileBytes(mediaToken, dataB64);
   const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const pdfRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
@@ -549,9 +555,13 @@ export default function PdfView({
     let cancelled = false;
     const container = containerRef.current;
     if (!container) return;
+    if (!fileBytes) return;
     setStatus("Rendering PDF…");
     setFailed(false);
-    const task = pdfjs.getDocument({ data: base64ToBytes(dataB64) });
+    // `slice()` hands pdf.js its own copy: it TRANSFERS the buffer it is given
+    // to the worker, which would detach the shared streamed array and leave a
+    // reopened document reading zero bytes.
+    const task = pdfjs.getDocument({ data: fileBytes.slice() });
     (async () => {
       try {
         const pdf = await task.promise;
@@ -578,7 +588,7 @@ export default function PdfView({
       pdfRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataB64, buildPages]);
+  }, [fileBytes, buildPages]);
 
   // A NEW target on the already-open document: drop the old highlight and
   // re-aim, reusing every parsed and rasterized page.
@@ -666,7 +676,19 @@ export default function PdfView({
           if (token !== findTokenRef.current) return;
           const page = await pdf.getPage(p);
           const { text } = pageSource(await readTextItems(page));
-          if (locateQuoteHebrewAware(text, needle)) hits.push(p);
+          if (locateQuoteHebrewAware(text, needle)) {
+            hits.push(p);
+            // Publish EACH hit as it is found, rather than after every page has
+            // been parsed. On a 462-page book the old tail-publish left the nav
+            // buttons disabled and the readout on "Searching…" for the whole
+            // document — indistinguishable, to the person waiting, from the
+            // find box being broken. A fresh array each time so React sees it.
+            setFindHits([...hits]);
+            if (hits.length === 1) {
+              setFindAt(0);
+              await showFindHit(p, needle);
+            }
+          }
           // Same memory discipline as the citation scan: a page parsed only
           // to be read is released again.
           if (pageWrapsRef.current[p - 1]?.dataset.rendered !== "1") page.cleanup();
@@ -674,13 +696,41 @@ export default function PdfView({
       } finally {
         if (token === findTokenRef.current) setFinding(false);
       }
-      if (token !== findTokenRef.current) return;
-      setFindHits(hits);
-      setFindAt(0);
-      if (hits.length > 0) await showFindHit(hits[0], needle);
     },
     [clearFindBoxes, showFindHit],
   );
+
+  // THE bug behind "Find is broken": `runFind` had exactly one call site — the
+  // Enter key. Typing set `findQuery` and nothing else, so `findHits` stayed
+  // empty, both nav buttons stayed `disabled`, and the count area rendered an
+  // empty string. Nothing on screen said Enter was required, so the box read as
+  // dead. Live QA reported it as "searching for `prose` left Previous and Next
+  // disabled" — which is exactly what it did, on a document that contains the
+  // word.
+  //
+  // Search as you type instead, debounced so a fast typist does not start a
+  // scan per keystroke. `runFind` already bumps `findTokenRef`, so a superseded
+  // scan abandons itself and only the newest writes state.
+  useEffect(() => {
+    if (!findOpen) return;
+    const q = findQuery.trim();
+    // Enter is STEPPING through results for a query already searched, not
+    // re-running it — leave that to the key handler.
+    if (q === findForRef.current) return;
+    // One or two characters match nearly everything and cost a full parse of the
+    // document to prove it. Clear rather than scan.
+    if (q.length < 2) {
+      findTokenRef.current++;
+      setFinding(false);
+      setFindHits([]);
+      setFindAt(0);
+      findForRef.current = q;
+      clearFindBoxes();
+      return;
+    }
+    const t = window.setTimeout(() => void runFind(findQuery), 250);
+    return () => window.clearTimeout(t);
+  }, [findQuery, findOpen, runFind, clearFindBoxes]);
 
   /** Next/previous hit, wrapping at both ends. */
   const stepFind = useCallback(
@@ -795,6 +845,16 @@ export default function PdfView({
         hoverRef.current = false;
       }}
     >
+      {/* The bytes stream in before pdf.js sees them, so a read that fails
+          (a staged token evicted, the room locked) has to say so on its own —
+          otherwise the pane just sits empty with a live zoom bar over it. */}
+      {readError && !failed && (
+        <div className="pdf-failed" role="alert">
+          <div className="pdf-failed-title">This PDF could not be read.</div>
+          <p className="pdf-failed-body">{readError}</p>
+        </div>
+      )}
+      {readLoading && !failed && <div className="viewer-status">Loading PDF…</div>}
       {failed && (
         <div className="pdf-failed" role="alert">
           <div className="pdf-failed-title">This PDF could not be opened.</div>
@@ -902,14 +962,24 @@ export default function PdfView({
               }
             }}
           />
+          {/* Always says something once there is a query. The blank branch this
+              replaces is why the bar read as dead: with `runFind` unreachable
+              from typing, `findQuery !== findForRef.current` was permanently
+              true, so this rendered "" forever no matter what was typed. Even
+              with the search now running as you type, a silent readout would
+              leave the sub-2-character case unexplained. */}
           <span className="pdf-find-count" role="status">
-            {finding
-              ? "Searching…"
-              : findForRef.current === "" || findQuery.trim() !== findForRef.current
-                ? ""
-                : findHits.length === 0
-                  ? "No matches"
-                  : `Page ${findHits[findAt]} · ${findAt + 1} of ${findHits.length}`}
+            {findQuery.trim() === ""
+              ? ""
+              : findQuery.trim().length < 2
+                ? "Keep typing…"
+                : finding && findHits.length === 0
+                  ? "Searching…"
+                  : findHits.length === 0
+                    ? "No matches"
+                    : `Page ${findHits[findAt]} · ${findAt + 1} of ${findHits.length}${
+                        finding ? "…" : ""
+                      }`}
           </span>
           <button
             type="button"

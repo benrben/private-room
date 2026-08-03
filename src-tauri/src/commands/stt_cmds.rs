@@ -37,8 +37,60 @@ pub(crate) fn stt_effective_model(app: &tauri::AppHandle) -> Option<std::path::P
     bundled_stt_model(app)
 }
 
+/// Is this the head of a ggml model file?
+///
+/// The 574 MB weights are fetched over HTTPS from a fixed address and then
+/// mmapped by whisper.cpp — and until now nothing looked at what arrived at
+/// all. `MODEL_URL` points at HuggingFace's `resolve/main/…`, a MUTABLE
+/// pointer, so there is no digest that can honestly be pinned here: a hash
+/// baked into a shipped build goes stale the day the file is re-uploaded, and
+/// it would then refuse the real model on every machine that has not bundled
+/// one — the download path is the only one an unbundled build has. So this is
+/// deliberately NOT a signature check and does not pretend to be one. It is
+/// the same cheap sanity check `ytdlp::looks_like_macos_binary` performs, for
+/// the same reason: what actually goes wrong is a captive portal, an error
+/// page or a truncated body arriving with a 200 on it and being renamed into
+/// place as a model.
+///
+/// ggml writes its magic as the u32 `0x67676d6c` in little-endian, so the file
+/// begins with the bytes `l m g g` (verified against the bundled
+/// `ggml-large-v3-turbo-q5_0.bin`, not from memory).
+fn looks_like_ggml_model(head: &[u8]) -> bool {
+    head.get(..4) == Some(&0x6767_6d6c_u32.to_le_bytes()[..])
+}
+
+/// Size bounds for the fetched model. The real file is ~574 MB (`MODEL_SIZE_MB`);
+/// the floor rejects an error page and a truncated body, the ceiling stops a
+/// misbehaving mirror filling the disk while the UI says "Downloading…".
+const MIN_MODEL_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_MODEL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// What a rejected download says. Deliberately about the FILE, not the network:
+/// the bytes arrived fine, they just were not a model.
+const NOT_A_MODEL: &str =
+    "What arrived is not the dictation model — the download was refused rather than used.";
+
 /// One download at a time; the UI disables the button while this is set.
 pub(crate) static STT_DOWNLOADING: AtomicBool = AtomicBool::new(false);
+/// Set by `stt_cancel_download`, cleared by the download itself when it starts
+/// and when it ends. The 574 MB model takes many minutes on a slow line and
+/// there was no way to stop it: the button disabled itself and the only exit
+/// was quitting the app mid-write.
+static STT_DOWNLOAD_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Stop a model download in progress.
+///
+/// Returns whether there WAS one to stop. A false answer is not a failure — it
+/// means nothing was downloading — and the caller must not report a stop it did
+/// not perform.
+#[tauri::command]
+pub fn stt_cancel_download() -> bool {
+    if !STT_DOWNLOADING.load(Ordering::SeqCst) {
+        return false;
+    }
+    STT_DOWNLOAD_CANCEL.store(true, Ordering::SeqCst);
+    true
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +132,8 @@ pub async fn stt_download_model(
     if STT_DOWNLOADING.swap(true, Ordering::SeqCst) {
         return Err("The dictation model is already downloading.".into());
     }
+    // A Stop pressed against the PREVIOUS download must not kill this one.
+    STT_DOWNLOAD_CANCEL.store(false, Ordering::SeqCst);
     let result: Result<(), String> = async {
         if let Some(dir) = dest.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -89,15 +143,36 @@ pub async fn stt_download_model(
             .await
             .and_then(|r| r.error_for_status())
             .map_err(|e| format!("download failed: {e}"))?;
+        // An implausible declared size is refused before a byte is written.
+        if resp.content_length().is_some_and(|len| len > MAX_MODEL_BYTES) {
+            return Err(NOT_A_MODEL.into());
+        }
         let total = resp.content_length().unwrap_or(stt::MODEL_SIZE_MB * 1024 * 1024);
         let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
         let mut got: u64 = 0;
         let mut last_pct: u64 = 0;
+        // The first four bytes decide whether this is a model at all; kept
+        // rather than re-read because the file is renamed straight into the
+        // place whisper.cpp mmaps from.
+        let mut head: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
+            if STT_DOWNLOAD_CANCEL.load(Ordering::SeqCst) {
+                // Erroring out (rather than returning Ok) is what takes the
+                // .part file away below, so a stopped download leaves no half
+                // model behind and `installed` keeps telling the truth.
+                return Err("Download stopped.".into());
+            }
             let chunk = chunk.map_err(|e| format!("download interrupted: {e}"))?;
-            std::io::Write::write_all(&mut file, &chunk).map_err(|e| e.to_string())?;
             got += chunk.len() as u64;
+            // A server that declares nothing (or lies) is still bounded.
+            if got > MAX_MODEL_BYTES {
+                return Err(NOT_A_MODEL.into());
+            }
+            if head.len() < 4 {
+                head.extend_from_slice(&chunk[..chunk.len().min(4 - head.len())]);
+            }
+            std::io::Write::write_all(&mut file, &chunk).map_err(|e| e.to_string())?;
             let pct = got * 100 / total.max(1);
             if pct != last_pct {
                 last_pct = pct;
@@ -108,6 +183,14 @@ pub async fn stt_download_model(
             }
         }
         drop(file);
+        // Only now is it renamed into the path `stt_effective_model` prefers
+        // over the bundled copy. Nothing checked what arrived before, so an
+        // error page served with a 200 became "installed: true" and every
+        // transcription afterwards failed on a file the app had told the user
+        // it had. The Err path below removes the .part.
+        if got < MIN_MODEL_BYTES || !looks_like_ggml_model(&head) {
+            return Err(NOT_A_MODEL.into());
+        }
         std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -115,6 +198,7 @@ pub async fn stt_download_model(
     if result.is_err() {
         let _ = std::fs::remove_file(dest.with_extension("bin.part"));
     }
+    STT_DOWNLOAD_CANCEL.store(false, Ordering::SeqCst);
     STT_DOWNLOADING.store(false, Ordering::SeqCst);
     result
 }
@@ -652,7 +736,7 @@ pub async fn shape_text(
             .and_then(|room| model_setting(&room.conn))
             .unwrap_or_else(|| best_local_default(&models))
     };
-    if is_external_engine(&model) || is_cloud_model(&model) {
+    if !runs_on_this_mac(&model) {
         model = best_local_default(&models);
     }
 
@@ -699,7 +783,24 @@ pub(crate) async fn run_dict_pass(model: &str, steps: &[&str], text: &str) -> Re
         ..Default::default()
     }];
     // MIGRATION Phase 2a: non-streamed sidecar `/generate` (no tools, no Stop).
-    ollama::generate(model, messages, Some(0.2), "5m", None, ollama::CtxTier::Chat).await
+    //
+    // `generate` returns the model's RAW text, and a thinking model prefixes it
+    // with `<think>…</think>`. This text goes straight into the composer as the
+    // user's own dictated words, so the monologue would be typed into their
+    // message — and, with the prompt optimizer, into whatever they send next.
+    let raw = ollama::generate(model, messages, Some(0.2), "5m", None).await?;
+    Ok(dict_pass_text(&raw))
+}
+
+/// What a shaping pass hands back as the user's dictated words.
+///
+/// `ollama::generate` returns the model's RAW text and a thinking model prefixes
+/// it with `<think>…</think>`. This text is typed into the composer AS the
+/// user's own sentence, so an unstripped monologue is dictation putting the
+/// model's private reasoning in the user's mouth — and, in `prompt` mode, in the
+/// next thing they send.
+pub(crate) fn dict_pass_text(raw: &str) -> String {
+    ollama::strip_think_spans(raw).trim().to_string()
 }
 
 // ---------------------------------------------------------------- Touch ID (ADD-11)
@@ -708,6 +809,19 @@ pub(crate) async fn run_dict_pass(model: &str, steps: &[&str], text: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dictation shaping runs on a thinking model like anything else, and its
+    /// text is typed into the composer AS the user's own words — so an
+    /// unstripped `<think>` span puts the model's reasoning in their mouth.
+    #[test]
+    fn dictation_shaping_never_types_the_models_reasoning() {
+        assert_eq!(
+            dict_pass_text("<think>They said 'their' but meant 'there'.</think>\nMeet me there at six."),
+            "Meet me there at six."
+        );
+        assert_eq!(dict_pass_text("<think>unterminated"), "");
+        assert_eq!(dict_pass_text("  Meet me at six.  "), "Meet me at six.");
+    }
 
     /// Each preview repaint re-decodes the dictation from the start, so its
     /// cost grows with how long someone has been speaking. A fixed step meant
@@ -725,6 +839,100 @@ mod tests {
         // fresh audio — roughly half the machine, never more.
         assert_eq!(dict_partial_step(rate, Duration::from_secs(3)), rate as usize * 3);
         assert!(dict_partial_step(rate, Duration::from_secs(30)) > dict_partial_step(rate, Duration::from_secs(3)));
+    }
+
+    /// The 574 MB weights are fetched, renamed into place and mmapped. Nothing
+    /// looked at what arrived, so an error page or a captive-portal redirect
+    /// served with a 200 became "installed: true" — and every transcription
+    /// afterwards failed on a file the app had told the user it had.
+    #[test]
+    fn only_something_shaped_like_a_ggml_model_is_accepted() {
+        // ggml's magic is the u32 0x67676d6c little-endian — the bytes "lmgg".
+        // Checked against the real bundled model, not from memory.
+        assert!(looks_like_ggml_model(b"lmgg\x9a\xca\x00\x00"));
+        assert!(looks_like_ggml_model(b"lmgg"));
+        // An error page, a redirect body, a truncated download, nothing at all.
+        assert!(!looks_like_ggml_model(b"<!DOCTYPE html>"));
+        assert!(!looks_like_ggml_model(b"{\"error\":\"not found\"}"));
+        assert!(!looks_like_ggml_model(b"ggml"), "byte order matters");
+        assert!(!looks_like_ggml_model(b"lmg"));
+        assert!(!looks_like_ggml_model(&[]));
+        // The size bounds bracket the real file, so neither can reject it.
+        let real = stt::MODEL_SIZE_MB * 1024 * 1024;
+        assert!(MIN_MODEL_BYTES < real, "the floor would refuse the real model");
+        assert!(MAX_MODEL_BYTES > real, "the ceiling would refuse the real model");
+    }
+
+    /// The bundled copy is the one a release build actually uses, and it is the
+    /// ground truth this check was derived from. If a future bundle stops
+    /// matching, the download check is wrong — not the model.
+    #[test]
+    fn the_bundled_model_passes_the_check_it_is_derived_from() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/models")
+            .join(stt::MODEL_FILE);
+        // A working tree without the bundled weights (a fresh clone) has
+        // nothing to compare against; saying so beats asserting on absence.
+        let Ok(mut f) = std::fs::File::open(&path) else { return };
+        let mut head = [0u8; 4];
+        use std::io::Read;
+        f.read_exact(&mut head).expect("bundled model is shorter than its magic");
+        assert!(
+            looks_like_ggml_model(&head),
+            "the bundled model fails the download check — the check is wrong"
+        );
+        let len = f.metadata().expect("bundled model metadata").len();
+        assert!(len >= MIN_MODEL_BYTES && len <= MAX_MODEL_BYTES, "bundled model is {len} bytes");
+    }
+
+    /// A check nothing calls is decoration. The download's own guard cannot be
+    /// exercised without a 574 MB fetch, so this pins the wiring at the source
+    /// — the same shape `web::fetch`'s redirect-policy test uses.
+    #[test]
+    fn the_download_actually_refuses_what_is_not_a_model() {
+        let src = include_str!("stt_cmds.rs");
+        let at = src.find("pub async fn stt_download_model").expect("the command is gone");
+        let body = &src[at..];
+        let end = body.find("\n#[tauri::command]").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("looks_like_ggml_model(&head)"),
+            "the download renames whatever arrived into place without looking at it"
+        );
+        assert!(
+            body.contains("MIN_MODEL_BYTES"),
+            "a truncated body must not become an installed model"
+        );
+        assert!(
+            body.contains("MAX_MODEL_BYTES"),
+            "the fetch is unbounded — a misbehaving mirror can fill the disk"
+        );
+        // The refusal has to happen BEFORE the rename, or the check is a log line.
+        let refuse = body.find("looks_like_ggml_model(&head)").expect("checked above");
+        let rename = body.find("std::fs::rename(&part, &dest)").expect("the rename is gone");
+        assert!(refuse < rename, "the model is renamed into place before it is checked");
+    }
+
+    /// Stop must never claim to have stopped something that was not running.
+    ///
+    /// The 574 MB download had no Stop at all; the one it has now answers with
+    /// what it actually did, so the Settings panel cannot report a cancellation
+    /// that never happened.
+    #[test]
+    fn cancelling_a_download_that_is_not_running_says_so() {
+        // Nothing in flight: no claim, and no flag left set to ambush the next
+        // download that starts.
+        STT_DOWNLOADING.store(false, Ordering::SeqCst);
+        STT_DOWNLOAD_CANCEL.store(false, Ordering::SeqCst);
+        assert!(!stt_cancel_download(), "claimed to stop a download that was not running");
+        assert!(!STT_DOWNLOAD_CANCEL.load(Ordering::SeqCst));
+
+        // One in flight: the flag the download loop reads is raised.
+        STT_DOWNLOADING.store(true, Ordering::SeqCst);
+        assert!(stt_cancel_download());
+        assert!(STT_DOWNLOAD_CANCEL.load(Ordering::SeqCst), "the download never sees the Stop");
+        STT_DOWNLOADING.store(false, Ordering::SeqCst);
+        STT_DOWNLOAD_CANCEL.store(false, Ordering::SeqCst);
     }
 
     /// The streaming dictation worker end-to-end against the real model:

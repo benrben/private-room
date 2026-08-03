@@ -151,6 +151,23 @@ pub(crate) fn apply_with_staleness(
     cause: &str,
 ) -> Result<(), EditError> {
     for p in plans {
+        // IDENTITY FIRST, for every plan — including the rename-only ones, which
+        // carry no byte token (`staleness: None`) and were therefore applied
+        // with NO check whatsoever. The card said "notes.md → archive.md"; if
+        // notes.md has since been renamed by the user, or trashed, that sentence
+        // is no longer true of the file this id points at, and renaming it
+        // anyway performs a change nobody was shown.
+        let current_name = db::get_file_name(conn, &p.file_id).ok();
+        if current_name.as_deref() != Some(p.real_name.as_str()) {
+            return Err(EditError::new(
+                format!(
+                    "\"{}\" was renamed or removed while the approval was pending; \
+                     nothing was applied. Look it up again and retry.",
+                    p.real_name
+                ),
+                "stale",
+            ));
+        }
         if let Some(token) = &p.staleness {
             let current = db::get_file_bytes(conn, &p.file_id).ok().flatten().unwrap_or_default();
             if &hash_bytes(&current) != token {
@@ -298,6 +315,52 @@ mod tests {
         // The concurrent bytes are intact; no new snapshot from the refused apply.
         assert_eq!(db::get_file_bytes(&conn, &id).unwrap().unwrap(), b"before edits (touched)");
         assert_eq!(db::list_file_versions(&conn, &id).unwrap().len(), before_versions);
+    }
+
+    #[test]
+    fn an_approved_rename_refuses_once_the_file_is_no_longer_that_file() {
+        // The gap this pins: a rename-only plan carries no byte token, so phase
+        // 3 had NOTHING to check — the rename landed on whatever that id had
+        // become while the card sat open, a change nobody was shown.
+        let conn = db::open_in_memory_schema();
+        let id = db::insert_file(&conn, "notes.md", "text/plain", b"body", Some("body"), "upload")
+            .unwrap()
+            .id;
+        let plans = plan_batch(
+            &conn,
+            &[BatchOp::Rename { name: "notes.md".into(), new_name: "archive.md".into() }],
+        )
+        .unwrap();
+        assert!(plans[0].staleness.is_none(), "a rename-only plan has no byte token");
+
+        // The user renames it themselves while the approval card is open.
+        db::rename_file(&conn, &id, "minutes.md").unwrap();
+        let err = apply_with_staleness(&conn, &plans, "AI edit").unwrap_err();
+        assert_eq!(err.outcome, "stale");
+        assert_eq!(db::get_file_name(&conn, &id).unwrap(), "minutes.md");
+
+        // Untouched, the same plan still applies — the check is staleness, not a ban.
+        db::rename_file(&conn, &id, "notes.md").unwrap();
+        apply_with_staleness(&conn, &plans, "AI edit").unwrap();
+        assert_eq!(db::get_file_name(&conn, &id).unwrap(), "archive.md");
+    }
+
+    #[test]
+    fn a_trashed_file_is_never_written_by_a_pending_approval() {
+        let conn = db::open_in_memory_schema();
+        let id = db::insert_file(&conn, "n.md", "text/plain", b"before edits", Some("before edits"), "upload")
+            .unwrap()
+            .id;
+        let edit = PreviewEdit {
+            name: "n.md".into(),
+            old_text: "before".into(),
+            new_text: "AFTER".into(),
+            all: false,
+        };
+        let plans = plan_single_edit(&conn, &edit).unwrap();
+        db::trash_file(&conn, &id, db::TrashActor::User).unwrap();
+        let err = apply_with_staleness(&conn, &plans, "AI edit").unwrap_err();
+        assert_eq!(err.outcome, "stale");
     }
 
     #[test]

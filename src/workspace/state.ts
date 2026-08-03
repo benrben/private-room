@@ -2,17 +2,18 @@ import { useCallback, useRef, useState } from "react";
 import {
   AiActionDef,
   AiStatus,
-  AskActiveAgent,
-  AskPlanStep,
   AskPrivacy,
   AskTokenUsage,
   Chat,
   ChatCommand,
+  Specialist,
   ExternalModelInfo,
   FileMeta,
   FileMetaSuggestion,
+  TrashedFile,
   EditApproveRequest,
   FileVersion,
+  Provenance,
   Folder,
   FrontPage,
   Job,
@@ -30,18 +31,39 @@ import {
   Workflow,
   WorkflowNodeEvent,
 } from "../api";
+import {
+  applyEvent,
+  finishRun,
+  isAsking,
+  liveTurn,
+  LiveTurn,
+  runIdOf as runIdIn,
+  Runs,
+  startRun,
+  usageOf,
+} from "./runIdentity";
 import { AutocompleteState } from "./composer";
+import { type FileSort, loadFileSort, saveFileSort } from "./fileSort";
 import { OpenFile, Toast, WorkArea } from "./types";
 
 /** How many messages may stack in the corner at once. Errors no longer expire,
  * so without a cap a run of failures would paper over the whole window. */
 const MAX_TOASTS = 5;
 
+/** How many error messages the bug-report sheet may offer. Enough to cover the
+ * run-up to a failure, few enough that the sheet stays readable — the user has
+ * to be able to READ what they are attaching before they attach it. */
+const MAX_ERROR_LOG = 10;
+
+
 /** All of Workspace's state + refs, plus the toast primitives that nearly every
  * handler needs. Split out of Workspace.tsx verbatim; the shell threads this to
  * the action factories, the effects hook, and the pane components. */
 export function useWorkspaceState(_info: RoomInfo) {
   const [files, setFiles] = useState<FileMeta[]>([]);
+  // Trash: deleted files, kept apart from `files` on purpose — anything that
+  // reads `files` is asking "what is in this room", and a trashed file is not.
+  const [trashed, setTrashed] = useState<TrashedFile[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -57,25 +79,72 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [attachments, setAttachments] = useState<FileMeta[]>([]);
   const [question, setQuestion] = useState("");
   const [commands, setCommands] = useState<ChatCommand[]>([]);
+  // The composer's "*" menu: the specialists this room can dispatch to.
+  // `null` is NOT "none" — it is "not established yet", and the menu says which
+  // of the two it is looking at. `specialistsError` carries the reason a lookup
+  // failed, because "we could not ask" must never be drawn as "there are none".
+  const [specialists, setSpecialists] = useState<Specialist[] | null>(null);
+  const [specialistsError, setSpecialistsError] = useState("");
   const [ac, setAc] = useState<AutocompleteState | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
-  const [asking, setAsking] = useState(false);
-  const [streamText, setStreamText] = useState("");
-  const [steps, setSteps] = useState<{ label: string; ok: boolean }[]>([]);
-  const [lane, setLane] = useState("");
-  // Dispatch-first agent visibility: the roster of domain agents handling the
-  // current ask (ask-plan, one entry per step) and which one is active
-  // (ask-agent). Both live only while `asking` — like `steps` and `lane`.
-  const [agentPlan, setAgentPlan] = useState<AskPlanStep[] | null>(null);
-  const [activeAgent, setActiveAgent] = useState<AskActiveAgent | null>(null);
+  // ---- the live overlay of a turn in progress, OWNED BY ITS CHAT -----------
+  //
+  // Owner replacement #4 (2026-08-03). All of this used to be seven module-wide
+  // useStates written by unkeyed window events, so it described "the newest
+  // turn" rather than "this conversation's turn": start an answer, open another
+  // chat, and the previous chat's streamed text, step chips and agent roster
+  // were painting into the new one (live QA: "new chats inherit orphaned agent
+  // work"). Keyed by chat id, each turn writes only into its own slot and the
+  // reads below simply look up the conversation on screen — so two chats can
+  // have runs in flight at once with no way to cross-talk, and an answer the
+  // user switched away from is still complete when they switch back.
+  const [runs, setRuns] = useState<Runs>({});
+  // The conversation on screen, for the mount-once event listeners — they close
+  // over the first render and cannot read `activeChatId` directly.
+  const activeChatIdRef = useRef<string | null>(null);
+  activeChatIdRef.current = activeChatId;
+  const live: LiveTurn = liveTurn(runs, activeChatId);
+  const asking = isAsking(runs, activeChatId);
+  const streamText = live.text;
+  const steps = live.steps;
+  const lane = live.lane;
+  // Dispatch-first agent visibility: the roster of domain agents handling this
+  // chat's ask (ask-plan, one entry per step) and which one is active
+  // (ask-agent).
+  const agentPlan = live.plan;
+  const activeAgent = live.agent;
   // The same tool steps as `steps`, but filed under the agent that ran them
   // (`AskPlanStep.key`) so the graph's inspector can show one node's work
   // alone. Kept ALONGSIDE the flat list rather than replacing it: `steps` is
   // still what the flat chip row renders, and the many non-sidecar `ask-step`
   // emitters carry no node at all.
-  const [agentSteps, setAgentSteps] = useState<
-    Record<string, { label: string; ok: boolean }[]>
-  >({});
+  const agentSteps = live.agentSteps;
+  // What each specialist handed back, keyed by `AskPlanStep.key`. The same
+  // words stream into the live text area and are wiped by the next round, so
+  // this is the only lasting copy — and for a child that FAILED it is the only
+  // account of why anywhere in the UI.
+  const agentReports = live.agentReports;
+
+  // The rules themselves live in `runIdentity.ts` — pure, and pinned by
+  // `e2e/page-script/runIdentity.test.mjs`. These are just their React bindings.
+  const beginRun = useCallback(
+    (chatId: string, runId: string) =>
+      setRuns((r) => startRun(r, chatId, runId)),
+    [],
+  );
+  const endRun = useCallback(
+    (chatId: string) => setRuns((r) => finishRun(r, chatId)),
+    [],
+  );
+  const runIdOf = useCallback(
+    (chatId: string | null) => runIdIn(runs, chatId),
+    [runs],
+  );
+  const applyToRun = useCallback(
+    (chatId: string, runId: string | null, patch: (t: LiveTurn) => LiveTurn) =>
+      setRuns((r) => applyEvent(r, chatId, runId, patch)),
+    [],
+  );
   const [undoByMsg, setUndoByMsg] = useState<Record<string, string[]>>({});
   const editedRef = useRef<Set<string>>(new Set());
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -103,6 +172,11 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [renaming, setRenaming] = useState(false);
   const [renameDraft, setRenameDraft] = useState("");
   const [pullingModel, setPullingModel] = useState(false);
+  // The model name a running download was started with — what Stop needs to
+  // reach the backend's `pull:<name>` cancel flag. A ref, not state: `model`
+  // can be switched (or the card re-rendered) while a multi-gigabyte pull is
+  // still running, and Stop must never reach for a name that has moved on.
+  const pullingModelRef = useRef<string | null>(null);
   const [pullStatus, setPullStatus] = useState("");
   const [pullPercent, setPullPercent] = useState<number | null>(null);
   const [pullError, setPullError] = useState("");
@@ -132,12 +206,38 @@ export function useWorkspaceState(_info: RoomInfo) {
   // PRIV-1: is the cloud-privacy door effectively ON for this room? null =
   // not loaded yet. Drives the loud OFF banner and the composer badge truth.
   const [privacyOn, setPrivacyOn] = useState<boolean | null>(null);
-  // PRIV-1: what the door did on the latest finished turn (the chat chip);
-  // cleared when the next turn starts.
-  const [askPrivacy, setAskPrivacy] = useState<AskPrivacy | null>(null);
-  // Token-budget bar: the latest turn's live usage snapshot (null = nothing
-  // asked yet this session, or the active model reports nothing at all).
-  const [tokenUsage, setTokenUsage] = useState<AskTokenUsage | null>(null);
+  // PRIV-1: what the door did on the latest finished turn (the chat chip),
+  // per conversation — it describes THAT chat's last turn, and survives the
+  // turn ending, so it cannot live in `runs`.
+  const [privacyByChat, setPrivacyByChat] = useState<
+    Record<string, AskPrivacy | null>
+  >({});
+  const askPrivacy = (activeChatId && privacyByChat[activeChatId]) || null;
+  const setAskPrivacy = useCallback(
+    (chatId: string, p: AskPrivacy | null) =>
+      setPrivacyByChat((m) => ({ ...m, [chatId]: p })),
+    [],
+  );
+  // Token-budget bar: the latest turn's usage snapshot FOR EACH CHAT.
+  //
+  // Owner replacement #4: this was one global snapshot that only the next
+  // turn's event ever overwrote, so a brand-new conversation kept displaying
+  // the previous one's reading — live QA saw an identical "30,034 / 1,000,000"
+  // with 12,092 tokens of "conversation history" on a chat that had none, and
+  // reasonably concluded New Chat was inheriting context. It was not: history
+  // is keyed by chat_id in `db::recent_messages` and a fresh chat matches no
+  // rows. Only the READOUT was stale — the more dangerous kind of wrong,
+  // because it made a correct system look broken. A fresh chat now reads zero
+  // because it HAS no entry, not because something remembered to clear one.
+  const [usageByChat, setUsageByChat] = useState<
+    Record<string, AskTokenUsage>
+  >({});
+  const tokenUsage = usageOf(usageByChat, activeChatId);
+  const setChatUsage = useCallback(
+    (chatId: string, usage: AskTokenUsage) =>
+      setUsageByChat((m) => ({ ...m, [chatId]: usage })),
+    [],
+  );
   // True while a "hand off" (context-compaction) summary call is in flight.
   const [handoffStarting, setHandoffStarting] = useState(false);
   // Engine parity: mirrors the "let a cloud AI use this room's tools" switch,
@@ -145,6 +245,14 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [advisorToolsOn, setAdvisorToolsOn] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [versions, setVersions] = useState<FileVersion[]>([]);
+  // How many UNPINNED versions a file keeps. Read from the host (one constant,
+  // one source) rather than written twice — the History strip states the limit
+  // so the eleventh save no longer drops the oldest version in silence.
+  const [versionsKept, setVersionsKept] = useState(10);
+  // ART-1: what produced the open file's CURRENT content. `null` means the room
+  // recorded nothing, which the History strip shows as no attribution at all —
+  // never as "made by the AI".
+  const [headProvenance, setHeadProvenance] = useState<Provenance | null>(null);
   const [confirmRestore, setConfirmRestore] = useState<string | null>(null);
   // Idea 11: the open side-by-side compare (null when closed). Holds both
   // diff texts (fetched once), plus the version id so the modal's own
@@ -158,6 +266,12 @@ export function useWorkspaceState(_info: RoomInfo) {
     fileName: string;
   } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // The message a search hit asked the transcript to jump to, held only until
+  // the pane has PAINTED it. The transcript renders a tail page (CHAT_PAGE), so
+  // a hit on an older message has no element to scroll to and the search jump
+  // silently did nothing; ChatPane reads this, widens its page far enough to
+  // include the row, and clears it.
+  const [revealMsgId, setRevealMsgId] = useState<string | null>(null);
   const [showSyncWarn, setShowSyncWarn] = useState(false);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
@@ -181,6 +295,13 @@ export function useWorkspaceState(_info: RoomInfo) {
     where?: "viewer" | "library";
   } | null>(null);
   const [fileFilter, setFileFilter] = useState("");
+  // How the Library orders files. Device-wide and remembered, so a reader who
+  // works by name doesn't re-choose it every launch.
+  const [fileSort, setFileSortState] = useState<FileSort>(loadFileSort);
+  const setFileSort = useCallback((next: FileSort) => {
+    setFileSortState(next);
+    saveFileSort(next);
+  }, []);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
@@ -215,6 +336,10 @@ export function useWorkspaceState(_info: RoomInfo) {
    * A real unlock builds a fresh state, so a reopened room seeds again. */
   const seededRef = useRef(false);
   const toastSeq = useRef(0);
+  /** The error toasts this session, newest last — see `pushToast`. A ref, not
+   * state: nothing renders on every error, and the feedback sheet reads it at
+   * the moment it opens. */
+  const errorLogRef = useRef<{ at: string; text: string }[]>([]);
   const openFileRef = useRef<OpenFile | null>(null);
   openFileRef.current = openFile;
   // Wave 1b (idea 10): the mount-once onFileUpdated listener captures the
@@ -224,6 +349,15 @@ export function useWorkspaceState(_info: RoomInfo) {
   const editModeRef = useRef(false);
   editModeRef.current = editMode;
   const editorDirtyRef = useRef(false);
+  // The open editor's own save, registered by CodeEditor while it is mounted.
+  // The unsaved-edits dialog needs it: "Save and continue" has to write the
+  // buffer that is about to be unmounted, and only the editor holds that text.
+  // Resolves false when the write failed, so a failed save never proceeds with
+  // the navigation that would have thrown the edit away.
+  const editorSaveRef = useRef<(() => Promise<boolean>) | null>(null);
+  // The pending "you have unsaved edits" question. `proceed` is the navigation
+  // that was interrupted — running it is what Save and Discard both end with.
+  const [pendingLeave, setPendingLeave] = useState<PendingLeave | null>(null);
   // Wave 1b (idea 5): the auto-save switch, mirrored as a ref for the same
   // mount-once-listener reason; re-read when Settings closes.
   const memAutoSaveRef = useRef(false);
@@ -234,10 +368,13 @@ export function useWorkspaceState(_info: RoomInfo) {
   const exportWarnedRef = useRef(false);
   const autolockRef = useRef<string>("15");
   const lastActivityRef = useRef<number>(Date.now());
+  // "Is ANY turn in flight?" — autolock, the hands-free re-arm and the lock
+  // ritual all mean the whole app, not the chat on screen (locking mid-answer
+  // in a background conversation is the same casualty). `asking` above is the
+  // per-chat question; these two are deliberately different.
   const askingRef = useRef(false);
   const prevAskingRef = useRef(false);
-  askingRef.current = asking;
-  const askIdRef = useRef<string | null>(null);
+  askingRef.current = Object.keys(runs).length > 0;
   const recheckTimer = useRef<number | undefined>(undefined);
   const prevModelRef = useRef<string>("");
   const userPickedModelRef = useRef(false);
@@ -253,7 +390,9 @@ export function useWorkspaceState(_info: RoomInfo) {
   // contextual tools. Approvals/jobs pull attention to "activity".
   const [aiTab, setAiTab] = useState<"chat" | "studio" | "activity">("chat");
   // Library-pane tab: browse the room vs. manage the AI's evidence set.
-  const [libraryTab, setLibraryTab] = useState<"browse" | "sources">("browse");
+  const [libraryTab, setLibraryTab] = useState<"browse" | "sources" | "trash">(
+    "browse",
+  );
   // Wave 4a (Idea 2): the full-pane Workflows view, mirroring showMap (+ ref for
   // the mount-once Escape handler). `wfDetailId` selects a workflow inside it.
   const [showWorkflows, setShowWorkflows] = useState(false);
@@ -304,6 +443,20 @@ export function useWorkspaceState(_info: RoomInfo) {
   // (Ollama waking, listing models); this optimistic flag shows a "Starting…"
   // card the instant the button is pressed, so a click is never silent.
   const [summaryStarting, setSummaryStarting] = useState(false);
+  // AUDIT 262: what a Studio job is doing RIGHT NOW ("Reading the material…",
+  // "Building the deck — a local model can take a few minutes…"). The backend
+  // has always named each step, and nothing was listening: a run that takes
+  // minutes on a local model sat on "Starting…" the whole way through, and the
+  // step that says "your cloud AI is writing (content leaves this Mac)" — a
+  // privacy statement, not a nicety — was never shown at all. "" = no step
+  // reported since the last job ended.
+  const [studioStep, setStudioStep] = useState("");
+  // AUDIT 262: file names whose scanned pages are being read right now. The
+  // `ocr-progress` event existed from the first build with nothing listening,
+  // so a vision pass that takes minutes on a local model looked like nothing at
+  // all was happening. Names, not a count: "Reading X" is the answer to "why is
+  // this slow", and a bare number is not.
+  const [ocrFiles, setOcrFiles] = useState<string[]>([]);
   const [studioDefaults, setStudioDefaults] = useState<StudioPrompts | null>(
     null,
   );
@@ -323,6 +476,12 @@ export function useWorkspaceState(_info: RoomInfo) {
     question: string;
   } | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
+  // The running AI action's cancel id. Studio builds have had a Stop button all
+  // along; Summarize/Research/Translate/Fact-check had none, and their modal's
+  // Cancel went grey while the run held the window — so a room-wide Summarize
+  // on a local model could not be ended at all. Null when nothing is running.
+  const [aiOpId, setAiOpId] = useState<string | null>(null);
+  const [aiStopping, setAiStopping] = useState(false);
   const [memSuggestion, setMemSuggestion] = useState<{ fact: string } | null>(
     null,
   );
@@ -368,6 +527,19 @@ export function useWorkspaceState(_info: RoomInfo) {
   const pushToast = useCallback(
     (kind: Toast["kind"], text: string, action?: Toast["action"]) => {
       const id = ++toastSeq.current;
+      // ADD-28 (audit #548): keep the last few error messages so the bug-report
+      // sheet can offer them. An error pop-up is this app's ONLY report that
+      // something failed and it disappears when dismissed, so "what did it
+      // say?" was answerable from memory alone. In-memory only — this is room
+      // content (an error can name a file), so it is never persisted, never
+      // logged, and the sheet attaches it only if the user ticks the box after
+      // reading it.
+      if (kind === "error") {
+        errorLogRef.current = [
+          ...errorLogRef.current,
+          { at: new Date().toISOString(), text },
+        ].slice(-MAX_ERROR_LOG);
+      }
       // Errors WAIT to be dismissed. They are this app's only report that
       // something failed, and there is no log to go back to — deleting one on
       // a timer means a user who looked away is simply never told.
@@ -394,21 +566,25 @@ export function useWorkspaceState(_info: RoomInfo) {
   }
 
   return {
-    files, setFiles, chats, setChats, activeChatId, setActiveChatId,
+    files, setFiles, trashed, setTrashed, chats, setChats, activeChatId, setActiveChatId,
     messages, setMessages, memories, setMemories, ai, setAi, model, setModel,
     engineModels, setEngineModels,
     attachments, setAttachments, question, setQuestion, commands, setCommands,
-    ac, setAc, composerRef, asking, setAsking, streamText, setStreamText,
-    steps, setSteps, lane, setLane, agentPlan, setAgentPlan,
-    activeAgent, setActiveAgent, agentSteps, setAgentSteps,
+    specialists, setSpecialists, specialistsError, setSpecialistsError,
+    ac, setAc, composerRef, asking, streamText,
+    steps, lane, agentPlan,
+    activeAgent, agentSteps,
+    agentReports,
+    runs, beginRun, endRun, applyToRun, runIdOf,
     undoByMsg, setUndoByMsg, editedRef,
     toasts, setToasts, dictState, setDictState, dictStateRef, dictOwner, setDictOwner,
     recorderRef, dictChunksRef, dictStreamRef, dictPartial, setDictPartial,
     dragOver, setDragOver, renaming, setRenaming,
-    renameDraft, setRenameDraft, pullingModel, setPullingModel,
+    renameDraft, setRenameDraft, pullingModel, setPullingModel, pullingModelRef,
     pullStatus, setPullStatus, pullPercent, setPullPercent, pullError, setPullError,
     openFile, setOpenFile, viewerRev, setViewerRev, editMode, setEditMode,
     staleFile, setStaleFile, editModeRef, editorDirtyRef, memAutoSaveRef,
+    editorSaveRef, pendingLeave, setPendingLeave,
     memoryDraft, setMemoryDraft, memoryDraftCat, setMemoryDraftCat,
     saveDraft, setSaveDraft,
     showSettings, setShowSettings, settingsSection, setSettingsSection, mcpTools, setMcpTools,
@@ -417,14 +593,17 @@ export function useWorkspaceState(_info: RoomInfo) {
     showAddLink, setShowAddLink, linkUrl, setLinkUrl, importingLink, setImportingLink,
     webOn, setWebOn, advisorToolsOn, setAdvisorToolsOn,
     privacyOn, setPrivacyOn, askPrivacy, setAskPrivacy,
-    tokenUsage, setTokenUsage, handoffStarting, setHandoffStarting,
-    showHistory, setShowHistory, versions, setVersions,
+    tokenUsage, setChatUsage, handoffStarting, setHandoffStarting,
+    showHistory, setShowHistory, versions, setVersions, versionsKept, setVersionsKept,
+    headProvenance, setHeadProvenance,
     confirmRestore, setConfirmRestore, compare, setCompare,
     confirmDelete, setConfirmDelete,
+    revealMsgId, setRevealMsgId,
     showSyncWarn, setShowSyncWarn, folders, setFolders,
     collapsedFolders, setCollapsedFolders, moveMenuFor, setMoveMenuFor,
     ctxMenu, setCtxMenu, ctxMenuRef, ctxMenuElRef, moveMenuElRef,
     renamingFile, setRenamingFile, fileFilter, setFileFilter,
+    fileSort, setFileSort,
     addMenuOpen, setAddMenuOpen, roomMenuOpen, setRoomMenuOpen,
     modelMenuOpen, setModelMenuOpen, mcpApprovals, setMcpApprovals,
     browseConsents, setBrowseConsents,
@@ -435,9 +614,9 @@ export function useWorkspaceState(_info: RoomInfo) {
     showSearch, setShowSearch, searchQuery, setSearchQuery,
     searchResults, setSearchResults, searchError, setSearchError,
     searchSel, setSearchSel, showShortcuts, setShowShortcuts,
-    chatRef, seededRef, toastSeq, openFileRef, showSearchRef, showSettingsRef,
+    chatRef, seededRef, toastSeq, errorLogRef, openFileRef, showSearchRef, showSettingsRef,
     exportWarnedRef, autolockRef, lastActivityRef,
-    askingRef, prevAskingRef, askIdRef, recheckTimer, prevModelRef,
+    askingRef, prevAskingRef, activeChatIdRef, recheckTimer, prevModelRef,
     userPickedModelRef, showMemoryIntro, setShowMemoryIntro,
     showMap, setShowMap, showMapRef, showHelp, setShowHelp,
     area, setArea, aiTab, setAiTab, libraryTab, setLibraryTab,
@@ -452,15 +631,29 @@ export function useWorkspaceState(_info: RoomInfo) {
     importProgress, setImportProgress,
     jobs, setJobs, jobProgress, setJobProgress,
     summaryStarting, setSummaryStarting,
+    studioStep, setStudioStep,
+    ocrFiles, setOcrFiles,
     studioDefaults, setStudioDefaults, studioPrompt, setStudioPrompt,
     studioPromptRef, studioAc, setStudioAc, aiActionDefs, setAiActionDefs,
-    aiPrompt, setAiPrompt, aiBusy, setAiBusy, memSuggestion, setMemSuggestion,
+    aiPrompt, setAiPrompt, aiBusy, setAiBusy,
+    aiOpId, setAiOpId, aiStopping, setAiStopping,
+    memSuggestion, setMemSuggestion,
     importSuggestions, setImportSuggestions, pushToast, dismissToast,
     recLive, setRecLive, recLiveRef, recSave, setRecSave,
     sttStatus, setSttStatus, showFeedback, setShowFeedback,
     autoSpeak, setAutoSpeak, handsFree, setHandsFree, handsFreeRef,
     armTimerRef, speakingMsgId, setSpeakingMsgId,
   };
+}
+
+/** A navigation held up by unsaved edits.
+ *
+ * `what` completes the sentence "Save your changes before you …", so it reads
+ * as the thing the user just tried to do rather than as a generic warning.
+ * `proceed` is that action, replayed once the question is answered. */
+export interface PendingLeave {
+  what: string;
+  proceed: () => void;
 }
 
 export type WSState = ReturnType<typeof useWorkspaceState>;

@@ -10,6 +10,10 @@ import {
 import { displayName, uniqueFileName } from "./composer";
 import { tryToast } from "./guard";
 import { WSState } from "./state";
+import {
+  EditMode,
+  editModeOf as registryEditModeOf,
+} from "../viewers/registry";
 
 /** File + folder + open-file state handlers (import/view/edit/versions/folders).
  * All state lives in `s`; this only owns the plumbing. Extracted verbatim. */
@@ -59,7 +63,52 @@ export function makeFileActions(s: WSState) {
     try {
       const vs = await api.listFileVersions(s.openFile.id);
       s.setVersions([...vs].sort((a, b) => b.savedAt.localeCompare(a.savedAt)));
+      // The retention limit is the host's constant, asked for rather than
+      // duplicated here — the strip has to state a number that is actually the
+      // one the prune uses, or it becomes a second lie about the same thing.
+      s.setVersionsKept(await api.fileVersionsKept());
+      // ART-1: what made the state currently on screen. Fetched alongside the
+      // list — a version history that can say where the OLD states came from but
+      // not the one you are looking at answers the less useful half.
+      s.setHeadProvenance(await api.getFileProvenance(s.openFile.id));
       s.setShowHistory(true);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
+  /** Keep this version out of the rolling window, or let it back in. The list
+   *  is re-read rather than patched in place: pinning changes what the NEXT
+   *  save would evict, and the strip's "only N kept" note is derived from it. */
+  async function pinVersion(versionId: string, pinned: boolean) {
+    const current = s.openFile;
+    if (!current) return;
+    try {
+      await api.pinFileVersion(versionId, pinned);
+      s.setVersions(
+        [...(await api.listFileVersions(current.id))].sort((a, b) =>
+          b.savedAt.localeCompare(a.savedAt),
+        ),
+      );
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
+  /** Delete ONE saved version. Every version is a whole copy of the file, so
+   *  this is how a 200 MB recording's ten snapshots stop costing 2 GB. Not
+   *  undoable — the caller arms it behind a confirm row. */
+  async function deleteVersion(versionId: string) {
+    const current = s.openFile;
+    if (!current) return;
+    try {
+      await api.deleteFileVersion(versionId);
+      s.setVersions(
+        [...(await api.listFileVersions(current.id))].sort((a, b) =>
+          b.savedAt.localeCompare(a.savedAt),
+        ),
+      );
+      s.pushToast("success", "Deleted that saved version.");
     } catch (e) {
       s.pushToast("error", String(e));
     }
@@ -102,6 +151,9 @@ export function makeFileActions(s: WSState) {
           b.savedAt.localeCompare(a.savedAt),
         ),
       );
+      // ART-1: a restore moves the head's provenance back with the bytes, so the
+      // strip must re-read it rather than keep describing the state it replaced.
+      s.setHeadProvenance(await api.getFileProvenance(current.id));
       s.pushToast("success", "Restored an earlier version.");
     } catch (e) {
       s.pushToast("error", String(e));
@@ -284,19 +336,88 @@ export function makeFileActions(s: WSState) {
     }
   }
 
+  /** Refresh the trash list + count. Every trash mutation ends with this, so
+   * the badge is read back from the room rather than adjusted by hand. */
+  async function reloadTrash() {
+    await tryToast(s, async () => s.setTrashed(await api.listTrashedFiles()));
+  }
+
+  /** Detach a file id from everything in the UI that is still pointing at it.
+   * Shared by trash and by permanent delete: both make the id unreadable, and
+   * a viewer left open on it would keep fetching a row it can no longer get
+   * ("Query returned no rows" toasts). */
+  function forgetFile(id: string) {
+    s.setAttachments((a) => a.filter((f) => f.id !== id));
+    if (s.openFileRef.current?.id === id) s.setOpenFile(null);
+    s.setRecLive((r) => (r?.fileId === id ? null : r));
+  }
+
   async function removeFile(id: string) {
+    const name = s.files.find((f) => f.id === id)?.name;
     try {
-      await api.deleteFile(id);
+      await api.trashFile(id);
     } catch (e) {
       s.pushToast("error", `Could not remove that file: ${String(e)}`);
       return;
     }
-    s.setAttachments((a) => a.filter((f) => f.id !== id));
-    // A viewer left open on the deleted file would keep fetching a row that
-    // no longer exists ("Query returned no rows" toasts).
-    if (s.openFileRef.current?.id === id) s.setOpenFile(null);
-    s.setRecLive((r) => (r?.fileId === id ? null : r));
+    forgetFile(id);
     await tryToast(s, async () => s.setFiles(await api.listFiles()));
+    await reloadTrash();
+    // Say where it went. "Deleted" with no undo in sight is what made this the
+    // audit's one high-severity gap; the toast is the first place the net is
+    // visible, so it names the trash rather than just reporting success.
+    s.pushToast(
+      "success",
+      name ? `Moved "${displayName(name)}" to the trash.` : "Moved to the trash.",
+    );
+  }
+
+  async function restoreFile(id: string) {
+    let name: string;
+    try {
+      name = (await api.restoreFile(id)).name;
+    } catch (e) {
+      s.pushToast("error", `Could not restore that file: ${String(e)}`);
+      return;
+    }
+    await tryToast(s, async () => s.setFiles(await api.listFiles()));
+    await reloadTrash();
+    s.pushToast("success", `Restored "${displayName(name)}".`);
+  }
+
+  async function destroyFile(id: string) {
+    const name = s.trashed.find((f) => f.id === id)?.name;
+    try {
+      await api.deleteFilePermanently(id);
+    } catch (e) {
+      s.pushToast("error", `Could not delete that file: ${String(e)}`);
+      return;
+    }
+    forgetFile(id);
+    await reloadTrash();
+    s.pushToast(
+      "success",
+      name ? `Deleted "${displayName(name)}" for good.` : "Deleted for good.",
+    );
+  }
+
+  async function emptyTrash() {
+    let destroyed: number;
+    try {
+      destroyed = await api.emptyTrash();
+    } catch (e) {
+      s.pushToast("error", `Could not empty the trash: ${String(e)}`);
+      return;
+    }
+    await reloadTrash();
+    // Report the number the backend actually destroyed. An empty trash must
+    // not read as work done.
+    s.pushToast(
+      destroyed > 0 ? "success" : "info",
+      destroyed > 0
+        ? `Deleted ${destroyed} file${destroyed === 1 ? "" : "s"} for good.`
+        : "The trash was already empty.",
+    );
   }
 
   async function viewFile(id: string, target?: FileTarget) {
@@ -361,18 +482,26 @@ print(data.upper())
    * onSave is fire-and-forget — so a failed write MUST be loud here, and must
    * leave the dirty mirror raised so the unsaved-edits guard still stops a tab
    * switch from throwing the text away. */
-  async function saveEdit(newText: string) {
+  async function saveEdit(newText: string): Promise<boolean> {
     const current = s.openFile;
-    if (!current) return;
+    if (!current) return false;
     try {
-      await api.updateFileContent(current.id, newText);
+      // A Word file is rewritten paragraph by paragraph inside its own OOXML
+      // so its styles, tables and images survive; everything else is a plain
+      // whole-file write. Both are in-place saves — the difference is only in
+      // what "in place" means for the format.
+      if (current.content.kind === "docx") {
+        await api.updateDocxText(current.id, newText);
+      } else {
+        await api.updateFileContent(current.id, newText);
+      }
     } catch (e) {
       s.editorDirtyRef.current = true;
       s.pushToast(
         "error",
         `Could not save "${current.content.name}" — your edit is still in the editor. ${String(e)}`,
       );
-      return;
+      return false;
     }
     s.setOpenFile({
       ...current,
@@ -380,22 +509,25 @@ print(data.upper())
     });
     s.pushToast("success", `Saved "${current.content.name}".`);
     await tryToast(s, async () => s.setFiles(await api.listFiles()));
+    return true;
   }
 
-  async function saveEditAsCopy(newText: string) {
+  async function saveEditAsCopy(newText: string): Promise<boolean> {
     const current = s.openFile;
-    if (!current) return;
+    if (!current) return false;
     const base = current.content.name.replace(/\.[^.]+$/, "");
     try {
       const meta = await api.saveGeneratedFile(`${base} (edited).md`, newText);
       s.setFiles(await api.listFiles());
       s.pushToast("success", `Saved "${meta.name}" into the room — the original file is unchanged.`);
+      return true;
     } catch (e) {
       s.editorDirtyRef.current = true;
       s.pushToast(
         "error",
         `Could not save a copy of "${current.content.name}" — your edit is still in the editor. ${String(e)}`,
       );
+      return false;
     }
   }
 
@@ -439,14 +571,34 @@ print(data.upper())
     }
   }
 
-  /** What edit mode means for the open file, if anything. */
-  function editModeOf(c: FileContent): "grid" | "editor" | "copy" | null {
-    if (c.kind === "sheet" || c.kind === "csv") {
-      return /\.xls$/i.test(c.name) ? null : "grid";
+  /** Ask before an action throws away an unsaved edit.
+   *
+   * Monaco holds ONE buffer — the file that is showing — so anything that
+   * unmounts it takes the edit with it: closing the file, switching or closing
+   * a tab, opening an area, ⌘T. Those paths used to disagree with each other:
+   * locking and quitting asked, the tab strip refused with a toast that offered
+   * no way forward, and the viewer's own Close button silently discarded the
+   * work. One question, three answers, one code path.
+   *
+   * `what` completes "… now would lose them", and `proceed` is the interrupted
+   * action, replayed by whichever answer the user gives.
+   */
+  function guardLeave(what: string, proceed: () => void) {
+    if (!s.editModeRef.current || !s.editorDirtyRef.current) {
+      proceed();
+      return;
     }
-    if (c.editable) return "editor";
-    if (c.text && ["pdf", "docx", "text"].includes(c.kind)) return "copy";
-    return null;
+    s.setPendingLeave({ what, proceed });
+  }
+
+  /** What edit mode means for the open file, if anything.
+   *
+   * Answered by the viewer registry now — one table, shared with the viewer
+   * dispatch and checked against the Rust format registry by a test. This used
+   * to restate the rules by hand, which is how ".docx offers Edit as text"
+   * outlived the in-place docx writer that had already been built for the AI. */
+  function editModeOf(c: FileContent): EditMode | null {
+    return registryEditModeOf(c);
   }
 
   // ---- ADD-16: folders ----
@@ -535,10 +687,12 @@ print(data.upper())
 
   return {
     noteExportOnce, exportOne, exportAllFiles, openHistory, openCompare, restoreVersion,
+    pinVersion, deleteVersion,
     undoEdits, suggestImports, dismissImportSuggestion, applyImportSuggestion,
     applyAllImportSuggestions, dismissAllImportSuggestions,
-    reportImport, importFiles, removeFile, viewFile, createNewNote, createNewScript, saveEdit, saveEditAsCopy,
-    duplicateOpenFile, editCell, editModeOf, startCreateFolder, commitCreateFolder,
+    reportImport, importFiles, removeFile, reloadTrash, restoreFile, destroyFile, emptyTrash,
+    viewFile, createNewNote, createNewScript, saveEdit, saveEditAsCopy,
+    duplicateOpenFile, editCell, editModeOf, guardLeave, startCreateFolder, commitCreateFolder,
     commitFolderRename, deleteFolder, moveFile, commitRenameFile,
     toggleFolderCollapse, clampMenu,
   };

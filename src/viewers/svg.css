@@ -1,0 +1,27 @@
+/* An SVG with its source one click away. The drawing is an <img> from a data
+   URL, never inline markup — an .svg is an untrusted room file. */
+.svg-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.svg-bar {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.svg-stage {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: 1.5rem;
+  /* A checkerboard reads as "transparent" rather than as a white drawing. */
+  background-image:
+    linear-gradient(45deg, var(--panel) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--panel) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--panel) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--panel) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+.svg-stage.dark { background-color: #111; background-image: none; }
+.svg-stage img { max-width: 100%; max-height: 100%; }
+.svg-source { flex: 1; overflow: auto; margin: 0; padding: 0.75rem; white-space: pre-wrap; }

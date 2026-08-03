@@ -9,6 +9,14 @@ interface DeleteControlProps {
   confirmDelete: string | null;
   askConfirm: (key: string) => void;
   cancelConfirm: () => void;
+  /** What the armed prompt asks, when plain "Delete?" would understate it.
+   *
+   * The trash's per-file destroy is the case this exists for: there, ✓ is the
+   * one click in the app with nothing behind it, and asking the same "Delete?"
+   * as the reversible move-to-trash would make the irreversible act look like
+   * the recoverable one. Defaults to "Delete?" so every existing caller is
+   * unchanged. */
+  question?: string;
 }
 
 /** A trash/× button that first asks "Delete? ✓ ✕" before firing. Extracted
@@ -27,6 +35,7 @@ export default function DeleteControl({
   confirmDelete,
   askConfirm,
   cancelConfirm,
+  question = "Delete?",
 }: DeleteControlProps) {
   const armed = confirmDelete === k;
   const yesRef = useRef<HTMLButtonElement | null>(null);
@@ -50,7 +59,7 @@ export default function DeleteControl({
       // ADD-25: an armed destructive confirm is a consent surface — the agent
       // driver must not be able to click ✓ on a delete it didn't earn.
       <span className="confirm-del" data-agent-blocked role="alert">
-        <span className="confirm-q">Delete?</span>
+        <span className="confirm-q">{question}</span>
         <button
           ref={yesRef}
           className="chip-btn confirm-yes"

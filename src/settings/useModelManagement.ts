@@ -17,6 +17,13 @@ export function useModelManagement(
   const [pulling, setPulling] = useState(false);
   const [pullStatus, setPullStatus] = useState("");
   const [pullPercent, setPullPercent] = useState<number | null>(null);
+  // The exact model name the running download was started with. The backend
+  // files a multi-gigabyte pull's cancel flag under `pull:<that name>` and
+  // nothing was ever calling it, so a 3 GB helper could not be stopped short of
+  // quitting the app (`models.rs::pull_cancel_key`). A ref, not state: Stop has
+  // to reach the name the CURRENT call used, not a re-render behind.
+  const pullingRef = useRef<string | null>(null);
+  const [stoppingPull, setStoppingPull] = useState(false);
   const [error, setError] = useState("");
   // ADD-3: two-step confirm for deleting a model.
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
@@ -35,6 +42,15 @@ export function useModelManagement(
   // HELPERS — vision + embedding models (recommended_models drives the pulls).
   const [recommended, setRecommended] = useState<RecommendedModels | null>(null);
   const [pullingSpecial, setPullingSpecial] = useState<string | null>(null);
+  // Which model would actually mark an image for this room (null = none can).
+  // Asked, not derived: this section used to answer it from the local Ollama
+  // list alone, so a room running a cloud vision model was told its vision
+  // helper was missing and offered a download it did not need.
+  const [groundingModel, setGroundingModel] = useState<string | null>(null);
+  /** Why this room cannot mark an image, when the reason is NOT "download a
+   *  vision helper". Null means either it can, or the honest answer really is
+   *  "nothing here can see" — which the download offer already covers. */
+  const [visionBlock, setVisionBlock] = useState<string | null>(null);
 
   const modelsKey = ai?.models.join(",") ?? "";
   useEffect(() => {
@@ -43,6 +59,32 @@ export function useModelManagement(
     } else {
       setCaps([]);
     }
+    // The room's model can see even when Ollama is down or empty (a cloud
+    // engine), so this ask is NOT gated on either.
+    api
+      .groundingModelForRoom()
+      .then(setGroundingModel)
+      .catch(() => setGroundingModel(null));
+    // PREFLIGHT, not a second guess: when nothing can mark an image, ASK the
+    // engine's declared record why before advising a download. "Your model can
+    // see but this room's privacy door removes the pixels" is fixed by a switch,
+    // not by a 3 GB download — and offering the download was the only thing this
+    // screen ever said.
+    //
+    // ONLY the door. `blocked` alone is not the question: the ordinary "this
+    // model cannot see" answer is ALSO blocked, and that is precisely the case
+    // the download button exists for — keying off the status swallowed the
+    // button on the most common Mac in the world (one text-only local model, no
+    // vision helper yet) and replaced it with "choose a different model". The
+    // record already separates the two; read its code, do not re-derive it.
+    api
+      .enginePreflight("vision")
+      .then((v) =>
+        setVisionBlock(
+          v.status === "blocked" && v.code === "privacy-door" ? v.reason : null,
+        ),
+      )
+      .catch(() => setVisionBlock(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ai?.running, modelsKey]);
 
@@ -81,6 +123,16 @@ export function useModelManagement(
     }
   }
 
+  /** Stop the 574 MB download. It ran for many minutes with no way out — the
+   * button disabled itself and quitting the app mid-write was the only exit. */
+  async function cancelStt() {
+    try {
+      if (await api.sttCancelDownload()) setSttErr("Download stopped.");
+    } catch (e) {
+      setSttErr(String(e));
+    }
+  }
+
   async function removeStt() {
     setSttErr("");
     try {
@@ -91,10 +143,34 @@ export function useModelManagement(
     }
   }
 
+  /** Did this failure come from the user pressing Stop? `ollama::PULL_CANCELLED`
+   *  is a sentence rather than a sentinel, so match its wording — a stopped
+   *  download is not an error and must not be reported as one. */
+  function wasStopped(msg: string): boolean {
+    return msg.includes("download was cancelled");
+  }
+
+  /** Abandon the running download. Reaches the SAME cancel registry chat's Stop
+   *  uses, keyed by the model name the pull was started with. */
+  async function stopPull() {
+    const name = pullingRef.current;
+    if (!name || stoppingPull) return;
+    setStoppingPull(true);
+    try {
+      await api.cancelAsk(`pull:${name}`);
+      setPullStatus("stopping…");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setStoppingPull(false);
+    }
+  }
+
   async function pull() {
     const name = pullName.trim();
     if (!name || pulling) return;
     setPulling(true);
+    pullingRef.current = name;
     setError("");
     setPullStatus("starting…");
     setPullPercent(null);
@@ -104,9 +180,11 @@ export function useModelManagement(
       setPullName("");
       onModelsChanged();
     } catch (e) {
-      setPullStatus("");
-      setError(String(e));
+      const msg = String(e);
+      setPullStatus(wasStopped(msg) ? "download stopped" : "");
+      if (!wasStopped(msg)) setError(msg);
     } finally {
+      pullingRef.current = null;
       setPulling(false);
       setPullPercent(null);
     }
@@ -148,6 +226,9 @@ export function useModelManagement(
     if (!label || pulling || pullingSpecial) return;
     setError("");
     setPullingSpecial(label);
+    // `ensure_embed_model` pulls under the embed model's own name, so Stop has
+    // to reach THAT key, not the empty `name` this was called with.
+    pullingRef.current = name || recommended?.embed || null;
     setPullStatus("starting…");
     setPullPercent(null);
     try {
@@ -159,9 +240,11 @@ export function useModelManagement(
       setPullStatus("ready ✓");
       onModelsChanged();
     } catch (e) {
-      setPullStatus("");
-      setError(String(e));
+      const msg = String(e);
+      setPullStatus(wasStopped(msg) ? "download stopped" : "");
+      if (!wasStopped(msg)) setError(msg);
     } finally {
+      pullingRef.current = null;
       setPullingSpecial(null);
       setPullPercent(null);
     }
@@ -175,10 +258,11 @@ export function useModelManagement(
     return ai.models.some((m) => base(m) === target);
   }
 
-  // Vision counts as present if the recommended helper is installed OR any
-  // installed model already reports vision. Embed is name-only.
-  const visionInstalled =
-    hasModel(recommended?.vision) || caps.some((c) => c.vision);
+  // Vision counts as present when SOMETHING can actually mark an image for this
+  // room — the room's own model included. Was `hasModel(recommended.vision) ||
+  // caps.some(c => c.vision)`: a name match plus the local capability list, both
+  // blind to the cloud model the room may be running. Embed is name-only.
+  const visionInstalled = groundingModel != null;
   const embedInstalled = hasModel(recommended?.embed);
 
   // Dictation shaping handlers (moved verbatim from the Model section JSX so the
@@ -197,6 +281,8 @@ export function useModelManagement(
     setPullName,
     pulling,
     pull,
+    stopPull,
+    stoppingPull,
     pullStatus,
     pullPercent,
     error,
@@ -209,6 +295,7 @@ export function useModelManagement(
     sttPercent,
     sttErr,
     downloadStt,
+    cancelStt,
     removeStt,
     dictTranslate,
     dictMode,
@@ -219,6 +306,8 @@ export function useModelManagement(
     pullingSpecial,
     pullSpecial,
     visionInstalled,
+    groundingModel,
+    visionBlock,
     embedInstalled,
   };
 }

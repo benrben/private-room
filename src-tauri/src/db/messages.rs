@@ -16,19 +16,60 @@ pub fn like_escape(needle: &str) -> String {
     out
 }
 
-/// ADD-6: chat messages whose content contains `needle` (already lowercased) —
-/// (chat id, message id, content). Orphan (chat_id NULL) rows are skipped.
-/// `needle` is taken literally: its LIKE wildcards are escaped here, so callers
-/// pass the user's raw text.
+/// How many words of a query are actually matched on. A query is a handful of
+/// words; the cap only stops a pasted paragraph from building a statement with
+/// a hundred `LIKE` clauses in it. Words past the cap are IGNORED, which widens
+/// the result set — never narrows it — so nothing a user typed can silently
+/// remove a row that the words we did use match.
+const MAX_SEARCH_TERMS: usize = 8;
+
+/// The words a hit must contain, escaped and ready to bind.
+///
+/// Search used to be ONE literal substring, so "diarisation speaker" found
+/// nothing in a room full of "speaker diarisation" — the words were right and
+/// the order was not. Splitting on whitespace and requiring ALL of them, in any
+/// order, is what people already expect of a search box. A query with no
+/// whitespace behaves exactly as it always did.
+pub fn search_terms(needle: &str) -> Vec<String> {
+    needle
+        .split_whitespace()
+        .take(MAX_SEARCH_TERMS)
+        .map(like_escape)
+        .collect()
+}
+
+/// `AND lower(<col>) LIKE …` once per term, numbered from `first_param`.
+///
+/// Returned as SQL text rather than as a fixed clause because the term count is
+/// the user's, not ours. Every clause carries `ESCAPE '\'` — `search_terms`
+/// escapes the wildcards, and an escape without the clause does nothing.
+pub fn like_all_clause(col: &str, terms: &[String], first_param: usize) -> String {
+    terms
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            format!(" AND lower({col}) LIKE '%' || ?{} || '%' ESCAPE '\\'", first_param + i)
+        })
+        .collect()
+}
+
+/// ADD-6: chat messages containing every word of `needle` (already lowercased),
+/// in any order — (chat id, message id, content). Orphan (chat_id NULL) rows are
+/// skipped. The words are taken literally: their LIKE wildcards are escaped
+/// here, so callers pass the user's raw text.
 pub fn messages_like(conn: &Connection, needle: &str) -> Result<Vec<(String, String, String)>, String> {
-    query_rows(
-        conn,
-        "SELECT chat_id, id, content FROM messages
-         WHERE chat_id IS NOT NULL AND lower(content) LIKE '%' || ?1 || '%' ESCAPE '\\'
+    let terms = search_terms(needle);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT chat_id, id, content FROM messages WHERE chat_id IS NOT NULL{}
          ORDER BY rowid DESC LIMIT 30",
-        [like_escape(needle)],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )
+        like_all_clause("content", &terms, 1),
+    );
+    query_rows(conn, &sql, rusqlite::params_from_iter(terms), |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })
 }
 
 /// Insert a new message and return it (with the row's assigned timestamp).
@@ -67,6 +108,29 @@ pub fn insert_message(
         effects: effects.cloned(),
         kind: None,
     })
+}
+
+/// Room map: the `sources` list of the newest `limit` answers that cited
+/// anything, newest first — one Vec of file NAMES per message.
+///
+/// Names, not ids, is what the column holds (see `insert_message`), so the
+/// caller has to resolve them and must expect misses: a renamed file, or a
+/// second run that `available_name` bumped to "X (2)", no longer matches the
+/// name the answer was written with. An unresolved name is dropped, never
+/// guessed at.
+pub fn recent_message_sources(conn: &Connection, limit: usize) -> Result<Vec<Vec<String>>, String> {
+    let raw: Vec<String> = query_rows(
+        conn,
+        "SELECT sources FROM messages
+         WHERE sources IS NOT NULL AND sources <> '' AND sources <> '[]'
+         ORDER BY rowid DESC LIMIT ?1",
+        [limit as i64],
+        |r| r.get(0),
+    )?;
+    Ok(raw
+        .iter()
+        .filter_map(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .collect())
 }
 
 /// A context-handoff summary marker: `role='assistant'` (so it renders and
@@ -167,8 +231,12 @@ pub fn recent_messages(
 }
 
 /// (file count, message count) for the room summary shown in RoomInfo.
+///
+/// The file half is [`room_file_count`], not a `count(*)` spelled out again
+/// here: RoomInfo, the front page and the Library badge are all answering the
+/// same question, so they ask it in one place.
 pub fn room_counts(conn: &Connection) -> Result<(i64, i64), String> {
-    let file_count: i64 = query_one(conn, "SELECT count(*) FROM files", [], |r| r.get(0))?;
+    let file_count = room_file_count(conn)?;
     let message_count: i64 = query_one(conn, "SELECT count(*) FROM messages", [], |r| r.get(0))?;
     Ok((file_count, message_count))
 }
@@ -208,6 +276,31 @@ mod tests {
         // An ordinary query is unaffected.
         assert_eq!(messages_like(&conn, "deposit").unwrap().len(), 1);
         assert_eq!(like_escape("100% _sure_"), r"100\% \_sure\_");
+    }
+
+    #[test]
+    fn every_word_has_to_appear_but_the_order_does_not() {
+        // Search matched ONE literal substring, so a reader who typed the right
+        // words in the wrong order got "nothing found" from a room that plainly
+        // contained them.
+        let conn = mem();
+        insert_message(&conn, "c1", "user", "speaker diarisation notes", &[], None).unwrap();
+        insert_message(&conn, "c1", "user", "diarisation of one speaker", &[], None).unwrap();
+        insert_message(&conn, "c1", "user", "speakers at the conference", &[], None).unwrap();
+
+        // Both orders find both rows that hold both words — and only those.
+        for q in ["speaker diarisation", "diarisation speaker"] {
+            let hits = messages_like(&conn, q).unwrap();
+            assert_eq!(hits.len(), 2, "{q:?} found {hits:?}");
+        }
+        // A word that is missing still excludes the row: this is AND, not OR.
+        assert!(messages_like(&conn, "speaker rhubarb").unwrap().is_empty());
+        // Extra whitespace is not a term, and a whitespace-only query is not a
+        // match-everything query.
+        assert_eq!(messages_like(&conn, "  speaker   notes  ").unwrap().len(), 1);
+        assert!(messages_like(&conn, "   ").unwrap().is_empty());
+        // Wildcards stay literal per-word, exactly as for a one-word query.
+        assert_eq!(search_terms("50% a_b"), vec![r"50\%", r"a\_b"]);
     }
 
     #[test]

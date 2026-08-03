@@ -135,8 +135,14 @@ test("the chrome's remaining controls answer like the real commands", async () =
 
   // Save reports the sentence the notice banner prints verbatim.
   const saved = await qa.invoke("browser_save_page", { what: "page" });
-  assert.match(saved, /^Saved ".+" \(readable copy\) and ".+" \(exact HTML\) into the room\.$/);
-  assert.match(await qa.invoke("browser_save_page", { what: "selection" }), /^Saved ".+" into the room\.$/);
+  assert.match(saved, /^Saved the readable article as ".+\.md" \(searchable\) and ".+\.html" \(formatted\)\./);
+  // What the page declared is named, so the banner can be read for whether the
+  // author and date survived the save.
+  assert.match(saved, /Kept from the page: .+ · by .+ · published .+\./);
+  assert.match(
+    await qa.invoke("browser_save_page", { what: "selection" }),
+    /^Saved the selected text as ".+ \(selection\)\.md"\.$/,
+  );
 
   await qa.invoke("browser_clear_journal");
   assert.deepEqual(await qa.invoke("browser_journal", {}), []);
@@ -184,4 +190,32 @@ test("?qa_state=empty empties the collections without breaking their shape", asy
   const front = await qa.invoke("front_page");
   assert.deepEqual(front.recentFiles, []);
   assert.equal(front.fileCount, 0);
+});
+
+test("the start screen's recent rooms carry the field name and type the app reads", async () => {
+  // The mock sent `lastOpened` as an ISO string; the app reads `openedAt` as
+  // epoch millis (RecentRoom / commands.rs). So `relativeTime(room.openedAt)`
+  // was always undefined and the "Opened 2 hours ago" line was never captured
+  // in a QA screenshot — the one part of the start screen nobody ever reviewed.
+  const qa = install({ hash: "#gate" });
+  const recent = await qa.invoke("list_recent");
+  assert.ok(recent.length, "the gate screen needs recent rooms to draw");
+  for (const room of recent) {
+    assert.equal(typeof room.openedAt, "number", `openedAt missing on ${room.name}`);
+    assert.ok(room.openedAt > 0 && room.openedAt <= Date.now());
+    assert.equal(room.lastOpened, undefined, "the old wrong key is gone");
+    assert.equal(typeof room.missing, "boolean");
+  }
+});
+
+test("the recording fixture does not carry a RecMeta field the backend dropped", async () => {
+  // Rust's RecMeta has no `version` (there is no version dispatch). A mock that
+  // sends one hides the divergence from the harness, and the TS interface that
+  // declared it let `meta.version < 2` type-check and be silently false.
+  const qa = install();
+  const rec = await qa.invoke("rec_get", { fileId: "f-audio" });
+  assert.ok(rec && rec.meta, "the recording fixture has to exist for this to prove anything");
+  assert.equal(rec.meta.version, undefined, "RecMeta.version is not on the wire");
+  assert.equal(typeof rec.meta.durationCs, "number");
+  assert.ok(Array.isArray(rec.meta.segments) && rec.meta.segments.length);
 });

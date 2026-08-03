@@ -145,6 +145,22 @@ class RunRequest(BaseModel):
     #: this list is read (``graph.py`` gates the ``consult_advisor`` tool on it).
     advisors: list[str] = Field(default_factory=list)
 
+    def resolved_write(self) -> bool:
+        """Just the write lane — host decision else router.
+
+        The ONE lane the agent run reads. Asking :meth:`resolved_routing` for it
+        and subscripting ``[0]`` still scanned the question four more times for
+        answers that went straight into the bin, which is the waste this exists
+        to remove; the full tuple stays for the callers that really want all
+        five (the Rust-vs-sidecar agreement checks).
+        """
+        from .routing import wants_write_tools
+
+        r = self.routing
+        if r and r.write is not None:
+            return r.write
+        return wants_write_tools(self.question)
+
     def resolved_routing(self) -> tuple[bool, bool, bool, bool, bool]:
         """(write, ui, jobs, skills, connectors) — host decision else router."""
         from .routing import (
@@ -264,6 +280,43 @@ class CapabilitiesRequest(BaseModel):
 
     model: str
     base_url: str = "http://127.0.0.1:11434"
+
+
+class SpecialistsRequest(BaseModel):
+    """Body of ``POST /agents`` — which specialists this room can dispatch to.
+
+    The host asks because the COMPOSER now draws a menu of them (the owner's
+    ``*`` tag). It sends the same two facts a turn's catalog is built from —
+    the room's web setting and the tool names its bridge tier would serve — so
+    the menu and the turn cannot disagree about who exists. Nothing about the
+    room's CONTENT crosses: tool names and one boolean.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    web_enabled: bool = False
+    served_names: list[str] = Field(default_factory=list)
+
+
+class AgentSupportRequest(BaseModel):
+    """Body of ``POST /agent_support`` — the provider × agent matrix's agent half.
+
+    The host declares one capability record per engine (``commands/
+    capabilities.rs``) and knows which built-in tool names each bridge TIER
+    serves; only this side knows which workers those names add up to. So it
+    sends ``{tier name: [tool names]}`` and gets back the worker ids each tier
+    can actually reach, from the same predicate a live turn uses. Neither side
+    keeps a written-down matrix, which is the point — a hand-maintained one
+    would be stale the next time an agent, a tier or an engine changed.
+
+    Nothing about the room's CONTENT crosses: tool names and one boolean.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    web_enabled: bool = False
+    #: Tier name -> the built-in tool names that tier may ever be served.
+    tiers: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class DeleteRequest(BaseModel):
@@ -490,6 +543,8 @@ __all__ = [
     "WarmRequest",
     "PullRequest",
     "CapabilitiesRequest",
+    "SpecialistsRequest",
+    "AgentSupportRequest",
     "DeleteRequest",
     "LabelRequest",
     "TtsRequest",

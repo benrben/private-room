@@ -51,6 +51,27 @@ export const LANGUAGE_BY_EXT: Record<string, SyntaxLanguage> = {
   lua: "lua",
   scala: "scala",
   pl: "perl",
+  // Extensions the app already accepted as text but rendered with NO syntax
+  // colours at all, because this table never listed them.
+  jsonl: "json",
+  ndjson: "json",
+  vue: "html",
+  svelte: "html",
+  svg: "xml",
+  // monaco-editor ships no `latex` or `diff` basic language, and the type
+  // above makes claiming one a compile error rather than silently-plain text.
+  // reStructuredText's tokenizer is the closest thing to LaTeX's markup that
+  // this build actually has; a diff reads fine as plain text and is left so.
+  tex: "restructuredtext",
+  rst: "restructuredtext",
+  dockerfile: "dockerfile",
+  graphql: "graphql",
+  gql: "graphql",
+  proto: "proto",
+  properties: "ini",
+  cfg: "ini",
+  conf: "ini",
+  ipynb: "json",
 };
 
 export function languageForFile(name: string): string {

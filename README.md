@@ -77,12 +77,14 @@ Nothing leaves your Mac unless you say so.
 
 ## About the project
 
-A `.roomai` file works like a document. Double-click it in Finder, unlock it
+An `.arcelle` file works like a document. Double-click it in Finder, unlock it
 with your password (or a fingerprint), and you're inside a private workspace
 containing your files, chat history, AI memory, recordings, and generated
 documents. Everything lives in **one SQLCipher-encrypted SQLite file** — copy
-it, back it up, or AirDrop it like any other document. By default nothing
-leaves your computer: the AI runs locally through Ollama — and if you *choose*
+it, back it up, or AirDrop it like any other document. (Rooms made before the
+Arcelle rename end in `.roomai`; those still open, and nothing needs
+converting.) By default nothing leaves your computer: the AI runs locally
+through Ollama — and if you *choose*
 to point a room at a cloud engine, the app says so out loud, everywhere.
 
 ### Why it's different
@@ -94,7 +96,7 @@ to point a room at a cloud engine, the app says so out loud, everywhere.
   that re-opens the highlight right in the file.
 - 📤 **AirDrop your whole workspace as one file.** A room is a single document,
   so handing someone an entire encrypted workspace — files, chats, memory, and
-  all — is one drop of one `.roomai` file. Seal it and send it; nothing is left
+  all — is one drop of one `.arcelle` file. Seal it and send it; nothing is left
   behind on a server.
 - 🔐 **One encrypted file, no cloud.** The whole workspace is a single AES-256
   SQLCipher document. No account, no sync, no server. Your password is the key
@@ -425,9 +427,10 @@ The Leash lets outside agents into your room; **Connectors** are the other
 direction — outside tools brought to *your* room's AI. The Connectors area
 installs MCP servers by hand or from the public Model Context Protocol registry,
 with filters for verified publishers, local-only, and "no API key needed."
-Browsing that registry is the app's *only* unprompted outbound request, so it
-sits behind an explicit opt-in; nothing about your room is sent, only the
-catalog comes back. A connector that ships both a local package and a hosted
+Browsing that registry is one of only two things Arcelle ever sends anywhere
+without being asked — the other is the launch update check, which you can
+switch off in Settings → Updates &amp; version — so it sits behind an explicit
+opt-in; nothing about your room is sent, only the catalog comes back. A connector that ships both a local package and a hosted
 endpoint installs the **local** one, with a one-tap switch to the cloud
 version. Remote connectors are badged loudly, run their arguments through the
 same redaction door before anything leaves the Mac, and can sign in with OAuth
@@ -594,7 +597,7 @@ are already there.
   access control — it never touches the room file or any plain file, and
   re-enrolling a finger invalidates it.
 - **Checkpoints.** Snapshot the whole room — like a git commit for your
-  `.roomai` — and roll back to any of them. Rollback takes a "before
+  `.arcelle` — and roll back to any of them. Rollback takes a "before
   rollback" safety copy first and refuses to run while jobs or recordings are
   in flight.
 - **OCR for scans.** When a PDF or image has no extractable text, Apple's
@@ -605,8 +608,19 @@ are already there.
 - **Dictation & transcription.** A Whisper engine is *compiled into* the app
   (whisper.cpp on Metal) and the release DMG **ships the voice model**, so
   transcription works offline the moment you open it — no download.
-- **Web is off until you ask.** No online tool is offered to the model — and
-  the browser's address bar refuses to load anything — until you turn the
+- **A room is readable without the app.** Every install also carries a small
+  command-line tool, `roomai`, at
+  `/Applications/Arcelle.app/Contents/MacOS/roomai`. It can `verify` a room
+  file's integrity, print `info` about it, `export` its contents, and open one
+  with a `recover`y code — each only after you give it the room's own password
+  or recovery code, since it opens the same SQLCipher database the app does
+  and has no other way in. (The tool keeps its original `roomai` name — it
+  reads both `.arcelle` and `.roomai` rooms.) It exists so a
+  room file is never hostage to the app that wrote it; nothing in the app
+  calls it, and deleting it costs you only that escape hatch.
+- **Web is off until you ask.** No online tool is offered to the model — the
+  browser's address bar refuses to load anything, and Add → Web link, the
+  video import and the download-job button all refuse too — until you turn the
   internet on in **Settings → Online features**; then *search the web* and
   *use the private browser* are two separate switches under it. There's no key
   to paste and no provider to choose: search is built in, and one query fans
@@ -627,7 +641,7 @@ are already there.
 
 ```mermaid
 flowchart LR
-    subgraph file [".roomai — one encrypted file"]
+    subgraph file [".arcelle — one encrypted file"]
         DB[("SQLCipher · AES-256<br/>files · chats · memory<br/>recordings · versions")]
     end
     subgraph app ["Arcelle.app"]
@@ -705,7 +719,8 @@ git clone https://github.com/benrben/private-room.git
 cd private-room
 npm install
 npm run tauri dev            # run the app
-npm run tauri build          # build Arcelle.app + DMG (registers .roomai)
+npm run tauri build          # build Arcelle.app ONLY (registers .arcelle/.roomai)
+scripts/release.sh           # the DMG + signed updater payload come from here
 ```
 
 Release builds bundle three on-device models (Whisper, TitaNet, Silero — 615 MB
@@ -820,7 +835,18 @@ Next:
       only "fetch an authed asset no link points at"
 - [ ] **Save as PDF** from the browser (needs `WKPDFConfiguration`)
 - [ ] Notarized releases (Developer ID)
-- [ ] Windows port (Tauri)
+- [ ] Windows port — a **rebuild, not a recompile**. Tauri itself is portable;
+      these are not, and each needs a Windows implementation written from
+      scratch or a deliberate "not on Windows":
+      recording the computer's own sound (ScreenCaptureKit),
+      reading text from images (Apple Vision),
+      the private browser (WKWebView),
+      the protected key store (Keychain),
+      audio decoding and conversion (AVFoundation / `afconvert`),
+      spoken output (the macOS neural voices),
+      and the signing/notarization half of the release. Nothing is broken for
+      Mac users today; this line is here so the size of the job is not a
+      surprise.
 
 See the [open issues](https://github.com/benrben/private-room/issues) for
 everything else on the pile, and [CHANGELOG.md](CHANGELOG.md) for what shipped

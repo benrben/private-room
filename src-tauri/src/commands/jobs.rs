@@ -231,15 +231,12 @@ pub fn list_jobs(state: State<'_, AppState>) -> Result<Vec<db::Job>, String> {
 /// checkpoints, and parks the job as 'paused' — Resume continues from there.
 #[tauri::command]
 pub fn cancel_job(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let has_flag = {
-        let flags = state.job_cancels.lock().unwrap();
-        if let Some(flag) = flags.get(&id) {
-            flag.store(true, Ordering::SeqCst);
-            true
-        } else {
-            false
-        }
-    };
+    // Owner replacement #3: through the tree, so a job that has started work of
+    // its own (a child pass, a studio build) stops with it rather than leaving
+    // it running against a job card that already says stopped. Falls back to the
+    // flat `job_cancels` flag for every job that has no node yet, which is what
+    // it did before.
+    let has_flag = crate::cancel::cancel_id(state.inner(), &id).known;
     // Wave 4a: a QUEUED job has no in-memory cancel flag (it never spawned), so
     // the flag flip above is a no-op — park the row directly instead, so
     // "Remove from queue" actually stops it starting later.
@@ -257,31 +254,197 @@ pub fn cancel_job(state: State<'_, AppState>, id: String) -> Result<(), String> 
 
 #[tauri::command]
 pub fn delete_job(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    // Stop it first if it happens to be running.
-    if let Some(flag) = state.job_cancels.lock().unwrap().get(&id) {
-        flag.store(true, Ordering::SeqCst);
-    }
+    // Stop it first if it happens to be running — and, per owner replacement #3,
+    // whatever it had started too: deleting the row while a child keeps writing
+    // is the artifact-after-cancel case with no card left to explain it.
+    crate::cancel::cancel_id(state.inner(), &id);
     state.with_room(|room| db::delete_job(&room.conn, &id))
+}
+
+// ---------------------------------------------------- parked: the app stopped it
+
+/// Why a job stopped when the room was LOCKED (or swapped) under it. The user
+/// caused this, but not by pressing Stop, so the card must not read like a pause
+/// they chose — "Resume" on a job they never paused is a small lie about who
+/// stopped it and why the work is unfinished.
+pub(crate) const PARKED_BY_LOCK: &str = "The room was locked while this was still running.";
+
+/// Why a job stopped when the APP went away — a quit, a crash, a forced restart.
+/// Detected at the next unlock, because nothing ran at exit to say it.
+pub(crate) const PARKED_BY_EXIT: &str = "The app closed while this was still running.";
+
+/// Stamp the parking reason on every live top-level job, WITHOUT stopping any of
+/// them. Called from the lock/close drain while the room is still open and the
+/// runners are still alive, so whichever way each runner lands a moment later the
+/// row can already say what interrupted it (`db::mark_job_parking` explains the
+/// three landings). Returns how many rows were stamped.
+///
+/// 'running' ONLY. A queued row is never parked by the app — `park_running_jobs`
+/// and `quiesce_stale_jobs` both skip it so `pump_on_open` can auto-start it —
+/// and if the pump promotes one to 'running' during the drain, `park_job` writes
+/// the reason itself. So stamping a queued row can never come true, and it does
+/// come back to bite: the only way a queued row reaches 'paused' is the user
+/// pressing Remove, and `set_job_status(.., "paused")` deliberately PRESERVES
+/// the reason (the running runner's epilogue depends on that), so the card would
+/// blame the lock for a removal the user chose, on work that never started.
+pub(crate) fn mark_jobs_parking(conn: &Connection, reason: &str) -> usize {
+    let Ok(jobs) = db::unfinished_jobs(conn) else {
+        return 0;
+    };
+    jobs.iter()
+        .filter(|j| j.status == "running")
+        .filter(|j| db::mark_job_parking(conn, &j.id, reason).is_ok())
+        .count()
+}
+
+/// Park every job still reading as 'running' — the runner is gone, or is about
+/// to lose the room it writes to. Returns how many were parked.
+///
+/// 'queued' is deliberately left alone: a queued job never started, holds no
+/// half-finished work, and `pump_on_open` auto-resumes it at the next unlock.
+/// Demoting it here is exactly the change that once made `pump_on_open` a dead
+/// no-op.
+pub(crate) fn park_running_jobs(conn: &Connection, reason: &str) -> usize {
+    let Ok(jobs) = db::unfinished_jobs(conn) else {
+        return 0;
+    };
+    let mut parked = 0;
+    for j in jobs.iter().filter(|j| j.status == "running") {
+        if db::park_job(conn, &j.id, reason).is_err() {
+            continue;
+        }
+        // A workflow's run row must stop reading as 'running' too, or its
+        // history line keeps a live green dot for a job that is parked.
+        // Harmless for the other job kinds — they have no run row.
+        let _ = db::set_workflow_run_status_by_job(conn, &j.id, "paused");
+        parked += 1;
+    }
+    parked
 }
 
 /// On room open, any job left 'running' belongs to a process that's gone — mark
 /// those 'paused' so the UI offers Resume instead of showing a phantom active
 /// job. Called from the room-open path.
 pub(crate) fn quiesce_stale_jobs(conn: &Connection) {
-    if let Ok(jobs) = db::unfinished_jobs(conn) {
-        // A job left 'running' belongs to a process that's gone (in-memory cancel
-        // flags don't survive a restart) — park it 'paused' so the UI offers
-        // Resume instead of a phantom-active card. A 'queued' job never started,
-        // so it is LEFT queued: `pump_on_open` auto-resumes it at unlock (engine
-        // review #3 — demoting queued here made pump_on_open a dead no-op).
-        for j in jobs.iter().filter(|j| j.status == "running") {
-            let _ = db::set_job_status(conn, &j.id, "paused", None);
-            // A workflow's run row must stop reading as 'running' too, or its
-            // history line keeps a live green dot for a job that is parked.
-            // Harmless for the other job kinds — they have no run row.
-            let _ = db::set_workflow_run_status_by_job(conn, &j.id, "paused");
-        }
+    // A job left 'running' belongs to a process that's gone (in-memory cancel
+    // flags don't survive a restart) — park it 'paused' so the UI offers
+    // Resume instead of a phantom-active card. A 'queued' job never started,
+    // so it is LEFT queued: `pump_on_open` auto-resumes it at unlock (engine
+    // review #3 — demoting queued here made pump_on_open a dead no-op).
+    //
+    // The lock path parks its own jobs before the room handle drops, so what
+    // reaches here still reading 'running' is work the app never got to say
+    // goodbye to: a quit, a crash, a kill. Naming that is the whole point —
+    // "Paused" alone described a deliberate Stop the user never made.
+    park_running_jobs(conn, PARKED_BY_EXIT);
+    // Those rows became parked JUST NOW — after `migrate`'s duplicate sweep had
+    // already run (open_room migrates, then quiesces). A workflow that was still
+    // 'running' when the app died is exactly the row that superseded the parked
+    // attempt beside it, so without this the user opens the room and still sees
+    // two indistinguishable cards for one workflow, and only sees one after the
+    // NEXT open. Sweeping again here costs one scan of a handful of rows and is
+    // a no-op on a room that is already clean.
+    let _ = db::dedupe_parked_jobs(conn);
+}
+
+// ------------------------------------------------ a terminal state on EVERY exit
+
+/// Park a job whose runner died without reaching its own epilogue.
+///
+/// Returns the row's `(cursor, total)` when it actually parked something, and
+/// `None` when the row was already off the live statuses — a panic thrown in
+/// the epilogue AFTER the terminal write must not rewrite a real 'done' as a
+/// failure, and a 'paused' row is already resumable and already honest. Only
+/// 'running' and 'queued' still read as live work, so only those are parked.
+pub(crate) fn park_crashed_job(
+    conn: &Connection,
+    job_id: &str,
+    reason: &str,
+) -> Result<Option<(i64, i64)>, String> {
+    let job = db::get_job(conn, job_id)?;
+    if !matches!(job.status.as_str(), "running" | "queued") {
+        return Ok(None);
     }
+    db::set_job_status(conn, job_id, "error", Some(reason))?;
+    // A workflow job also owns a `workflow_runs` row; the other kinds have none
+    // and this is a no-op for them (same reasoning as `quiesce_stale_jobs`).
+    let _ = db::finish_workflow_run_by_job(conn, job_id, "error", Some(reason));
+    Ok(Some((job.cursor, job.total)))
+}
+
+/// A caught panic payload as a sentence fit for the job's `error` column.
+/// `catch_unwind` hands back `Box<dyn Any>`; only the `&str`/`String` cases
+/// carry the message, and the fallback must still say a CRASH happened rather
+/// than leaving the column blank for the Sidebar to render as "Stopped — ".
+pub(crate) fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .filter(|d| !d.trim().is_empty());
+    match detail {
+        Some(d) => format!("the job runner crashed: {d}"),
+        None => "the job runner crashed".to_string(),
+    }
+}
+
+/// Run a job runner's body on the async runtime with a terminal state
+/// GUARANTEED on every exit — including the one nobody writes code for.
+///
+/// `tauri::async_runtime::spawn` drops the JoinHandle, so a panic anywhere in a
+/// runner is completely silent: a poisoned `state.room` mutex, an index out of
+/// range in a plan, an `unwrap` on a step's params. The epilogue that writes the
+/// terminal status, frees the single queue slot and drops the cancel flag never
+/// runs, so the row stays 'running' for the whole session — a Sidebar card with
+/// a live progress bar for work nothing is doing, behind it a queue that will
+/// never start another job, and `quiesce_stale_jobs` only reconciles any of it
+/// at the NEXT room open. Live QA 2026-08-03: a long agent turn ended with the
+/// reply lost while its background job kept reading as running.
+fn spawn_job_runner<F>(window: tauri::Window, job_id: String, room_path: String, body: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    use futures_util::FutureExt;
+    use tauri::{Emitter, Manager};
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn(async move {
+        let Err(payload) = std::panic::AssertUnwindSafe(body).catch_unwind().await else {
+            return; // the body ran its own epilogue
+        };
+        let reason = panic_reason(payload.as_ref());
+        eprintln!("job {job_id} runner panicked: {reason}");
+        let state = app.state::<AppState>();
+        let parked = {
+            // A panic thrown while the room lock was held POISONS it, and this
+            // handler is the one place that must not go down with it: recover
+            // the guard instead of panicking a second time inside a task whose
+            // JoinHandle is already gone.
+            let guard = state.room.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .as_ref()
+                .filter(|r| r.path == room_path)
+                .and_then(|r| park_crashed_job(&r.conn, &job_id, &reason).ok().flatten())
+        };
+        state
+            .job_cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&job_id);
+        // Report the row's OWN checkpointed numbers — a crash knows how far the
+        // job got only from what it managed to persist, and inventing 0/0 would
+        // wipe a progress bar that had honestly advanced.
+        if let Some((cursor, total)) = parked {
+            let _ = window.emit(
+                "job-progress",
+                serde_json::json!({
+                    "jobId": job_id, "label": format!("Stopped — {reason}"),
+                    "done": cursor, "total": total, "failed": true,
+                }),
+            );
+        }
+        // Free the single queue slot and start whatever was waiting behind this.
+        queue::finish_and_pump(&app, &window, &job_id).await;
+    });
 }
 
 /// Wave 1b (idea 8): a cached one-liner that actually says something. The ''
@@ -405,10 +568,14 @@ async fn deep_summary_plan(
     // CLIs go through the sidecar's external backend, `:cloud` through the
     // proxy; both ride the Cloud lane (remote capacity, visible labeling).
     let chat_model = model.unwrap_or_else(|| best_default(&models));
-    let lane = if is_cloud_model(&chat_model) || is_external_engine(&chat_model) {
-        Lane::Cloud
-    } else {
+    // ONE test for "does this run here" (`capabilities::engine_id_of`), not the
+    // pair of name tests that missed Ollama's `<size>-cloud` spelling — such a
+    // room used to be queued on the LOCAL lane, i.e. one slot at a time, for
+    // work that was actually happening on someone else's machine.
+    let lane = if runs_on_this_mac(&chat_model) {
         Lane::LocalLlm
+    } else {
+        Lane::Cloud
     };
     let steps: Vec<Step> = files
         .iter()
@@ -454,7 +621,9 @@ fn spawn_deep_summary(
 ) {
     use tauri::Manager;
     let app = window.app_handle().clone();
-    tauri::async_runtime::spawn(async move {
+    let (runner_window, runner_job, runner_room) =
+        (window.clone(), job_id.clone(), room_path.clone());
+    spawn_job_runner(runner_window, runner_job, runner_room, async move {
         let state = app.state::<AppState>();
         {
             let guard = state.room.lock().unwrap();
@@ -739,7 +908,9 @@ fn spawn_studio(
 ) {
     use tauri::Manager;
     let app = window.app_handle().clone();
-    tauri::async_runtime::spawn(async move {
+    let (runner_window, runner_job, runner_room) =
+        (window.clone(), job_id.clone(), room_path.clone());
+    spawn_job_runner(runner_window, runner_job, runner_room, async move {
         let state = app.state::<AppState>();
         // Status → running, room-pinned so a swapped room can't be mislabeled.
         {
@@ -907,10 +1078,10 @@ async fn resolve_pass_engine(state: &AppState) -> (String, Lane) {
     };
     let models = ollama::list_models().await.unwrap_or_default();
     let chat_model = explicit.unwrap_or_else(|| best_local_default(&models));
-    let lane = if is_cloud_model(&chat_model) || is_external_engine(&chat_model) {
-        Lane::Cloud
-    } else {
+    let lane = if runs_on_this_mac(&chat_model) {
         Lane::LocalLlm
+    } else {
+        Lane::Cloud
     };
     (chat_model, lane)
 }
@@ -1058,7 +1229,9 @@ fn spawn_file_pass(
 ) {
     use tauri::Manager;
     let app = window.app_handle().clone();
-    tauri::async_runtime::spawn(async move {
+    let (runner_window, runner_job, runner_room) =
+        (window.clone(), job_id.clone(), room_path.clone());
+    spawn_job_runner(runner_window, runner_job, runner_room, async move {
         let state = app.state::<AppState>();
         {
             let guard = state.room.lock().unwrap();
@@ -1919,14 +2092,17 @@ mod tests {
         // at a time (local) or 4 at a time (cloud / external CLI). A crash on a
         // cloud engine therefore replays up to 3 already-summarized files.
         let lane_for = |m: &str| {
-            if is_cloud_model(m) || is_external_engine(m) {
-                Lane::Cloud
-            } else {
+            if runs_on_this_mac(m) {
                 Lane::LocalLlm
+            } else {
+                Lane::Cloud
             }
         };
         assert_eq!(lane_for("qwen3.5:4b"), Lane::LocalLlm);
         assert_eq!(lane_for("minimax-m3:cloud"), Lane::Cloud);
+        // The spelling the old pair of name tests missed: this ran on the LOCAL
+        // lane, one slot at a time, for work happening off the Mac.
+        assert_eq!(lane_for("gpt-oss:120b-cloud"), Lane::Cloud);
         assert_eq!(lane_for("claude-cli::opus::high"), Lane::Cloud);
         assert_eq!(lane_for("openrouter::x-ai/grok-4"), Lane::Cloud);
 
@@ -2086,5 +2262,295 @@ mod tests {
         assert_eq!(j.total, 4);
         assert_eq!(j.plan["steps"][0]["kind"], "summarize_file");
         assert_eq!(db::get_job(&conn, &failed).unwrap().error.as_deref(), Some("OLLAMA_DOWN"));
+    }
+
+    #[test]
+    fn quiesce_collapses_the_duplicate_it_just_created() {
+        // The room-open ordering hole. `open_room` runs migrate() — which sweeps
+        // duplicate parked rows — and only THEN quiesces. A workflow left
+        // 'running' by a crash is invisible to that sweep (it is not parked
+        // yet), so the moment quiesce parks it the room holds two
+        // indistinguishable cards for one workflow again. The user's retest is
+        // exactly this: open the room, still see duplicates.
+        let conn = db::mem();
+        let plan = |trigger: &str| {
+            serde_json::json!({ "workflow_id": "wf-1", "trigger": trigger })
+        };
+        // Both rows are minted while still 'queued', which is how the room
+        // really got here — the write-site guard only ever retires a PARKED row,
+        // so it cannot build this state for us.
+        let stale = db::create_job(&conn, "workflow", "Workflow — Digest", &plan("schedule"), 2)
+            .unwrap();
+        let live =
+            db::create_job(&conn, "workflow", "Workflow — Digest", &plan("manual"), 2).unwrap();
+        let other = db::create_job(&conn, "workflow", "Workflow — Weekly",
+            &serde_json::json!({ "workflow_id": "wf-2" }), 1).unwrap();
+        db::set_job_status(&conn, &stale, "paused", None).unwrap();
+        // The run that superseded it, still 'running' because the app died.
+        db::set_job_status(&conn, &live, "running", None).unwrap();
+        db::checkpoint_job(&conn, &live, 1, &serde_json::json!({})).unwrap();
+        // A different workflow is never folded in.
+        db::set_job_status(&conn, &other, "paused", None).unwrap();
+
+        // Reproduce the real order: the migration sweep, then quiesce.
+        db::dedupe_parked_jobs(&conn).unwrap();
+        assert!(db::get_job(&conn, &stale).is_ok(), "not parked-vs-parked yet");
+        quiesce_stale_jobs(&conn);
+
+        let mut left: Vec<String> = db::list_jobs(&conn).unwrap().into_iter().map(|j| j.id).collect();
+        left.sort();
+        let mut want = vec![live.clone(), other.clone()];
+        want.sort();
+        assert_eq!(left, want, "one card per workflow after a crash-open");
+        // The survivor is the one that actually ran, checkpoint intact.
+        let j = db::get_job(&conn, &live).unwrap();
+        assert_eq!(j.status, "paused");
+        assert_eq!(j.cursor, 1, "quiesce must not reset the checkpoint");
+    }
+
+    /// The two DB writes `close_room` makes, in the order it makes them: stamp
+    /// every live row while the runners are still alive and the room is still
+    /// open (`drain_inflight`), then force whatever is still 'running' when the
+    /// room handle drops (`teardown_open_room`).
+    fn simulate_lock(conn: &Connection) {
+        mark_jobs_parking(conn, PARKED_BY_LOCK);
+        park_running_jobs(conn, PARKED_BY_LOCK);
+    }
+
+    #[test]
+    fn a_job_running_when_the_room_locks_is_parked_and_says_the_lock_did_it() {
+        // What locking used to do to work in flight: the drain waits ~2s, a
+        // runner inside a model call never observes the cancel in that window,
+        // and when it finally wakes its epilogue finds the room gone and writes
+        // NOTHING — so the row sat 'running' in the encrypted file until some
+        // later unlock quiesced it. Locking is terminal for the work; the row
+        // must say so at the moment it happens, and say WHO stopped it.
+        let conn = db::mem();
+        let plan = serde_json::json!({ "steps": summarize_steps(4, Lane::LocalLlm) });
+        let running = db::create_job(&conn, "deep_summary", "Room summary", &plan, 4).unwrap();
+        db::set_job_status(&conn, &running, "running", None).unwrap();
+        db::checkpoint_job(&conn, &running, 2, &serde_json::json!({ "points": ["a", "b"] }))
+            .unwrap();
+        let queued = db::create_job(&conn, "file_pass", "Full pass", &plan, 4).unwrap();
+
+        simulate_lock(&conn);
+
+        let j = db::get_job(&conn, &running).unwrap();
+        assert_eq!(j.status, "paused", "never left reading as running");
+        assert_eq!(j.parked_reason.as_deref(), Some(PARKED_BY_LOCK));
+        assert_eq!(j.cursor, 2, "the checkpoint is what makes Resume worth offering");
+        assert_eq!(j.state["points"], serde_json::json!(["a", "b"]));
+        // A queued job never started and holds no half-finished work, so it stays
+        // queued for `pump_on_open` to auto-start — and it is left UNSTAMPED. The
+        // lock did not interrupt it (there was nothing to interrupt), and the
+        // sentence could never come true later: the app only ever parks 'running'
+        // rows, so the one route from 'queued' to 'paused' is the user's own
+        // Remove. See `removing_a_job_from_the_queue_after_a_lock_is_not_blamed_on_the_lock`.
+        let q = db::get_job(&conn, &queued).unwrap();
+        assert_eq!(q.status, "queued");
+        assert_eq!(q.parked_reason, None);
+    }
+
+    #[test]
+    fn a_runner_that_stops_in_time_during_the_lock_still_reads_as_parked() {
+        // The other landing. A runner that DOES observe the cancel inside the
+        // drain window writes its own 'paused' — and it has no idea a lock caused
+        // it. Whether a job reads "you paused this" or "the room was locked" must
+        // not come down to a two-second race, so the reason is stamped up front
+        // and 'paused' is the one status that preserves it.
+        let conn = db::mem();
+        let id = db::create_job(&conn, "file_pass", "Full pass", &serde_json::json!({}), 4).unwrap();
+        db::set_job_status(&conn, &id, "running", None).unwrap();
+
+        mark_jobs_parking(&conn, PARKED_BY_LOCK);
+        // The runner's own epilogue, landing before the teardown.
+        db::set_job_status(&conn, &id, "paused", None).unwrap();
+        park_running_jobs(&conn, PARKED_BY_LOCK);
+
+        let j = db::get_job(&conn, &id).unwrap();
+        assert_eq!(j.status, "paused");
+        assert_eq!(j.parked_reason.as_deref(), Some(PARKED_BY_LOCK));
+    }
+
+    #[test]
+    fn a_job_that_finishes_inside_the_lock_drain_is_not_called_parked() {
+        // The stamp is a prediction, and a job that beats it must not keep it.
+        // "Done" plus "the room was locked while this was still running" is two
+        // contradictory claims on one row, and the second one is the lie.
+        let conn = db::mem();
+        let id = db::create_job(&conn, "studio", "Flashcards", &serde_json::json!({}), 1).unwrap();
+        db::set_job_status(&conn, &id, "running", None).unwrap();
+
+        mark_jobs_parking(&conn, PARKED_BY_LOCK);
+        db::set_job_status(&conn, &id, "done", None).unwrap();
+        park_running_jobs(&conn, PARKED_BY_LOCK);
+
+        let j = db::get_job(&conn, &id).unwrap();
+        assert_eq!(j.status, "done");
+        assert_eq!(j.parked_reason, None);
+    }
+
+    #[test]
+    fn a_parked_job_resumes_from_its_checkpoint_and_drops_the_explanation() {
+        // The second half of the owner's decision: parked work is RESUMABLE. The
+        // DB half of `resume_job` — put the row back in the queue — must leave a
+        // row the pump will pick up, at the cursor the job actually reached, with
+        // the interruption no longer described (it recovered from it).
+        let conn = db::mem();
+        let plan = serde_json::json!({ "steps": summarize_steps(4, Lane::LocalLlm) });
+        let id = db::create_job(&conn, "deep_summary", "Room summary", &plan, 4).unwrap();
+        db::set_job_status(&conn, &id, "running", None).unwrap();
+        db::checkpoint_job(&conn, &id, 3, &serde_json::json!({ "points": ["a"] })).unwrap();
+        simulate_lock(&conn);
+
+        // What `resume_job` writes before handing the row to `queue::submit`.
+        db::set_job_status(&conn, &id, "queued", None).unwrap();
+
+        let j = db::get_job(&conn, &id).unwrap();
+        assert_eq!(j.status, "queued");
+        assert_eq!(j.parked_reason, None, "a resumed job stops explaining the lock");
+        assert_eq!(j.cursor, 3, "resumes where it got to, not from the top");
+        assert_eq!(j.state["points"], serde_json::json!(["a"]));
+        // And the pump can see it: this is the row `pump_on_open` starts.
+        let next = db::unfinished_jobs(&conn).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].id, id);
+        assert_eq!(next[0].status, "queued");
+    }
+
+    #[test]
+    fn a_job_the_user_stopped_is_never_blamed_on_the_app() {
+        // The inverse lie. Stop is a deliberate choice, and dressing it up as
+        // "the room was locked while this was still running" would invent an
+        // interruption that never happened.
+        let conn = db::mem();
+        let id = db::create_job(&conn, "file_pass", "Full pass", &serde_json::json!({}), 4).unwrap();
+        db::set_job_status(&conn, &id, "running", None).unwrap();
+        // `cancel_job` flips the flag; the runner's epilogue writes this.
+        db::set_job_status(&conn, &id, "paused", None).unwrap();
+        assert_eq!(db::get_job(&conn, &id).unwrap().parked_reason, None);
+    }
+
+    #[test]
+    fn removing_a_job_from_the_queue_after_a_lock_is_not_blamed_on_the_lock() {
+        // The same lie, by the one route that survives a lock. A QUEUED row is
+        // never parked by the app — `park_running_jobs` and `quiesce_stale_jobs`
+        // both touch 'running' only — so the sole way it reaches 'paused' is the
+        // user pressing Remove. If the lock had stamped a reason onto it on the
+        // way past, `set_job_status(.., "paused")` preserves that reason (it must,
+        // for the running runner's epilogue), and the card would read "The room
+        // was locked while this was still running" about work the user removed
+        // by hand that had never started.
+        let conn = db::mem();
+        let plan = serde_json::json!({ "steps": summarize_steps(4, Lane::LocalLlm) });
+        let queued = db::create_job(&conn, "file_pass", "Full pass", &plan, 4).unwrap();
+
+        simulate_lock(&conn);
+        assert_eq!(db::get_job(&conn, &queued).unwrap().status, "queued");
+
+        // Next unlock; the lane is busy (or the engine is down), so the pump
+        // leaves it queued and the user clears it themselves — `cancel_job`'s
+        // no-flag branch.
+        db::set_job_status(&conn, &queued, "paused", None).unwrap();
+
+        let j = db::get_job(&conn, &queued).unwrap();
+        assert_eq!(j.status, "paused");
+        assert_eq!(
+            j.parked_reason, None,
+            "the user removed it; nothing interrupted it, and it never ran"
+        );
+    }
+
+    #[test]
+    fn a_job_the_app_died_on_is_parked_at_the_next_unlock_and_named_as_such() {
+        // No teardown runs on a crash or a force-quit, so the row is still
+        // 'running' when the room is next opened. Quiesce has always parked it;
+        // what it could not say is that NOBODY chose to stop it.
+        let conn = db::mem();
+        let plan = serde_json::json!({ "steps": summarize_steps(4, Lane::LocalLlm) });
+        let running = db::create_job(&conn, "deep_summary", "Room summary", &plan, 4).unwrap();
+        db::set_job_status(&conn, &running, "running", None).unwrap();
+        db::checkpoint_job(&conn, &running, 2, &serde_json::json!({})).unwrap();
+        // One the user really had paused before the crash: quiesce must not
+        // rewrite its story on the way past.
+        let paused = db::create_job(&conn, "file_pass", "Full pass", &plan, 4).unwrap();
+        db::set_job_status(&conn, &paused, "paused", None).unwrap();
+
+        quiesce_stale_jobs(&conn);
+
+        let j = db::get_job(&conn, &running).unwrap();
+        assert_eq!(j.status, "paused");
+        assert_eq!(j.parked_reason.as_deref(), Some(PARKED_BY_EXIT));
+        assert_eq!(j.cursor, 2);
+        assert_eq!(db::get_job(&conn, &paused).unwrap().parked_reason, None);
+    }
+
+    #[test]
+    fn a_crashed_runner_leaves_every_live_row_terminal_and_says_why() {
+        // The exit path nobody writes code for. `tauri::async_runtime::spawn`
+        // drops the JoinHandle, so a panicking runner never reaches its own
+        // epilogue: before `spawn_job_runner` the row simply stayed 'running'
+        // for the rest of the session, with a live progress bar and a queue
+        // slot nothing would ever free. Both live statuses must end terminal,
+        // and the reason must reach the row's `error` column — the Sidebar
+        // renders it, and "Stopped — " with nothing after it explains nothing.
+        let conn = db::mem();
+        let plan = serde_json::json!({ "steps": summarize_steps(4, Lane::LocalLlm) });
+        let running = db::create_job(&conn, "deep_summary", "Room summary", &plan, 4).unwrap();
+        db::set_job_status(&conn, &running, "running", None).unwrap();
+        db::checkpoint_job(&conn, &running, 3, &serde_json::json!({})).unwrap();
+        let queued = db::create_job(&conn, "file_pass", "Full pass", &plan, 4).unwrap();
+
+        let reason = panic_reason(&"index out of bounds" as &(dyn std::any::Any + Send));
+        // The row's OWN checkpoint comes back, so the terminal event reports the
+        // progress the job really made instead of inventing 0.
+        assert_eq!(park_crashed_job(&conn, &running, &reason).unwrap(), Some((3, 4)));
+        assert_eq!(park_crashed_job(&conn, &queued, &reason).unwrap(), Some((0, 4)));
+
+        let st = |id: &str| db::get_job(&conn, id).unwrap().status;
+        assert_eq!(st(&running), "error");
+        assert_eq!(st(&queued), "error");
+        let err = db::get_job(&conn, &running).unwrap().error.unwrap();
+        assert!(err.contains("crashed"), "{err:?}");
+        assert!(err.contains("index out of bounds"), "{err:?}");
+        // The checkpoint survives, so Retry resumes rather than restarting.
+        assert_eq!(db::get_job(&conn, &running).unwrap().cursor, 3);
+    }
+
+    #[test]
+    fn a_crash_after_the_epilogue_never_rewrites_a_finished_job() {
+        // The panic can land AFTER the runner wrote its own terminal status —
+        // in the progress emit, in `finish_and_pump`. Overwriting 'done' with
+        // 'error' there would be this app's own prose fabricating a failure
+        // that did not happen; 'paused' is already honest and resumable.
+        let conn = db::mem();
+        let plan = serde_json::json!({ "steps": summarize_steps(1, Lane::LocalLlm) });
+        for (status, err) in [("done", None), ("paused", None), ("error", Some("OLLAMA_DOWN"))] {
+            let id = db::create_job(&conn, "deep_summary", "s", &plan, 1).unwrap();
+            db::set_job_status(&conn, &id, status, err).unwrap();
+            assert_eq!(park_crashed_job(&conn, &id, "crashed").unwrap(), None);
+            let job = db::get_job(&conn, &id).unwrap();
+            assert_eq!(job.status, status);
+            assert_eq!(job.error.as_deref(), err);
+        }
+    }
+
+    #[test]
+    fn a_panic_with_no_message_still_reports_a_crash() {
+        // `catch_unwind` only carries the text for `&str`/`String` payloads. An
+        // empty or unknown payload must still say a crash happened — an empty
+        // `error` column reads on screen as a job that stopped for no reason.
+        assert_eq!(
+            panic_reason(&String::from("mutex poisoned") as &(dyn std::any::Any + Send)),
+            "the job runner crashed: mutex poisoned"
+        );
+        assert_eq!(
+            panic_reason(&42u8 as &(dyn std::any::Any + Send)),
+            "the job runner crashed"
+        );
+        assert_eq!(
+            panic_reason(&"   " as &(dyn std::any::Any + Send)),
+            "the job runner crashed"
+        );
     }
 }

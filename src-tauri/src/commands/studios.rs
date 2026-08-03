@@ -169,6 +169,40 @@ pub fn cleanup_browser_previews() {
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join("arcelle-preview"));
 }
 
+/// The same sweep, but only for files that have had time to be read.
+///
+/// Room lock also has to clear this folder — waiting for the next app start
+/// meant a locked room's decrypted pages sat on disk for the rest of the
+/// session — but it happens mid-session, which is exactly the case the blanket
+/// sweep above documents as unsafe: `/usr/bin/open` returns before the browser
+/// has opened the file. `grace` is how long a page gets before it counts as
+/// handed over. Best-effort, like its blanket twin: an unreadable timestamp
+/// leaves the file alone rather than guessing.
+pub fn cleanup_browser_previews_older_than(grace: std::time::Duration) {
+    sweep_previews_older_than(&std::env::temp_dir().join("arcelle-preview"), grace);
+}
+
+/// The body of [`cleanup_browser_previews_older_than`], over an explicit
+/// directory so the age rule is testable without touching the shared temp dir
+/// every other test and the running app share.
+pub(crate) fn sweep_previews_older_than(dir: &std::path::Path, grace: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // nothing was ever opened this session
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= grace);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// How many staged preview pages the store holds. Each is a whole HTML document
 /// kept in memory, so the store stays bounded.
 pub(crate) const PREVIEW_MAX: usize = 24;
@@ -257,23 +291,32 @@ Make it a polished, responsive, dark-themed page: near-black background (#0b0b12
 soft violet accent (#8b7cf6), light text, system font. Write correct JavaScript that \
 runs on load with no errors.";
 
-/// ADD-31: create this operation's cancel flag and, when the frontend supplied
+/// ADD-31: create this operation's cancel node and, when the frontend supplied
 /// an op id, register it in the shared cancel registry — the same one chat's
 /// Stop uses — so `cancel_ask(opId)` stops a Studio run too. The caller keeps a
 /// `CancelGuard` so the entry is removed on every return path.
+///
+/// Owner replacement #3: `parent_run` is the ask that asked for this build, when
+/// there is one. A Studio started by the agent's `studio_flashcards` tool used
+/// to be born with NO flag at all (`run_studio(..., op_id: None)`) — Stop ended
+/// the answer and the build kept going, then saved its page into the room. As a
+/// CHILD of the run it inherits that Stop before it can commit.
 pub(crate) fn register_studio_cancel(
     state: &State<'_, AppState>,
     op_id: &Option<String>,
-) -> Arc<AtomicBool> {
-    let cancel = Arc::new(AtomicBool::new(false));
+    parent_run: Option<&str>,
+    label: &str,
+) -> Arc<crate::cancel::Node> {
+    let node = crate::cancel::child_of_run(state, parent_run, label);
     if let Some(id) = op_id {
         state
             .cancels
             .lock()
             .unwrap()
-            .insert(id.clone(), cancel.clone());
+            .insert(id.clone(), node.flag());
+        crate::cancel::remember(state, id, &node);
     }
-    cancel
+    node
 }
 
 /// Ask the model to author a complete interactive HTML page for a Studio artifact.
@@ -388,6 +431,9 @@ pub(crate) async fn run_studio(
     instructions: Option<String>,
     refs: Option<Vec<String>>,
     op_id: Option<String>,
+    // Owner replacement #3: the ask that asked for this build, when one did.
+    // `None` for the three Studio buttons in the UI — nobody's child.
+    parent_run: Option<&str>,
 ) -> Result<FileMeta, String> {
     // Wave 3 (Idea 9): a Studio run writes a file at the end — don't start one
     // while a rollback is swapping the DB.
@@ -397,12 +443,15 @@ pub(crate) async fn run_studio(
     // ADD-31: a cancellable operation with visible stages. The flag is
     // registered under the caller's op id (same registry the chat Stop uses),
     // so a foreground Stop button works mid-generation.
-    let cancel = register_studio_cancel(state, &op_id);
+    let node = register_studio_cancel(state, &op_id, parent_run, spec.filename_prefix);
     let _cancel_guard = op_id.as_ref().map(|id| CancelGuard {
         state: state.inner(),
         ask_id: id.clone(),
     });
-    run_studio_core(window, state, spec, scope, instructions, refs, cancel, None).await
+    // The node is held for the whole build (dropped here, on every return path):
+    // that is what keeps the parent's `Weak` link alive, and what makes the
+    // parent's Stop reach the flag `run_studio_core` is polling.
+    run_studio_core(window, state, spec, scope, instructions, refs, node.flag(), None).await
 }
 
 /// Reconstruct a studio's `StudioSpec` from the durable job plan's `kind` string
@@ -459,7 +508,11 @@ pub(crate) async fn run_studio_core(
         .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
     let _ = window.emit(
         "studio-step",
-        if is_cloud_model(&model) || is_external_engine(&model) {
+        // "Does this leave the Mac?" is the DECLARED `local` field, not a pair
+        // of name tests — the pair missed Ollama's `<size>-cloud` spelling
+        // (`gpt-oss:120b-cloud`), so such a room was told a local model was
+        // writing while the content was already on its way out.
+        if !declared_for(&model).local {
             format!("{} — your cloud AI is writing (content leaves this Mac)…", spec.working_label)
         } else {
             format!("{} — a local model can take a few minutes…", spec.working_label)
@@ -509,8 +562,37 @@ pub(crate) async fn run_studio_core(
             return Err("the room this job belongs to was closed".into());
         }
     }
+    // LAST look before the side effect. Every cancel check above guards a MODEL
+    // CALL; none of them guards the WRITE, and the generate -> render -> room-pin
+    // stretch between the last one and this line is where a Stop lands in
+    // practice. Live QA 2026-08-03: "Studio can create files after the UI says the
+    // run failed or stopped" — the run reported stopped, and a file appeared in
+    // the Library anyway.
+    //
+    // Checking here rather than only earlier is the whole point: a side effect
+    // must be gated at the moment it is committed, not at the moment it was
+    // decided. The generated HTML is discarded, which is what "Stopped" already
+    // told the user happened.
+    //
+    // Owner replacement #3: this check is now `crate::cancel`'s, named once and
+    // shared, and the flag it reads belongs to a NODE — so it is also how a
+    // Stop pressed on the run that asked for this build reaches it (this
+    // pipeline is a child of that run when an agent started it). The message
+    // names the artifact rather than saying only "Stopped.", because "was not
+    // saved" is the part the user needs.
+    crate::cancel::guard_commit(&cancel, "the studio page")?;
     let name = format!("{} - {}.html", spec.filename_prefix, safe_scope_name(&label));
-    save_and_open(window, state, &name, "text/html", &content, "generated")
+    // ART-1: the funnel re-reads `cancel` immediately before it commits, so the
+    // gap between the check above and the write is closed at the write itself —
+    // and a re-run of the same Studio over the same scope becomes a new version
+    // of that deck, not a "Flashcards - clean-code (2).html" twin.
+    let mut art = Artifact::new(&name, "text/html", &content)
+        .by(spec.filename_prefix)
+        .cancel_with(&cancel);
+    if let Some(ids) = refs.as_ref().filter(|r| !r.is_empty()) {
+        art = art.from_files(ids);
+    }
+    save_and_open(window, state, art).map(|w| w.meta)
 }
 
 #[cfg(test)]
@@ -550,5 +632,37 @@ mod tests {
         assert_eq!(map.len(), PREVIEW_MAX);
         assert!(map.contains_key(tokens.last().unwrap()));
         assert!(!map.contains_key(&tokens[0]), "the oldest entry is the one dropped");
+    }
+
+    #[test]
+    fn locking_sweeps_handed_over_previews_but_spares_the_one_just_opened() {
+        // "Open in browser" is the one place room content touches unencrypted
+        // disk. It used to be cleared only at the NEXT app start, so a locked
+        // room (or a crash) left it readable for the rest of the session. The
+        // grace period is what makes a mid-session sweep safe: `/usr/bin/open`
+        // returns before the browser has read the file.
+        let dir = std::env::temp_dir().join(format!("arcelle-preview-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("old-1.html");
+        let fresh = dir.join("new-1.html");
+        std::fs::write(&stale, "<p>room content</p>").unwrap();
+        std::fs::write(&fresh, "<p>room content</p>").unwrap();
+        // Age the first one past the grace period without sleeping for it.
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        sweep_previews_older_than(&dir, std::time::Duration::from_secs(60));
+
+        assert!(!stale.exists(), "a handed-over preview must not survive the lock");
+        assert!(
+            fresh.exists(),
+            "a page opened seconds ago would be pulled out from under the browser"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -37,6 +37,17 @@ use crate::browser;
 /// ＋ that turns a result into a room source.
 mod search;
 pub use search::*;
+/// BROWSE-3c: URL-or-question, decided from the text alone. Shared by the
+/// address bar (its TypeScript twin) and by `browse_open`.
+mod address;
+/// Item #18: the page as text, and the keyboard's way back out of the native
+/// layer — the two things the host DOM cannot provide for a native webview.
+mod reader;
+pub use reader::*;
+/// BROWSE-2: what "save this page" saves — the readable article, its declared
+/// metadata, and the two files they land in.
+mod saved;
+use saved::capture_and_save;
 use std::time::Duration;
 use tauri::Manager;
 
@@ -61,9 +72,9 @@ const SETTLE_BUDGET: Duration = Duration::from_secs(20);
 pub(crate) fn browse_tools_specs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({"type": "function", "function": {"name": "browse_open",
-            "description": "Open a web page in the room's private browser and return the page's interactive elements. The browser keeps nothing — no history, cookies or cache. Use this when the user asks you to visit, check or look something up on a specific site. Example: {\"url\": \"https://example.com\"}",
+            "description": "Open a web page in the room's private browser and return the page's interactive elements — or, when you pass plain words instead of an address, search the room's own seven engines and return the ranked results to open. The browser keeps nothing — no history, cookies or cache. Never navigate to google.com or another search engine to search: this tool IS the search. Examples: {\"url\": \"https://example.com\"} · {\"url\": \"tallest building in europe\"}",
             "parameters": {"type": "object", "properties": {
-                "url": {"type": "string", "description": "Full http(s) URL to open"}},
+                "url": {"type": "string", "description": "A full http(s) URL or bare domain to open, OR plain words to search for when no site is named"}},
                 "required": ["url"]}}}),
         serde_json::json!({"type": "function", "function": {"name": "browse_read",
             "description": "Read the CURRENT page as text. This is the cheapest way to answer a question about a page — prefer it over snapshot/click loops whenever you only need to KNOW something rather than operate the page. Returns readable content with links; call again with a larger offset to continue a long page.",
@@ -88,7 +99,7 @@ pub(crate) fn browse_tools_specs() -> Vec<serde_json::Value> {
             "description": "Look at the current page as an image, with each interactive element's number drawn on it — the SAME numbers browse_snapshot returns, so you can read the list and see the layout together. Use it for layout questions, canvases, maps, or to check what actually happened after an action.",
             "parameters": {"type": "object", "properties": {}}}}),
         serde_json::json!({"type": "function", "function": {"name": "browse_save",
-            "description": "Save the CURRENT page into the room as files: a readable Markdown copy (searchable) plus the exact HTML. Captures the live page as rendered, logins and scripts included — works where fetch_page can't. what=selection saves only the text the user has selected on the page.",
+            "description": "Save the CURRENT page into the room as files: the readable article as Markdown (searchable) plus a formatted HTML copy, both under the metadata the page declares — site, author, publication date. Captures the live page as rendered, logins and scripts included — works where fetch_page can't. what=selection saves only the text the user has selected on the page.",
             "parameters": {"type": "object", "properties": {
                 "what": {"type": "string", "enum": ["page", "selection"], "description": "Default page"}}}}}),
     ]
@@ -247,11 +258,19 @@ pub(crate) fn entities_in(text: &str) -> Vec<String> {
     let Some(policy) = remote_seam_redactor() else {
         return Vec::new();
     };
-    let mut report = PrivacyReport::default();
-    let _ = policy.redactor.redact(text, &mut report);
-    if report.replacements == 0 {
-        return Vec::new();
-    }
+    // ONE matcher decides both halves. It used to be two: the `redact()` gate
+    // said whether to ask at all, and this list said what to show — and the
+    // gate was the STRICTER of the pair. `Redactor` folds case with
+    // `ascii_case_insensitive`, which by definition leaves every non-ASCII
+    // letter case-sensitive, while `to_lowercase()` here folds the whole of
+    // Unicode. So a protected name differing only in an accented letter's case
+    // ("JOSÉ" against a stored "José") failed the gate, passed the list, and
+    // was typed into the page with no prompt and nothing in the journal.
+    //
+    // `is_protectable` is the redactor's own floor and has to be shared, not
+    // re-guessed: a one-character entity matches nearly every string, and a
+    // consent card on every keystroke is a door people learn to click through.
+    let haystack = text.to_lowercase();
     // Report the REAL strings that matched, in the order the map lists them —
     // the user is being asked about their own data, so showing placeholders
     // here would defeat the point of asking.
@@ -259,11 +278,32 @@ pub(crate) fn entities_in(text: &str) -> Vec<String> {
         .rules
         .iter()
         .filter(|(real, _)| {
-            !real.trim().is_empty()
-                && text.to_lowercase().contains(&real.to_lowercase())
+            is_protectable(real) && haystack.contains(real.trim().to_lowercase().as_str())
         })
         .map(|(real, _)| real.clone())
         .collect()
+}
+
+/// Does the outbound door have to ask about this text, and about what?
+///
+/// `None` — nothing to ask. `Some(hits)` — ask, naming `hits`; an EMPTY `hits`
+/// means the room has no entity map at all, so the door cannot name what it
+/// recognised and must not pretend to.
+///
+/// That empty case is the point. The match list only ever holds what the local
+/// scanner has already found, so in a brand-new room, a room where privacy is
+/// off and nothing was ever scanned, or one where the scan came back empty, the
+/// door matched nothing and therefore asked nothing — and the agent could type
+/// anything the room had told it into any web form, silently. "I have nothing
+/// to check this against" is not the same fact as "this is safe", and only one
+/// of them is true here. Consent is the floor, exactly as it is for a remote
+/// connector's arguments (SEC-1b).
+pub(crate) fn outbound_hits(text: &str) -> Option<Vec<String>> {
+    if remote_seam_redactor().is_none() {
+        return Some(Vec::new());
+    }
+    let hits = entities_in(text);
+    (!hits.is_empty()).then_some(hits)
 }
 
 /// Ask the user before typing room content into a page. Approval is per call
@@ -291,6 +331,13 @@ async fn consent_for_typing(
     .await?;
     if v.get("approved").and_then(|a| a.as_bool()) == Some(true) {
         Ok(())
+    } else if hits.is_empty() {
+        // Nothing was RECOGNISED — the room has no entity map — so the refusal
+        // must not claim it did. Saying "it contains room information ()" would
+        // be a fabricated reason for a real refusal.
+        Err(format!(
+            "The user did not approve typing that into {field}. Nothing was typed."
+        ))
     } else {
         Err(format!(
             "The user did not approve typing that into {field} — it contains room information ({}). Nothing was typed.",
@@ -376,6 +423,9 @@ pub(crate) async fn exec_browse(
     name: &str,
     args: &serde_json::Value,
     effects: &mut ToolEffects,
+    // Owner replacement #4: the turn that called this tool, so the step chips
+    // below land in the conversation that asked rather than the one on screen.
+    turn: Option<&crate::turn::TurnId>,
 ) -> Result<String, String> {
     let app = window.app_handle().clone();
     require_web_enabled(&app.state::<AppState>())?;
@@ -388,7 +438,7 @@ pub(crate) async fn exec_browse(
         browser::wait_ready(&app, READY_BUDGET_OPEN).await?;
     }
 
-    let outcome = exec_browse_inner(window, &app, name, args, effects).await;
+    let outcome = exec_browse_inner(window, &app, name, args, effects, turn).await;
     if let Err(e) = &outcome {
         // A failing browser tool must leave a trace the USER can read; the
         // model's own transcript is not something they can inspect after the
@@ -398,19 +448,100 @@ pub(crate) async fn exec_browse(
     outcome
 }
 
+/// What `browse_open` should actually do with the string the model handed it,
+/// AFTER the privacy door has had its say. Split out from the tool body so the
+/// decision is testable without a live webview: the seam is the whole point.
+#[derive(Debug, PartialEq)]
+pub(crate) enum BrowseOpen {
+    /// Nothing usable in the argument.
+    Nothing,
+    /// Search the room's engines with this (possibly masked) query. `mask_note`
+    /// is empty when nothing was masked, and otherwise says so in the tool
+    /// result — a masked search must never read as a search for the real name.
+    Search { query: String, mask_note: String },
+    /// Open this address.
+    Url(String),
+    /// Refuse, and tell the model why in a way it can relay to the user.
+    Refuse(String),
+}
+
+/// PRIV-4, the browser half. Mirrors `web_search` (mask + disclose) and
+/// `fetch_page` (refuse) in `agent.rs`: a query is still a useful search once
+/// the name is a placeholder, but a URL with a masked path or query string only
+/// 404s, so the honest move there is to refuse rather than to fetch.
+pub(crate) fn classify_browse_open(raw: &str) -> BrowseOpen {
+    match address::classify(raw) {
+        None => BrowseOpen::Nothing,
+        Some(address::Address::Search(query)) => {
+            match crate::commands::privacy::mask_outbound_web(&query) {
+                Some((masked, hidden)) => BrowseOpen::Search {
+                    query: masked,
+                    mask_note: crate::commands::privacy::web_mask_note(hidden),
+                },
+                None => BrowseOpen::Search { query, mask_note: String::new() },
+            }
+        }
+        Some(address::Address::Url(url)) => {
+            match crate::commands::privacy::outbound_url_hides(&url) {
+                Some(hidden) => BrowseOpen::Refuse(format!(
+                    "Not opened: this address carries {hidden} protected name(s) from this \
+                     room's block list, and Cloud privacy is on, so it must not leave this Mac \
+                     (Settings → Cloud privacy). Search for it instead, or tell the user — do \
+                     not retry."
+                )),
+                None => BrowseOpen::Url(url),
+            }
+        }
+    }
+}
+
 async fn exec_browse_inner(
     window: &tauri::Window,
     app: &tauri::AppHandle,
     name: &str,
     args: &serde_json::Value,
     effects: &mut ToolEffects,
+    turn: Option<&crate::turn::TurnId>,
 ) -> Result<String, String> {
     let app = app.clone();
     match name {
         "browse_open" => {
-            let url = args["url"].as_str().unwrap_or_default().trim().to_string();
-            // Bare hostnames are what people (and models) actually produce.
-            let url = if url.contains("://") { url } else { format!("https://{url}") };
+            let raw = args["url"].as_str().unwrap_or_default().trim().to_string();
+            // BROWSE-3c: the agent gets the address bar's rule, not a hostname
+            // guess. Before this, "best pizza nyc" became
+            // `https://best pizza nyc` and failed, and the agent's only
+            // recovery was to invent an address — which in practice meant
+            // opening google.com and hunting for its search box, on a page
+            // built to defeat exactly that. The room already runs seven
+            // engines for its own address bar; the agent searches with those.
+            // PRIV-4: this is the same outbound seam as `web_search`/`fetch_page`
+            // in agent.rs, and it was the one left open. The privacy door
+            // RESTORES real names into a cloud model's tool arguments before
+            // dispatch (`room_mcp::restore_value`, and its sidecar twin), so a
+            // model that only ever saw "[Person A]" can ask `browse_open` for
+            // "[Person A] linkedin" and have the real name handed to seven
+            // search engines — or put it in a URL's query string. Decide here,
+            // before anything leaves.
+            let url = match classify_browse_open(&raw) {
+                BrowseOpen::Nothing => {
+                    return Err("Say what to open, or what to search for.".into())
+                }
+                BrowseOpen::Refuse(msg) => return Ok(msg),
+                BrowseOpen::Search { query, mask_note } => {
+                    let state = app.state::<AppState>();
+                    let result = search::run_search(&app, &state, &query).await?;
+                    // Show the user the SAME results page they would get from
+                    // the address bar. Watching the agent search is the point:
+                    // a browser that searches invisibly is a browser you cannot
+                    // check. Dropped harmlessly when the area is not on screen.
+                    let _ = tauri::Emitter::emit(&app, "browser-searched", &result);
+                    return Ok(format!(
+                        "{}{mask_note}",
+                        search::format_hits_for_agent(&result)
+                    ));
+                }
+                BrowseOpen::Url(url) => url,
+            };
             let checked = browse_guard_url(&url).await?;
             browser::ensure(&app, &checked)?;
             // The page script is injected at document START, so it does not
@@ -430,7 +561,7 @@ async fn exec_browse_inner(
             )
             .await?;
             let snap = settled.get("snapshot").cloned().unwrap_or(settled);
-            Ok(clamp_tool_result(format_snapshot(&snap)))
+            Ok(format_snapshot(&snap))
         }
 
         "browse_read" => {
@@ -444,7 +575,7 @@ async fn exec_browse_inner(
             .await?;
             let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("");
             browser::journal(&app, "read", url, "Read the page text");
-            Ok(clamp_tool_result(format_read(&v)))
+            Ok(format_read(&v))
         }
 
         "browse_find" => {
@@ -472,16 +603,16 @@ async fn exec_browse_inner(
                 });
             }
             let listed = serde_json::json!({ "elements": matches });
-            Ok(clamp_tool_result(format!(
+            Ok(format!(
                 "{} match(es) for \"{text}\":\n{}",
                 matches.len(),
                 format_snapshot(&listed)
-            )))
+            ))
         }
 
         "browse_snapshot" => {
             let v = browser::call(&app, "snapshot", serde_json::json!({})).await?;
-            Ok(clamp_tool_result(format_snapshot(&v)))
+            Ok(format_snapshot(&v))
         }
 
         "browse_do" => {
@@ -496,13 +627,16 @@ async fn exec_browse_inner(
             // half-applied while the user is being asked about a later step.
             let ui = app.state::<AgentUi>();
             for (field, text) in typed_texts(&actions) {
-                let hits = entities_in(&text);
-                if !hits.is_empty() {
+                if let Some(hits) = outbound_hits(&text) {
                     browser::journal(
                         &app,
                         "consent",
                         &url,
-                        &format!("Asked to type room information into {field}: {}", hits.join(", ")),
+                        &if hits.is_empty() {
+                            format!("Asked to type into {field} (this room has no list of protected details to check it against)")
+                        } else {
+                            format!("Asked to type room information into {field}: {}", hits.join(", "))
+                        },
                     );
                     consent_for_typing(window, &ui, &url, &field, &text, &hits).await?;
                     browser::journal(
@@ -536,18 +670,18 @@ async fn exec_browse_inner(
                     now_url,
                     "An action navigated the page; later steps in the batch did not run",
                 );
-                let _ = tauri::Emitter::emit(&app, "ask-step", "Navigated the page");
+                crate::turn::step_for(turn, &app, "Navigated the page");
                 let snap = v.get("snapshot").cloned().unwrap_or(serde_json::Value::Null);
-                return Ok(clamp_tool_result(format!(
+                return Ok(format!(
                     "The first action loaded a new page, so any later actions in that \
                      batch did NOT run. You are now on {now_url}\n{}",
                     format_snapshot(&snap)
-                )));
+                ));
             }
 
             let did = summarize_actions(&v);
             browser::journal(&app, "act", &url, &did);
-            let _ = tauri::Emitter::emit(&app, "ask-step", did);
+            crate::turn::step_for(turn, &app, did);
 
             let mut out = format_act(&v);
             // Vision is first-class here: a failed action attaches the pixels
@@ -566,7 +700,7 @@ async fn exec_browse_inner(
                     )),
                 }
             }
-            Ok(clamp_tool_result(out))
+            Ok(out)
         }
 
         "browse_look" => {
@@ -592,72 +726,6 @@ async fn exec_browse_inner(
 
         other => Err(format!("Unknown browsing tool: {other}")),
     }
-}
-
-/// BROWSE-2 (D21): capture the live DOM and save it into the room — a readable
-/// Markdown copy that carries the search text, plus (for a full page) the exact
-/// HTML as a fidelity twin with no chunks of its own, so the page is never
-/// indexed twice. Shared by the agent's `save_page` tool and the toolbar's Save
-/// menu (`browser_save_page`) — D22, one code path.
-async fn capture_and_save(app: &tauri::AppHandle, what: &str) -> Result<String, String> {
-    let v = browser::call(app, "capture", serde_json::json!({ "what": what })).await?;
-    let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
-    let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
-    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
-    let html = v.get("html").and_then(|h| h.as_str()).unwrap_or("").to_string();
-    if text.trim().is_empty() && html.trim().is_empty() {
-        return Err("The page returned nothing to save — it may still be loading.".into());
-    }
-    let state = app.state::<AppState>();
-    let (saved_names, room_path) = state.with_room(|room| {
-        let saved = db::current_date(&room.conn);
-        let display_title = if title.trim().is_empty() { url.clone() } else { title.clone() };
-        let base_title = if what == "selection" {
-            format!("{display_title} (selection)")
-        } else {
-            display_title.clone()
-        };
-        let md_name = link_file_name(&base_title, &url);
-        let content = format!("# {display_title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
-        let md = db::insert_file_from_url(
-            &room.conn,
-            &md_name,
-            "text/markdown",
-            content.as_bytes(),
-            Some(&content),
-            "web",
-            Some(&url),
-        )?;
-        let mut names = vec![md.name];
-        if what == "page" && !html.trim().is_empty() {
-            let html_name = format!("{}.html", md_name.trim_end_matches(".md"));
-            let twin = db::insert_file_from_url(
-                &room.conn,
-                &html_name,
-                "text/html",
-                html.as_bytes(),
-                None,
-                "web",
-                Some(&url),
-            )?;
-            names.push(twin.name);
-        }
-        Ok((names, room.path.clone()))
-    })?;
-    // Every other web import (`save_web_markdown`, `import_download`) starts
-    // these two after the file lands; this one started neither, so a page saved
-    // from the browser was searchable immediately, had no AI description, and
-    // sat outside the privacy scan until some unrelated import happened to
-    // schedule one.
-    schedule_auto_index(app, room_path);
-    schedule_privacy_scan(app.clone());
-    browser::journal(app, "save", &url, &format!("Saved {}", saved_names.join(" and ")));
-    let _ = tauri::Emitter::emit(app, "room-files-changed", ());
-    Ok(match saved_names.as_slice() {
-        [md, html] => format!("Saved \"{md}\" (readable copy) and \"{html}\" (exact HTML) into the room."),
-        [only] => format!("Saved \"{only}\" into the room."),
-        _ => "Saved into the room.".to_string(),
-    })
 }
 
 fn summarize_actions(v: &serde_json::Value) -> String {
@@ -871,6 +939,11 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
         "title": info.get("title").cloned().unwrap_or(serde_json::Value::Null),
         "ready": info.get("ready").cloned().unwrap_or(serde_json::Value::Null),
         "takeover": app.state::<browser::BrowserState>().takeover.load(Ordering::SeqCst),
+        // Item #18: the page latches a double Escape and reports it here, once.
+        // This poll is the ONLY channel out of the native layer — nothing the
+        // page script does can reach the app directly — so the flag has to ride
+        // the state the chrome already asks for.
+        "leaveRequested": info.get("leaveRequested").and_then(|l| l.as_bool()) == Some(true),
     });
     // Present ONLY when there is a reason, so the field means what `apiTypes.ts`
     // declares it to mean (`error?: string`). A `null` on every poll is not an
@@ -1134,6 +1207,59 @@ mod tests {
         );
     }
 
+    /// PRIV-4, the hole the web-seam fix left open. `web_search`/`fetch_page`
+    /// were masked at the seam, but `browse_open` reaches the SAME seven engines
+    /// and the same public web, and its `url` argument goes through the very
+    /// same `restore_value` on the way in from a cloud model. Without the mask
+    /// the real name left this Mac through the browser instead.
+    #[test]
+    fn browse_open_masks_a_restored_name_before_it_reaches_the_engines() {
+        let _guard = crate::commands::privacy::policy_test_lock();
+        crate::commands::privacy::clear_policy();
+        // No room / no policy: unchanged behaviour, and no note invented.
+        assert_eq!(
+            classify_browse_open("Ben Reich CV"),
+            BrowseOpen::Search { query: "Ben Reich CV".into(), mask_note: String::new() }
+        );
+
+        crate::commands::privacy::set_policy_for_test(true);
+        // A search still runs — masked — and SAYS it was masked.
+        match classify_browse_open("Ben Reich CV") {
+            BrowseOpen::Search { query, mask_note } => {
+                assert_eq!(query, "[Person A] CV");
+                assert!(!mask_note.is_empty(), "a masked search must disclose itself");
+            }
+            other => panic!("a protected name must not reach the engines: {other:?}"),
+        }
+        // A query with nothing protected in it is untouched and silent.
+        assert_eq!(
+            classify_browse_open("weather in Haifa"),
+            BrowseOpen::Search { query: "weather in Haifa".into(), mask_note: String::new() }
+        );
+        // A URL cannot be masked and still resolve, so it is refused — the
+        // exfiltration shape that matters is `https://anywhere/?q=<real name>`.
+        match classify_browse_open("https://example.com/?q=Ben%20Reich") {
+            BrowseOpen::Url(u) => panic!("a protected name left in a URL: {u}"),
+            BrowseOpen::Refuse(msg) => assert!(msg.contains("protected name"), "{msg}"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // An ordinary address is still opened.
+        assert_eq!(
+            classify_browse_open("https://example.com/docs"),
+            BrowseOpen::Url("https://example.com/docs".into())
+        );
+
+        // Switch OFF: same documented asymmetry as `web_search` — real names
+        // already flow to cloud models, so masking here would only break
+        // lookups. Asserted so a change in EITHER direction lands loudly.
+        crate::commands::privacy::set_policy_for_test(false);
+        assert_eq!(
+            classify_browse_open("Ben Reich CV"),
+            BrowseOpen::Search { query: "Ben Reich CV".into(), mask_note: String::new() }
+        );
+        crate::commands::privacy::clear_policy();
+    }
+
     #[test]
     fn every_advertised_browse_tool_has_a_dispatch_name() {
         let specs = browse_tools_specs();
@@ -1179,6 +1305,55 @@ mod tests {
         ] {
             assert_eq!(uncapturable_media_note(&quiet), None, "for {quiet}");
         }
+    }
+
+    /// The gate and the list have to be ONE matcher. `Redactor` folds only
+    /// ASCII case, so a name whose only difference is an accented letter's case
+    /// failed the old `redact()` gate, never reached the list, and was typed
+    /// into the page with no prompt and nothing in the journal.
+    #[test]
+    fn the_outbound_door_matches_names_the_same_way_it_lists_them() {
+        let _guard = crate::commands::privacy::policy_test_lock();
+        crate::commands::privacy::set_policy_rules_for_test(
+            true,
+            vec![
+                ("José Álvarez".to_string(), "[Person A]".to_string()),
+                // Below Redactor's own floor: a one-character entity matches
+                // almost everything, and a card on every keystroke is a card
+                // people learn to click through.
+                ("A".to_string(), "[Person B]".to_string()),
+            ],
+        );
+        assert_eq!(
+            entities_in("please contact JOSÉ ÁLVAREZ today"),
+            vec!["José Álvarez".to_string()],
+            "an accented name in caps must still be recognised"
+        );
+        assert_eq!(entities_in("please contact josé álvarez"), vec!["José Álvarez".to_string()]);
+        // The one-character rule must never make every string a match.
+        assert!(entities_in("a plain sentence about nothing").is_empty());
+        crate::commands::privacy::clear_policy();
+    }
+
+    /// A room with NO entity map is the case the door used to be blind to: it
+    /// matched nothing, so it asked nothing, and the agent could type anything
+    /// the room had told it into any web form. "Nothing matched" is not
+    /// "nothing private".
+    #[test]
+    fn a_room_with_no_entity_map_still_asks_before_typing() {
+        let _guard = crate::commands::privacy::policy_test_lock();
+        crate::commands::privacy::clear_policy();
+        let hits = outbound_hits("my flat is at 12 Herzl St").expect("must ask");
+        assert!(hits.is_empty(), "nothing was recognised, so nothing may be named");
+
+        // With a map, only a real match asks — the card must not cry wolf.
+        crate::commands::privacy::set_policy_for_test(true);
+        assert_eq!(outbound_hits("hello there"), None);
+        assert_eq!(
+            outbound_hits("mail from Ben Reich"),
+            Some(vec!["Ben Reich".to_string()])
+        );
+        crate::commands::privacy::clear_policy();
     }
 
     /// The spec block is re-sent on EVERY model turn. The Playwright-MCP

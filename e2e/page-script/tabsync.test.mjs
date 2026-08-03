@@ -50,3 +50,42 @@ test("a tab that did not survive the pass is not restored", () => {
   // pane, so whatever `open` focused stays.
   assert.equal(shouldRestoreFocus(["p1"], new Set(), false), false);
 });
+
+/* AUDIT 238: Rust tells the strip which page is on screen, and the strip used
+ * to throw that away. A page that closes on its own hands the screen to Rust's
+ * heir rule while the strip carries on highlighting the tab the user chose —
+ * and clicking that tab does nothing, because `browser_select_tab` only fires
+ * on a real tab change and Rust already believes the other page is active. */
+const { pageToReassert } = await import(
+  `data:text/javascript,${encodeURIComponent(JS)}`
+);
+
+test("agreement needs no correction", () => {
+  const live = [
+    { id: "a", active: true },
+    { id: "b", active: false },
+  ];
+  assert.equal(pageToReassert(live, "a"), "");
+});
+
+test("Rust showing another page is corrected back to the highlighted tab", () => {
+  const live = [
+    { id: "a", active: false },
+    { id: "b", active: true },
+  ];
+  assert.equal(pageToReassert(live, "a"), "a");
+});
+
+test("a file or area tab is not a page, so nothing is asserted", () => {
+  assert.equal(pageToReassert([{ id: "b", active: true }], null), "");
+});
+
+test("a page Rust no longer has is the pruner's business, not this one's", () => {
+  // Asking Rust to show a page it has closed would just fail; the pruning pass
+  // removes the tab in the same tick.
+  assert.equal(pageToReassert([{ id: "b", active: true }], "gone"), "");
+});
+
+test("nothing open at all is not a disagreement", () => {
+  assert.equal(pageToReassert([], "a"), "");
+});

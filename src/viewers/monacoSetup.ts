@@ -26,6 +26,11 @@ import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import "monaco-editor/esm/vs/language/json/monaco.contribution.js";
 import "monaco-editor/esm/vs/basic-languages/cpp/cpp.contribution.js"; // c + cpp
 import "monaco-editor/esm/vs/basic-languages/csharp/csharp.contribution.js";
+// Added with the extensions the app already accepted but rendered uncoloured.
+import "monaco-editor/esm/vs/basic-languages/dockerfile/dockerfile.contribution.js";
+import "monaco-editor/esm/vs/basic-languages/graphql/graphql.contribution.js";
+import "monaco-editor/esm/vs/basic-languages/protobuf/protobuf.contribution.js"; // id "proto"
+import "monaco-editor/esm/vs/basic-languages/restructuredtext/restructuredtext.contribution.js";
 import "monaco-editor/esm/vs/basic-languages/css/css.contribution.js";
 import "monaco-editor/esm/vs/basic-languages/go/go.contribution.js";
 import "monaco-editor/esm/vs/basic-languages/html/html.contribution.js";
@@ -66,7 +71,9 @@ export const LANGUAGES_WITH_SYNTAX = [
   "cpp",
   "csharp",
   "css",
+  "dockerfile",
   "go",
+  "graphql",
   "html",
   "ini",
   "java",
@@ -78,8 +85,10 @@ export const LANGUAGES_WITH_SYNTAX = [
   "markdown",
   "perl",
   "php",
+  "proto",
   "python",
   "r",
+  "restructuredtext",
   "ruby",
   "rust",
   "scala",

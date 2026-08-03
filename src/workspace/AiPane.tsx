@@ -9,14 +9,19 @@ import {
   FocusIcon,
   SparkIcon,
 } from "../icons";
-import { isCloudEngine, trustState } from "./markup";
+import { isCloudRoute, trustState } from "./markup";
 import ChatPane from "./ChatPane";
 import StudioShelf from "./StudioShelf";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkArea } from "./types";
 import { LayoutApi } from "../shell/useLayout";
-import { pendingApprovalCount, runningJobCount } from "../shell/activity";
+import {
+  groupActivity,
+  HISTORY_LIMIT,
+  pendingApprovalCount,
+  runningJobCount,
+} from "../shell/activity";
 
 /** Pane 3: persistent Chat / Studio / Activity tabs. Chat keeps the entire
  * existing conversation surface; Studio hosts the room's transformations;
@@ -38,7 +43,7 @@ export default function AiPane({
   // ../shell/activity.
   const pendingApprovals = pendingApprovalCount(s);
   const jobsRunning = runningJobCount(s);
-  const cloud = isCloudEngine(s.model);
+  const cloud = isCloudRoute(s.model, s.ai);
   return (
     <>
       <div
@@ -219,7 +224,7 @@ function StudioView({
       </button>
       <div className="studio-note">
         <strong>Private by design.</strong> Studio uses only this room's
-        content{isCloudEngine(s.model) ? " — but the current engine is a cloud model, so prompts leave this Mac" : ", processed on this Mac"}.
+        content{isCloudRoute(s.model, s.ai) ? " — but the current engine is a cloud model, so prompts leave this Mac" : ", processed on this Mac"}.
       </div>
     </div>
   );
@@ -249,12 +254,12 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
   );
 
   const pendingApprovals = pendingApprovalCount(s);
-  const running = s.jobs.filter(
-    (j) => j.status === "running" || j.status === "queued",
-  );
-  const parked = s.jobs.filter(
-    (j) => j.status !== "running" && j.status !== "queued",
-  );
+  // Decision #12: Activity is a live MANAGER and an audit LOG, and the two are
+  // separate places on the screen — not a sort order inside one list. The rule
+  // lives in shell/activity.ts so the counters, the attention dot and this list
+  // can never disagree about which side a job is on.
+  const { active: running, parked, history } = groupActivity(s.jobs);
+  const shownHistory = history.slice(0, HISTORY_LIMIT);
   // A recording is "being written out" while EITHER signal is up — the two
   // arrive a beat apart, and the counters use the same rule.
   const savingRec = s.recSave != null || s.recLive?.status === "saving";
@@ -262,6 +267,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
     pendingApprovals === 0 &&
     runningJobCount(s) === 0 &&
     parked.length === 0 &&
+    history.length === 0 &&
     !s.importProgress;
 
   return (
@@ -290,12 +296,14 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
             <div key={r.id} className="activity-row">
               <div className="activity-row-head">
                 <span className="activity-row-title">
-                  Tool call: {r.tool}
+                  {r.confirm ? `Delete ${r.tool} “${r.server}”?` : `Tool call: ${r.tool}`}
                 </span>
                 <span className="activity-state">Waiting</span>
               </div>
               <div className="activity-copy">
-                A connected tool wants to run — review the open consent card.
+                {r.confirm
+                  ? "The AI asked to delete something that cannot be restored — review the open card."
+                  : "A connected tool wants to run — review the open consent card."}
               </div>
             </div>
           ))}
@@ -327,97 +335,188 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
         </>
       )}
 
-      {(running.length > 0 ||
-        s.summaryStarting ||
-        s.importProgress ||
-        savingRec) && (
-        <div className="activity-group-title">Running now</div>
-      )}
+      {/* The LIVE half: work in flight and work waiting to be picked back up.
+          Everything in here is actionable — Stop, Remove, Resume, Retry. */}
+      <section className="activity-live" aria-label="Work happening now">
+        {(running.length > 0 ||
+          s.summaryStarting ||
+          s.importProgress ||
+          s.studioStep ||
+          s.ocrFiles.length > 0 ||
+          savingRec) && (
+          <div className="activity-group-title">Running now</div>
+        )}
 
-      {s.importProgress && (
-        <div className="activity-row" role="status">
-          <div className="activity-row-head">
-            <span className="activity-row-title">
-              Importing {s.importProgress.done + 1} of {s.importProgress.total}
-            </span>
-          </div>
-          <div className="activity-copy">{s.importProgress.name}</div>
-          <div className="activity-progress">
-            <span
-              style={{
-                width: `${Math.round((s.importProgress.done / Math.max(1, s.importProgress.total)) * 100)}%`,
-              }}
-            />
-          </div>
-        </div>
-      )}
-
-      {/* The summary command can take seconds to RESOLVE on a cold local
-          model; this optimistic card shows the instant the button is pressed,
-          so a click is never silent. */}
-      {s.summaryStarting &&
-        !s.jobs.some((j) => j.status === "running" || j.status === "queued") && (
+        {/* AUDIT 262: a scanned page being read. The host has emitted this the
+            whole time and nothing listened, so a vision pass that runs for
+            minutes on a local model showed no sign of activity anywhere. */}
+        {s.ocrFiles.length > 0 && (
           <div className="activity-row" role="status">
             <div className="activity-row-head">
-              <span className="activity-row-title">Room summary</span>
-              <span className="activity-state">Starting…</span>
+              <span className="activity-row-title">
+                Reading {s.ocrFiles.length === 1 ? "a scanned page" : `${s.ocrFiles.length} scanned pages`}
+              </span>
             </div>
+            <div className="activity-copy">{s.ocrFiles.join(", ")}</div>
             <div className="activity-progress">
               <span className="indeterminate" />
             </div>
           </div>
         )}
 
-      {/* A recording being finalized keeps a visible card here, so leaving
-          the recording view never turns the save into a mystery. The audio
-          is already durable when this card appears — the label says so. */}
-      {savingRec && (
-        <div className="activity-row" role="status">
-          <div className="activity-row-head">
-            <span className="activity-row-title">Saving recording</span>
-            {s.recSave && (
-              <span className="activity-state">{elapsedOf(s.recSave.startedAt)}</span>
-            )}
+        {/* AUDIT 262: what the Studio is doing right now. Rust named each step
+            from the start and nothing displayed it, so a flashcard deck or a
+            mind map sat on "Starting…" for the whole run — minutes, on a local
+            model — and the step that says "your cloud AI is writing (content
+            leaves this Mac)" never reached the person it is about. */}
+        {s.studioStep && (
+          <div className="activity-row" role="status">
+            <div className="activity-row-head">
+              <span className="activity-row-title">Studio</span>
+            </div>
+            <div className="activity-copy">{s.studioStep}</div>
+            <div className="activity-progress">
+              <span className="indeterminate" />
+            </div>
           </div>
-          <div className="activity-copy">
-            {s.recSave?.stage === "writing"
-              ? "Audio saved — writing into the room…"
-              : s.recSave && s.recSave.remaining > 0
-                ? `Audio saved — transcribing (${s.recSave.remaining} to go)`
-                : "Audio saved — finishing the transcript…"}
-          </div>
-          {s.recLive?.fileId && (
-            <div className="activity-row-actions">
-              <button
-                className="subtle"
-                title="Open the recording"
-                onClick={() => {
-                  const id = s.recLive?.fileId;
-                  if (id) void a.viewFile(id);
+        )}
+
+        {s.importProgress && (
+          <div className="activity-row" role="status">
+            <div className="activity-row-head">
+              <span className="activity-row-title">
+                Importing {s.importProgress.done + 1} of {s.importProgress.total}
+              </span>
+            </div>
+            <div className="activity-copy">{s.importProgress.name}</div>
+            <div className="activity-progress">
+              <span
+                style={{
+                  width: `${Math.round((s.importProgress.done / Math.max(1, s.importProgress.total)) * 100)}%`,
                 }}
-              >
-                Open
-              </button>
+              />
+            </div>
+          </div>
+        )}
+
+        {/* The summary command can take seconds to RESOLVE on a cold local
+            model; this optimistic card shows the instant the button is pressed,
+            so a click is never silent. */}
+        {s.summaryStarting &&
+          !s.jobs.some((j) => j.status === "running" || j.status === "queued") && (
+            <div className="activity-row" role="status">
+              <div className="activity-row-head">
+                <span className="activity-row-title">Room summary</span>
+                <span className="activity-state">Starting…</span>
+              </div>
+              <div className="activity-progress">
+                <span className="indeterminate" />
+              </div>
             </div>
           )}
-        </div>
-      )}
 
-      {/* ADD-30: background-job cards — live progress while running, Resume
-          for a job that was paused or parked by an error. */}
-      {[...running, ...parked].map((j) => (
-        <JobRow key={j.id} j={j} s={s} a={a} elapsedOf={elapsedOf} />
-      ))}
+        {/* A recording being finalized keeps a visible card here, so leaving
+            the recording view never turns the save into a mystery. The audio
+            is already durable when this card appears — the label says so. */}
+        {savingRec && (
+          <div className="activity-row" role="status">
+            <div className="activity-row-head">
+              <span className="activity-row-title">Saving recording</span>
+              {s.recSave && (
+                <span className="activity-state">{elapsedOf(s.recSave.startedAt)}</span>
+              )}
+            </div>
+            <div className="activity-copy">
+              {s.recSave?.stage === "writing"
+                ? "Audio saved — writing into the room…"
+                : s.recSave && s.recSave.remaining > 0
+                  ? `Audio saved — transcribing (${s.recSave.remaining} to go)`
+                  : "Audio saved — finishing the transcript…"}
+            </div>
+            {s.recLive?.fileId && (
+              <div className="activity-row-actions">
+                <button
+                  className="subtle"
+                  title="Open the recording"
+                  onClick={() => {
+                    const id = s.recLive?.fileId;
+                    if (id) void a.viewFile(id);
+                  }}
+                >
+                  Open
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ADD-30: background-job cards — live progress while running. */}
+        {running.map((j) => (
+          <JobRow key={j.id} j={j} s={s} a={a} elapsedOf={elapsedOf} />
+        ))}
+
+        {parked.length > 0 && (
+          <div className="activity-group-title">Stopped — waiting for you</div>
+        )}
+        {parked.map((j) => (
+          <JobRow key={j.id} j={j} s={s} a={a} elapsedOf={elapsedOf} />
+        ))}
+      </section>
+
+      {/* The AUDIT half (decision #12). Deliberately a separate section with its
+          own heading and its own muted styling, not a run of quieter cards at
+          the bottom of one list: the user must be able to tell at a glance what
+          they can still act on from what is only a record. Nothing in here has a
+          button — a finished job is not a thing you resume. */}
+      {shownHistory.length > 0 && (
+        <section className="activity-history" aria-label="What already happened">
+          <div className="activity-group-title">
+            History
+            <span className="activity-history-note">
+              {history.length > shownHistory.length
+                ? `the ${shownHistory.length} most recent of ${history.length} — a record, nothing to act on`
+                : "a record, nothing to act on"}
+            </span>
+          </div>
+          {shownHistory.map((j) => (
+            <HistoryRow key={j.id} j={j} />
+          ))}
+        </section>
+      )}
 
       {nothing && (
         <div className="activity-empty">
           <ActivityIcon size={18} />
           <p>
-            Nothing running right now. Studio jobs, workflow runs, imports and
-            approval requests will appear here.
+            Nothing running right now, and nothing finished yet. Studio jobs,
+            workflow runs, imports and approval requests appear here while they
+            run, then move down to History when they are done.
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+/** One finished job in the audit log. A record, so it carries no Stop, no
+ * Resume, no Dismiss — the live section owns every affordance. It reports what
+ * the row itself stored (`cursor` of `total`, and when it last moved); nothing
+ * here is inferred, because a finished job's own numbers are the only evidence
+ * of what it did. */
+function HistoryRow({ j }: { j: WSState["jobs"][number] }) {
+  const when = Date.parse(j.updatedAt);
+  return (
+    <div className="activity-row history">
+      <div className="activity-row-head">
+        <span className="activity-row-title">{j.title}</span>
+        <span className="activity-state">
+          {Number.isNaN(when) ? "" : new Date(when).toLocaleString()}
+        </span>
+      </div>
+      <div className="activity-copy">
+        Finished
+        {j.total > 0 ? ` — ${Math.min(j.cursor, j.total)} of ${j.total} steps` : ""}
+      </div>
     </div>
   );
 }
@@ -445,6 +544,10 @@ function JobRow({
     : 0;
   const done = live?.done ?? j.cursor;
   const total = Math.max(live?.total ?? j.total, 1);
+  // Only meaningful while the job is stopped-but-resumable; a running job is
+  // not being interrupted by anything, and the backend clears the column the
+  // moment it moves off 'paused'.
+  const parkedReason = !running ? (j.parkedReason ?? null) : null;
   const friendlyError =
     j.error === "OLLAMA_DOWN"
       ? "The local AI isn't running."
@@ -516,7 +619,15 @@ function JobRow({
               ? (live?.label ?? "Working…")
               : j.status === "error"
                 ? (friendlyError ?? "Stopped.")
-                : `Paused at ${done} of ${total}`}
+                : // A job the APP stopped must not read like one the user
+                  // chose to pause. `parkedReason` is set only when the room
+                  // was locked (or the app closed) with this job in flight, so
+                  // the card names what actually interrupted it — and says the
+                  // checkpoint is still there, which is the whole reason Resume
+                  // is worth pressing.
+                  parkedReason
+                  ? `${parkedReason} Picks up at ${done} of ${total}.`
+                  : `Paused at ${done} of ${total}`}
         </span>
         {queued ? (
           <button

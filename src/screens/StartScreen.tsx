@@ -46,17 +46,36 @@ export function StartScreen({
           <div className="recent-label">Recent</div>
           <ul className="recent-list">
             {recent.map((room) => (
-              <li key={room.path} className="recent-row">
+              <li
+                key={room.path}
+                className={`recent-row${room.missing ? " missing" : ""}`}
+              >
                 <button
                   className="recent-open"
                   onClick={() => onOpenRecent(room.path)}
+                  /* A room whose file is gone still OPENS: the open path is
+                     what knows how to ask you where it moved to. Saying so
+                     here just stops you typing a password for a file that
+                     isn't there. */
+                  title={
+                    room.missing
+                      ? "This room's file is not at that location any more"
+                      : undefined
+                  }
                 >
                   <span className="recent-name">{room.name}</span>
                   <span className="recent-path">{room.path}</span>
-                  {relativeTime(room.openedAt) && (
-                    <span className="recent-when">
-                      Opened {relativeTime(room.openedAt)}
+                  {room.missing ? (
+                    <span className="recent-when recent-missing">
+                      File not found — moved, deleted, or on a drive that isn't
+                      connected
                     </span>
+                  ) : (
+                    relativeTime(room.openedAt) && (
+                      <span className="recent-when">
+                        Opened {relativeTime(room.openedAt)}
+                      </span>
+                    )
                   )}
                 </button>
                 <button

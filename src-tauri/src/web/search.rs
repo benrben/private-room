@@ -5,12 +5,21 @@ use super::*;
 /// them into a single relevance ranking. Rust holds no scraper of its own any
 /// more — there is nothing to pick between, so nothing here dispatches.
 ///
-/// Budget: a fused search is seven engines in sequence (~3-5s warm from a clean
-/// IP), and every one of them can time out on its own. 4 minutes covers the
-/// worst case where most of them hang, while still being far short of the
-/// 10-minute generation budget — a search must not be able to hold a turn open
-/// that long.
-const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(240);
+/// The sidecar's own overall fan-out deadline (`websearch.FANOUT_BUDGET`),
+/// mirrored here because this timeout only makes sense relative to it. Keep the
+/// two in step: the engines run CONCURRENTLY and everything still running when
+/// this expires simply does not contribute, so the sidecar cannot take longer
+/// than this to answer /web_search however many engines hang.
+const SIDECAR_FANOUT_BUDGET: Duration = Duration::from_secs(22);
+
+/// Budget: the sidecar answers within [`SIDECAR_FANOUT_BUDGET`] by construction,
+/// so this only has to cover that plus the request itself and a cold sidecar
+/// wake. It used to be 4 minutes, sized for a design where the engines ran one
+/// after another and the wall clock was the SUM of seven timeouts. They have run
+/// in parallel since 2026-08-01, so those 4 minutes could only ever be reached
+/// by a sidecar that had stopped answering at all — and then the user watched a
+/// dead "Searching…" for 218 seconds longer than there was anything to wait for.
+const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many fused hits to ask for. The old single-engine scrapers took 5; the
 /// fused ranking is worth a few more, since cross-engine agreement means the top
@@ -64,12 +73,25 @@ pub fn render_hits(hits: &[WebHit]) -> String {
         .join("\n")
 }
 
-/// Free multi-engine web search with no account or API key. Never returns a
-/// partial failure: a blocked or rotted engine drops out silently on the Python
-/// side and the rest of the fusion still answers, so an empty result here means
-/// "no results", not "one scraper broke".
-pub async fn search_web(query: &str) -> Result<Vec<WebHit>, String> {
-    Ok(search_page(query, WEB_SEARCH_LIMIT).await?.hits)
+/// Join engine names for a sentence a person reads: "brave and mojeek",
+/// "brave, mojeek and marginalia".
+pub fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Free multi-engine web search with no account or API key.
+///
+/// Returns the whole page, not just the hits, because a caller MUST be able to
+/// tell an empty web from a blocked one. This used to hand back a bare
+/// `Vec<WebHit>` and document that an empty result meant "no results, not one
+/// scraper broke" — the opposite of what the fusion actually reports, and a
+/// claim contradicted by any day on which two engines answer 403 and 429.
+pub async fn search_web(query: &str) -> Result<SearchPage, String> {
+    search_page(query, WEB_SEARCH_LIMIT).await
 }
 
 /// The browser's results page (BROWSE-3) — a dozen hits with the fusion's own
@@ -99,6 +121,16 @@ pub async fn search_page(query: &str, limit: u32) -> Result<SearchPage, String> 
         merged: value["merged"].as_u64().unwrap_or(0) as u32,
         took_ms: value["tookMs"].as_u64().unwrap_or(0) as u32,
         cached: false,
+        failed: value["failed"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| n.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -155,6 +187,22 @@ fn parse_hits(value: &serde_json::Value) -> Vec<WebHit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_timeout_tracks_the_sidecar_fan_out_budget() {
+        // The host's wait described a design that no longer exists (seven
+        // engines in sequence) and was 11x the deadline the sidecar actually
+        // enforces, so a wedged sidecar showed "Searching…" for four minutes.
+        // Room for the request, a cold sidecar wake and slack — not a multiple.
+        assert!(
+            WEB_SEARCH_TIMEOUT > SIDECAR_FANOUT_BUDGET,
+            "the host must outwait the fan-out it is waiting for"
+        );
+        assert!(
+            WEB_SEARCH_TIMEOUT <= SIDECAR_FANOUT_BUDGET * 3,
+            "waiting past ~3x the sidecar's own deadline is waiting for nothing"
+        );
+    }
 
     fn hit(engines: &[&str], date: Option<&str>, score: f64) -> WebHit {
         WebHit {
@@ -264,6 +312,60 @@ mod tests {
         assert_eq!(
             render_hits(&[hit(&["brave"], None, 0.5)]),
             "1. T\n   https://example.com/a\n   via brave · relevance 0.50"
+        );
+    }
+
+    // --- Which engines could not answer -----------------------------------
+    //
+    // The fan-out has always reported this and this boundary used to drop it,
+    // so a day on which mojeek returns 403 and brave returns 429 (an observed
+    // day, in the sidecar log) was indistinguishable from a quiet web.
+
+    fn page(hits: Vec<WebHit>, failed: &[&str]) -> SearchPage {
+        SearchPage {
+            merged: hits.len() as u32,
+            hits,
+            took_ms: 5,
+            cached: false,
+            failed: failed.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_engines_that_could_not_answer_survive_the_boundary() {
+        let v = serde_json::json!({
+            "hits": [], "merged": 0, "tookMs": 12, "failed": ["mojeek", "brave"],
+        });
+        // parse_hits covers the hits; this is the field that had no reader at all.
+        let failed: Vec<String> = v["failed"]
+            .as_array()
+            .map(|n| n.iter().filter_map(|x| x.as_str()).map(str::to_string).collect())
+            .unwrap_or_default();
+        assert_eq!(failed, vec!["mojeek", "brave"]);
+    }
+
+    #[test]
+    fn a_fully_healthy_search_says_nothing_about_engines() {
+        assert!(page(vec![hit(&["brave"], None, 0.5)], &[]).blocked_note().is_none());
+    }
+
+    #[test]
+    fn a_partial_search_warns_that_the_results_are_incomplete() {
+        let note = page(vec![hit(&["brave"], None, 0.5)], &["mojeek", "marginalia"])
+            .blocked_note()
+            .expect("engines were blocked");
+        assert!(note.contains("mojeek and marginalia"), "{note}");
+        assert!(note.contains("only part of the web"), "{note}");
+    }
+
+    #[test]
+    fn engine_names_read_as_a_sentence_not_a_debug_list() {
+        assert_eq!(join_names(&[]), "");
+        assert_eq!(join_names(&["brave".into()]), "brave");
+        assert_eq!(join_names(&["brave".into(), "mojeek".into()]), "brave and mojeek");
+        assert_eq!(
+            join_names(&["brave".into(), "mojeek".into(), "ddg".into()]),
+            "brave, mojeek and ddg"
         );
     }
 }

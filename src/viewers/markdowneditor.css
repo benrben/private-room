@@ -1,0 +1,121 @@
+/* The Markdown note editor: toolbar over source-and-preview. */
+
+.mde {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.mde-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.mde-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex-wrap: wrap;
+}
+
+.mde-tool {
+  min-width: 1.9rem;
+  height: 1.75rem;
+  padding: 0 0.4rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.mde-tool:hover {
+  border-color: var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+/* Bold and italic read as what they do. */
+.mde-tool:nth-child(1) {
+  font-weight: 800;
+}
+.mde-tool:nth-child(2) {
+  font-style: italic;
+  font-family: Georgia, serif;
+}
+
+.mde-layout {
+  display: flex;
+  gap: 0.1rem;
+  margin-left: auto;
+  padding: 0.1rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+.mde-layout-btn {
+  padding: 0.2rem 0.55rem;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--muted);
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+.mde-layout-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.mde-panes {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.mde-source {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+.mde-source .code-editor {
+  flex: 1;
+  min-height: 0;
+}
+
+.mde-preview {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 1.25rem 1.5rem 3rem;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+/* In preview-only mode there is no source pane to divide from, and the column
+   should read like the page rather than like half of one. */
+.mde[data-layout="preview"] .mde-preview {
+  border-left: none;
+}
+.mde[data-layout="preview"] .mde-preview > * {
+  max-width: 46rem;
+  margin-inline: auto;
+}
+
+@media (max-width: 900px) {
+  /* Two panes side by side stop being readable well before this; stack them. */
+  .mde[data-layout="split"] .mde-panes {
+    flex-direction: column;
+  }
+  .mde[data-layout="split"] .mde-preview {
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+}

@@ -154,3 +154,52 @@ test("the launch check honours prUpdateCheck=0", async () => {
   assert.equal(h.log.confirms, 0);
   assert.equal(h.log.installs, 0);
 });
+
+/* The preference existed from the day the check did; nothing WROTE it, so the
+ * only way to stop the app contacting GitHub on every launch was to edit
+ * localStorage by hand. A setting a user cannot reach is not a setting. */
+test("the launch check can be switched off, and back on, from the app", async () => {
+  const h = harness({ confirm: async () => true });
+  assert.equal(updater.autoUpdateCheckEnabled(), true);
+
+  assert.equal(updater.setAutoUpdateCheck(false), false);
+  assert.equal(h.store.get("prUpdateCheck"), "0");
+  await updater.checkForUpdatesQuietly();
+  assert.equal(h.log.confirms, 0, "switched off, launch must contact nothing");
+
+  assert.equal(updater.setAutoUpdateCheck(true), true);
+  // Back to the default by REMOVING the key, not by writing "1": the reader
+  // treats anything but "0" as on, and a stray value would read as on anyway.
+  assert.equal(h.store.has("prUpdateCheck"), false);
+  await updater.checkForUpdatesQuietly();
+  assert.equal(h.log.confirms, 1);
+});
+
+/* It answers with what actually reads back. A private-mode write is lost, and
+ * a checkbox told "off" while the next launch still reaches out would be the
+ * app claiming a promise it does not keep. */
+test("a preference that could not be stored is reported as unchanged", async () => {
+  harness();
+  const store = globalThis.localStorage;
+  globalThis.localStorage = {
+    getItem: () => null,
+    setItem: () => {
+      throw new Error("quota");
+    },
+    removeItem: () => {},
+  };
+  assert.equal(updater.setAutoUpdateCheck(false), true);
+  globalThis.localStorage = store;
+});
+
+/* The switch has to be ON A SCREEN, wired to this setter. The finding was not
+ * "the module lacks a function" — it was that no control anywhere reached it. */
+test("Settings → Updates & version renders the switch and wires it up", () => {
+  const about = readFileSync(
+    join(here, "../../src/settings/AboutSection.tsx"),
+    "utf8",
+  );
+  assert.match(about, /setAutoUpdateCheck/, "no control calls the setter");
+  assert.match(about, /autoUpdateCheckEnabled\(\)/, "the box must show what is in force");
+  assert.match(about, /type="checkbox"/, "the switch is not rendered");
+});

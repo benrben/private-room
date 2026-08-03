@@ -11,6 +11,43 @@ type Props = {
 
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
+/** What the backend will accept, checked here so Save can't close on something
+ * the backend is about to reject.
+ *
+ * Mirrors `next_run_after` in `jobs/scheduler.rs`: minutes must be a whole
+ * number above zero, and a time must be a real 24-hour HH:MM. Nothing used to
+ * be checked while the popover was open — pressing Save closed it, threw away
+ * what had been typed, and only THEN showed "That schedule is invalid", so the
+ * one thing needed to fix it was already gone. Returns null when it is fine. */
+export function scheduleProblem(
+  kind: string,
+  interval: string,
+  daily: string,
+  weekTime: string,
+): string | null {
+  const badTime = (t: string) => {
+    const m = /^\s*(\d{1,2}):(\d{2})\s*$/.exec(t);
+    if (!m) return true;
+    const h = Number(m[1]);
+    const min = Number(m[2]);
+    return h > 23 || min > 59;
+  };
+  if (kind === "interval") {
+    const n = Number(interval.trim());
+    if (!interval.trim() || !Number.isInteger(n) || n <= 0) {
+      return "Minutes must be a whole number above zero.";
+    }
+    return null;
+  }
+  if (kind === "daily" && badTime(daily)) {
+    return "Time must be HH:MM on a 24-hour clock — e.g. 08:00 or 17:30.";
+  }
+  if (kind === "weekly" && badTime(weekTime)) {
+    return "Time must be HH:MM on a 24-hour clock — e.g. 08:00 or 17:30.";
+  }
+  return null;
+}
+
 export function SchedulePopover({ schedule, disabled, onSave, onClose }: Props) {
   const [kind, setKind] = useState<string>(schedule?.kind ?? "");
   const [interval, setIntervalMin] = useState(
@@ -37,12 +74,17 @@ export function SchedulePopover({ schedule, disabled, onSave, onClose }: Props) 
     );
   }
 
+  const problem = scheduleProblem(kind, interval, daily, weekTime);
+
   function save() {
     if (!kind) {
       onSave({ kind: "" });
       onClose();
       return;
     }
+    // Stay open on a bad value: closing is what destroyed the input the user
+    // needed in order to correct it.
+    if (problem) return;
     const param =
       kind === "interval" ? interval : kind === "daily" ? daily : `${weekDay} ${weekTime}`;
     onSave({ kind, param, enabled, catchUp });
@@ -109,11 +151,16 @@ export function SchedulePopover({ schedule, disabled, onSave, onClose }: Props) 
           </div>
         </>
       )}
+      {problem && (
+        <div className="caption wf-schedule-problem" role="alert">
+          {problem}
+        </div>
+      )}
       <div style={{ display: "flex", gap: "0.4rem", justifyContent: "flex-end" }}>
         <button className="subtle" onClick={onClose}>
           Cancel
         </button>
-        <button className="primary" onClick={save}>
+        <button className="primary" onClick={save} disabled={!!problem}>
           Save
         </button>
       </div>

@@ -196,8 +196,6 @@ pub async fn ask(
     // confirmed re-ask; absent for every ordinary turn.
     privacy_bypass: Option<bool>,
 ) -> Result<Message, String> {
-    use tauri::Emitter;
-
     // Wave 3 (Idea 9): don't start a turn while a rollback is swapping the DB —
     // it would save messages that either fail or land against the wrong room.
     if state.rolling_back() {
@@ -206,24 +204,30 @@ pub async fn ask(
 
     // ADD-7: register this ask's cancel flag; the guard removes it on return
     // (success, error, or cancel) so `close_room`'s wait can see us finish.
-    let cancel = Arc::new(AtomicBool::new(false));
-    state
-        .cancels
-        .lock()
-        .unwrap()
-        .insert(ask_id.clone(), cancel.clone());
+    //
+    // Owner replacement #3: the flag is now the ROOT of this run's cancel tree.
+    // Nothing about the flag changes for the loops that poll it — but the work
+    // this turn starts (a Studio build, a background job) can now be attached to
+    // it by run id, so Stop reaches that work too. `cancel_node` must outlive
+    // every child it adopts, which it does: it is dropped when `ask` returns.
+    let cancel_node = crate::cancel::register_run(&state, &ask_id, "this answer");
+    let cancel = cancel_node.flag();
     let _cancel_guard = CancelGuard {
         state: state.inner(),
         ask_id: ask_id.clone(),
     };
+    // Owner replacement #4: the identity every event of this turn carries. The
+    // ask id is the frontend's own handle, so the chat has already registered
+    // this run and will reject anything that names a different one.
+    let turn = crate::turn::TurnId::new(&ask_id, &chat_id);
 
     // ADD-31: the audit's worst wait was an anonymous "Thinking locally…" for
     // 30+ seconds. Name the two hidden phases: waking the daemon (ADD-29 makes
     // this implicit and slow the first time) and searching the room.
     if !crate::ollama_lifecycle::is_awake(&ollama::resolved_base_url()).await {
-        let _ = window.emit("ask-step", "Starting the local AI…");
+        turn.step(&window, "Starting the local AI…");
     }
-    let _ = window.emit("ask-step", "Searching your files…");
+    turn.step(&window, "Searching your files…");
 
     // ADD-13: embed the question BEFORE taking the room lock (the Ollama call is
     // async; the lock is not held across it). None on any failure → keyword-only.
@@ -282,9 +286,9 @@ pub async fn ask(
                 name,
                 content,
             )?;
-            let _ = window.emit("ask-step", "Saved to the room");
+            turn.step(&window, "Saved to the room");
             let text = format!("Saved your previous answer to the room as \"{}\".", meta.name);
-            let _ = window.emit("ask-delta", text.clone());
+            turn.emit(&window, "ask-delta", text.clone());
             let mut fx = ToolEffects::default();
             fx.wrote = true;
             let fx = effects_json(&fx);
@@ -328,6 +332,7 @@ pub async fn ask(
         cancel.clone(),
         &injected_rowids,
         privacy_bypass.unwrap_or(false),
+        &turn,
     )
     .await?;
     let stopped = cancel.load(Ordering::SeqCst);
@@ -341,11 +346,13 @@ pub async fn ask(
     if effects.boxes.is_none() && !stopped {
         if let Some((img_id, img_name, img_bytes, w, h)) = &first_image {
             if is_locate_intent(&question, Some(img_name)) {
-                let mut vmodel = vision_model(&models, &model);
-                if is_external_engine(&vmodel) {
-                    vmodel = best_default(&models);
-                }
-                if !models.is_empty() && !is_external_engine(&vmodel) {
+                // Was: `vision_model` (Qwen-VL names only), then any external
+                // model swapped for `best_default` — which on a cloud room
+                // handed the grounding pass to whatever local model happened to
+                // be installed, text-only ones included, and got `[]` back. Ask
+                // who can really see instead; `None` means nothing can, and the
+                // pass is skipped rather than faked.
+                if let Some(vmodel) = grounding_pick(&models, &model).await {
                     if let Ok(boxes) =
                         ground_prepared_image(&vmodel, &model, img_bytes, &question, *w, *h).await
                     {
@@ -355,7 +362,7 @@ pub async fn ask(
                                 "name": img_name,
                                 "boxes": boxes,
                             }));
-                            let _ = window.emit("ask-step", "Marked the image");
+                            turn.step(&window, "Marked the image");
                         }
                     }
                 }
@@ -383,6 +390,17 @@ pub async fn ask(
     }
     // ADD-7: mark the transcript so it matches what the user watched.
     if stopped {
+        // Owner replacement #3: a Stop that also killed a Studio build or a
+        // file pass has to SAY so. Only the tree knows what this run had
+        // started, and only nodes that are still live are listed — work that
+        // finished before the Stop produced a real artifact and must not be
+        // reported as stopped. Written before the marker so the exact
+        // `" *(stopped)*"` suffix stays the last thing in the message (the
+        // save-that-as-a-file path strips it by that literal).
+        let also = cancel_node.stopped_children();
+        if !also.is_empty() {
+            content.push_str(&format!("\n\n*(Also stopped: {}.)*", also.join(", ")));
+        }
         content.push_str(" *(stopped)*");
     }
     // ADD-23: viewer effects ride the message's own `effects` column as
@@ -884,14 +902,45 @@ fn gather_context_and_save_question(
 /// Whether one connector call's arguments get masked on the way out.
 ///
 /// Two conditions, both required. A LOCAL connector runs on this Mac, so
-/// nothing leaves and there is nothing to mask. AUTO MODE is the user's
-/// explicit "full approval" for connector tools — approving the call but
-/// rewriting the values it asks about is the worst of both: the call fails,
-/// and the restore on the way back erases the evidence, so the agent can only
-/// report that the connector "would not answer". Auto mode therefore sends
-/// real arguments; turning it off restores masking and the per-call card.
-pub(crate) fn masks_outbound_args(remote: bool, auto_mode: bool) -> bool {
-    remote && !auto_mode
+/// nothing leaves and there is nothing to mask. `unmask_outbound` is the user's
+/// explicit "send remote connectors my real values" — without it, masking
+/// rewrites the values the call asks ABOUT, so the call fails and the restore
+/// on the way back erases the evidence, leaving the agent able to report only
+/// that the connector "would not answer".
+///
+/// It takes the UNMASKING preference, never the auto-approve one. Those were a
+/// single flag until 2026-08-03: wanting the second was the only way to get
+/// past the first, so anyone who needed a working lookup silently gave up their
+/// consent card too. Auto-approve now decides only whether the card appears.
+pub(crate) fn masks_outbound_args(remote: bool, unmask_outbound: bool) -> bool {
+    remote && !unmask_outbound
+}
+
+/// What to tell the agent when the outbound seam actually rewrote something.
+///
+/// `None` when nothing matched — an empty result must keep reading as empty,
+/// and a note about masking that did not happen would be its own fabrication.
+///
+/// This is the missing half of the 2026-07-24 finding. Masking was made
+/// visible on the consent card, but the card is skipped entirely under "run
+/// connector tools without asking", and the restore on the way home puts the
+/// real names back into whatever came back — so a lookup that returned nothing
+/// BECAUSE it asked about `[Person A]` was indistinguishable from a connector
+/// that simply had no answer. The count is all that travels: naming the values
+/// here would put the very strings the seam just removed back into the
+/// model's context.
+pub(crate) fn masked_args_note(server: &str, entities_hidden: usize) -> Option<String> {
+    if entities_hidden == 0 {
+        return None;
+    }
+    let n = entities_hidden;
+    let plural = if n == 1 { "value" } else { "values" };
+    Some(format!(
+        "\n\n[This room hid {n} protected {plural} in what it sent, so \"{server}\" was asked \
+         about placeholders, not the real text. If the answer above is empty or off-target, \
+         that is very likely why — tell the user, and that Connectors → \"Send remote \
+         connectors real values\" is what would send the real ones.]"
+    ))
 }
 
 /// The bridge tier for a cloud CLI selected as the ROOM'S OWN engine.
@@ -903,7 +952,10 @@ pub(crate) fn masks_outbound_args(remote: bool, auto_mode: bool) -> bool {
 /// live QA saw it substitute a disabled draft SKILL for a requested workflow.
 /// The engine-parity doctrine named only four gaps (dictation, `local_generate`,
 /// vision boxes, UI tools); jobs were never one of them.
-pub(crate) fn primary_cli_scope() -> crate::room_mcp::ToolScope {
+/// `const` so the engine capability table (`commands::capabilities`) can name
+/// this function directly in its declarations instead of restating the variant
+/// — the tier a non-local engine is served at then has exactly one definition.
+pub(crate) const fn primary_cli_scope() -> crate::room_mcp::ToolScope {
     crate::room_mcp::ToolScope::CloudEngine
 }
 
@@ -944,12 +996,13 @@ pub(crate) async fn stream_answer(
     // PRIV-1: "send real details this once" — the user confirmed sharing real
     // values for THIS turn only.
     privacy_bypass: bool,
+    // Owner replacement #4: the run/chat every event of this turn is stamped with.
+    turn: &crate::turn::TurnId,
 ) -> Result<String, String> {
-    use tauri::Emitter;
     // PRIV-1: an explicit bypass is loud — the transcript records that real
     // details were shared this once, whichever engine answers.
     if privacy_bypass && crate::commands::active_policy().is_some() {
-        let _ = window.emit("ask-privacy", serde_json::json!({ "bypassed": true }));
+        turn.emit(window, "ask-privacy", serde_json::json!({ "bypassed": true }));
     }
     let advisors = if advisors_on {
         detected_advisors(state).await
@@ -971,7 +1024,7 @@ pub(crate) async fn stream_answer(
         // The old direct CLI path emitted this; the transparency belongs to the
         // engine choice, not to which code path answers.
         if is_cli_engine(model) {
-            let _ = window.emit("ask-step", "Asking your cloud AI (content leaves this Mac)");
+            turn.step(window, "Asking your cloud AI (content leaves this Mac)");
         }
         // MIGRATION Phase 2b: the Python/LangGraph sidecar is the app's SOLE local
         // AI engine — EVERY local turn routes through `/run`, including the
@@ -999,6 +1052,7 @@ pub(crate) async fn stream_answer(
             privacy_bypass,
             advisors,
             advisor_tools_on,
+            Some(turn),
         )
         .await
         {
@@ -1024,8 +1078,17 @@ pub(crate) async fn stream_answer(
             // available; it just was not being read. Same rule as the `Failed`
             // arm below, which has always said "any change shown here was already
             // applied".
+            //
+            // The third case is the one the owner retested on 2026-08-03: the
+            // turn died, "so nothing was written. Please try again." went into
+            // the transcript, and a background job from that same turn was still
+            // running in the Sidebar. Retrying on that instruction starts the
+            // work a second time. `background_work_live` reads the jobs table
+            // rather than guessing, and the notice points at it.
             SidecarOutcome::Done(text) if text.trim().is_empty() => Ok(if effects.wrote {
                 LOST_REPLY_AFTER_WRITE.to_string()
+            } else if background_work_live(state) {
+                LOST_REPLY_WITH_JOB.to_string()
             } else {
                 LOST_REPLY_CLEAN.to_string()
             }),
@@ -1154,13 +1217,80 @@ pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(map))
 }
 
+/// One specialist the composer's `*` menu may offer.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct Specialist {
+    /// The short domain key the user types after `*` ("web").
+    pub key: String,
+    /// The `ask_*_agent` tool a turn tagged with this key is narrowed to.
+    pub tool: String,
+    /// The agent's own label ("Web agent") — the same words the agent diagram
+    /// shows for the node that then lights up.
+    pub label: String,
+    /// One plain-words noun phrase: what this specialist's area is.
+    pub area: String,
+    /// The full catalog sentence — what it can actually be asked for.
+    pub description: String,
+}
+
+/// The specialists THIS room can dispatch to, for the composer's `*` menu
+/// (owner feature, 2026-08-03: "ask the specialist agent to run by tag").
+///
+/// Derived, never listed. The host contributes the two facts only it knows —
+/// the room's web setting and the tool names its engine's bridge tier would
+/// serve, lanes applied — and the sidecar's own registry turns those into the
+/// domains a turn could actually reach (`agents.specialist_roster`). So the
+/// menu is built from the same function as the Main agent's tool catalog, and
+/// a specialist can never appear in one and be missing from the other.
+///
+/// Errors rather than returning an empty list when the sidecar cannot be
+/// reached: "this room has no specialists" and "we could not find out" are
+/// different answers, and the menu says which one it is.
+#[tauri::command]
+pub async fn list_specialists(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<Specialist>, String> {
+    let (web_enabled, model) = {
+        let guard = state.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        (web_access_enabled(&room.conn), model_setting(&room.conn))
+    };
+    let models = ollama::list_models().await.unwrap_or_default();
+    let model = model.unwrap_or_else(|| best_default(&models));
+    let served = crate::room_mcp::room_tool_names(
+        &app,
+        web_enabled,
+        open_room_web_lanes(&state),
+        crate::sidecar::bridge_scope_for(&model),
+    );
+    let body = serde_json::json!({ "web_enabled": web_enabled, "served_names": served });
+    let value = crate::sidecar::sidecar_json("/agents", &body)
+        .await
+        .map_err(|e| e.sentinel(None))?;
+    serde_json::from_value(value["agents"].clone())
+        .map_err(|e| format!("the specialist list could not be read: {e}"))
+}
+
 /// ADD-7: stop a running answer. Sets its cancel flag; a no-op for an unknown
 /// id (the ask may have already finished).
+///
+/// Owner replacement #3: the flag is the root of a TREE, so this stops the
+/// studio build / background job / file pass the run started as well — and
+/// RETURNS what it stopped. Stop used to report nothing at all, which left the
+/// user to infer from a stalled screen whether anything had happened; the
+/// report is the only place the app can say "and the flashcards build it had
+/// started" truthfully, because only the tree knows.
 #[tauri::command]
-pub fn cancel_ask(state: State<'_, AppState>, ask_id: String) {
-    if let Some(flag) = state.cancels.lock().unwrap().get(&ask_id) {
-        flag.store(true, Ordering::SeqCst);
-    }
+pub fn cancel_ask(state: State<'_, AppState>, ask_id: String) -> crate::cancel::StopReport {
+    // Not an error when unknown — the ask may have already finished. But the two
+    // cases look identical from the UI, so the report and the host log both
+    // record which it was: a Stop that stopped nothing is the failure mode worth
+    // seeing.
+    let report = crate::cancel::cancel_id(state.inner(), &ask_id);
+    crate::obs::cancel_requested(&ask_id, report.known);
+    crate::obs::cancel_subtree(&ask_id, report.stopped.len());
+    report
 }
 
 /// Token-budget bar / context handoff: summarize the conversation the model
@@ -1190,10 +1320,36 @@ pub async fn handoff_chat(state: State<'_, AppState>, chat_id: String) -> Result
 
     let models = ollama::list_models().await.unwrap_or_default();
     let model = explicit_model.unwrap_or_else(|| best_default(&models));
+
+    // The engine's own window, read once and used twice (the budget below and
+    // the bar's snapshot at the end). `None` means "not published", and the
+    // 128k floor for that case stays here rather than inside the record — a
+    // made-up number does not belong in something the app calls a fact.
+    let max_context = crate::commands::capabilities_for(&model)
+        .await
+        .context_window
+        .unwrap_or(128_000);
+
+    // FIT THE CONVERSATION TO THE ENGINE BEFORE SENDING IT.
+    //
+    // This is the one history read with no compaction behind it: every row is
+    // flattened into a single prompt for the one-shot `handoff_summary`
+    // gateway. Local Ollama still fits that to its window itself, but a
+    // `:cloud` model, an OpenRouter provider and a cloud CLI trim NOTHING — so
+    // once the row bound went from 12 to 200 a long technical chat could
+    // overflow the window and come back as an engine error or an empty summary,
+    // precisely when the user pressed the button.
+    let total = history.len();
+    let history = compact_history(history, handoff_budget_bytes(max_context));
     let messages: Vec<ollama::ChatMessage> = history
         .into_iter()
         .map(|(role, content)| ollama::ChatMessage::new(&role, content))
         .collect();
+    // What the recap could NOT cover has to be said, because the marker is a
+    // hard cut-off: `db::recent_messages` starts every later turn here, so
+    // anything dropped is gone from the model's memory. The transcript above
+    // the marker still shows it to the user — this is what tells them to look.
+    let uncovered = total.saturating_sub(messages.len());
 
     // Phase 2 (unlocked): the summarization call — any engine, same as `ask`.
     //
@@ -1211,24 +1367,26 @@ pub async fn handoff_chat(state: State<'_, AppState>, chat_id: String) -> Result
                 .into(),
         );
     }
+    let summary = if uncovered > 0 {
+        // No claim about WHY — only what was and was not covered. (Compaction
+        // drops whole older turns to fit the window, and also skips
+        // viewer-markup payloads, which are UI data rather than conversation.)
+        format!(
+            "{summary}\n\n_This recap covers the most recent {} of {total} messages in this \
+             chat. The earlier ones are still above this marker in the transcript._",
+            total - uncovered,
+        )
+    } else {
+        summary
+    };
 
     // Token-budget bar: no LLM "ask" turn happens as part of a handoff, so no
     // `ask-token-usage` event fires on its own — build a snapshot for the new,
     // much smaller post-handoff context now, so the bar can update
     // immediately rather than waiting for a turn that hasn't happened yet.
     // Necessarily an estimate (no real usage exists until the next real turn).
-    let (engine, submodel, _effort) = split_external_model(&model);
-    let max_context = if engine == "codex-cli" {
-        crate::commands::external::codex_context_window(submodel)
-            .await
-            .unwrap_or_else(|| crate::model_limits::external_max_context(engine))
-    } else if is_external_engine(&model) {
-        crate::model_limits::external_max_context(engine)
-    } else {
-        ollama::native_context_length(&model)
-            .await
-            .unwrap_or(128_000)
-    };
+    // `max_context` is the same window the budget above was sized from — read
+    // once, at the top, from the engine's capability record.
     let usage_value = crate::token_usage::handoff_usage_value(&summary, max_context);
 
     // Phase 3 (locked): persist the marker, with that snapshot as its effects.
@@ -1760,7 +1918,7 @@ pub(crate) fn media_tools_specs() -> Vec<serde_json::Value> {
 /// to install (open decision 3: error, never a silent cloud fallback).
 pub(crate) fn resolve_local_generate_model(explicit: Option<String>, models: &[String]) -> String {
     match explicit {
-        Some(m) if !is_external_engine(&m) && !is_cloud_model(&m) => m,
+        Some(m) if runs_on_this_mac(&m) => m,
         _ => best_local_default(models),
     }
 }
@@ -1956,6 +2114,18 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
     }
     tools
 }
+
+/// The download/save tool names, which belong to the WEB AGENT's box — the
+/// sidecar boxes them on `chat.web` alone (`routing.DOWNLOAD_TOOL_NAMES`).
+///
+/// They are therefore part of the SEARCH lane, and `WebLanes::blocks` says so.
+/// While they were not, turning the Web agent off removed only `web_search` and
+/// `fetch_page`: the box still intersected the served catalog, so the sidecar's
+/// `worker_reachable` kept the Web agent reachable, the Main agent kept routing
+/// internet asks to it, and it could still pull a page, a file or a video off
+/// the internet into the room — with Settings claiming the AI has no internet
+/// abilities. A switch that leaves three inlets open is a false privacy claim.
+pub(crate) const DOWNLOAD_TOOL_NAMES: &[&str] = &["save_link", "download_url", "download_media"];
 
 /// BROWSE-2 (D17): the download/save tools. Web-gated like `fetch_page`, but
 /// served only to the engine tiers (`include_browse_tools` class in the room
@@ -2391,8 +2561,9 @@ pub(crate) struct ToolEffects {
     /// right after the tool result, so the model looks at what it captured.
     pub(crate) pending_images: Vec<String>,
     /// ADD-25: whether the CHAT model can read attached images. Set by the
-    /// caller from `is_vision_chat_model`; when false the perception tools
-    /// return a local vision-model description instead of attaching pixels.
+    /// caller from `chat_model_sees_images` (the engine's own answer, not the
+    /// model's name); when false the perception tools return a local
+    /// vision-model description instead of attaching pixels.
     pub(crate) vision_chat: bool,
     /// Wave 2 (Idea 4): content-free per-edit outcome records for this turn —
     /// each `{"tool", "outcome", "n", …}`, never `old_text`/`new_text`. Emitted
@@ -2437,6 +2608,10 @@ pub(crate) async fn exec_tool(
     // started in `ask` and passed down. `None` disables the room-tools handoff.
     // Threaded in rather than started here to avoid an async-recursion cycle.
     advisor_bridge: Option<&crate::room_mcp::Bridge>,
+    // Owner replacement #4: the run/chat whose turn dispatched this tool, so a
+    // step chip from inside a tool call is owned exactly like the deltas around
+    // it. `None` for a persistent bridge, which runs behind no ask.
+    turn: Option<&crate::turn::TurnId>,
 ) -> Result<String, String> {
     use tauri::Emitter;
     let args = &call.arguments;
@@ -2481,7 +2656,7 @@ pub(crate) async fn exec_tool(
             Ok(if rows.is_empty() {
                 "The room has no files.".into()
             } else {
-                clamp_tool_result(rows.join("\n"))
+                rows.join("\n")
             })
         }
         "search_room" => {
@@ -2785,7 +2960,7 @@ pub(crate) async fn exec_tool(
         // BROWSE-1: the private browser. Dispatched as a block because all six
         // share the takeover check, the page-script transport and the journal;
         // the per-tool bodies live in `commands::browse`.
-        name if is_browse_tool(name) => exec_browse(window, name, args, effects).await,
+        name if is_browse_tool(name) => exec_browse(window, name, args, effects, turn).await,
         // ADD-25: the agent↔UI tools. Each is one round-trip through the
         // AgentUi bridge to the live webview driver; the driver enforces the
         // data-agent-blocked consent denylist a second time at act time.
@@ -2813,7 +2988,7 @@ pub(crate) async fn exec_tool(
             if out.trim().is_empty() {
                 return Ok("No interactive controls are visible right now.".into());
             }
-            Ok(clamp_tool_result(out))
+            Ok(out)
         }
         "ui_act" => {
             use tauri::Manager;
@@ -2833,7 +3008,7 @@ pub(crate) async fn exec_tool(
             let desc = v["description"].as_str().unwrap_or("Done.").to_string();
             // The generic "Operated the app" chip already fired; follow with
             // the precise receipt so the user sees exactly what was touched.
-            let _ = window.emit("ask-step", desc.clone());
+            crate::turn::step_for(turn, window, desc.clone());
             Ok(desc)
         }
         "view_screenshot" => {
@@ -2914,7 +3089,17 @@ pub(crate) async fn exec_tool(
             .await
         }
         "web_search" => {
-            let query = args["query"].as_str().unwrap_or_default();
+            // PRIV-4: the door restores placeholders in a cloud model's tool
+            // arguments so ROOM tools see real values — but this argument does
+            // not stay on the Mac, it goes to seven search engines. Mask it back
+            // out here, at the seam, and disclose it below.
+            let asked = args["query"].as_str().unwrap_or_default();
+            let masked = crate::commands::privacy::mask_outbound_web(asked);
+            let query = masked.as_ref().map_or(asked, |(q, _)| q.as_str());
+            let mask_note = masked
+                .as_ref()
+                .map(|(_, hidden)| crate::commands::privacy::web_mask_note(*hidden))
+                .unwrap_or_default();
             let enabled = {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
@@ -2932,15 +3117,16 @@ pub(crate) async fn exec_tool(
                 db::get_fresh_web_search(&room.conn, query)
             };
             if let Some(hits) = cached {
-                let _ = window.emit(
-                    "ask-step",
+                crate::turn::step_for(
+                    turn,
+                    window,
                     format!("Using recent search results for \"{query}\" (from this Mac's cache)"),
                 );
                 // BROWSE-3: the cache holds hits now, not rendered text, and the
                 // browser's results page shares this row. A search the user ran
                 // in the address bar lands here as a free hit — same web, same
                 // ranking, whichever of the two asked first.
-                return Ok(clamp_tool_result(web::render_hits(&hits)));
+                return Ok(format!("{}{mask_note}", web::render_hits(&hits)));
             }
             // CHG-33: once the search path has failed outright this turn, don't
             // keep calling it — steer the model to salvage the answer from what it
@@ -2952,30 +3138,67 @@ pub(crate) async fn exec_tool(
                            already have or from fetched pages — do not search again this turn."
                     .into());
             }
-            let _ = window.emit(
-                "ask-step",
+            crate::turn::step_for(
+                turn,
+                window,
                 format!("Searching the web for \"{query}\" (leaves this Mac)"),
             );
-            let hits = match web::search_web(query).await {
-                Ok(h) => h,
+            let page = match web::search_web(query).await {
+                Ok(p) => p,
                 Err(e) => {
                     effects.web_search_throttled = true;
                     return Err(e);
                 }
             };
+            let hits = &page.hits;
             if hits.is_empty() {
-                return Ok("No results found.".into());
+                // "No results found." is a claim about the WEB. When every engine
+                // was blocked or rate limited it is a claim about our scrapers,
+                // and the model has no way to tell the two apart — so it reports
+                // to the user that a subject does not exist online. Say which
+                // happened, and never cache a blocked search as an empty one.
+                return Ok(if page.failed.is_empty() {
+                    format!("No results found.{mask_note}")
+                } else {
+                    format!(
+                        "The search did not run: {} could not be reached (blocked, rate limited \
+                         or too slow). This is NOT evidence that nothing exists for this query — \
+                         tell the user the search was blocked rather than reporting no results, \
+                         and answer from a fetched page or what you already have.",
+                        web::join_names(&page.failed)
+                    )
+                });
             }
             {
                 let guard = state.room.lock().unwrap();
                 if let Some(room) = guard.as_ref() {
-                    let _ = db::put_web_search(&room.conn, query, &hits);
+                    let _ = db::put_web_search(&room.conn, query, hits);
                 }
             }
-            Ok(clamp_tool_result(web::render_hits(&hits)))
+            let rendered = match page.blocked_note() {
+                Some(note) => format!("{}\n\n{note}", web::render_hits(hits)),
+                None => web::render_hits(hits),
+            };
+            Ok(format!("{rendered}{mask_note}"))
         }
         "fetch_page" => {
             let url = args["url"].as_str().unwrap_or_default();
+            // PRIV-4: same seam as web_search, but a URL cannot be masked and
+            // still resolve — a masked path or query string just 404s. So this
+            // one REFUSES rather than fetching. It is the exfiltration shape
+            // that matters: a cloud model that saw "[Person A]" can restore the
+            // real name into `https://anywhere/?q=…` and the door would have put
+            // it back for it.
+            // `outbound_url_hides`, not `mask_outbound_web`: a URL is ENCODED,
+            // so "?q=Ben%20Reich" (or "Ben+Reich") carries the real name past a
+            // redactor that only reads the raw string.
+            if let Some(hidden) = crate::commands::privacy::outbound_url_hides(url) {
+                return Ok(format!(
+                    "Not fetched: this URL carries {hidden} protected name(s) from this room's \
+                     block list, and Cloud privacy is on, so it must not leave this Mac \
+                     (Settings → Cloud privacy). Tell the user rather than retrying."
+                ));
+            }
             // CHG-5/CHG-28: continue reading a long page from a char offset.
             let start = args["start"].as_u64().unwrap_or(0) as usize;
             let enabled = {
@@ -2995,7 +3218,7 @@ pub(crate) async fn exec_tool(
             let (title, text) = if let Some(hit) = cached {
                 hit
             } else {
-                let _ = window.emit("ask-step", format!("Fetching {url} (leaves this Mac)"));
+                crate::turn::step_for(turn, window, format!("Fetching {url} (leaves this Mac)"));
                 let (title, text) = web::fetch_page(url).await?;
                 {
                     let guard = state.room.lock().unwrap();
@@ -3019,12 +3242,23 @@ pub(crate) async fn exec_tool(
             if !enabled {
                 return Ok("Web access is turned off in Settings → Online features.".into());
             }
-            let _ = window.emit("ask-step", format!("Saving {url} into the room (leaves this Mac)"));
-            match import_link_impl(state, &url).await {
-                Ok(meta) => {
-                    let _ = window.emit("room-files-changed", ());
-                    Ok(format!("Saved \"{}\" into the room.", meta.name))
-                }
+            crate::turn::step_for(
+                turn,
+                window,
+                format!("Saving {url} into the room (leaves this Mac)"),
+            );
+            // Through the funnel that also schedules the auto-index and the
+            // privacy scan, NOT the bare row write. The redactor's substitution
+            // table is built from what the scan found, so a page the assistant
+            // saved and never scanned contributes no entities to it — and this
+            // is the one save path a cloud call usually follows immediately.
+            let handle = {
+                use tauri::Manager;
+                window.app_handle().clone()
+            };
+            match crate::commands::files::import_link_and_index(&handle, state, &url).await {
+                // `import_link_and_index` emits `room-files-changed` itself.
+                Ok(meta) => Ok(format!("Saved \"{}\" into the room.", meta.name)),
                 Err(e) if e == "YT_NO_CAPTIONS" => Ok(
                     "This video has no captions to save as a transcript. Use download_media to \
                      download the video itself — it will be transcribed after it arrives."
@@ -3044,7 +3278,7 @@ pub(crate) async fn exec_tool(
             if !enabled {
                 return Ok("Web access is turned off in Settings → Online features.".into());
             }
-            let _ = window.emit("ask-step", format!("Downloading {url} (leaves this Mac)"));
+            crate::turn::step_for(turn, window, format!("Downloading {url} (leaves this Mac)"));
             let app = window.app_handle().clone();
             match web::download_to_temp(&url, web::INLINE_DOWNLOAD_BYTES, None, |_, _| {}).await? {
                 web::DownloadOutcome::Done(d) => {
@@ -3109,9 +3343,17 @@ pub(crate) async fn exec_tool(
             // vision_keep_alive computes the right keep-alive and grounding uses
             // the user's model when no separate VL model is installed.
             let chat_model = explicit.unwrap_or_else(|| best_default(&models));
-            let vmodel = {
-                let v = vision_model(&models, &chat_model);
-                if is_external_engine(&v) { chat_model.clone() } else { v }
+            // A real "can you see?" pick, not a Qwen-VL name match — so the
+            // room's own cloud vision model (or a local build with an unfamiliar
+            // name) does the marking instead of being passed over. When nothing
+            // can see, say so rather than running a text-only model at pixels
+            // and relaying its empty answer as "not in the image".
+            let Some(vmodel) = grounding_pick(&models, &chat_model).await else {
+                return Ok(format!(
+                    "Cannot mark {real_name}: this room's model can't see images, and no vision \
+                     model is installed on this Mac. Install one (Settings → AI helpers) or pick \
+                     a vision-capable model in Settings → Model."
+                ));
             };
             let boxes = ground_prepared_image(&vmodel, &chat_model, &prepared, find, w, h).await?;
             if boxes.is_empty() {
@@ -3137,7 +3379,43 @@ pub(crate) async fn exec_tool(
             // create onto the existing pad as a normal versioned overwrite.
             if is_scratch_pad_name(&name) {
                 if let Some(meta) = db::file_by_exact_name(&room.conn, SCRATCH_PAD_NAME)? {
+                    // ART-1: this is the one generated write that CANNOT go
+                    // through `Artifact`. The pad is get-or-create over any
+                    // source, so the funnel's "never version a person's file"
+                    // rule would step aside to "Scratch pad (2).md" for a pad the
+                    // user made — the exact shadowing this branch exists to
+                    // prevent. The funnel's other two guarantees still hold here,
+                    // by hand, because the reasons for them do not change:
+                    //
+                    //   * an empty rewrite is refused. `content` defaults to ""
+                    //     when the model omits it, and blanking the shared pad on
+                    //     the strength of a missing argument is the app throwing
+                    //     the user's notes away and reporting a successful write.
+                    //   * the Stop is read before the write, not after.
+                    if content.trim().is_empty() {
+                        return Err(format!(
+                            "Nothing was generated for \"{}\" — it was left as it was. \
+                             (An empty pad would look like finished work.)",
+                            meta.name
+                        ));
+                    }
+                    if cancel.as_deref().map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+                        return Err(format!(
+                            "Stopped before \"{}\" was rewritten — nothing was written to the room.",
+                            meta.name
+                        ));
+                    }
                     store_file_bytes(&room.conn, &meta.id, content.as_bytes(), Some(&content), "AI edit")?;
+                    // The pad's History says who rewrote it, like every other
+                    // generated state. `store_file_bytes` has already snapshotted
+                    // the outgoing head (carrying ITS provenance onto the
+                    // version), so this only moves the head's.
+                    let prov = db::Provenance {
+                        run_id: turn.map(|t| t.run_id().to_string()),
+                        tool: Some("create_file".into()),
+                        ..Default::default()
+                    };
+                    db::set_file_provenance(&room.conn, &meta.id, prov.to_json().as_deref())?;
                     let _ = window.emit("room-files-changed", ());
                     let _ = window.emit("file-updated", &meta.id);
                     effects.wrote = true;
@@ -3149,14 +3427,12 @@ pub(crate) async fn exec_tool(
                 }
                 // No pad yet: create it under the CANONICAL name (never the
                 // HTML-defaulted variant), so the chip and prompt line resolve it.
-                let meta = db::insert_file(
-                    &room.conn,
-                    SCRATCH_PAD_NAME,
-                    &note_mime(SCRATCH_PAD_NAME),
-                    content.as_bytes(),
-                    Some(&content),
-                    "generated",
-                )?;
+                let meta = Artifact::note(SCRATCH_PAD_NAME, &content)
+                    .via_tool("create_file")
+                    .during_run(turn.map(|t| t.run_id()))
+                    .cancel_maybe(cancel.as_deref())
+                    .commit(&room.conn)?
+                    .meta;
                 let _ = window.emit("room-files-changed", ());
                 effects.wrote = true;
                 return Ok(format!("Created \"{}\" in the room.", meta.name));
@@ -3178,10 +3454,27 @@ pub(crate) async fn exec_tool(
                 .first_or(mime_guess::mime::TEXT_PLAIN)
                 .essence_str()
                 .to_string();
-            let meta = db::insert_file(&room.conn, &name, &mime, content.as_bytes(), Some(&content), "generated")?;
+            // ART-1: the agent's own write goes through the staging funnel like
+            // every other generated artifact. Two consequences the model is told
+            // about below: a Stop pressed while it was writing lands BEFORE the
+            // commit, and asking for the same document twice versions it instead
+            // of leaving two files with the same name.
+            let written = Artifact::new(&name, &mime, &content)
+                .via_tool("create_file")
+                .during_run(turn.map(|t| t.run_id()))
+                .cancel_maybe(cancel.as_deref())
+                .commit(&room.conn)?;
             let _ = window.emit("room-files-changed", ());
             effects.wrote = true;
-            Ok(format!("Created \"{}\" in the room.", meta.name))
+            Ok(if written.versioned {
+                format!(
+                    "\"{}\" already existed — rewrote it instead of creating a duplicate. \
+                     The previous version is kept in History.",
+                    written.meta.name
+                )
+            } else {
+                format!("Created \"{}\" in the room.", written.meta.name)
+            })
         }
         "rename_file" => {
             let name = args["name"].as_str().unwrap_or_default();
@@ -3274,7 +3567,7 @@ pub(crate) async fn exec_tool(
                     None => format!("- {}", m.content),
                 })
                 .collect();
-            Ok(clamp_tool_result(lines.join("\n")))
+            Ok(lines.join("\n"))
         }
         // 2026-07-24: the agent could add a memory but never correct or drop
         // one, so a wrong note it saved was permanent. Both verbs match on the
@@ -3386,7 +3679,22 @@ pub(crate) async fn exec_tool(
                 }
             };
             let instructions = args["instructions"].as_str().map(str::to_string);
-            let meta = super::run_studio(window, &st, spec, None, instructions, refs, None).await?;
+            // Owner replacement #3: this build is a CHILD of the run that asked
+            // for it. It had no cancel flag at all before — Stop ended the
+            // answer, the page kept generating, and it saved itself into the
+            // room minutes later. `turn` carries the run id the frontend minted,
+            // which is the same id `cancel_ask` stops.
+            let meta = super::run_studio(
+                window,
+                &st,
+                spec,
+                None,
+                instructions,
+                refs,
+                None,
+                turn.map(crate::turn::TurnId::run_id),
+            )
+            .await?;
             Ok(format!("Saved \"{}\" into the room.", meta.name))
         }
         "stt_status" => {
@@ -3505,16 +3813,16 @@ pub(crate) async fn exec_tool(
         }
         "save_skill" => agent_save_skill(window, state.inner(), args),
         "write_skill_resource" => agent_write_skill_resource(window, state.inner(), args),
-        "delete_skill" => agent_delete_skill(window, state.inner(), args),
+        "delete_skill" => agent_delete_skill(window, state.inner(), args).await,
         "delete_skill_resource" => agent_delete_skill_resource(window, state.inner(), args),
         "run_skill_script" => agent_run_skill_script(window, state.inner(), args).await,
-        "list_mcps" => Ok(clamp_tool_result(agent_list_mcps(state.inner())?)),
+        "list_mcps" => Ok(agent_list_mcps(state.inner())?),
         "read_mcp" => {
             let name = args["name"].as_str().unwrap_or_default();
-            Ok(clamp_tool_result(agent_read_mcp(state.inner(), name)?))
+            Ok(agent_read_mcp(state.inner(), name)?)
         }
         "save_mcp" => agent_save_mcp(window, state.inner(), args),
-        "delete_mcp" => agent_delete_mcp(window, state.inner(), args),
+        "delete_mcp" => agent_delete_mcp(window, state.inner(), args).await,
         // ADD-32: kick off a durable whole-file pass. The heavy lifting is the
         // deterministic job runner's; the agent only starts it and reports.
         "start_file_pass" => {
@@ -3543,32 +3851,41 @@ pub(crate) async fn exec_tool(
                 .iter()
                 .take(8)
                 .map(|j| {
+                    // A job the APP stopped is 'paused' too, and reporting only
+                    // the status would have the assistant tell the user their
+                    // work is paused as if they had paused it. The row records
+                    // who actually stopped it; say so.
+                    let why = j
+                        .parked_reason
+                        .as_deref()
+                        .map(|r| format!(" — {r} Resume picks it up here."))
+                        .unwrap_or_default();
                     format!(
-                        "- {} — {} ({} of {} steps done)",
-                        j.title, j.status, j.cursor, j.total
+                        "- {} — {} ({} of {} steps done){}",
+                        j.title, j.status, j.cursor, j.total, why
                     )
                 })
                 .collect();
-            Ok(clamp_tool_result(lines.join("\n")))
+            Ok(lines.join("\n"))
         }
         // Wave 4a (Idea 2): the workflow authoring tools. All logic lives in
         // commands::jobs::workflow; these arms just route args + the agent
         // messages. Drafts require explicit user activation (the review gate).
         "list_workflows" => {
             let name = args["name"].as_str();
-            Ok(clamp_tool_result(agent_list_workflows(state.inner(), name)?))
+            Ok(agent_list_workflows(state.inner(), name)?)
         }
         "save_workflow" => agent_save_workflow(state.inner(), window, args, "agent").await,
         "update_workflow" => agent_update_workflow(state.inner(), window, args).await,
-        "delete_workflow" => agent_delete_workflow(state.inner(), window, args),
+        "delete_workflow" => agent_delete_workflow(state.inner(), window, args).await,
         "run_workflow" => agent_run_workflow(window, state.inner(), args).await,
         "test_workflow" => {
-            Ok(clamp_tool_result(agent_test_workflow(window, state.inner(), args).await?))
+            Ok(agent_test_workflow(window, state.inner(), args).await?)
         }
         // Wave 1a: run one prompt on the LOCAL model for an external agent on
         // the Leash's full tier (only `ToolScope::ExternalAgent` advertises
         // it). Never touches `effects` — the bridge passes a throwaway sink
-        // for this scope. No `clamp_tool_result`: the output is
+        // for this scope. Nothing caps the output here: it is
         // generation-bounded and the external client has a big context.
         "local_generate" => {
             let prompt = args["prompt"].as_str().unwrap_or_default().trim().to_string();
@@ -3608,7 +3925,6 @@ pub(crate) async fn exec_tool(
                     temperature,
                     KEEP_ALIVE_WARM,
                     None,
-                    ollama::CtxTier::Chat,
                 )
                 .await?;
                 Ok(strip_think_spans(&raw).trim().to_string())
@@ -3647,7 +3963,7 @@ pub(crate) async fn exec_tool(
                 // CLI-invocation's own usage-capture complexity.
                 Ok((answer, _usage)) => Ok(format!(
                     "Advisor ({want}) replied:\n\n{}",
-                    clamp_tool_result(answer)
+                    answer
                 )),
                 // Return Ok so the local model recovers by answering itself,
                 // instead of surfacing a raw tool error to the user.
@@ -3665,37 +3981,51 @@ pub(crate) async fn exec_tool(
                 // and restore them in the result so the model's view stays
                 // consistent. Local connectors run on this Mac and are exempt.
                 //
-                // AUTO MODE (owner's call, 2026-07-24) is the one exception, and
-                // it is deliberate: masking rewrites the VALUES a connector is
-                // asked about, so a room whose entity map holds the very things
-                // the user wants looked up ("NVDA", "#eng") sent the server
-                // `[Person A]` and got nothing back — the call failed, and the
-                // restore on the way home hid WHY, so the agent could only
-                // report that the connector "would not answer". Auto mode means
-                // the agent has full approval to act, so it also sends real
-                // arguments. Turning auto mode OFF restores masking along with
-                // the per-call consent card. None when the entity map is empty.
+                // Connectors → "Send remote connectors real values" is the one
+                // exception, and it is deliberate: masking rewrites the VALUES a
+                // connector is asked about, so a room whose entity map holds the
+                // very things the user wants looked up ("NVDA", "#eng") sent the
+                // server `[Person A]` and got nothing back — the call failed, and
+                // the restore on the way home hid WHY, so the agent could only
+                // report that the connector "would not answer". Turning that
+                // preference OFF restores masking. None when the entity map is
+                // empty.
+                //
+                // It is `mcp_outbound_unmask`, NOT `mcp_auto_approve`: since the
+                // 2026-08-03 split, being allowed to run unattended says nothing
+                // about what the call may carry, and vice versa.
                 //
                 // Computed BEFORE the consent card on purpose. The card used to
                 // be built from the model's raw arguments while the masked copy
                 // was what actually left the room, so in a room with protected
                 // words the user approved "look up Dana Cohen" and the connector
                 // was asked about "[Person A]" — an empty result neither they
-                // nor the agent could explain. What is shown is now what is sent.
-                let auto_mode = state
-                    .mcp_auto_approve
-                    .load(std::sync::atomic::Ordering::SeqCst);
-                let seam = if masks_outbound_args(route.remote, auto_mode) {
+                // nor the agent could explain. What is shown is now what is sent,
+                // which is also what makes "real values, still ask me" honest.
+                //
+                // Read PER CONNECTOR since 2026-08-03: "this connector may see
+                // real values" is a judgement about one destination, and one
+                // remote service being trusted with the room's names says
+                // nothing about the next one.
+                let unmask_outbound = outbound_unmask_for(state, &route.server_name);
+                let seam = if masks_outbound_args(route.remote, unmask_outbound) {
                     crate::commands::remote_seam_redactor()
                 } else {
                     None
                 };
-                let sent = match &seam {
+                // `hidden` is why the report is no longer discarded: with "run
+                // connector tools without asking" ON there is no consent card,
+                // so masking that actually FIRED had no user-visible trace at
+                // all — and the restore on the way home turns the placeholders
+                // back, leaving an empty result that looks like the connector
+                // failing. See `masked_args_note`.
+                let (sent, hidden) = match &seam {
                     Some(p) => {
                         let mut report = crate::commands::PrivacyReport::default();
-                        p.redactor.redact_value(args, &mut report)
+                        let masked = p.redactor.redact_value(args, &mut report);
+                        (masked, report.entities_hidden)
                     }
-                    None => args.clone(),
+                    None => (args.clone(), 0),
                 };
                 // SEC-1b: consent is tied to the moment data actually leaves the
                 // room. Ask the user before invoking a connector's tool, unless
@@ -3708,17 +4038,44 @@ pub(crate) async fn exec_tool(
                         route.tool_name, route.server_name
                     ));
                 }
-                let result = route
+                let out = route
                     .client
                     .lock()
                     .await
                     .call_tool(&route.tool_name, &sent)
                     .await?;
                 let result = match &seam {
-                    Some(p) => p.redactor.restore(&result),
-                    None => result,
+                    Some(p) => p.redactor.restore(&out.text),
+                    None => out.text,
                 };
-                Ok(clamp_tool_result(result))
+                // A connector that answers with a PICTURE (a screenshot tool, a
+                // chart renderer, a map) used to have it replaced with
+                // "[image content omitted]" — the model was handed a note about
+                // an image instead of the image. Route it through the same
+                // perception funnel the room's own tools use, which attaches the
+                // pixels only to a vision-capable chat model and otherwise has a
+                // LOCAL vision model describe them. Nothing new leaves the Mac:
+                // the decision about pixels is `perceive_image`'s, unchanged.
+                let mut result = result;
+                for (i, image) in out.images.into_iter().enumerate() {
+                    let caption =
+                        format!("image {} from \"{}\"", i + 1, route.tool_name);
+                    match perceive_image(effects, image, &caption).await {
+                        Ok(note) => result.push_str(&format!("\n\n{note}")),
+                        // Honest, and never fatal: the TEXT half of the result is
+                        // still good, so say the picture did not make it rather
+                        // than failing the whole call.
+                        Err(e) => result.push_str(&format!(
+                            "\n\n[{caption} could not be attached: {e}]"
+                        )),
+                    }
+                }
+                // Appended AFTER the clamp so the one sentence explaining a
+                // thin result cannot be the part that gets cut.
+                Ok(match masked_args_note(&route.server_name, hidden) {
+                    Some(note) => format!("{}{note}", result),
+                    None => result,
+                })
             }
             None => Err(format!("Unknown tool: {other}")),
         },
@@ -3744,9 +4101,12 @@ pub(crate) const FETCH_PAGE_WINDOW: usize = 40_000;
 ///    value from the truncation notice", so a pagination protocol was declared,
 ///    documented, and never implemented — `start` could only ever be supplied
 ///    by a model guessing.
-/// 2. Nothing downstream can undo it. `clamp_tool_result` is a deliberate
-///    no-op, and on a cloud room `budget::trim_messages_to_window`'s Python
-///    twin no-ops as well, while compaction's `_split` always keeps the NEWEST
+/// 2. Nothing downstream can undo it. The host applies NO character cap of its
+///    own to a tool result (there used to be a `clamp_tool_result` wrapper on
+///    ~20 call sites whose whole body was `s` — deleted, audit #223: a name
+///    that claims a safety check it does not perform is how this very failure
+///    got past review). On a cloud room `budget::trim_messages_to_window`'s
+///    Python twin no-ops as well, while compaction's `_split` keeps the NEWEST
 ///    message whole however big it is. So one `fetch_page` of a heavy site
 ///    (finance.yahoo.com is ~69 KB of text before any JS runs) went to the
 ///    provider verbatim and the request was rejected — which the user sees as
@@ -3769,11 +4129,6 @@ pub(crate) fn fetch_page_window(title: &str, url: &str, text: &str, start: usize
     } else {
         format!("{header}{body}")
     }
-}
-
-/// Tool results are passed through without an app-level character cap.
-pub(crate) fn clamp_tool_result(s: String) -> String {
-    s
 }
 
 // --------------------------------------------------------------------------- #
@@ -3804,8 +4159,35 @@ pub(crate) const LOST_REPLY_AFTER_WRITE: &str =
      it reached the app. A change was already applied to this room before that \
      happened; check the file and undo it if it was not what you wanted.)*";
 
+/// No answer and no write, but durable background work in this room is STILL
+/// RUNNING. `LOST_REPLY_CLEAN`'s "Please try again" is an instruction, and on a
+/// long turn that started a job it was the wrong one: the answer is safe to
+/// re-ask, the job is not safe to start twice. Says only what the jobs table
+/// can prove — that work is live in this room, not that this turn started it
+/// (nothing links a job row to an ask).
+pub(crate) const LOST_REPLY_WITH_JOB: &str =
+    "*(The agent finished without producing an answer — the reply was lost before \
+     it reached the app, and nothing was written. Background work in this room is \
+     still running: check the Jobs list before asking again, so you don't start \
+     the same job twice.)*";
+
 /// The mid-run failure note's stable fragment (the rest carries the error text).
 pub(crate) const STOPPED_MID_RUN: &str = "hit an error and stopped mid-run";
+
+/// Is durable background work still live in the OPEN room? The jobs table is
+/// the deterministic ground truth behind `LOST_REPLY_WITH_JOB` — the same rows
+/// the Sidebar draws — so the notice can never describe a job the user cannot
+/// go and look at. A failed read is NOT "nothing is running": stay with the
+/// plainer notice rather than claiming either way.
+pub(crate) fn background_work_live(state: &State<'_, AppState>) -> bool {
+    state
+        .with_room(|room| db::list_jobs(&room.conn))
+        .map(|jobs| {
+            jobs.iter()
+                .any(|j| j.status == "running" || j.status == "queued")
+        })
+        .unwrap_or(false)
+}
 
 /// Is this assistant message one of Arcelle's own failure notices rather than a
 /// real answer? Anything that reads the "last answer" must ask this first.
@@ -3874,12 +4256,18 @@ pub(crate) fn tail_bytes(s: &str, max: usize) -> &str {
 /// which `is_cloud_model`'s exact `:cloud` suffix does not catch. The cost of a
 /// false exclusion is one honest "install a local vision model"; the cost of a
 /// false inclusion is the user's screenshot leaving the Mac.
+///
+/// The rule itself now lives in the engine capability record
+/// (`commands::capabilities::engine_id_of`) and this reads its `local` field —
+/// one definition, so the vision pick, the bridge tier, the trust label, the
+/// job lanes and the privacy door can no longer disagree about which models run
+/// here. THE NAME STAYS: every call site reads as the question it is asking.
+///
+/// The record answers for the MODEL; `ollama_runs_here` answers for the
+/// TRANSPORT. Both must say yes: a room with the Closet override set relays
+/// `qwen3.5:4b` to another computer, and the name alone cannot know that.
 pub(crate) fn runs_on_this_mac(model: &str) -> bool {
-    if is_external_engine(model) || is_cloud_model(model) {
-        return false;
-    }
-    let tag = model.rsplit(':').next().unwrap_or_default();
-    !tag.ends_with("-cloud")
+    crate::commands::declared_for(model).local && crate::commands::ollama_runs_here()
 }
 
 /// ADD-25: hand a captured image (screenshot / video frame) to the model.
@@ -3904,34 +4292,26 @@ pub(crate) async fn perceive_image(
         return Err("No local model is available to look at the image.".into());
     }
     // This path only runs when the chat model itself can't read pixels, so we
-    // need a *separate* image-capable LOCAL model to describe them. Prefer a
-    // dedicated grounding VL model; otherwise any local vision-capable chat
-    // model (qwen3.5, gemma3, llava…). Refuse if there's no genuine on-device
-    // vision model: a text-only model just parrots the schema back
-    // (`{"properties":{"description":{}}}`), and an external engine — or an
-    // Ollama `:cloud` entry, which is served from someone else's machine — would
-    // leak pixels this path promises never leave the Mac (`runs_on_this_mac`).
-    let mut vmodel = models
-        .iter()
-        .filter(|m| runs_on_this_mac(m))
-        .find(|m| m.contains("qwen2.5vl") || m.contains("qwen2.5-vl") || m.contains("qwen3-vl"))
-        .cloned();
-    if vmodel.is_none() {
-        // No dedicated VL build installed: ASK each local model whether it can
-        // see, instead of scanning names. A multimodal model whose name matches
-        // none of the known patterns used to be skipped here, and the user was
-        // told to install a vision model they already had.
-        for m in &models {
-            if runs_on_this_mac(m) && chat_model_sees_images(m).await {
-                vmodel = Some(m.clone());
-                break;
-            }
+    // need a *separate* image-capable LOCAL model to describe them. ASK each one
+    // whether it can see rather than scanning for known names — a multimodal
+    // model whose name matched none of the hard-coded patterns used to be
+    // skipped here, and the user was told to install a vision model they already
+    // had. Refuse if there's no genuine on-device vision model: a text-only
+    // model just parrots the schema back (`{"properties":{"description":{}}}`),
+    // and an external engine — or an Ollama `:cloud` entry, which is served from
+    // someone else's machine — would leak pixels this path promises never leave
+    // the Mac (`runs_on_this_mac`).
+    let mut vmodel = None;
+    for m in &models {
+        if runs_on_this_mac(m) && chat_model_sees_images(m).await {
+            vmodel = Some(m.clone());
+            break;
         }
     }
     let Some(vmodel) = vmodel else {
         return Err(
-            "This room's chat model can't see images, and no local vision model is installed to \
-             describe them. Install one — for example `ollama pull qwen2.5vl:3b` — then try again."
+            "This room's chat model can't see images, and no model on this Mac can describe them \
+             either. Pick a model with the `vision` badge in Settings → Model, or install one."
                 .into(),
         );
     };
@@ -3958,10 +4338,10 @@ pub(crate) async fn perceive_image(
         .ok()
         .and_then(|v| v["description"].as_str().map(str::to_string))
         .unwrap_or(raw);
-    Ok(clamp_tool_result(format!(
+    Ok(format!(
         "Your chat model can't view images, so a local vision model looked at {caption} and \
          reports: {desc}"
-    )))
+    ))
 }
 
 /// ADD-25: resolve the video a `view_media_frame` call means. First honor the
@@ -4196,13 +4576,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_mode_sends_real_connector_args() {
+    fn unmasking_not_auto_approve_decides_the_outbound_args() {
         // The reported failure: a remote connector asked about values the room's
         // entity map also knows ("NVDA", "#eng") received placeholders and
-        // returned nothing, and the restore hid why. Auto mode = full approval,
-        // so the args go out real.
+        // returned nothing, and the restore hid why. The cure is the user's
+        // explicit "send real values", and ONLY that — this argument is
+        // `mcp_outbound_unmask`, never `mcp_auto_approve`.
         assert!(!masks_outbound_args(true, true));
-        // Auto mode off: the per-call card is back, and so is the mask.
+        // Unmasking off: the mask is back, whatever the consent card is doing.
         assert!(masks_outbound_args(true, false));
         // A local connector never leaves this Mac, either way.
         assert!(!masks_outbound_args(false, false));
@@ -4210,7 +4591,26 @@ mod tests {
     }
 
     #[test]
+    fn a_masked_connector_call_says_so_in_its_own_result() {
+        // The other half of that failure: under "run connector tools without
+        // asking" there is no consent card, and the restore on the way home
+        // puts the real names back — so the ONE trace that the call asked about
+        // placeholders has to travel with the result, or a thin answer is
+        // indistinguishable from a connector with nothing to say.
+        let note = masked_args_note("gmail", 2).expect("masking fired, so it is reported");
+        assert!(note.contains("hid 2 protected values"));
+        assert!(note.contains("gmail"));
+        assert!(note.contains("Send remote connectors real values"));
+        // Singular reads as English, not "1 values".
+        assert!(masked_args_note("gmail", 1).unwrap().contains("hid 1 protected value in"));
+        // Nothing matched: empty must keep reading as empty. A note here would
+        // invent a cause for a result that simply had none.
+        assert!(masked_args_note("gmail", 0).is_none());
+    }
+
+    #[test]
     fn the_describe_pass_only_ever_picks_a_model_that_runs_here() {
+        let _guard = crate::ollama::base_url_test_lock();
         // `perceive_image` promises the pixels of a screenshot or video frame
         // never leave the Mac. `is_external_engine` alone does not keep that
         // promise: it returns false for Ollama `:cloud` models by design, and a
@@ -4226,6 +4626,30 @@ mod tests {
         // …as would an external engine.
         assert!(!runs_on_this_mac("claude-cli::opus"));
         assert!(!runs_on_this_mac("openrouter::vendor/vision-agent"));
+    }
+
+    /// The Closet (`set_ollama_url`) moves the SAME model to another computer.
+    /// Locality used to be read off the model NAME alone, so with a LAN box
+    /// configured `qwen3.5:4b` still answered "runs on this Mac" — and every
+    /// seam that reads this said so too: the privacy door skipped injection
+    /// (real names, whole documents), pixels were handed over, and the trust
+    /// chip said "Local only — nothing leaves the device".
+    #[test]
+    fn a_relayed_ollama_is_not_this_mac_however_local_the_model_name_looks() {
+        let _guard = crate::ollama::base_url_test_lock();
+        crate::ollama::set_base_url_override(None);
+        assert!(runs_on_this_mac("qwen3.5:4b"), "no override: this Mac");
+
+        crate::ollama::set_base_url_override(Some("http://192.168.1.20:11434".into()));
+        assert!(
+            !runs_on_this_mac("qwen3.5:4b"),
+            "the Closet relays this model to another computer"
+        );
+        // A loopback override is still this Mac — the field is also how people
+        // point at a non-default local port.
+        crate::ollama::set_base_url_override(Some("http://127.0.0.1:11500".into()));
+        assert!(runs_on_this_mac("qwen3.5:4b"));
+        crate::ollama::set_base_url_override(None);
     }
 
     #[test]
@@ -4551,7 +4975,7 @@ mod tests {
         for p in ["prompt", "system", "schema", "temperature"] {
             assert!(f["parameters"]["properties"][p].is_object(), "missing param {p}");
         }
-        // The `long` switch is gone: it selected a CtxTier the request builder
+        // The `long` switch is gone: it selected a context tier the request builder
         // ignores, so it advertised a capability the app could not deliver.
         assert!(f["parameters"]["properties"]["long"].is_null());
         // The content-perception subset is exactly view_media_frame.
@@ -5202,6 +5626,7 @@ mod tests {
     fn failure_notices_are_recognised_by_their_own_predicate() {
         assert!(is_failure_notice(LOST_REPLY_CLEAN));
         assert!(is_failure_notice(LOST_REPLY_AFTER_WRITE));
+        assert!(is_failure_notice(LOST_REPLY_WITH_JOB));
         let mid_run = format!(
             "*(The agent {STOPPED_MID_RUN}: boom. Any change shown here was already applied.)*"
         );
@@ -5220,6 +5645,34 @@ mod tests {
         assert!(LOST_REPLY_AFTER_WRITE.contains("already applied"));
         // ...and the clean one still says it, because there it is true.
         assert!(LOST_REPLY_CLEAN.contains("nothing was written"));
+    }
+
+    /// The other half, found by the owner's 2026-08-03 retest: "Please try
+    /// again" is an INSTRUCTION, and it was handed out unconditionally — with a
+    /// background job from the same turn still running behind it. Only the
+    /// notice that knows no work is live may issue it.
+    #[test]
+    fn the_retry_instruction_is_withheld_while_background_work_is_live() {
+        assert!(LOST_REPLY_CLEAN.contains("Please try again"));
+        assert!(!LOST_REPLY_WITH_JOB.contains("Please try again"));
+        assert!(LOST_REPLY_WITH_JOB.contains("still running"));
+        assert!(LOST_REPLY_WITH_JOB.contains("Jobs list"));
+        // Still true here, and still said: no write committed on this path.
+        assert!(LOST_REPLY_WITH_JOB.contains("nothing was written"));
+    }
+
+    /// The frontend recovery strip (`markup.ts` `lostReplyNotice`) matches on
+    /// these exact fragments to decide when to offer Try again — it cannot
+    /// import a Rust constant, so this is the contract between the two.
+    #[test]
+    fn the_notices_keep_the_fragments_the_chat_ui_matches_on() {
+        for notice in [LOST_REPLY_CLEAN, LOST_REPLY_AFTER_WRITE, LOST_REPLY_WITH_JOB] {
+            assert!(notice.starts_with("*(The agent "), "{notice}");
+            assert!(
+                notice.contains("the reply was lost before it reached the app"),
+                "{notice}"
+            );
+        }
     }
 
     #[test]

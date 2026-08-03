@@ -25,25 +25,38 @@ pub struct ProviderRuntimeConfig {
     pub supports_tools: bool,
 }
 
-/// What the live catalog says a provider model can do: (context window,
-/// tool-calling, image input), keyed by the provider's own model slug.
-type ModelRuntimeFacts = (Option<u32>, bool, bool);
+/// What the live catalog says a provider model can do, keyed by the provider's
+/// own model slug. A named struct rather than a tuple since `capabilities.rs`
+/// reads all four together to build the model's declared record — a positional
+/// `(Option<u32>, bool, bool, bool)` at four call sites is a swap waiting to
+/// happen, and swapping `tools` for `vision` would be silent.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModelRuntimeFacts {
+    pub context_window: Option<u32>,
+    pub tools: bool,
+    pub vision: bool,
+    pub structured_outputs: bool,
+}
 
 fn model_runtime_cache() -> &'static RwLock<HashMap<String, ModelRuntimeFacts>> {
     static CACHE: OnceLock<RwLock<HashMap<String, ModelRuntimeFacts>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Everything the live catalog knows about one provider model, or `None` when
+/// it has no entry for it — so the caller decides what "unknown" means rather
+/// than being handed a guess. `capabilities.rs` turns each field into a
+/// `Support`, where that `None` becomes `Support::Unknown`.
+pub(crate) fn provider_model_facts(model: &str) -> Option<ModelRuntimeFacts> {
+    let selected = model.splitn(3, "::").nth(1)?.trim();
+    model_runtime_cache().read().ok()?.get(selected).copied()
+}
+
 /// Does the catalog say this provider model accepts image input? `None` when
 /// the catalog has nothing for it, so the caller can decide what "unknown"
 /// means rather than being handed a guess.
 pub(crate) fn provider_model_vision(model: &str) -> Option<bool> {
-    let selected = model.splitn(3, "::").nth(1)?.trim();
-    model_runtime_cache()
-        .read()
-        .ok()?
-        .get(selected)
-        .map(|(_, _, vision)| *vision)
+    provider_model_facts(model).map(|facts| facts.vision)
 }
 
 /// Whether the catalog has been fetched at least once in THIS process.
@@ -220,7 +233,12 @@ async fn fetch_openrouter_models(key: &str) -> Result<Vec<ExternalModelInfo>, St
         for model in &models {
             cache.insert(
                 model.slug.clone(),
-                (model.context_window, model.tools, model.vision),
+                ModelRuntimeFacts {
+                    context_window: model.context_window,
+                    tools: model.tools,
+                    vision: model.vision,
+                    structured_outputs: model.structured_outputs,
+                },
             );
         }
     }
@@ -324,11 +342,11 @@ pub(crate) fn provider_runtime_config(
         .filter(|v| !v.trim().is_empty())
         .ok_or("Choose a specific OpenRouter model first.")?;
     let (label, base_url) = provider_spec(provider)?;
-    let (context_window, supports_tools, _vision) = model_runtime_cache()
+    let (context_window, supports_tools) = model_runtime_cache()
         .read()
         .ok()
         .and_then(|cache| cache.get(selected).copied())
-        .unwrap_or((None, true, false));
+        .map_or((None, true), |facts| (facts.context_window, facts.tools));
     // Disconnecting a provider only re-points the OPEN room at a local model.
     // Every other room still set to it lands here with no key, and the generic
     // Keychain error ("No API key is saved for openrouter") was logged and

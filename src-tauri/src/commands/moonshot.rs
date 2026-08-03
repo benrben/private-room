@@ -47,18 +47,23 @@ pub(crate) async fn resolve_structured_model(state: &State<'_, AppState>) -> Opt
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendedModels {
-    pub chat: Vec<String>,
     pub embed: String,
     pub vision: String,
 }
 
-/// D1: the curated model set the first-run chooser and Settings drive pulls
-/// from. Pure/static — `chat` mirrors the frontend RECOMMENDED_MODELS, `vision`
-/// matches the grounding router's Qwen-VL pick, `embed` is the shared constant.
+/// D1: the two SPECIAL models Settings offers to pull — the grounding
+/// (vision) model and the embedding model. Pure/static: `vision` matches the
+/// grounding router's Qwen-VL pick, `embed` is the shared constant.
+///
+/// There used to be a `chat` list here too, sent on every Settings open and
+/// declared in two type files, which no screen ever rendered: the first-run
+/// chooser has its own richer roster (`workspace/constants.ts`
+/// RECOMMENDED_MODELS — name, size, blurb, tag), and Settings only ever read
+/// `embed`/`vision`. The qa-mock did not even supply `chat` and nothing
+/// noticed, which is what "never displayed" looks like from the test side.
 #[tauri::command]
 pub fn recommended_models() -> RecommendedModels {
     RecommendedModels {
-        chat: vec!["qwen3.5:4b".into(), "qwen3.5:9b".into(), "gemma3:4b".into()],
         embed: ollama::EMBED_MODEL.to_string(),
         vision: "qwen2.5vl".to_string(),
     }
@@ -110,10 +115,15 @@ mod tests {
 
     #[test]
     fn recommended_models_are_populated() {
-        // D1: the frontend pulls this to drive first-run downloads.
+        // D1: Settings pulls this to offer the two SPECIAL model downloads.
         let r = recommended_models();
-        assert!(r.chat.iter().any(|m| m == "qwen3.5:4b"), "chat list has the default");
         assert_eq!(r.embed, ollama::EMBED_MODEL);
         assert_eq!(r.vision, "qwen2.5vl");
+        // The chat roster is the frontend's own (RECOMMENDED_MODELS), so this
+        // payload must carry exactly the two fields a screen actually reads —
+        // a re-added `chat` would be dead weight on every Settings open.
+        let json = serde_json::to_value(&r).unwrap();
+        let keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["embed", "vision"], "unread fields are back on the wire");
     }
 }

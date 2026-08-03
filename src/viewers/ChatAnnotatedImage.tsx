@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, FileContent, ImageBox } from "../api";
 import { BOX_COLORS } from "./util";
+import { fileUrl } from "./useFileBytes";
 
 interface Props {
   fileId: string;
@@ -22,7 +23,9 @@ export default function ChatAnnotatedImage({ fileId, boxes }: Props) {
       .getFileContent(fileId)
       .then((c) => {
         if (!alive) return;
-        if (c.kind === "image" && c.dataB64) setImg(c);
+        // Pictures stream over roommedia:// now; dataB64 is only ever
+        // populated if byte delivery is switched back.
+        if (c.kind === "image" && (c.mediaToken || c.dataB64)) setImg(c);
         else setFailed(true);
       })
       .catch(() => {
@@ -40,11 +43,14 @@ export default function ChatAnnotatedImage({ fileId, boxes }: Props) {
       </div>
     );
   }
-  if (!img || img.kind !== "image" || !img.dataB64) return null;
+  const src = img?.dataB64
+    ? `data:${img.mime};base64,${img.dataB64}`
+    : fileUrl(img?.mediaToken);
+  if (!img || img.kind !== "image" || !src) return null;
   return (
     <div className="img-wrap chat-img">
       <img
-        src={`data:${img.mime};base64,${img.dataB64}`}
+        src={src}
         alt={img.name}
         onError={() => setFailed(true)}
       />

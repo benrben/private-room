@@ -299,6 +299,85 @@ async def test_stream_delivers_everything_when_not_cancelled() -> None:
     assert content == "t0t1t2t3t4"
 
 
+class _StalledStream:
+    """A stream that yields nothing and never ends — a wedged daemon.
+
+    The failure live QA 2026-08-03 reported as "Stop this answer did not stop
+    Claude, local, or other long-running work": the pre-fix loop only sampled
+    the cancel flag from inside its body, which a stream with no chunks never
+    reaches. Under that code this fixture hangs forever.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def __aiter__(self) -> "_StalledStream":
+        return self
+
+    async def __anext__(self):
+        await asyncio.Event().wait()  # never resolves
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_stop_lands_on_a_stream_that_never_sends_a_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    stream = _StalledStream()
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+    _fake_llm(m, stream)
+
+    cancel = _Cancel()
+
+    async def press_stop() -> None:
+        await asyncio.sleep(0.05)
+        cancel.cancel()
+
+    async def on_delta(d: str) -> None:  # pragma: no cover - nothing streams
+        raise AssertionError("a stalled stream delivers no deltas")
+
+    asyncio.ensure_future(press_stop())
+    # The assertion is that this RETURNS at all. Bounded so a regression fails
+    # the suite instead of hanging it.
+    content, calls, _ = await asyncio.wait_for(
+        m.stream([{"role": "user", "content": "hi"}], [], on_delta, cancel),
+        timeout=5,
+    )
+    assert content == ""  # nothing arrived, so nothing is claimed
+    assert calls == []
+    assert stream.closed is True  # the wedged read was closed, not orphaned
+
+
+async def test_a_silent_stream_ends_as_an_engine_error_not_an_empty_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With no Stop pressed, silence past the budget must be REPORTED. Returning
+    # "" here would render as a finished, empty answer — the exact fabrication
+    # shape this codebase's anti-fabrication doctrine exists to prevent.
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    monkeypatch.setattr(chat_module, "REQUEST_TIMEOUT_SECONDS", 0.3)
+    stream = _StalledStream()
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+    _fake_llm(m, stream)
+
+    async def on_delta(d: str) -> None:  # pragma: no cover - nothing streams
+        raise AssertionError("a stalled stream delivers no deltas")
+
+    from arcelle_sidecar.llm import LlmError
+
+    with pytest.raises(LlmError) as caught:
+        await asyncio.wait_for(
+            m.stream([{"role": "user", "content": "hi"}], [], on_delta, cancel=None),
+            timeout=5,
+        )
+    assert caught.value.code == "ENGINE_ERROR"
+    assert "sent nothing" in caught.value.message
+    assert stream.closed is True
+
+
 async def test_stream_surfaces_real_usage_when_ollama_reports_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

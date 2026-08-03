@@ -8,10 +8,27 @@ export interface GraphNode {
   summary?: string | null;
   kind: "file" | "memory";
 }
+/** WHAT a link claims. Mirrors EDGE_KINDS in
+ *  src-tauri/src/commands/moonshot/graph.rs; the first five are relations the
+ *  room can prove from what it stored, `similar` is the only inferred one. */
+export type EdgeKind =
+  | "derived"
+  | "same_page"
+  | "mentions"
+  | "cited"
+  | "same_site"
+  | "similar";
+
 export interface GraphEdge {
   a: string;
   b: string;
   weight: number;
+  /** One of EdgeKind. Typed as string because the payload comes from the
+   *  backend: an unrecognised kind must render as the weakest thing it could
+   *  be (see `styleFor`), not crash the map. */
+  kind: string;
+  /** True when the relation reads a → b (a produced b, or a names b). */
+  directed: boolean;
   shared: string[];
 }
 export interface RoomGraph {
@@ -28,11 +45,14 @@ export interface RoomMapProps {
 /** A node with a live position in layout ("world") space. */
 export type SimNode = GraphNode & { x: number; y: number };
 /** An edge resolved to layout-array indices, keeping the source edge for its
- *  weight + `shared` reasons. */
+ *  kind, weight + `shared` reasons. `hidden` is set by the type/strength
+ *  filter: a hidden edge is neither drawn nor allowed to pull on the layout,
+ *  but it stays in the array so filtering never re-seeds the simulation. */
 export interface SimEdge {
   ai: number;
   bi: number;
   edge: GraphEdge;
+  hidden?: boolean;
 }
 /** The screen transform: world→screen is `screen = world * k + (x, y)`. */
 export interface View {

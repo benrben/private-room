@@ -50,3 +50,33 @@ export function classifyAddress(input: string): AddressIntent | null {
   // A bare word: "weather", "בנק ישראל". Nothing about it addresses a host.
   return { kind: "search", query: text };
 }
+
+/** Must this address be FETCHED to be saved, rather than read off the page
+ *  that is already on screen?
+ *
+ *  Two cases, and only two. A video page's value is its CAPTIONS, which the
+ *  rendered DOM does not contain; a PDF/image/archive is a binary that has to
+ *  go through the download funnel. `import_link` handles both — capturing the
+ *  live page would save neither.
+ *
+ *  For anything else the live page WINS: the toolbar's "Save link" used to
+ *  re-fetch the address as a stranger even with the page open in front of you,
+ *  so a signed-in or paywalled article saved its sign-in wall under the real
+ *  page's title. Nothing said so.
+ */
+export function needsFreshFetch(url: string): boolean {
+  let path = "";
+  let host = "";
+  try {
+    const u = new URL(url);
+    path = u.pathname.toLowerCase();
+    host = u.hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    // Not parseable: the live page is the only thing we could read anyway.
+    return false;
+  }
+  if (/(^|\.)(youtube\.com|youtu\.be)$/.test(host)) return true;
+  return /\.(pdf|docx?|pptx?|xlsx?|csv|zip|png|jpe?g|gif|webp|mp[34]|m4a|mov|epub)$/.test(
+    path,
+  );
+}

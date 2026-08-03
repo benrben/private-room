@@ -920,14 +920,17 @@ fn resolve_node_model(
     let name = match choice.trim() {
         "" | "auto" => room_model.clone().unwrap_or_else(|| best_default(models)),
         "local" => best_local_default(models),
+        // An installed Ollama entry that is NOT run here — the record's own
+        // split, so the `<size>-cloud` spelling counts as a cloud pick too
+        // instead of falling through to `best_default` (which can be local).
         "cloud" => models
             .iter()
-            .find(|m| is_cloud_model(m))
+            .find(|m| !runs_on_this_mac(m))
             .cloned()
             .unwrap_or_else(|| best_default(models)),
         literal => literal.to_string(),
     };
-    let lane = if is_cloud_model(&name) || is_external_engine(&name) {
+    let lane = if !runs_on_this_mac(&name) {
         Lane::Cloud
     } else {
         Lane::LocalLlm
@@ -1163,7 +1166,8 @@ fn resolve_files<R: tauri::Runtime>(
                 .ok_or("this workflow needs a file to run on")?;
             let (name, mime): (String, String) = conn
                 .query_row(
-                    "SELECT name, coalesce(mime_type,'') FROM files WHERE id = ?1",
+                    "SELECT name, coalesce(mime_type,'') FROM files \
+                     WHERE id = ?1 AND trashed_at IS NULL",
                     [id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -1180,6 +1184,7 @@ fn resolve_files<R: tauri::Runtime>(
         "newest" => query_files(
             conn,
             "SELECT id, name, coalesce(mime_type,'') FROM files \
+             WHERE trashed_at IS NULL \
              ORDER BY created_at DESC LIMIT 1",
             [],
         )?,
@@ -1189,6 +1194,7 @@ fn resolve_files<R: tauri::Runtime>(
         "all" => query_files(
             conn,
             "SELECT id, name, coalesce(mime_type,'') FROM files \
+             WHERE trashed_at IS NULL \
              ORDER BY created_at DESC LIMIT 50",
             [],
         )?,
@@ -1200,7 +1206,7 @@ fn resolve_files<R: tauri::Runtime>(
             query_files(
                 conn,
                 "SELECT id, name, coalesce(mime_type,'') FROM files \
-                 WHERE lower(name) LIKE ?1 ESCAPE '\\' \
+                 WHERE trashed_at IS NULL AND lower(name) LIKE ?1 ESCAPE '\\' \
                  ORDER BY created_at DESC LIMIT 20",
                 [pat],
             )?
@@ -1213,7 +1219,7 @@ fn resolve_files<R: tauri::Runtime>(
         "missing_summary" => query_files(
             conn,
             "SELECT id, name, coalesce(mime_type,'') FROM files \
-             WHERE ai_summary IS NULL \
+             WHERE trashed_at IS NULL AND ai_summary IS NULL \
                AND extracted_text IS NOT NULL AND trim(extracted_text) != '' \
              ORDER BY created_at DESC LIMIT 50",
             [],
@@ -1223,7 +1229,7 @@ fn resolve_files<R: tauri::Runtime>(
             query_files(
                 conn,
                 "SELECT id, name, coalesce(mime_type,'') FROM files \
-                 WHERE source != 'generated' AND created_at > ?1 \
+                 WHERE trashed_at IS NULL AND source != 'generated' AND created_at > ?1 \
                  ORDER BY created_at DESC LIMIT 50",
                 [since],
             )?
@@ -1274,15 +1280,7 @@ fn count_new_files<R: tauri::Runtime>(
     guard
         .as_ref()
         .filter(|r| r.path == room_path)
-        .and_then(|r| {
-            r.conn
-                .query_row(
-                    "SELECT count(*) FROM files WHERE source != 'generated' AND created_at > ?1",
-                    [since],
-                    |row| row.get::<_, i64>(0),
-                )
-                .ok()
-        })
+        .and_then(|r| db::new_source_file_count(&r.conn, &since).ok())
         .unwrap_or(0)
 }
 
@@ -1758,6 +1756,19 @@ async fn run_workflow_node<R: tauri::Runtime>(
                 }),
                 Err(e) => Err(e),
             }
+        }
+        NodeKind::SaveFile {
+            name_template,
+            format,
+            mode,
+        } if crate::cancel::stopped(cancel) => {
+            // Owner replacement #3: the one node in this match that COMMITS.
+            // `HttpFetch` above already refuses on a stopped run, but Save File
+            // is the arm that writes into the room — a Stop (or a room lock,
+            // which flips the same flag) landing on the step before it left the
+            // workflow's page in the library after the card said stopped.
+            let _ = (name_template, format, mode);
+            Err("STOPPED".into())
         }
         NodeKind::SaveFile {
             name_template,
@@ -2307,7 +2318,9 @@ fn save_file_node<R: tauri::Runtime>(
             let existing_id: Option<String> = room
                 .conn
                 .query_row(
-                    "SELECT id FROM files WHERE name = ?1 AND source = 'generated' ORDER BY created_at DESC LIMIT 1",
+                    "SELECT id FROM files \
+                     WHERE name = ?1 AND source = 'generated' AND trashed_at IS NULL \
+                     ORDER BY created_at DESC LIMIT 1",
                     [&name],
                     |r| r.get(0),
                 )
@@ -2450,6 +2463,10 @@ pub(crate) async fn run_agent_headless(
         false, // background turns never bypass the privacy door
         advisors,
         advisor_tools_on,
+        // A workflow node belongs to a job, not to a conversation — it has no
+        // run/chat identity to stamp, and `headless` means it emits nothing to
+        // stamp it onto.
+        None,
     )
     .await;
     match outcome {
@@ -2481,7 +2498,9 @@ pub(crate) fn spawn_workflow_job(
 ) {
     use tauri::{Emitter, Manager};
     let app = window.app_handle().clone();
-    tauri::async_runtime::spawn(async move {
+    let (runner_window, runner_job, runner_room) =
+        (window.clone(), job_id.clone(), room_path.clone());
+    super::spawn_job_runner(runner_window, runner_job, runner_room, async move {
         let state = app.state::<AppState>();
         {
             let guard = state.room.lock().unwrap();
@@ -2745,6 +2764,13 @@ pub(crate) async fn start_workflow_run(
             Ok(String::new())
         };
     }
+    // Nothing is in flight, so any job still sitting parked for this workflow is
+    // a stale attempt this run replaces. Clearing it here is what stops Activity
+    // filling up with indistinguishable paused copies of the same workflow.
+    state.with_room(|room| {
+        retire_parked_jobs(&room.conn, workflow_id);
+        Ok(())
+    })?;
     if full {
         return if trigger == "manual" {
             Err(queue::QUEUE_FULL.into())
@@ -3087,6 +3113,18 @@ pub async fn update_workflow(
 
 /// Flip a workflow active/draft. Activating is the explicit user consent that
 /// also pre-consents any scheduled/headless runs (no 180s prompt at cron time).
+///
+/// Activation is GATED on the definition being runnable. It never was: this
+/// command wrote the status and nothing else, so the only thing standing between
+/// an empty workflow and "active" was the Activate button's `disabled` — and that
+/// button is driven by an async validator whose result starts out empty, so it is
+/// enabled for the first frames of every draft. Live QA 2026-08-03 activated a
+/// workflow with no steps through exactly that gap.
+///
+/// `validate_runnable`, not `validate_definition`: a workflow saved by an earlier
+/// version may break a rule added since, and refusing to let the user re-activate
+/// something already in their room is a worse failure than the rule catches.
+/// Deactivating is always allowed — turning something off must never be blocked.
 #[tauri::command]
 pub fn set_workflow_status(
     state: State<'_, AppState>,
@@ -3097,6 +3135,18 @@ pub fn set_workflow_status(
         "active" => "active",
         _ => "draft",
     };
+    if status == "active" {
+        let def = state.with_room(|room| {
+            let wf = db::get_workflow(&room.conn, &id)?;
+            parse_def(&wf.definition)
+        })?;
+        if let Err(errs) = validate_runnable(&def) {
+            return Err(format!(
+                "This workflow can't be activated yet — {}",
+                errs.join("; ")
+            ));
+        }
+    }
     state.with_room(|room| db::set_workflow_status(&room.conn, &id, status))?;
     Ok(())
 }
@@ -3159,6 +3209,39 @@ fn has_inflight_run(conn: &Connection, workflow_id: &str) -> bool {
             .map(|j| matches!(j.status.as_str(), "running" | "queued"))
             .unwrap_or(false)
     })
+}
+
+/// Retire this workflow's PARKED jobs, because a fresh run is about to start.
+///
+/// A parked job deliberately does not block a new run — counting it as in flight
+/// left a workflow stuck for good (see
+/// `a_paused_run_neither_blocks_the_next_one_nor_reads_as_running`). But nothing
+/// cleared it either, so every trigger that found one added a second parked job
+/// beside it, then a third: live QA 2026-08-03 found duplicate paused entries for
+/// one workflow stacked in Activity with no way to tell them apart.
+///
+/// Starting a run is the statement that the stale attempt is no longer wanted, so
+/// retire it here — one workflow, one live entry. The run's HISTORY line survives
+/// (that lives in `workflow_runs`); only the resumable job is dropped.
+fn retire_parked_jobs(conn: &Connection, workflow_id: &str) {
+    let Ok(runs) = db::list_workflow_runs(conn, workflow_id) else {
+        return;
+    };
+    for run in runs {
+        let Some(job_id) = run.job_id.as_ref() else { continue };
+        let Ok(job) = db::get_job(conn, job_id) else { continue };
+        // Only genuinely parked work — never a running or queued job, which the
+        // in-flight check above has already refused to run alongside, and never
+        // a FINISHED one. Decision #12 made the `jobs` table the source of
+        // Activity's history section, so a 'done' row is the log's evidence that
+        // the run happened, not a stale attempt this run replaces — deleting it
+        // erased the audit trail of the job kind that repeats most often.
+        // `dedupe_parked_jobs` scopes itself the same way, for the same reason.
+        if matches!(job.status.as_str(), "running" | "queued" | "done") {
+            continue;
+        }
+        let _ = db::delete_job(conn, job_id);
+    }
 }
 
 #[tauri::command]
@@ -3238,7 +3321,11 @@ pub async fn run_workflow(
                 .map(|_| ())
                 .or_else(|| {
                     room.conn
-                        .query_row("SELECT 1 FROM files WHERE id = ?1", [fid], |_| Ok(()))
+                        .query_row(
+                            "SELECT 1 FROM files WHERE id = ?1 AND trashed_at IS NULL",
+                            [fid],
+                            |_| Ok(()),
+                        )
                         .ok()
                 })
                 .ok_or_else(|| "That file is no longer in this room.".to_string())
@@ -3467,7 +3554,6 @@ pub(crate) async fn generate_text_any_engine(model: &str, prompt: &str) -> Resul
             Some(0.2),
             KEEP_ALIVE_WARM,
             None,
-            ollama::CtxTier::Job,
         )
         .await
         .map(|t| ollama::strip_think_spans(&t))
@@ -3639,7 +3725,11 @@ pub(crate) async fn agent_update_workflow(
 /// cancelled before their workflow row (and cascading schedule/history rows) is
 /// removed. It is intentionally a separate tool so delete is never inferred
 /// from an update payload.
-pub(crate) fn agent_delete_workflow(
+///
+/// Audit #505 (second half): unrecoverable and reachable from anything the
+/// agent READ — the workflow, its schedule and its whole run history go, and
+/// there is no trash for any of them — so the user's click is the undo.
+pub(crate) async fn agent_delete_workflow(
     state: &AppState,
     window: &tauri::Window,
     args: &serde_json::Value,
@@ -3653,6 +3743,18 @@ pub(crate) fn agent_delete_workflow(
         return Err("delete_workflow needs a workflow name or id.".into());
     }
     let workflow = state.with_room(|room| db::find_workflow(&room.conn, key))?;
+    if !crate::commands::mcp_cmds::confirm_destructive(
+        state,
+        window,
+        "workflow",
+        &workflow.name,
+        "Its schedule and its whole run history go with it, and any run still \
+         going is cancelled. There is no undo.",
+    )
+    .await
+    {
+        return Err(crate::commands::mcp_cmds::DELETE_DECLINED.into());
+    }
     state.with_room(|room| {
         let runs = db::list_workflow_runs(&room.conn, &workflow.id)?;
         for run in runs {
@@ -5175,6 +5277,92 @@ mod tests {
         let runs = db::list_workflow_runs(&conn, &wf).unwrap();
         assert_eq!(runs[0].status, "paused", "and its history line says so");
         assert!(runs[0].finished_at.is_none(), "it is still resumable");
+    }
+
+    #[test]
+    fn parked_runs_do_not_pile_up_one_per_trigger() {
+        // The other half of the rule above. A parked job rightly does not block
+        // the next run — but nothing retired it either, so each trigger left
+        // another parked job behind it. Live QA 2026-08-03 found several
+        // identical paused entries for one workflow stacked in Activity.
+        let conn = db::mem();
+        let wf = db::create_workflow(&conn, "Digest", "", "", &serde_json::json!({}), "user",
+            &serde_json::json!({"scope": "general"})).unwrap();
+
+        let parked = |conn: &Connection| -> usize {
+            db::list_workflow_runs(conn, &wf)
+                .unwrap()
+                .iter()
+                .filter_map(|r| r.job_id.as_ref())
+                .filter(|jid| db::get_job(conn, jid).is_ok())
+                .count()
+        };
+
+        // Three triggers in a row, each one parking where the last left off.
+        for _ in 0..3 {
+            let job = db::create_job(&conn, "workflow", "Workflow — Digest",
+                &serde_json::json!({}), 3).unwrap();
+            db::create_workflow_run(&conn, &wf, &job, "schedule", None).unwrap();
+            db::set_job_status(&conn, &job, "paused", None).unwrap();
+            db::set_workflow_run_status_by_job(&conn, &job, "paused").unwrap();
+            // What `start_workflow_run` now does before creating the next run.
+            retire_parked_jobs(&conn, &wf);
+        }
+        assert_eq!(parked(&conn), 0, "no stale parked job survives a later trigger");
+
+        // The run HISTORY is untouched — only the resumable job is retired.
+        assert_eq!(
+            db::list_workflow_runs(&conn, &wf).unwrap().len(),
+            3,
+            "every attempt still has its history line"
+        );
+
+        // A live job is never retired by this sweep.
+        let live = db::create_job(&conn, "workflow", "Workflow — Digest",
+            &serde_json::json!({}), 3).unwrap();
+        db::create_workflow_run(&conn, &wf, &live, "manual", None).unwrap();
+        db::set_job_status(&conn, &live, "running", None).unwrap();
+        retire_parked_jobs(&conn, &wf);
+        assert!(db::get_job(&conn, &live).is_ok(), "a running job survives");
+    }
+
+    #[test]
+    fn retiring_stale_attempts_does_not_erase_the_runs_that_finished() {
+        // Decision #12 gave Activity a HISTORY section, and it reads the `jobs`
+        // table. This sweep skipped only 'running'/'queued', so every FINISHED
+        // job row for a workflow was deleted the next time that workflow fired —
+        // and a workflow is the job kind that repeats most. The audit log would
+        // have quietly held at most one entry per workflow, and lost even that on
+        // the next tick. `dedupe_parked_jobs` already states the invariant this
+        // has to respect: a finished row is the history section's evidence that
+        // the work happened, so nothing may collapse or delete it.
+        let conn = db::mem();
+        let wf = db::create_workflow(&conn, "Digest", "", "", &serde_json::json!({}), "user",
+            &serde_json::json!({"scope": "general"})).unwrap();
+
+        let mut finished = Vec::new();
+        for _ in 0..3 {
+            let job = db::create_job(&conn, "workflow", "Workflow — Digest",
+                &serde_json::json!({}), 3).unwrap();
+            db::create_workflow_run(&conn, &wf, &job, "schedule", None).unwrap();
+            db::set_job_status(&conn, &job, "done", None).unwrap();
+            finished.push(job);
+        }
+        // One genuinely stale attempt, which this sweep DOES exist to remove.
+        let stale = db::create_job(&conn, "workflow", "Workflow — Digest",
+            &serde_json::json!({}), 3).unwrap();
+        db::create_workflow_run(&conn, &wf, &stale, "schedule", None).unwrap();
+        db::set_job_status(&conn, &stale, "paused", None).unwrap();
+
+        retire_parked_jobs(&conn, &wf);
+
+        assert!(db::get_job(&conn, &stale).is_err(), "the parked attempt is still retired");
+        for job in &finished {
+            assert!(
+                db::get_job(&conn, job).is_ok(),
+                "a finished run is the audit log's evidence — it is not a stale attempt"
+            );
+        }
     }
 
     #[test]

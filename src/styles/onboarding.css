@@ -191,6 +191,15 @@
   flex: 0 0 auto;
 }
 
+/* The "*" menu's honest empty state — a sentence, not an option. Sentence case
+   and full width, so it never reads as a row someone could arrow onto. */
+.ac-empty {
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 8px 9px 10px;
+  line-height: 1.4;
+}
+
 .ac-item {
   /* Stack label ▸ usage ▸ description so nothing is clipped. */
   display: flex;

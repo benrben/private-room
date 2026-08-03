@@ -281,3 +281,59 @@ async def test_vision_locate_engine_down_maps_to_ollama_down(fake_client: type[F
         )
     assert resp.status_code == 502
     assert resp.json()["code"] == "OLLAMA_DOWN"
+
+
+async def test_vision_locate_refuses_when_the_door_would_strip_the_image(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    """A blocked image must fail LOUDLY, never ground on nothing.
+
+    ``guard_outbound`` strips images bound for a non-local model and only counts
+    them — the call still runs. Everywhere else that is right; here it would send
+    a grounding prompt with no picture, get no boxes back, and the viewer renders
+    no boxes as "could not locate that in this image" — a claim about the user's
+    photo caused by a privacy setting. So this path refuses instead.
+    """
+    fake_client.script["chat"] = _chat_reply('[{"bbox_2d":[1,1,50,50],"label":"x"}]')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/vision_locate",
+            json={
+                "model": "openrouter::vendor/sees-images",
+                "image_b64": _png_b64(64, 64),
+                "query": "q",
+                "base_url": "http://h:1",
+                "privacy": {"active": True, "rules": [{"real": "Ben", "placeholder": "[P]"}]},
+            },
+        )
+    assert resp.status_code == 502
+    assert resp.json()["code"] == "ENGINE_ERROR"
+    assert "privacy door" in resp.json()["error"]
+    # ...and it refused BEFORE spending anything on the engine.
+    assert "chat" not in fake_client.calls
+
+
+async def test_vision_locate_allows_a_cloud_model_when_the_door_is_off(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    """The refusal above is about the door, not about the model being non-local:
+    with the door off, a cloud vision model marks images like any other."""
+    fake_client.script["chat"] = _chat_reply('[{"bbox_2d":[0,0,500,500],"label":"x"}]')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/vision_locate",
+            json={
+                # Non-local, so the door WOULD have applied had it been on.
+                "model": "vendor-vl:cloud",
+                "image_b64": _png_b64(64, 64),
+                "query": "q",
+                "base_url": "http://h:1",
+                "privacy": {"active": False, "rules": []},
+            },
+        )
+    assert resp.status_code == 200
+    assert len(resp.json()["boxes"]) == 1
+    # The picture really did go out — the refusal above is not a blanket ban.
+    assert len(fake_client.calls["chat"]["messages"][-1]["images"]) == 1

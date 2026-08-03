@@ -1,0 +1,17 @@
+/* What is inside a zip, without unpacking it. */
+.zip-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.zip-tree { flex: 1; overflow: auto; padding: 0.35rem 0.75rem 2rem; font-size: 0.85rem; }
+.zip-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  width: 100%;
+  padding: 2px 0;
+  line-height: 1.5;
+}
+.zip-folder { background: none; border: 0; text-align: start; cursor: pointer; color: inherit; }
+.zip-folder:hover { background: var(--panel); }
+.zip-caret { width: 0.8em; flex: none; color: var(--muted); }
+.zip-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.zip-folder .zip-name { color: var(--accent); }
+.zip-size { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 0.8rem; }

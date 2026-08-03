@@ -395,9 +395,20 @@ def clear_cache() -> None:
     _CACHE.clear()
 
 
+def cache_size() -> int:
+    """How many digests are held. A COUNT — never the digests themselves.
+
+    The host reports "N summaries dropped" when a room locks, and a count is the
+    whole of what may leave this process: every value in the cache is boiled-down
+    room content.
+    """
+    return len(_CACHE)
+
+
 __all__ = [
     "CLOUD_SPEND_FRACTION",
     "DIGEST_PROMPT",
+    "cache_size",
     "MIN_COMPACT_BYTES",
     "RECENT_SHARE",
     "SPEND_FRACTION",

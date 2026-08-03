@@ -79,50 +79,243 @@ pub(crate) fn add_mcp_approval(app: &tauri::AppHandle, fingerprint: &str) {
     }
 }
 
-/// "Auto mode" for connector tool calls lives per-Mac next to the fingerprint
-/// approvals — a single JSON bool, outside any room (the room's author is the
+/// The connector preference files live per-Mac next to the fingerprint
+/// approvals — one JSON bool each, outside any room (the room's author is the
 /// attacker; a blanket-consent flag must never travel inside a `.roomai`).
-pub(crate) fn mcp_auto_approve_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+fn mcp_flag_file(app: &tauri::AppHandle, name: &str) -> Result<std::path::PathBuf, String> {
     use tauri::Manager as _;
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir.join("mcp_auto_approve.json"))
+    Ok(dir.join(name))
 }
 
-/// The persisted auto-approve preference. **Absent file = OFF.**
-///
-/// Auto mode is not only "skip the card": since 2026-07-24 it also sends a
-/// remote connector its REAL arguments (`agent::masks_outbound_args`), because
-/// masking the values a connector is asked ABOUT made the lookup fail with no
-/// visible reason. That is a defensible trade for a user who asks for it — but
-/// it is two gates at once, so it cannot be the state a room arrives in. A
-/// fresh install therefore keeps the per-call card AND the outbound mask, and
-/// the toggle turns both off together, saying so.
-///
-/// Reading is resilient — any parse failure falls back to the default rather
-/// than erroring.
+pub(crate) fn mcp_auto_approve_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    mcp_flag_file(app, "mcp_auto_approve.json")
+}
+
+/// The unmasking preference is a SEPARATE file, deliberately. It has no legacy
+/// value to inherit, so an install that had the old combined "auto mode" on
+/// keeps its unattended calls and goes back to sending placeholders until the
+/// user asks for real values. That is the fail-closed direction, and the
+/// Connectors copy states the live state rather than the default, so the user
+/// reads what is true on this Mac instead of being told nothing changed.
+pub(crate) fn mcp_outbound_unmask_file(
+    app: &tauri::AppHandle,
+) -> Result<std::path::PathBuf, String> {
+    mcp_flag_file(app, "mcp_outbound_unmask.json")
+}
+
+/// The persisted "run connector tools without asking" preference. **Absent
+/// file = OFF.** Reading is resilient — any parse failure falls back to the
+/// default rather than erroring.
 pub(crate) fn read_mcp_auto_approve(app: &tauri::AppHandle) -> bool {
-    let raw = mcp_auto_approve_file(app)
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok());
-    parse_auto_approve(raw.as_deref())
+    read_mcp_flag(mcp_auto_approve_file(app))
 }
 
-/// The pure half of [`read_mcp_auto_approve`], so the DEFAULT is unit-testable
-/// without an `AppHandle`. Only an explicit `true` on disk turns auto mode on;
-/// a missing, empty or corrupt file fails closed.
-pub(crate) fn parse_auto_approve(raw: Option<&str>) -> bool {
+/// The persisted "send remote connectors real values" preference. **Absent
+/// file = OFF** — this is the flag that decides whether the room's private
+/// details leave the Mac intact, so it never defaults on.
+pub(crate) fn read_mcp_outbound_unmask(app: &tauri::AppHandle) -> bool {
+    read_mcp_flag(mcp_outbound_unmask_file(app))
+}
+
+fn read_mcp_flag(path: Result<std::path::PathBuf, String>) -> bool {
+    let raw = path.ok().and_then(|p| std::fs::read_to_string(p).ok());
+    parse_connector_flag(raw.as_deref())
+}
+
+/// The pure half of the two readers above, so the DEFAULT is unit-testable
+/// without an `AppHandle`. Only an explicit `true` on disk turns a connector
+/// power on; a missing, empty or corrupt file fails closed.
+pub(crate) fn parse_connector_flag(raw: Option<&str>) -> bool {
     raw.and_then(|s| serde_json::from_str::<bool>(s.trim()).ok())
         .unwrap_or(false)
 }
 
-fn write_mcp_auto_approve(app: &tauri::AppHandle, on: bool) {
-    if let Ok(path) = mcp_auto_approve_file(app) {
+fn write_mcp_flag(path: Result<std::path::PathBuf, String>, on: bool) {
+    if let Ok(path) = path {
         let _ = std::fs::write(path, if on { "true" } else { "false" });
     }
 }
 
-/// Connectors → Auto-approve: read the current "auto mode" state for the UI toggle.
+// ------------------------------------------------- per-connector overrides
+
+/// One connector's answer to each of the two powers, or `None` for "whatever
+/// the switch above says". Optional rather than `bool` on purpose: a connector
+/// nobody has touched must be indistinguishable from one set back to the
+/// default, because that is what lets the Mac-wide switch keep meaning
+/// something after this became per-connector — and it is what makes the
+/// upgrade grant nothing. An install arriving from the single global pair has
+/// no entries at all, so every connector simply inherits the value that
+/// install already had.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConnectorOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_unmask: Option<bool>,
+}
+
+/// Which of the two powers a per-connector edit is about. An enum, so the
+/// stringly-typed name from the UI is validated ONCE, at the command boundary —
+/// a typo there must be an error the user can see, never a silently-ignored
+/// write that leaves the switch showing a value the backend never stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectorPower {
+    AutoApprove,
+    OutboundUnmask,
+}
+
+impl ConnectorPower {
+    pub(crate) fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "auto_approve" => Ok(Self::AutoApprove),
+            "outbound_unmask" => Ok(Self::OutboundUnmask),
+            other => Err(format!(
+                "unknown connector power \"{other}\" (expected auto_approve or outbound_unmask)"
+            )),
+        }
+    }
+}
+
+/// Read the per-connector overrides (`{server: {auto_approve?, outbound_unmask?}}`).
+/// Missing/invalid → empty, which means every connector follows the Mac-wide
+/// switch. Pure over the stored string, mirroring `parse_tool_prefs`.
+pub(crate) fn parse_connector_powers(
+    raw: &str,
+) -> std::collections::BTreeMap<String, ConnectorOverride> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// Set (or clear, with `value: None`) one power for one connector and return the
+/// new JSON. Pure — unit-tested, mirroring `set_tool_pref`. An entry that ends
+/// up saying nothing is dropped, so "back to following the switch" leaves no
+/// residue that a later reading of the file could mistake for a choice.
+pub(crate) fn set_connector_power(
+    raw: &str,
+    server: &str,
+    power: ConnectorPower,
+    value: Option<bool>,
+) -> Result<String, String> {
+    let mut map = parse_connector_powers(raw);
+    let entry = map.entry(server.to_string()).or_default();
+    match power {
+        ConnectorPower::AutoApprove => entry.auto_approve = value,
+        ConnectorPower::OutboundUnmask => entry.outbound_unmask = value,
+    }
+    if *entry == ConnectorOverride::default() {
+        map.remove(server);
+    }
+    serde_json::to_string(&map).map_err(|e| e.to_string())
+}
+
+/// What is actually in force for one connector: its own answer when it has one,
+/// otherwise the Mac-wide switch. Pure, and the ONLY place the two levels are
+/// combined — the UI states the result of this, so a user never has to work out
+/// which level wins.
+pub(crate) fn effective_power(global: bool, over: Option<bool>) -> bool {
+    over.unwrap_or(global)
+}
+
+/// The overrides live per-Mac beside the two global flags, for the same SEC-1
+/// reason: the room's author is the attacker, so a consent decision must never
+/// travel inside a `.roomai`.
+pub(crate) fn mcp_connector_powers_file(
+    app: &tauri::AppHandle,
+) -> Result<std::path::PathBuf, String> {
+    mcp_flag_file(app, "mcp_connector_powers.json")
+}
+
+pub(crate) fn read_mcp_connector_powers(
+    app: &tauri::AppHandle,
+) -> std::collections::BTreeMap<String, ConnectorOverride> {
+    let raw = mcp_connector_powers_file(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    parse_connector_powers(raw.as_deref().unwrap_or("{}"))
+}
+
+/// The override this connector has recorded, if any. Split out so the two
+/// accessors below each name exactly one power.
+fn override_for(state: &AppState, server: &str) -> ConnectorOverride {
+    state
+        .mcp_connector_powers
+        .lock()
+        .unwrap()
+        .get(server)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// "Run connector tools without asking", as it applies to ONE connector.
+/// Touches the auto-approve level only: unmasking is not a way to stop being
+/// asked, at either level.
+pub(crate) fn auto_approve_for(state: &AppState, server: &str) -> bool {
+    effective_power(
+        state
+            .mcp_auto_approve
+            .load(std::sync::atomic::Ordering::SeqCst),
+        override_for(state, server).auto_approve,
+    )
+}
+
+/// "Send remote connectors real values", as it applies to ONE connector.
+/// Touches the unmasking level only: standing consent to run is not a way to
+/// unmask, at either level.
+pub(crate) fn outbound_unmask_for(state: &AppState, server: &str) -> bool {
+    effective_power(
+        state
+            .mcp_outbound_unmask
+            .load(std::sync::atomic::Ordering::SeqCst),
+        override_for(state, server).outbound_unmask,
+    )
+}
+
+/// Connectors → per-connector overrides, as JSON for the UI. Empty object when
+/// every connector follows the two switches above.
+#[tauri::command]
+pub fn get_mcp_connector_powers(state: State<'_, AppState>) -> String {
+    let map = state.mcp_connector_powers.lock().unwrap();
+    serde_json::to_string(&*map).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Connectors → set one connector's answer for one power, or clear it back to
+/// the switch above (`value: None`). Persists per-Mac and takes effect on the
+/// next connector call — both seams read the live state. Returns the new map so
+/// the UI shows what was actually stored rather than what it hoped for.
+#[tauri::command]
+pub fn set_mcp_connector_power(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+    power: String,
+    value: Option<bool>,
+) -> Result<String, String> {
+    let which = ConnectorPower::parse(&power)?;
+    let mut map = state.mcp_connector_powers.lock().unwrap();
+    let raw = serde_json::to_string(&*map).unwrap_or_else(|_| "{}".to_string());
+    let next = set_connector_power(&raw, &server, which, value)?;
+    *map = parse_connector_powers(&next);
+    drop(map);
+    if let Ok(path) = mcp_connector_powers_file(&app) {
+        let _ = std::fs::write(path, &next);
+    }
+    Ok(next)
+}
+
+/// Whether one connector call may skip its consent card.
+///
+/// Pure, and it takes ONLY the two things that may ever excuse the card: the
+/// user's standing "don't ask me" preference, and their "always allow" for this
+/// connector earlier in the session. The outbound-unmasking preference is
+/// deliberately not a parameter — that was the bug the 2026-08-03 split fixes,
+/// where asking for real arguments also silently stopped asking permission.
+pub(crate) fn skips_consent_card(auto_approve: bool, remembered_this_session: bool) -> bool {
+    auto_approve || remembered_this_session
+}
+
+/// Connectors → "Run connector tools without asking": read the live state for
+/// the UI toggle.
 #[tauri::command]
 pub fn get_mcp_auto_approve(state: State<'_, AppState>) -> bool {
     state
@@ -130,15 +323,37 @@ pub fn get_mcp_auto_approve(state: State<'_, AppState>) -> bool {
         .load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Connectors → Auto-approve: flip "auto mode" and persist it per-Mac. Takes
-/// effect immediately for the next connector call (the flag is read live in
-/// `mcp_call_approved`); the file makes it survive a restart.
+/// Connectors → "Run connector tools without asking": flip it and persist it
+/// per-Mac. Takes effect immediately for the next connector call (the flag is
+/// read live in `mcp_call_approved`); the file makes it survive a restart.
+/// Does NOT touch masking — that is `set_mcp_outbound_unmask`.
 #[tauri::command]
 pub fn set_mcp_auto_approve(app: tauri::AppHandle, state: State<'_, AppState>, on: bool) {
     state
         .mcp_auto_approve
         .store(on, std::sync::atomic::Ordering::SeqCst);
-    write_mcp_auto_approve(&app, on);
+    write_mcp_flag(mcp_auto_approve_file(&app), on);
+}
+
+/// Connectors → "Send remote connectors real values": read the live state for
+/// the UI toggle.
+#[tauri::command]
+pub fn get_mcp_outbound_unmask(state: State<'_, AppState>) -> bool {
+    state
+        .mcp_outbound_unmask
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Connectors → "Send remote connectors real values": flip it and persist it
+/// per-Mac. Read live at the outbound seam (`exec_tool`), so the next call
+/// carries whatever this says. Does NOT grant consent — with the card still on,
+/// the user sees the real arguments and approves them before they leave.
+#[tauri::command]
+pub fn set_mcp_outbound_unmask(app: tauri::AppHandle, state: State<'_, AppState>, on: bool) {
+    state
+        .mcp_outbound_unmask
+        .store(on, std::sync::atomic::Ordering::SeqCst);
+    write_mcp_flag(mcp_outbound_unmask_file(&app), on);
 }
 
 /// SEC-1: the spawn/approval decision for a room's MCP config, decided PURELY
@@ -450,26 +665,26 @@ pub(crate) async fn mcp_call_approved(
     args: &serde_json::Value,
 ) -> bool {
     use tauri::Emitter;
-    // "Auto mode" (Connectors → Auto-approve): the user granted blanket consent
-    // to RUN connector tools, so the agent's calls never stall on a card nobody
-    // is watching. Since 2026-07-24 it also means the call carries REAL
-    // arguments: `exec_tool` skips the outbound remote-arg masking under auto
-    // mode, because masking the values a connector is asked about made the call
-    // fail with no visible reason. Auto mode is therefore full approval —
-    // consent AND real args — which is exactly why it is OFF until the user
-    // turns it on (`read_mcp_auto_approve`). Turning it off restores both gates.
-    if state
-        .mcp_auto_approve
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
-        return true;
-    }
-    if state
+    // Connectors → "Run connector tools without asking": the user granted
+    // standing consent to RUN connector tools, so the agent's calls never stall
+    // on a card nobody is watching. That is ALL it grants. Whether the arguments
+    // on that call are the room's real values is `mcp_outbound_unmask`, read
+    // separately at the outbound seam in `exec_tool` — the two were one switch
+    // until 2026-08-03, which meant a user who only wanted their lookups to stop
+    // returning nothing also stopped being asked. `args` here is already the
+    // copy that will leave, so the card shows what is actually sent either way.
+    //
+    // Read PER CONNECTOR (owner's decision, per connector, 2026-08-03): a user
+    // who trusts one local connector enough to stop being asked has said
+    // nothing about the remote one that reaches the internet. The Mac-wide
+    // switch is only the default a connector inherits when it has no answer of
+    // its own.
+    let remembered = state
         .mcp_session_ok
         .lock()
         .unwrap()
-        .contains(&route.server_name)
-    {
+        .contains(&route.server_name);
+    if skips_consent_card(auto_approve_for(state, &route.server_name), remembered) {
         return true;
     }
     let id = Uuid::new_v4().to_string();
@@ -504,6 +719,70 @@ pub(crate) async fn mcp_call_approved(
     }
     decision.approved
 }
+
+// ------------------------------------------------- agent-initiated deletions
+
+/// The consent-card payload for an agent-initiated DELETION.
+///
+/// Deliberately a different shape from the tool-call card: `confirm` carries
+/// the one sentence naming what goes with the thing being deleted, and its
+/// presence is what makes the frontend render the destructive card instead of
+/// "Allow a connected tool to run?" — copy that would be a lie here, since
+/// nothing is being *run*. Pure, so the shape is unit-tested.
+pub(crate) fn destructive_request(
+    id: &str,
+    what: &str,
+    name: &str,
+    detail: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "server": name,
+        "tool": what,
+        "args": "",
+        "confirm": detail,
+    })
+}
+
+/// Ask the user before the agent deletes something it cannot put back.
+///
+/// One command wiped a connector AND its saved sign-in with nothing asking
+/// first — and because the agent reads the room's documents, a file containing
+/// "remove the github connector" was enough to set it off (audit #505). There
+/// is no trash for connectors, skills or workflows, so the card IS the undo.
+///
+/// Standing consent does NOT reach here. "Run connector tools without asking"
+/// is permission to CALL a connector; it has never been permission to destroy
+/// the room's own configuration, and `mcp_session_ok` is likewise not consulted
+/// or written. A timeout or a closed window is a decline, never a silent yes.
+pub(crate) async fn confirm_destructive(
+    state: &AppState,
+    window: &tauri::Window,
+    what: &str,
+    name: &str,
+    detail: &str,
+) -> bool {
+    use tauri::Emitter;
+    let id = Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel::<McpDecision>();
+    state.mcp_pending.lock().unwrap().insert(id.clone(), tx);
+    let _ = window.emit(
+        "mcp-approve-request",
+        destructive_request(&id, what, name, detail),
+    );
+    match tokio::time::timeout(std::time::Duration::from_secs(180), rx).await {
+        Ok(Ok(d)) => d.approved,
+        _ => {
+            state.mcp_pending.lock().unwrap().remove(&id);
+            false
+        }
+    }
+}
+
+/// What the agent is told when the user says no. Its own sentence, so the model
+/// reports a refusal instead of inventing a reason or trying again.
+pub(crate) const DELETE_DECLINED: &str =
+    "Not deleted — the confirmation was declined. Nothing was changed.";
 
 // ---------------------------------------------------------------- OAuth
 
@@ -1170,7 +1449,7 @@ fn same_destination(
         .all(|k| old.get(*k) == new.get(*k))
 }
 
-pub(crate) fn agent_delete_mcp(
+pub(crate) async fn agent_delete_mcp(
     window: &tauri::Window,
     state: &AppState,
     args: &serde_json::Value,
@@ -1178,6 +1457,20 @@ pub(crate) fn agent_delete_mcp(
     use tauri::Manager as _;
 
     let name = agent_mcp_name(args["name"].as_str().unwrap_or_default())?.to_string();
+    // Unrecoverable and reachable from anything the agent READ, so it is the
+    // user's click, not the model's (audit #505).
+    if !confirm_destructive(
+        state,
+        window,
+        "connector",
+        &name,
+        "Its saved sign-in (OAuth token) is erased with it. There is no undo — \
+         you would have to add the connector and sign in again.",
+    )
+    .await
+    {
+        return Err(DELETE_DECLINED.into());
+    }
     let json = state.with_room(|room| {
         let raw = db::get_setting(&room.conn, MCP_CONFIG_KEY)
             .unwrap_or_else(|| DEFAULT_MCP_CONFIG.to_string());
@@ -1392,19 +1685,314 @@ pub fn resolve_mcp_call(
 mod tests {
     use super::*;
 
+    /// Audit #505: the agent could delete a connector and its saved sign-in
+    /// with nothing asking first. The card is the undo, so its payload must be
+    /// recognisably a DELETION — the frontend renders the tool-call card
+    /// ("Allow a connected tool to run?", "Always allow this connector") for
+    /// anything without `confirm`, which would be the wrong question and would
+    /// offer standing consent to destruction.
     #[test]
-    fn auto_mode_is_off_until_the_user_turns_it_on() {
-        // Auto mode opens TWO gates — no consent card AND real (unmasked)
-        // arguments to a remote connector (`agent::masks_outbound_args`). A
-        // fresh install must not arrive with both already open, so anything
-        // other than an explicit `true` on disk fails closed.
-        assert!(!parse_auto_approve(None), "a fresh install must default OFF");
-        assert!(!parse_auto_approve(Some("")));
-        assert!(!parse_auto_approve(Some("garbage")));
-        assert!(!parse_auto_approve(Some("false")));
-        // Only the user's own explicit choice turns it on, whitespace and all.
-        assert!(parse_auto_approve(Some("true")));
-        assert!(parse_auto_approve(Some(" true\n")));
+    fn a_deletion_card_is_never_mistaken_for_a_tool_call_card() {
+        let v = destructive_request("id-1", "connector", "github", "Its sign-in goes too.");
+        assert_eq!(v["confirm"], "Its sign-in goes too.");
+        assert_eq!(v["tool"], "connector");
+        assert_eq!(v["server"], "github");
+        assert_eq!(v["id"], "id-1");
+        // No arguments to preview: nothing is being SENT anywhere.
+        assert_eq!(v["args"], "");
+    }
+
+    /// Declining must read as a refusal, not as a done deed — the model
+    /// otherwise reports the deletion it was stopped from making.
+    #[test]
+    fn a_declined_deletion_says_nothing_was_changed() {
+        assert!(DELETE_DECLINED.contains("Not deleted"));
+        assert!(DELETE_DECLINED.contains("Nothing was changed"));
+    }
+
+    #[test]
+    fn both_connector_powers_are_off_until_the_user_turns_them_on() {
+        // Each power now has its OWN file, and both are read through here. A
+        // fresh install must not arrive with either open, so anything other than
+        // an explicit `true` on disk fails closed. (An install that had the old
+        // combined "auto mode" on has no unmasking file at all — None — which is
+        // why this row is the one that decides the upgrade lands masked.)
+        assert!(
+            !parse_connector_flag(None),
+            "a fresh install must default OFF"
+        );
+        assert!(!parse_connector_flag(Some("")));
+        assert!(!parse_connector_flag(Some("garbage")));
+        assert!(!parse_connector_flag(Some("false")));
+        // Only the user's own explicit choice turns one on, whitespace and all.
+        assert!(parse_connector_flag(Some("true")));
+        assert!(parse_connector_flag(Some(" true\n")));
+    }
+
+    /// All four (auto-approve, unmask) combinations for ONE connector, stated
+    /// over the real deciders. The per-connector layer only earns its keep if
+    /// every combination is reachable for a single connector, so this walks the
+    /// truth table with the two GLOBAL switches held OFF and only the
+    /// connector's own answers moving — which is also the case an upgraded
+    /// install starts from.
+    #[test]
+    fn one_connector_can_reach_all_four_combinations() {
+        let mut raw = "{}".to_string();
+        let mut seen = std::collections::HashSet::new();
+        for auto in [false, true] {
+            for unmask in [false, true] {
+                raw = set_connector_power(&raw, "linear", ConnectorPower::AutoApprove, Some(auto))
+                    .unwrap();
+                raw = set_connector_power(
+                    &raw,
+                    "linear",
+                    ConnectorPower::OutboundUnmask,
+                    Some(unmask),
+                )
+                .unwrap();
+                let over = parse_connector_powers(&raw)["linear"];
+                // The globals are OFF; what is in force is the connector's own
+                // answer, and each power reads only its own field.
+                let skips = skips_consent_card(effective_power(false, over.auto_approve), false);
+                let masks = super::super::masks_outbound_args(
+                    true,
+                    effective_power(false, over.outbound_unmask),
+                );
+                assert_eq!(skips, auto, "auto={auto} unmask={unmask}: wrong consent");
+                assert_eq!(masks, !unmask, "auto={auto} unmask={unmask}: wrong masking");
+                seen.insert((skips, masks));
+            }
+        }
+        assert_eq!(seen.len(), 4, "a connector's two powers must not collapse");
+    }
+
+    #[test]
+    fn two_connectors_do_not_affect_each_other() {
+        // The reason the global-only pair was the wrong granularity: trusting
+        // the connector that runs on this Mac must say nothing about the one
+        // that reaches the internet.
+        let raw =
+            set_connector_power("{}", "filesystem", ConnectorPower::AutoApprove, Some(true))
+                .unwrap();
+        let raw =
+            set_connector_power(&raw, "linear", ConnectorPower::OutboundUnmask, Some(true))
+                .unwrap();
+        let map = parse_connector_powers(&raw);
+        // Each connector holds exactly the one answer it was given…
+        assert_eq!(map["filesystem"].auto_approve, Some(true));
+        assert_eq!(map["filesystem"].outbound_unmask, None);
+        assert_eq!(map["linear"].outbound_unmask, Some(true));
+        assert_eq!(map["linear"].auto_approve, None);
+        // …so with both globals OFF, filesystem skips its card while linear
+        // still gets one, and linear unmasks while filesystem's untouched
+        // power stays masked.
+        assert!(skips_consent_card(
+            effective_power(false, map["filesystem"].auto_approve),
+            false
+        ));
+        assert!(!skips_consent_card(
+            effective_power(false, map["linear"].auto_approve),
+            false
+        ));
+        assert!(!super::super::masks_outbound_args(
+            true,
+            effective_power(false, map["linear"].outbound_unmask)
+        ));
+        assert!(super::super::masks_outbound_args(
+            true,
+            effective_power(false, map["filesystem"].outbound_unmask)
+        ));
+        // Clearing one connector's answer leaves the other's alone, and leaves
+        // no residue behind that a later read could mistake for a choice.
+        let cleared =
+            set_connector_power(&raw, "filesystem", ConnectorPower::AutoApprove, None).unwrap();
+        let map = parse_connector_powers(&cleared);
+        assert!(!map.contains_key("filesystem"), "an empty entry must be dropped");
+        assert_eq!(map["linear"].outbound_unmask, Some(true));
+    }
+
+    #[test]
+    fn the_upgrade_from_the_global_switches_grants_nothing_new() {
+        // The migration, which is deliberately a no-op: an install arriving
+        // from the global-only pair has no overrides file, so every connector
+        // inherits the value that install already had. What must NOT happen is
+        // the reverse — a global ON being written out as per-connector grants
+        // (which would then survive the user turning the global back off), or
+        // a global OFF being read as a grant anywhere.
+        assert!(
+            parse_connector_powers("{}").is_empty(),
+            "no file = no overrides"
+        );
+        assert!(parse_connector_powers("garbage").is_empty());
+        // Inheritance, both directions, for a connector nobody has touched.
+        for global in [false, true] {
+            assert_eq!(effective_power(global, None), global);
+        }
+        // A global OFF can never become a grant on its own.
+        assert!(!effective_power(false, None));
+        assert!(!skips_consent_card(effective_power(false, None), false));
+        assert!(super::super::masks_outbound_args(
+            true,
+            effective_power(false, None)
+        ));
+        // …and an explicit per-connector NO outranks a global YES, so the
+        // stricter answer is always reachable.
+        assert!(!effective_power(true, Some(false)));
+        assert!(effective_power(false, Some(true)));
+        // Only the two known powers can be written; a typo is an error the UI
+        // can show, never a silent write into the other power.
+        assert_eq!(
+            ConnectorPower::parse("auto_approve"),
+            Ok(ConnectorPower::AutoApprove)
+        );
+        assert_eq!(
+            ConnectorPower::parse("outbound_unmask"),
+            Ok(ConnectorPower::OutboundUnmask)
+        );
+        assert!(ConnectorPower::parse("autoApprove").is_err());
+    }
+
+    #[test]
+    fn a_connectors_powers_survive_a_restart_without_leaking_into_each_other() {
+        // The persistence half of the per-connector layer, run for real against
+        // the same JSON the file holds. Two connectors, one answer each, written
+        // one at a time — the round trip must keep them apart and keep "follow
+        // the switch" as an ABSENT key rather than a false, because a false
+        // would pin a connector to today's global forever.
+        let mut raw = "{}".to_string();
+        raw = set_connector_power(&raw, "filesystem", ConnectorPower::AutoApprove, Some(true))
+            .unwrap();
+        raw = set_connector_power(&raw, "linear", ConnectorPower::OutboundUnmask, Some(false))
+            .unwrap();
+        assert!(
+            !raw.contains("\"outbound_unmask\":null") && !raw.contains("\"auto_approve\":null"),
+            "an unanswered power must be absent, not a null: {raw}"
+        );
+        let reloaded = parse_connector_powers(&raw);
+        assert_eq!(reloaded["filesystem"].auto_approve, Some(true));
+        assert_eq!(reloaded["filesystem"].outbound_unmask, None);
+        assert_eq!(reloaded["linear"].outbound_unmask, Some(false));
+        assert_eq!(reloaded["linear"].auto_approve, None);
+        // An entry that names an unknown power is ignored, not fatal, and never
+        // turns into an answer.
+        let odd = parse_connector_powers(r#"{"linear":{"auto_approve":true,"bogus":1}}"#);
+        assert_eq!(odd["linear"].auto_approve, Some(true));
+        assert_eq!(odd["linear"].outbound_unmask, None);
+    }
+
+    #[test]
+    fn the_two_connector_powers_are_independent() {
+        // The 2026-08-03 split, stated as a truth table over the REAL deciders
+        // for a REMOTE connector: `skips_consent_card` (does the user get a say)
+        // and `masks_outbound_args` (does the room's private data leave intact).
+        // All four combinations must be distinct — before the split only the two
+        // diagonal rows existed, because one flag drove both columns.
+        //
+        //  auto-approve, unmask   → skips the card, masks the args
+        let table = [
+            (false, false, false, true),
+            (true, false, true, true),
+            (false, true, false, false),
+            (true, true, true, false),
+        ];
+        for (auto, unmask, skips, masks) in table {
+            assert_eq!(
+                skips_consent_card(auto, false),
+                skips,
+                "auto={auto} unmask={unmask}: unmasking must never grant consent"
+            );
+            assert_eq!(
+                super::super::masks_outbound_args(true, unmask),
+                masks,
+                "auto={auto} unmask={unmask}: auto-approve must never unmask"
+            );
+        }
+        // The four (skips, masks) outcomes really are four different behaviours.
+        let outcomes: std::collections::HashSet<(bool, bool)> = table
+            .iter()
+            .map(|&(auto, unmask, _, _)| {
+                (
+                    skips_consent_card(auto, false),
+                    super::super::masks_outbound_args(true, unmask),
+                )
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 4, "the two switches must not collapse");
+        // A local connector never leaves this Mac, so unmasking is moot there
+        // while auto-approve still decides whether the user is asked.
+        assert!(!super::super::masks_outbound_args(false, false));
+        assert!(!super::super::masks_outbound_args(false, true));
+        // "Always allow this connector" for the session is still its own path
+        // into skipping the card, and still has nothing to do with unmasking.
+        assert!(skips_consent_card(false, true));
+    }
+
+    #[test]
+    fn a_fresh_state_has_both_powers_off_and_they_move_apart() {
+        // Named for what it can actually prove. `AppState::default()` is where
+        // the two atomics get their startup value before `setup` hydrates them,
+        // so the thing worth pinning is that BOTH arrive false — a `true`
+        // default on either would open a gate nobody asked for on first launch.
+        // It does NOT prove the commands write the right field: they need an
+        // `AppHandle`, so that wiring is pinned textually in
+        // e2e/page-script/connectorpowers.test.mjs instead.
+        use std::sync::atomic::Ordering::SeqCst;
+        let state = AppState::default();
+        assert!(
+            !state.mcp_auto_approve.load(SeqCst),
+            "a fresh launch must still ask before running a connector tool"
+        );
+        assert!(
+            !state.mcp_outbound_unmask.load(SeqCst),
+            "a fresh launch must still mask what leaves for a remote connector"
+        );
+        state.mcp_auto_approve.store(true, SeqCst);
+        assert!(
+            !state.mcp_outbound_unmask.load(SeqCst),
+            "turning off the consent card must not unmask outbound args"
+        );
+        let state = AppState::default();
+        state.mcp_outbound_unmask.store(true, SeqCst);
+        assert!(
+            !state.mcp_auto_approve.load(SeqCst),
+            "asking for real args must not also skip the consent card"
+        );
+    }
+
+    #[test]
+    fn each_power_persists_to_its_own_file() {
+        // The persistence half of the split, run for real. Both flags go
+        // through ONE `write_mcp_flag`/`read_mcp_flag` pair that takes the path
+        // as an argument, so the only thing standing between "two switches" and
+        // "one switch with two labels" is that the two callers pass different
+        // paths. Write one, read the other back, and check it did not move —
+        // and that a flag whose file has never been created reads OFF, which is
+        // exactly the upgrade case (an install with the old combined switch on
+        // has no unmasking file at all).
+        let dir = std::env::temp_dir().join(format!("arcelle-connflags-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let auto = Ok(dir.join("mcp_auto_approve.json"));
+        let unmask = Ok(dir.join("mcp_outbound_unmask.json"));
+
+        assert!(!read_mcp_flag(auto.clone()), "no file yet = OFF");
+        assert!(!read_mcp_flag(unmask.clone()), "no file yet = OFF");
+
+        write_mcp_flag(auto.clone(), true);
+        assert!(read_mcp_flag(auto.clone()));
+        assert!(
+            !read_mcp_flag(unmask.clone()),
+            "granting standing consent must not create or set the unmasking flag"
+        );
+
+        write_mcp_flag(unmask.clone(), true);
+        write_mcp_flag(auto.clone(), false);
+        assert!(
+            read_mcp_flag(unmask.clone()),
+            "withdrawing consent must not silently re-mask behind the user's back"
+        );
+        assert!(!read_mcp_flag(auto));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

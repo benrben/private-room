@@ -388,6 +388,9 @@ async def test_live_seam_single_tool_run():
         "step_status",
         "round",
         "usage",
+        # The child's report, as the durable copy the diagram keeps — its live
+        # `delta`s are wiped by the next `round`.
+        "report",
         # A child FINISHED: its own roster slot flips to done the moment its
         # sub-loop ends — not when the parent gets round to collecting it, or a
         # fast sibling would keep pulsing until the slowest one returned.
@@ -405,19 +408,26 @@ async def test_live_seam_single_tool_run():
     # (c) Every event matches the {"t":..,"v":..}/{"t":"step_status","ok":..} shape
     #     the Rust side reads (str_v() reads "v"; step_status reads "ok").
     lane = next(e for e in events if e["t"] == "lane")
-    assert lane == {"t": "lane", "v": "Answering"}  # ui=False,write=False,web=False
+    # ui=False,write=False,web=False — plus the run stamp every line carries.
+    assert lane == {"t": "lane", "v": "Answering", "run_id": token}
     steps = [e["v"] for e in events if e["t"] == "step"]
     assert steps == ["Asked the File agent", "Searched the room"]
     step_status = next(e for e in events if e["t"] == "step_status")
     # `node` names the emitting agent's graph slot — the ONLY way to attribute a
     # step once siblings run concurrently and their events interleave.
-    assert step_status == {"t": "step_status", "ok": True, "node": "files.read#0"}
+    assert step_status == {
+        "t": "step_status",
+        "ok": True,
+        "node": "files.read#0",
+        "run_id": token,
+    }
     # `delta` and `round` carry the same optional `node` stamp `step` does — the
     # host reads only `t`/`v` (`str_v`), so the extra key is inert there, and it
     # is what lets a consumer say WHOSE words these are. (Updated 2026-08-01;
-    # this asserted the key set was exactly {"t","v"}.)
+    # this asserted the key set was exactly {"t","v"}. Updated again 2026-08-03:
+    # `run_id` names the RUN the same way `node` names the agent inside it.)
     for d in [e for e in events if e["t"] in ("delta", "round")]:
-        assert set(d.keys()) <= {"t", "v", "node"}
+        assert set(d.keys()) <= {"t", "v", "node", "run_id"}
         assert d["t"] == "round" or isinstance(d["v"], str)
 
     # (d) The worker's report streams, then the Main agent's answer streams —
@@ -426,7 +436,8 @@ async def test_live_seam_single_tool_run():
     delta_text = "".join(e["v"] for e in events if e["t"] == "delta")
     assert delta_text.endswith(final_answer)
     final = events[-1]
-    assert final == {"t": "final", "v": final_answer}
+    # Owner replacement #4: every line names the run it belongs to.
+    assert final == {"t": "final", "v": final_answer, "run_id": token}
 
     # (e) The mock bridge actually received tools/call for the tool the model asked
     #     for, with the right arguments and the right bearer token.
@@ -528,7 +539,10 @@ async def test_duplicate_tool_call_suppressed():
     # Main delegates (1) + three worker rounds + main answers = 5 rounds.
     assert kinds.count("round") == 5, kinds
     assert kinds[-1] == "final"
-    assert events[-1] == {"t": "final", "v": final_answer}
+    assert events[-1] == {"t": "final", "v": final_answer, "run_id": token}
+    # Including every line a DELEGATED sub-agent produced: they travel on this
+    # same stream, so they have to name the same run.
+    assert all(e["run_id"] == token for e in events), "an unstamped line has no owner"
     assert len(ollama_state.requests) == 5, ollama_state.requests
 
 

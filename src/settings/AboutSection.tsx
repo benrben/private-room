@@ -2,7 +2,9 @@ import { useEffect, useState } from "react";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
-import { AlertIcon, CircleCheckIcon, DownloadIcon } from "../icons";
+import { AlertIcon, CircleCheckIcon, DownloadIcon, FolderIcon } from "../icons";
+import { api } from "../api";
+import { autoUpdateCheckEnabled, setAutoUpdateCheck } from "../updater";
 
 /** The update handle `check()` hands back (typed off the plugin so we don't
  * depend on an un-exported class name). */
@@ -26,6 +28,13 @@ export default function AboutSection() {
   const [update, setUpdate] = useState<UpdateHandle | null>(null);
   const [pct, setPct] = useState<number | null>(null);
   const [err, setErr] = useState<string>("");
+  // The log folder, shown only once the reveal actually succeeded — naming a
+  // path we failed to open would be the same small lie the logs exist to catch.
+  const [logDir, setLogDir] = useState<string>("");
+  const [logErr, setLogErr] = useState<string>("");
+  // Read once from the same preference the launch check reads, so the box
+  // shows what is actually in force rather than a fresh-install default.
+  const [autoCheck, setAutoCheck] = useState<boolean>(() => autoUpdateCheckEnabled());
 
   useEffect(() => {
     getVersion().then(setCurrent).catch(() => setCurrent(""));
@@ -76,16 +85,56 @@ export default function AboutSection() {
     }
   }
 
+  async function showLogs() {
+    setLogErr("");
+    try {
+      setLogDir(await api.revealLogs());
+    } catch (e) {
+      setLogDir("");
+      setLogErr(typeof e === "string" ? e : "The logs folder could not be opened.");
+    }
+  }
+
   const busy = phase === "checking" || phase === "downloading";
 
   return (
     <section id="set-about">
       <h3>Updates &amp; version</h3>
       <p className="settings-hint">
-        Arcelle updates itself from its signed GitHub releases. It checks
-        quietly on launch; use the button below to check right now and install
-        the latest release in one click.
+        Arcelle updates itself from its signed GitHub releases.{" "}
+        {autoCheck
+          ? "It checks quietly on launch;"
+          : "The launch check is switched off, so nothing is contacted until you ask;"}{" "}
+        use the button below to check right now and install the latest release
+        in one click.
       </p>
+
+      {/* The launch check reaches GitHub before any room is unlocked, which
+          makes it one of only two things this app sends anywhere on its own.
+          The preference has existed since the check did; until now nothing
+          wrote it, so the only way to switch it off was to edit localStorage
+          by hand — a promise the README made on the app's behalf that the app
+          itself did not keep. `data-agent-blocked` for the same reason every
+          other outbound-network switch is: it is the user's decision, not an
+          agent's. */}
+      <div className="settings-toggle-row" data-agent-blocked="true">
+        <label className="switch">
+          <input
+            type="checkbox"
+            checked={autoCheck}
+            aria-label="Check for updates automatically on launch"
+            onChange={(e) => setAutoCheck(setAutoUpdateCheck(e.target.checked))}
+          />
+          <span className="switch-track" aria-hidden="true">
+            <span className="switch-thumb" />
+          </span>
+        </label>
+        <span>
+          {autoCheck
+            ? "Check for updates on launch — Arcelle contacts GitHub each time it starts."
+            : "OFF — Arcelle never contacts GitHub on its own. Checking here still works."}
+        </span>
+      </div>
 
       <div className="model-row" style={{ justifyContent: "space-between" }}>
         <span>
@@ -136,6 +185,35 @@ export default function AboutSection() {
       {phase === "error" && (
         <div className="gate-error btn-ic" style={{ marginTop: 8 }}>
           <AlertIcon size={14} className="warn-ic" /> {err}
+        </div>
+      )}
+
+      <h3 style={{ marginTop: 24 }}>Logs</h3>
+      <p className="settings-hint">
+        Arcelle keeps two small log files — one for the app and one for its AI
+        service. They record what the app <em>did</em>: which tools an agent was
+        given, which model answered, how long it took, whether a Stop landed.
+        Nothing from a room goes in them — no messages, no file contents, not
+        even file names — so they're safe to attach to a bug report.
+      </p>
+
+      <div className="model-row" style={{ justifyContent: "space-between" }}>
+        <span>Show the log files in Finder</span>
+        <button className="subtle btn-ic" onClick={() => void showLogs()}>
+          <FolderIcon size={14} /> Reveal logs
+        </button>
+      </div>
+
+      {logDir && (
+        <div className="settings-hint" style={{ marginTop: 8 }}>
+          Opened <code>{logDir}</code> — look for{" "}
+          <code>arcelle-host.log</code> and <code>arcelle-sidecar.log</code>.
+        </div>
+      )}
+
+      {logErr && (
+        <div className="gate-error btn-ic" style={{ marginTop: 8 }}>
+          <AlertIcon size={14} className="warn-ic" /> {logErr}
         </div>
       )}
     </section>

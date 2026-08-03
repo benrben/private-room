@@ -26,6 +26,10 @@ export interface Toast {
 export interface Props {
   info: RoomInfo;
   onLock: () => void | Promise<void>;
+  /** The room was renamed (top bar → the room name). The shell owns `info`, so
+   * it has to be handed the refreshed record — nothing else re-reads it, and
+   * without this the new name would only appear after locking and unlocking. */
+  onRenamed?: (info: RoomInfo) => void;
 }
 
 /** The product areas the activity rail navigates between. "files" is the

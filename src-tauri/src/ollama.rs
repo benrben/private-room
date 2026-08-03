@@ -189,8 +189,7 @@ async fn sidecar_post(
         }
         None => body,
     };
-    let resp = client()?
-        .post(format!("{base}{path}"))
+    let resp = crate::sidecar_lifecycle::authed(client()?.post(format!("{base}{path}")))
         .json(&body)
         .send()
         .await
@@ -288,18 +287,8 @@ async fn post_generate_cancellable(
 /// `keep_alive` (HLT-5) is how long Ollama holds the model resident after this
 /// call (e.g. "30m" to stay warm, "2m"/"0" to release a vision model on
 /// low-RAM machines). The caller decides per model — see `vision_keep_alive`.
-/// Compatibility classification retained for existing callers. Context-window
-/// sizing is now owned by Ollama/the selected model, so both variants use the
-/// same uncapped request body.
-#[derive(Clone, Copy, Default)]
-pub enum CtxTier {
-    #[default]
-    Chat,
-    Job,
-}
-
 /// The knobs a `chat_structured` caller may vary. `Default` is the interactive
-/// case: Chat context tier, no cancellation.
+/// case: no cancellation.
 #[derive(Default, Clone)]
 pub struct StructuredOpts {
     // `tier: CtxTier` lived here and is DELETED (2026-07-25). Its own doc said
@@ -377,16 +366,21 @@ pub async fn chat_structured(
 
 /// Build the `/generate`(`_stream`) request body for a tool-less, plain-text
 /// chat — the shared schema the streaming ([`crate::sidecar::generate_stream`])
-/// and non-streaming ([`generate`]) plain paths both POST. The legacy `tier`
-/// argument is accepted for caller compatibility, but the request omits
+/// and non-streaming ([`generate`]) plain paths both POST. The request omits
 /// `num_ctx` so Ollama/the model owns the context window. No `format` (that is
 /// `chat_structured`'s grammar path) and no `tools`.
+///
+/// There used to be a `tier: CtxTier` argument here — a Chat/Job classification
+/// every caller had to pick and nothing read, kept alive as `_tier` after the
+/// body stopped varying. Deleted (audit #225): an argument that names a choice
+/// the code does not make is the same lie as a helper that names a check it
+/// does not perform. Context sizing is decided by payload-fitted `num_ctx` in
+/// the sidecar.
 pub fn plain_generate_body(
     model: &str,
     messages: &[ChatMessage],
     temperature: Option<f64>,
     keep_alive: &str,
-    _tier: CtxTier,
 ) -> serde_json::Value {
     serde_json::json!({
         "model": model,
@@ -411,18 +405,14 @@ pub fn plain_generate_body(
 /// races the request against the flag and drops it on Stop, yielding empty text
 /// the caller treats as stopped (same "partial == stopped" contract the old
 /// streamed path had). Callers with no Stop affordance pass `None`.
-///
-/// `tier` remains part of this API for existing callers but no longer changes
-/// the generated request.
 pub async fn generate(
     model: &str,
     messages: Vec<ChatMessage>,
     temperature: Option<f64>,
     keep_alive: &str,
     cancel: Option<Arc<AtomicBool>>,
-    tier: CtxTier,
 ) -> Result<String, String> {
-    let body = plain_generate_body(model, &messages, temperature, keep_alive, tier);
+    let body = plain_generate_body(model, &messages, temperature, keep_alive);
     let value = post_generate_cancellable(&body, model, cancel).await?;
     Ok(value["text"].as_str().unwrap_or_default().to_string())
 }
@@ -605,8 +595,7 @@ pub async fn pull_cancellable(
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(format!("{base}/pull"))
+    let resp = crate::sidecar_lifecycle::authed(client.post(format!("{base}/pull")))
         .json(&serde_json::json!({ "model": model, "base_url": resolved_base_url() }))
         .send()
         .await
@@ -740,8 +729,7 @@ pub async fn capabilities(model: &str) -> Vec<String> {
     let _busy = crate::sidecar_lifecycle::busy();
     let Ok(client) = metadata_client() else { return Vec::new() };
     let body = serde_json::json!({ "model": model, "base_url": resolved_base_url() });
-    let Ok(resp) = client
-        .post(format!("{base}/capabilities"))
+    let Ok(resp) = crate::sidecar_lifecycle::authed(client.post(format!("{base}/capabilities")))
         .json(&body)
         .send()
         .await
@@ -760,6 +748,17 @@ pub async fn capabilities(model: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The base-URL override is process-global, so any two tests that write it —
+/// or that read a locality answer derived from it (`ollama_runs_here`, and
+/// therefore `runs_on_this_mac`) — would race under cargo's parallel runner.
+/// Every such test holds this first. Same shape and same reason as
+/// `privacy::policy_test_lock`.
+#[cfg(test)]
+pub(crate) fn base_url_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,6 +767,7 @@ mod tests {
     // and clearing it falls back to the env/default path. No network involved.
     #[test]
     fn base_url_override_precedence() {
+        let _guard = base_url_test_lock();
         // A set override wins over env/default...
         set_base_url_override(Some("http://example:1".to_string()));
         assert_eq!(resolved_base_url(), "http://example:1");
@@ -819,10 +819,8 @@ mod tests {
     #[test]
     fn plain_generate_body_leaves_context_to_the_engine() {
         let messages = vec![ChatMessage::new("user", "hi")];
-        let chat = plain_generate_body("m", &messages, None, "30m", CtxTier::Chat);
-        let job = plain_generate_body("m", &messages, None, "30m", CtxTier::Job);
-        assert!(chat.get("num_ctx").is_none());
-        assert!(job.get("num_ctx").is_none());
+        let body = plain_generate_body("m", &messages, None, "30m");
+        assert!(body.get("num_ctx").is_none());
     }
 
     // A structured-output response must parse whether the model returns bare

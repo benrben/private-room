@@ -1,34 +1,27 @@
-import { Component, lazy, Suspense, type ReactNode } from "react";
+import { Component, Suspense, type ReactNode } from "react";
+
 import { FileContent } from "../api";
 import { OpenFile } from "./types";
-import AudioView from "../viewers/AudioView";
 import type { RecordingLiveState } from "../viewers/RecordingView";
-import HtmlView from "../viewers/HtmlView";
-import ImageView from "../viewers/ImageView";
-import MarkdownView from "../viewers/MarkdownView";
-import TextView from "./TextView";
-// The extension → language table lives on its own and imports nothing, so
-// reading it here never drags monaco-editor into the eager startup bundle.
+import {
+  EditMode,
+  FORMATS,
+  LazyViewers,
+  makeLazyViewers,
+  ViewerContext,
+} from "../viewers/registry";
 import { languageForFile } from "../viewers/languages";
+import { encodingSaveNote, useTextEncoding } from "../viewers/TextEncoding";
+import PageSource from "../viewers/PageSource";
 
-// The heavy viewers (monaco-editor, pdfjs-dist, xlsx, docx-preview, the live
-// recording editor) load on demand so they stay out of the eager startup
-// bundle. All are default exports, so lazy() needs no remapping. They live in
-// a rebuildable bundle (not module consts) because lazy() caches a rejected
-// import forever — ViewerChunkBoundary's Retry swaps in fresh wrappers so the
-// import actually re-runs.
-const makeLazyViewers = () => ({
-  CodeEditor: lazy(() => import("../viewers/CodeEditor")),
-  DocxView: lazy(() => import("../viewers/DocxView")),
-  PdfView: lazy(() => import("../viewers/PdfView")),
-  RecordingView: lazy(() => import("../viewers/RecordingView")),
-  SheetView: lazy(() => import("../viewers/SheetView")),
-});
-let lazyViewers = makeLazyViewers();
+/** The lazy viewer bundle. Rebuildable (not a module const) because lazy()
+ * caches a rejected import forever — the boundary's Retry swaps in fresh
+ * wrappers so the import actually re-runs. */
+let lazyViewers: LazyViewers = makeLazyViewers();
 
-/** The lazy viewers above are the app's first dynamic imports, and a rejected
- * chunk fetch (classically: the updater replaced the bundle on disk while the
- * old process is still running, then the user opens their first PDF) would
+/** The lazy viewers are the app's first dynamic imports, and a rejected chunk
+ * fetch (classically: the updater replaced the bundle on disk while the old
+ * process is still running, then the user opens their first PDF) would
  * otherwise throw through Suspense to the root and unmount the entire app.
  * Catch it here instead and offer a retry. */
 class ViewerChunkBoundary extends Component<
@@ -63,42 +56,37 @@ interface ViewerRouterProps {
   openFile: OpenFile;
   viewerRev: number;
   editMode: boolean;
-  editModeOf: (c: FileContent) => "grid" | "editor" | "copy" | null;
+  editModeOf: (c: FileContent) => EditMode | null;
   editCell: (sheet: string, cell: string, value: string) => Promise<void>;
-  saveEdit: (newText: string) => Promise<void>;
-  saveEditAsCopy: (newText: string) => Promise<void>;
+  /** Both resolve false when the write failed, so the editor keeps the buffer
+   * dirty and the unsaved-edits dialog doesn't proceed with a lost edit. */
+  saveEdit: (newText: string) => Promise<boolean>;
+  saveEditAsCopy: (newText: string) => Promise<boolean>;
   /** Wave 1b (idea 10): mirrors the editable Monaco buffer's dirty flag out to
    * the workspace so agent writes can't silently blow unsaved user edits. */
   onDirtyChange?: (dirty: boolean) => void;
-  /** ADD-27: what the Recording editor needs from the workspace — the live
-   * session state plus the session-lifecycle handlers (recordingActions). */
+  /** Lets the workspace save the editor's buffer when something is about to
+   * unmount it (the unsaved-edits dialog's "Save"). */
+  registerSave?: (save: (() => Promise<boolean>) | null) => void;
   /** ADD-18: background-transcription state by file NAME (stt-progress) —
    * lets media viewers say "transcribing…" instead of "no transcript yet". */
   sttStatus?: Record<string, string>;
-  recording: {
-    live: RecordingLiveState | null;
-    /** Stop→saved drain readout (null outside a save). */
-    saveProgress: { stage: "transcribing" | "writing"; remaining: number } | null;
-    pushToast: (
-      kind: "info" | "success" | "error",
-      text: string,
-      action?: { label: string; run: () => void },
-    ) => void;
-    onStart: (
-      fileId: string,
-      opts: { systemAudio: boolean; liveTranslate: string | null },
-    ) => Promise<void>;
-    onPause: () => Promise<void>;
-    onResume: () => Promise<void>;
-    onStop: () => Promise<void>;
-  };
+  recording: ViewerContext["recording"] & { live: RecordingLiveState | null };
 }
 
-/** The middle-pane viewer dispatch: given the open FileContent + edit state,
- * render the right viewer/editor. Extracted verbatim from Workspace's viewer
- * body; the shell still owns all state and passes the callbacks. One Suspense
- * boundary around the whole dispatch (not per-branch) so a mounted viewer is
- * never remounted by a sibling lazy chunk loading. */
+/**
+ * The middle-pane viewer dispatch.
+ *
+ * This used to be a ~110-line `switch` over file kinds — one of the three
+ * places (with Rust's `classify_file` and the frontend's `editModeOf`) that
+ * had to agree about what a file is. All three are now one table each side:
+ * `src-tauri/src/formats.rs` says what a file IS, `src/viewers/registry.tsx`
+ * says what it looks like, and this file only decides between "edit" and
+ * "preview" and holds the Suspense/error boundary.
+ *
+ * One Suspense boundary around the whole dispatch (not per-branch) so a
+ * mounted viewer is never remounted by a sibling lazy chunk loading.
+ */
 export default function ViewerRouter(props: ViewerRouterProps) {
   return (
     <ViewerChunkBoundary>
@@ -107,6 +95,44 @@ export default function ViewerRouter(props: ViewerRouterProps) {
       </Suspense>
     </ViewerChunkBoundary>
   );
+}
+
+/**
+ * A plain sentence, above the buffer, about what pressing Save will do.
+ *
+ * The editors all LOOK the same — a monospace pane — while meaning three very
+ * different things: rewrite this file, rewrite the words inside a Word document
+ * that keeps its layout, or write a separate note and leave the original alone.
+ * Live QA's verdict on the whole area was "hard to see what's edit", and the
+ * only thing distinguishing these was the tooltip on a button the user had
+ * already clicked.
+ */
+function editBanner(mode: EditMode, name: string, encodingNote?: string | null): ReactNode {
+  // A file that isn't UTF-8 is CONVERTED by being saved — the writer only
+  // writes UTF-8 — and on a detected encoding that conversion rests on a guess.
+  // Saying so here is the point: it is the last screen before the rewrite.
+  if (mode === "editor" && encodingNote) {
+    return encodingNote;
+  }
+  if (mode === "docx") {
+    return (
+      <>
+        You're editing the words of <strong dir="auto">{name}</strong>. Saving
+        writes them back into the Word file, keeping its styles, tables and
+        images — so you can reword paragraphs, but not add or delete them.
+      </>
+    );
+  }
+  if (mode === "copy") {
+    return (
+      <>
+        This is the text read out of <strong dir="auto">{name}</strong>, which
+        can't be edited in place. Saving creates a <strong>separate note</strong>{" "}
+        in the room; the original file is left exactly as it is.
+      </>
+    );
+  }
+  return null;
 }
 
 function ViewerBody({
@@ -118,35 +144,74 @@ function ViewerBody({
   saveEdit,
   saveEditAsCopy,
   onDirtyChange,
+  registerSave,
   recording,
   sttStatus,
 }: ViewerRouterProps) {
-  const { CodeEditor, DocxView, PdfView, RecordingView, SheetView } =
-    lazyViewers;
-  const c = openFile.content;
+  // How this file's bytes are being decoded, and the user's override if they
+  // gave one. A no-op for every kind whose text is read OUT of a container.
+  const enc = useTextEncoding(openFile.id, openFile.content);
+  const c =
+    enc.text === null
+      ? openFile.content
+      : // The re-read is the single source for both the text and whether it may
+        // be edited: a reading that produced replacement characters is not the
+        // file, so its editor must not open.
+        { ...openFile.content, text: enc.text, editable: enc.decoded?.editable ?? false };
   const t = openFile.target;
   const mode = editModeOf(c);
-  // Edit mode: per-format editors. Monaco is keyed by edit
-  // state too — it takes value/readOnly at mount only.
+  const { CodeEditor, MarkdownEditor, SheetView } = lazyViewers;
+  // Monaco takes its value at MOUNT, so a re-decode has to remount it or the
+  // buffer would keep showing the encoding the user just overruled.
+  const rev = `${viewerRev}-${enc.key}`;
+
+  // ---- edit mode: per-format editors -----------------------------------
+  // Monaco is keyed by edit state too — it takes value/readOnly at mount only.
   if (editMode && mode === "grid") {
     return (
       <SheetView
         key={`${openFile.id}-grid-${viewerRev}`}
+        mediaToken={c.mediaToken}
         dataB64={c.dataB64}
-        text={c.text}
+        text={c.kind === "csv" ? c.text : undefined}
         target={{ sheet: t?.sheet, range: t?.range ?? t?.cell }}
         editable
         onEditCell={editCell}
       />
     );
   }
-  if (editMode && mode === "editor") {
+  // A Markdown note edits in a split view — source beside the rendered page —
+  // rather than as a bare monospace buffer with the page hidden behind a toggle.
+  if (editMode && mode === "editor" && c.kind === "markdown") {
+    return (
+      <MarkdownEditor
+        key={`${openFile.id}-md-${rev}`}
+        value={c.text ?? ""}
+        onSave={saveEdit}
+        // A .md is a raw-text file like any other, so a legacy-encoded one is
+        // CONVERTED by being saved. This editor has the same banner slot as
+        // Monaco's and was the one path that didn't say so.
+        banner={editBanner(mode, c.name, encodingSaveNote(enc.decoded))}
+        registerSave={registerSave}
+        onDirtyChange={onDirtyChange}
+        find={t?.find}
+      />
+    );
+  }
+  if (editMode && (mode === "editor" || mode === "docx")) {
+    // `docx` edits the EXTRACTED text and writes it back into the Word file
+    // paragraph by paragraph; `editor` rewrites a plain-text file whole. Both
+    // are in-place saves, so both get the same editor — only `saveEdit`
+    // differs, and the workspace picks the right writer from the file's kind.
     return (
       <CodeEditor
-        key={`${openFile.id}-edit-${viewerRev}`}
+        key={`${openFile.id}-edit-${rev}`}
         value={c.text ?? ""}
-        language={languageForFile(c.name)}
+        language={mode === "docx" ? "plaintext" : languageForFile(c.name)}
         onSave={saveEdit}
+        saveLabel={mode === "docx" ? "Save into the Word file" : undefined}
+        banner={editBanner(mode, c.name, encodingSaveNote(enc.decoded))}
+        registerSave={registerSave}
         find={t?.find}
         onDirtyChange={onDirtyChange}
       />
@@ -159,133 +224,38 @@ function ViewerBody({
         value={c.text ?? ""}
         language="markdown"
         onSave={saveEditAsCopy}
-        saveLabel="Save copy"
+        saveLabel="Save as a new note"
+        banner={editBanner(mode, c.name)}
+        registerSave={registerSave}
         find={t?.find}
         onDirtyChange={onDirtyChange}
       />
     );
   }
-  // Preview mode. Code gets a read-only Monaco (syntax
-  // colors) — the Edit button unlocks it.
-  if (c.kind === "code") {
-    return (
-      <CodeEditor
-        key={`${openFile.id}-view-${viewerRev}`}
-        value={c.text ?? ""}
-        language={languageForFile(c.name)}
-        readOnly
-        find={t?.find}
-      />
-    );
-  }
-  switch (c.kind) {
-    case "image":
-      return (
-        <ImageView
-          key={`${openFile.id}-${viewerRev}`}
-          fileId={openFile.id}
-          name={c.name}
-          mime={c.mime}
-          dataB64={c.dataB64 ?? ""}
-        />
-      );
-    case "pdf":
-      return (
-        <PdfView
-          key={`${openFile.id}-${viewerRev}`}
-          dataB64={c.dataB64 ?? ""}
-          target={{ page: t?.page, quote: t?.quote ?? t?.find }}
-        />
-      );
-    case "docx":
-      return (
-        <DocxView
-          key={`${openFile.id}-${viewerRev}`}
-          dataB64={c.dataB64 ?? ""}
-          target={{ quote: t?.quote ?? t?.find }}
-        />
-      );
-    case "sheet":
-      return (
-        <SheetView
-          key={`${openFile.id}-${viewerRev}`}
-          dataB64={c.dataB64}
-          target={{ sheet: t?.sheet, range: t?.range ?? t?.cell }}
-        />
-      );
-    case "csv":
-      return (
-        <SheetView
-          key={`${openFile.id}-${viewerRev}`}
-          text={c.text}
-          target={{ sheet: t?.sheet, range: t?.range ?? t?.cell }}
-        />
-      );
-    case "markdown":
-      return (
-        <MarkdownView
-          key={`${openFile.id}-${viewerRev}`}
-          text={c.text ?? ""}
-          target={{ quote: t?.quote ?? t?.find }}
-        />
-      );
-    // HTML renders live in a sandboxed runner; Edit drops to
-    // Monaco for the source.
-    case "html":
-      return (
-        <HtmlView
-          key={`${openFile.id}-${viewerRev}`}
-          source={c.text ?? ""}
-          name={c.name}
-        />
-      );
-    case "text":
-      return (
-        <TextView
-          key={`${openFile.id}-${viewerRev}`}
-          text={c.text ?? ""}
-          quote={t?.quote ?? t?.find}
-        />
-      );
-    // ADD-27: the live Recording file — its own editor (live transcript,
-    // speakers, transcript-based deletion, translate).
-    case "recording":
-      return (
-        <RecordingView
-          key={`${openFile.id}-${viewerRev}`}
-          fileId={openFile.id}
-          mediaToken={c.mediaToken}
-          live={recording.live}
-          saveProgress={recording.saveProgress}
-          pushToast={recording.pushToast}
-          onStart={recording.onStart}
-          onPause={recording.onPause}
-          onResume={recording.onResume}
-          onStop={recording.onStop}
-        />
-      );
-    // ADD-18: recordings/videos with a clickable transcript.
-    case "audio":
-    case "video":
-      return (
-        <AudioView
-          key={`${openFile.id}-${viewerRev}`}
-          kind={c.kind}
-          fileId={openFile.id}
-          mime={c.mime}
-          dataB64={c.dataB64 ?? ""}
-          mediaToken={c.mediaToken}
-          text={c.text}
-          target={{ quote: t?.quote ?? t?.find }}
-          transcribing={sttStatus?.[c.name] === "processing"}
-        />
-      );
-    default:
-      return (
-        <div className="empty-hint">
-          No preview available for this file type yet. Its
-          content is still stored safely inside the room.
-        </div>
-      );
-  }
+
+  // ---- preview: one lookup, no switch ----------------------------------
+  // The encoding strip rides above the preview (not the editors: those already
+  // have a banner slot, and the reading is chosen before you start typing).
+  const entry = FORMATS[c.kind] ?? FORMATS.binary;
+  return (
+    <>
+      {enc.strip}
+      {/* A saved page says where it came from. Renders nothing for every file
+          that is not one, and nothing for a page that declared nothing. */}
+      <PageSource meta={c.webMeta} />
+      <div key={`${openFile.id}-${c.kind}-${rev}`} className="viewer-host">
+        {entry.render({
+          fileId: openFile.id,
+          content: c,
+          target: t,
+          viewerRev,
+          lazy: lazyViewers,
+          editCell,
+          saveEdit,
+          sttStatus,
+          recording,
+        })}
+      </div>
+    </>
+  );
 }

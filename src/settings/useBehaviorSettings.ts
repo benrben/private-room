@@ -12,6 +12,12 @@ export function useBehaviorSettings(clearError: () => void) {
   const [temperature, setTemperature] = useState(0.7);
   const [instructions, setInstructions] = useState("");
   const [saved, setSaved] = useState(false);
+  // What the ROOM currently holds for the two Save-button fields. Kept beside
+  // the editable copies so "has the user typed something they haven't saved"
+  // is answerable: closing Settings used to throw a paragraph of custom
+  // instructions away without a word.
+  const [storedTemperature, setStoredTemperature] = useState(0.7);
+  const [storedInstructions, setStoredInstructions] = useState("");
   // Wave 1b (idea 12): "default" | "terse" | "friendly" | "formal".
   const [responseStyle, setResponseStyle] = useState("default");
   // Wave 1b (idea 8): absent = on ("1"); "0" = off.
@@ -30,15 +36,20 @@ export function useBehaviorSettings(clearError: () => void) {
           // Clamp legacy saves above 1.0 once and persist the clamp (CHG-8).
           if (n > 1) {
             setTemperature(1);
+            setStoredTemperature(1);
             api.setSetting("temperature", "1.00");
           } else {
             setTemperature(n);
+            setStoredTemperature(n);
           }
         }
       }
     });
     api.getSetting("custom_instructions").then((v) => {
-      if (v) setInstructions(v);
+      if (v) {
+        setInstructions(v);
+        setStoredInstructions(v);
+      }
     });
     api.getSetting("response_style").then((v) => {
       if (v) setResponseStyle(v);
@@ -60,6 +71,10 @@ export function useBehaviorSettings(clearError: () => void) {
     clearError();
     await api.setSetting("temperature", temperature.toFixed(2));
     await api.setSetting("custom_instructions", instructions.trim());
+    // The baseline moves only AFTER the writes land, so a failed save still
+    // reads as unsaved work rather than as a clean close.
+    setStoredTemperature(temperature);
+    setStoredInstructions(instructions.trim());
     setSaved(true);
     window.setTimeout(() => setSaved(false), 1600);
   }
@@ -93,6 +108,11 @@ export function useBehaviorSettings(clearError: () => void) {
     setInstructions,
     saveTuning,
     saved,
+    /** Typed-but-not-saved work in the two Save-button fields. The segmented
+     * controls and checkboxes below persist on change, so they are never dirty. */
+    tuningDirty:
+      instructions.trim() !== storedInstructions.trim() ||
+      temperature.toFixed(2) !== storedTemperature.toFixed(2),
     responseStyle,
     changeResponseStyle,
     autoIndex,

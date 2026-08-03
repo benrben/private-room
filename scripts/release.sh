@@ -39,6 +39,19 @@ if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
   exit 1
 fi
 
+# The version above is read from ONE file and, until this line, TRUSTED. Seven
+# files carry it, and v0.14.0 shipped with `sidecar/uv.lock` still saying
+# 0.13.0 — a mismatch that sailed all the way to a published GitHub release
+# because nothing compared them. RELEASING.md § 2 step 3 asks you to run the
+# preflight; a step you can forget is not a gate, and this script is the last
+# thing that runs before assets are uploaded under `${TAG}`, so it checks here
+# too. `--checks` only (versions, changelog, bundled weights, command drift) —
+# seconds, no suites, so it costs the release nothing. Run the full
+# `npm run preflight` yourself before tagging; this is the backstop, not a
+# substitute for it.
+echo "▶ Preflight checks…"
+scripts/preflight.sh --checks
+
 # ADD-33: build + stage the Python agent sidecar (onedir PyInstaller bundle) into
 # src-tauri/resources/sidecar/ BEFORE the app build, so tauri.conf.json's resource
 # map can bundle it into Contents/Resources/. This is NOT optional: since the
@@ -142,10 +155,18 @@ fi
 # carries no dmg styling block; this plain hdiutil window is what users get.
 echo "▶ Packaging updater tar + DMG from the final app…"
 tar -czf "$TAR" -C "$MACOS" "Arcelle.app"
-PATH=/usr/bin:"$PATH" npm run tauri signer sign -- \
-  --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
-  ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+--password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"} \
-  "$TAR"
+# The key is handed over ONLY through the environment. `tauri signer sign` reads
+# --private-key from TAURI_SIGNING_PRIVATE_KEY and --password from
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD, so passing either on argv is pure downside:
+# on macOS every process running as you can read another's command line (`ps`),
+# and `npm run` echoes the command it is about to run into the terminal and into
+# any log capturing it. This is the one secret that lets someone publish a fake
+# "Arcelle update" that every install would accept — it must never be written
+# down. The empty-string default matters: the key of record has no password, and
+# an unset variable makes the signer prompt for one instead of failing.
+PATH=/usr/bin:"$PATH" \
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD-}" \
+  npm run tauri signer sign -- "$TAR"
 
 mkdir -p "$DMG_DIR"
 DMG_STAGE="$(mktemp -d)"

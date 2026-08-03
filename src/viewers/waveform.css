@@ -1,0 +1,88 @@
+/* ------------------------------------------------------------------ *
+ * The recording waveform and its speaker ribbon.
+ *
+ * The app has diarized recordings on-device since v0.14.0 and none of it
+ * reached the screen — the player was a bare <audio controls>.
+ *
+ * THE FIRST VERSION OF THIS drew each speaker's turn as a full-height
+ * translucent band across the wave, using wavesurfer's Regions plugin.
+ * Two things were wrong with that and both are fixed here:
+ *
+ *   1. A region overlay is positioned against wavesurfer's own wrapper,
+ *      which has no containing block of its own — so the bands painted
+ *      straight through the toolbar and the transcript below. `contain`
+ *      and `overflow: hidden` below make that impossible now, whatever
+ *      the plugin does.
+ *   2. Saturated colour over the whole wave is unreadable. Colour lives
+ *      in a 6px ribbon under the wave instead, so the wave stays a plain
+ *      shape and the turns are a legible strip beside it.
+ * ------------------------------------------------------------------ */
+
+.waveform {
+  position: relative;
+  /* A hard box: nothing this component draws can escape into the pane. */
+  overflow: hidden;
+  contain: paint;
+  padding: 0.5rem 0.75rem 0.4rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Reserve the height before wavesurfer measures, so the transcript below
+   doesn't jump down the moment the waveform appears. */
+/* An exact box, not a minimum: whatever the renderer produces, this component
+   occupies the height it was budgeted and nothing of it escapes. The height
+   itself is set inline from WAVE_HEIGHT so the two can't drift. */
+.waveform-canvas {
+  position: relative;
+  overflow: hidden;
+}
+
+/* ---- speaker ribbon ---- */
+.waveform-ribbon {
+  position: relative;
+  height: 6px;
+  margin-top: 4px;
+  border-radius: 3px;
+  overflow: hidden;
+  /* The gaps between turns are silence; show the track through them. */
+  background: color-mix(in srgb, var(--border) 55%, transparent);
+}
+.waveform-turn {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+}
+
+.waveform-failed {
+  color: var(--danger, var(--text));
+}
+
+/* Said under a wave that DID draw: the lane is flat because the track is
+   silent, not because anything went wrong. Muted, not red — nothing failed. */
+.waveform-note {
+  color: var(--muted, var(--text-dim));
+  padding-top: 2px;
+}
+
+.waveform-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.85rem;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+.waveform-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.waveform-swatch {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 2px;
+  flex: none;
+}

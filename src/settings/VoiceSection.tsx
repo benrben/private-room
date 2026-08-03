@@ -13,6 +13,7 @@ interface Props {
   voicesError: boolean;
   save: () => void;
   saved: boolean;
+  saveError: string;
   preview: () => void;
   previewing: boolean;
 }
@@ -68,6 +69,7 @@ export default function VoiceSection({
   voicesError,
   save,
   saved,
+  saveError,
   preview,
   previewing,
 }: Props) {
@@ -201,6 +203,12 @@ export default function VoiceSection({
           {saved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
         </button>
       </div>
+      {/* A save that fails used to look exactly like a click that did nothing. */}
+      {saveError && (
+        <p className="settings-hint" role="alert">
+          {saveError}
+        </p>
+      )}
     </section>
   );
 }

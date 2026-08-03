@@ -1,4 +1,5 @@
 import { AiStatus, AnnotationPayload, FileTarget, splitExternalModel } from "../api";
+import { isRelayedModel } from "./localModel";
 
 /** External cloud engines/providers. Recognizes both a bare engine id and a
  * composite "engine::submodel" selection from the Cloud picker. */
@@ -7,17 +8,35 @@ export function isExternalEngine(model: string): boolean {
   return engine === "claude-cli" || engine === "codex-cli" || engine === "openrouter";
 }
 
-/** An Ollama `:cloud` model: listed alongside local models and driven through
+/** An Ollama relayed model: listed alongside local models and driven through
  * the same tool loop (ADD-29 parity), but it RUNS REMOTELY — prompts and file
- * context leave this Mac. Must never be labeled "Local". */
+ * context leave this Mac. Must never be labeled "Local".
+ *
+ * The rule itself lives in `localModel.isRelayedModel`, which mirrors the
+ * host's declared capability record. It used to be an exact `endsWith(":cloud")`
+ * here, which misses Ollama's `<size>-cloud` spelling (`gpt-oss:120b-cloud`) —
+ * so `trustState` called such a room "Local only — nothing leaves the device"
+ * while every prompt was going to ollama.com. */
 export function isRemoteModel(model: string): boolean {
-  return model.endsWith(":cloud");
+  return isRelayedModel(model);
 }
 
 /** Anything that sends room content off this Mac (SEC-6): drives the privacy
  * strip and the Cloud tier label. */
 export function isCloudEngine(model: string): boolean {
   return isExternalEngine(model) || isRemoteModel(model);
+}
+
+/** Does this room's content leave this Mac — engine OR transport?
+ *
+ * `isCloudEngine` reads the model NAME, and a name cannot know that Settings →
+ * the Closet has pointed Ollama at another computer. With that set, the very
+ * same `qwen3.5:4b` runs on a LAN box: prompts, documents and transcripts go
+ * there. The host reports it as `AiStatus.remoteRelay` (its own locality rule
+ * is `capabilities::ollama_runs_here`), and every trust surface ORs it in — so
+ * the chip can never say "Local only" about a relayed room. */
+export function isCloudRoute(model: string, ai: { remoteRelay?: boolean } | null): boolean {
+  return isCloudEngine(model) || ai?.remoteRelay === true;
 }
 
 export type TrustTone = "good" | "warn" | "danger";
@@ -126,6 +145,38 @@ export function annotationTarget(a: AnnotationPayload): FileTarget {
     sheet: a.sheet,
     range: a.range,
   };
+}
+
+/** What the app itself wrote into the transcript when a turn produced no
+ * answer, and what the user may safely do about it.
+ *  • "clean"      — no answer, nothing written, nothing running: re-ask freely.
+ *  • "after-write"— a file change already landed; re-asking would repeat it.
+ *  • "with-job"   — background work is still running; re-asking may start it twice.
+ * `null` for every real answer, including one that merely talks about a
+ * failure. The strings are Arcelle's own constants (`agent.rs`
+ * LOST_REPLY_*), pinned from the Rust side by
+ * `the_notices_keep_the_fragments_the_chat_ui_matches_on`. */
+export type LostReplyKind = "clean" | "after-write" | "with-job";
+
+export function lostReplyNotice(content: string): LostReplyKind | null {
+  const t = content.trimStart();
+  if (!t.startsWith("*(The agent ")) return null;
+  if (!t.includes("the reply was lost before it reached the app")) return null;
+  if (t.includes("A change was already applied")) return "after-write";
+  if (t.includes("Background work in this room is still running")) return "with-job";
+  return "clean";
+}
+
+/** The one line the recovery strip shows above Try again. Says what is true of
+ * THIS turn — never "nothing happened" when a write landed or a job is live. */
+export function lostReplyAdvice(kind: LostReplyKind): string {
+  if (kind === "after-write") {
+    return "A change was already applied before the reply was lost — check the file first; asking again may repeat it.";
+  }
+  if (kind === "with-job") {
+    return "Background work in this room is still running — check the Jobs list first; asking again may start it twice.";
+  }
+  return "Nothing was written, so asking again is safe.";
 }
 
 /** CHG-6: an in-progress stream may hold a half-open ``` fence — balance it

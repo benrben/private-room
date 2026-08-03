@@ -9,6 +9,45 @@ pub fn list_file_versions(
     state.with_room(|room| db::list_file_versions(&room.conn, &id))
 }
 
+/// How many unpinned versions a file keeps — so the History strip can SAY it.
+/// The eleventh save used to drop the oldest version with nothing on screen
+/// ever mentioning a limit.
+#[tauri::command]
+pub fn file_versions_kept() -> usize {
+    db::VERSIONS_KEPT
+}
+
+/// Keep (or stop keeping) one saved version: a pinned version is not counted
+/// by, and never deleted by, the rolling prune on the next save.
+#[tauri::command]
+pub fn pin_file_version(
+    state: State<'_, AppState>,
+    version_id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    state.with_room(|room| db::set_version_pinned(&room.conn, &version_id, pinned))
+}
+
+/// Delete one saved version. Every version stores the WHOLE file, so this is
+/// the only way to reclaim a big snapshot's space without deleting the file
+/// itself. There is no history of the history: the caller confirms first.
+#[tauri::command]
+pub fn delete_file_version(state: State<'_, AppState>, version_id: String) -> Result<(), String> {
+    state.with_room(|room| db::delete_file_version(&room.conn, &version_id))
+}
+
+/// ART-1: what produced the file's CURRENT content, if the app recorded it.
+/// `None` for everything a person made or imported, and for every file written
+/// before provenance existed — the History strip shows nothing at all rather
+/// than crediting a run that may not have written what is on screen.
+#[tauri::command]
+pub fn get_file_provenance(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<db::Provenance>, String> {
+    state.with_room(|room| db::file_provenance(&room.conn, &id))
+}
+
 /// Idea 11: the text of one saved version alongside the file's CURRENT text,
 /// both shaped by `content_text` so the compare view diffs like-for-like. Pure
 /// over a connection (no `State`) so it is unit-testable against
@@ -41,6 +80,48 @@ pub fn get_file_version(
     state.with_room(|room| version_content(&room.conn, &version_id))
 }
 
+/// The body of [`restore_file_version`], over a plain connection — pure for the
+/// same reason `version_content` is: the restore's invariants (bytes, text,
+/// recording meta and ART-1 provenance all move together, or none of them do)
+/// are exactly what a unit test needs to hold, and they cannot be reached
+/// through a `State`. Returns the id of the file that was restored.
+pub(crate) fn restore_version_into(conn: &Connection, version_id: &str) -> Result<String, String> {
+    let (file_id, bytes, text, rec_meta) = db::get_version(conn, version_id)?;
+    // A version row outlives a delete (trash is reversible, and a restored file
+    // must find its whole history waiting), so a version id held by an open tab
+    // still resolves after the file is gone. Writing through it would put an old
+    // draft into a file the room is not showing and fire `file-updated` for it —
+    // the resurrection `db::get_file_meta` documents. The name doubles as the
+    // re-derivation input below, so the guard costs nothing.
+    let name = db::get_file_name(conn, &file_id)
+        .map_err(|_| "That file is no longer in this room.".to_string())?;
+    // Versions saved before compound snapshots carry no text: re-derive it.
+    let text = text.or_else(|| {
+        extraction::extract_text(&name, &bytes).or_else(|| String::from_utf8(bytes.clone()).ok())
+    });
+    // ART-1: whatever made THIS version made the file's content again, so the
+    // head's provenance moves back with the bytes. Read before the write,
+    // because `store_file_bytes` snapshots the outgoing head (and its
+    // provenance) on the way past. A version with none CLEARS the head's —
+    // restoring a hand-typed state must not leave an AI run credited for it.
+    let back_to = db::version_provenance_json(conn, version_id);
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+    let restored = store_file_bytes(conn, &file_id, &bytes, text.as_deref(), "Restored")
+        .and_then(|_| db::set_file_provenance(conn, &file_id, back_to.as_deref()))
+        .and_then(|_| match &rec_meta {
+            Some(meta) => db::set_rec_meta(conn, &file_id, meta),
+            None => Ok(()),
+        });
+    match restored {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|e| e.to_string())?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+    Ok(file_id)
+}
+
 /// ADD-2: restore a saved version. Goes back through `store_file_bytes`,
 /// so the CURRENT state is snapshotted first — restoring is itself undoable.
 /// A version is a compound snapshot: bytes, extracted text, and (for a
@@ -54,30 +135,75 @@ pub fn restore_file_version(
     version_id: String,
 ) -> Result<(), String> {
     use tauri::Emitter;
-    state.with_room(|room| {
-        let (file_id, bytes, text, rec_meta) = db::get_version(&room.conn, &version_id)?;
-        // Versions saved before compound snapshots carry no text: re-derive it.
-        let text = text.or_else(|| {
-            let name = db::get_file_name(&room.conn, &file_id).ok()?;
-            extraction::extract_text(&name, &bytes).or_else(|| String::from_utf8(bytes.clone()).ok())
-        });
-        room.conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
-        let restored = store_file_bytes(&room.conn, &file_id, &bytes, text.as_deref(), "Restored")
-            .and_then(|_| match &rec_meta {
-                Some(meta) => db::set_rec_meta(&room.conn, &file_id, meta),
-                None => Ok(()),
-            });
-        match restored {
-            Ok(()) => room.conn.execute_batch("COMMIT").map_err(|e| e.to_string())?,
-            Err(e) => {
-                let _ = room.conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-        }
-        let _ = window.emit("room-files-changed", ());
-        let _ = window.emit("file-updated", &file_id);
-        Ok(())
-    })
+    let file_id = state.with_room(|room| restore_version_into(&room.conn, &version_id))?;
+    let _ = window.emit("room-files-changed", ());
+    let _ = window.emit("file-updated", &file_id);
+    Ok(())
+}
+
+// ------------------------------------------------------ the "came from the web" mark
+//
+// macOS shows its "downloaded from the Internet — are you sure?" warning off a
+// single extended attribute, `com.apple.quarantine`. A file that arrived in a
+// room over the network carries that history in `files.origin_url`, but the
+// bytes written back out on export were plain, unmarked files: the warning that
+// would have appeared had the user downloaded the same installer in Safari
+// simply never came. Exporting must not launder a download.
+//
+// Declared here rather than pulling in `libc`: two one-line macOS syscalls do
+// not justify a new direct dependency on a crate this app has never needed.
+
+unsafe extern "C" {
+    fn setxattr(
+        path: *const std::ffi::c_char,
+        name: *const std::ffi::c_char,
+        value: *const std::ffi::c_void,
+        size: usize,
+        position: u32,
+        options: std::ffi::c_int,
+    ) -> std::ffi::c_int;
+}
+
+/// The `com.apple.quarantine` value written on an exported download.
+///
+/// Format is `flags;hex-timestamp;agent;uuid`. The last two fields are
+/// DELIBERATELY the app name and an empty uuid: the real Safari-style value
+/// ends with a LaunchServices id that ties the file back to the URL it came
+/// from, and the origin URL is the user's — it belongs inside the room, not in
+/// an attribute travelling on a file they just put on their Desktop. Flag
+/// `0001` (QTN_FLAG_DOWNLOAD) is the bit Gatekeeper reads, which is the whole
+/// point of the mark.
+pub(crate) fn quarantine_value(now_secs: u64) -> String {
+    format!("0001;{now_secs:x};Arcelle;")
+}
+
+/// Put the quarantine mark on a just-exported file. Best-effort: a filesystem
+/// that cannot hold extended attributes (a FAT USB stick, a network share) is
+/// not a reason to fail an export the user asked for, and the caller has
+/// already written the bytes.
+pub(crate) fn mark_as_downloaded(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    let name = c"com.apple.quarantine";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let value = quarantine_value(now);
+    // SAFETY: both pointers are valid, NUL-terminated C strings that outlive
+    // the call, and `size` is the exact byte length of `value`.
+    unsafe {
+        setxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        );
+    }
 }
 
 /// ADD-1: write one file's original bytes out as a normal (unencrypted) file.
@@ -90,7 +216,13 @@ pub fn export_file(
     state.with_room(|room| {
         let bytes = db::get_file_bytes(&room.conn, &id)?
             .ok_or("This file has no stored content to export.")?;
+        // Read BEFORE the write: a file that came over the network keeps the
+        // "downloaded" mark on the way out (see `mark_as_downloaded`).
+        let from_web = db::file_origin_url(&room.conn, &id).is_some();
         std::fs::write(&dest_path, &bytes).map_err(|e| format!("Could not save the file: {e}"))?;
+        if from_web {
+            mark_as_downloaded(std::path::Path::new(&dest_path));
+        }
         Ok(())
     })
 }
@@ -155,8 +287,14 @@ pub fn export_all(state: State<'_, AppState>, dest_dir: String) -> Result<u32, S
             let name = unique_export_name(&safe_export_name(&f.name), |candidate| {
                 dir.join(candidate).exists()
             });
-            std::fs::write(dir.join(&name), &bytes)
+            let out = dir.join(&name);
+            std::fs::write(&out, &bytes)
                 .map_err(|e| format!("Could not write \"{name}\": {e}"))?;
+            // A room's downloads leave as downloads: exporting must not strip
+            // the mark macOS shows its Gatekeeper warning off.
+            if f.origin_url.is_some() {
+                mark_as_downloaded(&out);
+            }
             written += 1;
         }
         Ok(written)
@@ -232,12 +370,21 @@ pub fn change_password(
     // Wave 3 (Idea 9): `vacuum_into` copies keep the key of the moment they were
     // made, so a later rekey would strand every checkpoint. Re-key each one from
     // the OLD password (`current`) to the new, off the room lock. A failure is
-    // logged, not fatal — the password change still succeeds, and a stranded
-    // checkpoint is caught (with a clear error) by verify_password at rollback.
+    // NOT fatal — the room itself is already re-keyed and refusing now would be
+    // worse — but it must not pass as a clean success either: the frontend asks
+    // `list_stranded_checkpoints` straight afterwards and names what is stuck on
+    // the old password, while the user still remembers it.
+    //
+    // The counter is deliberately content-free: a checkpoint path carries the
+    // room's own file name, which is the user's, and it never goes to a log.
+    let mut stranded = 0u32;
     for ck in checkpoint_ck_paths(&room_path) {
-        if let Err(e) = db::rekey_copy(&ck, &current, &new_password) {
-            eprintln!("checkpoint rekey failed for {ck}: {e}");
+        if db::rekey_copy(&ck, &current, &new_password).is_err() {
+            stranded += 1;
         }
+    }
+    if stranded > 0 {
+        eprintln!("change_password: {stranded} checkpoint(s) could not be re-keyed");
     }
     Ok(new_code)
 }
@@ -379,6 +526,41 @@ mod tests {
         assert!(version_content(&conn, "does-not-exist").is_err());
     }
 
+    /// A version id held by an open History strip still resolves after the file
+    /// is deleted — the version rows deliberately survive, so a restore from the
+    /// trash finds its whole history intact. Neither door it opens may lead back
+    /// into the file: comparing would show a deleted file's text side by side,
+    /// and restoring would write an old draft into it and tell the UI it changed.
+    #[test]
+    fn a_version_of_a_trashed_file_can_neither_be_read_nor_restored_through() {
+        let conn = db::open_in_memory_schema();
+        let fid = db::insert_file(
+            &conn, "offer.txt", "text/plain", b"we offer 90 days", Some("we offer 90 days"), "upload",
+        ).unwrap().id;
+        db::snapshot_file_version(&conn, &fid, "Edited").unwrap();
+        let vid = db::list_file_versions(&conn, &fid).unwrap()[0].id.clone();
+        db::update_file_content(&conn, &fid, b"we offer 30 days", Some("we offer 30 days")).unwrap();
+
+        db::trash_file(&conn, &fid, db::TrashActor::User).unwrap();
+
+        assert!(version_content(&conn, &vid).is_err(), "the compare view has nothing to show");
+        assert!(restore_version_into(&conn, &vid).is_err());
+        // The row is untouched by the refused restore — a later undelete gets
+        // the file exactly as the user left it.
+        let (_, _, text, _) = db::get_version(&conn, &vid).unwrap();
+        assert_eq!(text.as_deref(), Some("we offer 90 days"));
+        db::restore_file(&conn, &fid).unwrap();
+        assert_eq!(
+            db::get_file_extracted_text(&conn, &fid).as_deref(),
+            Some("we offer 30 days"),
+            "the trashed file kept the content it had, not the version nobody restored"
+        );
+        // And with the file back, the strip and the restore work again.
+        assert_eq!(db::list_file_versions(&conn, &fid).unwrap().len(), 1);
+        assert_eq!(restore_version_into(&conn, &vid).unwrap(), fid);
+        assert_eq!(db::get_file_extracted_text(&conn, &fid).as_deref(), Some("we offer 90 days"));
+    }
+
     // ------------------------------------------------ Idea 9: password rekey
 
     #[test]
@@ -405,6 +587,109 @@ mod tests {
         // After: the NEW password opens it; the old no longer does.
         assert!(db::verify_password(&ck_path, "new-password-xx").is_ok());
         assert!(db::verify_password(&ck_path, "old-password").is_err());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_exported_download_keeps_its_came_from_the_web_mark() {
+        // Exporting used to write plain, unmarked files, so a room's downloaded
+        // installer came out of the room with Gatekeeper's warning stripped —
+        // the one export that most needed it.
+        let dir = std::env::temp_dir().join(format!("arcelle-qtn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let downloaded = dir.join("installer.dmg");
+        let hand_made = dir.join("notes.txt");
+        std::fs::write(&downloaded, b"payload").unwrap();
+        std::fs::write(&hand_made, b"mine").unwrap();
+
+        mark_as_downloaded(&downloaded);
+
+        assert_eq!(
+            read_quarantine(&downloaded).as_deref().map(|v| v.split(';').next().unwrap_or("")),
+            Some("0001"),
+            "an exported download must carry the QTN_FLAG_DOWNLOAD bit"
+        );
+        // And it carries no origin URL — the room's provenance stays in the room.
+        let value = read_quarantine(&downloaded).unwrap();
+        assert!(!value.contains("http"), "the mark must not carry the origin URL: {value}");
+        assert_eq!(value.split(';').count(), 4, "flags;time;agent;uuid — got {value}");
+        // A file the user made themselves is left alone: quarantining every
+        // export would put a scary dialog in front of their own documents.
+        assert_eq!(read_quarantine(&hand_made), None);
+
+        assert_eq!(quarantine_value(0x6890_0000), "0001;68900000;Arcelle;");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Read `com.apple.quarantine` back off a path (test-only mirror of the
+    /// setter, so the assertion is about the real filesystem, not our string).
+    fn read_quarantine(path: &std::path::Path) -> Option<String> {
+        use std::os::unix::ffi::OsStrExt as _;
+        unsafe extern "C" {
+            fn getxattr(
+                path: *const std::ffi::c_char,
+                name: *const std::ffi::c_char,
+                value: *mut std::ffi::c_void,
+                size: usize,
+                position: u32,
+                options: std::ffi::c_int,
+            ) -> isize;
+        }
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut buf = [0u8; 256];
+        // SAFETY: valid NUL-terminated path, a buffer we own, and its length.
+        let n = unsafe {
+            getxattr(
+                cpath.as_ptr(),
+                c"com.apple.quarantine".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                0,
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        String::from_utf8(buf[..n as usize].to_vec()).ok()
+    }
+
+    #[test]
+    fn a_checkpoint_that_missed_the_rekey_is_reported_not_silently_stranded() {
+        // The re-key loop swallowed every failure, so the password change
+        // reported a clean success and the user met the stranded checkpoint
+        // weeks later — as a rollback error blaming the password they typed.
+        let path = db::temp_room_path();
+        let dir = checkpoints_dir(&path);
+        {
+            let conn = db::create_room(&path, "old-password", "Room").unwrap();
+            db::insert_file(&conn, "a.txt", "text/plain", b"hi", Some("hi"), "upload").unwrap();
+            write_checkpoint(&conn, &dir, "Before the big edit", false).unwrap();
+            write_checkpoint(&conn, &dir, "Weekly", false).unwrap();
+        }
+        // Every checkpoint still opens with the old password: nothing stranded.
+        assert!(stranded_checkpoint_names(&path, "old-password").is_empty());
+
+        // Re-key ONE of them and leave the other behind, exactly as a failed
+        // `rekey_copy` in change_password's loop does.
+        let one = checkpoint_ck_paths(&path).into_iter().next().unwrap();
+        db::rekey_copy(&one, "old-password", "new-password-xx").unwrap();
+
+        let stuck = stranded_checkpoint_names(&path, "new-password-xx");
+        assert_eq!(stuck.len(), 1, "exactly one checkpoint is still on the old key");
+        assert!(
+            stuck[0] == "Before the big edit" || stuck[0] == "Weekly",
+            "a stranded checkpoint is named by the name the user gave it, got {:?}",
+            stuck[0]
+        );
+        // And once the laggard is re-keyed too, nothing is reported — the answer
+        // is recomputed from the files, never remembered from the failure.
+        for ck in checkpoint_ck_paths(&path) {
+            let _ = db::rekey_copy(&ck, "old-password", "new-password-xx");
+        }
+        assert!(stranded_checkpoint_names(&path, "new-password-xx").is_empty());
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);

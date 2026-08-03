@@ -22,6 +22,29 @@ pub(crate) fn checkpoint_file_path(dir: &str, id: &str) -> String {
     format!("{dir}/{id}.roomck")
 }
 
+/// What a command says when handed something that is not one of our ids.
+pub(crate) const NOT_A_CHECKPOINT_ID: &str = "That isn't a checkpoint of this room.";
+
+/// Whether `id` is a plain path component we minted ourselves.
+///
+/// Every checkpoint id in the manifest is a `Uuid::new_v4()` string, so this is
+/// exactly the shape of a real one. The two commands that take an id from the
+/// frontend paste it into `checkpoint_file_path` and then DELETE or SWAP IN the
+/// result; today only our own screens send one, but every other place in the
+/// app that turns a caller-supplied name into a path guards it first
+/// (`safety::safe_export_name`), and a command that overwrites the user's
+/// workspace is the last one that should rest on a guard living somewhere else.
+/// Reject rather than sanitize: an id is either one we wrote or it is not a
+/// checkpoint at all, and quietly rewriting it into a different id would delete
+/// the wrong file.
+pub(crate) fn checkpoint_id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// One checkpoint's plaintext metadata. `auto` marks the pre-rollback safety
 /// copies (capped/pruned) apart from user checkpoints. camelCase so the same
 /// struct serves the manifest file AND the frontend api.
@@ -137,7 +160,13 @@ pub(crate) fn read_manifest(dir: &str) -> CheckpointManifest {
 pub(crate) fn write_manifest(dir: &str, manifest: &CheckpointManifest) -> Result<(), String> {
     let json = serde_json::to_string_pretty(manifest).map_err(|e| e.to_string())?;
     let tmp = format!("{dir}/manifest.json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| format!("Could not write the checkpoint manifest: {e}"))?;
+    // 0600, not the default 0644: the checkpoint COPIES are encrypted but this
+    // index is not, and the names in it are ones the user typed — "Before the
+    // tax settlement" told anyone with the disk or a backup what the room is
+    // about without a single encrypted byte being touched. Written on the temp
+    // file, since the rename below carries the mode over with it.
+    super::recent::write_private(std::path::Path::new(&tmp), json.as_bytes())
+        .map_err(|e| format!("Could not write the checkpoint manifest: {e}"))?;
     std::fs::rename(&tmp, manifest_path(dir))
         .map_err(|e| format!("Could not save the checkpoint manifest: {e}"))
 }
@@ -202,6 +231,44 @@ pub(crate) fn checkpoint_ck_paths(room_path: &str) -> Vec<String> {
         .iter()
         .map(|e| checkpoint_file_path(&dir, &e.id))
         .collect()
+}
+
+/// The checkpoints that do NOT open with `password` — i.e. the ones a
+/// `change_password` re-key failed on and left locked under the OLD password.
+///
+/// Recomputed from the files themselves rather than remembered from the failure,
+/// so it can never claim a checkpoint is stranded after someone fixed it (or
+/// miss one stranded by a crash mid-rekey). Names, because that is what the
+/// user picked them out by; they never leave the app.
+pub(crate) fn stranded_checkpoint_names(room_path: &str, password: &str) -> Vec<String> {
+    let dir = checkpoints_dir(room_path);
+    if !std::path::Path::new(&dir).exists() {
+        return Vec::new();
+    }
+    reconcile(&dir)
+        .entries
+        .into_iter()
+        .filter(|e| {
+            let path = checkpoint_file_path(&dir, &e.id);
+            std::path::Path::new(&path).exists()
+                && db::verify_password(&path, password).is_err()
+        })
+        .map(|e| e.name)
+        .collect()
+}
+
+/// SEC-4 / Idea 9: which of this room's checkpoints a rollback could NOT open
+/// with the room's current password. Empty is the normal answer.
+///
+/// Called right after a password change: a `.roomck` whose re-key failed is
+/// still a perfectly good copy, just locked under the password the user has
+/// only just replaced — and saying nothing meant they found out weeks later,
+/// from a rollback error that blamed the password they were typing.
+#[tauri::command]
+pub fn list_stranded_checkpoints(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let (room_path, password) =
+        state.with_room(|room| Ok((room.path.clone(), room.password.clone())))?;
+    Ok(stranded_checkpoint_names(&room_path, &password))
 }
 
 fn checkpoint_name(dir: &str, id: &str) -> String {
@@ -436,6 +503,9 @@ pub fn delete_room_checkpoint(state: State<'_, AppState>, id: String) -> Result<
     if state.rolling_back() {
         return Err("Can't delete a checkpoint while the room is rolling back.".into());
     }
+    if !checkpoint_id_ok(&id) {
+        return Err(NOT_A_CHECKPOINT_ID.into());
+    }
     let room_path = state.with_room(|room| Ok(room.path.clone()))?;
     let dir = checkpoints_dir(&room_path);
     let _ = std::fs::remove_file(checkpoint_file_path(&dir, &id));
@@ -465,6 +535,10 @@ pub async fn rollback_room_checkpoint(
     id: String,
 ) -> Result<RoomInfo, String> {
     use tauri::Emitter;
+
+    if !checkpoint_id_ok(&id) {
+        return Err(NOT_A_CHECKPOINT_ID.into());
+    }
 
     // Snapshot (path, password) under the lock — the Room holds the password in
     // memory for exactly this kind of re-key/duplicate/rollback flow.
@@ -502,7 +576,15 @@ pub async fn rollback_room_checkpoint(
 
     // Verify the checkpoint opens with the CURRENT password before tearing
     // anything down (catches a checkpoint that missed a change_password rekey).
-    db::verify_password(&ck_path, &password)?;
+    // `verify_password`'s own message — "The current password is not correct" —
+    // is simply WRONG here: the user typed nothing, and the password they have
+    // is the only one this room accepts. Say what actually happened.
+    db::verify_password(&ck_path, &password).map_err(|_| {
+        "This checkpoint could not be unlocked with the room's current password. \
+         It was made before a password change that failed to re-key it, so only \
+         the PREVIOUS password opens it."
+            .to_string()
+    })?;
 
     // Before-rollback safety copy of the live room, then cap auto copies at 3.
     let target_name = checkpoint_name(&dir, &id);
@@ -584,6 +666,44 @@ mod tests {
             .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| r.get(0))
             .unwrap();
         assert!(is_app_timestamp(&from_db));
+    }
+
+    #[test]
+    fn a_checkpoint_id_that_escapes_the_checkpoints_folder_is_refused() {
+        // `delete_room_checkpoint` and `rollback_room_checkpoint` paste the id
+        // straight into `checkpoint_file_path` and then unlink / swap in the
+        // result. Only our own screens send one today, so this is the guard
+        // that stops that from being the only thing standing between a caller
+        // and someone else's file.
+        let dir = "/tmp/room.checkpoints";
+        // A real id — a v4 uuid — passes, and stays inside the folder.
+        let real = Uuid::new_v4().to_string();
+        assert!(checkpoint_id_ok(&real));
+        assert_eq!(
+            checkpoint_file_path(dir, &real),
+            format!("/tmp/room.checkpoints/{real}.roomck")
+        );
+        // Everything that could leave the folder, name another room's file, or
+        // simply isn't an id we minted is refused outright.
+        for bad in [
+            "../../../Users/someone/Documents/notes",
+            "..",
+            "sub/dir",
+            "/etc/passwd",
+            "id\0trailer",
+            "",
+            &"x".repeat(65),
+        ] {
+            assert!(!checkpoint_id_ok(bad), "accepted {bad:?}");
+            // And what it WOULD have built is outside the checkpoints folder,
+            // which is the whole point of refusing it.
+            if bad.contains('/') {
+                assert!(
+                    !checkpoint_file_path(dir, bad).starts_with(&format!("{dir}/x")),
+                    "{bad:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -3,6 +3,172 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## Unreleased
+
+### When something goes wrong, there is now a record of what Arcelle did
+
+Arcelle already kept the AI service's own log. It kept nothing about its own
+decisions — so when an agent behaved strangely, the only account of what
+happened came from the model, and a model handed no tools does not report that;
+it invents a reason. That guess has ended up in bug reports.
+
+- **A second log file, `arcelle-host.log`**, records what the app decided: which
+  tools each AI was given (by name), which model answered a question and how
+  long it took, whether a Stop actually reached the AI service, and every change
+  of state in a background job.
+- **Settings → Updates & version → Reveal logs** opens the folder holding both
+  files, so a bug report can have them attached.
+- **Nothing from a room is in them.** No messages, no file contents, and not
+  even file names. The log holds ids, counts, sizes, durations and the *kind* of
+  an error ("not found", "network") — never its text. This is enforced by the
+  code rather than by care: there is no way to write a room's words into the log
+  even by mistake.
+- Both files keep one previous copy instead of growing forever, and the app log
+  is capped in size.
+- The detail level is quiet by default and turned up with `ARCELLE_LOG`
+  (`ARCELLE_LOG=arcelle=debug`). A value Arcelle cannot make sense of falls back
+  to the default and says so in the log, rather than leaving you with an empty
+  file and no hint that your setting was the reason.
+
+### Deleting a file is no longer permanent
+
+Arcelle had no undo for a deleted file. That mattered more here than in most
+apps, because Arcelle edits and removes things on its own without asking first.
+
+- **Deleting moves a file to the trash.** It leaves the library, the counts,
+  ⌘F search and everything the AI can find or answer from — but its bytes, its
+  saved versions and its transcript are still there.
+- **A Trash tab in the Library** lists what was deleted, when, and **by what**:
+  by you, by the AI (naming which tool), or by Arcelle itself (naming which
+  command). "What did the AI delete" is now a question with an answer.
+- **Restore puts a file back whole** — including back into search. A restored
+  file is findable by keyword and by meaning immediately, not after some later
+  background pass.
+- **Deleting for good is a separate, explicit act**, only available on a file
+  already in the trash, and it says so. Emptying the trash reports the number
+  of files it actually destroyed.
+- Nothing ever leaves the room. Trashed files stay inside the encrypted room
+  file — there is no hop through the macOS Trash and no copy on your disk.
+
+Files and how you read them. Arcelle already stored a lot of formats; it could
+only really *show* about half of them. Nine formats had no viewer at all, three
+more opened in the wrong one, and a file over a size limit silently lost its
+viewer entirely. This is that gap, closed.
+
+### Formats that had no viewer now have one
+
+- **PowerPoint decks open as slides — drawn by macOS itself**, so a deck looks
+  the way it looks in PowerPoint: real backgrounds, real type, real artwork.
+  Both `.pptx` and the old `.ppt` render this way, with a slide rail, speaker
+  notes, and citations that land on the right slide.
+- **Old Word files (`.doc`) and `.rtf` keep their formatting** — headings,
+  weights, sizes, colours and alignment — read by the same importer TextEdit
+  uses. They used to arrive as one flat column of text, when they arrived at
+  all.
+- **E-books open as books**, with a table of contents, chapter navigation and
+  adjustable text size, instead of the whole volume as one block of text.
+- **Zip archives show what is inside them**, as a folder tree with sizes,
+  without unpacking anything.
+- **Jupyter notebooks render like notebooks** — prose, code and output — rather
+  than as raw JSON in a code editor.
+- **Saved email (.eml) reads as mail**: subject, sender, date, body, and a list
+  of the attachments. It used to show MIME headers and base64.
+- **Subtitles (.srt/.vtt) open as a timed transcript**, and you can fix a line
+  without hand-editing a single timecode.
+- **JSON opens as a collapsible tree** you can actually navigate, with a Raw
+  toggle when you want the source.
+- **SVG shows the drawing with its source one click away.** It used to open as
+  a flat picture with the markup unreachable.
+- **Plain text and logs stopped opening in a code editor.** A letter gets prose
+  typography; a log gets severity colours, a filter, and the end of the file
+  first — which is where the answer usually is.
+- **Anything else the Mac can preview now gets previewed.** Keynote, Pages,
+  Numbers, RAW photos, Photoshop files, 3D models — macOS draws the page.
+  "No preview available for this file type yet" is now genuinely the last
+  resort rather than the first answer.
+
+### Formats that had a viewer, improved
+
+- **Recordings show their waveform, with each speaker's turns drawn over it.**
+  Arcelle has separated speakers on-device since 0.14.0 and none of it was
+  visible; now the shape of a conversation is the first thing you see, and the
+  speaker's name sits in its own column down the transcript.
+- **Spreadsheets show the whole sheet.** The grid stopped at 1,000 rows and 60
+  columns — silently. It now scrolls the entire workbook and honours the
+  column widths, merged cells, colours and bold that were in the file all along.
+- **Word files can actually be edited.** "Edit as text" saved a separate
+  Markdown copy and left the document untouched; the assistant could edit the
+  real file and you could not. Editing a `.docx` now writes back into it,
+  paragraph by paragraph, keeping its styles, tables and images.
+- **Notes render maths, diagrams and highlighted code.** `$…$` becomes real
+  mathematics, a ```mermaid block becomes a diagram, and fenced code is
+  coloured — all drawn on this Mac, nothing fetched.
+- **Pictures pan by dragging**, and Word documents show their page breaks,
+  headers, footers and comments.
+
+### Big files stopped breaking
+
+- **The 50 MB wall is gone.** A PDF, scan, workbook or document over it used to
+  lose its real viewer and open as plain text with no explanation. Files now
+  stream to the viewer instead of being copied through as one giant string, so
+  a 300 MB scan is just a scan.
+
+### Files that imported as unreadable
+
+- **Old Office files read on their own.** `.doc`, `.ppt`, `.xls` and
+  OpenDocument spreadsheets needed a separate developer tool installed to be
+  readable at all — which in practice meant they weren't, so their contents
+  were invisible to search and to the assistant. Arcelle reads them itself now.
+- **Badly-extracted PDFs get read again properly.** A PDF whose text came out
+  as interleaved columns or words with no spaces between them was indexed
+  exactly like that, quietly poisoning search results and the assistant's
+  answers. Arcelle now notices and re-reads the page with the same on-device
+  recognizer it uses for scans.
+- **Notebooks, email, subtitles, SVG and archives became searchable**, because
+  their text is now read at import instead of being skipped.
+- **Old Word and PowerPoint files no longer read as gibberish.** Reading them
+  natively worked on paper and not on real files: a `.doc` came out as its font
+  table followed by mojibake, and a `.ppt` as its slide master's placeholder
+  prompts and binary noise. That was not just what the editor showed — it was
+  the text stored for the file, so search and the assistant saw it too. `.doc`
+  now goes through the same macOS importer that draws its preview, and `.ppt`
+  is read from its actual slide records, numbered `[slide 1]`, `[slide 2]`, the
+  same way a `.pptx` is. **Files already in a room are re-read once, on open**,
+  so an old import fixes itself.
+- **Links in old Word files are links.** A hyperlink used to print as
+  `HYPERLINK "https://…"` in the middle of the sentence it belonged to, both on
+  screen and in the indexed text.
+- **A file renamed `.doc` can no longer smuggle its bytes into the index.** The
+  macOS importer does not check that its input is really a Word document — hand
+  it anything and it hands the bytes back as "text" — so Arcelle checks first.
+
+### Editing tells you what it will do
+
+The editors all looked alike — one monospace pane — while meaning three quite
+different things, and several ways out of them threw work away without asking.
+
+- **Nothing discards your edits silently any more.** Closing a file, closing or
+  switching a tab, or opening another area now asks: Save, Discard, or Cancel.
+  Closing the file used to lose the edit outright, and the tab strip used to
+  refuse with a message that offered no way forward. A failed save no longer
+  continues as though it had worked.
+- **Undo clears the unsaved marker.** Typing and then undoing back to the
+  original left "● unsaved changes" showing and the tab still blocked.
+- **Every editor says what saving does** — rewrite this file, rewrite the words
+  inside a Word document while keeping its layout, or write a separate note and
+  leave the original untouched.
+- **Notes edit beside their preview.** A `.md` file now opens with the Markdown
+  and the finished page side by side, and a toolbar for headings, lists,
+  quotes, links, code and tables. Source-only and preview-only are a click away.
+- **Spreadsheet edits can be undone.** A cell saves the moment you leave it, and
+  nothing said so: there was no mark on the changed cell, ⌘Z did nothing, and
+  the only way back was the version history. Changed cells are now marked, the
+  bar counts them, and ⌘Z puts the last one back.
+- **Legacy `.xls` says it is read-only** instead of just having no Edit button.
+- **Files that differ only by extension are told apart.** `report.doc` and
+  `report.docx` both showed as "report" in the library and as "repo…" in the
+  tab strip; where the tidy name is ambiguous the full filename is shown.
+
 ## 0.15.0 — 2026-08-02
 
 A repair release. The whole app was read end to end — every Rust, Python and
@@ -43,6 +209,65 @@ you will never notice, which is the point. These are the ones you will.
 - **One broken panel no longer blanks the whole app.** A crash inside a viewer,
   the chat or the browser is now caught and shown in place, with everything
   else still working and a button to reload just that piece.
+
+### Every agent works on every engine
+
+- **The Browser agent works on cloud API models.** When a cloud provider
+  rejected a request, Arcelle retried it with a hardcoded list of "its own"
+  tools — a list last updated long ago, missing 19 of the room's 62 tools
+  including *every* browser tool. For the Browser agent nothing matched, so the
+  retry was skipped and the failure surfaced as an unexplained provider error;
+  for other agents it quietly removed tools they were never told they had lost.
+  The list is gone: a rejected request is now reported, with the provider's own
+  reason, and never worked around by shrinking an agent's abilities behind its
+  back.
+- **Cloud models no longer get the screen tools.** The rule was always that an
+  engine running outside this Mac can do everything the local one can *except*
+  see or operate the app's own controls. The check only recognised the two
+  command-line engines, so rooms on a cloud API model — added later — were
+  handed those tools anyway. They now get the same tier as every other
+  non-local engine; nothing else about what they can do changes.
+
+### When a search or an agent fails, it says so
+
+- **A blocked web search no longer reports an empty web.** Arcelle searches
+  seven engines at once. When some of them are rate limited or blocked — which
+  happens on an ordinary day — the assistant used to be handed the words "No
+  results found.", so it told you a subject had nothing written about it when
+  really the search had not run. It now says which engines were unreachable,
+  and the results page marks a partial search as partial.
+- **Every agent's full reply is kept in its own box.** A specialist's answer
+  scrolled past in the chat and was gone a second later; the box that should
+  have held it only said the agent had reported back.
+- **A failed agent explains itself.** The panel used to say "the agent did not
+  finish" and nothing more.
+- **Provider errors now name the actual cause.** When a cloud provider routes
+  your request to a backend that fails, it hands back the fixed phrase
+  "Provider returned error" and files the real reason separately — that reason
+  is now shown, so a rate limit, a rejected key and a refused request stop
+  looking identical.
+
+### Connectors ask two questions instead of one
+
+- **"Run connector tools without asking" and "Send remote connectors real
+  values" are now separate switches**, and both start off. They used to be one:
+  the only way to stop a lookup coming back empty — because the privacy door
+  had replaced the name you were asking about with a placeholder — was to also
+  stop Arcelle asking your permission to run anything. Those are different
+  risks, so they are now two decisions. Turning off the prompt no longer changes
+  what leaves your Mac, and asking for real values no longer stops the prompt:
+  with the prompt on, the card shows you the actual arguments before they go.
+- **Both questions are asked per connector.** The two switches are now the
+  default, and every installed connector can answer either one for itself —
+  trusting the connector that reads files on your Mac says nothing about the one
+  that reaches a service on the internet. Each connector shows which answer is
+  in force for it and where it came from, so there is never a pair of controls
+  whose combination you have to work out.
+- If you had the old combined switch on, your connector calls still run
+  unattended and Arcelle goes back to sending placeholders until you ask for
+  real values. Nothing gains a per-connector permission you did not choose:
+  every connector simply follows the switch until you tell it otherwise. The
+  Connectors page states which is true right now, on this Mac.
 
 ### Around the code
 

@@ -546,6 +546,21 @@ pub fn rec_set_speaker_name(
     speaker: String,
     name: String,
 ) -> Result<RecMeta, String> {
+    set_speaker_name(&state, &id, &speaker, &name)
+}
+
+/// The body of [`rec_set_speaker_name`], against a plain `AppState` — a
+/// `State<'_, AppState>` can only be built by a running Tauri app, so the
+/// command's refusals (no speaker chosen, a recording with no transcript, a
+/// label nobody in the recording has) had no test of their own. The QA
+/// stand-in's copy of them did, which is confidence the real code had not
+/// earned.
+fn set_speaker_name(
+    state: &AppState,
+    id: &str,
+    speaker: &str,
+    name: &str,
+) -> Result<RecMeta, String> {
     let speaker = speaker.trim().to_string();
     if speaker.is_empty() {
         return Err("No speaker selected.".into());
@@ -553,7 +568,7 @@ pub fn rec_set_speaker_name(
     // A name long enough to blow out the transcript prefix is a paste accident.
     let name = name.trim().chars().take(60).collect::<String>();
     state.with_room(|room| {
-        let mut meta = parse_meta(db::get_rec_meta(&room.conn, &id))?;
+        let mut meta = parse_meta(db::get_rec_meta(&room.conn, id))?;
         if meta.segments.is_empty() {
             return Err("That recording has no transcript yet.".into());
         }
@@ -571,8 +586,8 @@ pub fn rec_set_speaker_name(
         // Rewrite the searchable transcript in place. The audio is untouched,
         // so this is not a new file version — renaming is not an edit to the
         // recording, and versioning every rename would bury the real edits.
-        db::set_file_extracted_text(&room.conn, &id, &text)?;
-        db::set_rec_meta(&room.conn, &id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
+        db::set_file_extracted_text(&room.conn, id, &text)?;
+        db::set_rec_meta(&room.conn, id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
         Ok(meta)
     })
 }
@@ -625,6 +640,129 @@ pub fn rec_delete_range(
     })
 }
 
+/// Retype the words a selection covers, keeping their place in time.
+///
+/// The transcript could be EDITED only by deleting — so a misheard name was a
+/// choice between leaving it wrong and losing the sentence, and the recording's
+/// text is what search, the AI and every export read. Correcting is not
+/// deleting: the audio is untouched, no cut is added, and `del` is never set.
+///
+/// Deliberately confined to ONE phrase. A correction spread across a speaker
+/// change has no honest place to put the new words — whose line are they? —
+/// and guessing there would put words in somebody's mouth. Split behaviour is
+/// therefore refused with a message that says what to do instead.
+pub(crate) fn correct_words(
+    seg: &mut recording::RecSegment,
+    t0: i64,
+    t1: i64,
+    text: &str,
+) -> Result<usize, String> {
+    let hit: Vec<usize> = seg
+        .words
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| !w.del && w.t0 < t1 && w.t1 > t0)
+        .map(|(i, _)| i)
+        .collect();
+    let (Some(&first), Some(&last)) = (hit.first(), hit.last()) else {
+        return Ok(0);
+    };
+    let span_t0 = seg.words[first].t0;
+    let span_t1 = seg.words[last].t1;
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    // Timings are spread evenly across the span the old words occupied. It is
+    // an approximation and it is stated as one: what it must NOT do is invent a
+    // time outside the words that were really said, because playback, the
+    // subtitle export and the audio cut all read these numbers.
+    let span = (span_t1 - span_t0).max(1);
+    let n = tokens.len().max(1) as i64;
+    let replacement: Vec<recording::RecWord> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, w)| recording::RecWord {
+            w: (*w).to_string(),
+            t0: span_t0 + span * i as i64 / n,
+            t1: span_t0 + span * (i as i64 + 1) / n,
+            del: false,
+        })
+        .collect();
+    // Splice in place: the words BEFORE and AFTER the selection keep their own
+    // timings, including any already marked deleted inside the range's gaps.
+    let tail = seg.words.split_off(last + 1);
+    seg.words.truncate(first);
+    seg.words.extend(replacement);
+    seg.words.extend(tail);
+    Ok(hit.len())
+}
+
+/// Studio-style transcript editing: retype what a selection says.
+#[tauri::command]
+pub fn rec_correct_range(
+    state: State<'_, AppState>,
+    rec: State<'_, RecState>,
+    id: String,
+    t0: i64,
+    t1: i64,
+    text: String,
+) -> Result<RecMeta, String> {
+    if t1 <= t0 {
+        return Err("Nothing selected.".into());
+    }
+    // An empty correction is a DELETE, and delete is a different button with a
+    // different consequence (it cuts the audio). Never guess which was meant.
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("Type the corrected words, or use \"Delete from recording\" to remove them.".into());
+    }
+    {
+        let mut live = rec.session.lock().unwrap();
+        clear_finished(&mut live);
+        if live.as_ref().map(|l| l.file_id == id).unwrap_or(false) {
+            return Err("Pause the recording before editing the transcript.".into());
+        }
+    }
+    if rec.retranscribing.lock().unwrap().contains(&id) {
+        return Err("This recording is being re-transcribed — wait for it to finish.".into());
+    }
+    state.with_room(|room| {
+        let mut meta = parse_meta(db::get_rec_meta(&room.conn, &id))?;
+        let touched: Vec<usize> = meta
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.words.iter().any(|w| !w.del && w.t0 < t1 && w.t1 > t0)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match touched.as_slice() {
+            [] => {
+                return Err(
+                    "Nothing to correct there — that selection has no word timings. Re-transcribe the recording to get them."
+                        .into(),
+                )
+            }
+            [one] => {
+                let n = correct_words(&mut meta.segments[*one], t0, t1, &text)?;
+                if n == 0 {
+                    return Err("Nothing to correct there.".into());
+                }
+            }
+            _ => {
+                return Err(
+                    "That selection crosses more than one phrase. Correct one phrase at a time — otherwise there is no honest way to say who said the new words."
+                        .into(),
+                )
+            }
+        }
+        let bytes = db::get_file_bytes(&room.conn, &id)?.unwrap_or_default();
+        let text = recording::transcript_text(&meta);
+        store_file_bytes(&room.conn, &id, &bytes, Some(&text), "Corrected transcript")?;
+        db::set_rec_meta(&room.conn, &id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
+        Ok(meta)
+    })
+}
+
 /// Render the edits into a new file: cut spans removed from the audio,
 /// timestamps re-flowed, deleted words gone. The original stays untouched.
 ///
@@ -633,7 +771,7 @@ pub fn rec_delete_range(
 /// to happen under that lock, which froze every other thing the room does —
 /// files, chat, search — for as long as it took.
 #[tauri::command]
-pub fn rec_export_clean(
+pub async fn rec_export_clean(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
@@ -647,14 +785,53 @@ pub fn rec_export_clean(
     if meta.cuts.is_empty() && meta.segments.iter().all(|s| s.words.iter().all(|w| !w.del)) {
         return Err("No edits to apply — delete something from the transcript first.".into());
     }
-    let samples = recording::decode_wav(&bytes.unwrap_or_default())?;
-    let spliced = recording::splice_out(&samples, &meta.cuts);
-    drop(samples);
+    // Decoding, splicing and re-encoding a multi-hour WAV is minutes of CPU.
+    // A synchronous Tauri command runs on the thread that PAINTS the window, so
+    // doing it there froze the whole app — not just the room — with no progress
+    // and nothing to click. Off the UI thread; the room lock is not held here
+    // either (see the doc comment).
+    let (spliced, new_meta) = tauri::async_runtime::spawn_blocking(move || {
+        let samples = recording::decode_wav(&bytes.unwrap_or_default())?;
+        let spliced = recording::splice_out(&samples, &meta.cuts);
+        drop(samples);
+        let new_meta = reflow_after_cuts(&meta, spliced.len());
+        Ok::<_, String>((spliced, new_meta))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
-    // Re-flow the surviving segments onto the shortened timeline.
+    let stem = name.trim_end_matches(".wav");
+    let new_name = format!("{stem} (edited).wav");
+    let transcript = recording::transcript_text(&new_meta);
+    let wav = recording::encode_wav(&spliced);
+    drop(spliced);
+    let file = state.with_room(|room| {
+        let file = db::insert_file(
+            &room.conn,
+            &new_name,
+            "audio/wav",
+            &wav,
+            Some(&transcript),
+            "recording",
+        )?;
+        db::set_rec_meta(
+            &room.conn,
+            &file.id,
+            &serde_json::to_string(&new_meta).map_err(|e| e.to_string())?,
+        )?;
+        Ok(file)
+    })?;
+    let _ = app.emit("room-files-changed", ());
+    Ok(file)
+}
+
+/// The surviving transcript, re-flowed onto the timeline the cuts leave behind:
+/// deleted words gone, every remaining timestamp pulled back by the length of
+/// the cuts before it, empty segments dropped.
+pub(crate) fn reflow_after_cuts(meta: &RecMeta, spliced_len: usize) -> RecMeta {
     let mut new_meta = RecMeta {
         max_speakers: meta.max_speakers,
-        duration_cs: recording::cs_of_samples(spliced.len()),
+        duration_cs: recording::cs_of_samples(spliced_len),
         // The edited copy keeps the same speaker labels, so it keeps their
         // names too (GH #5) — otherwise "Dana" silently reverts to "Speaker 2".
         speaker_names: meta.speaker_names.clone(),
@@ -696,30 +873,7 @@ pub fn rec_export_clean(
             voice: seg.voice.clone(),
         });
     }
-
-    let stem = name.trim_end_matches(".wav");
-    let new_name = format!("{stem} (edited).wav");
-    let transcript = recording::transcript_text(&new_meta);
-    let wav = recording::encode_wav(&spliced);
-    drop(spliced);
-    let file = state.with_room(|room| {
-        let file = db::insert_file(
-            &room.conn,
-            &new_name,
-            "audio/wav",
-            &wav,
-            Some(&transcript),
-            "recording",
-        )?;
-        db::set_rec_meta(
-            &room.conn,
-            &file.id,
-            &serde_json::to_string(&new_meta).map_err(|e| e.to_string())?,
-        )?;
-        Ok(file)
-    })?;
-    let _ = app.emit("room-files-changed", ());
-    Ok(file)
+    new_meta
 }
 
 /// Translate the whole transcript into any language on the LOCAL model,
@@ -799,7 +953,6 @@ pub async fn rec_translate(
             Some(0.2),
             KEEP_ALIVE_WARM,
             None,
-            ollama::CtxTier::Chat,
         )
         .await?;
         let out = strip_think_spans(&out);
@@ -834,7 +987,20 @@ pub async fn rec_translate(
         translated.join("\n\n")
     );
     let meta = state.with_room(|room| {
-        db::insert_file(&room.conn, &out_name, "text/markdown", content.as_bytes(), Some(&content), "generated")
+        let meta = db::insert_file(
+            &room.conn,
+            &out_name,
+            "text/markdown",
+            content.as_bytes(),
+            Some(&content),
+            "generated",
+        )?;
+        // Room map: this translation was made from THIS recording. The name
+        // says so too ("{stem} — {language}.md"), but a name is not evidence —
+        // renaming either file would leave the map asserting a link it can no
+        // longer check.
+        db::set_derived_from(&room.conn, &meta.id, &id)?;
+        Ok(meta)
     })?;
     let _ = window.emit("room-files-changed", ());
     let _ = window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
@@ -947,5 +1113,170 @@ mod tests {
         };
         drop(second);
         assert!(state.cancels.lock().unwrap().is_empty(), "the registry leaked an entry");
+    }
+
+    fn word(w: &str, t0: i64, t1: i64) -> recording::RecWord {
+        recording::RecWord { w: w.to_string(), t0, t1, del: false }
+    }
+
+    fn phrase(words: Vec<recording::RecWord>) -> recording::RecSegment {
+        let t0 = words.first().map(|w| w.t0).unwrap_or(0);
+        let t1 = words.last().map(|w| w.t1).unwrap_or(0);
+        recording::RecSegment {
+            id: "s1".into(),
+            source: "mic".into(),
+            speaker: "You".into(),
+            t0,
+            t1,
+            text: words.iter().map(|w| w.w.as_str()).collect::<Vec<_>>().join(" "),
+            words,
+            lang: None,
+            voice: None,
+        }
+    }
+
+    /// A transcript could be edited only by DELETING, so a misheard name was a
+    /// choice between leaving it wrong and losing the sentence. Correcting must
+    /// not become a delete by another route: no `del`, no cut, and the
+    /// surrounding words keep their own timings.
+    #[test]
+    fn correcting_words_replaces_the_text_without_touching_the_audio() {
+        let mut seg = phrase(vec![
+            word("call", 0, 100),
+            word("Jozzay", 100, 300),
+            word("today", 300, 400),
+        ]);
+        let n = correct_words(&mut seg, 100, 300, "José Álvarez").unwrap();
+        assert_eq!(n, 1, "one word was under the selection");
+        let text = recording::segment_visible_text(&seg);
+        assert_eq!(text, "call José Álvarez today");
+        assert!(seg.words.iter().all(|w| !w.del), "a correction must never cut audio");
+        // The new words live inside the span the old one occupied — playback,
+        // the .srt export and the audio cut all read these numbers.
+        let new_words: Vec<&recording::RecWord> =
+            seg.words.iter().filter(|w| w.w != "call" && w.w != "today").collect();
+        assert_eq!(new_words.len(), 2);
+        assert_eq!(new_words[0].t0, 100);
+        assert_eq!(new_words[new_words.len() - 1].t1, 300);
+        // ...and the untouched neighbours are exactly where they were.
+        let last = seg.words.len() - 1;
+        assert_eq!((seg.words[0].w.as_str(), seg.words[0].t0, seg.words[0].t1), ("call", 0, 100));
+        assert_eq!(
+            (seg.words[last].w.as_str(), seg.words[last].t0, seg.words[last].t1),
+            ("today", 300, 400)
+        );
+    }
+
+    #[test]
+    fn a_correction_shorter_than_what_it_replaces_leaves_no_stray_words() {
+        let mut seg = phrase(vec![
+            word("the", 0, 100),
+            word("Jose", 100, 200),
+            word("Al", 200, 300),
+            word("Varez", 300, 400),
+            word("file", 400, 500),
+        ]);
+        assert_eq!(correct_words(&mut seg, 100, 400, "Álvarez").unwrap(), 3);
+        assert_eq!(recording::segment_visible_text(&seg), "the Álvarez file");
+        assert_eq!(seg.words.len(), 3, "the replaced run must not leave remnants");
+        // A selection that covers nothing is a no-op, never a silent rewrite.
+        assert_eq!(correct_words(&mut seg, 9000, 9100, "nope").unwrap(), 0);
+        assert_eq!(recording::segment_visible_text(&seg), "the Álvarez file");
+    }
+
+    /// An `AppState` holding a room on an in-memory DB, for the command bodies
+    /// that only need the room.
+    fn room_state(tag: &str) -> (AppState, Connection) {
+        let uri = format!("file:{tag}?mode=memory&cache=shared");
+        let reader = Connection::open(&uri).unwrap();
+        reader.execute_batch(crate::db::SCHEMA).unwrap();
+        let conn = Connection::open(&uri).unwrap();
+        let state = AppState::default();
+        *state.room.lock().unwrap() = Some(Room {
+            conn,
+            path: uri,
+            name: "QA".into(),
+            password: "qa-room-pw".into(),
+        });
+        (state, reader)
+    }
+
+    /// GH #5's write path, which had no test of its own — only the QA stand-in
+    /// had one, and the stand-in was missing two of these refusals entirely.
+    #[test]
+    fn naming_a_speaker_refuses_everything_it_cannot_honestly_do() {
+        let (state, _reader) = room_state("rec-speaker-names");
+        let id = state
+            .with_room(|room| {
+                Ok(db::insert_file(
+                    &room.conn,
+                    "call.wav",
+                    "audio/wav",
+                    b"",
+                    Some("(live recording)"),
+                    "recording",
+                )?
+                .id)
+            })
+            .unwrap();
+
+        // No speaker chosen.
+        assert_eq!(
+            set_speaker_name(&state, &id, "   ", "Dana").unwrap_err(),
+            "No speaker selected."
+        );
+        // A recording with no transcript has nobody to name.
+        assert!(set_speaker_name(&state, &id, "Speaker 1", "Dana")
+            .unwrap_err()
+            .contains("no transcript yet"));
+
+        let mut meta = RecMeta { duration_cs: 500, ..Default::default() };
+        meta.segments.push(recording::RecSegment {
+            speaker: "Speaker 1".into(),
+            ..phrase(vec![word("hello", 0, 100)])
+        });
+        state
+            .with_room(|room| {
+                db::set_rec_meta(&room.conn, &id, &serde_json::to_string(&meta).unwrap())
+            })
+            .unwrap();
+
+        // A label nobody in the recording carries.
+        assert!(set_speaker_name(&state, &id, "Speaker 7", "Dana")
+            .unwrap_err()
+            .contains("Speaker 7"));
+
+        let named = set_speaker_name(&state, &id, "Speaker 1", "  Dana  ").unwrap();
+        assert_eq!(named.speaker_names.get("Speaker 1").map(String::as_str), Some("Dana"));
+        // Naming someone back to their machine label CLEARS the overlay rather
+        // than storing an entry that shadows itself.
+        let cleared = set_speaker_name(&state, &id, "Speaker 1", "Speaker 1").unwrap();
+        assert!(cleared.speaker_names.is_empty());
+    }
+
+    /// The edited copy's transcript: cut words gone, everything after a cut
+    /// pulled back by its length, and the speaker names carried over (GH #5).
+    #[test]
+    fn the_edited_copy_reflows_onto_the_shortened_timeline() {
+        let mut meta = RecMeta { duration_cs: 600, ..Default::default() };
+        meta.speaker_names.insert("Speaker 1".into(), "Dana".into());
+        let mut seg = phrase(vec![
+            word("keep", 0, 100),
+            word("cut", 200, 300),
+            word("keep-too", 400, 500),
+        ]);
+        seg.speaker = "Speaker 1".into();
+        seg.words[1].del = true;
+        meta.segments.push(seg);
+        meta.cuts.push(RecCut { t0: 200, t1: 300 });
+
+        let out = reflow_after_cuts(&meta, recording::SAMPLE_RATE * 5);
+        assert_eq!(out.speaker_names.get("Speaker 1").map(String::as_str), Some("Dana"));
+        assert_eq!(out.segments.len(), 1);
+        let words: Vec<&str> = out.segments[0].words.iter().map(|w| w.w.as_str()).collect();
+        assert_eq!(words, ["keep", "keep-too"], "a deleted word survived the export");
+        // The surviving word moved back by the 100cs the cut removed before it.
+        assert_eq!(out.segments[0].words[1].t0, 300);
+        assert_eq!(out.duration_cs, 500, "the copy's length is the SPLICED audio's");
     }
 }

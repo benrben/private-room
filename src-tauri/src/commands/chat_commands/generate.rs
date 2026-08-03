@@ -132,8 +132,7 @@ pub(crate) async fn cmd_transcribe(ctx: &CmdCtx<'_>) -> Result<CommandResult, St
         };
         // The import-time background job may have failed or not finished — so do
         // it now, on demand. Whisper is CPU-bound, so run it OFF the async runtime.
-        let _ = ctx.window.emit(
-            "ask-step",
+        ctx.step(
             format!("Transcribing {name} (long recordings take a while)…"),
         );
         let (bytes, room_path) = ctx.state.with_room(|room| {
@@ -231,8 +230,7 @@ pub(crate) async fn cmd_minutes(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
         if ctx.cancelled() {
             break;
         }
-        let _ = ctx.window.emit(
-            "ask-step",
+        ctx.step(
             if total > 1 {
                 format!("Building the meeting minutes — part {}/{}…", i + 1, total)
             } else {
@@ -280,7 +278,17 @@ pub(crate) async fn cmd_minutes(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
     let body = render_minutes_html(&parsed, &title);
     let doc = html_document(&title, &body);
     let name = html_note_name(&title);
-    let meta = ctx.state.with_room(|room| create_note(&room.conn, &name, &doc))?;
+    // ART-1: minutes of the same meeting re-run over the same transcript become
+    // a new version of the same file — the earlier minutes stay in History.
+    let meta = ctx.state.with_room(|room| {
+        Artifact::note(&name, &doc)
+            .by("#minutes")
+            .during_run(Some(ctx.turn.run_id()))
+            .from_files(ctx.refs)
+            .cancel_with(&ctx.cancel)
+            .commit(&room.conn)
+            .map(|w| w.meta)
+    })?;
     let _ = ctx.window.emit("room-files-changed", ());
     let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
     let items = parsed["timeline"].as_array().map_or(0, |a| a.len());
@@ -304,7 +312,13 @@ pub(crate) async fn cmd_to_sheet(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         return Err("No table found in a recent answer to convert.".into());
     };
     let csv = serialize_delim(&rows, ',');
-    let meta = ctx.state.with_room(|room| create_note(&room.conn, "table.csv", &csv))?;
+    let meta = ctx.state.with_room(|room| {
+        Artifact::note("table.csv", &csv)
+            .by("#to-sheet")
+            .during_run(Some(ctx.turn.run_id()))
+            .commit(&room.conn)
+            .map(|w| w.meta)
+    })?;
     let _ = ctx.window.emit("room-files-changed", ());
     let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
     Ok(CommandResult {
@@ -392,9 +406,7 @@ pub(crate) async fn cmd_translate(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
         if ctx.cancelled() {
             break;
         }
-        let _ = ctx
-            .window
-            .emit("ask-step", format!("Translating part {}/{}", i + 1, total));
+        ctx.step(format!("Translating part {}/{}", i + 1, total));
         // One bad piece must not cost the user the twenty already translated:
         // skip it and report it, the same best-effort contract `map_windows`
         // gives every other full-ops command. But a RUN of failures is the
@@ -446,7 +458,17 @@ pub(crate) async fn cmd_translate(ctx: &CmdCtx<'_>) -> Result<CommandResult, Str
     }
     let base = name.rsplit_once('.').map(|(b, _)| b).unwrap_or(&name);
     let fname = format!("{base} ({lang}).md");
-    let meta = ctx.state.with_room(|room| create_note(&room.conn, &fname, &out))?;
+    // ART-1: no cancel flag here on purpose — a Stop mid-translation keeps the
+    // parts already translated (the partial note above says so), so the write is
+    // the honest record of what was done, not work that should be thrown away.
+    let meta = ctx.state.with_room(|room| {
+        Artifact::note(&fname, &out)
+            .by("#translate")
+            .during_run(Some(ctx.turn.run_id()))
+            .from_files(ctx.refs)
+            .commit(&room.conn)
+            .map(|w| w.meta)
+    })?;
     let _ = ctx.window.emit("room-files-changed", ());
     let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
     Ok(CommandResult {
@@ -490,14 +512,24 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     }
 
     // (2) Search. The same one search path the agent's web_search uses.
-    let _ = ctx.window.emit(
-        "ask-step",
+    ctx.step(
         format!("Searching the web for \"{question}\" (leaves this Mac)"),
     );
-    let hits = web::search_web(question).await?;
+    let page = web::search_web(question).await?;
+    let hits = &page.hits;
     if hits.is_empty() {
+        // Same distinction the agent's web_search tool makes: a blocked fan-out
+        // is not an empty web, and saying so in the room would be a fabrication.
         return Ok(CommandResult {
-            content: format!("No web results found for **{question}**."),
+            content: match page.blocked_note() {
+                Some(_) => format!(
+                    "The web search for **{question}** did not run — {} could not be reached \
+                     (blocked, rate limited or too slow). This does not mean there is nothing \
+                     to find; try again in a few minutes.",
+                    web::join_names(&page.failed)
+                ),
+                None => format!("No web results found for **{question}**."),
+            },
             ..Default::default()
         });
     }
@@ -513,8 +545,7 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
         if ctx.cancelled() {
             break;
         }
-        let _ = ctx.window.emit(
-            "ask-step",
+        ctx.step(
             format!("Saving source: {} (leaves this Mac)", hit.title),
         );
         // fetch_readable keeps the SEC-5 private-network guard intact.
@@ -573,7 +604,7 @@ pub(crate) async fn cmd_research(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     }
     // Many sources can still exceed one call; fold rather than drop the last few.
     let context = ctx.digest(&context, "Reading the saved sources").await;
-    let _ = ctx.window.emit("ask-step", "Answering from the saved sources");
+    ctx.step("Answering from the saved sources");
     let answer = ctx
         .ask_streaming(
             "You answer the user's question using ONLY the provided sources, which were just \

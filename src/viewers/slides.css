@@ -1,0 +1,89 @@
+/* A deck, as slides. Shapes are absolutely positioned as PERCENTAGES of the
+   slide, so one layout scales to any pane width; `container-type: size` is
+   what lets the text size scale with it (the `cqh` units in SlidesView). */
+.sl-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.sl-bar {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.sl-stage {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: 1rem;
+  min-height: 0;
+}
+/* The slide is a macOS-rendered image now, so it only needs framing. */
+.sl-image {
+  max-width: min(100%, 62rem);
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 2px 14px rgb(0 0 0 / 0.12);
+}
+
+.sl-canvas {
+  container-type: size;
+  position: relative;
+  width: 100%;
+  max-width: min(100%, 62rem);
+  max-height: 100%;
+  background: #fff;
+  color: #111;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: 0 2px 14px rgb(0 0 0 / 0.12);
+}
+.sl-shape { position: absolute; overflow: hidden; }
+.sl-shape img { width: 100%; height: 100%; object-fit: contain; }
+.sl-p { margin: 0 0 0.25em; line-height: 1.25; }
+.sl-bullet { list-style: none; }
+.sl-bullet::before { content: "• "; opacity: 0.6; }
+.sl-placeholder {
+  display: grid;
+  place-items: center;
+  border: 1px dashed color-mix(in srgb, #111 25%, transparent);
+  border-radius: 4px;
+}
+.sl-note { font-size: 0.75rem; color: #666; text-transform: capitalize; }
+.sl-notes {
+  max-height: 9rem;
+  overflow: auto;
+  padding: 0.6rem 0.9rem;
+  border-top: 1px solid var(--border);
+  white-space: pre-wrap;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+.sl-rail {
+  display: flex;
+  gap: 0.4rem;
+  overflow-x: auto;
+  padding: 0.5rem 0.75rem;
+  border-top: 1px solid var(--border);
+}
+.sl-thumb {
+  flex: none;
+  width: 9rem;
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  padding: 0.3rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: start;
+  font-size: 0.75rem;
+}
+.sl-thumb.active { border-color: var(--accent); background: var(--panel); }
+.sl-thumb-n { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; }
+.sl-thumb-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

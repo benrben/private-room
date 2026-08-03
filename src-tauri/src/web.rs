@@ -66,4 +66,31 @@ pub struct SearchPage {
     pub took_ms: u32,
     /// Served from this Mac's 15-minute cache without touching the network.
     pub cached: bool,
+    /// The engines that could not answer at all — blocked (HTTP 403), rate
+    /// limited (429), unreachable, or slower than the fan-out budget.
+    ///
+    /// This is the difference between the two ways a search comes back empty,
+    /// and the sidecar has always computed it; this boundary used to drop it.
+    /// No hits and nothing failed means the web really had nothing. No hits and
+    /// every engine failed means the search never happened — and reporting that
+    /// as "No results found." tells the model, and then the user, that a subject
+    /// does not exist on the web because a scraper got a 429.
+    #[serde(default)]
+    pub failed: Vec<String>,
+}
+
+impl SearchPage {
+    /// A sentence naming the engines that could not answer, or `None` when the
+    /// whole fan-out answered. Appended to what the model reads so a thin result
+    /// set is never mistaken for a thorough one.
+    pub fn blocked_note(&self) -> Option<String> {
+        if self.failed.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Note: {} could not be reached for this search (blocked, rate limited or too slow), \
+             so these results are only part of the web.",
+            crate::web::join_names(&self.failed)
+        ))
+    }
 }

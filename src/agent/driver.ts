@@ -1,5 +1,6 @@
 import "./driver.css";
 import type { AgentUiRequest } from "../api";
+import { drawToPngB64, grabFrame } from "../viewers/frameGrab";
 
 /**
  * ADD-25: the frontend half of the agent↔UI bridge. The backend emits an
@@ -25,6 +26,12 @@ declare const WeakRef: new (target: Element) => AgentElementRef;
 const registry = new Map<number, AgentElementRef>();
 
 const MARK_CAP = 80;
+
+/** Every capture that goes to a VISION MODEL is capped here — the model gains
+ * nothing from a 4K still and the bridge payload is base64. Captures the user
+ * keeps (an exported video frame) are not capped: that would silently save a
+ * 1280px PNG of a 4K video. */
+const VISION_MAX_WIDTH = 1280;
 
 /** Anything a human could plausibly click or type into, plus this app's
  * click-handler rows/chips that carry no interactive tag of their own. */
@@ -516,7 +523,7 @@ function viewScreenshot(): Record<string, unknown> {
 
   try {
     return {
-      imageB64: drawToPngB64(source, srcW, srcH),
+      imageB64: drawToPngB64(source, srcW, srcH, VISION_MAX_WIDTH),
       note: "DOM-composite fallback capture of the viewer content only — window chrome and overlays are not included.",
     };
   } catch {
@@ -535,29 +542,17 @@ function visibleArea(el: Element): number {
   return Math.max(0, w) * Math.max(0, h);
 }
 
-/** Draw a source into an offscreen canvas capped at 1280px wide and return
- * bare base64 (no data: prefix) — the bridge payload wants raw PNG bytes. */
-function drawToPngB64(
-  source: CanvasImageSource,
-  srcW: number,
-  srcH: number,
-): string {
-  const scale = Math.min(1, 1280 / srcW);
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(srcW * scale));
-  canvas.height = Math.max(1, Math.round(srcH * scale));
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Couldn't create a 2D canvas context.");
-  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
-  const url = canvas.toDataURL("image/png");
-  return url.slice(url.indexOf(",") + 1);
-}
 
 // ------------------------------------------------------------ media frame
 
 /** Grab one frame of a video at a timestamp via the roommedia:// streaming
  * protocol (ADD-24 tokens) — a hidden <video> seeks and paints to canvas, so
- * no decoded bytes ever leave the webview. */
+ * no decoded bytes ever leave the webview.
+ *
+ * The grab itself lives in `viewers/frameGrab.ts`: the video viewer's "Save
+ * frame" button runs the same code, and the two fixes that make it work at all
+ * (CORS before src, wait for a PRESENTED frame) must not exist in two copies.
+ * This wrapper only caps the result for the vision model. */
 async function mediaFrame(
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
@@ -565,124 +560,5 @@ async function mediaFrame(
   const mime = typeof args.mime === "string" ? args.mime : "";
   const seconds = typeof args.seconds === "number" ? args.seconds : 0;
   if (!token) return { error: "media_frame needs a media token." };
-
-  const video = document.createElement("video");
-  video.muted = true;
-  video.preload = "auto";
-  video.setAttribute("playsinline", "");
-  // ADD-25: roommedia:// is a different origin than the app, so a same-origin
-  // draw taints the canvas and toDataURL throws a SecurityError (this was the
-  // "frames couldn't be exported" failure). Requesting the stream as CORS —
-  // paired with the handler's Access-Control-Allow-Origin: * — keeps the
-  // canvas clean. Must be set BEFORE the source is assigned.
-  video.crossOrigin = "anonymous";
-  // Off-screen but in the document — WKWebView won't load detached media.
-  video.style.position = "fixed";
-  video.style.left = "-10000px";
-  video.style.width = "1px";
-  video.style.height = "1px";
-
-  try {
-    const source = document.createElement("source");
-    source.src = `roommedia://localhost/${token}`;
-    if (mime) source.type = mime;
-    video.appendChild(source);
-    document.body.appendChild(video);
-    video.load();
-
-    if ((await mediaEvent(video, "loadedmetadata", 8000)) !== "ok") {
-      return {
-        error: "That video couldn't be loaded for a frame grab (timed out).",
-      };
-    }
-    if (!video.videoWidth || !video.videoHeight) {
-      return { error: "That file has no video track." };
-    }
-
-    const duration = video.duration;
-    const t = Number.isFinite(duration)
-      ? Math.min(Math.max(0, seconds), duration)
-      : Math.max(0, seconds);
-    video.currentTime = t;
-    const seeked = await mediaEvent(video, "seeked", 8000);
-    // HAVE_CURRENT_DATA: even if "seeked" got lost, a decodable frame is up.
-    if (seeked !== "ok" && video.readyState < 2) {
-      return { error: `Couldn't seek that video to ${t.toFixed(1)}s.` };
-    }
-    // WKWebView fires "seeked" before the decoder has PAINTED the new frame —
-    // drawing immediately captures a black canvas (the model then honestly
-    // reports "a completely black screen"). Wait for a real presented frame,
-    // nudging the paused pipeline with a muted play/pause if it stalls.
-    await presentedFrame(video, 2500);
-
-    try {
-      return {
-        imageB64: drawToPngB64(video, video.videoWidth, video.videoHeight),
-        width: video.videoWidth,
-        height: video.videoHeight,
-        // The time actually PRESENTED, not the one asked for. A request past
-        // the end clamps to `duration`, and `presentedFrame`'s play/pause nudge
-        // advances the pipeline — so the two can differ, and the caption used
-        // to assert the requested time either way. A model comparing a frame
-        // against a transcript then has no way to see the drift.
-        atSeconds: video.currentTime,
-      };
-    } catch {
-      return { error: "That video's frames couldn't be exported to an image." };
-    }
-  } finally {
-    video.remove();
-  }
-}
-
-/** Resolve once the video has actually PRESENTED a frame (safe to draw).
- * requestVideoFrameCallback fires per composited frame; on a paused,
- * just-seeked pipeline it can stall, so after 300ms a muted play/pause forces
- * a frame through the decoder. Always resolves by timeoutMs — a black frame
- * beats a hung tool call. */
-function presentedFrame(video: HTMLVideoElement, timeoutMs: number): Promise<void> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = () => {
-      if (!settled) {
-        settled = true;
-        video.pause();
-        resolve();
-      }
-    };
-    const v = video as HTMLVideoElement & {
-      requestVideoFrameCallback?: (cb: () => void) => number;
-    };
-    if (typeof v.requestVideoFrameCallback === "function") {
-      v.requestVideoFrameCallback(() => done());
-      window.setTimeout(() => {
-        if (!settled) void video.play().catch(() => done());
-      }, 300);
-    } else {
-      requestAnimationFrame(() => requestAnimationFrame(done));
-    }
-    window.setTimeout(done, timeoutMs);
-  });
-}
-
-/** Await one media event, racing "error" and a timeout — a bad token or a
- * codec WKWebView won't play must degrade to an {error} payload, not a hang. */
-function mediaEvent(
-  el: HTMLMediaElement,
-  event: string,
-  timeoutMs: number,
-): Promise<"ok" | "error" | "timeout"> {
-  return new Promise((resolve) => {
-    const finish = (result: "ok" | "error" | "timeout") => {
-      window.clearTimeout(timer);
-      el.removeEventListener(event, onOk);
-      el.removeEventListener("error", onErr);
-      resolve(result);
-    };
-    const timer = window.setTimeout(() => finish("timeout"), timeoutMs);
-    const onOk = () => finish("ok");
-    const onErr = () => finish("error");
-    el.addEventListener(event, onOk, { once: true });
-    el.addEventListener("error", onErr, { once: true });
-  });
+  return { ...(await grabFrame(token, mime, seconds, VISION_MAX_WIDTH)) };
 }

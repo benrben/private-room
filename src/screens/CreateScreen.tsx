@@ -168,8 +168,15 @@ export function CreateScreen({
           Back
         </button>
       </div>
+      {/* The password seals the room permanently, and this is the screen where
+        * it is chosen — "longer is stronger" alone read as ordinary
+        * password-strength advice. There is no reset: saying so HERE, not one
+        * screen later beside a "Skip for now" button, is the only place the
+        * warning can still change what the user types. */}
       <p className="gate-note">
-        Longer is stronger. You'll get a one-time recovery code next.
+        Longer is stronger. There is no password reset — if you forget this
+        password, only the one-time recovery code on the next screen can reopen
+        the room, and nobody (including us) can recover either one for you.
       </p>
     </form>
   );

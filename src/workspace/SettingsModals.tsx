@@ -319,6 +319,15 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
               <span className="banner-pull-label">
                 Downloading <strong>video</strong>… you can close this — it
                 keeps going and lands in the room.
+                {/* …or actually abandon it. Closing only hides a download that
+                    can run for the whole budget, so a video started by mistake
+                    used to need a force-quit. */}
+                <button
+                  className="subtle"
+                  onClick={() => void api.cancelMediaDownload().catch(() => {})}
+                >
+                  Stop download
+                </button>
               </span>
               <span className="pull-bar">
                 <span

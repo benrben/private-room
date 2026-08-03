@@ -10,6 +10,7 @@ network, no Ollama and no weights.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
 
@@ -123,6 +124,98 @@ class Cancellable(Protocol):
 
     @property
     def cancelled(self) -> bool: ...
+
+
+class StreamStalled(Exception):
+    """Nothing arrived on the token stream for the whole silence budget.
+
+    Carries no message — the call site names the engine it was waiting on.
+    """
+
+
+#: How often :func:`iter_with_stop` wakes to sample Stop while no chunk has
+#: arrived. Mirrors ``external_llm._POLL_SECS`` (the CLI half of the same
+#: watchdog) so Stop feels equally prompt on both engine families.
+_STOP_POLL_SECS = 0.25
+
+
+async def _abandon(task: "asyncio.Future[Any]") -> None:
+    """Cancel a pending ``__anext__`` and reap it, so no task outlives the read."""
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, StopAsyncIteration):
+        pass
+    except Exception:  # noqa: BLE001 - the read is being abandoned either way
+        pass
+
+
+async def iter_with_stop(
+    stream: Any,
+    cancel: Optional[Cancellable],
+    idle: float,
+) -> AsyncIterator[Any]:
+    """Yield from ``stream``, sampling Stop *while waiting for* the next chunk.
+
+    ``async for`` only reaches its body once a chunk arrives, so the plain loop
+    this replaces sampled the Stop flag exactly when the stream was healthy and
+    never when it was not. A model that goes quiet — Ollama loading weights, a
+    provider holding the connection open, a wedged socket — therefore swallowed
+    Stop entirely: the flag was set, nothing read it, and the turn ran on. Live
+    QA (2026-08-03) hit this as "Stop this answer did not stop Claude, local, or
+    other long-running work", and as Main agents queued behind a stalled
+    specialist forever, because the stalled wave never returned to a flag check.
+
+    Rust already learned this lesson on the ``#command`` path
+    (``chat_commands::watch_stream``) — the same race, the same fix, one layer
+    down. This is the sidecar's own copy.
+
+    ``idle`` bounds SILENCE, not duration: the deadline resets on every chunk, so
+    an answer that keeps arriving may take as long as it likes. Exceeding it
+    raises :class:`StreamStalled`; tripping ``cancel`` simply stops iteration, so
+    the caller keeps the partial the user already watched arrive.
+    """
+    it = stream.__aiter__()
+    aborted = False
+    try:
+        while True:
+            nxt = asyncio.ensure_future(it.__anext__())
+            deadline = time.monotonic() + idle
+            while True:
+                done, _pending = await asyncio.wait({nxt}, timeout=_STOP_POLL_SECS)
+                if done:
+                    break
+                if cancel is not None and cancel.cancelled:
+                    aborted = True
+                    await _abandon(nxt)
+                    return
+                if time.monotonic() >= deadline:
+                    aborted = True
+                    await _abandon(nxt)
+                    raise StreamStalled
+            try:
+                chunk = nxt.result()
+            except StopAsyncIteration:
+                return
+            # Also sample once the chunk is in hand: a stream that is never idle
+            # (a fast local model, a buffered replay) never reaches the wait
+            # branch above, and Stop must still land BEFORE this chunk is
+            # processed — that is the in-flight break ADD-7 / F1 added.
+            if cancel is not None and cancel.cancelled:
+                aborted = True
+                return
+            yield chunk
+    finally:
+        # Only when we walked away mid-read: a stream drained to StopAsyncIteration
+        # has already closed itself, and closing a live one the caller merely broke
+        # out of is the caller's call, not ours.
+        if aborted:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001 - best-effort close
+                    pass
 
 
 class ChatModel(Protocol):
@@ -586,24 +679,39 @@ class OllamaChatModel:
         parts: list[str] = []
         merged: AIMessageChunk | None = None
         stream = llm.astream(_to_langchain(send))
-        async for chunk in stream:
-            # ADD-7 / F1: Stop must break the token stream mid-flight, not only
-            # between rounds. On the plain-chat path the whole answer is one
-            # stream, so without this Stop is a no-op until generation finishes.
-            if cancel is not None and cancel.cancelled:
-                aclose = getattr(stream, "aclose", None)
-                if aclose is not None:
-                    await aclose()
-                break
-            if not isinstance(chunk, AIMessageChunk):  # pragma: no cover - defensive
-                continue
-            merged = chunk if merged is None else merged + chunk
-            delta = _chunk_text(chunk.content)
-            if restorer is not None:
-                delta = restorer.feed(delta)
-            if delta:
-                parts.append(delta)
-                await on_delta(delta)
+        # ADD-7 / F1: Stop must break the token stream mid-flight, not only
+        # between rounds. On the plain-chat path the whole answer is one
+        # stream, so without this Stop is a no-op until generation finishes.
+        #
+        # The check used to sit in the loop body, which meant it ran only once a
+        # chunk had already arrived — i.e. never on the stalls it existed for.
+        # `iter_with_stop` polls the flag WHILE the read is outstanding and
+        # bounds the silence, so a daemon that wedges before the first token
+        # ends the turn instead of hanging it (see live QA 2026-08-03).
+        try:
+            guarded = iter_with_stop(stream, cancel, REQUEST_TIMEOUT_SECONDS)
+            async for chunk in guarded:
+                if not isinstance(chunk, AIMessageChunk):  # pragma: no cover - defensive
+                    continue
+                merged = chunk if merged is None else merged + chunk
+                delta = _chunk_text(chunk.content)
+                if restorer is not None:
+                    delta = restorer.feed(delta)
+                if delta:
+                    parts.append(delta)
+                    await on_delta(delta)
+        except StreamStalled as exc:
+            # Silent for the whole budget: report it as an engine error rather
+            # than hand back a partial that reads like a finished answer. Same
+            # contract the CLI path uses for a wedged child (external_llm).
+            # Imported here, not at module scope: `llm` imports THIS module.
+            from .llm import LlmError
+
+            raise LlmError(
+                "ENGINE_ERROR",
+                f"{self.model} sent nothing for {REQUEST_TIMEOUT_SECONDS:g}s "
+                "and was stopped.",
+            ) from exc
         if restorer is not None:
             tail = restorer.flush()
             if tail:
@@ -681,4 +789,12 @@ class OllamaChatModel:
         return RoundUsage(input_tokens=None, max_context=max_context, is_real=False)
 
 
-__all__ = ["ChatModel", "OllamaChatModel", "DeltaSink", "Cancellable", "RoundUsage"]
+__all__ = [
+    "ChatModel",
+    "OllamaChatModel",
+    "DeltaSink",
+    "Cancellable",
+    "RoundUsage",
+    "StreamStalled",
+    "iter_with_stop",
+]

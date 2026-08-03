@@ -6,14 +6,20 @@ interface Props {
   setWebOn: (v: boolean) => void;
   webTesting: boolean;
   testWebSearch: () => void;
-  saveWebAccess: () => void;
+  /** Rejects when nothing was stored, so the caller must swallow it — the
+   *  panel's own error line is the report, not an unhandled rejection. */
+  saveWebAccess: () => Promise<void>;
   webSaved: boolean;
+  webDirty: boolean;
+  webError: string;
   webTestResult: string;
   AlertIcon: IconComponent;
   searchAgent: boolean;
   setSearchAgent: (v: boolean) => void;
   browseAgent: boolean;
   setBrowseAgent: (v: boolean) => void;
+  resultPreviews: boolean;
+  setResultPreviews: (v: boolean) => void;
 }
 
 export default function OnlineSection({
@@ -23,12 +29,16 @@ export default function OnlineSection({
   testWebSearch,
   saveWebAccess,
   webSaved,
+  webDirty,
+  webError,
   webTestResult,
   AlertIcon,
   searchAgent,
   setSearchAgent,
   browseAgent,
   setBrowseAgent,
+  resultPreviews,
+  setResultPreviews,
 }: Props) {
   return (
     <section id="set-online">
@@ -104,6 +114,25 @@ export default function OnlineSection({
                     driving it.
                   </p>
                 )}
+                {/* BROWSE-3b. The results page has always pointed here to turn
+                    previews off; the switch it pointed at did not exist, so the
+                    only honest options were to build it or to stop saying so. */}
+                <label className="settings-label">Search results</label>
+                <label className="settings-label">
+                  <input
+                    type="checkbox"
+                    checked={resultPreviews}
+                    onChange={(e) => setResultPreviews(e.target.checked)}
+                  />{" "}
+                  Show previews on the results page — read the top few result
+                  pages for their own picture and description
+                </label>
+                <p className="settings-hint">
+                  Arcelle reads those pages itself: no cookies, no scripts, no
+                  browser fingerprint. Turn it off and a search contacts only
+                  the search engines — the cards then show initials instead of
+                  pictures.
+                </p>
               </>
             )}
             <div className="settings-actions">
@@ -114,10 +143,28 @@ export default function OnlineSection({
               >
                 {webTesting ? "Testing…" : "Test search"}
               </button>
-              <button className="primary btn-ic" onClick={saveWebAccess}>
+              <button
+                className="primary btn-ic"
+                onClick={() => void saveWebAccess().catch(() => {})}
+              >
                 {webSaved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
               </button>
             </div>
+            {/* Unticking the internet switch and closing Settings used to
+                discard the change in silence — the user believed the room was
+                offline and it was not. Say it out loud instead. */}
+            {webDirty && !webSaved && (
+              <p className="settings-hint" role="status">
+                <AlertIcon size={13} className="warn-ic" /> Not saved yet —
+                press Save, or these changes are discarded when you close
+                Settings.
+              </p>
+            )}
+            {webError && (
+              <p className="settings-hint" role="alert">
+                <AlertIcon size={13} className="warn-ic" /> {webError}
+              </p>
+            )}
             {webTestResult && (
               <p className="settings-hint">{webTestResult}</p>
             )}

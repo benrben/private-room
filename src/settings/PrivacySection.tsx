@@ -1,4 +1,36 @@
 import { CircleCheckIcon } from "../icons";
+import { passwordCriteria, passwordStrength } from "../rooms/helpers";
+import { MIN_PASSWORD } from "../rooms/constants";
+
+/** The Create screen's strength meter + checklist, reused verbatim here.
+ *
+ * Creating a room showed a live meter and a checklist; CHANGING a password —
+ * and setting one on a duplicate — showed three blank boxes and then an error
+ * after the button, which is the worst moment to learn a rule. Same component
+ * both places so the guidance cannot drift, and the minimum comes from
+ * `MIN_PASSWORD` rather than being typed out by hand a third and fourth time. */
+function PasswordFeedback({ password }: { password: string }) {
+  const strength = passwordStrength(password);
+  return (
+    // Always mounted (like CreateScreen's) so it does not shove the field
+    // below it down on the first keystroke.
+    <div className={`pw-feedback${password ? "" : " reserved"}`} aria-hidden={!password}>
+      <div className={`pw-meter ${strength.level}`}>
+        <div className="pw-meter-track">
+          <div className="pw-meter-fill" />
+        </div>
+        <span className="pw-meter-label">{strength.label}</span>
+      </div>
+      <ul className="pw-criteria">
+        {passwordCriteria(password).map((c) => (
+          <li key={c.label} className={c.met ? "met" : undefined}>
+            {c.met ? "\u2713" : "\u25cb"} {c.label}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 interface Props {
   autolock: string;
@@ -103,10 +135,11 @@ export default function PrivacySection({
               />
               <input
                 type="password"
-                placeholder="New password"
+                placeholder={`New password (at least ${MIN_PASSWORD} characters)`}
                 value={pwNew}
                 onChange={(e) => setPwNew(e.target.value)}
               />
+              <PasswordFeedback password={pwNew} />
               <input
                 type="password"
                 placeholder="Repeat new password"
@@ -209,10 +242,11 @@ export default function PrivacySection({
               </div>
               <input
                 type="password"
-                placeholder="New password for the copy (optional)"
+                placeholder={`New password for the copy (optional, at least ${MIN_PASSWORD} characters)`}
                 value={dupPassword}
                 onChange={(e) => setDupPassword(e.target.value)}
               />
+              {dupPassword && <PasswordFeedback password={dupPassword} />}
               <input
                 type="password"
                 placeholder="Repeat new password"

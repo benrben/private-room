@@ -10,7 +10,8 @@
 //! * the room's resolved policy, cached so every sidecar request body and the
 //!   external-CLI path can consult it without re-reading the DB;
 //! * the mechanical redact/restore engine (aho-corasick, ASCII-case-insensitive
-//!   — Hebrew has no case, so exact matching there is already right);
+//!   plus explicit case spellings for every non-ASCII rule, so this half folds
+//!   case for the same scripts the sidecar's `re.I` does);
 //! * the tauri commands behind the Settings section, the reader's cloud view,
 //!   and the chat valve;
 //! * the background scan runner that keeps per-file scan state fresh.
@@ -41,14 +42,69 @@ pub struct PrivacyReport {
     pub images_blocked: usize,
 }
 
+/// The shortest a protected item may be, in characters.
+///
+/// Anything shorter is dropped by the redactor: a one-character rule matches
+/// somewhere in almost every sentence and would turn the whole payload into
+/// placeholders. Settings used to accept one anyway, so the panel listed an
+/// item as protected that the door silently ignored — and if it was the ONLY
+/// item, the room's whole shield (including holding images back) switched off.
+/// The floor is enforced where an item is ADDED as well as where it is used.
+pub(crate) const MIN_PROTECTED_CHARS: usize = 2;
+
+/// Can this text be enforced mechanically? The one definition, shared by the
+/// block-list command, the scanner's ingest, and the redactor's own filter.
+pub(crate) fn is_protectable(text: &str) -> bool {
+    text.trim().chars().count() >= MIN_PROTECTED_CHARS
+}
+
 /// The compiled redact/restore engine over the room's entity map.
+///
+/// KNOWN, DELIBERATE over-redaction (AUDIT, left as-is pending an owner call).
+/// Matching is plain substring, not whole-word, so a room protecting "Ben"
+/// turns "benchmark" into "[Person B]chmark" in what the cloud model reads. It
+/// is real and it can make an answer worse. The obvious fix — word boundaries —
+/// was tried and rejected because it does not only tidy text, it HIDES LESS:
+/// a protected phone number "5551234" stops matching inside "+9725551234", and
+/// an unspaced "BenReich" stops matching either rule. Trading a guaranteed leak
+/// for tidier prompts is the wrong direction for this component, so the failure
+/// is left pointing the safe way. `substring_matching_over_redacts_but_never_leaks`
+/// pins the two properties any future fix must keep.
 pub(crate) struct Redactor {
-    /// (real, placeholder), longest real first (index-aligned with `ac`).
+    /// (real, placeholder), longest real first — the room's rules as stored.
     rules: Vec<(String, String)>,
+    /// What `ac` actually matches: every rule PLUS, for any rule containing
+    /// non-ASCII letters, its lower- and upper-cased spellings mapped to the
+    /// same placeholder (index-aligned with `ac`).
+    ///
+    /// `AhoCorasick`'s `ascii_case_insensitive` folds A–Z and nothing else, so
+    /// "José" was matched only in the exact capitalisation the room stored it
+    /// in — while the sidecar half of the same door uses Python's `re.I`, which
+    /// folds every script. The two halves therefore disagreed about the same
+    /// name, and the disagreement fell on the Mac side: the "what the cloud
+    /// sees" preview and the outbound remote-connector masking (both Rust) let
+    /// the real spelling through. Widening the pattern set here rather than
+    /// dropping to a slower engine keeps the match semantics identical.
+    redact_patterns: Vec<(String, String)>,
     ac: Option<AhoCorasick>,
     /// placeholder -> real (index-aligned with `restore_ac`).
     restore: Vec<(String, String)>,
     restore_ac: Option<AhoCorasick>,
+}
+
+/// A rule's extra spellings for the matcher: nothing for plain ASCII (the
+/// matcher already folds that itself), and the lower/upper forms otherwise.
+fn case_variants(real: &str) -> Vec<String> {
+    if real.is_ascii() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for variant in [real.to_lowercase(), real.to_uppercase()] {
+        if variant != real && !out.contains(&variant) {
+            out.push(variant);
+        }
+    }
+    out
 }
 
 fn build_ac(patterns: &[String]) -> Option<AhoCorasick> {
@@ -64,14 +120,28 @@ fn build_ac(patterns: &[String]) -> Option<AhoCorasick> {
 
 impl Redactor {
     pub(crate) fn new(mut rules: Vec<(String, String)>) -> Self {
-        rules.retain(|(r, p)| r.trim().len() >= 2 && !p.trim().is_empty());
+        rules.retain(|(r, p)| is_protectable(r) && !p.trim().is_empty());
         rules.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-        let ac = build_ac(&rules.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>());
+        // The matcher's table is the rules PLUS their non-ASCII case spellings
+        // (see `redact_patterns`). Longest-first here too, so LeftmostLongest
+        // still prefers "Ben Reich" over "Ben" whichever spelling matched.
+        let mut redact_patterns: Vec<(String, String)> = rules.clone();
+        for (real, placeholder) in &rules {
+            for variant in case_variants(real) {
+                redact_patterns.push((variant, placeholder.clone()));
+            }
+        }
+        redact_patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let ac = build_ac(
+            &redact_patterns.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        );
+        // Restore is built from the CANONICAL rules only: a placeholder must
+        // come back as the room's own spelling, not a case variant of it.
         let mut restore: Vec<(String, String)> =
             rules.iter().map(|(r, p)| (p.clone(), r.clone())).collect();
         restore.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         let restore_ac = build_ac(&restore.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
-        Redactor { rules, ac, restore, restore_ac }
+        Redactor { rules, redact_patterns, ac, restore, restore_ac }
     }
 
     fn sub(
@@ -83,14 +153,19 @@ impl Redactor {
         let Some(ac) = ac else { return text.to_string() };
         let mut out = String::with_capacity(text.len());
         let mut last = 0;
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Distinct ENTITIES, keyed by what they were replaced with — not by
+        // pattern index. One entity can now own several patterns (its non-ASCII
+        // case spellings), and a name hidden in two capitalisations is still
+        // one name hidden.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut replacements = 0usize;
         for m in ac.find_iter(text) {
+            let replacement = &table[m.pattern().as_usize()].1;
             out.push_str(&text[last..m.start()]);
-            out.push_str(&table[m.pattern().as_usize()].1);
+            out.push_str(replacement);
             last = m.end();
             replacements += 1;
-            seen.insert(m.pattern().as_usize());
+            seen.insert(replacement.as_str());
         }
         out.push_str(&text[last..]);
         if let Some(r) = report {
@@ -102,7 +177,7 @@ impl Redactor {
 
     /// real → placeholder (counted).
     pub(crate) fn redact(&self, text: &str, report: &mut PrivacyReport) -> String {
-        Self::sub(&self.ac, &self.rules, text, Some(report))
+        Self::sub(&self.ac, &self.redact_patterns, text, Some(report))
     }
 
     /// placeholder → real.
@@ -194,12 +269,30 @@ fn policy_cell() -> &'static StdMutex<Option<Arc<PolicyState>>> {
 }
 
 /// The current policy when it is ACTIVE (switch on) — the enforcement getter.
+///
+/// The switch is the WHOLE condition. It used to also require a non-empty
+/// entity map, on the reasonable-sounding logic that with nothing to replace
+/// there is nothing to do — but the entity map is only ONE of the three things
+/// this policy carries, and the other two need no entities at all:
+///
+///   * `concepts` — the topic rules the user typed ("my health", "my kids").
+///     They are enforced by the sidecar's live guard, which never runs if the
+///     policy is not attached.
+///   * images — the door strips every attached image out of a non-local
+///     request. Pixels cannot be redacted, so this is the only protection a
+///     photograph or a scan gets.
+///
+/// So in a brand-new room — no scan has finished, nothing on the block list —
+/// the panel said the door was ON while topic rules were never applied and
+/// photographs went to the cloud in full. That is the badge promising something
+/// the code did not do, which is the one thing this app does not get to do.
+///
+/// A policy with an empty entity map still redacts nothing, exactly as before;
+/// what changes is that it is now ATTACHED, so the other two protections
+/// engage. See `remote_seam_redactor` for the one getter that is genuinely
+/// about the entity map and still tests it.
 pub(crate) fn active_policy() -> Option<Arc<PolicyState>> {
-    policy_cell()
-        .lock()
-        .unwrap()
-        .clone()
-        .filter(|p| p.active && !p.redactor.is_empty())
+    policy_cell().lock().unwrap().clone().filter(|p| p.active)
 }
 
 /// The room's redactor for the OUTBOUND remote-connector seam. Unlike
@@ -210,11 +303,14 @@ pub(crate) fn active_policy() -> Option<Arc<PolicyState>> {
 /// and the SEC-1b per-call consent (which shows the user the exact args) is the
 /// floor. Whatever the local scanner has found for this room is enforced here.
 ///
-/// ONE caller-side exception (`exec_tool`): connector "auto mode" skips this
-/// seam entirely, so an approved agent sends real arguments. Masking rewrites
-/// the values being asked ABOUT, which silently broke lookups; auto mode is
-/// the user's explicit "full approval". This function stays switch-blind — the
-/// exception lives at the call site, where the auto-mode flag is known.
+/// ONE caller-side exception (`exec_tool`): Connectors → "Send remote
+/// connectors real values" (`mcp_outbound_unmask`) skips this seam entirely, so
+/// the connector receives real arguments. Masking rewrites the values being
+/// asked ABOUT, which silently broke lookups. That is the ONLY flag with this
+/// power — until the 2026-08-03 split it was the same switch as "run connector
+/// tools without asking", which meant needing a working lookup also cost you
+/// the consent card. This function stays switch-blind — the exception lives at
+/// the call site, where the unmasking flag is known.
 pub(crate) fn remote_seam_redactor() -> Option<Arc<PolicyState>> {
     policy_cell()
         .lock()
@@ -223,9 +319,154 @@ pub(crate) fn remote_seam_redactor() -> Option<Arc<PolicyState>> {
         .filter(|p| !p.redactor.is_empty())
 }
 
+/// Are remote-connector arguments being masked RIGHT NOW? The one fact the
+/// Cloud-privacy panel cannot derive from its own switch.
+///
+/// Every other seam this module guards is governed by `active`, so the panel
+/// could describe them all from `effective_on`: door off ⇒ real values leave.
+/// The connector seam is the exception ([`remote_seam_redactor`] is
+/// switch-blind, deliberately), and the panel's off-state warning therefore
+/// used to state the opposite of what happens — "questions, documents and tool
+/// results go to cloud models with real names", full stop, while a remote
+/// connector was still being asked about `[Person A]`. That is the exact shape
+/// of the 2026-07-24 misdiagnosis: silent outbound masking read as a broken
+/// connector, and the panel a user checks first said masking was impossible.
+///
+/// Reported rather than changed. Masking here is not weakened by the switch —
+/// it is made visible, so both switches can be believed.
+pub(crate) fn connector_args_masked(unmask_outbound: bool) -> bool {
+    remote_seam_redactor().is_some() && super::masks_outbound_args(true, unmask_outbound)
+}
+
+/// PRIV-4 — the WEB seam. Mask the room's protected entities out of a string
+/// the AGENT is about to send to a public web service (a `web_search` query, a
+/// `fetch_page` URL).
+///
+/// Why this seam exists at all: the door redacts on the way to a cloud model,
+/// then RESTORES placeholders in the tool-call arguments coming back, because a
+/// room tool must see the real name to find anything (`Redactor::restore_value`,
+/// and its sidecar twin `PrivacyPolicy.restore_value`). That restore is right
+/// for a tool that reads the room's own database and wrong for a tool whose
+/// argument leaves the Mac: a cloud model asking to search "[Person A]" had the
+/// real name put back and handed to seven search engines. The whole point of the
+/// entity map is that those names do not leave.
+///
+/// Governed by the SWITCH (`active_policy`), unlike the remote-connector seam.
+/// A remote connector is a hard non-local destination whatever the user thinks;
+/// the web is a destination the user chose by turning web access on, and with
+/// the door off real names already flow to cloud models, so masking here would
+/// be protecting against a threat the user has already accepted — while quietly
+/// breaking every search for a name on the block list.
+///
+/// Returns `None` when nothing changed, so a caller can stay silent unless it
+/// actually has something to disclose. Never silent when it DID change: every
+/// caller says so in the tool result (anti-fabrication — the model must not
+/// report a search it believes was about the real name).
+pub(crate) fn mask_outbound_web(text: &str) -> Option<(String, usize)> {
+    let policy = active_policy()?;
+    let mut report = PrivacyReport::default();
+    let masked = policy.redactor.redact(text, &mut report);
+    (masked != text).then_some((masked, report.entities_hidden))
+}
+
+/// Percent-decode, permissively: a malformed `%` sequence is left alone rather
+/// than dropped. Only used to LOOK at a URL, never to rebuild one, so being
+/// generous costs nothing and being strict would open the hole below.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        // `+` is a space in a query string, and "Ben+Reich" is the single most
+        // likely spelling of a name a model puts in a search URL.
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Does this URL carry any of the room's protected names? Returns how many.
+///
+/// Separate from [`mask_outbound_web`] because a URL is ENCODED: a cloud model
+/// writing `https://example.com/?q=Ben%20Reich` (or `Ben+Reich`) hands over the
+/// real name while the raw string contains no entity the redactor can see. The
+/// callers refuse rather than mask — a URL with a placeholder in its path or
+/// query only 404s — so this answers the question a refusal needs and nothing
+/// more. Governed by the switch, exactly like `mask_outbound_web`.
+pub(crate) fn outbound_url_hides(url: &str) -> Option<usize> {
+    let policy = active_policy()?;
+    let mut report = PrivacyReport::default();
+    let hits = |text: &str, report: &mut PrivacyReport| {
+        policy.redactor.redact(text, report) != text
+    };
+    let decoded = percent_decode(url);
+    let leaks = hits(url, &mut report) || hits(&decoded, &mut report);
+    leaks.then(|| report.entities_hidden.max(1))
+}
+
+/// The disclosure line that goes with [`mask_outbound_web`]. Says what was done
+/// and how to undo it, so a masked search cannot read as a failed one.
+pub(crate) fn web_mask_note(hidden: usize) -> String {
+    format!(
+        "\n\nNote: {hidden} protected name(s) in this request were replaced with placeholders \
+         before it left this Mac (Settings → Cloud privacy). The results are for the masked \
+         wording, NOT the real name — say so rather than presenting them as results for the \
+         real name."
+    )
+}
+
 /// Room closed: no policy may outlive the room (teardown invariant).
 pub(crate) fn clear_policy() {
     *policy_cell().lock().unwrap() = None;
+}
+
+/// The policy cell is process-global, so any two tests that write it would race
+/// under cargo's parallel runner. Every such test holds this first.
+#[cfg(test)]
+pub(crate) fn policy_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: StdMutex<()> = StdMutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Cache a minimal ACTIVE policy so sibling modules can test what the door
+/// changes about their own behaviour. The cell stays private outside tests —
+/// only `set_policy` (room open) fills it in a real run.
+#[cfg(test)]
+pub(crate) fn set_active_policy_for_test() {
+    set_policy_for_test(true);
+}
+
+/// Same, with the switch chosen by the caller — the door being OFF is a state
+/// with its own documented behaviour at the connector seam, so it needs a
+/// fixture too.
+#[cfg(test)]
+pub(crate) fn set_policy_for_test(active: bool) {
+    set_policy_rules_for_test(
+        active,
+        vec![("Ben Reich".to_string(), "[Person A]".to_string())],
+    );
+}
+
+/// …and with the entity map chosen by the caller, for the doors whose behaviour
+/// turns on WHICH entities a room happens to hold (the browser's outbound
+/// typing door and its non-ASCII case folding).
+#[cfg(test)]
+pub(crate) fn set_policy_rules_for_test(active: bool, rules: Vec<(String, String)>) {
+    *policy_cell().lock().unwrap() = Some(Arc::new(PolicyState {
+        active,
+        redactor: Redactor::new(rules.clone()),
+        rules,
+        concepts: vec![],
+        guard_model: DEFAULT_MODEL.to_string(),
+    }));
 }
 
 fn parse_concepts(raw: Option<String>) -> Vec<String> {
@@ -291,9 +532,11 @@ fn compute_policy(app: &tauri::AppHandle, state: &AppState) -> Option<PolicyStat
     // The live guard + scanner need a model that runs ON THIS MAC. The room's
     // chosen model qualifies only when local; otherwise the tuned default.
     let room_model = model_setting(&room.conn).unwrap_or_default();
+    // `runs_on_this_mac` — the ONE definition of "runs here" — rather than the
+    // pair of name tests, which missed Ollama's `<size>-cloud` spelling and so
+    // would have made a HOSTED model the guard for the privacy door itself.
     let guard_model = if !room_model.is_empty()
-        && !is_external_engine(&room_model)
-        && !is_cloud_model(&room_model)
+        && runs_on_this_mac(&room_model)
         && !is_embedding_model(&room_model)
     {
         room_model
@@ -318,7 +561,11 @@ fn compute_policy(app: &tauri::AppHandle, state: &AppState) -> Option<PolicyStat
 /// `privacy.guard_outbound` no-ops on a missing policy.
 pub(crate) fn inject_policy(body: &serde_json::Value) -> Option<serde_json::Value> {
     let model = body.get("model").and_then(|m| m.as_str())?;
-    if !(is_cloud_model(model) || is_external_engine(model)) {
+    // EXTENDS the door, never narrows it: `runs_on_this_mac` is strictly more
+    // conservative than the pair it replaces — it also catches Ollama's
+    // `<size>-cloud` spelling (`gpt-oss:120b-cloud`), which used to reach the
+    // sidecar with NO policy attached at all because neither name test matched.
+    if runs_on_this_mac(model) {
         return None;
     }
     if body.get("privacy").is_some() {
@@ -366,6 +613,10 @@ pub struct PrivacyStatus {
     /// Files whose scan is missing or stale under the current rules.
     pub pending_files: usize,
     pub scanning: bool,
+    /// Whether remote-connector arguments are masked right now — see
+    /// [`connector_args_masked`]. Independent of `effective_on`, which is why
+    /// the panel has to be told rather than infer it.
+    pub connector_args_masked: bool,
 }
 
 #[tauri::command]
@@ -374,6 +625,17 @@ pub async fn privacy_status(
     state: State<'_, AppState>,
 ) -> Result<PrivacyStatus, String> {
     let global_on = global_default_on(&app);
+    // The Mac-wide switch, not `outbound_unmask_for`, because this is a
+    // room-wide statement with no one connector in view — and because
+    // `effective_power` currently returns the global switch for every
+    // connector anyway, so the two agree. If per-connector overrides are ever
+    // made to bite, this becomes a per-connector question and the panel's two
+    // notes have to be able to appear together (some masked, some not).
+    let connector_masked = connector_args_masked(
+        state
+            .mcp_outbound_unmask
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
     state.with_room(|room| {
         let switch = db::get_setting(&room.conn, KEY_SWITCH);
         let effective = match switch.as_deref() {
@@ -395,6 +657,7 @@ pub async fn privacy_status(
             concepts,
             pending_files: pending,
             scanning: scan_running(),
+            connector_args_masked: connector_masked,
         })
     })
 }
@@ -451,6 +714,17 @@ pub async fn add_privacy_block(
         "person" | "address" | "phone" | "email" | "id" | "org" => category.as_str(),
         _ => "concept",
     };
+    // The door's own floor, enforced at the door's own entrance. Settings used
+    // to accept a single character, list it as protected, and then have the
+    // redactor drop it — so the panel showed protection that was not happening,
+    // and a room whose ONLY item was that one character had no active policy at
+    // all (images included). Refusing it here is the honest half of that fix.
+    if !is_protectable(&text) {
+        return Err(format!(
+            "A protected item needs at least {MIN_PROTECTED_CHARS} characters — \
+             anything shorter would match almost every word."
+        ));
+    }
     let entity = state.with_room(|room| db::add_privacy_entity(&room.conn, &text, cat, "user"))?;
     refresh_policy(&app, &state);
     Ok(entity)
@@ -533,7 +807,10 @@ pub async fn privacy_preview(
         let text: Option<String> = room
             .conn
             .query_row(
-                "SELECT extracted_text FROM files WHERE id = ?1",
+                // Trash: same rule as every other by-id content read — a
+                // deleted file is not previewable, or a stale id in an open
+                // blackout view would keep rendering its text.
+                "SELECT extracted_text FROM files WHERE id = ?1 AND trashed_at IS NULL",
                 [&file_id],
                 |r| r.get(0),
             )
@@ -651,8 +928,22 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
         }
     };
 
+    // Files this RUN could not scan. A transient failure leaves no scan row, so
+    // the file comes straight back in the next work list — and with nothing
+    // remembering that it just failed, one document that always fails made this
+    // outer loop spin forever: the machine stayed busy, Settings said
+    // "scanning" for good, and (because `payload` withholds the guard model
+    // while a scan is running) the live guard stayed off for every cloud chat
+    // in the meantime. Remembering them ends the run honestly instead.
+    // Cleared whenever the rules change, since a new generation is a new run.
+    let mut failed: HashSet<String> = HashSet::new();
+    let mut failed_generation = scan_generation().load(Ordering::SeqCst);
     loop {
         let generation = scan_generation().load(Ordering::SeqCst);
+        if generation != failed_generation {
+            failed.clear();
+            failed_generation = generation;
+        }
         // Snapshot the work list + scan config under the room lock.
         let state = app.state::<AppState>();
         let snapshot = {
@@ -680,6 +971,20 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
         let (concepts, sha, work, mut known, guard_model) = snapshot;
         if work.is_empty() {
             return None;
+        }
+        // Anything that already failed this run is not retried in it.
+        let work: Vec<_> = work.into_iter().filter(|(id, _, _)| !failed.contains(id)).collect();
+        if work.is_empty() {
+            // Everything left is something we just failed on. Say so — counts
+            // only, never a file name (a name is room content) — and stop, so
+            // the next import or "Scan now" is what retries.
+            return Some(format!(
+                "{} file{} couldn't be scanned all the way through this time — \
+                 anything found so far is protected, the rest is not yet. They'll \
+                 be retried on the next import, or when you press Scan now.",
+                failed.len(),
+                if failed.len() == 1 { "" } else { "s" }
+            ));
         }
         let total = work.len();
         for (i, (file_id, name, text)) in work.into_iter().enumerate() {
@@ -734,11 +1039,42 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
                     for f in findings {
                         let real = f.get("text").and_then(|t| t.as_str()).unwrap_or("");
                         let cat = f.get("category").and_then(|c| c.as_str()).unwrap_or("concept");
+                        // Same floor as the block list: a one-character finding
+                        // would be listed as protected and then ignored.
+                        if !is_protectable(real) {
+                            continue;
+                        }
                         if let Ok(e) = db::add_privacy_entity(&room.conn, real, cat, "scan") {
                             known.push(e.real_text);
                         }
                     }
-                    let _ = db::set_privacy_scan(&room.conn, &file_id, &hex_sha(text.as_bytes()), &sha);
+                    // A scan that stopped short (a chunk's model call failed, or
+                    // the 300-finding cap cut it off) never read the tail of the
+                    // document. Its findings are kept — every one of them is a
+                    // real protection — but the scan ROW is not written, because
+                    // that row is the claim "this file is protected" and the
+                    // unread remainder would still go to a cloud model in full.
+                    // Absent the flag (older sidecar) we assume complete, which
+                    // is the pre-existing behaviour rather than a new silence.
+                    let complete = v.get("complete").and_then(|c| c.as_bool()).unwrap_or(true);
+                    if complete {
+                        // The digest goes through db::privacy_text_sha because
+                        // the staleness reader recomputes it the same way — a
+                        // second spelling here would either re-scan the library
+                        // forever or never re-scan an edited file again.
+                        let _ = db::set_privacy_scan(
+                            &room.conn,
+                            &file_id,
+                            &db::privacy_text_sha(&text),
+                            &sha,
+                        );
+                    } else {
+                        // Not marked done, so a later run continues it; remembered
+                        // here so THIS run doesn't come straight back to it and
+                        // spin. The run-end message says how many were partial.
+                        failed.insert(file_id);
+                        continue;
+                    }
                 }
                 Err(e) if e.code == "OLLAMA_DOWN" || e.code == "MODEL_MISSING" => {
                     // No engine to scan with — stop and SAY SO (a silent stop
@@ -757,7 +1093,9 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
                 }
                 Err(_) => {
                     // Transient failure on this file: leave it stale (no scan
-                    // row) so the next run retries it; keep going.
+                    // row) so a LATER run retries it, but remember it so THIS
+                    // run does not come straight back to it forever.
+                    failed.insert(file_id);
                     continue;
                 }
             }
@@ -787,6 +1125,37 @@ mod tests {
         assert_eq!(out, "[Person A] lives at [Address A]. [Person B] was here.");
         assert_eq!(report.replacements, 3);
         assert_eq!(report.entities_hidden, 3);
+    }
+
+    /// AUDIT (medium, deliberately NOT "fixed"): substring matching over-redacts
+    /// — "benchmark" comes out mangled when "Ben" is protected. That is ugly and
+    /// it is recorded here so nobody rediscovers it as news. What this test
+    /// actually guards is the other half: the two cases a word-boundary fix
+    /// would silently start LEAKING. If someone makes the first assertion pass,
+    /// the last two must still pass.
+    #[test]
+    fn substring_matching_over_redacts_but_never_leaks() {
+        let r = Redactor::new(vec![
+            ("Ben Reich".into(), "[Person A]".into()),
+            ("Ben".into(), "[Person B]".into()),
+            ("5551234".into(), "[Phone A]".into()),
+        ]);
+        let mut report = PrivacyReport::default();
+        // Known cost, stated plainly.
+        assert_eq!(r.redact("the benchmark ran", &mut report), "the [Person B]chmark ran");
+
+        // Non-negotiable: a protected number inside a longer number still goes.
+        let mut report = PrivacyReport::default();
+        let out = r.redact("call +9725551234 now", &mut report);
+        assert!(!out.contains("5551234"), "a protected number leaked: {out}");
+
+        // Non-negotiable: an unspaced spelling of a protected name still goes.
+        let mut report = PrivacyReport::default();
+        let out = r.redact("from BenReich@example.com", &mut report);
+        assert!(
+            !out.to_lowercase().contains("ben"),
+            "a protected name leaked unspaced: {out}"
+        );
     }
 
     #[test]
@@ -839,6 +1208,117 @@ mod tests {
     }
 
     #[test]
+    fn remote_seam_survives_the_switch_but_active_policy_does_not() {
+        // The documented asymmetry, pinned: the model seams follow `active`,
+        // the outbound connector seam does not. A change to either getter that
+        // silently aligned them would land here — one direction weakens the
+        // door, the other re-opens the model leak.
+        let _guard = policy_test_lock();
+        clear_policy();
+        assert!(remote_seam_redactor().is_none()); // no room open: nothing to mask
+        set_policy_for_test(false);
+        assert!(
+            active_policy().is_none(),
+            "switch off: cloud models must get the raw text the panel promises"
+        );
+        let seam = remote_seam_redactor().expect("connector seam ignores the switch");
+        assert!(!seam.active);
+        let mut report = PrivacyReport::default();
+        let sent = seam
+            .redactor
+            .redact_value(&serde_json::json!({"q": "mail from Ben Reich"}), &mut report);
+        assert_eq!(sent["q"], "mail from [Person A]");
+        assert_eq!(report.entities_hidden, 1);
+        clear_policy();
+    }
+
+    #[test]
+    fn web_seam_masks_a_restored_name_before_it_reaches_a_search_engine() {
+        // PRIV-4. The leak this closes: the door hands a cloud model
+        // "[Person A]", the model asks to search for it, `restore_value` puts
+        // the real name back for the room tools — and `web_search` is not a room
+        // tool. Before the fix the query left the Mac as "Ben Reich".
+        let _guard = policy_test_lock();
+        clear_policy();
+        assert!(
+            mask_outbound_web("Ben Reich CV").is_none(),
+            "no room open: nothing to mask, and no note to invent"
+        );
+        set_policy_for_test(true);
+        let (masked, hidden) =
+            mask_outbound_web("Ben Reich CV").expect("a protected name must not leave");
+        assert_eq!(masked, "[Person A] CV");
+        assert_eq!(hidden, 1);
+        // Silence is only allowed when nothing changed.
+        assert!(mask_outbound_web("weather in Haifa").is_none());
+        // And the disclosure names the count, so a masked search cannot be
+        // reported to the user as a search for the real name.
+        assert!(web_mask_note(hidden).contains('1'));
+        // Switch OFF: real names already go to cloud models, so masking here
+        // would break lookups while protecting nothing the user has not already
+        // accepted. This is the documented asymmetry with the connector seam.
+        set_policy_for_test(false);
+        assert!(mask_outbound_web("Ben Reich CV").is_none());
+        clear_policy();
+    }
+
+    /// The refusing half of PRIV-4's web seam, and the hole a raw-string check
+    /// leaves: a URL is ENCODED. `fetch_page`/`browse_open` were checked with
+    /// `mask_outbound_web`, which reads the literal characters — so a cloud
+    /// model writing "?q=Ben%20Reich" or "?q=Ben+Reich" handed the real name
+    /// straight out, which is exactly the exfiltration shape the refusal exists
+    /// to stop.
+    #[test]
+    fn an_encoded_name_in_a_url_is_still_caught() {
+        let _guard = policy_test_lock();
+        clear_policy();
+        assert_eq!(outbound_url_hides("https://x.test/?q=Ben%20Reich"), None);
+
+        set_policy_for_test(true);
+        // Plain, percent-encoded, and the query-string "+ is a space" spelling.
+        for url in [
+            "https://x.test/?q=Ben Reich",
+            "https://x.test/?q=Ben%20Reich",
+            "https://x.test/?q=Ben+Reich",
+            "https://x.test/Ben%20Reich/cv",
+        ] {
+            assert!(outbound_url_hides(url).is_some(), "leaked: {url}");
+        }
+        // A URL with nothing protected in it is not refused — the door must not
+        // break ordinary browsing.
+        assert_eq!(outbound_url_hides("https://x.test/weather?q=Haifa"), None);
+        // A malformed escape is left alone rather than mangled into a match.
+        assert_eq!(outbound_url_hides("https://x.test/?q=100%ZZ"), None);
+
+        // Switch OFF: same asymmetry the masking half documents.
+        set_policy_for_test(false);
+        assert_eq!(outbound_url_hides("https://x.test/?q=Ben%20Reich"), None);
+        clear_policy();
+    }
+
+    #[test]
+    fn connector_args_masked_reports_what_the_seam_actually_does() {
+        // The user-visible signal must equal the behaviour in every state,
+        // INCLUDING switch-off — that combination is exactly the one the
+        // Cloud-privacy panel used to describe as "real names and details".
+        let _guard = policy_test_lock();
+        clear_policy();
+        assert!(!connector_args_masked(false)); // no entity map: nothing masked
+        for active in [true, false] {
+            set_policy_for_test(active);
+            assert!(
+                connector_args_masked(false),
+                "door {active}: args are masked, so the panel must say so"
+            );
+            assert!(
+                !connector_args_masked(true),
+                "door {active}: unmasked connector sends real values, panel must say so"
+            );
+        }
+        clear_policy();
+    }
+
+    #[test]
     fn rules_sha_changes_with_concepts_only() {
         let a = rules_sha(&["my health".into()]);
         let b = rules_sha(&["my health".into(), "my kids".into()]);
@@ -849,6 +1329,7 @@ mod tests {
 
     #[test]
     fn inject_policy_needs_nonlocal_model_and_active_policy() {
+        let _guard = policy_test_lock();
         clear_policy();
         let body = serde_json::json!({"model": "m:cloud", "text": "x"});
         assert!(inject_policy(&body).is_none()); // no policy cached
@@ -867,5 +1348,101 @@ mod tests {
         let no_model = serde_json::json!({"base_url": "http://127.0.0.1:11434"});
         assert!(inject_policy(&no_model).is_none());
         clear_policy();
+    }
+
+    /// THE CLOSET HOLE: the door asked the model NAME whether content was
+    /// leaving. Point the room at another computer's Ollama (`set_ollama_url`)
+    /// and the same `qwen3.5:4b` still read as local, so NO policy rode along —
+    /// real names, whole documents and transcripts went to that box in the
+    /// clear, while the trust chip said "Local only".
+    #[test]
+    fn a_relayed_ollama_gets_the_policy_even_with_a_local_model_name() {
+        let _guard = policy_test_lock();
+        let _base = crate::ollama::base_url_test_lock();
+        crate::ollama::set_base_url_override(None);
+        *policy_cell().lock().unwrap() = Some(Arc::new(PolicyState {
+            active: true,
+            rules: vec![("Ben Reich".into(), "[Person A]".into())],
+            concepts: vec![],
+            guard_model: "qwen3.5:4b".into(),
+            redactor: Redactor::new(vec![("Ben Reich".into(), "[Person A]".into())]),
+        }));
+        let body = serde_json::json!({"model": "qwen3.5:4b", "text": "x"});
+        assert!(inject_policy(&body).is_none(), "on this Mac: no door needed");
+
+        crate::ollama::set_base_url_override(Some("http://192.168.1.20:11434".into()));
+        let injected = inject_policy(&body).expect("a relayed request must carry the rules");
+        assert_eq!(injected["privacy"]["rules"][0]["real"], "Ben Reich");
+
+        crate::ollama::set_base_url_override(None);
+        clear_policy();
+    }
+
+    #[test]
+    fn an_empty_entity_map_still_arms_the_door() {
+        // THE FRESH-ROOM HOLE: the door used to need at least one known entity
+        // before it engaged at all. In a new room — nothing scanned, nothing on
+        // the block list — the panel said "on" while the user's own topic rules
+        // were never sent and photographs went to a cloud model in full.
+        let _guard = policy_test_lock();
+        clear_policy();
+        set_policy_rules_for_test(true, vec![]);
+        let policy = active_policy().expect("switch on: the door is armed with no entities");
+        assert!(policy.redactor.is_empty());
+
+        // The concepts + guard model reach the sidecar, which is what enforces
+        // topic rules and strips images.
+        let body = serde_json::json!({"model": "m:cloud", "text": "x"});
+        let injected = inject_policy(&body).expect("a cloud call carries the policy");
+        assert_eq!(injected["privacy"]["active"], true);
+        assert!(injected["privacy"]["guard_model"].is_string());
+
+        // And the vision picker stops offering a cloud model whose pixels the
+        // door would silently drop — the false "The AI could not locate that in
+        // this image" that `image_reaches_model` exists to prevent.
+        assert!(!image_reaches_model("gpt-oss:120b-cloud"));
+        assert!(image_reaches_model("qwen2.5vl:7b"));
+
+        // The connector seam is the documented exception: with no entity map
+        // there is genuinely nothing to mask, so it stays None.
+        assert!(remote_seam_redactor().is_none());
+        clear_policy();
+    }
+
+    #[test]
+    fn accented_names_are_hidden_whatever_the_capitalisation() {
+        // The two halves of the door folded case differently: aho-corasick's
+        // `ascii_case_insensitive` folds A–Z only, while the sidecar's `re.I`
+        // folds every script — so the Mac side (the "what the cloud sees"
+        // preview and the outbound connector masking) let a differently-cased
+        // accented or Hebrew name through in the real spelling.
+        let r = Redactor::new(vec![
+            ("José Muñoz".into(), "[Person A]".into()),
+            ("Ürün".into(), "[Org A]".into()),
+        ]);
+        let mut report = PrivacyReport::default();
+        let out = r.redact("JOSÉ MUÑOZ and josé muñoz both work at ÜRÜN", &mut report);
+        assert!(!out.contains("MUÑOZ"), "{out}");
+        assert!(!out.contains("muñoz"), "{out}");
+        assert!(!out.contains("ÜRÜN"), "{out}");
+        assert_eq!(out, "[Person A] and [Person A] both work at [Org A]");
+        // Two distinct entities hidden, not four patterns.
+        assert_eq!(report.entities_hidden, 2);
+        assert_eq!(report.replacements, 3);
+        // A placeholder still restores to the room's OWN spelling, not a variant.
+        assert_eq!(r.restore("[Person A]"), "José Muñoz");
+    }
+
+    #[test]
+    fn a_one_character_block_item_is_refused_not_silently_dropped() {
+        // Settings accepted any text while the redactor dropped anything under
+        // two characters — so the panel listed an item as protected that was
+        // never hidden, and if it was the only one the whole door went quiet.
+        assert!(!is_protectable("B"));
+        assert!(!is_protectable("  x "));
+        assert!(is_protectable("Ben"));
+        // …and the redactor's own floor is the same rule, not a second one.
+        let r = Redactor::new(vec![("B".into(), "[Person A]".into())]);
+        assert!(r.is_empty());
     }
 }

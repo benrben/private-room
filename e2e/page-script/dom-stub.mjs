@@ -63,6 +63,12 @@ export class El {
   get disabled() {
     return this.attrs.disabled === true || this.attrs.disabled === "true";
   }
+  /** Writable, like the real property: a form that disables its Submit while
+   * it validates does exactly this, and that is the window in which a ref the
+   * agent already holds goes dead. */
+  set disabled(v) {
+    this.attrs.disabled = v === true || v === "true" ? true : undefined;
+  }
   get isContentEditable() {
     const c = this.getAttribute("contenteditable");
     return c === "" || c === "true";
@@ -282,6 +288,7 @@ class Doc {
 
 let doc = new Doc();
 let selectionText = "";
+let windowListeners = new Map();
 
 /** Install a fresh global environment and return `window.__arcelleBrowse`. */
 export function install(scriptSource) {
@@ -297,6 +304,23 @@ export function install(scriptSource) {
   g.getComputedStyle = (el) => el.__style || { display: "block", visibility: "visible", opacity: "1" };
   g.CSS = { escape: (s) => String(s).replace(/["\\]/g, "\\$&") };
   g.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+  // Window-level listeners, so the keyboard-escape chord (item #18) can be
+  // driven from a test rather than only from a real WKWebView. Capture and
+  // bubble are the same list here: nothing in the script depends on the
+  // difference, and modelling a real propagation path would be modelling the
+  // stub instead of the script.
+  windowListeners = new Map();
+  g.addEventListener = (type, fn) => {
+    if (!windowListeners.has(type)) windowListeners.set(type, []);
+    windowListeners.get(type).push(fn);
+  };
+  g.removeEventListener = (type, fn) => {
+    const list = windowListeners.get(type) || [];
+    windowListeners.set(
+      type,
+      list.filter((f) => f !== fn),
+    );
+  };
   g.scrollTo = () => {};
   g.scrollBy = () => {};
   g.MouseEvent = class { constructor(type, init) { Object.assign(this, init); this.type = type; } };
@@ -324,6 +348,11 @@ export function currentDocument() {
 /** What `window.getSelection()` reports, for the "Save selection" path. */
 export function setSelection(text) {
   selectionText = String(text ?? "");
+}
+
+/** Deliver a window event to whatever the script registered for it. */
+export function fireWindow(type, event) {
+  for (const fn of windowListeners.get(type) || []) fn({ type, ...event });
 }
 
 export { doc };

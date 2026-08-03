@@ -1,0 +1,32 @@
+/* A Jupyter notebook, laid out the way JupyterLab lays one out: a numbered
+   execution gutter beside each code cell, prose cells full-width between them. */
+.nb-view { padding: 0.75rem 1rem 3rem; }
+.nb-cell { margin-bottom: 1rem; }
+.nb-code { display: flex; gap: 0.6rem; align-items: flex-start; }
+.nb-gutter {
+  flex: none;
+  width: 3.5rem;
+  padding-top: 0.9rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--muted);
+}
+.nb-body { flex: 1; min-width: 0; }
+.nb-md { padding-inline-start: 4.1rem; }
+.nb-raw {
+  padding-inline-start: 4.1rem;
+  white-space: pre-wrap;
+  color: var(--muted);
+}
+.nb-out {
+  margin: 0.35rem 0 0;
+  padding: 0.5rem 0.7rem;
+  border-inline-start: 2px solid var(--border);
+  white-space: pre-wrap;
+  overflow-x: auto;
+  font-size: 0.85rem;
+}
+.nb-error { color: var(--danger, #e5646c); }
+.nb-muted { color: var(--muted); font-style: italic; }
+.nb-img { display: block; max-width: 100%; height: auto; margin-top: 0.35rem; }

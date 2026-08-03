@@ -214,7 +214,12 @@ pub fn webview(app: &tauri::AppHandle) -> Option<Webview<Wry>> {
     webview_of(app, &active_id(app)?)
 }
 
-pub fn webview_of(app: &tauri::AppHandle, id: &str) -> Option<Webview<Wry>> {
+/// Generic over the runtime purely so [`close`] can be — the app always calls
+/// it with the real `Wry` handle, and `Webview<R>` follows whatever it is given.
+pub fn webview_of<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: &str,
+) -> Option<Webview<R>> {
     app.webviews().get(&label_of(id)).cloned()
 }
 
@@ -461,7 +466,7 @@ fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
     // and works on every origin without an allowlist.
     .initialization_script_for_all_frames(PAGE_JS)
     .on_navigation(move |url| {
-        if !navigation_allowed(&app_for_nav, url) {
+        if !navigation_allowed(&app_for_nav, &nav_id, url) {
             return false;
         }
         // Only a real destination updates what this page IS. The hook fires for
@@ -527,7 +532,11 @@ fn should_go_after_rules(url: &str, recorded: Option<&str>) -> bool {
 
 /// Close EVERY page — room close and app quit, the two paths that are meant to
 /// destroy the session.
-pub fn close(app: &tauri::AppHandle) -> Result<(), String> {
+///
+/// Runtime-generic so `teardown_open_room` can be: the teardown is the one
+/// place the browser's death is sequenced against the room handle's, and that
+/// order is only testable if the whole chain accepts a mock runtime.
+pub fn close<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     let state = app.state::<BrowserState>();
     let ids = std::mem::take(&mut *state.tabs.lock().unwrap());
     for page in ids {
@@ -540,6 +549,20 @@ pub fn close(app: &tauri::AppHandle) -> Result<(), String> {
     state.downloads.lock().unwrap().clear();
     let _ = std::fs::remove_dir_all(staging_dir());
     Ok(())
+}
+
+/// The rect the ACTIVE page currently occupies, as last reported by the view.
+///
+/// [`PARKED`] until the browser area has mounted and measured once, which is
+/// also what it reads while the page is deliberately shrunk out of the way —
+/// the two are the same state and callers must treat them the same.
+pub fn bounds(app: &tauri::AppHandle) -> Bounds {
+    app.state::<BrowserState>()
+        .bounds
+        .lock()
+        .unwrap()
+        .unwrap_or(PARKED)
+        .sane()
 }
 
 pub fn set_bounds(app: &tauri::AppHandle, b: Bounds) -> Result<(), String> {
@@ -586,7 +609,13 @@ fn is_app_link_scheme(scheme: &str) -> bool {
     )
 }
 
-fn navigation_allowed(app: &tauri::AppHandle, url: &reqwest::Url) -> bool {
+/// `id` is the page whose hook this is — the closure is built per webview, so
+/// it is a constant. It matters for the off-thread recheck: pulling a page back
+/// has to pull back THAT page. Reaching for "the active webview" instead
+/// stopped whatever happened to be showing, which for a navigation in a
+/// background tab is the wrong page entirely — the same mistake `create` used
+/// to make when it attached the content blocker.
+fn navigation_allowed(app: &tauri::AppHandle, id: &str, url: &reqwest::Url) -> bool {
     // `about:blank` is the webview's own idle state, never a destination.
     if url.scheme() == "about" {
         return true;
@@ -614,7 +643,84 @@ fn navigation_allowed(app: &tauri::AppHandle, url: &reqwest::Url) -> bool {
             serde_json::json!({ "url": url.as_str() }),
         );
     }
+    if ok {
+        recheck_host_off_thread(app, id, url);
+    }
     ok
+}
+
+/// Does this ALLOWED navigation still need its host resolved?
+///
+/// The literal check above only reads the ADDRESS TEXT. A perfectly ordinary
+/// name can point at this Mac — `check_public_http_url`'s own doc says so, and
+/// the agent's path already answers it with `resolve_public_addr`. The
+/// navigation hook runs on the main thread for every click, so it cannot
+/// resolve inline; it can only decide whether a resolve is worth starting.
+///
+/// An IP LITERAL needs none: the literal check already classified it exactly,
+/// in both directions. Only a NAME can say one thing and mean another.
+fn needs_host_recheck(url: &reqwest::Url) -> bool {
+    if !is_recordable_url(url) {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // `host_str()` keeps the brackets on an IPv6 literal, so strip them before
+    // asking — otherwise every `[::1]` would be re-resolved as a name.
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_err()
+}
+
+/// Resolve an allowed navigation's host in the background and pull the page
+/// back if the name turns out to point into this Mac or the local network.
+///
+/// This is a SECOND layer, not the first: the load has already begun by the
+/// time an answer arrives, so it cannot promise the request was never sent.
+/// What it does promise is that the page is not left sitting on a local
+/// service's response, and that the attempt is journalled like every other
+/// blocked address instead of passing silently because it was spelled as a
+/// name. The content rules cannot cover this — they match address TEXT, so a
+/// name that resolves privately looks public to them too.
+fn recheck_host_off_thread(app: &tauri::AppHandle, id: &str, url: &reqwest::Url) {
+    if !needs_host_recheck(url) {
+        return;
+    }
+    let Some(host) = url.host_str().map(str::to_string) else {
+        return;
+    };
+    let port = url.port_or_known_default().unwrap_or(443);
+    let app = app.clone();
+    let id = id.to_string();
+    let shown = url.to_string();
+    tauri::async_runtime::spawn(async move {
+        // Only a name that genuinely resolves PRIVATE is worth halting a page
+        // for. A name that does not resolve at all fails to load on its own,
+        // and reporting that as a private-address block would be the untrue red
+        // banner `mailto:` links used to get.
+        if crate::web::host_resolves_private(&host, port).await {
+            halt_private_navigation(&app, &id, &shown);
+        }
+    });
+}
+
+/// Stop a page that turned out to be pointed at this Mac, and say so.
+///
+/// `window.stop()` rather than a navigation: the point is to abandon the load,
+/// not to throw away whatever the user was reading before the click.
+fn halt_private_navigation(app: &tauri::AppHandle, id: &str, url: &str) {
+    if let Some(wv) = webview_of(app, id) {
+        let _ = wv.eval("window.stop()");
+    }
+    journal(
+        app,
+        "blocked",
+        url,
+        "Navigation stopped: that name resolves to this Mac or a private network.",
+    );
+    let _ = tauri::Emitter::emit(app, "browser-blocked", serde_json::json!({ "url": url }));
 }
 
 /// Downloads land in the ROOM, never in `~/Downloads` (D9). The file is staged
@@ -690,6 +796,7 @@ fn download_allowed(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent
                 return false;
             }
             journal(app, "download", url.as_str(), &format!("Downloading {name}"));
+            watch_download_size(app, url.as_str(), &name, &staged);
             *destination = staged;
             true
         }
@@ -721,6 +828,79 @@ fn download_allowed(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent
         }
         _ => true,
     }
+}
+
+/// How often the staged file is measured while a download runs. Slow enough to
+/// cost nothing (one `stat` per file per tick), quick enough that a fast link
+/// does not pass the ceiling unremarked.
+const DOWNLOAD_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Is this staged download already too big to ever become a room file?
+///
+/// The ceiling is `import_download`'s — the SAME number, deliberately, because
+/// the point is to say early what that funnel will decide at the end.
+fn download_over_limit(bytes: u64) -> bool {
+    bytes > crate::web::MAX_DOWNLOAD_BYTES
+}
+
+/// Warn ONCE, while it is still downloading, that a file has already passed the
+/// size a room can hold.
+///
+/// tauri 2.11's `DownloadEvent` has exactly two arms — `Requested` and
+/// `Finished` — so there is no progress callback to hang this on and no way to
+/// cancel a download already in flight. What there IS is the staged file on
+/// disk, which grows. Measuring it turns "the whole file arrives, and only then
+/// is the user told it was too big" into a warning they get while it is
+/// happening. It does NOT stop the download: nothing in this API can, and
+/// claiming otherwise would be the fabrication this module exists to prevent.
+fn watch_download_size(
+    app: &tauri::AppHandle,
+    url: &str,
+    name: &str,
+    staged: &std::path::Path,
+) {
+    let app = app.clone();
+    let url = url.to_string();
+    let name = name.to_string();
+    let staged = staged.to_path_buf();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(DOWNLOAD_WATCH_INTERVAL).await;
+            // The slot is released by `Finished`; its absence means this
+            // download is over (imported, failed, or the room closed) and there
+            // is nothing left to warn about.
+            let still_running = app
+                .state::<BrowserState>()
+                .downloads
+                .lock()
+                .unwrap()
+                .contains_key(&url);
+            if !still_running {
+                return;
+            }
+            let bytes = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
+            if !download_over_limit(bytes) {
+                continue;
+            }
+            let limit_mb = crate::web::MAX_DOWNLOAD_BYTES / (1024 * 1024);
+            let detail = format!(
+                "{name} has already passed the {limit_mb} MB limit for a room file \
+                 ({} MB so far) — it will be refused when it finishes. Nothing here \
+                 can stop a download that has started.",
+                bytes / (1024 * 1024)
+            );
+            journal(&app, "download", &url, &detail);
+            // Its OWN event, not `browser-download`: that one means "this
+            // download is over, here is what happened", and reusing it would
+            // put a "failed" toast on a transfer that is still running.
+            let _ = tauri::Emitter::emit(
+                &app,
+                "browser-download-oversize",
+                serde_json::json!({ "url": url, "name": name, "bytes": bytes, "detail": detail }),
+            );
+            return;
+        }
+    });
 }
 
 /// Claim the staging slot for `url`. `false` when one is already in flight for
@@ -1474,6 +1654,81 @@ mod tests {
         for scheme in ["file", "data", "javascript", "http", "https"] {
             assert!(!is_app_link_scheme(scheme), "{scheme} must keep the loud path");
         }
+    }
+
+    /// AUDIT 169. The size of a clicked download used to be checked only once
+    /// the WHOLE file had arrived, so a 20 GB file filled the disk and was then
+    /// thrown away with an error. The staged file is measured while it grows,
+    /// against the SAME ceiling `import_download` will apply — a second number
+    /// here would warn about the wrong thing, or not warn at all.
+    #[test]
+    fn an_oversize_download_is_noticed_while_it_is_still_arriving() {
+        assert!(!download_over_limit(0));
+        assert!(!download_over_limit(crate::web::MAX_DOWNLOAD_BYTES));
+        assert!(download_over_limit(crate::web::MAX_DOWNLOAD_BYTES + 1));
+        // The watcher must be started from the arm that stages the file, or it
+        // measures nothing. Pinned as a source scan: both halves compile alone.
+        let src = include_str!("browser.rs");
+        let requested = src
+            .split("DownloadEvent::Requested")
+            .nth(1)
+            .expect("Requested arm exists");
+        let body = requested
+            .split("DownloadEvent::Finished")
+            .next()
+            .expect("Finished follows Requested");
+        assert!(
+            body.contains("watch_download_size"),
+            "a staged download must be measured while it runs — the ceiling was \
+             only ever applied after the whole file had landed"
+        );
+    }
+
+    /// AUDIT 154. The synchronous navigation gate only reads the address TEXT,
+    /// so a perfectly ordinary NAME pointing at 127.0.0.1 walked straight
+    /// through it — and the content rules cannot help, because they match the
+    /// same text. The hook cannot resolve on the main thread, so it decides
+    /// which navigations are worth resolving off it.
+    #[test]
+    fn a_named_host_is_re_resolved_after_the_literal_check_lets_it_through() {
+        let u = |s: &str| reqwest::Url::parse(s).unwrap();
+        // Names: the whole point — one of these may answer 127.0.0.1.
+        assert!(needs_host_recheck(&u("https://example.com/page")));
+        assert!(needs_host_recheck(&u("http://internal.example/")));
+        // IP literals were already decided EXACTLY by the literal check, in
+        // both directions; re-resolving them is pure cost.
+        assert!(!needs_host_recheck(&u("http://8.8.8.8/")));
+        assert!(!needs_host_recheck(&u("http://127.0.0.1/")));
+        assert!(!needs_host_recheck(&u("http://[::1]/")));
+        assert!(!needs_host_recheck(&u("http://[2606:4700::1111]/")));
+        // Not a web destination at all.
+        assert!(!needs_host_recheck(&u("about:blank")));
+        // …and the hook must actually start the recheck, or the helper is
+        // decoration. Pinned as a source scan: both halves compile alone.
+        let src = include_str!("browser.rs");
+        let hook = src
+            .split("fn navigation_allowed")
+            .nth(1)
+            .expect("navigation_allowed exists");
+        let body: String = hook.chars().take(1400).collect();
+        assert!(
+            body.contains("recheck_host_off_thread"),
+            "an allowed navigation must still have its host resolved off the \
+             main thread — the literal check cannot see where a name points"
+        );
+        // …and it must pull back the page that NAVIGATED. `webview(app)` is the
+        // page that is SHOWING: a background tab that resolved privately would
+        // have had `window.stop()` run on whatever the user was reading instead,
+        // leaving the offending page loading and interrupting an innocent one.
+        let halt = src
+            .split("fn halt_private_navigation")
+            .nth(1)
+            .expect("halt_private_navigation exists");
+        let halt: String = halt.chars().take(400).collect();
+        assert!(
+            halt.contains("webview_of(app, id)"),
+            "the halt must target the navigating page by id, not the active one"
+        );
     }
 
     /// macOS's `Finished` download event carries only the URL, so two staged

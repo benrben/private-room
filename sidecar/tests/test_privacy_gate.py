@@ -8,6 +8,7 @@ generate_stream, the agent chat model, the summarize client). The judgment
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -284,11 +285,12 @@ async def test_scan_chunks_and_dedupes(monkeypatch) -> None:
 
     monkeypatch.setattr(privacy_scan.llm, "generate", fake_generate)
     text = ("Ben Reich " + "x" * 200 + "\n") * 40  # forces multiple chunks
-    found = await privacy_scan.scan_text(
+    scan = await privacy_scan.scan_text(
         text, model="qwen3.5:4b", base_url="http://127.0.0.1:11434"
     )
     assert len(calls) > 1
-    assert found == [{"text": "Ben Reich", "category": "person"}]
+    assert scan.entities == [{"text": "Ben Reich", "category": "person"}]
+    assert scan.complete and scan.chunks_failed == 0
 
 
 async def test_scan_excludes_known(monkeypatch) -> None:
@@ -296,13 +298,74 @@ async def test_scan_excludes_known(monkeypatch) -> None:
         return '{"entities": [{"text": "Ben Reich", "category": "person"}]}'
 
     monkeypatch.setattr(privacy_scan.llm, "generate", fake_generate)
-    found = await privacy_scan.scan_text(
+    scan = await privacy_scan.scan_text(
         "Ben Reich",
         model="qwen3.5:4b",
         base_url="http://127.0.0.1:11434",
         known=["ben reich"],
     )
-    assert found == []
+    assert scan.entities == []
+
+
+async def test_scan_keeps_what_it_found_when_a_chunk_fails(monkeypatch) -> None:
+    """A failure part-way used to raise, losing every earlier chunk's findings —
+    and the host reported it with the engine's wording ("local AI unreachable")
+    for what was a timeout on one chunk of a long document."""
+    calls = {"n": 0}
+
+    async def flaky_generate(model, messages, base_url, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("read timeout")
+        return '{"entities": [{"text": "Ben Reich", "category": "person"}]}'
+
+    monkeypatch.setattr(privacy_scan.llm, "generate", flaky_generate)
+    text = ("Ben Reich " + "x" * 200 + "\n") * 40
+    scan = await privacy_scan.scan_text(
+        text, model="qwen3.5:4b", base_url="http://127.0.0.1:11434"
+    )
+    assert scan.entities == [{"text": "Ben Reich", "category": "person"}]
+    assert scan.chunks_failed == 1
+    # …and it must NOT claim the document was read to the end, or the host
+    # records the file as protected while its tail never was.
+    assert scan.complete is False
+
+
+async def test_scan_reports_itself_incomplete_when_capped(monkeypatch) -> None:
+    """MAX_FINDINGS stops the pass mid-document. The host used to mark the file
+    fully scanned anyway, so everything past the cap went to the cloud as-is."""
+    monkeypatch.setattr(privacy_scan, "MAX_FINDINGS", 2)
+
+    async def fake_generate(model, messages, base_url, **kwargs):
+        return (
+            '{"entities": [{"text": "Ben Reich", "category": "person"},'
+            '{"text": "Alice Kay", "category": "person"},'
+            '{"text": "Dana Levi", "category": "person"}]}'
+        )
+
+    monkeypatch.setattr(privacy_scan.llm, "generate", fake_generate)
+    scan = await privacy_scan.scan_text(
+        "Ben Reich Alice Kay Dana Levi",
+        model="qwen3.5:4b",
+        base_url="http://127.0.0.1:11434",
+    )
+    assert len(scan.entities) == 2
+    assert scan.capped is True
+    assert scan.complete is False
+
+
+async def test_scan_cancellation_is_not_swallowed(monkeypatch) -> None:
+    """`until_hangup` cancels this coroutine when the client disconnects — that
+    is not a bad chunk to skip, it is the caller going away."""
+
+    async def cancelled_generate(model, messages, base_url, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(privacy_scan.llm, "generate", cancelled_generate)
+    with pytest.raises(asyncio.CancelledError):
+        await privacy_scan.scan_text(
+            "Ben Reich", model="qwen3.5:4b", base_url="http://127.0.0.1:11434"
+        )
 
 
 def test_mint_ephemeral_rules_avoids_taken() -> None:

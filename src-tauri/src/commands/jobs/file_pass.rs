@@ -351,6 +351,18 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
         }
         "publish" => {
             use tauri::Emitter;
+            // Owner replacement #3: the commit gate, at the moment of the
+            // commit. Every other cancel check on this path lives inside
+            // `sidecar_json_cancellable` — i.e. it guards a MODEL CALL. Publish
+            // makes no model call at all: it gathers the stored windows and
+            // writes the deliverable, so a Stop landing anywhere in this step
+            // (including one that reached us through the parent's tree) used to
+            // produce exactly the artifact the user was told had not been made.
+            // `STOPPED` rather than `guard_commit`'s message because this
+            // runner's protocol parks the job for Resume on that sentinel.
+            if crate::cancel::stopped(cancel) {
+                return Err("STOPPED".into());
+            }
             let guard = state.room.lock().unwrap();
             let room = guard
                 .as_ref()
@@ -382,6 +394,15 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
             // overwrite, undoable) instead of minting a second identical one.
             let prior = load_artifact(&room.conn, job_id, step.id).and_then(|a| a.file_id);
             let write_deliverable = |name: &str, mime: &str, content: &str| {
+                // Owner replacement #3, at the moment of the commit. The gate at
+                // the top of this step guards the DECISION; the stitch/merge
+                // between there and here is real work, and the re-run branch
+                // below writes straight through `store_file_bytes` — it does not
+                // pass the funnel that re-reads the flag, so without this a Stop
+                // landing mid-publish still rewrote the user's deliverable.
+                if crate::cancel::stopped(cancel) {
+                    return Err("STOPPED".to_string());
+                }
                 if let Some(prev) = prior.as_deref() {
                     if db::get_file_meta(&room.conn, prev).is_ok() {
                         store_file_bytes(
@@ -391,17 +412,33 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
                             Some(content),
                             &format!("Full pass re-run — {}", plan.file_name),
                         )?;
+                        // Room map: a replay rewrites the same file, so its
+                        // provenance has to be (re)stated here too — the insert
+                        // branch below is skipped on this path.
+                        db::set_derived_from(&room.conn, prev, &plan.file_id)?;
                         return db::get_file_meta(&room.conn, prev);
                     }
                 }
-                db::insert_file(
-                    &room.conn,
-                    name,
-                    mime,
-                    content.as_bytes(),
-                    Some(content),
-                    "generated",
-                )
+                // ART-1: no recorded prior — this is a first write (or one whose
+                // file the user deleted). Through the staging funnel, so a crash
+                // between here and the commit leaves nothing behind, and a
+                // SECOND pass over the same source becomes a version of the
+                // first deliverable rather than "Full pass — lease.pdf (2).html".
+                // `cancel` is re-read at the commit: the check above guards the
+                // decision, this guards the side effect.
+                let meta = Artifact::new(name, mime, content)
+                    .by("Full pass")
+                    .during_run(Some(job_id))
+                    .from_files(&[plan.file_id.clone()])
+                    .cancel_with(cancel)
+                    .commit(&room.conn)?
+                    .meta;
+                // Room map: this deliverable IS the pass's source file, rewritten.
+                // Recording it here is what lets the map draw a provenance link
+                // the app witnessed, instead of guessing from the output's name
+                // (which `db::available_name` renames on a re-run anyway).
+                db::set_derived_from(&room.conn, &meta.id, &plan.file_id)?;
+                Ok(meta)
             };
             let meta = if plan.mode == "stitch" {
                 let inputs: Vec<usize> = step.params["inputs"]
@@ -1277,7 +1314,7 @@ mod tests {
         let Some(model) = models
             .iter()
             .find(|m| {
-                !is_external_engine(m) && !is_cloud_model(m) && !m.contains("embed")
+                runs_on_this_mac(m) && !is_embedding_model(m)
             })
             .cloned()
         else {
@@ -1305,7 +1342,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pass-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let room_path = dir.join("pass.roomai").to_string_lossy().into_owned();
-        let conn = db::create_room(&room_path, "pw", "pass-e2e").unwrap();
+        let conn = db::create_room(&room_path, "pass-e2e-pw", "pass-e2e").unwrap();
         let file = db::insert_file(
             &conn,
             "expedition.txt",
@@ -1343,7 +1380,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "pass-e2e".into(),
-            password: "pw".into(),
+            password: "pass-e2e-pw".into(),
         });
         app.manage(state);
         let handle = app.handle().clone();

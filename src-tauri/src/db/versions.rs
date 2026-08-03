@@ -2,53 +2,140 @@ use super::*;
 
 // ---------------------------------------------------------------- file versions (ADD-2)
 
+/// How many UNPINNED versions of one file the room keeps. Pinned versions are
+/// outside this window entirely — see `pinned` in the schema. Public so the
+/// History strip can state the number instead of the user discovering it by
+/// losing the eleventh save.
+pub const VERSIONS_KEPT: usize = 10;
+
 /// Copy a file's CURRENT state into history before it is overwritten,
-/// labelled with `cause`, then keep only the newest 10 versions for that
-/// file. The snapshot is compound — bytes, extracted text, and any recording
-/// meta — because for a Recording the bytes are the unchanged WAV and what
-/// is being replaced IS the transcript: restoring bytes alone could never
-/// bring the old words, speakers, or cuts back. A file with no stored bytes
-/// yet (nothing to preserve) is a no-op.
+/// labelled with `cause`, then keep only the newest [`VERSIONS_KEPT`] UNPINNED
+/// versions for that file. The snapshot is compound — bytes, extracted text,
+/// and any recording meta — because for a Recording the bytes are the
+/// unchanged WAV and what is being replaced IS the transcript: restoring bytes
+/// alone could never bring the old words, speakers, or cuts back. A file with
+/// no stored bytes yet (nothing to preserve) is a no-op.
 pub fn snapshot_file_version(conn: &Connection, file_id: &str, cause: &str) -> Result<(), String> {
-    let current: Option<(Option<Vec<u8>>, Option<String>)> = query_opt(
+    let current: Option<(Option<Vec<u8>>, Option<String>, Option<String>)> = query_opt(
         conn,
-        "SELECT original_bytes, extracted_text FROM files WHERE id = ?1",
+        "SELECT original_bytes, extracted_text, provenance FROM files WHERE id = ?1",
         [file_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    let Some((Some(bytes), text)) = current else { return Ok(()) };
+    let Some((Some(bytes), text, provenance)) = current else { return Ok(()) };
     let rec_meta: Option<String> = conn
         .query_row("SELECT meta FROM recordings WHERE file_id = ?1", [file_id], |r| r.get(0))
         .ok();
     execute_one(
         conn,
-        "INSERT INTO file_versions(id, file_id, bytes, text, rec_meta, cause)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![Uuid::new_v4().to_string(), file_id, bytes, text, rec_meta, cause],
+        "INSERT INTO file_versions(id, file_id, bytes, text, rec_meta, cause, provenance)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![Uuid::new_v4().to_string(), file_id, bytes, text, rec_meta, cause, provenance],
     )?;
+    // A PINNED version is neither counted nor deleted: pinning it is the user
+    // saying "this is the one I might need back", and a rolling window that
+    // could still evict it would be a promise the room does not keep.
     execute_one(
         conn,
-        "DELETE FROM file_versions WHERE file_id = ?1 AND id NOT IN (
-           SELECT id FROM file_versions WHERE file_id = ?1
-           ORDER BY saved_at DESC, rowid DESC LIMIT 10)",
+        &format!(
+            "DELETE FROM file_versions WHERE file_id = ?1 AND pinned = 0 AND id NOT IN (
+               SELECT id FROM file_versions WHERE file_id = ?1 AND pinned = 0
+               ORDER BY saved_at DESC, rowid DESC LIMIT {VERSIONS_KEPT})"
+        ),
         [file_id],
     )
 }
 
-/// A file's saved versions, newest first.
+/// Pin or unpin one saved version (the History strip's "Keep" toggle). Errors
+/// when the id is not a version of a live file, so an unpin from a stale tab
+/// cannot silently do nothing while reporting success.
+pub fn set_version_pinned(conn: &Connection, version_id: &str, pinned: bool) -> Result<(), String> {
+    execute_existing(
+        conn,
+        "UPDATE file_versions SET pinned = ?2 WHERE id = ?1",
+        params![version_id, if pinned { 1 } else { 0 }],
+        "That version is no longer available.",
+    )
+}
+
+/// Delete ONE saved version outright — the History strip's per-row delete.
+/// This is the only way to get a large old snapshot's bytes back out of the
+/// room short of deleting the file: every version stores the whole file, so ten
+/// edits of a 200 MB recording are ten 200 MB rows. Deliberately not undoable
+/// (there is no history of the history), which is why the UI confirms first.
+pub fn delete_file_version(conn: &Connection, version_id: &str) -> Result<(), String> {
+    execute_existing(
+        conn,
+        "DELETE FROM file_versions WHERE id = ?1",
+        [version_id],
+        "That version is no longer available.",
+    )
+}
+
+/// Total bytes this file's saved versions occupy — what the History strip shows
+/// so "old versions eat disk space" is a number the user can see, not a
+/// surprise. Sums the stored blob and text; a room with no versions is 0.
+pub fn versions_bytes(conn: &Connection, file_id: &str) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(LENGTH(bytes) + COALESCE(LENGTH(text), 0)), 0)
+         FROM file_versions WHERE file_id = ?1",
+        [file_id],
+        |r| r.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// A file's saved versions, newest first. `provenance` is what made THAT
+/// version's content (ART-1) — absent on every version saved before provenance
+/// was recorded, and on every version a person typed, so the History strip
+/// attributes a version only where the app actually witnessed the write.
+///
+/// Empty for a trashed file, by the join. The rows themselves stay — trash is
+/// reversible and a restore must bring the whole history back — but listing
+/// them by id would let a stale tab keep drawing a deleted file's History
+/// strip: when it was edited, what each edit was for, and which agent and tool
+/// made it.
 pub fn list_file_versions(conn: &Connection, file_id: &str) -> Result<Vec<FileVersion>, String> {
     query_rows(
         conn,
-        "SELECT id, saved_at, cause FROM file_versions WHERE file_id = ?1
-         ORDER BY saved_at DESC, rowid DESC",
+        "SELECT v.id, v.saved_at, v.cause, v.provenance, v.pinned, LENGTH(v.bytes)
+         FROM file_versions v JOIN files f ON f.id = v.file_id
+         WHERE v.file_id = ?1 AND f.trashed_at IS NULL
+         ORDER BY v.saved_at DESC, v.rowid DESC",
         [file_id],
         |r| {
+            let raw: Option<String> = r.get(3)?;
             Ok(FileVersion {
                 id: r.get(0)?,
                 saved_at: r.get(1)?,
                 cause: r.get(2)?,
+                provenance: raw.and_then(|j| serde_json::from_str(&j).ok()),
+                pinned: r.get::<_, i64>(4)? != 0,
+                bytes: r.get::<_, i64>(5)?,
             })
         },
+    )
+}
+
+/// The provenance stored ON a saved version, as raw JSON. Restoring a version
+/// restores what made it too, so the head never claims a run that produced
+/// different bytes (see `commands::safety::restore_file_version`).
+pub fn version_provenance_json(conn: &Connection, version_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT provenance FROM file_versions WHERE id = ?1",
+        [version_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
+/// Point a file's CURRENT provenance at `json` (or clear it with None).
+pub fn set_file_provenance(conn: &Connection, file_id: &str, json: Option<&str>) -> Result<(), String> {
+    execute_one(
+        conn,
+        "UPDATE files SET provenance = ?2 WHERE id = ?1",
+        params![file_id, json],
     )
 }
 
@@ -139,14 +226,31 @@ fn derive_recovery_key(code_normalized: &str, salt: &[u8]) -> [u8; 32] {
 
 /// A fresh recovery code: 6 groups of 4 alphabet chars joined by '-'
 /// (e.g. `K7QF-3M2X-...`), 24 random characters in all.
+///
+/// The draw is REJECTION-SAMPLED, not `byte % 31`. 256 is not a multiple of the
+/// 31-character alphabet, so the modulo mapped 9 byte values onto each of the
+/// first eight letters and 8 onto the rest — every character of the one secret
+/// this app asks you to copy onto paper was ~12% likelier to be A–H. Drawing
+/// again whenever the byte lands in the ragged tail (>= 248) makes the
+/// distribution exactly uniform; the expected number of extra bytes is under 1
+/// per code.
 fn generate_recovery_code() -> String {
     let mut rng = rand::rngs::OsRng;
-    let mut raw = [0u8; 24];
-    rng.fill_bytes(&mut raw);
-    let chars: Vec<char> = raw
-        .iter()
-        .map(|b| RECOVERY_ALPHABET[*b as usize % RECOVERY_ALPHABET.len()] as char)
-        .collect();
+    let n = RECOVERY_ALPHABET.len() as u8; // 31, so `limit` is 248
+    let limit = 256u16 - (256u16 % n as u16);
+    let mut chars: Vec<char> = Vec::with_capacity(24);
+    let mut buf = [0u8; 32];
+    while chars.len() < 24 {
+        rng.fill_bytes(&mut buf);
+        for b in buf {
+            if (b as u16) < limit {
+                chars.push(RECOVERY_ALPHABET[(b % n) as usize] as char);
+                if chars.len() == 24 {
+                    break;
+                }
+            }
+        }
+    }
     chars
         .chunks(4)
         .map(|g| g.iter().collect::<String>())
@@ -195,8 +299,39 @@ pub fn write_recovery(room_path: &str, password: &str) -> Result<String, String>
         ct: STANDARD.encode(&buf),
     };
     let json = serde_json::to_string(&wrap).map_err(|e| e.to_string())?;
-    std::fs::write(recovery_sidecar_path(room_path), json).map_err(|e| e.to_string())?;
+    write_sidecar_atomically(&recovery_sidecar_path(room_path), &json)?;
     Ok(code)
+}
+
+/// Write the recovery sidecar the way the checkpoint manifest and the recents
+/// list are written: into a temp file beside it, flushed to disk, then renamed
+/// over the old one.
+///
+/// `fs::write` truncates the existing sidecar first. A crash, a power loss or a
+/// full disk in that window leaves a 0-byte or half-written wrap — and the wrap
+/// is the ONLY copy of the sealed password. `has_recovery` just tests that the
+/// path exists, so the unlock screen would go on offering a recovery code that
+/// can never work, and you would find out on the one day it mattered. The most
+/// likely moment for that crash is a password change, which re-writes this file
+/// over a working one. The temp file sits beside the room so the rename stays
+/// on one volume (rename across volumes is not atomic, and is not even allowed).
+fn write_sidecar_atomically(path: &str, json: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let tmp = format!("{path}.tmp");
+    let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let staged = f
+        .write_all(json.as_bytes())
+        .and_then(|_| f.sync_all())
+        .map_err(|e| e.to_string());
+    drop(f);
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
 }
 
 /// True when a recovery sidecar exists for this room.
@@ -343,5 +478,165 @@ mod tests {
         remove_recovery(&path).unwrap();
         assert!(!has_recovery(&path));
         assert!(remove_recovery(&path).is_err());
+    }
+
+    #[test]
+    fn recovery_alphabet_is_drawn_uniformly() {
+        // The modulo draw mapped 9 of 256 byte values onto each of the first 8
+        // alphabet characters and 8 onto the other 23 — ~12.5% bias on every
+        // character of the one secret we ask the user to write down. With
+        // rejection sampling the letter frequencies converge; with `% 31` they
+        // do not, and this margin is far outside sampling noise at this N.
+        let mut counts = [0usize; 31];
+        let mut total = 0usize;
+        for _ in 0..2000 {
+            for c in generate_recovery_code().chars().filter(|c| *c != '-') {
+                let idx = RECOVERY_ALPHABET.iter().position(|b| *b as char == c).unwrap();
+                counts[idx] += 1;
+                total += 1;
+            }
+        }
+        assert_eq!(total, 2000 * 24);
+        let biased: usize = counts[..8].iter().sum();
+        let rest: usize = counts[8..].iter().sum();
+        // Uniform ⇒ biased/8 ≈ rest/23. Under `% 31` the per-character rate in
+        // the first 8 is 9/8 of the rest's; assert we are within 4% of parity.
+        let a = biased as f64 / 8.0;
+        let b = rest as f64 / 23.0;
+        assert!(
+            (a / b - 1.0).abs() < 0.04,
+            "recovery alphabet is not uniform: first-8 rate {a:.1} vs rest {b:.1}"
+        );
+    }
+
+    #[test]
+    fn recovery_sidecar_is_written_temp_then_renamed() {
+        // 483: `fs::write` truncates the live sidecar first, so a crash in that
+        // window leaves the only copy of the sealed password unusable while
+        // `has_recovery` still reports it exists. Proven two ways: a pre-placed
+        // `.tmp` (a previous crashed write) is replaced rather than tripping the
+        // new write up, and an unwritable temp path leaves the OLD sidecar
+        // intact and readable rather than destroying it.
+        let path = temp_room_path();
+        let code = write_recovery(&path, "first-password").unwrap();
+        let sidecar = recovery_sidecar_path(&path);
+        std::fs::write(format!("{sidecar}.tmp"), b"junk from a crashed write").unwrap();
+
+        // A failed write must not have consumed the existing sidecar.
+        assert!(write_sidecar_atomically("/nonexistent-dir-xyz/x.recovery", "{}").is_err());
+        assert_eq!(recover_password(&path, &code).unwrap(), "first-password");
+
+        // A successful write leaves no temp file behind and swaps the wrap.
+        let code2 = write_recovery(&path, "second-password").unwrap();
+        assert!(!std::path::Path::new(&format!("{sidecar}.tmp")).exists());
+        assert_eq!(recover_password(&path, &code2).unwrap(), "second-password");
+
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn all_four_open_paths_pin_the_cipher_parameters() {
+        // The A1 pin lived at two of the four call sites: `create_room` and
+        // `open_room` had it, `verify_password` and `rekey_copy` did not. It is
+        // now inside `apply_key`, so every path that keys a connection pins it.
+        // A room created with the pin must therefore be readable by BOTH of the
+        // paths that previously skipped it, including after a re-key.
+        let path = temp_room_path();
+        {
+            let _conn = create_room(&path, "the-password", "Pinned").unwrap();
+        }
+        verify_password(&path, "the-password").unwrap();
+        assert!(verify_password(&path, "not-the-password").is_err());
+
+        let copy = format!("{path}.copy");
+        std::fs::copy(&path, &copy).unwrap();
+        rekey_copy(&copy, "the-password", "another-password").unwrap();
+        // The re-keyed copy opens on the ordinary path — i.e. the parameter set
+        // `rekey_copy` wrote and the one `open_room` expects are the same one.
+        let conn = open_room(&copy, "another-password").unwrap();
+        assert_eq!(get_meta(&conn, "name").as_deref(), Some("Pinned"));
+        drop(conn);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&copy);
+    }
+
+    /// The behavioural test above cannot FAIL without the fix: SQLCipher 4 is
+    /// the linked library's default today, so an unpinned `verify_password` /
+    /// `rekey_copy` still opens the same rooms. The whole point of pinning is
+    /// the build where the default is NOT 4 — which no test here can create.
+    /// So the invariant is checked structurally instead: keying a connection
+    /// happens in exactly one place, and that place pins. A fifth caller that
+    /// spells `PRAGMA key` itself would re-open the hole, and this fails.
+    #[test]
+    fn keying_a_connection_happens_only_where_the_cipher_is_pinned() {
+        const SCHEMA_RS: &str = include_str!("schema.rs");
+        const VERSIONS_RS: &str = include_str!("versions.rs");
+        // The pin lives with the key, inside `apply_key`.
+        // Needles assembled at run time so this test's own source does not
+        // contain them and count itself.
+        let q = '"';
+        let key_call = format!("pragma_update(None, {q}key{q}");
+        let pin = format!("PRAGMA cipher{}compatibility", '_');
+
+        let apply = SCHEMA_RS
+            .split_once("pub(crate) fn apply_key")
+            .expect("apply_key must exist")
+            .1;
+        let body = &apply[..apply.find("\n}\n").expect("apply_key body")];
+        assert!(body.contains(&key_call), "apply_key must set the key");
+        assert!(
+            body.contains(&pin),
+            "apply_key must pin the cipher parameters alongside the key"
+        );
+        // …and nowhere else: a new open path that keys a connection on its own
+        // would skip the pin, which is exactly how two of the four call sites
+        // came to be missing it.
+        let keyings: usize =
+            [SCHEMA_RS, VERSIONS_RS].iter().map(|src| src.matches(&key_call).count()).sum();
+        assert_eq!(
+            keyings, 1,
+            "a connection is keyed outside apply_key — that path skips the cipher pin"
+        );
+        // The pin itself is written once, so it cannot drift between call sites.
+        let pins: usize = [SCHEMA_RS, VERSIONS_RS].iter().map(|src| src.matches(&pin).count()).sum();
+        assert_eq!(pins, 1, "the cipher pin is spelled out in more than one place");
+    }
+
+    #[test]
+    fn pinned_versions_survive_the_rolling_prune_and_can_be_deleted() {
+        // 468: the eleventh save silently dropped the oldest version and there
+        // was no way to protect or delete one. A pinned version is neither
+        // counted by nor evicted by the prune; delete removes exactly one row.
+        let conn = open_in_memory_schema();
+        conn.execute(
+            "INSERT INTO files(id, name, mime_type, original_bytes) VALUES ('f1','a.txt','text/plain', X'00')",
+            [],
+        )
+        .unwrap();
+        // The oldest version, pinned.
+        snapshot_file_version(&conn, "f1", "first").unwrap();
+        let oldest = list_file_versions(&conn, "f1").unwrap()[0].id.clone();
+        set_version_pinned(&conn, &oldest, true).unwrap();
+
+        // Well past the window: without the pin the first one is long gone.
+        for i in 0..VERSIONS_KEPT + 5 {
+            snapshot_file_version(&conn, "f1", &format!("save {i}")).unwrap();
+        }
+        let all = list_file_versions(&conn, "f1").unwrap();
+        assert!(
+            all.iter().any(|v| v.id == oldest && v.pinned),
+            "a pinned version was evicted by the rolling prune"
+        );
+        // The pinned row is EXTRA — the window still holds its full count.
+        assert_eq!(all.iter().filter(|v| !v.pinned).count(), VERSIONS_KEPT);
+        assert!(all.iter().all(|v| v.bytes > 0));
+        assert!(versions_bytes(&conn, "f1").unwrap() > 0);
+
+        delete_file_version(&conn, &oldest).unwrap();
+        let after = list_file_versions(&conn, "f1").unwrap();
+        assert!(after.iter().all(|v| v.id != oldest));
+        assert_eq!(after.len(), VERSIONS_KEPT);
+        assert!(delete_file_version(&conn, "no-such-version").is_err());
     }
 }

@@ -38,6 +38,9 @@ pub(crate) async fn start_download_job_inner(
     if !matches!(engine, DOWNLOAD_ENGINE_FETCH | DOWNLOAD_ENGINE_MEDIA) {
         return Err("Unknown download engine.".into());
     }
+    // Refuse at CREATION when the room is offline, rather than queueing a job
+    // whose only possible outcome is a network reach the switch forbids.
+    crate::commands::require_web_access(state)?;
     crate::web::check_public_http_url(url)?;
     let plan = serde_json::json!({ "url": url, "engine": engine });
     let title = download_title(url, engine);
@@ -99,7 +102,9 @@ fn spawn_download(
 ) {
     use tauri::Manager;
     let app = window.app_handle().clone();
-    tauri::async_runtime::spawn(async move {
+    let (runner_window, runner_job, runner_room) =
+        (window.clone(), job_id.clone(), room_path.clone());
+    super::spawn_job_runner(runner_window, runner_job, runner_room, async move {
         let state = app.state::<AppState>();
         {
             let guard = state.room.lock().unwrap();

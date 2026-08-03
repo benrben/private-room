@@ -14,8 +14,10 @@ import {
   LockIcon,
   AlertIcon,
 } from "../icons";
-import { classifyAddress } from "./address";
+import { classifyAddress, needsFreshFetch } from "./address";
 import { BrowserSearch, BrowserSearchSkeleton } from "./BrowserSearch";
+import { BrowserReader } from "./BrowserReader";
+import { announcement, stalledBanner } from "./browserAnnounce";
 
 /* BROWSE-1: the private browser area.
  *
@@ -94,8 +96,19 @@ export function BrowserView({
   const [editing, setEditing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [ephemeral, setEphemeral] = useState<boolean | null>(null);
+  // AUDIT 380: what the shield's answer was actually ABOUT. The check is
+  // deliberately asked of the live webview rather than read off a flag, but the
+  // answer used to be latched for the whole session — so it described whichever
+  // page happened to be showing when the browser opened, and every page after
+  // that inherited a verdict nobody had checked. Re-asked whenever the page
+  // changes; `verify_ephemeral` covers every OPEN tab, so one pass per
+  // navigation is the whole browser, not just the one in front.
+  const verifiedForRef = useRef<string | null>(null);
   const [journalOpen, setJournalOpen] = useState(false);
   const [journal, setJournal] = useState<BrowseJournalRow[]>([]);
+  // The journal is the ONLY record of what the assistant did in this browser
+  // and Clear erases it with no undo. It used to fire on the first click.
+  const [confirmClear, setConfirmClear] = useState(false);
   const [busy, setBusy] = useState(false);
   // BROWSE-2: the Save strip. A DROPDOWN cannot exist here (the native page
   // floats above all DOM), so Save opens a second chrome ROW in normal flow.
@@ -113,6 +126,14 @@ export function BrowserView({
   // The query that produced the current error, so the banner can offer to
   // search for it instead of silently doing so.
   const [failedInput, setFailedInput] = useState<string | null>(null);
+  // Item #18: the reading view, and the one live region that tells a screen
+  // reader what the native page just did. `lastInfo` is what the announcement
+  // is diffed against — a poll that changed nothing must say nothing.
+  const [readerOpen, setReaderOpen] = useState(false);
+  const [announce, setAnnounce] = useState("");
+  const lastInfoRef = useRef<BrowserInfo | null>(null);
+  const addressRef = useRef<HTMLInputElement | null>(null);
+  const saveRef = useRef<HTMLButtonElement | null>(null);
 
   // A brand-new tab sits on `about:blank`, which paints an OPAQUE rectangle.
   // Since the native view floats above the DOM, leaving it there hides the very
@@ -214,17 +235,44 @@ export function BrowserView({
     try {
       const next = await api.browserInfo();
       setInfo(next);
+      // Item #18: this poll IS the accessibility event stream. The native page
+      // repaints without changing a single DOM node, so nothing else in this
+      // window can tell assistive tech that the user moved.
+      const said = announcement(lastInfoRef.current, next);
+      lastInfoRef.current = next;
+      if (said) setAnnounce(said);
+      // The page latched a double Escape. Nothing in JavaScript can pull the
+      // first responder back from a sibling native view, so Rust does it and
+      // the DOM focus follows — otherwise the keyboard lands in the app with
+      // nothing focused, which is its own kind of trap.
+      if (next.leaveRequested) {
+        await api.browserFocusApp().catch(() => {});
+        addressRef.current?.focus();
+        setAnnounce(
+          "Keyboard returned to the browser toolbar. The address box has focus.",
+        );
+      }
       if (!editing && next.url) setAddress(next.url);
-      if (next.open && ephemeral === null) {
-        // Verified against the LIVE webview, not inferred from a flag: the
-        // failure mode is silent, so the shield must report a real check.
+      // Verified against the LIVE webview, not inferred from a flag: the
+      // failure mode is silent, so the shield must report a real check — and
+      // it must be a check of the page it is sitting next to. Re-asked on every
+      // change of page (AUDIT 380), not once per browser session.
+      const shieldFor = next.url ?? "";
+      if (next.open && verifiedForRef.current !== shieldFor) {
+        verifiedForRef.current = shieldFor;
         setEphemeral(await api.browserVerifyPrivate().catch(() => null));
       }
-      if (!next.open) setEphemeral(null);
+      if (!next.open) {
+        setEphemeral(null);
+        verifiedForRef.current = null;
+      }
     } catch {
       /* the room may be closing */
     }
-  }, [editing, ephemeral]);
+    // `ephemeral` is no longer a dependency: which page the shield has been
+    // verified for lives in a ref, so the poll does not have to be rebuilt
+    // every time the answer changes.
+  }, [editing]);
 
   useEffect(() => {
     void refresh();
@@ -247,9 +295,27 @@ export function BrowserView({
         if (journalOpen) void loadJournal();
       }),
       api.onBrowserNavigated(() => {
+        // This event has exactly one producer — the AGENT's browse_open (see
+        // the note on POLL_MS) — so it means "the agent moved the page", and a
+        // results page must not stay parked over it. Without this, the agent
+        // searching and then opening a result left its own page invisible
+        // behind the results it had just been handed. A person clicking a link
+        // emits nothing, and cannot anyway: the page is 1x1 while these show.
+        setSearchOpen(false);
         void refresh();
         // The title and readiness arrive a beat after the navigation itself.
         window.setTimeout(() => void refresh(), SETTLE_MS);
+      }),
+      // BROWSE-3c: the agent searched. Show its results on the same page the
+      // address bar uses — the whole point of a browser you can watch.
+      api.onBrowserSearched((result) => {
+        setSearch(result);
+        setSearchOpen(true);
+        setAddress(result.query);
+        setEditing(false);
+        setSearching(false);
+        setError(null);
+        setFailedInput(null);
       }),
       api.onBrowserBlocked((p) =>
         setError(
@@ -315,6 +381,18 @@ export function BrowserView({
     }
   }
 
+  /** Item #18: show the page as text.
+   *
+   * Closing the results page is part of opening the reader, not a courtesy:
+   * the results are drawn over a webview PARKED AT 1×1, and a page at one CSS
+   * pixel wide reflows to something whose extracted text is a fragment. Rust
+   * refuses to read a parked page for that reason, so leaving the results up
+   * would turn the reader into an error message. */
+  const openReader = useCallback(() => {
+    setSearchOpen(false);
+    setReaderOpen(true);
+  }, []);
+
   /** Open a result. The results page stays in memory behind the page, so
    *  coming back is free and costs no navigation. */
   const openResult = useCallback(
@@ -336,13 +414,35 @@ export function BrowserView({
     [refresh],
   );
 
-  const openResultInNewTab = useCallback(async (url: string) => {
-    try {
-      await api.browserNewTab(url);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
+  /** Open a result in a NEW tab.
+   *
+   * Two things this owes the user, neither of which it used to do. Rust creates
+   * the page, SELECTS it (`browser::new_tab`) and the tab strip adopts it on
+   * its own reconcile tick — up to a second of a click that looks ignored. So:
+   * say so immediately, and then get out of the way, because the results page
+   * is drawn OVER a webview parked at 1×1 and leaving it up hid the very page
+   * that was just opened until the user left the area and came back. The
+   * "◂ Results" row brings the list straight back with no re-search. */
+  const openResultInNewTab = useCallback(
+    async (url: string) => {
+      setBusy(true);
+      setError(null);
+      setNotice("Opening in a new tab…");
+      try {
+        await api.browserNewTab(url);
+        setSearchOpen(false);
+        setNotice("Opened in a new tab.");
+        window.setTimeout(() => setNotice(null), 4000);
+        await refresh();
+      } catch (e) {
+        setNotice(null);
+        setError(String(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [refresh],
+  );
 
   async function nav(action: "back" | "forward" | "reload" | "stop") {
     try {
@@ -377,9 +477,22 @@ export function BrowserView({
 
   const savePage = () => runSave(() => api.browserSavePage("page"));
   const saveSelection = () => runSave(() => api.browserSavePage("selection"));
+  /** Save the destination this toolbar is pointing at.
+   *
+   * With a page ON SCREEN this saves what you are looking at, through the same
+   * capture Save page uses. It used to re-fetch the address as a stranger even
+   * then — no session, no cookies — so a signed-in or paywalled article saved
+   * its sign-in wall under the real page's title and said "Saved".
+   *
+   * The fetch is still right for the two things a rendered page cannot give:
+   * a video's CAPTIONS and a binary (PDF, image, archive), which is what
+   * `needsFreshFetch` names. */
   const saveLink = () =>
     runSave(async () => {
       if (!info.url) throw new Error("No page is open.");
+      if (info.open && !blank && !needsFreshFetch(info.url)) {
+        return api.browserSavePage("page");
+      }
       const meta = await api.importLink(info.url);
       return `Saved "${meta.name}" into the room.`;
     });
@@ -408,6 +521,9 @@ export function BrowserView({
   // while the results page or the start screen is up: the address bar is
   // showing a query then, and a padlock over a query would be a claim about a
   // page nobody is looking at.
+  // The page stopped answering the poll. Silent while the results page is up:
+  // the native view is parked then, and nobody is looking at the page.
+  const stalled = searchOpen ? null : stalledBanner(info);
   const scheme = schemeOf(searchOpen || blank ? null : info.url);
   const secure = scheme === "https:";
   const insecure = scheme === "http:";
@@ -417,7 +533,31 @@ export function BrowserView({
 
   return (
     <div className="browser-area">
+      {/* Item #18: the ONE live region for this area. The page is a native
+          layer — it changes without changing the DOM — so this is the only
+          thing that can tell a screen-reader user where they now are. */}
+      <p className="browser-sr" role="status">
+        {announce}
+      </p>
       <div className="browser-chrome">
+        {/* Item #18: the first tab stop in the area, visually hidden until it
+            has focus — which is what makes the reading view discoverable
+            without pretending to detect a screen reader.
+
+            IT LIVES IN THE CHROME, NOT IN THE BODY. Anything positioned inside
+            `.browser-body` is drawn UNDER the native page, which covers that
+            rect exactly; a skip control there is enabled precisely when it is
+            invisible, so its focus ring — the whole point of it — could never
+            be seen. The chrome row is the nearest place the app can actually
+            paint. */}
+        <button
+          className="browser-skip"
+          type="button"
+          disabled={!info.open || blank}
+          onClick={openReader}
+        >
+          Read this page as text
+        </button>
         <div className="browser-nav">
           <button
             className="browser-btn"
@@ -447,6 +587,8 @@ export function BrowserView({
 
         <form
           className="browser-address"
+          role="search"
+          aria-label="Address and web search"
           onSubmit={(e) => {
             e.preventDefault();
             void go();
@@ -480,6 +622,7 @@ export function BrowserView({
             </span>
           )}
           <input
+            ref={addressRef}
             aria-label="Address — search the web, or type an address and press Enter"
             placeholder="Search or enter a web address"
             value={address}
@@ -517,12 +660,27 @@ export function BrowserView({
         <button
           className="browser-btn"
           type="button"
+          ref={saveRef}
           disabled={!info.open || blank}
           aria-label="Save this page, a selection, the link, or its video into the room"
           aria-expanded={saveOpen}
           onClick={() => setSaveOpen((v) => !v)}
         >
           Save
+        </button>
+
+        {/* Item #18: the one control that gives a screen reader the page's
+            actual content. Named for what it DOES first — the reason it has to
+            exist is in the title, not in the accessible name. */}
+        <button
+          className="browser-btn"
+          type="button"
+          disabled={!info.open || blank}
+          aria-pressed={readerOpen}
+          title="The page is a separate native layer this app cannot put into the reading order. This shows its text here, where a screen reader and the keyboard can reach it."
+          onClick={() => (readerOpen ? setReaderOpen(false) : openReader())}
+        >
+          Read as text
         </button>
 
         <button
@@ -537,7 +695,19 @@ export function BrowserView({
       </div>
 
       {saveOpen && (
-        <div className="browser-banner browser-save-row" role="toolbar" aria-label="Save into the room">
+        // A GROUP, not a `toolbar`: `role="toolbar"` promises arrow-key
+        // navigation between its controls, and these are plain tab stops.
+        // Claiming the role without the behaviour is a lie to assistive tech.
+        <div
+          className="browser-banner browser-save-row"
+          role="group"
+          aria-label="Save into the room"
+          onKeyDown={(e) => {
+            if (e.key !== "Escape") return;
+            setSaveOpen(false);
+            saveRef.current?.focus();
+          }}
+        >
           <button className="browser-btn" disabled={saving} onClick={() => void savePage()}>
             Save page
           </button>
@@ -584,6 +754,15 @@ export function BrowserView({
           hand it back.
         </div>
       )}
+      {/* A page that stopped answering looks EXACTLY like one that is fine —
+          the address bar falls back to Rust's own record, so the chrome stays
+          confident about a page it can no longer see. Say it on screen, not
+          only in the live region. */}
+      {stalled && (
+        <div className="browser-banner error" role="status">
+          {stalled}
+        </div>
+      )}
       {error && (
         <div className="browser-banner error" role="alert">
           {error}
@@ -615,8 +794,13 @@ export function BrowserView({
         </div>
       )}
 
-      <div className="browser-body">
-        {/* EMPTY BY DESIGN — the native page is parked over this rect. */}
+      <div className={`browser-body${readerOpen ? " reading" : ""}`}>
+        {/* EMPTY BY DESIGN — the native page is parked over this rect, and it
+            stays OUT of the accessibility tree. Naming it (`role="region"`,
+            `aria-label="the web page"`) would put a region in the rotor that
+            contains nothing at all: a promise that this app can show a screen
+            reader the page, which from the host DOM it cannot. The honest
+            route is the reading view above. */}
         <div className="browser-stage" ref={stageRef} aria-hidden />
         {/* BROWSE-3: the results page. Shown over the parked webview, so it
             takes precedence over the start screen. */}
@@ -651,14 +835,36 @@ export function BrowserView({
           <aside className="browser-journal" aria-label="Browser journal">
             <header>
               <h2>What happened here</h2>
-              <button
-                className="browser-btn"
-                onClick={() => {
-                  void api.browserClearJournal().then(loadJournal);
-                }}
-              >
-                Clear
-              </button>
+              {confirmClear ? (
+                <span className="browser-journal-confirm">
+                  <span>Erase this record?</span>
+                  <button
+                    className="browser-btn"
+                    onClick={() => {
+                      setConfirmClear(false);
+                      void api.browserClearJournal().then(loadJournal);
+                    }}
+                  >
+                    Erase
+                  </button>
+                  <button className="browser-btn" onClick={() => setConfirmClear(false)}>
+                    Keep
+                  </button>
+                </span>
+              ) : (
+                <button
+                  className="browser-btn"
+                  disabled={journal.length === 0}
+                  title={
+                    journal.length === 0
+                      ? "Nothing recorded yet"
+                      : "Erase this record — it cannot be brought back"
+                  }
+                  onClick={() => setConfirmClear(true)}
+                >
+                  Clear
+                </button>
+              )}
             </header>
             <p className="browser-journal-note">
               The web side of this browser saves nothing. This is the record of
@@ -679,6 +885,21 @@ export function BrowserView({
               </ol>
             )}
           </aside>
+        )}
+
+        {/* Item #18. A PANEL that shrinks the stage, never an overlay: the
+            native page must keep a real layout viewport beside it or the text
+            it reports is a 1px-wide reflow of itself. */}
+        {readerOpen && (
+          <BrowserReader
+            info={info}
+            onNavigate={(url) => void openResult(url)}
+            onClose={() => {
+              setReaderOpen(false);
+              // Focus must land somewhere the user chose, not nowhere.
+              addressRef.current?.focus();
+            }}
+          />
         )}
       </div>
     </div>

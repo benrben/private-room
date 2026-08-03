@@ -2,12 +2,14 @@ import { api, Workflow, ScheduleArg, WorkflowTemplate } from "../api";
 import { WSState } from "./state";
 import { tryToast } from "./guard";
 
-/** Wave 4a (Idea 2): Workflows page + shortcuts handlers. `viewFile` opens a
- * workflow's output when a manual run finishes. */
-export function makeWorkflowActions(
-  s: WSState,
-  _deps: { viewFile: (id: string) => Promise<void> },
-) {
+/** Wave 4a (Idea 2): Workflows page + shortcuts handlers.
+ *
+ * Takes no `viewFile` dep: this file used to ask for one so a finished manual
+ * run could open its output, and never called it — the run toast's "View"
+ * action opens the workflow's DETAIL pane instead, which is where the outputs
+ * are listed. An unused dependency reads as a wiring bug every time someone
+ * new looks at it. */
+export function makeWorkflowActions(s: WSState) {
   async function refreshWorkflows() {
     try {
       s.setWorkflows(await api.listWorkflows());

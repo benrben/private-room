@@ -106,13 +106,33 @@ fn import_files_blocking(app: &tauri::AppHandle, paths: Vec<String>) -> Result<I
                 }
                 let ext = extraction::extension_of(&file_name);
                 let no_text = text.as_deref().map_or(true, |t| t.trim().is_empty());
-                let needs_ocr = no_text && ocr::is_ocr_candidate(&mime, &ext);
+                // A PDF whose text came back DEGRADED — interleaved columns,
+                // words with no spaces, an unmapped font — used to be indexed
+                // exactly as it arrived, because the only OCR trigger was "no
+                // text at all". That silently poisoned search and every answer
+                // the model gave from the file. Vision reads the RENDERED page,
+                // so it is layout- and font-independent; the pass is queued on
+                // the same background lane as a scan.
+                let degraded_pdf = ext == "pdf"
+                    && text.as_deref().is_some_and(extraction::should_reread_with_ocr);
+                let needs_ocr = (no_text || degraded_pdf) && ocr::is_ocr_candidate(&mime, &ext);
                 // ADD-18: recordings/videos get transcribed in the background,
                 // the audio twin of the OCR fallback below.
                 let needs_stt = no_text && stt::media_kind(&mime, &ext).is_some();
+                // The user's own file is still on disk here, so a video can be
+                // asked what it is for free — no temp copy, no second decrypt.
+                // A probe that read nothing writes nothing: the column stays
+                // NULL and means "not probed yet", never "probed, all unknown".
+                let media_meta = (stt::media_kind(&mime, &ext) == Some(stt::MediaKind::Video))
+                    .then(|| crate::media_probe::probe_path(std::path::Path::new(&path)))
+                    .flatten()
+                    .and_then(|m| serde_json::to_string(&m).ok());
                 match db::insert_file(&room.conn, &file_name, &mime, &bytes, text.as_deref(), "upload")
                 {
                     Ok(meta) => {
+                        if let Some(json) = &media_meta {
+                            let _ = db::set_media_meta(&room.conn, &meta.id, json);
+                        }
                         if needs_ocr || needs_stt {
                             // CHG-27: enqueue metadata only; the worker re-reads
                             // bytes from the DB when it runs.
@@ -206,11 +226,19 @@ pub(crate) fn import_download(
         // real name ("{uuid}-{name}"), so its extension survives.
         text = extraction::markitdown_extract(&staged.to_string_lossy());
     }
+    let ext = extraction::extension_of(display_name);
+    // Ask the container what it is while the staged copy still exists — after
+    // the remove below there is no file left to probe without writing another.
+    let media_meta = (stt::media_kind(&mime, &ext) == Some(stt::MediaKind::Video))
+        .then(|| crate::media_probe::probe_path(staged))
+        .flatten()
+        .and_then(|m| serde_json::to_string(&m).ok());
     let _ = std::fs::remove_file(staged);
 
-    let ext = extraction::extension_of(display_name);
     let no_text = text.as_deref().map_or(true, |t| t.trim().is_empty());
-    let needs_ocr = no_text && ocr::is_ocr_candidate(&mime, &ext);
+    let degraded_pdf =
+        ext == "pdf" && text.as_deref().is_some_and(extraction::should_reread_with_ocr);
+    let needs_ocr = (no_text || degraded_pdf) && ocr::is_ocr_candidate(&mime, &ext);
     let needs_stt = no_text && stt::media_kind(&mime, &ext).is_some();
 
     let state = app.state::<AppState>();
@@ -225,6 +253,9 @@ pub(crate) fn import_download(
             "download",
             Some(origin_url),
         )?;
+        if let Some(json) = &media_meta {
+            db::set_media_meta(&room.conn, &meta.id, json)?;
+        }
         Ok((meta, room.path.clone()))
     })?;
     if needs_ocr || needs_stt {
@@ -380,6 +411,21 @@ pub(crate) fn read_job_bytes(app: &tauri::AppHandle, job: &JobMeta) -> Option<Ve
     }
 }
 
+/// The text a queued file already carries, under the same epoch pin as
+/// `read_job_bytes` — a rollback between enqueue and execution must not let a
+/// job read the swapped room.
+fn read_job_text(app: &tauri::AppHandle, job: &JobMeta) -> Option<String> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let guard = state.room.lock().unwrap();
+    match guard.as_ref() {
+        Some(room) if room.path == job.room_path && state.room_epoch() == job.epoch => {
+            db::get_file_full(&room.conn, &job.id).ok().and_then(|(_, _, _, text)| text)
+        }
+        _ => None,
+    }
+}
+
 /// ADD-14: on-device OCR for one file. On success, store the recognized text
 /// (prefixed so the AI can flag OCR uncertainty), re-index it, and tell the UI.
 /// Any failure is silent — the file simply keeps having no text.
@@ -387,11 +433,32 @@ pub(crate) fn run_ocr_job(app: &tauri::AppHandle, job: JobMeta) {
     use tauri::{Emitter, Manager};
     let _ = app.emit("ocr-progress", (&job.name, "started"));
     let Some(bytes) = read_job_bytes(app, &job) else { return };
+    // Whatever reading the file already has. For a scan this is None; for a
+    // PDF queued because its embedded text was DEGRADED it is that text, and
+    // it must not be thrown away unless the OCR is genuinely better.
+    let existing = read_job_text(app, &job);
     let Some(text) = ocr::recognize(&job.mime, &job.ext, &bytes) else {
         let _ = app.emit("ocr-progress", (&job.name, "none"));
         return;
     };
-    let full_text = format!("(text recognized from scan)\n{text}");
+    let recognized = format!("(text recognized from scan)\n{text}");
+    // `choose` keeps faultless embedded text over any OCR (Vision can misread
+    // a ligature where the embedded text is exact) and never lets a blank
+    // recognition erase a real, if imperfect, reading.
+    let full_text =
+        match extraction::choose(existing.as_deref(), Some(recognized.as_str())) {
+            Some(chosen) => chosen.to_string(),
+            None => {
+                let _ = app.emit("ocr-progress", (&job.name, "none"));
+                return;
+            }
+        };
+    if existing.as_deref() == Some(full_text.as_str()) {
+        // The existing reading won — nothing to write, and claiming "done"
+        // would report an improvement that did not happen.
+        let _ = app.emit("ocr-progress", (&job.name, "none"));
+        return;
+    }
     {
         let state = app.state::<AppState>();
         let guard = state.room.lock().unwrap();
@@ -415,14 +482,9 @@ pub fn list_files(state: State<'_, AppState>) -> Result<Vec<FileMeta>, String> {
     state.with_room(|room| db::list_files(&room.conn))
 }
 
-pub(crate) const MAX_VIEWER_BYTES: usize = 50 * 1024 * 1024;
-
-/// Ceiling on a file whose RAW bytes are handed over as editable text (csv,
-/// markdown, html, code). That text crosses IPC unclipped — it has to, because
-/// a clipped buffer saved back would truncate the file — so the ceiling is the
-/// only guard. csv and markdown used to have none at all, which is how opening
-/// a large exported spreadsheet hung the window.
-pub(crate) const MAX_RAW_TEXT_BYTES: usize = 10 * 1024 * 1024;
+/// The format registry is the single source of truth for what a file is; these
+/// re-exports keep every existing caller in this module working unchanged.
+pub(crate) use crate::formats::{classify_file, Delivery, TextSource};
 
 /// Text files are read as UTF-8. Bytes that aren't valid UTF-8 come back from
 /// `from_utf8_lossy` with every unreadable byte turned into U+FFFD, so writing
@@ -434,84 +496,6 @@ pub(crate) fn non_utf8_error(name: &str) -> String {
          accented characters with □. Re-save it as UTF-8 first, or save a corrected \
          copy as a new file."
     )
-}
-
-/// Where a file's text comes from.
-///
-/// There is deliberately no "no text" case: `classify_file` sees only a name,
-/// a MIME type and a length, so it can never know whether a file HAS text —
-/// "the stored text is None" answers that, and both readers already handle it
-/// (the viewer falls back to the binary card, the compare view to "no text to
-/// compare"). A third variant only ever encoded a guess, and guessing it for
-/// oversized images is what hid a large scan's OCR text from the viewer.
-pub(crate) enum TextSource {
-    /// The stored bytes ARE the text (csv, markdown, html, code).
-    Raw,
-    /// Text was read OUT of a binary format (pdf, docx, xlsx, pptx, OCR, STT).
-    Extracted,
-}
-
-/// What a file looks like to the app: which viewer opens it, where its text
-/// comes from, whether that text round-trips (so it can be edited in place),
-/// and whether the viewer needs the raw bytes.
-///
-/// This is the ONE table behind BOTH `get_file_content` (the viewer) and
-/// `content_text` (the version-compare view). They used to keep two hand-written
-/// copies of these rules, kept in step only by a comment asking future editors
-/// to match them — and they had already drifted, which is why comparing two
-/// versions of a spreadsheet always said there was nothing to compare.
-pub(crate) struct FileView {
-    pub kind: &'static str,
-    pub text: TextSource,
-    pub editable: bool,
-    pub needs_bytes: bool,
-}
-
-pub(crate) fn classify_file(name: &str, mime: &str, len: usize) -> FileView {
-    let ext = extraction::extension_of(name);
-    let view = |kind, text, editable, needs_bytes| FileView { kind, text, editable, needs_bytes };
-    // Images: the picture itself, plus whatever OCR read off it (ADD-14) — the
-    // recognized text was being computed, indexed and then withheld from the
-    // viewer, so it could never be seen, copied or corrected.
-    if extraction::is_image(mime) {
-        return if len <= MAX_VIEWER_BYTES {
-            view("image", TextSource::Extracted, false, true)
-        } else {
-            // Too big to hand the picture over base64 — drop the RAW BYTES, not
-            // the text. A 60 MB TIFF scan of a map or a poster that OCR read
-            // successfully opened as a read-only text preview before the
-            // refactor; sending it down the binary branch put its recognized
-            // text (still stored and still indexed) out of reach of the viewer
-            // and of "Copy all text".
-            view("text", TextSource::Extracted, false, false)
-        };
-    }
-    match ext.as_str() {
-        // PDF/DOCX/XLSX carry their extracted text too, so the viewer can offer
-        // "edit as text" and the compare view has something to diff.
-        "pdf" if len <= MAX_VIEWER_BYTES => return view("pdf", TextSource::Extracted, false, true),
-        "docx" if len <= MAX_VIEWER_BYTES => return view("docx", TextSource::Extracted, false, true),
-        "xlsx" | "xls" if len <= MAX_VIEWER_BYTES => {
-            return view("sheet", TextSource::Extracted, false, true)
-        }
-        "csv" | "tsv" if len <= MAX_RAW_TEXT_BYTES => return view("csv", TextSource::Raw, true, false),
-        "md" | "markdown" if len <= MAX_RAW_TEXT_BYTES => {
-            return view("markdown", TextSource::Raw, true, false)
-        }
-        // HTML runs live in a sandboxed preview iframe (the "runner"); the raw
-        // source is editable text that round-trips, so Edit drops to Monaco.
-        "html" | "htm" if len <= MAX_RAW_TEXT_BYTES => {
-            return view("html", TextSource::Raw, true, false)
-        }
-        _ => {}
-    }
-    // Files whose bytes ARE text: viewable and safely editable in place.
-    if extraction::is_text_extension(&ext) && len <= MAX_RAW_TEXT_BYTES {
-        return view("code", TextSource::Raw, true, false);
-    }
-    // Everything else (pptx, MarkItDown output, an oversized pdf or csv):
-    // read-only preview of whatever text we managed to extract.
-    view("text", TextSource::Extracted, false, false)
 }
 
 /// Clip huge extracted text at a char boundary for preview/edit payloads.
@@ -549,7 +533,10 @@ pub(crate) fn content_text(
         return extracted.map(clip_preview);
     }
     match classify_file(name, mime, bytes.len()).text {
-        TextSource::Raw => Some(clip_preview(String::from_utf8_lossy(bytes).into_owned())),
+        // Decoded exactly as the viewer decodes it, so a legacy-encoded file's
+        // two diff panes read as its own words rather than as U+FFFD on both
+        // sides — the compare view is where a bad decode looks like an edit.
+        TextSource::Raw => Some(clip_preview(extraction::decode_text_bytes(bytes))),
         TextSource::Extracted => extracted.map(clip_preview),
     }
 }
@@ -585,6 +572,12 @@ pub fn get_file_content(
             "audio"
         };
         let playable = playable_media_mime(&mime, &ext, kind == stt::MediaKind::Video);
+        // Whatever the container was already asked about. NOT probed here: the
+        // probe opens the file through AVFoundation, and this command runs
+        // holding the room lock. The viewer asks for `probe_video_meta` when
+        // this is None, which does the work with the lock released.
+        let media_meta = db::get_media_meta(&room.conn, &id)
+            .and_then(|j| serde_json::from_str(&j).ok());
         let token = stage_media_bytes(&media, std::mem::take(&mut bytes), &playable);
         return Ok(FileContent {
             kind: k.into(),
@@ -594,44 +587,182 @@ pub fn get_file_content(
             text: extracted.map(clip),
             data_b64: None,
             media_token: Some(token),
+            media_meta,
+            // A media file is not a saved page; the column is NULL for it and
+            // the strip has nothing to draw.
+            web_meta: None,
         });
     }
 
-    let content = |kind: &str, editable: bool, text: Option<String>, b64: bool| FileContent {
-        kind: kind.into(),
-        name: name.clone(),
-        mime: mime.clone(),
-        editable,
-        text,
-        data_b64: if b64 {
-            Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
+    let view = classify_file(&name, &mime, bytes.len());
+
+    // A viewer that parses the real bytes (pdf, docx, sheet, slides, book,
+    // archive, image) now STREAMS them over roommedia:// instead of receiving a
+    // base64 data URL through IPC.
+    //
+    // The old payload was 4/3 the size of the file, had to be built in Rust,
+    // copied across the IPC boundary and parsed by JS before a single page could
+    // render — which is why there was a 50 MB ceiling on it at all, and why a
+    // file one byte over that ceiling silently lost its real viewer and opened
+    // as a plain `<pre>`. Nothing about a 60 MB scan or a 200-page deck makes it
+    // unviewable; only the transport did. The staged map is capped and cleared
+    // on lock exactly as it already was for audio and video.
+    let stream_token = |bytes: Vec<u8>| {
+        // The MIME the protocol response announces. Media has its own
+        // playability mapping; everything else is served as-is, with a generic
+        // fallback so a mislabelled upload still downloads/renders.
+        let served = if mime.is_empty() || mime == "application/octet-stream" {
+            mime_guess::from_path(&name).first_or_octet_stream().essence_str().to_string()
         } else {
-            None
-        },
-        media_token: None,
+            mime.clone()
+        };
+        stage_media_bytes(&media, bytes, &served)
     };
 
-    let view = classify_file(&name, &mime, bytes.len());
+    // What the page this file was saved from declared about itself, if it was
+    // saved from one. Parsed here so a row written by an older build — or by a
+    // hand-edited room — can only cost the strip, never the file.
+    let web_meta = db::get_web_meta(&room.conn, &id).and_then(|j| serde_json::from_str(&j).ok());
+
+    let content =
+        |kind: &str, editable: bool, text: Option<String>, token: Option<String>| FileContent {
+            kind: kind.into(),
+            name: name.clone(),
+            mime: mime.clone(),
+            editable,
+            text,
+            data_b64: None,
+            media_token: token,
+            // Non-media viewers: there is no container to have technical
+            // metadata about.
+            media_meta: None,
+            web_meta: web_meta.clone(),
+        };
+
     match view.text {
         // The bytes ARE the text: handed over whole (never clipped — a clipped
         // buffer saved back would truncate the file), which is what
-        // MAX_RAW_TEXT_BYTES in `classify_file` bounds.
+        // MAX_RAW_TEXT_BYTES in the registry bounds.
         TextSource::Raw => {
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            // Bytes that aren't UTF-8 came back with U+FFFD in place of every
-            // unreadable one; saving that would destroy the original encoding's
-            // accented letters for good, so the file is preview-only.
-            let editable = view.editable && std::str::from_utf8(&bytes).is_ok();
-            Ok(content(view.kind, editable, Some(text), view.needs_bytes))
+            // This was `from_utf8_lossy`, which turned every byte of a legacy
+            // encoding into U+FFFD — so a Turkish ISO-8859-9 .txt opened as a
+            // wall of "" AND lost its Edit button, since a lossy string is
+            // exactly what must never be written back (live QA 2026-08-03, 1/5).
+            //
+            // It goes through the SAME function the encoding strip re-runs, so
+            // the text on screen and the encoding the strip names can never come
+            // from two different readings of the file — including the rule for
+            // whether Edit is on the table at all.
+            let decoded = decode_stored_text(&name, &mime, &bytes, None)?;
+            let token = (view.delivery == Delivery::Stream).then(|| stream_token(bytes));
+            Ok(content(view.kind, decoded.editable, Some(decoded.text), token))
         }
-        TextSource::Extracted => match extracted {
-            Some(text) => Ok(content(view.kind, view.editable, Some(clip(text)), view.needs_bytes)),
-            // No text was read out of it after all (an image awaiting OCR keeps
-            // its viewer; anything else falls back to the binary card).
-            None if view.needs_bytes => Ok(content(view.kind, false, None, true)),
-            None => Ok(content("binary", false, None, false)),
-        },
+        TextSource::Extracted => {
+            let token = (view.delivery == Delivery::Stream).then(|| stream_token(bytes));
+            match extracted {
+                Some(text) => Ok(content(view.kind, view.editable, Some(clip(text)), token)),
+                // No text was read out of it after all (an image awaiting OCR
+                // keeps its viewer; anything else falls back to the binary card).
+                None if token.is_some() => Ok(content(view.kind, false, None, token)),
+                None => Ok(content("binary", false, None, None)),
+            }
+        }
     }
+}
+
+/// One charset the viewer's encoding picker may offer. `name` is the WHATWG
+/// name a decode reports back, so the menu's selected row and the strip's
+/// "read as …" are always the same string.
+#[derive(Serialize, Clone, Debug)]
+pub struct EncodingChoice {
+    pub name: String,
+    pub title: String,
+}
+
+/// A text file re-read from its ORIGINAL BYTES, for the viewer's encoding strip.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DecodedFileText {
+    pub text: String,
+    pub encoding: String,
+    /// bom | utf8 | detected | chosen — a fact about the bytes, or a guess, or
+    /// the user's override. The strip says which.
+    pub source: extraction::EncodingSource,
+    /// Bytes with no meaning in this encoding became U+FFFD, so the text is not
+    /// the file and must not be saved back over it.
+    pub lossy: bool,
+    /// Whether Edit is on the table for this reading (the format allows an
+    /// in-place rewrite AND the decode was clean).
+    pub editable: bool,
+    pub options: Vec<EncodingChoice>,
+}
+
+/// Re-decode a stored file's bytes, optionally as a NAMED encoding.
+///
+/// `get_file_content` reads its raw-text payload through here too, so the text
+/// the viewer draws and the encoding the strip names are one answer rather than
+/// two readings that have to agree by eye.
+///
+/// Pure so it can be unit-tested without a room. Detection is a guess and
+/// single-byte encodings are genuinely ambiguous — the same bytes really are
+/// Turkish and really are Cyrillic — so the viewer has to let a human overrule
+/// it, and the override has to re-read the BYTES. Re-interpreting the string we
+/// already decoded could only ever launder one wrong reading into another.
+pub(crate) fn decode_stored_text(
+    name: &str,
+    mime: &str,
+    bytes: &[u8],
+    encoding: Option<&str>,
+) -> Result<DecodedFileText, String> {
+    let view = classify_file(name, mime, bytes.len());
+    // Extracted-text formats (a PDF, a Word file) have no charset the user could
+    // usefully change: their reader already decided how to read them. Saying so
+    // beats handing back a plausible-looking re-decode of a zip container.
+    if view.text != TextSource::Raw {
+        return Err(format!(
+            "\"{name}\" is not stored as plain text — its words are read out of the file, so \
+             there is no text encoding to change."
+        ));
+    }
+    let decoded = match encoding {
+        Some(label) => extraction::decode_text_as(bytes, label)
+            .ok_or_else(|| format!("Arcelle can't read text as \"{label}\"."))?,
+        None => extraction::decode_text_detail(bytes),
+    };
+    Ok(DecodedFileText {
+        text: decoded.text,
+        encoding: decoded.encoding.to_string(),
+        source: decoded.source,
+        lossy: decoded.lossy,
+        editable: view.editable && !decoded.lossy,
+        options: extraction::encoding_choices()
+            .into_iter()
+            .map(|(name, title)| EncodingChoice { name: name.to_string(), title: title.to_string() })
+            .collect(),
+    })
+}
+
+/// The viewer's encoding strip: what encoding this text file is being read as,
+/// and what it says when read as another one.
+///
+/// `encoding: None` answers with the automatic reading — the same one
+/// `get_file_content` shows — which is how the strip learns what to display
+/// without the viewer having to guess a second time.
+#[tauri::command]
+pub fn decode_file_text(
+    state: State<'_, AppState>,
+    id: String,
+    encoding: Option<String>,
+) -> Result<DecodedFileText, String> {
+    state.with_room(|room| {
+        let (name, mime, bytes, _) = db::get_file_full(&room.conn, &id)?;
+        decode_stored_text(
+            &name,
+            &mime.unwrap_or_default(),
+            &bytes.unwrap_or_default(),
+            encoding.as_deref(),
+        )
+    })
 }
 
 /// The single write path for changing an existing file's bytes. Snapshots the
@@ -671,26 +802,115 @@ pub fn update_file_content(
     Ok(meta)
 }
 
+/// ADD-27: whatever is about to happen to `id`, a live recording writing into
+/// it must be stopped first, or the engine keeps flushing into a row that is
+/// leaving the library. The stop is NOT awaited — its final flush would only
+/// recreate nothing; dropping the session is what matters.
+fn stop_recording_into(rec: &super::RecState, id: &str) {
+    let mut session = rec.session.lock().unwrap();
+    if session.as_ref().map(|l| l.file_id == id).unwrap_or(false) {
+        if let Some(live) = session.take() {
+            let (done_tx, _) = std::sync::mpsc::channel();
+            let _ = live.handle.tx.send(crate::recording::EngineMsg::Stop { done: done_tx });
+        }
+    }
+}
+
+/// Delete a file the way a person means it: it leaves the room's views and
+/// stops counting as present, and it is recoverable from the trash until
+/// someone explicitly destroys it.
+///
+/// This is the ONLY delete the UI can reach without a second, differently
+/// worded confirmation. "Ask before AI edits files" is off by owner decision,
+/// so the app changes and removes things without asking — the trash is the net
+/// under that, and a net with a hole in it is not one.
 #[tauri::command]
-pub fn delete_file(
+pub fn trash_file(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     rec: State<'_, super::RecState>,
     id: String,
 ) -> Result<(), String> {
-    // ADD-27: deleting the file a live recording writes into must stop the
-    // engine first, or it keeps flushing into a row that no longer exists.
-    // The stop is NOT awaited — its final flush would only recreate nothing
-    // (the row is going away); dropping the session is what matters.
-    {
-        let mut session = rec.session.lock().unwrap();
-        if session.as_ref().map(|l| l.file_id == id).unwrap_or(false) {
-            if let Some(live) = session.take() {
-                let (done_tx, _) = std::sync::mpsc::channel();
-                let _ = live.handle.tx.send(crate::recording::EngineMsg::Stop { done: done_tx });
-            }
+    stop_recording_into(&rec, &id);
+    // A Tauri command invoked from the window IS the person: the agent driver
+    // is blocked from clicking a destructive confirm (ADD-25), so nothing else
+    // can get here. An AI-initiated delete would come through `db::trash_file`
+    // with `TrashActor::Agent(tool)` and be labelled as such in the trash.
+    state.with_room(|room| db::trash_file(&room.conn, &id, db::TrashActor::User))?;
+    use tauri::Emitter;
+    let _ = app.emit("room-files-changed", ());
+    Ok(())
+}
+
+/// Everything currently in this room's trash, newest deletion first.
+#[tauri::command]
+pub fn list_trashed_files(state: State<'_, AppState>) -> Result<Vec<crate::commands::TrashedFile>, String> {
+    state.with_room(|room| db::list_trashed_files(&room.conn))
+}
+
+/// Put a trashed file back — row, bytes, versions, transcript and search index
+/// (keyword AND vector, see `db::restore_file`). Returns the restored file's
+/// metadata, which is also the proof it is really back: `db::get_file_meta`
+/// refuses to return a trashed row, so a `Ok(meta)` here cannot be reported for
+/// a file that is still in the trash.
+#[tauri::command]
+pub fn restore_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<FileMeta, String> {
+    let meta = state.with_room(|room| {
+        db::restore_file(&room.conn, &id)?;
+        db::get_file_meta(&room.conn, &id)
+    })?;
+    use tauri::Emitter;
+    let _ = app.emit("room-files-changed", ());
+    Ok(meta)
+}
+
+/// Destroy one trashed file for good. Named for what it does: no caller reaches
+/// this by way of an ordinary "delete".
+///
+/// Refuses anything that is not already in the trash, so permanent deletion is
+/// always a SECOND, separate act — a file cannot go from the library to gone in
+/// one click, however that click was made.
+#[tauri::command]
+pub fn delete_file_permanently(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    rec: State<'_, super::RecState>,
+    id: String,
+) -> Result<(), String> {
+    stop_recording_into(&rec, &id);
+    state.with_room(|room| {
+        let trashed: bool = room
+            .conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE id = ?1 AND trashed_at IS NOT NULL",
+                [&id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?
+            > 0;
+        if !trashed {
+            return Err("Only a file already in the trash can be deleted permanently.".into());
         }
-    }
-    state.with_room(|room| db::delete_file(&room.conn, &id))
+        db::delete_file(&room.conn, &id)
+    })?;
+    use tauri::Emitter;
+    let _ = app.emit("room-files-changed", ());
+    Ok(())
+}
+
+/// Destroy everything in the trash. Returns how many files were destroyed, so
+/// the caller can say what actually happened instead of "trash emptied" over an
+/// empty trash.
+#[tauri::command]
+pub fn empty_trash(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<usize, String> {
+    let destroyed = state.with_room(|room| db::empty_trash(&room.conn))?;
+    use tauri::Emitter;
+    let _ = app.emit("room-files-changed", ());
+    Ok(destroyed)
 }
 
 #[tauri::command]
@@ -781,6 +1001,11 @@ pub async fn import_link(
     state: State<'_, AppState>,
     url: String,
 ) -> Result<FileMeta, String> {
+    // An explicit user action still obeys the room's own internet switch: with
+    // it off the settings page promises the room stays offline, and fetching a
+    // page on a click would make that promise false. (The AI's `save_link` has
+    // always checked; this inlet did not.)
+    require_web_access(state.inner())?;
     import_link_and_index(&app, state.inner(), &url).await
 }
 
@@ -894,7 +1119,10 @@ pub(crate) fn save_web_markdown(
 ) -> Result<FileMeta, String> {
     let (meta, room_path) = state.with_room(|room| {
         let saved = db::current_date(&room.conn);
-        let name = link_file_name(title, url);
+        // The web-research funnel: one call per source, and a run that revisits a
+        // site the room already has produced a second file with the identical
+        // name. Step past what is already there (see `db::available_name`).
+        let name = db::available_name(&room.conn, &link_file_name(title, url))?;
         let content = format!("# {title}\n\nSource: {url}\nSaved: {saved}\n\n{text}");
         let meta = db::insert_file_from_url(
             &room.conn,
@@ -919,7 +1147,13 @@ pub(crate) fn save_web_markdown(
 /// The command's body: fetch the page and write the row. Nothing more —
 /// callers must go through [`import_link_and_index`] so the auto-index and the
 /// privacy scan happen too.
-pub(crate) async fn import_link_impl(state: &AppState, url: &str) -> Result<FileMeta, String> {
+///
+/// PRIVATE on purpose. It used to be `pub(crate)`, and the assistant's
+/// `save_link` tool called it directly: the page it saved was never scanned, so
+/// names appearing only in that page went to a cloud engine unmasked on the
+/// very next turn. Module privacy is the guard now — a caller outside this file
+/// cannot reach the un-scanned write at all.
+async fn import_link_impl(state: &AppState, url: &str) -> Result<FileMeta, String> {
     // ADD-19: a YouTube link imports the video's own captions as a timestamped
     // transcript (no video download) instead of the watch page's JS soup.
     let is_youtube = web::youtube_video_id(url).is_some();
@@ -991,6 +1225,72 @@ mod tests {
         assert_eq!(link_file_name("   ", "https://ex.com/p"), "https ex.com p.md");
     }
 
+    /// The file live QA rated 1/5: Turkish prose stored in ISO-8859-9, which
+    /// the Encoding Standard reads as windows-1254.
+    fn turkish_txt_bytes() -> Vec<u8> {
+        let (bytes, _, had_errors) =
+            encoding_rs::WINDOWS_1254.encode("Türkçe karakterler: ğ ı ş İ Ğ Ş");
+        assert!(!had_errors, "fixture must be representable in the Turkish page");
+        assert!(std::str::from_utf8(&bytes).is_err(), "fixture must not be valid UTF-8");
+        bytes.into_owned()
+    }
+
+    #[test]
+    fn a_legacy_encoded_text_file_is_readable_and_offers_an_editor() {
+        // It used to arrive as U+FFFD (from_utf8_lossy) AND with `editable`
+        // false, so the viewer showed boxes and the header had no Edit button —
+        // the two halves of the 1/5.
+        let bytes = turkish_txt_bytes();
+        let d = decode_stored_text("mektup.txt", "text/plain", &bytes, None).unwrap();
+        assert_eq!(d.encoding, "windows-1254");
+        assert_eq!(d.source, extraction::EncodingSource::Detected);
+        assert!(!d.lossy);
+        assert!(!d.text.contains('\u{FFFD}'), "{:?}", d.text);
+        assert!(d.editable, "a file we could read whole must be editable");
+        assert!(
+            d.options.iter().any(|o| o.name == "UTF-8"),
+            "the picker must always offer a way back to UTF-8"
+        );
+
+        // The compare view reads the same bytes the same way, or a legacy file
+        // shows a phantom whole-file diff against itself.
+        let compared = content_text("mektup.txt", "text/plain", &bytes, None).unwrap();
+        assert_eq!(compared, d.text);
+    }
+
+    #[test]
+    fn choosing_an_encoding_re_reads_the_bytes_and_can_shut_the_editor() {
+        let bytes = turkish_txt_bytes();
+        let auto = decode_stored_text("mektup.txt", "text/plain", &bytes, None).unwrap();
+
+        // The override is a genuine second reading of the ORIGINAL bytes, not a
+        // re-interpretation of the string we already decoded.
+        let cyrillic =
+            decode_stored_text("mektup.txt", "text/plain", &bytes, Some("windows-1251")).unwrap();
+        assert_eq!(cyrillic.source, extraction::EncodingSource::Chosen);
+        assert_eq!(cyrillic.encoding, "windows-1251");
+        assert_ne!(cyrillic.text, auto.text);
+
+        // Read as UTF-8 the same bytes are meaningless, so the text on screen is
+        // NOT the file — Edit goes away rather than offering to save boxes over it.
+        let as_utf8 = decode_stored_text("mektup.txt", "text/plain", &bytes, Some("utf-8")).unwrap();
+        assert!(as_utf8.lossy);
+        assert!(as_utf8.text.contains('\u{FFFD}'));
+        assert!(!as_utf8.editable, "a lossy reading must never be saveable");
+    }
+
+    #[test]
+    fn re_decoding_is_refused_where_it_would_be_a_lie() {
+        // A label the decoder doesn't know: answering with SOME other encoding's
+        // reading would look exactly like success.
+        assert!(decode_stored_text("a.txt", "text/plain", b"hi", Some("klingon-1")).is_err());
+        // An extracted-text format has no charset to change — its reader already
+        // decided how to read it.
+        let err = decode_stored_text("report.pdf", "application/pdf", b"%PDF-1.4", None)
+            .expect_err("a PDF has no text encoding to pick");
+        assert!(err.contains("read out of the file"), "{err}");
+    }
+
     #[test]
     fn the_viewer_and_the_compare_view_agree_on_every_kind() {
         // These rules used to be written out twice, kept in step only by a
@@ -1011,25 +1311,21 @@ mod tests {
         // computed, indexed and then withheld.
         let image = classify_file("scan.png", "image/png", 10_000);
         assert_eq!(image.kind, "image");
-        assert!(image.needs_bytes);
+        assert!(image.needs_bytes());
         assert!(matches!(image.text, TextSource::Extracted));
 
-        // Regression: an image too big for the viewer payload went down the
-        // binary branch with TextSource::None, so a large scan OCR HAD read
-        // opened as "no preview available" and its text — stored and indexed —
-        // could no longer be read or copied. Only the raw bytes are dropped.
-        let huge = classify_file("map.tif", "image/tiff", MAX_VIEWER_BYTES + 1);
-        assert_eq!(huge.kind, "text", "an oversized scan lost its text preview");
-        assert!(!huge.needs_bytes, "the picture itself is still too big to send");
+        // Regression, then its sequel. First an image too big for the viewer
+        // payload went down the binary branch, so a large scan OCR HAD read
+        // opened as "no preview available". That was fixed by keeping its text.
+        // Now the bytes STREAM, so the same scan keeps the real image viewer —
+        // there is no size at which a picture stops being a picture.
+        let huge = classify_file("map.tif", "image/tiff", 400 * 1024 * 1024);
+        assert_eq!(huge.kind, "image", "an oversized scan lost its picture viewer");
+        assert!(huge.needs_bytes(), "streamed bytes have no ceiling");
         assert!(matches!(huge.text, TextSource::Extracted));
         assert_eq!(
-            content_text(
-                "map.tif",
-                "image/tiff",
-                &vec![0u8; MAX_VIEWER_BYTES + 1],
-                Some("Sheet 3 of 12".into())
-            )
-            .as_deref(),
+            content_text("map.tif", "image/tiff", &[0u8; 64], Some("Sheet 3 of 12".into()))
+                .as_deref(),
             Some("Sheet 3 of 12")
         );
 
@@ -1047,17 +1343,142 @@ mod tests {
 
     #[test]
     fn a_huge_csv_or_markdown_file_stops_being_pushed_through_whole() {
-        // Web pages, code and images all had a size gate; csv and markdown had
-        // none, so opening a large export handed the entire file to the screen
-        // in one payload and hung the window.
-        let big = MAX_RAW_TEXT_BYTES + 1;
+        // csv and markdown had no size gate at all, so opening a large export
+        // handed the entire file to the screen in one payload and hung the
+        // window. This ceiling is the one that MUST stay: raw text crosses IPC
+        // as an unclipped string precisely so saving it back can't truncate the
+        // file. (Bytes that STREAM have no ceiling — see the image case above.)
+        let big = crate::formats::MAX_RAW_TEXT_BYTES + 1;
         for name in ["export.csv", "notes.md", "page.html", "main.rs"] {
             let v = classify_file(name, "text/plain", big);
             assert_eq!(v.kind, "text", "{name} should fall back to a clipped preview");
             assert!(!v.editable, "{name} must not be editable at this size");
         }
         // Just under the gate they are still the real editors.
-        assert_eq!(classify_file("export.csv", "text/csv", MAX_RAW_TEXT_BYTES).kind, "csv");
+        assert_eq!(
+            classify_file("export.csv", "text/csv", crate::formats::MAX_RAW_TEXT_BYTES).kind,
+            "csv"
+        );
+    }
+
+    /// The formats the registry newly claims must be readable end to end:
+    /// classified to their own viewer AND yielding comparable text, or the
+    /// version-compare view silently says "nothing to compare" for them.
+    #[test]
+    fn the_newly_supported_formats_classify_and_extract() {
+        let cases: [(&str, &str, &[u8], &str); 4] = [
+            ("notes.eml", "email", b"Subject: Hi\r\n\r\nbody text\r\n", "body text"),
+            ("cues.srt", "subtitle", b"1\n00:00:01,000 --> 00:00:02,000\nHello.\n", "Hello."),
+            ("logo.svg", "svg", b"<svg><text>Chart</text></svg>", "Chart"),
+            ("run.log", "log", b"WARN disk full", "WARN disk full"),
+        ];
+        for (name, kind, bytes, needle) in cases {
+            let v = classify_file(name, "application/octet-stream", bytes.len());
+            assert_eq!(v.kind, kind, "{name} landed on the wrong viewer");
+            // Raw-source kinds hand the viewer the bytes verbatim (it parses
+            // them itself); the SEARCH text is derived separately.
+            let text = content_text(name, "application/octet-stream", bytes, None)
+                .expect("no comparable text");
+            assert!(!text.is_empty(), "{name} produced no text for the compare view");
+            let indexed = extraction::extract_text(name, bytes)
+                .unwrap_or_else(|| panic!("{name} extracted no searchable text"));
+            assert!(
+                indexed.contains(needle),
+                "{name} indexed {indexed:?}, expected it to contain {needle:?}"
+            );
+        }
+    }
+
+    /// Every `.rs` file under `src/`, as (relative path, contents).
+    fn crate_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src is readable") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+                out.push((rel, std::fs::read_to_string(&path).expect("source is utf-8")));
+            }
+        }
+        out
+    }
+
+    /// The un-scanned page write must stay unreachable from anywhere else.
+    ///
+    /// `import_link_impl` writes the row and NOTHING else. The assistant's
+    /// `save_link` tool used to call it directly, so a page the model saved was
+    /// never privacy-scanned — and the redactor's substitution table is built
+    /// from what the scan found, so names appearing only in that page went out
+    /// to a cloud engine unmasked on the very next turn. It is a private `fn`
+    /// now; this is the guard against someone widening it again.
+    #[test]
+    fn the_unscanned_page_write_is_reachable_only_from_this_file() {
+        let offenders: Vec<String> = crate_sources()
+            .into_iter()
+            .filter(|(rel, src)| rel != "commands/files.rs" && src.contains("import_link_impl"))
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these files reach the un-scanned page write directly instead of \
+             import_link_and_index: {offenders:?}"
+        );
+    }
+
+    /// The room's "stay offline" switch has to hold for the inlets a PERSON
+    /// drives, not only for the model's tools.
+    ///
+    /// The agent's `save_link`/`download_url` arms have always checked
+    /// `web_access_enabled`, and the browser's address bar goes through
+    /// `browse::require_web_enabled` — but Add → Web link, the video import and
+    /// the download-job button each reached the internet with the switch off.
+    /// A settings page reading "Off — room stays offline" that still fetches on
+    /// a click is a false privacy claim, so each inlet is pinned by name.
+    #[test]
+    fn every_user_driven_network_inlet_obeys_the_room_switch() {
+        // (file, the function the check must sit in, what a user did to get here)
+        let inlets = [
+            ("commands/files.rs", "pub async fn import_link", "Add → Web link"),
+            ("commands/ytdlp.rs", "pub async fn import_media_url", "video import"),
+            (
+                "commands/jobs/download.rs",
+                "pub(crate) async fn start_download_job_inner",
+                "the download-job button",
+            ),
+        ];
+        let sources = crate_sources();
+        for (file, signature, what) in inlets {
+            let (_, src) = sources
+                .iter()
+                .find(|(rel, _)| rel == file)
+                .unwrap_or_else(|| panic!("{file} has moved — re-point this test"));
+            let at = src
+                .find(signature)
+                .unwrap_or_else(|| panic!("{file}: {signature} has moved — re-point this test"));
+            // The check must be in the FIRST few lines of the body, before
+            // anything is fetched. Generous window, tight claim.
+            let body = &src[at..src.len().min(at + 1200)];
+            assert!(
+                body.contains("require_web_access"),
+                "{what} ({file}) can still reach the internet with the room's switch off"
+            );
+        }
+        // And the one place any of them could be told the room is offline reads
+        // the same setting the Settings switch writes.
+        let conn = crate::db::open_in_memory_schema();
+        assert!(!web_access_enabled(&conn), "an unset switch means offline");
+        crate::db::set_setting(&conn, "web_provider", "off").unwrap();
+        assert!(!web_access_enabled(&conn));
+        crate::db::set_setting(&conn, "web_provider", "on").unwrap();
+        assert!(web_access_enabled(&conn));
     }
 
     #[test]

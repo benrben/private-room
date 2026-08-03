@@ -198,8 +198,10 @@ pub async fn ai_action(
     refs: Option<Vec<String>>,
     instructions: Option<String>,
     question: Option<String>,
+    // `op_id` is the frontend's id for this run, so Stop can reach it. Optional
+    // because the agent's own tool path has no button to press.
+    op_id: Option<String>,
 ) -> Result<FileMeta, String> {
-    use tauri::Emitter;
     let spec = AI_ACTIONS
         .iter()
         .find(|s| s.id == action)
@@ -210,6 +212,18 @@ pub async fn ai_action(
     if state.rolling_back() {
         return Err(ROLLBACK_BUSY.into());
     }
+    // A Summarize over a whole room runs for minutes on a local model, and
+    // until now there was no way to end it: no Stop button, the modal's Cancel
+    // greyed out, clicking outside ignored. A Studio build — the same shape of
+    // work, started from the same shelf — has had Stop and Resume all along.
+    // Registered in the SAME registry chat's Stop uses, so `cancel_ask(opId)`
+    // reaches it; the guard removes the entry on every return path.
+    let node = crate::commands::studios::register_studio_cancel(&state, &op_id, None, spec.title);
+    let _cancel_guard = op_id.as_ref().map(|id| CancelGuard {
+        state: state.inner(),
+        ask_id: id.clone(),
+    });
+    let cancel = node.flag();
     let instr = studio_instruction(instructions, spec.default_prompt);
     let (label, text) = state.with_room(|room| {
         match refs.as_ref().filter(|r| !r.is_empty()) {
@@ -223,9 +237,14 @@ pub async fn ai_action(
     // Say where the material is going, exactly as a Studio run does — Summarize,
     // Translate and Research hand the same document to the same cloud engine, so
     // the reminder shouldn't depend on which menu the user started from.
-    let _ = window.emit(
+    // Owner replacement #4: an AI action is started from the file header and
+    // belongs to no conversation, so its chip is emitted UNOWNED (null ids)
+    // rather than borrowed from whichever chat happens to be open. The chat only
+    // paints an unowned chip while it is itself running something.
+    crate::turn::emit_unowned(
+        &window,
         "ask-step",
-        if is_cloud_model(&model) || is_external_engine(&model) {
+        if !runs_on_this_mac(&model) {
             format!("{} — your cloud AI is working (content leaves this Mac)…", spec.title)
         } else {
             spec.title.to_string()
@@ -249,15 +268,31 @@ pub async fn ai_action(
     // `error` — surface it verbatim (a new branch, not the "Local AI error" wrapper),
     // preserving the current `Err(String)` surfaces; any real engine failure maps to
     // the usual OLLAMA_DOWN / MODEL_MISSING:<model> sentinel.
-    let v = crate::sidecar::sidecar_json("/ai_action", &body)
+    // Stop for a one-shot endpoint IS dropping the request: `until_hangup` on
+    // the sidecar side cancels the task, which closes its connection to the
+    // engine and actually ends the generation (`/ai_action` is one of the routes
+    // that does this). `Ok(None)` is the stopped step, same contract Studios and
+    // the file pass already use.
+    let stopped_msg = || format!("Stopped — the {} result was not saved.", spec.title);
+    let Some(v) = crate::sidecar::sidecar_json_cancellable("/ai_action", &body, &cancel)
         .await
         .map_err(|e| match e.code.as_str() {
             "UNKNOWN_ACTION" | "NEEDS_LANGUAGE" | "EMPTY_RESULT" => e.error.clone(),
             _ => e.sentinel(Some(&model)),
-        })?;
+        })?
+    else {
+        return Err(stopped_msg());
+    };
+    // Stopped between the answer arriving and the save: nothing lands. Saving
+    // here would be the app claiming a result the user had already ended.
+    // Same commit-time rule every other write-side effect uses.
+    crate::cancel::guard_commit(&cancel, &format!("the {} result", spec.title))?;
     let content = v["markdown"].as_str().unwrap_or_default().to_string();
     let name = format!("{} - {}.md", spec.title, safe_scope_name(&label));
-    save_and_open(&window, &state, &name, "text/markdown", &content, "generated")
+    // ART-1: re-running the same action over the same scope versions the earlier
+    // result instead of leaving two files nobody can tell apart.
+    save_and_open(&window, &state, Artifact::new(&name, "text/markdown", &content).by(spec.title))
+        .map(|w| w.meta)
 }
 
 // ---- D6: memory suggestion --------------------------------------------------

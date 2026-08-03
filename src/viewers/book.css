@@ -1,0 +1,49 @@
+/* An e-book, as a book. The chapter itself renders inside the roomdoc://
+   sandbox (an opaque, script-free, network-free origin), so everything here
+   is the reader's chrome around that frame. */
+.book-view { display: flex; flex-direction: column; height: 100%; min-height: 0; outline: none; }
+.book-bar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.book-where { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.book-of { color: var(--muted); }
+.book-actions { display: flex; gap: 0.3rem; }
+.book-stage { flex: 1; display: flex; min-height: 0; }
+.book-frame { flex: 1; border: 0; background: #fdfcfa; }
+.book-toc {
+  flex: none;
+  width: 16rem;
+  overflow: auto;
+  padding: 0.75rem;
+  border-inline-end: 1px solid var(--border);
+}
+.book-cover { display: block; width: 100%; border-radius: 4px; margin-bottom: 0.6rem; }
+.book-meta { display: flex; flex-direction: column; gap: 0.15rem; margin-bottom: 0.6rem; font-size: 0.8rem; }
+.book-meta span { color: var(--muted); }
+.book-toc ol { margin: 0; padding: 0; list-style: none; }
+.book-toc li button {
+  display: block;
+  width: 100%;
+  padding: 0.25rem 0.4rem;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: start;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+.book-toc li button:hover { background: var(--panel); }
+.book-toc li button.active { background: var(--panel); color: var(--accent); }
+.book-nav {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  padding: 0.45rem;
+  border-top: 1px solid var(--border);
+}

@@ -2267,7 +2267,6 @@ fn spawn_live_translator<R: tauri::Runtime>(
                     Some(0.2),
                     "5m",
                     None,
-                    crate::ollama::CtxTier::Chat,
                 )
                 .await
                 else {
@@ -2713,7 +2712,7 @@ mod tests {
             .join(format!("pr-rec-e2e-{}.roomai", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let conn = crate::db::create_room(&room_path, "qa", "QA").unwrap();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
         let file = crate::db::insert_file(
             &conn,
             "QA recording.wav",
@@ -2739,7 +2738,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "QA".into(),
-            password: "qa".into(),
+            password: "qa-room-pw".into(),
         });
         app.manage(state);
 
@@ -2800,7 +2799,7 @@ mod tests {
         assert_eq!(meta.duration_cs, cs_of_samples(total));
 
         // And it all landed in the room file, reopenable with the password.
-        let conn2 = crate::db::open_room(&room_path, "qa").unwrap();
+        let conn2 = crate::db::open_room(&room_path, "qa-room-pw").unwrap();
         let (_, _, bytes, text) = crate::db::get_file_full(&conn2, &file.id).unwrap();
         let wav = bytes.expect("no audio bytes persisted");
         assert_eq!(decode_wav(&wav).unwrap().len(), total);
@@ -2847,7 +2846,7 @@ mod tests {
             .join(format!("pr-rec-mtg-{}.roomai", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let conn = crate::db::create_room(&room_path, "qa", "QA").unwrap();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
         let file = crate::db::insert_file(
             &conn, "Meeting.wav", "audio/wav", &encode_wav(&[]), Some("(live recording)\n"), "recording",
         )
@@ -2863,7 +2862,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "QA".into(),
-            password: "qa".into(),
+            password: "qa-room-pw".into(),
         });
         app.manage(state);
 
@@ -2953,7 +2952,7 @@ mod tests {
             .join(format!("pr-rec-heb-{}.roomai", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let conn = crate::db::create_room(&room_path, "qa", "QA").unwrap();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
         let file = crate::db::insert_file(
             &conn, "Meeting.wav", "audio/wav", &encode_wav(&[]), Some("(live recording)\n"), "recording",
         )
@@ -2969,7 +2968,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "QA".into(),
-            password: "qa".into(),
+            password: "qa-room-pw".into(),
         });
         app.manage(state);
 
@@ -3072,7 +3071,7 @@ mod tests {
             .join(format!("pr-rec-relock-{}.roomai", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let conn = crate::db::create_room(&room_path, "qa", "QA").unwrap();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
         let file = crate::db::insert_file(
             &conn, "Meeting.wav", "audio/wav", &encode_wav(&[]), Some("(live recording)\n"), "recording",
         )
@@ -3088,7 +3087,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "QA".into(),
-            password: "qa".into(),
+            password: "qa-room-pw".into(),
         });
         app.manage(state);
 
@@ -3227,7 +3226,7 @@ mod tests {
             .join(format!("pr-rec-bleed-{}.roomai", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let conn = crate::db::create_room(&room_path, "qa", "QA").unwrap();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
         let file = crate::db::insert_file(
             &conn, "Meeting.wav", "audio/wav", &encode_wav(&[]), Some("(live recording)\n"), "recording",
         )
@@ -3243,7 +3242,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "QA".into(),
-            password: "qa".into(),
+            password: "qa-room-pw".into(),
         });
         app.manage(state);
 
@@ -3633,7 +3632,7 @@ mod tests {
             .join(format!("pr-rec-chunks-{}.roomai", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let conn = crate::db::create_room(&room_path, "qa", "QA").unwrap();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
         let file = crate::db::insert_file(
             &conn, "Long.wav", "audio/wav", &encode_wav(&[]), Some("(live recording)\n"), "recording",
         )
@@ -3649,7 +3648,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "QA".into(),
-            password: "qa".into(),
+            password: "qa-room-pw".into(),
         });
         app.manage(state);
 
@@ -3728,7 +3727,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         handle.tx.send(EngineMsg::Stop { done: done_tx }).unwrap();
         done_rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap().unwrap();
-        let conn2 = crate::db::open_room(&room_path, "qa").unwrap();
+        let conn2 = crate::db::open_room(&room_path, "qa-room-pw").unwrap();
         let bytes = crate::db::get_file_bytes(&conn2, &file.id).unwrap().unwrap();
         assert_eq!(decode_wav(&bytes).unwrap().len(), total, "stop must write the whole timeline");
         let n: i64 = conn2
@@ -3751,7 +3750,7 @@ mod tests {
             .join(format!("pr-rec-resume-{}.roomai", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let conn = crate::db::create_room(&room_path, "qa", "QA").unwrap();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
         // The prior session left 5 s of audio durably in the stored WAV.
         let base = vec![0.0f32; SAMPLE_RATE * 5];
         let file = crate::db::insert_file(
@@ -3769,7 +3768,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "QA".into(),
-            password: "qa".into(),
+            password: "qa-room-pw".into(),
         });
         app.manage(state);
 
@@ -3918,7 +3917,7 @@ mod tests {
             .join(format!("pr-rec-degraded-{}.roomai", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let conn = crate::db::create_room(&room_path, "qa", "QA").unwrap();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
         let file = crate::db::insert_file(
             &conn, "Meeting.wav", "audio/wav", &encode_wav(&[]), Some("(live recording)\n"), "recording",
         )
@@ -3934,7 +3933,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "QA".into(),
-            password: "qa".into(),
+            password: "qa-room-pw".into(),
         });
         app.manage(state);
 
@@ -4043,7 +4042,7 @@ mod tests {
             .join(format!("pr-rec-stt-{}.roomai", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        let conn = crate::db::create_room(&room_path, "qa", "QA").unwrap();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
         let file = crate::db::insert_file(
             &conn, "Toggle.wav", "audio/wav", &encode_wav(&[]), Some("(live recording)\n"), "recording",
         )
@@ -4059,7 +4058,7 @@ mod tests {
             conn,
             path: room_path.clone(),
             name: "QA".into(),
-            password: "qa".into(),
+            password: "qa-room-pw".into(),
         });
         app.manage(state);
 

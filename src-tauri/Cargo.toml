@@ -56,6 +56,19 @@ aes-gcm = "0.10"
 pbkdf2 = "0.12"
 rand = "0.8"
 sysinfo = "0.33"
+# Owner replacement #1: the host's own event log (`src/obs.rs`). The sidecar's
+# stderr was already mirrored to a file; the HOST's decisions — which tools were
+# served to which engine, which model a turn picked, whether a Stop was accepted
+# — left no trace at all, which is why the flagship agent failure could only be
+# diagnosed by believing the model's account of it.
+#
+# `tracing` was already in the lock (transitively, via tauri/reqwest), so this
+# adopts the ecosystem default for a Tokio app rather than inventing a logger.
+# tracing-subscriber is taken WITHOUT default features on purpose: `ansi` writes
+# colour codes a bug reporter would have to strip out of a file, and `env-filter`
+# pulls a regex engine for syntax `filter::Targets` already parses.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "registry"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 pdf-extract = "0.7"
 mime_guess = "2"
@@ -75,6 +88,43 @@ whisper-rs = { version = "0.16", features = ["metal"] }
 # mis-executed CAM++). The 38 MB model ships as a bundled resource.
 tract-onnx = "0.23.4"
 
+# Legacy Office formats, read natively instead of through an optional CLI.
+# `.doc`, `.ppt` and `.xls` used to be readable ONLY if the user happened to
+# have installed Microsoft's MarkItDown themselves (`pipx install markitdown`),
+# which for a shipped Mac app meant "not readable" — GUI apps don't inherit a
+# login shell's PATH, so even an installed copy is often invisible.
+#
+# calamine reads .xls (and .ods) in pure Rust; cfb reads the OLE Compound File
+# container that .doc and .ppt are stored in, which is enough to recover their
+# text. Both are pure Rust with no native libraries to bundle, sign or notarize
+# — deliberately chosen over Extractous (Apache Tika via GraalVM) and
+# office_oxide (0.1.x) for exactly that reason.
+calamine = "0.36"
+cfb = "0.14"
+chardetng = "1.0.0"
+
+# A saved web page has to be the ARTICLE, not the page: nav, share rails,
+# related-story promos and cookie bars stripped, headings/lists/images/links
+# kept. That is the Readability problem, and it is not a tag blacklist — it is
+# Mozilla's node-scoring algorithm, which is why `extraction::strip_html`'s
+# "keep <main>, drop <nav>" heuristic only works on pages that used semantic
+# tags in the first place.
+#
+# dom_smoothie is a maintained, pure-Rust port of that algorithm (metadata
+# included: og:/article:/JSON-LD), and it is built on dom_query — which this
+# app ALREADY compiles, because both wry and tauri-utils depend on it. So the
+# alternatives were: `readability` 0.3 (last released 2021, drags in its own
+# reqwest), `article_scraper` (libxml2 — a native library to bundle, sign and
+# notarize, the exact cost calamine/cfb were chosen to avoid), or writing the
+# scorer ourselves. `serde` is off: the metadata crosses our own boundary as
+# `extraction::PageMeta`, not as this crate's types.
+dom_smoothie = { version = "0.18", default-features = false }
+# Used directly to walk the extracted article into Markdown (the searchable
+# copy). Its own `md()` serializer escapes `.`, `"`, `(` and `#` in running
+# prose — correct CommonMark, unreadable as text, and that text is what search
+# indexes and the model reads.
+dom_query = "0.28"
+
 # macOS-only native deps: ADD-14 OCR (Apple Vision) + ADD-11 Touch ID (Keychain)
 # + ADD-27 system-audio capture (ScreenCaptureKit) for recording meetings.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -84,6 +134,10 @@ objc2-core-media = { version = "0.3", features = [
     "CMSampleBuffer",
     "CMBlockBuffer",
     "CMFormatDescription",
+    # `AVAsset::duration` returns a CMTime, and objc2-av-foundation's binding
+    # for it only exists when this crate exposes the type — enabling the
+    # optional dep is not enough, the module itself is feature-gated here.
+    "CMTime",
 ] }
 objc2-screen-capture-kit = { version = "0.3", features = [
     "SCStream",
@@ -125,6 +179,35 @@ objc2-web-kit = { version = "0.3", features = [
     "WKUserScript",
     "WKContentRuleList",
     "WKContentRuleListStore",
+] }
+# QuickLook: the OS's own preview generator. One integration turns
+# "No preview available for this file type yet" into a real page for the
+# formats nothing in this app can parse — .key/.pages/.numbers, legacy
+# .doc/.ppt, RAW photos, PSD, 3D models. Thumbnailing (not QuickLookUI) is the
+# right half: it renders to an image the webview can show, rather than to an
+# AppKit panel that cannot live inside a Tauri window.
+objc2-quick-look-thumbnailing = { version = "0.3", features = [
+    "QLThumbnailGenerator",
+    "QLThumbnailGenerationRequest",
+    "QLThumbnailRepresentation",
+    "block2",
+] }
+# Video technical metadata (duration/resolution/codec/fps/audio track). Already
+# in the lock as a transitive dep of objc2-screen-capture-kit and objc2-vision,
+# so promoting it to a direct dependency downloads nothing. `default-features =
+# false` is LOAD-BEARING: the default set pulls objc2-media-toolbox and
+# objc2-avf-audio (neither is in the lock, and avf-audio is the crate the
+# neural-voice work deliberately deleted) and compiles ~200 unused modules.
+# The two `objc2-*` feature names below are this crate's OPTIONAL-DEPENDENCY
+# features, not our own deps: without them `AVAsset::duration` (needs CMTime)
+# and `AVAssetTrack::naturalSize` (needs CGSize) do not exist at all.
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVAsset",
+    "AVAssetTrack",
+    "AVMediaFormat",
+    "objc2-core-media",
+    "objc2-core-foundation",
 ] }
 objc2-vision = { version = "0.3", features = [
     "VNRequest",
@@ -180,4 +263,7 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # ADD-27: mock-app harness for the live-recording engine integration test.
 tauri = { version = "2", features = ["test"] }
+# Scratch directories for tests that write real files (the recents list, the
+# recovery sidecar) — test-only, so it never ships in the app.
+tempfile = "3"
 

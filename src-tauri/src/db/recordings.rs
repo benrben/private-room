@@ -15,9 +15,19 @@ pub fn set_rec_meta(conn: &Connection, file_id: &str, meta_json: &str) -> Result
     )
 }
 
+/// A recording's meta, or None when this file is not a recording.
+///
+/// Joined to `files` for the trash clause: the meta IS the transcript —
+/// segments, every word, the speakers the user named — so a by-id read of a
+/// deleted recording hands back its content in full. The `recordings` row has
+/// no `trashed_at` of its own (it is keyed only by file id), and the join is
+/// what keeps the invariant `get_file_meta` documents true here too. The
+/// transcript-editing commands (`rec_set_speaker_name`, `rec_delete_range`)
+/// reach this before they touch any filtered read, so this is their only gate.
 pub fn get_rec_meta(conn: &Connection, file_id: &str) -> Option<String> {
     conn.query_row(
-        "SELECT meta FROM recordings WHERE file_id = ?1",
+        "SELECT r.meta FROM recordings r JOIN files f ON f.id = r.file_id
+         WHERE r.file_id = ?1 AND f.trashed_at IS NULL",
         [file_id],
         |r| r.get(0),
     )
@@ -83,30 +93,68 @@ pub fn recover_rec_chunks(conn: &Connection) -> Result<usize, String> {
         [],
         |r| r.get(0),
     )?;
+    let mut recovered = 0usize;
+    // One recording that cannot be rescued must not take the others down with
+    // it. A damaged WAV, a failing write — anything — used to abort the loop on
+    // the spot, so a single bad file meant every OTHER interrupted recording in
+    // the room stayed unrescued, on every unlock, forever. Failures are counted
+    // here and reported at the end; their checkpoints stay put, so the next
+    // unlock tries again.
+    let mut failed = 0usize;
     for id in &ids {
-        let mut samples = get_file_bytes(conn, id)?
-            .map(|b| crate::recording::decode_wav(&b))
-            .transpose()?
-            .unwrap_or_default();
-        let chunks: Vec<Vec<u8>> = query_rows(
-            conn,
-            "SELECT pcm FROM rec_chunks WHERE file_id = ?1 ORDER BY seq",
-            [id.as_str()],
-            |r| r.get(0),
-        )?;
-        for pcm in chunks {
-            samples.extend(
-                pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
-            );
+        // A file trashed while its live session was still checkpointing has no
+        // row this read can find. SKIPPED, not failed: `?` here aborted the
+        // whole loop, so one deleted recording would take the rescue of every
+        // OTHER interrupted recording in the room down with it — and the user
+        // would be told the recovery failed. The checkpoints stay put, so a
+        // restore still finds its tail waiting on the next open.
+        let Ok(stored) = get_file_bytes(conn, id) else { continue };
+        match recover_one(conn, id, stored) {
+            Ok(()) => recovered += 1,
+            Err(_) => failed += 1,
         }
-        let wav = crate::recording::encode_wav(&samples);
-        // The transcript was checkpointed by every flush and is CURRENT —
-        // it must ride through, or this rescue would erase it.
-        let text = get_file_extracted_text(conn, id);
-        update_file_content(conn, id, &wav, text.as_deref())?;
-        clear_rec_chunks(conn, id)?;
     }
-    Ok(ids.len())
+    if failed > 0 {
+        // Counts only — a recording's name is room content. `recovered` is
+        // reported alongside so the message can never read as a total loss.
+        return Err(format!(
+            "{failed} of {} interrupted recording(s) could not be restored \
+             ({recovered} were). Their audio is still stored in the room and the \
+             rescue runs again the next time you unlock it.",
+            ids.len(),
+        ));
+    }
+    Ok(recovered)
+}
+
+/// Splice one recording's checkpointed tail onto its stored WAV.
+fn recover_one(conn: &Connection, id: &str, stored: Option<Vec<u8>>) -> Result<(), String> {
+    let mut samples = stored
+        .map(|b| crate::recording::decode_wav(&b))
+        .transpose()?
+        .unwrap_or_default();
+    let chunks: Vec<Vec<u8>> = query_rows(
+        conn,
+        "SELECT pcm FROM rec_chunks WHERE file_id = ?1 ORDER BY seq",
+        [id],
+        |r| r.get(0),
+    )?;
+    for pcm in chunks {
+        samples.extend(
+            pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
+        );
+    }
+    let wav = crate::recording::encode_wav(&samples);
+    // The transcript was checkpointed by every flush and is CURRENT —
+    // it must ride through, or this rescue would erase it.
+    let text = get_file_extracted_text(conn, id);
+    // The write and the checkpoint drop are one step, for the same reason
+    // `finalize_rec_audio` is: a WAV that already contains its tail, with the
+    // checkpoints still on disk, gets that tail spliced on AGAIN next time.
+    in_transaction(conn, || {
+        update_file_content(conn, id, &wav, text.as_deref())?;
+        clear_rec_chunks(conn, id)
+    })
 }
 
 #[cfg(test)]
@@ -162,5 +210,75 @@ mod tests {
             .query_row("SELECT count(*) FROM rec_chunks WHERE file_id = ?1", [&id], |r| r.get(0))
             .unwrap();
         assert_eq!(still, 1, "a rolled-back write must keep its checkpoints");
+    }
+
+    /// A deleted recording must not take the crash rescue of the OTHERS down
+    /// with it.
+    ///
+    /// The rescue reads each checkpointed file's stored bytes BY ID, and that
+    /// read honours the trash — so `?` on it aborted the whole loop the moment
+    /// one interrupted recording had since been deleted. Every other room-mate
+    /// of that file lost its tail, and the user was told the recovery failed.
+    #[test]
+    fn a_trashed_recording_does_not_take_the_crash_rescue_down_with_it() {
+        let conn = mem();
+        let deleted = add_file(&conn, "old call.wav", "(live recording)");
+        let live = add_file(&conn, "board meeting.wav", "(live recording)");
+        // Both died mid-session with a checkpointed tail on disk.
+        update_file_content(&conn, &live, &crate::recording::encode_wav(&[0.25f32; 400]), None)
+            .unwrap();
+        append_rec_chunk(&conn, &deleted, &[0.1f32; 200]).unwrap();
+        append_rec_chunk(&conn, &live, &[0.3f32; 200]).unwrap();
+        trash_file(&conn, &deleted, TrashActor::User).unwrap();
+
+        assert_eq!(recover_rec_chunks(&conn).unwrap(), 1, "the surviving one was rescued");
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM rec_chunks WHERE file_id = ?1", [&live], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "its checkpoints were consumed");
+        // The trashed one's tail is kept rather than thrown away: trash is
+        // reversible, so a restore must still find something to recover.
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM rec_chunks WHERE file_id = ?1", [&deleted], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1);
+    }
+
+    /// One recording that genuinely CANNOT be rescued — damaged stored audio —
+    /// must not cancel the rescue of the others, and must be reported.
+    ///
+    /// The failure used to abort the loop with `?`, so a single unreadable WAV
+    /// meant every other interrupted recording in the room stayed unrescued on
+    /// every unlock, forever, while the caller (which then swallowed the error)
+    /// said nothing at all.
+    #[test]
+    fn a_recording_that_cannot_be_rescued_does_not_cancel_the_others() {
+        let conn = mem();
+        let damaged = add_file(&conn, "garbled.wav", "(live recording)");
+        let good = add_file(&conn, "board meeting.wav", "(live recording)");
+        // Not a WAV at all — decoding it fails.
+        update_file_content(&conn, &damaged, b"this is not a wav file", None).unwrap();
+        update_file_content(&conn, &good, &crate::recording::encode_wav(&[0.25f32; 400]), None)
+            .unwrap();
+        append_rec_chunk(&conn, &damaged, &[0.1f32; 200]).unwrap();
+        append_rec_chunk(&conn, &good, &[0.3f32; 200]).unwrap();
+
+        let err = recover_rec_chunks(&conn).expect_err("a failed rescue must be reported");
+        assert!(err.contains("1 of 2"), "{err}");
+        assert!(err.contains("still stored"), "the message must say nothing was lost: {err}");
+        // The healthy one was rescued anyway…
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM rec_chunks WHERE file_id = ?1", [&good], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "a healthy recording was skipped because of a damaged one");
+        // …and the damaged one keeps its tail for the next attempt.
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM rec_chunks WHERE file_id = ?1", [&damaged], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1);
     }
 }

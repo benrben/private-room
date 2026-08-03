@@ -1,0 +1,11 @@
+/* Plain text read as writing, not as source. A .txt used to open in the code
+   editor with a line-number gutter and a "plaintext" language mode. */
+.prose-view {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 4rem;
+  line-height: 1.7;
+  overflow-wrap: break-word;
+}
+.prose-view p { margin: 0 0 1em; white-space: pre-wrap; }
+.prose-view p:last-child { margin-bottom: 0; }

@@ -31,6 +31,24 @@
   font-weight: 600;
 }
 
+/* The "you have unsaved work" strip, under the title bar and above the pages.
+   It only ever appears in response to a close the user just attempted, so it
+   sits where their eye already is rather than as a second modal over a modal. */
+.settings-unsaved {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--warn-bg, rgba(255, 176, 32, 0.12));
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.settings-unsaved span {
+  flex: 1;
+}
+
 .settings-body {
   overflow-y: auto;
   padding: 6px 18px 18px;
@@ -583,6 +601,19 @@
   font-size: 12.5px;
   line-height: 1.45;
 }
+/* The connector seam does not follow the switch above, so its note is neither
+   an alarm (red) nor a throwaway hint — it is a standing correction to what the
+   switch appears to promise. */
+.cpv-seam-note {
+  margin: 6px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius, 8px);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
 .cpv-add-row {
   display: flex;
   gap: 8px;
@@ -677,4 +708,65 @@
   margin: 4px 0 8px;
 }
 .cpv-inline-hint { margin: 0; }
+/* An inline "do this instead" inside a hint line — the way back to the app-wide
+   default, which used to be a one-way door. */
+.cpv-inline-hint .linkish {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--accent, var(--text));
+  text-decoration: underline;
+  cursor: pointer;
+}
 .cpv-honesty { margin-top: 10px; opacity: 0.85; }
+
+/* WHAT EACH AI CAN DO — the published provider x agent matrix. Two tables that
+   can both outgrow the panel, so each scrolls inside its own box rather than
+   forcing the settings page sideways. */
+.cap-matrix-scroll {
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.cap-matrix {
+  border-collapse: collapse;
+  font-size: 12px;
+  min-width: 100%;
+}
+.cap-matrix th,
+.cap-matrix td {
+  border: 1px solid var(--border);
+  padding: 5px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+.cap-matrix thead th {
+  font-weight: 600;
+  opacity: 0.85;
+}
+.cap-matrix tbody th {
+  font-weight: 500;
+}
+.cap-cell {
+  text-align: center;
+}
+/* The three marks are colour-coded AND shaped differently, so the answer never
+   depends on colour alone. "unknown" is deliberately muted: it is not a No. */
+.cap-yes { color: var(--ok, #2e9e5b); }
+.cap-no { color: var(--danger, #c0392b); }
+.cap-unknown { opacity: 0.5; }
+.cap-unavailable { opacity: 0.6; }
+.cap-note {
+  opacity: 0.7;
+  font-weight: 400;
+}
+/* Screen-reader text for the mark glyphs — the table must read as words, not
+   as "check, cross, dash". */
+.cap-cell .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

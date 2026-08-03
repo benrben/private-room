@@ -3,13 +3,23 @@ import type {
   AiStatus,
   McpServerStatus,
   ModelCaps,
+  RecommendedModels,
+  RoomRole,
   RoomServerStatus,
   SttStatus,
 } from "../api";
 
 // Re-export the api-owned types the section components need, so those files
 // depend only on this local module (they never import from ../api directly).
-export type { AiStatus, McpServerStatus, ModelCaps, RoomServerStatus, SttStatus };
+export type {
+  AiStatus,
+  McpServerStatus,
+  ModelCaps,
+  RecommendedModels,
+  RoomRole,
+  RoomServerStatus,
+  SttStatus,
+};
 
 /** A stroke-icon component (from icons.tsx), passed down to a section as a prop
  * so the presentational section files never import from icons.tsx directly. */
@@ -22,22 +32,10 @@ export type IconComponent = ComponentType<{
 export const FOCUSABLE_SELECTOR =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-// Settings-local mirrors of a few BACKEND-ACTUALS return structs. Callers reach
-// the backend through the typed api.ts wrappers (getOllamaUrl/setOllamaUrl/
-// listRoles/writeRecoveryKey/recommendedModels).
-export interface RoomRole {
-  id: string;
-  name: string;
-  blurb: string;
-  instructions: string;
-  prompts: string[];
-  commands: string[];
-}
-export interface RecommendedModels {
-  chat: string[];
-  embed: string;
-  vision: string;
-}
+// RoomRole and RecommendedModels used to be spelled out AGAIN here, beside the
+// api.ts copies the same commands already return. They matched, so a drift
+// would have compiled cleanly and fed a screen a shape the backend never sends.
+// One declaration (apiTypes.ts), re-exported above like every other.
 
 export interface Props {
   ai: AiStatus | null;

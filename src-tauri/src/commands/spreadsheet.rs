@@ -41,11 +41,41 @@ pub(crate) fn is_a1_range(range: &str) -> bool {
     }
 }
 
+/// One field of a delimited file, plus whether the SOURCE wrote it quoted.
+///
+/// RFC 4180 quoting is meaning, not decoration: `"=SUM(A1:A2)"` is the literal
+/// string `=SUM(A1:A2)`, while the bare spelling is a formula. Dropping the
+/// quotes on the way back out — which is what editing any OTHER cell used to
+/// do — silently turns a label into a sum, so the flag rides along through an
+/// edit and is written back exactly as it was found.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct DelimField {
+    pub value: String,
+    pub quoted: bool,
+}
+
+impl DelimField {
+    /// A field being WRITTEN rather than read back. Quoted when the bare
+    /// spelling would come back as something else — today that is a leading
+    /// `=`, which every reader (the sheet viewer included) reads as a formula.
+    fn written(value: &str) -> Self {
+        Self { value: value.to_string(), quoted: value.starts_with('=') }
+    }
+}
+
 /// Minimal CSV/TSV parser — quoted fields, embedded delimiters and newlines.
 pub(crate) fn parse_delim(text: &str, delim: char) -> Vec<Vec<String>> {
+    parse_delim_quoted(text, delim)
+        .into_iter()
+        .map(|row| row.into_iter().map(|f| f.value).collect())
+        .collect()
+}
+
+/// The same parse, keeping each field's original quoting for a writer.
+pub(crate) fn parse_delim_quoted(text: &str, delim: char) -> Vec<Vec<DelimField>> {
     let mut rows = Vec::new();
-    let mut row: Vec<String> = Vec::new();
-    let mut field = String::new();
+    let mut row: Vec<DelimField> = Vec::new();
+    let mut field = DelimField::default();
     let mut in_quotes = false;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -53,27 +83,30 @@ pub(crate) fn parse_delim(text: &str, delim: char) -> Vec<Vec<String>> {
             if c == '"' {
                 if chars.peek() == Some(&'"') {
                     chars.next();
-                    field.push('"');
+                    field.value.push('"');
                 } else {
                     in_quotes = false;
                 }
             } else {
-                field.push(c);
+                field.value.push(c);
             }
         } else {
             match c {
-                '"' if field.is_empty() => in_quotes = true,
+                '"' if field.value.is_empty() => {
+                    in_quotes = true;
+                    field.quoted = true;
+                }
                 '\r' => {}
                 '\n' => {
                     row.push(std::mem::take(&mut field));
                     rows.push(std::mem::take(&mut row));
                 }
                 c if c == delim => row.push(std::mem::take(&mut field)),
-                _ => field.push(c),
+                _ => field.value.push(c),
             }
         }
     }
-    if !field.is_empty() || !row.is_empty() {
+    if !field.value.is_empty() || !row.is_empty() {
         row.push(field);
         rows.push(row);
     }
@@ -116,6 +149,26 @@ pub(crate) fn serialize_delim_styled(
     delim: char,
     style: DelimStyle,
 ) -> String {
+    let fields: Vec<Vec<DelimField>> = rows
+        .iter()
+        .map(|row| row.iter().map(|f| DelimField::written(f)).collect())
+        .collect();
+    serialize_fields_styled(&fields, delim, style)
+}
+
+/// Quoting a field is not optional when the bare spelling would parse back as
+/// something else: an embedded delimiter, quote or newline.
+fn must_quote(value: &str, delim: char) -> bool {
+    value.contains(delim) || value.contains('"') || value.contains('\n')
+}
+
+/// Write rows that came from `parse_delim_quoted`, keeping each field's own
+/// quoting. Only the field the caller replaced changes shape.
+fn serialize_fields_styled(
+    rows: &[Vec<DelimField>],
+    delim: char,
+    style: DelimStyle,
+) -> String {
     let mut out = String::new();
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
@@ -124,10 +177,10 @@ pub(crate) fn serialize_delim_styled(
         let line: Vec<String> = row
             .iter()
             .map(|f| {
-                if f.contains(delim) || f.contains('"') || f.contains('\n') {
-                    format!("\"{}\"", f.replace('"', "\"\""))
+                if f.quoted || must_quote(&f.value, delim) {
+                    format!("\"{}\"", f.value.replace('"', "\"\""))
                 } else {
-                    f.clone()
+                    f.value.clone()
                 }
             })
             .collect();
@@ -161,17 +214,20 @@ pub(crate) fn set_cell_in_bytes(
             // writing them out would destroy the file's accented letters for
             // good. Refuse rather than corrupt (Wave: encoding safety).
             let text = std::str::from_utf8(bytes).map_err(|_| non_utf8_error(name))?;
-            let mut rows = parse_delim(text, delim);
+            // Quoting is read along with the values: rewriting a quoted
+            // `"=SUM(A1:A2)"` bare would turn a cell of literal text into a
+            // formula, in a file the caller only meant to change one cell of.
+            let mut rows = parse_delim_quoted(text, delim);
             if rows.len() <= row {
                 rows.resize(row + 1, Vec::new());
             }
             if rows[row].len() <= col {
-                rows[row].resize(col + 1, String::new());
+                rows[row].resize(col + 1, DelimField::default());
             }
-            rows[row][col] = value.to_string();
+            rows[row][col] = DelimField::written(value);
             // Keep the file's own line endings and final-newline convention, so
             // a one-cell edit reads as a one-line change everywhere else.
-            let out = serialize_delim_styled(&rows, delim, delim_style(text));
+            let out = serialize_fields_styled(&rows, delim, delim_style(text));
             Ok((out.clone().into_bytes(), Some(out)))
         }
         "xlsx" => {
@@ -269,6 +325,48 @@ mod tests {
         assert_eq!(rows[2][1], "say \"hey\"");
         let out = serialize_delim(&rows, ',');
         assert_eq!(parse_delim(&out, ','), rows);
+    }
+
+    #[test]
+    fn csv_edit_leaves_a_quoted_literal_quoted() {
+        // RFC 4180: the quoted field IS the string "=SUM(A1:A2)". Re-writing it
+        // bare while editing a different cell handed the next reader a formula
+        // — the same defect live QA hit in the grid, arriving by the back door.
+        let src = "label,note\ntotal,\"=SUM(A1:A2)\"\n";
+        let (bytes, text) = set_cell_in_bytes("t.csv", src.as_bytes(), None, "A2", "sum").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "label,note\nsum,\"=SUM(A1:A2)\"\n");
+        assert_eq!(text.unwrap(), "label,note\nsum,\"=SUM(A1:A2)\"\n");
+
+        // An UNQUOTED formula field is left exactly as unquoted as it was:
+        // that spelling means "formula" and this edit is not the place to
+        // decide otherwise.
+        let src = "label,note\ntotal,=SUM(A1:A2)\n";
+        let (bytes, _) = set_cell_in_bytes("t.csv", src.as_bytes(), None, "A2", "sum").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "label,note\nsum,=SUM(A1:A2)\n");
+    }
+
+    #[test]
+    fn a_written_value_that_starts_with_equals_is_stored_as_text() {
+        // The writer stores VALUES — the grid editor refuses formulas outright.
+        // So a value beginning with "=" is data, and writing it bare would hand
+        // it back as a formula nobody asked for.
+        let (bytes, _) =
+            set_cell_in_bytes("t.csv", b"a,b\n1,2\n", None, "B2", "=SUM(A1:A2)").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a,b\n1,\"=SUM(A1:A2)\"\n");
+        // …and the same rule for a whole file built from values.
+        let rows = vec![vec!["label".to_string(), "=SUM(A1:A2)".to_string()]];
+        assert_eq!(serialize_delim(&rows, ','), "label,\"=SUM(A1:A2)\"\n");
+    }
+
+    #[test]
+    fn parse_delim_reports_which_fields_were_quoted() {
+        let rows = parse_delim_quoted("a,\"b, c\"\n\"=X()\",d\n", ',');
+        assert_eq!(rows[0][0], DelimField { value: "a".into(), quoted: false });
+        assert_eq!(rows[0][1], DelimField { value: "b, c".into(), quoted: true });
+        assert_eq!(rows[1][0], DelimField { value: "=X()".into(), quoted: true });
+        assert_eq!(rows[1][1], DelimField { value: "d".into(), quoted: false });
+        // The plain view is unchanged for every caller that only wants values.
+        assert_eq!(parse_delim("a,\"b, c\"\n", ','), vec![vec!["a", "b, c"]]);
     }
 
     #[test]

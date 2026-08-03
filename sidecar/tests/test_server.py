@@ -10,8 +10,8 @@ import httpx
 import pytest
 from conftest import FakeChatModel, FakeMCP, Round, call
 
-from arcelle_sidecar import __version__, server, tts
-from arcelle_sidecar.chat import RoundUsage
+from arcelle_sidecar import __version__, compaction, server, tts
+from arcelle_sidecar.chat import RoundUsage, StreamStalled
 from arcelle_sidecar.config import (
     AGENT_ROUND_BACKSTOP,
     CLOUD_WORKER_PARALLEL,
@@ -57,6 +57,45 @@ async def test_health() -> None:
     assert resp.json() == {"ok": True, "version": __version__}
 
 
+async def test_agents_answers_the_composer_menu_from_the_served_names() -> None:
+    """POST /agents is what draws the composer's `*` menu. The host sends only
+    tool NAMES and the room's web switch — no room content ever crosses — and
+    gets back the specialists a turn could actually be handed."""
+    from arcelle_sidecar.agents import ALL_REGISTRY_TOOLS
+
+    app = app_with(FakeChatModel([]), FakeMCP())
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/agents",
+            json={"web_enabled": True, "served_names": sorted(ALL_REGISTRY_TOOLS)},
+        )
+    assert resp.status_code == 200
+    rows = resp.json()["agents"]
+    assert {r["key"] for r in rows} >= {"file", "web"}
+    assert all({"key", "tool", "label", "area", "description"} <= set(r) for r in rows)
+
+
+async def test_agents_offers_no_web_specialist_to_an_offline_room() -> None:
+    """The menu carries the room's own settings, not the registry's ceiling."""
+    from arcelle_sidecar.agents import ALL_REGISTRY_TOOLS
+
+    app = app_with(FakeChatModel([]), FakeMCP())
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/agents",
+            json={"web_enabled": False, "served_names": sorted(ALL_REGISTRY_TOOLS)},
+        )
+    assert "web" not in {r["key"] for r in resp.json()["agents"]}
+
+
+async def test_agents_on_a_bridge_that_served_nothing_says_so_with_an_empty_list() -> None:
+    """Empty means empty — never a hopeful default roster."""
+    app = app_with(FakeChatModel([]), FakeMCP())
+    async with client_for(app) as c:
+        resp = await c.post("/agents", json={"web_enabled": True, "served_names": []})
+    assert resp.json()["agents"] == []
+
+
 async def test_run_streams_ndjson_in_order() -> None:
     chat = FakeChatModel(
         [
@@ -98,6 +137,9 @@ async def test_run_streams_ndjson_in_order() -> None:
         "round",
         "delta",
         "usage",
+        # The child's report, kept so the diagram can still show it once the
+        # next round has wiped the live text.
+        "report",
         # A child FINISHED: its own roster slot flips to done the moment its
         # sub-loop ends — not when the parent gets round to collecting it, or a
         # fast sibling would keep pulsing until the slowest one returned.
@@ -116,7 +158,10 @@ async def test_run_streams_ndjson_in_order() -> None:
     assert lanes[0]["v"] == "Working on your files"
     steps = [e["v"] for e in events if e["t"] == "step"]
     assert steps == ["Asked the File agent", "Searched the room"]
-    assert events[-1] == {"t": "final", "v": "The rent is 1200."}
+    # Owner replacement #4: every line names its run, so the host can drop a
+    # line that belongs to a different one.
+    assert events[-1] == {"t": "final", "v": "The rent is 1200.", "run_id": "run-1"}
+    assert all(e["run_id"] == "run-1" for e in events), "an unstamped line has no owner"
     assert mcp.closed is True  # the bridge client is released with the run
 
 async def test_every_line_is_one_json_object() -> None:
@@ -132,6 +177,30 @@ async def test_every_line_is_one_json_object() -> None:
         obj = json.loads(line)  # a newline inside a delta must not split a line
         assert "t" in obj
     assert json.loads(raw.strip().split("\n")[-1])["v"] == "multi\nline\nanswer"
+
+
+async def test_every_line_names_the_run_it_belongs_to() -> None:
+    """Owner replacement #4: identity travels on the wire, not on the screen.
+
+    The host turns these lines into window events that ONE conversation paints,
+    so a line that cannot say which run produced it can only be attributed by
+    guessing — which is how an answer ended up streaming into whichever chat the
+    user had since opened. Every exit of the stream is covered here because
+    every one of them is a line the host will attribute: the graph's own events,
+    the privacy receipt, and the terminal error.
+
+    An id and nothing else. The chat id stays on the host — the sidecar is never
+    told which conversation a run belongs to, and does not need to be.
+    """
+    chat = FakeChatModel([Round(content="", calls=[call("search_room", query="rent")]),
+                          Round(content="The rent is 1200.")])
+    app = app_with(chat, FakeMCP())
+    async with client_for(app) as c:
+        resp = await c.post("/run", json={**BODY, "run_id": "ask-77"})
+    events = [json.loads(line) for line in resp.text.strip().split("\n") if line]
+    assert events, "the run streamed nothing at all"
+    unstamped = [e for e in events if e.get("run_id") != "ask-77"]
+    assert not unstamped, f"these lines name no run: {unstamped}"
 
 
 async def test_a_failure_becomes_an_error_event_not_a_500() -> None:
@@ -152,7 +221,7 @@ async def test_a_failure_becomes_an_error_event_not_a_500() -> None:
         resp = await c.post("/run", json=BODY)
     events = [json.loads(line) for line in resp.text.strip().split("\n")]
     assert resp.status_code == 200
-    assert events[-1] == {"t": "error", "v": "ollama is not running"}
+    assert events[-1] == {"t": "error", "v": "ollama is not running", "run_id": "run-1"}
 
 
 async def test_a_torn_down_run_never_looks_like_a_finished_one(
@@ -191,7 +260,9 @@ async def test_cancel_unknown_run_is_a_no_op() -> None:
     async with client_for(app) as c:
         resp = await c.post("/cancel", json={"run_id": "nobody"})
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "known": False}
+    # `stopped` is empty AND `known` is false: a Stop for a run nobody has must
+    # not read like a Stop that worked.
+    assert resp.json() == {"ok": True, "known": False, "stopped": []}
 
 
 async def test_cancel_stops_a_live_run() -> None:
@@ -232,7 +303,9 @@ async def test_cancel_stops_a_live_run() -> None:
         task = asyncio.create_task(consume())
         await asyncio.wait_for(started.wait(), timeout=5)
         resp = await c.post("/cancel", json={"run_id": "run-1"})
-        assert resp.json() == {"ok": True, "known": True}
+        # `stopped` names what the Stop reached: this run had no specialist out,
+        # so the run itself is the whole of it.
+        assert resp.json() == {"ok": True, "known": True, "stopped": ["this answer"]}
         release.set()
         await asyncio.wait_for(task, timeout=5)
 
@@ -240,7 +313,7 @@ async def test_cancel_stops_a_live_run() -> None:
     assert "step" not in kinds  # the write_file call never ran
     assert mcp.calls == []
     assert chat.n == 1  # and no second round
-    assert events[-1] == {"t": "final", "v": "partial"}
+    assert events[-1] == {"t": "final", "v": "partial", "run_id": "run-1"}
 
 
 async def test_a_cloud_room_fans_out_but_not_unbounded(monkeypatch: Any) -> None:
@@ -273,17 +346,79 @@ async def test_a_cloud_room_fans_out_but_not_unbounded(monkeypatch: Any) -> None
     assert seen == [1, CLOUD_WORKER_PARALLEL]
 
 
+async def test_a_stalled_run_still_ends_with_a_terminal_error_and_frees_the_run() -> None:
+    """The exit path a LONG run actually takes.
+
+    ``iter_with_stop`` raises :class:`StreamStalled` when a provider stream goes
+    quiet, and that reaches the driver. It must put a terminal ``error`` event on
+    the wire before the stream closes: the host reads that event (sidecar.rs
+    ``Some("error")``) and keeps the partial the user watched arrive, whereas a
+    stream that simply STOPS is byte-identical to a finished turn. The registry
+    entry has to go with it too, or a later ``/cancel`` reports ``known`` for a
+    run that no longer exists.
+    """
+
+    class Stalling(FakeChatModel):
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[dict[str, Any]],
+            on_delta: Callable[[str], Awaitable[None]],
+            cancel: Any = None,
+        ) -> Any:
+            await on_delta("half an answer")
+            raise StreamStalled
+
+    app = app_with(Stalling([Round(content="")]), FakeMCP())
+    events: list[dict[str, Any]] = []
+    async with client_for(app) as c:
+        async with c.stream("POST", "/run", json=BODY) as resp:
+            async for line in resp.aiter_lines():
+                if line:
+                    events.append(json.loads(line))
+
+    assert any(
+        e["t"] == "delta" and e["v"] == "half an answer" for e in events
+    ), "the partial has to be on the wire for the host to have anything to keep"
+    assert not any(e["t"] == "final" for e in events), "a stall never produced an answer"
+    assert events[-1]["t"] == "error", events[-1]
+    assert events[-1]["v"], "an error event carrying no reason explains nothing"
+    assert len(app.state.registry) == 0
+
+
 def test_registry_lifecycle() -> None:
     from arcelle_sidecar.graph import CancelToken
 
     reg = RunRegistry()
     token = CancelToken()
     reg.register("a", token)
-    assert reg.cancel("a") is True
+    assert reg.cancel("a") == ["this answer"]
     assert token.cancelled is True
     reg.release("a")
-    assert reg.cancel("a") is False  # an ask that already finished
+    assert reg.cancel("a") is None  # an ask that already finished
     assert len(reg) == 0
+
+
+def test_cancelling_a_run_reports_the_specialists_it_stopped() -> None:
+    """Owner replacement #3: one Stop, one truthful account of what it reached.
+
+    The registry holds the ROOT of the run's cancel tree, so a Stop that lands
+    while two specialists are mid-task has to say so — and must not re-report
+    work a previous Stop already stopped.
+    """
+    from arcelle_sidecar.graph import CancelToken
+
+    reg = RunRegistry()
+    run = CancelToken()
+    reg.register("a", run)
+    files = run.child("File agent")
+    web = run.child("Browser agent")
+
+    assert reg.cancel("a") == ["this answer", "File agent", "Browser agent"]
+    assert files.cancelled and web.cancelled
+
+    # A second Stop stopped nothing — known, but with nothing to report.
+    assert reg.cancel("a") == []
 
 
 def test_run_request_defaults_and_routing_fallback() -> None:
@@ -339,6 +474,45 @@ def test_host_routing_wins_over_local_routing(host_says: dict, expected: bool) -
     # The host's decision is authoritative so the two engines can never drift.
     req = RunRequest(model="m", question="edit the lease", routing=host_says)  # type: ignore[arg-type]
     assert req.resolved_routing()[0] is expected
+    assert req.resolved_write() is expected
+
+
+def test_the_agent_run_scans_the_question_for_one_lane_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`resolved_write` must not drag the other four routers along.
+
+    The agent run reads the write lane and nothing else, but it used to ask for
+    all five and subscript `[0]` — four full scans of every question whose
+    answers went straight into the bin. Booby-trap the four so a revert to
+    `resolved_routing()[0]` fails here instead of quietly costing the work.
+    """
+    from arcelle_sidecar import routing as routing_mod
+
+    def trap(name: str):  # noqa: ANN202 - test-local
+        def _boom(_question: str) -> bool:
+            raise AssertionError(f"{name} was scanned for an answer nothing reads")
+
+        return _boom
+
+    for fn in ("wants_ui_tools", "wants_job_tools", "wants_skill_tools", "wants_mcp_management_tools"):
+        monkeypatch.setattr(routing_mod, fn, trap(fn))
+
+    assert RunRequest(model="m", question="edit the lease").resolved_write() is True
+    assert RunRequest(model="m", question="what is a lease?").resolved_write() is False
+    # The traps are live: the five-lane call really does pay for all of them,
+    # which is what `resolved_routing()[0]` at the agent-run call site was doing.
+    with pytest.raises(AssertionError):
+        RunRequest(model="m", question="edit the lease").resolved_routing()
+    # …so pin the call site too — this is the one place it mattered.
+    import inspect
+    from pathlib import Path
+
+    from arcelle_sidecar import graph as graph_mod
+
+    graph_src = Path(inspect.getfile(graph_mod)).read_text(encoding="utf-8")
+    assert "req.resolved_write()" in graph_src
+    assert "req.resolved_routing()" not in graph_src
 
 
 # --- request bounds ---------------------------------------------------------
@@ -357,13 +531,58 @@ async def test_an_oversized_body_is_refused_before_it_is_read(
     assert over.json()["code"] == "BODY_TOO_LARGE"
     # The bound refuses nothing a real caller sends.
     assert under.status_code == 200
-    assert under.json() == {"ok": True, "known": False}
+    assert under.json() == {"ok": True, "known": False, "stopped": []}
 
 
 def test_the_default_body_bound_is_far_above_a_real_request() -> None:
     # A base64 image or a file-pass window is the biggest body the app sends;
     # the bound exists to refuse the absurd, not to clamp a feature.
     assert server.MAX_REQUEST_BYTES >= 64 << 20
+
+
+# --- who may drive the sidecar ----------------------------------------------
+
+
+async def test_without_the_hosts_token_nothing_but_health_answers() -> None:
+    # The port is loopback, but loopback is not a boundary: any other program
+    # running as this user could start runs, generate text, search the web and
+    # delete downloaded models. The room MCP bridge and hub_mcp have always
+    # required a token; this one answered anybody.
+    app = create_app(token="s3cret")
+    async with client_for(app) as c:
+        anon = await c.post("/cancel", json={"run_id": "x"})
+        wrong = await c.post(
+            "/cancel", json={"run_id": "x"}, headers={"authorization": "Bearer nope"}
+        )
+        right = await c.post(
+            "/cancel", json={"run_id": "x"}, headers={"authorization": "Bearer s3cret"}
+        )
+        # The host's liveness probe runs before it knows anything and reveals
+        # nothing, so it stays open — deliberately, not by omission.
+        health = await c.get("/health")
+    assert anon.status_code == 401
+    assert anon.json()["code"] == "NO_TOKEN"
+    assert wrong.status_code == 401
+    assert right.status_code == 200
+    assert right.json() == {"ok": True, "known": False, "stopped": []}
+    assert health.status_code == 200
+
+
+async def test_the_token_comes_from_the_environment_the_host_spawns_us_with(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(server.TOKEN_ENV, "from-env")
+    async with client_for(create_app()) as c:
+        assert (await c.post("/cancel", json={"run_id": "x"})).status_code == 401
+        ok = await c.post(
+            "/cancel", json={"run_id": "x"}, headers={"authorization": "Bearer from-env"}
+        )
+    assert ok.status_code == 200
+    # No variable = open, which is how this repo's tests and a hand-run
+    # `python -m arcelle_sidecar` reach it. The host always sets it.
+    monkeypatch.delenv(server.TOKEN_ENV, raising=False)
+    async with client_for(create_app()) as c:
+        assert (await c.post("/cancel", json={"run_id": "x"})).status_code == 200
 
 
 # --- Stop for the one-shot endpoints ----------------------------------------
@@ -440,3 +659,30 @@ def test_the_tts_request_does_not_restate_the_voice_spec() -> None:
         tts.DEFAULT_RATE,
         tts.DEFAULT_PITCH,
     )
+
+
+# --- closing a room clears what the service still holds ----------------------
+
+
+async def test_forget_drops_the_compaction_digests_and_reports_the_count() -> None:
+    """The service outlives every room, so a lock has to be able to tell it.
+
+    Without this route the compaction cache — boiled-down summaries of the
+    room's own conversation — survived lock, room-switch and chat deletion, and
+    nothing anywhere could clear it.
+    """
+    compaction.clear_cache()
+    compaction._cache_put("hash-a", "…a digest of the room's chat…")
+    compaction._cache_put("hash-b", "…another…")
+    assert compaction.cache_size() == 2
+
+    async with client_for(create_app()) as c:
+        resp = await c.post("/forget", json={})
+
+    assert resp.status_code == 200
+    # A COUNT, never the digests: everything in that cache is room content.
+    assert resp.json() == {"ok": True, "dropped": 2}
+    assert compaction.cache_size() == 0
+    # Idempotent — a second lock has nothing left to drop and says so.
+    async with client_for(create_app()) as c:
+        assert (await c.post("/forget", json={})).json()["dropped"] == 0

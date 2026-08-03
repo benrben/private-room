@@ -259,17 +259,26 @@ pub async fn locate_in_image(
     // image" — a false statement about their picture rather than a true one
     // about their setup. `NO_VISION_MODEL` is a sentinel the viewer maps to the
     // one-click pull it already implements for exactly this case.
-    let vmodel = match grounding_model(&models) {
+    //
+    // The pick used to be `grounding_model` (three Qwen-VL name patterns) with a
+    // fallback that refused any `is_external_engine` model outright — so a room
+    // running Claude or Gemini through OpenRouter, or a local `llama3.2-vision`,
+    // got `NO_VISION_MODEL` and a Download button for a model it did not need.
+    // `grounding_pick` asks the engine instead; a provider model routes through
+    // the `provider` block `sidecar_json` injects below.
+    let vmodel = match grounding_pick(&models, &chat_model).await {
         Some(m) => m,
+        // PREFLIGHT: nothing could be picked, and `NO_VISION_MODEL` says only
+        // one thing — "download a vision helper". That is the right advice for
+        // exactly one of the reasons a pick fails. When the room's OWN model
+        // can see and the privacy door is what removes the pixels, downloading
+        // a second model fixes nothing, and the user was never told which
+        // switch was in the way. Ask the declared record instead and pass its
+        // sentence through; fall back to the sentinel (and its Download button)
+        // only when "nothing here can see images" really is the whole story.
         None => {
-            // The room's own chat model may still be able to ground if it is a
-            // VL build the name patterns above do not know; only give up when
-            // it cannot even read an image.
-            if !is_external_engine(&chat_model) && is_vision_chat_model(&chat_model) {
-                chat_model.clone()
-            } else {
-                return Err("NO_VISION_MODEL".into());
-            }
+            let caps = capabilities_for(&chat_model).await;
+            return Err(vision_door_block(&caps).unwrap_or_else(|| "NO_VISION_MODEL".into()));
         }
     };
 

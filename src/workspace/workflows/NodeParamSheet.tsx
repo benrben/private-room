@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { WorkflowNode, WorkflowEdge } from "../../api";
-import { KIND_LABELS, kindLabel } from "./kinds";
+import { KIND_DEFAULTS, KIND_LABELS, kindLabel } from "./kinds";
+import { branchFor } from "./selectors";
 
 type Props = {
   node: WorkflowNode;
@@ -46,28 +47,6 @@ const TRANSFORM_OPS = [
 /** Every engine-supported step kind and its human label — from the shared
  * kinds map so the dropdown, the canvas, and the backend backfill never drift. */
 const NODE_KINDS: [string, string][] = Object.entries(KIND_LABELS);
-
-/** Fields each kind needs seeded on a kind switch. serde requires the required
- * fields to even parse the def, so seeding them keeps validation showing
- * actionable field errors instead of an opaque parse failure. */
-const KIND_DEFAULTS: Record<string, Record<string, unknown>> = {
-  generate: { prompt: "", model: "auto" },
-  summarize_file: { select: { type: "newest" } },
-  file_pass: { select: { type: "newest" }, instruction: "", mode: "merge" },
-  for_each_file: { select: { type: "all" }, instruction: "", model: "auto" },
-  agent_run: { question: "" },
-  extract: { fields: [], model: "auto" },
-  route: { prompt: "", labels: ["a", "b"], model: "auto" },
-  vote: { prompt: "", samples: 3, mode: "concat", model: "auto" },
-  refine: { prompt: "", rubric: "", max_rounds: 2, model: "auto" },
-  plan_and_map: { objective: "", max_workers: 4, model: "auto" },
-  transform: { op: "trim" },
-  merge: { mode: "concat" },
-  http_fetch: { url: "" },
-  script_run: { file: "", mode: "import" },
-  save_file: { name_template: "", format: "html", mode: "create" },
-  condition: { op: "not_empty", input: "", value: "" },
-};
 
 /** Kinds that call a model — they get the auto/local/cloud picker. */
 const MODEL_KINDS = new Set([
@@ -165,14 +144,22 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
     onEdgesChange?.([...(edges ?? []), { from: node.id, to: target, branch }]);
   }
 
-  // ---- fan-in: which steps feed INTO this node (plain, non-branch edges) ----
+  // ---- fan-in: which steps feed INTO this node ----
+  // An edge OFF a condition/route must name the outcome it follows, or it is
+  // live whichever way that step went and every branch runs at once — which the
+  // save-time validator now refuses. This checkbox was the last place that
+  // still minted the unlabelled one, so ticking "runs after <my condition>"
+  // wrote a definition Save bounced, with no branch control in this sheet to
+  // repair it. Same rule, same helper, as the canvas's add-step buttons.
   function toggleInput(fromId: string) {
     const cur = edges ?? [];
     const has = cur.some((e) => e.from === fromId && e.to === node.id && e.branch == null);
+    const from = (allNodes ?? []).find((n) => n.id === fromId);
+    const branch = branchFor(from, cur.filter((e) => e.from === fromId));
     onEdgesChange?.(
       has
         ? cur.filter((e) => !(e.from === fromId && e.to === node.id && e.branch == null))
-        : [...cur, { from: fromId, to: node.id }],
+        : [...cur, branch ? { from: fromId, to: node.id, branch } : { from: fromId, to: node.id }],
     );
   }
 
@@ -586,7 +573,14 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
                     </option>
                   ))}
                 </select>
-                <button className="subtle" title="Remove branch" onClick={() => removeEdge(i)}>
+                {/* Its only content is "×", which a screen reader announces as
+                    "times" — the tooltip is not an accessible name. */}
+                <button
+                  className="subtle"
+                  title="Remove branch"
+                  aria-label="Remove branch"
+                  onClick={() => removeEdge(i)}
+                >
                   ×
                 </button>
               </div>

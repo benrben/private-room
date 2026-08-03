@@ -25,6 +25,55 @@ CREATE TABLE IF NOT EXISTS files (
   -- BROWSE-2 (D19): where a downloaded file came from. NULL for everything
   -- that did not arrive over the network (uploads, generated files).
   origin_url TEXT,
+  -- What a video ACTUALLY is (media_probe::MediaMeta as JSON): duration,
+  -- display size, codec, frame rate, audio track. NULL means "not probed
+  -- yet" — a probe that read nothing stores nothing, so NULL never has to
+  -- stand in for "we looked and there was no answer".
+  media_meta TEXT,
+  -- What a SAVED WEB PAGE declares about itself (extraction::PageMeta as
+  -- JSON): title, site, author, publication date, language, plus the room's
+  -- own source URL and capture time. A field the page never declared is absent
+  -- from the JSON — the room stores what the page said, and an author or a
+  -- date it did not say has no value that could stand in for one. NULL means
+  -- "this file did not come from a web page".
+  web_meta TEXT,
+  -- Room map: the file this one was MADE from, when a generator knows it (a
+  -- full pass's source, a translated transcript's recording). NULL means "no
+  -- provenance recorded" — never "made from nothing" — so the map draws a
+  -- `derived` link only where the app actually witnessed the derivation
+  -- instead of guessing from the output's name.
+  derived_from TEXT,
+  -- ART-1: what produced this file's CURRENT content (`Provenance` as JSON) —
+  -- run id, agent/tool name, source file ids. Ids only, never content. This is
+  -- the head of the same chain `file_versions.provenance` records for older
+  -- states, so every version of a generated artifact can say what made it.
+  -- Distinct from `derived_from`, which is a single file→file link for the room
+  -- map and survives independently. NULL means nobody recorded it.
+  provenance TEXT,
+  -- ART-1: the name the generator ASKED for, which is what identifies an
+  -- artifact across re-runs. Usually the same as `name`, but not always: when a
+  -- file a PERSON put in the room already holds the requested name, the artifact
+  -- lands under `available_name`'s next free one ("Plan (2).md") while its key
+  -- stays "Plan.md". Matching the next generation on the KEY rather than on the
+  -- final name is what stops a re-run minting "Plan (3).md", "Plan (4).md" …
+  -- forever instead of versioning its own previous output. NULL for everything
+  -- that did not come through the funnel, and CLEARED on rename — a file the
+  -- user renamed is one they have adopted, and the next run must leave it alone
+  -- and mint its own.
+  artifact_key TEXT,
+  -- Trash: when this file was deleted. NULL is the ONLY value that means
+  -- "present in the room" — every listing, count, search and retrieval query
+  -- filters on `trashed_at IS NULL`, so a trashed file is absent everywhere the
+  -- user or the model can see, while its row and its bytes survive.
+  trashed_at TEXT,
+  -- Who deleted it: 'user' (a person clicked delete), 'agent' (the AI deleted
+  -- it on its own), or 'app' (the app's own housekeeping). "What did the agent
+  -- delete" is the question the trash exists to answer, so the actor is
+  -- recorded at the moment of deletion rather than inferred later.
+  trashed_by TEXT,
+  -- WHICH actor, as an id: the agent/tool name for an 'agent' delete, the
+  -- command for an 'app' one. NULL when the kind alone is the whole answer.
+  trashed_by_id TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -35,6 +84,27 @@ CREATE TABLE IF NOT EXISTS chunks (
   embedding BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
+-- Trash: where a trashed file's search chunks WAIT. Trashing moves the rows out
+-- of `chunks` and into here; restoring moves them back verbatim, embedding blob
+-- and all.
+--
+-- Why move them instead of adding `AND f.trashed_at IS NULL` to the retrieval
+-- joins: two of the hot retrieval queries (`for_each_chunk_embedding`,
+-- `fts_file_matches`) never touch the `files` table at all, so there is no `f`
+-- to filter on, and any future query over `chunks` would silently inherit the
+-- bug. Emptying the table is the invariant — a trashed file cannot be retrieved
+-- because its text is not in the index, not because every reader remembered to
+-- ask. It also makes restore exact: re-chunking from `extracted_text` would
+-- come back with NULL embeddings and stay invisible to vector search until a
+-- background pass happened to re-embed it.
+CREATE TABLE IF NOT EXISTS trashed_chunks (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  embedding BLOB
+);
+CREATE INDEX IF NOT EXISTS idx_trashed_chunks_file ON trashed_chunks(file_id);
 -- HLT-3: full-text index over chunk text, kept in sync by the triggers below.
 -- External-content table: rows live in `chunks`, the index only stores terms.
 -- CHG-14: porter stemming so plural/inflected query words match singular
@@ -94,6 +164,17 @@ CREATE TABLE IF NOT EXISTS web_images (
   bytes BLOB NOT NULL,
   saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
+-- CHG-33: short-lived web_search results cache, keyed by normalized query. This
+-- lived ONLY in `migrate` for a while, which meant a brand-new room (which runs
+-- SCHEMA and never migrate) had no table at all: every attempt to remember a
+-- search failed silently until the room was closed and reopened. Both places
+-- must mint every table — `migrate` for rooms written before it existed, here
+-- for the ones created from now on.
+CREATE TABLE IF NOT EXISTS web_searches (
+  query_key TEXT PRIMARY KEY,
+  results_text TEXT NOT NULL,
+  saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -132,9 +213,38 @@ CREATE TABLE IF NOT EXISTS file_versions (
   text TEXT,
   rec_meta TEXT,
   saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  cause TEXT NOT NULL
+  cause TEXT NOT NULL,
+  -- ART-1: what produced the content this row snapshots (`Provenance` as
+  -- JSON) — run id, agent/tool name, source file ids. Ids only, never
+  -- content. NULL means "nobody recorded it", never "a person typed it".
+  provenance TEXT,
+  -- A version the user asked to KEEP. The prune in `snapshot_file_version`
+  -- counts and deletes only unpinned rows, so a pinned version survives any
+  -- number of later saves — the one way to stop the rolling window from
+  -- silently eating the state you actually wanted back.
+  pinned INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_file_versions_file ON file_versions(file_id);
+-- ART-1: the staging area for AI-generated artifacts. A generator writes its
+-- bytes HERE, they are validated here, and only then does one transaction move
+-- them into `files`. A crash, a Stop, or a failed validation therefore leaves
+-- the room's real files exactly as they were — there is no window in which a
+-- half-written artifact is what the library shows. Staging lives INSIDE the
+-- encrypted room like everything else: a scratch file in /tmp would put room
+-- content outside the room, which is the one thing this app does not do.
+--
+-- Rows are transient. A commit deletes its own row; anything an interrupted run
+-- left behind is swept on the next room open (`sweep_staged_artifacts`), which
+-- is why nothing else in the app ever reads this table.
+CREATE TABLE IF NOT EXISTS staged_artifacts (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  bytes BLOB NOT NULL,
+  text TEXT,
+  provenance TEXT,
+  staged_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
 -- ADD-27: live-recording metadata (word timings, speakers, cuts) as one JSON
 -- blob per file. Row existence marks the file as a Recording in the viewer.
 CREATE TABLE IF NOT EXISTS recordings (
@@ -170,6 +280,11 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- holds the lane slot and re-drives the child on its own resume, so a child
   -- must never start (or be Resumed) independently.
   parent_job_id TEXT,
+  -- Why this job stopped when NOBODY chose to stop it: the room was locked, or
+  -- the app closed, while it was still running. 'paused' alone cannot say that
+  -- — it is also what pressing Stop writes — so a job the app dropped read as a
+  -- job the user parked. NULL means the pause was the user's own.
+  parked_reason TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
@@ -256,8 +371,22 @@ CREATE TABLE IF NOT EXISTS browse_journal (
 );
 "#;
 
+/// Key a connection AND pin the on-disk cipher parameters (A1).
+///
+/// The pin used to be spelled out at each call site, and only two of the four
+/// call sites had it: `create_room` and `open_room` pinned SQLCipher 4,
+/// `verify_password` (change-password's "is this your current password?") and
+/// `rekey_copy` (duplicate-a-room, restore-a-checkpoint) did not. It matches the
+/// linked SQLCipher's default today, so nothing misbehaves — but the whole point
+/// of pinning is to survive a build where it does NOT, and in that build a room
+/// would open fine and then refuse its own password on the two paths that re-key
+/// it. Keying and pinning belong together, so they live in one function: a
+/// fifth caller cannot forget half of it. Must run before the first real read
+/// (`verify_key`), which is what every caller does next.
 pub(crate) fn apply_key(conn: &Connection, password: &str) -> Result<(), String> {
     conn.pragma_update(None, "key", password)
+        .map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA cipher_compatibility = 4;")
         .map_err(|e| e.to_string())
 }
 
@@ -268,35 +397,110 @@ pub(crate) fn verify_key(conn: &Connection) -> Result<(), String> {
         r.get::<_, i64>(0)
     })
     .map(|_| ())
-    .map_err(|_| "WRONG_PASSWORD".to_string())
+    .map_err(classify_first_read)
 }
+
+/// Why the first read after keying failed.
+///
+/// It used to be "WRONG_PASSWORD", unconditionally — so a truncated file, a
+/// failing disk, a room on a network volume that dropped, or a file another
+/// process holds locked all told the user their password was wrong. They retype
+/// it forever while the real fix is somewhere else entirely.
+///
+/// A wrong SQLCipher key decrypts the header into noise, which SQLite rejects as
+/// `SQLITE_NOTADB` — that (and an unclassifiable error, which stays the common
+/// case) is the only thing allowed to say "wrong password". Every other SQLite
+/// code names itself instead. Only the CODE travels: an error string can carry
+/// the file's path, and a file name is room content.
+fn classify_first_read(e: rusqlite::Error) -> String {
+    let code = match &e {
+        rusqlite::Error::SqliteFailure(err, _) => Some(err.code),
+        _ => None,
+    };
+    match code {
+        None | Some(rusqlite::ffi::ErrorCode::NotADatabase) => "WRONG_PASSWORD".to_string(),
+        Some(other) => format!(
+            "This room file could not be read ({other:?}) — the password may be fine. \
+             Check that the file is on a connected drive, not open in another copy of \
+             Arcelle, and not damaged."
+        ),
+    }
+}
+
+/// The schema revision a room created TODAY is already at, so `migrate` runs
+/// none of its one-time repairs against it.
+///
+/// A new room used to be stamped 0, which is what a room written years ago looks
+/// like: the very next unlock ran every repair, and repair #1 nulls every
+/// embedding in the room. A first session's whole semantic index was erased the
+/// first time the room was reopened, silently dropping meaning-based search back
+/// to keyword matching until the background backfill caught up. Raise this in
+/// lockstep with the last `if user_version < N` block in [`migrate`].
+pub(crate) const CURRENT_USER_VERSION: i64 = 3;
+
+/// Room-file password policy, enforced at the seam that actually encrypts one.
+///
+/// The 8-character rule was written into the new-room FORM and into
+/// `change_password`/`duplicate_room`, but never here — so the one place that
+/// creates and keys a room accepted a single character, and any new caller
+/// (a script, a future command, an agent tool) would have inherited that.
+pub const MIN_ROOM_PASSWORD_CHARS: usize = 8;
 
 pub fn create_room(path: &str, password: &str, name: &str) -> Result<Connection, String> {
     if std::path::Path::new(path).exists() {
         return Err("A file already exists at this location.".into());
     }
-    if password.is_empty() {
-        return Err("Password cannot be empty.".into());
+    if password.chars().count() < MIN_ROOM_PASSWORD_CHARS {
+        return Err(format!(
+            "A room password needs at least {MIN_ROOM_PASSWORD_CHARS} characters."
+        ));
     }
+    create_room_file(path, |conn| {
+        // A1: `apply_key` also pins the SQLCipher-4 parameter set, so a room
+        // stays portable across builds/platforms.
+        apply_key(conn, password)?;
+        verify_key(conn)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        // This room is BORN current — see `CURRENT_USER_VERSION`.
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_USER_VERSION}"), [])
+            .map_err(|e| e.to_string())?;
+
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('format','roomai'), ('format_version','1'), ('name', ?1)",
+            [name],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+/// Open a NEW room file and hand it to `init`; if `init` fails, take the
+/// half-written file away again.
+///
+/// SQLite creates the file the moment it is opened, before any of the keying or
+/// schema work can fail. Whatever went wrong then left a 0-byte (or partly
+/// keyed) file sitting at the chosen path, and the retry — with the same name,
+/// which is what anyone does next — hit "A file already exists at this
+/// location." for good, with nothing in the app able to remove it.
+fn create_room_file(
+    path: &str,
+    init: impl FnOnce(&Connection) -> Result<(), String>,
+) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
-    apply_key(&conn, password)?;
-    // A1: pin the SQLCipher-4 parameter set so a room stays portable across
-    // builds/platforms. These are already the current defaults, so nothing
-    // breaks for existing rooms — this just makes the on-disk format explicit
-    // rather than dependent on whatever the linked SQLCipher defaults to. Must
-    // run after `key` and before the first real read (verify_key).
-    conn.execute_batch("PRAGMA cipher_compatibility = 4;")
-        .map_err(|e| e.to_string())?;
-    verify_key(&conn)?;
-    conn.pragma_update(None, "foreign_keys", "ON")
-        .map_err(|e| e.to_string())?;
-    conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO meta(key, value) VALUES ('format','roomai'), ('format_version','1'), ('name', ?1)",
-        [name],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(conn)
+    match init(&conn) {
+        Ok(()) => Ok(conn),
+        Err(e) => {
+            // Close the handle first: an open connection can leave -wal/-shm
+            // siblings that would outlive the file we are about to remove.
+            drop(conn);
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(format!("{path}-wal"));
+            let _ = std::fs::remove_file(format!("{path}-shm"));
+            Err(e)
+        }
+    }
 }
 
 pub fn open_room(path: &str, password: &str) -> Result<Connection, String> {
@@ -304,13 +508,9 @@ pub fn open_room(path: &str, password: &str) -> Result<Connection, String> {
         return Err("File not found.".into());
     }
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    // A1: `apply_key` pins the SQLCipher-4 parameter set too, so this room
+    // decrypts regardless of the linked SQLCipher's own defaults.
     apply_key(&conn, password)?;
-    // A1: pin the SQLCipher-4 parameter set (same as create_room) so this room
-    // decrypts regardless of the linked SQLCipher's own defaults. Already the
-    // current default, so existing rooms keep opening; must run after `key` and
-    // before the first real read (verify_key).
-    conn.execute_batch("PRAGMA cipher_compatibility = 4;")
-        .map_err(|e| e.to_string())?;
     verify_key(&conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|e| e.to_string())?;
@@ -325,6 +525,37 @@ pub fn open_room(path: &str, password: &str) -> Result<Connection, String> {
             migrate(&conn)?;
             Ok(conn)
         }
+        _ => Err("This file is not an Arcelle project.".into()),
+    }
+}
+
+/// Open a room WITHOUT changing it — decrypt, prove the key, confirm the file
+/// really is one of ours, and stop there.
+///
+/// [`open_room`] always runs [`migrate`], which creates tables and at least one
+/// write. That is right for the app and wrong for a check: `roomai verify` /
+/// `roomai info` promise to read, and on a copy sitting on a read-only volume
+/// or a backup they failed with a database error instead of a verdict — and on
+/// a room that had not been opened since the last schema change, "verifying" it
+/// quietly rebuilt its search index.
+///
+/// SQLite is asked for a read-only handle as well, so the promise is enforced
+/// by the engine rather than by this function remembering not to write.
+pub fn open_room_readonly(path: &str, password: &str) -> Result<Connection, String> {
+    if !std::path::Path::new(path).exists() {
+        return Err("File not found.".into());
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| e.to_string())?;
+    apply_key(&conn, password)?;
+    verify_key(&conn)?;
+    let format: Result<String, _> =
+        conn.query_row("SELECT value FROM meta WHERE key = 'format'", [], |r| r.get(0));
+    match format {
+        Ok(f) if f == "roomai" => Ok(conn),
         _ => Err("This file is not an Arcelle project.".into()),
     }
 }
@@ -383,6 +614,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     // migrations above).
     if table_exists(conn, "jobs")? && !column_exists(conn, "jobs", "parent_job_id")? {
         conn.execute("ALTER TABLE jobs ADD COLUMN parent_job_id TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Why a job stopped when nobody pressed Stop (room locked / app closed).
+    // Same guarded-ALTER shape as `parent_job_id` above; an old room's rows come
+    // back NULL, which reads exactly as today's "the user paused this".
+    if table_exists(conn, "jobs")? && !column_exists(conn, "jobs", "parked_reason")? {
+        conn.execute("ALTER TABLE jobs ADD COLUMN parked_reason TEXT", [])
             .map_err(|e| e.to_string())?;
     }
 
@@ -508,9 +747,38 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     for stmt in [
         "ALTER TABLE file_versions ADD COLUMN text TEXT",
         "ALTER TABLE file_versions ADD COLUMN rec_meta TEXT",
+        // ART-1: per-version provenance. Existing versions keep NULL, which
+        // reads as "not recorded" — the History strip says nothing about them
+        // rather than attributing them to a run that may not have made them.
+        "ALTER TABLE file_versions ADD COLUMN provenance TEXT",
+        // "Keep this one": excluded from the rolling prune. Existing versions
+        // default to 0, i.e. exactly today's behaviour for every old room.
+        "ALTER TABLE file_versions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE files ADD COLUMN provenance TEXT",
+        // ART-1: the requested name a regeneration is matched on. Existing
+        // generated files keep NULL and are matched on their `name` instead
+        // (see `commit_staged`), so a room written before this column still
+        // versions its artifacts rather than duplicating them.
+        "ALTER TABLE files ADD COLUMN artifact_key TEXT",
     ] {
         add_column_if_missing(conn, stmt)?;
     }
+
+    // ART-1: the artifact staging area. Old rooms opened via open_room never ran
+    // SCHEMA, so mirror the table here — see the base schema for why staging
+    // lives inside the encrypted room.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS staged_artifacts (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL,
+           mime TEXT NOT NULL,
+           bytes BLOB NOT NULL,
+           text TEXT,
+           provenance TEXT,
+           staged_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );",
+    )
+    .map_err(|e| e.to_string())?;
 
     // RM-2: the web_pages cache must be keyed by URL so save_web_page can upsert.
     // Old rooms opened via open_room never ran SCHEMA, so the table may not exist
@@ -599,6 +867,86 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute("ALTER TABLE files ADD COLUMN origin_url TEXT", [])
             .map_err(|e| e.to_string())?;
     }
+
+    // Room map: file→file provenance, written at the moment a generator makes a
+    // file from another one. Guarded ALTER like origin_url above.
+    if table_exists(conn, "files")? && !column_exists(conn, "files", "derived_from")? {
+        conn.execute("ALTER TABLE files ADD COLUMN derived_from TEXT", [])
+            .map_err(|e| e.to_string())?;
+        // One-off recovery for rooms whose full passes ran before the column
+        // existed: a `file_pass` job's plan names the SOURCE file and its
+        // publish artifact names the OUTPUT, so the pair can be recovered
+        // exactly. Best-effort by design — `delete_job` cascades its artifacts,
+        // so a dismissed job leaves nothing to recover and the file simply keeps
+        // no provenance rather than being given a guessed one.
+        //
+        // `json_valid` guards both blobs: `job_artifacts.content` is
+        // unconstrained TEXT, and `json_extract` on a non-JSON row would abort
+        // the whole migration (i.e. refuse to open the room).
+        const RECOVERED: &str = "(SELECT json_extract(j.plan, '$.fileId')
+              FROM jobs j JOIN job_artifacts a ON a.job_id = j.id
+              WHERE j.kind = 'file_pass'
+                AND json_valid(j.plan) AND json_valid(a.content)
+                AND json_extract(a.content, '$.file_id') = files.id
+              LIMIT 1)";
+        if table_exists(conn, "jobs")? && table_exists(conn, "job_artifacts")? {
+            conn.execute(
+                &format!(
+                    "UPDATE files SET derived_from = {RECOVERED}
+                     WHERE derived_from IS NULL AND {RECOVERED} IS NOT NULL"
+                ),
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Video technical metadata (media_probe::MediaMeta as JSON). Guarded ALTER
+    // like origin_url above — and it has to be BOTH here and in `SCHEMA`,
+    // because `create_room` runs only `SCHEMA` (see the note at the top of
+    // this file); a migrate-only column is missing from every brand-new room.
+    if table_exists(conn, "files")? && !column_exists(conn, "files", "media_meta")? {
+        conn.execute("ALTER TABLE files ADD COLUMN media_meta TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    // What a saved web page declares about itself (extraction::PageMeta as
+    // JSON). Guarded ALTER, and in BOTH places for the same reason media_meta
+    // is: a migrate-only column is missing from every brand-new room.
+    if table_exists(conn, "files")? && !column_exists(conn, "files", "web_meta")? {
+        conn.execute("ALTER TABLE files ADD COLUMN web_meta TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Trash / undo. Guarded ALTERs like media_meta above, and — the schema.rs
+    // rule — every one of them also lives in `SCHEMA`, because `create_room`
+    // never runs `migrate`.
+    //
+    // Existing rooms come out with `trashed_at` NULL on every row, which is
+    // exactly right: nothing that was in the library before the trash existed
+    // was ever deleted, so nothing starts out in it.
+    if table_exists(conn, "files")? {
+        for (column, decl) in [
+            ("trashed_at", "ALTER TABLE files ADD COLUMN trashed_at TEXT"),
+            ("trashed_by", "ALTER TABLE files ADD COLUMN trashed_by TEXT"),
+            ("trashed_by_id", "ALTER TABLE files ADD COLUMN trashed_by_id TEXT"),
+        ] {
+            if !column_exists(conn, "files", column)? {
+                conn.execute(decl, []).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS trashed_chunks (
+           id TEXT PRIMARY KEY,
+           file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+           seq INTEGER NOT NULL,
+           text TEXT NOT NULL,
+           embedding BLOB
+         );
+         CREATE INDEX IF NOT EXISTS idx_trashed_chunks_file ON trashed_chunks(file_id);",
+    )
+    .map_err(|e| e.to_string())?;
 
     // Wave 1b (idea 5): memory categories. Guarded ALTER like ai_summary above;
     // NULL = uncategorized, so legacy rooms open unchanged and keep every memory.
@@ -771,6 +1119,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
          );",
     )
     .map_err(|e| e.to_string())?;
+
+    // Rooms opened before the jobs write path enforced one parked entry per unit
+    // of work carry the pile-up it allowed: several indistinguishable paused
+    // copies of the same workflow in Activity. Repair them here rather than
+    // behind a `user_version` stamp — the sweep is a cheap invariant check over a
+    // handful of rows, it is a no-op on a room that is already clean, and it
+    // keeps holding if a future write path ever misses the rule.
+    crate::db::dedupe_parked_jobs(conn)?;
+    // ART-1: a staged artifact that outlived its session belongs to a generation
+    // that never committed — by construction it is not in the library, so
+    // clearing it here reclaims the space without changing what the room shows.
+    crate::db::sweep_staged_artifacts(conn)?;
     Ok(())
 }
 
@@ -792,6 +1152,23 @@ fn add_column_if_missing(conn: &Connection, stmt: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Replace one file's chunks, all-or-nothing.
+///
+/// Both one-time repairs below re-index a file by erasing its chunks and
+/// rebuilding them from the stored text. Those were two loose statements: a
+/// failure (or a crash) in between left the file with NO chunks at all, and
+/// because the `user_version` stamp is written once for the whole sweep, the
+/// next unlock considers the repair done. The document still opens fine and is
+/// simply never found in search again, with nothing said. Either the new chunks
+/// land or the old ones stay.
+fn reindex_one_file(conn: &Connection, file_id: &str, text: &str) -> Result<(), String> {
+    crate::db::in_transaction(conn, || {
+        conn.execute("DELETE FROM chunks WHERE file_id = ?1", [file_id])
+            .map_err(|e| e.to_string())?;
+        insert_chunks(conn, file_id, Some(text))
+    })
 }
 
 /// One-time (user_version 3): CHUNK_CAP used to be 2000 (~2M chars), so a
@@ -823,9 +1200,7 @@ fn rebuild_capped_chunks(conn: &Connection) -> Result<(), String> {
             .ok()
             .flatten();
         let Some(text) = text else { continue };
-        conn.execute("DELETE FROM chunks WHERE file_id = ?1", [&file_id])
-            .map_err(|e| e.to_string())?;
-        insert_chunks(conn, &file_id, Some(&text))?;
+        reindex_one_file(conn, &file_id, &text)?;
     }
     Ok(())
 }
@@ -864,9 +1239,7 @@ fn rebuild_marked_hebrew_chunks(conn: &Connection) -> Result<(), String> {
             .ok()
             .flatten();
         let Some(text) = text else { continue };
-        conn.execute("DELETE FROM chunks WHERE file_id = ?1", [&file_id])
-            .map_err(|e| e.to_string())?;
-        insert_chunks(conn, &file_id, Some(&text))?;
+        reindex_one_file(conn, &file_id, &text)?;
     }
     Ok(())
 }
@@ -874,6 +1247,36 @@ fn rebuild_marked_hebrew_chunks(conn: &Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `roomai verify` promises to look, not touch. It used to go through
+    /// `open_room`, which always runs `migrate` — at least one write — so the
+    /// check failed outright on a copy on a read-only volume, and on a room not
+    /// opened since the last schema change it rebuilt the search index. The
+    /// read-only handle makes the promise SQLite's to keep.
+    #[test]
+    fn a_read_only_open_verifies_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("check.roomai");
+        let path = path.to_str().unwrap();
+        drop(create_room(path, "correct horse battery", "Check").unwrap());
+
+        let conn = open_room_readonly(path, "correct horse battery").unwrap();
+        // It really is the room…
+        let name: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'name'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "Check");
+        // …and nothing can write through this handle, migration included.
+        assert!(
+            conn.execute_batch("CREATE TABLE scribble(x)").is_err(),
+            "a verify handle must not be able to write to the room"
+        );
+        assert!(migrate(&conn).is_err(), "migrate must not run on a verify handle");
+
+        // A wrong password is still a wrong password, and a non-room is still
+        // not a room — the check must not become laxer for being read-only.
+        assert!(open_room_readonly(path, "wrong password here").is_err());
+    }
 
     #[test]
     fn fts5_is_available() {
@@ -941,6 +1344,132 @@ mod tests {
     }
 
     #[test]
+    fn artifact_staging_and_provenance_reach_a_room_written_before_them() {
+        // ART-1: the net under an unattended AI write is only a net if it also
+        // covers rooms that already exist. An old room must gain the staging
+        // table and both provenance columns on open, and its EXISTING versions
+        // must read back with no provenance rather than an invented one.
+        // Same shape as the two migration tests below: full schema, then the
+        // affected tables re-created exactly as older rooms had them. (Recreated
+        // rather than `ALTER … DROP COLUMN`, which rewrites the stored DDL and
+        // trips over the column comments the base schema carries.)
+        let conn = open_in_memory_schema();
+        conn.execute_batch(
+            "DROP TABLE staged_artifacts;
+             DROP TABLE file_versions;
+             DROP TABLE files;
+             CREATE TABLE files (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               mime_type TEXT,
+               size_bytes INTEGER NOT NULL DEFAULT 0,
+               source TEXT NOT NULL DEFAULT 'upload',
+               original_bytes BLOB,
+               extracted_text TEXT,
+               folder_id TEXT,
+               ai_summary TEXT,
+               origin_url TEXT,
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             );
+             CREATE TABLE file_versions (
+               id TEXT PRIMARY KEY,
+               file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+               bytes BLOB NOT NULL,
+               text TEXT,
+               rec_meta TEXT,
+               saved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+               cause TEXT NOT NULL
+             );
+             INSERT INTO files(id, name, mime_type, source, original_bytes, extracted_text)
+               VALUES ('f1', 'Deck.html', 'text/html', 'generated', x'6f6c64', 'old');
+             INSERT INTO file_versions(id, file_id, bytes, cause)
+               VALUES ('v1', 'f1', x'6f6c646572', 'You saved');",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "files", "provenance").unwrap());
+        assert!(!table_exists(&conn, "staged_artifacts").unwrap());
+
+        migrate(&conn).unwrap();
+
+        assert!(column_exists(&conn, "files", "provenance").unwrap());
+        assert!(column_exists(&conn, "files", "artifact_key").unwrap());
+        assert!(column_exists(&conn, "file_versions", "provenance").unwrap());
+        assert!(table_exists(&conn, "staged_artifacts").unwrap());
+        // The pre-existing version is listed, and claims no author.
+        let versions = crate::db::list_file_versions(&conn, "f1").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].cause, "You saved");
+        assert!(versions[0].provenance.is_none(), "an old version credits nobody");
+        assert!(crate::db::file_provenance(&conn, "f1").unwrap().is_none());
+
+        // And the funnel works on the migrated room: a regeneration versions it.
+        let staged = crate::db::stage_artifact(
+            &conn,
+            "Deck.html",
+            "text/html",
+            b"new",
+            Some("new"),
+            &crate::db::Provenance { agent: Some("Flashcards".into()), ..Default::default() },
+        )
+        .unwrap();
+        let (meta, versioned) = crate::db::commit_staged(&conn, &staged.id).unwrap();
+        assert!(versioned);
+        assert_eq!(meta.id, "f1");
+        assert_eq!(crate::db::list_file_versions(&conn, "f1").unwrap().len(), 2);
+        // Idempotent on a second open.
+        migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn derived_from_migration_recovers_provenance_from_finished_passes() {
+        // Room map: a room whose full passes ran BEFORE the column existed still
+        // has the pair on the jobs row (plan names the source, the publish
+        // artifact names the output), so the one-off ALTER recovers it. Same
+        // shape as the memories-category test: full schema, then the files table
+        // reshaped as legacy rooms had it.
+        let conn = open_in_memory_schema();
+        conn.execute_batch(
+            "DROP TABLE files;
+             CREATE TABLE files (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               mime_type TEXT,
+               size_bytes INTEGER NOT NULL DEFAULT 0,
+               source TEXT NOT NULL DEFAULT 'upload',
+               original_bytes BLOB,
+               extracted_text TEXT,
+               folder_id TEXT,
+               ai_summary TEXT,
+               origin_url TEXT,
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             );
+             INSERT INTO files(id, name) VALUES ('src', 'lease.pdf'), ('out', 'Full pass — lease.pdf.html'), ('plain', 'photo.png');
+             INSERT INTO jobs(id, kind, plan) VALUES ('j1', 'file_pass', '{\"fileId\":\"src\",\"fileName\":\"lease.pdf\"}');
+             INSERT INTO job_artifacts(job_id, step_id, content) VALUES ('j1', 9, '{\"file_id\":\"out\"}');
+             -- job_artifacts.content is unconstrained TEXT. A row that is not
+             -- JSON used to be enough to abort json_extract — i.e. to refuse to
+             -- open the room — so the migration must survive one.
+             INSERT INTO job_artifacts(job_id, step_id, content) VALUES ('j1', 10, 'not json at all');",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "files", "derived_from").unwrap());
+        migrate(&conn).unwrap();
+        assert!(column_exists(&conn, "files", "derived_from").unwrap());
+
+        let recovered = crate::db::derived_links(&conn).unwrap();
+        assert_eq!(recovered, vec![("src".to_string(), "out".to_string())]);
+        // A file no pass produced keeps no provenance — the migration recovers
+        // what the room recorded, it does not invent a parent for everything.
+        let plain: Option<String> = conn
+            .query_row("SELECT derived_from FROM files WHERE id = 'plain'", [], |r| r.get(0))
+            .unwrap();
+        assert!(plain.is_none());
+        // Idempotent on a second open.
+        migrate(&conn).unwrap();
+        assert_eq!(crate::db::derived_links(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
     fn room_reopens_after_create() {
         // A1: a room created then reopened still decrypts (cipher_compatibility
         // pinned in both paths), and a wrong password is rejected cleanly.
@@ -955,5 +1484,177 @@ mod tests {
         drop(conn);
         assert!(open_room(&path, "wrong password").is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A new room is stamped at the CURRENT schema revision. Stamped 0 — which
+    /// is what a room written years ago looks like — the very next unlock ran
+    /// every one-time repair against it, and the first of those nulls every
+    /// embedding in the room. A first session's whole semantic index was thrown
+    /// away the first time the room was reopened.
+    #[test]
+    fn a_new_room_keeps_the_search_index_it_built_in_its_first_session() {
+        let path = temp_room_path();
+        {
+            let conn = create_room(&path, "correct horse", "My Room").unwrap();
+            conn.execute(
+                "INSERT INTO files(id, name, mime_type, source, original_bytes, extracted_text)
+                 VALUES ('f1', 'notes.md', 'text/markdown', 'upload', x'00', 'hello')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks(id, file_id, seq, text, embedding)
+                 VALUES ('c1', 'f1', 0, 'hello', x'0102030405060708')",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = open_room(&path, "correct horse").unwrap();
+        let embedded: i64 = conn
+            .query_row("SELECT count(*) FROM chunks WHERE embedding IS NOT NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(embedded, 1, "reopening a NEW room erased its embeddings");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
+            CURRENT_USER_VERSION,
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `CURRENT_USER_VERSION` is what stops a brand-new room running the
+    /// one-time repairs (repair #1 nulls every embedding in the room). Its
+    /// correctness is a promise about a number in ANOTHER function — "raise this
+    /// in lockstep with the last `if user_version < N` block in `migrate`" — and
+    /// a promise in a doc comment is not a guard. The next migration added
+    /// without touching the constant silently re-opens the exact bug: the new
+    /// room is stamped 3, `migrate` sees `3 < 4`, and the sweep runs on a room
+    /// that was born current. Read the source and check.
+    #[test]
+    fn the_born_current_stamp_covers_every_one_time_repair() {
+        let src = include_str!("schema.rs");
+        let highest = src
+            .match_indices("user_version < ")
+            .filter_map(|(i, _)| {
+                src[i + "user_version < ".len()..]
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .filter(|d| !d.is_empty())
+                    .and_then(|d| d.parse::<i64>().ok())
+            })
+            .max()
+            .expect("migrate has no one-time repairs at all — did they move?");
+        assert_eq!(
+            CURRENT_USER_VERSION, highest,
+            "a migration was added without raising CURRENT_USER_VERSION: a room \
+             created today is stamped {CURRENT_USER_VERSION}, so `migrate` will run \
+             repair {highest} against it — and repair 1 erases every embedding the \
+             room built in its first session",
+        );
+    }
+
+    /// The search cache's table was minted only by `migrate`, so a brand-new
+    /// room had nowhere to put a result until it had been closed and reopened
+    /// once — every write failed, silently, for the whole first session.
+    #[test]
+    fn a_new_room_can_remember_a_web_search_straight_away() {
+        let path = temp_room_path();
+        let conn = create_room(&path, "correct horse", "My Room").unwrap();
+        let hits = vec![crate::web::WebHit {
+            title: "Rust".into(),
+            url: "https://example.test/rust".into(),
+            engines: vec!["test".into()],
+            date: None,
+            snippet: Some("systems language".into()),
+            score: 1.0,
+        }];
+        crate::db::put_web_search(&conn, "rust", &hits).expect("a new room could not cache a search");
+        assert_eq!(
+            crate::db::get_fresh_web_search(&conn, "rust").map(|h| h.len()),
+            Some(1),
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SQLite creates the file the moment it is opened — before anything that
+    /// could fail has run. A failure used to leave that file behind, and the
+    /// obvious retry (same name) then hit "A file already exists at this
+    /// location." for good, with nothing in the app able to remove it.
+    #[test]
+    fn a_failed_creation_leaves_no_file_blocking_the_retry() {
+        let path = temp_room_path();
+        let err = create_room_file(&path, |_| Err("the disk went away".into())).unwrap_err();
+        assert_eq!(err, "the disk went away");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the half-written room file blocks every retry with the same name",
+        );
+    }
+
+    /// The one place a room is actually created and encrypted enforces the
+    /// password rule the new-room FORM has always shown. Nothing may slip past
+    /// it — and a refusal must not leave a file behind either.
+    #[test]
+    fn a_room_password_must_clear_the_length_rule() {
+        let path = temp_room_path();
+        let err = create_room(&path, "1234567", "Short").unwrap_err();
+        assert!(err.contains("8 characters"), "{err}");
+        assert!(!std::path::Path::new(&path).exists());
+        create_room(&path, "12345678", "Exactly eight").expect("eight characters is enough");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A damaged file, a disk that is failing, a room on a network volume that
+    /// dropped: every one of these used to be reported as a wrong password, so
+    /// the user retypes it forever while the real fix is elsewhere.
+    #[test]
+    fn only_an_undecryptable_file_reads_as_a_wrong_password() {
+        let notadb = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            Some("file is not a database".into()),
+        );
+        assert_eq!(classify_first_read(notadb), "WRONG_PASSWORD");
+
+        let io = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            Some("disk I/O error".into()),
+        );
+        let msg = classify_first_read(io);
+        assert!(!msg.contains("WRONG_PASSWORD"), "{msg}");
+        assert!(msg.contains("could not be read"), "{msg}");
+    }
+
+    /// A one-time repair erases a file's chunks and rebuilds them. If the
+    /// rebuild fails in between, the old chunks must still be there: the
+    /// `user_version` stamp is written once for the whole sweep, so a file left
+    /// with no chunks is never re-indexed and simply stops being findable.
+    #[test]
+    fn a_reindex_that_fails_halfway_keeps_the_old_index() {
+        let conn = open_in_memory_schema();
+        conn.execute(
+            "INSERT INTO files(id, name, mime_type, source, original_bytes, extracted_text)
+             VALUES ('f1', 'lease.pdf', 'application/pdf', 'upload', x'00', 'the rent is due')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks(id, file_id, seq, text) VALUES ('c1', 'f1', 0, 'the rent is due')",
+            [],
+        )
+        .unwrap();
+        // Make the rebuild half fail, deterministically, the way a disk error
+        // or a crash would.
+        conn.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON chunks BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )
+        .unwrap();
+
+        assert!(reindex_one_file(&conn, "f1", "the rent is due").is_err());
+
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM chunks WHERE file_id = 'f1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "the file lost its search index with nothing to rebuild it");
     }
 }

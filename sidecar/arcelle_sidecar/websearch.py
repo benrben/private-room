@@ -182,14 +182,24 @@ def _fails_soft(engine: Engine) -> Engine:
     yields no results rather than an exception, so one bad engine can't sink a search.
     The error is silenced, not swallowed — it is logged at WARNING and reported to the
     fan-out as a failure, because a scraper whose selectors have rotted (or a Mac with
-    no network at all) looks exactly like 'nothing matched'."""
+    no network at all) looks exactly like 'nothing matched'.
+
+    The ENGINE and the exception TYPE are logged, never the exception itself and
+    never a traceback. `requests` builds its message out of the request it was
+    making — "HTTPSConnectionPool(host='www.mojeek.com', ...): Max retries
+    exceeded with url: /search?q=<the user's words>" — so `exc_info=True` here
+    wrote the query into an unencrypted file in the Mac's temp folder
+    (`sidecar_lifecycle::stderr_log_path`) on every network blip, which is
+    exactly what this module's docstring promises never happens (SPEC §6). The
+    type is what tells a rotted selector (AttributeError) from a dead network
+    (ConnectionError), and that is the diagnosis this log exists for."""
 
     @wraps(engine)
     def wrapper(*args: Any, **kwargs: Any) -> list[Hit]:
         try:
             return engine(*args, **kwargs)
         except Exception as exc:
-            _log.warning("engine %s failed", engine.__name__, exc_info=True)
+            _log.warning("engine %s failed: %s", engine.__name__, type(exc).__name__)
             _note_failure(type(exc).__name__)
             return []
 

@@ -17,19 +17,20 @@
 //! Docker-based servers can't be auto-provisioned (Docker is a background
 //! service, not a binary), so those surface a clear "install Docker" note.
 //!
-//! NOT IN THE BUILD (audit findings 80 + 228, 2026-08-01). Nothing declares
-//! `mod runtimes;`, so none of this ships and neither command can be invoked —
-//! a connector needing `uvx`/`npx` on a Mac without them still fails with the
-//! raw launcher error. It is complete and unit-tested, so this is one decision,
-//! not a repair. Ship it with all four of:
+//! IN THE BUILD as of audit findings 80 + 228. It was written complete and
+//! unit-tested but never declared, so none of it shipped and neither command
+//! could be invoked. All four halves are now wired, and they only make sense
+//! together — a download button that fetches 45 MB into a folder nothing looks
+//! in is worse than no button:
 //!   1. `mod runtimes; pub use runtimes::*;` in `commands.rs`,
 //!   2. `commands::mcp_runtime_for_command` + `commands::mcp_provision_runtime`
 //!      in `lib.rs`'s `invoke_handler`,
-//!   3. `mcp.rs`'s launcher prepending [`path_prefix`] to `login_shell_path()`
-//!      — without it a downloaded runtime is on no PATH the child ever sees,
+//!   3. `mcp.rs`'s launcher prepending the downloaded bin dirs to
+//!      `login_shell_path()` — without it a downloaded runtime is on no PATH
+//!      the child ever sees. The launcher has no `AppHandle`, so the prefix is
+//!      PUBLISHED here ([`refresh_path_prefix`]) at startup and after every
+//!      provision, and the launcher reads [`cached_path_prefix`],
 //!   4. the "Download runtime" prompt in `src/workspace/ConnectorsView.tsx`.
-//! Or delete the file. Half of it is the one outcome worth avoiding: a download
-//! button that fetches 45 MB into a folder nothing looks in.
 
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -183,6 +184,34 @@ pub fn path_prefix(app: &tauri::AppHandle) -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(":")
+}
+
+/// The published PATH prefix, for readers with no `AppHandle`.
+///
+/// The stdio connector launcher (`mcp::StdioClient::connect`) is handed a
+/// command and an env map and nothing else — there is no app handle to resolve
+/// the app-data dir from, and that is exactly the code that has to see a
+/// downloaded `uvx`. So the prefix is computed where the handle exists and
+/// cached here. Empty until published, which is the correct answer before
+/// anything is downloaded anyway.
+fn prefix_cell() -> &'static std::sync::RwLock<String> {
+    static CELL: std::sync::OnceLock<std::sync::RwLock<String>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::RwLock::new(String::new()))
+}
+
+/// Recompute and publish the prefix. Called at startup and after a provision —
+/// a runtime downloaded mid-session must reach the next connector launch
+/// without a restart.
+pub fn refresh_path_prefix(app: &tauri::AppHandle) {
+    let next = path_prefix(app);
+    if let Ok(mut g) = prefix_cell().write() {
+        *g = next;
+    }
+}
+
+/// What the connector launcher prepends to its PATH.
+pub fn cached_path_prefix() -> String {
+    prefix_cell().read().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// True when `cmd` resolves to an existing file in one of the PATH dirs. Pure —
@@ -347,7 +376,12 @@ pub fn mcp_runtime_for_command(app: tauri::AppHandle, command: String) -> Runtim
 #[tauri::command]
 pub async fn mcp_provision_runtime(app: tauri::AppHandle, kind: String) -> Result<(), String> {
     let kind = RuntimeKind::parse(&kind).ok_or_else(|| format!("unknown runtime \"{kind}\""))?;
-    provision(&app, kind).await
+    provision(&app, kind).await?;
+    // Publish immediately: without this the freshly-downloaded bin dir is on no
+    // PATH any child sees until the next launch, and the connector the user
+    // downloaded it FOR would still fail.
+    refresh_path_prefix(&app);
+    Ok(())
 }
 
 #[cfg(test)]

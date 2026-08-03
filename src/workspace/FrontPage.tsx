@@ -14,7 +14,7 @@ import {
   WorkflowsIcon,
 } from "../icons";
 import { displayName, formatWhen } from "./composer";
-import { isCloudEngine } from "./markup";
+import { isCloudRoute } from "./markup";
 import { visibleWorkflows } from "./workflows/selectors";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -53,7 +53,7 @@ function RoomBrief({ s, a }: { s: WSState; a: WSActions }) {
   };
 
   const items: BriefItem[] = [];
-  if (isCloudEngine(s.model) && s.privacyOn === false) {
+  if (isCloudRoute(s.model, s.ai) && s.privacyOn === false) {
     items.push({
       key: "raw-cloud",
       tone: "danger",

@@ -60,6 +60,63 @@
   var tickets = new Map();
   var ticketSeq = 0;
 
+  // ----------------------------------------------------- keyboard escape
+
+  /* THE WAY BACK OUT (item #18).
+   *
+   * The page is a SIBLING native view of the app's own webview, with its own
+   * first responder. Once the keyboard is inside it, no key the app listens
+   * for is ever delivered to the app — Tab cycles the page forever and there
+   * is no DOM route home. That is a focus trap, and for a keyboard-only or
+   * screen-reader user it is the whole feature broken.
+   *
+   * There is no push channel from here to Rust (this script plus
+   * `evaluateJavaScript` IS the transport), so the request is LATCHED and
+   * reported on the next `info` poll — the browser chrome already polls every
+   * 1200 ms, which is what makes this cost no new plumbing. It is read once
+   * and cleared, so a request can never fire twice.
+   *
+   * Escape TWICE is the chord because it is the one key VoiceOver passes
+   * straight through (⌃⌥ is its own modifier, and ⌘-anything belongs to the
+   * page or the system), and because a first Escape that a page consumed to
+   * close its own dialog leaves the second one free.
+   *
+   * Sub-frames run their own copy of this script and are never polled, so a
+   * double Escape typed inside an iframe is not seen. The main frame is where
+   * the chrome's own focus lands, so that is the case that matters.
+   */
+  var LEAVE_CHORD_MS = 700;
+  var lastEscapeAt = 0;
+  var leaveRequested = false;
+
+  function takeLeaveRequest() {
+    var asked = leaveRequested;
+    leaveRequested = false;
+    return asked;
+  }
+
+  try {
+    window.addEventListener(
+      "keydown",
+      function (e) {
+        if (!e || e.key !== "Escape") {
+          lastEscapeAt = 0;
+          return;
+        }
+        var now = Date.now();
+        if (lastEscapeAt && now - lastEscapeAt <= LEAVE_CHORD_MS) {
+          leaveRequested = true;
+          lastEscapeAt = 0;
+        } else {
+          lastEscapeAt = now;
+        }
+      },
+      true,
+    );
+  } catch (e) {
+    /* a document that refuses listeners still gets every other op */
+  }
+
   // ------------------------------------------------------------------ utils
 
   function truncate(s, max) {
@@ -71,7 +128,10 @@
     return String(s == null ? "" : s).replace(/\s+/g, " ").trim();
   }
 
-  function isVisible(el) {
+  /** @param el element
+   *  @param forReading true when the caller wants the page's TEXT rather than
+   *  the things a click can reach — see the band note below. */
+  function isVisible(el, forReading) {
     var r;
     try {
       r = el.getBoundingClientRect();
@@ -82,8 +142,26 @@
     // Off-screen in the scroll direction is still "on the page" for a browser
     // (unlike the app, where panes clip); only reject what is fully outside
     // the document flow's visible band by a wide margin.
-    if (r.bottom < -2000 || r.top > window.innerHeight + 4000) return false;
-    if (r.right < -2000 || r.left > window.innerWidth + 4000) return false;
+    //
+    // THE READING RULE IS NOT THE CLICKING RULE. The "far below / far to the
+    // right" half of this band is right for a SNAPSHOT — MARK_CAP only has 80
+    // marks and they belong near the user, and nothing is clicked five screens
+    // away. For TEXT it silently deletes the document: the extractor never
+    // scrolls, so a page whose body runs 30 000px down (which is what any long
+    // article becomes once the stage is narrow — and the reading view shrinks
+    // it to 320px on purpose) loses everything past its fifth screen while
+    // `read` still answers `truncated: false` and a `total` measured on the
+    // fragment. That is a slice presented as the whole page, in the one
+    // channel a screen-reader user has. Reading keeps every CSS check and both
+    // NEGATIVE-side rejections (that is where `left: -9999px` menus and
+    // scrolled-past-and-recycled rows live); it drops only the far side,
+    // because further down the document is what reading a document means.
+    if (r.bottom < -2000) return false;
+    if (r.right < -2000) return false;
+    if (!forReading) {
+      if (r.top > window.innerHeight + 4000) return false;
+      if (r.left > window.innerWidth + 4000) return false;
+    }
     if (typeof el.checkVisibility === "function") {
       try {
         return el.checkVisibility({ checkVisibilityCSS: true });
@@ -526,6 +604,10 @@
     if (!root) return "";
     var out = [];
     var full = mode === "full";
+    /** How many rows of the table currently being walked have been emitted.
+     *  Saved and restored around a nested table so the inner one gets its own
+     *  header row rather than inheriting the outer one's. */
+    var tableRow = 0;
 
     function walk(node, depth) {
       if (!node || depth > 40) return;
@@ -540,7 +622,7 @@
       if (node.getAttribute && node.getAttribute("data-arcelle-ui")) return;
       if (!full && CHROME_TAGS[tag] && node !== root) return;
       if (node.getAttribute && node.getAttribute("aria-hidden") === "true") return;
-      if (!isVisible(node) && tag !== "BODY") return;
+      if (!isVisible(node, true) && tag !== "BODY") return;
 
       if (/^H[1-6]$/.test(tag)) {
         var h = clean(node.textContent);
@@ -554,7 +636,11 @@
       }
       if (tag === "LI") {
         var li = clean(node.textContent);
-        if (li) out.push("- " + li);
+        // The LEADING newline is what makes this a list. Fragments are joined
+        // with a space (see the join below), so three items pushed as "- one"
+        // landed on one line and every Markdown renderer — and every screen
+        // reader reading the rendered result — saw a single item.
+        if (li) out.push("\n- " + li);
         return;
       }
       if (tag === "PRE") {
@@ -580,11 +666,28 @@
         out.push("\n");
         return;
       }
+      if (tag === "TABLE") {
+        var outerRow = tableRow;
+        tableRow = 0;
+        var rows = node.childNodes;
+        for (var t = 0; t < rows.length; t++) walk(rows[t], depth + 1);
+        tableRow = outerRow;
+        out.push("\n");
+        return;
+      }
       if (tag === "TR") {
         var cells = [];
-        var kids = node.children || [];
-        for (var c = 0; c < kids.length; c++) cells.push(clean(kids[c].textContent));
-        if (cells.length) out.push("| " + cells.join(" | ") + " |");
+        var tds = node.children || [];
+        for (var c = 0; c < tds.length; c++) cells.push(clean(tds[c].textContent));
+        if (cells.length) {
+          out.push("\n| " + cells.join(" | ") + " |");
+          // A run of `| a | b |` lines is not a table to any Markdown reader —
+          // it is a paragraph full of pipes, which is what a screen reader
+          // then reads out. The delimiter row under the FIRST row is what
+          // makes the rest of them cells.
+          if (tableRow === 0) out.push("\n|" + " --- |".repeat(cells.length));
+          tableRow++;
+        }
         return;
       }
       if (tag === "IMG") {
@@ -602,7 +705,15 @@
     } catch (e) {
       return clean(root.textContent || "");
     }
-    var text = out.join(" ").replace(/[ \t]+/g, " ").replace(/\n\s*\n\s*\n+/g, "\n\n");
+    var text = out
+      .join(" ")
+      .replace(/[ \t]+/g, " ")
+      // Fragments are joined with a space, so every line that a pushed "\n"
+      // starts inherits a trailing space from the fragment before it. Two of
+      // those in a row is a Markdown hard line break, and one on a table's
+      // header row is enough to make some readers miss the delimiter.
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n\s*\n\s*\n+/g, "\n\n");
     return text.trim();
   }
 
@@ -789,6 +900,36 @@
     return { el: el };
   }
 
+  /** The half of the disabled trap that `resolve` cannot close by itself.
+   *
+   * `snapshot` and `currentElements` both refuse to hand out a disabled or
+   * hidden control, so a ref taken from either is fine at the moment it is
+   * issued. It can still go dead between being issued and being used — a form
+   * that disables its Submit while validating is the ordinary case — and the
+   * click path then reported `clicked e7 — button "Submit"` for a click the
+   * browser itself discarded, which is a fabricated result.
+   *
+   * Deliberately NATIVE `disabled` only, not `aria-disabled` and not
+   * `isVisible`: the browser genuinely swallows a click on the former, so
+   * refusing can never be wrong, while `aria-disabled` is only the page's own
+   * claim and `isVisible` carries a "far below the fold" band that is right for
+   * choosing what to SHOW and would wrongly refuse a legitimate click five
+   * screens down. Scrolling to such an element stays allowed — that is how you
+   * look at it.
+   */
+  function refuseIfDead(ref, el) {
+    if (el.disabled === true) {
+      return (
+        "e" +
+        String(ref).replace(/^e/i, "") +
+        " is disabled right now — " +
+        describe(el) +
+        ". Nothing was clicked or typed; act on the fresh snapshot below."
+      );
+    }
+    return null;
+  }
+
   function fire(el, type, init) {
     try {
       el.dispatchEvent(
@@ -865,6 +1006,8 @@
       var rc = resolve(a.click);
       if (rc.error) return { ok: false, error: rc.error };
       var el = rc.el;
+      var deadClick = refuseIfDead(a.click, el);
+      if (deadClick) return { ok: false, error: deadClick };
       try {
         el.scrollIntoView({ block: "center" });
       } catch (e) {}
@@ -886,6 +1029,8 @@
       var rr = resolve(t.ref);
       if (rr.error) return { ok: false, error: rr.error };
       var input = rr.el;
+      var deadType = refuseIfDead(t.ref, input);
+      if (deadType) return { ok: false, error: deadType };
       var text = String(t.text == null ? "" : t.text);
       try {
         if (typeof input.focus === "function") input.focus();
@@ -918,6 +1063,8 @@
       var rs = resolve(a.select.ref);
       if (rs.error) return { ok: false, error: rs.error };
       var sel = rs.el;
+      var deadSel = refuseIfDead(a.select.ref, sel);
+      if (deadSel) return { ok: false, error: deadSel };
       var want = String(a.select.value == null ? "" : a.select.value).toLowerCase();
       var opts = sel.options || [];
       for (var i = 0; i < opts.length; i++) {
@@ -1212,6 +1359,10 @@
             ready: document.readyState,
             canGoBack: history.length > 1,
             mediaAreas: mediaAreas(),
+            // Read-and-clear: the poll that sees this is the one that acts on
+            // it, so a single double-Escape can never hand the keyboard back
+            // twice.
+            leaveRequested: takeLeaveRequest(),
             doc: DOC_ID,
           };
         default:
