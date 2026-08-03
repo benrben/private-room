@@ -80,7 +80,7 @@ async fn initialize_list_and_call() {
         .call_tool("echo", &serde_json::json!({"text": "hi there"}))
         .await
         .expect("echo call");
-    assert_eq!(out, "echo: hi there");
+    assert_eq!(out.text, "echo: hi there");
 
     let err = client
         .call_tool("always-fails", &serde_json::json!({}))
@@ -111,8 +111,11 @@ async fn real_duckduckgo_server() {
         .call_tool(&search.name, &serde_json::json!({"query": "rust language"}))
         .await
         .expect("live search");
-    println!("first result chars: {}", &out.chars().take(200).collect::<String>());
-    assert!(!out.trim().is_empty());
+    println!(
+        "first result chars: {}",
+        &out.text.chars().take(200).collect::<String>()
+    );
+    assert!(!out.text.trim().is_empty());
 }
 
 #[tokio::test]
