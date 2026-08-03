@@ -22,7 +22,7 @@ const SOURCE = readFileSync(
 const JS = ts.transpileModule(SOURCE, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { toNodes, toBands, MAIN_KEY } = await import(
+const { toNodes, toBands, chipClass, MAIN_KEY } = await import(
   `data:text/javascript,${encodeURIComponent(JS)}`
 );
 
@@ -130,4 +130,56 @@ test("consecutive children sharing a batch band together", () => {
     { ...children[1], batch: 1 },
   ]);
   assert.deepEqual(twoRounds.map((b) => b.length), [1, 1]);
+});
+
+/* ------------------------------------------------------------------------- */
+/* the `*` tag: ONE specialist is the whole turn                              */
+/* ------------------------------------------------------------------------- */
+
+/** What the sidecar emits for a tagged turn (graph.py `_run_tagged`): a single
+ *  entry in the ROOT slot, carrying a specialist rather than the Main agent. */
+const taggedTurn = [
+  {
+    agent: "files.read",
+    label: "File agent",
+    instruction: "what notice does the lease need",
+    status: "running",
+    batch: null,
+    key: MAIN_KEY,
+  },
+];
+
+test("a tagged turn's root is the specialist, not a Main agent that never ran", () => {
+  const nodes = toNodes(taggedTurn, null, true);
+  assert.deepEqual(nodes.map((n) => n.agent), ["files.read"]);
+  assert.equal(nodes[0].label, "File agent");
+});
+
+test("an archived tagged turn caught mid-run did not finish, and does not claim to", () => {
+  // `settled` may only settle a still-running ROOT to "done" for the hub, whose
+  // argument is "it composed the answer this diagram hangs under". A specialist
+  // in the root slot has no such argument: it is a worker, and one still marked
+  // running is one the turn was stopped on top of. Keyed on the position alone
+  // this read "done" — a finished File agent that never came back.
+  const nodes = toNodes(taggedTurn, null, false);
+  assert.equal(nodes[0].status, "failed");
+});
+
+test("an archived ordinary turn still settles its hub optimistically", () => {
+  // The control: the change above must not turn every replayed answer red.
+  const hubOnly = [{ ...taggedTurn[0], agent: "chat.answer", label: "Main agent" }];
+  assert.equal(toNodes(hubOnly, null, false)[0].status, "done");
+});
+
+test("the flat chip shows a failed one-node turn as failed", () => {
+  // The flat strip is what a one-node turn draws instead of a diagram. It used
+  // to map everything that was not "running" to "done", which was safe only
+  // while a one-node turn always meant the Main agent — and the Main agent does
+  // not fail. A tagged specialist does, and a green chip over
+  // `_fallback_answer`'s "nothing usable came back" is exactly the claim the
+  // four-case fallback exists to prevent.
+  assert.equal(chipClass("failed"), "failed");
+  assert.equal(chipClass("running"), "active");
+  assert.equal(chipClass("done"), "done");
+  assert.equal(chipClass(undefined), "done");
 });

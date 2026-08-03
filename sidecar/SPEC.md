@@ -109,6 +109,19 @@ substring matches (hint lists include Hebrew stems). Erring toward YES is safe.
   mark the active entry, so the UI renders e.g. File agent → Main agent live;
   the queue-jump guard still withholds the connector proxy pair from workers
   that don't own it. One `final` event per ask — the Main agent's own words.
+- **The `*` tag routes DIRECTLY (2026-08-04, owner report):** a question whose
+  first token is `*<tag>` (agents.py `tagged_specialist`) never reaches the hub.
+  `graph._run_tagged` looks the tag up in `agents.specialist_workers` — the same
+  tag→worker mapping the composer's `*` menu is drawn from — and invokes THAT
+  worker's own graph as the whole turn: no Main agent, no plan, no delegation.
+  The specialist gets the real conversation plus `DIRECT_SPECIALIST_NOTE`, which
+  replaces the `delegation_note` report contract (a DID/FOUND/MISSING report has
+  no reader when there is no hub). The `plan` event carries ONE entry, the
+  specialist's, in the root slot. A tag NOT in `specialist_workers` — a wrong
+  name, a room setting that is off, or a tier that serves none of that agent's
+  box — ends the turn before any model runs, answered by
+  `prompts.tag_unavailable_answer` in the composer's own refusal sentence. It is
+  never handed to the Main agent or to a default worker.
 - `request_tools` escape hatch: when a served group is locked, the sidecar
   offers a local mini-tool that unlocks it mid-turn (graph.py `_unlock_group`,
   groups = agents.py `GROUPS`); the system prompt names locked groups via

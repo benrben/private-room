@@ -35,10 +35,40 @@ export interface GraphNode {
  * which is the state the sidecar itself records for a cancelled child
  * (`entry["status"] = "failed"`, with no emit left to carry it) — so "no
  * report, it did not finish" is the honest reading, not "done".
+ *
+ * WHICH IS WHY THIS ASKS THE AGENT, NOT THE POSITION (2026-08-04). The root
+ * slot is not always the hub any more: a `*`-tagged turn runs ONE specialist
+ * as the whole turn (graph.py `_run_tagged`) and that specialist occupies the
+ * root. It has no "it composed the answer" argument going for it — it is a
+ * worker like any other — so a tagged turn frozen mid-run would have read as
+ * a finished File agent when what actually happened is that it never came
+ * back.
  */
-function settled(status: AgentNodeStatus, isMain: boolean): AgentNodeStatus {
+function settled(status: AgentNodeStatus, isHub: boolean): AgentNodeStatus {
   if (status !== "running") return status;
-  return isMain ? "done" : "failed";
+  return isHub ? "done" : "failed";
+}
+
+/** The Main agent's registry id — the sidecar's `agents.MAIN_AGENT_ID`. The
+ *  root node carries it on an ordinary turn and a specialist's id on a tagged
+ *  one, which is the only way to tell the two roots apart. */
+const HUB_AGENT_ID = "chat.answer";
+
+/** The modifier class for the FLAT chip — the strip a one-node turn draws
+ *  instead of a diagram.
+ *
+ * A one-node roster used to mean one thing only: the Main agent answered alone,
+ * and the Main agent does not fail. The `*` tag made it mean something else too
+ * — one SPECIALIST ran the whole turn (`graph._run_tagged`) — and a specialist
+ * that came back with nothing is sent as `failed`. Mapping anything that is not
+ * "running" to `done` therefore painted a green chip over
+ * `_fallback_answer`'s "nothing usable came back", which is the one reading the
+ * whole four-case fallback exists to prevent. Pure, and out here rather than
+ * inline in the JSX, so it can be pinned by the page-script tests. */
+export function chipClass(status: AgentNodeStatus | undefined): string {
+  if (status === "running") return "active";
+  if (status === "failed") return "failed";
+  return "done";
 }
 
 /** Roster + active marker -> nodes.
@@ -72,7 +102,10 @@ export function toNodes(
       agent: entry.agent,
       label: entry.label,
       instruction: entry.instruction,
-      status: live ? status : settled(status, isMain),
+      // `isMain` is a POSITION (the root slot is last) and `settled` needs to
+      // know WHO is in it — on a tagged turn that root is a specialist, and
+      // "it composed the answer, so it finished" is not true of one.
+      status: live ? status : settled(status, entry.agent === HUB_AGENT_ID),
       // Without backend batching every child reads as one group, which is the
       // honest degradation: "these were dispatched, grouping unknown".
       batch: entry.batch ?? (isMain ? null : 0),

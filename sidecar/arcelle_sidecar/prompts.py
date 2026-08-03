@@ -60,60 +60,78 @@ WEB_OFF_NOTE = (
     "connector for it, and never guess at page content instead."
 )
 
-#: The user TAGGED a specialist for this turn with the composer's ``*`` menu
-#: (owner feature, 2026-08-03). Appended to the Main agent's paragraph.
+#: The user TAGGED this specialist with the composer's ``*`` menu (owner
+#: feature, 2026-08-03) and `run_agent` routed the turn STRAIGHT to it. Rides
+#: on the specialist's own paragraph, not the Main agent's.
 #:
-#: The catalog has already been narrowed to that one ``ask_*_agent`` tool, so
-#: this paragraph cannot be the thing that keeps the turn on target — narrowing
-#: is. What it exists for is the OTHER half: a hub that finds the tagged
-#: specialist unsuitable must say so, because the alternative it would
-#: otherwise reach for is answering from memory, and the user asked for a
-#: named specialist precisely because they did not want that.
-TAGGED_SPECIALIST_NOTE = (
-    "\n\nTHE USER TAGGED ONE SPECIALIST for this turn ({label} — {area}), so "
-    "it is the only one you can reach right now: every part of this request "
-    "goes to it. If what they asked genuinely does not belong to that "
-    "specialist, say so plainly and name the area it does belong to — never "
-    "answer it yourself from memory instead."
+#: WHY THIS WORDING EXISTS (owner report, 2026-08-04: "when calling specialist
+#: it still calls the main agent first not direct to him"). The tag used to
+#: NARROW the hub's catalog to one ``ask_*_agent`` tool — the Main agent still
+#: ran, still planned, still delegated, and the user watched a hub node light
+#: up for a turn they had already routed themselves. Now no hub runs at all,
+#: and that removes the one thing the hub was still contributing: it composed
+#: the user's answer out of the worker's DID/FOUND/MISSING report. A specialist
+#: that writes that report to nobody has silently under-performed, so a
+#: directly-tagged one is told, here, to write the ANSWER instead.
+#:
+#: The second half is the same doctrine as :data:`TAG_UNAVAILABLE_ANSWER`: a
+#: specialist that finds the request is not its own must say so and name the
+#: area, because the alternative it reaches for is answering from memory — and
+#: the user tagged a named specialist precisely because they did not want that.
+DIRECT_SPECIALIST_NOTE = (
+    "\n\nTHE USER TAGGED YOU DIRECTLY for this turn ({label} — {area}), so you "
+    "are the only agent running: no Main agent planned this, and there is no "
+    "one to relay your reply. Write the answer TO THE USER yourself, in your "
+    "own words — not a DID/FOUND/MISSING report, which nobody would read. If "
+    "what they asked is not yours to do, say so plainly and name the area it "
+    "belongs to so they can tag that one instead; never answer it from memory "
+    "and never let another agent's job pass as your own."
 )
 
 #: The tag named a specialist this room cannot serve this turn: the web is off,
 #: the engine's bridge tier carries none of that box's tools, or the name is
-#: not a specialist at all (a typo — ``*banana``). One note for all three,
+#: not a specialist at all (a typo — ``*banana``). One answer for all three,
 #: because they are one answer to the person who typed it.
 #:
-#: The catalog is NOT narrowed in this case — narrowing to a domain with no
-#: tool would leave an empty catalog, which the degenerate-tier paragraph
-#: already claims means "nothing is reachable at all", and that is a different
-#: and much bigger untruth. So the hub keeps every specialist it really has and
-#: is told, in the same words the delegation guard uses, that the one thing it
-#: may not do is quietly substitute one.
+#: NO MODEL IS ASKED ANYTHING HERE. Direct routing has no hub to instruct, and
+#: instructing one was never a guarantee: the paragraph this replaced told the
+#: Main agent to refuse while leaving every OTHER specialist in its catalog, so
+#: a model that ignored the paragraph could still answer "what is the weather"
+#: out of the user's own files under a File agent label — the exact 2026-07-24
+#: failure `_unavailable_note` was written for. A refusal composed in code
+#: cannot be ignored.
 #:
-#: ``available`` names the tags that WOULD have worked, for the same reason the
-#: composer's toast lists them: "no such specialist" without them leaves the
-#: user guessing at a vocabulary the app already knows. It is rendered from
-#: `reachable_domain_keys`, so it can only ever name specialists that are
-#: really there.
-TAG_UNAVAILABLE_NOTE = (
-    "\n\nTHE USER TAGGED THE {key!r} SPECIALIST for this turn and this room "
-    "has no such specialist right now ({available}). Before anything else, "
-    "tell them that plainly, and tell them which ones they can tag. Do not "
-    "hand their request to a different specialist as if it were the one they "
-    "asked for, and do not answer it from memory."
+#: The first sentence is `composer.specialistErrorMessage` VERBATIM. The host
+#: refuses a tag it can see is bad before sending; this refuses the ones that
+#: reach us anyway (a headless ``agent_run``, a composer whose roster never
+#: loaded, a room whose web switch changed between menu and send). Two layers,
+#: one sentence — a user must not be able to tell which one caught it.
+TAG_UNAVAILABLE_ANSWER = (
+    "*{key} isn't a specialist this room has. {alternatives} I have not sent "
+    "this to a different specialist instead: you would have got an answer from "
+    "an agent you did not ask for."
 )
 
 
 def tag_available_clause(keys: list[str]) -> str:
-    """The ``available`` clause of :data:`TAG_UNAVAILABLE_NOTE`.
+    """The ``alternatives`` clause of :data:`TAG_UNAVAILABLE_ANSWER`.
 
-    Split out so the empty case reads as a sentence rather than as "the ones it
-    does have are: ". A room with no reachable specialist at all is the
-    degenerate tier, and there the honest clause is that there is nothing to
-    tag — not a list that happens to be blank.
+    Split out so the empty case reads as a sentence rather than as "Try: ". A
+    room with no reachable specialist at all is the degenerate tier, and there
+    the honest clause is that there is nothing to tag — not a list that happens
+    to be blank.
     """
     if not keys:
-        return "this room has no specialists to tag at all right now"
-    return "the ones it does have are: " + ", ".join(f"*{k}" for k in keys)
+        return "This room has no specialists right now."
+    return "Try: " + ", ".join(f"*{k}" for k in keys)
+
+
+def tag_unavailable_answer(key: str, keys: list[str]) -> str:
+    """What the USER is told when their ``*`` tag names no specialist this room
+    has — the whole answer for that turn, and the only thing that happens."""
+    return TAG_UNAVAILABLE_ANSWER.format(
+        key=key, alternatives=tag_available_clause(keys)
+    )
 
 
 MAIN_PROMPT_TEMPLATE = (
@@ -198,7 +216,7 @@ PLAN_CALL_SINGLE = "Make exactly one call — {tool} — with that instruction. 
 
 #: A part of the request whose specialist this room cannot reach this turn.
 #:
-#: Same doctrine as :data:`TAG_UNAVAILABLE_NOTE`: name it, refuse it, and do not
+#: Same doctrine as :data:`TAG_UNAVAILABLE_ANSWER`: name it, refuse it, and do not
 #: quietly hand it to whoever is left. Substituting a specialist is how "redo the
 #: transcript" was once answered by re-saving an unrelated earlier reply.
 PLAN_UNAVAILABLE_NOTE = (

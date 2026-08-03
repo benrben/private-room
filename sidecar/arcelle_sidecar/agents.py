@@ -153,6 +153,15 @@ class AgentSpec:
     already stated where something actually reads it: the first sentence of its
     ``prompt`` (the model reads that every turn) and the per-domain blurb in
     :data:`AGENT_TOOL_DOMAINS` (the Main agent's catalog).
+
+    ``tag``/``area``/``summary`` are the ``*`` menu's three columns, and they
+    are NOT that removed field coming back: they are read on every roster call
+    (:func:`specialist_roster`) and shown to a PERSON. The distinction that
+    matters is who the audience is. A MODEL picks among ≤6 domains, because
+    that is what a 4B does reliably; a person picks from a dropdown, where
+    "Web" and "Browser" are two different jobs and collapsing them hides one of
+    the room's agents behind the other. So the model-facing catalog stays
+    per-domain and this trio is per-AGENT.
     """
 
     #: Stable id, ``domain.name`` (e.g. ``"jobs.run"``).
@@ -177,6 +186,25 @@ class AgentSpec:
     #: video is already ``media.video``'s job under ``ask_file_agent``, so
     #: nothing is lost by dropping the domain on those tiers.
     requires: tuple[str, ...] = ()
+    #: The name a user types after ``*`` to send a turn HERE ("browse"). ``a-z``
+    #: only, because that is all `tagged_specialist` and the host's
+    #: ``composer.ts`` can lex, and unique across the registry — both pinned by
+    #: the import-time assert below. "" for the Main agent alone, which is the
+    #: interlocutor rather than a specialist anyone can tag.
+    #:
+    #: A domain's FIRST member carries its DOMAIN key ("web" is `chat.web`), so
+    #: the vocabulary a user already learned keeps meaning what it meant and
+    #: `resolve_worker`'s default is what a bare domain tag reaches.
+    tag: str = ""
+    #: The menu's one-line hint: this agent's area, in plain words. Also the
+    #: ``{area}`` of `prompts.DIRECT_SPECIALIST_NOTE`, so a directly-tagged
+    #: specialist is told its own scope in the words the menu offered it under.
+    area: str = ""
+    #: The menu's full sentence: what this agent can actually be asked for. Per
+    #: AGENT, not per domain — "searches and reads pages" and "opens and
+    #: operates a page" are the honest answers for the two internet workers, and
+    #: one shared domain sentence could only be one of them.
+    summary: str = ""
     #: System-prompt paragraph appended while this agent is active ("" = the
     #: base prompt already covers it).
     prompt: str = ""
@@ -421,6 +449,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # mutates the user's room — claims get a ground-truth check
         template="react_verify",
         label="File agent",
+        tag="file",
+        area="this room's own files and notes",
+        summary=(
+            "Lists, searches, reads, opens, summarizes, creates and edits the "
+            "files, notes and memories in this room."
+        ),
         tools=(),  # CORE alone (read + write verbs)
         prompt=FILES_PROMPT,
     ),
@@ -436,6 +470,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="recall_act_check",
         label="Scripts agent",
+        tag="scripts",
+        area="this room's own .py and .js scripts",
+        summary=(
+            "Lists this room's own .py/.js scripts, runs one, and reports what "
+            "it produced."
+        ),
         tools=("list_scripts", "run_script"),
         prompt=SCRIPTS_PROMPT,
         hints=(
@@ -476,6 +516,13 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="chain_stage",
         label="Web agent",
+        tag="web",
+        area="searching and reading the internet",
+        summary=(
+            "Searches the internet and fetches pages to read them — news, "
+            "weather, prices, documentation — and downloads a file from a link "
+            "you give it. It READS pages; it does not operate them."
+        ),
         tools=("web_search", "fetch_page", *DOWNLOAD_TOOL_NAMES),
         hints=(
             "web", "online", "internet", "news", "latest", "google",
@@ -517,6 +564,13 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="perceive_act",
         label="Browser agent",
+        tag="browse",
+        area="driving a real page in the private browser",
+        summary=(
+            "Opens a site in this room's private browser and OPERATES the live "
+            "page: reads what is on it, clicks, fills forms, signs in and works "
+            "through a site. Name the address or the site you mean."
+        ),
         # BROWSE-2: browse_save rode into BROWSE_TOOL_NAMES; the download verbs
         # deliberately did NOT — "download the report on that page" is a
         # browse_do CLICK (the browser imports the file automatically), and
@@ -574,6 +628,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         flow=Flow(probe="ui_snapshot"),
         template="perceive_act",
         label="App agent",
+        tag="app",
+        area="this app's own interface",
+        summary=(
+            "Sees and operates Arcelle itself: opens views, clicks buttons and "
+            "shows the user around the app."
+        ),
         tools=UI_TOOL_NAMES,
         # SEEING and CLICKING are what this agent IS: `flow.probe` fires
         # ui_snapshot as its opening move and UI_PROMPT briefs it on ui_act.
@@ -615,6 +675,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="route_act",
         label="Jobs agent",
+        tag="jobs",
+        area="whole-file background passes",
+        summary=(
+            "Runs a durable background pass over an ENTIRE file — translate or "
+            "summarize a whole book — and reports how a running job is going."
+        ),
         tools=_JOBS_RUN,
         prompt=FILE_PASS_PROMPT,
         # Vocabulary: routing.JOB_HINTS (Rust-parity) — wired in manager.py.
@@ -633,6 +699,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="recall_act_check",
         label="Workflow agent",
+        tag="workflows",
+        area="saved workflows and automation",
+        summary=(
+            "Creates, edits, tests, schedules and runs saved multi-step "
+            "workflows — anything recurring, \"every morning\", \"every week\"."
+        ),
         tools=_JOBS_WORKFLOWS,
         prompt=WORKFLOWS_PROMPT,
         hints=(
@@ -654,6 +726,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="recall_act_check",
         label="Skills agent",
+        tag="skills",
+        area="finding and running agent skills",
+        summary=(
+            "Finds, reads and runs Agent Skills — written procedures that teach "
+            "an agent how to carry out a kind of task."
+        ),
         tools=_SKILLS_USE,
         prompt=SKILLS_USE_PROMPT,
         hints=("skill", "agent instruction", "מיומנות", "סקיל"),
@@ -674,6 +752,13 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="recall_act_check",
         label="Skill-builder agent",
+        tag="skillbuilder",
+        area="writing and editing agent skills",
+        summary=(
+            "Writes and edits Agent Skills: drafts a new procedure, changes an "
+            "existing one, or turns something you just did into a reusable "
+            "skill."
+        ),
         tools=_SKILLS_AUTHOR,
         prompt=SKILLS_AUTHOR_PROMPT,
         # ALL-OF hints (see `manager._matches`): the discriminator against the
@@ -699,6 +784,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # inspect then edit a small fixed set of server configs.
         flow=Flow(),
         label="Connector setup agent",
+        tag="connectorsetup",
+        area="setting up connected services",
+        summary=(
+            "Inspects and configures this room's connections to third-party "
+            "tools: list them, add or remove one, enable, disable or reconnect."
+        ),
         tools=MCP_MANAGEMENT_TOOL_NAMES,
         prompt=CONNECTORS_ADMIN_PROMPT,
         # ADMINISTRATIVE INTENT ONLY — never the bare subject noun. Live QA
@@ -742,6 +833,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         template="react_verify",
         flow=Flow(),
         label="Connector agent",
+        tag="connector",
+        area="the user's connected services",
+        summary=(
+            "Uses the third-party tools the user has connected: sends email and "
+            "Slack messages, reads calendars, calls an external app's tools."
+        ),
         tools=("search_mcp_tools", "run_mcp_tool"),
         prompt=CONNECTORS_USE_PROMPT,
         hints=(
@@ -774,6 +871,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # model round is available for the actual work.
         template="probe_gate_act",
         label="Transcription agent",
+        tag="transcribe",
+        area="transcribing this room's audio and video",
+        summary=(
+            "Transcribes this room's audio and video on-device, and "
+            "re-transcribes a file whose transcript is missing or wrong."
+        ),
         # NOT transcribe_audio (it takes base64 bytes from the recorder UI)
         # and NOT rec_retranscribe (it drives a live recording session) — an
         # agent can supply neither. Re-transcribing a room FILE is the
@@ -823,6 +926,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # normal case, so the frames must stay.
         template="react",
         label="Video agent",
+        tag="video",
+        area="watching this room's videos",
+        summary=(
+            "Watches a video in this room and reports what is on screen at any "
+            "moment you ask about."
+        ),
         # One tool, deliberately. The value of this box is not its size — it is
         # that SOMEBODY owns watching, with CORE's search_room (which returns
         # the transcript's [m:ss] stamps) as the way in.
@@ -869,6 +978,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
         template="route_act",
         label="Studio agent",
+        tag="studio",
+        area="flashcards, mind maps and podcast scripts",
+        summary=(
+            "Turns this room's material into one made thing: a set of "
+            "flashcards, a mind map, or a podcast script."
+        ),
         # stage_preview_html is a UI staging call, not an agent verb.
         tools=("studio_flashcards", "studio_mindmap", "generate_podcast_script"),
         prompt=STUDIO_PROMPT,
@@ -883,6 +998,12 @@ REGISTRY: tuple[AgentSpec, ...] = (
         ),
     ),
 )
+
+#: Every agent by id. Defined HERE rather than beside the other lookups at the
+#: foot of the module because the import-time guards below (the `*` tag table)
+#: resolve domain members through it, and an assert that runs at import cannot
+#: wait for a name defined later in the file.
+_BY_ID: dict[str, AgentSpec] = {spec.id: spec for spec in REGISTRY}
 
 #: Sub-agent boxes may not exceed this (CORE is exempt — its size is dictated
 #: by the byte-stable Rust prompt, not by choice).
@@ -1013,6 +1134,64 @@ assert set(DOMAIN_BLURBS) == set(DOMAIN_KEYS) == set(DOMAIN_KEY_ORDER), (
     "DOMAIN_BLURBS/DOMAIN_KEY_ORDER must cover exactly the AGENT_TOOL_DOMAINS "
     f"keys; blurbs={sorted(DOMAIN_BLURBS)} order={sorted(DOMAIN_KEY_ORDER)} "
     f"domains={sorted(DOMAIN_KEYS)}"
+)
+
+#: ``*tag -> (domain key, worker id)`` for EVERY agent a user may tag.
+#:
+#: The `*` menu's index (owner feature 2026-08-03). It is per-AGENT where
+#: :data:`DOMAIN_KEYS` is per-DOMAIN, and that difference is the whole point:
+#: the Browser agent is a sibling of the Web agent under ``ask_web_agent``
+#: because a 4B picks reliably among no more than six domain tools — a cap that
+#: says nothing about a HUMAN reading a dropdown, who was shown only "web" and
+#: could not tell that the room has a browser at all (owner report 2026-08-03).
+#:
+#: The domain key rides along because a tag still routes through the domain
+#: TOOL: tagging the Browser narrows the hub's catalog to ``ask_web_agent`` and
+#: pins the worker behind it (`resolve_worker`'s ``pin``). The model-facing
+#: catalog is untouched.
+#:
+#: Built by walking :data:`AGENT_TOOL_DOMAINS`, so an agent that is in no domain
+#: is in no menu — a specialist the hub has no tool to reach must not be
+#: offered as one.
+SPECIALIST_TAGS: dict[str, tuple[str, str]] = {
+    _spec.tag: (_name.removeprefix("ask_").removesuffix("_agent"), _spec.id)
+    for _name, _members, _ in AGENT_TOOL_DOMAINS
+    for _spec in (_BY_ID[_m] for _m in _members)
+}
+
+# Same import-time discipline as the blurbs above, for the same reason: a menu
+# is one more thing that can claim a capability the room does not have, and
+# every way it could go wrong is a start-up failure rather than a live one.
+#
+# * a tag the composer cannot lex (`tagged_specialist` matches `[a-z]+`, and
+#   `composer.ts parseComposer` matches the same) would be a menu row that
+#   inserts text the host then refuses to send;
+# * two agents sharing a tag would make one of them unreachable while both are
+#   listed;
+# * an agent in a domain with no tag at all would be missing from the menu with
+#   nothing to say so;
+# * and a domain whose FIRST member does not carry the DOMAIN's own key would
+#   silently change what "*web" has always meant — the default member is what a
+#   bare domain tag reaches (`resolve_worker` returns ``members[0]`` on a tie).
+assert all(
+    _s.tag and re.fullmatch(r"[a-z]+", _s.tag) and _s.area and _s.summary
+    for _s in REGISTRY
+    if not _s.main
+), (
+    "every non-main agent needs an a-z `tag`, an `area` and a `summary` for "
+    "the `*` menu; bad="
+    f"{sorted(s.id for s in REGISTRY if not s.main and not (s.tag and re.fullmatch(r'[a-z]+', s.tag) and s.area and s.summary))}"
+)
+assert len(SPECIALIST_TAGS) == sum(len(m) for _, m, _ in AGENT_TOOL_DOMAINS), (
+    "`*` tags must be unique across every domain member; "
+    f"tags={sorted(SPECIALIST_TAGS)}"
+)
+assert all(
+    _BY_ID[_members[0]].tag == _name.removeprefix("ask_").removesuffix("_agent")
+    for _name, _members, _ in AGENT_TOOL_DOMAINS
+), (
+    "a domain's FIRST member must carry the domain's own key as its `*` tag; "
+    f"defaults={[(n, _BY_ID[m[0]].tag) for n, m, _ in AGENT_TOOL_DOMAINS]}"
 )
 
 #: EVERY tool name this registry knows: CORE, every agent's box, and the
@@ -1146,9 +1325,9 @@ def normalize_domain_key(raw: str) -> str | None:
 #: the composer had shown as untagged. The alias table is for what a MODEL
 #: emits; it has no business reading a human's first token.
 #:
-#: The tight charset is also what makes the name safe to quote back into the
-#: system message (`prompts.TAG_UNAVAILABLE_NOTE`): a-z cannot carry an
-#: instruction.
+#: The tight charset is also what makes the name safe to quote back to the user
+#: in the refusal (`prompts.TAG_UNAVAILABLE_ANSWER`): a-z cannot carry an
+#: instruction, and no model is asked to relay it.
 _TAG_RE = re.compile(r"^\s*\*([a-z]+)(?=\s|$)")
 
 
@@ -1167,10 +1346,10 @@ def tagged_specialist(question: str) -> tuple[str, str]:
     user their ``*banana`` had gone nowhere. The host refuses that message
     outright (``composer.ts``, the same refusal ``#cmd`` and ``/skill`` get);
     when one reaches us anyway — a headless ``agent_run``, or a composer whose
-    roster never loaded — `graph.prepare` names it back and refuses it, by the
+    roster never loaded — `graph.run_agent` names it back and refuses it, by the
     same sentence a REACHABLE-but-unavailable tag gets. Both are "this room has
     no such specialist", and the room's served catalog is the only thing that
-    can tell them apart — see :func:`reachable_domain_keys`.
+    can tell them apart — see :func:`specialist_workers`.
     """
     m = _TAG_RE.match(question)
     if not m:
@@ -1203,37 +1382,82 @@ def specialist_roster(
     The owner's ``*`` tag (2026-08-03) lets a user name the specialist a turn
     goes to, which means the HOST has to draw a menu of them — and a menu is
     one more thing that can claim a capability the room does not have. So it is
-    generated from :func:`reachable_domain_keys` like every other listing,
-    rather than shipped as a roster the frontend keeps in step by hand: a
-    web-disabled room offers no Web specialist in the menu for exactly the same
+    generated from :func:`worker_reachable` like every other listing, rather
+    than shipped as a roster the frontend keeps in step by hand: a web-disabled
+    room offers neither internet specialist in the menu for exactly the same
     reason its catalog carries no ``ask_web_agent``.
 
-    ``label`` is the FIRST reachable member's own label, so the menu says
-    "Web agent" in the same words the agent diagram uses for the node that then
-    lights up. ``area`` is the at-a-glance blurb; ``description`` is the full
-    catalog sentence, which is the honest answer to "what does this one do".
+    ONE ROW PER AGENT, not per domain (owner report 2026-08-03: the menu showed
+    only "web" and the Browser agent was nowhere in it). The Main agent's
+    catalog is capped at six DOMAIN tools because that is the number a 4B picks
+    among reliably — a constraint on a model choosing under a context budget,
+    and it says nothing about a person reading a dropdown. To that person "the
+    internet" is two different jobs (search a question vs drive a page), and a
+    menu that names only the first hides the second entirely. So the
+    model-facing catalog stays exactly as it was and the MENU goes finer.
+
+    Every row is still a route: ``agent`` is the worker the tag runs, and it is
+    read from :func:`specialist_workers` — the SAME function routing reads — so
+    "what the menu offers" and "what a tag reaches" are one set rather than two
+    lists to keep in step. ``tool`` is the ``ask_*_agent`` that worker's domain
+    hangs under, kept on the row because the delegation guard and the agent
+    diagram both still speak in domains.
     """
+    live = specialist_workers(web_enabled=web_enabled, served_names=served_names)
     out: list[dict[str, str]] = []
-    keys = reachable_domain_keys(web_enabled=web_enabled, served_names=served_names)
-    by_key = {
-        name.removeprefix("ask_").removesuffix("_agent"): (members, description)
-        for name, members, description in AGENT_TOOL_DOMAINS
-    }
-    for key in keys:
-        members, description = by_key[key]
-        live = reachable_members(
-            members, web_enabled=web_enabled, served_names=served_names
-        )
+    for tag, worker in live.items():
+        spec = _BY_ID[worker]
         out.append(
             {
-                "key": key,
-                "tool": DOMAIN_KEYS[key],
-                "label": _BY_ID[live[0]].label,
-                "area": DOMAIN_BLURBS[key],
-                "description": description,
+                "key": tag,
+                "tool": DOMAIN_KEYS[SPECIALIST_TAGS[tag][0]],
+                "agent": spec.id,
+                "label": spec.label,
+                "area": spec.area,
+                "description": spec.summary,
             }
         )
     return out
+
+
+def specialist_workers(
+    *, web_enabled: bool, served_names: set[str]
+) -> dict[str, str]:
+    """``{"web": "chat.web", "browse": "chat.browse", …}`` — the tags that WORK.
+
+    THE definition of "which specialists a person can tag right now", and the
+    one thing allowed to answer it: the ``*`` menu is drawn from it and a tagged
+    turn is routed by it, so a row that cannot be run and a run that was never
+    offered are both unrepresentable.
+
+    A tag missing from this mapping means "this room has no such specialist",
+    which covers all three ways that happens and deliberately does not
+    distinguish them: a name no agent answers to (``*banana``), an agent whose
+    ROOM SETTING is off (``*browse`` with the web off), and an agent whose box
+    this engine's bridge tier does not serve (``*browse`` on a cloud-CLI room,
+    which is served no ``browse_*`` at all). They are one answer to the person
+    who typed it, and the callers refuse them with one sentence.
+
+    Note what is tested: THE AGENT, via the same :func:`worker_reachable` a real
+    dispatch uses — never its domain. ``*browse`` in a room that can search but
+    cannot drive a page must be refused, because falling back to the domain
+    there would answer a browsing request with the Web agent under the Browser
+    agent's name: the substituted-specialist fabrication this whole feature is
+    fenced against.
+
+    Ordered by :data:`DOMAIN_KEY_ORDER` then by member order, so the menu leads
+    with the default worker of the most-used domain and a domain's own default
+    always precedes its siblings.
+    """
+    members_by_tool = {name: members for name, members, _ in AGENT_TOOL_DOMAINS}
+    return {
+        _BY_ID[member].tag: member
+        for key in DOMAIN_KEY_ORDER
+        for member in members_by_tool[DOMAIN_KEYS[key]]
+        if worker_reachable(
+            _BY_ID[member], web_enabled=web_enabled, served_names=served_names
+        )
+    }
 
 
 #: The ONE argument every delegation carries, per-domain and per batch task
@@ -1339,44 +1563,30 @@ def _batch_tool_spec(keys: list[str]) -> dict:
     )
 
 
-def agent_tool_specs(
-    *, web_enabled: bool, served_names: set[str], only: str | None = None
-) -> list[dict]:
+def agent_tool_specs(*, web_enabled: bool, served_names: set[str]) -> list[dict]:
     """The main agent's tool catalog: one entry per REACHABLE domain.
 
     A domain is reachable when some member worker could actually act — its box
     intersects the served catalog (the File agent's box is CORE, which the
     bridge always serves in agent scope). Web is a room setting.
 
-    ``only`` is the name the USER tagged with ``*`` in the composer, as typed.
-    It NARROWS the reachable set — it can never widen it — so a tag this room
-    cannot serve leaves the catalog exactly as it was and the caller is the one
-    that must say so out loud (`graph.prepare`). A name no domain answers to at
-    all takes that same path, deliberately: "web, in a room with the web off"
-    and "banana" are one answer to the user ("this room has no such
-    specialist"), and only reachability can tell them apart. Narrowing rather
-    than steering by prose is the point: with one specialist in the catalog the
-    hub has no tool with which to reach a different one, so "run the Web agent"
-    cannot quietly become the File agent answering from room content.
-
-    The batch tool goes with it — a fan-out enum of one is a call the model can
-    only get wrong, and the whole turn is already destined for that specialist.
+    THE ``*`` TAG IS NOT A NARROWING OF THIS (2026-08-04). It used to be: an
+    ``only=`` argument cut the catalog to the tagged domain, and the Main agent
+    still ran, still planned and still delegated — a hub node lighting up for a
+    turn the user had already routed themselves, which is what the owner
+    reported. A tagged turn no longer reaches the hub at all
+    (`graph.run_agent`), so there is nothing here to narrow.
     """
     keys = reachable_domain_keys(web_enabled=web_enabled, served_names=served_names)
-    narrowed = only is not None and only in keys
-    if narrowed:
-        keys = [str(only)]
     live = {DOMAIN_KEYS[k] for k in keys}
     out: list[dict] = [
         _function_spec(name, description, _instruction_only_params())
         for name, _members, description in AGENT_TOOL_DOMAINS
         if name in live
     ]
-    if not out or narrowed:
+    if not out:
         # No reachable specialist means no batch tool either: a fan-out over an
-        # empty roster is a call the model can only get wrong. Neither is a
-        # fan-out over the single specialist the user tagged — the enum would
-        # hold one key, and every task in the plan would name it.
+        # empty roster is a call the model can only get wrong.
         return out
     # `keys` came from reachable_domain_keys above — the enum, its description
     # and the Main agent's prompt therefore list the SAME domains in the SAME
@@ -1388,9 +1598,6 @@ def agent_tool_specs(
 # --------------------------------------------------------------------------- #
 # lookups
 # --------------------------------------------------------------------------- #
-
-_BY_ID: dict[str, AgentSpec] = {spec.id: spec for spec in REGISTRY}
-
 
 def get_agent(agent_id: str) -> AgentSpec:
     """The spec for ``agent_id``; unknown ids degrade to the read-only default
@@ -1518,7 +1725,9 @@ __all__ = [
     "group_prompt",
     "group_servable",
     "reachable_members",
+    "SPECIALIST_TAGS",
     "specialist_roster",
+    "specialist_workers",
     "tagged_specialist",
     "worker_reachable",
     "group_tools",

@@ -99,7 +99,7 @@ from .agents import (
     main_prompt,
     normalize_domain_key,
     reachable_domain_keys,
-    specialist_roster,
+    specialist_workers,
     tagged_specialist,
     toolbox_for,
 )
@@ -119,13 +119,12 @@ from .messages import (
 from .planner import build_plan
 from .privacy import is_nonlocal_model
 from .prompts import (
+    DIRECT_SPECIALIST_NOTE,
     DONE_TEXT,
     EMPTY_PLAN_NOTE,
     IMAGE_HANDOFF,
     READ_RESULT_TOOL,
     SKILLS_NOTE,
-    TAG_UNAVAILABLE_NOTE,
-    TAGGED_SPECIALIST_NOTE,
     TOOL_GROUP_LABELS,
     TOOL_GROUPS_PROMPT,
     correction_note,
@@ -133,7 +132,7 @@ from .prompts import (
     duplicate_call_note,
     request_tools_spec,
     spill_note,
-    tag_available_clause,
+    tag_unavailable_answer,
     turn_progress_note,
     unlocked_note,
     with_read_result,
@@ -435,15 +434,11 @@ class AgentState(TypedDict, total=False):
     #: The ACTIVE sub-agent (agents.py registry id) — set per plan step by
     #: run_agent; prepare scopes the catalog and prompt from it.
     agent_id: str
-    #: The name the USER tagged with the composer's ``*`` menu, AS TYPED — ""
-    #: for an ordinary turn. Not necessarily a domain key: a tag can reach us
-    #: naming nothing at all (a headless `agent_run`, or a composer whose
-    #: roster never loaded), and calling the field `tagged_domain` was how that
-    #: case got read as "no tag" and vanished. Read by the HUB only (`prepare`,
-    #: `_Delegator.for_round`), and only ever membership-tested against the
-    #: reachable keys: it narrows which specialists exist for this turn when it
-    #: names one, and is refused BY NAME when it does not.
-    tagged_name: str
+    #: The composer's ``*`` tag ran this turn STRAIGHT to this specialist: no
+    #: Main agent decided anything, so this loop writes the user's answer
+    #: itself rather than a report for a hub to relay (`DIRECT_SPECIALIST_NOTE`).
+    #: False for every other loop, the Main agent's included.
+    direct: bool
     #: This loop's UNIQUE node identity in the turn's agent graph — `"main"`
     #: for the Main agent, `"<agent_id>#<pipeline slot>"` for a worker. The
     #: registry id alone cannot address a node: a round may dispatch two
@@ -798,20 +793,17 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     served = await _list_tools(deps)
     served_specs = [s.to_ollama() for s in served]
     served_names = {s.get("function", {}).get("name") for s in served_specs}
-    # The specialist the user tagged with `*`, if any — narrows the hub's
-    # catalog to that one domain (`agent_tool_specs(only=…)`), and is ignored
-    # for a worker, which has no ask_*_agent tools to narrow.
-    tagged = str(state.get("tagged_name") or "") if agent.main else ""
     # Hub v3: the MAIN agent's only tools are its specialists — the
     # ask_*_agent catalog (≤6 entries, one per reachable domain). It never
     # sees a room tool; acting is what workers are for. (No request_tools
     # either: the specialists cover every unlockable lane.)
+    #
+    # The `*` tag does NOT narrow this any more (2026-08-04). It used to, and
+    # the Main agent still ran the turn — planning and delegating a route the
+    # user had already chosen. `run_agent` now sends a tagged turn straight to
+    # the specialist, so a hub that is running was never tagged.
     tools = (
-        agent_tool_specs(
-            web_enabled=web_enabled,
-            served_names=served_names,
-            only=tagged or None,
-        )
+        agent_tool_specs(web_enabled=web_enabled, served_names=served_names)
         if agent.main
         else _select_tools(
             served_specs,
@@ -862,7 +854,6 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             str(state.get("question") or ""),
             web_enabled=web_enabled,
             served_names=served_names,
-            tagged=tagged,
         )
         if agent.main
         else None
@@ -913,34 +904,19 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             and paragraph not in (messages[0].get("content") or "")
         ):
             messages[0]["content"] = (messages[0].get("content") or "") + paragraph
-        # The `*` tag, said out loud. Two cases, and they are opposites: the
-        # tagged specialist is the only one in the catalog (so the note is about
-        # what to do when the request does not suit it), or it is not there at
-        # all (so the note is the refusal). The ROSTER is what distinguishes
-        # them, and it is the same roster the composer's menu was drawn from —
-        # so "web with the web off" and "banana" land on the one refusal, which
-        # is also the one message the host's toast gives them.
-        if tagged:
-            roster = specialist_roster(
-                web_enabled=web_enabled, served_names=served_names
-            )
-            live = [entry for entry in roster if entry["key"] == tagged]
-            note = (
-                TAGGED_SPECIALIST_NOTE.format(
-                    label=live[0]["label"], area=live[0]["area"]
-                )
-                if live
-                else TAG_UNAVAILABLE_NOTE.format(
-                    key=tagged,
-                    available=tag_available_clause([e["key"] for e in roster]),
-                )
-            )
+        # The `*` tag, said out loud — to the SPECIALIST, which is the only
+        # thing running on a tagged turn now. Without it this loop writes the
+        # DID/FOUND/MISSING report `delegation_note` asks a delegated worker
+        # for, and there is no Main agent left to turn that into an answer: the
+        # user would read a form. `run_agent` refuses an unreachable tag before
+        # any of this, so a loop that gets here was tagged AND is reachable.
+        if state.get("direct", False) and not agent.main:
+            note = DIRECT_SPECIALIST_NOTE.format(label=agent.label, area=agent.area)
             if note not in (messages[0].get("content") or ""):
                 messages[0]["content"] = (messages[0].get("content") or "") + note
         # …and the plan Arcelle built, LAST of the hub's paragraphs so it is the
-        # most recent thing in the system message — the same placement the tag
-        # notes get, for the same reason. `Plan.note` is "" for the three cases
-        # that already have their own paragraph (a `*` tag, an empty catalog) or
+        # most recent thing in the system message. `Plan.note` is "" for the two
+        # cases that already have their own paragraph (an empty catalog) or
         # deliberately have none (the planner abstained in a room whose default
         # worker is unreachable), so nothing here can contradict them.
         if plan is not None:
@@ -1351,21 +1327,18 @@ def _referent_names(tool: str, args: dict[str, Any] | None) -> list[str]:
 
 
 def _live_domains(state: AgentState, served_names: set[str]) -> list[str]:
-    """Which specialists exist for THIS turn — reachability, then the `*` tag.
+    """Which specialists exist for THIS turn — the hub's delegation guard.
 
-    `reachable_domain_keys` answers "what could this room serve"; the tag is
-    the user's own narrowing on top of it, and the two have to be applied in
-    that order. A tag naming a domain the room cannot serve narrows nothing —
-    it is refused in `prepare` by name instead, because a turn whose whole
-    roster is empty reads to the model as "the bridge is down", which is a
-    different fault with a different answer.
+    Reachability and nothing else. It used to apply the `*` tag on top as a
+    NARROWING (``[tagged] if tagged in keys else keys``), which is the shape
+    the owner reported: the Main agent still ran, saw a one-item roster and
+    delegated into it. A tagged turn never reaches the hub now
+    (`run_agent`), so there is no tag here to apply.
     """
-    keys = reachable_domain_keys(
+    return reachable_domain_keys(
         web_enabled=bool(state.get("web_enabled", False)),
         served_names=served_names,
     )
-    tagged = str(state.get("tagged_name") or "")
-    return [tagged] if tagged in keys else keys
 
 
 def _unavailable_note(key: str, available: list[str]) -> str:
@@ -1755,10 +1728,9 @@ class _Delegator:
             carryover=carryover,
             served_names=served_names,
             # The same list that built the `agent` enum the model chose from, so
-            # the guard and the catalog cannot disagree — the `*` tag narrows
-            # BOTH or neither (`agent_tool_specs(only=…)`), which is the only
-            # way a tagged turn can refuse a delegation elsewhere by the same
-            # sentence a phantom domain gets.
+            # the guard and the catalog cannot disagree: a domain the hub was
+            # never offered is refused here by name rather than falling through
+            # to `resolve_worker`'s default worker.
             live_domain_keys=_live_domains(state, served_names),
         )
 
@@ -2825,6 +2797,181 @@ def _fallback_answer(final: AgentState, *, cancelled: bool) -> str:
     return NOTHING_TEXT
 
 
+async def _refuse_tag(deps: Deps, tag: str, available: list[str]) -> str:
+    """Answer a ``*`` tag this room cannot serve — and run nothing.
+
+    NO MODEL, NO WORKER, NO FALLBACK. The three ways a tag can be unservable —
+    a name no agent answers to, a room setting that is off, an engine tier that
+    carries none of that agent's box — are one answer to the person who typed
+    it, and `specialist_workers` deliberately does not tell them apart.
+
+    Refusing HERE is what closes the substitution hole. The old shape sent the
+    turn to the Main agent with a paragraph asking it to refuse, while leaving
+    every other specialist in its catalog — so a model that skimmed the
+    paragraph could still answer "what is the weather" out of the user's own
+    documents under a File agent label (live QA 2026-07-24). A paragraph is a
+    request; this is the whole turn.
+
+    No `plan` event: nothing ran, so there is no node to draw, and drawing one
+    would be the same claim the refusal exists to deny. The step chip carries
+    the cause and the answer carries the refusal.
+    """
+    answer = tag_unavailable_answer(tag, available)
+    await deps.emit({"t": "step", "v": f"No *{tag} specialist in this room"})
+    await deps.emit({"t": "step_status", "ok": False})
+    await deps.emit({"t": "final", "v": answer})
+    return answer
+
+
+async def _run_tagged(
+    req: RunRequest,
+    deps: Deps,
+    tag: str,
+    ask: str,
+    messages: list[Message],
+    *,
+    write: bool,
+    small_model: bool,
+    run_max_rounds: int,
+) -> str:
+    """A ``*``-tagged turn: the specialist the user named, and only it.
+
+    THE OWNER REPORT THIS EXISTS FOR (2026-08-04): "when calling specialist it
+    still calls the main agent first not direct to him". The tag used to narrow
+    the hub's catalog to one ``ask_*_agent`` tool — the Main agent still ran,
+    still planned, still delegated, and the diagram lit a hub node for a route
+    the user had already chosen. Here there is no hub at all: this invokes the
+    specialist's own compiled graph as the turn.
+
+    WHAT THE HUB WAS STILL CONTRIBUTING, and where it went:
+
+    * Dispatch — `build_plan` already abstained on a tagged turn (the user's
+      own routing beats any vocabulary), so nothing is lost.
+    * The conversation — a delegated worker gets `worker_base_messages` plus a
+      `delegation_note`; this one gets the REAL thread, the user's own words
+      included, which is strictly more than the handoff carried.
+    * The final wording — this is the one real loss. A delegated worker writes
+      DID/FOUND/MISSING for the hub to turn into an answer, and there is no hub
+      now, so `DIRECT_SPECIALIST_NOTE` tells it to write the answer instead.
+      Without that paragraph a tagged turn would show the user a report form:
+      not a wrong answer, but a visibly worse one, which is why it is a
+      prompt change and not a silent behaviour change.
+    * Answering out of its own head when the request suits nobody — the same
+      paragraph tells it to say so and name the area, rather than reach.
+
+    The catalog is listed HERE, one extra ``tools/list`` before the loop's own.
+    It is the price of deciding reachability before anything runs, and the
+    alternative — deciding it inside `prepare`, where the graph has already
+    started — cannot refuse without a model.
+    """
+    served = await _list_tools(deps)
+    served_names = {s.name for s in served}
+    # THE routing table, and the same one the `*` menu is drawn from: a tag the
+    # menu offered is a tag this resolves, and a tag it did not is refused. No
+    # `resolve_worker` anywhere on this path — that is the function that falls
+    # through to the DEFAULT worker for a domain it cannot serve, and its
+    # fallthrough is the fabrication this whole feature is fenced against.
+    live = specialist_workers(web_enabled=req.web_enabled, served_names=served_names)
+    worker_id = live.get(tag)
+    if worker_id is None:
+        return await _refuse_tag(deps, tag, list(live))
+
+    worker = get_agent(worker_id)
+    # The turn's ONE node, and it is the specialist — not a Main agent that
+    # never ran. `MAIN_NODE_KEY` is the ROOT slot's key, not a claim about who
+    # is in it: the UI files this loop's step events under it and draws a single
+    # chip carrying this agent's own label.
+    entry: dict[str, Any] = {
+        "agent": worker.id,
+        "label": worker.label,
+        "instruction": ask,
+        "status": "running",
+        "batch": None,
+        "key": MAIN_NODE_KEY,
+    }
+    # A COPY per emit. `stream_events` puts the event on a queue and serialises
+    # it when the queue is drained, so emitting this dict by reference lets the
+    # status flip below rewrite an event that was already sent: the roster would
+    # read "done" from the instant the turn started, and no consumer could tell
+    # a running specialist from a finished one.
+    await deps.emit({"t": "plan", "v": [dict(entry)]})
+    await deps.emit(
+        {
+            "t": "agent",
+            "v": {
+                "id": worker.id,
+                "label": worker.label,
+                "step": 1,
+                "total": 1,
+                "active_steps": [1],
+            },
+        }
+    )
+
+    initial: AgentState = {
+        # The ask WITHOUT the tag: `graphs.route_action` scores this string
+        # against each action's hints, and "*file" would score as the word
+        # "file". The messages keep the user's text verbatim — the transcript
+        # must not quietly differ from the composer.
+        "question": ask,
+        "web_enabled": req.web_enabled,
+        "write": write,
+        "advisors": bool(req.advisors),
+        "max_rounds": run_max_rounds,
+        "run_max_rounds": run_max_rounds,
+        "small_model": small_model,
+        "agent_id": worker.id,
+        "direct": True,
+        "node_key": MAIN_NODE_KEY,
+        # A single-step turn: the connector proxy pair stays offered, exactly as
+        # it is for an undelegated hub turn. `plan_multi` withholds it to stop a
+        # step jumping the queue in a multi-step plan, and there is no plan here.
+        "plan_multi": False,
+        "unlocked_groups": set(),
+        "spills": [],
+        "referents": [],
+        "produced": [],
+        "pipeline": [],
+        "worker_base_messages": [],
+        "messages": messages,
+        "seen": set(),
+        "force_synthesis": False,
+        "stalls": 0,
+        "round": 0,
+        "calls": [],
+        "pending_images": [],
+        "final_text": "",
+        "progress": [],
+        "cancelled": False,
+        "stop": False,
+    }
+    # This agent's OWN shape, the same one a delegation would have run.
+    # Imported here, not at module scope: `graphs` composes these node functions.
+    from .graphs import graph_for, recursion_limit_for, report_failure
+
+    final: AgentState = await graph_for(worker.id).ainvoke(
+        initial,
+        config={
+            "configurable": {"deps": deps},
+            "recursion_limit": recursion_limit_for(worker.id, run_max_rounds),
+        },
+    )  # type: ignore[assignment]
+
+    # The SAME rubric a delegated specialist's report is judged by (`report_
+    # failure`, zero model calls), because the failure it catches is the same
+    # one: "Done." after a round of tool calls, or the contract's own lines
+    # filled with "nothing". Graded here the verdict drives both the chip and
+    # the answer, so a green node cannot sit over `_fallback_answer`'s text.
+    answer = (final.get("final_text", "") or "").strip()
+    ok = bool(answer) and not report_failure(final) and not final.get("cancelled")
+    if not ok:
+        answer = _fallback_answer(final, cancelled=deps.cancel.cancelled)
+    entry["status"] = "done" if ok else "failed"
+    await deps.emit({"t": "plan", "v": [dict(entry)]})
+    await deps.emit({"t": "final", "v": answer})
+    return answer
+
+
 async def run_agent(req: RunRequest, deps: Deps) -> str:
     """Run one ask to completion. Emits SPEC §4 events through ``deps.emit``.
 
@@ -2836,6 +2983,9 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     round runs in PARALLEL — the batch is launched before any of it is awaited,
     and the reports are collected in call order. The pipeline roster grows live
     (``_emit_pipeline``); ONE final event per ask.
+
+    ONE EXCEPTION, and it is the user's: a question whose first token is the
+    composer's ``*`` tag never reaches the hub at all — see :func:`_run_tagged`.
     """
     # Only `write` is read downstream (the state flag and the lane label). The
     # other four answers were computed for every question and handed to
@@ -2873,10 +3023,27 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     # has to keep a second copy of what a specialist is called. The tag is left
     # in the message the model reads: it is what the user typed, and a
     # transcript that quietly differs from the box is its own kind of untruth.
-    # Whether the name is one we HAVE is decided in `prepare`, against the
-    # served catalog — not here, where a name that resolved to nothing used to
-    # be dropped on the floor and the turn ran as if it had never been typed.
-    tagged, _ = tagged_specialist(req.question)
+    #
+    # AND IT ROUTES THE WHOLE TURN (2026-08-04). Everything below this branch is
+    # the hub; a tagged turn does not run it.
+    #
+    # A plain local Ollama model (no API provider, no :cloud relay) gets the
+    # small-model guardrails: one delegation per round + turn-progress
+    # re-injection. Cloud-class models keep parallel calls and the lean prompt.
+    # Read before the branch because BOTH paths run a loop that needs it.
+    small_model = req.provider is None and not is_nonlocal_model(req.model)
+    tagged, ask = tagged_specialist(req.question)
+    if tagged:
+        return await _run_tagged(
+            req,
+            deps,
+            tagged,
+            ask or req.question,
+            messages,
+            write=write,
+            small_model=small_model,
+            run_max_rounds=run_max_rounds,
+        )
 
     main = get_agent(MAIN_AGENT_ID)
     pipeline: list[dict[str, str]] = []
@@ -2910,7 +3077,6 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
         }
     )
 
-    small_model = req.provider is None and not is_nonlocal_model(req.model)
     initial: AgentState = {
         "question": req.question,
         "web_enabled": req.web_enabled,
@@ -2918,12 +3084,9 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
         "advisors": bool(req.advisors),
         "max_rounds": max_rounds,
         "run_max_rounds": run_max_rounds,
-        # A plain local Ollama model (no API provider, no :cloud relay) gets
-        # the small-model guardrails: one delegation per round + turn-progress
-        # re-injection. Cloud-class models keep parallel calls, lean prompt.
         "small_model": small_model,
         "agent_id": main.id,
-        "tagged_name": tagged,
+        "direct": False,
         "node_key": MAIN_NODE_KEY,
         "plan_multi": False,
         "unlocked_groups": set(),

@@ -128,11 +128,14 @@ export interface ChatCommand {
  *  never a list this frontend keeps: a room with the internet switched off has
  *  no Web specialist to offer, and the menu has to agree with the turn. */
 export interface Specialist {
-  /** The short key the user types after "*" ("web"). */
+  /** The short key the user types after "*" ("browse"). */
   key: string;
-  /** The `ask_*_agent` tool a turn tagged with this key is narrowed to. */
+  /** The `ask_*_agent` tool this specialist's domain hangs under. */
   tool: string;
-  /** Its own label, the same words the agent diagram uses ("Web agent"). */
+  /** The worker this tag runs ("chat.browse"). One row per AGENT, not per
+   *  domain — the Browser agent is its own menu entry beside the Web agent. */
+  agent: string;
+  /** Its own label, the same words the agent diagram uses ("Browser agent"). */
   label: string;
   /** One plain-words noun phrase: the area it covers. */
   area: string;

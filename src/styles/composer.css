@@ -448,6 +448,15 @@ video.audio-view-media {
 .agent-chip.pending {
   opacity: 0.75;
 }
+/* One-agent turns can now FAIL: a `*` tag runs a single specialist as the whole
+   turn, and one that came back with nothing is sent as `failed`. Painting that
+   with `.done` put a green chip over "nothing usable came back". Never colour
+   alone — the glyph carries it too, as the diagram's nodes do. */
+.agent-chip.failed {
+  color: var(--danger, #c2453d);
+  border-color: color-mix(in srgb, var(--danger, #c2453d) 40%, transparent);
+  background: color-mix(in srgb, var(--danger, #c2453d) 8%, transparent);
+}
 /* The persisted roster on a finished message: quiet, informational. */
 .agent-strip.past {
   margin-top: 2px;

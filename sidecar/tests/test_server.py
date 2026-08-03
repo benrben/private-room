@@ -72,11 +72,30 @@ async def test_agents_answers_the_composer_menu_from_the_served_names() -> None:
     assert resp.status_code == 200
     rows = resp.json()["agents"]
     assert {r["key"] for r in rows} >= {"file", "web"}
-    assert all({"key", "tool", "label", "area", "description"} <= set(r) for r in rows)
+    # EVERY field, on every row: the host deserializes these into a struct with
+    # no optional members (`agent.rs Specialist`), so a row missing one does not
+    # degrade the menu — it fails the whole command and the composer shows "the
+    # specialist list could not be read".
+    assert all(
+        {"key", "tool", "agent", "label", "area", "description"} <= set(r) for r in rows
+    )
+    # One row per AGENT, not per domain: both internet workers are here, sharing
+    # a domain tool and nothing else (owner report 2026-08-03 — the menu showed
+    # only "web" and the room's browser was unreachable by name).
+    by_key = {r["key"]: r for r in rows}
+    assert by_key["web"]["agent"] == "chat.web"
+    assert by_key["browse"]["agent"] == "chat.browse"
+    assert by_key["browse"]["tool"] == by_key["web"]["tool"] == "ask_web_agent"
+    assert by_key["browse"]["description"] != by_key["web"]["description"]
 
 
-async def test_agents_offers_no_web_specialist_to_an_offline_room() -> None:
-    """The menu carries the room's own settings, not the registry's ceiling."""
+async def test_agents_offers_NEITHER_internet_specialist_to_an_offline_room() -> None:
+    """The menu carries the room's own settings, not the registry's ceiling.
+
+    Both rows, now that the browser has one of its own: a Browser agent offered
+    to a web-off room is the same untruth the Web agent was, and it is the row
+    that did not exist when this test was written.
+    """
     from arcelle_sidecar.agents import ALL_REGISTRY_TOOLS
 
     app = app_with(FakeChatModel([]), FakeMCP())
@@ -85,7 +104,10 @@ async def test_agents_offers_no_web_specialist_to_an_offline_room() -> None:
             "/agents",
             json={"web_enabled": False, "served_names": sorted(ALL_REGISTRY_TOOLS)},
         )
-    assert "web" not in {r["key"] for r in resp.json()["agents"]}
+    keys = {r["key"] for r in resp.json()["agents"]}
+    assert "web" not in keys
+    assert "browse" not in keys
+    assert "file" in keys, "the room still offers the specialists it really has"
 
 
 async def test_agents_on_a_bridge_that_served_nothing_says_so_with_an_empty_list() -> None:

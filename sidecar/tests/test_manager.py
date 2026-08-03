@@ -20,9 +20,11 @@ from arcelle_sidecar.agents import (
     MAIN_AGENT_ID,
     MAX_BOX_TOOLS,
     REGISTRY,
+    ALL_REGISTRY_TOOLS,
     AgentSpec,
     agent_tool_specs,
     get_agent,
+    specialist_roster,
     group_prompt,
     group_servable,
     group_tools,
@@ -64,12 +66,21 @@ def test_the_spec_carries_no_field_the_running_app_never_reads() -> None:
     ``worker_reachable``, ``toolbox_for``, ``manager.resolve_worker``,
     ``graphs.graph_for``, the agent strip). A new field has to earn the same,
     and an unread one must not drift back in behind a plausible docstring.
+
+    ``tag``/``area``/``summary`` (2026-08-03) earned it the hard way and are
+    NOT ``description`` returning: `specialist_workers` reads ``tag`` to route
+    a ``*`` turn and `specialist_roster` reads all three to draw the composer's
+    menu, so a wrong one is visible on screen. The test below pins that they
+    are read rather than merely present.
     """
     assert set(AgentSpec.__dataclass_fields__) == {
         "id",
         "label",
         "tools",
         "requires",
+        "tag",
+        "area",
+        "summary",
         "prompt",
         "hints",
         "available",
@@ -78,6 +89,27 @@ def test_the_spec_carries_no_field_the_running_app_never_reads() -> None:
         "flow",
         "main",
     }
+
+
+def test_the_menu_fields_are_READ_not_merely_carried() -> None:
+    """The predicate the removed ``description`` field would have failed.
+
+    "Is it in the dataclass" is not the question — ``description`` was too. The
+    question is whether the running app would notice it changing, and for these
+    three the answer is a row of the composer's ``*`` menu: the tag a user
+    types, the hint beside it, the sentence they choose by.
+    """
+    spec = get_agent("chat.browse")
+    row = next(
+        e
+        for e in specialist_roster(web_enabled=True, served_names=set(ALL_REGISTRY_TOOLS))
+        if e["agent"] == "chat.browse"
+    )
+    assert (row["key"], row["area"], row["description"]) == (
+        spec.tag,
+        spec.area,
+        spec.summary,
+    )
 
 
 def test_no_box_exceeds_the_small_model_cap() -> None:

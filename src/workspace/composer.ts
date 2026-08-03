@@ -151,9 +151,12 @@ export interface AutocompleteItem {
 /** The "*" menu's rows: the room's specialists filtered by what's been typed.
  *
  * Substring rather than prefix matching, like the "@" menu and unlike "#" and
- * "/": a user hunting for the browser types "brow", and the domain key it lives
- * under is "web". Matching the LABEL and the AREA too is what makes that work —
- * the key is an identifier, and the user is looking for a job to be done. */
+ * "/": the key is an identifier and the user is looking for a job to be done,
+ * so "sign in to a site" is found by typing "site" against the AREA and "flash"
+ * finds the Studio agent through neither its key nor its label. Every row is
+ * one AGENT — the Browser agent has its own key here rather than sitting
+ * unnamed under "web", which is how the owner came to report that this room had
+ * no browser at all (2026-08-03). */
 export function specialistItems(
   specialists: readonly Specialist[],
   query: string,
@@ -204,10 +207,12 @@ export function specialistNote(
  *
  * ONE wording, for every path that can refuse a tag (sending, and rewriting a
  * message and asking again) — the same discipline `#command` and `/skill`
- * already follow, and the same sentence the sidecar puts in front of the model
- * when a tag reaches it anyway (`prompts.TAG_UNAVAILABLE_NOTE`): no such
- * specialist, and here are the ones there are. A refusal that does not name the
- * alternatives leaves the user guessing at a vocabulary the app already knows.
+ * already follow, and the FIRST SENTENCE of the answer the sidecar gives a tag
+ * that reaches it anyway (`prompts.TAG_UNAVAILABLE_ANSWER`, which refuses it in
+ * code rather than asking a model to): no such specialist, and here are the
+ * ones there are. A refusal that does not name the alternatives leaves the user
+ * guessing at a vocabulary the app already knows, and a user must not be able
+ * to tell which of the two layers caught their typo.
  *
  * A typo ("*banana") and a real specialist this room cannot serve ("*web" with
  * the internet off) get the SAME sentence on purpose. The roster is the room's
@@ -295,7 +300,7 @@ export function parseComposer(
     // never established. This is the ONE path on which a tag leaves here
     // unchecked, and it is safe because the sidecar re-checks every tag it
     // receives against the live catalog and refuses it BY NAME in the answer
-    // (`prompts.TAG_UNAVAILABLE_NOTE`) — an unknown tag is never silently
+    // (`prompts.TAG_UNAVAILABLE_ANSWER`) — an unknown tag is never silently
     // dropped into an ordinary turn on either side of the wire.
     if (specialists !== null && !specialists.some((sp) => sp.key === key)) {
       return { args: cleaned, refIds, specialistError: key };

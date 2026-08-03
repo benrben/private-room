@@ -360,18 +360,23 @@ def test_a_web_off_clause_is_not_re_routed_to_whoever_is_left() -> None:
     assert "NO SPECIALIST" not in plan.note
 
 
-def test_a_tagged_turn_is_left_to_the_tag() -> None:
-    """The user picked the specialist with `*`, which is stronger and more
-    explicit than anything vocabulary can compute — and `agent_tool_specs`
-    has already narrowed the catalog to it."""
-    plan = build_plan(
-        "*web what is the weather",
-        web_enabled=True,
-        served_names=set(_EVERYTHING),
-        tagged="web",
-    )
-    assert plan.reason == "tagged"
-    assert plan.note == ""
+def test_the_planner_has_no_tagged_case_because_it_never_sees_one() -> None:
+    """The `*` tag used to reach here as a ``tagged=`` argument and return an
+    empty plan. It cannot reach here at all now: `graph.run_agent` sends a
+    tagged turn straight to the specialist, so the hub — and therefore this
+    planner — only ever runs on an untagged one.
+
+    Pinned rather than deleted: an argument that quietly came back would put a
+    second route into the feature, and the tagged branch's empty plan would
+    then be indistinguishable from the abstain the hub is told to act on.
+    """
+    with pytest.raises(TypeError):
+        build_plan(  # type: ignore[call-arg]
+            "*web what is the weather",
+            web_enabled=True,
+            served_names=set(_EVERYTHING),
+            tagged="web",
+        )
 
 
 # --------------------------------------------------------------------------- #

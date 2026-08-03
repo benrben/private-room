@@ -177,10 +177,6 @@ class Plan:
     ``abstained``        nothing in the words named a specialist — the hub keeps
                          its own judgement, and is told that this is the
                          exception rather than the norm.
-    ``tagged``           the user picked the specialist themselves with ``*``,
-                         which is a stronger, more explicit routing than
-                         anything this module could compute; the catalog is
-                         already narrowed to it.
     ``no-specialists``   the bridge served nothing. ``MAIN_PROMPT_NO_SPECIALISTS``
                          owns that turn; a plan note on top of it would be a
                          second, contradictory story.
@@ -318,15 +314,18 @@ def build_plan(
     *,
     web_enabled: bool,
     served_names: set[str],
-    tagged: str = "",
 ) -> Plan:
     """The specialist plan for one turn — deterministic, and capability-derived.
 
-    A pure function of ``(question, web_enabled, served_names, tagged)``: the
-    same request against the same room always produces the same plan, which is
-    the whole point (the defect was that it did not). ``served_names`` is only
-    ever membership-tested, so the caller's set ordering cannot reach the
-    output.
+    A pure function of ``(question, web_enabled, served_names)``: the same
+    request against the same room always produces the same plan, which is the
+    whole point (the defect was that it did not). ``served_names`` is only ever
+    membership-tested, so the caller's set ordering cannot reach the output.
+
+    There is no ``tagged`` case any more (2026-08-04). It returned an empty
+    plan for the composer's ``*`` tag because the user's own routing beats any
+    vocabulary — true, and now moot: a tagged turn never reaches the hub, so it
+    never reaches this function either (`graph._run_tagged`).
     """
     live = reachable_domain_keys(web_enabled=web_enabled, served_names=served_names)
     if not live:
@@ -334,11 +333,6 @@ def build_plan(
         # `MAIN_PROMPT_NO_SPECIALISTS` already tells the model it can reach
         # nothing; a plan note here would be a second story about the same turn.
         return Plan(steps=(), unavailable=(), reason="no-specialists")
-    if tagged:
-        # The user named the specialist themselves. That is a stronger routing
-        # than any vocabulary — and `agent_tool_specs(only=…)` has already
-        # narrowed the catalog to it, so there is nothing left to plan.
-        return Plan(steps=(), unavailable=(), reason="tagged")
 
     default_key = normalize_domain_key(DEFAULT_AGENT_ID) or ""
     default_tool = DOMAIN_KEYS[default_key] if default_key in live else ""

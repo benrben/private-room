@@ -1220,12 +1220,18 @@ pub(crate) fn effects_json(effects: &ToolEffects) -> Option<serde_json::Value> {
 /// One specialist the composer's `*` menu may offer.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Specialist {
-    /// The short domain key the user types after `*` ("web").
+    /// The short key the user types after `*` ("browse").
     pub key: String,
-    /// The `ask_*_agent` tool a turn tagged with this key is narrowed to.
+    /// The `ask_*_agent` tool this specialist's domain hangs under.
     pub tool: String,
-    /// The agent's own label ("Web agent") — the same words the agent diagram
-    /// shows for the node that then lights up.
+    /// The WORKER this tag runs (`chat.browse`). One row per agent, not per
+    /// domain: the Browser agent is a sibling of the Web agent under
+    /// `ask_web_agent` because a 4B picks reliably among no more than six
+    /// domain tools — a limit on a MODEL's choice, which is no reason to hide
+    /// an agent from a person reading a dropdown (owner report 2026-08-03).
+    pub agent: String,
+    /// The agent's own label ("Browser agent") — the same words the agent
+    /// diagram shows for the node that then lights up.
     pub label: String,
     /// One plain-words noun phrase: what this specialist's area is.
     pub area: String,
@@ -1239,9 +1245,10 @@ pub struct Specialist {
 /// Derived, never listed. The host contributes the two facts only it knows —
 /// the room's web setting and the tool names its engine's bridge tier would
 /// serve, lanes applied — and the sidecar's own registry turns those into the
-/// domains a turn could actually reach (`agents.specialist_roster`). So the
-/// menu is built from the same function as the Main agent's tool catalog, and
-/// a specialist can never appear in one and be missing from the other.
+/// AGENTS a turn could actually reach (`agents.specialist_roster`, which reads
+/// `specialist_workers`: the same mapping a tagged turn is routed by). So a
+/// specialist can never appear in this menu and be unreachable when picked,
+/// nor be reachable and missing from it.
 ///
 /// Errors rather than returning an empty list when the sidecar cannot be
 /// reached: "this room has no specialists" and "we could not find out" are

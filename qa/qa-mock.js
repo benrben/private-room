@@ -558,13 +558,17 @@
       { name: "summary", summary: "Summarize the attached files", usage: "#summary" },
       { name: "minutes", summary: "Meeting minutes from a transcript", usage: "#minutes" },
     ],
-    // The composer's "*" menu. Two of the six domains, deliberately: the
+    // The composer's "*" menu. Three of the fourteen AGENTS, deliberately: the
     // harness room is a local-engine room with the web ON, and a roster that
-    // listed every domain would let a UI test pass against a menu the real
-    // `reachable_domain_keys` would never produce.
+    // listed every agent would let a UI test pass against a menu the real
+    // `specialist_workers` would never produce.
+    //
+    // One row per AGENT, not per domain — Web and Browser are two rows sharing
+    // `ask_web_agent`, which is the case a menu built per domain got wrong.
     list_specialists: () => [
-      { key: "file", tool: "ask_file_agent", label: "File agent", area: "this room's own content", description: "Ask the File agent to work with this room's content." },
-      { key: "web", tool: "ask_web_agent", label: "Web agent", area: "the internet and browsing sites", description: "Ask the Web agent about anything on the internet." },
+      { key: "file", tool: "ask_file_agent", agent: "files.read", label: "File agent", area: "this room's own files and notes", description: "Lists, searches, reads, opens, summarizes, creates and edits the files, notes and memories in this room." },
+      { key: "web", tool: "ask_web_agent", agent: "chat.web", label: "Web agent", area: "searching and reading the internet", description: "Searches the internet and fetches pages to read them. It READS pages; it does not operate them." },
+      { key: "browse", tool: "ask_web_agent", agent: "chat.browse", label: "Browser agent", area: "driving a real page in the private browser", description: "Opens a site in this room's private browser and OPERATES the live page: reads it, clicks, fills forms, signs in." },
     ],
     ai_status: () => ({ running: true, installed: true, models: ["qwen3.5:4b"], defaultModel: "qwen3.5:4b", external: ["claude-cli"], remoteRelay: false }),
     model_capabilities: () => [{ model: "qwen3.5:4b", tools: true, vision: false }],

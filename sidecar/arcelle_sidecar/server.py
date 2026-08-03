@@ -578,10 +578,13 @@ def create_app(
 
     @app.post("/agents")
     async def agents(req: SpecialistsRequest) -> Any:
-        # The composer's `*` menu. Derived from the same `reachable_domain_keys`
-        # the turn's own catalog is built from — the menu may never offer a
-        # specialist the room could not actually dispatch to, which is the whole
-        # reason the host asks us instead of keeping its own list.
+        # The composer's `*` menu — one row per AGENT the room can run, not per
+        # domain, so the Browser agent is offered by name instead of hiding
+        # under the Web agent's row (owner report 2026-08-03). Derived from the
+        # same `specialist_workers` a tagged turn is ROUTED by, which is the
+        # whole reason the host asks us instead of keeping its own list: the
+        # menu may never offer a specialist the room could not dispatch to, nor
+        # withhold one it could.
         return {
             "agents": specialist_roster(
                 web_enabled=req.web_enabled,

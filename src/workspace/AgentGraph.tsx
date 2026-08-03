@@ -21,7 +21,7 @@
  */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AgentNodeStatus, AskPlanStep, AskActiveAgent } from "../apiTypes";
-import { MAIN_KEY, toBands, toNodes, type GraphNode } from "./agentNodes";
+import { MAIN_KEY, chipClass, toBands, toNodes, type GraphNode } from "./agentNodes";
 
 /** Mirror of the sidecar's `agents.REGISTRY` descriptions (agents.py), for the
  * inspector. Duplicated rather than fetched on purpose: the app is offline-first
@@ -197,16 +197,27 @@ export function AgentGraph({
     return elapsedLabel((t.end ?? performance.now()) - t.start);
   };
 
-  // Single-agent turn: the Main agent answered alone, nothing was dispatched.
-  // There is no graph to draw, so keep the flat chip exactly as it was — this
-  // is the overwhelmingly common turn and it must not grow a diagram.
+  // Single-agent turn: ONE agent held the whole turn and dispatched nothing —
+  // the Main agent answering alone, or the specialist a `*` tag routed the turn
+  // straight to (`graph._run_tagged`). There is no graph to draw, so keep the
+  // flat chip exactly as it was — this is the overwhelmingly common turn and it
+  // must not grow a diagram. The label is the roster's, so the tagged case says
+  // "File agent" rather than naming a hub that never ran.
   if (children.length === 0) {
     return (
       <div className="agent-strip" role="status" aria-label="Agents working on this request">
         <span className="agent-strip-caption">Agent</span>
         <span className="agent-pipe">
-          <span className={`agent-chip ${main?.status === "running" ? "active" : "done"}`}>
+          <span className={`agent-chip ${chipClass(main?.status)}`}>
             {main?.status === "running" && <span className="agent-dot" aria-hidden />}
+            {/* Never state by colour alone — the same rule the diagram's nodes
+                follow. A failed one-agent turn reads as failed with the styles
+                off, and `role="img"` gives a screen reader the word. */}
+            {main?.status === "failed" && (
+              <span role="img" aria-label={STATUS_WORD.failed}>
+                {GLYPH.failed}
+              </span>
+            )}
             {main?.label ?? "Main agent"}
           </span>
         </span>
