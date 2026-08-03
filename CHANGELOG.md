@@ -3,7 +3,7 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
-## Unreleased
+## 0.16.0 — 2026-08-04
 
 ### When something goes wrong, there is now a record of what Arcelle did
 
