@@ -10,7 +10,7 @@ pub fn memories_like(conn: &Connection, needle: &str) -> Result<Vec<(String, Str
         return Ok(Vec::new());
     }
     let sql = format!(
-        "SELECT id, content FROM memories WHERE 1=1{}
+        "SELECT id, content FROM memories WHERE trashed_at IS NULL{}
          ORDER BY created_at DESC LIMIT 30",
         like_all_clause("content", &terms, 1),
     );
@@ -49,7 +49,8 @@ pub fn add_memory(
 pub fn list_memories(conn: &Connection) -> Result<Vec<Memory>, String> {
     query_rows(
         conn,
-        "SELECT id, content, category, created_at FROM memories ORDER BY created_at ASC",
+        "SELECT id, content, category, created_at FROM memories \
+         WHERE trashed_at IS NULL ORDER BY created_at ASC",
         [],
         |r| {
             Ok(Memory {
@@ -62,8 +63,46 @@ pub fn list_memories(conn: &Connection) -> Result<Vec<Memory>, String> {
     )
 }
 
-pub fn delete_memory(conn: &Connection, id: &str) -> Result<(), String> {
-    execute_one(conn, "DELETE FROM memories WHERE id = ?1", [id])
+/// S9 (2026-08-04): soft delete, same shape as `trash_file`/`restore_file` —
+/// the row, its content and its history stay exactly where they are; only a
+/// flag changes. `delete_memory` was the app's one truly irreversible AI
+/// action (every file write has a snapshot; this had nothing). Trashing an
+/// already-trashed memory is refused rather than re-stamped, for the same
+/// reason `trash_file` refuses it: a second trash would overwrite the record
+/// of who actually deleted it.
+pub fn delete_memory(conn: &Connection, id: &str, actor: TrashActor<'_>) -> Result<(), String> {
+    let (kind, actor_id) = actor.parts();
+    let n = conn
+        .execute(
+            "UPDATE memories
+             SET trashed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+                 trashed_by = ?2, trashed_by_id = ?3
+             WHERE id = ?1 AND trashed_at IS NULL",
+            params![id, kind, actor_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("That memory is not in this room.".into());
+    }
+    Ok(())
+}
+
+/// Put a trashed memory back — same "error, not a no-op" reasoning as
+/// `restore_file`: a caller offering Restore on a memory already active is
+/// showing a stale list, and silently succeeding would confirm a state it
+/// never checked. Not exposed to the agent — recovery is a human action.
+pub fn restore_memory(conn: &Connection, id: &str) -> Result<(), String> {
+    let n = conn
+        .execute(
+            "UPDATE memories SET trashed_at = NULL, trashed_by = NULL, trashed_by_id = NULL
+             WHERE id = ?1 AND trashed_at IS NOT NULL",
+            [id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("That memory is not in the trash.".into());
+    }
+    Ok(())
 }
 
 /// UX-5: overwrite a memory's text (and, Wave 1b, its category) in place.
@@ -146,4 +185,51 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(got[0].category.is_none());
     }
+
+    #[test]
+    fn deleting_a_memory_soft_deletes_it_content_survives() {
+        let conn = mem();
+        let m = add_memory(&conn, "call every Friday", None).unwrap();
+        delete_memory(&conn, &m.id, TrashActor::Agent("delete_memory")).unwrap();
+        // Gone from every read path an agent or the UI would use...
+        assert!(list_memories(&conn).unwrap().is_empty());
+        assert!(memories_like(&conn, "Friday").unwrap().is_empty());
+        // ...but the row itself, and its text, are still there.
+        let raw: String = conn
+            .query_row("SELECT content FROM memories WHERE id = ?1", [&m.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, "call every Friday");
+    }
+
+    #[test]
+    fn restoring_a_memory_returns_it_to_every_listing() {
+        let conn = mem();
+        let m = add_memory(&conn, "call every Friday", None).unwrap();
+        delete_memory(&conn, &m.id, TrashActor::User).unwrap();
+        assert!(list_memories(&conn).unwrap().is_empty());
+        restore_memory(&conn, &m.id).unwrap();
+        let got = list_memories(&conn).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "call every Friday");
+    }
+
+    #[test]
+    fn deleting_an_already_deleted_memory_is_refused_not_re_stamped() {
+        // Same reasoning as `trash_file`: a second trash would overwrite the
+        // record of who actually deleted it.
+        let conn = mem();
+        let m = add_memory(&conn, "x", None).unwrap();
+        delete_memory(&conn, &m.id, TrashActor::Agent("delete_memory")).unwrap();
+        let err = delete_memory(&conn, &m.id, TrashActor::User).unwrap_err();
+        assert!(err.contains("not in this room"), "got: {err}");
+    }
+
+    #[test]
+    fn restoring_a_memory_that_is_not_trashed_is_an_error_not_a_no_op() {
+        let conn = mem();
+        let m = add_memory(&conn, "x", None).unwrap();
+        let err = restore_memory(&conn, &m.id).unwrap_err();
+        assert!(err.contains("not in the trash"), "got: {err}");
+    }
+
 }

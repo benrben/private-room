@@ -185,6 +185,33 @@ fn import_files_blocking(app: &tauri::AppHandle, paths: Vec<String>) -> Result<I
     Ok(ImportReport { imported, errors })
 }
 
+/// S3 (2026-08-04): a downloaded file's MIME today comes ONLY from
+/// `mime_guess::from_path(display_name)` — a name the SERVER chose (via
+/// `Content-Disposition` or the URL), sanitized for path-safety by
+/// `safe_file_name` but never checked against what the bytes actually are.
+/// This is deliberately narrow — not a general file-type detector, just the
+/// one dangerous shape: a script/executable signature wearing an inert-looking
+/// extension. `None` on any other mismatch (or none at all); a `.pdf` that
+/// sniffs as a `.docx` is a labeling curiosity, not a safety question.
+fn dangerous_content_mismatch(bytes: &[u8], claimed_ext: &str) -> bool {
+    const EXECUTABLE_LIKE_EXTS: &[&str] = &[
+        "sh", "bash", "zsh", "py", "js", "exe", "bin", "app", "command", "scpt", "workflow",
+        "applescript", "bat", "cmd", "ps1", "dmg", "pkg",
+    ];
+    if EXECUTABLE_LIKE_EXTS.contains(&claimed_ext) {
+        return false; // already labeled as something the user would treat with care
+    }
+    let looks_executable = bytes.starts_with(b"\x7fELF") // Linux ELF
+        || bytes.starts_with(b"MZ") // Windows PE
+        || bytes.starts_with(&[0xFE, 0xED, 0xFA, 0xCE]) // Mach-O 32-bit
+        || bytes.starts_with(&[0xFE, 0xED, 0xFA, 0xCF]) // Mach-O 64-bit
+        || bytes.starts_with(&[0xCE, 0xFA, 0xED, 0xFE]) // Mach-O 32-bit, reverse byte order
+        || bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE]) // Mach-O 64-bit, reverse byte order
+        || bytes.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE]) // Mach-O / Java class fat binary
+        || bytes.starts_with(b"#!"); // shebang script
+    looks_executable
+}
+
 /// BROWSE-2: import one downloaded file into the room and delete its staged
 /// temp copy. The single-file twin of [`import_files`], reachable from
 /// background threads (browser downloads, agent tools, download jobs) — the
@@ -216,16 +243,36 @@ pub(crate) fn import_download(
             return Err(format!("{display_name}: {e}"));
         }
     };
+    // S3 (2026-08-04): the name a server chose can lie. Check the bytes
+    // BEFORE anything downstream treats this as its claimed type. A flagged
+    // file skips extraction entirely (never falls to `markitdown_extract`
+    // below, which reads from `staged`'s own path — still on disk under its
+    // ORIGINAL, misleading extension — and would otherwise hand a disguised
+    // executable to a parser expecting PDF/office content).
+    let claimed_ext = extraction::extension_of(display_name);
+    let flagged = dangerous_content_mismatch(&bytes, &claimed_ext);
+    let display_name: std::borrow::Cow<'_, str> = if flagged {
+        let stem = display_name.strip_suffix(&format!(".{claimed_ext}")).unwrap_or(display_name);
+        std::borrow::Cow::Owned(format!("{stem} (blocked - not really a .{claimed_ext}).bin"))
+    } else {
+        std::borrow::Cow::Borrowed(display_name)
+    };
+    let display_name: &str = &display_name;
     let mime = mime_guess::from_path(display_name)
         .first_or_octet_stream()
         .essence_str()
         .to_string();
-    let mut text = extraction::extract_text(display_name, &bytes);
-    if text.as_deref().map_or(true, |t| t.trim().is_empty()) && !extraction::is_image(&mime) {
-        // MarkItDown reads from a path; the staged file still ends with the
-        // real name ("{uuid}-{name}"), so its extension survives.
-        text = extraction::markitdown_extract(&staged.to_string_lossy());
-    }
+    let text = if flagged {
+        None
+    } else {
+        let mut text = extraction::extract_text(display_name, &bytes);
+        if text.as_deref().map_or(true, |t| t.trim().is_empty()) && !extraction::is_image(&mime) {
+            // MarkItDown reads from a path; the staged file still ends with the
+            // real name ("{uuid}-{name}"), so its extension survives.
+            text = extraction::markitdown_extract(&staged.to_string_lossy());
+        }
+        text
+    };
     let ext = extraction::extension_of(display_name);
     // Ask the container what it is while the staged copy still exists — after
     // the remove below there is no file left to probe without writing another.
@@ -1168,7 +1215,8 @@ async fn import_link_impl(state: &AppState, url: &str) -> Result<FileMeta, Strin
             Err(e) => return Err(e),
         }
     } else {
-        web::fetch_page(&url).await?
+        let page = web::fetch_page(&url).await?;
+        (page.title, page.text)
     };
     state.with_room(|room| {
         let saved = db::current_date(&room.conn);
@@ -1215,6 +1263,40 @@ pub fn rename_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dangerous_content_mismatch_catches_executables_wearing_a_safe_extension() {
+        // ELF, Mach-O (both byte orders, 32/64-bit), PE, and a shebang script —
+        // each claiming to be an inert extension like .pdf.
+        assert!(dangerous_content_mismatch(b"\x7fELF\x02\x01\x01", "pdf"));
+        assert!(dangerous_content_mismatch(b"MZ\x90\x00\x03", "docx"));
+        assert!(dangerous_content_mismatch(&[0xFE, 0xED, 0xFA, 0xCE, 0, 0], "png"));
+        assert!(dangerous_content_mismatch(&[0xFE, 0xED, 0xFA, 0xCF, 0, 0], "jpg"));
+        assert!(dangerous_content_mismatch(&[0xCE, 0xFA, 0xED, 0xFE, 0, 0], "txt"));
+        assert!(dangerous_content_mismatch(&[0xCF, 0xFA, 0xED, 0xFE, 0, 0], "csv"));
+        assert!(dangerous_content_mismatch(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0], "xlsx"));
+        assert!(dangerous_content_mismatch(b"#!/bin/sh\necho hi\n", "pdf"));
+    }
+
+    #[test]
+    fn dangerous_content_mismatch_leaves_ordinary_files_alone() {
+        assert!(!dangerous_content_mismatch(b"%PDF-1.4", "pdf"), "a real PDF is not flagged");
+        assert!(!dangerous_content_mismatch(b"PK\x03\x04", "docx"), "a real docx is not flagged");
+        assert!(!dangerous_content_mismatch(b"just plain text", "txt"));
+        assert!(!dangerous_content_mismatch(b"", "pdf"), "an empty file is not flagged");
+    }
+
+    #[test]
+    fn dangerous_content_mismatch_does_not_relabel_a_file_already_claiming_to_be_executable() {
+        // The claimed extension already told the user to be careful — nothing
+        // to correct, and nothing to rename.
+        for ext in ["sh", "py", "js", "exe", "bin", "app", "command", "bat", "ps1"] {
+            assert!(
+                !dangerous_content_mismatch(b"\x7fELF\x02\x01\x01", ext),
+                "{ext} already declares itself executable"
+            );
+        }
+    }
 
     #[test]
     fn link_file_name_is_safe_and_falls_back() {

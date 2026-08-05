@@ -333,7 +333,7 @@ pub async fn browser_peek(
         }
     }
     let checked = browse_guard_url(&url).await?;
-    let (title, text) = crate::web::fetch_page(&checked).await?;
+    let crate::web::FetchedPage { title, text, .. } = crate::web::fetch_page(&checked).await?;
     if text.trim().is_empty() {
         return Err("That page has no readable text to preview.".into());
     }
@@ -386,7 +386,7 @@ pub async fn browser_search_summary(
         let text = match cached {
             Some((_, text)) if !text.trim().is_empty() => text,
             _ => match crate::web::fetch_page(&hit.url).await {
-                Ok((title, text)) => {
+                Ok(crate::web::FetchedPage { title, text, .. }) => {
                     let guard = state.room.lock().unwrap();
                     if let Some(room) = guard.as_ref() {
                         let _ = db::save_web_page(&room.conn, &key, &title, &text);

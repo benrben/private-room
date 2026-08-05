@@ -66,6 +66,191 @@ pub(crate) fn closest_snippet(extracted: &str, quote: &str) -> Option<String> {
     Some(extracted[h[si].0..h[ei - 1].1].to_string())
 }
 
+/// Multiset line difference between two texts — how many lines in `after`
+/// have no matching line left in `before` (added), and vice versa (removed).
+/// Not a real LCS diff (a moved-but-unchanged line counts as one added + one
+/// removed), but dependency-free and enough to answer "how much changed" —
+/// the point is catching an accidental near-total rewrite, not rendering a
+/// diff view (the approval card already shows the full before/after text).
+fn line_multiset_diff(before: &str, after: &str) -> (usize, usize) {
+    use std::collections::HashMap;
+    let mut before_counts: HashMap<&str, i64> = HashMap::new();
+    for line in before.lines() {
+        *before_counts.entry(line).or_insert(0) += 1;
+    }
+    let mut after_counts: HashMap<&str, i64> = HashMap::new();
+    for line in after.lines() {
+        *after_counts.entry(line).or_insert(0) += 1;
+    }
+    let added: i64 = after_counts
+        .iter()
+        .map(|(line, &n)| (n - before_counts.get(line).copied().unwrap_or(0)).max(0))
+        .sum();
+    let removed: i64 = before_counts
+        .iter()
+        .map(|(line, &n)| (n - after_counts.get(line).copied().unwrap_or(0)).max(0))
+        .sum();
+    (added as usize, removed as usize)
+}
+
+/// E5 (2026-08-04): report what `plan_single_edit`/`plan_batch` computed
+/// without ever calling `commit_plans` — the caller is responsible for that
+/// split; this only formats. Capped well below `PREVIEW_CLIP` (that clamp is
+/// sized for a UI diff card, not a tool result that returns to the model's
+/// context on every dry run).
+const DRY_RUN_AFTER_CLAMP: usize = 800;
+
+fn dry_run_summary(plans: &[PlannedWrite]) -> String {
+    let lines: Vec<String> = plans
+        .iter()
+        .map(|p| match (&p.new_bytes, &p.rename_to) {
+            (Some(_), rename_to) => {
+                let method = p.method.map(EditMethod::outcome).unwrap_or("exact");
+                let rename_note = rename_to
+                    .as_ref()
+                    .map(|n| format!(" and rename it to \"{n}\""))
+                    .unwrap_or_default();
+                format!(
+                    "\"{}\": would replace {} occurrence(s) via {method}{rename_note}. Resulting \
+                     content would start: \"{}\"",
+                    p.real_name,
+                    p.count,
+                    clamp_bytes(p.after.clone(), DRY_RUN_AFTER_CLAMP)
+                )
+            }
+            (None, Some(new_name)) => {
+                format!("\"{}\": would rename to \"{new_name}\". No content change.", p.real_name)
+            }
+            (None, None) => format!("\"{}\": no change.", p.real_name),
+        })
+        .collect();
+    format!(
+        "DRY RUN — nothing was written or renamed. {}",
+        lines.join("\n")
+    )
+}
+
+/// E9 (2026-08-04): `write_file` is a full-document rewrite with no version
+/// check — the one path where the model reproducing "most of" a long document
+/// instead of all of it looks like plain success. Reports what changed instead
+/// of only a character count, and flags a shrink big enough to suggest content
+/// was dropped rather than deliberately trimmed.
+fn write_file_summary(real_name: &str, before: &str, after: &str, new_chars: usize, clipped: bool) -> String {
+    let (added, removed) = line_multiset_diff(before, after);
+    let before_len = before.chars().count();
+    let delta = new_chars as i64 - before_len as i64;
+    let delta_str = if delta >= 0 {
+        format!("+{delta} characters")
+    } else {
+        format!("{delta} characters")
+    };
+    let partial_note = if clipped {
+        " (comparison is based on a partial view — this file is very large)"
+    } else {
+        ""
+    };
+    // A large shrink on a substantial file is the failure mode worth flagging;
+    // a short file shrinking (e.g. "delete everything but the title") is
+    // ordinary and not worth a warning every time.
+    let shrink_warning = if !clipped && before_len > 200 && new_chars * 2 < before_len {
+        " The new content is under half the size of what was there before — if that wasn't \
+         intentional, the rewrite may have dropped content."
+    } else {
+        ""
+    };
+    format!(
+        "Rewrote \"{real_name}\" ({new_chars} characters, {added} line(s) added, {removed} \
+         line(s) removed, {delta_str}){partial_note}.{shrink_warning}"
+    )
+}
+
+/// D1 (2026-08-04): `list_memories` was the one list tool with NO bound at
+/// all — every memory, in full, always. Same cap-plus-honest-count shape as
+/// `list_room_files` (CHG-1); a room with hundreds of notes could otherwise
+/// crowd out the whole system prompt on a single "what do you remember?"
+/// question. Caller has already handled the empty case.
+const MAX_LISTED_MEMORIES: usize = 50;
+
+fn format_memory_list(memories: Vec<Memory>) -> String {
+    let total = memories.len();
+    let mut lines: Vec<String> = memories
+        .into_iter()
+        .take(MAX_LISTED_MEMORIES)
+        .map(|m| match m.category.as_deref() {
+            Some(c) => format!("- [{c}] {}", m.content),
+            None => format!("- {}", m.content),
+        })
+        .collect();
+    if total > MAX_LISTED_MEMORIES {
+        lines.push(format!(
+            "…and {} more memories — ask about something more specific to find them.",
+            total - MAX_LISTED_MEMORIES
+        ));
+    }
+    lines.join("\n")
+}
+
+/// D5 (2026-08-04): `job_status` used to have no way to ask about ONE job —
+/// every call dumped up to 8 of them. No tool ever hands the model a job's id
+/// today (`start_file_pass` discards it), so the fix has to be self-contained:
+/// every listing now shows each job's own SHORT id prefix, and `job_id`
+/// accepts either that prefix or the full id from a previous listing. Omit it
+/// for the unchanged summary of everything.
+const JOB_SHORT_ID_LEN: usize = 8;
+
+fn job_status_reply(jobs: &[db::Job], job_id: Option<&str>) -> String {
+    let one_line = |j: &db::Job| -> String {
+        // A job the APP stopped is 'paused' too, and reporting only the
+        // status would have the assistant tell the user their work is paused
+        // as if they had paused it. The row records who actually stopped it;
+        // say so.
+        let why = j
+            .parked_reason
+            .as_deref()
+            .map(|r| format!(" — {r} Resume picks it up here."))
+            .unwrap_or_default();
+        let short_id = &j.id[..j.id.len().min(JOB_SHORT_ID_LEN)];
+        format!(
+            "- [{short_id}] {} — {} ({} of {} steps done){}",
+            j.title, j.status, j.cursor, j.total, why
+        )
+    };
+
+    let Some(query) = job_id.map(str::trim).filter(|q| !q.is_empty()) else {
+        return jobs.iter().take(8).map(one_line).collect::<Vec<_>>().join("\n");
+    };
+    let query_lower = query.to_lowercase();
+    let matches: Vec<&db::Job> =
+        jobs.iter().filter(|j| j.id.to_lowercase().starts_with(&query_lower)).collect();
+    match matches.as_slice() {
+        [] => format!(
+            "No background job matches id \"{query}\". Call job_status with no arguments to \
+             see every job's id."
+        ),
+        [job] => {
+            let why = job
+                .parked_reason
+                .as_deref()
+                .map(|r| format!("\nWhy it's paused: {r} Resume picks it up here."))
+                .unwrap_or_default();
+            let error = job
+                .error
+                .as_deref()
+                .map(|e| format!("\nError: {e}"))
+                .unwrap_or_default();
+            format!(
+                "[{}] {}\nStatus: {} ({} of {} steps done){why}{error}",
+                job.id, job.title, job.status, job.cursor, job.total
+            )
+        }
+        many => format!(
+            "\"{query}\" matches {} jobs; be more specific:\n{}",
+            many.len(),
+            many.iter().map(|j| one_line(j)).collect::<Vec<_>>().join("\n")
+        ),
+    }
+}
+
 /// The spreadsheet grid's column ceiling: columns run A..XFD, so 16 384 of them.
 ///
 /// `parse_a1` owns the row ceiling and the letter-count guard; the column VALUE
@@ -1824,8 +2009,9 @@ pub(crate) fn job_tools_specs() -> Vec<serde_json::Value> {
                     "description": "merge = one final document distilled from the whole file (default); stitch = transform each part and join them in order"}},
                 "required": ["name", "instruction"]}}}),
         serde_json::json!({"type": "function", "function": {"name": "job_status",
-            "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along.",
-            "parameters": {"type": "object", "properties": {}}}}),
+            "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along. Each listed job shows a short id in brackets; pass job_id (that short id, or more of it) to see just one job in full detail.",
+            "parameters": {"type": "object", "properties": {
+                "job_id": {"type": "string", "description": "A job's short id (shown in brackets by a previous job_status call) to see just that one job"}}}}}),
     ]
 }
 
@@ -1972,12 +2158,17 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                 "name": {"type": "string"}, "content": {"type": "string"}},
                 "required": ["name", "content"]}}},
         {"type": "function", "function": {"name": "edit_file",
-            "description": "Change ONE place in ONE file (text, code, notes, csv, or docx) by replacing exact text. Copy old_text exactly as it appears in the file — curly quotes, spacing and dashes are matched tolerantly, but old_text must identify a UNIQUE spot: if it appears more than once you get an error with the count, then either add surrounding text to pick one place or pass all: true to replace every occurrence. To change several places or several files at once, use edit_files. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
+            "description": "Change ONE place in ONE file (text, code, notes, csv, html, or docx) by replacing exact text. Copy old_text exactly as it appears — curly quotes/spacing/dashes are matched tolerantly, but old_text must be a UNIQUE spot: a repeat gives an error with the count, then use prefix_context/suffix_context/occurrence/section to narrow it, or all: true to replace every one. On HTML, quote the readable text — it may span inline markup (bold, a link) but never crosses into a different paragraph/heading/list item/table cell. To change several places or files at once, use edit_files. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "File name or part of it"},
                 "old_text": {"type": "string", "description": "Exact text currently in the file"},
                 "new_text": {"type": "string", "description": "Text to replace it with"},
-                "all": {"type": "boolean", "description": "Replace EVERY occurrence of old_text (default false → the text must appear exactly once)"}},
+                "all": {"type": "boolean", "description": "Replace EVERY occurrence (needs an exact quote; default false)"},
+                "prefix_context": {"type": "string", "description": "Exact text right before old_text, to pick one occurrence (exact quote only)"},
+                "suffix_context": {"type": "string", "description": "Exact text right after old_text, to pick one occurrence (exact quote only)"},
+                "occurrence": {"type": "integer", "description": "Which occurrence to replace, 1-based (exact quote only; not with all)"},
+                "section": {"type": "string", "description": "Scope to one heading's section, by its text e.g. \"2026 Outlook\" (html/md only)"},
+                "dry_run": {"type": "boolean", "description": "Preview the result without writing anything"}},
                 "required": ["name", "old_text", "new_text"]}}},
         {"type": "function", "function": {"name": "edit_files",
             "description": "Change several files (or several places in one file) in ONE atomic step: every edit is checked first, then all are applied together — if any single edit can't match, none are applied. Also renames files as part of the same atomic change, so \"rename X and update every reference\" fully lands or fully doesn't. Prefer this over repeated edit_file calls when a change spans files. Example: {\"edits\": [{\"name\": \"a.md\", \"old_text\": \"foo\", \"new_text\": \"bar\"}, {\"name\": \"old.md\", \"new_name\": \"new.md\"}]}",
@@ -1988,7 +2179,8 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                         "old_text": {"type": "string", "description": "For an edit: exact text currently in the file"},
                         "new_text": {"type": "string", "description": "For an edit: text to replace it with"},
                         "new_name": {"type": "string", "description": "For a rename: the file's new name"}},
-                        "required": ["name"]}}},
+                        "required": ["name"]}},
+                "dry_run": {"type": "boolean", "description": "Preview the results without writing anything"}},
                 "required": ["edits"]}}},
         {"type": "function", "function": {"name": "write_file",
             "description": "Replace the entire content of an existing text file. For small changes prefer edit_file.",
@@ -2805,6 +2997,20 @@ pub(crate) async fn exec_tool(
             if old_text.is_empty() {
                 return Err("old_text is required — copy the exact text to replace.".into());
             }
+            // E3/E4 (2026-08-04): disambiguation refinements. Reject `occurrence`
+            // together with `all: true` before any file work — "replace every
+            // occurrence" and "replace only the 3rd one" can't both be honored.
+            let prefix_context = args["prefix_context"].as_str().map(str::to_string);
+            let suffix_context = args["suffix_context"].as_str().map(str::to_string);
+            let occurrence = args["occurrence"].as_u64().map(|n| n as usize);
+            let section = args["section"].as_str().map(str::to_string);
+            if occurrence.is_some() && all {
+                return Err(
+                    "occurrence and all: true can't both be set — occurrence picks ONE place, \
+                     all replaces every place."
+                        .into(),
+                );
+            }
             // Idea 6: the diff-preview gate wraps this whole edit (compute under the
             // lock, await approval unlocked, re-lock + staleness-check + apply). When
             // the cadence setting is off (default) it applies inside the phase-1 lock,
@@ -2814,7 +3020,24 @@ pub(crate) async fn exec_tool(
                 old_text: old_text.to_string(),
                 new_text: new_text.to_string(),
                 all,
+                prefix_context,
+                suffix_context,
+                occurrence,
+                section,
             };
+            // E5 (2026-08-04): a dry run answers "how many, and what would it
+            // look like" without writing anything — it calls the SAME
+            // plan_single_edit the real path does, so it can't drift from what
+            // actually happens, but never reaches gated_write/commit_plans.
+            // Approval is meaningless for a call that never commits.
+            if args["dry_run"].as_bool().unwrap_or(false) {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                return match plan_single_edit(&room.conn, &edit) {
+                    Ok(plans) => Ok(dry_run_summary(&plans)),
+                    Err(e) => Err(e.message),
+                };
+            }
             match gated_write("edit_file", "AI edit", state, window, effects, |conn| {
                 plan_single_edit(conn, &edit)
             })
@@ -2857,6 +3080,14 @@ pub(crate) async fn exec_tool(
                 }
             };
             let (n_edits, n_renames) = count_batch_ops(&ops);
+            if args["dry_run"].as_bool().unwrap_or(false) {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                return match plan_batch(&room.conn, &ops) {
+                    Ok(plans) => Ok(dry_run_summary(&plans)),
+                    Err(msg) => Err(msg),
+                };
+            }
             let batch_id: String = Uuid::new_v4().to_string().chars().take(8).collect();
             let cause = format!("AI edit (batch {batch_id})");
             match gated_write("edit_files", &cause, state, window, effects, |conn| {
@@ -2896,7 +3127,7 @@ pub(crate) async fn exec_tool(
             {
                 GateOutcome::Applied(plans) => {
                     let p = &plans[0];
-                    Ok(format!("Rewrote \"{}\" ({} characters).", p.real_name, p.count))
+                    Ok(write_file_summary(&p.real_name, &p.before, &p.after, p.count, p.clipped))
                 }
                 GateOutcome::Declined(msg) => Ok(msg),
                 GateOutcome::Error(e) => Err(e.message),
@@ -3222,19 +3453,24 @@ pub(crate) async fn exec_tool(
                 let room = guard.as_ref().ok_or("No room is open.")?;
                 db::get_fresh_web_page(&room.conn, url)
             };
-            let (title, text) = if let Some(hit) = cached {
-                hit
+            // D2 (2026-08-04): a cache hit has no live redirect info (it
+            // wasn't just fetched); a fresh fetch's `final_url` is only worth
+            // mentioning when it actually differs — otherwise every ordinary
+            // fetch would carry a pointless "redirected to the same URL" line.
+            let (title, text, redirected_to) = if let Some((title, text)) = cached {
+                (title, text, None)
             } else {
                 crate::turn::step_for(turn, window, format!("Fetching {url} (leaves this Mac)"));
-                let (title, text) = web::fetch_page(url).await?;
+                let web::FetchedPage { title, text, final_url, .. } = web::fetch_page(url).await?;
                 {
                     let guard = state.room.lock().unwrap();
                     let room = guard.as_ref().ok_or("No room is open.")?;
                     let _ = db::save_web_page(&room.conn, url, &title, &text);
                 }
-                (title, text)
+                let redirected_to = (final_url != url).then_some(final_url);
+                (title, text, redirected_to)
             };
-            Ok(fetch_page_window(&title, url, &text, start))
+            Ok(fetch_page_reply(&title, url, &text, start, redirected_to.as_deref()))
         }
         // BROWSE-2 (D17): the download/save arms. All three re-check the web
         // switch (the catalog gate is advisory; the switch is the law) and end
@@ -3362,6 +3598,25 @@ pub(crate) async fn exec_tool(
                      a vision-capable model in Settings → Model."
                 ));
             };
+            // S1 (2026-08-04): the room's own privacy gateway (`inject_policy`,
+            // called by `sidecar_post` underneath `ground_prepared_image`) strips
+            // the image before it reaches a non-local model and only COUNTS the
+            // strip — the call still proceeds. Every other path that's the right
+            // behavior (the text still gets answered); here it's not: grounding
+            // with no image returns no boxes, and "no boxes" reads to the user as
+            // "could not locate that in this image" — a false claim about their
+            // photo instead of a true one about the room's privacy setting. The
+            // sidecar's own `/vision_locate` (the viewer's click-to-locate path)
+            // already refuses this case up front; this is the same backstop for
+            // `ground_prepared_image`, which calls the sidecar's plain `/generate`
+            // and has no such check of its own.
+            if image_grounding_blocked_by_privacy(&vmodel) {
+                return Ok(format!(
+                    "Cannot mark {real_name}: this room's privacy door does not let images leave \
+                     the Mac, so {vmodel} cannot be shown the picture. Mark images with a model \
+                     that runs on this Mac, or turn the door off for this room."
+                ));
+            }
             let boxes = ground_prepared_image(&vmodel, &chat_model, &prepared, find, w, h).await?;
             if boxes.is_empty() {
                 return Ok(format!("Could not locate \"{find}\" in {real_name}."));
@@ -3567,14 +3822,7 @@ pub(crate) async fn exec_tool(
             if memories.is_empty() {
                 return Ok("No memories are saved in this room yet.".into());
             }
-            let lines: Vec<String> = memories
-                .iter()
-                .map(|m| match m.category.as_deref() {
-                    Some(c) => format!("- [{c}] {}", m.content),
-                    None => format!("- {}", m.content),
-                })
-                .collect();
-            Ok(lines.join("\n"))
+            Ok(format_memory_list(memories))
         }
         // 2026-07-24: the agent could add a memory but never correct or drop
         // one, so a wrong note it saved was permanent. Both verbs match on the
@@ -3593,7 +3841,10 @@ pub(crate) async fn exec_tool(
                 1 => {
                     let (id, old) = &hits[0];
                     if call.name == "delete_memory" {
-                        db::delete_memory(&room.conn, id)?;
+                        // S9: soft-delete, attributed to this tool — "what did
+                        // the AI delete" now has an answer, same as the files
+                        // trash already gives for `TrashActor::Agent`.
+                        db::delete_memory(&room.conn, id, db::TrashActor::Agent("delete_memory"))?;
                         Ok(format!("Forgot: {old}"))
                     } else {
                         let content = args["content"].as_str().unwrap_or_default().trim();
@@ -3854,26 +4105,7 @@ pub(crate) async fn exec_tool(
             if jobs.is_empty() {
                 return Ok("There are no background jobs in this room.".into());
             }
-            let lines: Vec<String> = jobs
-                .iter()
-                .take(8)
-                .map(|j| {
-                    // A job the APP stopped is 'paused' too, and reporting only
-                    // the status would have the assistant tell the user their
-                    // work is paused as if they had paused it. The row records
-                    // who actually stopped it; say so.
-                    let why = j
-                        .parked_reason
-                        .as_deref()
-                        .map(|r| format!(" — {r} Resume picks it up here."))
-                        .unwrap_or_default();
-                    format!(
-                        "- {} — {} ({} of {} steps done){}",
-                        j.title, j.status, j.cursor, j.total, why
-                    )
-                })
-                .collect();
-            Ok(lines.join("\n"))
+            Ok(job_status_reply(&jobs, args["job_id"].as_str()))
         }
         // Wave 4a (Idea 2): the workflow authoring tools. All logic lives in
         // commands::jobs::workflow; these arms just route args + the agent
@@ -4138,6 +4370,25 @@ pub(crate) fn fetch_page_window(title: &str, url: &str, text: &str, start: usize
     }
 }
 
+/// D2 (2026-08-04): wraps `fetch_page_window` with a redirect note, so a
+/// fetch that landed somewhere other than the requested URL isn't invisible.
+/// `redirected_to` is `None` for a cache hit (no live redirect info) or a
+/// fetch that landed exactly where it was pointed — the common case gets no
+/// extra line at all.
+pub(crate) fn fetch_page_reply(
+    title: &str,
+    url: &str,
+    text: &str,
+    start: usize,
+    redirected_to: Option<&str>,
+) -> String {
+    let windowed = fetch_page_window(title, url, text, start);
+    match redirected_to {
+        Some(final_url) => format!("(Redirected to {final_url})\n{windowed}"),
+        None => windowed,
+    }
+}
+
 // --------------------------------------------------------------------------- #
 // the app's own "this turn produced no answer" notices
 //
@@ -4275,6 +4526,13 @@ pub(crate) fn tail_bytes(s: &str, max: usize) -> &str {
 /// `qwen3.5:4b` to another computer, and the name alone cannot know that.
 pub(crate) fn runs_on_this_mac(model: &str) -> bool {
     crate::commands::declared_for(model).local && crate::commands::ollama_runs_here()
+}
+
+/// S1 (2026-08-04): would grounding `vmodel` silently see no image, because
+/// this room's privacy door strips images before they reach a non-local
+/// model? See the `mark_image` call site for the full story.
+pub(crate) fn image_grounding_blocked_by_privacy(vmodel: &str) -> bool {
+    !runs_on_this_mac(vmodel) && privacy::active_policy().is_some()
 }
 
 /// ADD-25: hand a captured image (screenshot / video frame) to the model.
@@ -5145,6 +5403,276 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_is_a_sibling_of_edits_not_nested_inside_it() {
+        // A JSON schema literal is easy to mis-nest without a compile error —
+        // serde_json::json! only validates syntax, not shape. Pin the actual
+        // property paths so a future edit can't silently move `dry_run` inside
+        // `edits.items.properties` (where a model would never see it).
+        let tools = tools_catalog(false);
+        let by_name = |name: &str| -> serde_json::Value {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["function"]["name"] == name)
+                .unwrap()["function"]["parameters"]
+                .clone()
+        };
+        let edit_file = by_name("edit_file");
+        assert!(edit_file["properties"]["dry_run"]["type"] == "boolean");
+        let edit_files = by_name("edit_files");
+        assert!(edit_files["properties"]["dry_run"]["type"] == "boolean");
+        assert!(
+            edit_files["properties"]["edits"]["items"]["properties"].get("dry_run").is_none(),
+            "dry_run must not be nested inside one array item's own properties"
+        );
+        assert_eq!(edit_files["required"].as_array().unwrap(), &["edits"]);
+    }
+
+    fn planned_edit(real_name: &str, count: usize, method: EditMethod, after: &str) -> PlannedWrite {
+        PlannedWrite {
+            file_id: "id".into(),
+            real_name: real_name.into(),
+            new_bytes: Some(after.as_bytes().to_vec()),
+            rename_to: None,
+            method: Some(method),
+            count,
+            staleness: None,
+            before: String::new(),
+            after: after.into(),
+            clipped: false,
+        }
+    }
+
+    fn planned_rename(real_name: &str, new_name: &str) -> PlannedWrite {
+        PlannedWrite {
+            file_id: "id".into(),
+            real_name: real_name.into(),
+            new_bytes: None,
+            rename_to: Some(new_name.into()),
+            method: None,
+            count: 0,
+            staleness: None,
+            before: format!("name: {real_name}"),
+            after: format!("name: {new_name}"),
+            clipped: false,
+        }
+    }
+
+    #[test]
+    fn dry_run_summary_reports_count_method_and_a_preview_without_claiming_a_write() {
+        let plans = vec![planned_edit("notes.md", 2, EditMethod::ExactAll, "the new full text")];
+        let msg = dry_run_summary(&plans);
+        assert!(msg.starts_with("DRY RUN — nothing was written"), "got: {msg}");
+        assert!(msg.contains("notes.md"));
+        assert!(msg.contains("2 occurrence(s)"));
+        assert!(msg.contains("exact_all"));
+        assert!(msg.contains("the new full text"));
+    }
+
+    #[test]
+    fn dry_run_summary_covers_a_rename_only_plan() {
+        let plans = vec![planned_rename("old.md", "new.md")];
+        let msg = dry_run_summary(&plans);
+        assert!(msg.contains("old.md"));
+        assert!(msg.contains("would rename to \"new.md\""));
+        assert!(msg.contains("No content change"));
+    }
+
+    #[test]
+    fn dry_run_summary_lists_every_file_in_a_batch() {
+        let plans = vec![
+            planned_edit("a.md", 1, EditMethod::Exact, "a's new text"),
+            planned_rename("b.md", "c.md"),
+        ];
+        let msg = dry_run_summary(&plans);
+        assert!(msg.contains("a.md"));
+        assert!(msg.contains("a's new text"));
+        assert!(msg.contains("b.md"));
+        assert!(msg.contains("would rename to \"c.md\""));
+    }
+
+    #[test]
+    fn dry_run_summary_clamps_a_huge_preview() {
+        let plans = vec![planned_edit("big.md", 1, EditMethod::Exact, &"x".repeat(50_000))];
+        let msg = dry_run_summary(&plans);
+        assert!(msg.len() < 2_000, "dry run reply must stay small: {} bytes", msg.len());
+    }
+
+    #[test]
+    fn image_grounding_is_blocked_only_for_a_nonlocal_model_with_the_door_on() {
+        let _guard = privacy::policy_test_lock();
+        privacy::clear_policy();
+
+        // Door off (no policy attached): even a cloud model is allowed through
+        // here — `active_policy()` returns None, matching every other seam.
+        assert!(
+            !image_grounding_blocked_by_privacy("minimax-m3:cloud"),
+            "door off: this check must defer to the room's actual setting, not assume"
+        );
+
+        // Door on: a LOCAL vision model is never blocked — its pixels never
+        // left the Mac in the first place.
+        privacy::set_policy_for_test(true);
+        assert!(!image_grounding_blocked_by_privacy("qwen2.5vl:7b"));
+
+        // Door on + non-local model: THIS is the case that used to silently
+        // fall through to `ground_prepared_image`, get no image, find no
+        // boxes, and report "could not locate that in this image" — a false
+        // claim about the photo instead of a true one about the setting.
+        assert!(image_grounding_blocked_by_privacy("minimax-m3:cloud"));
+        assert!(image_grounding_blocked_by_privacy("claude-cli::opus"));
+
+        privacy::clear_policy();
+    }
+
+    fn job(id: &str, title: &str, status: &str, cursor: i64, total: i64) -> db::Job {
+        db::Job {
+            id: id.into(),
+            kind: "file_pass".into(),
+            title: title.into(),
+            plan: serde_json::json!({}),
+            state: serde_json::json!({}),
+            cursor,
+            total,
+            status: status.into(),
+            error: None,
+            parent_job_id: None,
+            parked_reason: None,
+            created_at: "2026-08-04T00:00:00Z".into(),
+            updated_at: "2026-08-04T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn job_status_reply_lists_every_job_with_its_short_id_when_no_filter_is_given() {
+        let jobs = vec![
+            job("a1b2c3d4-e5f6-0000-0000-000000000000", "Digest", "running", 2, 5),
+            job("f9e8d7c6-0000-0000-0000-000000000000", "Translate book", "paused", 1, 10),
+        ];
+        let out = job_status_reply(&jobs, None);
+        assert!(out.contains("[a1b2c3d4] Digest"), "got: {out}");
+        assert!(out.contains("[f9e8d7c6] Translate book"), "got: {out}");
+    }
+
+    #[test]
+    fn job_status_reply_resolves_a_short_id_to_full_detail() {
+        let jobs = vec![
+            job("a1b2c3d4-e5f6-0000-0000-000000000000", "Digest", "running", 2, 5),
+            job("f9e8d7c6-0000-0000-0000-000000000000", "Translate book", "paused", 1, 10),
+        ];
+        let out = job_status_reply(&jobs, Some("a1b2c3d4"));
+        assert!(out.contains("Digest"), "got: {out}");
+        assert!(out.contains("2 of 5 steps done"), "got: {out}");
+        assert!(!out.contains("Translate book"), "must not include the other job: {out}");
+    }
+
+    #[test]
+    fn job_status_reply_accepts_the_full_id_too() {
+        let jobs = vec![job("a1b2c3d4-e5f6-0000-0000-000000000000", "Digest", "running", 2, 5)];
+        let out = job_status_reply(&jobs, Some("a1b2c3d4-e5f6-0000-0000-000000000000"));
+        assert!(out.contains("Digest"));
+    }
+
+    #[test]
+    fn job_status_reply_reports_no_match_rather_than_guessing() {
+        let jobs = vec![job("a1b2c3d4-e5f6-0000-0000-000000000000", "Digest", "running", 2, 5)];
+        let out = job_status_reply(&jobs, Some("zzzzzzzz"));
+        assert!(out.contains("No background job matches"), "got: {out}");
+    }
+
+    #[test]
+    fn job_status_reply_shows_the_parked_reason_and_error_in_full_detail() {
+        let mut j = job("a1b2c3d4-e5f6-0000-0000-000000000000", "Digest", "paused", 2, 5);
+        j.parked_reason = Some("The room was locked.".into());
+        j.error = Some("MODEL_MISSING:qwen3.5:4b".into());
+        let out = job_status_reply(&[j], Some("a1b2c3d4"));
+        assert!(out.contains("The room was locked."), "got: {out}");
+        assert!(out.contains("MODEL_MISSING:qwen3.5:4b"), "got: {out}");
+    }
+
+    fn memory(content: &str, category: Option<&str>) -> Memory {
+        Memory {
+            id: "id".into(),
+            content: content.into(),
+            category: category.map(str::to_string),
+            created_at: "2026-08-04T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn format_memory_list_shows_every_note_under_the_cap() {
+        let memories = vec![memory("first", None), memory("second", Some("fact"))];
+        let out = format_memory_list(memories);
+        assert_eq!(out, "- first\n- [fact] second");
+    }
+
+    #[test]
+    fn format_memory_list_caps_and_reports_the_real_count() {
+        let memories: Vec<Memory> = (0..65).map(|i| memory(&format!("note {i}"), None)).collect();
+        let out = format_memory_list(memories);
+        let lines: Vec<&str> = out.lines().collect();
+        // 50 listed + one trailer line.
+        assert_eq!(lines.len(), 51);
+        assert_eq!(lines[0], "- note 0");
+        assert_eq!(lines[49], "- note 49");
+        assert!(lines[50].contains("…and 15 more memories"), "got: {}", lines[50]);
+        // The cap must never silently drop the trailer's own count.
+        assert!(!out.contains("note 50"), "the 51st note must not sneak into the list");
+    }
+
+    #[test]
+    fn line_multiset_diff_counts_added_and_removed() {
+        let before = "one\ntwo\nthree\n";
+        let after = "one\ntwo\nfour\nfive\n";
+        // "three" removed; "four" and "five" added; "one"/"two" unchanged.
+        assert_eq!(line_multiset_diff(before, after), (2, 1));
+        assert_eq!(line_multiset_diff("same\n", "same\n"), (0, 0));
+        assert_eq!(line_multiset_diff("", "a\nb\n"), (2, 0));
+        assert_eq!(line_multiset_diff("a\nb\n", ""), (0, 2));
+    }
+
+    #[test]
+    fn write_file_summary_reports_added_and_removed_lines() {
+        let before = "line one\nline two\nline three\n";
+        let after = "line one\nline two\nline three\nline four\n";
+        let msg = write_file_summary("notes.md", before, after, after.chars().count(), false);
+        assert!(msg.contains("1 line(s) added"), "got: {msg}");
+        assert!(msg.contains("0 line(s) removed"), "got: {msg}");
+        assert!(msg.contains("+10 characters"), "got: {msg}");
+        assert!(!msg.contains("dropped content"), "no shrink here: {msg}");
+    }
+
+    #[test]
+    fn write_file_summary_flags_a_large_shrink() {
+        let before = "x".repeat(1000);
+        let after = "short replacement";
+        let msg = write_file_summary("notes.md", &before, after, after.chars().count(), false);
+        assert!(msg.contains("dropped content"), "got: {msg}");
+    }
+
+    #[test]
+    fn write_file_summary_does_not_flag_a_small_file_shrinking() {
+        // "Delete everything but the title" is an ordinary, deliberate shrink
+        // on a short file — not worth a warning every time.
+        let before = "Title\nOld body.";
+        let after = "Title";
+        let msg = write_file_summary("notes.md", before, after, after.chars().count(), false);
+        assert!(!msg.contains("dropped content"), "got: {msg}");
+    }
+
+    #[test]
+    fn write_file_summary_skips_the_shrink_check_on_a_clipped_comparison() {
+        // A file too large for the unclipped preview shouldn't get a shrink
+        // warning computed against a partial view of the original.
+        let before = "x".repeat(1000);
+        let after = "short";
+        let msg = write_file_summary("notes.md", &before, after, after.chars().count(), true);
+        assert!(!msg.contains("dropped content"), "got: {msg}");
+        assert!(msg.contains("partial view"), "got: {msg}");
+    }
+
+    #[test]
     fn build_annotation_falls_back_to_closest_passage() {
         let text = "Payment is due within thirty days of receipt of invoice.";
         // A quote that isn't verbatim (drops "is", "thirty"→"30") still anchors,
@@ -5723,6 +6251,28 @@ mod tests {
     fn a_short_page_is_returned_whole_with_no_truncation_notice() {
         let out = fetch_page_window("Title", "https://e.com", "hello", 0);
         assert_eq!(out, "[Title] https://e.com\n\nhello");
+    }
+
+    #[test]
+    fn fetch_page_reply_notes_a_redirect_the_model_never_asked_for() {
+        let out = fetch_page_reply(
+            "Title",
+            "https://short.link/x",
+            "hello",
+            0,
+            Some("https://real-site.com/full-article"),
+        );
+        assert!(out.starts_with("(Redirected to https://real-site.com/full-article)\n"), "{out}");
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn fetch_page_reply_adds_no_note_for_an_ordinary_fetch_or_a_cache_hit() {
+        // No redirect (or a cache hit, which never has redirect info either):
+        // identical to fetch_page_window, byte for byte — no pointless noise
+        // on the common case.
+        let plain = fetch_page_reply("Title", "https://e.com", "hello", 0, None);
+        assert_eq!(plain, fetch_page_window("Title", "https://e.com", "hello", 0));
     }
 
     #[test]

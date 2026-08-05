@@ -205,6 +205,7 @@ pub fn run() {
             commands::list_memories,
             commands::update_memory,
             commands::delete_memory,
+            commands::restore_memory,
             commands::list_folders,
             commands::create_folder,
             commands::rename_folder,

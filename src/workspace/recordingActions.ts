@@ -10,6 +10,54 @@ import {
   stopMicTap,
 } from "./liveRec";
 import { WSState } from "./state";
+import { base64ToBytes } from "../viewers/util";
+
+/** Below this RMS (PCM samples in [-1, 1]) counts as silence for hands-free
+ * auto-send — comfortably above the mic's noise floor (echoCancellation /
+ * noiseSuppression are already on for dictation) but well under a speaking
+ * voice. Tune here if it fires too eagerly or not eagerly enough. */
+const SILENCE_RMS = 0.02;
+/** How long the user has to stay quiet, AFTER having said something, before
+ * hands-free treats the turn as finished and sends it — long enough to
+ * survive a mid-sentence breath, short enough to still feel like a live
+ * conversation. */
+const SILENCE_MS = 1500;
+
+function rms(floats: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < floats.length; i++) sum += floats[i] * floats[i];
+  return Math.sqrt(sum / floats.length);
+}
+
+/** Wraps a dictation push callback with an energy-based "the user stopped
+ * talking" watch: once real speech has been heard, SILENCE_MS of quiet
+ * fires `onSilence` (once, ever, for this session). Batches land ~250ms
+ * apart (liveRec's makeSink), plenty of resolution for a ~1.5s threshold.
+ * Decoding the batch back out of base64 is wasteful-looking but avoids
+ * threading a second callback through createPcmTap for one caller. */
+function withSilenceGate(
+  push: (rate: number, b64: string) => Promise<void>,
+  onSilence: () => void,
+): (rate: number, b64: string) => Promise<void> {
+  let heardSpeech = false;
+  let lastLoud = 0;
+  let fired = false;
+  return (rate, b64) => {
+    if (!fired) {
+      const bytes = base64ToBytes(b64);
+      const floats = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+      const now = Date.now();
+      if (rms(floats) >= SILENCE_RMS) {
+        heardSpeech = true;
+        lastLoud = now;
+      } else if (heardSpeech && now - lastLoud >= SILENCE_MS) {
+        fired = true;
+        onSilence();
+      }
+    }
+    return push(rate, b64);
+  };
+}
 
 /** Dictation (one shared mic, several sinks) + model onboarding/status.
  * Cross-hook: `viewFile` (files) for talk-to-file; `changeModel` (misc) for the
@@ -143,7 +191,17 @@ export function makeRecordingActions(
           s.setDictPartial(text);
           onPartial?.(text);
         });
-        tapDown = await createPcmTap(mic, (rate, b64) => api.dictPushAudio(rate, b64));
+        const push = (rate: number, b64: string) => api.dictPushAudio(rate, b64);
+        // Hands-free: once you've said something, going quiet for a beat
+        // ends your turn and sends it — the same "stop and send" the mic
+        // button/capture dock already do, just triggered by silence instead
+        // of a click. Scoped to the composer (never journal/file/note/memory
+        // dictation, where a mid-thought pause must not auto-cut you off).
+        const autoSend = owner === "composer" && s.handsFree;
+        tapDown = await createPcmTap(
+          mic,
+          autoSend ? withSilenceGate(push, () => s.dictStreamRef.current?.()) : push,
+        );
       } catch (e) {
         mic.getTracks().forEach((t) => t.stop());
         unlisten?.();

@@ -54,12 +54,23 @@ pub(crate) struct DelimField {
     pub quoted: bool,
 }
 
+/// S2 (2026-08-04): the leading characters a spreadsheet reader can take as
+/// "this cell is a formula, not text" — this app's own sheet viewer reacts
+/// only to `=`, but a CSV exported for real use may be opened in Excel/Sheets/
+/// Numbers, whose CSV import heuristics are the OWASP-documented broader set.
+/// A value pasted verbatim from a web page (a phone number starting `+`, a
+/// negative figure, an email-style handle starting `@`) must not silently
+/// become live once it round-trips through set_cells.
+const FORMULA_TRIGGER_CHARS: [char; 4] = ['=', '+', '-', '@'];
+
 impl DelimField {
     /// A field being WRITTEN rather than read back. Quoted when the bare
-    /// spelling would come back as something else — today that is a leading
-    /// `=`, which every reader (the sheet viewer included) reads as a formula.
+    /// spelling would come back as something else — a leading formula-trigger
+    /// character, which some reader (this app's viewer for `=`, or a real
+    /// spreadsheet app's CSV import for the rest) would read as a formula.
     fn written(value: &str) -> Self {
-        Self { value: value.to_string(), quoted: value.starts_with('=') }
+        let quoted = value.starts_with(FORMULA_TRIGGER_CHARS);
+        Self { value: value.to_string(), quoted }
     }
 }
 
@@ -356,6 +367,24 @@ mod tests {
         // …and the same rule for a whole file built from values.
         let rows = vec![vec!["label".to_string(), "=SUM(A1:A2)".to_string()]];
         assert_eq!(serialize_delim(&rows, ','), "label,\"=SUM(A1:A2)\"\n");
+    }
+
+    #[test]
+    fn a_value_starting_with_plus_minus_or_at_is_also_quoted() {
+        // S2: `=` is what THIS app's viewer reads as a formula, but a CSV
+        // exported for real use can open in Excel/Sheets/Numbers, whose CSV
+        // import heuristics react to the fuller OWASP set too — a value
+        // pasted verbatim from elsewhere (a phone number, a negative figure,
+        // a handle) must not silently become live on round-trip.
+        for dangerous in ["+1 555 0100", "-4200000", "@handle"] {
+            let quoted = DelimField::written(dangerous);
+            assert!(quoted.quoted, "{dangerous:?} should be quoted");
+            assert_eq!(quoted.value, dangerous);
+        }
+        // Ordinary values that merely CONTAIN one of these chars mid-string
+        // are untouched — only a LEADING trigger char matters.
+        let ordinary = DelimField::written("total = 5");
+        assert!(!ordinary.quoted);
     }
 
     #[test]

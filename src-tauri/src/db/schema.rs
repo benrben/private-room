@@ -143,7 +143,13 @@ CREATE TABLE IF NOT EXISTS memories (
   -- Wave 1b (idea 5): preference | fact | project | instruction; NULL =
   -- uncategorized (every legacy row). Organizational only in v1.
   category TEXT,
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  -- S9 (2026-08-04): soft delete, same shape as files' trash — NULL means
+  -- never trashed. `delete_memory` was the app's one truly irreversible AI
+  -- action; every other write has snapshot/Undo or the files Trash tab.
+  trashed_at TEXT,
+  trashed_by TEXT,
+  trashed_by_id TEXT
 );
 CREATE TABLE IF NOT EXISTS web_pages (
   id TEXT PRIMARY KEY,
@@ -955,6 +961,21 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
+    // S9 (2026-08-04): memory soft-delete, same guarded-ALTER shape as the
+    // files trash above. Existing rooms come out with `trashed_at` NULL on
+    // every row — nothing trashed before the column existed.
+    if table_exists(conn, "memories")? {
+        for (column, decl) in [
+            ("trashed_at", "ALTER TABLE memories ADD COLUMN trashed_at TEXT"),
+            ("trashed_by", "ALTER TABLE memories ADD COLUMN trashed_by TEXT"),
+            ("trashed_by_id", "ALTER TABLE memories ADD COLUMN trashed_by_id TEXT"),
+        ] {
+            if !column_exists(conn, "memories", column)? {
+                conn.execute(decl, []).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
     // ADD-23: structured viewer effects (boxes/annotation) ride their own
     // column so assistant `content` stays plain prose. Guarded ALTER for rooms
     // created before the column existed; legacy fenced ```boxes/```annotation
@@ -1339,6 +1360,35 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].content, "the dog is named Rex");
         assert!(got[0].category.is_none(), "legacy rows are uncategorized");
+        // Idempotent on a second open.
+        migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn s9_trash_columns_reach_a_memories_table_written_before_them() {
+        // A room created before S9 (2026-08-04) gains trashed_at/by/by_id on
+        // migrate(), and its existing memory reads back active (untrashed) —
+        // nothing that predates the trash column starts out inside it.
+        let conn = open_in_memory_schema();
+        conn.execute_batch(
+            "DROP TABLE memories;
+             CREATE TABLE memories (
+               id TEXT PRIMARY KEY,
+               content TEXT NOT NULL,
+               category TEXT,
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             );
+             INSERT INTO memories(id, content) VALUES ('m1', 'call every Friday');",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "memories", "trashed_at").unwrap());
+        migrate(&conn).unwrap();
+        for col in ["trashed_at", "trashed_by", "trashed_by_id"] {
+            assert!(column_exists(&conn, "memories", col).unwrap(), "missing {col}");
+        }
+        let got = crate::db::list_memories(&conn).unwrap();
+        assert_eq!(got.len(), 1, "the legacy memory must not start out trashed");
+        assert_eq!(got[0].content, "call every Friday");
         // Idempotent on a second open.
         migrate(&conn).unwrap();
     }

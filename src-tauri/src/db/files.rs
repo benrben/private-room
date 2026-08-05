@@ -581,8 +581,9 @@ pub enum TrashActor<'a> {
 
 impl TrashActor<'_> {
     /// (kind, id) as stored. The kind is a closed vocabulary the UI switches
-    /// on; the id is free-form and may be absent.
-    fn parts(&self) -> (&'static str, Option<&str>) {
+    /// on; the id is free-form and may be absent. `pub(crate)`: `db::memories`
+    /// (S9) reuses the same actor type for its own soft-delete.
+    pub(crate) fn parts(&self) -> (&'static str, Option<&str>) {
         match self {
             TrashActor::User => ("user", None),
             TrashActor::Agent(who) => ("agent", Some(who)),

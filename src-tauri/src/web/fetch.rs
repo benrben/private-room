@@ -166,8 +166,23 @@ async fn guarded_get(url: &str) -> Result<reqwest::Response, String> {
     Err("Too many redirects.".into())
 }
 
-pub async fn fetch_page(url: &str) -> Result<(String, String), String> {
+/// D2 (2026-08-04): `fetch_page`'s result, now carrying where the request
+/// actually landed. `guarded_get` follows redirects itself (reqwest's own
+/// policy is `none`, see `fetch_client`), so without this the model asking
+/// for one URL and silently reading the text of a DIFFERENT one — a
+/// redirect it never saw — was invisible. `status` is always a 2xx: anything
+/// else already became an `Err` inside `guarded_get` before this is built.
+pub struct FetchedPage {
+    pub title: String,
+    pub text: String,
+    pub final_url: String,
+    pub status: u16,
+}
+
+pub async fn fetch_page(url: &str) -> Result<FetchedPage, String> {
     let resp = guarded_get(url).await?;
+    let final_url = resp.url().to_string();
+    let status = resp.status().as_u16();
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -195,7 +210,7 @@ pub async fn fetch_page(url: &str) -> Result<(String, String), String> {
         text = text.chars().take(MAX_PAGE_CHARS).collect();
         text.push_str("\n… (truncated)");
     }
-    Ok((title, text))
+    Ok(FetchedPage { title, text, final_url, status })
 }
 
 /// Like `fetch_page`, but also hands back the raw page bytes so the caller can

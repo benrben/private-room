@@ -1834,7 +1834,7 @@ async fn run_workflow_node<R: tauri::Runtime>(
             }
             let url = interpolate(app, room_path, url, &inputs_joined);
             match crate::web::fetch_page(&url).await {
-                Ok((title, text)) => Ok(WfArtifact {
+                Ok(crate::web::FetchedPage { title, text, .. }) => Ok(WfArtifact {
                     result: format!("{title}\n\n{text}"),
                     ..Default::default()
                 }),

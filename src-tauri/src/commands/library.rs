@@ -64,7 +64,14 @@ pub fn update_memory(
 
 #[tauri::command]
 pub fn delete_memory(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    state.with_room(|room| db::delete_memory(&room.conn, &id))
+    state.with_room(|room| db::delete_memory(&room.conn, &id, db::TrashActor::User))
+}
+
+/// S9 (2026-08-04): put a soft-deleted memory back. Not reachable from the
+/// agent — recovery is a human action, same posture as file restore.
+#[tauri::command]
+pub fn restore_memory(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.with_room(|room| db::restore_memory(&room.conn, &id))
 }
 
 // ---------------------------------------------------------------- folders (ADD-16)
@@ -127,6 +134,24 @@ pub fn set_setting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trashed_memory_does_not_block_re_adding_the_same_text() {
+        // S9: duplicate_memory rides on db::list_memories, which now excludes
+        // trashed rows — trashing "buy milk" must not permanently block ever
+        // adding "buy milk" again.
+        let conn = db::open_in_memory_schema();
+        let m1 = db::add_memory(&conn, "buy milk", None).unwrap();
+        assert!(
+            duplicate_memory(&conn, "buy milk").unwrap().is_some(),
+            "an active memory is still a duplicate"
+        );
+        db::delete_memory(&conn, &m1.id, db::TrashActor::User).unwrap();
+        assert!(
+            duplicate_memory(&conn, "buy milk").unwrap().is_none(),
+            "a trashed memory must not count as an existing duplicate"
+        );
+    }
 
     #[test]
     fn memory_dedup_normalization() {

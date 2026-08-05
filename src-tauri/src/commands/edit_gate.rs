@@ -47,6 +47,24 @@ pub(crate) fn approval_needed(setting: Option<&str>, effects: &ToolEffects) -> b
     }
 }
 
+/// A2 (2026-08-04): above this many changed places, force the preview card
+/// even with the gate OFF (the app's default) — replacing 2 occurrences and
+/// replacing 400 were previously treated identically, both applying instantly.
+pub(crate) const REPLACE_ALL_PREVIEW_THRESHOLD: usize = 10;
+
+/// Does this batch of plans change enough places to force a preview regardless
+/// of the cadence setting? `PlannedWrite.count` means OCCURRENCES for
+/// `edit_file` (an `all: true`/HTML multi-replace can be large) and, for
+/// `edit_files`, is 1 per touched file (it has no `all`, so no single file-edit
+/// there can be a mass replace) — summing across files also catches an
+/// unusually large atomic batch, which is worth a look too. `write_file`'s
+/// `count` is a CHARACTER count, not occurrences, so it is deliberately never
+/// scale-checked here — every ordinary rewrite would trip a 10-character floor.
+fn is_large_scale_edit(tool: &str, plans: &[PlannedWrite]) -> bool {
+    matches!(tool, "edit_file" | "edit_files")
+        && plans.iter().map(|p| p.count).sum::<usize>() > REPLACE_ALL_PREVIEW_THRESHOLD
+}
+
 /// Map the frontend's decision string. Factored out so it is unit-testable.
 pub(crate) fn decision_from_str(decision: &str) -> EditDecision {
     match decision {
@@ -215,8 +233,9 @@ pub(crate) async fn gated_write(
         }
         let setting = db::get_setting(&room.conn, "edit_approval");
         let allow_turn = setting.as_deref() == Some("turn") && effects.run_scoped;
-        if !approval_needed(setting.as_deref(), effects) {
-            // Gate off (or "turn" already granted): apply under THIS lock.
+        if !approval_needed(setting.as_deref(), effects) && !is_large_scale_edit(tool, &plans) {
+            // Gate off (or "turn" already granted), and not a mass replace:
+            // apply under THIS lock.
             if let Err(e) = commit_plans(&room.conn, &plans, cause) {
                 return GateOutcome::Error(EditError::new(e, "error"));
             }
@@ -261,6 +280,45 @@ mod tests {
         ToolEffects { run_scoped, edit_approved_this_turn: granted, ..Default::default() }
     }
 
+    fn plan_with_count(count: usize) -> PlannedWrite {
+        PlannedWrite {
+            file_id: "id".into(),
+            real_name: "n.md".into(),
+            new_bytes: Some(b"x".to_vec()),
+            rename_to: None,
+            method: Some(EditMethod::Exact),
+            count,
+            staleness: None,
+            before: String::new(),
+            after: String::new(),
+            clipped: false,
+        }
+    }
+
+    #[test]
+    fn large_scale_edit_is_judged_by_summed_count_only_for_edit_tools() {
+        // At/under the threshold, never forced.
+        assert!(!is_large_scale_edit("edit_file", &[plan_with_count(10)]));
+        // Over it, forced — this is the replace-all-of-50 case A2 closes.
+        assert!(is_large_scale_edit("edit_file", &[plan_with_count(11)]));
+        assert!(is_large_scale_edit("edit_file", &[plan_with_count(50)]));
+        // edit_files sums across files (each touched file is count: 1 in
+        // practice, but the check itself just sums whatever it's given).
+        assert!(is_large_scale_edit(
+            "edit_files",
+            &(0..11).map(|_| plan_with_count(1)).collect::<Vec<_>>()
+        ));
+        assert!(!is_large_scale_edit(
+            "edit_files",
+            &(0..10).map(|_| plan_with_count(1)).collect::<Vec<_>>()
+        ));
+        // write_file's count is a CHARACTER count, not occurrences — a normal
+        // rewrite of any real length must never trip this.
+        assert!(!is_large_scale_edit("write_file", &[plan_with_count(50_000)]));
+        // set_cells is untouched by A2 too — only the two edit tools scale-check.
+        assert!(!is_large_scale_edit("set_cells", &[plan_with_count(50)]));
+    }
+
     #[test]
     fn approval_needed_follows_cadence() {
         // Off / absent / unknown → never prompt.
@@ -303,6 +361,10 @@ mod tests {
             old_text: "before".into(),
             new_text: "AFTER".into(),
             all: false,
+            prefix_context: None,
+            suffix_context: None,
+            occurrence: None,
+            section: None,
         };
         let plans = plan_single_edit(&conn, &edit).unwrap();
         // A concurrent change lands while the approval card is open.
@@ -356,6 +418,10 @@ mod tests {
             old_text: "before".into(),
             new_text: "AFTER".into(),
             all: false,
+            prefix_context: None,
+            suffix_context: None,
+            occurrence: None,
+            section: None,
         };
         let plans = plan_single_edit(&conn, &edit).unwrap();
         db::trash_file(&conn, &id, db::TrashActor::User).unwrap();
@@ -378,6 +444,10 @@ mod tests {
             old_text: "5%".into(),
             new_text: "7%".into(),
             all: false,
+            prefix_context: None,
+            suffix_context: None,
+            occurrence: None,
+            section: None,
         };
         let plans = plan_single_edit(&conn, &edit).unwrap();
         assert!(plans[0].before.contains("Fee is 5%"), "before is extracted text");

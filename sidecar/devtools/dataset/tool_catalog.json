@@ -410,11 +410,15 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Change ONE place in ONE file (text, code, notes, csv, or docx) by replacing exact text. Copy old_text exactly as it appears in the file — curly quotes, spacing and dashes are matched tolerantly, but old_text must identify a UNIQUE spot: if it appears more than once you get an error with the count, then either add surrounding text to pick one place or pass all: true to replace every occurrence. To change several places or several files at once, use edit_files. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
+    "description": "Change ONE place in ONE file (text, code, notes, csv, html, or docx) by replacing exact text. Copy old_text exactly as it appears — curly quotes/spacing/dashes are matched tolerantly, but old_text must be a UNIQUE spot: a repeat gives an error with the count, then use prefix_context/suffix_context/occurrence/section to narrow it, or all: true to replace every one. On HTML, quote the readable text — it may span inline markup (bold, a link) but never crosses into a different paragraph/heading/list item/table cell. To change several places or files at once, use edit_files. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
     "inputSchema": {
       "properties": {
         "all": {
-          "description": "Replace EVERY occurrence of old_text (default false → the text must appear exactly once)",
+          "description": "Replace EVERY occurrence (needs an exact quote; default false)",
+          "type": "boolean"
+        },
+        "dry_run": {
+          "description": "Preview the result without writing anything",
           "type": "boolean"
         },
         "name": {
@@ -425,8 +429,24 @@
           "description": "Text to replace it with",
           "type": "string"
         },
+        "occurrence": {
+          "description": "Which occurrence to replace, 1-based (exact quote only; not with all)",
+          "type": "integer"
+        },
         "old_text": {
           "description": "Exact text currently in the file",
+          "type": "string"
+        },
+        "prefix_context": {
+          "description": "Exact text right before old_text, to pick one occurrence (exact quote only)",
+          "type": "string"
+        },
+        "section": {
+          "description": "Scope to one heading's section, by its text e.g. \"2026 Outlook\" (html/md only)",
+          "type": "string"
+        },
+        "suffix_context": {
+          "description": "Exact text right after old_text, to pick one occurrence (exact quote only)",
           "type": "string"
         }
       },
@@ -449,6 +469,10 @@
     "description": "Change several files (or several places in one file) in ONE atomic step: every edit is checked first, then all are applied together — if any single edit can't match, none are applied. Also renames files as part of the same atomic change, so \"rename X and update every reference\" fully lands or fully doesn't. Prefer this over repeated edit_file calls when a change spans files. Example: {\"edits\": [{\"name\": \"a.md\", \"old_text\": \"foo\", \"new_text\": \"bar\"}, {\"name\": \"old.md\", \"new_name\": \"new.md\"}]}",
     "inputSchema": {
       "properties": {
+        "dry_run": {
+          "description": "Preview the results without writing anything",
+          "type": "boolean"
+        },
         "edits": {
           "description": "The changes to apply atomically. Each is either an edit {name, old_text, new_text} or a rename {name, new_name}.",
           "items": {
@@ -544,9 +568,14 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along.",
+    "description": "Report the progress of background jobs (whole-file passes, room summaries): what is running, paused, finished or failed, and how far along. Each listed job shows a short id in brackets; pass job_id (that short id, or more of it) to see just one job in full detail.",
     "inputSchema": {
-      "properties": {},
+      "properties": {
+        "job_id": {
+          "description": "A job's short id (shown in brackets by a previous job_status call) to see just that one job",
+          "type": "string"
+        }
+      },
       "type": "object"
     },
     "name": "job_status"
