@@ -3,6 +3,50 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.17.0 — 2026-08-05
+
+### Hands-free now sends on its own
+
+Talking to Arcelle hands-free used to still need one manual step: after you
+finished speaking, you had to tap the mic again to stop the recording and
+send it. Now it notices the pause — once you've said something and go quiet
+for a beat, it sends on its own. Nothing to tap mid-conversation.
+
+### Deleting a memory is no longer permanent
+
+The same trash Arcelle already gives deleted files now covers memories too.
+Removing one moves it to the trash instead of erasing it — it drops out of
+what the AI can recall, but it can be put back.
+
+### The AI's editing tools got more precise, and more honest about what they did
+
+A handful of fixes to how Arcelle's own AI edits files and reports back on
+its work:
+
+- Asking it to change one specific occurrence among several identical ones,
+  or to edit only a named section of a document, now works instead of
+  guessing.
+- A full-document rewrite now reports what actually changed — added/removed
+  lines and a flag when the new version is suspiciously shorter — instead of
+  just a character count that could hide a partial rewrite passed off as
+  complete.
+- A big find-and-replace (more than 10 occurrences at once) now always shows
+  a preview first, even with the "ask before AI edits" setting off.
+- Checking on a background job can now target one specific job instead of
+  always listing all of them.
+- Fetching a web page that redirects elsewhere now says so, instead of
+  silently reading the page it landed on.
+- The memory list the AI can see is now capped (with an honest count) so one
+  room with hundreds of saved notes can't crowd out everything else it knows.
+
+### Quieter security hardening
+
+- A downloaded file whose actual content doesn't match its extension (an
+  executable disguised with an inert-looking name) is now caught.
+- Spreadsheet values pasted or imported from elsewhere are checked against
+  the same broader "could this be read as a live formula" rule Excel/Sheets/
+  Numbers use, not just this app's own narrower one.
+
 ## 0.16.0 — 2026-08-04
 
 ### When something goes wrong, there is now a record of what Arcelle did
