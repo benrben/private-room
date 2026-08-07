@@ -110,8 +110,8 @@ to point a room at a cloud engine, the app says so out loud, everywhere.
 - 🔁 **It works while you don't.** Workflows chain AI steps into pipelines that
   run on a schedule; room scripts are real Python/JavaScript files that run
   against your files with explicit consent; studios turn sources into
-  flashcards, mind maps, and podcast scripts — all as cancellable background
-  jobs.
+  flashcards, mind maps, and podcasts you can cast with real voices and
+  record as audio — all as cancellable background jobs.
 - 🎙️ **It listens on-device.** Record your mic *and* the meeting's system
   audio, watch a live transcript build with speakers told apart automatically,
   and keep the whole thing — audio, transcript, speakers — inside the encrypted
@@ -243,7 +243,7 @@ flows through one token system so both are first-class.
 | **Memory** | Everything the AI remembers about you — a full area with categories, approval flow, and a shared scratch pad |
 | **Connectors** | MCP tool connectors, installed from a live registry or by hand, with per-tool switches and OAuth sign-in |
 | **Browser** | A private browser that persists nothing, blocks ads and trackers, and the assistant can drive on your behalf |
-| **Studio** | Flashcards, mind maps, podcast scripts, and a living room summary, generated as background jobs |
+| **Studio** | Flashcards, mind maps, and a living room summary, generated as background jobs — plus podcast scripts you can cast with real voices and record as audio |
 | **Settings** | Per-room engine and model, creativity, custom instructions, role, Touch ID, dictation, online features, cloud privacy, and one-click app updates |
 
 ### The AI lives in the room
@@ -509,6 +509,14 @@ renders exactly what Safari renders and costs the app nothing extra in size.
   scripts enqueue as cancellable jobs, progress lives on the sidebar job card,
   and the finished page opens when it's ready. Jobs queue FIFO instead of
   refusing to start while another is running.
+- **Podcasts you can listen to.** A podcast script isn't only a page to read.
+  Open one and cast it: each host gets their own voice, speed and pitch, with
+  a preview that reads one of *their* real lines rather than a generic sample.
+  Record, and the episode is saved back into the room as audio — each host in
+  their own voice — with a timed transcript you can click to jump to any
+  moment. Re-cast and record again and the earlier episode is kept, under its
+  own name. Recording speaks to an online voice service, so the panel says so
+  before the button, not after.
 
 ![Scripts: real Python files with explicit inputs, outputs, and consent](docs/screens/scripts.png)
 
@@ -571,6 +579,19 @@ all bundled locally, no CDN, no network fetch.
 
 - **Folders.** Group files into collapsible folders; drag to organize. Delete
   a folder and its files return to the top level — nothing is lost.
+- **Many files at once.** Hold ⌘ to pick files one by one, Shift to take a
+  run, ⌘A for everything on screen — then move, export, attach or trash the
+  whole selection in a single step. Dragging any picked file drags all of
+  them, and the Trash works the same way, so putting a dozen files back is one
+  action. If part of a batch fails, Arcelle names the files that failed and
+  finishes the rest, instead of reporting the whole thing as done.
+- **Ask the AI to tidy up.** The file assistant can sort files into folders,
+  rename them, merge two documents into one, and move clutter to the trash —
+  in one pass, not one file at a time. For anything large, ask for the plan
+  first: it can preview a whole reorganisation without touching a thing. It
+  can trash, and that is as far as it goes — permanently deleting and emptying
+  the trash stay yours alone. When it does trash something, the Trash tab says
+  so and names the tool it used.
 - **Version history & compare.** Every edit keeps the previous version with a
   cause and timestamp. Open any version in a side-by-side diff against the
   current text (RTL-aware for Hebrew/Arabic documents) and restore from
@@ -824,6 +845,8 @@ Shipped since the first cut:
 - [x] A hub of domain specialists that run in parallel, drawn live in the AI pane
 - [x] The token-budget bar and one-click conversation handoff
 - [x] Semantic search — an opt-in embedding model, fused with keyword scoring
+- [x] Multi-file operations, and a file assistant that can organize the room
+- [x] Podcasts with real voices — cast each host, record the episode as audio
 
 Next:
 
