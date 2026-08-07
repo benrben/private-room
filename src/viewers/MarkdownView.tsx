@@ -74,6 +74,17 @@ export default function MarkdownView({ text, target }: Props) {
         }
         return <code className={className}>{children}</code>;
       },
+      // A wide table scrolls inside its own box rather than widening the
+      // document (or the chat bubble) around it. Presentational only — the
+      // table, its cells and its reading order are untouched, so a screen
+      // reader and the quote-highlighter both see exactly what they did.
+      table({ children }: { children?: React.ReactNode }) {
+        return (
+          <div className="md-table-scroll">
+            <table>{children}</table>
+          </div>
+        );
+      },
     }),
     [],
   );

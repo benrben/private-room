@@ -1,6 +1,21 @@
 /* A legacy .doc or .rtf, rendered by macOS's own Word importer inside the
    roomdoc:// sandbox. Everything visual belongs to the document; this is only
-   the frame around it. */
+   the frame around it.
+
+   THE DOCUMENT IS PAPER IN BOTH THEMES, and so is this frame.
+
+   The frame used to follow the app's theme and go charcoal in dark mode. That
+   is the trap: `textutil` emits Word's own character formatting, and Word
+   writes explicit ink colours (`color:#000000` on a run is ordinary) while
+   writing no background at all — so a themed page produced black text on
+   charcoal, unreadable, with nothing to tell the reader the app had done it.
+   A rasterised PDF page and a rendered slide already keep their author's
+   ground in this app; a legacy Word document is the same kind of object.
+
+   The literal below is the same warm ivory `wrap()` paints into the document
+   in OfficeDocView.tsx, so the seam under a short page is invisible. It cannot
+   be a token: a custom property set on the app's <html> does not cross into an
+   opaque `roomdoc://` origin. Keep the two values in step. */
 .odoc-view {
   display: flex;
   flex-direction: column;
@@ -10,8 +25,5 @@
 .odoc-frame {
   flex: 1;
   border: 0;
-  background: #fff;
-}
-@media (prefers-color-scheme: dark) {
-  .odoc-frame { background: #17171b; }
+  background: #f7f4ec;
 }

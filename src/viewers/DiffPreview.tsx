@@ -1,5 +1,10 @@
 import { useEffect, useRef } from "react";
-import monaco, { monacoTheme, watchMonacoTheme } from "./monacoSetup";
+import monaco, {
+  EDITOR_FONT,
+  monacoTheme,
+  remeasureWhenFontReady,
+  watchMonacoTheme,
+} from "./monacoSetup";
 
 interface Props {
   before: string;
@@ -25,6 +30,7 @@ export default function DiffPreview({ before, after, clipped, language }: Props)
       renderSideBySide: wide,
       automaticLayout: true,
       minimap: { enabled: false },
+      fontFamily: EDITOR_FONT,
       fontSize: 13,
       wordWrap: "on",
       scrollBeyondLastLine: false,
@@ -44,6 +50,13 @@ export default function DiffPreview({ before, after, clipped, language }: Props)
 
   // Follow the app's light/dark switch instead of staying black in light mode.
   useEffect(watchMonacoTheme, []);
+
+  // Same bundled-webfont race as the code editor: monaco measures its glyph
+  // box at construction, and IBM Plex Mono can arrive after that. A diff has
+  // no scroll position worth preserving, so it only needs the remeasure.
+  useEffect(() => {
+    void remeasureWhenFontReady();
+  }, []);
 
   return (
     <div className="diff-preview">

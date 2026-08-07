@@ -251,6 +251,10 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
           <button
             className="subtle btn-ic"
             title="Close"
+            // An icon-only control needs a name of its own. `title` alone is a
+            // last-resort fallback in the accessible-name calculation and is
+            // not surfaced at all to a keyboard user who cannot hover it.
+            aria-label="Close"
             onClick={() => s.setShowAddLink(false)}
           >
             <CloseIcon size={12} />
@@ -329,7 +333,20 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
                   Stop download
                 </button>
               </span>
-              <span className="pull-bar">
+              {/* A bar whose only state was a CSS width. Given the real ARIA
+                  role it becomes a progress report the room can read out — and
+                  `aria-valuenow` is deliberately omitted while yt-dlp has not
+                  reported a percentage yet, which is how ARIA spells
+                  "indeterminate". Claiming 0% would be a number we do not
+                  have. */}
+              <span
+                className="pull-bar"
+                role="progressbar"
+                aria-label="Download progress"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={ytProgress?.percent ?? undefined}
+              >
                 <span
                   className="pull-bar-fill"
                   style={{ width: `${ytProgress?.percent ?? 0}%` }}

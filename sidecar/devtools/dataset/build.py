@@ -405,6 +405,37 @@ REPLIES: dict[str, Any] = {
     "move_file": lambda a: f"moved {_a(a, 'name')} into "
     + (f"the {a['folder']} folder." if a.get("folder") else "the top level."),
     "annotate_file": lambda a: f"highlighted {_a(a, 'text', 'note')!r} in {_a(a, 'name')}.",
+    # --- organizing --------------------------------------------------------
+    # Each fixture reports COUNTS AND NAMES, because that is what the real tool
+    # returns and what the agent is then supposed to repeat. A vague "done"
+    # here would teach the model to answer vaguely about a destructive action.
+    "organize_files": lambda a: "moved "
+    + str(len(a.get("files") or [1]))
+    + " file(s)"
+    + (
+        f", created folder(s) {', '.join(a['make_folders'])}"
+        if a.get("make_folders")
+        else ""
+    )
+    + (
+        f", removed folder(s) {', '.join(a['remove_folders'])} — their files went to the top level"
+        if a.get("remove_folders")
+        else ""
+    )
+    + (" (PREVIEW ONLY, nothing was changed)" if a.get("dry_run") else "")
+    + ".",
+    # The undo clause is part of the fixture on purpose: the trained answer
+    # should always name the way back, since the user did not press this.
+    "trash_files": lambda a: f"{len(a.get('names') or [1])} file(s) moved to the trash. "
+    "They are recoverable from Library → Trash.",
+    "merge_files": lambda a: f"merged {len(a.get('names') or [2])} files into "
+    f"{_a(a, 'into', default='Merged notes.md')} (18,402 characters)"
+    + (
+        " and moved the originals to the trash"
+        if a.get("trash_sources")
+        else " — the originals are untouched"
+    )
+    + ".",
     "set_cells": lambda a: f"set {len(a.get('updates') or [1]) } cell(s) in {_a(a, 'name')}"
     + (f" (sheet {a['sheet']})." if a.get("sheet") else "."),
     "mark_image": lambda a: f"drew 2 labeled boxes on {_a(a, 'image_name')} for {_a(a, 'find')}.",
@@ -481,6 +512,8 @@ REPLIES: dict[str, Any] = {
     "stt_status": "speech model ready (whisper-large-v3, on this Mac).",
     "retranscribe_file": lambda a: f"re-transcribing {_a(a, 'name', default='talk.mp4')} on this "
     "computer — running in the background.",
+    "read_recording": lambda a: f"started reading {_a(a, 'name', default='standup.m4a')} — "
+    "chapters, highlights and notes appear on it when the job finishes.",
     # --- scripts -----------------------------------------------------------
     "list_scripts": (
         "invoice.py — build the monthly invoice (needs: pandas)\n"

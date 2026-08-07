@@ -12,6 +12,7 @@ import {
 import { isCloudRoute, trustState } from "./markup";
 import ChatPane from "./ChatPane";
 import StudioShelf from "./StudioShelf";
+import PodcastPanel from "./PodcastPanel";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkArea } from "./types";
@@ -89,17 +90,26 @@ export default function AiPane({
         >
           <ActivityIcon size={14} />
           <span>Activity</span>
-          {(pendingApprovals > 0 || jobsRunning > 0) && (
+          {/* Two different things used to share one 6px dot in two different
+              colours, so "something needs your approval" and "work is running"
+              were told apart by hue alone. They are different SHAPES now — a
+              hand-circled count and a live dot — and the count says how many.
+              The tab's own aria-label still carries the words. */}
+          {pendingApprovals > 0 ? (
             <span
-              className={`tab-dot${pendingApprovals === 0 ? " busy" : ""}`}
+              className="nb-circled nb-sem-pending ap-tab-count"
               aria-hidden="true"
-              title={
-                pendingApprovals > 0
-                  ? "Something needs your approval"
-                  : "Background work is running"
-              }
+              title="Something needs your approval"
+            >
+              {pendingApprovals}
+            </span>
+          ) : jobsRunning > 0 ? (
+            <span
+              className="ap-tab-live"
+              aria-hidden="true"
+              title="Background work is running"
             />
-          )}
+          ) : null}
         </button>
         <div className="pane-actions">
           <button
@@ -195,17 +205,57 @@ function StudioView({
   const jobRunning = s.jobs.some(
     (j) => j.status === "running" || j.status === "queued",
   );
+  const working = s.summaryStarting || jobRunning;
+  // A podcast script's own panel takes over the top of this tab. It is the one
+  // thing you can make FROM this particular file, and burying it under the
+  // three generic "make something new" cards would put the least discoverable
+  // action furthest down.
+  if (s.openPodcast && scope) {
+    return (
+      <div className="studio-tab-view">
+        <p className="studio-intro">
+          Give this script voices and record it. Each host reads in their own
+          voice; the finished episode is saved back into the room.
+        </p>
+        <PodcastPanel fileId={scope} s={s} a={a} />
+      </div>
+    );
+  }
   return (
     <div className="studio-tab-view">
       <p className="studio-intro">
         Turn {scope ? "the open file" : "this room's sources"} into something
         useful. Outputs are saved back into the room.
       </p>
+      {/* AUDIT 262 named the step the host has always emitted; it only ever
+          reached Activity. On a local model a deck takes minutes, so the tab
+          you pressed Create on showed no sign of anything happening at all.
+          The word carries it, the pending marker only agrees. */}
+      {s.studioStep.text && (
+        <div className="studio-running" role="status">
+          <span className="nb-tape nb-sem-pending">Working</span>
+          {/* A cloud stage says room content is leaving this Mac, which is a
+              consequence, not an aside — so it drops the hand and takes the
+              caution note, exactly as the chat's route line does for the same
+              fact (see .chat-route / .chat-route-cloud in chat.css). The flag
+              comes from the event, never from matching the sentence. */}
+          <span
+            className={
+              s.studioStep.local ? "studio-running-step" : "studio-running-cloud"
+            }
+          >
+            {s.studioStep.text}
+          </span>
+        </div>
+      )}
       <StudioShelf scope={scope} s={s} a={a} />
       <div className="studio-section-title">Whole room</div>
+      {/* No category hue on this one, deliberately: the three cards above make
+          an artefact, this one is about the room itself, and the bare pencil
+          tile is the difference. */}
       <button
-        className="studio-row"
-        disabled={s.files.length === 0 || s.summaryStarting || jobRunning}
+        className="studio-row ap-sig-d"
+        disabled={s.files.length === 0 || working}
         title="Write a short overview of this room and what's inside — runs in the background"
         onClick={() => void a.startDeepSummary()}
       >
@@ -218,11 +268,13 @@ function StudioView({
             A cited overview of everything inside
           </span>
         </span>
-        <span className="studio-row-state">
-          {s.summaryStarting || jobRunning ? "Working…" : "Create"}
+        <span
+          className={`studio-row-state${working ? " is-working nb-tape nb-sem-pending" : ""}`}
+        >
+          {working ? "Working…" : "Create"}
         </span>
       </button>
-      <div className="studio-note">
+      <div className="studio-note nb-taped">
         <strong>Private by design.</strong> Studio uses only this room's
         content{isCloudRoute(s.model, s.ai) ? " — but the current engine is a cloud model, so prompts leave this Mac" : ", processed on this Mac"}.
       </div>
@@ -231,6 +283,32 @@ function StudioView({
 }
 
 /* ---------- Activity tab ---------- */
+
+/** A job's state as a WORD, plus the product-wide marker meaning that agrees
+ * with it. Activity is the surface a person audits background work from, so
+ * nothing here is signalled by hue alone: the tape carries the word, and the
+ * marker is the second, redundant cue. Blue is "active", yellow "pending or
+ * waiting on you", red "failed", green "complete" — the same five meanings
+ * the rest of the product uses, never repurposed locally. */
+const JOB_FLAG: Record<string, { word: string; mark: string }> = {
+  running: { word: "Running", mark: "nb-sem-linked" },
+  queued: { word: "Queued", mark: "nb-sem-pending" },
+  paused: { word: "Paused", mark: "nb-sem-pending" },
+  error: { word: "Failed", mark: "nb-sem-urgent" },
+  done: { word: "Done", mark: "nb-sem-done" },
+};
+
+/** A status this build has never heard of is reported as waiting rather than
+ * as anything more definite — the same direction `groupActivity` files it in. */
+function jobFlag(status: string): { word: string; mark: string } {
+  return JOB_FLAG[status] ?? { word: "Waiting", mark: "nb-sem-pending" };
+}
+
+/** One strip of tape naming a state. Contains no control, by design: History
+ * must render without a single button in it. */
+function StateTape({ word, mark }: { word: string; mark: string }) {
+  return <span className={`nb-tape ${mark} activity-flag`}>{word}</span>;
+}
 
 function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
   // A once-a-second tick so running cards' elapsed time advances. Armed only
@@ -284,7 +362,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
             <div key={r.id} className="activity-row">
               <div className="activity-row-head">
                 <span className="activity-row-title">Run script {r.name}?</span>
-                <span className="activity-state">Waiting</span>
+                <StateTape word="Waiting" mark="nb-sem-pending" />
               </div>
               <div className="activity-copy">
                 The consent card is open — approving is always your click, never
@@ -298,7 +376,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
                 <span className="activity-row-title">
                   {r.confirm ? `Delete ${r.tool} “${r.server}”?` : `Tool call: ${r.tool}`}
                 </span>
-                <span className="activity-state">Waiting</span>
+                <StateTape word="Waiting" mark="nb-sem-pending" />
               </div>
               <div className="activity-copy">
                 {r.confirm
@@ -313,7 +391,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
                 <span className="activity-row-title">
                   Type room information into a page?
                 </span>
-                <span className="activity-state">Waiting</span>
+                <StateTape word="Waiting" mark="nb-sem-pending" />
               </div>
               <div className="activity-copy">
                 The assistant wants to type something private into {r.field} —
@@ -325,7 +403,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
             <div key={r.id} className="activity-row">
               <div className="activity-row-head">
                 <span className="activity-row-title">Apply AI edits?</span>
-                <span className="activity-state">Diff ready</span>
+                <StateTape word="Diff ready" mark="nb-sem-pending" />
               </div>
               <div className="activity-copy">
                 Review the proposed change before anything is written.
@@ -341,7 +419,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
         {(running.length > 0 ||
           s.summaryStarting ||
           s.importProgress ||
-          s.studioStep ||
+          s.studioStep.text ||
           s.ocrFiles.length > 0 ||
           savingRec) && (
           <div className="activity-group-title">Running now</div>
@@ -356,7 +434,10 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
               <span className="activity-row-title">
                 Reading {s.ocrFiles.length === 1 ? "a scanned page" : `${s.ocrFiles.length} scanned pages`}
               </span>
+              <StateTape word="Running" mark="nb-sem-linked" />
             </div>
+            {/* Filenames, so the interface sans — the hand is for the aside,
+                never for a path or a name the user has to match by eye. */}
             <div className="activity-copy">{s.ocrFiles.join(", ")}</div>
             <div className="activity-progress">
               <span className="indeterminate" />
@@ -369,12 +450,21 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
             mind map sat on "Starting…" for the whole run — minutes, on a local
             model — and the step that says "your cloud AI is writing (content
             leaves this Mac)" never reached the person it is about. */}
-        {s.studioStep && (
+        {s.studioStep.text && (
           <div className="activity-row" role="status">
             <div className="activity-row-head">
               <span className="activity-row-title">Studio</span>
+              <StateTape word="Running" mark="nb-sem-linked" />
             </div>
-            <div className="activity-copy">{s.studioStep}</div>
+            <div
+              className={
+                s.studioStep.local
+                  ? "activity-copy ap-hand"
+                  : "activity-copy studio-running-cloud"
+              }
+            >
+              {s.studioStep.text}
+            </div>
             <div className="activity-progress">
               <span className="indeterminate" />
             </div>
@@ -387,6 +477,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
               <span className="activity-row-title">
                 Importing {s.importProgress.done + 1} of {s.importProgress.total}
               </span>
+              <StateTape word="Running" mark="nb-sem-linked" />
             </div>
             <div className="activity-copy">{s.importProgress.name}</div>
             <div className="activity-progress">
@@ -407,7 +498,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
             <div className="activity-row" role="status">
               <div className="activity-row-head">
                 <span className="activity-row-title">Room summary</span>
-                <span className="activity-state">Starting…</span>
+                <StateTape word="Starting…" mark="nb-sem-linked" />
               </div>
               <div className="activity-progress">
                 <span className="indeterminate" />
@@ -422,11 +513,12 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
           <div className="activity-row" role="status">
             <div className="activity-row-head">
               <span className="activity-row-title">Saving recording</span>
+              <StateTape word="Saving" mark="nb-sem-linked" />
               {s.recSave && (
                 <span className="activity-state">{elapsedOf(s.recSave.startedAt)}</span>
               )}
             </div>
-            <div className="activity-copy">
+            <div className="activity-copy ap-hand">
               {s.recSave?.stage === "writing"
                 ? "Audio saved — writing into the room…"
                 : s.recSave && s.recSave.remaining > 0
@@ -509,11 +601,14 @@ function HistoryRow({ j }: { j: WSState["jobs"][number] }) {
     <div className="activity-row history">
       <div className="activity-row-head">
         <span className="activity-row-title">{j.title}</span>
+        {/* `groupActivity` files only `done` here, so the tape is not guessing:
+            everything in the log finished. */}
+        <StateTape word="Done" mark="nb-sem-done" />
         <span className="activity-state">
           {Number.isNaN(when) ? "" : new Date(when).toLocaleString()}
         </span>
       </div>
-      <div className="activity-copy">
+      <div className="activity-copy ap-hand">
         Finished
         {j.total > 0 ? ` — ${Math.min(j.cursor, j.total)} of ${j.total} steps` : ""}
       </div>
@@ -558,6 +653,10 @@ function JobRow({
     <div className={`activity-row job ${j.status}`} role="status">
       <div className="activity-row-head">
         <span className="activity-row-title">{j.title}</span>
+        {/* The word first, the marker second. A queued job says "Queued", not
+            "Running", because the queue is a real state the row already
+            explains in its foot. */}
+        <StateTape {...jobFlag(queued ? "queued" : j.status)} />
         {running ? (
           <span className="activity-state">{elapsedOf(j.createdAt)}</span>
         ) : (
@@ -599,20 +698,33 @@ function JobRow({
             </div>
           );
         })()}
-      <div className="activity-progress">
-        <span
-          className={running && !live ? "indeterminate" : undefined}
-          style={
-            running && !live
-              ? undefined
-              : {
-                  width: `${Math.min(100, Math.round((done / total) * 100))}%`,
-                }
-          }
-        />
+      {/* A marker stroke and a written count, never one without the other: a
+          length and a colour on their own do not state a quantity, and an
+          indeterminate bar has no quantity to state — its label does the work
+          instead. */}
+      <div className="activity-meter">
+        <div className="activity-progress">
+          <span
+            className={running && !live ? "indeterminate" : undefined}
+            style={
+              running && !live
+                ? undefined
+                : {
+                    width: `${Math.min(100, Math.round((done / total) * 100))}%`,
+                  }
+            }
+          />
+        </div>
+        {!(running && !live) && (
+          <span className="activity-figure">
+            {Math.min(done, total)}/{total}
+          </span>
+        )}
       </div>
       <div className="activity-row-foot">
-        <span className="activity-copy">
+        <span
+          className={`activity-copy${j.status === "error" ? "" : " ap-hand"}`}
+        >
           {queued
             ? `Waiting — ${queuePos}${queuePos === 1 ? "st" : queuePos === 2 ? "nd" : queuePos === 3 ? "rd" : "th"} in line`
             : running

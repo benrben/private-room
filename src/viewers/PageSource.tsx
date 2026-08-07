@@ -56,11 +56,23 @@ function formatDate(raw: string | undefined): string | undefined {
   return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
 }
 
+/** The rows whose value is a DATE. Written in the hand, because a date
+ * pencilled beside a clipping is exactly what handwriting is reserved for —
+ * and because it separates "when" from "who" and "where" at a glance without
+ * a second colour or a divider. Derived from the label rather than added to
+ * `SourceFact`, so the pure function above stays a statement about the page's
+ * declarations and not about how they are drawn. */
+const DATE_ROWS = new Set(["Published", "Updated", "Saved"]);
+
 export default function PageSource({ meta }: { meta: PageMeta | null }) {
   const facts = sourceFacts(meta);
   if (facts.length === 0) return null;
   return (
-    <div className="page-source" role="note" aria-label="Where this page came from">
+    // `nb-clip` hooks the drawn paper clip over the corner (paper.css). It is
+    // a pseudo-element with pointer-events off, so it is inert and never
+    // reaches assistive technology — the card's own role and label carry all
+    // the meaning.
+    <div className="page-source nb-clip" role="note" aria-label="Where this page came from">
       {facts.map((f) => (
         <span className="page-source-fact" key={f.label}>
           <span className="page-source-label">{f.label}</span>
@@ -72,7 +84,9 @@ export default function PageSource({ meta }: { meta: PageMeta | null }) {
               {f.value}
             </span>
           ) : (
-            <span>{f.value}</span>
+            <span className={DATE_ROWS.has(f.label) ? "page-source-when" : undefined}>
+              {f.value}
+            </span>
           )}
         </span>
       ))}

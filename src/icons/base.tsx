@@ -3,9 +3,14 @@ import { IconProps } from "./types";
 
 /*
  * Brand icon set. One visual system: 24px grid, 1.6px rounded strokes,
- * currentColor so icons inherit text color (slate by default, violet on
- * hover/active via CSS). The violet accent is reserved for the logomark,
- * the AI spark and focal glows.
+ * currentColor so icons inherit text colour and an icon can never disagree
+ * with the label beside it.
+ *
+ * There is no violet in this interface. The old brand violet was removed
+ * everywhere; the accent is now the PINK PEN, and it means selection and
+ * active state — nothing else reaches for it. The logomark is theme ink at
+ * three opacity steps with one yellow marker nib (see ./icons/nav.tsx); the
+ * brand lilac and gold live only in src-tauri/icons and public/logo.svg.
  */
 
 export function Stroke({

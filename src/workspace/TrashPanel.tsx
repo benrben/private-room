@@ -80,6 +80,19 @@ export default function TrashPanel({
     );
   }
 
+  // The trash gets the same multi-selection as the library, over its own rows.
+  // Twenty files deleted by one agent errand is exactly the case where putting
+  // them back one at a time is the difference between undo being real and undo
+  // being theoretical.
+  const picked = shown.filter((f) => s.selectedTrashIds.has(f.id));
+  const toggle = (id: string) =>
+    s.setSelectedTrashIds((cur) => {
+      const next = new Set(cur);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
   return (
     <div className="library-scroll trash-list">
       <p className="trash-note">
@@ -89,8 +102,62 @@ export default function TrashPanel({
       {shown.length === 0 && (
         <p className="trash-empty">No deleted file matches that filter.</p>
       )}
+      {picked.length > 0 && (
+        <div className="selection-bar" role="toolbar" aria-label={`${picked.length} deleted files selected`}>
+          <span className="selection-count" role="status">
+            {picked.length} selected
+          </span>
+          <div className="selection-actions">
+            <button
+              className="chip-btn"
+              title={`Put ${picked.length} files back in the library`}
+              onClick={() => {
+                const ids = picked.map((f) => f.id);
+                s.setSelectedTrashIds(new Set());
+                void a.restoreFiles(ids);
+              }}
+            >
+              <UndoIcon size={13} /> Restore
+            </button>
+            {/* Its own confirm key and its own question: this one ends the
+                files, unlike the library's Remove which lands them here. */}
+            <DeleteControl
+              k="trash-destroy-selection"
+              trigger={<TrashIcon size={13} />}
+              question={`Delete ${picked.length} file${picked.length === 1 ? "" : "s"} for good? This cannot be undone.`}
+              title={`Delete ${picked.length} selected file${picked.length === 1 ? "" : "s"} for good`}
+              onConfirm={() => {
+                const ids = picked.map((f) => f.id);
+                s.setSelectedTrashIds(new Set());
+                void a.destroyFiles(ids);
+              }}
+              confirmDelete={s.confirmDelete}
+              askConfirm={a.askConfirm}
+              cancelConfirm={a.cancelConfirm}
+            />
+            <button
+              className="chip-btn"
+              title="Clear the selection"
+              aria-label="Clear the selection"
+              onClick={() => s.setSelectedTrashIds(new Set())}
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
       {shown.map((f) => (
-        <div className="trash-row" key={f.id}>
+        <div
+          className={`trash-row${s.selectedTrashIds.has(f.id) ? " is-picked" : ""}`}
+          key={f.id}
+        >
+          <input
+            type="checkbox"
+            className="trash-row-check"
+            checked={s.selectedTrashIds.has(f.id)}
+            aria-label={`Select ${displayName(f.name)}`}
+            onChange={() => toggle(f.id)}
+          />
           <div className="trash-row-main">
             <span className="trash-row-name" dir="auto" title={f.name}>
               {displayName(f.name)}

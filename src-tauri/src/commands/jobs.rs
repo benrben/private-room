@@ -39,6 +39,12 @@ pub use script_run::*;
 mod download;
 pub use download::*;
 
+// The "rec_read" job kind — the room reads a recording and writes its
+// chapters, highlights and notes. A simpler `file_pass`: windows of whole
+// speaker turns, and a reduce made of ordinary code rather than a model fold.
+mod rec_read;
+pub(crate) use rec_read::*;
+
 /// Where a step runs — decides how many may run at once. Local-model work is
 /// serial because only one model is resident; CPU and cloud work fan out.
 ///
@@ -979,6 +985,123 @@ fn spawn_studio(
     });
 }
 
+/// Record a podcast script as audio, in the background.
+///
+/// A background job rather than a foreground call because it CANNOT be a
+/// foreground call: every turn is at least one round-trip to the voice service,
+/// so a twenty-turn episode is minutes of work. As a job it gets the sidebar
+/// card, Stop, Resume and the auto-open the other long builds already have,
+/// and the user keeps working while it records.
+fn spawn_podcast_audio(
+    window: tauri::Window,
+    job_id: String,
+    room_path: String,
+    script_file_id: String,
+    cancel: Arc<AtomicBool>,
+) {
+    use tauri::Manager;
+    let app = window.app_handle().clone();
+    let (runner_window, runner_job, runner_room) =
+        (window.clone(), job_id.clone(), room_path.clone());
+    spawn_job_runner(runner_window, runner_job, runner_room, async move {
+        let state = app.state::<AppState>();
+        {
+            let guard = state.room.lock().unwrap();
+            if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+                let _ = db::set_job_status(&r.conn, &job_id, "running", None);
+            }
+        }
+        emit_progress(&window, &job_id, "Reading the script…", 0, 1);
+
+        let outcome: Result<FileMeta, Option<String>> = match crate::commands::render_podcast_audio(
+            &window,
+            &state,
+            &script_file_id,
+            cancel.clone(),
+            Some(&room_path),
+        )
+        .await
+        {
+            Ok(meta) => Ok(meta),
+            // Same convention as the studio runner: any error while the cancel
+            // flag is set is a clean Pause, not a failure to explain.
+            Err(_) if cancel.load(Ordering::SeqCst) => Err(None),
+            Err(e) => Err(Some(e)),
+        };
+
+        {
+            let guard = state.room.lock().unwrap();
+            if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
+                let (status, err) = match &outcome {
+                    Ok(_) => ("done", None),
+                    Err(None) => ("paused", None),
+                    Err(Some(e)) => ("error", Some(e.as_str())),
+                };
+                let _ = db::set_job_status(&r.conn, &job_id, status, err);
+            }
+        }
+        state.job_cancels.lock().unwrap().remove(&job_id);
+
+        use tauri::Emitter;
+        let payload = match outcome {
+            Ok(meta) => serde_json::json!({
+                "jobId": job_id, "label": "Episode ready",
+                "done": 1, "total": 1, "finished": true,
+                "fileId": meta.id,
+            }),
+            Err(None) => serde_json::json!({
+                "jobId": job_id, "label": "Paused", "done": 0, "total": 1, "paused": true,
+            }),
+            Err(Some(e)) => serde_json::json!({
+                "jobId": job_id, "label": format!("Stopped — {e}"), "done": 0, "total": 1,
+                "failed": true,
+            }),
+        };
+        let _ = window.emit("job-progress", payload);
+        queue::finish_and_pump(&app, &window, &job_id).await;
+    });
+}
+
+/// Start recording a podcast script. Returns the job id immediately.
+#[tauri::command]
+pub async fn start_podcast_audio_job(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    script_file_id: String,
+) -> Result<String, String> {
+    if state.rolling_back() {
+        return Err(ROLLBACK_BUSY.into());
+    }
+    let plan = serde_json::json!({ "scriptFileId": &script_file_id });
+    let (job_id, room_path) = state.with_room(|room| {
+        // Refuse EARLY, with the real reason. Discovering mid-job that the file
+        // has no turns costs the user a queue slot and a progress card for
+        // something that was never going to work.
+        let p = db::get_podcast(&room.conn, &script_file_id).ok_or(
+            "This file has no podcast script attached. Scripts made before voices \
+             existed have to be generated again before they can be recorded.",
+        )?;
+        if p.turns.is_empty() {
+            return Err("This script has no lines to read.".to_string());
+        }
+        if queue::at_capacity(&room.conn) {
+            return Err(queue::QUEUE_FULL.into());
+        }
+        let id = db::create_job(&room.conn, "podcast_audio", "Podcast episode", &plan, 1)?;
+        Ok((id, room.path.clone()))
+    })?;
+    if queue::try_reserve(state.inner(), &job_id) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        state
+            .job_cancels
+            .lock()
+            .unwrap()
+            .insert(job_id.clone(), cancel.clone());
+        spawn_podcast_audio(window, job_id.clone(), room_path, script_file_id, cancel);
+    }
+    Ok(job_id)
+}
+
 /// Enqueue a Studio generation as a background job and return its id immediately.
 /// The result arrives via `room-files-changed` + the terminal `job-progress`
 /// (which auto-opens the generated HTML). If the single job slot is busy the job
@@ -1053,7 +1176,7 @@ pub async fn resume_job(
     }
     if !matches!(
         job.kind.as_str(),
-        "deep_summary" | "file_pass" | "workflow" | "studio" | "download"
+        "deep_summary" | "file_pass" | "workflow" | "studio" | "download" | "podcast_audio"
     ) {
         return Err("This job can't be resumed.".into());
     }

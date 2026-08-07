@@ -1,32 +1,58 @@
-/* ---------- sidebar ---------- */
+/* ---------- sidebar chrome, and the modals that grew out of it ----------
 
+   What is left in this file is the library column's own furniture (its
+   container, the import strip, the folder-create input, the count badge, the
+   Trash tab) plus three surfaces that were written beside it and never moved:
+   the connector-approval card, the Add-link modal, and the whole-file-pass
+   mosaic in the AI pane.
+
+   The library column itself is a FRAME on the sheet — transparent, identified
+   by the drawn rule down its edge — while the two modals genuinely float and
+   are therefore the only opaque things here (paper.css section 9).
+
+   Nothing below names a colour, so both themes come from tokens and there is
+   no light-mode block at the end of this file. */
+
+/* The legacy standalone sidebar. Still queried by the agent driver
+   (agent/driver.ts maps ".pane-library, .sidebar" to "sidebar"), so it keeps
+   its name; the shell's own pane is what renders in the new layout. */
 .sidebar {
   width: 300px;
-  border-right: 1px solid var(--border-subtle);
-  background: var(--surface-1);
   display: flex;
   flex-direction: column;
   min-height: 0;
+  background: transparent;
+  background-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--line-soft) 4%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 1px 100%;
+  background-position: right top;
 }
 
-/* The one violet call-to-action in the sidebar toolbar. */
+/* The one pen-coloured call to action in the sidebar toolbar. */
 .add-btn {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  min-height: 24px;
   padding: 4px 11px 4px 8px;
-  font-size: 12px;
+  font-size: var(--fs-meta);
   font-weight: 600;
   color: var(--accent);
   background: var(--accent-ghost);
-  border: 1px solid rgba(139, 124, 246, 0.2);
-  border-radius: 7px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
   text-transform: none;
   letter-spacing: 0;
 }
 .add-btn:hover {
   background: var(--accent-soft);
-  border-color: rgba(139, 124, 246, 0.35);
+  border-color: var(--accent);
 }
 .add-btn svg {
   flex-shrink: 0;
@@ -39,35 +65,33 @@
   gap: 8px;
   margin: 4px 10px 2px;
   padding: 6px 9px;
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--accent, #8b7cf6) 10%, transparent);
-  font-size: 11.5px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-ghost);
+  font-size: var(--fs-micro);
   overflow: hidden;
 }
 .import-strip-count {
-  color: var(--accent, #8b7cf6);
+  color: var(--accent);
   font-weight: 600;
   flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
 }
 .import-strip-name {
-  color: var(--muted, #8b93a7);
+  color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-@keyframes job-sweep {
-  0% { margin-left: -40%; }
-  100% { margin-left: 100%; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .job-card-fill.indeterminate { animation-duration: 3s; }
-}
+
 /* ADD-32: the whole-file-pass mosaic. One cell per stretch of the file; each
    lights up in spectral order as its part is read, so a pass over a huge file
-   is literally watchable — a tapestry filling in, window by window. When every
-   part is read and the notes are being folded ("weaving"), the whole strip
-   breathes gently until the final document lands. */
+   is literally watchable — a tapestry filling in, window by window.
+
+   Exactly ONE thing here moves: the cell being read right now. That is a live
+   activity indicator, not ambience, and it is the same allowance a spinner
+   gets. The whole-strip "breathing" that used to mark the folding phase is
+   gone — a page that is always moving is the thing this system refuses — and
+   the phase is now drawn instead, as a pen ring around every finished cell. */
 .pass-mosaic {
   display: grid;
   grid-template-columns: repeat(24, 1fr);
@@ -77,32 +101,49 @@
 .pass-cell {
   aspect-ratio: 1;
   border-radius: 2px;
-  background: var(--surface-3);
-  transition: background 0.5s ease, box-shadow 0.5s ease;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
+  transition:
+    background-color var(--dur-slow) var(--ease-pen),
+    box-shadow var(--dur-slow) var(--ease-pen);
 }
 .pass-cell.on {
-  /* --h is set per cell (0→300): the file fills as a quiet rainbow. */
-  background: hsl(calc(var(--h, 0) * 1deg) 55% 55% / 0.85);
-  box-shadow: 0 0 4px hsl(calc(var(--h, 0) * 1deg) 55% 55% / 0.35);
+  /* --h is set per cell (0→300): the file fills as a quiet rainbow. Marker
+     ink, not a lit cell — desaturated, absorbed, and capped in lightness so
+     it never reads as neon. `calc()` inside hsl() is fine in WebKit; it is
+     only inside color-mix()'s PERCENTAGE that the engine refuses it. */
+  background-color: hsl(calc(var(--h, 0) * 1deg) 34% 58% / 0.7);
+  /* The pen drawn round the filled cell. Not decoration: this wash measures
+     under 2:1 against ivory paper, and a mosaic cell is meaningful non-text
+     that owes 3:1 — the --sketch ring is what pays it, in both themes, the
+     same way .nb-bar outlines a marker fill in paper.css. */
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sketch) 55%, transparent);
 }
 .pass-cell.now {
-  background: var(--accent);
+  background-color: var(--accent);
   animation: pass-now 1.1s ease-in-out infinite;
 }
+/* The floor is 0.6, not 0.35: the cell has to stay identifiable at the bottom
+   of the pulse, or the indicator disappears twice a second. */
 @keyframes pass-now {
-  0%, 100% { opacity: 0.35; }
+  0%, 100% { opacity: 0.6; }
   50% { opacity: 1; }
 }
+/* Folding: every read cell gets the pen drawn round it. Static, so the phase
+   is legible without anything on screen having to move. */
 .pass-mosaic.weaving .pass-cell.on {
-  animation: pass-weave 2.6s ease-in-out infinite;
-}
-@keyframes pass-weave {
-  0%, 100% { filter: saturate(0.75) brightness(0.95); }
-  50% { filter: saturate(1.25) brightness(1.12); }
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 @media (prefers-reduced-motion: reduce) {
-  .pass-cell.now { animation-duration: 3s; }
-  .pass-mosaic.weaving .pass-cell.on { animation: none; }
+  .pass-cell {
+    transition: none;
+  }
+  /* A real escape, not a slower loop: the cell being read stays at full
+     strength and stops flashing, which still tells you which one it is. */
+  .pass-cell.now {
+    animation: none;
+    opacity: 1;
+  }
 }
 
 /* SEC-1: sit above Settings (z-index 30) — it's a security prompt. */
@@ -110,14 +151,19 @@
   z-index: 40;
 }
 
-.mcp-approve {
+/* Written as `.settings.mcp-approve` (0,2,0), not a bare class. The element is
+   `<div class="settings mcp-approve">`, and shell.css — which loads LAST — sets
+   `.settings { width: min(720px, 94vw) }` at (0,1,0). A bare `.mcp-approve`
+   ties on specificity and loses the tie to load order, so this consent sheet
+   was silently rendering at the full Settings width instead of its own. */
+.settings.mcp-approve {
   width: min(520px, 92vw);
 }
 
 .mcp-approve-lead {
   margin: 10px 0 14px;
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
 }
 
 .mcp-approve-list {
@@ -127,23 +173,26 @@
 }
 
 .mcp-approve-server {
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius);
   padding: 10px 12px;
-  background: var(--panel-2);
+  background: transparent;
 }
 
 .mcp-approve-name {
   font-weight: 600;
-  font-size: 13px;
+  font-size: var(--fs-meta);
+  color: var(--text-strong);
   margin-bottom: 6px;
 }
 
+/* The exact command that will run. Mono, because it is a literal string a
+   person has to be able to read character by character before approving it. */
 .mcp-approve-cmd {
   display: block;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
   white-space: pre-wrap;
   word-break: break-all;
   line-height: 1.5;
@@ -153,8 +202,10 @@
   padding: 0 18px 18px;
 }
 
-/* ADD-12: compact add-link modal. */
-.add-link-modal {
+/* ADD-12: compact add-link modal. Same specificity note as `.mcp-approve`
+   above — it also wears `.settings`, so it has to out-specify shell.css to
+   keep its own width. */
+.settings.add-link-modal {
   width: min(460px, 92vw);
 }
 
@@ -171,23 +222,38 @@
   margin: 8px 0 4px;
 }
 
+/* These are radios, so their edges are control boundaries and are drawn in
+   --rule-strong, which is the 3:1 floor WCAG 1.4.11 asks for. */
 .yt-mode-opt {
+  position: relative;
   flex: 1;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 2px;
   padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--surface-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--rule-strong);
   background: transparent;
   cursor: pointer;
   text-align: left;
 }
 
+/* Chosen reads as CIRCLED — the pen on the edge, a wash inside, and a second
+   stroke offset outside it, as though the option had been ringed. That is a
+   shape change, so the choice is not carried by hue alone; `aria-checked` in
+   the markup carries it for the reader. */
 .yt-mode-opt.active {
-  border-color: var(--accent, #8b7cf6);
-  background: color-mix(in srgb, var(--accent, #8b7cf6) 10%, transparent);
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+}
+.yt-mode-opt.active::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
 }
 
 .yt-mode-opt:disabled {
@@ -196,22 +262,27 @@
 }
 
 .yt-mode-name {
-  font-size: 12.5px;
+  font-size: var(--fs-meta);
   font-weight: 600;
-  color: var(--text);
+  color: var(--text-strong);
 }
 
 .yt-mode-sub {
-  font-size: 11px;
-  color: var(--text-dim);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  line-height: var(--lh-body);
 }
 
+/* A tally beside a heading: an outlined capsule, drawn rather than filled, so
+   it never competes with the marker badges that actually mean something. */
 .count {
-  background: var(--surface-3);
-  color: var(--text-dim);
-  font-size: 10px;
-  border-radius: 10px;
-  padding: 1px 7px;
+  display: inline-block;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--line);
+  border-radius: 999px 999px 999px 999px / 12px 10px 12px 10px;
+  padding: 0 7px;
   margin-left: 4px;
 }
 
@@ -226,14 +297,15 @@
   width: 100%;
   box-sizing: border-box;
   margin: 4px 0 6px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   padding: 6px 8px;
 }
 
-
 /* ---------------------------------------------------------------- trash tab
    The Library pane's third tab. Rows are quieter than file rows on purpose:
-   this is not the room's content, it is a record of what left it. */
+   this is not the room's content, it is a record of what left it. Quieter
+   means a pencil frame and a lighter ink — never smaller than the floor, so
+   "quiet" never turns into "unreadable". */
 .trash-list {
   display: flex;
   flex-direction: column;
@@ -242,20 +314,35 @@
 .trash-note,
 .trash-empty {
   margin: 8px 6px;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--faint);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+  color: var(--muted);
 }
 .trash-row {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px 6px 6px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--line);
+  transition: background-color var(--dur-fast) var(--ease-pen);
 }
 .trash-row:hover {
-  background: var(--hover);
+  background-color: var(--hover);
+}
+/* Picked for a bulk Restore / Delete-for-good. Same drawn-frame idiom as the
+   library's .file-row.is-picked, so "in the set I am about to act on" looks the
+   same in both tabs — solved against --hover, which a picked row can also be. */
+.trash-row.is-picked {
+  background-color: color-mix(in srgb, var(--sem-linked-fill) 16%, transparent);
+  border-color: var(--sem-linked);
+}
+/* An explicit checkbox here rather than the library's click-gestures: these
+   rows have no "open" action to overload, so the plainest control is the right
+   one — and it is the affordance a destroy-for-good needs anyway. */
+.trash-row-check {
+  flex: none;
+  margin: 0 2px 0 0;
 }
 .trash-row-main {
   flex: 1;
@@ -265,15 +352,15 @@
   gap: 2px;
 }
 .trash-row-name {
-  font-size: 12px;
-  color: var(--text-dim);
+  font-size: var(--fs-meta);
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .trash-row-meta {
-  font-size: 10px;
-  color: var(--faint);
+  font-size: var(--fs-micro);
+  color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -284,20 +371,36 @@
   gap: 2px;
   flex: none;
 }
+/* The tapered pencil rule that separates the list from what it costs. */
 .trash-footer {
   margin: 12px 6px 8px;
   padding-top: 10px;
-  border-top: 1px solid var(--line);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
 }
 .trash-confirm {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-dim);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+  color: var(--text);
 }
 .trash-confirm-actions {
   display: flex;
   gap: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trash-row {
+    transition: none;
+  }
 }

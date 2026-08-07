@@ -11,7 +11,7 @@
 // ever finds out.
 //
 // So each check below is the same three questions, asked of every screen:
-//   1. did the place open (its tab is the current tab)?
+//   1. did the place open (the breadcrumb names it)?
 //   2. did anything crash into a boundary (`.crash-pane`)?
 //   3. did the pane draw actual content, or is it a blank rectangle?
 // Plus one the mock can now answer: did opening it reach a command nobody
@@ -20,9 +20,17 @@
 
 import { openApp, openFile } from "./helpers.mjs";
 
-/** `data-area` on the rail button -> the tab title `areaLabel()` gives it. */
+/** `data-area` on the rail button -> the breadcrumb `AREA_CRUMBS` gives it.
+ *
+ * Areas stopped being TABS in the notebook pass: the rail is the app's one
+ * primary navigation and the tab strip carries documents only, so "its tab is
+ * the current tab" is no longer a question with an answer. The breadcrumb is
+ * what names the place on screen now, so that is what this asserts. `home`
+ * reads "Home" there rather than the old tab's "Room home"; every other
+ * wording is unchanged. `find` is the area the same pass added. */
 const AREAS = [
-  ["home", "Room home"],
+  ["home", "Home"],
+  ["find", "Find"],
   ["map", "Room Map"],
   ["recordings", "Recordings"],
   ["workflows", "Workflows"],
@@ -68,25 +76,25 @@ async function paneDrewSomething(what) {
 }
 
 describe("every area opens and every viewer draws", () => {
-  for (const [area, tabTitle] of AREAS) {
-    it(`opens ${tabTitle}`, async () => {
+  for (const [area, crumb] of AREAS) {
+    it(`opens ${crumb}`, async () => {
       await openApp();
       const before = await unhandled();
 
       await (await $(`.rail-button[data-area="${area}"]`)).click();
-      const current = await $('.tab[aria-selected="true"] .tab-title');
-      await browser.waitUntil(async () => (await current.getText()) === tabTitle, {
+      const current = await $(".editor-breadcrumb .crumb-title");
+      await browser.waitUntil(async () => (await current.getText()) === crumb, {
         timeout: 10_000,
-        timeoutMsg: `the ${area} rail button did not bring up its tab`,
+        timeoutMsg: `the ${area} rail button did not bring up its page`,
       });
 
-      await paneDrewSomething(tabTitle);
+      await paneDrewSomething(crumb);
       // Give the pane's own loaders a beat to land before asking what they hit.
       await browser.pause(400);
       const added = (await unhandled()).filter((c) => !before.includes(c));
       if (added.length) {
         throw new Error(
-          `${tabTitle} called commands qa/qa-mock.js does not fake: ${added.join(", ")} — ` +
+          `${crumb} called commands qa/qa-mock.js does not fake: ${added.join(", ")} — ` +
             `the pane rendered from nothing, so this check is the only sign`,
         );
       }

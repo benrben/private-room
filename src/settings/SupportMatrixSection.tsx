@@ -57,7 +57,7 @@ export default function SupportMatrixSection() {
         it cannot drift out of date.
       </p>
       {error ? (
-        <p className="settings-hint warn-ic">
+        <p className="set-note set-note--flag nb-sem-pending">
           The support matrix could not be built: {error}
         </p>
       ) : !matrix ? (
@@ -115,33 +115,43 @@ export default function SupportMatrixSection() {
             privacy door is on.
           </p>
           {matrix.agentsKnown ? (
-            <div className="cap-matrix-scroll">
-              <table className="cap-matrix">
-                <thead>
-                  <tr>
-                    <th scope="col">Agent</th>
-                    {matrix.providers.map((p) => (
-                      <th scope="col" key={p.engine}>
-                        {p.label}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {matrix.agents.map((a) => (
-                    <tr key={a.id}>
-                      <th scope="row">{a.label}</th>
+            /* The per-agent grid is providers x agents — the single biggest
+               object in Settings, and it was pushing everything else off the
+               page. It is the DETAIL behind the "n of m" count in the table
+               above, so it folds behind a disclosure: the count answers "does
+               this engine lose anything?", and opening this answers "what?".
+               Nothing is removed — the whole grid stays in the DOM and in the
+               accessibility tree. */
+            <details className="set-more">
+              <summary>Which agents each provider can run</summary>
+              <div className="cap-matrix-scroll">
+                <table className="cap-matrix">
+                  <thead>
+                    <tr>
+                      <th scope="col">Agent</th>
                       {matrix.providers.map((p) => (
-                        <Cell
-                          key={p.engine}
-                          value={p.agents.includes(a.id) ? "yes" : "no"}
-                        />
+                        <th scope="col" key={p.engine}>
+                          {p.label}
+                        </th>
                       ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody>
+                    {matrix.agents.map((a) => (
+                      <tr key={a.id}>
+                        <th scope="row">{a.label}</th>
+                        {matrix.providers.map((p) => (
+                          <Cell
+                            key={p.engine}
+                            value={p.agents.includes(a.id) ? "yes" : "no"}
+                          />
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </details>
           ) : (
             <p className="settings-hint">
               The per-agent half needs the AI engine, which could not be reached

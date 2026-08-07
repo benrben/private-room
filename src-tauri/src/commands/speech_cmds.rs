@@ -84,11 +84,34 @@ pub async fn speak_text_neural(
     text: String,
     voice: Option<String>,
 ) -> Result<String, String> {
-    let trimmed = speak_precheck(&text)?;
-    let outbound = speakable_text(&state, &trimmed)?;
+    speak_one(&state, &text, voice, None, None).await
+}
+
+/// One sentence through the door and the service — the body both spoken-answer
+/// playback and the podcast panel's per-host Preview share.
+///
+/// `pub(crate)` and shared on purpose. The Preview button speaks a real line of
+/// the user's script in a chosen voice, which is the same outbound act as
+/// reading an answer aloud; giving it its own path would eventually give it its
+/// own (weaker) door, and the one place that must never happen is the seam
+/// where room text leaves the Mac.
+pub(crate) async fn speak_one(
+    state: &State<'_, AppState>,
+    text: &str,
+    voice: Option<String>,
+    rate: Option<String>,
+    pitch: Option<String>,
+) -> Result<String, String> {
+    let trimmed = speak_precheck(text)?;
+    let outbound = speakable_text(state, &trimmed)?;
     let mut body = serde_json::json!({ "text": outbound });
-    if let Some(v) = voice.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
-        body["voice"] = serde_json::Value::String(v);
+    // Each knob is only sent when the caller set it, so an unset one falls to
+    // the sidecar's product default rather than to an empty string the service
+    // would reject.
+    for (key, value) in [("voice", voice), ("rate", rate), ("pitch", pitch)] {
+        if let Some(v) = value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+            body[key] = serde_json::Value::String(v);
+        }
     }
     let resp = crate::sidecar::sidecar_json("/tts", &body)
         .await
@@ -106,14 +129,68 @@ pub async fn speak_text_neural(
 /// Preview, not us. Carries no room data. Offline with no sidecar-side
 /// cache surfaces as an Err the webview maps to "list couldn't load".
 #[tauri::command]
-pub async fn list_neural_voices() -> Result<serde_json::Value, String> {
+pub async fn list_neural_voices(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let resp = crate::sidecar::sidecar_json("/tts/voices", &serde_json::json!({}))
         .await
         .map_err(|e| e.error)?;
-    resp.get("voices")
+    let voices = resp
+        .get("voices")
         .filter(|v| v.is_array())
         .cloned()
-        .ok_or_else(|| "voice catalog returned no voices".to_string())
+        .ok_or_else(|| "voice catalog returned no voices".to_string())?;
+    remember_voice_ids(&state, &voices);
+    Ok(voices)
+}
+
+/// The room-setting key holding the ids of the last catalog we saw.
+pub(crate) const VOICE_CATALOG_KEY: &str = "voice_catalog_ids";
+/// How many ids to keep. A cast needs a handful of DISTINCT voices, not a
+/// roster — the live catalog is 300+, and the whole list in a settings row
+/// would be a kilobyte of string re-parsed on every podcast build.
+const VOICE_CATALOG_KEEP: usize = 24;
+
+/// Note the catalog's ids in the room, so a new podcast cast can be seeded with
+/// DISTINCT voices without a network round-trip inside the room lock.
+///
+/// Ids only — no gender, no locale, nothing about the user. Best-effort by
+/// design: this is a convenience for seeding, and a room with no cache simply
+/// gets hosts with the default voice, which the panel then lets them change.
+fn remember_voice_ids(state: &State<'_, AppState>, voices: &serde_json::Value) {
+    let ids: Vec<&str> = voices
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("id").and_then(|i| i.as_str()))
+        // Multilingual voices first: they read whatever language the script is
+        // in, so a Hebrew or Spanish episode is not silently cast in voices
+        // that can only pronounce English.
+        .filter(|id| id.contains("Multilingual"))
+        .chain(
+            voices
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.get("id").and_then(|i| i.as_str()))
+                .filter(|id| !id.contains("Multilingual")),
+        )
+        .take(VOICE_CATALOG_KEEP)
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let _ = state.with_room(|room| db::set_setting(&room.conn, VOICE_CATALOG_KEY, &ids.join(",")));
+}
+
+/// The ids [`remember_voice_ids`] last stored, in order. Empty when the room
+/// has never loaded the catalog.
+pub(crate) fn cached_voice_ids(conn: &Connection) -> Vec<String> {
+    db::get_setting(conn, VOICE_CATALOG_KEY)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]

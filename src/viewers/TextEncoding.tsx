@@ -144,8 +144,12 @@ function EncodingStrip({
   onPick: (name: string) => void;
 }) {
   if (error) {
+    // Its own class, not the lossy-reading one: "we could not check" is a
+    // failure (red across this product) and "we read it and got replacement
+    // characters" is something to review (yellow). They used to share a
+    // stylesheet rule and so said the same thing in the same colour.
     return (
-      <div className="encoding-strip encoding-warn" role="status">
+      <div className="encoding-strip encoding-error" role="status">
         This file's text encoding couldn't be checked ({error})
       </div>
     );

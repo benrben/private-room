@@ -735,6 +735,44 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
+    "description": "Join text files into ONE new file, in order. A mechanical join of their FULL contents — nothing summarized, no length limit — for combining notes/chapters/transcripts. To have the material rewritten or summarized instead, use start_file_pass. Example: {\"names\": [\"ch1.md\", \"ch2.md\"], \"into\": \"Book draft.md\"}",
+    "inputSchema": {
+      "properties": {
+        "headings": {
+          "description": "Head each part with its source file name (default true)",
+          "type": "boolean"
+        },
+        "into": {
+          "description": "Name for the new file (.md added if omitted)",
+          "type": "string"
+        },
+        "names": {
+          "description": "At least two files, in the order they should appear",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "trash_sources": {
+          "description": "Trash the originals afterwards (default false)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "names",
+        "into"
+      ],
+      "type": "object"
+    },
+    "name": "merge_files"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
     "description": "Move a file into a folder (created if it doesn't exist), or to the top level with an empty folder. Example: {\"name\": \"NVDA_Stock_Info.md\", \"folder\": \"stocks\"}",
     "inputSchema": {
       "properties": {
@@ -792,6 +830,63 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Tidy the room: move files into folders, rename them, add/remove folders — ALL IN ONE CALL. Use this, not repeated move_file/rename_file, whenever more than one file is involved. Folders are created on the way in. dry_run: true shows the user the plan first. To delete, use trash_files. Example: {\"files\": [{\"name\": \"q3.pdf\", \"folder\": \"Invoices\", \"new_name\": \"Q3 invoice\"}], \"remove_folders\": [\"Untitled\"]}",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "description": "Report the plan, change nothing (default false)",
+          "type": "boolean"
+        },
+        "files": {
+          "description": "Per file: folder to move it, new_name to rename it, or both.",
+          "items": {
+            "properties": {
+              "folder": {
+                "description": "Destination folder, created if missing; empty string = top level",
+                "type": "string"
+              },
+              "name": {
+                "description": "File name or part of it; \"Folder/file.md\" works as listed",
+                "type": "string"
+              },
+              "new_name": {
+                "description": "New name; extension kept if omitted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "make_folders": {
+          "description": "Folders to create even if empty",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "remove_folders": {
+          "description": "Folders to delete; their files survive at the top level",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "organize_files"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false,
       "readOnlyHint": true
@@ -810,6 +905,28 @@
       "type": "object"
     },
     "name": "read_mcp"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Read a recording and write its chapters, highlights and notes (decisions, action items, open questions) onto it. Needs an existing transcript; runs in the background.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "The recording's name in this room",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "read_recording"
   },
   {
     "annotations": {
@@ -1382,6 +1499,31 @@
       "type": "object"
     },
     "name": "test_workflow"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Move files to the room's trash. They leave the library and everything you can search, but the user can restore them from Library → Trash — you cannot destroy anything. Only when the user asked. Example: {\"names\": [\"old draft.md\"]}",
+    "inputSchema": {
+      "properties": {
+        "names": {
+          "description": "File names or parts of them",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "names"
+      ],
+      "type": "object"
+    },
+    "name": "trash_files"
   },
   {
     "annotations": {

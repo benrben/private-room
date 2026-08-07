@@ -126,7 +126,14 @@ export default function CloudPrivacySection() {
       </p>
 
       <label className="settings-label">Hide private details from cloud AI</label>
-      <div className="settings-toggle-row" data-agent-blocked="true">
+      {/* `set-consequence` lifts the sentence beside the switch to --fs-lead:
+          it is not a caption for the control, it is the statement of what this
+          room does with your data, and it was being set two rungs below the
+          paragraph that introduces it. */}
+      <div
+        className="settings-toggle-row set-consequence"
+        data-agent-blocked="true"
+      >
         <label className="switch">
           <input type="checkbox" checked={effectiveOn} onChange={toggleRoom} />
           <span className="switch-track" aria-hidden="true">
@@ -149,10 +156,15 @@ export default function CloudPrivacySection() {
         </p>
       )}
       {!effectiveOn && (
-        <p className="cpv-off-warning">
-          The door is open: questions, documents and tool results go to cloud
-          models with real names and details. Your stored blackouts are kept
-          and enforcement resumes the moment you switch back on.
+        /* The marker label is the sentence's OWN opening clause, moved onto a
+           strip of tape — not a word invented to decorate a warning. The
+           copy is unchanged, and the red edge plus the sentence itself mean
+           the state survives being read in greyscale. */
+        <p className="cpv-off-warning set-note set-note--flag set-note--lead nb-sem-urgent">
+          <span className="nb-tape set-note-tag">The door is open</span>:
+          questions, documents and tool results go to cloud models with real
+          names and details. Your stored blackouts are kept and enforcement
+          resumes the moment you switch back on.
         </p>
       )}
       {/* The switch above governs every seam this section describes EXCEPT the
@@ -163,7 +175,7 @@ export default function CloudPrivacySection() {
           notes read off `connectorArgsMasked`, the backend's own account of
           what that seam is doing, rather than restating the switch. */}
       {status && !effectiveOn && status.connectorArgsMasked && (
-        <p className="cpv-seam-note">
+        <p className="cpv-seam-note set-note set-note--flag nb-sem-pending">
           One exception, and this switch does not control it: a{" "}
           <b>remote connector</b> is still sent placeholders instead of the
           items below, even with the door open. If a connector lookup comes
@@ -172,7 +184,7 @@ export default function CloudPrivacySection() {
         </p>
       )}
       {status && status.entities.length > 0 && !status.connectorArgsMasked && (
-        <p className="cpv-seam-note">
+        <p className="cpv-seam-note set-note set-note--flag nb-sem-pending">
           {effectiveOn ? "Even with the door shut, one" : "One"} seam sends
           real values: a <b>remote connector</b> receives the items below as
           themselves, because Connectors → “Send remote connectors real values”
@@ -321,7 +333,11 @@ export default function CloudPrivacySection() {
       </div>
       {scan?.error && <div className="gate-error">{scan.error}</div>}
 
-      <p className="settings-hint cpv-honesty">
+      {/* The paragraph that admits what this feature cannot do. It used to be
+          dimmed with opacity — the one paragraph on the surface that should
+          never be the faintest. Quiet by position and by a pencil edge now,
+          at full legibility. */}
+      <p className="cpv-honesty set-note">
         Honest limits: hiding names can’t stop every inference from remaining
         context, and anything already sent to a cloud can’t be recalled.
         Images never go to cloud models while the door is on.

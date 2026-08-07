@@ -69,6 +69,23 @@ WRITE_TOOL_NAMES: tuple[str, ...] = (
     "add_memory",
 )
 
+#: The File agent's ORGANIZE box — tidying, deleting into the trash, merging.
+#: Mirrors ``commands::agent::organize_tools_specs`` on the Rust side; the host
+#: serves them only to the engine tiers (``include_organize_tools``), never to a
+#: merely consulted advisor, so a room whose main engine is an advisor simply
+#: never sees this box and the File agent degrades to its read/write CORE.
+#:
+#: NOT folded into ``WRITE_TOOL_NAMES``. Those are always-offered because the
+#: base system prompt teaches them by name every turn; these are boxed on one
+#: agent, and ``trash_files`` in particular must stay separately nameable — the
+#: lane label and the host log are how "what did the AI delete" stays
+#: answerable, and a verb hidden inside a general write set is not answerable.
+ORGANIZE_TOOL_NAMES: tuple[str, ...] = (
+    "organize_files",
+    "trash_files",
+    "merge_files",
+)
+
 #: Agent Skills are a distinct administrative surface. They are withheld until
 #: the user asks about a skill, so ordinary chat does not carry their CRUD,
 #: resource, or script schemas.
@@ -346,6 +363,7 @@ def lane_label(*, ui: bool, write: bool, web_enabled: bool, agent_id: str = "") 
 
 __all__ = [
     "WRITE_TOOL_NAMES",
+    "ORGANIZE_TOOL_NAMES",
     "SKILL_TOOL_NAMES",
     "MCP_MANAGEMENT_TOOL_NAMES",
     "UI_TOOL_NAMES",

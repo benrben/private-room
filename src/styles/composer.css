@@ -1,25 +1,73 @@
-/* ---------- composer ---------- */
+/* ---------- composer ----------
+   The bottom margin of the notebook: the strip of sheet the reader writes back
+   on. The transcript above it is the conversation; this is the pen.
 
+   Two rules shape everything below.
+
+   THE USER'S OWN TEXT IS NEVER HANDWRITTEN. The placeholder is in the hand,
+   because it is the notebook prompting; the value is in the interface sans the
+   instant there is one, because the person has to see exactly what they are
+   about to send — a path, a Unicode name, a snippet of code, a "1" that is not
+   an "l". The split is enforced structurally: `font-family` on the field and a
+   different one on `::placeholder`, so there is no state in which real text
+   could come out in Kalam. See the note on `.composer-input`.
+
+   NOTHING HERE ANIMATES ON CONTENT. This composer hosts live dictation and
+   repaints the box several times a second while someone is speaking; every
+   transition below is keyed to focus or hover, never to the value.
+
+   NOTE: this file also carries rules for four surfaces that are NOT the
+   composer — the audio/video viewer, the HTML runner, the agent strip and the
+   per-turn step chips — from before it was split up. They are left untouched
+   here; they belong to the panes that render them. */
+
+/* The writing strip is part of the same sheet, so it takes no fill of its own
+   and the dotted grid runs straight through it. What separates it from the
+   transcript is a pencil rule that thins at both ends — the `.nb-list` idiom,
+   drawn as a background gradient rather than a border so it can taper.
+   The old treatment was an opaque `--panel` scrim, which read as a second
+   surface butted against the page; nothing scrolls under the composer (the
+   message list is a sibling, not a layer), so there was never anything for it
+   to hide. */
 .composer {
   position: relative;
   flex: 0 0 auto;
-  background: linear-gradient(180deg, transparent, var(--panel) 24%);
-  padding: 8px max(10px, calc((100% - 720px) / 2)) 10px;
+  padding: var(--sp-2) max(10px, calc((100% - 720px) / 2)) var(--sp-3);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 4%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
 }
 
-/* Compact, calm one-line cloud status (was a heavy amber banner). */
+/* ----- cloud status -----
+   A strip of caution tape across the page: yellow is "notable, needs review"
+   product-wide, and the words carry the meaning so the colour only reinforces
+   them.
+
+   The label and the action are written in --ink, NOT in amber. A hue's own ink
+   on a wash of the same hue is the one combination this palette fails (see the
+   .nb-cat note in paper.css) — amber-on-amber measured under the floor, while
+   ink on the wash is 10.3:1 dark and 13.2:1 light. */
 .cloud-strip {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
-  padding: 5px 10px;
-  font-size: 11px;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--amber) 7%, transparent);
-  border: 1px solid color-mix(in srgb, var(--amber) 22%, transparent);
-  color: var(--warn);
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+  padding: 4px 10px;
+  font-size: var(--fs-micro);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--sem-pending-fill) 22%, transparent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sem-pending-fill) 46%, transparent);
+  border: 0;
+  border-radius: 2px 4px 2px 5px / 5px 2px 4px 2px;
 }
 .cloud-strip-label {
   display: inline-flex;
@@ -29,38 +77,205 @@
 .cloud-strip-label svg {
   flex-shrink: 0;
 }
+/* Was a bare underlined word ~14px tall — under the 24px minimum for anything
+   clickable. It keeps the underline (so the affordance is not colour) and
+   gains a real target. */
 .cloud-strip-action {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 6px;
   background: none;
-  border: none;
-  padding: 0;
-  color: var(--warn);
-  font-size: 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  font-size: var(--fs-micro);
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-underline-offset: 3px;
 }
 .cloud-strip-action:hover {
+  color: var(--ink-strong);
+  background: color-mix(in srgb, var(--sem-pending-fill) 26%, transparent);
   border-color: transparent;
-  color: var(--amber);
 }
 
-/* Floating composer card. */
+/* ----- reach badge -----
+   "This room can reach the internet" is information, not a warning, so it
+   takes the linked-blue tape rather than the caution one. Scoped to .composer
+   because two other stylesheets own a `.mcp-badge` of their own. */
+.composer .mcp-badge {
+  display: flex;
+  align-items: center;
+  margin-bottom: var(--sp-2);
+}
+.composer .mcp-badge .badge-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  font-size: var(--fs-micro);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--sem-linked-fill) 22%, transparent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sem-linked-fill) 46%, transparent);
+  border-radius: 2px 4px 2px 5px / 5px 2px 4px 2px;
+}
+.composer .mcp-badge svg {
+  flex-shrink: 0;
+}
+
+/* The nudge to attach an image the question already names. A pencilled aside
+   with the pen's ghost behind it, not a warning. */
+.composer .attach-nudge {
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-2);
+  padding: 5px 10px;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  background: var(--accent-ghost);
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+  border-radius: var(--radius-sm);
+}
+/* base.css gives a `.subtle` button 2px of vertical padding, which left this
+   one about 20px tall — under the floor for something clickable. */
+.composer .attach-nudge .subtle {
+  min-height: 24px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+}
+
+/* ==========================================================================
+   ATTACHMENTS — clippings taped onto the page
+   ========================================================================== */
+
+.composer .attach-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  /* Room for the tape strips, which hang above each chip's top edge. */
+  padding-top: 5px;
+  margin-bottom: var(--sp-2);
+}
+
+/* "Attached (2)" — the handwritten label plus the circled count, drawn with
+   paper.css's own `.nb-circled` rather than a second ring primitive. Marked
+   aria-hidden in the markup: the row itself is a group whose
+   accessible name already says how many files there are, and saying it twice
+   is worse than saying it once. */
+.composer .attach-row-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+/* Each attachment is a fragment of paper taped to the sheet: a paper fill so
+   it reads as a scrap rather than a UI pill, the pen's accent edge because an
+   attached file IS a chosen one, and a strip of tape across its top-left.
+
+   The tape is the `.nb-taped` recipe at chip scale — an 11% wash of --ink,
+   which is the one mix that reads as tape in BOTH themes without an override
+   (11% of ivory lightens charcoal, 11% of charcoal greys ivory, and real tape
+   does exactly that). The primitive itself is not reused because its strip is
+   58px wide, which is card scale and would cover half of a chip. */
+.composer .attach-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 16rem;
+  min-width: 0;
+  padding: 2px 3px 2px 9px;
+  font-size: var(--fs-micro);
+  color: var(--text);
+  background: color-mix(in srgb, var(--raised) 74%, transparent);
+  border: 1px solid var(--accent);
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+}
+.composer .attach-chip::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: 12px;
+  width: 26px;
+  height: 10px;
+  background: color-mix(in srgb, var(--ink) 11%, transparent);
+  box-shadow:
+    inset 1px 0 0 color-mix(in srgb, var(--ink) 7%, transparent),
+    inset -1px 0 0 color-mix(in srgb, var(--ink) 7%, transparent);
+  border-radius: 1px 2px 1px 2px;
+  transform: rotate(-4deg);
+  pointer-events: none;
+}
+.composer .attach-chip svg {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+/* The name truncates at the END with an ellipsis. It is `displayName`, which
+   drops the extension on purpose — the type icon to its left carries that, and
+   the FULL original filename is on the chip's title and inside the remove
+   button's accessible name — so ellipsising the tail can never cost the reader
+   the file's type. */
+.composer .attach-chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 24x24, which is the floor for anything clickable — it used to be a bare "×"
+   with 2px of padding. */
+.composer .attach-chip button {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 5px 4px 6px 4px / 4px 6px 4px 5px;
+  color: var(--muted);
+}
+.composer .attach-chip button:hover {
+  color: var(--sem-urgent);
+  background: color-mix(in srgb, var(--sem-urgent-fill) 18%, transparent);
+  border-color: transparent;
+}
+
+/* ==========================================================================
+   THE CARD, THE FIELD, THE CONTROLS
+   ========================================================================== */
+
+/* A frame drawn on the sheet, not a card floating over it: a translucent paper
+   wash (the `.nb-field` recipe) so the dots still come through, and the pen's
+   own stroke around it. The heavy drop shadow it used to carry claimed it was
+   hovering above the page, which in this system means "occludes something" —
+   and nothing passes underneath it. */
 .composer-card {
   position: relative;
   display: flex;
   flex-direction: column;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  padding: 8px 10px 6px;
-  box-shadow: 0 7px 22px var(--shadow);
-  transition: border-color 0.15s ease;
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius);
+  padding: var(--sp-2) var(--sp-3) 6px;
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
 }
+/* Focus is the spec's coloured double outline: the border goes to the pen, a
+   second hairline is drawn just inside it — the pen going round twice — and a
+   full-strength ring sits 2px outside. Exactly the `.nb-field:focus-within`
+   treatment, because that is what this is: a wrapper around a field. */
 .composer-card:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 75%, var(--line));
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent),
-    0 7px 22px var(--shadow);
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
+
 .composer-input {
   width: 100%;
   min-height: 58px;
@@ -69,51 +284,150 @@
   background: none;
   border: none;
   padding: 2px;
-  font-size: 13.5px;
-  line-height: 1.5;
+  /* THE MOST IMPORTANT RULE IN THIS FILE. What the user has typed is set in
+     the interface sans, always. They are about to send it, and they have to be
+     able to read back a path, a command, a mixed-script name or a digit that a
+     cursive face would blur. The hand appears only on the placeholder below —
+     which is a prompt from the notebook, not the person's own words — and
+     because the two live on different selectors there is no state, no length
+     and no content that can put real input into Kalam. */
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
   color: var(--text);
   outline: none;
 }
-.composer-input:focus {
+/* base.css gives every field a border AND an inset accent hairline on focus.
+   The card above already draws both, so the inner control drops its own — the
+   suppression is only safe because `:focus-within` on the card fires in
+   exactly the same state, so there is always precisely one focus indicator on
+   screen and never zero (the same guarantee paper.css documents for
+   `.nb-field`). Clearing the box-shadow closes a long-standing miss: the old
+   rule reset only the border, so a second accent hairline was being drawn
+   around the textarea inside the card's own. */
+.composer-input:focus,
+.composer-input:focus-visible {
   border: none;
+  box-shadow: none;
+  outline: none;
 }
+/* The notebook's own prompt, in the hand. Kalam sits smaller on the line than
+   Manrope at the same size, so it takes --fs-hand to match the field's optical
+   weight. --muted rather than --faint: handwriting is a thin face and the
+   prompt still has to be read (5.43:1 light / 5.70:1 dark worst case). */
+.composer-input::placeholder {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  color: var(--muted);
+  opacity: 1;
+}
+
+/* Wraps, and every group inside it wraps.
+   §24 asked the AI pane to give up width, and at its narrower default the four
+   controls (Attach / Action / Skill / Specialist) no longer fit on one line —
+   "Specialist" was being cut off mid-word at the pane edge, which makes a real
+   control unreachable rather than merely tight. Wrapping keeps every label,
+   every accessible name and every 26px target intact and simply takes a second
+   line when the pane is narrow. Shrinking or hiding the labels would have
+   bought the same space by making the controls harder to identify, which is
+   the wrong trade on the row that picks which agent answers you. */
 .composer-tools {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-top: 4px;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+  margin-top: var(--sp-1);
 }
 .composer-tools-left,
 .composer-tools-right {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
   gap: 6px;
 }
+
+/* ----- the attach / action / skill / specialist controls -----
+   Outlined chips in the `.nb-chip` idiom: a real --rule-strong boundary at
+   rest (3.13:1 dark / 3.24:1 light, the floor a control edge owes) and a
+   marker swash that wipes in from the left on hover. The swash is the
+   element's own background-image growing from 0% width, so the label can never
+   end up underneath it. */
 .tool-chip {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 5px 10px;
-  font-size: 12px;
-  color: var(--text-dim);
-  background: none;
-  border: 1px solid transparent;
-  border-radius: 7px;
+  min-height: 26px;
+  padding: 3px 10px;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  background-color: transparent;
+  background-image: linear-gradient(
+    98deg,
+    color-mix(in srgb, var(--accent-fill) 30%, transparent) 0%,
+    color-mix(in srgb, var(--accent-fill) 20%, transparent) 62%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  background-repeat: no-repeat;
+  background-position: left center;
+  background-size: 0% 100%;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 13px 11px 13px 11px;
+  transition:
+    background-size var(--dur) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    color var(--dur-fast) var(--ease-pen);
 }
-.tool-chip:hover {
+.tool-chip:hover:not(:disabled) {
   color: var(--text);
-  background: var(--surface-4);
-  border-color: transparent;
+  /* base.css puts --accent-ghost behind every hovered button; under the swash
+     it just muddies it, and the swash is the treatment here. */
+  background-color: transparent;
+  background-size: 100% 100%;
+  border-color: var(--sketch);
 }
 .tool-chip svg {
   flex-shrink: 0;
 }
+/* The sigil is a literal character the user is about to type, so it belongs in
+   the mono face rather than being bolded prose. */
 .tool-hash {
-  font-weight: 700;
-  color: var(--text-dim);
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--muted);
 }
-/* Violet square send button — icon only, no label. */
+.tool-chip:hover:not(:disabled) .tool-hash {
+  color: var(--text);
+}
+/* Chosen: the message currently opens with this chip's token, so the chip is
+   drawn circled — the pen's colour on the ring, a wash inside, and a second
+   offset stroke so it reads as gone-round-twice rather than merely tinted. The
+   shape is the signal; the colour only reinforces it. Nothing is announced
+   from here, and nothing needs to be: the token is sitting in the textarea in
+   plain text, which is where a screen reader is already reading it. */
+.tool-chip.is-on {
+  color: var(--text);
+  border-color: var(--accent);
+  background-size: 100% 100%;
+}
+.tool-chip.is-on .tool-hash {
+  color: var(--accent);
+}
+.tool-chip.is-on::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+/* ----- send -----
+   The spec's primary action: filled with ink — warm ivory on charcoal, 15.49:1
+   dark and 14.19:1 light — carrying the hand-drawn arrow from paper.css's
+   glyph set rather than a second icon system. */
 .send-btn {
   display: inline-flex;
   align-items: center;
@@ -121,32 +435,93 @@
   width: 34px;
   height: 34px;
   padding: 0;
-  border-radius: 9px;
-  background: var(--accent);
-  border: 1px solid var(--accent);
-  color: #fff;
+  border-radius: var(--radius);
+  background: var(--btn-ink);
+  border: 1px solid var(--btn-ink);
+  color: var(--btn-ink-text);
+}
+.send-btn .send-arrow {
+  --nb-ico-size: 17px;
+  transition: transform var(--dur-fast) var(--ease-pen);
 }
 .send-btn:hover:not(:disabled) {
-  background: #7d6ef0;
-  border-color: #7d6ef0;
+  background: color-mix(in srgb, var(--btn-ink) 86%, var(--accent));
+  border-color: color-mix(in srgb, var(--btn-ink) 86%, var(--accent));
+}
+/* The one movement in the control set: the arrow nudges forward, the way
+   `.nb-btn-go` does. */
+.send-btn:hover:not(:disabled) .send-arrow {
+  transform: translateX(2px);
 }
 .send-btn:disabled {
-  background: var(--surface-4);
-  border-color: transparent;
-  color: var(--text-faint);
+  background: transparent;
+  border-color: var(--line);
+  color: var(--faint);
 }
+/* Stop is destructive: a red outline going to a red wash, never a filled
+   saturated red, and the glyph changes to a square so the state is not
+   carried by colour. */
 .send-btn.stop {
   background: transparent;
-  border-color: var(--danger);
-  color: var(--danger);
+  border-color: var(--sem-urgent);
+  color: var(--sem-urgent);
 }
 .send-btn.stop:hover {
-  background: rgba(229, 100, 108, 0.12);
+  background: color-mix(in srgb, var(--sem-urgent-fill) 16%, transparent);
+  border-color: var(--sem-urgent);
+}
+
+/* ----- reduced motion -----
+   Every treatment above still HAPPENS — the swash still fills, the focus
+   outline still appears, the arrow still points — it just stops travelling.
+   base.css switches off the generic `button` transition, but the rules here
+   are more specific than the element selector it uses, so they need their own
+   escape rather than inheriting one. */
+@media (prefers-reduced-motion: reduce) {
+  .composer-card,
+  .tool-chip,
+  .send-btn .send-arrow {
+    transition: none;
+  }
+  .send-btn:hover:not(:disabled) .send-arrow {
+    transform: none;
+  }
+}
+
+/* ----- the autocomplete palette -----
+   The #, @, / and * menus. A menu genuinely floats — it has to occlude the
+   transcript behind it — so this is one of the few opaque surfaces in the
+   system, and it takes `.nb-float`'s exact recipe.
+
+   Scoped to .composer on purpose: `.ac-popover` is shared with the Studio and
+   AI-action modals, which belong to other stylesheets. The shared definition in
+   onboarding.css hardcodes an rgba() shadow that is wrong on ivory paper; this
+   corrects it for the composer's copy only. */
+.composer .ac-popover {
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+}
+.composer .ac-hint-row {
+  background: var(--raised);
+}
+/* The highlighted row is marked with a marker stroke down its leading edge as
+   well as the wash, so "which one will Enter run" is a shape and not only a
+   tint. `aria-selected` carries the same fact to assistive technology. */
+.composer .ac-item.active {
+  box-shadow: inset 3px 0 0 var(--accent-fill);
 }
 
 /* ===== Wave 3 (Workspace) additions ===== */
 
-/* ADD-8 — full-window drop highlight while dragging files over the app. */
+/* ADD-8 — dragging files anywhere over the window. The sheet is washed with
+   the pen's own ghost and a single note is laid on it: an opaque scrap (it
+   covers the whole app, so it has to occlude) inside a DASHED pen frame, which
+   is paper.css's idiom for a boundary that is provisional — a drop target is
+   exactly that. */
 .drop-overlay {
   position: fixed;
   inset: 0;
@@ -154,22 +529,27 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(139, 124, 246, 0.14);
-  backdrop-filter: blur(1px);
+  background: var(--accent-ghost);
   pointer-events: none;
 }
 .drop-overlay-inner {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
-  padding: 26px 40px;
+  gap: var(--sp-3);
+  padding: var(--sp-6) var(--sp-8);
   border: 2px dashed var(--accent);
-  border-radius: 16px;
-  background: var(--panel);
-  color: var(--accent);
-  font-size: 15px;
+  border-radius: var(--radius-lg);
+  background: var(--raised);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+  color: var(--text-strong);
+  font-size: var(--fs-lead);
   font-weight: 600;
+}
+.drop-overlay-inner svg {
+  color: var(--accent);
 }
 
 /* ADD-7 — Stop button while an answer streams. */
@@ -197,7 +577,7 @@
 .audio-view-media {
   width: 100%;
   flex-shrink: 0;
-  border-radius: 8px;
+  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
   outline: none;
 }
 video.audio-view-media {
@@ -251,7 +631,7 @@ video.audio-view-media {
   color: var(--text);
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
   padding: 4px 10px;
 }
 .video-tools .btn-ic:hover:not(:disabled) {
@@ -276,7 +656,7 @@ video.audio-view-media {
   color: var(--text);
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
   padding: 4px 10px;
 }
 .audio-retranscribe:hover:not(:disabled) {
@@ -315,7 +695,7 @@ video.audio-view-media {
   align-items: baseline;
   text-align: left;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
   padding: 4px 8px;
   background: none;
   color: var(--text);
@@ -388,29 +768,51 @@ video.audio-view-media {
   min-height: 0;
   width: 100%;
   border: 0;
-  background: #fff;
+  /* Paper, following the app's theme rather than a fixed white — this is the
+     frame, the document inside brings its own page. */
+  background: var(--raised);
 }
 
-/* ADD-18 — dictation mic in the composer. */
+/* ADD-18 — dictation mic in the composer.
+   Recording is the red ink, and it is marked with a SHAPE as well: a small
+   filled dot in the corner, the way a device shows it is live. Colour is never
+   the only carrier, and the button's own title and accessible name say
+   "Stop dictation" throughout.
+
+   The dot replaces a 1.4s infinite box-shadow pulse. Two reasons it had to go:
+   this system allows no constant movement, and the one thing that pulsed was
+   the control sitting beside a box being repainted several times a second by
+   the live transcript — the two fought each other for the reader's eye at
+   exactly the moment nothing should have been competing with the words.
+
+   ::before, not ::after: shell.css owns `.icon-btn[data-tip]::after` for
+   tooltips and loads after this file, so ::after is not this rule's to take. */
 .mic-btn {
   flex-shrink: 0;
+  /* `.icon-btn` already sets this, but the dot below depends on it and this
+     rule should not be relying on another stylesheet's ordering for that. */
+  position: relative;
 }
 .mic-btn.recording {
-  color: var(--danger);
-  border-color: var(--danger);
-  animation: mic-pulse 1.4s ease-in-out infinite;
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
 }
-.mic-btn.busy {
+.mic-btn.recording::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sem-urgent);
+  pointer-events: none;
+}
+/* Both waiting states read the same way — quieter, not gone. `preparing` had
+   no rule at all, so "Preparing the microphone…" looked identical to idle. */
+.mic-btn.busy,
+.mic-btn.preparing {
   opacity: 0.6;
-}
-@keyframes mic-pulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(224, 82, 82, 0.35);
-  }
-  50% {
-    box-shadow: 0 0 0 5px rgba(224, 82, 82, 0);
-  }
 }
 
 /* Dispatch-first agent visibility — the roster of domain agents handling the
@@ -429,9 +831,9 @@ video.audio-view-media {
   gap: 5px;
   font-size: 11px;
   font-weight: 500;
-  border-radius: 20px;
+  border-radius: 20px 18px 21px 19px / 19px 21px 18px 20px;
   padding: 2px 10px;
-  border: 1px solid var(--border);
+  border: 1.5px solid var(--sketch);
   color: var(--text-dim);
   background: var(--panel);
 }
@@ -441,9 +843,9 @@ video.audio-view-media {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 .agent-chip.done {
-  color: var(--ok, #3c9a5f);
-  border-color: color-mix(in srgb, var(--ok, #3c9a5f) 40%, transparent);
-  background: color-mix(in srgb, var(--ok, #3c9a5f) 8%, transparent);
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  background: color-mix(in srgb, var(--ok) 8%, transparent);
 }
 .agent-chip.pending {
   opacity: 0.75;
@@ -453,9 +855,9 @@ video.audio-view-media {
    with `.done` put a green chip over "nothing usable came back". Never colour
    alone — the glyph carries it too, as the diagram's nodes do. */
 .agent-chip.failed {
-  color: var(--danger, #c2453d);
-  border-color: color-mix(in srgb, var(--danger, #c2453d) 40%, transparent);
-  background: color-mix(in srgb, var(--danger, #c2453d) 8%, transparent);
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
 }
 /* The persisted roster on a finished message: quiet, informational. */
 .agent-strip.past {
@@ -514,26 +916,17 @@ video.audio-view-media {
   font-size: 11px;
   color: var(--text-dim);
   background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 20px;
+  border: 1.5px solid var(--sketch);
+  border-radius: 20px 18px 21px 19px / 19px 21px 18px 20px;
   padding: 2px 9px;
 }
 
-/* CHG-7 — source chips are clickable buttons; style them to read as links. */
-.source-chip {
-  cursor: pointer;
-  text-decoration: underline;
-  text-decoration-color: var(--border);
-  text-underline-offset: 2px;
-  transition: color 0.15s ease, border-color 0.15s ease,
-    background 0.15s ease, text-decoration-color 0.15s ease;
-}
-.source-chip:hover {
-  color: var(--text);
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  text-decoration-color: var(--accent);
-}
+/* CHG-7's `.source-chip` block used to live here. It has moved to chat.css
+   beside `.msg-sources .source-chip`, which is the only place the class is
+   rendered (ChatPane.tsx). Two files describing one chip meant chat.css's
+   citation rules quietly depended on this sheet for the underline and the
+   pointer, while this sheet's hover colours were dead — out-specified by
+   chat.css's (0,3,0) descendant rule. One owner now. */
 
 /* ADD-9 — inline chat rename input matches the chat select. */
 .chat-rename {

@@ -5,7 +5,17 @@ export function base64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
-export const BOX_COLORS = ["#8b7cf6", "#4cc38a", "#e3b341", "#e5646c", "#5ab8d4"];
+/* Annotation boxes drawn over a user's image. These are the notebook's five
+   markers in their fixed order, so a box on a photo belongs to the same colour
+   language as a highlight in a document. Read from the theme rather than fixed
+   hex: the old set was tuned for a dark UI and washed out on light paper. */
+export const BOX_COLORS = [
+  "var(--mk-pink-ink)",
+  "var(--mk-green-ink)",
+  "var(--mk-yellow-ink)",
+  "var(--mk-blue-ink)",
+  "var(--mk-red-ink)",
+];
 
 /** The prefix `run_ocr_job` stamps on recognised text so the model can flag
  * that the words are a machine reading rather than the file's own. See

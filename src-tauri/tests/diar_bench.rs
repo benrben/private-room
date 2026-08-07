@@ -220,6 +220,7 @@ fn bench_manifest() {
             &model(),
             &pcm,
             &arcelle_lib::recording::RecMeta::default(),
+            &[],
             |_, _| {},
             || false, // never stopped: the bench measures a full pass
         )
@@ -259,4 +260,110 @@ fn bench_manifest() {
         }
     }
     assert!(failures.is_empty(), "diarization regressed:\n  {}", failures.join("\n  "));
+}
+
+/// Cross-recording recognition, measured rather than assumed.
+///
+/// `KNOWN_SAME` decides whether a name from last week lands on the person
+/// talking now. Picking it by intuition would be picking how often the app
+/// puts a real person's name on somebody else's words — so this sweeps it and
+/// reports both error rates at every candidate bar:
+///
+/// * **false accept** — two DIFFERENT people whose saved centroids agree above
+///   the bar. The mistake that matters: nothing downstream catches it.
+/// * **false reject** — the SAME person, in two different recordings, failing
+///   to clear it. Costs a name, not the truth; they stay "Speaker N".
+///
+/// The manifest is the same `sid\twav\trttm` shape as [`bench_manifest`], and
+/// the identity of a row is its `sid` up to the first `-`: two rows of the
+/// same speaker recorded on different days share a prefix (`dana-monday`,
+/// `dana-thursday`). Rows are enrolled per RTTM speaker, so a meeting with
+/// ground truth gives one saved voice per participant.
+///
+///   PR_VOICEID_MANIFEST=…/voices.tsv
+///   PR_VOICEID_MAX_FALSE_ACCEPT=…      (percent, default 0)
+///   cargo test --release --test diar_bench -- --ignored --nocapture voice_id
+#[test]
+#[ignore = "acceptance benchmark; set PR_VOICEID_MANIFEST"]
+fn voice_id_threshold_sweep() {
+    use arcelle_lib::recording::diarize;
+    let manifest = std::env::var("PR_VOICEID_MANIFEST").expect("set PR_VOICEID_MANIFEST");
+    let max_fa: f64 = std::env::var("PR_VOICEID_MAX_FALSE_ACCEPT")
+        .ok()
+        .map(|v| v.parse().expect("PR_VOICEID_MAX_FALSE_ACCEPT"))
+        .unwrap_or(0.0);
+
+    // (person, take id, saved centroid) — one entry per person per recording,
+    // built exactly the way `set_speaker_name` builds one.
+    let mut takes: Vec<(String, String, diarize::VoicePrint)> = Vec::new();
+    for line in std::fs::read_to_string(&manifest).expect("read manifest").lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        let (sid, wav, rttm) = (f[0], f[1], f[2]);
+        let pcm =
+            arcelle_lib::stt::decode_to_pcm(Path::new(wav), arcelle_lib::stt::MediaKind::Audio)
+                .expect("decode audio");
+        // Ground-truth turns, so the sweep measures RECOGNITION and not the
+        // clusterer feeding it — a diarization miss would otherwise show up
+        // here as an identity error and hide behind this number.
+        let mut by_speaker: HashMap<String, Vec<diarize::VoicePrint>> = HashMap::new();
+        for (b, e, who) in parse_rttm(rttm) {
+            let (i0, i1) = ((b * 16000.0) as usize, ((e * 16000.0) as usize).min(pcm.len()));
+            if i1 <= i0 {
+                continue;
+            }
+            by_speaker.entry(who).or_default().push(diarize::embed(&pcm[i0..i1]));
+        }
+        for (who, prints) in by_speaker {
+            let refs: Vec<&diarize::VoicePrint> = prints.iter().collect();
+            let Some(print) = diarize::identity_print(&refs) else {
+                eprintln!("{sid}/{who}: too little speech to save a voice — skipped");
+                continue;
+            };
+            let person = format!("{}/{who}", sid.split('-').next().unwrap_or(sid));
+            takes.push((person, sid.to_string(), print));
+        }
+    }
+    assert!(takes.len() >= 2, "the manifest produced {} saved voices", takes.len());
+
+    // Every cross-RECORDING pair. Same take is not a measurement of anything.
+    let mut same: Vec<f64> = Vec::new();
+    let mut diff: Vec<f64> = Vec::new();
+    for i in 0..takes.len() {
+        for j in i + 1..takes.len() {
+            if takes[i].1 == takes[j].1 {
+                continue;
+            }
+            let Some(sim) = diarize::raw_similarity(&takes[i].2, &takes[j].2) else { continue };
+            let sim = sim as f64;
+            if takes[i].0 == takes[j].0 { &mut same } else { &mut diff }.push(sim);
+        }
+    }
+    eprintln!("cross-recording pairs: {} same-person, {} different", same.len(), diff.len());
+    assert!(!same.is_empty() && !diff.is_empty(), "the manifest has no cross-recording pairs");
+
+    let pct = |v: &[f64], f: &dyn Fn(f64) -> bool| {
+        100.0 * v.iter().filter(|x| f(**x)) .count() as f64 / v.len() as f64
+    };
+    eprintln!("  bar   false-accept   false-reject");
+    let mut at_shipped = None;
+    for step in 0..=20 {
+        let bar = 0.55 + 0.02 * step as f64;
+        let fa = pct(&diff, &|x| x >= bar);
+        let fr = pct(&same, &|x| x < bar);
+        let shipped = (bar - diarize::KNOWN_SAME as f64).abs() < 0.01;
+        eprintln!("  {bar:.2}   {fa:11.1}%   {fr:11.1}%{}", if shipped { "   <- shipped" } else { "" });
+        if shipped {
+            at_shipped = Some((fa, fr));
+        }
+    }
+    let (fa, fr) = at_shipped.expect("the shipped bar must fall inside the swept range");
+    eprintln!("shipped bar {:.2}: {fa:.1}% false accept, {fr:.1}% false reject", diarize::KNOWN_SAME);
+    assert!(
+        fa <= max_fa,
+        "{fa:.1}% of different-speaker pairs clear the shipped bar (ceiling {max_fa:.1}%) — \
+         the app would be putting real people's names on the wrong voices"
+    );
 }

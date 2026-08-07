@@ -38,6 +38,7 @@ from . import (
     handoff,
     llm,
     model_limits,
+    rec_read,
     vision,
     websearch,
     wf_nodes,
@@ -65,6 +66,7 @@ from .config import (
     RunRequest,
     AgentSupportRequest,
     SpecialistsRequest,
+    PodcastTtsRequest,
     TtsRequest,
     VisionLocateRequest,
     WarmRequest,
@@ -666,6 +668,39 @@ def create_app(
             )
         return {"audio_b64": tts_mod.wav_b64(wav)}
 
+    @app.post("/tts/podcast")
+    async def tts_podcast(req: PodcastTtsRequest) -> Any:
+        """A whole episode: many turns, each in its own voice, one WAV back.
+
+        Deliberately not "loop /tts N times from the host". The loudness pass
+        has to run over the finished mix (per-clip normalization makes every
+        speaker change a level jump), the gaps between turns are part of the
+        result, and the per-turn OFFSETS returned here are what let the caller
+        write a seekable ``[m:ss] Speaker: line`` transcript onto the room file.
+
+        Minutes of network work in one request. The host runs it as a
+        background job with its own Stop, so nothing here needs a timeout of
+        its own — a dropped caller ends the request the same way it ends a long
+        model call.
+        """
+        if not req.turns:
+            return JSONResponse(
+                {"code": "TTS_BAD_REQUEST", "error": "no turns"}, status_code=400
+            )
+        try:
+            wav, offsets, duration_ms = await tts_mod.synthesize_podcast(
+                [t.model_dump() for t in req.turns], req.gap_ms
+            )
+        except tts_mod.TtsError as exc:
+            return JSONResponse(
+                {"code": "TTS_UNAVAILABLE", "error": str(exc)}, status_code=502
+            )
+        return {
+            "audio_b64": tts_mod.wav_b64(wav),
+            "offsets_ms": offsets,
+            "duration_ms": duration_ms,
+        }
+
     @app.post("/tts/voices")
     async def tts_voices() -> Any:
         """The service's LIVE voice catalog, for the Settings picker.
@@ -844,6 +879,17 @@ def create_app(
                     provider=req.provider,
                 ),
             )
+        except llm.LlmError as exc:
+            return exc.response()
+
+    @app.post("/rec_read_map")
+    async def rec_read_map(req: rec_read.RecReadMapRequest, request: Request) -> Any:
+        # One window of a meeting, read into findings. The model answers with the
+        # NUMBER of the line each finding came from — never a time — and Rust drops
+        # any number that is not a real turn, so a hallucinated moment cannot reach
+        # the transcript.
+        try:
+            return await until_hangup(request, rec_read.read_window(req))
         except llm.LlmError as exc:
             return exc.response()
 

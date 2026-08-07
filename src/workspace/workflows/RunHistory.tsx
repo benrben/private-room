@@ -137,7 +137,7 @@ function StepRow({ index, raw, fallback }: { index: number; raw: string; fallbac
         {kind && <span className="run-step-kind">{kind}</span>}
         {step.branch && <span className="wf-badge">branch: {step.branch}</span>}
         <span className={`wf-badge ${step.skipped ? "" : "dot-ok"}`}>{statusLabel}</span>
-        <span style={{ flex: 1 }} />
+        <span className="run-step-spacer" />
         {step.result.trim() && (
           <button className="subtle run-step-copy btn-ic" onClick={() => void copy()} title="Copy this step's output">
             {copied ? (<><CircleCheckIcon size={12} /> Copied</>) : "Copy"}
@@ -176,7 +176,7 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
   }
 
   if (runs.length === 0) {
-    return <div className="caption">No runs yet.</div>;
+    return <div className="caption run-history-empty">No runs yet.</div>;
   }
 
   // Collapse a LEADING streak of identical failures (newest-first) into one
@@ -196,7 +196,11 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
   const shown = collapsed ? [runs[0], ...runs.slice(lead)] : runs;
 
   return (
-    <div className="run-history">
+    // A ruled timeline: one dashed pencil thread down the gutter (.nb-connect,
+    // which spans the container's own box and so needs nothing measured), a
+    // drawn node per run, and mono timestamps that line up column-wise because
+    // reading a run history means comparing times.
+    <div className="run-history nb-connect">
       {shown.map((r, idx) => {
         const expanded = openRun === r.id;
         // `undefined` = the artifacts are still being fetched. Treating that as
@@ -213,9 +217,12 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
             >
               <span className={`wf-badge ${runDotClass(r.status)}`}>{r.status}</span>
               <span className="run-row-trigger">{r.trigger}</span>
-              <span style={{ flex: 1 }}>{fmt(r.startedAt)}</span>
-              {r.error && <span style={{ color: "#b33" }}>{r.error}</span>}
-              <span aria-hidden style={{ opacity: 0.5 }}>{expanded ? "▾" : "▸"}</span>
+              <span className="run-row-when">{fmt(r.startedAt)}</span>
+              {/* Was an inline #b33 — the one hardcoded colour on this surface,
+                  which meant the failure text was the same red on ivory as on
+                  charcoal and answered to neither theme. */}
+              {r.error && <span className="run-row-err">{r.error}</span>}
+              <span aria-hidden className="run-row-caret">{expanded ? "▾" : "▸"}</span>
             </button>
             {idx === 0 && collapsed > 0 && (
               <div className="run-step caption">

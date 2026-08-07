@@ -7,6 +7,7 @@ import ModelSection from "./settings/ModelSection";
 import BehaviorSection from "./settings/BehaviorSection";
 import VoiceSection from "./settings/VoiceSection";
 import MicSection from "./settings/MicSection";
+import SavedVoicesSection from "./settings/SavedVoicesSection";
 import CloudPrivacySection from "./settings/CloudPrivacySection";
 import PrivacySection from "./settings/PrivacySection";
 import CheckpointsSection from "./settings/CheckpointsSection";
@@ -58,7 +59,7 @@ const SETTINGS_GROUPS: { key: string; label: string; sections: string[] }[] = [
   {
     key: "voice",
     label: "Voice",
-    sections: ["set-voice", "set-mic"],
+    sections: ["set-voice", "set-mic", "set-voice-ids"],
   },
   {
     key: "privacy",
@@ -294,6 +295,17 @@ export default function Settings({
   const unsaved =
     tuningDirty || voiceSettings.voiceDirty || webDirty || closetDirty;
   unsavedRef.current = unsaved;
+  // …and WHICH page is holding it, so the index can say so. This is a display
+  // of the four dirty flags above, not a fifth source of truth: only sections
+  // with a real deferred Save appear here. Everything else on this surface
+  // applies the moment you change it, and flagging those as "unsaved" would be
+  // a lie. Custom instructions + creativity live on AI & behavior; the voice
+  // choice on Voice; the internet switch and the remote-AI address both on
+  // Connections.
+  const dirtyPages = new Set<string>();
+  if (tuningDirty) dirtyPages.add("ai");
+  if (voiceSettings.voiceDirty) dirtyPages.add("voice");
+  if (webDirty || closetDirty) dirtyPages.add("connections");
   // A section that got saved while the warning was up leaves nothing to warn
   // about — drop the strip rather than make the user dismiss a stale question.
   if (confirmClose && !unsaved) setConfirmClose(false);
@@ -302,8 +314,12 @@ export default function Settings({
     // ADD-25: consent surface — the agent UI driver must never see or operate
     // Settings (web/cloud/advisor/room-server switches, password, Touch ID).
     <div className="settings-backdrop" data-agent-blocked onClick={requestClose}>
+      {/* `settings-sheet` is the real Settings modal, as opposed to the two
+          smaller sheets in workspace/SettingsModals.tsx that reuse the same
+          `.settings*` chrome. Everything that would be wrong at 460px — the
+          width, the index, the group frames — is scoped to it. */}
       <div
-        className="settings"
+        className="settings settings-sheet"
         ref={modalRef}
         role="dialog"
         aria-modal="true"
@@ -313,7 +329,9 @@ export default function Settings({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="settings-head">
-          <span id="settings-title">Settings</span>
+          <span id="settings-title" className="settings-head-title">
+            Settings
+          </span>
           <button
             className="subtle btn-ic"
             aria-label="Close settings"
@@ -325,6 +343,7 @@ export default function Settings({
         </div>
         {confirmClose && (
           <div className="settings-unsaved" role="alert">
+            <AlertIcon size={16} />
             <span>
               Some changes on this page haven't been saved yet — closing now
               would discard them.
@@ -349,7 +368,16 @@ export default function Settings({
                 aria-current={activeGroup === g.key ? "page" : undefined}
                 onClick={() => setActiveGroup(g.key)}
               >
-                {g.label}
+                <span className="settings-nav-label">{g.label}</span>
+                {/* The flag is a WORD on a marker strip, not a coloured dot:
+                    it has to be readable in greyscale and it has to reach a
+                    screen reader, which it does by joining the button's own
+                    accessible name ("Voice, Unsaved"). */}
+                {dirtyPages.has(g.key) && (
+                  <span className="nb-tape nb-sem-pending settings-nav-flag">
+                    Unsaved
+                  </span>
+                )}
               </button>
             ))}
           </nav>
@@ -440,6 +468,7 @@ export default function Settings({
             <div className="settings-page" hidden={activeGroup !== "voice"}>
               <VoiceSection {...voiceSettings} />
               <MicSection />
+              <SavedVoicesSection />
             </div>
 
             <div className="settings-page" hidden={activeGroup !== "privacy"}>

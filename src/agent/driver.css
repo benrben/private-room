@@ -1,10 +1,21 @@
 /* ADD-25: agent-driver visuals — Set-of-Marks badges over the snapshot's
    numbered elements, plus the ghost-cursor ring flashed on whatever the agent
    touches. These exist so the user always SEES what the local model is looking
-   at / acting on. Deliberately theme-agnostic (dark pill + rgba borders) so
-   the same rules read fine in light and dark without pulling in theme vars.
+   at / acting on.
+
+   THE ONE SURFACE IN THE PRODUCT THAT DOES NOT FOLLOW THE THEME. A badge here
+   is drawn over an arbitrary screenshot of the app — a white PDF page, a dark
+   code editor, a photo — so it cannot borrow the paper and ink tokens the way
+   everything else does: whichever theme it picked would be invisible over half
+   of what it labels. It is therefore a fixed dark pill with a light rule around
+   it, legible on anything, and that is deliberate rather than an oversight.
+   The two things it DOES take from the system are the bundled mono face (so a
+   numbered mark has tabular figures and "1" and "11" sit on the same grid) and
+   the hand-drawn corner.
+
    z-index sits above every app overlay — the badges must never hide behind a
-   modal the agent can see. */
+   modal the agent can see. Everything here is pointer-events:none, so none of
+   it is hit-testable and none of it can swallow the click it is announcing. */
 
 .agent-som-layer {
   position: fixed;
@@ -19,37 +30,51 @@
   height: 18px;
   padding: 0 5px;
   box-sizing: border-box;
-  border-radius: 9px;
-  background: rgba(22, 22, 27, 0.9);
-  color: #fff;
+  border-radius: 9px 7px 10px 8px / 8px 10px 7px 9px;
+  background: rgba(20, 21, 14, 0.92);
+  color: #f0eee5;
   border: 1px solid rgba(255, 255, 255, 0.55);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
-  font-family: -apple-system, system-ui, sans-serif;
+  font-family: var(--mono);
   font-size: 11px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   line-height: 16px;
   text-align: center;
 }
 
-/* Flashed at the acted-on element's rect for ~700ms; pointer-events none so
-   it can never swallow the very click it is announcing. */
+/* Flashed at the acted-on element's rect for ~700ms, then removed by the
+   driver. Blue is "active / linked" product-wide, which is exactly what this
+   mark claims: something is happening HERE, right now. */
 .agent-ghost-ring {
   position: fixed;
   pointer-events: none;
   z-index: 2147483000;
-  border-radius: 6px;
-  animation: agent-ghost-pulse 0.7s ease-out forwards;
+  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  animation: agent-ghost-pulse 0.7s var(--ease-pen) forwards;
 }
 
 @keyframes agent-ghost-pulse {
   0% {
     box-shadow:
-      0 0 0 2px rgba(88, 156, 255, 0.95),
-      0 0 0 6px rgba(88, 156, 255, 0.35);
+      0 0 0 2px color-mix(in srgb, var(--sem-linked-fill) 95%, transparent),
+      0 0 0 6px color-mix(in srgb, var(--sem-linked-fill) 35%, transparent);
   }
   100% {
     box-shadow:
-      0 0 0 2px rgba(88, 156, 255, 0),
-      0 0 0 14px rgba(88, 156, 255, 0);
+      0 0 0 2px color-mix(in srgb, var(--sem-linked-fill) 0%, transparent),
+      0 0 0 14px color-mix(in srgb, var(--sem-linked-fill) 0%, transparent);
+  }
+}
+
+/* Reduced motion: the ring still has to be SEEN — it is the only report the
+   user gets that the agent is about to act on this element — so it holds a
+   static outline for its 700ms life instead of expanding. The driver removes
+   the node either way, so nothing lingers. */
+@media (prefers-reduced-motion: reduce) {
+  .agent-ghost-ring {
+    animation: none;
+    box-shadow: 0 0 0 2px
+      color-mix(in srgb, var(--sem-linked-fill) 95%, transparent);
   }
 }

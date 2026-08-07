@@ -853,7 +853,11 @@ pub fn update_file_content(
 /// it must be stopped first, or the engine keeps flushing into a row that is
 /// leaving the library. The stop is NOT awaited — its final flush would only
 /// recreate nothing; dropping the session is what matters.
-fn stop_recording_into(rec: &super::RecState, id: &str) {
+///
+/// `pub(crate)` for `commands::bulk`: a multi-file trash owes each of its ids
+/// exactly what the single-file one does, and re-implementing that check beside
+/// it is how the two paths would eventually disagree.
+pub(crate) fn stop_recording_into(rec: &super::RecState, id: &str) {
     let mut session = rec.session.lock().unwrap();
     if session.as_ref().map(|l| l.file_id == id).unwrap_or(false) {
         if let Some(live) = session.take() {

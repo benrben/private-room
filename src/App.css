@@ -1,9 +1,17 @@
 /* App.css — barrel of section stylesheets.
-   tokens.css loads first (the palette + legacy aliases both themes swap on);
-   shell.css loads last (the new full-window frame wins migration ties).
+   fonts.css loads first so the three bundled faces are declared before any
+   rule asks for them; tokens.css follows (the palette + legacy aliases both themes swap on);
+   base.css sets the element defaults; paper.css lays down the sheet and the
+   notebook primitives every section file composes from — it must follow
+   base.css, which sets `body`'s background, so the grid is not reset away.
+   shell.css loads last (the full-window frame wins migration ties).
+   Everything between paper.css and shell.css is a feature sheet; order within
+   that band carries no meaning, so add new ones at the end of it.
    Edit the section files under ./styles/ rather than adding rules here. */
+@import "./styles/fonts.css";
 @import "./styles/tokens.css";
 @import "./styles/base.css";
+@import "./styles/paper.css";
 @import "./styles/gate.css";
 @import "./styles/workspace.css";
 @import "./styles/sidebar.css";
@@ -13,6 +21,7 @@
 @import "./styles/viewer-formats.css";
 @import "./styles/chat.css";
 @import "./styles/composer.css";
+@import "./styles/aiPane.css";
 @import "./styles/tokenBudget.css";
 @import "./styles/agentGraph.css";
 @import "./styles/onboarding.css";
@@ -27,4 +36,5 @@
 @import "./styles/scripts.css";
 @import "./styles/skills.css";
 @import "./styles/marketplace.css";
+@import "./styles/find.css";
 @import "./styles/shell.css";

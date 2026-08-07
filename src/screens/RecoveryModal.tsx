@@ -41,18 +41,11 @@ export function RecoveryModal({
   const { modalRef, onModalKeyDown } = useFocusTrap(() => void skip());
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0, 0, 0, 0.6)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 24,
-        zIndex: 100,
-      }}
-    >
+    /* The one genuinely floating surface on the gate, so the one thing that
+       is allowed to be opaque: it has to occlude the code shown behind it.
+       The veil and the sheet's lift live in gate.css; `.recovery-sheet`
+       itself is shared with Settings and styled in misc-moonshot-cards.css. */
+    <div className="gate-backdrop">
       <div
         ref={modalRef}
         tabIndex={-1}
@@ -60,17 +53,11 @@ export function RecoveryModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="recovery-modal-title"
-        style={{ width: "min(420px, 100%)" }}
+        className="gate-backdrop-panel"
       >
-        <div className="recovery-sheet">
+        <div className="recovery-sheet nb-float nb-float-draw">
           <div className="recovery-sheet-title" id="recovery-modal-title">
-            <span
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-              }}
-            >
+            <span className="gate-sheet-title">
               <RecoveryKeyIcon size={18} /> Your recovery code
             </span>
           </div>

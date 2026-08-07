@@ -60,6 +60,10 @@ pub(crate) fn flashcards_spec() -> StudioSpec {
         fallback_temp: 0.3,
         render: fallback_flashcards,
         filename_prefix: "Flashcards",
+        // HTML-authoring stays primary here: this artifact is a PAGE, and
+        // nothing downstream needs to read its parts back as data.
+        structured_first: false,
+        after_save: None,
     }
 }
 
@@ -97,8 +101,17 @@ pub(crate) fn render_flashcards_html(title: &str, cards: &[StudioCard]) -> Strin
             } else {
                 format!("<p class=\"hint\">Hint: {}</p>", html_escape(&c.hint))
             };
+            // The checkbox is off-screen but NOT `hidden`. `hidden` is
+            // display:none, which takes it out of the tab order as well as off
+            // the screen — the deck was mouse-only, with no way to flip a card
+            // from the keyboard and nothing for a screen reader to operate. It
+            // is the same CSS-only flip either way; only its reachability
+            // changes. The label wraps both faces, so the control's accessible
+            // name still reads the whole card, which is what a static page
+            // with no script can honestly offer: nothing here was ever hidden
+            // from assistive technology, only rotated away from the eye.
             out.push_str(&format!(
-                "<label class=\"card\"><input type=\"checkbox\" hidden>\
+                "<label class=\"card\"><input type=\"checkbox\" class=\"flip\">\
                  <span class=\"inner\">\
                  <span class=\"face front\"><span class=\"tag\">Q{}</span>\
                  <span class=\"txt\">{}</span>{}</span>\
@@ -120,6 +133,10 @@ pub(crate) fn render_flashcards_html(title: &str, cards: &[StudioCard]) -> Strin
     fill_template(
         FLASHCARDS_TEMPLATE,
         &[
+            // The notebook's palette, type and paper, spliced in from the one
+            // copy in docs_html.rs rather than restated here — see NOTEBOOK_CSS
+            // for why a standalone page has to inline it at all.
+            ("__NOTEBOOK__", NOTEBOOK_CSS),
             ("__TITLE__", &html_escape(title)),
             ("__COUNT__", &count),
             ("__CARDS__", &cards_html),
@@ -134,27 +151,44 @@ pub(crate) const FLASHCARDS_TEMPLATE: &str = r####"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__ — Flashcards</title>
 <style>
-:root{color-scheme:light dark;--bg:#f6f7f9;--surface:#fff;--surface-2:#eef0f4;--fg:#191b1f;--muted:#63697a;--accent:#6d5cf0;--accent-2:#8b7cf6;--border:#e6e7ee;--radius:16px}
-@media (prefers-color-scheme:dark){:root{--bg:#0e1014;--surface:#161a22;--surface-2:#1c212c;--fg:#e8eaf0;--muted:#8b93a7;--accent:#8b7cf6;--accent-2:#a99df8;--border:#232a37}}
-*{box-sizing:border-box}
-html,body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif}
-.wrap{max-width:52rem;margin:0 auto;padding:2.5rem 1.25rem}
-.eyebrow{font-size:.72rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)}
-h1{font-size:1.9rem;margin:.25rem 0 .25rem;letter-spacing:-.02em}
-.sub{color:var(--muted);font-size:.9rem;margin:0 0 1.5rem}
+__NOTEBOOK__
+/* ---- the deck: index cards laid on the sheet ------------------------------
+   Everything above comes from NOTEBOOK_CSS (docs_html.rs), which is the one
+   inlined copy of src/styles/tokens.css. Nothing below may restate a colour;
+   if a value is missing there, add it there. */
+.wrap{max-width:52rem;margin:0 auto;padding:2.5rem 1.25rem 3rem}
+.eyebrow{display:inline-block;font-size:var(--fs-micro);font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent);margin-bottom:.4rem}
+h1{font-family:var(--sans);font-weight:700;font-size:var(--fs-page);line-height:1.15;letter-spacing:-.022em;color:var(--ink-strong);margin:.05rem 0 .3rem}
+/* The standfirst carries the deck's only instruction, so it is set at reading
+   size rather than at the metadata rung — an instruction is never set small. */
+.sub{color:var(--ink-2);font-size:var(--fs-body);margin:0}
+.rule{height:3px;width:66px;border-radius:3px 2px 4px 2px / 2px 4px 2px 3px;background:linear-gradient(90deg,var(--accent-fill),color-mix(in srgb,var(--mk-pink) 30%,transparent));margin:1rem 0 1.9rem}
 /* `min(15rem,100%)`, not a bare 15rem: an auto-fill floor wider than the deck
    still lays out ONE 15rem column, which then runs past the right edge instead
    of collapsing to a single readable column. The deck is read inside the
    viewer's iframe, which in a split pane is routinely narrower than that. */
 .deck{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(15rem,100%),1fr));gap:1rem}
-.card{display:block;height:12rem;perspective:1200px;cursor:pointer}
-.card .inner{position:relative;display:block;width:100%;height:100%;transition:transform .5s;transform-style:preserve-3d}
+.card{position:relative;display:block;height:12rem;perspective:1200px;cursor:pointer;transition:transform var(--dur) var(--ease-pen)}
+.card:hover{transform:translateY(-2px)}
+.card:active{transform:translateY(1px)}
+/* The flip control, off-screen but reachable. `hidden` (display:none) took it
+   out of the tab order, so the deck could only be used with a mouse; opacity
+   leaves it focusable. The ring is drawn on the CARD, which is the thing the
+   user is actually aiming at, and pointer-events stay off it so a click still
+   lands on the label. */
+.card .flip{position:absolute;top:0;left:0;width:1px;height:1px;margin:0;padding:0;opacity:0;pointer-events:none}
+.card:focus-within{transform:translateY(-2px)}
+.card:focus-within .face{outline:2px solid var(--accent);outline-offset:2px}
+.card .inner{position:relative;display:block;width:100%;height:100%;transition:transform var(--dur-slow) var(--ease-pen);transform-style:preserve-3d}
 .card input:checked + .inner{transform:rotateY(180deg)}
-/* `overflow-wrap:anywhere`: a card can hold a URL, a formula or a German
+/* An index card is a physical object laid on the sheet, and it is the one
+   thing in this document system that earns an opaque fill and a lift: a
+   transparent front would show its own mirrored back through it mid-flip.
+   `overflow-wrap:anywhere`: a card can hold a URL, a formula or a German
    compound, and an unbreakable run wider than the card used to push straight
    out of it — the face scrolls sideways rather than wrapping, and on the back
    of a flipped card that text is simply lost. */
-.face{position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);box-shadow:0 12px 30px rgba(24,24,60,.08);padding:1.3rem;display:flex;flex-direction:column;justify-content:flex-start;text-align:center;overflow:auto;overflow-wrap:anywhere}
+.face{position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;border:var(--stroke-w) solid var(--sketch);border-radius:var(--radius-lg);background:var(--surface);box-shadow:0 2px 10px var(--shadow-lift);padding:1.25rem;display:flex;flex-direction:column;text-align:center;overflow:auto;overflow-wrap:anywhere}
 /* Centred with auto margins rather than by centring `justify-content`. A
    centred flex column puts half of any overflow ABOVE the scroll origin, where no
    scrollbar reaches it: the opening lines of a long answer were clipped and
@@ -162,19 +196,34 @@ h1{font-size:1.9rem;margin:.25rem 0 .25rem;letter-spacing:-.02em}
    card, so it starts at the top and scrolls the whole way. */
 .face>:first-child{margin-top:auto}
 .face>:last-child{margin-bottom:auto}
-.back{transform:rotateY(180deg);background:var(--surface-2)}
-.tag{font-size:.62rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:.5rem}
-.txt{font-size:1.05rem}
-.hint{margin:.6rem 0 0;font-size:.8rem;color:var(--muted)}
-.tip{text-align:center;color:var(--muted);font-size:.82rem;margin:1.25rem 0 0}
-.empty{text-align:center;color:var(--muted);padding:3rem 0}
+/* The index-card tab: yellow is PENDING (a question you have not answered
+   yet), green is DONE (the answer). The words "Q1" and "Answer" carry the
+   same distinction, so the marker is never the only signal. */
+.front{border-top:3px solid var(--sem-pending-fill)}
+.back{transform:rotateY(180deg);border-top:3px solid var(--sem-done-fill)}
+.tag{font-family:var(--sans);font-size:var(--fs-micro);font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-variant-numeric:tabular-nums;margin-bottom:.5rem}
+.front .tag{color:var(--sem-pending)}
+.back .tag{color:var(--sem-done)}
+.txt{font-size:var(--fs-card);line-height:1.5}
+.hint{margin:.6rem 0 0;font-size:var(--fs-meta);color:var(--ink-2)}
+.tip{text-align:center;color:var(--ink-2);font-family:var(--hand);font-size:var(--fs-hand);line-height:var(--lh-hand);margin:1.7rem 0 0}
+.empty{text-align:center;color:var(--ink-2);padding:3rem 0}
+@media print{
+  /* A printed card cannot be flipped, so print BOTH faces stacked: the deck
+     becomes a study sheet instead of a page of unanswered questions. */
+  .card{height:auto;perspective:none;transform:none;cursor:auto;break-inside:avoid;page-break-inside:avoid}
+  .card .inner{transform:none!important;transform-style:flat}
+  .face{position:static;transform:none!important;backface-visibility:visible;-webkit-backface-visibility:visible;box-shadow:none;overflow:visible}
+  .back{margin-top:.4rem}
+}
 </style>
 </head>
 <body>
 <main class="wrap">
   <div class="eyebrow">Flashcards</div>
   <h1>__TITLE__</h1>
-  <p class="sub">__COUNT__ · click a card to flip it</p>
+  <p class="sub">__COUNT__ · click a card, or tab to it and press Space, to flip it</p>
+  <div class="rule"></div>
   <div class="deck">__CARDS__</div>
   <p class="tip">Every answer is grounded in this room's files.</p>
 </main>

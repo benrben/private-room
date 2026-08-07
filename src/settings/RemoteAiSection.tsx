@@ -37,8 +37,12 @@ export default function RemoteAiSection({
               onChange={(e) => setClosetUrl(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && saveOllamaUrl()}
             />
-            <p className="settings-hint">
-              <AlertIcon size={13} className="warn-ic" /> Set this and the room
+            {/* Filling this field ends the room's locality, which is the
+                promise the whole product is built on — so the sentence that
+                says so is a marked note at lead size, attached to the field
+                that does it, rather than a 12px hint underneath it. */}
+            <p className="set-note set-note--flag set-note--lead nb-sem-urgent">
+              <AlertIcon size={16} className="warn-ic" /> Set this and the room
               is no longer local. Your questions, and the parts of your files
               the AI is given to read, travel over the network to that machine —
               the same as a cloud model, and the app labels the room that way.

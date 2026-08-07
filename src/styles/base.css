@@ -1,4 +1,7 @@
-/* Tokens (colors, radii, spacing, both themes) live in tokens.css. */
+/* Element defaults, in the notebook idiom.
+   Tokens (colors, type, radii, spacing, motion, both themes) live in
+   tokens.css. The sheet and the shared primitives live in paper.css, which
+   loads immediately after this file. */
 
 * {
   box-sizing: border-box;
@@ -16,25 +19,42 @@ body,
   overflow: hidden;
 }
 
+/* No background here: paper.css paints the dotted sheet on <html> and this
+   element stays transparent so it shows through. */
 body {
-  background: var(--bg);
   color: var(--text);
-  font-size: 14px;
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
   -webkit-font-smoothing: antialiased;
 }
 
+/* ----- buttons -----
+   Default is the secondary: a paper surface with a drawn border, which
+   picks up a marker swipe behind the label on hover. */
 button {
   font: inherit;
   color: var(--text);
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: 9px 7px 10px 8px / 8px 10px 7px 9px;
   padding: 6px 12px;
   cursor: pointer;
+  position: relative;
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    background-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
 }
 
 button:hover {
-  border-color: var(--accent);
+  border-color: var(--sketch);
+  background-color: var(--accent-ghost);
+}
+
+/* Pressed against the paper. */
+button:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 button:disabled {
@@ -42,24 +62,62 @@ button:disabled {
   cursor: default;
 }
 
+/* Focus is a drawn double-outline: the ring plus a hairline gap, so it
+   reads as a deliberate mark rather than a browser default.
+
+   NO border-radius here. It used to hard-set the button radius, which does
+   not shape the ring — `outline` already follows the element's own radius —
+   it reshapes the ELEMENT. Every pill, circle and square in the app snapped
+   to a rounded rectangle the instant it took keyboard focus, so the one
+   interaction that most needs to look deliberate read as a glitch. The
+   defaults above already give button/input/textarea/select the hand-drawn
+   corners, and anything with a shape of its own now keeps it. */
 button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible,
 [tabindex]:focus-visible {
   outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  outline-offset: 2px;
 }
 
+/* Primary: filled with ink — charcoal on paper, warm ivory on charcoal.
+   14.19:1 light / 15.49:1 dark. The accent (pink pen) is reserved for
+   selection and active state, so a primary action never reads as
+   "selected" and a destructive one never reads as primary. */
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-ink);
+  background: var(--btn-ink);
+  border-color: var(--btn-ink);
+  color: var(--btn-ink-text);
   font-weight: 600;
 }
+button.primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--btn-ink) 86%, var(--accent));
+  border-color: color-mix(in srgb, var(--btn-ink) 86%, var(--accent));
+}
 
-/* Violet is reserved for primary actions, selection and AI. Everyday text
-   buttons read as slate and only warm up on hover. */
+/* Destructive: a red outline with a red marker wash on hover. Never a
+   filled saturated red, and always carrying a word — colour is never the
+   only signal.
+
+   The border is the FULL ink red, not a wash of the fill-track hue: the
+   marker fill at 62% measures ~2.4:1 on the charcoal sheet, under the 3:1
+   floor WCAG 1.4.11 sets for a control boundary. `--red` is the contrast-safe
+   track (= --sem-urgent = --danger), 5.68:1 dark / 4.83:1 light. This is the
+   ONE definition of the danger button — misc.css used to carry a second copy
+   that loaded later and quietly beat this one back. */
+button.danger,
+button.subtle.danger {
+  color: var(--red);
+  border-color: var(--red);
+}
+button.danger:hover:not(:disabled),
+button.subtle.danger:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--mk-red) 20%, transparent);
+  border-color: var(--red);
+}
+
+/* Everyday text buttons read as quiet ink and only warm up on hover. */
 button.subtle {
   background: none;
   border: none;
@@ -68,9 +126,10 @@ button.subtle {
 }
 button.subtle:hover {
   border-color: transparent;
+  background-color: var(--accent-ghost);
   color: var(--text);
 }
-/* Opt back into the accent where a button really is the accent action. */
+/* Opt back into the pen where a button really is the accent action. */
 button.subtle.accent {
   color: var(--accent);
 }
@@ -78,27 +137,52 @@ button.subtle.accent:hover {
   color: var(--accent-2);
 }
 
+/* ----- inputs -----
+   A paper surface with a thin sketched border. User-entered text is always
+   the interface sans — never the hand — unless the field is explicitly a
+   note. Control boundaries use --rule-strong so they clear the 3:1 that
+   WCAG 1.4.11 asks of a component edge. */
 input,
 textarea,
 select {
   font: inherit;
+  font-family: var(--sans);
   color: var(--text);
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
   padding: 7px 10px;
   outline: none;
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
 }
 
+/* Focus draws a second stroke just inside the border, like going over the
+   line twice, rather than swapping the colour and losing the edge. */
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--faint);
+}
+
+/* Checkboxes and radios pick up the pen colour when checked. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
 }
 
 code {
-  background: var(--panel-2);
+  background: color-mix(in srgb, var(--raised) 70%, transparent);
+  border-radius: 4px 3px 5px 3px / 3px 5px 3px 4px;
   padding: 1px 6px;
-  border-radius: 5px;
+  font-family: var(--mono);
   font-size: 12px;
 }
 
@@ -113,3 +197,14 @@ code {
   flex-shrink: 0;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  button,
+  input,
+  textarea,
+  select {
+    transition: none;
+  }
+  button:active:not(:disabled) {
+    transform: none;
+  }
+}

@@ -50,8 +50,11 @@ export function UnlockScreen({
             onUnlock();
           }}
         >
+          {/* The room's file name is set in the mono face (.gate-file): it is
+              a file name, and which file you are about to open is the only
+              question this screen asks. */}
           <p className="gate-sub">
-            Unlock <strong>{fileNameOf(path)}</strong>
+            Unlock <strong className="gate-file">{fileNameOf(path)}</strong>
           </p>
           {canTouchId && (
             <button
@@ -117,12 +120,6 @@ export function UnlockScreen({
             <button
               type="button"
               className="subtle recovery-forgot"
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 6,
-              }}
               onClick={() => onEnterRecoveryMode()}
             >
               <RecoveryKeyIcon size={14} /> Forgot password? Use a recovery
@@ -141,13 +138,17 @@ export function UnlockScreen({
           }}
         >
           <p className="gate-sub">
-            Unlock <strong>{fileNameOf(path)}</strong> with a recovery
-            code
+            Unlock <strong className="gate-file">{fileNameOf(path)}</strong>{" "}
+            with a recovery code
           </p>
+          {/* A recovery code is data that has to be transcribed exactly, so
+              the field it is typed into is the mono face — the same face the
+              code was shown and printed in. Never the hand, and never the
+              sans: an O and a 0 have to be told apart here. */}
           <input
             type="text"
             placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"
-            className={error ? "invalid" : undefined}
+            className={`gate-code-input${error ? " invalid" : ""}`}
             aria-invalid={!!error}
             value={recoveryInput}
             autoFocus

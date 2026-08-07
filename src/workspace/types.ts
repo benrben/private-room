@@ -1,4 +1,11 @@
-import { FileContent, FileTarget, RoomInfo } from "../api";
+import {
+  FileContent,
+  FileMeta,
+  FileTarget,
+  RoomInfo,
+  ScriptInfo,
+  isRecordingFile,
+} from "../api";
 
 export interface OpenFile {
   id: string;
@@ -46,6 +53,85 @@ export type WorkArea =
   | "skills"
   | "memory"
   | "connectors"
+  // Full-page search. The ⌘K launcher and this are deliberately different
+  // things: the launcher is a COMMAND — type, jump, gone — while Find is a
+  // PLACE you stay in and work through, with room to scope, re-read and open
+  // several hits in turn. Both read the same room-wide search, so neither can
+  // show a different answer than the other.
+  | "find"
   // BROWSE-1: the private browser. Its page is a native child webview
   // parked over the workspace pane, not a React subtree.
   | "browser";
+
+/** The areas the rail can navigate to, as VALUES — the type above cannot be
+ * checked at runtime, and the room's remembered place comes back off disk as
+ * a bare string. Keep this in step with the union; the exhaustiveness check
+ * below makes the compiler say so if it ever falls behind. */
+export const WORK_AREAS = [
+  "files",
+  "home",
+  "map",
+  "recordings",
+  "workflows",
+  "scripts",
+  "skills",
+  "memory",
+  "connectors",
+  "find",
+  "browser",
+] as const;
+
+/** Fails to compile if WORK_AREAS and WorkArea ever disagree in either
+ * direction — a missing member, or one that is no longer in the union. */
+const _areasCoverUnion: readonly WorkArea[] = WORK_AREAS;
+type _UnionCoversAreas = Exclude<WorkArea, (typeof WORK_AREAS)[number]> extends never
+  ? true
+  : never;
+const _unionCovered: _UnionCoversAreas = true;
+void _areasCoverUnion;
+void _unionCovered;
+
+/** Whether a string off disk still names a real area. A remembered place
+ * outlives the build that wrote it, so a retired area name has to degrade to
+ * the default rather than put the room into a state that no longer renders. */
+export function isWorkArea(value: string): value is Exclude<WorkArea, "files"> {
+  return value !== "files" && (WORK_AREAS as readonly string[]).includes(value);
+}
+
+/** Whether `area` actually CONTAINS the open file.
+ *
+ * An open file always wins the centre pane — that is deliberate, so a citation
+ * or an agent open is never swallowed by whichever area page happens to be
+ * showing (see ViewerPane). But most areas hold no room files at all, and the
+ * two contextual surfaces — the breadcrumb trail and the library pane — were
+ * naming the area regardless. Open a .docx while the private browser is the
+ * current area and the trail read `Room / Private browser / report.docx` with
+ * the browser's own controls still in the left pane: an ordinary room document
+ * announced as browser content.
+ *
+ * Only three answers are true. The file-centric areas browse the library, so
+ * they contain everything. Recordings and Scripts each list a subset and their
+ * navigators highlight the very row that was opened, so they contain a file
+ * when it is one of theirs. Nothing else contains files, so nothing else may
+ * put its name on one. */
+export function areaHoldsFile(
+  area: WorkArea,
+  fileId: string,
+  files: FileMeta[],
+  scripts: ScriptInfo[],
+): boolean {
+  if (area === "files" || area === "home" || area === "map") return true;
+  if (area === "recordings") {
+    const meta = files.find((f) => f.id === fileId);
+    return meta != null && isRecordingFile(meta);
+  }
+  if (area === "scripts") return scripts.some((sc) => sc.fileId === fileId);
+  return false;
+}
+
+/** The areas that name themselves in a file's breadcrumb trail.
+ *
+ * `areaHoldsFile` also answers true for the file-centric areas, and rightly —
+ * they browse the whole library. They are absent here because "Files", "Home"
+ * and "Room Map" are not places a document lives; the folder is. */
+export const FILE_BEARING_AREAS: readonly WorkArea[] = ["recordings", "scripts"];

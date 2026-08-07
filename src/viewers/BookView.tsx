@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { unzip } from "fflate";
 import { api } from "../api";
 import { Book, chapterHtml, parseEpub } from "./epub";
-import { frameIsDark } from "./frameTheme";
+import { frameIsDark, useFrameTheme } from "./frameTheme";
 import { useFileBytes } from "./useFileBytes";
 import "./book.css";
 
@@ -39,6 +39,9 @@ export default function BookView({
   const [error, setError] = useState("");
   const [at, setAt] = useState(0);
   const [url, setUrl] = useState("");
+  // A staged chapter is an opaque origin and carries its palette in its own
+  // markup, so a theme change means restaging — see the effect below.
+  const theme = useFrameTheme();
   const [fontStep, setFontStep] = useState(1);
   const [tocOpen, setTocOpen] = useState(false);
 
@@ -91,7 +94,10 @@ export default function BookView({
     return () => {
       alive = false;
     };
-  }, [book, at, fontStep]);
+    // `theme` belongs here because chapterHtml BAKES the palette in: without
+    // it, switching the app to light left the chapter charcoal until the
+    // reader changed page or font size.
+  }, [book, at, fontStep, theme]);
 
   const go = useCallback(
     (delta: number) => {
@@ -119,8 +125,8 @@ export default function BookView({
 
   return (
     <div className="book-view" onKeyDown={onKeyDown} tabIndex={-1}>
-      <div className="book-bar">
-        <button className="subtle" onClick={() => setTocOpen((o) => !o)} aria-expanded={tocOpen}>
+      <div className="book-bar rdr-bar">
+        <button className="nb-btn" onClick={() => setTocOpen((o) => !o)} aria-expanded={tocOpen}>
           Contents
         </button>
         <span className="book-where" title={book.title}>
@@ -132,7 +138,7 @@ export default function BookView({
         </span>
         <span className="book-actions">
           <button
-            className="subtle"
+            className="nb-btn nb-btn-icon"
             disabled={fontStep <= 0}
             title="Smaller text"
             onClick={() => setFontStep((s) => Math.max(0, s - 1))}
@@ -140,7 +146,7 @@ export default function BookView({
             A−
           </button>
           <button
-            className="subtle"
+            className="nb-btn nb-btn-icon"
             disabled={fontStep >= FONT_STEPS.length - 1}
             title="Larger text"
             onClick={() => setFontStep((s) => Math.min(FONT_STEPS.length - 1, s + 1))}
@@ -148,6 +154,24 @@ export default function BookView({
             A+
           </button>
         </span>
+      </div>
+      {/* HOW FAR THROUGH THE BOOK, as a marker stroke.
+          It tracks CHAPTERS, not the scroll inside one, and that is the honest
+          limit rather than a shortcut: a chapter renders in a `roomdoc://`
+          frame, which is an opaque origin — the app cannot read its scroll
+          position and must not pretend to. The words beside it say "4 of 21",
+          so the stroke never claims more precision than the sentence does.
+          Decorative and aria-hidden for exactly that reason. */}
+      <div
+        className="rdr-progress book-progress"
+        aria-hidden
+        style={
+          {
+            "--nb-val": `${last > 0 ? Math.round((at / last) * 100) : 100}%`,
+          } as React.CSSProperties
+        }
+      >
+        <i />
       </div>
       <div className="book-stage">
         {tocOpen && (
@@ -190,10 +214,10 @@ export default function BookView({
         )}
       </div>
       <div className="book-nav">
-        <button className="subtle" disabled={at <= 0} onClick={() => go(-1)}>
+        <button className="nb-btn" disabled={at <= 0} onClick={() => go(-1)}>
           ‹ Previous
         </button>
-        <button className="subtle" disabled={at >= last} onClick={() => go(1)}>
+        <button className="nb-btn" disabled={at >= last} onClick={() => go(1)}>
           Next ›
         </button>
       </div>

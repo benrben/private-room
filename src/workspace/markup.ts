@@ -185,3 +185,173 @@ export function patchStreamFences(s: string): string {
   const fences = (s.match(/```/g) ?? []).length;
   return fences % 2 === 1 ? `${s}\n\`\`\`` : s;
 }
+
+/* ==========================================================================
+   THE CHAT'S TWO VOICES
+   The AI pane is a shared notebook rather than a chat panel, so a message can
+   be set in the hand (Kalam) or in the interface sans — and WHICH one is a
+   fact about the MESSAGE, not about who wrote it:
+
+     short and conversational  → the hand, either speaker
+     long, or technical        → the sans, either speaker
+
+   That is the whole rule, and it is deliberately not "user messages are
+   handwritten". A three-word answer from the model is a note; a 900-word
+   answer from the user pasted out of a brief is a document, and setting a
+   document in a handwriting face makes it harder to read for nothing. The
+   design system says the same thing from the other side: the hand is for
+   annotations, dates, counts and short asides, never for code, tables, URLs,
+   paths, long answers or instructions.
+   ========================================================================== */
+
+/** The longest message still set in the hand.
+ *
+ * Calibrated against what this app actually receives rather than a round
+ * number: the 29 live-QA prompts in qa/AGENT-PROMPTS.md — one real prompt per
+ * agent, from "how is it going?" to "create a new skill that teaches you how I
+ * format meeting notes" — run 16 to 62 characters, and the four starter
+ * prompts in the empty chat run 24 to 39. 220 is about three lines of Kalam at
+ * the conversation's 720px measure: comfortably past every real question, and
+ * short of the pasted paragraph where the hand stops being charming. */
+export const HAND_MAX_CHARS = 220;
+
+/** …and a note is a few lines, whatever its character count says. */
+export const HAND_MAX_LINES = 4;
+
+/** Anything outside the two Kalam subsets this app bundles (latin +
+ * latin-ext), plus the general punctuation and currency blocks that any script
+ * borrows. Shared by `isHandwritten` and `isLatinScript` so there is one answer
+ * to "can the hand actually draw this?". */
+const NON_LATIN = /[^\u0000-\u024F\u2000-\u206F\u20A0-\u20BF]/;
+
+/** Structure that means "this is a document, not a note". Any one of these
+ * sends the whole message to the sans — the clean-font fallback is not
+ * optional, because these are exactly the things a handwriting face renders
+ * badly and that a reader may need to copy character for character. */
+const HAND_STOPPERS: RegExp[] = [
+  /```|~~~/, // a fenced code block
+  /`[^`\n]+`/, // inline code
+  /^[ \t]*\|.*\|/m, // a table row
+  /^[ \t]*#{1,6}[ \t]/m, // a heading (a "#command" has no space after it)
+  /^[ \t]*(?:[-*+]|\d+[.)])[ \t]+/m, // a list ("*agent" has no space either)
+  /^[ \t]*>[ \t]*\S/m, // a block quotation
+  /\bhttps?:\/\/\S|\bwww\.\S/i, // a full URL
+  // A filesystem path: "~/…", or two slash-separated segments ("/Users/ben",
+  // "./src/main.rs"). Deliberately NOT any slash — "/skill" is the composer's
+  // own token and "and/or" is a word, and neither is a path.
+  /(?:^|\s)(?:~\/|\.{0,2}\/[\w.-]+\/)/,
+  // A filename: the extension is exactly the part a reader may need to copy.
+  /\.(?:ts|tsx|js|jsx|json|md|py|rs|css|html?|pdf|docx?|xlsx?|pptx?|csv|txt|toml|ya?ml|png|jpe?g|gif|svg|mp[34]|wav|zip)\b/i,
+  /\$\$|\\\(|\\\[/, // display or inline maths
+  /\n[ \t]*\n/, // more than one paragraph — that is a document, not a note
+  // ANYTHING OUTSIDE LATIN + LATIN-EXT. This is the most important stopper in
+  // the list and the least obvious. Only those two Kalam subsets are bundled
+  // (see fonts.css), so a Hebrew, Arabic or CJK message set in the hand gets
+  // its Latin punctuation and digits from Kalam and every other glyph from
+  // whatever the system offers — two faces inside one sentence, at metrics
+  // tuned for the face that is not rendering. Sending those to the sans keeps
+  // them in ONE face that actually has the glyphs, which is the honest version
+  // of the same intent. Hebrew is this app's second language.
+  NON_LATIN,
+];
+
+/** Can the handwriting face render this text at all?
+ *
+ * Separate from `isHandwritten` because the two questions come apart on LONG
+ * answers: the brief asks for a long reply to be clean body text with
+ * handwritten HEADINGS, so the message goes to the sans while its headings
+ * still take the hand. A Hebrew or CJK heading inside such an answer would
+ * then be drawn in a face with none of its glyphs — so the heading rule is
+ * gated on this instead of on `isHandwritten`. */
+export function isLatinScript(text: string): boolean {
+  return !NON_LATIN.test(text);
+}
+
+/** Should this message be set in the hand? Length first, then kind. */
+export function isHandwritten(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  if (t.length > HAND_MAX_CHARS) return false;
+  if (t.split("\n").length > HAND_MAX_LINES) return false;
+  return !HAND_STOPPERS.some((re) => re.test(t));
+}
+
+/** Who a transcript row is from.
+ *
+ * One definition, read by the on-screen speaker label AND by the copied
+ * transcript, so the two can never drift apart — they were separate string
+ * literals in two files before, which is how "Room AI" on screen becomes
+ * something else in the clipboard the first time anyone renames it. */
+export function speakerName(role: string): string {
+  return role === "assistant" ? "Room AI" : "You";
+}
+
+/** One run of a handwritten message. `mono` runs are PRINTED. */
+export interface HandToken {
+  text: string;
+  mono: boolean;
+}
+
+/** A token that stays printed inside a handwritten note. Both patterns are
+ * tested against the chunk with its surrounding punctuation stripped. */
+const MONO_CHUNK: RegExp[] = [
+  // The composer's own vocabulary: @file, @folder/, #command, /skill, *agent.
+  /^[@#/*][A-Za-z0-9_][\w./-]*$/,
+  // A filename or a bare host — "notes.pdf", "lecture.mp4", "en.wikipedia.org".
+  // The last segment must START with a letter, so "12.50" and "3.5" stay words
+  // and "e.g." (one-letter tail) is not mistaken for a file.
+  /^[\w-]+(?:\.[\w-]+)*\.[A-Za-z][A-Za-z0-9]{1,11}$/,
+];
+
+/** Split a handwritten message into hand runs and printed runs.
+ *
+ * A person writing a note by hand still PRINTS the things that have to be read
+ * exactly — a filename, a domain, an @mention — and that is the whole idea
+ * here: "browse to google.com" reads as handwriting with `google.com` set in
+ * the mono face. It is the reason a bare host or a filename does not send the
+ * entire message to the sans the way a URL or a path does.
+ *
+ * The chunks concatenate back to the input exactly (the split keeps its
+ * separators), so the rendered note is character-for-character what was sent —
+ * nothing is dropped, reordered, or re-spaced. */
+export function handTokens(text: string): HandToken[] {
+  const out: HandToken[] = [];
+  const push = (t: string, mono: boolean) => {
+    if (!t) return;
+    const prev = out[out.length - 1];
+    if (prev && prev.mono === mono) prev.text += t;
+    else out.push({ text: t, mono });
+  };
+  for (const chunk of text.split(/(\s+)/)) {
+    if (!chunk || /^\s+$/.test(chunk)) {
+      push(chunk, false);
+      continue;
+    }
+    const lead = /^[([{"'«]*/.exec(chunk)![0];
+    const rest = chunk.slice(lead.length);
+    const tail = /[)\]}"'».,;:!?…]*$/.exec(rest)![0];
+    const core = rest.slice(0, rest.length - tail.length);
+    if (core && MONO_CHUNK.some((re) => re.test(core))) {
+      push(lead, false);
+      push(core, true);
+      push(tail, false);
+    } else {
+      push(chunk, false);
+    }
+  }
+  return out;
+}
+
+/** The clock time in a message's margin, or "" when there is none to show (an
+ * optimistic row that has not been stored yet carries an empty `createdAt`).
+ *
+ * A time, not a relative age: this is the log line of a notebook page, and
+ * "14:32" stays true where "2 minutes ago" silently goes stale on screen. The
+ * stored value is ISO-8601 UTC (`strftime('%Y-%m-%dT%H:%M:%SZ')`), so the
+ * conversion to the reader's own clock is the browser's. */
+export function messageClock(createdAt: string): string {
+  if (!createdAt) return "";
+  const d = new Date(createdAt);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}

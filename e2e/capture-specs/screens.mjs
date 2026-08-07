@@ -32,15 +32,21 @@ const MANIFEST = path.join(OUT, "_shots.jsonl");
 
 const SMOKE = !!process.env.CAPTURE_SMOKE;
 
-/** The nine product areas, by their stable `data-area` attribute.
+/** The ten product areas, by their stable `data-area` attribute.
  *
  * The Browser was the missing ninth: the mock answered none of its commands,
  * so the area could not be walked at all and the dataset had no picture of it.
  * It contributes its `full` shot like any other area — its start screen is
  * static, so `empty`/`loading`/`error` are reported as unreached below for the
- * same reason the Recordings start screen is. */
+ * same reason the Recordings start screen is. Find is the tenth, added by the
+ * notebook pass; it is a search page with nothing typed into it, so it too
+ * only ever contributes `full`.
+ *
+ * The labels here are the BREADCRUMB wording (`AREA_CRUMBS` in ViewerPane),
+ * which is what names a place now that areas are no longer tabs. */
 const AREAS = [
-  ["home", "Room home"],
+  ["home", "Home"],
+  ["find", "Find"],
   ["map", "Room Map"],
   ["recordings", "Recordings"],
   ["workflows", "Workflows"],
@@ -336,8 +342,20 @@ describe("capture the app's screens", () => {
     const [openDetail, resultsDetail] = PALETTE_DETAILS;
     for (const theme of few(THEMES, 1)) {
       await open({ theme });
-      const search = await $('button[aria-label="Search this room or run a command (⌘K)"]');
-      if (!(await search.isExisting())) continue;
+      // Matched on the CLASS, not on an accessible name. The name is the
+      // button's own visible text now that the aria-label is gone (which is
+      // the better answer — WCAG 2.5.3 wants the two to agree), and pinning a
+      // capture selector to user-facing wording means the wording cannot be
+      // edited without silently emptying this shot.
+      const search = await $(".command-button");
+      // NOT `continue`. A capture spec that quietly skips is worse than one
+      // that fails: it reports green while teaching the calibration set that
+      // the palette does not exist. The coverage check at the end of this file
+      // caught it once; this makes the failure land where the cause is.
+      await search.waitForExist({
+        timeout: 10_000,
+        timeoutMsg: "the ⌘K palette trigger is gone from the top bar",
+      });
       await search.click();
       await browser.pause(400);
       await shoot({ kind: "overlay", detail: openDetail, state: "empty", theme, w: 1440, h: 900 });
@@ -400,16 +418,18 @@ describe("capture the app's screens", () => {
     await browser.setWindowSize(1440, 900);
   });
 
-  it("the rail collapsed and expanded", async () => {
+  it("the rail expanded and collapsed", async () => {
     const [collapsed, expanded] = CHROME_DETAILS;
     for (const theme of few(THEMES, 1)) {
       await open({ theme });
-      await shoot({ kind: "chrome", detail: collapsed, state: "full", theme, w: 1440, h: 900 });
+      // A new room now opens EXPANDED, so the first shot is the wide rail and
+      // the toggle goes the other way. Both details are still captured.
+      await shoot({ kind: "chrome", detail: expanded, state: "full", theme, w: 1440, h: 900 });
       const exp = await $('[data-testid="rail-expander"]');
       if (await exp.isExisting()) {
         await exp.click();
         await browser.pause(400);
-        await shoot({ kind: "chrome", detail: expanded, state: "full", theme, w: 1440, h: 900 });
+        await shoot({ kind: "chrome", detail: collapsed, state: "full", theme, w: 1440, h: 900 });
       }
     }
   });

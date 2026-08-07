@@ -354,6 +354,45 @@ class TtsRequest(BaseModel):
     pitch: str = DEFAULT_PITCH
 
 
+class PodcastTurnRequest(BaseModel):
+    """One spoken turn: what is said, and in whose voice."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
+    #: Per TURN, not per request — that is the entire point of the endpoint.
+    #: Empty means the product default, the same meaning it carries in
+    #: :class:`TtsRequest`.
+    voice: str = ""
+    rate: str = ""
+    pitch: str = ""
+
+
+class PodcastTtsRequest(BaseModel):
+    """Body of ``POST /tts/podcast`` — a whole episode in one call.
+
+    NOT the same shape as looping ``/tts``. Three things only the whole
+    episode can get right:
+
+    * ONE loudness pass over the finished mix. Normalizing each turn on its own
+      makes every speaker change a jump in level, which is the single most
+      obvious way a synthesized conversation stops sounding like a recording.
+    * REAL GAPS between speakers. Turns butted together sound like one person
+      reading both parts.
+    * TIMINGS. The caller gets the start offset of every turn back, which is
+      what lets the room file carry a ``[m:ss] Speaker: line`` transcript — and
+      that is what makes the finished episode seekable in the player rather
+      than an opaque blob of audio.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    turns: list[PodcastTurnRequest] = Field(default_factory=list)
+    #: Silence between turns. A beat, not a pause — long enough that the voices
+    #: do not collide, short enough that the conversation keeps moving.
+    gap_ms: int = 420
+
+
 class LabelRequest(BaseModel):
     """Body of ``POST /label`` — front_page.rs ``front_page_suggestions``.
 

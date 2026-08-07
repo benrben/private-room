@@ -539,6 +539,13 @@ export default function AudioView({
           media={mediaEl}
           regions={speakerRegions}
           hasAudioTrack={meta?.hasAudio ?? null}
+          // One lane per voice, the same as a room recording gets: an
+          // imported podcast or meeting has exactly the same question to
+          // answer — who was talking, and when — and a single mixed ribbon
+          // makes a two-person interview look like one continuous stripe.
+          // The component falls back to the ribbon on its own past the
+          // number of voices lanes stay readable at.
+          lanes
           onSeek={onWaveformSeek}
         />
       )}

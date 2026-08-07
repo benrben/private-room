@@ -120,6 +120,16 @@ export default function FeedbackModal({ s }: { s: WSState }) {
       <div
         className="studio-prompt feedback-modal"
         data-testid="feedback-modal"
+        // Named and announced as a dialog, the way every other sheet in the
+        // app already is (AiActionModal, CompareModal, the consent cards). It
+        // was the one modal that arrived as an anonymous div, so a screen
+        // reader had no way to say what had just opened. `aria-busy` is the
+        // same fact the disabled fields state visually while the local model
+        // is drafting.
+        role="dialog"
+        aria-modal="true"
+        aria-label="Send feedback"
+        aria-busy={drafting}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="studio-prompt-title">Send feedback</div>

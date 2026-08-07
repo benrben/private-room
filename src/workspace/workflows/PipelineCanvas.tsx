@@ -1,12 +1,21 @@
-import { useMemo } from "react";
+import { useId, useMemo } from "react";
 import type { WorkflowDef, WorkflowNodeEvent } from "../../api";
 import { kindLabel, nodeTitle } from "./kinds";
 
 const NODE_W = 150;
-const NODE_H = 62;
+/** Tall enough for the three lines a block actually holds — the kind, up to two
+ * lines of label, and the live status word. It was 62, which fits one line of
+ * label and nothing else: a two-line step name spilled out of its own block and
+ * over the row beneath it. Every other measurement below is derived, so this is
+ * the only number that had to move; the matching line-heights are pinned in
+ * workflows.css and the two have to be changed together. */
+const NODE_H = 82;
 const GAP_X = 70;
 const GAP_Y = 26;
 const PAD = 24;
+/** The drawn "+" affordances. 24px is the floor for anything clickable, and
+ * halving it is how a button gets centred on the edge it hangs off. */
+const ADD_SIZE = 24;
 
 type NodeStatus = Record<string, WorkflowNodeEvent>;
 
@@ -86,11 +95,54 @@ export function PipelineCanvas({
   editable,
 }: Props) {
   const { pos, width, height } = useMemo(() => layout(def), [def]);
+  // A marker can only be referenced by id, and two canvases mounted at once
+  // would otherwise share one. Colons are legal in an id but awkward inside a
+  // url() fragment, so they come out.
+  const uid = useId().replace(/:/g, "");
+  const arrowId = `wf-pipe-arrow-${uid}`;
+  const arrowLiveId = `wf-pipe-arrow-live-${uid}`;
 
   return (
     <div className="pipeline-wrap">
       <div className="pipeline-canvas" style={{ width, height }}>
+        {/* Deliberately NOT aria-hidden: the branch labels drawn on the edges
+            ("then", "else", a route's own outcome names) are the only place a
+            reader is told which way a condition went, and hiding the whole
+            drawing to hide its arrowheads would take those with it. */}
         <svg className="pipeline-edges" width={width} height={height}>
+          {/* The pipeline connector's head: two barbs, open and round-capped,
+              so it reads as a pen stroke rather than a filled UI triangle. It
+              is stroked in CSS (one marker per edge state) because a marker
+              does not inherit the referencing path's colour, and the
+              `context-stroke` keyword that would fix that is younger than the
+              WebKit builds this app ships against. userSpaceOnUse keeps the
+              head 7px whatever the line weight is. */}
+          <defs>
+            <marker
+              id={arrowId}
+              viewBox="0 0 10 10"
+              refX="9"
+              refY="5"
+              markerWidth="7"
+              markerHeight="7"
+              markerUnits="userSpaceOnUse"
+              orient="auto"
+            >
+              <path className="pipeline-arrow" d="M2.4 1.3 9 5 2.2 8.7" />
+            </marker>
+            <marker
+              id={arrowLiveId}
+              viewBox="0 0 10 10"
+              refX="9"
+              refY="5"
+              markerWidth="7"
+              markerHeight="7"
+              markerUnits="userSpaceOnUse"
+              orient="auto"
+            >
+              <path className="pipeline-arrow live" d="M2.4 1.3 9 5 2.2 8.7" />
+            </marker>
+          </defs>
           {def.edges.map((e, i) => {
             const from = pos.get(e.from);
             const to = pos.get(e.to);
@@ -104,7 +156,8 @@ export function PipelineCanvas({
             return (
               <g key={i}>
                 <path
-                  className={live ? "live" : undefined}
+                  className={`pipeline-edge${live ? " live" : ""}`}
+                  markerEnd={`url(#${live ? arrowLiveId : arrowId})`}
                   d={`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`}
                 />
                 {e.branch && (
@@ -155,7 +208,12 @@ export function PipelineCanvas({
                 <button
                   className="pipeline-add"
                   title="Add a step after this one"
-                  style={{ left: p.x + NODE_W - 9, top: p.y + NODE_H / 2 - 11, zIndex: 3 }}
+                  aria-label="Add a step after this one"
+                  style={{
+                    left: p.x + NODE_W - ADD_SIZE / 2,
+                    top: p.y + NODE_H / 2 - ADD_SIZE / 2,
+                    zIndex: 3,
+                  }}
                   onClick={(e) => {
                     e.stopPropagation();
                     onAddAfter?.(n.id);
@@ -167,7 +225,12 @@ export function PipelineCanvas({
                   <button
                     className="pipeline-add pipeline-branch"
                     title="Add a parallel branch from this step"
-                    style={{ left: p.x + NODE_W - 9, top: p.y + NODE_H - 9, zIndex: 3 }}
+                    aria-label="Add a parallel branch from this step"
+                    style={{
+                      left: p.x + NODE_W - ADD_SIZE / 2,
+                      top: p.y + NODE_H - ADD_SIZE / 2,
+                      zIndex: 3,
+                    }}
                     onClick={(e) => {
                       e.stopPropagation();
                       onAddBranch(n.id);
@@ -183,7 +246,8 @@ export function PipelineCanvas({
           <button
             className="pipeline-add"
             title="Add a step"
-            style={{ left: PAD, top: PAD + NODE_H / 2 - 11 }}
+            aria-label="Add a step"
+            style={{ left: PAD, top: PAD + NODE_H / 2 - ADD_SIZE / 2 }}
             onClick={() => onAddAfter?.(null)}
           >
             +

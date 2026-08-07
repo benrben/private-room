@@ -58,7 +58,11 @@ export default function HelpersSection({
                     missing and offered a download it had no use for. Naming the
                     model that will do the looking makes that checkable. */}
                 {visionInstalled ? (
-                  <div className="model-row active">
+                  /* `is-ok`, not bare `active`: this row reports a FACT (a
+                     helper is present and working), and `active` alone is the
+                     pink selection wash. Same distinction the Model section
+                     draws — green means installed, pink means chosen. */
+                  <div className="model-row active is-ok">
                     <span className="btn-ic">
                       <CircleCheckIcon size={13} /> Ready — the AI can see and mark images
                       {groundingModel ? <> (<code>{groundingModel}</code>)</> : null}.
@@ -67,8 +71,11 @@ export default function HelpersSection({
                 ) : visionBlock ? (
                   /* Something here CAN see — a download would fix nothing. The
                      engine's declared record said what is actually in the way,
-                     so show that sentence instead of the Download button. */
-                  <p className="settings-hint">{visionBlock}</p>
+                     so show that sentence instead of the Download button.
+                     Marked, because it is the reason a feature is off. */
+                  <p className="set-note set-note--flag nb-sem-pending">
+                    {visionBlock}
+                  </p>
                 ) : (
                   <>
                     <p className="settings-hint">
@@ -93,7 +100,7 @@ export default function HelpersSection({
                   Semantic search
                 </label>
                 {embedInstalled ? (
-                  <div className="model-row active">
+                  <div className="model-row active is-ok">
                     <span className="btn-ic"><CircleCheckIcon size={13} /> On — search understands meaning, not just words.</span>
                   </div>
                 ) : (

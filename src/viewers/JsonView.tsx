@@ -76,11 +76,14 @@ function Node({
           {visible.map(([k, v]) => (
             <Node key={k} name={k} value={v} depth={depth + 1} />
           ))}
-          {/* Never a silent cut: say how many are hidden and offer the rest. */}
+          {/* Never a silent cut: say how many are hidden and offer the rest.
+              Drawn as a real outlined control, not as a coloured link — it is
+              the only thing standing between the reader and the rest of the
+              data, and a link-coloured sentence reads as a footnote. */}
           {entries.length > shown && (
             <button
               type="button"
-              className="json-more"
+              className="json-more nb-btn"
               style={{ marginLeft: (depth + 1) * 14 }}
               onClick={() => setShown((n) => n + PAGE * 5)}
             >
@@ -126,21 +129,37 @@ export default function JsonView({ text, name }: { text: string; name: string })
         <div className="viewer-status">
           This file isn't valid JSON ({parsed.error}) — showing its source instead.
         </div>
-        <pre className="json-raw">{text}</pre>
+        {/* The source is code, so it gets a drawn frame rather than sitting
+            loose in the pane: this is a quotation of the file, not the app's
+            own prose. */}
+        <pre className="json-raw nb-frame-soft">{text}</pre>
       </div>
     );
   }
 
   return (
     <div className="json-view">
+      {/* The file's header: what this data IS, before the toggle that changes
+          how it is drawn. `summary` is the same shape line every branch row in
+          the tree carries, so the header and the tree agree word for word. */}
       <div className="json-bar">
-        <button type="button" className="subtle" onClick={() => setRaw((r) => !r)}>
+        <span className="json-summary">{summary(parsed.value)}</span>
+        {lines && <span className="viewer-status">JSON Lines — one record per line</span>}
+        {/* One outlined control instead of a flat link. The label is the
+            destination — "Raw" takes you to the source — which is why it is a
+            button and not an aria-pressed toggle. */}
+        <button
+          type="button"
+          className="nb-btn"
+          style={{ marginLeft: "auto" }}
+          title={raw ? "Show the structure as a collapsible tree" : "Show the file's own source"}
+          onClick={() => setRaw((r) => !r)}
+        >
           {raw ? "Tree" : "Raw"}
         </button>
-        {lines && <span className="viewer-status">JSON Lines — one record per line</span>}
       </div>
       {raw ? (
-        <pre className="json-raw">{text}</pre>
+        <pre className="json-raw nb-frame-soft">{text}</pre>
       ) : (
         <div className="json-tree">
           <Node name={null} value={parsed.value} depth={0} />

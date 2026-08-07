@@ -5,13 +5,11 @@ import {
   ChevronDownIcon,
   CloudIcon,
   DotsIcon,
-  LayoutResetIcon,
   LockIcon,
   Logomark,
   PlayIcon,
   ScriptIcon,
   SearchIcon,
-  ThemeIcon,
   WorkflowsIcon,
 } from "../icons";
 import { WorkflowGlyph } from "./workflows/workflowGlyph";
@@ -23,9 +21,25 @@ import { QuickActionsMenu, QuickAction } from "./QuickActions";
 import { LayoutApi } from "../shell/useLayout";
 import { toggleTheme } from "../theme";
 
-/** The 46px room toolbar: brand seal, room identity, the ⌘K command entry,
- * pinned workflow/script shortcuts, the engine pill with its truthful
- * local/cloud route badge, theme, layout reset, the room menu, and Lock. */
+/** The room toolbar: brand seal, room name, the ⌘K command entry, pinned
+ * workflow/script shortcuts, the engine pill with its truthful local/cloud
+ * route badge, the room menu, and Lock.
+ *
+ * Shorter and quieter than it was, because a title bar is not where the work
+ * happens. Three things went:
+ *
+ *   • the "ARCELLE" kicker over the room name — the seal to its left already
+ *     says which app this is, twice was once too often, and the room's own
+ *     name is what the line is for;
+ *   • the theme switch and Reset layout, which are settings you touch twice a
+ *     year sitting permanently beside the two controls you touch constantly.
+ *     Both moved into the room menu, keeping their exact behaviour;
+ *   • the pinned-workflows pill when nothing is pinned to it — it used to draw
+ *     itself anyway for the sake of its "All workflows…" footer, which is a
+ *     second, quieter route to a place the rail already lists by name.
+ *
+ * What stayed is what is true right now and cannot wait: a live recording, the
+ * engine, where this room's content goes, and the lock. */
 export default function TopBar({
   s,
   a,
@@ -102,7 +116,6 @@ export default function TopBar({
       </div>
       <div className="room-identity" title={info.path}>
         <div className="room-identity-text">
-          <div className="room-kicker">Arcelle</div>
           {/* The room's name lives in its own encrypted `meta`, not in the file
               path — renaming the .roomai in Finder changes nothing — so this is
               the only place it can be changed. Inline, the same grammar the
@@ -164,23 +177,27 @@ export default function TopBar({
                 : "Saving…"}
           </button>
         )}
-        {/* Wave 4a: pinned-workflow shortcuts, left of the model pill (⌘J). */}
-        <QuickActionsMenu
-          actions={pinnedActions}
-          open={s.qaMenuOpen}
-          onOpenChange={(o) => {
-            if (o) {
-              s.setModelMenuOpen(false);
-              s.setRoomMenuOpen(false);
-            }
-            s.setQaMenuOpen(o);
-          }}
-          buttonLabel="Workflows"
-          buttonIcon={<WorkflowsIcon size={15} />}
-          inlineMax={3}
-          pill
-          footer={{ label: "All workflows…", onClick: a.openWorkflows }}
-        />
+        {/* Wave 4a: pinned-workflow shortcuts, left of the model pill (⌘J).
+            Only when something is actually pinned — an empty shortcut rack is
+            not a shortcut, and Workflows is one click away in the rail. */}
+        {pinnedActions.length > 0 && (
+          <QuickActionsMenu
+            actions={pinnedActions}
+            open={s.qaMenuOpen}
+            onOpenChange={(o) => {
+              if (o) {
+                s.setModelMenuOpen(false);
+                s.setRoomMenuOpen(false);
+              }
+              s.setQaMenuOpen(o);
+            }}
+            buttonLabel="Workflows"
+            buttonIcon={<WorkflowsIcon size={15} />}
+            inlineMax={3}
+            pill
+            footer={{ label: "All workflows…", onClick: a.openWorkflows }}
+          />
+        )}
         {/* Wave 5: global-shortcut scripts, beside the workflow pins (only when
             a script opts into `room-shortcut: global`). */}
         {globalScriptActions.length > 0 && (
@@ -284,22 +301,6 @@ export default function TopBar({
             </div>
           );
         })()}
-        <button
-          className="icon-btn"
-          data-tip="Switch theme"
-          aria-label="Switch between dark and light theme"
-          onClick={() => toggleTheme()}
-        >
-          <ThemeIcon size={16} />
-        </button>
-        <button
-          className="icon-btn"
-          data-tip="Reset layout"
-          aria-label="Reset the three-pane layout"
-          onClick={layout.resetLayout}
-        >
-          <LayoutResetIcon size={16} />
-        </button>
         <div className="room-menu-wrap">
           <button
             className="icon-btn"
@@ -321,6 +322,34 @@ export default function TopBar({
                 onMouseDown={() => s.setRoomMenuOpen(false)}
               />
               <div className="pop-menu room-menu" role="menu">
+                {/* The two controls that used to sit permanently in the bar.
+                    Same handlers, same outcomes; they are named in full here
+                    because a menu row has the space an icon square never did,
+                    and the visible words now ARE the accessible name rather
+                    than a tooltip standing in for one. Neither was ever only
+                    reachable from the bar — ⌘K carries both (Overlays.tsx
+                    "reset-layout" / "theme"), Settings → App carries the
+                    theme, and double-clicking a splitter still resets. */}
+                <button
+                  className="pop-item"
+                  role="menuitem"
+                  onClick={() => {
+                    toggleTheme();
+                    s.setRoomMenuOpen(false);
+                  }}
+                >
+                  Switch between dark and light theme
+                </button>
+                <button
+                  className="pop-item"
+                  role="menuitem"
+                  onClick={() => {
+                    layout.resetLayout();
+                    s.setRoomMenuOpen(false);
+                  }}
+                >
+                  Reset the three-pane layout
+                </button>
                 <button
                   className="pop-item"
                   role="menuitem"

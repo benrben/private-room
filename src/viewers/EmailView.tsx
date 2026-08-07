@@ -16,7 +16,12 @@ export default function EmailView({ text }: { text: string }) {
   return (
     <div className="eml-view">
       <header className="eml-head">
-        <h1 className="eml-subject">{mail.subject || "(no subject)"}</h1>
+        {/* `dir="auto"` for the same reason the fields and the body already
+            carry it: a Hebrew or Arabic subject line was the one part of the
+            message still being forced left-to-right. */}
+        <h1 className="eml-subject" dir="auto">
+          {mail.subject || "(no subject)"}
+        </h1>
         <dl className="eml-fields">
           {(
             [

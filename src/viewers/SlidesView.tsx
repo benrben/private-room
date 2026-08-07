@@ -163,21 +163,28 @@ export default function SlidesView({
   return (
     <div className="sl-view">
       <div className="sl-bar">
-        <button className="subtle" disabled={at <= 0} onClick={() => setAt((n) => Math.max(0, n - 1))}>
+        <button className="nb-btn" disabled={at <= 0} onClick={() => setAt((n) => Math.max(0, n - 1))}>
           ‹ Previous
         </button>
-        <span className="viewer-status">
+        {/* "Slide 3 of 12" is a count pencilled beside the deck — see
+            `.sl-where`. The class is additive, so the status keeps whatever
+            `.viewer-status` gives it. */}
+        <span className="viewer-status sl-where">
           Slide {at + 1} of {slideCount}
         </span>
         <button
-          className="subtle"
+          className="nb-btn"
           disabled={at >= last}
           onClick={() => setAt((n) => Math.min(last, n + 1))}
         >
           Next ›
         </button>
         {notes && (
-          <button className="subtle" onClick={() => setShowNotes((s) => !s)}>
+          <button
+            className="nb-btn"
+            aria-pressed={showNotes}
+            onClick={() => setShowNotes((s) => !s)}
+          >
             {showNotes ? "Hide notes" : "Speaker notes"}
           </button>
         )}

@@ -1,26 +1,100 @@
 /* A saved message, read as mail: the header block first, then the body in a
-   measured column. Before this an .eml showed its MIME source. */
-.eml-view { padding: 1rem 1.25rem 3rem; max-width: 46rem; }
-.eml-subject { margin: 0 0 0.6rem; font-size: 1.2rem; line-height: 1.3; }
-.eml-fields { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 0.15rem 0.75rem; }
-.eml-field { display: contents; }
-.eml-fields dt { color: var(--muted); font-size: 0.8rem; }
-.eml-fields dd { margin: 0; font-size: 0.85rem; overflow-wrap: anywhere; }
-.eml-head { padding-bottom: 0.75rem; border-bottom: 1px solid var(--border); }
+   measured column. Before this an .eml showed its MIME source.
+
+   The PAGE — warm paper, drawn edge, measure and margins — comes from
+   `.viewer-host > .eml-view` in styles/viewer.css, where every document the
+   app draws itself is described once. What is here is the letter on it. */
+
+.eml-subject {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-section);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--text-strong);
+}
+
+.eml-fields {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px var(--sp-3);
+}
+.eml-field {
+  display: contents;
+}
+/* From / To / Cc / Date: field names, so they stay in the interface face and
+   read as a label rather than as a note. */
+.eml-fields dt {
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.eml-fields dd {
+  margin: 0;
+  font-size: var(--fs-meta);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* The header sits above a pencil rule that thins at both ends, rather than a
+   flat border across the page. */
+.eml-head {
+  padding-bottom: var(--sp-3);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+
+/* What came with the message, as strips of tape stuck to the page. The
+   filename carries the meaning; the marker only says "there is something
+   attached here". */
 .eml-attachments {
   list-style: none;
-  margin: 0.6rem 0 0;
+  margin: var(--sp-3) 0 0;
   padding: 0;
   display: flex;
   flex-wrap: wrap;
-  gap: 0.4rem 0.9rem;
-  font-size: 0.8rem;
-  color: var(--muted);
+  gap: var(--sp-2);
 }
-.eml-body {
-  margin: 1rem 0 0;
+.eml-attachments li {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  font-size: var(--fs-micro);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--sem-linked-fill) 26%, transparent);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sem-linked-fill) 40%, transparent);
+}
+
+/* The message itself. `pre-wrap` is load-bearing — it preserves the sender's
+   own line breaks and quoting indentation — and the interface face is what
+   makes a letter read as a letter rather than as a wire dump. It matters more
+   for one written in Hebrew, Japanese or Turkish: --sans is the only stack in
+   the app with the per-glyph fallbacks those need. `dir="auto"` in the markup
+   sets the direction from the message's own first strong character.
+
+   Written as `.eml-view .eml-body` on purpose. This is a <pre>, and
+   `.viewer-body pre` in styles/viewer.css is (0,1,1): the old single-class
+   `font-family: inherit` lost to it outright, so every saved message has in
+   fact been rendering in 13px monospace. Two classes is what fixes it. */
+.eml-view .eml-body {
+  margin: var(--sp-4) 0 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font-family: inherit;
-  line-height: 1.6;
+  font-family: var(--sans);
+  font-size: var(--fs-lead);
+  line-height: 1.7;
 }

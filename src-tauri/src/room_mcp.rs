@@ -161,6 +161,30 @@ impl ToolScope {
             ToolScope::LocalEngine | ToolScope::CloudEngine | ToolScope::ExternalAgent
         )
     }
+    /// The File agent's organize box (`organize_files`, `trash_files`,
+    /// `merge_files`) — moving, renaming, deleting into the trash and merging
+    /// the user's own documents.
+    ///
+    /// The same line `include_browse_tools` draws: the engine the user chose to
+    /// run this room, or an external agent they explicitly opted in — never a
+    /// merely CONSULTED advisor. Asking a second model for an opinion must not
+    /// hand it the power to reorganize the room it was asked about; tidying is
+    /// an action, not advice.
+    ///
+    /// This is precisely why these specs are NOT in `tools_catalog`, which is
+    /// served to every scope unconditionally. Putting a delete verb there would
+    /// have granted it to the advisor tier by default, silently.
+    ///
+    /// What the grant is bounded BY, rather than by trust: the box has no
+    /// permanent delete in it at all. `trash_files` is recoverable from
+    /// Library → Trash and is recorded against the agent, and `delete_file` /
+    /// `empty_trash` are reachable from no scope and no tool.
+    fn include_organize_tools(self) -> bool {
+        matches!(
+            self,
+            ToolScope::LocalEngine | ToolScope::CloudEngine | ToolScope::ExternalAgent
+        )
+    }
     /// Connector configuration can start local programs or reach remote
     /// services, so its CRUD tools belong only to the engine the user chose to
     /// run this room — local or a cloud CLI — never to a consulted advisor or
@@ -898,13 +922,29 @@ fn arcelle_tool_annotations(name: &str) -> Option<serde_json::Value> {
         | "studio_mindmap"
         | "generate_podcast_script"
         | "retranscribe_file"
+        | "read_recording"
         | "test_workflow"
         | "ui_act"
+        // The organize box's two non-deleting verbs. Recoverable like the file
+        // writes above: a move or a rename is undone by another one, a merge
+        // only ADDS a file, and deleting a folder never deletes its files.
+        // Not idempotent — running the same organize plan twice can rename an
+        // already-renamed file again — and never open-world.
+        | "organize_files"
+        | "merge_files"
         | "save_mcp" => (false, false, false, false),
         // Deletion is intentionally marked honestly. A non-interactive Codex
         // subprocess cannot confirm it, while the local main agent reaches it
         // only through the on-demand management lane.
-        "delete_memory"
+        //
+        // `trash_files` is here rather than beside the file writes above for
+        // exactly the reason it is a separate tool at all: the hint a host reads
+        // to decide whether to ask a human must say "this removes the user's
+        // files". It is recoverable — Library → Trash, with the agent named —
+        // but "recoverable" is not "non-destructive", and marking it soft would
+        // be the app choosing the model's convenience over the user's.
+        "trash_files"
+        | "delete_memory"
         | "delete_skill"
         | "delete_skill_resource"
         | "delete_workflow"
@@ -1147,6 +1187,9 @@ fn scoped_specs(web_enabled: bool, scope: ToolScope) -> Vec<serde_json::Value> {
         // trust class (minutes of work, results land as reviewable room files).
         extras.extend(commands::studio_tools_specs());
         extras.extend(commands::transcribe_tools_specs());
+    }
+    if scope.include_organize_tools() {
+        extras.extend(commands::organize_tools_specs());
     }
     if scope.include_mcp_management_tools() {
         extras.extend(commands::mcp_management_tools_specs());
@@ -2044,6 +2087,28 @@ mod tests {
         // gets through this gate. The next wave that grows any tier should spend
         // its effort shrinking descriptions rather than raising these again.
         //
+        // RE-MEASURED 2026-08-07, after the File agent's ORGANIZE box
+        // (`organize_files`, `trash_files`, `merge_files` — see
+        // `include_organize_tools`):
+        //   CloudAdvisor  4,458    CloudEngine  10,453
+        //   ExternalAgent 10,163   LocalEngine  10,300
+        //
+        // The three tools cost ~1,000 tokens across the three engine tiers, and
+        // those three budgets are raised by ~700 each to sit ~2% clear rather
+        // than the ~25% the note above describes. That is a deliberate
+        // tightening, not headroom: the next addition to any of these tiers has
+        // to trip this test immediately.
+        //
+        // The previous note's advice — shrink rather than raise — WAS tried
+        // first and rejected on the evidence. The longest descriptions in the
+        // catalog (`save_skill`, `edit_file`, `create_file`, `start_file_pass`)
+        // are each mostly one hard-won rule: create_file's is the whole
+        // "self-contained HTML, never a CDN" paragraph that exists because
+        // charts silently rendered blank without it. Cutting those to make room
+        // would buy catalog size by re-introducing shipped bugs, which is a
+        // worse trade than 700 tokens. CloudAdvisor is untouched and still sits
+        // 16% clear — the advisor tier does not get this box at all.
+        //
         // This is the BRIDGE catalog — what a cloud CLI or external agent sees
         // whole. An in-room worker is narrowed to its box first (`toolbox_for`
         // in the sidecar), so it never carries all of this; the tiers that do
@@ -2052,13 +2117,30 @@ mod tests {
         // meaningfully grows the catalog has to come here and say so out loud.
         // Lower them when a wave makes real headroom; never raise one without
         // measuring the window it eats.
-        for (scope, budget) in [
+        // EVERY tier is measured and PRINTED before any of them is asserted.
+        // Failing on the first one over budget told you one number and hid the
+        // other three, so re-measuring after a change that touches the catalog
+        // meant editing this test, running it, and editing it back. The whole
+        // table is what the comment above has to be updated from, so the test
+        // hands it over. (`cargo test -- --nocapture each_tier` to read it.)
+        // Raised by ~40 for `read_recording` (2026-08-07): the room reads
+        // recordings automatically, and the tool is what lets it be asked for
+        // in words — "make chapters for this meeting", "what did we decide".
+        // Its description is already cut to one sentence plus its precondition;
+        // the remaining cost is the tool existing at all, which is the point.
+        let measured: Vec<(ToolScope, usize, usize)> = [
             (ToolScope::CloudAdvisor { include_mcp: true }, 5_300usize),
-            (ToolScope::CloudEngine, 9_900),
-            (ToolScope::LocalEngine, 9_700),
-            (ToolScope::ExternalAgent, 9_600),
-        ] {
-            let tokens = approx_tokens(&scoped_specs(true, scope));
+            (ToolScope::CloudEngine, 10_650),
+            (ToolScope::LocalEngine, 10_450),
+            (ToolScope::ExternalAgent, 10_350),
+        ]
+        .into_iter()
+        .map(|(scope, budget)| (scope, approx_tokens(&scoped_specs(true, scope)), budget))
+        .collect();
+        for (scope, tokens, budget) in &measured {
+            println!("{:<14} {tokens:>6} / {budget}", scope.label());
+        }
+        for (scope, tokens, budget) in &measured {
             assert!(
                 tokens <= budget,
                 "{scope:?} catalog is ~{tokens} tokens, over its {budget} budget — \

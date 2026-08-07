@@ -59,6 +59,10 @@ pub(crate) fn mindmap_spec() -> StudioSpec {
         fallback_temp: 0.3,
         render: fallback_mindmap,
         filename_prefix: "Mind map",
+        // HTML-authoring stays primary here: this artifact is a PAGE, and
+        // nothing downstream needs to read its parts back as data.
+        structured_first: false,
+        after_save: None,
     }
 }
 
@@ -134,7 +138,13 @@ pub(crate) fn render_mindmap_html(title: &str, root: &str, nodes: &[MindNode]) -
     );
     fill_template(
         MINDMAP_TEMPLATE,
-        &[("__TITLE__", &html_escape(title)), ("__TREE__", &tree)],
+        &[
+            // One inlined copy of the notebook for every generated page — see
+            // NOTEBOOK_CSS in docs_html.rs.
+            ("__NOTEBOOK__", NOTEBOOK_CSS),
+            ("__TITLE__", &html_escape(title)),
+            ("__TREE__", &tree),
+        ],
     )
 }
 
@@ -145,30 +155,58 @@ pub(crate) const MINDMAP_TEMPLATE: &str = r####"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__ — Mind map</title>
 <style>
-:root{color-scheme:light dark;--bg:#f6f7f9;--surface:#fff;--surface-2:#eef0f4;--fg:#191b1f;--muted:#63697a;--accent:#6d5cf0;--accent-2:#8b7cf6;--border:#e6e7ee}
-@media (prefers-color-scheme:dark){:root{--bg:#0e1014;--surface:#161a22;--surface-2:#1c212c;--fg:#e8eaf0;--muted:#8b93a7;--accent:#8b7cf6;--accent-2:#a99df8;--border:#232a37}}
-*{box-sizing:border-box}
-html,body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif}
-.wrap{max-width:50rem;margin:0 auto;padding:2.5rem 1.25rem}
-.eyebrow{font-size:.72rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)}
-h1{font-size:1.9rem;margin:.25rem 0 1.5rem;letter-spacing:-.02em}
-ul{list-style:none;margin:0;padding-left:1.4rem;border-left:2px solid var(--border)}
+__NOTEBOOK__
+/* ---- the map: inked nodes, pencil connectors ------------------------------
+   Everything above comes from NOTEBOOK_CSS (docs_html.rs), the one inlined
+   copy of src/styles/tokens.css. Nothing below restates a colour. */
+.wrap{max-width:50rem;margin:0 auto;padding:2.5rem 1.25rem 3rem}
+.eyebrow{display:inline-block;font-size:var(--fs-micro);font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent);margin-bottom:.4rem}
+h1{font-family:var(--sans);font-weight:700;font-size:var(--fs-page);line-height:1.15;letter-spacing:-.022em;color:var(--ink-strong);margin:.05rem 0 0}
+.rule{height:3px;width:66px;border-radius:3px 2px 4px 2px / 2px 4px 2px 3px;background:linear-gradient(90deg,var(--accent-fill),color-mix(in srgb,var(--mk-pink) 30%,transparent));margin:1rem 0 2rem}
+/* Connectors are PENCIL — a guide line drawn before the ink, not a frame. The
+   spine runs down each branch and an elbow reaches out to every node. */
+ul{list-style:none;margin:0;padding-left:1.5rem;border-left:var(--stroke-w) solid var(--rule)}
 ul.tree{border-left:none;padding-left:0}
-li{margin:.4rem 0}
+li{position:relative;margin:.4rem 0}
+ul:not(.tree)>li::before{content:'';position:absolute;left:-1.5rem;top:1.2rem;width:1.1rem;border-top:var(--stroke-w) solid var(--rule);pointer-events:none}
 details{display:block}
-summary,.leaf{display:inline-flex;align-items:center;gap:.5rem;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:.4rem .7rem;box-shadow:0 4px 14px rgba(24,24,60,.05);list-style:none;margin:.1rem 0}
-summary{cursor:pointer}
+/* Nodes are FRAMES DRAWN ON THE SHEET: transparent, so the dotted grid runs
+   under the whole map, with the pen as their outline. min-height keeps the
+   smallest node a 24px target. */
+summary,.leaf{display:inline-flex;align-items:center;gap:.5rem;min-height:24px;background:transparent;border:var(--stroke-w) solid var(--sketch);border-radius:var(--radius);padding:.4rem .7rem;list-style:none;margin:.1rem 0}
+summary{cursor:pointer;transition:background var(--dur-fast) var(--ease-pen)}
+summary:hover{background:color-mix(in srgb,var(--ink) 6%,transparent)}
+summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 summary::-webkit-details-marker{display:none}
-summary::before{content:'\25B8';color:var(--muted);font-size:.85rem;transition:transform .15s}
+summary::before{content:'\25B8';color:var(--ink-2);font-size:.85rem;transition:transform var(--dur-fast) var(--ease-pen)}
 details[open]>summary::before{transform:rotate(90deg)}
-ul.tree>li>details>summary,ul.tree>li>.leaf{background:var(--accent);color:#fff;border-color:transparent;font-weight:650}
-ul.tree>li>details>summary::before{color:rgba(255,255,255,.85)}
+/* The central topic is FILLED INK, the notebook's primary treatment. Reversing
+   white out of the pink pen is the obvious move and it fails the contrast
+   gate: white on the dark theme's pink is 3.1:1. Ink on paper is 14:1 in both
+   themes, and the pen still marks the map through the rule and the branches. */
+ul.tree>li>details>summary,ul.tree>li>.leaf{background:var(--btn-ink);color:var(--btn-ink-text);border-color:var(--btn-ink);font-weight:650;font-size:var(--fs-lead)}
+ul.tree>li>details>summary:hover{background:var(--btn-ink)}
+ul.tree>li>details>summary::before{color:var(--btn-ink-text)}
+/* The first ring off the centre carries the pen as a marker edge, so the main
+   branches read at a glance without inventing a second colour scheme. The <ul>
+   is a child of the root's <details>, not of its <li> — render_mindmap_html
+   emits <li><details><summary>…</summary><ul>…</ul></details></li>, so a
+   `ul.tree>li>ul` selector matches nothing at all. */
+ul.tree>li>details>ul>li>details>summary,
+ul.tree>li>details>ul>li>.leaf{border-left:3px solid var(--accent-fill)}
+@media print{
+  /* A collapsed branch prints collapsed — CSS cannot open a <details> the
+     reader left shut, and faking it would print something the page is not
+     showing. Expand what you want before you print. */
+  li,summary,.leaf{break-inside:avoid;page-break-inside:avoid}
+}
 </style>
 </head>
 <body>
 <main class="wrap">
   <div class="eyebrow">Mind map</div>
   <h1>__TITLE__</h1>
+  <div class="rule"></div>
   __TREE__
 </main>
 </body>

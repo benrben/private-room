@@ -54,7 +54,8 @@ export default function BehaviorSection({
     <section id="set-behavior">
       <h3>Behavior</h3>
             <label className="settings-label">
-              Creativity (temperature): <strong>{temperature.toFixed(2)}</strong>
+              Creativity (temperature):{" "}
+              <strong className="set-figure">{temperature.toFixed(2)}</strong>
             </label>
             <div className="temp-row">
               <span className="settings-hint">focused</span>

@@ -57,10 +57,16 @@ export default function MicSection() {
         Clean up microphone audio (echo cancellation and noise suppression)
       </label>
 
-      <p className="settings-hint">
+      {/* What is in force, attached to the switch that decides it. The bold
+          "On"/"Off" the copy already carried becomes the tape label — the same
+          words, with the emphasis drawn instead of bolded — and the hue says
+          which of the two states you are in without the word having to change.
+          Neither state is a risk, so both are quiet notes rather than flagged
+          ones; the marker only distinguishes them. */}
+      <p className={`set-note set-note--flag ${on ? "nb-sem-done" : "nb-sem-pending"}`}>
         {on ? (
           <>
-            <b>On</b> — meeting audio coming out of your speakers is kept out of
+            <span className="nb-tape set-note-tag">On</span> — meeting audio coming out of your speakers is kept out of
             your own voice track, so speakers are told apart correctly. macOS
             puts the microphone into voice-processing mode for this. If you wear
             headphones, or another app sounds quieter while Arcelle records,
@@ -68,7 +74,7 @@ export default function MicSection() {
           </>
         ) : (
           <>
-            <b>Off</b> — the microphone is passed through untouched. Best with
+            <span className="nb-tape set-note-tag">Off</span> — the microphone is passed through untouched. Best with
             headphones. On speakers, the other people in the call may be picked
             up by your own microphone as well and land in your voice track.
           </>
@@ -78,9 +84,12 @@ export default function MicSection() {
         Takes effect on the next recording or dictation you start.
       </p>
 
+      {/* This setting applies immediately, so there is no Save button and no
+          unsaved state to show — only the confirmation that it stuck, in the
+          same green every other "Saved" on this surface uses. */}
       <div className="settings-actions">
         {saved && (
-          <span className="settings-hint">
+          <span className="settings-confirm btn-ic" role="status">
             <CircleCheckIcon size={13} /> Saved
           </span>
         )}

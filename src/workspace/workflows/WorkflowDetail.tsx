@@ -293,7 +293,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
         <button className="subtle btn-ic" onClick={() => void leave()}>
           ← Library
         </button>
-        <div className="wf-icon-pick" style={{ position: "relative" }}>
+        <div className="wf-icon-pick">
           <button
             type="button"
             className="wf-icon-btn"
@@ -331,16 +331,20 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
             </>
           )}
         </div>
+        {/* The workflow's name is edited in place, so the field is drawn as the
+            title it is: no box until you touch it, then the pen's own focus
+            stroke. It carries user-typed text, which is always the interface
+            sans and never the hand. */}
         <input
-          className="viewer-title"
-          style={{ font: "inherit", fontWeight: 600, border: "none", background: "transparent", flex: 1 }}
+          className="viewer-title wf-title-input"
+          aria-label="Workflow name"
           value={name}
           onChange={(e) => {
             setName(e.target.value);
             /* dirty is derived from a diff */
           }}
         />
-        <span className="viewer-actions" style={{ position: "relative" }}>
+        <span className="viewer-actions wf-detail-actions">
           <button className="subtle btn-ic" disabled={workflow.status !== "active"} onClick={() => void a.runWorkflowNow(workflow.id)}>
             <PlayIcon size={12} /> Run now
           </button>
@@ -395,8 +399,10 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
           >
             <CalendarClockIcon size={12} /> Schedule
           </button>
+          {/* Destructive actions are drawn in the urgent ink across the whole
+              product, so this one stops being indistinguishable from Save. */}
           <button
-            className="subtle"
+            className="subtle danger"
             data-agent-blocked
             onClick={async () => {
               const ok = await confirm(`Delete the workflow “${workflow.name}”? This can't be undone.`, {
@@ -432,7 +438,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
 
       <div className="wf-body">
         {workflow.status === "draft" && (
-          <div className="wf-badges" style={{ marginBottom: "0.6rem" }}>
+          <div className="wf-badges wf-detail-badges">
             <span className="wf-badge draft">Draft — activate to run on schedule</span>
             {workflow.createdBy === "agent" && <span className="wf-badge agent">Drafted by the agent</span>}
           </div>
@@ -521,24 +527,34 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
           </label>
           {binding.scope === "file" && (
             <>
-              <label>
-                File kinds it runs on
-                <div className="wf-badges">
-                  {KIND_UNION.map((k) => (
-                    <button
-                      key={k}
-                      className={`wf-badge ${(binding.kinds ?? []).includes(k) ? "agent" : ""}`}
-                      style={{ cursor: "pointer", border: "none" }}
-                      onClick={() => toggleKind(k)}
-                    >
-                      {k}
-                    </button>
-                  ))}
+              {/* A group of toggles, not a <label>: a label may only name one
+                  control, and these are chips. They were styled as badges with
+                  the border stripped off, which left them under the 24px
+                  minimum target, with no boundary, and with their on/off state
+                  carried by colour alone. .nb-chip-btn brings the target, the
+                  focus ring and the circled "on" treatment; aria-pressed puts
+                  the state in the accessibility tree where colour cannot. */}
+              <div className="field" role="group" aria-label="File kinds it runs on">
+                <span className="field-head">File kinds it runs on</span>
+                <div className="wf-chips">
+                  {KIND_UNION.map((k) => {
+                    const on = (binding.kinds ?? []).includes(k);
+                    return (
+                      <button
+                        key={k}
+                        type="button"
+                        aria-pressed={on}
+                        className={`nb-chip nb-chip-btn${on ? " is-on" : ""}`}
+                        onClick={() => toggleKind(k)}
+                      >
+                        {k}
+                      </button>
+                    );
+                  })}
                 </div>
-              </label>
+              </div>
               <label>
-                File extensions{" "}
-                <span style={{ opacity: 0.6, fontWeight: 400 }}>(comma-separated, e.g. pdf, docx)</span>
+                File extensions <span className="wf-field-hint">(comma-separated, e.g. pdf, docx)</span>
                 <input
                   type="text"
                   value={extsText}
@@ -548,7 +564,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
               </label>
               <label>
                 Only this specific file{" "}
-                <span style={{ opacity: 0.6, fontWeight: 400 }}>(optional — overrides kinds/exts)</span>
+                <span className="wf-field-hint">(optional — overrides kinds/exts)</span>
                 <select
                   value={binding.file_id ?? ""}
                   onChange={(e) => setBindingFile(e.target.value || null)}
@@ -568,7 +584,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
           )}
         </div>
 
-        <h3 style={{ marginTop: "1.2rem" }}>Run history</h3>
+        <h3 className="wf-sec-head">Run history</h3>
         <RunHistory runs={runs} nodeCount={nodeCount} nodes={def.nodes} />
       </div>
     </div>

@@ -18,6 +18,7 @@ from arcelle_sidecar.routing import (
     UI_HINTS,
     UI_TOOL_NAMES,
     WRITE_HINTS,
+    ORGANIZE_TOOL_NAMES,
     WRITE_TOOL_NAMES,
     lane_label,
     wants_job_tools,
@@ -97,6 +98,41 @@ def test_management_tool_names_are_gated_in_their_own_lanes() -> None:
         "write_skill_resource", "delete_skill_resource", "delete_skill", "run_skill_script",
     )
     assert MCP_MANAGEMENT_TOOL_NAMES == ("list_mcps", "read_mcp", "save_mcp", "delete_mcp")
+    assert ORGANIZE_TOOL_NAMES == ("organize_files", "trash_files", "merge_files")
+
+
+@pytest.mark.skipif(not _AGENT_RS.exists(), reason="Rust source not present in this checkout")
+def test_the_organize_box_matches_the_tools_rust_actually_serves() -> None:
+    """The box the File agent asks for must be the box the host can serve.
+
+    These two lists live in different languages and neither imports the other:
+    `routing.ORGANIZE_TOOL_NAMES` decides what goes in the agent's toolbox, and
+    `commands::agent::organize_tools_specs` decides what the bridge advertises
+    and what `exec_tool` can run. Drift is silent in the worst direction — a
+    name here with no spec there is a tool the model is told it holds and gets
+    an "unknown tool" for, mid-errand, after it has already promised the user.
+
+    Parsed from the spec function rather than from `BUILTIN_TOOL_NAMES`, which
+    is a reservation list: a name can sit there (correctly, so MCP cannot shadow
+    it) long before or after anything serves it.
+    """
+    src = _AGENT_RS.read_text()
+    body_at = src.index("pub(crate) fn organize_tools_specs")
+    body_end = src.index("\n}", body_at)
+    served = tuple(
+        re.findall(r'"function", "function": \{"name": "([a-z_]+)"', src[body_at:body_end])
+    )
+    assert served == ORGANIZE_TOOL_NAMES
+
+    # …and every one of them is reserved, so no connector can shadow an arm.
+    reserved = _rust_str_list(src, "BUILTIN_TOOL_NAMES: &[&str]")
+    assert set(ORGANIZE_TOOL_NAMES) <= set(reserved)
+
+    # The agent must never be handed a way to destroy a file. These two are
+    # room commands with no tool spec anywhere, and this asserts they stay that
+    # way — the trash is only a safety net while nothing can empty it.
+    assert "delete_file_permanently" not in reserved
+    assert "empty_trash" not in reserved
 
 
 def test_edit_files_is_a_write_tool() -> None:

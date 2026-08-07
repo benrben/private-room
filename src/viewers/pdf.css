@@ -9,6 +9,30 @@
  * importing that 100 KB sheet, of which this is the only part we use.
  * ------------------------------------------------------------------ */
 
+/* ---- the document column ----
+   `.pdf-view` and `.pdf-pages` had no rule anywhere in the app: the reader was
+   whatever `.viewer-body` happened to give it. The pages are the dominant
+   thing on this pane, so they get the column and the chrome gets out of the
+   way. The pages themselves keep the author's white (viewer-formats.css) in
+   BOTH themes — a rasterised page is a photograph of a document, and tinting
+   it would be the app editing the file. */
+.pdf-view {
+  min-width: 0;
+}
+
+/* Reading progress across the whole document, flush at the top of the scroll
+   region with the toolbar sitting just under it. Driven by `curPage`, which
+   the viewer derives from where the pages actually are on screen — so this
+   tracks real scroll position, at the granularity the sentence beside it
+   ("Page 4 of 21") already claims.
+
+   Written at two-class specificity because `.rdr-progress` in styles/viewer.css
+   sets the same property, and which of the two stylesheets the bundler emits
+   first is not something this file should have to know. */
+.pdf-view .pdf-progress {
+  margin-bottom: var(--sp-1);
+}
+
 /* Exactly the page: the canvas's own `margin: 0 auto` would otherwise centre
    it inside a wider wrap, leaving the overlays a few px out. */
 .pdf-page-box {
@@ -64,7 +88,7 @@
 }
 
 .textLayer ::selection {
-  background: rgba(120, 160, 255, 0.35);
+  background: color-mix(in srgb, var(--mk-blue) 35%, transparent);
 }
 
 /* The quote highlight and its receipt badge sit above the canvas but BELOW the
@@ -75,66 +99,161 @@
   z-index: 0;
 }
 
+/* A TRUE marker highlight over the cited passage: uneven alpha across the run,
+   heavier where the pen touched down and lighter where it lifted, with the
+   corners drawn rather than computed. The flat 45% wash it replaces read as a
+   UI selection rectangle.
+
+   `mix-blend-mode: multiply` (inherited from the base rule) is what makes it
+   sit UNDER the page's ink instead of over it — a highlighter is transparent,
+   and the words have to stay black. The base rule lives in
+   settings-annotations.css, which this agent does not own, so the marker is
+   written at two-class specificity here rather than by editing it. */
+.pdf-page-box .pdf-hl {
+  background-color: transparent;
+  background-image: linear-gradient(
+    100deg,
+    transparent 0.4%,
+    color-mix(in srgb, var(--mk-yellow) 62%, transparent) 1.5%,
+    color-mix(in srgb, var(--mk-yellow) 46%, transparent) 42%,
+    color-mix(in srgb, var(--mk-yellow) 60%, transparent) 78%,
+    color-mix(in srgb, var(--mk-yellow) 34%, transparent) 97%,
+    transparent 99.5%
+  );
+  border-radius: 3px 6px 4px 5px / 5px 4px 6px 3px;
+}
+
 /* ---- ⌘F: find inside this document ---- */
 /* Deliberately NOT the citation yellow: a citation highlight is a receipt
    ("this sentence is on this page"), a find hit is just where you looked. */
 .pdf-find-hl {
   position: absolute;
-  background: rgba(120, 160, 255, 0.45);
+  background: color-mix(in srgb, var(--mk-blue) 45%, transparent);
   border-radius: 2px;
   pointer-events: none;
   mix-blend-mode: multiply;
 }
 
-.pdf-findbar {
+/* The find bar: a strip of pencil marks on the sheet, not a filled toolbar.
+   Composed to match `.rdr-bar`, which every other reader's chrome uses. */
+.pdf-view .pdf-findbar {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 0;
+  background: transparent;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }
-.pdf-find-input {
+/* --rule-strong, not --rule: a field the user types into is a control, and a
+   control boundary owes 3:1. */
+.pdf-view .pdf-find-input {
   flex: 1;
   min-width: 0;
   max-width: 320px;
-  padding: 3px 7px;
+  min-height: 26px;
+  padding: 3px 8px;
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   color: var(--text);
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 5px;
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
 }
+.pdf-view .pdf-find-input:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* A count is figures: mono, tabular, so the readout does not jitter as the
+   scan walks the document. */
 .pdf-find-count {
-  font-size: 12px;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
-/* ---- toolbar: where am I / jump to a page ---- */
+/* ---- toolbar: where am I / jump to a page ----
+   The zoom bar genuinely FLOATS over the pages (sticky, above the document),
+   so it is one of the few things allowed an opaque fill — paper.css section 9.
+   `.pdf-zoombar` and its buttons are declared in settings-annotations.css,
+   which this agent does not own, so the notebook treatment is written at
+   two-class specificity here and the base rules are left intact. */
+.pdf-view .pdf-zoombar {
+  /* Sits flush under the 3px reading-progress stroke rather than on top of
+     it — both are sticky against the same scrollport. */
+  top: 3px;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-2);
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow:
+    0 6px 18px var(--shadow-lift),
+    0 1px 3px var(--shadow-lift);
+}
+.pdf-view .pdf-zoom-btn:hover:not(:disabled),
+.pdf-view .pdf-zoom-fit:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+.pdf-view .pdf-zoom-btn:focus-visible,
+.pdf-view .pdf-zoom-fit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* Figures, in the mono face with tabular digits: a zoom percentage that
+   reflows as it counts is the classic jittering readout. */
+.pdf-view .pdf-zoom-pct,
+.pdf-view .pdf-page-total {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+}
+
 .pdf-page-jump {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   margin-left: 10px;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   color: var(--text-dim);
 }
 .pdf-page-jump input {
-  width: 3.4em;
-  padding: 2px 4px;
+  width: 3.6em;
+  min-height: 24px;
+  padding: 2px 5px;
   font: inherit;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
   text-align: right;
   font-variant-numeric: tabular-nums;
   color: var(--text);
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 5px;
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+}
+.pdf-page-jump input:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
-/* Scan progress: a moving readout and a way out of a long, fruitless search. */
+/* Scan progress: a moving readout and a way out of a long, fruitless search.
+   Drawn as a marker stroke in a pencil track — paper.css's progress recipe —
+   so it reads as the same object as the reading-progress mark above it. The
+   percentage is also written out beside it in words; a bar is never the only
+   statement of how far something has got. */
 .pdf-scan {
   display: flex;
   align-items: center;
@@ -143,14 +262,30 @@
 .pdf-scan-bar {
   flex: 1;
   max-width: 220px;
-  height: 4px;
-  border-radius: 2px;
+  height: 6px;
+  border-radius: 999px 999px 999px 999px / 6px 5px 6px 5px;
   overflow: hidden;
-  background: var(--line-soft, rgba(255, 255, 255, 0.08));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
 }
 .pdf-scan-bar > i {
   display: block;
   height: 100%;
-  background: var(--accent);
+  border-radius: inherit;
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 0%,
+    color-mix(in srgb, var(--accent-fill) 52%, transparent) 46%,
+    color-mix(in srgb, var(--accent-fill) 68%, transparent) 88%,
+    color-mix(in srgb, var(--accent-fill) 46%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px var(--accent);
+  /* Linear and short: it is reporting a real position, so it must not ease
+     into a value the scan has not reached. */
   transition: width 0.1s linear;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pdf-scan-bar > i {
+    transition: none;
+  }
 }

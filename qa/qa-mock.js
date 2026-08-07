@@ -153,12 +153,56 @@
     // "Author: unknown" row on the second).
     { id: "f-heron", name: "The Heron Returns.md", mimeType: "text/markdown", sizeBytes: 4300, source: "web", hasText: true, createdAt: iso(20), folderId: "fo-research", partiallyIndexed: false },
     { id: "f-bare", name: "Status page.md", mimeType: "text/markdown", sizeBytes: 900, source: "web", hasText: true, createdAt: iso(18), folderId: null, partiallyIndexed: false },
+    // A podcast SCRIPT, so the Studio tab's Voices panel is reachable at all.
+    // Without a file that has a `podcasts` row behind it the panel only ever
+    // renders its "this page has no script attached" branch.
+    { id: "f-podcast", name: "Diarization - podcast script.html", mimeType: "text/html", sizeBytes: 7400, source: "generated", hasText: true, createdAt: iso(9), folderId: null, partiallyIndexed: false },
   ];
 
   const folders = [
     { id: "fo-product", name: "Product" },
     { id: "fo-research", name: "Research" },
   ];
+
+  /** Run `step` over each id and answer in the shape the batch commands really
+   * return: `{ ok, failed, capped }`.
+   *
+   * `ok` holds NAMES, not ids, because that is what the receipt shows the user
+   * — a toast reading "moved f-clean" would be the harness leaking its own
+   * primary keys into a sentence meant for a person. A step that throws is
+   * recorded as a named failure and the batch carries on, which is exactly the
+   * best-effort contract the real commands have. */
+  const bulk = (ids, step) => {
+    const report = { ok: [], failed: [], capped: 0 };
+    for (const id of ids || []) {
+      try {
+        report.ok.push(step(id));
+      } catch (e) {
+        report.failed.push({ name: id, error: String(e && e.message ? e.message : e) });
+      }
+    }
+    return report;
+  };
+
+  /* The podcast behind `f-podcast`: two hosts, two DIFFERENT voices, and a
+     line each so the panel's Preview speaks a host's own words rather than a
+     generic sample. `audioFileId` is null — nothing recorded yet — so the
+     Record button is reachable in its first state. */
+  const podcast = {
+    fileId: "f-podcast",
+    title: "How diarization actually works",
+    turns: [
+      { speaker: "Ada", line: "Welcome in — today we're talking about telling voices apart." },
+      { speaker: "Bo", line: "Which sounds simple until two people talk over each other." },
+      { speaker: "Ada", line: "Right, and that overlap is where most of the errors live." },
+    ],
+    cast: [
+      { name: "Ada", voice: "en-US-AvaMultilingualNeural", rate: "", pitch: "" },
+      { name: "Bo", voice: "en-US-AndrewMultilingualNeural", rate: "", pitch: "" },
+    ],
+    audioFileId: null,
+    createdAt: iso(9),
+  };
 
   /* Trash: the Library pane's third tab. Deliberately seeded with all three
      actor kinds — a person's delete, an AI's, and one Arcelle did on its own —
@@ -506,6 +550,69 @@
       trashedFiles = [];
       return n;
     },
+
+    /* ---- multi-file operations -------------------------------------------
+       The batch commands return a REPORT, not nothing, and the whole point of
+       that report is partial failure. So these fixtures deliberately fail one
+       id — the last one — whenever more than two are asked for: a harness that
+       only ever succeeds cannot show a tester what a half-done batch looks
+       like, which is the state the receipt exists to describe. */
+    move_file_to_folder: (a2) => {
+      const f = files.find((x) => x.id === a2?.fileId);
+      if (!f) throw new Error("That file is not in this room.");
+      f.folderId = a2?.folderId ?? null;
+      return null;
+    },
+    trash_files: (a2) => bulk(a2?.ids, (id) => {
+      const i = files.findIndex((f) => f.id === id);
+      if (i < 0) throw new Error("That file is not in this room.");
+      const [gone] = files.splice(i, 1);
+      trashedFiles = [
+        { id: gone.id, name: gone.name, mimeType: gone.mimeType, sizeBytes: gone.sizeBytes, trashedAt: new Date().toISOString(), trashedBy: "user", trashedById: null, folderId: gone.folderId },
+        ...trashedFiles,
+      ];
+      return gone.name;
+    }),
+    move_files_to_folder: (a2) => bulk(a2?.ids, (id) => {
+      const f = files.find((x) => x.id === id);
+      if (!f) throw new Error("That file is not in this room.");
+      f.folderId = a2?.folderId ?? null;
+      return f.name;
+    }),
+    restore_files: (a2) => bulk(a2?.ids, (id) => {
+      const i = trashedFiles.findIndex((f) => f.id === id);
+      if (i < 0) throw new Error("That file is not in the trash.");
+      const [back] = trashedFiles.splice(i, 1);
+      files.unshift({ id: back.id, name: back.name, mimeType: back.mimeType, sizeBytes: back.sizeBytes, source: "upload", hasText: true, createdAt: iso(500), folderId: back.folderId, partiallyIndexed: false });
+      return back.name;
+    }),
+    delete_files_permanently: (a2) => bulk(a2?.ids, (id) => {
+      const i = trashedFiles.findIndex((f) => f.id === id);
+      if (i < 0) throw new Error("Only a file already in the trash can be deleted permanently.");
+      const [gone] = trashedFiles.splice(i, 1);
+      return gone.name;
+    }),
+
+    /* ---- podcast voices --------------------------------------------------
+       The cast's two hosts are seeded with DIFFERENT voices on purpose. A
+       fixture that gave both the same one would make the panel look right
+       while hiding the exact collision the feature exists to prevent. */
+    get_podcast: (a2) => (a2?.fileId === "f-podcast" ? podcast : null),
+    set_podcast_cast: (a2) => {
+      podcast.cast = (a2?.cast || []).map((h) => ({ ...h }));
+      return podcast;
+    },
+    // A tiny silent WAV — enough for the panel to build a blob and "play" it,
+    // without a fixture that pretends a voice was actually synthesized.
+    preview_podcast_voice: () =>
+      "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=",
+    start_podcast_audio_job: () => ({
+      id: "job-podcast",
+      kind: "podcast_audio",
+      status: "running",
+      title: "Recording the episode",
+      createdAt: new Date().toISOString(),
+    }),
     // BROWSE-3: the browser's search half.
     browser_search: (a2) => ({
       hits: searchHits,

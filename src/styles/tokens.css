@@ -1,74 +1,246 @@
-/* ---------- tokens ----------
-   The one place colors, radii and spacing are defined. Two layers:
+/* ---------- tokens: the notebook ----------
+   The one place colors, type, radii, spacing and motion are defined.
 
-   1. Canonical tokens (the reference design language): --bg/--top/--rail/
-      --panel/--panel-2/--editor surfaces, --text/--text-strong/--muted/--faint
-      ink, --line/--line-soft hairlines, --hover/--selected states, --accent
-      (+ --accent-2 soft foreground, --accent-ink text-on-accent), and the four
-      semantic hues --green/--amber/--red/--blue. Dark is the default; light
-      lives under [data-theme="light"] on <html>.
+   Arcelle is drawn onto an analyst's working notebook. Dark mode is a matte
+   charcoal sketchbook; light mode is warm ivory paper. Dark is the :root
+   default and light lives under [data-theme="light"] on <html> — the same
+   contract the app has always had, so existing per-file light overrides
+   keep working.
 
-   2. Legacy aliases so every pre-redesign rule (surface ramp, --border,
-      --text-dim, --ok/--warn/--danger …) resolves onto the same palette.
-      New CSS should use canonical names only. */
+   Three layers:
+
+   1. NOTEBOOK PRIMITIVES — the raw material. Paper (--page/--surface/
+      --raised), ink (--ink/--ink-2/--ink-muted), the drawn stroke
+      (--sketch/--rule), the grid dot, and the five markers.
+
+      Markers come in two tracks, and the distinction is load-bearing:
+        --mk-*      the spec fill values. Translucent, absorbed, uneven.
+                    Highlights, underlines, category edges, chip fills.
+                    In light mode these sit at 1.4-2.8:1 on paper — they are
+                    NOT legible as text.
+        --mk-*-ink  derived per theme, contrast-checked >=4.6:1 against
+                    EVERY surface of that theme — including --hover, which is
+                    the floor and which an earlier solve missed — saturation
+                    capped so they read as absorbed ink and never as neon.
+                    Labels, icons, strokes.
+      Reach for -ink whenever a marker hue has to carry a word.
+
+   2. CANONICAL APP TOKENS — --bg/--panel/--text/--accent/--line etc.,
+      mapped onto the primitives above. This is what most CSS should use.
+
+   3. LEGACY ALIASES — --surface-1..4, --border, --text-dim, --ok/--warn/
+      --danger and friends, so every pre-notebook rule resolves onto the
+      same palette. New CSS should use canonical names only.
+
+   Accent is the PINK pen (active, selected, AI attribution). Danger is the
+   RED ink (destructive, error, recording). They are close in hue by design
+   of the source palette, so they are separated by TREATMENT — accent is a
+   translucent wash behind things, danger is an outline or underline on them
+   — and per the spec, status is never signalled by colour alone. */
 
 :root {
-  --bg: #121116;
-  --top: #18171d;
-  --rail: #151419;
-  --panel: #1b1a20;
-  --panel-2: #201f26;
-  --editor: #17161b;
-  --text: #eeeaf2;
-  --text-strong: #fbf9fc;
-  --muted: #aaa5b0;
-  /* --faint is the smallest secondary text (timestamps, hints, meta). The old
-     #77727e sat ~3.7:1 on the panels — below the WCAG 1.4.3 minimum of 4.5:1
-     for normal text. Lifted to clear it on --bg/--panel/--panel-2. */
-  --faint: #928d9a;
-  --line: #312f38;
-  --line-soft: #27262d;
-  --hover: #28262f;
-  --selected: #302b3d;
-  --selected-strong: #3b3250;
-  --accent: #ae93e7;
-  --accent-2: #d4c3f6;
-  --accent-ink: #1e152e;
-  --green: #83cfaa;
-  --amber: #dfbc72;
-  --red: #e99b9f;
-  --blue: #8fbde7;
-  --shadow: rgba(0, 0, 0, 0.34);
+  /* ----- paper: a black sketchbook, not a cyberpunk surface ----- */
+  --page: #151716; /* matte charcoal, the sheet everything is drawn on */
+  --surface: #202321; /* a panel laid on the sheet */
+  --raised: #292c29; /* a note lifted off the sheet */
+  /* The dotted rule, alpha baked in. Deliberately NOT a color-mix with a
+     calc() percentage: WebKit — which is what the app actually ships on —
+     rejects calc() inside color-mix()'s percentage, so the grid silently
+     vanished in the real Tauri window while rendering fine in Chrome. A
+     literal rgba needs no engine support at all. */
+  --grid-dot: rgba(80, 84, 79, 0.42);
+  --grid-gap: 22px; /* spec: 20-24px */
 
-  /* Token-budget bar: 5 fixed categorical hues (system/history/tools/skills/
-     files), distinct from the green/amber/red status triad above (which stay
-     reserved for the bar's own near/at/over-budget signal, never category
-     identity). Validated with the dataviz skill's validate_palette.js against
-     this surface (--panel-2): CVD worst-adjacent ΔE 17.9, well over the 12
-     target. Fixed order — never reordered, never cycled. */
-  --tok-system: #008eb1;
-  --tok-history: #2d74ca;
-  --tok-tools: #b559a3;
-  --tok-skills: #00997c;
-  --tok-files: #8d73ce;
+  /* ----- ink: warm off-white ----- */
+  --ink: #f0eee5; /* primary text */
+  --ink-strong: #fbfaf4; /* titles, the brightest mark on the page */
+  --ink-2: #a9ada3; /* secondary. 7.88:1 on --page, 5.70:1 on --hover. */
+  /* Smallest meta text (timestamps, hints). Solved against --hover #2e322e,
+     NOT --raised: --hover is the lightest ground in dark mode, and roughly 25
+     rules paint it behind a row whose metadata is --faint. An earlier comment
+     here called --raised "the lightest dark surface", which was simply wrong,
+     so the value was tuned against a surface that is not the floor and this
+     token sat at 4.15:1 on a hovered row. 4.54:1 worst case now. */
+  --ink-muted: #959a92;
 
-  /* BROWSE-3 search: one fixed hue per search engine. These are IDENTITY, not
-     status — an engine keeps its hue and its slot on every consensus dial, so
-     "who agreed" is readable by position without reading a word. Kept apart
-     from the --tok-* set above (different surface, different meaning) and from
-     the green/amber/red triad, which stays reserved for status. */
-  --eng-duckduckgo: #4da3c0;
-  --eng-brave: #c77bb6;
-  --eng-mojeek: #4fae96;
-  --eng-marginalia: #9d85d6;
-  --eng-wikipedia: #6f9fd8;
-  --eng-ddgia: #dfbc72;
-  --eng-news: #83cfaa;
+  /* ----- drawn strokes ----- */
+  --sketch: #d8d8cc; /* the pen: frames, dividers, hand-drawn borders */
+  --rule: #555a54; /* a light pencil rule; decorative separators only */
+  /* Control boundaries must clear 3:1 (WCAG 1.4.11) — --rule is 2.55:1,
+     fine for a divider but not for the edge of an input. This is the border
+     for anything the user can type in, click, or toggle.
+     Solved against ALL FOUR grounds, worst case --hover, not just --page. The
+     previous #5F655E cleared 3:1 on the bare sheet and nowhere else: 2.65 on
+     --surface, 2.36 on --raised, 2.18 on --hover. That meant every button and
+     field inside a menu, popover or modal — the recovery sheet's "I've saved
+     it", every input in Settings — had an edge under the floor, and the input
+     defaults in base.css fill themselves from --raised, so a field's border
+     failed against its own interior. 3.13:1 worst case now. */
+  --rule-strong: #787e77;
+  --stroke-w: 1.5px; /* spec: 1.5-2px hand-drawn stroke */
+  --redraw: 2px; /* offset of the second "quick pen redraw" outline */
 
-  /* Shape + rhythm. Restrained radii; 4/8px spacing. */
-  --radius-sm: 5px;
-  --radius: 7px;
-  --radius-lg: 10px;
+  /* ----- markers: FILL track (spec values, absorbed ink) ----- */
+  --mk-pink: #c77a90;
+  --mk-yellow: #c2a84f;
+  --mk-green: #719c75;
+  --mk-blue: #6896b2;
+  --mk-red: #bb6661;
+
+  /* ----- markers: INK track (>=4.6:1 on EVERY surface, saturation capped) ---
+     Solved against --hover, not --raised. --hover is the lightest ground in
+     dark mode and the darkest in light, so it is the floor in both — the same
+     correction --ink-2, --ink-muted and --rule-strong needed above. Solved
+     against --raised these sat at 4.15-4.17:1 on a hovered row while this
+     comment claimed they cleared 4.5, which is the worst kind of wrong: an
+     invariant stated as verified fact that a reader would reasonably build on.
+     Lightness moves only; hue and saturation are the spec's. */
+  --mk-pink-ink: #d1849a;
+  --mk-yellow-ink: #baa457;
+  --mk-green-ink: #79a47d;
+  --mk-blue-ink: #73a0bc;
+  --mk-red-ink: #cf8883;
+
+  /* ----- marker MEANINGS -----
+     Every marker hue carries one stable meaning across the whole product.
+     Reach for the semantic name, not the hue name, whenever the colour is
+     saying something — then "yellow means pending" is a fact the stylesheet
+     enforces rather than a convention a reviewer has to police.
+
+       saved    pink    personal, saved, editorial, AI attribution
+       pending  yellow  pending, notable, needs review, caution
+       done     green   complete, verified, approved, positive
+       linked   blue    linked, informational, active, connected
+       urgent   red     recording, urgent, failed, error
+
+     -fill is the translucent marker (washes, edges, highlights); plain is
+     the ink that can carry a word. Per the spec these ALWAYS ride with a
+     word or an icon — colour is never the only signal. */
+  --sem-saved: var(--mk-pink-ink);
+  --sem-saved-fill: var(--mk-pink);
+  --sem-pending: var(--mk-yellow-ink);
+  --sem-pending-fill: var(--mk-yellow);
+  --sem-done: var(--mk-green-ink);
+  --sem-done-fill: var(--mk-green);
+  --sem-linked: var(--mk-blue-ink);
+  --sem-linked-fill: var(--mk-blue);
+  --sem-urgent: var(--mk-red-ink);
+  --sem-urgent-fill: var(--mk-red);
+
+  /* ----- canonical app surfaces ----- */
+  --bg: var(--page);
+  --top: var(--surface); /* top bar */
+  --rail: var(--page); /* activity rail sits on the sheet itself */
+  --panel: var(--surface);
+  --panel-2: var(--raised);
+  --editor: var(--page); /* the centre pane IS the sheet — the grid shows */
+
+  /* ----- canonical ink ----- */
+  --text: var(--ink);
+  --text-strong: var(--ink-strong);
+  --muted: var(--ink-2);
+  --faint: var(--ink-muted);
+
+  /* ----- canonical lines ----- */
+  --line: var(--rule);
+  --line-soft: #343834;
+
+  /* ----- states ----- */
+  /* Hover is a warm paper wash, as though the sheet darkened slightly under
+     a hand — not a different surface colour. Dark mode separates surfaces
+     rather than leaning on shadow, per the spec. */
+  --hover: #2e322e;
+  --selected: color-mix(in srgb, var(--mk-pink) 20%, transparent);
+  --selected-strong: color-mix(in srgb, var(--mk-pink) 32%, transparent);
+
+  /* ----- the pen (accent) ----- */
+  --accent: var(--mk-pink-ink);
+  --accent-2: #dda0b0; /* lifted pen: hover on an accent-coloured label */
+  --accent-fill: var(--mk-pink); /* the marker swash behind active things */
+  --accent-ink: var(--page); /* text on a filled-accent ground */
+  --accent-soft: color-mix(in srgb, var(--mk-pink) 18%, transparent);
+  --accent-ghost: color-mix(in srgb, var(--mk-pink) 9%, transparent);
+
+  /* ----- primary button: filled ink, per spec -----
+     Dark mode fills with warm ivory and labels in charcoal — 15.49:1. */
+  --btn-ink: var(--ink);
+  --btn-ink-text: var(--page);
+
+  /* ----- semantic hues (ink track: these carry words) ----- */
+  --green: var(--mk-green-ink);
+  --amber: var(--mk-yellow-ink);
+  --red: var(--mk-red-ink);
+  --blue: var(--mk-blue-ink);
+
+  /* ----- shadow: near-black, broad and restrained (spec) ----- */
+  --shadow: rgba(0, 0, 0, 0.46);
+  --shadow-lift: rgba(0, 0, 0, 0.34);
+
+  /* ----- token-budget bar: 5 categorical marker FILLS -----
+     Fixed order, never reordered, never cycled. These are identity, not
+     status: the bar's own near/at/over-budget signal is carried by the red
+     ink outline plus a label, so category and status never collide. */
+  --tok-system: var(--mk-blue);
+  --tok-history: var(--mk-green);
+  --tok-tools: var(--mk-pink);
+  --tok-skills: var(--mk-yellow);
+  --tok-files: #7d8279; /* graphite — the fifth mark, deliberately neutral */
+
+  /* ----- search engines: 7 identity hues -----
+     One fixed hue per engine so "who agreed" is readable by position and
+     colour together. Drawn from the marker family plus two neutrals, since
+     the palette has five markers and this needs seven slots. */
+  --eng-duckduckgo: var(--mk-blue-ink);
+  --eng-brave: var(--mk-pink-ink);
+  --eng-mojeek: var(--mk-green-ink);
+  --eng-marginalia: var(--mk-yellow-ink);
+  --eng-wikipedia: #93a0ae; /* slate graphite */
+  --eng-ddgia: var(--mk-red-ink);
+  --eng-news: #b3a68e; /* warm sepia */
+
+  /* ----- type: three faces, three jobs -----
+     All three are BUNDLED (see fonts.css) — the app renders text without
+     touching the network, which is the whole promise of a local room.
+
+       Manrope        every functional label, control, and body run
+       Kalam          the hand. Annotations, dates, counts, short notes ONLY
+       IBM Plex Mono  code, timestamps, paths, sizes, technical data
+
+     The system fallbacks are not decoration: only latin + latin-ext are
+     bundled, so Hebrew, CJK and the rest fall through per-glyph to a face
+     that actually has them. Turkish is inside latin-ext and stays in
+     Manrope. Never collapse these stacks to a single family. */
+  --sans: Manrope, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    sans-serif;
+  --hand: Kalam, "Bradley Hand", "Noteworthy", "Chalkboard SE", cursive;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    monospace;
+
+  /* Type scale. The app previously carried ~45 ad-hoc sizes across a px and
+     a rem track; these are the rungs. Four tiers with real distance between
+     them — title, section, content, metadata — so hierarchy is legible at a
+     glance instead of everything landing within 3px of everything else. */
+  --fs-page: 44px; /* page title */
+  --fs-section: 26px; /* section title */
+  --fs-lead: 16px; /* intro + instruction copy: never set instructions small */
+  --fs-card: 16px; /* card title */
+  --fs-body: 14px;
+  --fs-meta: 13px; /* metadata floor — was 12, too small to be a floor */
+  --fs-micro: 12px; /* the smallest size allowed anywhere */
+  --fs-hand: 15px; /* handwritten note */
+  --fs-hand-lg: 24px; /* handwritten emphasis */
+  /* Kalam sits high on the baseline and runs airy; these keep a run of
+     handwriting from colliding with the line above it. */
+  --lh-hand: 1.45;
+  --lh-body: 1.55;
+
+  /* ----- shape + rhythm ----- */
+  /* Drawn, not computed: the corner radii are deliberately asymmetric so any
+     rule that says `border-radius: var(--radius)` gets a hand-made rectangle
+     for free. Fixed values, so a box draws identically on every render. */
+  --radius-sm: 6px 5px 7px 5px / 5px 7px 5px 6px;
+  --radius: 9px 7px 10px 8px / 8px 10px 7px 9px; /* spec: 8-14px */
+  --radius-lg: 13px 11px 14px 12px / 12px 14px 11px 13px;
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
@@ -76,7 +248,13 @@
   --sp-6: 24px;
   --sp-8: 32px;
 
-  /* Legacy aliases — old rules keep working, on the new palette. */
+  /* ----- motion: physical, restrained (spec 160-260ms) ----- */
+  --dur-fast: 160ms;
+  --dur: 200ms;
+  --dur-slow: 260ms;
+  --ease-pen: cubic-bezier(0.32, 0.72, 0.3, 1);
+
+  /* ----- legacy aliases — old rules keep working, on the new palette ----- */
   --surface-1: var(--bg);
   --surface-2: var(--panel);
   --surface-3: var(--panel-2);
@@ -86,72 +264,97 @@
   --input-bg: var(--panel-2);
   --border: var(--line);
   --border-subtle: var(--line-soft);
-  --border-strong: color-mix(in srgb, var(--text) 24%, var(--line));
+  --border-strong: var(--rule-strong);
   --text-dim: var(--muted);
   --text-faint: var(--faint);
   --slate: var(--muted);
-  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
-  --accent-ghost: color-mix(in srgb, var(--accent) 8%, transparent);
   --ok: var(--green);
   --warn: var(--amber);
   --danger: var(--red);
+  /* Previously used but defined nowhere, so they silently fell back to an
+     invalid value — a transparent panel background, an invisible "on"
+     badge. Defined here once. */
+  --success: var(--green);
+  --text-2: var(--muted);
+  --on-accent: var(--accent-ink);
+  --warn-bg: color-mix(in srgb, var(--mk-yellow) 26%, transparent);
+  --danger-bg: color-mix(in srgb, var(--mk-red) 24%, transparent);
 
-  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    sans-serif;
+  font-family: var(--sans);
   color-scheme: dark;
 }
 
 :root[data-theme="light"] {
-  --bg: #efedf1;
-  --top: #f9f8fa;
-  --rail: #f2f0f3;
-  --panel: #f8f7f9;
-  --panel-2: #ffffff;
-  --editor: #fdfcfd;
-  --text: #353139;
-  --text-strong: #201d23;
-  --muted: #736d78;
-  /* Light-mode --faint was #96909b (~2.9:1 on white) — well under WCAG 4.5:1.
-     Darkened to clear the minimum on --panel/--panel-2 (converges toward
-     --muted, which legibility here is worth). */
-  --faint: #6f6974;
-  --line: #d9d5dc;
-  --line-soft: #e6e2e8;
-  --hover: #ebe8ed;
-  --selected: #e9e2f2;
-  --selected-strong: #dcd0eb;
-  --accent: #65449a;
-  --accent-2: #573882;
-  --accent-ink: #ffffff;
-  --green: #2f7c58;
-  --amber: #876116;
-  --red: #a64c50;
-  --blue: #3d6f9b;
-  --shadow: rgba(45, 36, 52, 0.16);
+  /* ----- paper: warm ivory ----- */
+  --page: #f4f1e8;
+  --surface: #faf8f1;
+  --raised: #ffffff;
+  --grid-dot: rgba(200, 198, 186, 0.45);
+
+  /* ----- ink: charcoal ----- */
+  --ink: #20221f;
+  --ink-strong: #14150e;
+  /* Light mode is the tight one, and --hover is its floor — not --page. The
+     old comment claimed "--page is the worst case in light mode (the lighter
+     --surface/--raised only improve it)", which forgot that --hover is DARKER
+     than the page. Both ink tiers were solved against #EBE7DA.
+
+     There is barely room for three tiers of small text on ivory: at the spec's
+     --ink-2 the muted tier could not clear 4.5:1 on a hovered row at any value
+     that still read as fainter. So --ink-2 darkens a little and --ink-muted
+     takes the old --ink-2 value — the hierarchy survives (12.96 / 5.43 / 4.52)
+     and every tier passes on every ground. Do not lighten either one back
+     toward the spec without re-solving against --hover. */
+  --ink-2: #5a5d54; /* secondary. 6.29:1 on --page, 5.43:1 on --hover. */
+  --ink-muted: #666960; /* smallest meta text. 4.52:1 worst case. */
+
+  --sketch: #292b27;
+  --rule: #b8b7ac;
+  /* 3.24:1 worst case (--hover). The old #8E8C7B was solved against --page
+     alone and measured 2.74:1 on a hovered row — see the dark-mode note. */
+  --rule-strong: #847f6f;
+
+  /* Markers: fills are the spec's light track. The ink track is derived —
+     these hues are unreadable as text on paper at their fill values. */
+  --mk-pink: #e9a4b3;
+  --mk-yellow: #e6cc70;
+  --mk-green: #9fc59d;
+  --mk-blue: #8eb8d2;
+  --mk-red: #dc8179;
+
+  /* Same correction as the dark track: solved against --hover #EBE7DA, the
+     darkest ground light mode puts text on, rather than against --page. */
+  --mk-pink-ink: #ba3350;
+  --mk-yellow-ink: #786420;
+  --mk-green-ink: #447142;
+  --mk-blue-ink: #366b8d;
+  --mk-red-ink: #b53c32;
+
+  --line-soft: #e0dccf;
+  --hover: #ebe7da;
+  --selected: color-mix(in srgb, var(--mk-pink) 24%, transparent);
+  --selected-strong: color-mix(in srgb, var(--mk-pink) 38%, transparent);
+
+  --accent-2: #8f2740; /* pressed / deeper pen */
+
+  /* Light mode fills the primary button with charcoal — 14.19:1. */
+  --btn-ink: var(--ink);
+  --btn-ink-text: var(--page);
+
+  /* Soft gray-brown, low opacity (spec). */
+  /* Soft gray-brown, low opacity (spec) — a warm neutral, not a marker. */
+  --shadow: rgba(74, 66, 48, 0.14);
+  --shadow-lift: rgba(74, 66, 48, 0.1);
+
+  --tok-files: #b3ae9c;
+  --eng-wikipedia: #5c6470;
+  --eng-news: #6d6250;
+
   color-scheme: light;
-
-  /* Token-budget bar categorical hues — re-derived (not just darkened) for
-     this surface (--panel-2: #ffffff), separately validated. */
-  --tok-system: #00648c;
-  --tok-history: #0053a5;
-  --tok-tools: #872e78;
-  --tok-skills: #007456;
-  --tok-files: #5f439c;
-
-  /* Engine identity hues re-derived for the light surface — same order, same
-     meaning, darkened to hold contrast on --panel/--panel-2 rather than being
-     naively reused from dark. */
-  --eng-duckduckgo: #00648c;
-  --eng-brave: #872e78;
-  --eng-mojeek: #007456;
-  --eng-marginalia: #5f439c;
-  --eng-wikipedia: #0053a5;
-  --eng-ddgia: #876116;
-  --eng-news: #2f7c58;
 }
 
 /* Quiet, theme-matched scrollbars everywhere. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--line) transparent;
+  scrollbar-color: var(--rule) transparent;
 }

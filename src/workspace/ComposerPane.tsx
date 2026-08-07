@@ -6,11 +6,10 @@ import {
   GlobeIcon,
   MicIcon,
   PaperclipIcon,
-  SendIcon,
   SparkIcon,
   StopIcon,
 } from "../icons";
-import { displayName } from "./composer";
+import { displayName, openingSigil } from "./composer";
 import { isCloudEngine, isCloudRoute, isExternalEngine } from "./markup";
 import { bestLocalModel } from "./localModel";
 import { RECOMMENDED_MODELS } from "./constants";
@@ -48,6 +47,10 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
   const acOpen = Boolean(s.ac) && (acItems.length > 0 || Boolean(a.autocompleteNote()));
   const acActive =
     s.ac && acItems.length > 0 ? `ac-opt-${Math.min(s.ac.index, acItems.length - 1)}` : undefined;
+  // Which of the three token controls the message currently commits to, so the
+  // matching chip can be drawn circled. Display only — `parseComposer` still
+  // decides what is actually sent, and this reads the same patterns it does.
+  const sigil = openingSigil(s.question);
   return (
     <div className="composer">
       {batchTidy ? (
@@ -203,11 +206,39 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
         );
       })()}
       {s.attachments.length > 0 && (
-        <div className="attach-row">
+        // A labelled group, so the count reaches assistive technology once and
+        // the chips read as belonging to it rather than as loose buttons.
+        <div
+          className="attach-row"
+          role="group"
+          aria-label={`${s.attachments.length} attached ${
+            s.attachments.length === 1 ? "file" : "files"
+          }`}
+        >
+          {/* A count is what the handwriting is for, and the ring keeps it from
+              reading as part of a sentence. aria-hidden: the group above
+              already says the number, and saying it twice is noise. */}
+          <span className="attach-row-label nb-hand" aria-hidden="true">
+            Attached <span className="nb-circled">{s.attachments.length}</span>
+          </span>
           {s.attachments.map((f) => (
-            <span key={f.id} className="attach-chip">
-              <FileTypeIcon file={f} size={13} /> {displayName(f.name)}
-              <button onClick={() => a.toggleAttach(f)}>×</button>
+            // `title` carries the FULL stored filename. The visible label is
+            // the tidy one every other list in the app uses (no extension —
+            // the type icon beside it says that), so ellipsising its tail can
+            // never hide what kind of file this is.
+            <span key={f.id} className="attach-chip" title={f.name}>
+              <FileTypeIcon file={f} size={13} />
+              <span className="attach-chip-name">{displayName(f.name)}</span>
+              <button
+                title="Remove"
+                // The bare "×" was this button's whole accessible name, which
+                // told a screen-reader user nothing about WHICH chip they were
+                // on. The real filename does.
+                aria-label={`Remove ${f.name} from this message`}
+                onClick={() => a.toggleAttach(f)}
+              >
+                <CloseIcon size={12} />
+              </button>
             </span>
           ))}
         </div>
@@ -358,15 +389,20 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
             >
               <PaperclipIcon size={14} /> Attach
             </button>
+            {/* `is-on` is drawn, not announced: it says the message already
+                opens with this control's token, which is sitting in the
+                textarea in plain text where a screen reader is reading it
+                anyway. Adding a pressed state would claim these are toggles,
+                and they are not — each one inserts a token. */}
             <button
-              className="tool-chip"
+              className={`tool-chip${sigil === "#" ? " is-on" : ""}`}
               title="Run a prebuilt action"
               onClick={() => a.insertComposerToken("#")}
             >
               <span className="tool-hash">#</span> Action
             </button>
             <button
-              className="tool-chip"
+              className={`tool-chip${sigil === "/" ? " is-on" : ""}`}
               title={
                 s.skills.some((skill) => skill.enabled)
                   ? "Use a specific enabled skill for this answer"
@@ -382,7 +418,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
                 button would state as fact something we have not established.
                 The menu itself says which of the two it is. */}
             <button
-              className="tool-chip"
+              className={`tool-chip${sigil === "*" ? " is-on" : ""}`}
               title="Send this turn to one specialist agent"
               onClick={() => a.insertComposerToken("*")}
             >
@@ -428,7 +464,12 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
                 onClick={() => void a.send()}
                 disabled={!s.question.trim()}
               >
-                <SendIcon size={16} />
+                {/* The spec's "small hand-drawn arrow" on the primary action.
+                    paper.css already owns that mark (--nb-glyph-arrow, masked
+                    from currentColor), so it costs no second icon system and
+                    inherits the button's ink for free. Decorative: the
+                    button's accessible name is the aria-label above. */}
+                <span className="nb-ico nb-ico-arrow send-arrow" aria-hidden="true" />
               </button>
             )}
           </div>

@@ -1,5 +1,71 @@
-/* ---------- settings ---------- */
+/* ---------- settings ----------
+   The densest text surface in the product, and the one place a person goes to
+   find out what this room does with their data. Almost every word on it is an
+   instruction or a consequence, so the notebook direction shows up here as
+   TYPOGRAPHY AND STRUCTURE rather than as decoration: no handwriting on
+   anything that instructs, no marker on anything that is not saying something.
 
+   What this file does, and why:
+
+     ONE SHEET        the modal is a floating surface, so it is opaque (that is
+                      paper.css section 9's rule) — but it carries the same
+                      dotted grid as the app canvas, and every settings group
+                      inside it is a FRAME DRAWN ON THAT SHEET rather than
+                      another filled box. Panes stay transparent; only the
+                      sheet itself has a fill.
+
+     THE INDEX        the left rail is a real index: bigger type, a drawn edge
+                      instead of a hairline border, the marker underline as the
+                      active mark (the app's one active idiom), and a tape
+                      badge on any page holding unsaved work.
+
+     TYPE             instruction copy was set at 12px and metadata at 11px.
+                      Both are now on the scale: a section's lead runs at
+                      --fs-lead, every other explanation at --fs-body, and
+                      nothing on this surface is below --fs-meta. The type
+                      scale's own comment says instructions are never set
+                      small; this is the surface that was breaking that.
+
+     NOTES            a consequence is drawn as a note attached to the control
+                      that decides it. Quiet (a pencil edge) when the state in
+                      force is the safe one, MARKED (a marker edge in the
+                      meaning's ink plus a wash of the same hue) when a door is
+                      open. Same recipe as the Connectors page and Room Home's
+                      attention strips, so "look at this" looks the same
+                      everywhere in the product.
+
+     DISCLOSURE       the mechanics behind a setting move into a native
+                      <details>. Nothing is deleted and nothing is reworded —
+                      every word stays in the DOM and in the accessibility
+                      tree, one Enter away.
+
+   MARKER MEANINGS USED HERE (product-wide, from tokens.css — never local):
+     green  --sem-done      saved, installed, connected, verified
+     yellow --sem-pending   unsaved, caution, needs your attention
+     red    --sem-urgent    this room's content leaves this Mac
+     pink   --sem-saved     the current selection (the pen)
+
+   Colour never travels alone anywhere on this surface: every marked note
+   carries its own sentence, every tape badge carries a word taken verbatim
+   from the copy it labels, and every table mark has screen-reader text.
+
+   THREE MODALS SHARE THESE CLASSES. `.settings-backdrop`, `.settings`,
+   `.settings-head`, `.settings-body` and `.settings-actions` are also used by
+   workspace/SettingsModals.tsx for the connector-approval and add-link sheets.
+   Anything that would be wrong at 460px — the width, the index, the group
+   frames, the section type scale — is scoped to `.settings-sheet`, a class
+   only the real Settings modal carries.
+
+   Nothing below names a colour. Both themes fall out of tokens.css, so there
+   is deliberately no light-mode block at the end of this file. */
+
+/* ==========================================================================
+   1. THE MODAL SHELL — shared by all three .settings modals
+   ========================================================================== */
+
+/* A literal rgba rather than a token, for the reason gate.css states about
+   its own backdrop: a veil has to darken BOTH themes, and every paper and ink
+   token inverts between them. */
 .settings-backdrop {
   position: fixed;
   inset: 0;
@@ -14,536 +80,958 @@
   width: min(560px, 90vw);
   max-height: 86vh;
   background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 14px;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  box-shadow:
+    0 24px 60px var(--shadow),
+    0 2px 6px var(--shadow-lift);
 }
 
 .settings-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 18px;
-  border-bottom: 1px solid var(--border);
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-6);
   font-weight: 600;
+  /* The rule under the head drawn the way .nb-rule draws one — thinning at
+     both ends — but as a background, so it costs no element and gives a
+     screen reader nothing extra to walk past. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 3%,
+    var(--line) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }
 
-/* The "you have unsaved work" strip, under the title bar and above the pages.
-   It only ever appears in response to a close the user just attempted, so it
-   sits where their eye already is rather than as a second modal over a modal. */
-.settings-unsaved {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 18px;
-  border-bottom: 1px solid var(--border);
-  background: var(--warn-bg, rgba(255, 176, 32, 0.12));
-  font-size: 13px;
-  font-weight: 400;
-}
-
-.settings-unsaved span {
-  flex: 1;
+.settings-head > span {
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  letter-spacing: -0.005em;
 }
 
 .settings-body {
   overflow-y: auto;
-  padding: 6px 18px 18px;
-}
-
-.settings-body section {
-  padding: 14px 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.settings-body section:last-of-type {
-  border-bottom: none;
-}
-
-/* Focused pages: the nav is a page selector, and only the active page's
-   sections show. Each page's last section drops its divider. */
-.settings-nav-item.is-active {
-  background: var(--accent-soft);
-  color: var(--text-strong);
-  font-weight: 600;
-}
-.settings-page[hidden] {
-  display: none;
-}
-.settings-page > section:last-child {
-  border-bottom: none;
-}
-
-/* Deep-link flash: when the status-bar trust chip (or any jump) opens Settings
-   straight to a section, pulse its edge so the eye lands on the right place. */
-.settings-body section.settings-section-flash {
-  animation: settings-section-flash 1.4s ease-out;
-  border-radius: 8px;
-}
-
-/* The Voice page's data-boundary banner — states plainly that spoken text
-   leaves this Mac (the only engine is the cloud neural voice). */
-.voice-boundary {
-  font-size: 12.5px;
-  line-height: 1.5;
-  padding: 8px 11px;
-  border-radius: 8px;
-  margin: 2px 0 12px;
-  border: 1px solid var(--line);
-}
-.voice-boundary.danger {
-  color: var(--text);
-  background: color-mix(in srgb, var(--danger) 10%, transparent);
-  border-color: color-mix(in srgb, var(--danger) 35%, var(--line));
-}
-@keyframes settings-section-flash {
-  0% { box-shadow: inset 0 0 0 2px var(--accent); background: var(--hover); }
-  100% { box-shadow: inset 0 0 0 0 transparent; background: transparent; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .settings-body section.settings-section-flash { animation: none; }
-}
-
-.settings-body h3 {
-  margin: 0 0 4px;
-  font-size: 13px;
-  text-transform: uppercase;
-  letter-spacing: 0.7px;
-  color: var(--text-dim);
-}
-
-.settings-hint {
-  color: var(--text-dim);
-  font-size: 12px;
-  margin: 4px 0 10px;
-  line-height: 1.5;
-}
-
-.settings-label {
-  display: block;
-  font-size: 13px;
-  margin: 12px 0 6px;
-}
-
-.model-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-bottom: 10px;
-}
-
-.model-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 8px;
-  border-radius: 8px;
-}
-
-.model-row.active {
-  background: var(--accent-soft);
-}
-
-.model-row label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.pull-row {
-  display: flex;
-  gap: 8px;
-}
-
-.pull-row input {
-  flex: 1;
-  font-size: 13px;
-}
-
-.provider-card {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface-2);
-}
-.provider-card.connected {
-  border-color: color-mix(in srgb, var(--ok) 40%, var(--border));
-}
-.provider-card-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-.provider-card-head .settings-hint {
-  margin: 3px 0 0;
-}
-.provider-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  flex: none;
-  color: var(--text-dim);
-  font-size: 11px;
-}
-.provider-state.connected,
-.provider-message.good {
-  color: var(--ok);
-}
-.provider-key-row {
-  display: flex;
-  gap: 8px;
-}
-.provider-key-row input {
-  flex: 1;
-  min-width: 0;
-}
-.provider-message {
-  color: var(--danger);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.pull-progress {
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--text-dim);
-}
-
-.pull-bar {
-  height: 6px;
-  background: var(--panel-2);
-  border-radius: 4px;
-  overflow: hidden;
-  margin-bottom: 5px;
-}
-
-.pull-bar-fill {
-  height: 100%;
-  background: var(--accent);
-  transition: width 0.3s ease;
-}
-
-.mcp-config {
-  width: 100%;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  resize: vertical;
-}
-
-.mcp-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 10px;
-}
-
-.mcp-row {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  font-size: 13px;
-}
-
-.mcp-row .settings-hint {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
-.mcp-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex: none;
-  align-self: center;
-  background: var(--text-dim);
-}
-
-.mcp-dot.connected {
-  background: var(--ok);
-}
-
-.mcp-dot.connecting {
-  background: var(--warn);
-}
-
-.mcp-dot.failed {
-  background: var(--danger);
-}
-
-.mcp-badge {
-  font-size: 11px;
-  color: var(--text-dim);
-  margin-bottom: 6px;
-}
-
-/* SEC-6 — always-visible cloud-engine warning by the composer. */
-.cloud-badge {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--warn);
-  background: rgba(227, 179, 65, 0.1);
-  border: 1px solid rgba(227, 179, 65, 0.3);
-  border-radius: 8px;
-  padding: 5px 10px;
-  margin-bottom: 6px;
-}
-.cloud-badge button {
-  color: var(--accent);
-  font-size: 11px;
-  white-space: nowrap;
-}
-/* SEC-6 — tint the model dropdown while a cloud engine is selected. */
-.topbar-right select.cloud-engine {
-  color: var(--warn);
-  border-color: rgba(227, 179, 65, 0.4);
-}
-
-/* CHG-4 — friendly model name with the raw id as secondary text. */
-.model-label {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-}
-.model-id {
-  font-size: 11px;
-  color: var(--text-dim);
-}
-
-/* UX-7 — stacked toast notifications, anchored just above the composer so they
-   never overlap the engine/internet status strip that sits inside it. */
-.toast-stack {
-  position: absolute;
-  right: 16px;
-  bottom: calc(100% + 10px);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-width: 340px;
-  z-index: 30;
-  pointer-events: none;
-}
-.toast {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 9px 11px;
-  border-radius: 9px;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--text-dim);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
-  font-size: 12.5px;
-  color: var(--text);
-  pointer-events: auto;
-  animation: toast-in 0.18s ease-out;
-}
-.toast.success {
-  border-left-color: var(--ok);
-}
-.toast.error {
-  border-left-color: var(--danger);
-}
-.toast.info {
-  border-left-color: var(--accent);
-}
-.toast-text {
-  flex: 1;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.toast-close {
-  color: var(--text);
-  opacity: 0.75;
-  flex-shrink: 0;
-}
-.toast-close:hover {
-  opacity: 1;
-}
-@keyframes toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.temp-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.temp-row input[type="range"] {
-  flex: 1;
-  padding: 0;
-  accent-color: var(--accent);
-}
-
-.settings textarea {
-  width: 100%;
-  resize: vertical;
-  font-size: 13px;
+  padding: var(--sp-4) var(--sp-6) var(--sp-8);
 }
 
 .settings-actions {
   display: flex;
   justify-content: flex-end;
   align-items: center;
-  gap: 10px;
-  margin-top: 12px;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
 }
 
-/* ---- Privacy section (Wave 2: SEC-3/4/7, ADD-3/4) ---- */
+/* ==========================================================================
+   2. THE SETTINGS SHEET
+   Wider, and drawn on paper of its own. `.settings-sheet` is on the real
+   Settings modal only — see the ownership note at the top of the file.
+   ========================================================================== */
+
+/* 1040px puts a ~64ch reading column beside the 210px index, which is the
+   whole argument for the width: the old 720px left about 44ch for privacy copy
+   once the nav and the padding were paid for, and a 44ch column of
+   instructions is a column nobody finishes. Specificity, not source order,
+   is what beats
+   shell.css's `.settings` here, and it has to: shell.css loads LAST, so a
+   single-class selector of mine would lose the tie no matter what it said.
+   Every rule in this section is written as `.settings.settings-sheet` for
+   that reason — including the background, which shell.css sets with the
+   `background` SHORTHAND and would therefore reset the grid image to none.
+
+   The sheet itself is opaque because it floats and must occlude the app under
+   it, and dotted because it is still a page of the same notebook. Same recipe
+   as the canvas in paper.css — a plain radial-gradient with a literal rgba
+   dot, no color-mix percentage arithmetic (WebKit rejects calc() inside
+   color-mix()'s percentage, which is how the app's grid vanished once
+   already) and no background-attachment: fixed, which is what made a gradient
+   stack stutter on scroll. The grid is painted on the modal, which never
+   scrolls; the body inside it is transparent and scrolls over it, exactly as
+   the app's panes scroll over the canvas. */
+.settings.settings-sheet {
+  width: min(1040px, 94vw);
+  max-height: min(900px, 90vh);
+  background-color: var(--raised);
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    var(--grid-dot) 1.1px,
+    transparent 1.2px
+  );
+  background-size: var(--grid-gap) var(--grid-gap);
+}
+
+.settings-sheet .settings-head {
+  padding: var(--sp-4) var(--sp-6);
+}
+
+/* The reading column beside the index. `min-width: 0` is what lets a long
+   table or a mono config string scroll inside its own box instead of pushing
+   the whole flex row wider than the sheet. */
+.settings-sheet .settings-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* The masthead. --fs-section is the section-title rung; --fs-page is Room
+   Home's alone. */
+.settings-sheet .settings-head-title {
+  font-size: var(--fs-section);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  color: var(--text-strong);
+}
+
+/* ----- the unsaved strip -----
+   Raised only by a close the user just attempted, so it sits where their eye
+   already is rather than as a second modal over a modal. Drawn as a marked
+   note in the pending hue: the words say what happened, the mark says it
+   matters, and the glyph means the state survives being read in greyscale. */
+.settings-unsaved {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-6);
+  color: var(--text);
+  font-size: var(--fs-body);
+  font-weight: 400;
+  line-height: var(--lh-body);
+  box-shadow: inset 0 -1px 0 var(--line-soft);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--sem-pending-fill) 20%, transparent) 0%,
+    color-mix(in srgb, var(--sem-pending-fill) 10%, transparent) 62%,
+    color-mix(in srgb, var(--sem-pending-fill) 15%, transparent) 100%
+  );
+}
+
+.settings-unsaved span {
+  flex: 1;
+  min-width: 16ch;
+}
+
+.settings-unsaved svg {
+  flex: none;
+  color: var(--sem-pending);
+}
+
+/* ==========================================================================
+   3. THE INDEX
+   A page selector, so it takes the app's one active idiom: the marker
+   underline (paper.css section 2 — rail items, tabs, chips, pane headers and
+   this nav all use it rather than a mix of spines, fills and border swaps).
+   ========================================================================== */
+
+/* 210px because the labels are now --fs-body and the longest of them has to
+   sit beside a state badge. The edge is a drawn vertical rule, not a flat
+   border — same stroke as .nb-rule-v, painted as a background so it needs no
+   element. */
+.settings-sheet .settings-nav {
+  flex: 0 0 210px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-6) var(--sp-3);
+  border-right: 0;
+  overflow-y: auto;
+  background-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--line) 4%,
+    var(--line) 94%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 1px 100%;
+  background-position: right top;
+}
+
+.settings-sheet .settings-nav-item {
+  display: flex;
+  align-items: center;
+  align-content: center;
+  /* The state badge drops to a second line rather than squeezing the label,
+     for whichever label ends up longest after translation or a font change.
+     No measurement, no JS — the flex line breaks by itself. */
+  flex-wrap: wrap;
+  gap: 2px var(--sp-2);
+  position: relative;
+  min-height: 34px;
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  font-size: var(--fs-body);
+  color: var(--muted);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  transition:
+    color var(--dur-fast) var(--ease-pen),
+    background-color var(--dur-fast) var(--ease-pen);
+}
+
+.settings-sheet .settings-nav-item:hover {
+  color: var(--text);
+  background-color: var(--hover);
+  border-color: transparent;
+}
+
+.settings-sheet .settings-nav-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Active: full-strength ink, a heavier weight, and the pen stroke under the
+   label. The underline is drawn under the LABEL, not the button box, so it
+   reads as a mark on the word rather than as a filled tab. `aria-current` in
+   the markup carries the same fact for anyone not seeing the stroke. */
+.settings-sheet .settings-nav-item.is-active {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.settings-nav-label {
+  position: relative;
+}
+
+.settings-sheet .settings-nav-item.is-active .settings-nav-label::after {
+  content: "";
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  bottom: -4px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--accent-fill) 0%,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 68%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  pointer-events: none;
+}
+
+/* The unsaved badge. It is a .nb-tape from paper.css, so the word rides on a
+   34% wash of the pending marker and carries the meaning by itself — the hue
+   only reinforces it. Pushed to the trailing edge so a run of pages reads as
+   a column of labels with flags in the margin. */
+.settings-nav-flag {
+  margin-left: auto;
+  flex: none;
+  padding: 1px 6px;
+  font-weight: 400;
+}
+
+/* ==========================================================================
+   4. PAGES AND GROUPS
+   One page at a time; each settings group is an outlined sheet of paper on
+   the dotted ground, not a slab of fill with a divider under it.
+   ========================================================================== */
+
+.settings-page[hidden] {
+  display: none;
+}
+
+.settings-sheet .settings-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+
+/* Repeated because the rule above raises the specificity of `display` on the
+   same element and a hidden page must stay hidden regardless of order. */
+.settings-sheet .settings-page[hidden] {
+  display: none;
+}
+
+.settings-sheet .settings-page > section {
+  position: relative;
+  padding: var(--sp-4) var(--sp-4) var(--sp-6);
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 62%, transparent);
+  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  /* Transparent: the group is a FRAME on the sheet, so the dots keep running
+     through it. This is the difference between the notebook and a stack of
+     grey boxes. */
+  background: transparent;
+  /* A deep-linked section is scrolled to with block:"start"; without this the
+     frame's own top edge lands hard against the body's top padding. */
+  scroll-margin-top: var(--sp-4);
+}
+
+/* Four fixed corner signatures rotated by position, the same way
+   .nb-frame-set does it, so a column of six groups does not look stamped from
+   one template. Deterministic — a frame draws identically on every render. */
+.settings-sheet .settings-page > section:nth-of-type(4n + 2) {
+  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+}
+.settings-sheet .settings-page > section:nth-of-type(4n + 3) {
+  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+}
+.settings-sheet .settings-page > section:nth-of-type(4n + 4) {
+  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+}
+
+/* Deep-link flash: when the status-bar trust chip (or any jump) opens Settings
+   straight to a section, mark its edge so the eye lands on the right place.
+
+   A LOCATOR, not a UI transition. It runs once, it fades rather than blinks,
+   and it is deliberately longer than the 160-260ms interaction budget — a
+   200ms mark on a 900px sheet is a flicker nobody catches. The caller removes
+   the class after 1400ms. */
+.settings-body section.settings-section-flash {
+  animation: settings-section-flash 800ms var(--ease-pen);
+}
+@keyframes settings-section-flash {
+  0% {
+    box-shadow: inset 0 0 0 2px var(--accent);
+  }
+  100% {
+    box-shadow: inset 0 0 0 0 transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .settings-body section.settings-section-flash {
+    animation: none;
+    /* Without the pulse the section still has to be findable, so the mark
+       becomes a state rather than a movement. */
+    box-shadow: inset 0 0 0 2px var(--accent);
+  }
+}
+
+/* ==========================================================================
+   5. TYPE
+   The whole reason this surface was hard to read. Nothing here is below
+   --fs-meta, and no instruction is below --fs-body.
+   ========================================================================== */
+
+/* The group's title, with the same fading hairline the Connectors page draws
+   under its section heads. Not uppercase: at 16px, letter-spaced caps read as
+   shouting and cost legibility on the one surface that can least afford it. */
+.settings-body h3 {
+  margin: 0 0 var(--sp-3);
+  padding-bottom: var(--sp-2);
+  font-size: var(--fs-card);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  text-transform: none;
+  color: var(--text-strong);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 1%,
+    var(--line-soft) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+
+/* A second heading inside one group (Settings → App carries Updates and Logs
+   in a single section) needs air above it. */
+.settings-body h3 ~ h3 {
+  margin-top: var(--sp-6);
+}
+
+/* Explanation copy. It used to be 12px in --text-dim, which is what made
+   Settings read as one undifferentiated wall. */
+.settings-hint {
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  margin: var(--sp-2) 0 var(--sp-3);
+  max-width: 74ch;
+}
+
+/* The section's LEAD — the paragraph directly under the heading, which says
+   what the whole group is for. Promoted to --fs-lead and full ink, purely by
+   position, so fifteen section components did not each need an extra class to
+   say the obvious. The type scale's own comment is explicit that instruction
+   copy is never set small; this is the one paragraph in a group that always
+   is instruction copy. */
+.settings-body section > h3 + .settings-hint {
+  color: var(--text);
+  font-size: var(--fs-lead);
+  margin-top: 0;
+  margin-bottom: var(--sp-4);
+}
+
+.settings-hint code {
+  overflow-wrap: anywhere;
+}
+
+/* A control's own label — the name of the field under it. Block, and at the
+   same weight as a small heading, because that is what it is. */
+.settings-label {
+  display: block;
+  margin: var(--sp-4) 0 var(--sp-2);
+  color: var(--text);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  line-height: var(--lh-body);
+}
+
+/* A label that IS the control (it wraps a checkbox) is a sentence, not a
+   heading: normal weight, and a target tall enough to click at.
+
+   It stays a BLOCK deliberately. Several of these labels contain inline
+   <code> and <strong> inside the sentence, and a flex container would promote
+   every one of those to its own flex item — the sentence would come apart
+   into a row of fragments that no longer wraps. Inline flow keeps the words a
+   sentence; the checkbox's own vertical-align below puts it on the first
+   line. :has() has shipped in WebKit since 15.4 and a browser without it
+   simply renders these at heading weight, which is the old behaviour. */
+.settings-label:has(> input[type="checkbox"]),
+.settings-label:has(> input[type="radio"]) {
+  min-height: 28px;
+  padding: 3px 0;
+  font-weight: 400;
+  cursor: pointer;
+}
+
+.settings-sheet textarea,
+.settings textarea {
+  width: 100%;
+  resize: vertical;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+/* ==========================================================================
+   6. NOTES AND MARKER LABELS
+   A consequence, drawn as a note pinned to the control that decides it.
+
+   These are a deliberate re-statement of the Connectors page's `.mkt-note`
+   rather than a reuse of it: that class belongs to marketplace.css, which
+   owns a different surface, and a privacy warning here must not change shape
+   because someone retuned a card over there. Same recipe on purpose — a note
+   that means "look at this" should look the same everywhere in the product.
+
+   The edge is --mk-ink, never a marker fill: a 3px stroke is meaningful
+   non-text and owes 3:1, and a fill measures about 1.7:1 on ivory paper.
+   ========================================================================== */
+
+.set-note {
+  position: relative;
+  margin: var(--sp-3) 0;
+  padding: 0 0 0 var(--sp-3);
+  box-shadow: inset 1px 0 0 var(--line);
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  max-width: 74ch;
+}
+
+.set-note--flag {
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 3px 0 0 var(--mk-ink, var(--sem-pending));
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 20%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 10%, transparent) 62%,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 15%, transparent) 100%
+  );
+}
+
+/* A consequence that is the product's core promise — what leaves this Mac,
+   and what cannot be taken back — is instruction copy of the highest kind, so
+   it is set at the lead rung rather than at body size. */
+.set-note--lead {
+  font-size: var(--fs-lead);
+}
+
+/* An inline glyph inside a note — the warning triangle the copy already
+   carried. It takes the note's own meaning ink, so the mark and the edge
+   agree. */
+.set-note svg,
+.set-note .warn-ic {
+  flex: none;
+  vertical-align: -3px;
+  margin-right: 5px;
+  color: var(--mk-ink, var(--muted));
+}
+
+.set-note b,
+.set-note strong {
+  color: var(--text-strong);
+}
+
+.set-note code {
+  overflow-wrap: anywhere;
+}
+
+/* The tape label on a note. Every one of these is a phrase lifted VERBATIM
+   from the sentence it now heads — "The door is open", "Not saved yet", "On",
+   "Off" — so the mark carries emphasis the copy already had and not one word
+   was invented to decorate a warning.
+
+   It is deliberately allowed to wrap. Two of these labels are full clauses,
+   and nowrap on a 30-character strip is how a note ends up wider than the
+   column it sits in on a narrow window. */
+/* The lifted opening clause of a privacy note — "The door is open", "There is
+   no password reset", "Spoken answers use a cloud voice".
+
+   It inherits the paragraph's OWN size and takes its emphasis from weight and
+   the marker wash, rather than from .nb-tape's --fs-micro. The tape primitive
+   is built for a badge sitting beside something; used inline at the head of a
+   16px paragraph it rendered the singled-out clause at 12px — four pixels
+   SMALLER than the sentence it introduces. Emphasis set smaller than its own
+   body text is de-emphasis, and one of these ("Spoken answers use a cloud
+   voice") had been a full-size <b> before the change. */
+.set-note-tag {
+  margin-right: 2px;
+  font-size: inherit;
+  font-weight: 700;
+}
+
+/* ==========================================================================
+   7. DISCLOSURE
+   The mechanics behind a setting. A native <details>, so every word stays in
+   the DOM, in the accessibility tree, and in find-in-page — this is a fold,
+   not a cut. Same summary treatment as the Connectors page's two disclosures.
+   ========================================================================== */
+
+.set-more {
+  margin: var(--sp-3) 0;
+  padding-top: var(--sp-2);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 1%,
+    var(--line-soft) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+
+.set-more > summary {
+  cursor: pointer;
+  padding: var(--sp-1) 0;
+  min-height: 24px;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  user-select: none;
+}
+
+.set-more > summary:hover {
+  color: var(--text);
+}
+
+.set-more > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The disclosed copy keeps the same size and colour it would have had in the
+   open — folding it away must not also demote it. */
+.set-more[open] > summary {
+  color: var(--text);
+  margin-bottom: var(--sp-1);
+}
+
+.set-more .settings-hint:last-child {
+  margin-bottom: 0;
+}
+
+/* ==========================================================================
+   8. CONTROLS
+   Native elements, styled. Nothing here is replaced by a div: every checkbox,
+   radio, select and range on this surface is the real control, with its own
+   role, checked state, keyboard handling and label association.
+   ========================================================================== */
+
+/* Everything clickable clears the 24px minimum target with room to spare.
+   Scoped to the sheet so the two sibling modals keep their own proportions. */
+.settings-sheet button {
+  min-height: 28px;
+  min-width: 28px;
+}
+
+/* …except a control that lives INSIDE a sentence, where WCAG's inline
+   exception applies and a 28px box would break the line it sits in. */
+.settings-sheet .linkish {
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Native boxes, sized up. `accent-color` (base.css) already puts the pen in
+   them; this only makes them big enough to see and to hit. The negative
+   vertical-align sits a 16px box on the baseline of a 14px line, which is
+   what keeps a checkbox-in-a-sentence label aligned without flex.
+   The painted toggle in settings-annotations.css overrides this — its input
+   is a full-size transparent hit target, not a visible box. */
+.settings-sheet input[type="checkbox"],
+.settings-sheet input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin: 0 4px 0 0;
+  vertical-align: -3px;
+}
 
 .settings-form {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-top: 6px;
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
 }
 
 .settings-form input {
   width: 100%;
-  font-size: 13px;
+  font-size: var(--fs-body);
 }
 
-/* saved/recovered confirmation, calm green */
+.temp-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin: var(--sp-2) 0 var(--sp-3);
+}
+
+.temp-row input[type="range"] {
+  flex: 1;
+  min-width: 140px;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: none;
+  accent-color: var(--accent);
+}
+
+.temp-row .settings-hint {
+  margin: 0;
+  flex: none;
+}
+
+/* A live readout beside a slider. Mono with tabular figures, so the value
+   does not jitter sideways while the thumb is being dragged — the same
+   treatment .nb-num gives every other counting figure, at the size of the
+   line it sits in rather than shrunk to metadata. */
+.set-figure {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.pull-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0;
+}
+
+.pull-row input {
+  flex: 1;
+  min-width: 200px;
+  font-size: var(--fs-body);
+}
+
+/* ----- segmented control -----
+   One exclusive choice, applied immediately (no Save gate): the response
+   style, the theme, the voice archetype. It is a real radiogroup of real
+   role="radio" buttons in the markup; the chosen option is circled the way
+   .nb-chip circles a chosen filter — the pen on the ring, a wash inside — and
+   never by colour alone, since aria-checked plus the heavier ink carry it. */
+.style-seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0 var(--sp-3);
+}
+
+.style-seg-opt {
+  flex: 1 1 120px;
+  min-height: 32px;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--rule-strong);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-body);
+  cursor: pointer;
+  text-align: center;
+}
+
+.style-seg-opt:hover {
+  color: var(--text);
+  border-color: var(--sketch);
+}
+
+.style-seg-opt.active {
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+/* ----- saved / pending confirmations ----- */
+
 .settings-confirm {
-  color: var(--ok);
-  font-size: 13px;
+  color: var(--sem-done);
+  font-size: var(--fs-body);
 }
 
 /* duplicate-room destination row sits left, not pushed to the edge */
 .settings-actions.dup-dest-row {
   justify-content: flex-start;
-  margin-top: 6px;
+  margin-top: var(--sp-2);
 }
 
+/* A filesystem path fragment is technical data: mono, exact, never the hand. */
 .dup-dest {
-  font-size: 12px;
-  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* ADD-3: inline two-step delete confirm on a model row */
+/* inline two-step delete confirm on a model row */
 .model-confirm {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-1);
+}
+
+.model-confirm .settings-hint {
+  margin: 0;
+  font-size: var(--fs-meta);
 }
 
 .model-confirm .confirm-yes {
-  color: var(--ok);
+  color: var(--sem-done);
   font-weight: 600;
 }
 
 .model-confirm .confirm-no {
-  color: var(--danger);
+  color: var(--sem-urgent);
   font-weight: 600;
 }
 
+/* ==========================================================================
+   9. LISTS
+   Model rows, role rows, checkpoints, blocked items. Rows are drawn on the
+   sheet; only the selected one takes a wash.
+   ========================================================================== */
 
-/* Wave 1b (idea 12): the response-style segmented control — four exclusive
-   registers, immediate-apply (no Save gate). */
-.style-seg {
+.model-list {
   display: flex;
-  gap: 6px;
-  margin: 4px 0 6px;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-bottom: var(--sp-3);
 }
 
-.style-seg-opt {
-  flex: 1;
-  padding: 6px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--surface-3);
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 12.5px;
+.model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  min-height: 32px;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+}
+
+/* Selected: the pen. A wash plus the ring, exactly as .nb-chip draws a chosen
+   filter, and never the only cue — the radio or the label says it too. */
+.model-row.active {
+  background: var(--accent-ghost);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 46%, transparent);
+}
+
+/* "…installed" reports a FACT rather than a choice, so it takes the green
+   semantic, not the selection wash — the two used to share `.active` and
+   collapsing them made reading a confirmation as a selection easy to do. The
+   check glyph beside it carries the same meaning, so this is never colour
+   alone. Do not merge these two rules again. */
+.model-row.active.is-ok {
+  background: color-mix(in srgb, var(--sem-done-fill) 16%, transparent);
+  box-shadow: inset 3px 0 0 var(--sem-done);
+}
+
+.model-row label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-body);
   cursor: pointer;
-  text-align: center;
 }
 
-.style-seg-opt.active {
-  border-color: var(--accent, #8b7cf6);
-  background: color-mix(in srgb, var(--accent, #8b7cf6) 10%, transparent);
-  color: var(--text);
+/* friendly model name with the raw id as secondary text */
+.model-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-body);
   font-weight: 600;
+  color: var(--text);
 }
 
-/* ---- Checkpoints section (Idea 9) — cribs Time Machine row anatomy ---- */
+.model-id {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+
+/* ----- provider card -----
+   One drawn card per provider. Connected is stated in a word beside the name
+   AND drawn on the edge, so the state survives greyscale. */
+.provider-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+  background: transparent;
+}
+
+.provider-card.connected {
+  border-color: var(--sem-done);
+}
+
+.provider-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.provider-card-head strong {
+  font-size: var(--fs-card);
+  color: var(--text-strong);
+}
+
+.provider-card-head .settings-hint {
+  margin: var(--sp-1) 0 0;
+}
+
+.provider-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: none;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+
+.provider-state.connected,
+.provider-message.good {
+  color: var(--sem-done);
+}
+
+.provider-key-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.provider-key-row input {
+  flex: 1;
+  min-width: 200px;
+}
+
+.provider-message {
+  color: var(--sem-urgent);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+/* ----- checkpoints ----- */
 
 .ckpt-create {
   flex-direction: row;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
 }
+
 .ckpt-create input {
   flex: 1;
+  min-width: 200px;
 }
+
 .ckpt-notice {
-  margin-top: 6px;
-  font-size: 12.5px;
-  color: var(--ok);
+  margin-top: var(--sp-2);
+  font-size: var(--fs-body);
+  color: var(--sem-done);
 }
+
+/* A total is a figure, so it is set in the mono face with tabular figures —
+   the one treatment this system gives numbers that have to line up. */
 .ckpt-total {
-  margin-top: 14px;
-  font-size: 12px;
-  color: var(--text-dim);
+  margin-top: var(--sp-4);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+
+/* The disk-usage warning is a marked note, so its words stay --text. A hue's
+   own ink on a wash of the same hue is the one combination in this palette
+   that fails — dark-mode yellow ink on a yellow wash measures 4.43:1 — and
+   the meaning was never coming from the letter colour anyway: it comes from
+   the sentence plus the marker edge behind it. */
 .ckpt-warn {
-  color: var(--warn, #d8a657);
+  color: var(--text);
 }
+
+/* The list gets its own scroll box so a room with forty checkpoints does not
+   turn the page into a mile of rows. */
 .ckpt-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin-top: 8px;
-  padding: 6px;
-  background: var(--surface-2, var(--panel-2));
-  border: 1px solid var(--border);
-  border-radius: 11px;
+  margin-top: var(--sp-2);
+  padding: var(--sp-2);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
   max-height: 320px;
   overflow-y: auto;
 }
+
 .ckpt-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 9px;
+  gap: var(--sp-3);
+  min-height: 40px;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
 }
+
 .ckpt-row:hover {
-  background: var(--surface-3, var(--panel));
+  background: var(--hover);
 }
+
+/* The dot is decoration with a title attribute behind it; the row's name and
+   date carry the meaning, so this stays a quiet mark. */
 .ckpt-dot {
   flex-shrink: 0;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--accent, #8b7cf6);
+  background: var(--accent);
 }
+
 .ckpt-dot.auto {
-  background: var(--text-faint, var(--text-dim));
+  background: var(--faint);
 }
+
 .ckpt-meta {
   display: flex;
   flex-direction: column;
@@ -551,113 +1039,119 @@
   flex: 1;
   min-width: 0;
 }
+
 .ckpt-name {
-  font-size: 13px;
+  font-size: var(--fs-body);
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
 .ckpt-sub {
-  font-size: 11px;
-  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+
 .ckpt-actions {
   flex-shrink: 0;
   display: inline-flex;
-  gap: 4px;
+  gap: var(--sp-2);
 }
+
 .ckpt-action {
-  font-size: 11px;
-  padding: 4px 8px;
-  border-radius: 7px;
+  font-size: var(--fs-meta);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
 }
+
+/* The inline destructive question. Red edge plus the sentence, so a step that
+   erases a copy of the whole room never looks like a row. */
 .ckpt-confirm {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px;
-  background: var(--surface-3, var(--panel));
-  border: 1px solid var(--border);
-  border-radius: 9px;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--sem-urgent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--sem-urgent-fill) 10%, transparent);
 }
+
 .ckpt-confirm-q {
-  font-size: 12px;
-  line-height: 1.4;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text);
 }
+
 .ckpt-confirm-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--sp-2);
 }
 
-/* ---------- PRIV-1: Cloud privacy section ---------- */
-.cpv-off-warning {
-  margin: 6px 0 10px;
-  padding: 8px 10px;
-  border: 1px solid var(--red);
-  border-radius: var(--radius, 8px);
-  color: var(--red);
-  font-size: 12.5px;
-  line-height: 1.45;
-}
-/* The connector seam does not follow the switch above, so its note is neither
-   an alarm (red) nor a throwaway hint — it is a standing correction to what the
-   switch appears to promise. */
+/* ==========================================================================
+   10. CLOUD PRIVACY
+   The blocked-item list and its editors. This is the section a user opens to
+   check a promise, so nothing on it is quieter than --fs-body.
+   ========================================================================== */
+
+/* The two standing corrections. Both are marked notes (the section supplies
+   the meaning class); this only sets their size, because a sentence about
+   what leaves this Mac is instruction copy of the highest kind and the type
+   scale says instructions are never set small.
+
+   The connector seam does not follow the switch above it, so its note is
+   neither an alarm nor a throwaway hint — it is a standing correction to what
+   the switch appears to promise, and it is drawn in the caution hue while the
+   open-door warning above it is drawn in the urgent one. */
+.cpv-off-warning,
 .cpv-seam-note {
-  margin: 6px 0 10px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--amber);
-  border-radius: var(--radius, 8px);
-  color: var(--text);
-  font-size: 12.5px;
-  line-height: 1.45;
+  font-size: var(--fs-lead);
 }
+
 .cpv-add-row {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
   align-items: center;
-  margin: 6px 0 8px;
+  margin: var(--sp-2) 0 var(--sp-3);
 }
+
 .cpv-add-row input {
   flex: 1;
-  min-width: 0;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  color: var(--text);
-  padding: 7px 10px;
-  font-size: 13px;
+  min-width: 200px;
+  font-size: var(--fs-body);
 }
+
 .cpv-cat {
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  color: var(--text);
-  padding: 7px 8px;
-  font-size: 12.5px;
+  font-size: var(--fs-body);
 }
+
 .cpv-list {
   list-style: none;
-  margin: 4px 0 10px;
+  margin: var(--sp-2) 0 var(--sp-3);
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  max-height: 220px;
+  gap: var(--sp-1);
+  max-height: 260px;
   overflow-y: auto;
 }
+
 .cpv-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
+  gap: var(--sp-2);
+  min-height: 34px;
+  padding: var(--sp-1) var(--sp-2);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  font-size: 12.5px;
-  background: var(--panel);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-body);
+  background: transparent;
 }
+
 .cpv-real {
   font-weight: 600;
   overflow: hidden;
@@ -665,101 +1159,213 @@
   white-space: nowrap;
   max-width: 40%;
 }
-.cpv-arrow { color: var(--faint); }
+
+.cpv-arrow {
+  color: var(--faint);
+}
+
+/* The placeholder is the literal token a cloud model would receive. Mono,
+   because it is a string the user has to be able to read character by
+   character. */
 .cpv-placeholder {
-  font-family: var(--mono, ui-monospace, monospace);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
   color: var(--muted);
 }
+
+/* "guaranteed" vs "found by scan" — two different strengths of promise, so
+   they are drawn as two different tape strips and each keeps its word. */
 .cpv-source {
   margin-left: auto;
-  font-size: 11px;
-  padding: 1px 7px;
-  border-radius: 99px;
-  border: 1px solid var(--line);
-  color: var(--muted);
+  flex: none;
+  font-size: var(--fs-micro);
+  padding: 1px 8px;
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--sem-pending-fill) 30%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sem-pending-fill) 46%, transparent);
   white-space: nowrap;
 }
-.cpv-source.user { color: var(--green); border-color: var(--green); }
-.cpv-remove {
-  background: none;
-  border: none;
-  color: var(--faint);
-  font-size: 15px;
-  cursor: pointer;
-  padding: 0 2px;
-  line-height: 1;
+
+.cpv-source.user {
+  background: color-mix(in srgb, var(--sem-done-fill) 30%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sem-done-fill) 46%, transparent);
 }
-.cpv-remove:hover { color: var(--red); }
+
+.cpv-remove {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: none;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-size: var(--fs-lead);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.cpv-remove:hover {
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+  background: none;
+}
+
 .cpv-concepts {
   width: 100%;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  color: var(--text);
-  padding: 8px 10px;
-  font-size: 13px;
-  font-family: inherit;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
   resize: vertical;
 }
+
 .cpv-scan-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin: 4px 0 8px;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin: var(--sp-2) 0 var(--sp-3);
 }
-.cpv-inline-hint { margin: 0; }
-/* An inline "do this instead" inside a hint line — the way back to the app-wide
-   default, which used to be a one-way door. */
+
+.cpv-scan-row .settings-hint {
+  margin: 0;
+}
+
+.cpv-inline-hint {
+  margin: var(--sp-2) 0;
+}
+
+/* An inline "do this instead" inside a hint line — the way back to the
+   app-wide default, which used to be a one-way door. */
 .cpv-inline-hint .linkish {
   background: none;
   border: 0;
   padding: 0;
   font: inherit;
-  color: var(--accent, var(--text));
+  color: var(--accent);
   text-decoration: underline;
+  text-underline-offset: 2px;
   cursor: pointer;
 }
-.cpv-honesty { margin-top: 10px; opacity: 0.85; }
 
-/* WHAT EACH AI CAN DO — the published provider x agent matrix. Two tables that
-   can both outgrow the panel, so each scrolls inside its own box rather than
-   forcing the settings page sideways. */
-.cap-matrix-scroll {
-  overflow-x: auto;
-  margin: 8px 0;
+.cpv-inline-hint .linkish:hover {
+  color: var(--accent-2);
+  background: none;
 }
+
+/* The honest-limits paragraph. It used to be dimmed with opacity, which is a
+   contrast hazard on the one paragraph that admits what this feature cannot
+   do. It is quieter now by position and by ink, at full legibility. */
+.cpv-honesty {
+  margin-top: var(--sp-4);
+}
+
+/* ==========================================================================
+   11. TABLES
+   The support matrix is two tables that can both outgrow the modal. Each gets
+   its own scroll box in BOTH axes and a tighter type scale, rather than the
+   whole sheet shrinking to accommodate them.
+   ========================================================================== */
+
+.cap-matrix-scroll {
+  overflow: auto;
+  max-height: 340px;
+  margin: var(--sp-3) 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+/* border-collapse is SEPARATE on purpose: a collapsed table's cell borders
+   belong to the table, not to the cell, so they scroll out from under a
+   sticky header and leave it floating with no edge. Separate + zero spacing
+   draws the same grid and keeps each border attached to its own cell. */
 .cap-matrix {
-  border-collapse: collapse;
-  font-size: 12px;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
   min-width: 100%;
 }
+
 .cap-matrix th,
 .cap-matrix td {
-  border: 1px solid var(--border);
-  padding: 5px 8px;
+  border: 0;
+  border-right: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  padding: var(--sp-2) var(--sp-3);
   text-align: left;
   white-space: nowrap;
 }
+
+.cap-matrix th:last-child,
+.cap-matrix td:last-child {
+  border-right: 0;
+}
+
+.cap-matrix tbody tr:last-child th,
+.cap-matrix tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+/* The header row and the row-name column stay put while the grid scrolls
+   under them — a wide matrix is unreadable the moment the row you are on
+   loses its label. Opaque, because a sticky cell has to occlude the rows
+   passing beneath it. */
 .cap-matrix thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--raised);
+  color: var(--text-strong);
   font-weight: 600;
-  opacity: 0.85;
 }
-.cap-matrix tbody th {
+
+.cap-matrix tbody th[scope="row"] {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--raised);
   font-weight: 500;
+  color: var(--text);
 }
+
+.cap-matrix thead th:first-child {
+  left: 0;
+  z-index: 2;
+}
+
 .cap-cell {
   text-align: center;
 }
-/* The three marks are colour-coded AND shaped differently, so the answer never
-   depends on colour alone. "unknown" is deliberately muted: it is not a No. */
-.cap-yes { color: var(--ok, #2e9e5b); }
-.cap-no { color: var(--danger, #c0392b); }
-.cap-unknown { opacity: 0.5; }
-.cap-unavailable { opacity: 0.6; }
+
+/* The three marks are colour-coded AND shaped differently AND carry
+   screen-reader words, so the answer never depends on colour alone. "unknown"
+   is deliberately quiet: it is not a No. It is drawn in --faint rather than
+   with opacity, because dimming a glyph with opacity fails contrast on the
+   one mark that already means "we could not find out". */
+.cap-yes {
+  color: var(--sem-done);
+}
+
+.cap-no {
+  color: var(--sem-urgent);
+}
+
+.cap-unknown {
+  color: var(--faint);
+}
+
+.cap-unavailable th,
+.cap-unavailable td {
+  color: var(--muted);
+}
+
 .cap-note {
-  opacity: 0.7;
+  color: var(--muted);
   font-weight: 400;
 }
+
 /* Screen-reader text for the mark glyphs — the table must read as words, not
    as "check, cross, dash". */
 .cap-cell .sr-only {
@@ -769,4 +1375,261 @@
   overflow: hidden;
   clip: rect(0 0 0 0);
   white-space: nowrap;
+}
+
+/* ==========================================================================
+   12. PROGRESS
+   A model download. Shared with the image viewer and the chat pane, so this
+   stays a general-purpose bar rather than a settings-only one.
+   ========================================================================== */
+
+.pull-progress {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+/* The status string is technical data (Ollama's own words, a size, a
+   percentage) and takes the mono face — but a BUTTON inside the row is
+   interface, and interface is always the sans. */
+.pull-progress button {
+  font-family: var(--sans);
+}
+
+/* `display: block` because two callers render this as a <span> outside a flex
+   row, and an inline element ignores height — the bar would vanish. */
+.pull-bar {
+  display: block;
+  height: 8px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
+  border-radius: 999px 999px 999px 999px / 8px 6px 8px 6px;
+  overflow: hidden;
+}
+
+/* Inside the settings/viewer progress block the bar takes a line of its own
+   and the percentage is written out beneath it — progress is never a length
+   and a colour alone. The chat banner lays its own copy out differently
+   (`.banner-pull .pull-bar` in onboarding.css) and is deliberately not
+   touched here. */
+.pull-progress > .pull-bar {
+  flex: 1 0 100%;
+}
+
+/* A marker stroke wiped across the page, with the highlighter's own uneven
+   alpha ramp — the same recipe as .nb-progress-fill in paper.css. */
+.pull-bar-fill {
+  height: 100%;
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 0%,
+    color-mix(in srgb, var(--accent-fill) 52%, transparent) 46%,
+    color-mix(in srgb, var(--accent-fill) 68%, transparent) 88%,
+    color-mix(in srgb, var(--accent-fill) 46%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px var(--accent);
+  border-radius: inherit;
+  transition: width var(--dur-slow) var(--ease-pen);
+}
+
+/* ==========================================================================
+   13. VOICE
+   ========================================================================== */
+
+/* The data boundary. It is the first thing on the page for a reason: speaking
+   always uses the cloud voice, and a naive reader must not have to infer
+   that. Drawn as a marked note; the section sets the meaning class. */
+.voice-boundary {
+  margin: 0 0 var(--sp-4);
+}
+
+/* ==========================================================================
+   14. OTHER SURFACES THAT LIVE IN THIS FILE
+   Not Settings, but historically defined here and consumed elsewhere:
+   Toasts.tsx, the connector dot in Sidebar.tsx, the composer's connector
+   badge, the raw mcpServers box in ConnectorsView.
+
+   Their ANATOMY is untouched — same elements, same layout, same left-edge
+   colour code — because the components that render them belong to other
+   surfaces. What changed is that they now resolve through tokens instead of
+   through literal rgba shadows, legacy --ok/--warn/--danger aliases and
+   off-scale sizes (a toast was 12.5px), so they flip with the theme and land
+   on the same type scale as everything else.
+   ========================================================================== */
+
+.mcp-config {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  line-height: 1.55;
+  tab-size: 2;
+  resize: vertical;
+}
+
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-top: var(--sp-3);
+}
+
+.mcp-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-body);
+}
+
+.mcp-row .settings-hint {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* A status dot always rides with the connector's name and its state word in
+   the markup — it is a reinforcement, never the signal. */
+.mcp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  align-self: center;
+  background: var(--faint);
+}
+
+.mcp-dot.connected {
+  background: var(--sem-done);
+}
+
+.mcp-dot.connecting {
+  background: var(--sem-pending);
+}
+
+.mcp-dot.failed {
+  background: var(--sem-urgent);
+}
+
+.mcp-badge {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  margin-bottom: var(--sp-2);
+}
+
+/* SEC-6 — always-visible cloud-engine warning by the composer. */
+.cloud-badge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  font-size: var(--fs-meta);
+  color: var(--text);
+  background: color-mix(in srgb, var(--sem-pending-fill) 14%, transparent);
+  box-shadow: inset 3px 0 0 var(--sem-pending);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-1) var(--sp-3);
+  margin-bottom: var(--sp-2);
+}
+
+.cloud-badge button {
+  color: var(--accent);
+  font-size: var(--fs-meta);
+  white-space: nowrap;
+}
+
+/* SEC-6 — mark the model dropdown while a cloud engine is selected. */
+.topbar-right select.cloud-engine {
+  color: var(--sem-pending);
+  border-color: var(--sem-pending);
+}
+
+/* ----- toasts -----
+   They float, so they are opaque (paper.css section 9). The kind is carried
+   by the message text; the edge only reinforces it. */
+.toast-stack {
+  position: absolute;
+  right: 16px;
+  bottom: calc(100% + 10px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  max-width: 340px;
+  z-index: 30;
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius);
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-left: 3px solid var(--muted);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text);
+  pointer-events: auto;
+  animation: toast-in var(--dur-fast) var(--ease-pen);
+}
+
+.toast.success {
+  border-left-color: var(--sem-done);
+}
+
+.toast.error {
+  border-left-color: var(--sem-urgent);
+}
+
+.toast.info {
+  border-left-color: var(--sem-linked);
+}
+
+.toast-text {
+  flex: 1;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.toast-close {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.toast-close:hover {
+  color: var(--text);
+}
+
+/* A short rise and fade, no scale, no bounce — the same arrival every other
+   floating surface in the system gets. */
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+/* ==========================================================================
+   15. MOTION ESCAPES
+   Every transition and animation added above has one. Nothing animates INTO
+   its resting state from a value the element does not otherwise have, so
+   switching them off lands on the finished frame.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-sheet .settings-nav-item,
+  .pull-bar-fill {
+    transition: none;
+  }
+  .toast {
+    animation: none;
+  }
 }

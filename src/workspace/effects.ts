@@ -239,7 +239,7 @@ export function useWorkspaceEffects(
         // AUDIT 262: the Studio step line belongs to a RUN. It must not outlive
         // one, or a finished deck leaves "a local model can take a few
         // minutes…" sitting under an idle sidebar.
-        s.setStudioStep("");
+        s.setStudioStep({ text: "", local: true });
         void a.refreshJobs();
         if (p.finished) {
           // The label names what finished ("Summary ready", "Full pass of …").
@@ -263,7 +263,9 @@ export function useWorkspaceEffects(
     // the start and nothing listened — a run that takes minutes on a local
     // model read "Starting…" the whole way, and the step that says the content
     // is leaving this Mac was never shown at all.
-    const unlistenStudioStep = api.onStudioStep((text) => s.setStudioStep(text));
+    const unlistenStudioStep = api.onStudioStep((p) =>
+      s.setStudioStep({ text: p.step, local: p.local }),
+    );
     // Wave 4a: per-node run status feeds the pipeline animation; a save/update/
     // delete refreshes the library (esp. an agent-authored draft appearing).
     const unlistenWfNode = api.onWorkflowNode((e) => {
@@ -860,6 +862,35 @@ export function useWorkspaceEffects(
     // stale-write banner and the dirty mirror so old state can't leak onto it.
     s.setStaleFile(null);
     s.editorDirtyRef.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.openFile?.id]);
+
+  // Is the open file a podcast SCRIPT? One cheap indexed lookup per file open,
+  // and it answers a question two surfaces ask: whether the Studio tab shows
+  // the Voices panel at all, and whether the tab's own label mentions it.
+  //
+  // Held in state rather than fetched inside the panel so the ANSWER is
+  // available before the panel exists — a panel that mounts on every file and
+  // then hides itself would flash "no script attached" over every note in the
+  // room on the way to rendering nothing.
+  useEffect(() => {
+    const id = s.openFile?.id;
+    if (!id) {
+      s.setOpenPodcast(null);
+      return;
+    }
+    let alive = true;
+    void api
+      .getPodcast(id)
+      .then((p) => {
+        // Guard the id too, not only `alive`: two quick file opens can resolve
+        // out of order, and the loser would paint its script over the winner's.
+        if (alive && s.openFileRef.current?.id === id) s.setOpenPodcast(p);
+      })
+      .catch(() => alive && s.setOpenPodcast(null));
+    return () => {
+      alive = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.openFile?.id]);
 

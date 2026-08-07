@@ -10,6 +10,9 @@ import {
   LABEL_MIN_R_PX,
   LABEL_FONT,
   LABEL_CHAR_W,
+  LABEL_PAD,
+  LABEL_H,
+  LABEL_MARK_W,
   LABEL_MAX,
   NAME_MAX,
 } from "./roomMap/constants";
@@ -55,6 +58,14 @@ export type { GraphNode, GraphEdge, RoomGraph, RoomMapProps } from "./roomMap/ty
  * setView re-frames the graph; the graph's setFocus resets selection), and
  * renders.
  * ------------------------------------------------------------------ */
+
+/** Keep a label card of length `len` inside a `span`-wide canvas, with a hair
+ *  of paper at the edge. Falls back to the near edge when the card is wider
+ *  than the canvas, so a long name still starts where it can be read. */
+function onCanvas(at: number, len: number, span: number): number {
+  const EDGE = 4;
+  return Math.max(EDGE, Math.min(at, span - len - EDGE));
+}
 
 export default function RoomMap({ onOpenFile }: RoomMapProps) {
   const [tip, setTip] = useState<Tip | null>(null);
@@ -152,37 +163,77 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
       if (prio === 0) continue;
       cands.push({ n, sx, sy, rScreen, prio, deg });
     }
-    cands.sort((a, b) => b.prio - a.prio || b.deg - a.deg);
+    // Ties are broken on the node id, never on array order and never on
+    // anything derived from time: two names that would print on top of each
+    // other have to lose to each other the SAME way on every frame, or the
+    // loser flickers in and out while the layout settles. `id` is the only key
+    // here that is unique and stable, and a plain code-unit comparison keeps
+    // the order independent of the reader's locale.
+    cands.sort(
+      (a, b) =>
+        b.prio - a.prio ||
+        b.deg - a.deg ||
+        (a.n.id < b.n.id ? -1 : a.n.id > b.n.id ? 1 : 0),
+    );
 
     const placed: { x: number; y: number; w: number; h: number }[] = [];
     const out: LabelBox[] = [];
     for (const c of cands) {
       if (out.length >= LABEL_MAX) break;
       const name = c.n.name.length > NAME_MAX ? c.n.name.slice(0, NAME_MAX - 1) + "…" : c.n.name;
-      const tw = name.length * LABEL_CHAR_W + 12;
-      const th = 17;
+      // A memory's card carries a ring mark before its name, so it is wider by
+      // exactly that much — see Label.tsx.
+      const markW = c.n.kind === "memory" ? LABEL_MARK_W : 0;
+      const tw = name.length * LABEL_CHAR_W + LABEL_PAD * 2 + markW;
       const off = Math.max(c.rScreen, 3) + 6;
-      // Prefer the right of the star; flip left if it would fall off-canvas.
-      let boxX = c.sx + off;
-      if (boxX + tw > size.w - 4) boxX = c.sx - off - tw;
-      if (boxX < 4) boxX = 4;
-      const boxY = c.sy - th / 2;
-      const box = { x: boxX, y: boxY, w: tw, h: th };
-      const overlaps = placed.some(
-        (p) => !(box.x > p.x + p.w || box.x + box.w < p.x || box.y > p.y + p.h || box.y + box.h < p.y),
+      // Six placements tried in a FIXED order — beside the node first, then
+      // below it, then above it, right before left each time. A fixed ladder is
+      // what makes the de-clutter reproducible: there is no jitter and no
+      // search, so the same graph at the same zoom always parks the same card
+      // in the same place.
+      const spots: { x: number; y: number }[] = [
+        { x: c.sx + off, y: c.sy - LABEL_H / 2 },
+        { x: c.sx - off - tw, y: c.sy - LABEL_H / 2 },
+        { x: c.sx + off * 0.5, y: c.sy + off },
+        { x: c.sx - off * 0.5 - tw, y: c.sy + off },
+        { x: c.sx + off * 0.5, y: c.sy - off - LABEL_H },
+        { x: c.sx - off * 0.5 - tw, y: c.sy - off - LABEL_H },
+      ];
+      // Clamp BEFORE the overlap test, or a card shoved back on-canvas could
+      // land on one already drawn.
+      const boxes = spots.map((s) => ({
+        x: onCanvas(s.x, tw, size.w),
+        y: onCanvas(s.y, LABEL_H, size.h),
+        w: tw,
+        h: LABEL_H,
+      }));
+      const free = boxes.find(
+        (cand) =>
+          !placed.some(
+            (p) =>
+              !(
+                cand.x > p.x + p.w ||
+                cand.x + cand.w < p.x ||
+                cand.y > p.y + p.h ||
+                cand.y + cand.h < p.y
+              ),
+          ),
       );
-      // Always keep the selection + its neighbours; skip crowded zoom-labels.
-      if (overlaps && c.prio < 2) continue;
+      // Nowhere clear: the selection and its neighbours are the reason the
+      // reader is looking, so they print anyway, beside the node. A crowded
+      // zoom-label just waits until there is room for it.
+      const box = free ?? (c.prio >= 2 ? boxes[0] : null);
+      if (!box) continue;
       placed.push(box);
       out.push({
         id: c.n.id,
         name,
-        textX: boxX + 6,
-        textY: c.sy + LABEL_FONT * 0.35,
-        boxX,
-        boxY,
+        textX: box.x + LABEL_PAD + markW,
+        textY: box.y + LABEL_H / 2 + LABEL_FONT * 0.35,
+        boxX: box.x,
+        boxY: box.y,
         boxW: tw,
-        boxH: th,
+        boxH: LABEL_H,
         prio: c.prio,
         kind: c.n.kind,
       });
@@ -264,7 +315,9 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
         {graph && !showEmpty && (
           <button
             type="button"
-            className="subtle rm-listtoggle"
+            className={`nb-chip nb-chip-btn rm-toolchip rm-listtoggle${
+              showLegend ? " is-on" : ""
+            }`}
             aria-pressed={showLegend}
             title="Choose which kinds of link the map shows"
             onClick={() => setShowLegend((v) => !v)}
@@ -275,7 +328,9 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
         {graph && !showEmpty && (
           <button
             type="button"
-            className="subtle rm-toolbtn"
+            className={`nb-chip nb-chip-btn rm-toolchip rm-toolbtn${
+              listView ? " is-on" : ""
+            }`}
             aria-pressed={listView}
             title="Show the same files and connections as a plain, keyboard-reachable list"
             onClick={() => setListView((v) => !v)}
@@ -297,7 +352,7 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
               <button
                 key={kind}
                 type="button"
-                className="rm-legend-item"
+                className={`nb-chip nb-chip-btn rm-legend-chip${on ? " is-on" : ""}`}
                 aria-pressed={on}
                 disabled={count === 0}
                 title={
@@ -311,19 +366,28 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
                   )
                 }
               >
-                <svg width="18" height="8" aria-hidden="true">
+                {/* The swatch is a SAMPLE OF THE ACTUAL LINE, at the same
+                    dash pattern and the same relative weight the map draws —
+                    which is what lets the chip stand in for its kind even for
+                    a reader who cannot separate the two graphite kinds by hue.
+                    Drawn a little longer than a hairline so a 5-3 dash and a
+                    1-3.5 dot are visibly different things, and inset from both
+                    ends so the round caps on the heaviest kind are not clipped
+                    by the swatch's own box. */}
+                <svg className="rm-legend-swatch" width="26" height="10" aria-hidden="true">
                   {/* `stroke` via `style`, not the presentation attribute: the
                       value is a var() custom property, and a presentation
                       attribute is the weakest thing in the cascade — the same
                       trap that made every edge on the map render as one violet
                       hairline. An inline declaration cannot be outranked. */}
                   <line
-                    x1="1"
-                    y1="4"
-                    x2="17"
-                    y2="4"
-                    style={{ stroke: style.color, strokeWidth: 1.6 * style.widthMul }}
+                    x1="2.5"
+                    y1="5"
+                    x2="23.5"
+                    y2="5"
+                    style={{ stroke: style.color, strokeWidth: 1.5 * style.widthMul }}
                     strokeDasharray={style.dash ?? undefined}
+                    strokeLinecap="round"
                   />
                 </svg>
                 {style.label}
@@ -331,8 +395,11 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
               </button>
             );
           })}
+          {/* The visible, reversible control behind "the weak links are quiet".
+              Nothing on this map is hidden without a way back, and this is the
+              way back for the faintest end of the ink ramp. */}
           <label className="rm-legend-strength">
-            Strength
+            <span className="rm-legend-strength-label">Strength</span>
             <input
               type="range"
               min={0}
@@ -358,17 +425,19 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
               this is only the map.
             </p>
             <p className="room-map-error-detail">{error}</p>
-            <button type="button" className="subtle" onClick={reload}>
+            <button type="button" className="nb-btn rm-retry" onClick={reload}>
               Try again
             </button>
           </div>
         )}
 
         {error ? null : showEmpty ? (
-          <div className="room-map-empty">{EMPTY_TEXT}</div>
+          // An empty-state direction, which is one of the few places the hand
+          // is allowed — see the reserve list in paper.css.
+          <div className="room-map-empty rm-empty">{EMPTY_TEXT}</div>
         ) : listView ? (
           <div className="room-map-list">
-            <ul>
+            <ul className="nb-list rm-list">
               {listRows.map((row) => (
                 <li key={row.id}>
                   <button
@@ -502,7 +571,7 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
           <div className="rm-controls">
             <button
               type="button"
-              className="rm-btn"
+              className="nb-btn nb-btn-icon rm-btn"
               title="Zoom in"
               aria-label="Zoom in"
               onClick={() => zoomBy(1.25)}
@@ -513,7 +582,7 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
             </button>
             <button
               type="button"
-              className="rm-btn"
+              className="nb-btn nb-btn-icon rm-btn"
               title="Zoom out"
               aria-label="Zoom out"
               onClick={() => zoomBy(1 / 1.25)}
@@ -524,7 +593,7 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
             </button>
             <button
               type="button"
-              className="rm-btn rm-btn-reset"
+              className="nb-btn nb-btn-icon rm-btn rm-btn-reset"
               title="Reset view (fit to screen)"
               aria-label="Reset view"
               onClick={resetView}

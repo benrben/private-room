@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { ReactNode, useEffect, useId, useState } from "react";
 import { api, FrontPage as FrontPageData, fileKindLabel } from "../api";
 import {
   BookOpenIcon,
   ChatBubbleIcon,
+  ClockIcon,
   FileTypeIcon,
   GlobeIcon,
   GraphIcon,
@@ -16,6 +17,7 @@ import {
 import { displayName, formatWhen } from "./composer";
 import { isCloudRoute } from "./markup";
 import { visibleWorkflows } from "./workflows/selectors";
+import { groupActivity, runningJobCount } from "../shell/activity";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import type { LayoutApi } from "../shell/useLayout";
@@ -29,6 +31,23 @@ interface BriefItem {
   run: () => void;
 }
 const TONE_RANK: Record<BriefTone, number> = { danger: 0, warn: 1, info: 2 };
+/** A strip's colour comes from the marker MEANING, never from a hue picked by
+ * hand, so "red means urgent" stays a fact of the stylesheet rather than a
+ * convention this file has to remember. */
+const TONE_MARK: Record<BriefTone, string> = {
+  danger: "nb-sem-urgent",
+  warn: "nb-sem-pending",
+  info: "nb-sem-linked",
+};
+/** …and the colour never travels alone. The tape label spells the tone out in
+ * a word, so a strip is still fully readable with colour ignored entirely —
+ * by a screen reader, in greyscale, or by anyone who cannot separate the
+ * yellow strip from the red one. */
+const TONE_WORD: Record<BriefTone, string> = {
+  danger: "Urgent",
+  warn: "Check",
+  info: "Note",
+};
 
 /** Room Brief: the one place Home leads with what NEEDS ATTENTION rather than
  * what's merely recent — raw-cloud exposure, unscanned files, scripts to
@@ -111,30 +130,252 @@ function RoomBrief({ s, a }: { s: WSState; a: WSActions }) {
   items.sort((x, y) => TONE_RANK[x.tone] - TONE_RANK[y.tone]);
 
   return (
-    <section className="home-section room-brief">
-      <div className="home-section-head">
+    <section className="rh-section">
+      <div className="rh-section-head">
         <h2>Needs your attention</h2>
-        <span>
+        <span className="rh-section-note">
           {items.length} item{items.length === 1 ? "" : "s"}
         </span>
       </div>
-      <div className="brief-list">
+      <ul className="rh-attn-list">
         {items.map((it) => (
-          <div key={it.key} className={`brief-row ${it.tone}`}>
-            <span className="brief-dot" aria-hidden="true" />
-            <span className="brief-text">{it.text}</span>
-            <button className="brief-cta" onClick={it.run}>
+          <li key={it.key} className={`rh-attn ${TONE_MARK[it.tone]}`}>
+            <span className="nb-tape rh-attn-tag">{TONE_WORD[it.tone]}</span>
+            <span className="rh-attn-text">{it.text}</span>
+            <button className="nb-btn nb-btn-go rh-attn-cta" onClick={it.run}>
               {it.cta}
             </button>
-          </div>
+          </li>
         ))}
-      </div>
+      </ul>
     </section>
   );
 }
 
-/** Room home: continue recent work, then reach every capability — quiet
- * lists, not a card gallery. Shown in the center pane on unlock. */
+/** The dated annotation in the masthead's upper-right: what day it is, how big
+ * the room is, and whether anything is happening in it right now.
+ *
+ * The date is CONTENT, not decoration — nothing on this page derives its shape,
+ * angle or position from the clock, so a given room state still draws an
+ * identical frame every render. */
+function RoomStamp({ page, s }: { page: FrontPageData; s: WSState }) {
+  const today = new Date().toLocaleDateString(undefined, {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+  });
+  // `runningJobCount` is the ONE definition of "something is happening" the
+  // status bar and the Activity tab already count through. Asking it here
+  // rather than re-testing job statuses is what stops Home from disagreeing
+  // with the rest of the window about whether the room is busy.
+  const busy = runningJobCount(s);
+  const rec = s.recLive;
+  const state =
+    rec && rec.status === "recording"
+      ? { word: "Recording now", mark: "nb-sem-urgent" }
+      : rec && rec.status === "paused"
+        ? { word: "Recording paused", mark: "nb-sem-pending" }
+        : busy > 0
+          ? { word: `${busy} running`, mark: "nb-sem-linked" }
+          : { word: "All quiet", mark: "nb-sem-done" };
+  return (
+    <div className="rh-stamp">
+      <span className="rh-stamp-date">{today}</span>
+      <span className="rh-stamp-counts">
+        {page.fileCount} file{page.fileCount === 1 ? "" : "s"} · {page.chatCount}{" "}
+        chat{page.chatCount === 1 ? "" : "s"}
+      </span>
+      <span className={`nb-tape rh-stamp-state ${state.mark}`}>{state.word}</span>
+    </div>
+  );
+}
+
+/** One entry on the ruled timeline. `at` is the ISO instant it is filed under;
+ * `running` swaps the date for a live state, because work that is still
+ * happening has no "when" yet. */
+interface TimelineEntry {
+  key: string;
+  icon: ReactNode;
+  title: string;
+  kind: string;
+  at: string;
+  hint: string;
+  running?: boolean;
+  open: () => void;
+}
+
+/** ISO instant as a number, with a malformed value sorting to the bottom
+ * rather than poisoning the comparator into an unstable order. */
+function instant(iso: string): number {
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? 0 : t;
+}
+
+/** Everything that has happened in this room lately, newest first.
+ *
+ * Files and chats interleave rather than sitting in two blocks: a timeline is
+ * chronological or it is not a timeline, and "I added that PDF right after I
+ * asked about it" is exactly the relationship the two separate lists hid.
+ * Work that is still running is filed above all of it, because "now" is newer
+ * than anything with a timestamp. */
+function timeline(
+  page: FrontPageData,
+  s: WSState,
+  a: WSActions,
+  layout: LayoutApi,
+): TimelineEntry[] {
+  const openActivity = () => {
+    s.setAiTab("activity");
+    layout.showPane("ai");
+  };
+  const running: TimelineEntry[] = groupActivity(s.jobs).active.map((j) => {
+    const live = s.jobProgress[j.id];
+    const done = live?.done ?? j.cursor;
+    // A job's step count is 0 until a plan says otherwise (jobs.rs defaults it,
+    // and an empty plan leaves it there), so there is often no denominator to
+    // report. Clamping it to 1 manufactured one: a job with no known length
+    // read "0 of 1" here while the Activity tab beside it correctly said
+    // nothing, and this timeline exists precisely so Home cannot disagree with
+    // the rest of the window. The Running tape already carries the state.
+    const total = live?.total ?? j.total;
+    return {
+      key: `job:${j.id}`,
+      icon: <ClockIcon size={14} />,
+      title: j.title,
+      kind: total > 0 ? `${done} of ${total}` : "Running",
+      at: j.updatedAt,
+      hint: j.title,
+      running: true,
+      open: openActivity,
+    };
+  });
+
+  const past: TimelineEntry[] = [];
+  for (const f of page.recentFiles) {
+    past.push({
+      key: `file:${f.id}`,
+      icon: <FileTypeIcon file={f} size={14} />,
+      title: displayName(f.name),
+      kind: fileKindLabel(f).replace(/^./, (c) => c.toUpperCase()),
+      at: f.createdAt,
+      hint: f.name,
+      open: () => a.viewFile(f.id),
+    });
+  }
+  for (const c of page.recentChats) {
+    past.push({
+      key: `chat:${c.id}`,
+      icon: <ChatBubbleIcon size={14} />,
+      title: c.title,
+      kind: "Chat",
+      at: c.createdAt,
+      hint: c.title,
+      open: () => {
+        s.setActiveChatId(c.id);
+        s.setAiTab("chat");
+        // The conversation lives in the AI pane — reveal it, or a
+        // collapsed pane makes this click look like nothing.
+        layout.showPane("ai");
+      },
+    });
+  }
+  past.sort((x, y) => instant(y.at) - instant(x.at));
+  return [...running, ...past];
+}
+
+/** A major action: a wide notebook card, drawn as a frame on the sheet. These
+ * are the four things Home actively invites you to START. */
+function ActionCard({
+  area,
+  title,
+  copy,
+  icon,
+  onClick,
+}: {
+  area: string;
+  title: string;
+  copy: string;
+  icon: ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button className="rh-card nb-card nb-lift" onClick={onClick}>
+      <span className="rh-card-ico" aria-hidden="true">
+        {icon}
+      </span>
+      <span className="rh-card-title">{title}</span>
+      {/* Sans, never the hand: this is an instruction about what the area
+          does, and handwriting is reserved for asides, dates and counts. */}
+      <span className="rh-card-copy">{copy}</span>
+      <span className="rh-card-area">{area}</span>
+    </button>
+  );
+}
+
+/** A destination that already has a permanent home in the rail. It keeps its
+ * link and its full description (as the hover title), and gives up the row of
+ * page it did not need — Home was a second copy of the primary navigation. */
+/** A compressed link to a place, below the fold on Room Home.
+ *
+ * The hint is carried three ways on purpose. As `title`, for a pointer. As an
+ * `aria-describedby` target, because a `title` is not reliably announced and a
+ * chip reading only "Scripts" tells a screen-reader user nothing about what is
+ * behind it. And, when the chip cannot be used, as VISIBLE text — see below.
+ *
+ * `aria-disabled`, never the `disabled` attribute. A disabled button does not
+ * fire pointer events, so its `title` cannot appear: the Room Map chip on an
+ * empty room was greyed out with the explanation for WHY sealed inside a
+ * tooltip that could not open. Marking it disabled instead keeps it focusable
+ * and hoverable, so the reason is reachable by every route. */
+function AreaChip({
+  label,
+  hint,
+  icon,
+  unavailable,
+  onClick,
+  children,
+}: {
+  label: string;
+  hint: string;
+  icon: ReactNode;
+  /** Why the chip cannot be used right now, shown in place of the hint. */
+  unavailable?: string;
+  onClick: () => void;
+  children?: ReactNode;
+}) {
+  const describedBy = useId();
+  const note = unavailable ?? hint;
+  return (
+    <>
+      <button
+        className={`nb-chip nb-chip-btn rh-chip${unavailable ? " is-unavailable" : ""}`}
+        title={note}
+        aria-disabled={unavailable ? true : undefined}
+        aria-describedby={describedBy}
+        onClick={unavailable ? undefined : onClick}
+      >
+        <span className="rh-chip-ico" aria-hidden="true">
+          {icon}
+        </span>
+        {label}
+        {children}
+      </button>
+      {/* Visible when it explains an unavailable chip, since that is the one
+          case where the reader is stuck and needs the words on screen; a
+          screen-reader description the rest of the time. */}
+      <span
+        id={describedBy}
+        className={unavailable ? "rh-chip-why nb-hand" : "rh-chip-why sr-only"}
+      >
+        {note}
+      </span>
+    </>
+  );
+}
+
+/** Room home, as a briefing: masthead and date, then what needs attention,
+ * then a ruled timeline of what has been happening, and only then the things
+ * you can start. Shown in the center pane on unlock. */
 export default function FrontPage({
   page,
   s,
@@ -154,212 +395,163 @@ export default function FrontPage({
     s.setOpenFile(null);
     s.setArea(area);
   };
+  const recent = timeline(page, s, a, layout);
   return (
-    <div className="home-view">
-      <div className="home-inner">
-        <header className="home-head">
-          <h1>Continue where you left off</h1>
-          <p>
-            Recent work, current background activity, and everything this room
-            can do — nothing here leaves this Mac on its own.
-          </p>
+    <div className="rh-view">
+      <div className="rh-inner">
+        <header className="rh-masthead">
+          <div className="rh-masthead-main">
+            <h1 className="rh-title">Continue where you left off</h1>
+            <p className="rh-subtitle nb-subtitle">
+              Recent work, current background activity, and everything this room
+              can do — nothing here leaves this Mac on its own.
+            </p>
+          </div>
+          <RoomStamp page={page} s={s} />
         </header>
 
         <RoomBrief s={s} a={a} />
 
-        <section className="home-section">
-          <div className="home-section-head">
+        <section className="rh-section">
+          <div className="rh-section-head">
             <h2>Continue</h2>
-            <span>Recent activity</span>
+            <span className="rh-section-note">Recent activity</span>
           </div>
-          <div className="home-list">
-            {page.recentFiles.length === 0 && page.recentChats.length === 0 && (
-              <div className="empty-hint">
-                Nothing here yet — add a file or ask the room a question.
-              </div>
-            )}
-            {page.recentFiles.map((f) => (
-              <button
-                key={f.id}
-                className="home-row"
-                title={f.name}
-                onClick={() => a.viewFile(f.id)}
-              >
-                <span className="home-row-icon">
-                  <FileTypeIcon file={f} size={15} />
-                </span>
-                <span className="home-row-main">
-                  <span className="home-row-title">{displayName(f.name)}</span>
-                  <span className="home-row-copy">
-                    {fileKindLabel(f).replace(/^./, (c) => c.toUpperCase())}
-                  </span>
-                </span>
-                <span className="home-row-meta">{formatWhen(f.createdAt)}</span>
-              </button>
-            ))}
-            {page.recentChats.map((c) => (
-              <button
-                key={c.id}
-                className="home-row"
-                title={c.title}
-                onClick={() => {
-                  s.setActiveChatId(c.id);
-                  s.setAiTab("chat");
-                  // The conversation lives in the AI pane — reveal it, or a
-                  // collapsed pane makes this click look like nothing.
-                  layout.showPane("ai");
-                }}
-              >
-                <span className="home-row-icon">
-                  <ChatBubbleIcon size={15} />
-                </span>
-                <span className="home-row-main">
-                  <span className="home-row-title">{c.title}</span>
-                  <span className="home-row-copy">Chat</span>
-                </span>
-                <span className="home-row-meta">{formatWhen(c.createdAt)}</span>
-              </button>
-            ))}
-          </div>
+          {recent.length === 0 ? (
+            <p className="rh-empty nb-annot">
+              Nothing here yet — add a file or ask the room a question.
+            </p>
+          ) : (
+            <ul className="rh-timeline nb-connect">
+              {recent.map((e) => (
+                <li key={e.key}>
+                  <button
+                    className={`rh-tl-row${e.running ? " is-running" : ""}`}
+                    title={e.hint}
+                    onClick={e.open}
+                  >
+                    <span className="rh-tl-ico" aria-hidden="true">
+                      {e.icon}
+                    </span>
+                    <span className="rh-tl-main">
+                      <span className="rh-tl-title">{e.title}</span>
+                      <span className="rh-tl-kind">{e.kind}</span>
+                    </span>
+                    {e.running ? (
+                      <span className="nb-tape rh-tl-state nb-sem-linked">
+                        Running
+                      </span>
+                    ) : (
+                      <span className="rh-tl-when">{formatWhen(e.at)}</span>
+                    )}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
 
-        <section className="home-section">
-          <div className="home-section-head">
+        <section className="rh-section">
+          <div className="rh-section-head">
             <h2>Work in this room</h2>
             {/* This list is a shortcut into the areas, not an inventory —
                 it said "All capabilities" while omitting three of them. */}
-            <span>Go to an area</span>
+            <span className="rh-section-note">Go to an area</span>
           </div>
-          <div className="home-list">
-            <button className="home-row" onClick={() => goArea("recordings")}>
-              <span className="home-row-icon">
-                <MicIcon size={15} />
-              </span>
-              <span className="home-row-main">
-                <span className="home-row-title">Record and transcribe</span>
-                <span className="home-row-copy">
-                  Microphone, Mac audio, live translation, editing, export
-                </span>
-              </span>
-              <span className="home-row-meta">Recordings</span>
-            </button>
-            <button className="home-row" onClick={() => a.openWorkflows()}>
-              <span className="home-row-icon">
-                <WorkflowsIcon size={15} />
-              </span>
-              <span className="home-row-main">
-                <span className="home-row-title">Automate repeated work</span>
-                <span className="home-row-copy">
-                  Visual pipelines, schedules, file actions, run history
-                </span>
-              </span>
-              <span className="home-row-meta">Workflows</span>
-            </button>
-            <button className="home-row" onClick={() => a.openScripts()}>
-              <span className="home-row-icon">
-                <ScriptIcon size={15} />
-              </span>
-              <span className="home-row-main">
-                <span className="home-row-title">Run a room script</span>
-                <span className="home-row-copy">
-                  Python or JavaScript with explicit inputs, outputs, and consent
-                </span>
-              </span>
-              <span className="home-row-meta">Scripts</span>
-            </button>
-            <button
-              className="home-row"
-              disabled={s.files.length === 0}
-              onClick={() => {
-                s.setOpenFile(null);
-                s.setShowMap(true);
-              }}
-            >
-              <span className="home-row-icon">
-                <GraphIcon size={15} />
-              </span>
-              <span className="home-row-main">
-                <span className="home-row-title">See how files connect</span>
-                <span className="home-row-copy">
-                  The Room Map of files, notes, and their relationships
-                </span>
-              </span>
-              <span className="home-row-meta">Room Map</span>
-            </button>
-            <button className="home-row" onClick={() => goArea("memory")}>
-              <span className="home-row-icon">
-                <MemoryIcon size={15} />
-              </span>
-              <span className="home-row-main">
-                <span className="home-row-title">
-                  Manage memory and scratch notes
-                </span>
-                <span className="home-row-copy">
-                  {page.memories.length > 0
-                    ? `${page.memories.length} saved memor${page.memories.length === 1 ? "y" : "ies"} — visible and editable`
-                    : "Durable facts and preferences, always visible and editable"}
-                </span>
-              </span>
-              <span className="home-row-meta">Memory</span>
-            </button>
-            <button
-              className="home-row"
+
+          {/* Marginalia: deterministic, inert, and hidden by the stylesheet
+              the moment the column stops having a margin to draw in. */}
+          <aside className="rh-margin" aria-hidden="true">
+            <span className="rh-margin-note">start here</span>
+            <span className="nb-arrow-curve nb-arrow-curve--se rh-margin-arrow" />
+          </aside>
+
+          <div className="rh-cards nb-frame-set">
+            <ActionCard
+              area="Recordings"
+              title="Record and transcribe"
+              copy="Microphone, Mac audio, live translation, editing, export"
+              icon={<MicIcon size={17} />}
+              onClick={() => goArea("recordings")}
+            />
+            <ActionCard
+              area="Workflows"
+              title="Automate repeated work"
+              copy="Visual pipelines, schedules, file actions, run history"
+              icon={<WorkflowsIcon size={17} />}
+              onClick={() => a.openWorkflows()}
+            />
+            <ActionCard
+              area="Studio"
+              title="Transform your sources"
+              copy="Flashcards, mind maps, podcast scripts, room summary"
+              icon={<SparkIcon size={17} />}
               onClick={() => {
                 s.setAiTab("studio");
                 layout.showPane("ai");
               }}
+            />
+            <ActionCard
+              area="Browser"
+              title="Read the web privately"
+              copy="A browser that keeps no history, with search and downloads straight into the room"
+              icon={<GlobeIcon size={17} />}
+              onClick={() => a.revealBrowser()}
+            />
+          </div>
+
+          {/* A dashed pencil rule is the system's mark for a provisional
+              boundary — below it is the fold, not a second class of feature.
+              Every one of these still has a permanent home in the rail. */}
+          <hr className="nb-rule-dash rh-more-rule" />
+
+          <div className="rh-more">
+            <AreaChip
+              label="Scripts"
+              hint="Run a room script — Python or JavaScript with explicit inputs, outputs, and consent"
+              icon={<ScriptIcon size={13} />}
+              onClick={() => a.openScripts()}
+            />
+            <AreaChip
+              label="Room Map"
+              hint="See how files connect — the Room Map of files, notes, and their relationships"
+              icon={<GraphIcon size={13} />}
+              unavailable={
+                s.files.length === 0
+                  ? "Add a file first — the map draws the connections between them"
+                  : undefined
+              }
+              onClick={() => {
+                s.setOpenFile(null);
+                s.setShowMap(true);
+              }}
+            />
+            <AreaChip
+              label="Memory"
+              hint="Manage memory and scratch notes — durable facts and preferences, always visible and editable"
+              icon={<MemoryIcon size={13} />}
+              onClick={() => goArea("memory")}
             >
-              <span className="home-row-icon">
-                <SparkIcon size={15} />
-              </span>
-              <span className="home-row-main">
-                <span className="home-row-title">Transform your sources</span>
-                <span className="home-row-copy">
-                  Flashcards, mind maps, podcast scripts, room summary
+              {/* A count is the handwriting's natural home, and the ring keeps
+                  it from reading as part of the label. */}
+              {page.memories.length > 0 && (
+                <span className="nb-circled rh-chip-count">
+                  {page.memories.length}
                 </span>
-              </span>
-              <span className="home-row-meta">Studio</span>
-            </button>
-            {/* The rail has nine areas; this list used to show six, so anyone
-                who navigated from Home concluded the other three didn't exist. */}
-            <button className="home-row" onClick={() => a.revealBrowser()}>
-              <span className="home-row-icon">
-                <GlobeIcon size={15} />
-              </span>
-              <span className="home-row-main">
-                <span className="home-row-title">Read the web privately</span>
-                <span className="home-row-copy">
-                  A browser that keeps no history, with search and downloads
-                  straight into the room
-                </span>
-              </span>
-              <span className="home-row-meta">Browser</span>
-            </button>
-            <button className="home-row" onClick={() => goArea("skills")}>
-              <span className="home-row-icon">
-                <BookOpenIcon size={15} />
-              </span>
-              <span className="home-row-main">
-                <span className="home-row-title">Teach the AI a skill</span>
-                <span className="home-row-copy">
-                  Reusable instructions and resources, stored encrypted in this
-                  room
-                </span>
-              </span>
-              <span className="home-row-meta">Skills</span>
-            </button>
-            <button className="home-row" onClick={() => goArea("connectors")}>
-              <span className="home-row-icon">
-                <LinkIcon size={15} />
-              </span>
-              <span className="home-row-main">
-                <span className="home-row-title">Connect outside tools</span>
-                <span className="home-row-copy">
-                  MCP connectors — every call asks first
-                </span>
-              </span>
-              <span className="home-row-meta">Connectors</span>
-            </button>
+              )}
+            </AreaChip>
+            <AreaChip
+              label="Skills"
+              hint="Teach the AI a skill — reusable instructions and resources, stored encrypted in this room"
+              icon={<BookOpenIcon size={13} />}
+              onClick={() => goArea("skills")}
+            />
+            <AreaChip
+              label="Connectors"
+              hint="Connect outside tools — MCP connectors, every call asks first"
+              icon={<LinkIcon size={13} />}
+              onClick={() => goArea("connectors")}
+            />
           </div>
         </section>
 
@@ -367,7 +559,7 @@ export default function FrontPage({
             home page's optional ideas must not compete with the actual work.
             One click opens them; the count says what's inside. */}
         {s.fpSuggestions.length > 0 && (
-          <div className="fp-suggestions">
+          <div className="fp-suggestions rh-tray">
             <button
               className="fp-suggestions-toggle"
               aria-expanded={suggestionsOpen}

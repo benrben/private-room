@@ -5,8 +5,15 @@
 //
 //   1. The activity rail (the icon strip) genuinely could not expand — it was
 //      nailed to 74px, which is why its labels had to be abbreviated to ≤9
-//      characters ("Connectors" showed as "Connect"). It now toggles to a
-//      184px column with full labels, and the choice is remembered.
+//      characters ("Connectors" showed as "Connect"). It now toggles between an
+//      84px icon column and a 192px column with full labels, and the choice is
+//      remembered.
+//
+//      The notebook pass INVERTED the default: the rail is the app's one
+//      primary navigation, and navigation you have to hover to identify is not
+//      navigation, so full labels are what a new room opens with. The toggle,
+//      the persistence and the abbreviation are all still the thing under test
+//      — they are just exercised starting from the other end.
 //
 //   2. The Library pane always resized, but you could not tell: the handle was
 //      a 5px line whose grip only appeared on hover, and it refused to go past
@@ -46,41 +53,41 @@ describe("GH #2a — the activity rail expands", () => {
     await openApp();
   });
 
-  it("widens to full labels and back", async () => {
-    const collapsed = await widthOf(RAIL);
-    await expect(collapsed).toBeLessThan(100);
-    // Abbreviated while narrow — this is the thing users were reading as broken.
-    await expect(await $(RAIL).$('[data-area="connectors"]').getText()).toContain("Connect");
-
-    await (await $(EXPANDER)).click();
-    await browser.waitUntil(async () => (await widthOf(RAIL)) > 150, {
-      timeout: 5_000,
-      timeoutMsg: "the rail never widened",
-    });
-    // ...and the real name once there is room for it.
+  it("narrows to icons and back", async () => {
+    // A new room opens with the readable labels.
+    await expect(await widthOf(RAIL)).toBeGreaterThan(150);
     await expect(await $(RAIL).$('[data-area="connectors"]').getText()).toBe("Connectors");
     await expect(await $(RAIL).$('[data-area="recordings"]').getText()).toBe("Recordings");
 
     await (await $(EXPANDER)).click();
     await browser.waitUntil(async () => (await widthOf(RAIL)) < 100, {
       timeout: 5_000,
-      timeoutMsg: "the rail never collapsed again",
+      timeoutMsg: "the rail never narrowed",
+    });
+    // Abbreviated while narrow — the ≤9-character short form, still present.
+    await expect(await $(RAIL).$('[data-area="connectors"]').getText()).toContain("Connect");
+
+    await (await $(EXPANDER)).click();
+    await browser.waitUntil(async () => (await widthOf(RAIL)) > 150, {
+      timeout: 5_000,
+      timeoutMsg: "the rail never widened again",
     });
   });
 
   it("remembers the choice across a reload", async () => {
+    // Choose AGAINST the default, which is the only choice a stored value has
+    // to survive: keeping the default needs no storage to look right.
     await (await $(EXPANDER)).click();
-    await browser.waitUntil(async () => (await widthOf(RAIL)) > 150);
-    await expect((await saved()).railExpanded).toBe(true);
+    await browser.waitUntil(async () => (await widthOf(RAIL)) < 100);
+    await expect((await saved()).railExpanded).toBe(false);
 
     // Reload WITHOUT wiping the layout — that is the point of the test.
     await openApp({ wipe: false });
-    await expect(await widthOf(RAIL)).toBeGreaterThan(150);
-    await expect(await $(EXPANDER).getAttribute("aria-expanded")).toBe("true");
+    await expect(await widthOf(RAIL)).toBeLessThan(100);
+    await expect(await $(EXPANDER).getAttribute("aria-expanded")).toBe("false");
   });
 
   it("keeps every rail destination reachable while expanded", async () => {
-    await (await $(EXPANDER)).click();
     await browser.waitUntil(async () => (await widthOf(RAIL)) > 150);
     // A wider rail must not push its own buttons out of the viewport.
     for (const area of ["map", "recordings", "workflows", "memory", "connectors"]) {

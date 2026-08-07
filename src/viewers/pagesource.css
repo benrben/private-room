@@ -1,36 +1,85 @@
-/* The provenance strip above a saved web page. Same quiet register as the
-   encoding strip directly above it — a saved article should look like the
-   article, not like a form. */
+/* WHERE THIS CAME FROM — the provenance of a saved web page, as a compact
+   notebook card above the article.
+
+   It used to be a full-bleed strip with a rule under it, which read as a
+   second toolbar stacked on the first. A researcher's source note is a small
+   card clipped to the top of the page, so that is what it is now: a drawn
+   frame on the sheet (transparent, the grid runs through it), inset from both
+   margins so it clearly belongs TO the document rather than to the app's
+   chrome, with a paper-clip mark hooked over its corner.
+
+   It stays quiet on purpose. Everything in it is the page's own claim about
+   itself — PageSource.tsx renders no row the page did not declare — and a card
+   that shouted would present those claims as findings. */
 .page-source {
   /* `.viewer-body.fill` is a flex column whose other child takes the rest of
-     the height; the strip keeps its own and is never squashed by it. */
+     the height; the card keeps its own and is never squashed by it. */
   flex: 0 0 auto;
+  position: relative;
   display: flex;
   flex-wrap: wrap;
-  gap: 0.25rem 1rem;
-  padding: 0.3rem 0.75rem;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.8rem;
+  align-items: baseline;
+  gap: var(--sp-2) var(--sp-6);
+  max-width: var(--doc-measure, 86ch);
+  /* The top margin is what gives the paper clip room to hang above the card;
+     see the note below before shrinking it. */
+  margin: var(--sp-4) auto var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--line);
+  /* Drawn, not computed — the asymmetric radius is the hand-made rectangle. */
+  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  background: transparent;
+  font-size: var(--fs-micro);
   color: var(--muted);
 }
+
+/* The paper clip hooked over the corner comes from paper.css's `.nb-clip`,
+   which PageSource.tsx composes onto this element — one glyph, one recipe, no
+   second copy to drift. Half of the mark hangs above the card, so the top
+   margin above has to stay at least as deep as `.nb-clip`'s 11px overhang and
+   nothing here may grow an `overflow: hidden`. */
+
 .page-source-fact {
   display: inline-flex;
-  gap: 0.35rem;
+  gap: var(--sp-2);
   align-items: baseline;
   min-width: 0;
 }
+
+/* The field name: small, spaced capitals, one tier back from the value. It is
+   a structural label, so it stays in the interface face — the hand is for the
+   annotation, not for the form. */
 .page-source-label {
-  color: var(--faint, var(--muted));
+  color: var(--faint);
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  font-size: var(--fs-micro);
+  font-weight: 600;
   white-space: nowrap;
 }
-/* A URL is the one field that can be arbitrarily long; it gets to shrink. */
+
+/* The page's own words about itself, a step brighter than the label so the
+   claim reads before the field name does. */
+.page-source-fact > span:not(.page-source-label) {
+  color: var(--text);
+}
+
+/* A date, pencilled in beside the clipping. Kalam sits high and runs small
+   for its nominal size, so it is set at the metadata floor rather than at
+   --fs-micro, where it would fall under it. */
+.page-source-when {
+  font-family: var(--hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-hand);
+}
+
+/* A URL is the one field that can be arbitrarily long; it gets to shrink, and
+   it is technical content, so it is set in the mono face. */
 .page-source-url {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 28rem;
+  font-family: var(--mono);
   user-select: text;
 }

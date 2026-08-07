@@ -1,8 +1,9 @@
 /* =====================================================================
-   THE SEAL — Arcelle's signature ritual (owned by A3)
+   THE SEAL — Arcelle's signature ritual
    One deliberate, calm motion in BOTH directions, on the app's palette:
-   ink background (--bg), a single violet accent (--accent / --accent-2),
-   a keyhole/seal motif. No sound, nothing garish.
+   the sheet itself (--bg) and the pink pen (--accent / --accent-fill) as a
+   keyhole/seal motif. No sound, nothing garish. The pen is pigment spreading
+   on paper here, never a glow — the notebook has no lit surfaces in it.
 
      UNLOCK  .seal-unlocking          keyhole blooms OPEN, ink veil lifts (~520ms)
              @keyframes seal-open-veil / seal-open-core / seal-open-ring
@@ -38,7 +39,8 @@
   animation: seal-open-veil var(--seal-unlock-dur) var(--seal-ease) forwards;
 }
 
-/* The keyhole itself: a violet point that lights, holds, then irises open. */
+/* The keyhole: an ink wash that opens outward. Drawn rather than lit — the
+   notebook has no glowing surfaces, so this is pigment spreading on paper. */
 .seal-unlocking::before {
   content: "";
   position: absolute;
@@ -49,15 +51,15 @@
   border-radius: 50%;
   background: radial-gradient(
     circle,
-    rgba(169, 157, 248, 0.95),
-    rgba(139, 124, 246, 0.32) 46%,
+    color-mix(in srgb, var(--accent-fill) 95%, transparent),
+    color-mix(in srgb, var(--accent-fill) 32%, transparent) 46%,
     transparent 72%
   );
   transform: translate(-50%, -50%) scale(0.35);
   animation: seal-open-core var(--seal-unlock-dur) var(--seal-ease) forwards;
 }
 
-/* The seal ring: a thin violet outline that opens outward past the frame. */
+/* The seal ring: a thin pen outline that opens outward past the frame. */
 .seal-unlocking::after {
   content: "";
   position: absolute;
@@ -65,9 +67,8 @@
   top: 50%;
   width: 92px;
   height: 92px;
-  border-radius: 50%;
-  border: 2px solid rgba(139, 124, 246, 0.7);
-  box-shadow: 0 0 24px rgba(139, 124, 246, 0.5);
+  border-radius: 52% 48% 51% 49% / 49% 51% 48% 52%;
+  border: 2px solid color-mix(in srgb, var(--accent-fill) 70%, transparent);
   transform: translate(-50%, -50%) scale(0.4);
   opacity: 0;
   animation: seal-open-ring var(--seal-unlock-dur) var(--seal-ease) forwards;
@@ -147,8 +148,8 @@
   border-radius: 50%;
   background: radial-gradient(
     circle,
-    rgba(169, 157, 248, 0.95),
-    rgba(139, 124, 246, 0.32) 46%,
+    color-mix(in srgb, var(--accent-fill) 95%, transparent),
+    color-mix(in srgb, var(--accent-fill) 32%, transparent) 46%,
     transparent 72%
   );
   transform: translate(-50%, -50%) scale(2.6);
@@ -164,9 +165,8 @@
   top: 50%;
   width: 92px;
   height: 92px;
-  border-radius: 50%;
-  border: 2px solid rgba(139, 124, 246, 0.7);
-  box-shadow: 0 0 24px rgba(139, 124, 246, 0.45);
+  border-radius: 52% 48% 51% 49% / 49% 51% 48% 52%;
+  border: 2px solid color-mix(in srgb, var(--accent-fill) 70%, transparent);
   transform: translate(-50%, -50%) scale(9);
   opacity: 0;
   animation: seal-close-ring var(--seal-lock-dur) var(--seal-ease) forwards;
@@ -263,6 +263,9 @@
    jobs, compacting the file), which is exactly when a dark still screen starts
    reading as a hung app. It fades in on its own so it never competes with the
    keyhole animation. */
+/* Sans, not the hand: this is an explanation of what the app is doing, and
+   handwriting is reserved for annotations. --muted is 7.9:1 on the dark sheet
+   and 5.0:1 on ivory, both against the veil's own --bg. */
 .seal-note {
   position: absolute;
   left: 50%;
@@ -270,21 +273,26 @@
   transform: translateX(-50%);
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--sp-3);
   max-width: min(420px, 80vw);
   text-align: left;
-  font-size: 13px;
-  line-height: 1.45;
-  color: var(--text-dim);
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
   opacity: 0;
-  animation: seal-note-in 0.3s var(--seal-ease) forwards;
+  animation: seal-note-in var(--dur-slow) var(--seal-ease) forwards;
 }
+/* The one piece of looping motion in the product, and it earns it: it is the
+   only thing distinguishing a room that is still closing from a frozen app.
+   Drawn as a pen nib going round — a --rule-strong ring (3:1, so the shape
+   itself is discernible) with the pen picking out one quarter of it. */
 .seal-note-spinner {
   flex: 0 0 auto;
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  border: 2px solid var(--border);
+  border: 2px solid var(--rule-strong);
   border-top-color: var(--accent);
   animation: seal-note-spin 0.9s linear infinite;
 }
@@ -303,8 +311,10 @@
     opacity: 1;
     animation: none;
   }
+  /* No rotation, so the pen's quarter-arc would just be a mark stuck at
+     twelve o'clock; the ring goes back to being a plain drawn circle. */
   .seal-note-spinner {
     animation: none;
-    border-top-color: var(--border);
+    border-top-color: var(--rule-strong);
   }
 }

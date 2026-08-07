@@ -1,13 +1,13 @@
 /* ---- agent annotations: highlights across viewers ---- */
 
 ::highlight(pr-annotation) {
-  background: rgba(255, 213, 79, 0.45);
+  background: color-mix(in srgb, var(--mk-yellow) 45%, transparent);
   color: inherit;
 }
 
 .quote-flash {
-  background: rgba(255, 213, 79, 0.35);
-  border-radius: 3px;
+  background: color-mix(in srgb, var(--mk-yellow) 35%, transparent);
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
 }
 
 .pdf-page-wrap {
@@ -27,7 +27,7 @@
   color: var(--text-dim);
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
@@ -54,8 +54,8 @@
   padding: 18px 20px;
   text-align: center;
   background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 12px;
+  border: 1.5px solid var(--sketch);
+  border-radius: 12px 10px 13px 11px / 11px 13px 10px 12px;
 }
 .pdf-failed-title {
   font-weight: 650;
@@ -81,7 +81,7 @@
   padding: 4px 6px;
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
 }
 
@@ -91,7 +91,7 @@
   color: var(--text-dim);
   background: transparent;
   border: none;
-  border-radius: 5px;
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
   cursor: pointer;
   transition: color 0.12s ease, background 0.12s ease;
 }
@@ -138,16 +138,16 @@
 
 .pdf-hl {
   position: absolute;
-  background: rgba(255, 213, 79, 0.45);
+  background: color-mix(in srgb, var(--mk-yellow) 45%, transparent);
   border-radius: 2px;
   pointer-events: none;
   mix-blend-mode: multiply;
 }
 
 .cell-hl {
-  outline: 2px solid #e8a800;
+  outline: 2px solid var(--amber);
   outline-offset: -2px;
-  background: rgba(255, 213, 79, 0.3) !important;
+  background: color-mix(in srgb, var(--mk-yellow) 30%, transparent) !important;
 }
 
 .annot-chip {
@@ -159,7 +159,7 @@
   font-size: 12px;
   border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
   border-radius: 999px;
-  background: rgba(255, 213, 79, 0.12);
+  background: color-mix(in srgb, var(--mk-yellow) 12%, transparent);
   cursor: pointer;
   max-width: 100%;
   overflow: hidden;
@@ -168,7 +168,7 @@
 }
 
 .annot-chip:hover {
-  background: rgba(255, 213, 79, 0.25);
+  background: color-mix(in srgb, var(--mk-yellow) 25%, transparent);
 }
 
 /* ---- spreadsheet grid editing ---- */
@@ -188,14 +188,19 @@
   box-sizing: border-box;
   font: inherit;
   padding: 0 2px;
-  border: 2px solid #e8a800;
+  border: 2px solid var(--amber);
   border-radius: 2px;
   outline: none;
   background: inherit;
   color: inherit;
 }
 
-/* ADD-11 — Touch ID unlock button on the gate's unlock screen */
+/* ADD-11 — Touch ID unlock button on the gate's unlock screen.
+   Outlined ink, not accent-on-accent-soft. Two reasons: `--accent` over
+   `--accent-soft` measured 4.45:1 dark / 4.35:1 light for a 14px 600-weight
+   label, under 4.5; and the accent is this app's SELECTION colour, so a
+   filled-accent button at rest read as already chosen. The drawn outline is
+   the same treatment every other secondary action on the gate gets. */
 .touchid-btn {
   display: flex;
   align-items: center;
@@ -203,70 +208,119 @@
   gap: 8px;
   width: 100%;
   padding: 10px 12px;
-  border: 1px solid var(--accent);
-  border-radius: 8px;
-  background: var(--accent-soft);
-  color: var(--accent);
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  background: transparent;
+  color: var(--text);
   font-weight: 600;
   cursor: pointer;
 }
 .touchid-btn:hover:not(:disabled) {
-  background: var(--accent);
-  color: #fff;
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+  color: var(--text-strong);
 }
 .touchid-btn:disabled {
   opacity: 0.5;
   cursor: default;
 }
 
-/* ADD-11 — Touch ID toggle in Settings → Privacy */
+/* ---- the toggle row and its switch ----
+   Used by Settings → Cloud privacy, Privacy, Room server and App. The row is
+   a control plus the sentence saying what is in force, so the sentence is the
+   thing that has to be legible: it runs at --fs-body, and where the sentence
+   is a privacy CONSEQUENCE the section adds `.set-consequence` to lift it to
+   --fs-lead. */
 .settings-toggle-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin: 6px 0 2px;
+  gap: var(--sp-3);
+  margin: var(--sp-2) 0 var(--sp-1);
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
 }
+.settings-toggle-row.set-consequence {
+  font-size: var(--fs-lead);
+}
+
 .switch {
   position: relative;
   display: inline-flex;
   flex: 0 0 auto;
   cursor: pointer;
 }
-.switch input {
+
+/* The native checkbox IS the control and it covers the whole switch, so the
+   42x24 track is the real hit target rather than a decorative span next to a
+   0x0 input. Kept transparent rather than replaced: it keeps its role, its
+   checked state, its keyboard handling and its label association, and the
+   painted track below is only its face.
+
+   Written as `.settings-toggle-row .switch input` on purpose — settings.css
+   sizes every other checkbox on the sheet to 16px, and this one has to win
+   that. */
+.settings-toggle-row .switch input {
   position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
   opacity: 0;
-  width: 0;
-  height: 0;
+  cursor: pointer;
 }
 .switch-track {
   display: inline-block;
-  width: 38px;
-  height: 22px;
-  border-radius: 999px;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  transition: background 0.15s ease, border-color 0.15s ease;
+  width: 42px;
+  /* 24px is the minimum target, paid by the control itself. */
+  height: 24px;
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  background: transparent;
+  /* --rule-strong is the 3:1 a control boundary owes (WCAG 1.4.11). */
+  border: 1.5px solid var(--rule-strong);
+  transition:
+    background-color var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
 }
+/* The knob keeps ONE colour in both states, because a physical knob does not
+   change colour — the track carries the state. --ink-2 measures 7.9:1 in dark
+   and 6.3:1 in light, far past the 3:1 a meaningful non-text mark owes. */
 .switch-thumb {
   display: block;
   width: 16px;
   height: 16px;
-  margin: 2px;
+  margin: 2.5px;
   border-radius: 50%;
-  background: var(--text-dim);
-  transition: transform 0.15s ease, background 0.15s ease;
+  background: var(--ink-2);
+  transition: transform var(--dur) var(--ease-pen);
 }
 .switch input:checked + .switch-track {
-  background: var(--accent-soft);
+  background-color: var(--accent-soft);
   border-color: var(--accent);
 }
 .switch input:checked + .switch-track .switch-thumb {
-  transform: translateX(16px);
-  background: var(--accent);
+  transform: translateX(18px);
 }
+.switch input:disabled + .switch-track {
+  opacity: 0.5;
+}
+.switch input:disabled {
+  cursor: default;
+}
+/* A real ring, not a border-colour swap: the outline is the app's one focus
+   indicator and it is drawn on the face because the input itself is
+   transparent. */
 .switch input:focus-visible + .switch-track {
   border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch-track,
+  .switch-thumb {
+    transition: none;
+  }
 }
 

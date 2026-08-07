@@ -65,7 +65,7 @@ export default function SubtitleView({ text, name, onSave }: Props) {
           {shortStamp(cues[cues.length - 1].endMs)} long
         </span>
         {onSave && (
-          <button className="subtle" disabled={!dirty || saving} onClick={() => void save()}>
+          <button className="nb-btn" disabled={!dirty || saving} onClick={() => void save()}>
             {saving ? "Saving…" : dirty ? "Save" : "Saved"}
           </button>
         )}

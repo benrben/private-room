@@ -195,7 +195,13 @@ async fn start_job_from_row(
             .map(|_| true),
         "workflow" => start_workflow_row(window, &state, &job, &room_path, cancel).map(|_| true),
         "studio" => start_studio_row(window, &state, &job, &room_path, cancel).map(|_| true),
+        "podcast_audio" => {
+            start_podcast_audio_row(window, &state, &job, &room_path, cancel).map(|_| true)
+        }
         "download" => start_download_row(window, &state, &job, &room_path, cancel).map(|_| true),
+        "rec_read" => start_rec_read_row(window, &state, &job, &room_path, cancel)
+            .await
+            .map(|_| true),
         _ => Err("This job kind can't be started.".into()),
     };
     match started {
@@ -362,6 +368,33 @@ fn start_studio_row(
         scope,
         instructions,
         refs,
+        cancel,
+    );
+    Ok(())
+}
+
+/// Rebuild + spawn a podcast recording from its plan.
+///
+/// Like a studio run, a single atomic unit with no cursor: a half-recorded
+/// episode is not a resumable state, it is a file nobody wants. Resuming
+/// re-records from the top, which is also what the user means by "try again".
+fn start_podcast_audio_row(
+    window: &tauri::Window,
+    _state: &AppState,
+    job: &db::Job,
+    room_path: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let script = job
+        .plan
+        .get("scriptFileId")
+        .and_then(|v| v.as_str())
+        .ok_or("This job's plan is unreadable.")?;
+    super::spawn_podcast_audio(
+        window.clone(),
+        job.id.clone(),
+        room_path.to_string(),
+        script.to_string(),
         cancel,
     );
     Ok(())

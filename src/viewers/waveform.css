@@ -1,5 +1,6 @@
 /* ------------------------------------------------------------------ *
- * The recording waveform and its speaker ribbon.
+ * The recording waveform: the wave itself, a pencil-tick time scale,
+ * and one named lane per voice.
  *
  * The app has diarized recordings on-device since v0.14.0 and none of it
  * reached the screen — the player was a bare <audio controls>.
@@ -14,8 +15,21 @@
  *      and `overflow: hidden` below make that impossible now, whatever
  *      the plugin does.
  *   2. Saturated colour over the whole wave is unreadable. Colour lives
- *      in a 6px ribbon under the wave instead, so the wave stays a plain
- *      shape and the turns are a legible strip beside it.
+ *      under the wave instead, so the wave stays a plain shape and the
+ *      turns are a legible strip beside it.
+ *
+ * THE ALIGNMENT RULE, which shapes the whole layout: the wave, the tick
+ * scale and every speaker lane are three drawings of ONE timeline, so
+ * they must share one horizontal extent to the pixel. They are therefore
+ * three rows of the same two-column grid — a label gutter and a plot
+ * column — rather than three independently padded boxes. A lane whose
+ * left edge is 78px off from the wave's would put a speaker's turn under
+ * audio they were not speaking over, which is exactly the kind of
+ * confident wrongness this app must never draw.
+ *
+ * Nothing here names a colour: hues arrive as --mk / --mk-ink from a
+ * marker class on the element (paper.css), so light mode falls out of
+ * the same rules.
  * ------------------------------------------------------------------ */
 
 .waveform {
@@ -24,44 +38,213 @@
   overflow: hidden;
   contain: paint;
   padding: 0.5rem 0.75rem 0.4rem;
-  border-bottom: 1px solid var(--border);
+  /* The drawn divider, as a background rather than a border: a pencil rule
+     thins at both ends. Same idiom the section heads use on Room Home. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 4%,
+    var(--line) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+  /* No gutter by default — the compact lane under an imported file has no
+     lane labels to make room for, and the wave gets the full width. */
+  --wave-gutter: 0px;
+}
+
+/* With lanes, every row gives up the same strip on the left so the names
+   have somewhere to live that is not on top of the data. */
+.waveform.has-lanes {
+  --wave-gutter: 78px;
+}
+
+.waveform-stage,
+.waveform-axis,
+.waveform-lane {
+  display: grid;
+  grid-template-columns: var(--wave-gutter) minmax(0, 1fr);
+  align-items: center;
+}
+
+/* The plot column. Everything drawn over the wave is positioned inside this
+   box and nowhere else, so a percentage always means "this far into the
+   file" and never "this far into the component". */
+.waveform-plot,
+.waveform-axis-track,
+.waveform-lane-track {
+  grid-column: 2;
+  position: relative;
 }
 
 /* Reserve the height before wavesurfer measures, so the transcript below
-   doesn't jump down the moment the waveform appears. */
-/* An exact box, not a minimum: whatever the renderer produces, this component
-   occupies the height it was budgeted and nothing of it escapes. The height
-   itself is set inline from WAVE_HEIGHT so the two can't drift. */
+   doesn't jump down the moment the waveform appears. An exact box, not a
+   minimum: whatever the renderer produces, this component occupies the
+   height it was budgeted and nothing of it escapes. The height itself is
+   set inline from the component so the two can't drift. */
 .waveform-canvas {
   position: relative;
   overflow: hidden;
 }
 
-/* ---- speaker ribbon ---- */
+/* ---- the selected span ----
+   What the transcript has selected, drawn over the audio it refers to. The
+   fill is a marker wash so the wave stays readable through it, and the exact
+   boundaries are carried by a full-strength outline — which also means a
+   selection of a few hundredths of a second is still visible as a mark
+   without the FILL being widened to a lie about how much audio it covers. */
+.waveform-band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background-color: color-mix(in srgb, var(--mk, var(--mk-yellow)) 22%, transparent);
+  box-shadow: 0 0 0 1.5px var(--mk-ink, var(--amber));
+  border-radius: 2px 3px 2px 3px / 3px 2px 3px 2px;
+  pointer-events: none;
+}
+
+/* ---- pencil tick scale ----
+   Half-steps are pencil weight and unlabelled; the labelled steps are drawn
+   in the 3:1 stroke because they are what the numbers are attached to.
+
+   The stamps are HANDWRITTEN, which is the one place in a recording this
+   font is allowed near a time: these are annotations on a drawing, the same
+   job as the dates in Room Home's masthead. Every timestamp the user reads
+   as DATA — transcript rows, clip lengths, the selection bar — stays mono. */
+.waveform-axis {
+  margin-top: 3px;
+}
+.waveform-axis-track {
+  height: 22px;
+}
+.waveform-tick {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 5px;
+  margin-left: -0.5px;
+  background: var(--rule);
+  pointer-events: none;
+}
+.waveform-tick.is-major {
+  height: 8px;
+  background: var(--rule-strong);
+}
+/* The axis stamps are a SCALE — you read a time off them — so they are sans
+   with tabular figures, which also stops the labels shifting width as the
+   digits change while playback runs. Kalam was tried here and is wrong twice
+   over: the brief bars the hand on timestamps, and Kalam runs small for its
+   nominal size, so at --fs-micro it fell under the readable floor this project
+   documents seven files away in pagesource.css. Quiet is achieved with --faint
+   and the metadata size instead of with the face. */
+.waveform-tick-label {
+  position: absolute;
+  top: 10px;
+  left: 0;
+  transform: translateX(-50%);
+  font-family: var(--sans);
+  font-variant-numeric: tabular-nums;
+  font-style: normal;
+  font-size: var(--fs-meta);
+  line-height: 1;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+/* ---- speaker lanes ----
+   One row per voice: the name in the gutter, that voice's turns across the
+   plot. Colour repeats past the fourth speaker, so the name is what actually
+   identifies a lane and the colour only helps you find it again. */
+.waveform-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 7px;
+}
+.waveform-lane {
+  min-height: 16px;
+}
+/* A speaker name is a FORM VALUE — the reader renames a voice, in whatever
+   script they think in — so it stays in the sans with its full fallback
+   chain. */
+.waveform-lane-name {
+  grid-column: 1;
+  padding-right: 8px;
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  line-height: 1.25;
+  color: var(--muted);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.waveform-lane-track,
 .waveform-ribbon {
-  position: relative;
-  height: 6px;
-  margin-top: 4px;
-  border-radius: 3px;
+  height: 9px;
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
   overflow: hidden;
   /* The gaps between turns are silence; show the track through them. */
-  background: color-mix(in srgb, var(--border) 55%, transparent);
+  background: color-mix(in srgb, var(--rule) 45%, transparent);
 }
+
+/* ---- the mixed ribbon ----
+   The fallback when there are more voices than lanes stay readable at, and
+   what an imported audio/video file gets under its compact wave. */
+.waveform-ribbon {
+  position: relative;
+  margin-top: 6px;
+}
+
+/* One turn. The marker wash is the fill and the --mk-ink stroke is what pays
+   the 3:1 a meaningful non-text mark owes — a marker fill alone measures
+   about 1.7:1 on ivory paper. */
 .waveform-turn {
   position: absolute;
   top: 0;
   bottom: 0;
-  border-radius: 3px;
+  background-color: color-mix(in srgb, var(--mk, var(--mk-blue)) 62%, transparent);
+  box-shadow: inset 0 0 0 1px var(--mk-ink, var(--blue));
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
+}
+/* Each time the four-hue palette wraps, the spans take the next texture, so
+   two speakers sharing a colour are still told apart with colour ignored. A
+   LADDER rather than an on/off hatch: with a single hatch, the ninth voice
+   went back to plain and became indistinguishable from the first — and nine
+   voices is precisely when the lanes give up and everyone shares one ribbon.
+   Three textures plus plain separate 16 voices. */
+.waveform-turn.is-tex-1 {
+  background-image: repeating-linear-gradient(
+    45deg,
+    color-mix(in srgb, var(--mk-ink, var(--blue)) 55%, transparent) 0 2px,
+    transparent 2px 5px
+  );
+}
+.waveform-turn.is-tex-2 {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--mk-ink, var(--blue)) 55%, transparent) 0 2px,
+    transparent 2px 5px
+  );
+}
+.waveform-turn.is-tex-3 {
+  background-image: radial-gradient(
+    circle at 1.5px 1.5px,
+    color-mix(in srgb, var(--mk-ink, var(--blue)) 62%, transparent) 1.1px,
+    transparent 1.2px
+  );
+  background-size: 5px 5px;
 }
 
 .waveform-failed {
-  color: var(--danger, var(--text));
+  color: var(--sem-urgent);
 }
 
 /* Said under a wave that DID draw: the lane is flat because the track is
    silent, not because anything went wrong. Muted, not red — nothing failed. */
 .waveform-note {
-  color: var(--muted, var(--text-dim));
+  color: var(--muted);
   padding-top: 2px;
 }
 
@@ -72,7 +255,7 @@
   margin: 0.35rem 0 0;
   padding: 0;
   list-style: none;
-  font-size: 0.75rem;
+  font-size: var(--fs-meta);
   color: var(--muted);
 }
 .waveform-legend li {
@@ -80,9 +263,47 @@
   align-items: center;
   gap: 0.3rem;
 }
+/* Drawn in the hue's INK, not its fill: a legend swatch is the only thing
+   standing for a colour, so it has to be identifiable on its own. */
 .waveform-swatch {
   width: 0.6rem;
   height: 0.6rem;
-  border-radius: 2px;
+  border-radius: 2px 3px 2px 3px / 3px 2px 3px 2px;
+  background: var(--mk-ink, var(--muted));
   flex: none;
+}
+
+/* ---- what the room found, on the audio it found it in --------------------
+   Saved marks are a standing wash (the live SELECTION is drawn over them, and
+   must stay the louder of the two — it is what pressing Delete would remove).
+   Chapters are pencil rules with their names beside them. */
+.waveform-saved-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  pointer-events: none;
+  background-color: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-inline: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+}
+.waveform-chapter {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  pointer-events: none;
+  border-inline-start: 1px dashed var(--ink-soft);
+}
+.waveform-chapter-label {
+  position: absolute;
+  top: 2px;
+  inset-inline-start: 4px;
+  max-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-micro);
+  color: var(--ink-soft);
+  background-color: color-mix(in srgb, var(--page) 78%, transparent);
+  padding: 0 3px;
+  border-radius: 3px;
 }

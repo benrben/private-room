@@ -47,7 +47,9 @@ test("the recovery panel is a real modal dialog", () => {
 });
 
 test("the password screen itself says there is no reset", () => {
-  const note = /<p className="gate-note">([\s\S]*?)<\/p>/.exec(CREATE)?.[1] ?? "";
+  // The class list is allowed to grow — the notebook pass added a
+  // `gate-note-warn` modifier beside it. What is pinned here is the copy.
+  const note = /<p className="gate-note(?: [^"]*)?">([\s\S]*?)<\/p>/.exec(CREATE)?.[1] ?? "";
   assert.ok(note, "the create screen lost its password note entirely");
   assert.match(note, /no password reset/i, `the note still only says: ${note.trim()}`);
   assert.match(note, /recover/i, "the note does not say nobody can recover it");

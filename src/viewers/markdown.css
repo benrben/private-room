@@ -31,6 +31,16 @@
   color: inherit;
 }
 
+/* Syntax colours are IDENTITY, not status: a keyword is not "selected" and a
+   string is not "done". So they are drawn from the marker library's HUE track
+   (--mk-*-ink) rather than from the semantic aliases (--accent / --ok / --warn
+   / --danger) these rules used to name, which are reserved product-wide for
+   what a colour MEANS. The values are unchanged — the semantic aliases resolve
+   to these very hues — so no code sample renders differently; what changes is
+   that "green means complete" stays true everywhere else in the app.
+
+   The -ink track is the contrast-checked one (>=4.5:1 on the worst-case
+   surface of each theme), which is what a run of code needs. */
 .hljs-comment,
 .hljs-quote {
   color: var(--muted);
@@ -44,7 +54,7 @@
 .hljs-type,
 .hljs-name,
 .hljs-strong {
-  color: var(--accent);
+  color: var(--mk-pink-ink);
 }
 .hljs-string,
 .hljs-title,
@@ -53,7 +63,7 @@
 .hljs-symbol,
 .hljs-bullet,
 .hljs-addition {
-  color: var(--ok, #4cc38a);
+  color: var(--mk-green-ink);
 }
 .hljs-number,
 .hljs-meta,
@@ -62,10 +72,10 @@
 .hljs-variable,
 .hljs-template-variable,
 .hljs-link {
-  color: var(--warn, #e3b341);
+  color: var(--mk-yellow-ink);
 }
 .hljs-deletion {
-  color: var(--danger, #e5646c);
+  color: var(--mk-red-ink);
 }
 .hljs-emphasis {
   font-style: italic;

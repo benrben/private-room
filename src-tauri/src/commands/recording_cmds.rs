@@ -209,6 +209,11 @@ pub fn rec_start(
         }
     };
     let room_path = room.path.clone();
+    // The voices this room already knows, read once — a returning speaker is
+    // recognised from the first re-cluster instead of being numbered afresh.
+    // Best-effort: a failed read means this recording names nobody
+    // automatically, which is exactly how it behaved before there was a table.
+    let known_voices = db::known_voices(&room.conn).unwrap_or_default();
     drop(guard);
 
     let handle = recording::start_engine(
@@ -221,6 +226,7 @@ pub fn rec_start(
             meta: meta.clone(),
             system_audio,
             live_translate,
+            known_voices,
         },
     );
     // QA hook: ARCELLE_QA_SYS_WAV=<16k mono wav> plays that file into
@@ -383,17 +389,24 @@ pub async fn rec_retranscribe(
 /// that exact name for that label, and it is added only where the rebuild left
 /// the label unnamed: a name the rebuild placed itself is the one that follows
 /// the voice.
+///
+/// Returns the names it brought back. They came from the user's keyboard while
+/// the rebuild ran, so the caller can strip them out of the rebuild's GUESSES —
+/// a name the user typed is never one the app inferred.
 fn merge_typed_since(
     rebuilt: &mut std::collections::BTreeMap<String, String>,
     prior: &std::collections::BTreeMap<String, String>,
     current: std::collections::BTreeMap<String, String>,
-) {
+) -> std::collections::BTreeSet<String> {
+    let mut typed = std::collections::BTreeSet::new();
     for (label, name) in current {
         if prior.get(&label) == Some(&name) || rebuilt.contains_key(&label) {
             continue;
         }
+        typed.insert(name.clone());
         rebuilt.insert(label, name);
     }
+    typed
 }
 
 async fn rec_retranscribe_inner(
@@ -410,11 +423,14 @@ async fn rec_retranscribe_inner(
     recording::install_diarize_model(app);
     recording::install_vad_model(app);
 
-    let (samples, prior) = state.with_room(|room| {
+    let (samples, prior, known) = state.with_room(|room| {
         let (_name, _mime, bytes, _text) = db::get_file_full(&room.conn, &id)?;
         let samples = recording::decode_wav(&bytes.unwrap_or_default())?;
         let prior = parse_meta(db::get_rec_meta(&room.conn, &id))?;
-        Ok((samples, prior))
+        // A rebuild recognises saved voices exactly as a fresh recording does
+        // — it IS the current pipeline over this audio, and half a pipeline
+        // would make "re-transcribe" quietly lose people's names.
+        Ok((samples, prior, db::known_voices(&room.conn).unwrap_or_default()))
     })?;
     if samples.is_empty() {
         return Err("This recording has no audio yet.".into());
@@ -430,6 +446,7 @@ async fn rec_retranscribe_inner(
             &model,
             &samples,
             &prior,
+            &known,
             |done_cs, total_cs| {
                 let _ = progress_app.emit(
                     "rec-retranscribe",
@@ -447,7 +464,15 @@ async fn rec_retranscribe_inner(
         // be overwritten by the snapshot it started from — the names typed
         // since are the newest ones, so they win (GH #5).
         if let Ok(current) = parse_meta(db::get_rec_meta(&room.conn, &id)) {
-            merge_typed_since(&mut meta.speaker_names, &prior_names, current.speaker_names);
+            let typed = merge_typed_since(&mut meta.speaker_names, &prior_names, current.speaker_names);
+            // A name typed while the rebuild ran is the user's, so it must not
+            // stay listed as something the app guessed: the screen would call
+            // their own correction a guess, and the next pass would feel free
+            // to withdraw it.
+            meta.recognized.retain(|n| !typed.contains(n));
+            // …and a guess whose label the rebuild did not mint at all is
+            // about nobody in this transcript.
+            meta.recognized.retain(|n| meta.speaker_names.values().any(|v| v == n));
         }
         // Same bytes, new transcript — through the single snapshotting write
         // path, so the old transcript stays recoverable via History.
@@ -476,15 +501,19 @@ async fn rec_retranscribe_inner(
 /// and finished moments later. The wait ends when the engine answers or when
 /// the engine is gone; `rec-save-progress` events name the phase throughout.
 #[tauri::command]
-pub async fn rec_stop(rec: State<'_, RecState>) -> Result<RecMeta, String> {
-    let (done_rx, shared) = {
+pub async fn rec_stop(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    rec: State<'_, RecState>,
+) -> Result<RecMeta, String> {
+    let (done_rx, shared, file_id) = {
         let mut guard = rec.session.lock().unwrap();
         let live = guard.take().ok_or("No live recording.")?;
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let _ = live.handle.tx.send(EngineMsg::Stop { done: done_tx });
-        (done_rx, live.handle.shared.clone())
+        (done_rx, live.handle.shared.clone(), live.file_id.clone())
     };
-    tauri::async_runtime::spawn_blocking(move || {
+    let meta = tauri::async_runtime::spawn_blocking(move || {
         match done_rx.recv() {
             Ok(result) => result,
             // The engine is gone without answering: it stopped itself first
@@ -497,7 +526,18 @@ pub async fn rec_stop(rec: State<'_, RecState>) -> Result<RecMeta, String> {
         }
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+    // The meeting is over and the transcript is durable: read it. Best-effort
+    // and deliberately after the save — a stop must never fail because the
+    // room could not start reading (no model installed, the queue full, a
+    // recording with nothing said in it). The background sweep picks up
+    // anything missed here.
+    if !meta.segments.is_empty() {
+        if let Ok(room_path) = state.with_room(|room| Ok(room.path.clone())) {
+            let _ = start_rec_read(&window, &state, &room_path, &file_id).await;
+        }
+    }
+    Ok(meta)
 }
 
 /// The live session, if any — lets a reopened view re-attach to a recording
@@ -529,6 +569,60 @@ pub fn rec_get(state: State<'_, AppState>, id: String) -> Result<RecFile, String
     })
 }
 
+/// THE one way to change a recording's metadata. Everything that edits a
+/// transcript's overlay — a speaker's name, a note, a mark, a chapter — goes
+/// through here, live recording or not.
+///
+/// **The bug this exists for.** `Engine::flush` writes the engine's OWN copy of
+/// the meta over the room's row every few phrases. A command that wrote to that
+/// row while a recording was running was therefore erased seconds later, in
+/// silence. `rec_delete_range` sidesteps this by refusing while live;
+/// `rec_set_speaker_name` did not, so renaming a speaker mid-meeting quietly
+/// lost the name — which is exactly the moment you know who is talking.
+///
+/// So: a LIVE recording's meta is edited on the engine thread
+/// ([`recording::EngineMsg::EditMeta`]), which owns the authoritative copy and
+/// persists it immediately. Anything else is edited in the room directly. Both
+/// paths refresh the searchable transcript, so what search and the AI read can
+/// never drift from what the screen shows.
+///
+/// `apply` may refuse (a label nobody carries, a time outside the recording);
+/// its error reaches the user unchanged, and nothing is written.
+pub(crate) fn edit_rec_meta(
+    state: &AppState,
+    rec: &RecState,
+    id: &str,
+    apply: impl FnOnce(&mut RecMeta) -> Result<(), String> + Send + 'static,
+) -> Result<RecMeta, String> {
+    let live_tx = {
+        let mut session = rec.session.lock().unwrap();
+        clear_finished(&mut session);
+        session.as_ref().filter(|l| l.file_id == id).map(|l| l.handle.tx.clone())
+    };
+    if let Some(tx) = live_tx {
+        let (done, wait) = std::sync::mpsc::channel();
+        tx.send(recording::EngineMsg::EditMeta { apply: Box::new(apply), done })
+            .map_err(|_| "That recording just stopped — try again.".to_string())?;
+        // Bounded: the engine answers between phrases, and a caller blocked
+        // forever on a wedged engine is a hung window. The stop/pause split
+        // pass is the longest thing that can be in front of us.
+        return wait
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .map_err(|_| "The recording is busy — try again in a moment.".to_string())?;
+    }
+    state.with_room(|room| {
+        let mut meta = parse_meta(db::get_rec_meta(&room.conn, id))?;
+        apply(&mut meta)?;
+        let text = recording::transcript_text(&meta);
+        // The audio is untouched, so this is not a new file version — annotating
+        // is not an edit to the recording, and versioning every note would bury
+        // the real edits.
+        db::set_file_extracted_text(&room.conn, id, &text)?;
+        db::set_rec_meta(&room.conn, id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
+        Ok(meta)
+    })
+}
+
 /// GH #5: name a speaker after the fact ("Speaker 2" → "Dana").
 ///
 /// Stores an OVERLAY keyed by the machine label rather than rewriting the
@@ -536,17 +630,24 @@ pub fn rec_get(state: State<'_, AppState>, id: String) -> Result<RecFile, String
 /// destroy the name, and one write renames every line that speaker said. An
 /// empty (or whitespace-only) `name` clears it back to the machine label.
 ///
-/// Safe to call while a recording is live: only the name map is touched, and
-/// the engine never reads it. The stored transcript text is refreshed so search
-/// and the AI see the same names the screen does.
+/// This is also where the room LEARNS a voice: the speaker's voiceprints are
+/// folded into the saved-voices table, so the next recording recognises them
+/// without being asked again (see `db::voices`). Correcting a name the app
+/// guessed teaches both halves of the correction — the right person gains this
+/// voice, the wrong one is told it is not theirs.
+///
+/// Safe to call while a recording is live — through [`edit_rec_meta`], which is
+/// what makes that true. It used to say so while writing straight into the room,
+/// and the engine's next flush erased the name a few seconds later.
 #[tauri::command]
 pub fn rec_set_speaker_name(
     state: State<'_, AppState>,
+    rec: State<'_, RecState>,
     id: String,
     speaker: String,
     name: String,
 ) -> Result<RecMeta, String> {
-    set_speaker_name(&state, &id, &speaker, &name)
+    set_speaker_name(&state, &rec, &id, &speaker, &name)
 }
 
 /// The body of [`rec_set_speaker_name`], against a plain `AppState` — a
@@ -557,6 +658,7 @@ pub fn rec_set_speaker_name(
 /// earned.
 fn set_speaker_name(
     state: &AppState,
+    rec: &RecState,
     id: &str,
     speaker: &str,
     name: &str,
@@ -567,28 +669,401 @@ fn set_speaker_name(
     }
     // A name long enough to blow out the transcript prefix is a paste accident.
     let name = name.trim().chars().take(60).collect::<String>();
-    state.with_room(|room| {
-        let mut meta = parse_meta(db::get_rec_meta(&room.conn, id))?;
+    // What the app had GUESSED here and has just been corrected on, read out of
+    // the edit itself. Teaching the room is DB work and the edit may run on the
+    // engine thread, which has no room handle — so the edit reports what it saw
+    // and the enrolment happens back here, once, on whichever path ran.
+    let corrected: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let seen = corrected.clone();
+    let (label, called) = (speaker.clone(), name.clone());
+    let meta = edit_rec_meta(state, rec, id, move |meta| {
         if meta.segments.is_empty() {
             return Err("That recording has no transcript yet.".into());
         }
-        if !meta.segments.iter().any(|s| s.speaker == speaker) {
-            return Err(format!("Nobody in this recording is labelled \"{speaker}\"."));
+        if !meta.segments.iter().any(|s| s.speaker == label) {
+            return Err(format!("Nobody in this recording is labelled \"{label}\"."));
         }
+        // What this voice was called a moment ago, and whether the app is the
+        // one that said so — the difference between "you are correcting my
+        // guess" and "you are changing your own mind", which teach the room
+        // opposite things.
+        let was = meta.speaker_names.get(&label).cloned();
+        let was_guessed = was.as_ref().is_some_and(|w| meta.recognized.contains(w));
         // Naming someone back to their machine label is a removal, not an
         // entry that shadows itself.
-        if name.is_empty() || name == speaker {
-            meta.speaker_names.remove(&speaker);
+        if called.is_empty() || called == label {
+            meta.speaker_names.remove(&label);
         } else {
-            meta.speaker_names.insert(speaker, name);
+            meta.speaker_names.insert(label.clone(), called.clone());
         }
-        let text = recording::transcript_text(&meta);
-        // Rewrite the searchable transcript in place. The audio is untouched,
-        // so this is not a new file version — renaming is not an edit to the
-        // recording, and versioning every rename would bury the real edits.
-        db::set_file_extracted_text(&room.conn, id, &text)?;
-        db::set_rec_meta(&room.conn, id, &serde_json::to_string(&meta).map_err(|e| e.to_string())?)?;
-        Ok(meta)
+        // Either way the name on this voice is now the user's own, so it is no
+        // longer a guess — and must stop being re-decided by the next pass.
+        if let Some(was) = &was {
+            meta.recognized.remove(was);
+        }
+        meta.recognized.remove(&called);
+        *seen.lock().unwrap() = was.filter(|_| was_guessed);
+        Ok(())
+    })?;
+    let wrong = corrected.lock().unwrap().clone();
+    state.with_room(|room| {
+        learn_voice(&room.conn, &meta, &speaker, &name, wrong.as_deref());
+        Ok(())
+    })?;
+    Ok(meta)
+}
+
+/// Teach the room this voice, so the NEXT recording knows who it is.
+///
+/// `label` is the machine label just named, `name` what the user called them
+/// (empty clears the name), and `wrong` the name the app had GUESSED here and
+/// has just been corrected on, if any.
+///
+/// Best-effort by design: this is an enhancement to a rename, and a rename that
+/// refused to save because a voice could not be learned would be strictly worse
+/// than one that quietly learns nothing. Nothing is learned when the voice has
+/// too little speech behind it, or came from the DSP fallback — see
+/// [`diarize::identity_print`], which is the one place that rule lives.
+fn learn_voice(
+    conn: &rusqlite::Connection,
+    meta: &RecMeta,
+    label: &str,
+    name: &str,
+    wrong: Option<&str>,
+) {
+    let prints: Vec<&recording::diarize::VoicePrint> = meta
+        .segments
+        .iter()
+        .filter(|s| s.speaker == label)
+        .filter_map(|s| s.voice.as_ref())
+        .collect();
+    let Some(print) = recording::diarize::identity_print(&prints) else { return };
+    // The correction first: whatever the user renamed this to, the name they
+    // renamed it FROM is now known to be somebody else.
+    if let Some(wrong) = wrong.filter(|w| *w != name) {
+        let _ = db::reject_voice(conn, wrong, &print);
+    }
+    if !name.is_empty() {
+        let _ = db::enroll_voice(conn, name, &print);
+    }
+}
+
+/// "Read this recording" / "Read again": have the room read a recording and
+/// write its chapters, highlights and notes.
+///
+/// The same job the room starts by itself when a recording stops — this is the
+/// button for the times it did not: no AI model installed then, the room was
+/// busy, an old recording the background sweep has not reached, or a transcript
+/// you have since corrected and want re-read.
+///
+/// Returns the job id, so the viewer can follow the progress card.
+#[tauri::command]
+pub async fn rec_read_start(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let room_path = state.with_room(|room| Ok(room.path.clone()))?;
+    start_rec_read(&window, &state, &room_path, &id).await
+}
+
+// ---- your own notes, marks and chapters ---------------------------------
+//
+// Everything here goes through `edit_rec_meta`, so all of it works WHILE a
+// recording is running — which is the point. Marking the moment someone says
+// the thing that matters is the reason to have a mark button at all, and
+// before `EngineMsg::EditMeta` a mark written mid-meeting was erased by the
+// engine's next save.
+//
+// Anything the user writes or edits is `By::You`, and the room's reading pass
+// never touches a `By::You` item again.
+
+/// Where in the recording an item may sit. A time past the end is a bug in the
+/// caller, not something to store — an item nobody can ever reach is worse
+/// than a refusal.
+fn at_time(meta: &RecMeta, t0: i64) -> Result<i64, String> {
+    if t0 < 0 || (meta.duration_cs > 0 && t0 > meta.duration_cs) {
+        return Err("That moment is outside this recording.".into());
+    }
+    Ok(t0)
+}
+
+fn clean(text: &str, cap: usize) -> String {
+    text.trim().chars().take(cap).collect()
+}
+
+/// Write your own note at a moment. `kind` is decision | action | question |
+/// point; anything else is a plain point.
+#[tauri::command]
+pub fn rec_note_add(
+    state: State<'_, AppState>,
+    rec: State<'_, RecState>,
+    id: String,
+    t0: i64,
+    kind: String,
+    text: String,
+    who: Option<String>,
+) -> Result<RecMeta, String> {
+    rec_note_add_inner(&state, &rec, &id, t0, &kind, &text, who)
+}
+
+/// The body of [`rec_note_add`] against a plain `AppState` — the same reason
+/// [`set_speaker_name`] has one: a `State<'_, _>` only exists inside a running
+/// Tauri app, so a command with no plain body has no test.
+fn rec_note_add_inner(
+    state: &AppState,
+    rec: &RecState,
+    id: &str,
+    t0: i64,
+    kind: &str,
+    text: &str,
+    who: Option<String>,
+) -> Result<RecMeta, String> {
+    let text = clean(text, 400);
+    if text.is_empty() {
+        return Err("A note needs some words.".into());
+    }
+    let kind = match kind.trim() {
+        "decision" => recording::NoteKind::Decision,
+        "action" => recording::NoteKind::Action,
+        "question" => recording::NoteKind::Question,
+        _ => recording::NoteKind::Point,
+    };
+    let who = who.map(|w| clean(&w, 60)).filter(|w| !w.is_empty());
+    edit_rec_meta(state, rec, id, move |meta| {
+        let t0 = at_time(meta, t0)?;
+        meta.notes.push(recording::RecNote {
+            id: uuid::Uuid::new_v4().to_string(),
+            t0,
+            kind,
+            text,
+            who,
+            by: recording::By::You,
+        });
+        meta.notes.sort_by_key(|n| n.t0);
+        Ok(())
+    })
+}
+
+/// Retype a note. Correcting one the ROOM wrote makes it yours, so the next
+/// reading leaves it alone — the same rule as confirming a recognised speaker.
+#[tauri::command]
+pub fn rec_note_set(
+    state: State<'_, AppState>,
+    rec: State<'_, RecState>,
+    id: String,
+    note_id: String,
+    text: String,
+) -> Result<RecMeta, String> {
+    rec_note_set_inner(&state, &rec, &id, &note_id, &text)
+}
+
+/// The body of [`rec_note_set`] against a plain `AppState` — the same reason
+/// [`set_speaker_name`] has one: a `State<'_, _>` only exists inside a running
+/// Tauri app, so a command with no plain body has no test.
+fn rec_note_set_inner(
+    state: &AppState,
+    rec: &RecState,
+    id: &str,
+    note_id: &str,
+    text: &str,
+) -> Result<RecMeta, String> {
+    let text = clean(text, 400);
+    if text.is_empty() {
+        return Err("A note needs some words.".into());
+    }
+    let note_id = note_id.to_string();
+    edit_rec_meta(state, rec, id, move |meta| {
+        let note = meta
+            .notes
+            .iter_mut()
+            .find(|n| n.id == note_id)
+            .ok_or("That note is no longer in this recording.")?;
+        note.text = text;
+        note.by = recording::By::You;
+        Ok(())
+    })
+}
+
+/// Name a section, starting at `t0`.
+#[tauri::command]
+pub fn rec_chapter_add(
+    state: State<'_, AppState>,
+    rec: State<'_, RecState>,
+    id: String,
+    t0: i64,
+    title: String,
+) -> Result<RecMeta, String> {
+    rec_chapter_add_inner(&state, &rec, &id, t0, &title)
+}
+
+/// The body of [`rec_chapter_add`] against a plain `AppState` — the same reason
+/// [`set_speaker_name`] has one: a `State<'_, _>` only exists inside a running
+/// Tauri app, so a command with no plain body has no test.
+fn rec_chapter_add_inner(
+    state: &AppState,
+    rec: &RecState,
+    id: &str,
+    t0: i64,
+    title: &str,
+) -> Result<RecMeta, String> {
+    let title = clean(title, 80);
+    if title.is_empty() {
+        return Err("A chapter needs a name.".into());
+    }
+    edit_rec_meta(state, rec, id, move |meta| {
+        let t0 = at_time(meta, t0)?;
+        meta.chapters.push(recording::RecChapter {
+            id: uuid::Uuid::new_v4().to_string(),
+            t0,
+            title,
+            by: recording::By::You,
+        });
+        meta.chapters.sort_by_key(|c| c.t0);
+        Ok(())
+    })
+}
+
+/// Rename a chapter — and make it yours.
+#[tauri::command]
+pub fn rec_chapter_set(
+    state: State<'_, AppState>,
+    rec: State<'_, RecState>,
+    id: String,
+    chapter_id: String,
+    title: String,
+) -> Result<RecMeta, String> {
+    rec_chapter_set_inner(&state, &rec, &id, &chapter_id, &title)
+}
+
+/// The body of [`rec_chapter_set`] against a plain `AppState` — the same reason
+/// [`set_speaker_name`] has one: a `State<'_, _>` only exists inside a running
+/// Tauri app, so a command with no plain body has no test.
+fn rec_chapter_set_inner(
+    state: &AppState,
+    rec: &RecState,
+    id: &str,
+    chapter_id: &str,
+    title: &str,
+) -> Result<RecMeta, String> {
+    let title = clean(title, 80);
+    if title.is_empty() {
+        return Err("A chapter needs a name.".into());
+    }
+    let chapter_id = chapter_id.to_string();
+    edit_rec_meta(state, rec, id, move |meta| {
+        let c = meta
+            .chapters
+            .iter_mut()
+            .find(|c| c.id == chapter_id)
+            .ok_or("That chapter is no longer in this recording.")?;
+        c.title = title;
+        c.by = recording::By::You;
+        Ok(())
+    })
+}
+
+/// Mark a span worth coming back to. `t1` before `t0` marks the instant.
+#[tauri::command]
+pub fn rec_highlight_add(
+    state: State<'_, AppState>,
+    rec: State<'_, RecState>,
+    id: String,
+    t0: i64,
+    t1: i64,
+) -> Result<RecMeta, String> {
+    rec_highlight_add_inner(&state, &rec, &id, t0, t1)
+}
+
+/// The body of [`rec_highlight_add`] against a plain `AppState` — the same reason
+/// [`set_speaker_name`] has one: a `State<'_, _>` only exists inside a running
+/// Tauri app, so a command with no plain body has no test.
+fn rec_highlight_add_inner(
+    state: &AppState,
+    rec: &RecState,
+    id: &str,
+    t0: i64,
+    t1: i64,
+) -> Result<RecMeta, String> {
+    edit_rec_meta(state, rec, id, move |meta| {
+        let t0 = at_time(meta, t0)?;
+        meta.highlights.push(recording::RecHighlight {
+            id: uuid::Uuid::new_v4().to_string(),
+            t0,
+            t1: t1.max(t0),
+            by: recording::By::You,
+        });
+        meta.highlights.sort_by_key(|h| h.t0);
+        Ok(())
+    })
+}
+
+/// Remove one item. `kind` is "note" | "chapter" | "highlight".
+///
+/// Deleting one the ROOM wrote is a real removal, not a correction, so the
+/// next reading may find it again — which is right: you removed this reading's
+/// claim, not the fact that the words are there.
+#[tauri::command]
+pub fn rec_item_delete(
+    state: State<'_, AppState>,
+    rec: State<'_, RecState>,
+    id: String,
+    kind: String,
+    item_id: String,
+) -> Result<RecMeta, String> {
+    rec_item_delete_inner(&state, &rec, &id, &kind, &item_id)
+}
+
+/// The body of [`rec_item_delete`] against a plain `AppState` — the same reason
+/// [`set_speaker_name`] has one: a `State<'_, _>` only exists inside a running
+/// Tauri app, so a command with no plain body has no test.
+fn rec_item_delete_inner(
+    state: &AppState,
+    rec: &RecState,
+    id: &str,
+    kind: &str,
+    item_id: &str,
+) -> Result<RecMeta, String> {
+    let (kind, item_id) = (kind.to_string(), item_id.to_string());
+    edit_rec_meta(state, rec, id, move |meta| {
+        let before = meta.notes.len() + meta.chapters.len() + meta.highlights.len();
+        match kind.as_str() {
+            "note" => meta.notes.retain(|n| n.id != item_id),
+            "chapter" => meta.chapters.retain(|c| c.id != item_id),
+            "highlight" => meta.highlights.retain(|h| h.id != item_id),
+            other => return Err(format!("Unknown item kind \"{other}\".")),
+        }
+        if before == meta.notes.len() + meta.chapters.len() + meta.highlights.len() {
+            return Err("That item is no longer in this recording.".into());
+        }
+        Ok(())
+    })
+}
+
+/// The voices this room can recognise, for Settings.
+#[tauri::command]
+pub fn voices_list(state: State<'_, AppState>) -> Result<Vec<db::SavedVoice>, String> {
+    state.with_room(|room| db::saved_voices(&room.conn))
+}
+
+/// Forget a saved voice. Transcripts already written keep the names they show
+/// — this is the room forgetting how to recognise someone, not a retraction of
+/// what was said.
+#[tauri::command]
+pub fn voice_forget(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Vec<db::SavedVoice>, String> {
+    voice_forget_inner(&state, &name)
+}
+
+/// The body of [`voice_forget`] against a plain `AppState`, for the same
+/// reason [`set_speaker_name`] has one: a `State<'_, AppState>` can only be
+/// built by a running Tauri app, so a command with no plain body has no test.
+fn voice_forget_inner(state: &AppState, name: &str) -> Result<Vec<db::SavedVoice>, String> {
+    state.with_room(|room| {
+        db::forget_voice(&room.conn, name.trim())?;
+        db::saved_voices(&room.conn)
     })
 }
 
@@ -829,12 +1304,42 @@ pub async fn rec_export_clean(
 /// deleted words gone, every remaining timestamp pulled back by the length of
 /// the cuts before it, empty segments dropped.
 pub(crate) fn reflow_after_cuts(meta: &RecMeta, spliced_len: usize) -> RecMeta {
+    // Annotations move onto the shortened timeline with the words they point
+    // at, and anything that pointed INTO a cut is dropped — the copy no longer
+    // contains what it was about. The original keeps everything: cuts are
+    // undoable, so un-deleting a span has to bring its notes back with it.
+    let shift = |t: i64| t - recording::cut_shift_before(&meta.cuts, t);
+    let kept = |t: i64| !recording::inside_cut(&meta.cuts, t);
     let mut new_meta = RecMeta {
         max_speakers: meta.max_speakers,
         duration_cs: recording::cs_of_samples(spliced_len),
         // The edited copy keeps the same speaker labels, so it keeps their
         // names too (GH #5) — otherwise "Dana" silently reverts to "Speaker 2".
         speaker_names: meta.speaker_names.clone(),
+        recognized: meta.recognized.clone(),
+        read_of: meta.read_of,
+        chapters: meta
+            .chapters
+            .iter()
+            .filter(|c| kept(c.t0))
+            .map(|c| recording::RecChapter { t0: shift(c.t0), ..c.clone() })
+            .collect(),
+        highlights: meta
+            .highlights
+            .iter()
+            .filter(|h| kept(h.t0))
+            .map(|h| recording::RecHighlight {
+                t0: shift(h.t0),
+                t1: shift(h.t1),
+                ..h.clone()
+            })
+            .collect(),
+        notes: meta
+            .notes
+            .iter()
+            .filter(|n| kept(n.t0))
+            .map(|n| recording::RecNote { t0: shift(n.t0), ..n.clone() })
+            .collect(),
         ..Default::default()
     };
     for seg in &meta.segments {
@@ -1034,6 +1539,13 @@ mod tests {
         pairs.iter().map(|(l, n)| (l.to_string(), n.to_string())).collect()
     }
 
+    /// No recording is running — so `edit_rec_meta` takes its room path. The
+    /// LIVE path needs a real engine thread and is covered by
+    /// `recording::tests` instead.
+    fn idle() -> RecState {
+        RecState::default()
+    }
+
     /// GH #5. The rebuild moved "Dana" from Speaker 2 onto Speaker 1 (that is
     /// where her voice ended up). Merging the stored map back in wholesale put
     /// the old pair back beside the new one, so ONE person showed up as two
@@ -1222,11 +1734,11 @@ mod tests {
 
         // No speaker chosen.
         assert_eq!(
-            set_speaker_name(&state, &id, "   ", "Dana").unwrap_err(),
+            set_speaker_name(&state, &idle(), &id, "   ", "Dana").unwrap_err(),
             "No speaker selected."
         );
         // A recording with no transcript has nobody to name.
-        assert!(set_speaker_name(&state, &id, "Speaker 1", "Dana")
+        assert!(set_speaker_name(&state, &idle(), &id, "Speaker 1", "Dana")
             .unwrap_err()
             .contains("no transcript yet"));
 
@@ -1242,15 +1754,15 @@ mod tests {
             .unwrap();
 
         // A label nobody in the recording carries.
-        assert!(set_speaker_name(&state, &id, "Speaker 7", "Dana")
+        assert!(set_speaker_name(&state, &idle(), &id, "Speaker 7", "Dana")
             .unwrap_err()
             .contains("Speaker 7"));
 
-        let named = set_speaker_name(&state, &id, "Speaker 1", "  Dana  ").unwrap();
+        let named = set_speaker_name(&state, &idle(), &id, "Speaker 1", "  Dana  ").unwrap();
         assert_eq!(named.speaker_names.get("Speaker 1").map(String::as_str), Some("Dana"));
         // Naming someone back to their machine label CLEARS the overlay rather
         // than storing an entry that shadows itself.
-        let cleared = set_speaker_name(&state, &id, "Speaker 1", "Speaker 1").unwrap();
+        let cleared = set_speaker_name(&state, &idle(), &id, "Speaker 1", "Speaker 1").unwrap();
         assert!(cleared.speaker_names.is_empty());
     }
 
@@ -1278,5 +1790,276 @@ mod tests {
         // The surviving word moved back by the 100cs the cut removed before it.
         assert_eq!(out.segments[0].words[1].t0, 300);
         assert_eq!(out.duration_cs, 500, "the copy's length is the SPLICED audio's");
+    }
+
+    /// Annotations ride the shortened timeline with the words they point at.
+    /// One before a cut (unmoved), one inside it (gone — the copy no longer
+    /// contains what it was about), one after it (pulled back by the cut's
+    /// length).
+    #[test]
+    fn the_edited_copy_moves_annotations_and_drops_the_ones_it_cut_out() {
+        let mut meta = RecMeta { duration_cs: 600, ..Default::default() };
+        let mut seg = phrase(vec![
+            word("keep", 0, 100),
+            word("cut", 200, 300),
+            word("keep-too", 400, 500),
+        ]);
+        seg.words[1].del = true;
+        meta.segments.push(seg);
+        meta.cuts.push(RecCut { t0: 200, t1: 300 });
+
+        let note = |t0: i64, text: &str| recording::RecNote {
+            id: text.into(),
+            t0,
+            kind: recording::NoteKind::Decision,
+            text: text.into(),
+            who: None,
+            by: recording::By::Room,
+        };
+        meta.notes = vec![note(50, "before"), note(250, "inside"), note(450, "after")];
+        meta.chapters = vec![recording::RecChapter {
+            id: "c".into(),
+            t0: 450,
+            title: "Second half".into(),
+            by: recording::By::Room,
+        }];
+        meta.highlights = vec![recording::RecHighlight {
+            id: "h".into(),
+            t0: 400,
+            t1: 500,
+            by: recording::By::You,
+        }];
+
+        let out = reflow_after_cuts(&meta, recording::SAMPLE_RATE * 5);
+        let kept: Vec<(&str, i64)> = out.notes.iter().map(|n| (n.text.as_str(), n.t0)).collect();
+        assert_eq!(
+            kept,
+            [("before", 50), ("after", 350)],
+            "a note inside the cut survived, or a surviving one did not move"
+        );
+        assert_eq!(out.chapters[0].t0, 350);
+        assert_eq!((out.highlights[0].t0, out.highlights[0].t1), (300, 400));
+        // …and the ORIGINAL is untouched: cuts are undoable, so un-deleting a
+        // span has to bring its notes back with it.
+        assert_eq!(meta.notes.len(), 3);
+    }
+
+    /// Your own items, through the one funnel. The refusals matter as much as
+    /// the writes: an item at a moment nobody can reach is worse than a "no".
+    #[test]
+    fn your_own_items_are_yours_and_land_where_you_put_them() {
+        let (state, _reader) = room_state("rec-own-items");
+        let mut meta = RecMeta { duration_cs: 1000, ..Default::default() };
+        meta.segments.push(recording::RecSegment {
+            speaker: "Speaker 1".into(),
+            ..phrase(vec![word("hello", 0, 100)])
+        });
+        let id = recording_named(&state, "talk.wav", &meta);
+        let idle = idle();
+
+        let out = rec_note_add_inner(&state, &idle, &id, 200, "decision", "Ship it", None).unwrap();
+        assert_eq!(out.notes.len(), 1);
+        assert_eq!(out.notes[0].by, recording::By::You, "your own note was filed as the room's");
+        assert_eq!(out.notes[0].kind, recording::NoteKind::Decision);
+
+        // A moment outside the recording is refused, not stored where nobody
+        // can ever reach it.
+        assert!(rec_note_add_inner(&state, &idle, &id, 99_999, "point", "nope", None)
+            .unwrap_err()
+            .contains("outside this recording"));
+        assert!(rec_note_add_inner(&state, &idle, &id, -1, "point", "nope", None).is_err());
+        assert!(rec_note_add_inner(&state, &idle, &id, 0, "point", "   ", None).is_err());
+
+        // Chapters and marks, sorted by time as they go in.
+        rec_chapter_add_inner(&state, &idle, &id, 500, "Later").unwrap();
+        let out = rec_chapter_add_inner(&state, &idle, &id, 100, "Earlier").unwrap();
+        assert_eq!(
+            out.chapters.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            ["Earlier", "Later"]
+        );
+        let out = rec_highlight_add_inner(&state, &idle, &id, 300, 100).unwrap();
+        assert_eq!((out.highlights[0].t0, out.highlights[0].t1), (300, 300), "a backwards span");
+    }
+
+    /// Correcting something the ROOM wrote makes it yours — so the next
+    /// reading leaves it alone, which is the same rule as confirming a
+    /// recognised speaker name.
+    #[test]
+    fn correcting_the_rooms_item_makes_it_yours() {
+        let (state, _reader) = room_state("rec-correct-items");
+        let mut meta = RecMeta { duration_cs: 1000, ..Default::default() };
+        meta.segments.push(recording::RecSegment {
+            speaker: "Speaker 1".into(),
+            ..phrase(vec![word("hello", 0, 100)])
+        });
+        meta.notes.push(recording::RecNote {
+            id: "theirs".into(),
+            t0: 100,
+            kind: recording::NoteKind::Decision,
+            text: "the room's reading".into(),
+            who: None,
+            by: recording::By::Room,
+        });
+        meta.chapters.push(recording::RecChapter {
+            id: "c1".into(),
+            t0: 100,
+            title: "Room title".into(),
+            by: recording::By::Room,
+        });
+        let id = recording_named(&state, "talk.wav", &meta);
+        let idle = idle();
+
+        let out = rec_note_set_inner(&state, &idle, &id, "theirs", "what was actually said").unwrap();
+        assert_eq!(out.notes[0].by, recording::By::You);
+        assert_eq!(out.notes[0].text, "what was actually said");
+
+        let out = rec_chapter_set_inner(&state, &idle, &id, "c1", "My title").unwrap();
+        assert_eq!(out.chapters[0].by, recording::By::You);
+
+        // Removing something that is already gone is an error, not a silent
+        // success — the caller believes the item is there.
+        rec_item_delete_inner(&state, &idle, &id, "note", "theirs").unwrap();
+        assert!(rec_item_delete_inner(&state, &idle, &id, "note", "theirs").is_err());
+        assert!(rec_item_delete_inner(&state, &idle, &id, "nonsense", "c1").is_err());
+    }
+
+    /// A strong neural print pointing in a chosen direction — the shape
+    /// `identity_print` will accept.
+    fn voice_print(dir: usize) -> recording::diarize::VoicePrint {
+        let mut vec = vec![0.0f32; 192];
+        vec[dir] = 1.0;
+        recording::diarize::VoicePrint { vec, voiced_frames: 400 }
+    }
+
+    /// A recording of one voice, already labelled, ready to be named.
+    fn one_voice_meta(label: &str, dir: usize) -> RecMeta {
+        let mut meta = RecMeta { duration_cs: 500, ..Default::default() };
+        meta.segments.push(recording::RecSegment {
+            speaker: label.into(),
+            source: "sys".into(),
+            voice: Some(voice_print(dir)),
+            ..phrase(vec![word("hello", 0, 100)])
+        });
+        meta
+    }
+
+    fn recording_named(state: &AppState, file: &str, meta: &RecMeta) -> String {
+        state
+            .with_room(|room| {
+                let id = db::insert_file(
+                    &room.conn,
+                    file,
+                    "audio/wav",
+                    b"",
+                    Some("(live recording)"),
+                    "recording",
+                )?
+                .id;
+                db::set_rec_meta(&room.conn, &id, &serde_json::to_string(meta).unwrap())?;
+                Ok(id)
+            })
+            .unwrap()
+    }
+
+    /// The whole point of the feature, at the write path: naming a speaker
+    /// teaches the ROOM that voice, not just this transcript.
+    #[test]
+    fn naming_a_speaker_teaches_the_room_their_voice() {
+        let (state, _reader) = room_state("rec-learns-voices");
+        let id = recording_named(&state, "monday.wav", &one_voice_meta("Speaker 1", 3));
+
+        assert!(
+            state.with_room(|r| db::saved_voices(&r.conn)).unwrap().is_empty(),
+            "a room knows nobody until it is told"
+        );
+        set_speaker_name(&state, &idle(), &id, "Speaker 1", "Dana").unwrap();
+        let saved = state.with_room(|r| db::saved_voices(&r.conn)).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "Dana");
+        assert_eq!(saved[0].takes, 1);
+
+        // …and the room can be told to forget again.
+        assert!(voice_forget_inner(&state, "Dana").unwrap().is_empty());
+    }
+
+    /// A voice with almost nothing behind it is a fine label for THIS
+    /// recording and far too little to recognise anyone by later. The name is
+    /// still stored; only the identity is withheld.
+    #[test]
+    fn a_voice_barely_heard_is_named_but_not_learned() {
+        let (state, _reader) = room_state("rec-thin-voice");
+        let mut meta = one_voice_meta("Speaker 1", 3);
+        meta.segments[0].voice.as_mut().unwrap().voiced_frames = 30;
+        let id = recording_named(&state, "hallway.wav", &meta);
+
+        let named = set_speaker_name(&state, &idle(), &id, "Speaker 1", "Dana").unwrap();
+        assert_eq!(named.speaker_names.get("Speaker 1").map(String::as_str), Some("Dana"));
+        assert!(
+            state.with_room(|r| db::saved_voices(&r.conn)).unwrap().is_empty(),
+            "half a sentence became a permanent identity"
+        );
+    }
+
+    /// Correcting a guess must teach BOTH halves: the right person gains this
+    /// voice, and the wrong one is told it is not theirs — otherwise the same
+    /// mistake is made in every future recording, because the correction only
+    /// ever taught the other name.
+    #[test]
+    fn correcting_a_guess_teaches_the_room_both_halves() {
+        let (state, _reader) = room_state("rec-corrects-guesses");
+        // Monday: Dana is named, so the room learns her voice.
+        let monday = recording_named(&state, "monday.wav", &one_voice_meta("Speaker 1", 3));
+        set_speaker_name(&state, &idle(), &monday, "Speaker 1", "Dana").unwrap();
+
+        // Tuesday: somebody else turns up and the app guesses Dana.
+        let mut meta = one_voice_meta("Speaker 1", 3);
+        meta.speaker_names.insert("Speaker 1".into(), "Dana".into());
+        meta.recognized.insert("Dana".into());
+        let id = recording_named(&state, "tuesday.wav", &meta);
+
+        let out = set_speaker_name(&state, &idle(), &id, "Speaker 1", "Michal").unwrap();
+        assert_eq!(out.speaker_names.get("Speaker 1").map(String::as_str), Some("Michal"));
+        assert!(out.recognized.is_empty(), "the user's own correction was filed as a guess");
+
+        let saved = state.with_room(|r| db::saved_voices(&r.conn)).unwrap();
+        let dana = saved.iter().find(|v| v.name == "Dana");
+        assert_eq!(
+            dana.map(|v| v.corrections),
+            Some(1),
+            "the wrong name was never told it was wrong: {saved:?}"
+        );
+        assert!(saved.iter().any(|v| v.name == "Michal"), "the right name learned nothing");
+
+        // And the correction bites: this voice is no longer offered as Dana.
+        let known = state.with_room(|r| db::known_voices(&r.conn)).unwrap();
+        let dana = known.iter().find(|k| k.name == "Dana").expect("Dana is still a saved voice");
+        assert_eq!(
+            recording::diarize::recognize_groups(&[Some(voice_print(3))], &[dana.clone()], &[]),
+            vec![None],
+        );
+    }
+
+    /// A name the user typed is theirs. Clearing it back to the machine label
+    /// must not be read as "that was never this person" — nothing was guessed,
+    /// so there is nothing to deny.
+    #[test]
+    fn clearing_a_typed_name_denies_nobody() {
+        let (state, _reader) = room_state("rec-clears-names");
+        let id = recording_named(&state, "wednesday.wav", &one_voice_meta("Speaker 1", 3));
+        set_speaker_name(&state, &idle(), &id, "Speaker 1", "Dana").unwrap();
+        set_speaker_name(&state, &idle(), &id, "Speaker 1", "").unwrap();
+        let saved = state.with_room(|r| db::saved_voices(&r.conn)).unwrap();
+        assert_eq!(saved.iter().find(|v| v.name == "Dana").map(|v| v.corrections), Some(0));
+    }
+
+    /// The rebuild's own guesses do not outlive the labels they were made
+    /// about, and a name typed while the rebuild ran is never filed as one.
+    #[test]
+    fn a_rebuild_does_not_call_the_users_own_rename_a_guess() {
+        let mut rebuilt = names(&[("Speaker 1", "Dana")]);
+        let prior = names(&[]);
+        let typed = merge_typed_since(&mut rebuilt, &prior, names(&[("Speaker 2", "Yossi")]));
+        assert_eq!(typed.into_iter().collect::<Vec<_>>(), ["Yossi"]);
+        assert_eq!(rebuilt.get("Speaker 2").map(String::as_str), Some("Yossi"));
     }
 }

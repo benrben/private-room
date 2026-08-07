@@ -103,8 +103,8 @@ export default function RoomServerSection({
                   </label>
                 ))}
                 {scope === "full" && (
-                  <p className="settings-hint">
-                    <AlertIcon size={13} className="warn-ic" /> An external
+                  <p className="set-note set-note--flag nb-sem-pending">
+                    <AlertIcon size={16} className="warn-ic" /> An external
                     agent at this level can start hours of local compute and
                     run the local model. It still can't see your screen or
                     drive the app.
@@ -144,25 +144,33 @@ export default function RoomServerSection({
                 {scope === "full" ? (
                   <>
                     {!leash.stable && (
-                      <p className="settings-hint">
-                        <AlertIcon size={13} className="warn-ic" /> The fixed
+                      /* A port collision changes the address the user just
+                         pasted somewhere else, so it stays open. */
+                      <p className="set-note set-note--flag nb-sem-pending">
+                        <AlertIcon size={16} className="warn-ic" /> The fixed
                         Leash port (17872) was already in use, so this address is
                         temporary and will change on the next restart — re-paste
                         the config, or free that port for a stable address.
                       </p>
                     )}
-                    <p className="settings-hint">
-                      {leash.stable
-                        ? "This address and config survive restarts. "
-                        : ""}
-                      Agents can also self-configure from
-                      {" ~/.arcelle/leash.json"} (written only while the
-                      room is open). Regenerate the token to revoke every pasted
-                      config at once.
-                    </p>
+                    {/* Where the self-configure file lives and what revoking a
+                        token does is setup detail — needed once, then never
+                        again. Folded, not cut. */}
+                    <details className="set-more">
+                      <summary>About this address</summary>
+                      <p className="settings-hint">
+                        {leash.stable
+                          ? "This address and config survive restarts. "
+                          : ""}
+                        Agents can also self-configure from
+                        {" ~/.arcelle/leash.json"} (written only while the
+                        room is open). Regenerate the token to revoke every pasted
+                        config at once.
+                      </p>
+                    </details>
                   </>
                 ) : (
-                  <p className="settings-hint">
+                  <p className="set-note">
                     Only apps you paste this into can reach the unlocked room;
                     it dies when you lock.
                   </p>
@@ -190,8 +198,11 @@ export default function RoomServerSection({
                           : "Local apps only."}
                       </span>
                     </div>
-                    <p className="settings-hint">
-                      <AlertIcon size={13} className="warn-ic" /> With this on,
+                    {/* "What they retrieve, they keep" is the strongest
+                        consequence sentence in this section, and it was set
+                        at 12px under a switch. */}
+                    <p className="set-note set-note--flag set-note--lead nb-sem-urgent">
+                      <AlertIcon size={16} className="warn-ic" /> With this on,
                       a cloud AI can read this room through the bridge — and
                       what they retrieve, they keep. Leave it off unless you
                       mean it.

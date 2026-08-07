@@ -22,7 +22,7 @@ pub mod diarize;
 pub mod sck;
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -140,6 +140,93 @@ pub struct RecSegment {
     pub voice: Option<diarize::VoicePrint>,
 }
 
+/// Who put an annotation on the recording: the room's reading pass, or the
+/// person.
+///
+/// The distinction is the whole safety property of the feature. The room reads
+/// every recording automatically, and it is sometimes wrong — an action item
+/// attributed to a real colleague, a decision nobody made. Marked as the
+/// room's, that is a claim you can check at a glance and correct in one click.
+/// Unmarked, it is indistinguishable from something you wrote yourself, in the
+/// transcript and in everything exported from it.
+///
+/// It is also the re-run rule: a fresh pass replaces everything [`By::Room`]
+/// and never touches anything [`By::You`]. Editing an item makes it yours,
+/// permanently.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum By {
+    #[default]
+    Room,
+    You,
+}
+
+impl By {
+    pub fn is_room(self) -> bool {
+        self == By::Room
+    }
+}
+
+/// What the room found in a stretch of the conversation.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NoteKind {
+    /// Something settled ("we ship Thursday").
+    Decision,
+    /// Something somebody agreed to do.
+    Action,
+    /// Something raised and left open.
+    Question,
+    /// What a stretch of the meeting was about.
+    Point,
+}
+
+/// A note pinned to a moment: what was decided, who agreed to do what, what is
+/// still open, what a stretch was about.
+///
+/// `t0` is ORIGINAL-timeline centiseconds — the same timeline [`RecCut`] is
+/// stated on. Not a segment id: `retranscribe` mints every segment id afresh,
+/// so an id-anchored note would orphan on every rebuild, while the audio does
+/// not change, so a time stays exactly true.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RecNote {
+    pub id: String,
+    pub t0: i64,
+    pub kind: NoteKind,
+    pub text: String,
+    /// Who the action is on, when the transcript actually says. Only ever a
+    /// name that appears in this recording — see `rec_read`'s attribution rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub who: Option<String>,
+    #[serde(default)]
+    pub by: By,
+}
+
+/// A stretch worth coming back to. The words are the transcript's own — a
+/// highlight marks them, it does not copy them.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RecHighlight {
+    pub id: String,
+    pub t0: i64,
+    pub t1: i64,
+    #[serde(default)]
+    pub by: By,
+}
+
+/// A named section of the recording, starting at `t0` and running to the next
+/// chapter (or the end).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RecChapter {
+    pub id: String,
+    pub t0: i64,
+    pub title: String,
+    #[serde(default)]
+    pub by: By,
+}
+
 /// A span deleted from the transcript. Playback skips it; "export edited
 /// copy" cuts it out of the audio for real. Kept separate from the words so
 /// the edit is non-destructive and undoable via file versions.
@@ -181,6 +268,53 @@ pub struct RecMeta {
     /// the room's file-version history, so key order has to be stable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub speaker_names: BTreeMap<String, String>,
+    /// Which of `speaker_names` the app GUESSED from a voice it had heard
+    /// before, rather than the user typing them.
+    ///
+    /// Names, not labels — see [`diarize::Naming`] for why. Two things depend
+    /// on the distinction: a guess is re-decided (and withdrawn) on every
+    /// diarization pass while a typed name is never touched, and the screen
+    /// says which it is, because a name the app inferred and a name the user
+    /// asserted are not the same claim.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub recognized: BTreeSet<String>,
+    /// What the room found when it read this recording, plus anything you
+    /// wrote yourself. All three are kept in time order and anchored on the
+    /// original timeline (see [`RecNote`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chapters: Vec<RecChapter>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlights: Vec<RecHighlight>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<RecNote>,
+    /// The transcript the last reading pass was made from — the `[`turn count,
+    /// text length`]` fingerprint of `segments` at the time. A pass whose
+    /// fingerprint no longer matches is STALE: the words changed under it (a
+    /// re-transcribe, a correction, a cut), so the tabs say so and offer
+    /// "Read again" rather than presenting old findings as current.
+    ///
+    /// `None` means never read. That is what the automatic sweep looks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_of: Option<ReadStamp>,
+}
+
+/// The fingerprint of the transcript a reading pass was made from. Cheap and
+/// exact enough: any edit to the words moves one of the two numbers.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadStamp {
+    pub turns: usize,
+    pub chars: usize,
+}
+
+impl ReadStamp {
+    /// The stamp for a transcript as it stands now.
+    pub fn of(segments: &[RecSegment]) -> Self {
+        Self {
+            turns: segments.len(),
+            chars: segments.iter().map(|s| s.text.len()).sum(),
+        }
+    }
 }
 
 impl Default for RecMeta {
@@ -191,6 +325,11 @@ impl Default for RecMeta {
             cuts: Vec::new(),
             max_speakers: 0,
             speaker_names: BTreeMap::new(),
+            recognized: BTreeSet::new(),
+            chapters: Vec::new(),
+            highlights: Vec::new(),
+            notes: Vec::new(),
+            read_of: None,
         }
     }
 }
@@ -269,17 +408,64 @@ fn time_overlap(a: (i64, i64), b: (i64, i64)) -> f32 {
 /// action already consume. Deleted words are simply absent from it.
 pub fn transcript_text(meta: &RecMeta) -> String {
     let mut out = String::from("(live recording)\n");
+    // What the room found, folded into the words it found it in — so asking
+    // "what did we decide about the budget" reaches both the decision and the
+    // conversation around it.
+    //
+    // Highlights are marked, NOT repeated. A highlight is a pointer at words
+    // already on the line below it; copying them would put every marked
+    // sentence into the search index and into every AI prompt twice.
+    let mut chapters = meta.chapters.iter().peekable();
+    let mut notes = meta.notes.iter().peekable();
     for seg in &meta.segments {
         let text = segment_visible_text(seg);
         if text.is_empty() {
             continue;
         }
+        while chapters.peek().is_some_and(|c| c.t0 <= seg.t0) {
+            let c = chapters.next().expect("peeked");
+            out.push_str(&format!("\n## {} {}\n", format_stamp(c.t0), c.title));
+        }
+        while notes.peek().is_some_and(|n| n.t0 <= seg.t0) {
+            let n = notes.next().expect("peeked");
+            out.push_str(&format!("{} {}\n", format_stamp(n.t0), note_line(n)));
+        }
+        let marked = meta
+            .highlights
+            .iter()
+            .any(|h| h.t0 < seg.t1 && seg.t0 < h.t1.max(h.t0 + 1));
         // The user's name for the speaker, when they set one (GH #5) — this
         // text is what search and the AI read, so it has to match the screen.
         let who = meta.display_speaker(&seg.speaker);
-        out.push_str(&format!("{} {}: {}\n", format_stamp(seg.t0), who, text));
+        let mark = if marked { "* " } else { "" };
+        out.push_str(&format!("{}{} {}: {}\n", mark, format_stamp(seg.t0), who, text));
+    }
+    // Anything anchored past the last phrase still belongs in the text.
+    for c in chapters {
+        out.push_str(&format!("\n## {} {}\n", format_stamp(c.t0), c.title));
+    }
+    for n in notes {
+        out.push_str(&format!("{} {}\n", format_stamp(n.t0), note_line(n)));
     }
     out
+}
+
+/// One note as the transcript states it. Labelled by kind so a reader — human
+/// or model — can tell a decision from an open question without guessing, and
+/// so "action items" is a searchable phrase.
+fn note_line(n: &RecNote) -> String {
+    let label = match n.kind {
+        NoteKind::Decision => "Decision",
+        NoteKind::Action => "Action",
+        NoteKind::Question => "Open question",
+        NoteKind::Point => "Point",
+    };
+    match (&n.who, n.kind) {
+        (Some(who), NoteKind::Action) if !who.is_empty() => {
+            format!("{label} ({who}): {}", n.text)
+        }
+        _ => format!("{label}: {}", n.text),
+    }
 }
 
 /// A segment's text with deleted words removed. Falls back to the raw text
@@ -401,6 +587,14 @@ pub fn splice_out(samples: &[f32], cuts: &[RecCut]) -> Vec<f32> {
 /// exported (spliced) copy needs.
 pub fn cut_shift_before(cuts: &[RecCut], t: i64) -> i64 {
     cuts.iter().map(|c| (c.t1.min(t) - c.t0).max(0)).sum()
+}
+
+/// Is `t` inside a deleted span? An annotation there points at words the
+/// exported copy no longer contains, so the copy drops it rather than
+/// carrying a note about nothing. The original keeps it — cuts are undoable,
+/// and un-deleting a span must bring its notes back with it.
+pub fn inside_cut(cuts: &[RecCut], t: i64) -> bool {
+    cuts.iter().any(|c| t >= c.t0 && t < c.t1)
 }
 
 /// Per-chunk linear resampler to 16 kHz. Chunks are a quarter-second, so the
@@ -871,6 +1065,24 @@ pub enum EngineMsg {
     Resume,
     Stop { done: mpsc::Sender<Result<RecMeta, String>> },
     DecodeDone(DecodeOut),
+    /// Change the recording's metadata WHILE it is being recorded — a speaker
+    /// renamed, a note written, a moment marked.
+    ///
+    /// THE BUG THIS EXISTS FOR: [`Engine::flush`] serializes `self.meta` — the
+    /// engine's OWN copy — over the room's row every few phrases. A command
+    /// that wrote to that row directly was therefore erased seconds later, in
+    /// silence. `rec_delete_range` sidesteps it by refusing while live;
+    /// `rec_set_speaker_name` did not, so renaming a speaker mid-meeting quietly
+    /// lost the name. Nothing may edit a LIVE recording's meta except through
+    /// here.
+    ///
+    /// `apply` runs on the engine thread against the authoritative copy, and
+    /// `done` hands the result back so the calling command can answer with the
+    /// meta that was actually stored.
+    EditMeta {
+        apply: Box<dyn FnOnce(&mut RecMeta) -> Result<(), String> + Send>,
+        done: mpsc::Sender<Result<RecMeta, String>>,
+    },
 }
 
 pub struct DecodeJob {
@@ -945,6 +1157,11 @@ pub struct EngineConfig {
     pub meta: RecMeta,
     pub system_audio: bool,
     pub live_translate: Option<String>,
+    /// The room's saved voices, read once at start. A voice enrolled DURING
+    /// this recording is not added here on purpose: naming someone mid-meeting
+    /// already names every line they said in it, so re-recognising them from
+    /// the same audio could only ever agree with the user or contradict them.
+    pub known_voices: Vec<diarize::KnownVoice>,
 }
 
 pub struct EngineHandle {
@@ -1060,20 +1277,44 @@ fn merge_phrase(segs: &[crate::stt::SegOut]) -> (String, Vec<RecWord>, Option<St
 /// A stopped rebuild returns [`RETRANSCRIBE_STOPPED`] and writes nothing — the
 /// whole meta is handed back at the end or not at all, so the stored
 /// transcript is untouched either way.
+///
+/// `known` is the room's saved voices, so a rebuild recognises people exactly
+/// as a fresh recording would. The GUESSES are rebuilt from the new audio
+/// rather than carried over — they belong to labels this pass is about to mint
+/// — while the names the user typed come along untouched.
 pub fn retranscribe(
     model: &std::path::Path,
     samples: &[f32],
     prior: &RecMeta,
+    known: &[diarize::KnownVoice],
     mut progress: impl FnMut(i64, i64),
     stop: impl Fn() -> bool,
 ) -> Result<RecMeta, String> {
     let total_cs = cs_of_samples(samples.len());
     let max_speakers = prior.max_speakers;
+    // The typed names survive; a guess does not outlive the labels it was
+    // made about (a name still in `speaker_names` with nothing recognising it
+    // this time round is withdrawn by `apply_names`).
+    //
+    // Annotations survive WHOLE, all of them: the audio is unchanged, so every
+    // time they are anchored on is still exactly true. `read_of` deliberately
+    // does NOT survive — the transcript is about to be rewritten, so the
+    // room's reading is stale by definition and the tabs must say so rather
+    // than present findings about words that are gone. Your own items are
+    // never stale in that sense; they are yours, about a moment in the audio.
     let mut meta = RecMeta {
         duration_cs: total_cs,
         cuts: prior.cuts.clone(),
         max_speakers,
-        speaker_names: prior.speaker_names.clone(),
+        speaker_names: prior
+            .speaker_names
+            .iter()
+            .filter(|(_, n)| !prior.recognized.contains(*n))
+            .map(|(l, n)| (l.clone(), n.clone()))
+            .collect(),
+        chapters: prior.chapters.clone(),
+        highlights: prior.highlights.clone(),
+        notes: prior.notes.clone(),
         ..Default::default()
     };
 
@@ -1153,8 +1394,9 @@ pub fn retranscribe(
     if stop() {
         return Err(RETRANSCRIBE_STOPPED.into());
     }
-    let RecMeta { segments, speaker_names, .. } = &mut meta;
-    diarize::split_by_voice(segments, max_speakers as usize, speaker_names, |seg| {
+    let RecMeta { segments, speaker_names, recognized, .. } = &mut meta;
+    let mut naming = diarize::Naming { names: speaker_names, recognized, known };
+    diarize::split_by_voice(segments, max_speakers as usize, &mut naming, |seg| {
         let i0 = (seg.t0.max(0) as usize) * (SAMPLE_RATE / 100);
         let i1 = ((seg.t1.max(0) as usize) * (SAMPLE_RATE / 100)).min(samples.len());
         if i1 <= i0 {
@@ -1318,6 +1560,8 @@ struct Engine<R: tauri::Runtime> {
     /// resumed history, pieces of an earlier split — are re-embedded from the
     /// mixed timeline when the pass runs.
     win_cache: std::collections::HashMap<String, Vec<(i64, i64, diarize::VoicePrint)>>,
+    /// The room's saved voices (see [`EngineConfig::known_voices`]).
+    known: Vec<diarize::KnownVoice>,
 }
 
 impl<R: tauri::Runtime> Engine<R> {
@@ -1341,8 +1585,10 @@ impl<R: tauri::Runtime> Engine<R> {
         // Re-seed the numbering from prior segments so a resumed meeting keeps
         // naming new voices after the ones it already knows.
         book.seed_labels(&meta.segments);
+        let known = std::mem::take(&mut cfg.known_voices);
         let translate_tx = spawn_live_translator(app.clone(), cfg.file_id.clone());
         Self {
+            known,
             mixed,
             mic: Lane::new(base),
             sys: Lane::new(base),
@@ -1491,6 +1737,17 @@ impl<R: tauri::Runtime> Engine<R> {
                 self.emit_state();
             }
             EngineMsg::Stop { done } => self.begin_stop(Some(done)),
+            // Edit the authoritative copy, then persist it NOW rather than at
+            // the next scheduled flush: a rename that the user can see on
+            // screen but that a crash in the next few seconds would lose is
+            // not saved, and this is the one write path that can promise it is.
+            EngineMsg::EditMeta { apply, done } => {
+                let applied = apply(&mut self.meta);
+                let _ = done.send(applied.map(|()| {
+                    self.flush(false);
+                    self.meta.clone()
+                }));
+            }
             EngineMsg::DecodeDone(out) => {
                 self.decode_busy = false;
                 self.integrate(out);
@@ -1856,10 +2113,11 @@ impl<R: tauri::Runtime> Engine<R> {
     /// every caller persists the meta right after and the UI reloads it
     /// whole.
     fn split_speakers(&mut self) {
-        let Self { meta, win_cache, mixed, .. } = self;
+        let Self { meta, win_cache, mixed, known, .. } = self;
         let cap = meta.max_speakers as usize;
-        let RecMeta { segments, speaker_names, .. } = meta;
-        diarize::split_by_voice(segments, cap, speaker_names, |seg| {
+        let RecMeta { segments, speaker_names, recognized, .. } = meta;
+        let mut naming = diarize::Naming { names: speaker_names, recognized, known };
+        diarize::split_by_voice(segments, cap, &mut naming, |seg| {
             if let Some(w) = win_cache.get(&seg.id) {
                 return w.clone();
             }
@@ -1873,14 +2131,16 @@ impl<R: tauri::Runtime> Engine<R> {
     }
 
     /// Re-derive every meeting speaker from the whole recording's voices and,
-    /// when a label moved, tell the UI so the transcript on screen corrects
-    /// itself mid-conversation. Times itself and schedules the next pass
-    /// accordingly ([`relabel_interval`]).
+    /// when a label moved — or a saved voice was recognised — tell the UI so
+    /// the transcript on screen corrects itself mid-conversation. Times itself
+    /// and schedules the next pass accordingly ([`relabel_interval`]).
     fn relabel_speakers(&mut self) {
         let began = std::time::Instant::now();
         let cap = self.meta.max_speakers as usize;
-        let RecMeta { segments, speaker_names, .. } = &mut self.meta;
-        let moved = diarize::relabel(segments, cap, speaker_names);
+        let Self { meta, known, .. } = self;
+        let RecMeta { segments, speaker_names, recognized, .. } = meta;
+        let mut naming = diarize::Naming { names: speaker_names, recognized, known };
+        let moved = diarize::relabel(segments, cap, &mut naming);
         self.relabel_countdown = relabel_interval(began.elapsed().as_millis());
         if !moved {
             return;
@@ -1891,9 +2151,18 @@ impl<R: tauri::Runtime> Engine<R> {
             .iter()
             .map(|s| serde_json::json!({ "id": s.id, "speaker": s.speaker }))
             .collect();
+        // The overlay rides along: a pass can now change what a voice is
+        // CALLED without moving a single label (a saved voice recognised mid
+        // meeting), and a payload of labels alone would leave that on screen
+        // only after the next full reload.
         let _ = self.app.emit(
             "rec-relabel",
-            serde_json::json!({ "fileId": self.cfg.file_id, "labels": labels }),
+            serde_json::json!({
+                "fileId": self.cfg.file_id,
+                "labels": labels,
+                "speakerNames": self.meta.speaker_names,
+                "recognized": self.meta.recognized,
+            }),
         );
     }
 
@@ -2694,6 +2963,123 @@ mod tests {
         pcm
     }
 
+    /// Editing a recording's meta WHILE it is being recorded must survive the
+    /// engine's own saves.
+    ///
+    /// THE BUG THIS PINS. `flush` writes `self.meta` — the engine's own copy —
+    /// over the room's row every few phrases. A command that wrote into that
+    /// row directly was erased seconds later, silently, and
+    /// `rec_set_speaker_name` did exactly that: renaming a speaker mid-meeting
+    /// lost the name, at the very moment you learn who is talking. Before
+    /// `EngineMsg::EditMeta` this test fails on its last two assertions.
+    ///
+    /// No Whisper here on purpose: the engine is handed a RESUMED meta that
+    /// already has a phrase in it, so this measures the write path and nothing
+    /// else.
+    #[test]
+    fn an_edit_during_a_recording_survives_the_engines_own_save() {
+        use tauri::Manager;
+
+        let room_path = std::env::temp_dir()
+            .join(format!("pr-rec-edit-{}.roomai", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
+        let file = crate::db::insert_file(
+            &conn,
+            "QA recording.wav",
+            "audio/wav",
+            &encode_wav(&[]),
+            Some("(live recording)\n"),
+            "recording",
+        )
+        .unwrap();
+        // A resumed recording: one phrase already transcribed and labelled.
+        let mut meta = RecMeta { duration_cs: 300, ..Default::default() };
+        meta.segments.push(RecSegment {
+            id: "s1".into(),
+            source: "sys".into(),
+            speaker: "Speaker 1".into(),
+            t0: 0,
+            t1: 300,
+            text: "hello there".into(),
+            words: Vec::new(),
+            lang: None,
+            voice: None,
+        });
+        crate::db::set_rec_meta(&conn, &file.id, &serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = crate::commands::AppState::default();
+        *state.room.lock().unwrap() = Some(crate::commands::Room {
+            conn,
+            path: room_path.clone(),
+            name: "QA".into(),
+            password: "qa-room-pw".into(),
+        });
+        app.manage(state);
+
+        let handle = start_engine(
+            app.handle().clone(),
+            EngineConfig {
+                file_id: file.id.clone(),
+                room_path: room_path.clone(),
+                model_path: std::path::PathBuf::from("/nonexistent-model"),
+                base_samples: vec![0.0; SAMPLE_RATE],
+                meta: meta.clone(),
+                system_audio: false,
+                live_translate: None,
+                known_voices: Vec::new(),
+            },
+        );
+        // The live session, exactly as `rec_start` registers it — this is what
+        // makes `edit_rec_meta` take the engine path instead of the room path.
+        let rec = crate::commands::RecState::default();
+        *rec.session.lock().unwrap() = Some(crate::commands::LiveSession {
+            file_id: file.id.clone(),
+            handle,
+            awake: None,
+        });
+
+        let state = app.state::<crate::commands::AppState>();
+        let named = crate::commands::edit_rec_meta(&state, &rec, &file.id, |m| {
+            m.speaker_names.insert("Speaker 1".into(), "Dana".into());
+            Ok(())
+        })
+        .expect("the edit was refused");
+        assert_eq!(named.speaker_names.get("Speaker 1").map(String::as_str), Some("Dana"));
+
+        // Now stop, which flushes the engine's own copy over the room's row.
+        // THIS is the step that used to erase the name.
+        let session = rec.session.lock().unwrap().take().unwrap();
+        let (done, wait) = mpsc::channel();
+        session.handle.tx.send(EngineMsg::Stop { done }).unwrap();
+        let stopped = wait
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("engine never finished")
+            .expect("engine reported an error");
+        assert_eq!(
+            stopped.speaker_names.get("Speaker 1").map(String::as_str),
+            Some("Dana"),
+            "the engine's save erased a name typed while recording"
+        );
+
+        let guard = state.room.lock().unwrap();
+        let stored: RecMeta = serde_json::from_str(
+            &crate::db::get_rec_meta(&guard.as_ref().unwrap().conn, &file.id).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stored.speaker_names.get("Speaker 1").map(String::as_str),
+            Some("Dana"),
+            "the room kept a transcript whose speaker name had been erased"
+        );
+        drop(guard);
+        let _ = std::fs::remove_file(&room_path);
+    }
+
     /// The whole live loop, headless: a real room DB, a mock Tauri app, real
     /// Whisper, and `say`-synthesized speech pushed through the meeting lane.
     /// Proves VAD → streaming decode → speaker labeling → persistence without
@@ -2752,6 +3138,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
         );
 
@@ -2876,6 +3263,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
         );
         for chunk in audio.chunks(4000) {
@@ -2982,6 +3370,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
         );
         for chunk in audio.chunks(4000) {
@@ -3101,6 +3490,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
         );
         for chunk in audio.chunks(4000) {
@@ -3256,6 +3646,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
         );
         // Interleaved, the way two live capture callbacks actually arrive.
@@ -3350,6 +3741,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
             tx,
             job_tx,
@@ -3422,6 +3814,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: true,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
             tx,
             job_tx,
@@ -3565,6 +3958,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: true,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
             tx,
             job_tx,
@@ -3662,6 +4056,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
         );
         // 61 s of silence: crosses the time-flush threshold exactly once.
@@ -3782,6 +4177,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
         );
         // 61 s of NEW silence: crosses the time-flush threshold exactly once.
@@ -3947,6 +4343,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
         );
         let mut sys_chunks = sys.chunks(4000);
@@ -4072,6 +4469,7 @@ mod tests {
                 meta: RecMeta::default(),
                 system_audio: false,
                 live_translate: None,
+                known_voices: Vec::new(),
             },
         );
 
@@ -4175,6 +4573,8 @@ mod tests {
             cuts: vec![RecCut { t0: 10, t1: 20 }],
             max_speakers: 0,
             speaker_names: BTreeMap::from([("Speaker 1".to_string(), "Dana".to_string())]),
+            recognized: BTreeSet::new(),
+            ..Default::default()
         };
 
         let mut ticks: Vec<(i64, i64)> = Vec::new();
@@ -4182,6 +4582,7 @@ mod tests {
             &model,
             &audio,
             &old,
+            &[],
             |d, t| {
                 ticks.push((d, t));
             },
@@ -4252,7 +4653,7 @@ mod tests {
         let missing_model = std::path::Path::new("/nonexistent/whisper-model.bin");
 
         let mut ticks = 0usize;
-        let err = retranscribe(missing_model, &audio, &prior, |_, _| ticks += 1, || true)
+        let err = retranscribe(missing_model, &audio, &prior, &[], |_, _| ticks += 1, || true)
             .expect_err("a stopped rebuild must not report success");
         assert_eq!(err, RETRANSCRIBE_STOPPED);
         // Reaching the decoder with that path would have failed with
@@ -4338,13 +4739,81 @@ mod tests {
         assert!(transcript_text(&meta).contains("[0:00] Speaker 1: hello"));
     }
 
+    /// What the room read goes into the text search and the AI actually see:
+    /// chapters as headings, notes as their own labelled lines, and highlights
+    /// as a MARK on the line they cover — never a second copy of those words.
+    #[test]
+    fn what_the_room_read_reaches_search_without_repeating_the_words() {
+        fn seg(id: &str, t0: i64, text: &str) -> RecSegment {
+            RecSegment {
+                id: id.into(),
+                source: "sys".into(),
+                speaker: "Speaker 1".into(),
+                t0,
+                t1: t0 + 100,
+                text: text.into(),
+                words: vec![RecWord { w: text.into(), t0, t1: t0 + 100, del: false }],
+                lang: None,
+                voice: None,
+            }
+        }
+        let meta = RecMeta {
+            segments: vec![seg("a", 0, "morning"), seg("b", 6000, "we ship thursday")],
+            chapters: vec![RecChapter {
+                id: "c".into(),
+                t0: 6000,
+                title: "Release date".into(),
+                by: By::Room,
+            }],
+            notes: vec![
+                RecNote {
+                    id: "n1".into(),
+                    t0: 6000,
+                    kind: NoteKind::Decision,
+                    text: "ship on Thursday".into(),
+                    who: None,
+                    by: By::Room,
+                },
+                RecNote {
+                    id: "n2".into(),
+                    t0: 6000,
+                    kind: NoteKind::Action,
+                    text: "send the release notes".into(),
+                    who: Some("Dana".into()),
+                    by: By::Room,
+                },
+            ],
+            highlights: vec![RecHighlight { id: "h".into(), t0: 6000, t1: 6100, by: By::Room }],
+            ..Default::default()
+        };
+        let text = transcript_text(&meta);
+        assert!(text.contains("## [1:00] Release date"), "{text}");
+        assert!(text.contains("[1:00] Decision: ship on Thursday"), "{text}");
+        // An action says who, so "what did Dana agree to" is answerable.
+        assert!(text.contains("[1:00] Action (Dana): send the release notes"), "{text}");
+        // The highlighted line is MARKED, and its words appear exactly once —
+        // repeating them would put every marked sentence into the search index
+        // and into every AI prompt twice.
+        assert!(text.contains("* [1:00] Speaker 1: we ship thursday"), "{text}");
+        assert_eq!(text.matches("we ship thursday").count(), 1, "{text}");
+        assert!(!text.contains("* [0:00]"), "an unmarked line was marked: {text}");
+    }
+
     /// Recordings saved before GH #5 have no `speakerNames` key at all; they
     /// must still load, and must not grow an empty one when saved back.
+    /// The same promise now covers what the room reads: a recording from
+    /// before any of it must open, and must not grow empty keys.
     #[test]
     fn speaker_names_absent_in_older_recordings() {
         let older = r#"{"version":1,"durationCs":500,"segments":[],"cuts":[],"maxSpeakers":0}"#;
         let meta: RecMeta = serde_json::from_str(older).expect("legacy meta must still parse");
         assert!(meta.speaker_names.is_empty());
+        assert!(meta.notes.is_empty() && meta.chapters.is_empty() && meta.highlights.is_empty());
+        assert_eq!(meta.read_of, None, "a recording nobody has read must say so");
+        let round = serde_json::to_string(&meta).unwrap();
+        for key in ["notes", "chapters", "highlights", "readOf"] {
+            assert!(!round.contains(key), "{key} appeared in {round}");
+        }
         let round = serde_json::to_string(&meta).unwrap();
         assert!(!round.contains("speakerNames"), "{round}");
         // The retired `version` counter: rooms that stored one still open,

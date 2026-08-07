@@ -56,13 +56,22 @@ test("the voice catalog is fetched only once the Voice page is shown", () => {
   // The hook must take the flag…
   assert.match(voiceHook, /export function useVoiceSettings\(visible: boolean\)/);
   // …the fetch must be behind it and behind a once-guard…
+  // The call is `loadVoiceCatalog` (the memo shared with the podcast panel),
+  // not `api.listNeuralVoices` directly: one fetch per session, so a panel that
+  // mounts and unmounts cannot keep cancelling its own request. The GATE is
+  // what this test protects, and it must survive that indirection.
   const gated = voiceHook.match(
-    /if \(!visible && ?[\s\S]{0,80}?\)[\s\S]{0,400}?listNeuralVoices|if \(!visible \|\| [\s\S]{0,120}?\)[\s\S]{0,400}?listNeuralVoices/,
+    /if \(!visible && ?[\s\S]{0,80}?\)[\s\S]{0,400}?loadVoiceCatalog|if \(!visible \|\| [\s\S]{0,120}?\)[\s\S]{0,400}?loadVoiceCatalog/,
   );
   assert.ok(
     gated,
-    "listNeuralVoices is not gated on the page being visible — opening the gear " +
+    "the catalog fetch is not gated on the page being visible — opening the gear " +
       "would contact the voice provider again",
+  );
+  // Nobody may go around the memo and fetch a second copy.
+  assert.ok(
+    !/api\.listNeuralVoices/.test(voiceHook),
+    "Settings must share loadVoiceCatalog, not fetch its own catalog",
   );
   // …and Settings must pass the real page state, not `true`.
   assert.match(settings, /useVoiceSettings\(activeGroup === "voice"\)/);

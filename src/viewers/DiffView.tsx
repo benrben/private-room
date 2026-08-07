@@ -1,5 +1,10 @@
 import { useEffect, useRef } from "react";
-import monaco, { monacoTheme, watchMonacoTheme } from "./monacoSetup";
+import monaco, {
+  EDITOR_FONT,
+  monacoTheme,
+  remeasureWhenFontReady,
+  watchMonacoTheme,
+} from "./monacoSetup";
 import { languageForFile } from "./monacoSetup";
 
 /** Idea 11: is this text Hebrew/Arabic-dominant? Monaco renders bidi runs
@@ -44,6 +49,7 @@ export default function DiffView({ original, modified, fileName }: Props) {
       automaticLayout: true,
       wordWrap: "on",
       minimap: { enabled: false },
+      fontFamily: EDITOR_FONT,
       fontSize: 13,
       theme: monacoTheme(),
       scrollBeyondLastLine: false,
@@ -63,6 +69,13 @@ export default function DiffView({ original, modified, fileName }: Props) {
 
   // Follow the app's light/dark switch instead of staying black in light mode.
   useEffect(watchMonacoTheme, []);
+
+  // Same bundled-webfont race as the code editor: monaco measures its glyph
+  // box at construction, and IBM Plex Mono can arrive after that. A diff has
+  // no scroll position worth preserving, so it only needs the remeasure.
+  useEffect(() => {
+    void remeasureWhenFontReady();
+  }, []);
 
   return <div className="compare-diff-host" ref={hostRef} />;
 }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { RoomInfo, formatSize } from "../api";
+import { api, RoomInfo, formatSize } from "../api";
 import {
+  ChevronLeftIcon,
   CloseIcon,
   CollapseLeftIcon,
   DownloadIcon,
@@ -23,11 +24,19 @@ import ViewerRouter from "./ViewerRouter";
 import CloudView from "../viewers/CloudView";
 import FrontPage from "./FrontPage";
 import MemoryView from "./MemoryView";
+import RecordingsPage from "./RecordingsPage";
+import {
+  DocSourceCard,
+  READER_KINDS,
+  ReadingProgress,
+  useReadingProgress,
+} from "./ReaderShell";
 import ConnectorsView from "./ConnectorsView";
+import FindPage from "./FindPage";
 import { BrowserView } from "./BrowserView";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
-import { WorkArea } from "./types";
+import { FILE_BEARING_AREAS, WorkArea } from "./types";
 import { LayoutApi } from "../shell/useLayout";
 import { WorkflowsPage } from "./workflows/WorkflowsPage";
 import { WorkflowGlyph } from "./workflows/workflowGlyph";
@@ -87,12 +96,18 @@ export default function ViewerPane({
   info,
   layout,
   area,
+  contextArea,
 }: {
   s: WSState;
   a: WSActions;
   info: RoomInfo;
   layout: LayoutApi;
+  /** The place: which area page draws when no file is open, and where Escape
+   * returns to when one is. */
   area: WorkArea;
+  /** What the open document's own context is — see Workspace.tsx. Equal to
+   * `area` except when a file is showing over an area that does not hold it. */
+  contextArea: WorkArea;
 }) {
   const { openFile } = s;
   // PRIV-1: the reader's "blocked version" toggle — resets per file.
@@ -109,6 +124,17 @@ export default function ViewerPane({
   // cloud model would be handed. Asking the kind was a proxy for that and went
   // stale every time a kind was added; ask the file itself.
   const cloudViewable = openFile != null && !!openFile.content.text;
+  // §14, the research reader: a source card at the head of the column and a
+  // reading-progress stroke over it. Reading formats only — see READER_KINDS —
+  // and never over the cloud-payload preview, which is a diagnostic of what
+  // WOULD be sent rather than a document to read.
+  const readerShell =
+    openFile != null &&
+    !cloudView &&
+    !s.editMode &&
+    READER_KINDS.has(openFile.content.kind);
+  // Keyed by file id, so opening the next document starts its own read.
+  const reading = useReadingProgress(openFile?.id ?? "");
   const frontPageView =
     s.fp && (s.fp.fileCount > 0 || s.fp.chatCount > 0 || s.fp.memories.length > 0)
       ? s.fp
@@ -123,6 +149,7 @@ export default function ViewerPane({
     skills: "Skills",
     memory: "Memory & scratch pad",
     connectors: "Connectors",
+    find: "Find",
     browser: "Private browser",
   };
   const folderName = openFile
@@ -137,6 +164,11 @@ export default function ViewerPane({
     area === "files" && !s.showWorkflows && !s.showScripts && !s.showMap
       ? "Home"
       : AREA_CRUMBS[area];
+  // The place underneath, when it is not where this document lives. Drawn as a
+  // way back rather than as part of the trail: a room file opened from the
+  // browser is not browser content, but the browser IS still what Escape
+  // returns to, and that was previously true with nothing on screen saying so.
+  const backTo = openFile && contextArea !== area ? AREA_CRUMBS[area] : null;
   // BROWSE-1: the page is a NATIVE webview floating above everything this app
   // draws, so any modal, approval card or palette is invisible and unclickable
   // underneath it. Park the page (BrowserView shrinks it to 1×1) whenever one
@@ -164,7 +196,12 @@ export default function ViewerPane({
           {" / "}
           {openFile ? (
             <>
-              {AREA_CRUMBS[area] !== "Files" ? `${AREA_CRUMBS[area]} / ` : ""}
+              {/* Only an area that CONTAINS this file may name itself here.
+                  Recordings and Scripts do; nothing else does, so the trail
+                  is otherwise the file's own folder — see types.ts. */}
+              {FILE_BEARING_AREAS.includes(contextArea)
+                ? `${AREA_CRUMBS[contextArea]} / `
+                : ""}
               {folderName ? `${folderName} / ` : ""}
               <span className="crumb-title">
                 {fileLabel(openFile.content.name, s.files)}
@@ -174,6 +211,16 @@ export default function ViewerPane({
             <span className="crumb-title">{areaCrumb}</span>
           )}
         </div>
+        {backTo && (
+          <button
+            className="crumb-back btn-ic"
+            aria-label={`Close this file and go back to ${backTo}`}
+            data-tip="Escape"
+            onClick={() => s.setOpenFile(null)}
+          >
+            <ChevronLeftIcon size={12} /> {backTo}
+          </button>
+        )}
         <div className="pane-actions">
           <button
             className="pane-icon-btn"
@@ -630,6 +677,10 @@ export default function ViewerPane({
               </span>
             </div>
           )}
+          {/* §14: how far down the document the reader has come, drawn as a
+              marker stroke across the head of the column. Outside the scroller
+              so it stays put while the page moves under it. */}
+          {readerShell && <ReadingProgress value={reading.progress} />}
           <div
             // `fill` = this viewer manages its own scrolling and wants the
             // full height. Naming the two kinds that did was fine when there
@@ -641,8 +692,16 @@ export default function ViewerPane({
               (s.editMode && a.editModeOf(openFile.content) !== "grid")
                 ? "fill"
                 : ""
-            }`}
+            }${readerShell ? " is-reader" : ""}`}
+            ref={readerShell ? reading.ref : undefined}
           >
+            {/* The room's own record of the document, at the head of its
+                column. Stands down for a saved web page: ViewerRouter draws
+                PageSource for those, and the page's own declarations are the
+                better witness. */}
+            {readerShell && !openFile.content.webMeta && (
+              <DocSourceCard file={s.files.find((f) => f.id === openFile.id)} />
+            )}
             {cloudView ? (
               <CloudView fileId={openFile.id} />
             ) : (
@@ -693,6 +752,22 @@ export default function ViewerPane({
           onAttach={(file) => a.toggleAttach(file)}
           onAsk={(query) => s.setQuestion(query)}
         />
+      ) : area === "find" ? (
+        // Full-page search. The props are values and callbacks rather than the
+        // `s`/`a` blobs the older pages take — the page is written against a
+        // contract (FindPageProps), and the shell stays the only thing that
+        // knows how a search is actually run or where a hit lives. The query
+        // is the SAME slot the ⌘K launcher writes to, so the two surfaces can
+        // never be searching for different words.
+        <FindPage
+          files={s.files}
+          query={s.searchQuery}
+          onQueryChange={s.setSearchQuery}
+          onSearch={api.searchAll}
+          onOpenResult={a.activateResult}
+          onOpenFile={(id) => void a.viewFile(id)}
+          onAsk={(question) => s.setQuestion(question)}
+        />
       ) : area === "connectors" ? (
         <ConnectorsView />
       ) : area === "skills" ? (
@@ -700,32 +775,7 @@ export default function ViewerPane({
       ) : area === "memory" ? (
         <MemoryView s={s} a={a} info={info} />
       ) : area === "recordings" ? (
-        <div className="viewer-empty">
-          <div className="viewer-empty-icon">
-            <MicIcon size={40} />
-          </div>
-          <h1 className="viewer-empty-title">Recordings</h1>
-          <p className="viewer-empty-sub">
-            Pick a recording on the left, or capture something new. Audio
-            stays inside this room and transcribes on this Mac.
-          </p>
-          <div className="viewer-empty-actions">
-            <button
-              className="qa-btn primary"
-              disabled={s.recLive != null}
-              onClick={() => void a.startLiveRecording()}
-            >
-              <MicIcon size={15} /> Start a live recording
-            </button>
-            <button
-              className="qa-btn"
-              disabled={a.micState("note").disabled}
-              onClick={() => a.recordVoiceNote()}
-            >
-              <MicIcon size={15} /> Voice note
-            </button>
-          </div>
-        </div>
+        <RecordingsPage s={s} a={a} />
       ) : frontPageView ? (
         <FrontPage page={frontPageView} s={s} a={a} layout={layout} />
       ) : (

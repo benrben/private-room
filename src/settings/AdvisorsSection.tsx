@@ -30,8 +30,11 @@ export default function AdvisorsSection({
               tool is not even offered to the model, so nothing can leave this
               Mac on the model's own initiative.
             </p>
-            <p className="settings-hint">
-              <AlertIcon size={13} className="warn-ic" /> When on, the selected model may decide — on its own, mid-answer — to
+            {/* The model deciding on its own to send text off this Mac is the
+                consequence the whole section turns on, so it is a marked note
+                at lead size rather than the third 12px paragraph in a row. */}
+            <p className="set-note set-note--flag set-note--lead nb-sem-urgent">
+              <AlertIcon size={16} className="warn-ic" /> When on, the selected model may decide — on its own, mid-answer — to
               send the subtask it writes to Claude or Codex through your cloud
               account. That text leaves this Mac. Each consult is shown as a
               step while it happens, and it's capped at one per question.
@@ -58,7 +61,10 @@ export default function AdvisorsSection({
                       />{" "}
                       Let a Claude advisor use this room's tools
                     </label>
-                    <p className="settings-hint">
+                    {/* "A second, separate way for content to leave this Mac"
+                        is a consequence, and it only appears once the switch
+                        above it is on — so it is attached to that switch. */}
+                    <p className="set-note set-note--flag nb-sem-urgent">
                       When consulted, the advisor can list, search, open and
                       edit this room's files — and drive any Connected tools
                       (MCP) below — through a private, one-question-long local

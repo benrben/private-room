@@ -125,6 +125,37 @@ pub(crate) fn schedule_auto_index(app: &tauri::AppHandle, room_path: String) {
             if !mine(&app) {
                 return;
             }
+            // The room reads recordings it has never read, on the same tick as
+            // the summary sweep — same debounce, same busy probes, same model
+            // probe. Deliberately NOT a second scheduler: this module's header
+            // says a feature that needs one must reuse this machinery, and two
+            // debounced waiters racing the same room is how a quiet Mac ends up
+            // grinding through the model twice over.
+            //
+            // ONE recording per tick. The queue serializes them anyway, and the
+            // next ingest (or the next recording stopped) re-arms the waiter,
+            // so an unread backlog drains steadily instead of all at once.
+            if models_available && !job_running && !asking {
+                let unread = {
+                    let state = app.state::<AppState>();
+                    let guard = state.room.lock().unwrap();
+                    match guard.as_ref() {
+                        Some(room) if room.path == room_path => {
+                            db::recordings_missing_read(&room.conn, 1).unwrap_or_default()
+                        }
+                        _ => Vec::new(),
+                    }
+                };
+                if let (Some(file_id), Some(window)) =
+                    (unread.first(), crate::main_window(&app))
+                {
+                    let state = app.state::<AppState>();
+                    // Best-effort: a room at job capacity, or a recording
+                    // already being read, simply waits for the next tick.
+                    let _ = start_rec_read(&window, state.inner(), &room_path, file_id).await;
+                    return;
+                }
+            }
             match auto_index_decision(setting_on, missing, job_running, asking, models_available) {
                 AutoIndexDecision::Skip => return,
                 AutoIndexDecision::QuietFiller => {

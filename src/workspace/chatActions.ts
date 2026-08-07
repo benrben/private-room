@@ -16,7 +16,7 @@ import {
   uniqueFileName,
 } from "./composer";
 import { runGuarded } from "./guard";
-import { splitMarkupBlocks } from "./markup";
+import { speakerName, splitMarkupBlocks } from "./markup";
 import { HELP_COMMAND } from "./constants";
 import * as voice from "./voice";
 import { WSState } from "./state";
@@ -735,7 +735,10 @@ export function makeChatActions(
         if (m.kind === "handoff") {
           return `**Context summarized, continuing**\n\n${m.content}`;
         }
-        const who = m.role === "assistant" ? "Room AI" : "You";
+        // The same speaker names the transcript shows on screen — one
+        // definition (markup.speakerName), so the copy and the page can never
+        // disagree about who said what.
+        const who = speakerName(m.role);
         const text =
           m.role === "assistant" ? splitMarkupBlocks(m.content).text : m.content;
         return `**${who}**\n\n${text}`;

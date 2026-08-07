@@ -738,14 +738,18 @@ function dialGradient(engines: string[]): string {
 }
 
 /** A stable hue per host, so the same site keeps the same tile between
- *  searches. No favicon is fetched for this — that would contact the origin. */
+ *  searches. No favicon is fetched for this — that would contact the origin.
+ *
+ *  Only the HUE is decided here. The lightness is the stylesheet's job
+ *  (browser.css .bsearch-mono), because one lightness cannot clear contrast
+ *  on both papers: the previous version wrote a finished `hsl(h 55% 68%)`
+ *  into the style attribute and that letter sat at roughly 2:1 on the ivory
+ *  theme's near-white tile. A component has no business picking a colour this
+ *  app has two themes for. */
 function monoStyle(host: string): React.CSSProperties {
   let h = 0;
   for (let i = 0; i < host.length; i++) h = (h * 31 + host.charCodeAt(i)) % 360;
-  return {
-    background: `color-mix(in srgb, hsl(${h} 55% 60%) 22%, var(--panel-2))`,
-    color: `hsl(${h} 55% 68%)`,
-  };
+  return { "--mono-h": String(h) } as React.CSSProperties;
 }
 
 function hostOf(url: string): string {

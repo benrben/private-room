@@ -1,0 +1,526 @@
+/* ---------- Find: the room's search page ----------
+   workspace/FindPage.tsx. The ⌘K launcher stays a COMMAND — type, jump,
+   gone — and this is the PLACE: a page you stay in, narrow, re-read, and open
+   several hits from in turn.
+
+   It reads like the index at the back of a notebook. There is no card grid and
+   no dashboard: a large drawn field, a row of circled filter chips, a counted
+   heading per source, and editorial rows separated by a pencil rule that fades
+   at both ends. The only marker on the page in quantity is the highlighter over
+   the words that matched, which is the one thing the reader came for.
+
+   Nothing here is opaque. The page frame, the field, the filter strip and every
+   row let the dotted sheet show through — per the direction, only things that
+   genuinely float get a fill, and this page never floats anything.
+
+   .find-view / .find-inner / .find-title / .find-lead are the page frame and
+   live in shell.css (the shell owns the area's reading column, so Find, Home
+   and Memory sit in the same measure). Everything below is this page's own.
+
+   Both themes come from tokens by construction: no rule here names a colour,
+   so there is deliberately no light-mode block at the end of this file. */
+
+/* ==========================================================================
+   1. THE FIELD
+   ========================================================================== */
+
+/* The search field composes .nb-field, so it gets the system's drawn border
+   and the double focus outline for free and only its SIZE is set here — the
+   page's one persistent control should be unmistakably the biggest thing on
+   the page after the title. --radius (not --radius-sm) because a box this
+   large wants the larger drawn corner or the asymmetry stops reading. */
+.find-search {
+  margin-top: var(--sp-6);
+  min-height: 52px;
+  padding: 8px 14px;
+  gap: var(--sp-3);
+  border-radius: var(--radius);
+}
+
+.find-search-ico {
+  display: flex;
+  flex: none;
+  color: var(--muted);
+  line-height: 0;
+}
+
+/* Set from the LEAD size, not the body size: this is the field the page is
+   named after, and a search box you have to lean in to read is a search box
+   that looks like a filter. */
+.find-search-input {
+  font-size: var(--fs-lead);
+  color: var(--text-strong);
+}
+
+/* 24px is the floor for anything clickable, and this button is only 13px of
+   glyph — the padding is what pays the target size, not decoration. */
+.find-search-clear {
+  flex: none;
+  display: grid;
+  place-items: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+}
+.find-search-clear:hover {
+  color: var(--text-strong);
+  background-color: var(--hover);
+  border-color: transparent;
+}
+
+/* What the search actually does, in the interface sans — this explains a
+   behaviour, and the hand is reserved for asides. */
+.find-hint {
+  margin: var(--sp-2) 0 0;
+  max-width: 58ch;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+.find-query-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-4);
+}
+/* Keeping a search and abandoning the list to ask the AI are opposite moves,
+   so they sit at opposite ends of the row rather than side by side. */
+.find-ask {
+  margin-left: auto;
+}
+
+/* ==========================================================================
+   2. FILTERS
+   Chips for the things that are toggled, selects for the things that are
+   chosen one of. A selected chip is CIRCLED (.nb-chip.is-on draws a second
+   offset ring around it) and carries a tick — a real shape change, so the
+   selection survives being read in greyscale or by someone who cannot
+   separate the pen from the paper by hue.
+   ========================================================================== */
+
+/* Ruled off above and below with the tapered pencil stroke rather than a
+   border, so the strip reads as a line drawn across the sheet instead of a
+   box laid on top of it. Two gradients, one pinned to each edge. */
+.find-filters {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+  padding: var(--sp-3) 0;
+  background-image:
+    linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--line-soft) 3%,
+      var(--line-soft) 95%,
+      transparent 100%
+    ),
+    linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--line-soft) 3%,
+      var(--line-soft) 95%,
+      transparent 100%
+    );
+  background-repeat: no-repeat, no-repeat;
+  background-size:
+    100% 1px,
+    100% 1px;
+  background-position:
+    left top,
+    left bottom;
+}
+
+.find-filter-group {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+}
+
+/* --muted, not --faint: this is a label a person reads, and the smallest text
+   on the page has the least room to be low-contrast. */
+.find-filter-label {
+  flex: none;
+  min-width: 46px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.find-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.find-chip {
+  max-width: 100%;
+}
+/* The chip's own label may be a file name a person typed, so it truncates
+   rather than pushing the row apart. */
+.find-chip > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.find-chip-tick {
+  --nb-ico-size: 0.92em;
+}
+/* Tabular figures so a row of counts does not jitter as a search narrows. The
+   colour is INHERITED from the chip on purpose: muting it to --muted put the
+   number at 4.36:1 on a selected chip's pink wash in light mode, and a count
+   nobody can read is not a quieter count, it is a missing one. */
+.find-chip-n {
+  font-variant-numeric: tabular-nums;
+}
+
+.find-filter-selects {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-4);
+}
+.find-filter-select {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.find-filter-select .find-filter-label {
+  min-width: 0;
+}
+.find-filter-select select {
+  font-size: var(--fs-meta);
+  padding: 5px 8px;
+}
+
+.find-clear {
+  margin-left: auto;
+}
+
+/* The date filter reads a file's "added" timestamp and the index dates
+   nothing else — said out loud, in the sans, because it explains how a
+   control behaves rather than annotating a result. */
+.find-caveat {
+  margin: 0;
+  max-width: 62ch;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+/* ==========================================================================
+   3. RESULTS HEAD
+   ========================================================================== */
+
+.find-results-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-top: var(--sp-6);
+}
+/* Idle: the live region is still in the document (see FindPage.tsx) but empty,
+   so the row has to take no space at all rather than leaving a gap where a
+   count is going to appear. */
+.find-results-head.is-idle {
+  margin-top: 0;
+  gap: 0;
+}
+
+/* The live region. Set at lead size and in the strong ink because the count
+   is the answer to the question the page was opened to ask. */
+.find-count {
+  margin: 0;
+  min-width: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-lead);
+  font-weight: 600;
+}
+
+.find-sort {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.find-sort .find-filter-label {
+  min-width: 0;
+}
+.find-sort select {
+  font-size: var(--fs-meta);
+  padding: 5px 8px;
+}
+
+.find-breakdown {
+  margin: var(--sp-1) 0 0;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+
+/* ==========================================================================
+   4. RESULT GROUPS AND ROWS
+   ========================================================================== */
+
+.find-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+  margin-top: var(--sp-4);
+}
+
+.find-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-1);
+  font-size: var(--fs-body);
+  font-weight: 600;
+}
+
+/* A count in the margin is exactly what the hand is for. */
+.find-group-n {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  color: var(--ink-2);
+}
+
+.find-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+/* An editorial row: glyph, the reading column, the date pencilled in the
+   margin. Transparent at rest — the sheet runs straight through it, and the
+   rows are told apart by the pencil rule .nb-list draws between them.
+
+   HOVER IS A DRAWN BOX, NOT A WASH, and that is a measured decision rather
+   than a stylistic one. Every row here carries the search's highlighter, and
+   .nb-mark is contrast-checked against the SHEET: put the ordinary --hover
+   wash behind it and a marked word in dark mode falls to 4.15:1, under the
+   4.5:1 that normal text owes. Outlining the row leaves the mark exactly
+   where it was measured (4.83:1 at the stroke's densest point) and reads
+   better here anyway — the pen goes round the entry your eye is on. The
+   border exists at rest, transparent, so nothing shifts when it appears. */
+.find-row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-3) var(--sp-2);
+  text-align: left;
+  color: var(--text);
+  background-color: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  transition: border-color var(--dur-fast) var(--ease-pen);
+}
+/* --rule-strong is 3.01:1 in both themes, which is the floor WCAG 1.4.11 asks
+   of a component boundary. This also beats base.css's `button:hover`, which
+   would otherwise wash the row in the pen colour and make an ordinary hover
+   read as a selection. */
+.find-row:hover {
+  background-color: transparent;
+  border-color: var(--rule-strong);
+}
+
+/* Sized to one line of the row's first line — 16px title at 1.35 leading, or
+   a 14px snippet at the body's 1.55, which come out within a pixel of each
+   other. The row is `align-items: start` because a tall snippet must not drag
+   the glyph down to the middle of the entry. */
+.find-row-ico {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 1.55em;
+  color: var(--muted);
+  line-height: 0;
+}
+
+.find-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+/* Leading is set tighter than the body's here for a reason: a title truncates
+   with `overflow: hidden`, and the highlighter has a little vertical padding
+   of its own, so the line box has to be roomy enough that a marked word in a
+   title is not shaved flat at the top and bottom. 1.35 leaves about 2.8px of
+   half-leading, which is more than the mark ever uses. */
+.find-row-title {
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 600;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The matched passage is the reason the row is on screen, so it is set in the
+   reading ink rather than muted — the highlighter has to sit on text that was
+   already legible, not rescue text that was not. */
+.find-row-snippet {
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  overflow-wrap: anywhere;
+}
+/* When the passage IS the title of the row — a chat message or a memory has
+   no name of its own — it carries the extra weight instead. */
+.find-row-lead {
+  color: var(--text-strong);
+}
+
+.find-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-2);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+.find-row-dot {
+  color: var(--faint);
+}
+
+/* The side note: why this row is here, or what is odd about it. Short,
+   handwritten, and always a fact the room actually recorded — "the name
+   matched, not the text", "only the first part of this file is indexed" —
+   never a guess about relevance. */
+.find-row-note {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: 1.1;
+  color: var(--ink-2);
+}
+
+/* The date pencilled into the margin, the way a dated entry is marked in a
+   notebook. Kalam is allowed here: a date is an annotation. */
+.find-row-date {
+  align-self: start;
+  padding-top: 2px;
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: 1.2;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   5. ERROR, EMPTY, IDLE
+   ========================================================================== */
+
+/* A search that FAILED and a search that found nothing are different answers.
+   This is the failed one: a red-edged frame carrying the backend's own words.
+   The border is the full --sem-urgent ink (measured 5.76:1 on the dark sheet,
+   4.83:1 on the light one) rather than a wash of it, because a frame edge that
+   says "something went wrong" is meaningful non-text and owes 3:1. .nb-edge
+   adds the marker stripe, and the heading is the WORD that carries the meaning
+   when neither mark can be seen. */
+.find-error {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-top: var(--sp-4);
+  padding: var(--sp-4);
+  border-color: var(--mk-ink);
+}
+.find-error-head {
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 600;
+}
+.find-error-body {
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  overflow-wrap: anywhere;
+}
+
+.find-empty {
+  margin-top: var(--sp-6);
+}
+.find-empty-line {
+  margin: 0;
+  max-width: 62ch;
+  color: var(--text);
+  font-size: var(--fs-lead);
+  line-height: var(--lh-body);
+}
+.find-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-4);
+}
+
+.find-idle {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+  margin-top: var(--sp-6);
+}
+.find-idle-note {
+  margin: 0;
+}
+
+.find-saved-row {
+  display: flex;
+  align-items: stretch;
+  gap: var(--sp-1);
+}
+.find-saved-run {
+  flex: 1;
+  min-width: 0;
+}
+/* Removing a saved search is a small target with a big consequence, so it
+   gets the 24px floor and a visible hover rather than living inside the row
+   that runs the search. */
+.find-saved-del {
+  flex: none;
+  align-self: center;
+  display: grid;
+  place-items: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+}
+.find-saved-del:hover {
+  color: var(--sem-urgent);
+  background-color: var(--hover);
+  border-color: transparent;
+}
+
+.find-recent {
+  gap: var(--sp-2);
+}
+
+/* ==========================================================================
+   6. MOTION
+   The only thing this page animates is the outline drawn round a row under
+   the pointer — 160ms, no travel, no bounce, no loop anywhere. Every
+   drawn-in mark it uses (the chips, the buttons, the highlighter) has its own
+   escape in paper.css; this covers the one transition declared here.
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .find-row {
+    transition: none;
+  }
+}

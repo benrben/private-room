@@ -62,12 +62,25 @@
 //! couple of phrases and tells the UI, which is what makes speakers "sort
 //! themselves out" while people are still talking, with nobody ever asked
 //! how many are in the room.
+//!
+//! ## Voices the room already knows (cross-recording recognition)
+//!
+//! Everything above tells voices apart WITHIN one recording. Naming a speaker
+//! also saves that voice ([`identity_print`]), so the next recording can put
+//! the name back on them instead of starting again at "Speaker 2". The saved
+//! print is compared RAW — a stored centroid comes from another day, another
+//! microphone and another room, so there is no shared session channel to
+//! subtract — and against a bar ([`KNOWN_SAME`]) deliberately above the
+//! within-session same-voice invariant: inside a recording a wrong merge is
+//! corrected by the next pass, while a wrong name is a real person's name on
+//! somebody else's words with nothing downstream to catch it. A voice that
+//! matches nobody stays "Speaker N", which is the honest answer.
 
 mod fbank;
 mod titanet;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -240,6 +253,167 @@ fn gates(v: &[f32]) -> &'static Gates {
     } else {
         &DSP_GATES
     }
+}
+
+// ---- Cross-recording recognition -----------------------------------------
+//
+// Deliberately NOT a field of [`Gates`]. A saved voice only ever exists in the
+// neural space (see [`identity_print`]), so there is no second calibration to
+// carry — and one threshold that cannot be reached from the DSP path states
+// that wall better than a DSP number nobody measured.
+
+/// A saved voice is put on a group only when their RAW centroids agree at
+/// least this strongly.
+///
+/// Anchored on [`NEURAL_GATES`]`.raw_same` (0.69) — the measured "one person
+/// through ANY channel" invariant, which is exactly the question being asked
+/// across recordings — and then raised. Within a session, `raw_same` guards a
+/// merge that the next re-cluster re-derives from scratch; nothing re-derives
+/// a name from last week. The cost of the two mistakes is not symmetric, so
+/// neither is the bar.
+///
+/// Public so `tests/diar_bench.rs::voice_id_threshold_sweep` sweeps the bar
+/// the app actually ships, rather than a copy of it free to drift away.
+pub const KNOWN_SAME: f32 = 0.72;
+
+/// How far the best saved voice must beat the runner-up. Two saved voices
+/// this close to one group are not two candidates, they are one unanswered
+/// question — and "Speaker 2" is the honest answer to it. Also how far a
+/// candidate must beat the counter-example the user corrected it with (see
+/// [`vetoed`]).
+const KNOWN_MARGIN: f32 = 0.04;
+
+/// Total voiced evidence (16 ms frames, ≈ 2.5 s) a voice needs before it can
+/// be saved or recognised across recordings — the same bar [`SpeakerBook`]
+/// demands to open a new voice live, which is the highest evidence bar in this
+/// module. Inside a recording a thin voice is corrected by the next pass;
+/// across recordings nothing corrects it.
+const MIN_IDENTITY_FRAMES: usize = MIN_OPEN_FRAMES;
+
+/// A voice the room has already been told the name of.
+///
+/// Held in memory for the length of a recording (the room's table is read
+/// once, at start), so recognition costs one dot product per group per pass.
+#[derive(Clone, Debug, Default)]
+pub struct KnownVoice {
+    /// What the user calls this person.
+    pub name: String,
+    /// Their saved centroid — L2-normalized, neural, and comparable raw.
+    pub vec: Vec<f32>,
+    /// Voices the user has said are NOT this person: each is the centroid of
+    /// a group this name was guessed onto and then corrected. Without them a
+    /// wrong match is wrong again in every future recording, because the
+    /// correction only ever taught the OTHER name.
+    pub rejects: Vec<Vec<f32>>,
+}
+
+/// The one print that stands for a voice across recordings: the renormalized
+/// mean of every strong print in `prints`.
+///
+/// Neural prints ONLY, and deliberately so — this is the single print that
+/// outlives its recording, and the DSP fallback space shares no geometry with
+/// the neural one, so a saved DSP centroid could only ever be compared against
+/// something it may not be compared against. A room recorded without the model
+/// saves nobody, rather than saving something meaningless.
+///
+/// `None` when the voice has not been heard for [`MIN_IDENTITY_FRAMES`] of
+/// real speech across those prints: a name typed on half a sentence is a fine
+/// label for that recording and far too little to recognise anyone by later.
+pub fn identity_print(prints: &[&VoicePrint]) -> Option<VoicePrint> {
+    let strong: Vec<&VoicePrint> =
+        prints.iter().copied().filter(|p| neural(&p.vec) && p.is_strong()).collect();
+    let dim = strong.first()?.vec.len();
+    let frames: usize = strong.iter().map(|p| p.voiced_frames).sum();
+    if frames < MIN_IDENTITY_FRAMES {
+        return None;
+    }
+    let mut mean = vec![0.0f32; dim];
+    for p in &strong {
+        for (a, b) in mean.iter_mut().zip(&p.vec) {
+            *a += b;
+        }
+    }
+    let norm = mean.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm < 1e-6 {
+        return None; // prints that cancel out define nothing
+    }
+    mean.iter_mut().for_each(|x| *x /= norm);
+    Some(VoicePrint { vec: mean, voiced_frames: frames })
+}
+
+/// Put saved voices onto this recording's groups — one name per group, one
+/// group per name.
+///
+/// `centroids[i]` is group i's [`identity_print`] (`None` when the group has
+/// too little neural evidence to be recognised at all). `blocked` names are
+/// already spoken for by the USER on some other group, and a name the user
+/// typed is not a candidate — it is already the answer.
+///
+/// Greedy best-first over every admissible (group, name) pair, so the
+/// strongest agreement in the room is settled first: two people who each sound
+/// a little like one saved voice cannot claim it by accident of iteration
+/// order. A group whose top two candidates sit within [`KNOWN_MARGIN`] of each
+/// other is named by nobody — an ambiguous identity is not an identity.
+/// What cross-recording recognition actually compares: the raw similarity of
+/// two saved voices, on the same terms [`recognize_groups`] judges them.
+/// `None` when the prints are not comparable at all.
+///
+/// Public for the acceptance bench, which has to measure the very quantity the
+/// threshold is set against — a bench that re-implemented the comparison would
+/// be certifying its own copy of it.
+pub fn raw_similarity(a: &VoicePrint, b: &VoicePrint) -> Option<f32> {
+    (neural(&a.vec) && neural(&b.vec) && a.vec.len() == b.vec.len())
+        .then(|| cosine(&a.vec, &b.vec))
+}
+
+/// Has the user already looked at this voice under this name and said no?
+///
+/// The test is DISCRIMINATIVE — closer to the counter-example than to the
+/// person — rather than "close to the counter-example at all". The two voices
+/// a user had to tell apart are, by the nature of the mistake, similar to each
+/// other: a flat "anywhere near the thing you rejected" veto would take Dana's
+/// own voice down with the impostor's and she would never be recognised
+/// again. Correcting one guess must cost exactly that guess.
+fn vetoed(c: &VoicePrint, k: &KnownVoice, sim: f32) -> bool {
+    k.rejects
+        .iter()
+        .filter(|r| r.len() == c.vec.len())
+        .any(|r| cosine(&c.vec, r) + KNOWN_MARGIN >= sim)
+}
+
+pub fn recognize_groups(
+    centroids: &[Option<VoicePrint>],
+    known: &[KnownVoice],
+    blocked: &[String],
+) -> Vec<Option<String>> {
+    let mut out = vec![None; centroids.len()];
+    let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+    for (g, centroid) in centroids.iter().enumerate() {
+        let Some(c) = centroid.as_ref().filter(|c| neural(&c.vec)) else { continue };
+        let mut scored: Vec<(f32, usize)> = known
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.vec.len() == c.vec.len() && neural(&k.vec))
+            .filter(|(_, k)| !blocked.iter().any(|b| *b == k.name))
+            .map(|(i, k)| (cosine(&c.vec, &k.vec), i))
+            .filter(|(sim, _)| *sim >= KNOWN_SAME)
+            .filter(|(sim, i)| !vetoed(c, &known[*i], *sim))
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let Some(&(sim, best)) = scored.first() else { continue };
+        if scored.get(1).is_some_and(|(next, _)| sim - next < KNOWN_MARGIN) {
+            continue; // two people it could be — so it is neither
+        }
+        pairs.push((sim, g, best));
+    }
+    pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut used: BTreeSet<usize> = BTreeSet::new();
+    for (_, g, k) in pairs {
+        if out[g].is_none() && used.insert(k) {
+            out[g] = Some(known[k].name.clone());
+        }
+    }
+    out
 }
 
 fn hz_to_mel(hz: f32) -> f32 {
@@ -1166,16 +1340,47 @@ impl SpeakerBook {
     }
 }
 
+/// Everything a pass needs to put NAMES on the voices it has just sorted out:
+/// the recording's label → name overlay, which of those names the app guessed
+/// from a saved voice rather than the user typing them, and the saved voices
+/// to guess from.
+///
+/// `recognized` holds NAMES, not labels, deliberately. Re-clustering moves
+/// labels constantly (see [`move_names`]), so a guess keyed to a label would
+/// be describing a different person by the next pass — while a name is at most
+/// one person by construction, which makes it the stable key. What it buys:
+/// a guess may be revised or withdrawn as the meeting grows, and a name the
+/// user typed never may.
+pub struct Naming<'a> {
+    pub names: &'a mut BTreeMap<String, String>,
+    pub recognized: &'a mut BTreeSet<String>,
+    pub known: &'a [KnownVoice],
+}
+
+impl<'a> Naming<'a> {
+    /// The overlay with no saved voices behind it — every caller that only
+    /// wants clustering, and every test that is about clustering rather than
+    /// recognition.
+    pub fn plain(
+        names: &'a mut BTreeMap<String, String>,
+        recognized: &'a mut BTreeSet<String>,
+    ) -> Self {
+        Self { names, recognized, known: &[] }
+    }
+}
+
 /// Re-label every phrase in `segments` from the whole recording's voices (see
 /// [`cluster`]). Phrases from before voiceprints were stored are left exactly
 /// as they are — and so are phrases whose prints belong to an older embedding
-/// generation (see `lane_voices`). Returns true when a label actually moved,
-/// so the caller can tell the UI.
+/// generation (see `lane_voices`). Returns true when a label actually moved —
+/// or a name did — so the caller can tell the UI.
 ///
-/// `names` is the user's label → name overlay (GH #5). It is carried WITH the
+/// `naming` carries the label → name overlay (GH #5). It is carried WITH the
 /// voice: when a group's label changes, the name the user typed changes label
 /// with it. Keying the name to a label alone meant that every time the
-/// clusterer moved a label, "Dana" appeared on somebody else's lines.
+/// clusterer moved a label, "Dana" appeared on somebody else's lines. It also
+/// carries the room's saved voices, which is how a name from a PREVIOUS
+/// recording lands on the person who is talking now.
 ///
 /// **A lane is not a person, but it is a wall.** Colleagues in the room share
 /// one microphone, so mic phrases must be clustered rather than all called
@@ -1184,11 +1389,7 @@ impl SpeakerBook {
 /// only the room, the system lane only the meeting. No voice can span both, so
 /// each lane is clustered on its own — which also keeps two similar voices on
 /// opposite sides of the wall from being merged into one person.
-pub fn relabel(
-    segments: &mut [RecSegment],
-    max_speakers: usize,
-    names: &mut BTreeMap<String, String>,
-) -> bool {
+pub fn relabel(segments: &mut [RecSegment], max_speakers: usize, naming: &mut Naming) -> bool {
     let cap = if max_speakers == 0 { AUTO_MAX_SPEAKERS } else { max_speakers };
     let in_room = lane_voices(segments, "mic", cap);
     let in_meeting = lane_voices(segments, "sys", cap);
@@ -1199,7 +1400,7 @@ pub fn relabel(
     if phrases < 2 {
         return false;
     }
-    apply_names(segments, &in_room, &in_meeting, names)
+    apply_names(segments, &in_room, &in_meeting, naming)
 }
 
 /// Move the user's names onto the labels their voices now carry.
@@ -1235,12 +1436,15 @@ fn move_names(names: &mut BTreeMap<String, String>, moves: &[(String, String)]) 
 /// else — and write them. Shared by [`relabel`] (phrase groups) and
 /// [`split_by_voice`] (sub-window groups): one naming brain, two clusterings.
 ///
-/// The user's typed names travel with the groups (see [`move_names`]).
+/// The user's typed names travel with the groups (see [`move_names`]), and the
+/// room's saved voices are put onto them here (see [`recognize_groups`]) —
+/// which is the whole of cross-recording recognition, in the one place that
+/// already knows what every voice in this recording is called.
 fn apply_names(
     segments: &mut [RecSegment],
     in_room: &[Vec<usize>],
     in_meeting: &[Vec<usize>],
-    names: &mut BTreeMap<String, String>,
+    naming: &mut Naming,
 ) -> bool {
     // Whoever does most of the talking into this Mac's microphone is its
     // owner. (Not "the mic lane" — the colleague beside them is on it too.)
@@ -1330,14 +1534,84 @@ fn apply_names(
             moves.push((was, name.clone()));
         }
     }
-    move_names(names, &moves);
+    move_names(naming.names, &moves);
+    // A name whose voice left the transcript entirely was just dropped by
+    // `move_names`; a GUESS about it has to go with it, or a stale guess sits
+    // in the way of the real one the next pass would make.
+    naming.recognized.retain(|n| naming.names.values().any(|v| v == n));
 
-    let mut changed = false;
+    let mut changed = recognize(segments, &named, naming);
     for (group, name) in named {
         for slot in group {
             if segments[*slot].speaker != name {
                 segments[*slot].speaker = name.clone();
                 changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Put the room's saved voices onto this recording's groups, as names in the
+/// overlay. Returns true when the overlay changed.
+///
+/// `named` is every group with the label it is about to carry. Two groups are
+/// out of scope by construction:
+///
+/// * **"You"** — the microphone's main talker is a POSITION, not an identity,
+///   and it is the one label the user never has to be told. A saved voice does
+///   not get to overwrite it.
+/// * **A label the user named by hand** — their word is the answer for that
+///   voice, and it is not up for re-guessing. Its name is also withheld from
+///   every other group, so the same person cannot appear twice.
+///
+/// Every other group is re-decided from scratch on every pass, guess included:
+/// a name put on two phrases of evidence should be withdrawn when twenty more
+/// phrases disagree with it, and leaving it there — visibly a name, indistinct
+/// from one that was typed — is the failure mode this whole feature has to
+/// avoid.
+fn recognize(segments: &[RecSegment], named: &[(&Vec<usize>, String)], naming: &mut Naming) -> bool {
+    if naming.known.is_empty() {
+        return false;
+    }
+    let typed: Vec<String> = naming
+        .names
+        .values()
+        .filter(|n| !naming.recognized.contains(*n))
+        .cloned()
+        .collect();
+    let open: Vec<usize> = (0..named.len())
+        .filter(|i| named[*i].1 != "You")
+        .filter(|i| naming.names.get(&named[*i].1).is_none_or(|n| naming.recognized.contains(n)))
+        .collect();
+    let centroids: Vec<Option<VoicePrint>> = open
+        .iter()
+        .map(|i| {
+            let prints: Vec<&VoicePrint> =
+                named[*i].0.iter().filter_map(|s| segments[*s].voice.as_ref()).collect();
+            identity_print(&prints)
+        })
+        .collect();
+
+    let mut changed = false;
+    for (i, picked) in open.iter().zip(recognize_groups(&centroids, naming.known, &typed)) {
+        let label = &named[*i].1;
+        match picked {
+            Some(person) => {
+                if naming.names.get(label) != Some(&person) {
+                    naming.names.insert(label.clone(), person.clone());
+                    changed = true;
+                }
+                naming.recognized.insert(person);
+            }
+            // Nothing saved matches this voice any more — a guess the meeting
+            // has since talked out of. Withdraw it; "Speaker 3" is true and a
+            // stale name is not.
+            None => {
+                if let Some(gone) = naming.names.remove(label) {
+                    naming.recognized.remove(&gone);
+                    changed = true;
+                }
             }
         }
     }
@@ -1448,7 +1722,7 @@ fn span_print(wins: &[(i64, i64, VoicePrint)], t0: i64, t1: i64) -> Option<Voice
 pub fn split_by_voice(
     segments: &mut Vec<RecSegment>,
     max_speakers: usize,
-    names: &mut BTreeMap<String, String>,
+    naming: &mut Naming,
     mut wins_for: impl FnMut(&RecSegment) -> Vec<(i64, i64, VoicePrint)>,
 ) -> bool {
     let cap = if max_speakers == 0 { AUTO_MAX_SPEAKERS } else { max_speakers };
@@ -1584,7 +1858,7 @@ pub fn split_by_voice(
         }
     }
     let [mic_groups, sys_groups] = groups;
-    let renamed = apply_names(&mut rebuilt, &mic_groups, &sys_groups, names);
+    let renamed = apply_names(&mut rebuilt, &mic_groups, &sys_groups, naming);
     if split_any || renamed {
         *segments = rebuilt;
         return true;
@@ -1724,7 +1998,7 @@ mod tests {
             lang: None,
             voice: Some(nembed(&audio)),
         }];
-        let changed = split_by_voice(&mut segments, 0, &mut BTreeMap::new(), |seg| {
+        let changed = split_by_voice(&mut segments, 0, &mut Naming::plain(&mut BTreeMap::new(), &mut BTreeSet::new()), |seg| {
             let i0 = seg.t0.max(0) as usize * (SAMPLE_RATE / 100);
             let i1 = (seg.t1.max(0) as usize * (SAMPLE_RATE / 100)).min(audio.len());
             window_prints(&audio[i0..i1], seg.t0)
@@ -1992,7 +2266,7 @@ mod tests {
             // What the live pass got wrong after the resume: a third voice.
             seg("Speaker 3", "sys", Some(nembed(&sam2))),
         ];
-        assert!(relabel(&mut segments, 0, &mut BTreeMap::new()), "the drifted new label was never corrected");
+        assert!(relabel(&mut segments, 0, &mut Naming::plain(&mut BTreeMap::new(), &mut BTreeSet::new())), "the drifted new label was never corrected");
         assert_eq!(segments[0].speaker, "Speaker 4", "old-generation label must not move");
         assert_eq!(segments[1].speaker, "Speaker 5", "old-generation label must not move");
         assert_eq!(segments[2].speaker, "Speaker 1");
@@ -2135,6 +2409,233 @@ mod tests {
         }
     }
 
+    // ------------------------------------------- saved voices, across files
+    //
+    // The mechanism, on synthetic prints. The question these CANNOT answer —
+    // does a real person's voice clear [`KNOWN_SAME`] from one recording to
+    // the next, and does somebody else's stay under it — is measured on real
+    // audio by `tests/diar_bench.rs::cross_recording_recognition`, which
+    // sweeps the threshold and reports the false-accept rate. A rule with no
+    // measurement behind it is a guess with a constant's name.
+
+    /// Build an L2-normalized print `frames` long out of a direction vector.
+    fn known_print(dir: &[f32], frames: usize) -> VoicePrint {
+        let mut vec = vec![0.0f32; titanet::EMB_DIM];
+        vec[..dir.len()].copy_from_slice(dir);
+        let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        vec.iter_mut().for_each(|x| *x /= norm);
+        VoicePrint { vec, voiced_frames: frames }
+    }
+
+    /// A print that sits `sim` away from `base` (cosine), in a direction
+    /// nothing else in these tests uses.
+    fn near(base: &VoicePrint, sim: f32) -> VoicePrint {
+        let mut vec = base.vec.clone();
+        let off = (1.0 - sim * sim).sqrt();
+        vec.iter_mut().for_each(|x| *x *= sim);
+        vec[titanet::EMB_DIM - 1] += off;
+        let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        vec.iter_mut().for_each(|x| *x /= norm);
+        VoicePrint { vec, voiced_frames: base.voiced_frames }
+    }
+
+    /// The one print that outlives a recording. Neural-only, and only once
+    /// there is real speech behind it — a name typed on half a sentence is a
+    /// fine label for that recording and far too little to recognise anyone by
+    /// next week.
+    #[test]
+    fn a_voice_is_only_saved_once_there_is_enough_of_it() {
+        let strong = known_print(&[1.0, 0.2], MIN_IDENTITY_FRAMES);
+        assert!(identity_print(&[&strong]).is_some());
+
+        let thin = known_print(&[1.0, 0.2], MIN_NEW_VOICE_FRAMES);
+        assert!(
+            identity_print(&[&thin]).is_none(),
+            "a voice heard for a second became a permanent identity"
+        );
+        // …but the same second, five times over, is enough.
+        let many: Vec<&VoicePrint> = (0..5).map(|_| &thin).collect();
+        let built = identity_print(&many).expect("five strong phrases are evidence");
+        assert_eq!(built.voiced_frames, MIN_NEW_VOICE_FRAMES * 5);
+
+        // The generation wall: a DSP print can never become a saved voice,
+        // because there is nothing it could ever be compared against.
+        let Some(sam) = say("Samantha", LINE_A) else { return };
+        let dsp = dsp_embed(&sam);
+        assert!(dsp.is_strong() && dsp.voiced_frames >= MIN_IDENTITY_FRAMES);
+        assert!(identity_print(&[&dsp]).is_none(), "a DSP print was saved as an identity");
+    }
+
+    /// Recognition, and the three ways it must decline: too far, too close to
+    /// call, and already spoken for.
+    #[test]
+    fn a_saved_voice_lands_only_when_it_is_unambiguous() {
+        let dana = known_print(&[1.0, 0.0, 0.0], MIN_IDENTITY_FRAMES);
+        let yossi = known_print(&[0.0, 1.0, 0.0], MIN_IDENTITY_FRAMES);
+        let known = vec![
+            KnownVoice { name: "Dana".into(), vec: dana.vec.clone(), rejects: vec![] },
+            KnownVoice { name: "Yossi".into(), vec: yossi.vec.clone(), rejects: vec![] },
+        ];
+
+        // Her voice, a little different from the day it was saved.
+        let hers = near(&dana, 0.80);
+        assert_eq!(
+            recognize_groups(&[Some(hers.clone())], &known, &[]),
+            vec![Some("Dana".to_string())]
+        );
+
+        // A stranger. Above zero, nowhere near her.
+        assert_eq!(recognize_groups(&[Some(near(&dana, 0.55))], &known, &[]), vec![None]);
+
+        // A group with too little speech is not judged at all.
+        assert_eq!(recognize_groups(&[None], &known, &[]), vec![None]);
+
+        // The user already typed "Dana" on somebody else in this recording,
+        // so she is not on offer — one person cannot be two speakers.
+        assert_eq!(recognize_groups(&[Some(hers)], &known, &["Dana".to_string()]), vec![None]);
+
+        // Two saved voices equally close is not two candidates, it is one
+        // unanswered question. Built as the exact midpoint of the pair, so
+        // the tie is a property of the fixture and not of the arithmetic.
+        let twin = near(&dana, 0.90);
+        let known_pair = [
+            known[0].clone(),
+            KnownVoice { name: "Twin".into(), vec: twin.vec.clone(), rejects: vec![] },
+        ];
+        let mut mid: Vec<f32> = dana.vec.iter().zip(&twin.vec).map(|(a, b)| a + b).collect();
+        let norm = mid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        mid.iter_mut().for_each(|x| *x /= norm);
+        let ambiguous = VoicePrint { vec: mid, voiced_frames: MIN_IDENTITY_FRAMES };
+        assert!(cosine(&ambiguous.vec, &dana.vec) > KNOWN_SAME, "the fixture must clear the bar");
+        assert_eq!(
+            recognize_groups(&[Some(ambiguous)], &known_pair, &[]),
+            vec![None],
+            "the app picked one of two people it could not tell apart"
+        );
+    }
+
+    /// One name, one group. Two people who both sound a bit like a saved
+    /// voice must not take turns claiming it — the strongest agreement in the
+    /// room settles first and the other is left as "Speaker N".
+    #[test]
+    fn one_saved_voice_cannot_be_two_people_in_the_same_recording() {
+        let dana = known_print(&[1.0, 0.0, 0.0], MIN_IDENTITY_FRAMES);
+        let known =
+            vec![KnownVoice { name: "Dana".into(), vec: dana.vec.clone(), rejects: vec![] }];
+        let weaker = near(&dana, 0.76);
+        let stronger = near(&dana, 0.93);
+        assert_eq!(
+            recognize_groups(&[Some(weaker), Some(stronger)], &known, &[]),
+            vec![None, Some("Dana".to_string())],
+        );
+    }
+
+    /// A correction has to stick. Telling the room "that is not Dana" once
+    /// must not leave it making the same claim in every future recording.
+    #[test]
+    fn a_corrected_guess_is_not_offered_again() {
+        let dana = known_print(&[1.0, 0.0, 0.0], MIN_IDENTITY_FRAMES);
+        let mistaken = near(&dana, 0.85);
+        let known = vec![KnownVoice {
+            name: "Dana".into(),
+            vec: dana.vec.clone(),
+            rejects: vec![mistaken.vec.clone()],
+        }];
+        assert_eq!(recognize_groups(&[Some(mistaken)], &known, &[]), vec![None]);
+        // Dana herself is still Dana — the correction was about one voice,
+        // not about the name.
+        assert_eq!(
+            recognize_groups(&[Some(near(&dana, 0.99))], &known, &[]),
+            vec![Some("Dana".to_string())]
+        );
+    }
+
+    /// End to end through the naming brain: a voice the room knows arrives in
+    /// a new recording and gets her name, as a GUESS — while the mic's owner
+    /// stays "You", because that is a position and not an identity.
+    #[test]
+    fn relabel_puts_a_saved_name_on_a_returning_voice() {
+        let Some(sam) = say("Samantha", LINE_A) else { return };
+        let Some(sam2) = say("Samantha", LINE_C) else { return };
+        let Some(dan) = say("Daniel", LINE_B) else { return };
+        let Some(dan2) = say("Daniel", LINE_D) else { return };
+
+        // What a previous recording would have saved for her.
+        let hers = identity_print(&[&nembed(&sam), &nembed(&sam2)]).expect("enough speech");
+        let known = vec![KnownVoice { name: "Dana".into(), vec: hers.vec, rejects: vec![] }];
+
+        let mut segments = vec![
+            seg("Speaker 1", "sys", Some(nembed(&sam))),
+            seg("Speaker 2", "sys", Some(nembed(&dan))),
+            seg("Speaker 1", "sys", Some(nembed(&sam2))),
+            seg("Speaker 2", "sys", Some(nembed(&dan2))),
+            seg("You", "mic", Some(nembed(&sam))),
+        ];
+        let (mut names, mut recognized) = (BTreeMap::new(), BTreeSet::new());
+        relabel(&mut segments, 0, &mut Naming { names: &mut names, recognized: &mut recognized, known: &known });
+
+        let her_label = &segments[0].speaker;
+        assert_eq!(
+            names.get(her_label).map(String::as_str),
+            Some("Dana"),
+            "the room had heard this voice before and did not say so: {names:?}"
+        );
+        assert!(recognized.contains("Dana"), "a guess must be marked as one");
+        assert_eq!(segments[4].speaker, "You", "the microphone's owner is a position, not a name");
+        assert!(
+            !names.values().any(|n| n == "Dana" && names.len() > 1),
+            "Dana was put on two speakers: {names:?}"
+        );
+    }
+
+    /// The user's word is final. A name they typed is never re-guessed, never
+    /// withdrawn, and never handed to anyone else.
+    #[test]
+    fn a_typed_name_outranks_every_saved_voice() {
+        let Some(sam) = say("Samantha", LINE_A) else { return };
+        let Some(sam2) = say("Samantha", LINE_C) else { return };
+        let Some(dan) = say("Daniel", LINE_B) else { return };
+        let hers = identity_print(&[&nembed(&sam), &nembed(&sam2)]).expect("enough speech");
+        let known = vec![KnownVoice { name: "Dana".into(), vec: hers.vec, rejects: vec![] }];
+
+        let mut segments = vec![
+            seg("Speaker 1", "sys", Some(nembed(&sam))),
+            seg("Speaker 1", "sys", Some(nembed(&sam2))),
+            seg("Speaker 2", "sys", Some(nembed(&dan))),
+        ];
+        // The user has already said who this is, and it is not Dana.
+        let mut names = BTreeMap::from([("Speaker 1".to_string(), "Michal".to_string())]);
+        let mut recognized = BTreeSet::new();
+        relabel(&mut segments, 0, &mut Naming { names: &mut names, recognized: &mut recognized, known: &known });
+        assert_eq!(names.get(&segments[0].speaker).map(String::as_str), Some("Michal"));
+        assert!(recognized.is_empty(), "the user's own name was recorded as a guess");
+        assert!(!names.values().any(|n| n == "Dana"), "a saved voice overrode a typed name");
+    }
+
+    /// A guess is provisional by construction: when the evidence stops
+    /// supporting it, it goes. Leaving a stale name on screen — indistinct
+    /// from one the user typed — is the failure this feature has to avoid.
+    #[test]
+    fn a_guess_the_evidence_no_longer_supports_is_withdrawn() {
+        let Some(sam) = say("Samantha", LINE_A) else { return };
+        let Some(sam2) = say("Samantha", LINE_C) else { return };
+        let Some(dan) = say("Daniel", LINE_B) else { return };
+        let stranger =
+            identity_print(&[&nembed(&dan)]).expect("one long phrase is enough to define one");
+        let known = vec![KnownVoice { name: "Nobody".into(), vec: stranger.vec, rejects: vec![] }];
+
+        let mut segments = vec![
+            seg("Speaker 1", "sys", Some(nembed(&sam))),
+            seg("Speaker 1", "sys", Some(nembed(&sam2))),
+        ];
+        // A guess made on evidence that has since moved on.
+        let mut names = BTreeMap::from([("Speaker 1".to_string(), "Nobody".to_string())]);
+        let mut recognized = BTreeSet::from(["Nobody".to_string()]);
+        relabel(&mut segments, 0, &mut Naming { names: &mut names, recognized: &mut recognized, known: &known });
+        assert!(names.is_empty(), "a name nothing supports stayed on screen: {names:?}");
+        assert!(recognized.is_empty());
+    }
+
     /// The property the whole feature rests on, stated the way the code
     /// actually relies on it: within one recording, same-speaker pairs sit
     /// clearly ABOVE different-speaker pairs. (The absolute values move with
@@ -2272,14 +2773,14 @@ mod tests {
             seg("You", "mic", Some(dsp_embed(&dan2))),
             seg("Speaker 9", "sys", None), // legacy row, no voiceprint
         ];
-        assert!(relabel(&mut segments, 0, &mut BTreeMap::new()), "expected a correction");
+        assert!(relabel(&mut segments, 0, &mut Naming::plain(&mut BTreeMap::new(), &mut BTreeSet::new())), "expected a correction");
         assert_eq!(segments[0].speaker, "Speaker 1");
         assert_eq!(segments[1].speaker, "You", "the mic-dominant voice is you");
         assert_eq!(segments[2].speaker, "Speaker 1", "phantom speaker survived");
         assert_eq!(segments[3].speaker, "You");
         assert_eq!(segments[4].speaker, "Speaker 9", "legacy segment must be left alone");
         // Idempotent: a second pass changes nothing.
-        assert!(!relabel(&mut segments, 0, &mut BTreeMap::new()));
+        assert!(!relabel(&mut segments, 0, &mut Naming::plain(&mut BTreeMap::new(), &mut BTreeSet::new())));
     }
 
     /// A re-cluster must not renumber people who never changed. First-
@@ -2297,7 +2798,7 @@ mod tests {
             seg("Speaker 1", "sys", Some(dsp_embed(&dan))),
             seg("Speaker 2", "sys", Some(dsp_embed(&sam2))),
         ];
-        assert!(!relabel(&mut segments, 0, &mut BTreeMap::new()), "nothing moved, so nothing may change");
+        assert!(!relabel(&mut segments, 0, &mut Naming::plain(&mut BTreeMap::new(), &mut BTreeSet::new())), "nothing moved, so nothing may change");
         assert_eq!(segments[0].speaker, "Speaker 2");
         assert_eq!(segments[1].speaker, "Speaker 1");
         assert_eq!(segments[2].speaker, "Speaker 2");
@@ -2316,7 +2817,7 @@ mod tests {
             seg("Speaker 1", "sys", Some(dsp_embed(&sam2))),
             seg("Speaker 6", "sys", Some(dsp_embed(&dan))),
         ];
-        relabel(&mut segments, 0, &mut BTreeMap::new());
+        relabel(&mut segments, 0, &mut Naming::plain(&mut BTreeMap::new(), &mut BTreeSet::new()));
         assert_eq!(segments[0].speaker, "Speaker 1");
         assert_eq!(segments[1].speaker, "Speaker 1");
         assert_eq!(segments[2].speaker, "Speaker 2", "the stray high number must compact");
@@ -2335,7 +2836,7 @@ mod tests {
             seg("Speaker 1", "sys", Some(dsp_embed(&sam2))),
             seg("Speaker 2", "sys", Some(dsp_embed(&sam3))), // the resume's fresh number
         ];
-        assert!(relabel(&mut segments, 0, &mut BTreeMap::new()), "the drifted label was never corrected");
+        assert!(relabel(&mut segments, 0, &mut Naming::plain(&mut BTreeMap::new(), &mut BTreeSet::new())), "the drifted label was never corrected");
         assert!(segments.iter().all(|s| s.speaker == "Speaker 1"), "{segments:?}");
     }
 
@@ -2351,7 +2852,7 @@ mod tests {
             seg("You", "mic", Some(dsp_embed(&sam))), // in the room, not at the Mac
             seg("You", "mic", Some(dsp_embed(&dan2))),
         ];
-        assert!(relabel(&mut segments, 0, &mut BTreeMap::new()), "the room's second voice went unnoticed");
+        assert!(relabel(&mut segments, 0, &mut Naming::plain(&mut BTreeMap::new(), &mut BTreeSet::new())), "the room's second voice went unnoticed");
         assert_eq!(segments[0].speaker, "You", "most of the mic's speech is yours");
         assert_eq!(segments[1].speaker, "Speaker 1");
         assert_eq!(segments[2].speaker, "You");
@@ -2369,7 +2870,7 @@ mod tests {
             seg("x", "sys", Some(dsp_embed(&dan))),
             seg("x", "sys", Some(dsp_embed(&sam2))),
         ];
-        relabel(&mut segments, 0, &mut BTreeMap::new());
+        relabel(&mut segments, 0, &mut Naming::plain(&mut BTreeMap::new(), &mut BTreeSet::new()));
         assert!(
             segments.iter().all(|s| s.speaker != "You"),
             "a voice the microphone never heard was called 'You'",
@@ -2397,7 +2898,7 @@ mod tests {
             seg("Speaker 2", "sys", Some(unit(0))),
         ];
         let mut names = BTreeMap::from([("Speaker 2".to_string(), "Dana".to_string())]);
-        assert!(relabel(&mut segments, 0, &mut names), "the split labels were never merged");
+        assert!(relabel(&mut segments, 0, &mut Naming::plain(&mut names, &mut BTreeSet::new())), "the split labels were never merged");
         let merged = segments[0].speaker.clone();
         assert!(segments.iter().all(|s| s.speaker == merged), "{segments:?}");
         assert_eq!(

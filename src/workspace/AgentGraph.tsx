@@ -20,6 +20,7 @@
  * glyph and outline weight.
  */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { AgentNodeStatus, AskPlanStep, AskActiveAgent } from "../apiTypes";
 import { MAIN_KEY, chipClass, toBands, toNodes, type GraphNode } from "./agentNodes";
 
@@ -299,42 +300,56 @@ export function AgentGraph({
       {/* Expanded: an overlay, not an in-place resize. The chat pane is often
           ~290px wide, where a roomier graph (edge labels, full instructions)
           simply does not fit — it collided with itself. The overlay is the only
-          place the wide layout is honest, so that is where it lives. */}
-      {expanded && (
-        <div
-          className="agraph-backdrop"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setExpanded(false);
-          }}
-        >
+          place the wide layout is honest, so that is where it lives.
+
+          PORTALLED TO THE BODY, and it has to be. `.pane` carries
+          `container-type: inline-size` (shell.css) so the container queries the
+          panes rely on can work — and a container establishes layout
+          containment, which makes it the containing block for fixed-position
+          DESCENDANTS. Left inside the tree, this `position: fixed` backdrop
+          resolved against the AI column instead of the window and was then
+          clipped by that column's `overflow: hidden`, so an 880px window was
+          drawn inside a ~290px box. Same escape SchedulePopover already makes,
+          for the same reason. Nothing else moves: the Escape handler is on
+          `window`, the backdrop keeps its own click target, and a modal at the
+          end of the body is where the focus order wants it anyway. */}
+      {expanded &&
+        createPortal(
           <div
-            className="agraph-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Agents working on this request"
+            className="agraph-backdrop"
+            onClick={(e) => {
+              if (e.target === e.currentTarget) setExpanded(false);
+            }}
           >
-            <div className="agraph-modal-head">
-              <span className="agraph-modal-title">Agents on this turn</span>
-              <span className="agraph-summary">
-                {runningCount > 0
-                  ? `${runningCount} running`
-                  : `${doneCount}/${children.length} done`}
-              </span>
-              <button
-                type="button"
-                className="agraph-expand"
-                onClick={() => setExpanded(false)}
-              >
-                Close
-              </button>
+            <div
+              className="agraph-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Agents working on this request"
+            >
+              <div className="agraph-modal-head">
+                <span className="agraph-modal-title">Agents on this turn</span>
+                <span className="agraph-summary">
+                  {runningCount > 0
+                    ? `${runningCount} running`
+                    : `${doneCount}/${children.length} done`}
+                </span>
+                <button
+                  type="button"
+                  className="agraph-expand"
+                  onClick={() => setExpanded(false)}
+                >
+                  Close
+                </button>
+              </div>
+              <div className="agraph-modal-body">
+                <GraphCanvas {...canvasProps} roomy />
+                {selectedNode && inspectorFor(selectedNode, false)}
+              </div>
             </div>
-            <div className="agraph-modal-body">
-              <GraphCanvas {...canvasProps} roomy />
-              {selectedNode && inspectorFor(selectedNode, false)}
-            </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

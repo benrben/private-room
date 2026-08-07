@@ -1,6 +1,13 @@
 /* The macOS-drawn fallback preview. Shown for the formats nothing in this app
    parses — .key/.pages/.numbers, legacy .doc/.ppt, RAW, PSD, 3D models — and
-   under the extracted text when there is some. */
+   under the extracted text when there is some.
+
+   Two things sit in this pane and they are NOT the same kind of thing: the
+   words we read out of the file (real, selectable, searchable text — see
+   `.text-extract` in styles/viewer-formats.css) and a PICTURE of the page the
+   Mac drew. The words lead, because they are the part that can be quoted and
+   corrected; the picture follows, framed as a figure so it plainly reads as an
+   image OF the document rather than as the document. */
 .ql-view {
   display: flex;
   flex-direction: column;
@@ -10,24 +17,42 @@
 }
 .ql-figure {
   margin: 0;
-  padding: 1rem;
+  padding: var(--sp-6) var(--sp-4);
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--sp-3);
 }
 .ql-figure img {
   max-width: 100%;
   height: auto;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 2px 14px rgb(0 0 0 / 0.12);
+  /* A drawn edge and a themed lift, so the page reads as an object laid on the
+     sheet. The literal `rgb(0 0 0 / .12)` it replaces was invisible on ivory
+     paper, which is where a light-mode room spends all of its time. */
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 4px 16px var(--shadow-lift);
 }
 .ql-figure figcaption {
-  max-width: 34rem;
+  max-width: 44ch;
   text-align: center;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
 }
-/* When there IS extracted text, it leads and the picture follows under a rule. */
-.ql-view > :not(.ql-figure):not(.empty-hint) {
-  border-bottom: 1px solid var(--border);
+/* When there IS extracted text, it leads and the picture follows under a
+   pencil rule that thins toward both ends. `.text-extract` is exempt — it is
+   already drawn as a sheet with its own edge, and a rule under a bordered card
+   is a second boundary saying the same thing. */
+.ql-view > :not(.ql-figure):not(.empty-hint):not(.text-extract) {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 4%,
+    var(--line-soft) 94%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }

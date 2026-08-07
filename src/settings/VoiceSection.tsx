@@ -1,6 +1,12 @@
 import { NeuralVoiceInfo } from "../api";
 import { PlayIcon, StopIcon, CircleCheckIcon } from "../icons";
 import { VoiceArchetype, VoiceParams } from "../workspace/voice";
+import {
+  groupVoices,
+  languageLabel,
+  optionLabel,
+  voiceName,
+} from "./voiceCatalog";
 
 interface Props {
   neuralVoiceId: string;
@@ -29,30 +35,8 @@ const ARCHETYPES: [VoiceArchetype, string][] = [
   ["custom", "Custom"],
 ];
 
-/** "he-IL-AvriNeural" → "Avri"; "en-US-AndrewMultilingualNeural" → "Andrew". */
-function voiceName(id: string): string {
-  return id
-    .split("-")
-    .slice(2)
-    .join("-")
-    .replace(/MultilingualNeural$/, "")
-    .replace(/Neural$/, "");
-}
-
-/** "he-IL" → "Hebrew (Israel)" — no bundled language table. */
-function languageLabel(locale: string): string {
-  try {
-    return (
-      new Intl.DisplayNames(["en"], { type: "language" }).of(locale) ?? locale
-    );
-  } catch {
-    return locale;
-  }
-}
-
-function optionLabel(v: NeuralVoiceInfo): string {
-  return v.gender ? `${voiceName(v.id)} — ${v.gender.toLowerCase()}` : voiceName(v.id);
-}
+// Naming and grouping live in `voiceCatalog` — shared with the podcast's
+// per-host picker, so the two cannot describe the same voice differently.
 
 /** Idea 3: "Spoken voice" — labeled to avoid colliding with the writing-style
  * "voice" presets in Behavior. The voice list is the service's LIVE catalog
@@ -92,20 +76,11 @@ export default function VoiceSection({
         value={params[k]}
         onChange={(e) => setParam(k, parseFloat(e.target.value))}
       />
-      <span className="settings-hint">{params[k].toFixed(2)}</span>
+      <span className="settings-hint set-figure">{params[k].toFixed(2)}</span>
     </div>
   );
 
-  const multilingual = voices.filter((v) => v.id.includes("Multilingual"));
-  const byLanguage = new Map<string, NeuralVoiceInfo[]>();
-  for (const v of voices) {
-    if (v.id.includes("Multilingual")) continue;
-    const lang = languageLabel(v.locale);
-    const group = byLanguage.get(lang);
-    if (group) group.push(v);
-    else byLanguage.set(lang, [v]);
-  }
-  const languages = [...byLanguage.keys()].sort();
+  const { multilingual, byLanguage } = groupVoices(voices);
   // A saved voice the catalog no longer lists (or a failed load) still needs
   // an option, or the select would silently jump to Default.
   const knownSaved =
@@ -119,11 +94,16 @@ export default function VoiceSection({
         answer with the speaker toggle above the chat.
       </p>
       {/* The data boundary, stated plainly and first — speaking always uses
-          the cloud voice, so a naïve user must not have to infer that. */}
-      <div className="voice-boundary danger">
-        <b>Spoken answers use a cloud voice</b> — the text of each spoken
-        sentence leaves this Mac, sent to Microsoft's Edge TTS service. Only
-        the sentence being spoken is sent, and only while speaking is on.
+          the cloud voice, so a naïve user must not have to infer that. The
+          tape carries the clause that was already bold in the copy; not one
+          word changed, the emphasis is simply drawn instead of bolded. */}
+      <div className="voice-boundary set-note set-note--flag set-note--lead nb-sem-urgent">
+        <span className="nb-tape set-note-tag">
+          Spoken answers use a cloud voice
+        </span>{" "}
+        — the text of each spoken sentence leaves this Mac, sent to Microsoft's
+        Edge TTS service. Only the sentence being spoken is sent, and only
+        while speaking is on.
       </div>
       <label className="settings-label">
         Voice{voices.length > 0 ? ` (${voices.length} available)` : ""}
@@ -148,9 +128,9 @@ export default function VoiceSection({
             ))}
           </optgroup>
         )}
-        {languages.map((lang) => (
+        {byLanguage.map(([lang, group]) => (
           <optgroup key={lang} label={lang}>
-            {byLanguage.get(lang)!.map((v) => (
+            {group.map((v) => (
               <option key={v.id} value={v.id}>
                 {optionLabel(v)}
               </option>
@@ -164,25 +144,38 @@ export default function VoiceSection({
           voice still works.
         </p>
       )}
-      <p className="settings-hint">
-        These are <b>neural synthetic voices, not human recordings</b> —
-        synthesized by Microsoft's Edge TTS service at +22% rate, −2 Hz
-        pitch, loudness normalized to about −16 LUFS. The list is fetched
-        live from the service's catalog, so new voices appear on their own.
-        <b> Multilingual</b> voices read whatever language your answer is in
-        — Hebrew included. A voice listed under a language heading only
-        sounds right in that language. Offline, answers stay silent until
-        the connection returns. Use ▶ Preview to hear the one you picked
-        before saving.
-      </p>
+      {/* Rates, pitch offsets and LUFS targets are the densest technical run
+          in Settings and they sit under a dropdown almost nobody reads twice.
+          Folded behind a disclosure — every word still in the DOM, still in
+          the accessibility tree, still reachable by find-in-page. The data
+          boundary above it stays open, because that one is a promise. */}
+      <details className="set-more">
+        <summary>About these voices</summary>
+        <p className="settings-hint">
+          These are <b>neural synthetic voices, not human recordings</b> —
+          synthesized by Microsoft's Edge TTS service at +22% rate, −2 Hz
+          pitch, loudness normalized to about −16 LUFS. The list is fetched
+          live from the service's catalog, so new voices appear on their own.
+          <b> Multilingual</b> voices read whatever language your answer is in
+          — Hebrew included. A voice listed under a language heading only
+          sounds right in that language. Offline, answers stay silent until
+          the connection returns. Use ▶ Preview to hear the one you picked
+          before saving.
+        </p>
+      </details>
       <label className="settings-label">Archetype</label>
-      <div className="temp-row" role="radiogroup" aria-label="Voice archetype">
+      {/* Same segmented control as Behavior's response style and Appearance's
+          theme — one exclusive choice, one idiom. The chosen option used to be
+          marked by TEXT COLOUR alone, which is the one thing status is never
+          allowed to be; it now carries the ring, the wash and a heavier
+          weight as well, and the role/aria-checked pair is untouched. */}
+      <div className="style-seg" role="radiogroup" aria-label="Voice archetype">
         {ARCHETYPES.map(([id, label]) => (
           <button
             key={id}
             role="radio"
             aria-checked={archetype === id}
-            className={`subtle${archetype === id ? " accent" : ""}`}
+            className={`style-seg-opt${archetype === id ? " active" : ""}`}
             onClick={() => pickArchetype(id)}
           >
             {label}
@@ -205,7 +198,7 @@ export default function VoiceSection({
       </div>
       {/* A save that fails used to look exactly like a click that did nothing. */}
       {saveError && (
-        <p className="settings-hint" role="alert">
+        <p className="set-note set-note--flag nb-sem-urgent" role="alert">
           {saveError}
         </p>
       )}

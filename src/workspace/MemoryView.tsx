@@ -33,6 +33,33 @@ const KNOWN_CATS = new Set(CATEGORY_OPTIONS);
 const groupKey = (m: { category: string | null }): string | null =>
   m.category && KNOWN_CATS.has(m.category) ? m.category : null;
 
+/** The one category that earns a marker colour.
+ *
+ * The five marker meanings are product-wide — pink saved, yellow pending,
+ * green done, blue linked, red urgent — and a memory's CATEGORY is not a
+ * status: a fact, a project note and an instruction are all equally current
+ * and equally approved. Painting them would import a meaning the product uses
+ * elsewhere and make a plain fact look like something waiting on the reader.
+ *
+ * Pink is "personal", and a preference is definitionally a personal standing
+ * note, so that one maps honestly and takes the marker. Everything else takes
+ * the neutral graphite tab and is carried by the category WORD instead — the
+ * same conclusion the sidebar's own category pill reached. */
+const catClass = (category: string | null) =>
+  category === "preference" ? " is-preference" : "";
+
+/** Three worked examples for the empty state, so the page shows what a good
+ * memory looks like instead of only saying there are none.
+ *
+ * They are inert by construction: no ids, no handlers, nothing focusable — and
+ * the caption, the tape label and the dashed pencil border each say
+ * independently that these are not saved. */
+const EXAMPLE_MEMORIES: { text: string; category: string }[] = [
+  { text: "Answer in British English, and keep replies under 200 words unless I ask for detail.", category: "instruction" },
+  { text: "Prefers bullet points over paragraphs when comparing options.", category: "preference" },
+  { text: "The Q3 supplier review runs from September to mid-October.", category: "project" },
+];
+
 /** The Memory & Scratch Pad area: durable, user-visible AI context with
  * add/edit/delete/categories (moved intact from the old sidebar panel),
  * kept clearly apart from the ordinary scratch-pad file. */
@@ -109,19 +136,38 @@ export default function MemoryView({
   }, []);
 
   return (
-    <div className="memory-view">
-      <div className="memory-view-inner">
-        <header className="memory-view-head">
-          <h1>Memory</h1>
+    <div className="mem-view">
+      <div className="mem-inner">
+        <header className="mem-masthead">
+          <div className="mem-masthead-main">
+            <h1 className="mem-title">Memory</h1>
+            {/* A privacy statement, so it stays in the sans and at reading
+                size. Only the second half — how suggestions are approved —
+                moves into the note below, because that is a setting's
+                behaviour rather than the promise this page opens with. */}
+            <p className="mem-lead">
+              Everything the AI remembers about you — visible, editable, and used
+              only when relevant.
+            </p>
+          </div>
+          {s.memories.length > 0 && (
+            <div className="mem-stamp">
+              {s.memories.length} saved
+            </div>
+          )}
         </header>
-        <p className="memory-view-sub">
-          Everything the AI remembers about you — visible, editable, and used
-          only when relevant. Suggestions from conversations wait for your
-          approval unless you turn on auto-save in Settings → AI &amp;
-          behavior.
-        </p>
 
-        <div className="memory-add">
+        <details className="mem-note">
+          <summary>How suggested memories are handled</summary>
+          <div className="mem-note-body">
+            <p>
+              Suggestions from conversations wait for your approval unless you
+              turn on auto-save in Settings → AI &amp; behavior.
+            </p>
+          </div>
+        </details>
+
+        <div className="mem-add">
           <input
             placeholder="Something the AI should always remember…"
             value={s.memoryDraft}
@@ -154,6 +200,7 @@ export default function MemoryView({
           <select
             className="memory-cat-select"
             title="Category for the new memory"
+            aria-label="Category for the new memory"
             value={s.memoryDraftCat}
             onChange={(e) => s.setMemoryDraftCat(e.target.value)}
           >
@@ -164,13 +211,13 @@ export default function MemoryView({
               </option>
             ))}
           </select>
-          <button className="subtle" onClick={a.addMemory}>
+          <button className="primary" onClick={a.addMemory}>
             Add
           </button>
         </div>
 
         {s.memories.length > 0 && (
-          <div className="source-tools">
+          <div className="mem-tools">
             <label className="search-field">
               <SearchIcon size={13} />
               <input
@@ -209,141 +256,185 @@ export default function MemoryView({
         )}
 
         {s.memories.length === 0 && (
-          <div className="memory-view-empty">
-            <MemoryIcon size={20} />
-            <p>
-              Nothing saved yet. Add a durable fact above, or accept a
-              "Worth remembering?" suggestion in Chat.
+          <div className="mem-empty">
+            <p className="mem-empty-copy">
+              <MemoryIcon size={20} />
+              <span>
+                Nothing saved yet. Add a durable fact above, or accept a
+                "Worth remembering?" suggestion in Chat.
+              </span>
             </p>
+            <figure className="mem-example">
+              <figcaption className="mem-example-cap">
+                <span className="nb-tape nb-sem-pending">Example</span>
+                <span>Not saved — this is what a good memory looks like.</span>
+              </figcaption>
+              <ul className="mem-example-list">
+                {EXAMPLE_MEMORIES.map((ex) => (
+                  <li key={ex.text} className={`mem-card mem-example-card nb-card${catClass(ex.category)}`}>
+                    <span className="mem-card-pin nb-ico nb-ico-pin" aria-hidden="true" />
+                    <span className="mem-card-body">{ex.text}</span>
+                    <span className="mem-card-foot">
+                      <span className="mem-cat">{ex.category}</span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </figure>
           </div>
         )}
         {s.memories.length > 0 && shown.length === 0 && (
-          <div className="memory-view-empty">
-            <MemoryIcon size={20} />
-            <p>
-              No memory matches “{filter.trim()}”. {s.memories.length} saved in
-              total.
+          <div className="mem-empty">
+            <p className="mem-empty-copy">
+              <MemoryIcon size={20} />
+              <span>
+                No memory matches “{filter.trim()}”. {s.memories.length} saved in
+                total.
+              </span>
             </p>
           </div>
         )}
 
         {MEMORY_GROUPS.filter((g) =>
           shown.some((m) => groupKey(m) === g.key),
-        ).map((g, _, groups) => (
-          <section key={g.key ?? "other"} className="memory-group">
-            {!(groups.length === 1 && g.key === null) && (
-              <div className="group-heading">{g.label}</div>
-            )}
-            {shown
-              .filter((m) => groupKey(m) === g.key)
-              .map((m) =>
-                s.editingMemory?.id === m.id ? (
-                  <div key={m.id} className="memory-row editing">
-                    <input
-                      className="memory-edit-input"
-                      autoFocus
-                      dir="auto"
-                      value={s.editingMemory.content}
-                      onChange={(e) =>
-                        s.setEditingMemory({
-                          id: m.id,
-                          content: e.target.value,
-                          category: s.editingMemory?.category ?? null,
-                        })
-                      }
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") a.saveMemoryEdit();
-                        if (e.key === "Escape") s.setEditingMemory(null);
-                      }}
-                    />
-                    <select
-                      className="memory-cat-select"
-                      title="Category"
-                      value={s.editingMemory.category ?? ""}
-                      onChange={(e) =>
-                        s.setEditingMemory({
-                          id: m.id,
-                          content: s.editingMemory?.content ?? m.content,
-                          category: e.target.value || null,
-                        })
-                      }
-                    >
-                      <option value="">no category</option>
-                      {CATEGORY_OPTIONS.map((c) => (
-                        <option key={c} value={c}>
-                          {c}
-                        </option>
-                      ))}
-                    </select>
-                    <button className="chip-btn" title="Save" aria-label="Save" onClick={a.saveMemoryEdit}>
-                      <CheckIcon size={13} />
-                    </button>
-                    <button
-                      className="chip-btn"
-                      title="Cancel"
-                      aria-label="Cancel"
-                      onClick={() => s.setEditingMemory(null)}
-                    >
-                      <CloseIcon size={13} />
-                    </button>
-                  </div>
-                ) : (
-                  <div key={m.id} className="memory-row">
-                    <span className="memory-row-body" dir="auto">
-                      <span className="memory-row-text">
-                        {m.content}
-                        {m.category && (
-                          <span className="memory-cat-pill">{m.category}</span>
-                        )}
-                      </span>
-                      <span className="memory-row-when">
-                        Added {formatWhen(m.createdAt)}
-                      </span>
-                    </span>
-                    <span className="memory-actions">
-                      <button
-                        className="chip-btn"
-                        title="Edit this memory"
+        ).map((g, _, groups) => {
+          const rows = shown.filter((m) => groupKey(m) === g.key);
+          return (
+            <section key={g.key ?? "other"} className="mem-group">
+              {!(groups.length === 1 && g.key === null) && (
+                <div className="mem-group-head">
+                  <h2>{g.label}</h2>
+                  {/* A count is exactly what the handwriting is for, and the
+                      ring keeps it from reading as part of the label. */}
+                  <span className="nb-circled">{rows.length}</span>
+                </div>
+              )}
+              <ul className="mem-list nb-frame-set">
+                {rows.map((m) =>
+                  s.editingMemory?.id === m.id ? (
+                    <li key={m.id} className="mem-card nb-card is-editing">
+                      <input
+                        className="mem-edit-input"
+                        autoFocus
+                        dir="auto"
                         aria-label="Edit this memory"
-                        onClick={() =>
+                        value={s.editingMemory.content}
+                        onChange={(e) =>
                           s.setEditingMemory({
                             id: m.id,
-                            content: m.content,
-                            category: m.category ?? null,
+                            content: e.target.value,
+                            category: s.editingMemory?.category ?? null,
+                          })
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") a.saveMemoryEdit();
+                          if (e.key === "Escape") s.setEditingMemory(null);
+                        }}
+                      />
+                      <select
+                        className="memory-cat-select"
+                        title="Category"
+                        aria-label="Category"
+                        value={s.editingMemory.category ?? ""}
+                        onChange={(e) =>
+                          s.setEditingMemory({
+                            id: m.id,
+                            content: s.editingMemory?.content ?? m.content,
+                            category: e.target.value || null,
                           })
                         }
                       >
-                        <PencilIcon size={13} />
-                      </button>
-                      <DeleteControl
-                        k={`mem:${m.id}`}
-                        trigger="×"
-                        onConfirm={async () => {
-                          await api.deleteMemory(m.id);
-                          s.setMemories(await api.listMemories());
-                        }}
-                        title="Forget this"
-                        confirmDelete={s.confirmDelete}
-                        askConfirm={a.askConfirm}
-                        cancelConfirm={a.cancelConfirm}
-                      />
-                    </span>
-                  </div>
-                ),
-              )}
-          </section>
-        ))}
+                        <option value="">no category</option>
+                        {CATEGORY_OPTIONS.map((c) => (
+                          <option key={c} value={c}>
+                            {c}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="mem-actions">
+                        <button className="chip-btn" title="Save" aria-label="Save" onClick={a.saveMemoryEdit}>
+                          <CheckIcon size={13} />
+                        </button>
+                        <button
+                          className="chip-btn"
+                          title="Cancel"
+                          aria-label="Cancel"
+                          onClick={() => s.setEditingMemory(null)}
+                        >
+                          <CloseIcon size={13} />
+                        </button>
+                      </span>
+                    </li>
+                  ) : (
+                    <li key={m.id} className={`mem-card nb-card${catClass(m.category)}`}>
+                      {/* Decoration: a pseudo-glyph, aria-hidden, and
+                          pointer-events:none via .nb-ico, so the pin is a mark
+                          on the page and never something to tab to. */}
+                      <span className="mem-card-pin nb-ico nb-ico-pin" aria-hidden="true" />
+                      <span className="mem-card-body" dir="auto">
+                        {m.content}
+                      </span>
+                      <span className="mem-card-foot">
+                        {m.category && <span className="mem-cat">{m.category}</span>}
+                        <span className="mem-when">Added {formatWhen(m.createdAt)}</span>
+                      </span>
+                      <span className="mem-actions">
+                        <button
+                          className="chip-btn"
+                          title="Edit this memory"
+                          aria-label="Edit this memory"
+                          onClick={() =>
+                            s.setEditingMemory({
+                              id: m.id,
+                              content: m.content,
+                              category: m.category ?? null,
+                            })
+                          }
+                        >
+                          <PencilIcon size={13} />
+                        </button>
+                        <DeleteControl
+                          k={`mem:${m.id}`}
+                          trigger="×"
+                          onConfirm={async () => {
+                            await api.deleteMemory(m.id);
+                            s.setMemories(await api.listMemories());
+                          }}
+                          title="Forget this"
+                          confirmDelete={s.confirmDelete}
+                          askConfirm={a.askConfirm}
+                          cancelConfirm={a.cancelConfirm}
+                        />
+                      </span>
+                    </li>
+                  ),
+                )}
+              </ul>
+            </section>
+          );
+        })}
 
-        <section className="memory-scratch-note">
-          <div className="group-heading">Scratch pad</div>
-          <p>
-            A shared working file — you and the AI both write{" "}
-            <strong>Scratch pad.md</strong>. It is ordinary room content and
-            never becomes memory automatically.
-          </p>
-          <button className="subtle btn-ic" onClick={() => void a.openScratchPad()}>
-            <PencilIcon size={13} /> Open the scratch pad
-          </button>
+        {/* A dashed pencil rule is the system's mark for a provisional
+            boundary, and it is doing real work here: above it is durable
+            memory the assistant may quote back at you, below it is a working
+            file that never becomes one. */}
+        <hr className="nb-rule-dash mem-fold" />
+
+        <section className="mem-scratch">
+          <div className="mem-scratch-head">
+            <h2>Scratch pad</h2>
+            <span className="mem-scratch-note">temporary — not memory</span>
+          </div>
+          <div className="mem-sheet">
+            <p className="mem-sheet-copy">
+              A shared working file — you and the AI both write{" "}
+              <strong>Scratch pad.md</strong>. It is ordinary room content and
+              never becomes memory automatically.
+            </p>
+            <button className="subtle btn-ic" onClick={() => void a.openScratchPad()}>
+              <PencilIcon size={13} /> Open the scratch pad
+            </button>
+          </div>
         </section>
       </div>
     </div>

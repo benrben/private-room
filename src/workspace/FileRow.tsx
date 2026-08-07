@@ -16,14 +16,26 @@ export default function FileRow({
   a: WSActions;
 }) {
   const attached = s.attachments.some((x) => x.id === f.id);
-  const selected = s.openFile?.id === f.id;
+  const isOpen = s.openFile?.id === f.id;
+  const picked = s.selectedFileIds.has(f.id);
   return (
     <div
       key={f.id}
-      className={`file-row${selected ? " selected" : ""}${attached ? " attached" : ""}`}
+      // Three independent states, three independent classes. `is-open` is
+      // "you are reading this", `is-picked` is "this is in the set you are
+      // about to act on", and they are genuinely different — the file you have
+      // open is very often NOT one of the seven you just selected to move.
+      className={`file-row${isOpen ? " selected" : ""}${attached ? " attached" : ""}${picked ? " is-picked" : ""}`}
+      // A picked row is a checkbox in every way that matters to a screen
+      // reader, without a checkbox column stealing width from the name.
+      aria-selected={picked}
       draggable
       onDragStart={(e) => {
-        e.dataTransfer.setData("text/plain", f.id);
+        // Dragging a row that is part of the selection drags the WHOLE
+        // selection. Dragging one that isn't drags just it — and does not
+        // silently redefine what "selected" means underneath the user.
+        const ids = picked ? a.selectedFiles().map((x) => x.id) : [f.id];
+        e.dataTransfer.setData("text/plain", ids.join("\n"));
         e.dataTransfer.effectAllowed = "move";
         s.internalDragRef.current = true;
       }}
@@ -35,7 +47,14 @@ export default function FileRow({
         e.preventDefault();
         s.setMoveMenuFor(null);
         a.cancelConfirm();
-        s.setCtxMenu({ file: f, x: e.clientX, y: e.clientY });
+        // Finder's rule: right-clicking INSIDE a selection acts on all of it;
+        // right-clicking outside one drops the selection and acts on that row.
+        // The alternative — always acting on the clicked row — makes "select
+        // 7, right-click, Remove" quietly delete one file.
+        const inSelection = s.selectedFileIds.has(f.id);
+        const files = inSelection ? a.selectedFiles() : [f];
+        if (!inSelection) a.clearSelection();
+        s.setCtxMenu({ file: f, files, x: e.clientX, y: e.clientY });
       }}
     >
       {/* Not when the VIEWER opened the rename: the library lists a row for the
@@ -57,16 +76,30 @@ export default function FileRow({
           }}
         />
       ) : (
-        <button className="file-main" onClick={() => a.viewFile(f.id)}>
+        <button
+          className="file-main"
+          onClick={(e) =>
+            a.clickFile(f, { meta: e.metaKey || e.ctrlKey, shift: e.shiftKey })
+          }
+        >
           <span className="file-icon">
             <FileTypeIcon file={f} />
           </span>
           <span className="file-name" title={f.name}>
             {fileLabel(f.name, s.files)}
           </span>
+          {/* Both badges below are STATE, and a row is rendered hundreds of
+              times, so each is a single span with no per-row cost. They are
+              also the two states in this list that were carried by a glyph or
+              a colour alone: a bare "◐" and an empty dot, each with only a
+              `title`, which a screen reader is not obliged to announce and a
+              keyboard user can never hover to see. `role="img"` plus a name
+              makes each one a real, announced status. */}
           {f.partiallyIndexed && (
             <span
               className="partial-badge"
+              role="img"
+              aria-label="Partially indexed"
               title="Partially indexed — only the first part of this large file is searchable."
             >
               ◐
@@ -77,6 +110,8 @@ export default function FileRow({
           {s.sttStatus[f.name] === "processing" && (
             <span
               className="stt-badge"
+              role="img"
+              aria-label="Transcribing"
               title="Transcribing on this Mac — the transcript appears when it's done."
             />
           )}
@@ -109,7 +144,12 @@ export default function FileRow({
             const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
             s.setMoveMenuFor(null);
             a.cancelConfirm();
-            s.setCtxMenu({ file: f, x: r.right - 4, y: r.bottom + 4 });
+            // Same many-vs-one rule as the right-click: the ••• of a row inside
+            // the selection opens the menu for the whole selection.
+            const inSelection = s.selectedFileIds.has(f.id);
+            const files = inSelection ? a.selectedFiles() : [f];
+            if (!inSelection) a.clearSelection();
+            s.setCtxMenu({ file: f, files, x: r.right - 4, y: r.bottom + 4 });
           }}
         >
           <DotsIcon size={14} />

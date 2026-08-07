@@ -6,14 +6,7 @@ import type {
   BrowserSearchResult,
   FileMeta,
 } from "../apiTypes";
-import {
-  GlobeIcon,
-  ShieldIcon,
-  ChevronLeftIcon,
-  ChevronRightIcon,
-  LockIcon,
-  AlertIcon,
-} from "../icons";
+import { ShieldIcon, LockIcon, AlertIcon } from "../icons";
 import { classifyAddress, needsFreshFetch } from "./address";
 import { BrowserSearch, BrowserSearchSkeleton } from "./BrowserSearch";
 import { BrowserReader } from "./BrowserReader";
@@ -558,30 +551,34 @@ export function BrowserView({
         >
           Read this page as text
         </button>
+        {/* The drawn marks. Every one of them is an aria-hidden pseudo-icon
+            with pointer-events:none (styles/browser.css, .bico) — the button
+            around it carries the whole accessible name, exactly as it did
+            when these were <svg> components. */}
         <div className="browser-nav">
           <button
-            className="browser-btn"
+            className="browser-btn browser-btn-ico"
             aria-label="Go back"
             disabled={!info.open}
             onClick={() => void nav("back")}
           >
-            <ChevronLeftIcon size={16} />
+            <span className="bico bico-back" aria-hidden />
           </button>
           <button
-            className="browser-btn"
+            className="browser-btn browser-btn-ico"
             aria-label="Go forward"
             disabled={!info.open}
             onClick={() => void nav("forward")}
           >
-            <ChevronRightIcon size={16} />
+            <span className="bico bico-forward" aria-hidden />
           </button>
           <button
-            className="browser-btn"
+            className="browser-btn browser-btn-ico"
             aria-label={busy ? "Stop loading" : "Reload the page"}
             disabled={!info.open}
             onClick={() => void nav(busy ? "stop" : "reload")}
           >
-            {busy ? "×" : "↻"}
+            <span className={`bico ${busy ? "bico-stop" : "bico-reload"}`} aria-hidden />
           </button>
         </div>
 
@@ -596,31 +593,20 @@ export function BrowserView({
         >
           {secure || insecure ? (
             <span
+              className={`browser-scheme${insecure ? " insecure" : ""}`}
               role="img"
               aria-label={schemeLabel}
               title={schemeLabel}
-              style={{
-                display: "inline-flex",
-                ...(insecure ? { color: "var(--danger, #b4322f)" } : null),
-              }}
             >
               {secure ? <LockIcon size={13} /> : <AlertIcon size={14} />}
             </span>
           ) : (
-            <GlobeIcon size={14} />
+            /* No page, or a results page: the label is a search box right
+               now, and the drawn magnifier says so. Decoration — the input's
+               own label already tells a screen reader what this box takes. */
+            <span className="bico bico-search browser-scheme" aria-hidden />
           )}
-          {insecure && (
-            <span
-              style={{
-                color: "var(--danger, #b4322f)",
-                fontSize: "11px",
-                fontWeight: 600,
-                whiteSpace: "nowrap",
-              }}
-            >
-              Not secure
-            </span>
-          )}
+          {insecure && <span className="browser-insecure">Not secure</span>}
           <input
             ref={addressRef}
             aria-label="Address — search the web, or type an address and press Enter"
@@ -635,8 +621,17 @@ export function BrowserView({
           />
         </form>
 
+        {/* The badge is a PRIVACY CLAIM, so its ink states how well founded
+            the claim is. `ephemeral === true` is a fact the live webview
+            answered for and takes the verified ink; `null` means the check
+            has not come back (or no page is open) and takes the neutral ink,
+            because a claim nobody has checked must not look like one that has
+            been. The word and the title already say which is which — the
+            colour only stops agreeing with them. */}
         <button
-          className={`browser-shield${ephemeral === false ? " warn" : ""}`}
+          className={`browser-shield${
+            ephemeral === false ? " warn" : ephemeral === null ? " pending" : ""
+          }`}
           type="button"
           aria-label={shieldLabel}
           title={shieldLabel}
@@ -657,8 +652,12 @@ export function BrowserView({
           {info.takeover ? "Hand back to the agent" : "Take over"}
         </button>
 
+        {/* The drawn mark is a stroke coming DOWN into an open tray, because
+            "into the room" is the whole meaning of this button — and it opens
+            a STRIP, never a menu: a dropdown here would be drawn under the
+            native page. */}
         <button
-          className="browser-btn"
+          className="browser-btn browser-save-btn"
           type="button"
           ref={saveRef}
           disabled={!info.open || blank}
@@ -666,6 +665,7 @@ export function BrowserView({
           aria-expanded={saveOpen}
           onClick={() => setSaveOpen((v) => !v)}
         >
+          <span className="bico bico-save" aria-hidden />
           Save
         </button>
 
@@ -817,17 +817,28 @@ export function BrowserView({
         {searching && !searchOpen && <BrowserSearchSkeleton query={pending} />}
 
         {!searchOpen && !searching && (!info.open || blank) && (
+          /* A ruled start page, not a centred globe. It is a real React
+             surface rather than something drawn over the page: the native
+             view is parked at 1×1 for as long as `blank` is true, which is
+             the only reason anything here can be seen at all. */
           <div className="browser-start">
-            <div className="viewer-empty-icon">
-              <GlobeIcon size={40} />
+            <div className="bstart-sheet">
+              <h1 className="bstart-title">Private browser</h1>
+              <p className="bstart-copy">
+                A browser that keeps nothing: no history, no cookies, no cache,
+                trackers blocked. Search or type an address above, or just ask
+                the assistant to look something up — it can drive this browser
+                for you, and everything it does is recorded in the Journal.
+              </p>
             </div>
-            <h1 className="viewer-empty-title">Private browser</h1>
-            <p className="viewer-empty-sub">
-              A browser that keeps nothing: no history, no cookies, no cache,
-              trackers blocked. Search or type an address above, or just ask the
-              assistant to look something up — it can drive this browser for
-              you, and everything it does is recorded in the Journal.
-            </p>
+            {/* Marginalia: fixed content, inert, aria-hidden, and drawn
+                outside the sheet, pointing up at the address box. The
+                stylesheet removes it entirely as soon as the centre pane is
+                too narrow to have a margin to draw it in. */}
+            <aside className="bstart-aside" aria-hidden="true">
+              <span className="bstart-aside-note">start here</span>
+              <span className="nb-arrow-curve nb-arrow-curve--ne bstart-aside-arrow" />
+            </aside>
           </div>
         )}
 
@@ -839,7 +850,7 @@ export function BrowserView({
                 <span className="browser-journal-confirm">
                   <span>Erase this record?</span>
                   <button
-                    className="browser-btn"
+                    className="browser-btn browser-btn-danger"
                     onClick={() => {
                       setConfirmClear(false);
                       void api.browserClearJournal().then(loadJournal);
@@ -873,12 +884,28 @@ export function BrowserView({
             {journal.length === 0 ? (
               <p className="browser-journal-empty">Nothing yet.</p>
             ) : (
-              <ol>
+              /* An annotated journal: a pencil thread down the margin
+                 (paper.css .nb-connect) with a node per entry, the kind on a
+                 strip of tape, what was done in the hand, and the address and
+                 the instant in mono — the two facts a user has to be able to
+                 check character by character.
+                 `dir` is set on both, and differently on purpose: a
+                 description can quote a page title or a query in Hebrew or
+                 Arabic and must read in its own direction, while an address
+                 is always shown left to right — that is how an address bar
+                 renders one, and a reordered URL is a misread URL. */
+              <ol className="nb-connect browser-journal-list">
                 {journal.map((row) => (
                   <li key={row.id} data-kind={row.kind}>
                     <span className="jk">{row.kind}</span>
-                    <span className="jd">{row.detail}</span>
-                    {row.url && <span className="ju">{row.url}</span>}
+                    <span className="jd" dir="auto">
+                      {row.detail}
+                    </span>
+                    {row.url && (
+                      <span className="ju" dir="ltr">
+                        {row.url}
+                      </span>
+                    )}
                     <time dateTime={row.at}>{journalTime(row.at)}</time>
                   </li>
                 ))}

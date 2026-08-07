@@ -73,7 +73,7 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
         <span className="script-row-status">
           {live ? (
             <span className="script-running">
-              <span className="rec-dot pulsing" /> {live.label}
+              <span className="rec-dot" /> {live.label}
             </span>
           ) : sc.consecutiveFailures >= 1 ? (
             <span className="wf-badge dot-err">
@@ -131,28 +131,65 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
         </div>
       )}
 
-      <div className="script-chips">
-        {sc.deps.length > 0 && (
-          <span className="script-chip deps" title="Python packages (installed by uv)">
-            📦 {sc.deps.join(", ")}
-          </span>
-        )}
-        {sc.inputs.map((i) => (
-          <span key={`in-${i}`} className="script-chip in" title="Reads this room file">
-            → {i}
-          </span>
-        ))}
-        {sc.outputs.map((o) => (
-          <span key={`out-${o}`} className="script-chip out" title="Writes this room file back">
-            ← {o}
-          </span>
-        ))}
-        {sc.shortcut !== "none" && (
-          <span className="script-chip shortcut" title="Shows as a one-click shortcut">
-            {sc.shortcut === "global" ? "top-bar shortcut" : "file shortcut"}
-          </span>
-        )}
-      </div>
+      {/* The manifest, as notebook fields rather than as a row of chips.
+          A chip carried its meaning only in a hover tooltip ("→ portfolio.csv"
+          with title "Reads this room file"), which a keyboard never sees and a
+          screen reader reads as an arrow. The keys are the same three words the
+          run-consent card uses — Installs / Reads / Writes back — so the page
+          and the card that gates it describe a script in one vocabulary. */}
+      {(sc.deps.length > 0 ||
+        sc.inputs.length > 0 ||
+        sc.outputs.length > 0 ||
+        sc.shortcut !== "none") && (
+        <dl className="script-fields">
+          {sc.deps.length > 0 && (
+            <div className="script-field">
+              <dt title="Python packages (installed by uv)">Installs</dt>
+              <dd>
+                <code>{sc.deps.join(", ")}</code>
+              </dd>
+            </div>
+          )}
+          {sc.inputs.length > 0 && (
+            <div className="script-field">
+              <dt title="Reads these room files">Reads</dt>
+              <dd>
+                <code>{sc.inputs.join(", ")}</code>
+              </dd>
+            </div>
+          )}
+          {sc.outputs.length > 0 && (
+            <div className="script-field">
+              <dt title="Writes these room files back">Writes back</dt>
+              <dd>
+                <code>{sc.outputs.join(", ")}</code>
+              </dd>
+            </div>
+          )}
+          {sc.shortcut !== "none" && (
+            <div className="script-field">
+              <dt title="Shows as a one-click shortcut">Shortcut</dt>
+              <dd>{sc.shortcut === "global" ? "top-bar shortcut" : "file shortcut"}</dd>
+            </div>
+          )}
+        </dl>
+      )}
+
+      {/* An unapproved script has ALWAYS been blocked — `run_script_inner`
+          refuses content whose hash is not approved on this Mac. Until now the
+          only place that said so was the Run button's tooltip, so a script that
+          had never been approved and never been run looked exactly like one
+          that had been. A caution note states it in words, at readable size, in
+          the interface sans: this is a security fact, never an aside, and never
+          the hand. */}
+      {!sc.approved && (
+        <p className="script-caution">
+          This version has not been approved on this Mac.{" "}
+          <strong>Review script</strong> opens the run-consent card, which
+          spells out exactly what would run and what it would be allowed to
+          touch — nothing runs until you approve it.
+        </p>
+      )}
 
       <div className="script-row-actions">
         {/* An unapproved script has ALWAYS been blocked — `run_script_inner`
@@ -162,9 +199,13 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
             was the BUTTON: labelled "Run", it promised execution that could not
             happen, so the review gate read as broken rather than as working.
             Live QA reported it twice as "unreviewed scripts can still run".
-            The gate is unchanged; the button now says what it actually does. */}
+            The gate is unchanged; the button now says what it actually does.
+
+            It is also the one action in this row drawn as a real outlined
+            control — Schedule and Runs stay quiet — so the row has a first
+            thing to press instead of four equal-weight links. */}
         <button
-          className="subtle btn-ic"
+          className={`btn-ic script-go${sc.approved ? "" : " needs-review"}`}
           title={
             sc.approved
               ? "Run this script now — outputs are saved into the room"
@@ -213,7 +254,11 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
           </span>
         )}
         {sc.workflowId && (
-          <button className="subtle btn-ic" onClick={() => void toggleHistory()}>
+          <button
+            className="subtle btn-ic"
+            aria-expanded={histOpen}
+            onClick={() => void toggleHistory()}
+          >
             {histOpen ? "Hide runs" : "Runs"}
           </button>
         )}
@@ -221,6 +266,9 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
 
       {histOpen && (
         <div className="script-history">
+          {/* The log gets a name of its own: without one it opened straight
+              onto a bare list of statuses hanging off the bottom of the row. */}
+          <div className="script-history-label">Run history</div>
           <RunHistory runs={runs} nodeCount={1} />
         </div>
       )}

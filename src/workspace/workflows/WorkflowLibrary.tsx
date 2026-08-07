@@ -5,6 +5,7 @@ import { WSActions } from "../actions";
 import { PlusIcon, SparklesIcon, PinIcon } from "../../icons";
 import { WorkflowGlyph } from "./workflowGlyph";
 import { runDotClass, visibleWorkflows } from "./selectors";
+import { CadenceNote, cadenceOf } from "./cadence";
 
 type Props = { s: WSState; a: WSActions };
 
@@ -62,9 +63,13 @@ function ComposeBar({ s, a }: Props) {
 
   return (
     <div className="wf-compose">
+      {/* The instruction leads, at instruction size — this is the one control
+          on the page that has to explain itself before it can be used, and the
+          old bar set it smaller than the card titles beneath it. Sans, never
+          the hand: handwriting is reserved for asides, not for directions. */}
       <div className="wf-compose-head">
-        <span className="wf-compose-spark">
-          <SparklesIcon size={16} />
+        <span className="wf-compose-spark" aria-hidden="true">
+          <SparklesIcon size={17} />
         </span>
         <span>Describe a workflow and let the assistant build it</span>
       </div>
@@ -85,7 +90,11 @@ function ComposeBar({ s, a }: Props) {
             }
           }}
         />
-        <button className="wf-compose-btn" onClick={() => void compose()} disabled={busy || !desc.trim()}>
+        <button
+          className="nb-btn nb-btn-primary nb-btn-go wf-compose-btn"
+          onClick={() => void compose()}
+          disabled={busy || !desc.trim()}
+        >
           {busy ? "Composing…" : "Compose with AI"}
         </button>
       </div>
@@ -198,21 +207,33 @@ export function WorkflowLibrary({ s, a }: Props) {
     return () => window.clearInterval(t);
   }, [anyScheduled]);
 
+  // Index cards. .nb-frame-set rotates four drawn corner signatures across the
+  // run so a gallery of eight does not look stamped from one die, and each
+  // card's cadence class sets the marker its identity edge is drawn in.
   const templateGrid = (
-    <div className="wf-grid">
-      {templates.map((t) => (
-        <div key={t.name} className="wf-card tmpl" {...cardButton(() => void a.instantiateTemplate(t))}>
-          <div className="wf-card-top">
-            <span className="wf-card-emoji">
-              <WorkflowGlyph emoji={t.emoji} size={18} />
-            </span>
-            <span className="wf-card-name">{t.name}</span>
-            {t.schedule && <span className="wf-badge">{t.schedule.kind}</span>}
+    <div className="wf-grid nb-frame-set">
+      {templates.map((t) => {
+        const cad = cadenceOf(t.schedule, t.binding);
+        return (
+          <div
+            key={t.name}
+            className={`wf-card tmpl ${cad.mark}`}
+            {...cardButton(() => void a.instantiateTemplate(t))}
+          >
+            <div className="wf-card-top">
+              <span className="wf-card-emoji">
+                <WorkflowGlyph emoji={t.emoji} size={17} />
+              </span>
+              <span className="wf-card-name">{t.name}</span>
+            </div>
+            <div className="wf-card-desc">{t.description}</div>
+            <div className="wf-card-foot">
+              <CadenceNote cadence={cad} />
+              <span className="wf-card-cta">Use template →</span>
+            </div>
           </div>
-          <div className="wf-card-desc">{t.description}</div>
-          <div className="wf-card-cta">Use template →</div>
-        </div>
-      ))}
+        );
+      })}
       <div className="wf-card wf-card-blank" {...cardButton(() => void a.createBlankWorkflow())}>
         <div className="wf-card-top">
           <span className="wf-card-emoji">
@@ -248,13 +269,13 @@ export function WorkflowLibrary({ s, a }: Props) {
       <div className="wf-toolbar">
         <div className="wf-section-label">Your workflows</div>
         <button
-          className="wf-new-btn btn-ic"
+          className="nb-btn wf-new-btn btn-ic"
           aria-pressed={showTemplates}
           onClick={() => setShowTemplates((v) => !v)}
         >
           <SparklesIcon size={13} /> {showTemplates ? "Hide templates" : "From template"}
         </button>
-        <button className="wf-new-btn btn-ic" onClick={() => void a.createBlankWorkflow()}>
+        <button className="nb-btn wf-new-btn btn-ic" onClick={() => void a.createBlankWorkflow()}>
           <PlusIcon size={13} /> New workflow
         </button>
       </div>
@@ -262,20 +283,26 @@ export function WorkflowLibrary({ s, a }: Props) {
         <>
           <div className="wf-section-label">Start from a template</div>
           {templateGrid}
-          <div className="wf-section-label" style={{ marginTop: "1rem" }}>
-            Your workflows
-          </div>
+          <div className="wf-section-label wf-section-label-again">Your workflows</div>
         </>
       )}
-      <div className="wf-grid">
+      <div className="wf-grid nb-frame-set">
         {visible.map((w) => {
           const sc = schedules[w.id];
           const bb = bindingBadge(w);
+          // Cadence drives the card's identity EDGE; the badges below carry
+          // run status as words. Two treatments, so a failed daily workflow
+          // never has to choose which of the two its colour is talking about.
+          const cad = cadenceOf(sc, w.binding);
           return (
-            <div key={w.id} className="wf-card" {...cardButton(() => a.openWorkflowDetail(w.id))}>
+            <div
+              key={w.id}
+              className={`wf-card ${cad.mark}`}
+              {...cardButton(() => a.openWorkflowDetail(w.id))}
+            >
               <div className="wf-card-top">
                 <span className="wf-card-emoji">
-                  <WorkflowGlyph emoji={w.emoji} size={18} />
+                  <WorkflowGlyph emoji={w.emoji} size={17} />
                 </span>
                 <span className="wf-card-name">{w.name}</span>
                 {w.pinned && (
@@ -285,16 +312,17 @@ export function WorkflowLibrary({ s, a }: Props) {
                 )}
               </div>
               {w.description && <div className="wf-card-desc">{w.description}</div>}
-              <div className="wf-badges">
-                {w.status === "draft" && <span className="wf-badge draft">Draft</span>}
-                {lastRunBadge(lastRuns[w.id])}
-                {w.createdBy === "agent" && <span className="wf-badge agent">Drafted by the agent</span>}
-                {sc?.enabled && (
-                  <span className="wf-badge">
-                    {sc.kind} {countdown(sc.nextRunAt, now) && `· ${countdown(sc.nextRunAt, now)}`}
-                  </span>
-                )}
-                {bb && <span className="wf-badge">{bb}</span>}
+              <div className="wf-card-foot">
+                <CadenceNote
+                  cadence={cad}
+                  countdown={sc?.enabled ? countdown(sc.nextRunAt, now) : ""}
+                />
+                <div className="wf-badges">
+                  {w.status === "draft" && <span className="wf-badge draft">Draft</span>}
+                  {lastRunBadge(lastRuns[w.id])}
+                  {w.createdBy === "agent" && <span className="wf-badge agent">Drafted by the agent</span>}
+                  {bb && <span className="wf-badge">{bb}</span>}
+                </div>
               </div>
             </div>
           );

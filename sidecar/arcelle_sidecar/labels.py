@@ -46,6 +46,13 @@ _LABELS: dict[str, str] = {
     "set_cells": "Updated spreadsheet cells",
     "rename_file": "Renamed a file",
     "move_file": "Moved a file",
+    # The organize box. "Tidied up the files" deliberately does NOT cover
+    # trashing: the step chip is often the only place a user sees that a
+    # deletion happened at all, and folding it into a tidy-up label would hide
+    # the one action the trash's attribution column exists to surface.
+    "organize_files": "Tidied up the files",
+    "trash_files": "Moved files to the trash",
+    "merge_files": "Merged files into one",
     "add_memory": "Saved a memory",
     # Wave 1b (idea 5): read-back for the budget-truncated injection.
     "list_memories": "Listed the saved memories",
@@ -125,6 +132,10 @@ _LABELS: dict[str, str] = {
     # need. The Rust handler says it in the present progressive for exactly this
     # reason: "Re-transcribing {name} on this computer; nothing is uploaded."
     "retranscribe_file": "Started transcribing a recording again",
+    # Also only STARTS a job — the chapters, highlights and notes land when it
+    # finishes, which can be a minute later on a local model. "Read" past-tense
+    # would claim a finished reading the user cannot yet see.
+    "read_recording": "Started reading a recording",
     # The studio verbs each SAVE a new file in the room, so name the artefact
     # the user will find there rather than the generator that made it.
     "studio_flashcards": "Made flashcards",

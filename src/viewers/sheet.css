@@ -1,91 +1,610 @@
 /* ------------------------------------------------------------------ *
- * Spreadsheet grid extras owned by SheetView (the base table rules live
- * in src/styles/viewer-formats.css). Two things the grid can't do without:
- * a visible focus ring, so arrow-key navigation isn't invisible, and a
- * mark on cells that hold a formula rather than a typed value.
+ * SPREADSHEETS AND CSV
+ *
+ * THE GRID IS SACRED. The notebook's hand-drawn geometry stops at the OUTER
+ * frame. The container is a sheet of paper with a drawn, asymmetric edge —
+ * and everything inside it stays perfectly straight and perfectly aligned,
+ * because a wobbly cell edge in a financial table is a lie about the data
+ * and a rounded corner on a cell breaks the one thing a grid is for. So:
+ * asymmetric radii on the frame, the dividers and the bars; never on a cell,
+ * never on a row, never on a column.
+ *
+ * Nothing here changes a cell's WIDTH, HEIGHT, PADDING or FACE. The virtual
+ * window's row arithmetic (SheetView's ROW_H) and the workbook's own
+ * <colgroup> widths are the geometry, and a stylesheet that nudged either
+ * would misplace the data it is drawing.
+ *
+ * The base table rules — cell borders, padding, sticky labels, zebra
+ * striping, `.num` alignment — live in src/styles/viewer-formats.css, which
+ * another owner maintains. This file ships in SheetView's own lazy chunk and
+ * therefore loads after it, so an equal-specificity rule here already wins;
+ * the overrides are still written with `.sheet-view` in front so they keep
+ * winning if the bundling ever changes.
+ *
+ * Every colour resolves through a token, so light mode falls out of the same
+ * rules rather than out of an override block at the end.
  * ------------------------------------------------------------------ */
 
-/* A declined commit (a formula typed into a viewer that can only save values)
-   has to be visible, or the cell silently keeps its old content. */
-.sheet-notice {
-  color: var(--warn, var(--text));
+/* The viewer is mounted in a `fill` body, which has no padding of its own —
+   without this the drawn frame below would be flush against the pane's edge
+   and would read as part of the window chrome rather than as a sheet laid on
+   the page. */
+.sheet-view {
+  padding: var(--sp-3) var(--sp-4) var(--sp-4);
 }
 
-.sheet-scroll td:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+/* ==================================================================== *
+ * 1. SHEET TABS — notebook dividers
+ * Index-card tabs standing on a drawn rule: square-bottomed so they open
+ * onto the rule, drawn corners on top only. The current sheet takes the
+ * app's ONE active mark (the marker swipe) plus full ink and weight, so the
+ * state never rests on colour alone — and it carries aria-current, which is
+ * what a screen reader reads.
+ * ==================================================================== */
+
+.sheet-view .sheet-tabs {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  margin: 0 0 var(--sp-3);
+  padding: 0 2px;
+  /* The rule the dividers stand on, drawn as a background so it costs no
+     element and gives a screen reader nothing extra to walk past — the same
+     idiom the Room Home masthead uses. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 2%,
+    var(--line) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }
 
-/* A formula cell shows its RESULT; the corner mark says the value is
-   computed, and the cell's tooltip spells the formula out. */
-.sheet-scroll td.cell-formula {
+.sheet-view .sheet-tabs button {
   position: relative;
-}
-.sheet-scroll td.cell-formula::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  right: 0;
-  border-top: 5px solid color-mix(in srgb, var(--accent) 70%, transparent);
-  border-left: 5px solid transparent;
-}
-
-/* ---- virtualized rows -------------------------------------------- *
- * Only the visible rows are in the DOM; two spacer rows carry the height
- * of everything above and below so the scrollbar reflects the WHOLE sheet.
- * `table-layout: fixed` is load-bearing: it makes the <colgroup> widths
- * (the workbook's own column widths) authoritative instead of letting the
- * browser re-measure content — which, with a changing set of rows, would
- * make the columns twitch on every scroll.
- */
-.sheet-scroll table {
-  table-layout: fixed;
-}
-.sheet-scroll col.sheet-corner-col {
-  width: 3.5rem;
-}
-/* Spacer rows must not inherit any cell chrome. */
-.sheet-scroll tr[aria-hidden] > td {
-  padding: 0;
-  border: 0;
-  background: none;
-}
-/* Fixed layout means overflowing text has to be told what to do. */
-.sheet-scroll td {
+  min-height: 26px;
+  padding: 4px 12px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  /* Drawn on top, open at the bottom onto the rule. */
+  border-radius: 8px 6px 0 0 / 7px 9px 0 0;
+  font-size: var(--fs-meta);
+  max-width: 26ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-/* ---- edit state ------------------------------------------------------- *
- * A grid edit commits to the file the moment you leave the cell, so there is
- * no Save button to carry the "something changed" signal. These do it instead:
- * the cell keeps a mark, and the bar keeps a count and a way back. */
-
-.sheet-editbar {
-  display: flex;
-  align-items: baseline;
-  gap: 0.75rem;
-  flex-wrap: wrap;
+.sheet-view .sheet-tabs button:hover {
+  color: var(--text);
+  /* --rule-strong, not --rule: the moment a control's edge becomes visible it
+     owes the 3:1 of WCAG 1.4.11, and the pencil rule is 2.55:1 in dark. */
+  border-color: var(--rule-strong);
+  /* base.css washes every hovered button in the accent ghost; on a divider
+     that competes with the current-sheet mark, so this one stays bare. */
+  background: transparent;
 }
-.sheet-edits {
+.sheet-view .sheet-tabs button[aria-current="true"] {
+  color: var(--text-strong);
+  font-weight: 600;
+  border-color: color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-bottom-color: transparent;
+  background: var(--accent-ghost);
+}
+/* The one active underline the whole app draws: ink where the pen landed,
+   marker where it ran out. Sits over the rule the tabs stand on. */
+.sheet-view .sheet-tabs button[aria-current="true"]::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  bottom: -1px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--accent) 3%,
+    var(--accent-fill) 62%,
+    color-mix(in srgb, var(--accent-fill) 24%, transparent) 100%
+  );
+  pointer-events: none;
+}
+
+/* ==================================================================== *
+ * 2. THE BARS ABOVE THE GRID
+ * Three strips, in falling order of urgency: why this file can't be
+ * edited, what editing does, what the last commit did — then the formula
+ * bar, which is attached to the grid and reads the cell you are on.
+ * ==================================================================== */
+
+/* All three status strips share the viewer's `.viewer-status` class, which
+   sets 12px and a flat padding. They are not all the same weight, so each
+   states its own. */
+.sheet-view .sheet-readonly,
+.sheet-view .sheet-editbar,
+.sheet-view .sheet-notice {
+  flex: 0 0 auto;
+  margin: 0 0 var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  line-height: var(--lh-body);
+}
+
+/* Why this workbook is read-only. Informational, not a warning: the blue
+   marker is the product-wide "here is something you should know", and the
+   sentence itself carries the meaning. */
+.sheet-view .sheet-readonly {
+  color: var(--text);
+  font-size: var(--fs-meta);
+  box-shadow: inset 3px 0 0 var(--sem-linked);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--sem-linked-fill) 16%, transparent) 0%,
+    color-mix(in srgb, var(--sem-linked-fill) 8%, transparent) 62%,
+    color-mix(in srgb, var(--sem-linked-fill) 13%, transparent) 100%
+  );
+}
+
+/* The editing strip. "Each change saves into the file immediately" is the
+   most consequential sentence in this viewer, so it is set at body size in
+   the interface sans — never small, and never in the hand: this is an
+   instruction, and the hand is reserved for asides. */
+.sheet-view .sheet-editbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  color: var(--text);
+  font-size: var(--fs-body);
+  /* A pencil rule under the strip rather than a wash behind it: this is an
+     instruction, not a warning, and the two must not look alike. Drawn as a
+     background so it fades at both ends the way a pencil stroke does. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+.sheet-view .sheet-editbar > span:first-child {
+  min-width: 0;
+  flex: 1 1 34ch;
+  /* A measure, so a wide pane does not stretch the instruction into one
+     unreadable line. */
+  max-width: 82ch;
+}
+.sheet-view .sheet-edits {
   display: inline-flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--sp-2);
   margin-left: auto;
   white-space: nowrap;
 }
-.sheet-edits strong {
+/* There is no Save button here, so the changed-cell count IS the receipt —
+   a strip of tape stuck across the bar. Pink means "saved / edited"
+   product-wide, and --ink on a 34% wash measures ~7.8:1, so the WORDS carry
+   the meaning and the colour only reinforces them (paper.css .nb-tape). */
+.sheet-view .sheet-edits strong {
+  padding: 2px 9px;
+  color: var(--ink);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  background: color-mix(in srgb, var(--sem-saved-fill) 34%, transparent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sem-saved-fill) 46%, transparent);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+}
+.sheet-view .sheet-edits .nb-btn {
+  font-size: var(--fs-meta);
+}
+
+/* The last commit's outcome — a declined formula, or a cell put back. Both
+   are things to notice rather than errors, which is exactly what the yellow
+   marker means; the sentence carries the meaning and the text stays --text
+   so it never depends on a hue being readable. */
+.sheet-view .sheet-notice {
   color: var(--text);
+  font-size: var(--fs-meta);
+  box-shadow: inset 3px 0 0 var(--sem-pending);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--sem-pending-fill) 20%, transparent) 0%,
+    color-mix(in srgb, var(--sem-pending-fill) 10%, transparent) 62%,
+    color-mix(in srgb, var(--sem-pending-fill) 15%, transparent) 100%
+  );
 }
 
-/* A cell this session changed. The left bar survives whatever fill the
-   workbook's own style put on the cell — a coloured budget cell would
-   otherwise swallow a background tint. */
-.cell-changed {
-  box-shadow: inset 2px 0 0 var(--accent);
-}
+/* ----- the formula bar -----
+   A spreadsheet cell shows a RESULT; this is the only place the source is
+   readable. Three fields on one line: the A1 reference, what kind of thing
+   the readout is, and the thing itself. Mono throughout, because a
+   reference, a formula and a raw value are all technical text.
 
-.sheet-readonly {
+   It sits directly on top of the grid and shares its drawn frame's left
+   edge, so it reads as attached to the sheet rather than as one more strip
+   of chrome. */
+.sheet-view .sheet-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 30px;
+  margin: 0 0 var(--sp-2);
+  padding: 0 2px;
+  min-width: 0;
+}
+.sheet-view .sheet-ref {
+  flex: 0 0 auto;
+  min-width: 7ch;
+  padding: 3px 9px;
+  color: var(--text-strong);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  white-space: nowrap;
+}
+/* The field's name — "Formula", "Value", "Sheet". A word, always, so the
+   blue below is a reinforcement and never the signal. */
+.sheet-view .sheet-field-key {
+  flex: 0 0 auto;
+  padding: 1px 7px;
   color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+/* Blue is the product's "informational / computed" marker, and it appears
+   here only when the cell really is a formula — the same fact the corner
+   mark in the grid states. --ink on the wash, not the hue's own ink: a
+   hue's ink on a wash of the same hue is the one pairing in this palette
+   that misses 4.5:1 (see paper.css .nb-cat). */
+.sheet-view .sheet-field-key.is-formula {
+  color: var(--ink);
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--sem-linked-fill) 30%, transparent) 0%,
+    color-mix(in srgb, var(--sem-linked-fill) 22%, transparent) 58%,
+    color-mix(in srgb, var(--sem-linked-fill) 28%, transparent) 100%
+  );
+  border-radius: 4px 6px 3px 5px / 5px 3px 6px 4px;
+}
+/* The source itself. It SCROLLS rather than truncating: a formula cut off
+   at the pane's edge is a formula misreported, and this bar exists
+   precisely because the grid can only show the result. */
+.sheet-view .sheet-src {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* Both axes scroll. A cell can hold a wrapped, multi-line value, and a bar
+     that grew to fit one would push the grid down the page; a bar that cut it
+     off would misreport it. Scrolling is the only honest option. */
+  overflow: auto;
+  max-height: 4.6em;
+  padding: 3px 0;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+  white-space: pre;
+  user-select: text;
+}
+
+/* ==================================================================== *
+ * 3. THE GRID
+ * The one drawn border in this viewer goes here, around the whole
+ * container. Inside it every rule is straight, 1px and aligned.
+ * ==================================================================== */
+
+.sheet-view .sheet-scroll {
+  /* The sheet's own edge, at the same 72% pen strength .nb-card uses — a
+     frame that states where the data ends without competing with it. The
+     asymmetric radius is the hand-drawn rectangle from tokens.css, and it
+     is the ONLY curved corner anywhere in this grid. */
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+  background: transparent;
+}
+
+/* ----- the three rules the grid cannot work without -----
+   These are LAYOUT, not style, and they are the reason everything below can
+   talk about ellipsis and column alignment as though they were settled.
+
+   `table-layout: fixed` makes the <colgroup> widths — the workbook's own
+   column widths, measured in SheetView — authoritative, instead of letting
+   the browser size columns from whatever cells happen to be mounted. This
+   grid is VIRTUALISED: the set of rows changes on every scroll, so under
+   auto layout the columns re-measure and twitch continuously, and the
+   `text-overflow: ellipsis` in viewer-formats.css never fires because an
+   auto table just grows the column instead of clipping the cell.
+
+   The corner column carries the row numbers and is the one column with no
+   width in the markup, so it needs one here or fixed layout hands it the
+   leftover space.
+
+   The spacer rows are the virtualiser's padding — a single empty <td> that
+   stands in for every row above and below the window. They must not take
+   cell chrome: a border draws a stray rule across the viewport as you
+   scroll, and the zebra stripe paints a band that belongs to no data. */
+.sheet-view .sheet-scroll table {
+  table-layout: fixed;
+}
+.sheet-view .sheet-scroll col.sheet-corner-col {
+  width: 3.5rem;
+}
+.sheet-view .sheet-scroll tr[aria-hidden] > td {
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+/* Column rules stay at the full pencil weight and row rules drop to the
+   soft one. That is the ledger convention and it is not decoration: reading
+   a table means comparing values DOWN a column, so the vertical rules are
+   the ones doing structural work. Both stay exactly 1px, so no cell moves. */
+.sheet-view .sheet-scroll td,
+.sheet-view .sheet-scroll tbody th {
+  border-color: var(--line-soft) var(--line);
+}
+
+/* ----- the label bands -----
+   Row numbers and column letters, in the mono face with tabular figures so
+   the numbers line up in their column. They are the file's own coordinates,
+   which is technical data, not interface copy.
+
+   These are the one opaque thing in this viewer: they are sticky, so they
+   have to occlude the rows and columns sliding under them. Everything else
+   stays transparent and lets the dotted sheet through. */
+.sheet-view .sheet-scroll thead th,
+.sheet-view .sheet-scroll tbody th {
+  background: var(--panel);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  text-align: center;
+  user-select: none;
+}
+/* The boundary between chrome and data is a real boundary, so it is drawn
+   at --rule-strong (3:1) rather than at the interior pencil weight. */
+.sheet-view .sheet-scroll thead th {
+  border-bottom-color: var(--rule-strong);
+}
+.sheet-view .sheet-scroll tbody th {
+  border-right-color: var(--rule-strong);
+}
+.sheet-view .sheet-scroll thead th.sheet-corner {
+  background: var(--panel);
+}
+
+/* Figures keep the interface face on purpose. `.num` cells already carry
+   `font-variant-numeric: tabular-nums`, which gives Manrope a fixed digit
+   advance — so the column lines up — and the mono face would change the
+   advance instead. With `table-layout: fixed` plus `text-overflow:
+   ellipsis`, a wider glyph means a number that fits today gets clipped to
+   "1,234,5…" tomorrow, and a truncated figure is a wrong figure. Mono is
+   used everywhere in this viewer that CANNOT truncate: the row and column
+   labels, the formula bar, the notes. */
+.sheet-view .sheet-scroll td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==================================================================== *
+ * 4. CELL STATES
+ * Marker fills, applied as INSET SHADOWS rather than as a background: a
+ * workbook can put its own fill on a cell with an inline style, and an
+ * inset shadow paints over that fill while a background-color would lose
+ * to it. A colour-coded budget keeps its colours AND its state marks.
+ * ==================================================================== */
+
+/* Keyboard and pointer focus. The ring is drawn INSIDE the cell
+   (outline-offset: -2px) so it can never widen a column, and the marker
+   wash inside it is what makes a selection read as selected. */
+.sheet-view .sheet-scroll td:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 100px var(--accent-soft);
+}
+
+/* A formula cell shows its RESULT. The corner mark says the value is
+   computed; the formula bar spells the source out, the tooltip repeats it,
+   and the notes panel counts them — so the mark is a fourth signal, never
+   the only one. Drawn in the full informational ink rather than a wash of
+   it, because a mark that means something owes 3:1. */
+.sheet-view .sheet-scroll td.cell-formula {
+  position: relative;
+}
+.sheet-view .sheet-scroll td.cell-formula::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  border-top: 6px solid var(--sem-linked);
+  border-left: 6px solid transparent;
+  pointer-events: none;
+}
+
+/* A cell this session changed. Pink is "saved / edited" product-wide. The
+   3px edge is a SHAPE as well as a hue, and the words are carried by the
+   changed-cell count, the Undo button naming the reference, and the notes
+   panel listing every one of them. */
+.sheet-view .cell-changed {
+  box-shadow:
+    inset 3px 0 0 var(--sem-saved),
+    inset 0 0 0 100px color-mix(in srgb, var(--sem-saved-fill) 14%, transparent);
+}
+/* Focus replaces a box-shadow rather than adding to it, so the changed
+   edge has to be restated here or a changed cell would lose its mark the
+   moment you moved onto it. The edge is listed first, which paints it on
+   top of the selection wash. */
+.sheet-view .sheet-scroll td.cell-changed:focus-visible {
+  box-shadow:
+    inset 3px 0 0 var(--sem-saved),
+    inset 0 0 0 100px var(--accent-soft);
+}
+
+/* The in-cell editor. No radius and no extra padding: the input has to
+   occupy exactly the cell it replaced, or committing a value would look
+   like it landed somewhere else. */
+.sheet-view .sheet-scroll .cell-input {
+  border-color: var(--accent);
+}
+
+/* ==================================================================== *
+ * 5. THE NOTES PANEL
+ * What the viewer can say about this sheet WITHOUT guessing: its true
+ * extent, how many cells are computed, what is merged or hidden, what the
+ * assistant pointed at, what you changed. Every line is derived from the
+ * parsed workbook, so it is a reading of the file rather than a summary
+ * of it.
+ *
+ * Explanations are interface copy: the sans, at readable size. Only the
+ * one-line glance in the summary takes the hand, and only because it is a
+ * run of counts — which is exactly what the hand is reserved for.
+ * ==================================================================== */
+
+.sheet-notes {
+  flex: 0 0 auto;
+  margin-top: var(--sp-3);
+  padding-top: 2px;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+.sheet-notes > summary {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  min-height: 26px;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  /* The UA's disclosure triangle is replaced by a drawn caret in the
+     markup, which can be rotated and which inherits the row's ink. */
+  list-style: none;
+}
+.sheet-notes > summary::-webkit-details-marker {
+  display: none;
+}
+.sheet-notes > summary:hover {
+  background: var(--hover);
+}
+.sheet-notes > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.sheet-notes-caret {
+  flex: 0 0 auto;
+  width: 0.9em;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  transition: transform var(--dur-fast) var(--ease-pen);
+}
+.sheet-notes[open] .sheet-notes-caret {
+  transform: rotate(90deg);
+}
+.sheet-notes-label {
+  flex: 0 0 auto;
+  color: var(--text-strong);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+/* Counts, in the hand — a margin annotation on the sheet, not a heading. */
+.sheet-notes-glance {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--faint);
+}
+
+.sheet-notes-fields {
+  margin: 0;
+  padding: var(--sp-1) var(--sp-2) var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  /* A long list of notes must never push the grid off the pane. */
+  max-height: 32vh;
+  overflow-y: auto;
+}
+/* A notebook field: the key written in the margin, the note beside it. */
+.sheet-note {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
+  gap: var(--sp-1) var(--sp-3);
+  align-items: baseline;
+}
+.sheet-note > dt {
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-align: right;
+}
+.sheet-note > dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+/* References, counts and ranges inside a note are technical data. */
+.sheet-note code {
+  font-family: var(--mono);
+  font-size: 0.94em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-strong);
+}
+/* A narrow pane folds the field onto two lines rather than squeezing the
+   note into a 12-character column. */
+@container (max-width: 460px) {
+  .sheet-note {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sheet-note > dt {
+    text-align: left;
+  }
+}
+
+/* The column-trim line stays OUTSIDE the notes panel: a wide report that
+   silently stops at column BH reads as "those columns aren't in the file",
+   so that sentence can never be behind a disclosure. */
+.sheet-view > .viewer-status:last-child {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheet-notes-caret {
+    transition: none;
+  }
 }

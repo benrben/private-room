@@ -1,13 +1,54 @@
-<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect width="64" height="64" rx="14" fill="#0e1014"/>
-  <rect x="1" y="1" width="62" height="62" rx="13" stroke="#8b7cf6" stroke-opacity="0.25" stroke-width="2"/>
-  <g transform="translate(10.5 10.5) scale(0.0768)">
-    <g transform="translate(-235 -258)">
-      <path d="M375 623 L654 710 Q668 715 661 730 L635 778 Q628 790 614 784 L345 682 Z" fill="#9d80d8"/>
-      <path d="M507 279 Q523 263 541 274 Q550 279 557 294 L731 739 Q738 757 727 772 L702 800 Q692 812 677 805 L637 785 L470 337 Q463 319 473 304 Z" fill="#7857b0"/>
-      <path d="M494 277 Q507 264 524 269 Q542 275 548 292 Q552 303 546 318 L381 737 Q376 749 387 758 L365 797 Q356 813 339 810 Q331 809 323 801 L304 781 Q292 769 298 750 L479 308 Q484 288 494 277 Z" fill="#c3acf2"/>
-      <path d="M672 781 L707 785" stroke="#dfbc72" stroke-width="9" stroke-linecap="round"/>
-      <circle cx="672" cy="781" r="4.5" fill="#fff0b5"/>
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Arcelle">
+  <title>Arcelle</title>
+  <!--
+    The standalone Arcelle mark: the highlighter swipe on the charcoal
+    notebook sheet, with the handwritten A drawn over it in cream ink.
+    This is the MICRO cut of the mark - the heavier redrawn small-size
+    variant - because this file is above all the document favicon and lives
+    at 16..32px, where the full textured drawing rots into noise.
+
+    This is the ONE place besides the application icon where the brand lilac
+    (#9A82D1) is correct. The in-app logomark (src/icons/nav.tsx) draws the
+    band with the product's own highlighter token instead, because the
+    interface itself carries no violet.
+
+    Everything is a literal colour and a plain path or stroke: this file is
+    used as the favicon before any stylesheet has loaded, so it cannot depend
+    on a custom property, an external reference, a filter, or a font.
+
+    The tile is a superellipse (|x/a|^5 + |y/a|^5 = 1) sampled as a polygon
+    rather than a rounded rect, so it matches the macOS icon shape and renders
+    identically in every engine.
+
+    The geometry is the 0..100 design space of src-tauri/icons/generate.py
+    (MICRO_GLYPH / MICRO_BAND), mapped here by scale(0.64). Changing the mark
+    means changing generate.py FIRST and carrying the same numbers into
+    src/icons/nav.tsx, index.html and this file.
+  -->
+  <defs>
+    <clipPath id="arcelle-tile">
+      <path d="M64 32L63.97 42.75L63.89 46.17L63.75 48.64L63.56 50.64L63.31 52.32L63 53.79L62.64 55.09L62.21 56.25L61.72 57.3L61.17 58.24L60.55 59.09L59.86 59.86L59.09 60.55L58.24 61.17L57.3 61.72L56.25 62.21L55.09 62.64L53.79 63L52.32 63.31L50.64 63.56L48.64 63.75L46.17 63.89L42.75 63.97L32 64L21.25 63.97L17.83 63.89L15.36 63.75L13.36 63.56L11.68 63.31L10.21 63L8.91 62.64L7.75 62.21L6.7 61.72L5.76 61.17L4.91 60.55L4.14 59.86L3.45 59.09L2.83 58.24L2.28 57.3L1.79 56.25L1.36 55.09L1 53.79L0.69 52.32L0.44 50.64L0.25 48.64L0.11 46.17L0.03 42.75L0 32L0.03 21.25L0.11 17.83L0.25 15.36L0.44 13.36L0.69 11.68L1 10.21L1.36 8.91L1.79 7.75L2.28 6.7L2.83 5.76L3.45 4.91L4.14 4.14L4.91 3.45L5.76 2.83L6.7 2.28L7.75 1.79L8.91 1.36L10.21 1L11.68 0.69L13.36 0.44L15.36 0.25L17.83 0.11L21.25 0.03L32 0L42.75 0.03L46.17 0.11L48.64 0.25L50.64 0.44L52.32 0.69L53.79 1L55.09 1.36L56.25 1.79L57.3 2.28L58.24 2.83L59.09 3.45L59.86 4.14L60.55 4.91L61.17 5.76L61.72 6.7L62.21 7.75L62.64 8.91L63 10.21L63.31 11.68L63.56 13.36L63.75 15.36L63.89 17.83L63.97 21.25Z"/>
+    </clipPath>
+    <!-- The dotted sheet. Centred on the tile so the grid is symmetrical at
+         every size, and clipped so it never spills past the corner. -->
+    <pattern id="arcelle-grid" x="28" y="28" width="8" height="8" patternUnits="userSpaceOnUse">
+      <circle cx="4" cy="4" r="0.39" fill="#9a82d1" fill-opacity="0.2"/>
+    </pattern>
+  </defs>
+
+  <path fill="#151716" d="M64 32L63.97 42.75L63.89 46.17L63.75 48.64L63.56 50.64L63.31 52.32L63 53.79L62.64 55.09L62.21 56.25L61.72 57.3L61.17 58.24L60.55 59.09L59.86 59.86L59.09 60.55L58.24 61.17L57.3 61.72L56.25 62.21L55.09 62.64L53.79 63L52.32 63.31L50.64 63.56L48.64 63.75L46.17 63.89L42.75 63.97L32 64L21.25 63.97L17.83 63.89L15.36 63.75L13.36 63.56L11.68 63.31L10.21 63L8.91 62.64L7.75 62.21L6.7 61.72L5.76 61.17L4.91 60.55L4.14 59.86L3.45 59.09L2.83 58.24L2.28 57.3L1.79 56.25L1.36 55.09L1 53.79L0.69 52.32L0.44 50.64L0.25 48.64L0.11 46.17L0.03 42.75L0 32L0.03 21.25L0.11 17.83L0.25 15.36L0.44 13.36L0.69 11.68L1 10.21L1.36 8.91L1.79 7.75L2.28 6.7L2.83 5.76L3.45 4.91L4.14 4.14L4.91 3.45L5.76 2.83L6.7 2.28L7.75 1.79L8.91 1.36L10.21 1L11.68 0.69L13.36 0.44L15.36 0.25L17.83 0.11L21.25 0.03L32 0L42.75 0.03L46.17 0.11L48.64 0.25L50.64 0.44L52.32 0.69L53.79 1L55.09 1.36L56.25 1.79L57.3 2.28L58.24 2.83L59.09 3.45L59.86 4.14L60.55 4.91L61.17 5.76L61.72 6.7L62.21 7.75L62.64 8.91L63 10.21L63.31 11.68L63.56 13.36L63.75 15.36L63.89 17.83L63.97 21.25Z"/>
+  <rect width="64" height="64" fill="url(#arcelle-grid)" clip-path="url(#arcelle-tile)"/>
+
+  <g transform="scale(0.64)">
+    <!-- the highlighter band, glowing over the dark sheet -->
+    <path fill="#9a82d1" fill-opacity="0.75"
+          d="M8 72C36 68.5 68 65.5 94 63.5L92.8 41C66 43.5 34 46.5 7 50Z"/>
+    <!-- the handwritten A, micro weight, in cream ink -->
+    <g fill="none" stroke="#f3f0e7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20 89C26 62 38 30 57 10" stroke-width="12.5"/>
+      <path d="M57 10C61 30 65.5 62 68 89" stroke-width="12.5"/>
+      <path d="M39 58L68 57.5" stroke-width="9.5"/>
+      <path d="M39.6 58L39.6 86" stroke-width="9.5"/>
     </g>
   </g>
 </svg>

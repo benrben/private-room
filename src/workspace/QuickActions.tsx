@@ -97,12 +97,28 @@ export function QuickActionsMenu({
   }
 
   return (
-    <span className="qa-wrap" style={{ position: "relative", display: "inline-flex", gap: "0.3rem", alignItems: "center" }}>
+    // The layout is inline because `.qa-wrap` has no rule of its own and the
+    // two stylesheets that DO style this component (.qa-pill / .qa-menu, in
+    // shell.css and workflows.css) belong to other areas. The values are token
+    // references rather than loose rems, so the spacing still comes off the
+    // system's scale.
+    <span
+      className="qa-wrap"
+      style={{
+        position: "relative",
+        display: "inline-flex",
+        gap: "var(--sp-1)",
+        alignItems: "center",
+      }}
+    >
       {inline.map((a) => (
         <button
           key={a.id}
           className="qa-pill"
           title={a.hint ?? a.label}
+          // An icon-only button's name came from `title` alone, which is a
+          // hint and not a label. Same words, said properly.
+          aria-label={a.hint ?? a.label}
           disabled={a.disabled}
           onClick={a.onRun}
         >
@@ -113,6 +129,9 @@ export function QuickActionsMenu({
         <button
           className={pill ? "qa-pill" : "subtle btn-ic"}
           title={buttonLabel}
+          // Only in the pill form: the text form already says the words, and
+          // labelling it again would name it twice.
+          aria-label={pill ? buttonLabel : undefined}
           aria-haspopup="menu"
           aria-expanded={open}
           onClick={() => onOpenChange(!open)}
@@ -124,12 +143,25 @@ export function QuickActionsMenu({
       {open && showTrigger && (
         <>
           <div className="menu-backdrop" onMouseDown={() => onOpenChange(false)} />
+          {/* The menu is the one thing here that genuinely floats, so it takes
+              the system's arrival: a 3px rise and a fade, which paper.css
+              already switches off under prefers-reduced-motion. */}
           <div
-            className="pop-menu qa-menu"
+            className="pop-menu qa-menu nb-float-draw"
             role="menu"
+            // A menu owes an accessible name; this one had none, so it opened
+            // as an unnamed list of items. The trigger's own words are the
+            // right name — "Workflows", "Scripts" — and they are already the
+            // words on screen.
+            aria-label={buttonLabel}
             ref={menuRef}
             onKeyDown={onKey}
-            style={{ position: "absolute", top: "100%", right: 0, marginTop: 4 }}
+            style={{
+              position: "absolute",
+              top: "100%",
+              right: 0,
+              marginTop: "var(--sp-1)",
+            }}
           >
             {menuItems.map((a) => (
               <button

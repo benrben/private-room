@@ -27,9 +27,17 @@ function useOnline(): boolean {
   return online;
 }
 
-/** The 23px status strip. Every item reflects real state: the trust route
- * (local / protected cloud / raw cloud), indexed file count, connected tools,
- * background work, and the current pane layout. */
+/** The status strip. Every item reflects real state: the trust route (local /
+ * protected cloud / raw cloud), indexed file count, connected tools,
+ * background work, and the current pane layout.
+ *
+ * It is the quietest thing on screen and stays that way: one hairline above
+ * it, no cell borders, no fills, and everything in the faint ink except the
+ * two readouts that are allowed to interrupt — the trust chip when the room's
+ * content is leaving the Mac, and anything actually waiting on the user. The
+ * type does NOT shrink to achieve that. It used to run at 10px, under the
+ * design system's 12px floor; a status bar earns its lightness from restraint,
+ * not from being too small to read. */
 export default function StatusBar({
   layout,
   fileCount,
@@ -117,7 +125,15 @@ export default function StatusBar({
             title="Something needs your approval — open Activity"
             onClick={onShowActivity}
           >
-            {pendingApprovals} approval{pendingApprovals === 1 ? "" : "s"} waiting
+            {/* The one notification in the bar, so the one circled number:
+                drawn round by hand, and still followed by the words that say
+                what it counts — the ring is emphasis, never the message. NOT
+                aria-hidden, and not abbreviated: the ring is a border around a
+                real number, and hiding it would take the count out of the
+                button's accessible name, which used to read "3 approvals
+                waiting". The explicit space keeps it reading that way. */}
+            <span className="nb-circled nb-sem-pending">{pendingApprovals}</span>{" "}
+            approval{pendingApprovals === 1 ? "" : "s"} waiting
           </button>
         )}
         {runningJobs > 0 && (
@@ -126,7 +142,9 @@ export default function StatusBar({
             title="Background work is running — open Activity"
             onClick={onShowActivity}
           >
-            <span className="status-dot" style={{ background: "var(--accent)" }} />
+            {/* The dot's colour lives in the stylesheet, where both themes can
+                be checked at once — an inline var() could only ever be one. */}
+            <span className="status-dot busy" />
             {runningJobs} job{runningJobs === 1 ? "" : "s"} running
           </button>
         )}

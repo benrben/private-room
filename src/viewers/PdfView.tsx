@@ -866,6 +866,24 @@ export default function PdfView({
           </p>
         </div>
       )}
+      {/* HOW FAR THROUGH THE DOCUMENT, as a marker stroke across the top.
+          `curPage` is set from where the pages actually are on screen as you
+          scroll, so this is a real position and not a decoration — at exactly
+          the granularity the "Page 4 of 21" readout beside it already claims.
+          aria-hidden: that readout is the accessible statement of it, and a
+          live region announcing a percentage on every scroll frame would make
+          the document unusable with a screen reader. */}
+      {!failed && numPages > 0 && (
+        <div
+          className="rdr-progress pdf-progress"
+          aria-hidden
+          style={
+            { "--nb-val": `${Math.round((curPage / numPages) * 100)}%` } as React.CSSProperties
+          }
+        >
+          <i />
+        </div>
+      )}
       {!failed && (
       <div className="pdf-zoombar">
         <button

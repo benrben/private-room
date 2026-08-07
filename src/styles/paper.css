@@ -1,0 +1,1421 @@
+/* ---------- paper ----------
+   The sheet the whole application is drawn on, plus the set of notebook
+   primitives every feature stylesheet composes from.
+
+   THE SIGNATURE: one sheet, not stacked surfaces. The dotted grid runs
+   edge to edge across the window and the panes are FRAMES drawn onto it,
+   not filled boxes butted against each other. A panel earns its identity
+   from its drawn border, not from a background colour. Only things that
+   genuinely float — popovers, menus, modals, toasts — get an opaque fill,
+   because they have to occlude what is underneath them.
+
+   All decoration here is deterministic: irregularity comes from fixed
+   asymmetric radii and fixed offsets, never from runtime randomness, so a
+   frame looks identical on every render. Every decorative mark is a
+   pseudo-element with pointer-events:none, so none of it is hit-testable
+   and none of it reaches assistive technology.
+
+   ----- how to use this file -----
+
+   These are OPT-IN classes. Element defaults for bare button/input live in
+   base.css; nothing here restyles an element selector, so a feature
+   stylesheet composes what it wants and inherits nothing it didn't ask for.
+
+   Three custom properties form the whole configuration surface:
+
+     --mk      a RAW marker hue (--mk-green, --sem-done-fill, …). Every
+               primitive applies its OWN alpha to it, so the same value can
+               drive a 60%-alpha highlight and a 34%-alpha tape strip. Never
+               pass a pre-mixed translucent colour — it would be mixed twice.
+     --mk-ink  the contrast-safe INK of that same hue, for anything that has
+               to carry a word or act as a 3:1 boundary.
+     --nb-val  a PERCENTAGE for the data primitives (bars, progress, dials).
+
+   Set both marker properties at once with a semantic class
+   (.nb-sem-done, .nb-sem-urgent, …) rather than by hand — then "green means
+   complete" is a fact the stylesheet enforces.
+
+   ----- the contrast rule that shapes most of this file -----
+
+   Marker FILLS are absorbed ink: at their spec alphas a light-mode marker
+   measures ~1.7:1 against paper. That is intentional and it is why a fill is
+   never allowed to be the only signal. Anything that must be identifiable —
+   a chart bar, a control edge, a focus ring, a status word — is drawn in
+   --mk-ink or in a full-strength token, never in a wash.
+
+   ----- theme -----
+
+   Nothing below names a colour. Every value resolves through a token, so the
+   library flips with :root[data-theme="light"] without a single override.
+   There is deliberately no light-mode block at the end of this file; if you
+   ever need one, the rule above it is probably wrong.
+
+   ----- namespace warning -----
+
+   src/viewers/notebook.css independently owns .nb-view, .nb-cell, .nb-code,
+   .nb-gutter, .nb-body, .nb-md, .nb-raw, .nb-out, .nb-error, .nb-muted and
+   .nb-img for the Jupyter viewer. Those names are NOT part of this library
+   and must never be defined here. */
+
+/* ----- the sheet -----
+   Dots plus a very faint cross-hatch grain. Pure CSS gradients — no bitmap,
+   nothing to download, nothing to decode at startup.
+
+   Painted on <html>, not on <body> and not on a pseudo-element. Two earlier
+   attempts failed in the engine the app actually ships on:
+
+     background-attachment: fixed on <body> — correct, but uncompositable: it
+     repaints the whole gradient stack on every scroll and made long lists
+     stutter.
+
+     a position:fixed body::before at z-index -1 — worked in Chrome, invisible
+     in WKWebView. <body> carries its own background (CSS, plus an inline one
+     from theme.ts's anti-flash guard), so a negative-z-index child paints
+     BEHIND it and is covered. Chrome happened to propagate body's background
+     to the canvas and leave body itself transparent; WebKit does not.
+
+   On <html> the paper simply IS the canvas. It cannot be covered, it needs no
+   stacking context, and because html/body are overflow:hidden — every pane
+   scrolls internally — it never scrolls, so there is nothing to repaint. */
+html {
+  background-color: var(--page);
+  background-image:
+    /* grain: two off-axis hatches, barely there */
+    repeating-linear-gradient(
+      64deg,
+      color-mix(in srgb, var(--ink) 2%, transparent) 0 1px,
+      transparent 1px 4px
+    ),
+    repeating-linear-gradient(
+      -51deg,
+      color-mix(in srgb, var(--ink) 1.6%, transparent) 0 1px,
+      transparent 1px 6px
+    ),
+    /* the dotted rule */ radial-gradient(circle at 1px 1px, var(--grid-dot) 1.1px, transparent 1.2px);
+  background-size:
+    auto,
+    auto,
+    var(--grid-gap) var(--grid-gap);
+}
+
+/* Transparent, so the sheet on <html> shows through. */
+body {
+  background-color: transparent;
+}
+
+/* ==========================================================================
+   1. FRAMES, PANELS, CARDS
+   The drawn boundary is the whole identity system: a pane is a frame on the
+   sheet, and the dots keep showing through it. Reach for a fill only in
+   section 9, where something genuinely floats.
+   ========================================================================== */
+
+/* ----- hand-drawn frame -----
+   An asymmetric border-radius makes a rectangle read as drawn rather than
+   computed, without warping it enough to break alignment. The optional
+   second outline is the "quick pen redraw" from the spec.
+
+   The stroke WIDTH stays uniform on all four sides on purpose. Varying it by
+   a fraction of a pixel is invisible at 2x (the device-pixel rounding eats
+   it) and varying it by a whole pixel stops reading as pen pressure and
+   starts reading as a bug. Asymmetric radii plus the optional redraw are the
+   entire irregularity budget.
+
+   Four fixed signatures so a run of sibling cards does not look stamped;
+   `nb-frame` cycles them by position, which keeps it deterministic. */
+.nb-frame {
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  position: relative;
+}
+.nb-frame--b {
+  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+}
+.nb-frame--c {
+  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+}
+.nb-frame--d {
+  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+}
+/* On a container of frames: rotates the four signatures by position, so the
+   author does not have to hand-label every child. 4n+1 keeps the base. */
+.nb-frame-set > *:nth-child(4n + 2) {
+  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+}
+.nb-frame-set > *:nth-child(4n + 3) {
+  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+}
+.nb-frame-set > *:nth-child(4n + 4) {
+  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+}
+
+/* A quieter frame for dense chrome: pencil weight rather than pen. --rule is
+   2.55:1 in dark, which is a divider, NOT a control boundary — do not put
+   this on anything the user clicks or types into. Use .nb-field or .nb-btn,
+   which are drawn in --rule-strong and clear 3:1. */
+.nb-frame-soft {
+  border: 1px solid var(--line);
+  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+}
+
+/* The redraw: a second stroke offset a couple of px, as though the pen went
+   round twice. Decorative only. Occasional by design — a page where every
+   box is redrawn reads as noise. */
+.nb-redraw::after {
+  content: "";
+  position: absolute;
+  inset: calc(var(--redraw) * -1);
+  border: 1px solid color-mix(in srgb, var(--sketch) 34%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+/* ----- pane -----
+   The frame a whole region of the app is drawn inside. Transparent, so the
+   dotted sheet runs straight through it: this is the difference between the
+   notebook and a stack of grey boxes. */
+.nb-panel {
+  background: transparent;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
+  position: relative;
+}
+
+/* ----- card -----
+   A single item drawn on the sheet. The border sits at 72% of the pen at
+   rest and goes to full strength on hover, which reads as the pen pressing
+   harder rather than as a colour change. Even at 72% it measures ~6.9:1 in
+   dark and ~5.2:1 in light, so a clickable card still clears the 3:1 that
+   WCAG 1.4.11 asks of a component boundary. */
+.nb-card {
+  background: transparent;
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+  padding: var(--sp-4);
+  position: relative;
+  transition: border-color var(--dur-fast) var(--ease-pen);
+}
+.nb-card:hover {
+  border-color: var(--sketch);
+}
+/* Dense lists: pencil weight, tighter padding. Decorative boundary only —
+   see the .nb-frame-soft note before putting it on a control. */
+.nb-card-soft {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-3);
+  position: relative;
+}
+
+/* ----- tilt -----
+   The brief caps a functional card at about one degree, and these sit under
+   it. Fixed angles, never generated: a card that re-rotates on every render
+   is a card the eye cannot trust.
+
+   WARNING: a transform makes the element a containing block for fixed-
+   position descendants, so a popover portalled inside a tilted card will
+   anchor to the card instead of the viewport. Tilt leaf notes, not
+   containers that host menus. */
+.nb-tilt {
+  transform: rotate(-0.6deg);
+}
+.nb-tilt-b {
+  transform: rotate(0.5deg);
+}
+/* Alternates the two angles down a list of pinned notes. */
+.nb-tilt-set > *:nth-child(odd) {
+  transform: rotate(-0.5deg);
+}
+.nb-tilt-set > *:nth-child(even) {
+  transform: rotate(0.6deg);
+}
+
+/* ----- taped note -----
+   A note stuck to the page with a strip of matte tape across the top-left.
+   The strip is a wash of --ink, which is the one recipe that reads correctly
+   in both themes without a per-theme override: 11% of warm ivory lightens
+   the charcoal sheet, 11% of charcoal greys the ivory sheet, and real tape
+   does exactly that to whatever is under it.
+
+   The strip hangs above the element's top edge, so an ancestor with
+   overflow:hidden will shear it off.
+
+   Not to be confused with .nb-tape, which is a small tape-strip BADGE.
+   .nb-taped is a container; .nb-tape is a label. */
+.nb-taped {
+  position: relative;
+}
+.nb-taped::before {
+  content: "";
+  position: absolute;
+  top: -7px;
+  left: 18px;
+  width: 58px;
+  height: 15px;
+  background: color-mix(in srgb, var(--ink) 11%, transparent);
+  box-shadow:
+    inset 1px 0 0 color-mix(in srgb, var(--ink) 7%, transparent),
+    inset -1px 0 0 color-mix(in srgb, var(--ink) 7%, transparent);
+  border-radius: 1px 2px 1px 2px;
+  transform: rotate(-3deg);
+  pointer-events: none;
+}
+
+/* ----- clipped paper -----
+   A drawn paper clip hooked over the top edge. Half of it hangs above the
+   element, so give the element (or its parent) room to overflow. Uses
+   ::before, so an element cannot be both .nb-taped and .nb-clip. */
+.nb-clip {
+  position: relative;
+}
+.nb-clip::before {
+  content: "";
+  position: absolute;
+  top: -11px;
+  right: 18px;
+  width: 20px;
+  height: 20px;
+  color: var(--ink-2);
+  transform: rotate(22deg);
+  --nb-glyph: var(--nb-glyph-clip);
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   2. MARKER MARKS
+   Highlights, underlines, edges, tape, circles. Colour here always rides
+   with a word or a shape — never alone.
+   ========================================================================== */
+
+/* ----- semantic setters -----
+   The whole marker vocabulary in one class. Put one of these on any element
+   that consumes --mk / --mk-ink (mark, swash, underline, edge, tape, chip,
+   circled, bar, progress, dial) and it picks up both the fill and the ink of
+   that meaning at once.
+
+     saved    pink    personal, saved, editorial, AI attribution
+     pending  yellow  pending, notable, needs review, caution
+     done     green   complete, verified, approved, positive
+     linked   blue    linked, informational, active, connected
+     urgent   red     recording, urgent, failed, error */
+.nb-sem-saved {
+  --mk: var(--sem-saved-fill);
+  --mk-ink: var(--sem-saved);
+}
+.nb-sem-pending {
+  --mk: var(--sem-pending-fill);
+  --mk-ink: var(--sem-pending);
+}
+.nb-sem-done {
+  --mk: var(--sem-done-fill);
+  --mk-ink: var(--sem-done);
+}
+.nb-sem-linked {
+  --mk: var(--sem-linked-fill);
+  --mk-ink: var(--sem-linked);
+}
+.nb-sem-urgent {
+  --mk: var(--sem-urgent-fill);
+  --mk-ink: var(--sem-urgent);
+}
+
+/* Hue setters, for the rare mark that is identity rather than status — the
+   five token-budget categories, the seven search engines. If the colour is
+   saying something, use the semantic class above instead. */
+.nb-mark-pink {
+  --mk: var(--mk-pink);
+  --mk-ink: var(--mk-pink-ink);
+}
+.nb-mark-yellow {
+  --mk: var(--mk-yellow);
+  --mk-ink: var(--mk-yellow-ink);
+}
+.nb-mark-green {
+  --mk: var(--mk-green);
+  --mk-ink: var(--mk-green-ink);
+}
+.nb-mark-blue {
+  --mk: var(--mk-blue);
+  --mk-ink: var(--mk-blue-ink);
+}
+.nb-mark-red {
+  --mk: var(--mk-red);
+  --mk-ink: var(--mk-red-ink);
+}
+
+/* ----- marker highlight -----
+   Translucent, uneven, absorbed into the paper. The alpha ramp across the
+   run is what stops it reading as a flat UI fill: the stroke is heavier
+   where the pen started and lighter where it lifted.
+
+   The text sitting on the stroke is forced to --ink-strong because a
+   highlighted word is an emphatic word and it has to clear 4.5:1 over the
+   densest part of the mark — plain --ink measures 4.34:1 over a dark-mode
+   yellow at peak alpha, which misses. A caller that genuinely needs another
+   colour (a marked word inside a coloured run) passes --mk-text and takes
+   responsibility for the ratio. */
+.nb-mark {
+  background-image: linear-gradient(
+    100deg,
+    transparent 0.4%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 60%, transparent) 1.2%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 47%, transparent) 42%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 60%, transparent) 76%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 37%, transparent) 96%,
+    transparent 99%
+  );
+  /* The UA stylesheet fills <mark> with its own yellow, which would sit
+     under this gradient and turn every hue into mustard. Cleared explicitly
+     so the class works on a semantic <mark> and not just on a <span>. */
+  background-color: transparent;
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+  border-radius: 3px 7px 4px 6px / 6px 4px 7px 3px;
+  padding: 0.05em 0.22em;
+  margin: 0 -0.1em;
+  color: var(--mk-text, var(--ink-strong));
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* ----- marker swash -----
+   The block-level cousin of .nb-mark: a highlighter dragged across the lower
+   two-thirds of a heading rather than around a phrase. Sits on the element's
+   own background, so text stays on top of it with no stacking games — the
+   negative-z-index pseudo-element trick is the one that vanished in WebKit,
+   and this avoids the question entirely. */
+.nb-swash {
+  background-image: linear-gradient(
+    101deg,
+    transparent 0.5%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 54%, transparent) 2%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 40%, transparent) 48%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 52%, transparent) 80%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 26%, transparent) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-position: 0 92%;
+  background-size: 100% 46%;
+}
+
+/* ----- marker underline -----
+   THE universal active signal: rail items, tabs, chips, pane headers and
+   settings nav all use this one idiom instead of the mix of left spines,
+   fills and border swaps the app used to carry. The stroke is thicker at
+   the start and tapers, like a swipe. Defaults to the pen; pass --mk for a
+   status-coloured stroke. */
+.nb-underline {
+  position: relative;
+}
+.nb-underline::after {
+  content: "";
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  bottom: -3px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--mk, var(--accent-fill)) 0%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 72%, transparent) 68%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 28%, transparent) 100%
+  );
+  transform-origin: left center;
+  pointer-events: none;
+}
+/* Draws itself in when the item becomes active. */
+.nb-underline-draw::after {
+  animation: nb-draw var(--dur) var(--ease-pen);
+}
+
+/* ----- category edge -----
+   A marker stroke down one edge, for rows that belong to a category or
+   carry a state. A fill this thin cannot clear 3:1 in light mode, so it is
+   ALWAYS paired with a word — never the only signal. */
+.nb-edge {
+  box-shadow: inset 3px 0 0 var(--mk, var(--mk-pink));
+}
+
+/* ----- taped label -----
+   A status badge that reads as a small strip of tape stuck to the page.
+   Text is --ink over a 34% wash, which measures 7.8:1 in dark and better in
+   light, so the word carries the meaning and the colour only reinforces it. */
+.nb-tape {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  font-size: var(--fs-micro);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--mk, var(--mk-yellow)) 34%, transparent);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 46%, transparent);
+}
+
+/* ----- circled count -----
+   Notification counts as a hand-circled number: an ellipse that is not quite
+   closed to the same radius on any corner. Drawn in --mk-ink (never a fill),
+   because the ring is the boundary AND the number is text. */
+.nb-circled {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  font-family: var(--hand);
+  font-size: 12px;
+  color: var(--mk-ink, var(--accent));
+  border: 1.5px solid var(--mk-ink, var(--accent));
+  border-radius: 60% 55% 58% 62% / 58% 62% 55% 60%;
+}
+
+/* ----- circled value -----
+   The analyst's ring around a number that matters — a chart datum, a total,
+   the one figure in a table worth arguing about. Unlike .nb-circled this
+   takes arbitrary content and does not force the hand. */
+.nb-ringed {
+  display: inline-block;
+  padding: 1px 7px;
+  color: var(--mk-ink, var(--accent));
+  border: 1.5px solid var(--mk-ink, var(--accent));
+  border-radius: 48% 52% 50% 50% / 56% 44% 54% 46%;
+}
+
+/* ==========================================================================
+   3. HANDWRITING AND NOTES
+   Kalam is reserved. Annotations, dates, counts, durations, short labels,
+   margin notes, empty-state directions, short conversational lines. NEVER
+   instructions, settings copy, transcripts, articles, tables, code, URLs,
+   paths, long answers, or anything the user typed into a field.
+   ========================================================================== */
+
+.nb-hand {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+}
+.nb-hand-lg {
+  font-family: var(--hand);
+  font-size: var(--fs-hand-lg);
+  line-height: 1.3;
+}
+
+/* A page's handwritten subtitle, with the marker swipe under it. */
+.nb-subtitle {
+  font-family: var(--hand);
+  font-size: 17px;
+  color: var(--ink-2);
+  display: inline-block;
+  position: relative;
+  padding-bottom: 2px;
+}
+.nb-subtitle::after {
+  content: "";
+  position: absolute;
+  left: -3px;
+  right: -6px;
+  bottom: 0;
+  height: 2.5px;
+  border-radius: 2px 4px 2px 3px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    91deg,
+    var(--mk-yellow) 2%,
+    color-mix(in srgb, var(--mk-yellow) 64%, transparent) 74%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+/* ----- margin note -----
+   A short handwritten aside set off from the column it comments on. Sized
+   from --fs-hand rather than shrunk: a note is quiet because it is in the
+   margin, not because it is small. */
+.nb-note {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+  display: block;
+  max-width: 26ch;
+}
+
+/* ----- figures -----
+   Numbers in tables, charts and tooltips, in the mono face with tabular
+   figures so columns of digits line up and a counting value does not jitter
+   as it changes. */
+.nb-num {
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   4. INK GLYPHS
+   The app's functional icons are React components in src/icons — a 24px
+   grid, 1.6px strokes, currentColor. These are the CSS-composable cousins:
+   the marks a stylesheet needs where adding a component would be silly (a
+   leading mark on a list row, a bookmark on a saved item, the arrow on a
+   go-button). One class, no JSX, no second icon system.
+
+   Each glyph is a data: URI SVG used as a MASK, so the paint comes from
+   background-color: currentColor — the mark inherits theme and semantic
+   colour for free and there is nothing to re-author per theme. Paths are
+   deliberately few and slightly off-true: a wobbly polyline reads as drawn,
+   a 40-node bezier reads as clip art.
+
+   Glyph elements must be aria-hidden in the markup; CSS cannot enforce that,
+   and every one of them is pointer-events:none so none is hit-testable. */
+:root {
+  --nb-glyph-check: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M4.3 12.6 7.1 15.7 9.9 18.6 14.2 12.1 20 5.4'/></svg>");
+  --nb-glyph-bookmark: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6.3 3.7 17.6 3.2 17.9 20.6 12.1 15.6 6 20.8Z'/></svg>");
+  --nb-glyph-star: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3.4 14.5 9.2 20.6 9.7 15.9 13.9 17.3 20.1 12 16.8 6.6 20.3 8.1 13.9 3.4 9.6 9.7 9.2Z'/></svg>");
+  --nb-glyph-pin: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M9.4 3.4 16.3 3.6 14.6 9.4 18.6 13.3 5.6 13.5 9.7 9.3Z'/><path d='M12 13.5 11.6 20.8'/></svg>");
+  --nb-glyph-mic: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M8.8 6.8a3.2 3.2 0 0 1 6.4 0v4.4a3.2 3.2 0 0 1-6.4 0Z'/><path d='M5.6 10.7c.3 3.5 3.1 6.1 6.4 6.1s6.2-2.6 6.4-6.1'/><path d='M12 17.1 11.9 20.7'/></svg>");
+  --nb-glyph-file: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6.4 3.5 14 3.2 18 7.5 17.8 20.6 6.2 20.8Z'/><path d='M13.8 3.4 14 7.6 18 7.5'/></svg>");
+  --nb-glyph-arrow: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.1' stroke-linecap='round' stroke-linejoin='round'><path d='M3.6 12.2C8 11.6 14 11.8 19.9 12.1'/><path d='M14.8 7.2 20.2 12.1 14.9 17.3'/></svg>");
+  --nb-glyph-clip: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M16.6 8.4 9.3 15.9c-1.6 1.7-4 1.6-5.3.2s-1.1-3.7.5-5.3L13 2.9c1.1-1.1 2.7-1 3.6 0s.9 2.6-.2 3.7L8 15.2c-.5.5-1.1.4-1.5 0s-.4-1 .1-1.5L14 6.5'/></svg>");
+  /* The margin arrow: one curve that sweeps down-left into a two-barb head.
+     Every other direction is this same file flipped, so there is exactly one
+     arrow in the bundle. */
+  --nb-glyph-curve: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='48' height='40' viewBox='0 0 48 40' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M45.5 5C34 6.5 14 11 8.5 31.5'/><path d='M8.5 31.5 14.9 25.1M8.5 31.5 6.2 22.8'/></svg>");
+  /* The empty glyph, used as the fallback when --nb-glyph was never set. An
+     unset mask is not "no icon" — mask-image resolves to `none`, the mask
+     stops clipping anything, and the element paints as a solid square of
+     ink. Masking with a blank SVG fails to nothing instead. */
+  --nb-glyph-none: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/>");
+}
+
+/* Every drawn glyph in this file paints through this one rule. The mask
+   longhands are written twice — prefixed and not — because the app ships on
+   whatever WebKit the host macOS has, and the unprefixed properties only
+   landed in Safari 15.4. Two extra lines is cheaper than an icon that
+   disappears on an older Mac. */
+.nb-ico,
+.nb-bookmark,
+.nb-lead-ico::before,
+.nb-arrow-curve,
+.nb-annot::after,
+.nb-annot-l::before,
+.nb-btn-go::after,
+.nb-clip::before {
+  background-color: currentColor;
+  -webkit-mask-image: var(--nb-glyph, var(--nb-glyph-none));
+  mask-image: var(--nb-glyph, var(--nb-glyph-none));
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  pointer-events: none;
+}
+
+/* The inline glyph. Sizes from the text it sits in — set font-size, or pass
+   --nb-ico-size for a fixed mark. */
+.nb-ico {
+  display: inline-block;
+  flex: none;
+  width: var(--nb-ico-size, 1em);
+  height: var(--nb-ico-size, 1em);
+  vertical-align: -0.14em;
+}
+.nb-ico-check {
+  --nb-glyph: var(--nb-glyph-check);
+}
+.nb-ico-bookmark {
+  --nb-glyph: var(--nb-glyph-bookmark);
+}
+.nb-ico-star {
+  --nb-glyph: var(--nb-glyph-star);
+}
+.nb-ico-pin {
+  --nb-glyph: var(--nb-glyph-pin);
+}
+.nb-ico-mic {
+  --nb-glyph: var(--nb-glyph-mic);
+}
+.nb-ico-file {
+  --nb-glyph: var(--nb-glyph-file);
+}
+.nb-ico-arrow {
+  --nb-glyph: var(--nb-glyph-arrow);
+}
+.nb-ico-clip {
+  --nb-glyph: var(--nb-glyph-clip);
+}
+
+/* ----- leading icon -----
+   The hand-drawn mark in front of a card title or list row, drawn as a
+   pseudo-element so the row needs no extra span. The consumer sets --nb-glyph
+   (any --nb-glyph-* above) and, optionally, --mk-ink to colour it. */
+.nb-lead-ico {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.nb-lead-ico::before {
+  content: "";
+  flex: none;
+  width: var(--nb-ico-size, 1em);
+  height: var(--nb-ico-size, 1em);
+  color: var(--mk-ink, var(--ink-2));
+  transform: translateY(0.12em);
+}
+
+/* ==========================================================================
+   5. ARROWS AND CONNECTORS
+   All of it is either normal flow or an inset-anchored pseudo-element. None
+   of it needs measured coordinates, a resize observer, or a line of JS.
+   ========================================================================== */
+
+/* ----- margin arrow -----
+   A standalone curved arrow to place in a layout the way you would place any
+   other element (a flex row, a grid cell, or absolutely inside your own
+   positioned container). One glyph, four directions by flip: the name is
+   where the arrow POINTS. Mark it aria-hidden. */
+.nb-arrow-curve {
+  display: block;
+  width: 48px;
+  height: 40px;
+  color: var(--ink-muted);
+  --nb-glyph: var(--nb-glyph-curve);
+}
+.nb-arrow-curve--se {
+  transform: scaleX(-1);
+}
+.nb-arrow-curve--nw {
+  transform: scaleY(-1);
+}
+.nb-arrow-curve--ne {
+  transform: scale(-1, -1);
+}
+
+/* ----- annotated note -----
+   A handwritten aside with the curved arrow attached, for pointing at the
+   thing being explained — the empty-state "start here", the one control a
+   first-run user has to find.
+
+   The arrow is an inline-flow pseudo-element, NOT an absolutely positioned
+   one: it takes part in layout, so it can never end up clipped by an
+   ancestor's overflow or land on top of a control. .nb-annot puts it after
+   the words pointing down-right; .nb-annot-l puts it before them pointing
+   down-left. */
+.nb-annot {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: var(--sp-1);
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+}
+.nb-annot::after,
+.nb-annot-l::before {
+  content: "";
+  flex: none;
+  width: 42px;
+  height: 34px;
+  color: var(--ink-muted);
+  --nb-glyph: var(--nb-glyph-curve);
+}
+.nb-annot::after {
+  transform: scaleX(-1);
+}
+/* The left variant moves the mark to the other side rather than adding one. */
+.nb-annot-l::after {
+  content: none;
+}
+
+/* ----- connector thread -----
+   The pencil line that ties a run of stacked items together: agent steps,
+   a workflow's nodes, a threaded reply. Spans the element's own box, so
+   nothing has to be measured. Give the element padding-left (or padding-top
+   for the horizontal variant) to make room for it, and --nb-connect-at to
+   move the thread off the edge. */
+.nb-connect,
+.nb-connect-h {
+  position: relative;
+}
+.nb-connect::before,
+.nb-connect-h::before {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+}
+.nb-connect::before {
+  left: var(--nb-connect-at, 0);
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background-image: repeating-linear-gradient(
+    to bottom,
+    var(--rule) 0 5px,
+    transparent 5px 9px
+  );
+}
+.nb-connect-h::before {
+  top: var(--nb-connect-at, 0);
+  left: 0;
+  right: 0;
+  height: 1px;
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--rule) 0 5px,
+    transparent 5px 9px
+  );
+}
+
+/* ==========================================================================
+   6. CONTROLS
+   Element defaults for bare button/input live in base.css. These are the
+   opt-in classes, for elements that are controls without being <button> or
+   <input> — and for buttons that want the marker treatment.
+   Every one of them keeps a 24px minimum target and a visible focus ring.
+   ========================================================================== */
+
+/* ----- secondary button -----
+   Transparent with a sketched border, so the sheet reads through it, and a
+   marker swash that wipes in from the left on hover. The swash is the
+   element's own background-image growing from 0% to 100% width — no
+   pseudo-element, so the label can never end up underneath it.
+
+   Border is --rule-strong (3.0:1 dark, 3.01:1 light), which is the floor
+   WCAG 1.4.11 sets for a control boundary. Pass --mk to change the swash. */
+.nb-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 6px 12px;
+  font: inherit;
+  font-family: var(--sans);
+  color: var(--text);
+  background-color: transparent;
+  background-image: linear-gradient(
+    98deg,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 34%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 22%, transparent) 62%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 30%, transparent) 100%
+  );
+  background-repeat: no-repeat;
+  background-position: left center;
+  background-size: 0% 100%;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition:
+    background-size var(--dur) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
+}
+.nb-btn:hover:not(:disabled) {
+  background-size: 100% 100%;
+  border-color: var(--sketch);
+}
+/* Pressed against the paper. */
+.nb-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.nb-btn:disabled,
+.nb-btn[aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: default;
+}
+.nb-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Primary: filled with ink — charcoal on paper, warm ivory on charcoal,
+   14.19:1 light and 15.49:1 dark. No swash: a solid fill and a marker wash
+   on top of it would be mud. The accent (pink pen) stays reserved for
+   selection, so a primary action never reads as "selected". */
+.nb-btn-primary {
+  background-color: var(--btn-ink);
+  background-image: none;
+  border-color: var(--btn-ink);
+  color: var(--btn-ink-text);
+  font-weight: 600;
+}
+.nb-btn-primary:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--btn-ink) 86%, var(--accent));
+  border-color: color-mix(in srgb, var(--btn-ink) 86%, var(--accent));
+}
+
+/* Quiet: ink text, no boundary until you touch it. Keeps the 24px target. */
+.nb-btn-quiet {
+  border-color: transparent;
+  color: var(--text-dim);
+  padding: 4px 8px;
+}
+.nb-btn-quiet:hover:not(:disabled) {
+  border-color: transparent;
+  color: var(--text);
+}
+
+/* Destructive: a red outline that goes to a red wash on hover, never a
+   filled saturated red, and always carrying a word. The border is the full
+   --sem-urgent ink rather than a wash of it because a 62% red measures
+   2.4:1 on the dark sheet — pretty, but under the 3:1 a control edge owes. */
+.nb-btn-danger {
+  --mk: var(--sem-urgent-fill);
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+}
+
+/* Icon-only: square, and 28px so it clears the 24px minimum target with the
+   border included. */
+.nb-btn-icon {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 4px;
+}
+
+/* The small hand-drawn arrow the brief asks for on a primary action. Nudges
+   forward on hover, which is the only movement in the whole control set. */
+.nb-btn-go::after {
+  content: "";
+  flex: none;
+  width: 1em;
+  height: 1em;
+  --nb-glyph: var(--nb-glyph-arrow);
+  transition: transform var(--dur-fast) var(--ease-pen);
+}
+.nb-btn-go:hover:not(:disabled)::after {
+  transform: translateX(2px);
+}
+
+/* ----- field -----
+   For an input WRAPPER (a box holding a native input plus an icon or a unit)
+   and for the controls that are not native inputs — comboboxes, token
+   fields, contenteditable notes. Bare input/textarea/select already get this
+   treatment from base.css; do not double it up.
+
+   Focus draws the double outline from the spec: the border goes to the pen
+   colour, a second hairline goes just inside it — going over the line twice
+   — and a full-strength ring sits 2px outside. The ring is solid --accent,
+   not a wash: at 60% it measures 2.8:1 on the dark sheet and a focus
+   indicator that fails 3:1 is not an indicator. */
+.nb-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 6px 10px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
+}
+.nb-field:focus-within {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* A field is a surface, not a control: the input inside it keeps its own
+   accessible name and its own caret, and loses only its duplicate box. */
+.nb-field > input,
+.nb-field > textarea,
+.nb-field > select {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+}
+.nb-field > input:focus,
+.nb-field > textarea:focus,
+.nb-field > select:focus {
+  box-shadow: none;
+}
+/* The inner control drops its own ring — but only because the wrapper's
+   :focus-within rule fires in exactly the same state, so there is always
+   precisely one focus indicator on screen and never zero. Do not copy this
+   suppression anywhere the guarantee does not hold. */
+.nb-field > input:focus-visible,
+.nb-field > textarea:focus-visible,
+.nb-field > select:focus-visible {
+  outline: none;
+}
+
+/* ----- outlined chip / capsule -----
+   A filter, a tag, a facet. Selected reads as circled: the pen colour on the
+   ring, a wash inside, and a second offset stroke so it looks gone-round-
+   twice rather than merely tinted. The wash is never the only cue — a chip
+   that carries state carries a word or a check glyph too. */
+.nb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 10px;
+  font-size: var(--fs-micro);
+  color: var(--ink-2);
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  background: transparent;
+  position: relative;
+}
+/* A chip that declares a marker MEANING draws in it. The block comment at the
+   head of §2 already lists the chip among the things the semantic classes
+   drive, but `.nb-chip` never read `--mk-ink`, so `.nb-chip.nb-sem-done` set a
+   variable nothing consumed and painted the same neutral pencil as every other
+   chip — the meaning was declared in the markup and absent on the page.
+
+   Written as its own rule rather than folded into the base `color` and
+   `border` above, so a plain chip — nearly all of them — keeps exactly the
+   pencil it has always had. The five are named explicitly because `--mk-ink`
+   is also set by the hue setters, which are identity rather than status: a
+   chip carrying one of those is a category label and must not read as a
+   state. The word always carries the meaning too (§2), so this is emphasis,
+   never the message. */
+.nb-chip:is(
+    .nb-sem-saved,
+    .nb-sem-pending,
+    .nb-sem-done,
+    .nb-sem-linked,
+    .nb-sem-urgent
+  ) {
+  color: var(--mk-ink);
+  border-color: color-mix(in srgb, var(--mk-ink) 66%, transparent);
+}
+.nb-chip.is-on {
+  color: var(--ink);
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+}
+.nb-chip.is-on::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
+}
+/* Interactive chips only: 24px is the floor for anything clickable. */
+.nb-chip-btn {
+  min-height: 24px;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    background-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
+}
+.nb-chip-btn:hover {
+  color: var(--ink);
+  border-color: var(--sketch);
+}
+.nb-chip-btn:active {
+  transform: translateY(1px);
+}
+.nb-chip-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   7. LISTS AND SEPARATORS
+   ========================================================================== */
+
+/* ----- hand-drawn divider -----
+   A pencil rule that thins toward both ends, rather than a flat 1px line. */
+.nb-rule {
+  height: 1px;
+  border: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--rule) 6%,
+    var(--rule) 92%,
+    transparent 100%
+  );
+}
+/* The same stroke stood on end, for splitting a row into columns. */
+.nb-rule-v {
+  width: 1px;
+  border: 0;
+  align-self: stretch;
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--rule) 8%,
+    var(--rule) 90%,
+    transparent 100%
+  );
+}
+/* A dashed pencil rule, for a boundary that is provisional: a drop target,
+   a section not yet filled in, the fold in a truncated list. */
+.nb-rule-dash {
+  height: 1px;
+  border: 0;
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--rule) 0 6px,
+    transparent 6px 11px
+  );
+}
+
+/* ----- list -----
+   Separators drawn as a background gradient on each row rather than as a
+   border, so they can fade at both ends the way a pencil stroke does. The
+   row keeps its background-COLOR free for hover and selection.
+
+   Rows carry the separator on top and the first row goes without, so a list
+   never opens with a rule hanging off nothing. */
+.nb-list > * + * {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+/* Groups get real air between them — the spec asks for spacing to do the
+   grouping work that a heavier line would otherwise have to. */
+.nb-list-groups > * + * {
+  margin-top: var(--sp-6);
+}
+
+/* ----- bookmark flag -----
+   The saved marker on a list row or card. Pink is "saved" across the whole
+   product, and the glyph carries the meaning so the colour never has to. */
+.nb-bookmark {
+  display: inline-block;
+  flex: none;
+  width: var(--nb-ico-size, 14px);
+  height: var(--nb-ico-size, 14px);
+  color: var(--mk-ink, var(--sem-saved));
+  --nb-glyph: var(--nb-glyph-bookmark);
+}
+
+/* ----- category label -----
+   The small marker-washed label over a group of cards. Sans, not the hand:
+   it is a structural label, and the hand is reserved for asides.
+
+   The word is written in --ink, not in the marker's own ink. A hue's ink on
+   a wash of the same hue is the one combination in this palette that fails:
+   dark-mode green ink on a 28% green wash measures 4.43:1, just under the
+   floor. Ink on the wash is 10:1 in every hue, and the meaning was never
+   coming from the letter colour anyway — it comes from the word plus the
+   marker behind it. */
+.nb-cat {
+  display: inline-block;
+  padding: 1px 7px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 30%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 22%, transparent) 58%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 28%, transparent) 100%
+  );
+  border-radius: 4px 6px 3px 5px / 5px 3px 6px 4px;
+}
+
+/* ==========================================================================
+   8. DATA, CHARTS, PROGRESS
+   The values are never distorted. Every primitive here maps --nb-val
+   linearly to a length or an angle: the drawing is hand-made, the geometry
+   is not. Pass --nb-val as a PERCENTAGE (e.g. --nb-val: 62%).
+   ========================================================================== */
+
+/* Pencil axes: the L a plot is drawn against. */
+.nb-axes {
+  border-left: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+/* Faint horizontal grid, one line every --nb-step (default quarters). Drawn
+   from the bottom up so the baseline lands on the axis. */
+.nb-gridlines {
+  background-image: repeating-linear-gradient(
+    to top,
+    color-mix(in srgb, var(--rule) 62%, transparent) 0 1px,
+    transparent 1px var(--nb-step, 25%)
+  );
+}
+
+/* ----- chart bar -----
+   A marker stroke inside a pen outline. The outline is not decoration: a
+   marker fill measures ~1.7:1 against light paper, and a bar is meaningful
+   non-text that owes 3:1 — the --mk-ink stroke is what pays it.
+
+   .nb-bar-v takes its height from --nb-val (put it in a fixed-height track);
+   .nb-bar-h takes its width. */
+.nb-bar {
+  background-image: linear-gradient(
+    100deg,
+    color-mix(in srgb, var(--mk, var(--mk-blue)) 62%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--mk-blue)) 48%, transparent) 55%,
+    color-mix(in srgb, var(--mk, var(--mk-blue)) 60%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px var(--mk-ink, var(--blue));
+  border-radius: 3px 4px 2px 3px / 3px 2px 4px 3px;
+}
+.nb-bar-v {
+  height: var(--nb-val, 0%);
+  width: 100%;
+  align-self: flex-end;
+}
+.nb-bar-h {
+  width: var(--nb-val, 0%);
+  height: 100%;
+}
+/* The track a bar sits in: a pencil outline that shows the full extent, so
+   a short bar still reads as "out of this much". */
+.nb-bar-track {
+  position: relative;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
+  border-radius: 3px 4px 2px 3px / 3px 2px 4px 3px;
+  overflow: hidden;
+}
+
+/* ----- progress -----
+   A marker stroke wiped across the page, not a generic bar: the fill uses
+   the same uneven alpha ramp as the highlighter, and the ends are rounded
+   the way a chisel tip leaves them. The percentage must also be written out
+   next to it — progress is never colour and length alone. */
+.nb-progress {
+  height: 8px;
+  border-radius: 999px 999px 999px 999px / 8px 6px 8px 6px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
+  overflow: hidden;
+}
+.nb-progress-fill {
+  width: var(--nb-val, 0%);
+  height: 100%;
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 72%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 52%, transparent) 46%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 68%, transparent) 88%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 46%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px var(--mk-ink, var(--accent));
+  border-radius: inherit;
+  transition: width var(--dur-slow) var(--ease-pen);
+}
+
+/* ----- dial -----
+   A partially filled circle, for the places a bar would be the wrong shape:
+   a quota, a confidence, a step count. The conic sweep starts at twelve
+   o'clock and is exactly --nb-val of the circle — no easing, no padding, no
+   minimum visible sliver that would overstate a small value. Size it with
+   --nb-dial-size. */
+.nb-dial {
+  display: inline-block;
+  width: var(--nb-dial-size, 20px);
+  height: var(--nb-dial-size, 20px);
+  border: 1.5px solid var(--mk-ink, var(--accent));
+  border-radius: 50%;
+  /* The second stop is 0deg, which the gradient clamps up to the first —
+     that is what produces a hard edge instead of a soft sweep. A bare `0`
+     is a length, not an angle, and is not valid here. */
+  background-image: conic-gradient(
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 68%, transparent)
+      var(--nb-val, 0%),
+    transparent 0deg
+  );
+}
+
+/* ----- tooltip -----
+   Structured and clean, per the spec — no hand-drawn wobble on the thing
+   that has to be read fast. It floats, so it is opaque (section 9's rule). */
+.nb-tip {
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 9px;
+  font-size: var(--fs-micro);
+  box-shadow: 0 6px 18px var(--shadow-lift);
+}
+
+/* ==========================================================================
+   9. FLOATING SURFACES
+   The ONLY opaque things in the system. A popover, menu, modal or toast has
+   to occlude what is under it; everything else stays a frame on the sheet.
+   ========================================================================== */
+
+.nb-float {
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+}
+
+/* ----- paper lift -----
+   Cards rise 2-4px, as though lifted off the sheet. */
+.nb-lift {
+  transition:
+    transform var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
+}
+.nb-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px var(--shadow-lift);
+}
+/* Pressed against the paper. */
+.nb-press {
+  transition: transform var(--dur-fast) var(--ease-pen);
+}
+.nb-press:active {
+  transform: translateY(1px);
+}
+
+/* ==========================================================================
+   10. MOTION
+   160-260ms, --ease-pen, and each animation is a pen doing one thing once.
+   No bounce, no glow, no loop, no parallax. Every one of them has an escape
+   in the reduced-motion block at the end of the file.
+   ========================================================================== */
+
+/* The underline swipes in from where the pen touched down. */
+@keyframes nb-draw {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* A highlighter is dragged left to right across the phrase. Only `from` is
+   declared, so the mark's own background-size is the resting state and
+   switching the animation off leaves it fully drawn. */
+@keyframes nb-mark-in {
+  from {
+    background-size: 0% 100%;
+  }
+}
+.nb-mark-draw {
+  animation: nb-mark-in var(--dur) var(--ease-pen);
+}
+
+@keyframes nb-swash-in {
+  from {
+    background-size: 0% 46%;
+  }
+}
+.nb-swash-draw {
+  animation: nb-swash-in var(--dur-slow) var(--ease-pen);
+}
+
+/* The border traces itself in, one side at a time, like a pen going round
+   the box. Done with border-color rather than a clip-path overlay so it
+   needs no pseudo-element and cannot collide with .nb-redraw's ::after.
+
+   Requires the element to already have a border. There is no 100% keyframe
+   on purpose — the last quarter interpolates to the element's OWN border
+   colour, so the animation can never end on a colour the box does not
+   actually have. Set --nb-trace-col to the same colour when the border is
+   not the pen. */
+@keyframes nb-trace {
+  0% {
+    border-color: transparent;
+  }
+  25% {
+    border-top-color: var(--nb-trace-col, var(--sketch));
+    border-right-color: transparent;
+    border-bottom-color: transparent;
+    border-left-color: transparent;
+  }
+  50% {
+    border-top-color: var(--nb-trace-col, var(--sketch));
+    border-right-color: var(--nb-trace-col, var(--sketch));
+    border-bottom-color: transparent;
+    border-left-color: transparent;
+  }
+  75% {
+    border-top-color: var(--nb-trace-col, var(--sketch));
+    border-right-color: var(--nb-trace-col, var(--sketch));
+    border-bottom-color: var(--nb-trace-col, var(--sketch));
+    border-left-color: transparent;
+  }
+}
+.nb-trace-in {
+  animation: nb-trace var(--dur-slow) var(--ease-pen);
+}
+
+/* A checkmark drawn like a pen stroke. It is a left-to-right REVEAL of the
+   glyph, not a path animation — a mask cannot be dashed the way an inline
+   <svg> stroke can, and for a tick the two read identically because the
+   stroke happens to run left to right. */
+@keyframes nb-check {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+.nb-check-draw {
+  animation: nb-check var(--dur) var(--ease-pen);
+}
+
+/* A floating surface arriving: a short rise and fade, no scale, no bounce. */
+@keyframes nb-float-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+.nb-float-draw {
+  animation: nb-float-in var(--dur-fast) var(--ease-pen);
+}
+
+/* ----- reduced motion -----
+   Every drawn-in mark becomes an instant state, and every hover treatment
+   still happens — it just stops travelling. Nothing above animates INTO its
+   resting state from a value the element does not otherwise have, so
+   switching the animations off lands on the finished frame rather than on a
+   half-drawn one. */
+@media (prefers-reduced-motion: reduce) {
+  .nb-underline-draw::after,
+  .nb-mark-draw,
+  .nb-swash-draw,
+  .nb-trace-in,
+  .nb-check-draw,
+  .nb-float-draw {
+    animation: none;
+  }
+  .nb-lift,
+  .nb-press,
+  .nb-card,
+  .nb-btn,
+  .nb-btn-go::after,
+  .nb-chip-btn,
+  .nb-field,
+  .nb-progress-fill {
+    transition: none;
+  }
+  .nb-lift:hover {
+    transform: none;
+  }
+  .nb-press:active,
+  .nb-btn:active:not(:disabled),
+  .nb-chip-btn:active {
+    transform: none;
+  }
+  .nb-btn-go:hover:not(:disabled)::after {
+    transform: none;
+  }
+}

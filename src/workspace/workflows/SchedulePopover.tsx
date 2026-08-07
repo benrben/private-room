@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Schedule, ScheduleArg } from "../../api";
+import { CadenceNote, DOW, cadenceOf } from "./cadence";
 
 type Props = {
   schedule: Schedule | null;
@@ -8,8 +9,6 @@ type Props = {
   onSave: (s: ScheduleArg) => void;
   onClose: () => void;
 };
-
-const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 /** What the backend will accept, checked here so Save can't close on something
  * the backend is about to reject.
@@ -76,6 +75,12 @@ export function SchedulePopover({ schedule, disabled, onSave, onClose }: Props) 
 
   const problem = scheduleProblem(kind, interval, daily, weekTime);
 
+  // The exact `param` string the backend stores for this kind, built ONCE: the
+  // calendar note below and what Save actually writes read the same value, so
+  // the preview cannot describe a schedule other than the one being saved.
+  const param =
+    kind === "interval" ? interval : kind === "daily" ? daily : `${weekDay} ${weekTime}`;
+
   function save() {
     if (!kind) {
       onSave({ kind: "" });
@@ -85,11 +90,15 @@ export function SchedulePopover({ schedule, disabled, onSave, onClose }: Props) 
     // Stay open on a bad value: closing is what destroyed the input the user
     // needed in order to correct it.
     if (problem) return;
-    const param =
-      kind === "interval" ? interval : kind === "daily" ? daily : `${weekDay} ${weekTime}`;
     onSave({ kind, param, enabled, catchUp });
     onClose();
   }
+
+  // The schedule read back in the same words the library card will show it in,
+  // so what you are about to save is legible before you save it. Only drawn
+  // once the values parse — echoing an invalid time as a calendar note would
+  // claim a run that is never going to happen.
+  const preview = kind && !problem ? cadenceOf({ kind, param, enabled }) : null;
 
   return (
     <div className="wf-popover">
@@ -135,6 +144,11 @@ export function SchedulePopover({ schedule, disabled, onSave, onClose }: Props) 
             <input type="text" value={weekTime} onChange={(e) => setWeekTime(e.target.value)} />
           </label>
         </>
+      )}
+      {preview && (
+        <div className="wf-sched-note">
+          <CadenceNote cadence={preview} />
+        </div>
       )}
       {kind && (
         <>

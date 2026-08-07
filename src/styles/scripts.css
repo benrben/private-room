@@ -1,6 +1,22 @@
-/* Wave 5 (Idea 13): the Scripts page + rows. Leans on the workflow/viewer
- * tokens (wf-badge, dot-ok/dot-err, caption, approve-*) so scripts read as one
- * system with the rest of the automation surfaces. */
+/* ------------------------------------------------------------------ *
+ * SCRIPTS — the page, the rows, and the run-consent card's fields.
+ *
+ * A script is the most dangerous object in a room: approving one runs real
+ * code on this Mac with no sandbox. So this page is drawn like a lab
+ * notebook page rather than like a list of apps — the manifest is a set of
+ * filled-in fields, the permissions are a caution note in the interface
+ * sans at reading size, and the run history is a ruled log underneath.
+ *
+ * The colour vocabulary is the product-wide one and it is never the only
+ * signal: yellow means "needs review / notable", green means "approved or
+ * succeeded", red means "failed or risky", blue means "running / active" —
+ * and every one of them rides with a word.
+ *
+ * This file loads after workflows.css and paper.css, so its rules win a tie
+ * with `.wf-*`, `.run-*` and `.nb-*`. That is used deliberately in two
+ * places (the running dot, the history container) and deliberately NOT used
+ * to restyle the shared RunHistory internals, which workflows.css owns.
+ * ------------------------------------------------------------------ */
 
 .scripts-page {
   display: flex;
@@ -13,162 +29,381 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 1rem 1.2rem;
+  padding: var(--sp-4) var(--sp-6) var(--sp-8);
 }
+
+/* ==================================================================== *
+ * 1. CAUTION NOTES — what a run is actually allowed to do
+ * The wording comes from src/workspace/scriptTrust.ts, which is the one
+ * place the app's trust sentences are written. These rules only have to
+ * make sure it is READ: sans, --fs-body, full ink, a marker edge beside
+ * it, and never the hand — a security statement is not an annotation.
+ * ==================================================================== */
+
+.script-caution {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  /* The edge is drawn in the marker's INK, not in its fill: a 3px stroke is
+     meaningful non-text and owes 3:1, and a yellow fill measures ~1.7:1 on
+     ivory. The wash behind the words is the fill's job. */
+  box-shadow: inset 3px 0 0 var(--sem-pending);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--sem-pending-fill) 20%, transparent) 0%,
+    color-mix(in srgb, var(--sem-pending-fill) 10%, transparent) 62%,
+    color-mix(in srgb, var(--sem-pending-fill) 15%, transparent) 100%
+  );
+}
+.script-caution strong {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+/* The page-level note states the powers EVERY run gets, so it sits above
+   the list with a measure of its own — one long line across a wide pane is
+   a paragraph nobody finishes. */
+.script-caution-page {
+  max-width: 84ch;
+  margin: 0 0 var(--sp-6);
+}
+/* The per-row note is attached to the Review button underneath it, so it
+   keeps the row's rhythm rather than the page's. */
+.script-row .script-caution {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-meta);
+}
+
+/* ==================================================================== *
+ * 2. THE EMPTY STATE
+ * ==================================================================== */
 
 .scripts-empty {
-  max-width: 42rem;
-  margin: 2rem auto;
+  max-width: 46rem;
+  margin: var(--sp-6) auto;
   text-align: left;
 }
-
 .scripts-empty h3 {
-  margin: 0 0 0.4rem;
+  margin: 0 0 var(--sp-2);
+  color: var(--text-strong);
+  font-size: var(--fs-section);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+/* This is instruction copy, so it is set at reading size — the `caption`
+   class it also carries is the app's smallest tier, and an instruction
+   nobody can read is not an instruction. */
+.scripts-empty .caption {
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
 }
 
+/* The manifest sample is CODE. It was set in the interface sans, which made
+   a block whose whole point is "type these characters exactly" render in a
+   face that does not align them. Drawn as a frame on the sheet rather than
+   as a filled slab, and it scrolls sideways rather than wrapping — a
+   re-wrapped manifest line is a manifest that would not parse. */
 .scripts-manifest-example {
-  margin: 0.8rem 0;
-  padding: 0.7rem 0.9rem;
-  border-radius: 8px;
-  background: var(--surface-2, rgba(127, 127, 127, 0.08));
-  font-size: 0.82rem;
-  line-height: 1.5;
+  margin: var(--sp-3) 0;
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  line-height: 1.6;
   overflow-x: auto;
   white-space: pre;
 }
 
+/* ==================================================================== *
+ * 3. THE ROW
+ * A card drawn on the sheet: a border, no fill, so the dotted paper runs
+ * through it the way it runs through every other pane in the app.
+ * ==================================================================== */
+
 .scripts-list {
   display: flex;
   flex-direction: column;
-  gap: 0.7rem;
+  gap: var(--sp-4);
 }
 
 .script-row {
-  border: 1px solid var(--border, rgba(127, 127, 127, 0.22));
-  border-radius: 10px;
-  padding: 0.7rem 0.9rem;
-  background: var(--surface-1, rgba(127, 127, 127, 0.04));
+  padding: var(--sp-4);
+  /* .nb-card's resting weight — 72% of the pen, which still measures ~6.9:1
+     dark and ~5.2:1 light, so the boundary clears 3:1 on its own. */
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+  background: transparent;
+}
+/* Four fixed radius signatures rotated by position, so a column of rows does
+   not look stamped from one die. Deterministic — position, never random. */
+.scripts-list > .script-row:nth-child(4n + 2) {
+  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+}
+.scripts-list > .script-row:nth-child(4n + 3) {
+  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+}
+.scripts-list > .script-row:nth-child(4n + 4) {
+  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
 }
 
+/* "Needs review" is a state the eye has to find across a long page, so the
+   row takes the pending ink on its own border rather than a second ring
+   around it. The ribbon inside says the word — the border never carries
+   this alone. */
 .script-row.needs-review {
-  border-color: var(--amber);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--amber) 35%, transparent);
+  border-color: var(--sem-pending);
 }
 
 .script-row-main {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--sp-2);
   flex-wrap: wrap;
 }
 
 .script-row-title {
   display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: var(--sp-2);
+  min-width: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-card);
   font-weight: 600;
 }
 
+/* py / js. Identity, not status, so it takes a neutral drawn capsule rather
+   than one of the five meanings. */
 .script-lang {
-  font-size: 0.68rem;
-  text-transform: uppercase;
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px 999px 999px 999px / 12px 10px 12px 10px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: 500;
   letter-spacing: 0.04em;
-  padding: 0.05rem 0.35rem;
-  border-radius: 5px;
-  background: var(--surface-2, rgba(127, 127, 127, 0.12));
-  opacity: 0.8;
+  text-transform: uppercase;
 }
 
+/* A strip of tape stuck over the row's title. --ink on a 34% wash measures
+   ~7.8:1 dark and better in light, so the WORD carries the meaning and the
+   yellow only reinforces it (paper.css .nb-tape). */
 .script-ribbon {
-  font-size: 0.72rem;
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  padding: 2px 9px;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--sem-pending-fill) 34%, transparent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sem-pending-fill) 46%, transparent);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+  font-size: var(--fs-micro);
   font-weight: 600;
-  color: var(--amber);
-  background: color-mix(in srgb, var(--amber) 16%, transparent);
-  padding: 0.1rem 0.45rem;
-  border-radius: 6px;
+  white-space: nowrap;
 }
 
 .script-row-status {
   margin-left: auto;
-  font-size: 0.8rem;
+  font-size: var(--fs-meta);
+  white-space: nowrap;
 }
 
-/* One grouped incident instead of N identical error rows. */
+/* Running work is BLUE across this whole product — the rail badge, Room
+   Home's timeline node and the status bar all agree on that, and the pen
+   (pink) is reserved for selection. The shared `.rec-dot` is red, which
+   means "recording / urgent / failed"; borrowing it here said a working
+   script was on fire. The label beside it is the real signal, and the dot
+   no longer pulses: nothing in this design system moves forever. */
+.script-running {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--sem-linked);
+  font-weight: 500;
+}
+.script-running .rec-dot {
+  background: var(--sem-linked);
+  animation: none;
+}
+
+/* ----- the failure incident -----
+   One grouped incident instead of N identical error rows. Red, plus the
+   word "failed" in its title and the cause underneath. */
 .script-incident {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-top: 8px;
-  padding: 9px 11px;
-  border: 1px solid rgba(233, 155, 159, 0.4);
-  background: rgba(233, 155, 159, 0.08);
-  border-radius: 8px;
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 3px 0 0 var(--sem-urgent);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--sem-urgent-fill) 18%, transparent) 0%,
+    color-mix(in srgb, var(--sem-urgent-fill) 9%, transparent) 62%,
+    color-mix(in srgb, var(--sem-urgent-fill) 14%, transparent) 100%
+  );
 }
 .script-incident-body {
   flex: 1;
   min-width: 0;
 }
 .script-incident-title {
-  font-size: 0.8rem;
+  color: var(--text-strong);
+  font-size: var(--fs-meta);
   font-weight: 600;
-  color: var(--danger);
 }
+/* The cause is a line of stderr — technical text, so the mono face, and one
+   line with the full text in the title attribute. */
 .script-incident-cause {
-  font-size: 0.75rem;
-  color: var(--muted);
-  font-family: var(--mono, ui-monospace, monospace);
   margin-top: 2px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .script-incident-actions {
   display: flex;
-  gap: 6px;
+  gap: var(--sp-2);
   flex: 0 0 auto;
 }
 
-.script-running {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  color: var(--accent, #7c5cff);
-}
+/* ==================================================================== *
+ * 4. THE MANIFEST, AS NOTEBOOK FIELDS
+ * Installs / Reads / Writes back / Shortcut — the same four words the
+ * run-consent card uses. A key written in the margin, the value beside it
+ * in the mono face, because every one of these values is a file name or a
+ * package name and both are technical text.
+ * ==================================================================== */
 
-.script-chips {
+.script-fields {
+  margin: var(--sp-3) 0 0;
+  padding: 0;
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem;
-  margin: 0.5rem 0 0.1rem;
+  flex-direction: column;
+  gap: 3px;
+}
+.script-field {
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  gap: 2px var(--sp-3);
+  align-items: baseline;
+  padding: 2px 0;
+}
+/* The ruled line under each field, drawn as a background so it fades at
+   both ends like a pencil stroke and costs no element. */
+.script-field + .script-field {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+.script-field > dt {
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-align: right;
+}
+.script-field > dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+.script-field > dd code {
+  font-family: var(--mono);
+  font-size: 0.96em;
+  color: var(--text);
+  /* A long list wraps at the commas between names. `break-word` only comes
+     into play for a SINGLE name wider than the column, and there breaking is
+     the lesser evil: an overflowing name is a name the card cuts off, and a
+     truncated file name is a different file name. */
+  overflow-wrap: break-word;
+}
+/* A narrow pane stacks the key over the value rather than squeezing the
+   value into a 7rem column. */
+@container (max-width: 460px) {
+  .script-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .script-field > dt {
+    text-align: left;
+  }
 }
 
-.script-chip {
-  font-size: 0.74rem;
-  padding: 0.1rem 0.45rem;
-  border-radius: 6px;
-  background: var(--surface-2, rgba(127, 127, 127, 0.1));
-  white-space: nowrap;
-}
-
-.script-chip.deps {
-  background: rgba(124, 92, 255, 0.12);
-}
-.script-chip.in {
-  background: rgba(64, 148, 255, 0.12);
-}
-.script-chip.out {
-  background: rgba(64, 191, 128, 0.14);
-}
-.script-chip.shortcut {
-  opacity: 0.75;
-}
+/* ==================================================================== *
+ * 5. ACTIONS
+ * One outlined control per row — Run, or Review script — and everything
+ * else stays a quiet link. Four equal-weight links gave the row no first
+ * thing to press.
+ * ==================================================================== */
 
 .script-row-actions {
   display: flex;
   align-items: center;
-  gap: 0.45rem;
-  margin-top: 0.6rem;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
   position: relative;
+}
+
+/* The primary action, drawn as an OUTLINE rather than a fill: a filled
+   button would read as the app urging you to run code, and on this page the
+   app is a gatekeeper, not a salesman. */
+.script-go {
+  min-height: 28px;
+  padding: 5px 13px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+}
+.script-go:hover:not(:disabled) {
+  border-color: var(--sketch);
+  background: var(--accent-ghost);
+}
+/* Not yet approved: the outline goes to the pending ink and the LABEL
+   changes with it — the button says "Review script", never "Run". Colour
+   could not carry this on its own and is not being asked to. */
+.script-go.needs-review {
+  color: var(--text-strong);
+  border-color: var(--sem-pending);
+}
+.script-go.needs-review:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--sem-pending-fill) 18%, transparent);
+  border-color: var(--sem-pending);
+}
+
+/* Everything quiet in this row is still a TARGET. base.css gives `.subtle`
+   2px of vertical padding, which lands a 12px label in a ~20px box — under
+   the 24px minimum the design system sets for anything clickable. */
+.script-row-actions .subtle,
+.script-incident-actions .subtle {
+  min-height: 26px;
+  padding: 4px 9px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-meta);
 }
 
 .script-sched-wrap {
@@ -185,28 +420,95 @@
 }
 
 .script-sched-hint {
-  font-size: 0.76rem;
-  opacity: 0.7;
+  font-size: var(--fs-micro);
+  color: var(--muted);
 }
+
+/* ==================================================================== *
+ * 6. THE RUN LOG
+ * The log itself is RunHistory, which workflows.css owns and another pass
+ * is already drawing as a ruled timeline — so this only frames it and
+ * names it. Deliberately no rules for `.run-row` / `.run-step` here: this
+ * file loads later and would silently overwrite that work.
+ * ==================================================================== */
 
 .script-history {
-  margin-top: 0.6rem;
-  border-top: 1px dashed var(--border, rgba(127, 127, 127, 0.22));
-  padding-top: 0.5rem;
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-2);
+  border-top: 0;
+  /* The fold in the page: a dashed pencil rule, because what is below it is
+     a record rather than a control. */
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--rule) 0 6px,
+    transparent 6px 11px
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+.script-history-label {
+  margin-bottom: var(--sp-2);
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
-/* The consent card's per-field rows (Reads / Writes back / Installs). */
+/* ==================================================================== *
+ * 7. THE RUN-CONSENT CARD'S FIELDS
+ * The markup lives in workspace/Overlays.tsx; these are the per-permission
+ * rows on it (Installs / Reads / Writes back). This is the single most
+ * important text in the product — it is what stands between "run a word
+ * counter" and arbitrary code on someone's Mac — and it was set at 11.8px
+ * with `opacity: .75` over it. Both are gone: the key is a legible label
+ * and the value is full-strength mono.
+ * ==================================================================== */
+
 .script-approve-line {
-  display: flex;
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  gap: 2px var(--sp-3);
   align-items: baseline;
-  gap: 0.5rem;
-  margin-top: 0.35rem;
+  /* No gap between lines: the caution edge below has to run unbroken down all
+     three of them, so they read as ONE block of granted permissions rather
+     than as three loose rows. The interpreter line above already carries the
+     space that separates the block from it. */
+  margin-top: 0;
+  padding: var(--sp-1) var(--sp-2) var(--sp-1) var(--sp-3);
+  box-shadow: inset 3px 0 0 var(--sem-pending);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--sem-pending-fill) 16%, transparent) 0%,
+    color-mix(in srgb, var(--sem-pending-fill) 8%, transparent) 100%
+  );
 }
 
 .script-approve-key {
-  font-size: 0.74rem;
+  min-width: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-micro);
   font-weight: 600;
-  opacity: 0.75;
-  min-width: 5.5rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   text-align: right;
+}
+.script-approve-line > .approve-args {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+}
+/* A @media query rather than a @container one: the consent card is rendered
+   at the app root, outside every container-type ancestor the panes set up, so
+   a container query here would simply never match. */
+@media (max-width: 560px) {
+  .script-approve-line {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .script-approve-key {
+    text-align: left;
+  }
 }

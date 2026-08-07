@@ -1,11 +1,30 @@
 /* Plain text read as writing, not as source. A .txt used to open in the code
-   editor with a line-number gutter and a "plaintext" language mode. */
+   editor with a line-number gutter and a "plaintext" language mode.
+
+   The PAGE — the warm-paper sheet, its drawn edge, the measure and the
+   margins — belongs to `.viewer-host > .prose-view` in styles/viewer.css,
+   where every document the app draws itself is described in one place. What
+   is left here is the typography of the writing inside it. */
 .prose-view {
-  max-width: 40rem;
-  margin: 0 auto;
-  padding: 2rem 1.5rem 4rem;
+  /* Never a bare font-family: --sans is the only stack in the app carrying
+     the per-glyph fallbacks Hebrew, CJK and the rest need, and a plain-text
+     file is exactly where those turn up. Turkish stays in Manrope (latin-ext
+     is bundled), so İstanbul, ÇAĞRI and GÜNEŞ render in the page's own face.
+     Each paragraph carries dir="auto", so an RTL document sets itself. */
+  font-family: var(--sans);
+  font-size: var(--fs-lead);
   line-height: 1.7;
+  color: var(--text);
   overflow-wrap: break-word;
 }
-.prose-view p { margin: 0 0 1em; white-space: pre-wrap; }
-.prose-view p:last-child { margin-bottom: 0; }
+
+/* `pre-wrap` is load-bearing, not styling: it is what preserves the author's
+   own indentation and the single line breaks inside a paragraph. The file is
+   shown exactly as written; only the face and the measure are ours. */
+.prose-view p {
+  margin: 0 0 1em;
+  white-space: pre-wrap;
+}
+.prose-view p:last-child {
+  margin-bottom: 0;
+}

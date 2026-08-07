@@ -338,6 +338,7 @@ fn bench_real_wav() {
         &model(),
         &pcm,
         &arcelle_lib::recording::RecMeta::default(),
+        &[],
         |_, _| {},
         || false, // never stopped: the bench measures a full pass
     )

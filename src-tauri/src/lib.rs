@@ -178,6 +178,19 @@ pub fn run() {
             commands::restore_file,
             commands::delete_file_permanently,
             commands::empty_trash,
+            // The batch twins of the four above (commands::bulk) — the Library's
+            // multi-selection. Each hands back a BulkReport rather than (), so a
+            // partial failure can be named instead of inferred.
+            commands::trash_files,
+            commands::move_files_to_folder,
+            commands::restore_files,
+            commands::delete_files_permanently,
+            // Podcast voices: read a script's cast, re-cast it, preview one
+            // host, and record the whole episode as a background job.
+            commands::get_podcast,
+            commands::set_podcast_cast,
+            commands::preview_podcast_voice,
+            commands::start_podcast_audio_job,
             commands::save_generated_file,
             commands::open_scratch_pad,
             commands::import_link,
@@ -333,6 +346,15 @@ pub fn run() {
             commands::rec_delete_range,
             commands::rec_correct_range,
             commands::rec_set_speaker_name,
+            commands::rec_read_start,
+            commands::rec_note_add,
+            commands::rec_note_set,
+            commands::rec_chapter_add,
+            commands::rec_chapter_set,
+            commands::rec_highlight_add,
+            commands::rec_item_delete,
+            commands::voices_list,
+            commands::voice_forget,
             commands::rec_export_clean,
             commands::rec_translate,
             commands::rec_retranscribe,

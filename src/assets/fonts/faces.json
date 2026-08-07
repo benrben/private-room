@@ -1,0 +1,146 @@
+[
+ {
+  "family": "Manrope",
+  "style": "normal",
+  "weight": "400 800",
+  "range": "U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF",
+  "file": "Manrope-400_800-normal-latin-ext.woff2",
+  "bytes": 15240,
+  "subset": "latin-ext"
+ },
+ {
+  "family": "Manrope",
+  "style": "normal",
+  "weight": "400 800",
+  "range": "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD",
+  "file": "Manrope-400_800-normal-latin.woff2",
+  "bytes": 24576,
+  "subset": "latin"
+ },
+ {
+  "family": "Kalam",
+  "style": "normal",
+  "weight": "300",
+  "range": "U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF",
+  "file": "Kalam-300-normal-latin-ext.woff2",
+  "bytes": 6228,
+  "subset": "latin-ext"
+ },
+ {
+  "family": "Kalam",
+  "style": "normal",
+  "weight": "300",
+  "range": "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD",
+  "file": "Kalam-300-normal-latin.woff2",
+  "bytes": 13224,
+  "subset": "latin"
+ },
+ {
+  "family": "Kalam",
+  "style": "normal",
+  "weight": "400",
+  "range": "U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF",
+  "file": "Kalam-400-normal-latin-ext.woff2",
+  "bytes": 6784,
+  "subset": "latin-ext"
+ },
+ {
+  "family": "Kalam",
+  "style": "normal",
+  "weight": "400",
+  "range": "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD",
+  "file": "Kalam-400-normal-latin.woff2",
+  "bytes": 14040,
+  "subset": "latin"
+ },
+ {
+  "family": "Kalam",
+  "style": "normal",
+  "weight": "700",
+  "range": "U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF",
+  "file": "Kalam-700-normal-latin-ext.woff2",
+  "bytes": 6236,
+  "subset": "latin-ext"
+ },
+ {
+  "family": "Kalam",
+  "style": "normal",
+  "weight": "700",
+  "range": "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD",
+  "file": "Kalam-700-normal-latin.woff2",
+  "bytes": 13104,
+  "subset": "latin"
+ },
+ {
+  "family": "IBM Plex Mono",
+  "style": "italic",
+  "weight": "400",
+  "range": "U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF",
+  "file": "IBMPlexMono-400-italic-latin-ext.woff2",
+  "bytes": 9788,
+  "subset": "latin-ext"
+ },
+ {
+  "family": "IBM Plex Mono",
+  "style": "italic",
+  "weight": "400",
+  "range": "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD",
+  "file": "IBMPlexMono-400-italic-latin.woff2",
+  "bytes": 11568,
+  "subset": "latin"
+ },
+ {
+  "family": "IBM Plex Mono",
+  "style": "normal",
+  "weight": "400",
+  "range": "U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF",
+  "file": "IBMPlexMono-400-normal-latin-ext.woff2",
+  "bytes": 8860,
+  "subset": "latin-ext"
+ },
+ {
+  "family": "IBM Plex Mono",
+  "style": "normal",
+  "weight": "400",
+  "range": "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD",
+  "file": "IBMPlexMono-400-normal-latin.woff2",
+  "bytes": 10052,
+  "subset": "latin"
+ },
+ {
+  "family": "IBM Plex Mono",
+  "style": "normal",
+  "weight": "500",
+  "range": "U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF",
+  "file": "IBMPlexMono-500-normal-latin-ext.woff2",
+  "bytes": 8848,
+  "subset": "latin-ext"
+ },
+ {
+  "family": "IBM Plex Mono",
+  "style": "normal",
+  "weight": "500",
+  "range": "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD",
+  "file": "IBMPlexMono-500-normal-latin.woff2",
+  "bytes": 10060,
+  "subset": "latin"
+ },
+ {
+  "family": "IBM Plex Mono",
+  "style": "normal",
+  "weight": "600",
+  "range": "U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF",
+  "file": "IBMPlexMono-600-normal-latin-ext.woff2",
+  "bytes": 8960,
+  "subset": "latin-ext"
+ },
+ {
+  "family": "IBM Plex Mono",
+  "style": "normal",
+  "weight": "600",
+  "range": "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD",
+  "file": "IBMPlexMono-600-normal-latin.woff2",
+  "bytes": 10120,
+  "subset": "latin"
+ }
+]

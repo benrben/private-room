@@ -1,39 +1,82 @@
-/* The encoding strip: one quiet line above a text file saying how its bytes
-   are being read, and a picker to say otherwise. Quiet because most files are
-   UTF-8 and the answer is boring — but it is always there, because the ONE
-   time it is wrong there has to be somewhere to go. */
+/* HOW THIS FILE'S BYTES ARE BEING READ — one quiet line above a text file,
+   and a picker to say otherwise. Quiet because most files are UTF-8 and the
+   answer is boring; always there, because the ONE time it is wrong there has
+   to be somewhere to go.
+
+   It reads as a compact information note now rather than as a full-bleed strip
+   with a rule under it. Two of those stacked over a document (this and the
+   provenance card) read as a second and third toolbar; two small cards inset
+   to the document's own measure read as notes clipped to the page, which is
+   what they are. */
 .encoding-strip {
   /* `.viewer-body.fill` is a flex column whose other child takes the rest of
-     the height — the strip must keep its own and never be squashed by it. */
+     the height — the note must keep its own and never be squashed by it. */
   flex: 0 0 auto;
   display: flex;
-  gap: 0.75rem;
+  gap: var(--sp-2) var(--sp-4);
   align-items: baseline;
   flex-wrap: wrap;
-  padding: 0.3rem 0.75rem;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.8rem;
+  max-width: var(--doc-measure, 86ch);
+  margin: var(--sp-3) auto 0;
+  padding: var(--sp-2) var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  background: transparent;
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
   color: var(--muted);
 }
 .encoding-label {
   display: flex;
-  gap: 0.4rem;
+  gap: var(--sp-2);
   align-items: baseline;
+  flex-wrap: wrap;
 }
 .encoding-lede {
   white-space: nowrap;
 }
+/* An encoding NAME is technical data — "windows-1254", "Shift_JIS" — so the
+   control that lists them is set in the mono face, where a run of unfamiliar
+   identifiers is easiest to tell apart. The sentence in front of it stays in
+   the interface face: it is an explanation, not data. */
 .encoding-select {
-  max-width: 16rem;
-  padding: 0.1rem 0.3rem;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  background: var(--bg);
-  color: inherit;
-  font: inherit;
+  max-width: 18rem;
+  min-height: 24px;
+  padding: 2px var(--sp-2);
+  /* --rule-strong, not --rule: this is a control the user operates, and a
+     control boundary owes 3:1. --rule measures 2.55:1 in dark. */
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  cursor: pointer;
 }
-/* A reading that produced replacement characters is not the file's text, so it
-   reads as a warning rather than as another muted note. */
+.encoding-select:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* A reading that produced replacement characters is not the file's text.
+   "Needs review" is yellow across the whole product, and the SENTENCE carries
+   the meaning — the marker stroke down the leading edge only reinforces it, so
+   the words stay in full-strength ink rather than in a hue. */
 .encoding-warn {
-  color: var(--warn);
+  flex: 1 1 24rem;
+  min-width: 0;
+  padding-inline-start: var(--sp-3);
+  box-shadow: inset 3px 0 0 var(--sem-pending-fill);
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  color: var(--text);
+}
+
+/* The re-read itself FAILED — a different thing from a bad reading, and red
+   across this product. Same shape, so the two are told apart by the word and
+   the hue together rather than by the hue alone. */
+.encoding-error {
+  box-shadow: inset 3px 0 0 var(--sem-urgent-fill);
+  border-color: color-mix(in srgb, var(--sem-urgent) 55%, var(--line));
+  color: var(--text);
 }

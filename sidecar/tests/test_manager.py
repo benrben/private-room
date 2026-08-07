@@ -78,6 +78,11 @@ def test_the_spec_carries_no_field_the_running_app_never_reads() -> None:
         "label",
         "tools",
         "requires",
+        # `core_capable` (2026-08-07) is read by `worker_reachable` and pinned
+        # below by `test_a_core_capable_worker_survives_losing_its_box` — it
+        # decides whether a worker is offered at all on a tier that withholds
+        # its box, which is as visible as a field gets.
+        "core_capable",
         "tag",
         "area",
         "summary",
@@ -112,6 +117,30 @@ def test_the_menu_fields_are_READ_not_merely_carried() -> None:
     )
 
 
+def test_a_core_capable_worker_survives_losing_its_box() -> None:
+    """The regression `core_capable` exists for.
+
+    Giving the File agent an ORGANIZE box moved it from the CORE branch of
+    `worker_reachable` onto the box branch, so every tier that withholds those
+    tools — a consulted advisor — dropped the room's DEFAULT worker entirely.
+    The symptom would have been the whole "file" domain vanishing from the
+    Main agent's catalog and from the composer's `*` menu, on exactly the tiers
+    least able to explain why.
+
+    Reading and editing files is its job whether or not it may also tidy them.
+    """
+    files = get_agent("files.read")
+    assert files.core_capable, "the File agent's box is additive, not its job"
+    core_only = set(CORE_TOOLS)
+    assert worker_reachable(files, web_enabled=True, served_names=core_only)
+
+    # …and the property is not blanket-applied: a worker whose box IS its job
+    # must still drop out, or routing sends work to an empty toolbox.
+    web = get_agent("chat.web")
+    assert not web.core_capable
+    assert not worker_reachable(web, web_enabled=True, served_names=core_only)
+
+
 def test_no_box_exceeds_the_small_model_cap() -> None:
     # CORE is exempt (its size is dictated by the byte-stable Rust prompt);
     # every sub-agent BOX must stay inside what a 4B chooses among reliably.
@@ -138,7 +167,10 @@ def test_groups_cover_exactly_the_gated_lanes() -> None:
 
 #: Underscore-shaped words that appear in a paragraph and are NOT tools. Every
 #: other one is read as a tool name by the guard below; keep this list tiny.
-_NOT_TOOL_WORDS = {"depends_on"}  # a batch-task FIELD, not a verb
+_NOT_TOOL_WORDS = {
+    "depends_on",  # a batch-task FIELD, not a verb
+    "dry_run",  # organize_files' preview ARGUMENT, not a tool
+}
 
 
 def test_every_agent_prompt_names_only_its_own_tools() -> None:

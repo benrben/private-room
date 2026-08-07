@@ -31,6 +31,7 @@ import asyncio
 import base64
 import io
 import math
+import re
 import tempfile
 import wave
 from pathlib import Path
@@ -120,16 +121,28 @@ async def synthesize_mp3(text: str, voice: str, rate: str, pitch: str) -> bytes:
     return b"".join(chunks)
 
 
-def mp3_to_wav(mp3_bytes: bytes) -> bytes:
-    """Decode MP3 → mono 16-bit WAV with macOS's own afconvert."""
+def mp3_to_wav(mp3_bytes: bytes, sample_rate: int | None = None) -> bytes:
+    """Decode MP3 → mono 16-bit WAV with macOS's own afconvert.
+
+    ``sample_rate`` forces the output rate. Left None (the spoken-answer path)
+    afconvert keeps whatever the source had, which is right when the bytes are
+    played and discarded one sentence at a time. The PODCAST path must pass a
+    rate: it CONCATENATES clips from several different voices, and a stream
+    whose header says 24 kHz while some frames were written at another rate
+    plays those turns at the wrong speed — a chipmunk halfway through the
+    episode, with nothing in any error path to explain it.
+    """
     import subprocess
 
     with tempfile.TemporaryDirectory(prefix="pr-tts-") as td:
         src = Path(td) / "in.mp3"
         dst = Path(td) / "out.wav"
         src.write_bytes(mp3_bytes)
+        cmd = [AFCONVERT, "-f", "WAVE", "-d", "LEI16", "-c", "1"]
+        if sample_rate:
+            cmd += ["-r", str(sample_rate)]
         proc = subprocess.run(
-            [AFCONVERT, "-f", "WAVE", "-d", "LEI16", "-c", "1", str(src), str(dst)],
+            [*cmd, str(src), str(dst)],
             capture_output=True,
             timeout=60,
         )
@@ -150,6 +163,139 @@ async def synthesize_wav(
     mp3 = await synthesize_mp3(text, voice, rate, pitch)
     wav = await asyncio.to_thread(mp3_to_wav, mp3)
     return await asyncio.to_thread(normalize_wav, wav, TARGET_LUFS)
+
+
+# --- podcast: many voices, one episode ---------------------------------------
+
+#: Every clip in an episode is decoded to this rate before being joined. Edge
+#: returns 24 kHz; forcing it makes the concatenation correct even if a voice
+#: (or the service) ever returns something else.
+PODCAST_SAMPLE_RATE = 24_000
+
+
+def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
+    """Break one turn into pieces the service will accept, on sentence ends.
+
+    A podcast turn is written by a model told to keep it short, but "short" is
+    not a guarantee, and one long turn would fail the whole episode at
+    :data:`MAX_TTS_CHARS`. Splitting on sentence boundaries keeps the prosody
+    right — a cut mid-clause is audible, a cut between sentences is not.
+
+    A single sentence longer than the limit is cut on whitespace as a last
+    resort; there is no way to say it in one call, and dropping it would lose
+    the line silently.
+    """
+    text = " ".join(text.split())
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    pieces: list[str] = []
+    current = ""
+    # Keep the terminator with its sentence — "Yes." must not become "Yes" "."
+    for chunk in re.split(r"(?<=[.!?…])\s+", text):
+        if not chunk:
+            continue
+        if len(chunk) > limit:
+            if current:
+                pieces.append(current)
+                current = ""
+            words, buf = chunk.split(" "), ""
+            for w in words:
+                if buf and len(buf) + 1 + len(w) > limit:
+                    pieces.append(buf)
+                    buf = w
+                else:
+                    buf = f"{buf} {w}".strip()
+            if buf:
+                current = buf
+            continue
+        if current and len(current) + 1 + len(chunk) > limit:
+            pieces.append(current)
+            current = chunk
+        else:
+            current = f"{current} {chunk}".strip()
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _wav_frames(wav_bytes: bytes) -> tuple[bytes, int]:
+    """(raw mono 16-bit frames, sample rate) — the joinable part of a WAV."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as r:
+        if r.getsampwidth() != 2 or r.getnchannels() != 1:
+            raise TtsError("expected mono 16-bit WAV from afconvert")
+        return r.readframes(r.getnframes()), r.getframerate()
+
+
+def _wav_from_frames(frames: bytes, fs: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(fs)
+        w.writeframes(frames)
+    return buf.getvalue()
+
+
+async def synthesize_podcast(
+    turns: list[dict[str, str]],
+    gap_ms: int = 420,
+) -> tuple[bytes, list[int], int]:
+    """A whole episode: ``(wav_bytes, per-turn start offsets in ms, duration ms)``.
+
+    Each turn is synthesized in ITS OWN voice, the clips are joined with a beat
+    of silence between them, and the finished mix is loudness-normalized ONCE.
+
+    That last word is the design. Normalizing per turn — which is what looping
+    ``/tts`` would do — sets every clip to the same target independently, so
+    each change of speaker lands at a slightly different level and the result
+    sounds assembled rather than recorded. Measuring the whole episode instead
+    keeps the relative dynamics between the two voices intact.
+
+    Offsets are computed from the frames actually written, not from an estimate,
+    so the transcript the caller builds from them lines up with the audio to the
+    sample.
+    """
+    if not turns:
+        raise TtsError("a podcast needs at least one turn")
+    gap_frames = b"\x00\x00" * int(PODCAST_SAMPLE_RATE * max(0, gap_ms) / 1000)
+    frames = bytearray()
+    offsets: list[int] = []
+
+    def ms_so_far() -> int:
+        return int(len(frames) / 2 / PODCAST_SAMPLE_RATE * 1000)
+
+    for i, turn in enumerate(turns):
+        text = (turn.get("text") or "").strip()
+        # An empty line still gets an offset, so the caller's turn list and the
+        # offsets list stay index-aligned — a silently shorter list would
+        # mis-stamp every following line in the transcript.
+        offsets.append(ms_so_far())
+        if not text:
+            continue
+        if i:
+            frames.extend(gap_frames)
+            offsets[-1] = ms_so_far()
+        voice = turn.get("voice") or DEFAULT_VOICE
+        rate = turn.get("rate") or DEFAULT_RATE
+        pitch = turn.get("pitch") or DEFAULT_PITCH
+        for piece in split_for_tts(text):
+            mp3 = await synthesize_mp3(piece, voice, rate, pitch)
+            wav = await asyncio.to_thread(mp3_to_wav, mp3, PODCAST_SAMPLE_RATE)
+            clip, fs = await asyncio.to_thread(_wav_frames, wav)
+            if fs != PODCAST_SAMPLE_RATE:  # afconvert was asked; belt and braces
+                raise TtsError(f"voice {voice} decoded at {fs} Hz, expected {PODCAST_SAMPLE_RATE}")
+            frames.extend(clip)
+    if not frames:
+        raise TtsError("every turn was empty — nothing to record")
+    duration_ms = ms_so_far()
+    mixed = _wav_from_frames(bytes(frames), PODCAST_SAMPLE_RATE)
+    return (
+        await asyncio.to_thread(normalize_wav, mixed, TARGET_LUFS),
+        offsets,
+        duration_ms,
+    )
 
 
 # --- BS.1770 loudness --------------------------------------------------------

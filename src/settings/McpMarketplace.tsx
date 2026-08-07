@@ -38,11 +38,29 @@ function specToEntry(
   return entry;
 }
 
-/** A deterministic hue per publisher, so a card's monogram is stable. */
-const hueFor = (s: string) => {
+/** The monogram tile's hue, as one of the five markers.
+ *
+ * This is IDENTITY, not status — the same job the token-budget categories and
+ * the seven search engines do — so it comes from the palette rather than from
+ * the `hsl(hash 45% 55%)` this used to generate. Two reasons the old version
+ * had to go: an arbitrary hue wheel is a second colour system sitting next to
+ * a five-marker one, and its white-on-mid-tone lettering measured under 4.5:1
+ * for the lighter hues. The tile now draws in .nb-cat's recipe (ink on a wash
+ * of the hue), which clears 10:1 in every hue and both themes.
+ *
+ * Still a pure function of the publisher's name, so a card's tile is identical
+ * on every render. */
+const MONO_MARKS = [
+  "nb-mark-blue",
+  "nb-mark-green",
+  "nb-mark-yellow",
+  "nb-mark-pink",
+  "nb-mark-red",
+];
+const markFor = (s: string) => {
   let h = 0;
-  for (const c of s) h = (h * 31 + c.charCodeAt(0)) % 360;
-  return `hsl(${h} 45% 55%)`;
+  for (const c of s) h = (h * 31 + c.charCodeAt(0)) % 1024;
+  return MONO_MARKS[h % MONO_MARKS.length];
 };
 
 /** The registry's real title when it has one, else the slug name. */
@@ -50,26 +68,64 @@ const label = (e: CatalogEntry) => e.title || e.name;
 
 /** True when an entry needs an API key/token to set up — its install spec
  * declares env vars (local) or auth headers (remote) the user must fill in.
- * Drives the "No API key" filter. (OAuth-only remote servers declare no header,
- * so they read as key-free — sign-in is a separate step.) */
+ * Drives the "No API key" filter and the "Needs a key" badge. (OAuth-only
+ * remote servers declare no header, so they read as key-free — sign-in is a
+ * separate step.) */
 const needsKey = (e: CatalogEntry) =>
   (e.install.kind === "stdio" ? e.install.envKeys : e.install.headerKeys).length > 0;
 
-/** A server's real icon (backend-inlined data URI) when present, else a colored
- * monogram tile. Only ~1 in 12 registry servers ship an icon, so the monogram
- * is the common case. */
+/** A server's real icon (backend-inlined data URI) when present, else a
+ * marker-washed monogram tile. Only ~1 in 12 registry servers ship an icon, so
+ * the monogram is the common case. Decorative either way — the name it stands
+ * for is written immediately beside it. */
 function Mono({ entry, lg }: { entry: CatalogEntry; lg?: boolean }) {
   const cls = `mkt-mono${lg ? " lg" : ""}`;
   if (entry.icon) return <img className={cls} src={entry.icon} alt="" />;
   return (
-    <span
-      className={cls}
-      style={{
-        background: `linear-gradient(145deg, ${hueFor(entry.publisher)}, color-mix(in srgb, ${hueFor(entry.publisher)} 62%, #000))`,
-      }}
-    >
+    <span className={`${cls} ${markFor(entry.publisher)}`} aria-hidden="true">
       {initials(label(entry))}
     </span>
+  );
+}
+
+/** A filter, drawn as one of the system's circled chips.
+ *
+ * The control is a real `<input type="checkbox">` — it keeps its role, its
+ * checked state and its keyboard handling, and the chip is only its FACE. The
+ * input sits invisibly on top of the chip rather than being `display: none`,
+ * which is what it used to be and which removed it from the accessibility
+ * tree and from the tab order entirely.
+ *
+ * Selected reads as CIRCLED (.nb-chip.is-on draws a second offset ring) and
+ * carries a tick — a real shape change, so the state survives greyscale. */
+function FilterChip({
+  on,
+  onChange,
+  label: text,
+  hint,
+}: {
+  on: boolean;
+  onChange: (next: boolean) => void;
+  label: string;
+  hint: string;
+}) {
+  return (
+    <label className="mkt-filter" title={hint}>
+      <input
+        type="checkbox"
+        className="mkt-filter-box"
+        checked={on}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span
+        className={`nb-chip nb-chip-btn mkt-filter-face${on ? " is-on" : ""}`}
+      >
+        {on && (
+          <span className="nb-ico nb-ico-check mkt-filter-tick" aria-hidden="true" />
+        )}
+        {text}
+      </span>
+    </label>
   );
 }
 
@@ -149,13 +205,15 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
   // --- Opt-in gate: the marketplace's fetch is the app's one outbound call. ---
   if (optedIn === false) {
     return (
-      <div className="mkt-gate">
+      <div className="mkt-gate nb-card">
         <div className="mkt-gate-icon" aria-hidden>
           {ICON.globe}
         </div>
-        <div>
-          <strong>Browse the connector marketplace</strong>
-          <p className="settings-hint">
+        <div className="mkt-gate-body">
+          <strong className="mkt-gate-title">
+            Browse the connector marketplace
+          </strong>
+          <p className="mkt-gate-copy">
             To list connectors, Arcelle fetches the public MCP registry over
             the internet — the one time it reaches out on its own. Nothing from
             your room is sent; only the catalog comes back. Installing still asks
@@ -173,7 +231,7 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
   // The opt-in answer has not come back yet: say nothing rather than render an
   // empty grid that reads as "the registry has no connectors".
   if (optedIn === null) {
-    return <div className="settings-hint mkt-status">Checking…</div>;
+    return <p className="mkt-status">Checking…</p>;
   }
 
   const shown = entries.filter(
@@ -182,13 +240,21 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
       (!localOnly || !e.remote) &&
       (!noKeyOnly || !needsKey(e)),
   );
+  const hidden = entries.length - shown.length;
 
   return (
     <div className="mkt">
       <div className="mkt-controls">
-        <div className="mkt-search">
-          {ICON.search}
+        {/* .nb-field carries the drawn border and the double focus outline;
+            only the size is set here. The clear button is the one addition —
+            a search you cannot empty in one gesture is a filter you are stuck
+            in. */}
+        <div className="mkt-search nb-field">
+          <span className="mkt-search-ico" aria-hidden="true">
+            {ICON.search}
+          </span>
           <input
+            className="mkt-search-input"
             type="text"
             placeholder="Search the marketplace — “search”, “github”, “postgres”…"
             value={query}
@@ -197,32 +263,37 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
               if (e.key === "Escape") e.stopPropagation();
             }}
           />
+          {query !== "" && (
+            <button
+              type="button"
+              className="mkt-search-clear"
+              aria-label="Clear the search"
+              onClick={() => setQuery("")}
+            >
+              {ICON.x}
+            </button>
+          )}
         </div>
-        <div className="mkt-toggles">
-          <label className="mkt-tgl" title="Publishers that own their namespace">
-            <input
-              type="checkbox"
-              checked={verifiedOnly}
-              onChange={(e) => setVerifiedOnly(e.target.checked)}
-            />
-            <span className="mkt-sw" /> Verified
-          </label>
-          <label className="mkt-tgl" title="Hide connectors that reach the internet">
-            <input
-              type="checkbox"
-              checked={localOnly}
-              onChange={(e) => setLocalOnly(e.target.checked)}
-            />
-            <span className="mkt-sw" /> Local only
-          </label>
-          <label className="mkt-tgl" title="Hide connectors that need an API key or token to set up">
-            <input
-              type="checkbox"
-              checked={noKeyOnly}
-              onChange={(e) => setNoKeyOnly(e.target.checked)}
-            />
-            <span className="mkt-sw" /> No API key
-          </label>
+        <div className="mkt-filters">
+          <span className="mkt-filter-label">Show</span>
+          <FilterChip
+            on={verifiedOnly}
+            onChange={setVerifiedOnly}
+            label="Verified"
+            hint="Publishers that own their namespace"
+          />
+          <FilterChip
+            on={localOnly}
+            onChange={setLocalOnly}
+            label="Local only"
+            hint="Hide connectors that reach the internet"
+          />
+          <FilterChip
+            on={noKeyOnly}
+            onChange={setNoKeyOnly}
+            label="No API key"
+            hint="Hide connectors that need an API key or token to set up"
+          />
           {/* The way back out of the one outbound feature in the app. */}
           <button
             type="button"
@@ -243,56 +314,86 @@ export default function McpMarketplace({ installServer, installedNames }: Props)
           </button>
         </div>
       )}
-      {loading && !error && (
-        <div className="settings-hint mkt-status">Fetching the catalog…</div>
-      )}
+      {loading && !error && <p className="mkt-status">Fetching the catalog…</p>}
       {/* Only once a fetch has actually come back is an empty grid a fact about
           the catalogue rather than about the app not having asked yet. */}
       {!loading && !error && searched && shown.length === 0 && (
-        <div className="settings-hint mkt-status">
+        <p className="mkt-status">
           {entries.length === 0
             ? "The registry returned nothing for that search."
             : "No connectors match that. Try clearing a filter."}
-        </div>
+        </p>
       )}
       {!loading && !error && !searched && (
-        <div className="settings-hint mkt-status">Fetching the catalog…</div>
+        <p className="mkt-status">Fetching the catalog…</p>
+      )}
+      {/* How many the grid is showing, and how many the filters are keeping
+          back — pencilled in the margin, because a count is what the hand is
+          for. Without it a chip left on days ago silently shortens the list. */}
+      {!loading && !error && searched && shown.length > 0 && (
+        <p className="mkt-count">
+          {shown.length} connector{shown.length === 1 ? "" : "s"}
+          {hidden > 0 ? ` · ${hidden} hidden by filters` : ""}
+        </p>
       )}
 
-      <div className="mkt-grid">
+      <div className="mkt-grid nb-frame-set">
         {shown.map((e) => {
           const installed = installedNames.includes(e.name);
           return (
             <button
               key={e.id}
-              className="mkt-card"
+              className="mkt-card nb-card nb-lift"
               onClick={() => setSelected(e)}
               aria-label={`${label(e)} by ${e.publisher}`}
             >
-              <div className="mkt-card-head">
+              <span className="mkt-card-head">
                 <Mono entry={e} />
                 <span className="mkt-id">
-                  <span className="mkt-name">
-                    {label(e)}
-                    {e.verified && (
-                      <span className="mkt-verified" title="Verified publisher">
-                        {ICON.check}
-                      </span>
-                    )}
-                  </span>
+                  <span className="mkt-name">{label(e)}</span>
                   <span className="mkt-pub">{e.publisher || "community"}</span>
                 </span>
-              </div>
-              <p className="mkt-desc">{e.description}</p>
-              <div className="mkt-badges">
+              </span>
+              {/* The registry's own words, verbatim. Clamped to two lines in
+                  the visual only; the drawer shows the whole thing. */}
+              <span className="mkt-desc">{e.description}</span>
+              {/* Every badge carries a word. The hues are the product's
+                  meanings, not local choices: green "runs here", yellow
+                  "reaches the internet", blue "the registry asserts this",
+                  pink "a secret of yours gets stored". */}
+              <span className="mkt-badges">
                 {e.remote ? (
-                  <span className="mkt-badge remote">{ICON.cloud} Remote · reaches internet</span>
+                  <span className="nb-tape mkt-badge nb-sem-pending">
+                    {ICON.cloud} Remote · reaches internet
+                  </span>
                 ) : (
-                  <span className="mkt-badge local">{ICON.mac} Local · on your Mac</span>
+                  <span className="nb-tape mkt-badge nb-sem-done">
+                    {ICON.mac} Local · on your Mac
+                  </span>
                 )}
-                <span className="mkt-badge plain">{e.transport}</span>
-                {installed && <span className="mkt-badge installed">Installed</span>}
-              </div>
+                {e.verified && (
+                  <span
+                    className="nb-tape mkt-badge nb-sem-linked"
+                    title="Verified publisher — this publisher owns the namespace in the registry"
+                  >
+                    {ICON.check} Verified
+                  </span>
+                )}
+                {needsKey(e) && (
+                  <span
+                    className="nb-tape mkt-badge nb-sem-saved"
+                    title="Needs an API key or token, which is stored in this room"
+                  >
+                    {ICON.key} Needs a key
+                  </span>
+                )}
+                <span className="mkt-badge mkt-badge-plain">{e.transport}</span>
+                {installed && (
+                  <span className="nb-tape mkt-badge mkt-badge-installed">
+                    {ICON.check} Installed
+                  </span>
+                )}
+              </span>
             </button>
           );
         })}
@@ -518,6 +619,26 @@ function InstallDrawer({
               {entry.publisher || "community"}
               {entry.verified ? " · verified publisher" : ""}
             </div>
+            {/* The two claims that decide what installing this costs you, read
+                off the spec actually selected (the transport switch below can
+                change both). */}
+            <div className="mkt-dr-badges">
+              {isRemote ? (
+                <span className="nb-tape mkt-badge nb-sem-pending">
+                  {ICON.cloud} Remote · reaches internet
+                </span>
+              ) : (
+                <span className="nb-tape mkt-badge nb-sem-done">
+                  {ICON.mac} Local · on your Mac
+                </span>
+              )}
+              {secretKeys.length > 0 && (
+                <span className="nb-tape mkt-badge nb-sem-saved">
+                  {ICON.key} Needs a key
+                </span>
+              )}
+              <span className="mkt-badge mkt-badge-plain">{spec.kind}</span>
+            </div>
           </div>
           <button className="mkt-dr-x" onClick={onClose} aria-label="Close">
             {ICON.x}
@@ -554,33 +675,34 @@ function InstallDrawer({
             </div>
           )}
 
+          {/* The one disclosure that decides whether this is a privacy event.
+              Marked note, in the meaning's own colour, with the glyph and the
+              bold lead sentence both saying it too. */}
           {isRemote ? (
-            <div className="mkt-wall warn">
+            <p className="mkt-note mkt-note--flag nb-sem-pending">
               {ICON.warn}
-              <div>
-                <b>This connector runs in the cloud.</b> When the assistant calls
-                it, your prompt and the tool's arguments leave your Mac and reach{" "}
-                <b>{host || "an address this catalogue entry did not spell out"}</b>.
-                Arcelle redacts sensitive spans first and asks again the moment
-                data is about to leave.
-              </div>
-            </div>
+              <b>This connector runs in the cloud.</b> When the assistant calls
+              it, your prompt and the tool's arguments leave your Mac and reach{" "}
+              <b>{host || "an address this catalogue entry did not spell out"}</b>.
+              Arcelle redacts sensitive spans first and asks again the moment
+              data is about to leave.
+            </p>
           ) : (
-            <div className="mkt-wall safe">
+            <p className="mkt-note mkt-note--flag nb-sem-done">
               {ICON.shield}
-              <div>
-                <b>Runs on your Mac.</b> Arcelle starts{" "}
-                <b>{spec.kind === "stdio" ? spec.command : ""}</b> as a local
-                program — it only reaches the internet if the tool itself makes a
-                request. You confirm below before it starts.
-              </div>
-            </div>
+              <b>Runs on your Mac.</b> Arcelle starts{" "}
+              <b>{spec.kind === "stdio" ? spec.command : ""}</b> as a local
+              program — it only reaches the internet if the tool itself makes a
+              request. You confirm below before it starts.
+            </p>
           )}
 
           <div>
             <div className="mkt-label">
               {isRemote ? "Endpoint" : "Command that will run"}
             </div>
+            {/* Shown exactly as it will be used — this is the thing being
+                agreed to, so it is never wrapped, shortened or prettified. */}
             <div className="mkt-code">
               {spec.kind === "http"
                 ? spec.url
@@ -638,25 +760,22 @@ function InstallDrawer({
           {/* Only when we ASKED and the answer was "it cannot run". A missing
               answer shows nothing rather than a reassurance we do not have. */}
           {runtime && !runtime.available && (
-            <div className="mkt-wall warn" role="status">
-              {ICON.warn}
-              <div>
+            <div className="mkt-note mkt-note--flag nb-sem-pending" role="status">
+              <p className="mkt-note-text">
+                {ICON.warn}
                 {runtime.note}
-                {runtime.provisionable && (
-                  <>
-                    {" "}
-                    <button
-                      className="subtle"
-                      disabled={runtimeBusy}
-                      onClick={() => void doProvision()}
-                    >
-                      {runtimeBusy
-                        ? `Downloading… ${runtimePct}%`
-                        : `Download ${runtime.kind} for me`}
-                    </button>
-                  </>
-                )}
-              </div>
+              </p>
+              {runtime.provisionable && (
+                <button
+                  className="subtle mkt-note-action"
+                  disabled={runtimeBusy}
+                  onClick={() => void doProvision()}
+                >
+                  {runtimeBusy
+                    ? `Downloading… ${runtimePct}%`
+                    : `Download ${runtime.kind} for me`}
+                </button>
+              )}
             </div>
           )}
           {err && <div className="gate-error">{err}</div>}
@@ -664,9 +783,9 @@ function InstallDrawer({
 
         <div className="mkt-dr-foot">
           {confirming && !done && (
-            <div className="mkt-wall warn mkt-confirm" role="alert">
-              {ICON.warn}
-              <div>
+            <div className="mkt-note mkt-note--flag nb-sem-pending" role="alert">
+              <p className="mkt-note-text">
+                {ICON.warn}
                 {isRemote ? (
                   <>
                     <b>Connect to {host || "this endpoint"} now?</b> Arcelle will
@@ -681,7 +800,7 @@ function InstallDrawer({
                 )}{" "}
                 Applying also (re)starts every other enabled connector in this
                 room — including any you have not approved before.
-              </div>
+              </p>
             </div>
           )}
           <button
@@ -734,11 +853,11 @@ function InstallDrawer({
               )}
               {authBusy && (
                 <div className="mkt-oauth-wait">
-                  <span className="settings-hint">
+                  <p className="mkt-oauth-hint">
                     A browser tab should have opened — finish sign-in there. If
                     this connector doesn't support in-app sign-in, cancel and add
                     its token under Auth headers instead.
-                  </span>
+                  </p>
                   <button className="btn-ic mkt-oauth-cancel" onClick={cancelOauth}>
                     Cancel
                   </button>
@@ -746,7 +865,7 @@ function InstallDrawer({
               )}
               {authBusy && authUrl && (
                 <div className="mkt-oauth-manual">
-                  <span className="settings-hint">Didn't open?</span>
+                  <span className="mkt-oauth-hint">Didn't open?</span>
                   <a
                     className="mkt-repo"
                     href={authUrl}
@@ -770,11 +889,11 @@ function InstallDrawer({
               )}
             </div>
           )}
-          <div className="mkt-dr-note">
+          <p className="mkt-dr-note">
             {isRemote
               ? "Added to this room only · sign-in opens your browser"
               : "Added to this room only · you confirm before it runs"}
-          </div>
+          </p>
         </div>
       </aside>
     </div>
@@ -782,50 +901,59 @@ function InstallDrawer({
 }
 
 // -------------------------------------------------------------------- icons
+// Decorative throughout: every one of these sits beside a word that says the
+// same thing, so all of them are aria-hidden and none reaches a screen reader.
 const ICON = {
   search: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
       <circle cx="11" cy="11" r="7" />
       <path d="M21 21l-4.3-4.3" />
     </svg>
   ),
   check: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" aria-hidden="true">
       <circle cx="12" cy="12" r="9" fill="currentColor" opacity=".14" stroke="none" />
       <path d="M8 12.5l2.5 2.5 5-5.5" />
     </svg>
   ),
   cloud: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
       <path d="M7 18a4 4 0 0 1-.5-8A6 6 0 0 1 18 9.5 3.5 3.5 0 0 1 17.5 18z" />
     </svg>
   ),
   mac: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
       <rect x="3" y="4" width="18" height="12" rx="2" />
       <path d="M8 20h8M12 16v4" />
     </svg>
   ),
+  // The credential mark: a key. Used only beside the words "Needs a key".
+  key: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
+      <circle cx="7.5" cy="12" r="3.8" />
+      <path d="M11.3 12H21M18 12v3.2M14.8 12v2.4" />
+    </svg>
+  ),
   warn: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
       <path d="M12 3l9.5 16.5H2.5z" />
       <path d="M12 10v4M12 17.5v.5" />
     </svg>
   ),
   shield: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
       <path d="M12 3l7 3v6c0 4.4-3 7.4-7 9-4-1.6-7-4.6-7-9V6z" />
       <path d="M9 12l2 2 4-4" />
     </svg>
   ),
   globe: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
       <circle cx="12" cy="12" r="9" />
       <path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18" />
     </svg>
   ),
   x: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
       <path d="M6 6l12 12M18 6L6 18" />
     </svg>
   ),

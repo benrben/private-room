@@ -102,7 +102,7 @@ export default function CheckpointsSection({
             disk
           </div>
           {totalBytes > ONE_GB && (
-            <p className="settings-hint ckpt-warn">
+            <p className="ckpt-warn set-note set-note--flag nb-sem-pending">
               Each checkpoint is a full copy of this room, including recordings —
               these are using a lot of disk. Delete old ones you don't need.
             </p>

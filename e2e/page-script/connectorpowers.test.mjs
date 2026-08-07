@@ -240,44 +240,98 @@ test("the hook's setters each move only their own flag", () => {
   assert.match(HOOK, /useState\(false\);\s*\n\s*const \[outboundUnmask/);
 });
 
-test("the Connectors page offers two switches and each states its own effect", () => {
-  const boxes = [...VIEW.matchAll(/checked=\{(\w+)\}/g)].map((m) => m[1]);
-  assert.ok(boxes.includes("autoApprove"), "the consent switch is gone");
-  assert.ok(boxes.includes("outboundUnmask"), "the unmasking switch is gone");
+/* The two powers used to be written out twice as hand-rolled <label> blocks.
+ * The notebook pass factored them into one local <PowerCard>, which is why this
+ * reads props rather than a raw checkbox: the flag now arrives as `on={…}` and
+ * the words as `copy`/`whenOn`/`whenOff`. The INVARIANT is unchanged, and so is
+ * what would break it — a card's flag and its words still live inside the same
+ * slice of source, so crossing the copy onto the wrong switch still fails here.
+ *
+ * Slicing on the sibling tag, not on `/>`: the copy contains `</>` fragments,
+ * whose last two characters are also `/>`. */
+function powerCards() {
+  const rowAt = VIEW.indexOf('<div className="conn-powers');
+  assert.notEqual(rowAt, -1, "the row that holds the two powers is gone");
+  const row = VIEW.slice(rowAt, VIEW.indexOf("</section>", rowAt));
+  const parts = row.split("<PowerCard").slice(1);
+  const byFlag = new Map();
+  for (const part of parts) {
+    const flag = /\bon=\{(\w+)\}/.exec(part)?.[1];
+    assert.ok(flag, `a power switch is not bound to a flag at all: ${part.slice(0, 80)}`);
+    // Cut at this card's OWN closing tag, not at the next <PowerCard. Splitting
+    // on the sibling left each slice running through the gap to the next one —
+    // including the next card's leading JSX comment — so the "must not mention
+    // the other power" guards below were reading text belonging to the control
+    // they were meant to be isolating from.
+    //
+    // The boundary is `/>` alone on its own line at the element's indent. A
+    // bare indexOf("/>") does NOT work: the copy is JSX containing `</>`
+    // fragment closers, whose last two characters are also `/>`, so it cuts in
+    // the middle of the very sentences these tests exist to pin.
+    const end = part.search(/\n\s*\/>/);
+    byFlag.set(flag, end === -1 ? part : part.slice(0, end));
+  }
+  return byFlag;
+}
 
-  // Each label's copy is scoped to its own power. The consent switch must NOT
+test("the Connectors page offers two switches and each states its own effect", () => {
+  const cards = powerCards();
+  assert.ok(cards.has("autoApprove"), "the consent switch is gone");
+  assert.ok(cards.has("outboundUnmask"), "the unmasking switch is gone");
+  assert.equal(cards.size, 2, "a third Mac-wide power appeared without a test");
+
+  // Each card's copy is scoped to its own power. The consent switch must NOT
   // still promise real values — that claim moving with the wrong switch is the
   // exact confusion the split removes.
-  const label = (checked) => {
-    const at = VIEW.indexOf(`checked={${checked}}`);
-    const end = VIEW.indexOf("</label>", at);
-    return VIEW.slice(at, end);
-  };
-  const autoCopy = label("autoApprove");
+  const autoCopy = cards.get("autoApprove");
   assert.ok(
     !/real values/i.test(autoCopy),
     "the consent switch must not claim to change what is sent",
   );
   assert.match(autoCopy, /without asking/i);
-  assert.match(label("outboundUnmask"), /real values/i);
+  assert.match(cards.get("outboundUnmask"), /real values/i);
 
-  // Both labels state the LIVE state, not the default — the wording live QA
-  // once read as a privacy bug.
-  for (const copy of [autoCopy, label("outboundUnmask")]) {
-    assert.match(copy, /Currently ON/);
-    assert.match(copy, /Currently OFF/);
+  // The CONSEQUENCE, not just the label. These two sentences are the whole
+  // reason the switches are dangerous, and pinning only the prop NAMES let
+  // them be emptied without failing anything: whenOn=" " would have passed.
+  assert.match(
+    autoCopy,
+    /run unattended/i,
+    "the consent switch no longer says its calls run unattended",
+  );
+  assert.match(
+    cards.get("outboundUnmask"),
+    /remote connectors see real values/i,
+    "the unmasking switch no longer says remote connectors see real values",
+  );
+
+  // Each still supplies BOTH halves of the live-state sentence. A card that
+  // passed only one would read as a default again the moment it was flipped.
+  for (const part of cards.values()) {
+    assert.match(part, /\bwhenOn=/);
+    assert.match(part, /\bwhenOff=/);
   }
+
+  // The state sentence itself is now rendered once, by the shared card, off the
+  // live flag — so neither power can quietly drift back to describing a fresh
+  // install. That wording is what live QA once read as a privacy bug.
+  const cardAt = VIEW.indexOf("function PowerCard");
+  assert.notEqual(cardAt, -1, "the shared power card is gone");
+  const card = VIEW.slice(cardAt, VIEW.indexOf("\n}\n", cardAt));
+  assert.match(card, /on \? "Currently ON" : "Currently OFF"/);
+  assert.match(card, /on \? whenOn : whenOff/);
 
   // …and so does the header ABOVE them. It used to promise flatly that Arcelle
   // "asks before either starts, and hides this room's private details", two
   // sentences the two switches can each falsify — sitting directly over the
   // checkbox that falsifies them. Splitting the control without fixing the
   // paragraph would have left the page's most prominent privacy claim wrong in
-  // one more way than before.
-  const head = VIEW.slice(
-    VIEW.indexOf('<p className="settings-hint">'),
-    VIEW.indexOf("</p>", VIEW.indexOf('<p className="settings-hint">')),
-  );
+  // one more way than before. (It was `.settings-hint`; the notebook pass moved
+  // it to `.conn-lead` because it is the page's lead instruction, not a 12px
+  // muted aside. The class may move again — the reading off both flags may not.)
+  const leadAt = VIEW.indexOf('<p className="conn-lead">');
+  assert.notEqual(leadAt, -1, "the page lost the lead paragraph over the switches");
+  const head = VIEW.slice(leadAt, VIEW.indexOf("</p>", leadAt));
   assert.match(head, /autoApprove/, "the header does not read off the consent switch");
   assert.match(head, /outboundUnmask/, "the header does not read off the unmasking switch");
 });

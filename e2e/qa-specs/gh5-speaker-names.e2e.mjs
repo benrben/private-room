@@ -60,11 +60,28 @@ async function rename(nth, name, key = "Enter") {
  * about re-numbering only while the overlay is non-empty, which is the one
  * place "cleared" and "stored an entry that shadows itself" look different. */
 async function warnsAboutNames() {
+  // Re-transcribe lives in the "Export & rebuild" drawer now — §13 of the
+  // notebook pass moved export and technical actions out of the reading line,
+  // so the button is in the DOM with a real rect but unpainted while the
+  // drawer is shut, and a click on it reports "did not become interactable".
+  // Open the drawer first; it stays open for the rest of the turn, so this is
+  // a no-op on every later call.
+  const drawer = await $(".rec-drawer");
+  if (await drawer.isExisting()) {
+    const open = await drawer.getAttribute("open");
+    if (open === null) {
+      await (await $(".rec-drawer-head")).click();
+      await browser.pause(150);
+    }
+  }
   await (await $('button[title^="Rebuild the transcript"]')).click();
   const confirm = await $(".rec-retrans-confirm");
   await confirm.waitForDisplayed({ timeout: 5_000 });
   const text = await confirm.getText();
-  await (await $(".rec-retrans-confirm button.subtle")).click();
+  // Cancel — the notebook pass restyled the confirmation's two buttons from
+  // `.subtle` to the paper controls (`.nb-btn-danger` / `.nb-btn-quiet`), so
+  // ask for the one that says Cancel rather than for a class.
+  await (await $(".rec-retrans-confirm .nb-btn-quiet")).click();
   await confirm.waitForDisplayed({ reverse: true, timeout: 5_000 });
   return /check the names you gave them/i.test(text);
 }

@@ -3,10 +3,15 @@ use super::*;
 mod flashcards;
 mod mindmap;
 mod podcast;
+/// Recording a podcast script as audio — many voices, one m4a room file with a
+/// seekable transcript. Split from `podcast` because it is a different act with
+/// a different, much larger outbound seam; see the module header.
+mod podcast_audio;
 
 pub use flashcards::*;
 pub use mindmap::*;
 pub use podcast::*;
+pub use podcast_audio::*;
 
 /// Gather the text a studio command works over. `scope` = a file id (that one
 /// file) or None (a slice of the whole room). Returns (label, text), or an error
@@ -281,15 +286,48 @@ pub fn studio_prompts() -> StudioPrompts {
 /// offline HTML file (all CSS/JS inline, no network) so it renders fully in the
 /// app's `roomdoc://` sandbox. Shared by the flashcards / mind-map / podcast
 /// authors below.
+///
+/// The theme clause is specific for two reasons that are easy to undo by
+/// accident. It names `html[data-theme="dark"]` because that is the ONLY
+/// signal a staged document gets: `withFrameTheme` (src/viewers/frameTheme.ts)
+/// stamps that attribute, and a page keyed on `prefers-color-scheme` would
+/// follow the MAC instead of the room — the exact bug the built-in templates
+/// were rewritten to kill. And it names one palette, because this string used
+/// to carry both: a notebook clause was appended without deleting the old
+/// "dark-themed page: near-black background (#0b0b12)", so every model was
+/// asked for a near-black page made of warm paper and resolved the
+/// contradiction its own way.
+///
+/// This is the ONE prompt in the Studio pipeline allowed to talk about colour,
+/// and only because on this path the model IS the template: it authors the
+/// whole page and no Rust template gets to style it afterwards. The four hex
+/// values are copies of `src/styles/tokens.css` (--page and --ink for both
+/// themes, plus --mk-pink-ink) and have to be kept in step with it, exactly
+/// like `NOTEBOOK_CSS` in docs_html.rs. The light accent was #c63a58, which is
+/// not a token from anywhere and measured 4.49:1 on the ivory page — under the
+/// 4.5:1 floor by a rounding error; it is tokens.css's --mk-pink-ink now.
+///
+/// NO OTHER PROMPT IN THESE FILES NAMES A COLOUR OR A FONT, and none should.
+/// A `page_role` describes the page's STRUCTURE and BEHAVIOUR and then defers
+/// to this string for the look, so the palette is stated once. A
+/// `fallback_system` asks for content and nothing else — on that path the
+/// model's JSON goes into a Rust template that owns every pixel, and a styling
+/// instruction there is dead weight at best and a fight with the template at
+/// worst. (Audited 2026-08-05; the "soft violet accent (#8b7cf6)" clause an
+/// earlier pass removed was exactly this bug.)
 pub(crate) const SELF_CONTAINED_HTML_RULES: &str = "Output ONE complete, self-contained HTML \
 document and nothing else — no explanation, no markdown code fences. Put ALL CSS \
 inside a <style> tag and ALL JavaScript inside a <script> tag in the same file. Use \
 NO external resources whatsoever: no <link>, no <script src>, no CDN, no web fonts, \
 no remote images, no fetch/XMLHttpRequest — the page runs offline in a sandbox and \
 any network request silently fails. For images use inline SVG or a data: URI only. \
-Make it a polished, responsive, dark-themed page: near-black background (#0b0b12), \
-soft violet accent (#8b7cf6), light text, system font. Write correct JavaScript that \
-runs on load with no errors.";
+Make it a polished, responsive page: ink on warm paper, light by default \
+(#f4f1e8 paper, #20221f ink) with a dark palette under the html[data-theme=\"dark\"] \
+selector (#151716 paper, #f0eee5 ink) — never a prefers-color-scheme media query — \
+and a muted marker accent (#be3754 light, #c87b91 dark). System font stack only. \
+Add a @media print rule that puts the page back on white with black text and drops \
+any background pattern, because these pages get saved and printed. Write correct \
+JavaScript that runs on load with no errors.";
 
 /// ADD-31: create this operation's cancel node and, when the frontend supplied
 /// an op id, register it in the shared cancel registry — the same one chat's
@@ -416,6 +454,30 @@ pub(crate) struct StudioSpec {
     pub(crate) render: fn(&str, &str) -> Result<String, String>,
     /// Output filename prefix, e.g. "Flashcards".
     pub(crate) filename_prefix: &'static str,
+    /// Run the STRUCTURED extraction as the primary path, and never author
+    /// free-form HTML at all.
+    ///
+    /// Only the podcast sets this, and the reason is the whole point of the
+    /// artifact: its turns have to be readable as DATA, because voices are
+    /// assigned per speaker and synthesized per line. A page of model-authored
+    /// markup is a script that cannot be spoken — and under the HTML-first
+    /// pipeline that was the usual outcome, since the structured shape only
+    /// ever appeared on the fallback path.
+    ///
+    /// It also happens to be the more reliable path on a small model: authoring
+    /// a whole styled HTML page is the hardest thing this pipeline asks of a
+    /// 4B, while filling a four-field schema is the easiest. What is given up
+    /// is per-episode visual invention, which `render_podcast_html` (already
+    /// themed from NOTEBOOK_CSS, already tested) was doing better anyway.
+    pub(crate) structured_first: bool,
+    /// Called after the artifact is saved, with (room, new file id, raw model
+    /// JSON). Lets an artifact persist STRUCTURE alongside its page — the
+    /// podcast stores its cast and turns so voices can be re-assigned and the
+    /// audio re-rendered without asking the model again.
+    ///
+    /// Only ever `Some` together with `structured_first`: the raw string handed
+    /// over is the structured JSON, and on the HTML path there is none.
+    pub(crate) after_save: Option<fn(&Connection, &str, &str) -> Result<(), String>>,
 }
 
 /// The one Studio pipeline shared by flashcards, mind map and podcast script:
@@ -476,6 +538,39 @@ pub(crate) fn studio_title(kind: &str) -> &'static str {
     }
 }
 
+/// Ask the model for this artifact's STRUCTURED shape (its `fallback_schema`).
+///
+/// Extracted because two callers now want it: the JSON fallback under the
+/// HTML-authoring path, and the podcast's primary path. Keeping one function
+/// means the two cannot drift into asking for the same artifact differently —
+/// which would show up as a podcast whose turns parse in one code path and not
+/// the other.
+async fn studio_structured(
+    model: &str,
+    spec: &StudioSpec,
+    instr: &str,
+    label: &str,
+    text: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    let messages = vec![
+        ollama::ChatMessage::new("system", spec.fallback_system),
+        ollama::ChatMessage::new(
+            "user",
+            format!("{instr}\n\n{} \"{label}\":\n\n{text}", spec.fallback_intro),
+        ),
+    ];
+    ollama::chat_structured(
+        model,
+        messages,
+        Some(spec.fallback_temp),
+        KEEP_ALIVE_WARM,
+        &spec.fallback_schema,
+        ollama::StructuredOpts::default().with_cancel(cancel),
+    )
+    .await
+}
+
 /// The shared Studio pipeline, driven by an explicit `cancel` flag so a
 /// background job's own `job_cancels` flag can Stop it (the foreground path
 /// passes its chat-registry flag instead). `room_path`, when set, pins every
@@ -493,7 +588,10 @@ pub(crate) async fn run_studio_core(
 ) -> Result<FileMeta, String> {
     use tauri::Emitter;
     let instr = studio_instruction(instructions, spec.default_prompt);
-    let _ = window.emit("studio-step", "Reading the material…");
+    let _ = window.emit(
+        "studio-step",
+        serde_json::json!({ "step": "Reading the material…", "local": true }),
+    );
     let (label, text) = state.with_room(|room| {
         if room_path.is_some_and(|rp| room.path != rp) {
             return Err("the room this job belongs to was closed".to_string());
@@ -506,49 +604,69 @@ pub(crate) async fn run_studio_core(
     let model = resolve_structured_model(state)
         .await
         .ok_or("The local AI (Ollama) isn't running — start it and try again.")?;
+    // "Does this leave the Mac?" is the DECLARED `local` field, not a pair of
+    // name tests — the pair missed Ollama's `<size>-cloud` spelling
+    // (`gpt-oss:120b-cloud`), so such a room was told a local model was writing
+    // while the content was already on its way out.
+    //
+    // The flag is EMITTED alongside the words, rather than left for the
+    // frontend to recover by matching "leaves this Mac" against the string.
+    // The pane styles a privacy notice differently from a progress aside — one
+    // is a consequence, the other is an aside — and deciding which is which by
+    // grepping English would break on the first reworded sentence or the first
+    // translation, silently, in the direction that under-warns.
+    let local = declared_for(&model).local;
     let _ = window.emit(
         "studio-step",
-        // "Does this leave the Mac?" is the DECLARED `local` field, not a pair
-        // of name tests — the pair missed Ollama's `<size>-cloud` spelling
-        // (`gpt-oss:120b-cloud`), so such a room was told a local model was
-        // writing while the content was already on its way out.
-        if !declared_for(&model).local {
-            format!("{} — your cloud AI is writing (content leaves this Mac)…", spec.working_label)
-        } else {
-            format!("{} — a local model can take a few minutes…", spec.working_label)
-        },
+        serde_json::json!({
+            "step": if local {
+                format!("{} — a local model can take a few minutes…", spec.working_label)
+            } else {
+                format!("{} — your cloud AI is writing (content leaves this Mac)…", spec.working_label)
+            },
+            "local": local,
+        }),
     );
-    let content = match generate_studio_html(&model, spec.page_role, &instr, &label, &text, cancel.clone())
+    // `structured_first` artifacts (the podcast) skip HTML authoring entirely:
+    // their turns must survive as DATA, and the only path that produces data is
+    // the structured one. The raw JSON is kept so `after_save` can persist it.
+    let mut structured_raw: Option<String> = None;
+    let content = if spec.structured_first {
+        let raw = studio_structured(
+            &model,
+            &spec,
+            &instr,
+            &label,
+            &text,
+            cancel.clone(),
+        )
+        .await?;
+        crate::cancel::guard_commit(&cancel, "the studio page")?;
+        let html = (spec.render)(&raw, &label)?;
+        structured_raw = Some(raw);
+        html
+    } else {
+        match generate_studio_html(&model, spec.page_role, &instr, &label, &text, cancel.clone())
         .await?
     {
         Some(html) if !cancel.load(Ordering::SeqCst) => html,
         _ if cancel.load(Ordering::SeqCst) => return Err("Stopped.".into()),
         _ => {
             if let Some(step) = spec.fallback_step {
-                let _ = window.emit("studio-step", step);
+                let _ = window.emit(
+                    "studio-step",
+                    serde_json::json!({ "step": step, "local": true }),
+                );
             }
             // Fallback: extract the structured artifact and render the built-in
             // template (so the caller never hard-fails on unusable HTML).
-            let messages = vec![
-                ollama::ChatMessage::new("system", spec.fallback_system),
-                ollama::ChatMessage::new(
-                    "user",
-                    format!("{instr}\n\n{} \"{label}\":\n\n{text}", spec.fallback_intro),
-                ),
-            ];
-            let raw = ollama::chat_structured(
-                &model,
-                messages,
-                Some(spec.fallback_temp),
-                KEEP_ALIVE_WARM,
-                &spec.fallback_schema,
-                ollama::StructuredOpts::default().with_cancel(cancel.clone()),
-            )
-            .await?;
+            let raw =
+                studio_structured(&model, &spec, &instr, &label, &text, cancel.clone()).await?;
             if cancel.load(Ordering::SeqCst) {
                 return Err("Stopped.".into());
             }
             (spec.render)(&raw, &label)?
+        }
         }
     };
     // Pin the write too: bail if the room was swapped between gather and save,
@@ -592,7 +710,28 @@ pub(crate) async fn run_studio_core(
     if let Some(ids) = refs.as_ref().filter(|r| !r.is_empty()) {
         art = art.from_files(ids);
     }
-    save_and_open(window, state, art).map(|w| w.meta)
+    let meta = save_and_open(window, state, art).map(|w| w.meta)?;
+    // Persist the artifact's STRUCTURE beside its page (the podcast's cast and
+    // turns). After the save, because the row is keyed by the file id — and
+    // deliberately non-fatal: the page is already in the room and useful, so a
+    // failure here degrades the extras (voices can be re-assigned only after a
+    // regenerate) rather than reporting a build that visibly succeeded as
+    // failed.
+    if let (Some(hook), Some(raw)) = (spec.after_save, structured_raw.as_deref()) {
+        let stored = state.with_room(|room| hook(&room.conn, &meta.id, raw));
+        if let Err(e) = stored {
+            // Classified, never the text: an error string here can carry the
+            // artifact's own name (obs::err_kind's whole reason).
+            crate::obs::warn(
+                "studio.structure_not_stored",
+                &[
+                    ("artifact", crate::obs::id(spec.filename_prefix)),
+                    ("error", crate::obs::err_kind(&e)),
+                ],
+            );
+        }
+    }
+    Ok(meta)
 }
 
 #[cfg(test)]

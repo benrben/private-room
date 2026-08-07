@@ -2,13 +2,12 @@ import { useCallback, useEffect, useRef } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { exit } from "@tauri-apps/plugin-process";
-import { Props, WorkArea } from "./workspace/types";
+import { Props, WorkArea, areaHoldsFile, isWorkArea } from "./workspace/types";
 import { useTabs, tabId, type Tab } from "./workspace/tabs";
 import TabStrip from "./shell/TabStrip";
-import { areaLabel } from "./shell/ActivityRail";
 import { fileLabel } from "./workspace/composer";
-import { FilesIcon, GlobeIcon } from "./icons";
-import { api } from "./api";
+import { GlobeIcon } from "./icons";
+import { api, type ViewerKind } from "./api";
 import { useWorkspaceState } from "./workspace/state";
 import { useWorkspaceActions, type WSActions } from "./workspace/actions";
 import { useWorkspaceEffects } from "./workspace/effects";
@@ -32,6 +31,30 @@ import ErrorBoundary from "./shell/ErrorBoundary";
 import { pendingApprovalCount, runningJobCount } from "./shell/activity";
 import { pageToReassert, shouldRestoreFocus } from "./shell/tabsync";
 import { isCloudRoute } from "./workspace/markup";
+
+/** Which place the room was left in, so it reopens there. Sits beside
+ * "workspace_tabs" (see workspace/tabs.ts) — same room, same lifetime, and
+ * the two are read back together on the way in. */
+const AREA_SETTING = "workspace_area";
+
+/** Pages whose whole job is reading or capturing, where the AI column steps
+ * aside on arrival so the document gets the width (see useLayout's
+ * `setFocusedPage`). Long-form documents and recordings only: a spreadsheet, a
+ * script or a note is something you work ON, usually with the assistant, and
+ * closing its column would be taking a tool away mid-task. */
+const FOCUSED_KINDS = new Set<ViewerKind>([
+  "book",
+  "pdf",
+  "prose",
+  "email",
+  "worddoc",
+  "docx",
+  "slides",
+  "subtitle",
+  "recording",
+  "audio",
+  "video",
+]);
 
 /** The room workspace. A thin shell: state in useWorkspaceState, handlers in
  * useWorkspaceActions, backend-event wiring in useWorkspaceEffects — composed
@@ -173,6 +196,23 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
         ? "map"
         : s.area;
 
+  /** The area the two CONTEXTUAL surfaces describe: the breadcrumb trail and
+   * the library pane.
+   *
+   * `area` above is the PLACE — what the rail marks as current, and what
+   * Escape puts back on screen. That is not always the same question. An open
+   * file wins the centre pane over any area page, so a room document can be
+   * showing while the browser, Memory or Workflows is the place underneath —
+   * and the trail and the left pane were both still describing the place.
+   *
+   * They follow the document instead whenever the place does not hold it.
+   * The rail is deliberately untouched: it is still true that the browser is
+   * where Escape goes, and the strip's page tab is still there to click. */
+  const contextArea: WorkArea =
+    s.openFile && !areaHoldsFile(area, s.openFile.id, s.files, s.scripts)
+      ? "files"
+      : area;
+
   const tabs = useTabs(info.name);
   // Which tab's state has already been put into effect. Declared up here
   // because closing a tab has to forget it: re-activating the SAME tab id
@@ -233,10 +273,25 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     [tabs, guardLeave],
   );
 
+  /** Files whose tab was closed, newest last — the ⇧⌘T stack.
+   *
+   * Files only, and deliberately: a private-browser page is not remembered
+   * anywhere, and a list of pages you could bring back is a history file
+   * wearing a different hat (the same reason page tabs are never persisted). */
+  const reopenableRef = useRef<string[]>([]);
+
   const doCloseTab = useCallback(
     (id: string) => {
       const tab = tabsRef.current.tabs.find((t) => t.id === id);
       if (tab?.kind === "page") void api.browserCloseTab(tab.ref).catch(() => {});
+      if (tab?.kind === "file") {
+        // Re-closing a file that was already reopened must not leave two
+        // entries, or ⇧⌘T twice would open the same file twice.
+        reopenableRef.current = reopenableRef.current
+          .filter((ref) => ref !== tab.ref)
+          .concat(tab.ref)
+          .slice(-20);
+      }
       // Closing the tab must close what it was SHOWING, or the file stays on
       // screen with no tab pointing at it — and the watcher below would hand
       // it a new tab on the next file-list refresh.
@@ -342,13 +397,77 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.webOn, area, tabs.tabs.length, tabs.activeId]);
 
-  // Rail click = focus-or-open, which is what makes an area STAY open.
+  // Rail click = go there. Places used to earn a TAB as well, which is what
+  // made the strip fill up with the same nine names the rail already lists;
+  // the rail is now the only navigation and the strip holds documents (see
+  // shell/ActivityRail.tsx for why that way round). Nothing is lost by not
+  // having a tab: the area is held by `s.area` and the view flags, an open
+  // file simply draws on top of it, and closing that file returns to the area
+  // underneath exactly as it did when a tab was doing the remembering.
+  //
+  // Except for one thing, which is why AREA_SETTING exists. A tab was also
+  // doing the remembering ACROSS LAUNCHES. Once areas stopped being tabs the
+  // room had nowhere to record which place the reader was in, so quitting on
+  // Home and reopening landed them on a file instead. The area is written here
+  // — at the one entry point a person actually navigates through — and read
+  // back below.
   const openArea = useCallback(
     (next: Exclude<WorkArea, "files">) => {
-      guardLeave("Opening this area", () => tabs.open("area", next, areaLabel(next)));
+      guardLeave("Opening this area", () => {
+        showArea(next);
+        void api.setSetting(AREA_SETTING, next).catch(() => {
+          /* a forgotten place is cosmetic; never disturb the room over it */
+        });
+        // ...and the strip selects NOTHING. Going to a place closes the open
+        // file, so leaving its tab highlighted would have the strip claiming
+        // to show a document that is no longer on screen — and clicking that
+        // highlight would do nothing, because the state it describes is
+        // already "applied". Forgetting the applied id is the other half:
+        // clicking the tab again has to genuinely re-open the file.
+        //
+        // The Browser is the exception, and it is not an exception to the
+        // rule so much as the rule applied honestly: it is the one "place"
+        // that shows a DOCUMENT — a live page. So it keeps a selection,
+        // whichever page tab was current or else the first, and the apply
+        // effect below asks Rust to show that page.
+        const page =
+          next === "browser"
+            ? tabsRef.current.active?.kind === "page"
+              ? tabsRef.current.active
+              : tabsRef.current.tabs.find((t) => t.kind === "page")
+            : undefined;
+        appliedRef.current = "";
+        tabs.activate(page ? page.id : "");
+      });
     },
-    [tabs, guardLeave],
+    [showArea, guardLeave, tabs],
   );
+
+  /** Reopen the room in the place it was left.
+   *
+   * Runs once per room, and only AFTER the tab restore has finished — hence
+   * `tabs.restored`. showArea() closes the open file, so firing this while a
+   * file tab was still being restored would undo it.
+   *
+   * Two guards, both deliberate. A restored file tab wins: a document is a
+   * more specific place than the area behind it, and it is what the reader was
+   * actually looking at. And a saved value is only honoured if it is still a
+   * real area — the setting outlives the build that wrote it, so a renamed or
+   * retired area has to degrade to the default rather than wedge the room. */
+  const areaRestoredFor = useRef("");
+  useEffect(() => {
+    if (!tabs.restored || areaRestoredFor.current === info.name) return;
+    areaRestoredFor.current = info.name;
+    if (tabs.activeId) return;
+    void api
+      .getSetting(AREA_SETTING)
+      .then((saved) => {
+        if (saved && isWorkArea(saved)) showArea(saved);
+      })
+      .catch(() => {
+        /* opens at the default place, which is a fine outcome */
+      });
+  }, [tabs.restored, tabs.activeId, info.name, showArea]);
 
   // Every existing `setOpenFile` call site — citations, agent opens, the
   // library, Quick Actions, 21 of them — earns a tab for free by being watched
@@ -388,6 +507,10 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       return;
     }
     if (tab.kind === "area") {
+      // Legacy only: rooms saved before places stopped being tabs still have
+      // area tabs in their settings, and this is the tick between them being
+      // read back and the prune below dropping them. Applying it keeps that
+      // tick honest — the room opens where it was left.
       showArea(tab.ref as Exclude<WorkArea, "files">);
       return;
     }
@@ -398,13 +521,14 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs.active?.id]);
 
-  // The full-pane views (Scripts, Workflows, Room Map) are flags, and they can
-  // be raised or dropped from outside the strip: a toast action, the ⌘K
-  // palette, the page's own Close button, Escape. Both directions have to
-  // reach the strip, or the tab and the pane disagree — closing Scripts from
-  // inside it used to leave its tab selected over an empty pane, and clicking
-  // that tab did nothing, because the state it describes was already
-  // "applied".
+  // A full-pane view (Scripts, Workflows, Room Map) can be raised from outside
+  // the rail — the "Scripts" action on a run toast, the ⌘K palette, a Home
+  // row, the library's "New workflow" — and every one of those takes the pane
+  // away from whatever document was on screen. Places are not tabs any more,
+  // so there is nothing for the strip to select instead: it selects nothing,
+  // for the same reason `openArea` does. Dropping a flag needs no handling at
+  // all now — whatever the pane falls back to is an area, and areas are the
+  // rail's business.
   const areaFlagsRef = useRef({ scripts: false, workflows: false, map: false });
   useEffect(() => {
     const prev = areaFlagsRef.current;
@@ -414,30 +538,22 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       map: s.showMap,
     };
     areaFlagsRef.current = now;
-    const keys = ["scripts", "workflows", "map"] as const;
-    // Raised: make sure the view that is on screen owns the selected tab —
-    // the "Scripts" action on a run toast opens the page directly.
-    for (const key of keys) {
-      if (!prev[key] && now[key]) tabs.open("area", key, areaLabel(key));
-    }
-    const fell = keys.filter((key) => prev[key] && !now[key]);
-    if (fell.length === 0) return;
-    // Dropped: wait a tick before deciding. Leaving one view for another (a
-    // file, a different area) drops this flag too, and whatever takes over
-    // brings its own tab — only a view dismissed with nothing replacing it
-    // leaves its tab pointing at an empty pane.
-    const t = window.setTimeout(() => {
-      const live = tabsRef.current;
-      for (const key of fell) {
-        const id = tabId("area", key);
-        if (live.activeId !== id) continue;
-        if (appliedRef.current === id) appliedRef.current = "";
-        live.close(id);
-      }
-    }, 0);
-    return () => window.clearTimeout(t);
+    const raised = (["scripts", "workflows", "map"] as const).some(
+      (key) => !prev[key] && now[key],
+    );
+    if (!raised || !tabsRef.current.activeId) return;
+    appliedRef.current = "";
+    tabsRef.current.activate("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.showScripts, s.showWorkflows, s.showMap]);
+
+  // One-time housekeeping: a room saved before places stopped being tabs has
+  // area tabs in `workspace_tabs`, and they arrive a tick after mount when the
+  // setting is read back. Dropping them here rewrites the setting clean.
+  useEffect(() => {
+    tabs.prune((t) => t.kind !== "area");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabs.tabs.length]);
 
   // A tab whose file was deleted has nothing to show.
   useEffect(() => {
@@ -484,15 +600,35 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       if (e.key === "t" && !e.shiftKey && s.webOn) {
         e.preventDefault();
         newBrowserPage();
+        return;
+      }
+      // ⇧⌘T — put back the file whose tab you just closed, the way every
+      // browser does it. Closing is meant to be cheap, and it only is when it
+      // is reversible; before this the only way back was to find the file in
+      // the library again. Deleted files are skipped rather than reported: the
+      // stack is a convenience, and a toast about a file the user removed on
+      // purpose would be noise.
+      if (e.key.toLowerCase() === "t" && e.shiftKey) {
+        e.preventDefault();
+        const live = new Set(s.files.map((f) => f.id));
+        let id = reopenableRef.current.pop();
+        while (id && !live.has(id)) id = reopenableRef.current.pop();
+        if (id) void a.viewFile(id);
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [tabs, closeTab, guardLeave, newBrowserPage, s.webOn]);
+    // `s.files` is in here because ⇧⌘T reads it — a stale list would reopen a
+    // file that has since been deleted, or skip one that has not.
+  }, [tabs, closeTab, guardLeave, newBrowserPage, s.webOn, s.files, a]);
 
+  // A tab's glyph. Pages keep the globe, because a web page really is a
+  // different KIND of thing from a room file and the strip mixes the two.
+  // Files get none: every file tab used to carry the same generic sheet icon,
+  // which spent the row's first 18px saying something the reader already knew
+  // and pushed the one useful thing — the file's name — out of view.
   const tabIcon = useCallback(
-    (tab: Tab) =>
-      tab.kind === "page" ? <GlobeIcon size={12} /> : <FilesIcon size={12} />,
+    (tab: Tab) => (tab.kind === "page" ? <GlobeIcon size={12} /> : null),
     [],
   );
 
@@ -506,6 +642,18 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     s.setAiTab("activity");
     layout.showPane("ai");
   }, [s, layout]);
+
+  // Reading and recording are one-column jobs, and the layout is told so it
+  // can hand the width over once (useLayout's `setFocusedPage`). Derived here
+  // rather than inside the layout because this is the only place that knows
+  // both which area is showing and what kind of file is open.
+  const setFocusedPage = layout.setFocusedPage;
+  const focusedPage =
+    area === "recordings" ||
+    (s.openFile != null && FOCUSED_KINDS.has(s.openFile.content.kind));
+  useEffect(() => {
+    setFocusedPage(focusedPage);
+  }, [focusedPage, setFocusedPage]);
 
   return (
     <div className="workspace">
@@ -531,12 +679,9 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
           layout={layout}
           area={area}
           onArea={openArea}
-          onSearch={() => {
-            s.setSearchSel(0);
-            s.setShowSearch(true);
-          }}
           onSettings={() => s.setShowSettings(true)}
-          aiAttention={pendingApprovals > 0 || runningJobs > 0}
+          approvals={pendingApprovals}
+          running={runningJobs}
         />
         <div
           className={`pane-grid${layout.dragging ? " is-dragging" : ""}`}
@@ -549,7 +694,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
             aria-hidden={!layout.visible.includes("library")}
           >
             <ErrorBoundary scope="The library">
-              <LibraryPane s={s} a={a} layout={layout} area={area} />
+              <LibraryPane s={s} a={a} layout={layout} area={contextArea} />
             </ErrorBoundary>
           </section>
           <Splitter side="a" layout={layout} label="Resize the Library pane" />
@@ -567,7 +712,14 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
                 rest of the centre pane — the browser, workflows, scripts and
                 the map — which had no net at all. */}
             <ErrorBoundary scope="The workspace pane">
-              <ViewerPane s={s} a={a} info={info} layout={layout} area={area} />
+              <ViewerPane
+                s={s}
+                a={a}
+                info={info}
+                layout={layout}
+                area={area}
+                contextArea={contextArea}
+              />
             </ErrorBoundary>
           </section>
           <Splitter side="b" layout={layout} label="Resize the AI pane" />

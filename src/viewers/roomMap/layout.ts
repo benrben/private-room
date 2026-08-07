@@ -108,16 +108,50 @@ export function runTick(nodes: SimNode[], edges: SimEdge[], temp: number, k: num
   }
 }
 
-/** An 8-vertex sparkle (4-point star) of radius `r`, centred on the origin. */
-export function starPoints(r: number): string {
-  const inner = r * 0.4;
+/* ----- the pen circle round a selected node -----
+ *
+ * The analyst's ring around the thing being talked about: a circle drawn by
+ * hand, so it is slightly out of true and the pen carries a little past where
+ * it started rather than closing exactly.
+ *
+ * Every number here is FIXED. The wobble is two harmonics of the angle, not a
+ * random walk, so the same node draws the same ring on every frame and every
+ * launch — a mark that re-shuffles as the layout settles would read as the map
+ * twitching. Decoration on this map is inert by rule; this is the only mark on
+ * it that is not a datum, and it still has to be reproducible.
+ *
+ * The ring is a polyline rather than a set of beziers because nodeRadius only
+ * ever produces a handful of distinct sizes, so the paths are generated once
+ * and cached. At HAND_CIRCLE_STEPS segments the chord sags about a pixel away
+ * from a true arc at the map's absolute maximum zoom and far less than that
+ * anywhere a reader actually works — which on a mark that is deliberately out
+ * of true is not an error worth fitting curves to. Only the SELECTED node gets
+ * a ring, so this runs once or twice a frame whatever the room's size. */
+const HAND_CIRCLE_STEPS = 44;
+/** Slightly more than one turn — where the overshoot comes from. */
+const HAND_CIRCLE_TURNS = 1.06;
+/** Where the pen touches down, in radians. Up and to the left in SVG's
+ *  y-down coordinates, the way a hand starts a circle. */
+const HAND_CIRCLE_START = -1.9;
+const handCircleCache = new Map<number, string>();
+
+export function handCircle(r: number): string {
+  // Quantised so pan/zoom cannot mint a new path per frame. The step is a
+  // quarter of a world unit, far below what a reader can see on a ring this
+  // size, and it bounds the cache to the handful of radii nodeRadius produces.
+  const key = Math.round(r * 4) / 4;
+  const hit = handCircleCache.get(key);
+  if (hit) return hit;
   const pts: string[] = [];
-  for (let i = 0; i < 8; i++) {
-    const ang = -Math.PI / 2 + (i * Math.PI) / 4;
-    const rad = i % 2 === 0 ? r : inner;
-    pts.push(`${(Math.cos(ang) * rad).toFixed(2)},${(Math.sin(ang) * rad).toFixed(2)}`);
+  const span = Math.PI * 2 * HAND_CIRCLE_TURNS;
+  for (let i = 0; i <= HAND_CIRCLE_STEPS; i++) {
+    const a = HAND_CIRCLE_START + span * (i / HAND_CIRCLE_STEPS);
+    const rad = key * (1 + 0.055 * Math.sin(3 * a + 0.9) + 0.032 * Math.cos(5 * a - 2.1));
+    pts.push(`${(Math.cos(a) * rad).toFixed(2)},${(Math.sin(a) * rad).toFixed(2)}`);
   }
-  return pts.join(" ");
+  const d = `M${pts[0]}L${pts.slice(1).join("L")}`;
+  handCircleCache.set(key, d);
+  return d;
 }
 
 /** Fit the node bounds into a `w`×`h` viewport with padding, returning the

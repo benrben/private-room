@@ -1,4 +1,15 @@
-/* ---------- ADD-16 folders ---------- */
+/* ---------- ADD-16 folders, the "Move to…" menu, and the two row badges ----
+
+   A folder is a section of the sheet, not a container laid on top of it: the
+   head is a label with a caret, and the files under it hang off a single
+   pencil thread down the left (the .nb-connect idiom, written out here
+   because the markup is built in Sidebar.tsx and cannot take the class).
+
+   The one exception is the "Move to…" popover, which genuinely floats over
+   the list and therefore gets an opaque fill — see paper.css section 9.
+
+   Nothing here names a colour, so both themes come from tokens and there is
+   no light-mode block at the end of this file. */
 
 .folder-group {
   margin-top: 2px;
@@ -8,34 +19,47 @@
   display: flex;
   align-items: center;
   gap: 2px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 2px 2px 2px 0;
+  transition: background-color var(--dur-fast) var(--ease-pen);
 }
 
 .folder-head:hover {
-  background: var(--panel-2);
+  background-color: var(--hover);
 }
 
-/* ADD-16: drag-a-file-onto-a-folder (and onto the Files header to un-group). */
+/* ADD-16: drag-a-file-onto-a-folder (and onto the Files header to un-group).
+   A dashed pencil outline is the system's mark for a boundary that is
+   provisional (.nb-rule-dash), which is exactly what a drop target is. */
 .file-row[draggable="true"] {
   cursor: grab;
 }
 .folder-head.drag-over,
 .side-head.drag-over {
-  background: var(--accent-soft);
+  background-color: var(--accent-soft);
   outline: 1px dashed var(--accent);
   outline-offset: -1px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
 }
 
+/* 24px in both directions: the caret used to be about 19px, which is under
+   the floor for anything clickable. */
 .folder-caret-btn {
+  display: inline-grid;
+  place-items: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
   background: none;
   border: none;
-  color: var(--text-dim);
-  padding: 4px 4px 4px 6px;
-  font-size: 11px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
   line-height: 1;
   cursor: pointer;
+}
+.folder-caret-btn:hover {
+  color: var(--text-strong);
+  border-color: transparent;
 }
 
 .folder-label {
@@ -44,16 +68,21 @@
   align-items: center;
   gap: 6px;
   min-width: 0;
+  min-height: 24px;
   background: none;
   border: none;
-  padding: 6px 2px;
+  padding: 4px 2px;
   text-align: left;
-  font-size: 10px;
+  font-size: var(--fs-micro);
   font-weight: 600;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.075em;
   text-transform: uppercase;
-  color: var(--text-dim);
+  color: var(--muted);
   cursor: pointer;
+}
+.folder-label:hover {
+  color: var(--text-strong);
+  border-color: transparent;
 }
 
 .folder-name {
@@ -65,33 +94,50 @@
 .folder-rename {
   flex: 1;
   min-width: 0;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   padding: 5px 7px;
 }
 
+/* Revealed on hover OR on focus. `opacity: 0` leaves these buttons in the tab
+   order, so without the focus-within clause a keyboard user tabs into an
+   invisible control — the worst of both states. */
 .folder-actions {
   display: inline-flex;
   align-items: center;
   opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-pen);
 }
 
-.folder-head:hover .folder-actions {
+.folder-head:hover .folder-actions,
+.folder-head:focus-within .folder-actions {
   opacity: 1;
 }
 
+/* The thread that ties a folder's files to their heading: a dashed pencil
+   line rather than a solid border, because the grouping is a drawn aside and
+   not a structural edge. */
 .folder-files {
   padding-left: 16px;
   margin-left: 12px;
-  border-left: 1px solid var(--border-subtle);
+  background-image: repeating-linear-gradient(
+    to bottom,
+    var(--rule) 0 5px,
+    transparent 5px 9px
+  );
+  background-repeat: no-repeat;
+  background-size: 1px 100%;
+  background-position: left top;
 }
 
 .folder-empty {
-  color: var(--text-dim);
-  font-size: 12px;
-  padding: 4px 8px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+  padding: 6px 8px;
 }
 
-/* File-row "Move to…" menu */
+/* ----- File-row "Move to…" menu -----
+   It floats over the list, so it is opaque and casts the system shadow. */
 
 .move-wrap {
   position: relative;
@@ -106,10 +152,12 @@
   min-width: 150px;
   margin-top: 2px;
   padding: 4px;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -119,10 +167,11 @@
   background: none;
   border: none;
   text-align: left;
+  min-height: 24px;
   padding: 7px 9px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -130,48 +179,57 @@
 }
 
 .move-opt:hover:not(:disabled) {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background-color: var(--accent-soft);
+  border-color: transparent;
+  color: var(--text-strong);
 }
 
 .move-opt:disabled {
-  color: var(--text-dim);
+  color: var(--muted);
   cursor: default;
   opacity: 0.5;
 }
 
 .move-empty {
-  color: var(--text-dim);
-  font-size: 12px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
   padding: 7px 9px;
 }
 
-/* HLT-4 partial-index badge */
-
+/* ----- HLT-4 partial-index badge -----
+   Yellow is "notable, needs review" across the product. The glyph in the
+   markup is the word here — the colour only reinforces it. */
 .partial-badge {
   flex-shrink: 0;
-  color: var(--warn);
-  font-size: 11px;
+  color: var(--sem-pending);
+  font-size: var(--fs-micro);
   line-height: 1;
   cursor: default;
 }
 
-/* ADD-18: "this media file is being transcribed" — a small pulsing dot so
-   readiness scans from the file list without opening anything. */
+/* ----- ADD-18: "this media file is being transcribed" -----
+   A ring rather than a filled dot, so it is a different SHAPE from every
+   other dot in the list and not merely a different hue, and it pulses because
+   it is a live activity indicator — the one thing on this surface allowed to
+   move. Reduced motion stops it dead and leaves the ring, which still reads
+   as "in progress" beside its tooltip. */
 .stt-badge {
   flex-shrink: 0;
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
-  background: var(--accent, #8b7cf6);
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--accent);
   animation: rec-pulse 1.4s ease-in-out infinite;
   cursor: default;
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .folder-head,
+  .folder-actions {
+    transition: none;
+  }
   .stt-badge {
     animation: none;
-    opacity: 0.8;
   }
 }
-

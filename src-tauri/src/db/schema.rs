@@ -257,6 +257,35 @@ CREATE TABLE IF NOT EXISTS recordings (
   file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   meta TEXT NOT NULL
 );
+-- A generated podcast SCRIPT, as data: its hosts, its turns, and the voice
+-- assigned to each host. Keyed by the script page's file id.
+--
+-- WHY A TABLE AND NOT A ROOM FILE. The turns have to be re-readable to render
+-- audio, and re-readable AFTER the user re-casts a host, without asking the
+-- model to write the episode again. A companion "<name>.podcast.json" would do
+-- that too, at the cost of a file in the library that nobody wants to open and
+-- that every count, search and AI-source list would have to carry.
+--
+-- `audio_file_id` is the rendered episode, when one exists — a plain room file
+-- like any other, so it plays, seeks and exports with no special case. NULL
+-- means the script has never been recorded, which is the state every podcast
+-- starts in.
+CREATE TABLE IF NOT EXISTS podcasts (
+  file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  -- [{"speaker": "...", "line": "..."}], the model's own output, in order.
+  turns TEXT NOT NULL,
+  -- [{"name": "...", "voice": "...", "rate": "...", "pitch": "..."}] — the
+  -- CAST. Written once from the script, then owned by the user's edits.
+  --
+  -- NOT named `cast`: SQLite parses a bare `cast` in a SELECT LIST as the start
+  -- of a CAST(x AS y) expression, so `SELECT file_id, cast FROM podcasts` is a
+  -- syntax error while `INSERT INTO podcasts(file_id, cast)` is perfectly legal
+  -- — the write half works and only the read half breaks.
+  cast_json TEXT NOT NULL,
+  audio_file_id TEXT REFERENCES files(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
 -- Live-recording audio checkpoints (raw 16-bit PCM since the last full WAV
 -- write). Normally empty: pause/stop assemble the WAV and clear them; rows
 -- surviving here mean a crashed session, recovered on the next room open.
@@ -374,6 +403,29 @@ CREATE TABLE IF NOT EXISTS browse_journal (
   url TEXT NOT NULL DEFAULT '',
   detail TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+-- The voices this room can recognise: one row per person the user has NAMED in
+-- a recording, so the next recording puts the name back on them instead of
+-- starting again at "Speaker 2" (see db/voices.rs for why they live in the
+-- room and nowhere else). `emb` is the L2-normalized neural centroid as raw
+-- little-endian f32; `frames` is the 16 ms voiced frames behind it and `takes`
+-- how many namings have been folded in, which together are the evidence the
+-- Settings list shows and the weight a further naming is merged at. The NAME
+-- is the key: one person, one voice.
+CREATE TABLE IF NOT EXISTS voice_ids (
+  name TEXT PRIMARY KEY,
+  emb BLOB NOT NULL,
+  frames INTEGER NOT NULL DEFAULT 0,
+  takes INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+-- Voices the user has said are NOT that person — one row per corrected guess.
+-- Without them a wrong match is wrong again in every future recording, because
+-- correcting it only ever taught the OTHER name.
+CREATE TABLE IF NOT EXISTS voice_rejects (
+  name TEXT NOT NULL,
+  emb BLOB NOT NULL,
+  PRIMARY KEY (name, emb)
 );
 "#;
 
@@ -844,6 +896,23 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // Podcast scripts as data (hosts, turns, cast, rendered audio). Guarded
+    // like every table above — a room made before this feature simply has none,
+    // and its existing podcast PAGES keep working as pages. They have no row
+    // here and so cannot be given voices; the panel says exactly that rather
+    // than offering a Record button that would find no turns.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS podcasts (
+           file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+           title TEXT NOT NULL,
+           turns TEXT NOT NULL,
+           cast_json TEXT NOT NULL,
+           audio_file_id TEXT REFERENCES files(id) ON DELETE SET NULL,
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );",
+    )
+    .map_err(|e| e.to_string())?;
+
     // ADD-16: folders table + a nullable files.folder_id (NULL = top level).
     // Old rooms never ran SCHEMA, so create the table and add the column when
     // it is missing — mirroring the chat_id migration above. The column only
@@ -1137,6 +1206,26 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
            url TEXT NOT NULL DEFAULT '',
            detail TEXT NOT NULL DEFAULT '',
            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );",
+    )
+    .map_err(|e| e.to_string())?;
+
+    // The room's saved voices (see db/voices.rs). In BOTH places for the reason
+    // spelled out at `jobs` above: create_room runs only SCHEMA, so a table that
+    // exists only here is missing from a brand-new room until it is closed and
+    // reopened — and a fresh room is exactly where the first speaker gets named.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS voice_ids (
+           name TEXT PRIMARY KEY,
+           emb BLOB NOT NULL,
+           frames INTEGER NOT NULL DEFAULT 0,
+           takes INTEGER NOT NULL DEFAULT 1,
+           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );
+         CREATE TABLE IF NOT EXISTS voice_rejects (
+           name TEXT NOT NULL,
+           emb BLOB NOT NULL,
+           PRIMARY KEY (name, emb)
          );",
     )
     .map_err(|e| e.to_string())?;

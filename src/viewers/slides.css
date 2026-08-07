@@ -1,31 +1,65 @@
 /* A deck, as slides. Shapes are absolutely positioned as PERCENTAGES of the
    slide, so one layout scales to any pane width; `container-type: size` is
-   what lets the text size scale with it (the `cqh` units in SlidesView). */
-.sl-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+   what lets the text size scale with it (the `cqh` units in SlidesView).
+
+   The slide itself keeps the author's ground in BOTH themes — see `.sl-canvas`
+   below — for the same reason a rasterised PDF page does: a deck was designed
+   against a background, and repainting it would be the app editing the file.
+   Everything else here is the reader's chrome around it, and that follows the
+   notebook. */
+.sl-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+/* Composed to match `.rdr-bar` (styles/viewer.css). */
 .sl-bar {
   display: flex;
-  gap: 0.6rem;
+  gap: var(--sp-3);
   align-items: center;
-  padding: 0.4rem 0.75rem;
-  border-bottom: 1px solid var(--border);
+  padding: var(--sp-2) var(--sp-3);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }
+/* Where you are in the deck: a count, which is exactly what the hand is
+   reserved for. Set at the metadata floor rather than smaller — Kalam has a
+   small x-height and reads a tier down from Manrope at the same nominal size. */
+.sl-where {
+  font-family: var(--hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-hand);
+  color: var(--muted);
+  padding: 0;
+}
+
 .sl-stage {
   flex: 1;
   display: grid;
   place-items: center;
   overflow: auto;
-  padding: 1rem;
+  padding: var(--sp-4);
   min-height: 0;
 }
-/* The slide is a macOS-rendered image now, so it only needs framing. */
+/* The slide is a macOS-rendered image now, so it only needs framing. The lift
+   is themed: the literal `rgb(0 0 0 / .12)` it replaces was invisible on ivory
+   paper, which is where a light-mode room spends all of its time. */
 .sl-image {
   max-width: min(100%, 62rem);
   max-height: 100%;
   width: auto;
   height: auto;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  box-shadow: 0 2px 14px rgb(0 0 0 / 0.12);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 4px 16px var(--shadow-lift);
 }
 
 .sl-canvas {
@@ -34,56 +68,154 @@
   width: 100%;
   max-width: min(100%, 62rem);
   max-height: 100%;
-  background: #fff;
-  color: #111;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  /* A slide canvas is a slide: it keeps its own white ground so a deck renders
+     as authored, in either theme. The ink is a fixed literal for the same
+     reason — the app's --text is ivory in dark mode and would vanish here. */
+  background: #ffffff;
+  color: #14150e;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
   overflow: hidden;
-  box-shadow: 0 2px 14px rgb(0 0 0 / 0.12);
+  box-shadow: 0 4px 16px var(--shadow-lift);
 }
-.sl-shape { position: absolute; overflow: hidden; }
-.sl-shape img { width: 100%; height: 100%; object-fit: contain; }
-.sl-p { margin: 0 0 0.25em; line-height: 1.25; }
-.sl-bullet { list-style: none; }
-.sl-bullet::before { content: "• "; opacity: 0.6; }
+.sl-shape {
+  position: absolute;
+  overflow: hidden;
+}
+.sl-shape img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.sl-p {
+  margin: 0 0 0.25em;
+  line-height: 1.25;
+}
+.sl-bullet {
+  list-style: none;
+}
+.sl-bullet::before {
+  content: "• ";
+  opacity: 0.6;
+}
 .sl-placeholder {
   display: grid;
   place-items: center;
-  border: 1px dashed color-mix(in srgb, #111 25%, transparent);
-  border-radius: 4px;
+  border: 1px dashed color-mix(in srgb, #14150e 25%, transparent);
+  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
 }
-.sl-note { font-size: 0.75rem; color: #666; text-transform: capitalize; }
+.sl-note {
+  font-size: 0.75rem;
+  color: #666960;
+  text-transform: capitalize;
+}
+/* Speaker notes are the author's PROSE, so they stay in the interface face
+   with the fallbacks Hebrew, CJK and Turkish need, and `pre-wrap` keeps the
+   line breaks they typed. */
 .sl-notes {
   max-height: 9rem;
   overflow: auto;
-  padding: 0.6rem 0.9rem;
-  border-top: 1px solid var(--border);
+  padding: var(--sp-3) var(--sp-4);
   white-space: pre-wrap;
-  font-size: 0.85rem;
+  font-family: var(--sans);
+  font-size: var(--fs-body);
   line-height: 1.6;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
 }
 .sl-rail {
   display: flex;
-  gap: 0.4rem;
+  gap: var(--sp-1);
   overflow-x: auto;
-  padding: 0.5rem 0.75rem;
-  border-top: 1px solid var(--border);
+  padding: var(--sp-2) var(--sp-3);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
 }
 .sl-thumb {
+  position: relative;
   flex: none;
   width: 9rem;
+  min-height: 24px;
   display: flex;
-  gap: 0.4rem;
+  gap: var(--sp-1);
   align-items: baseline;
-  padding: 0.3rem 0.45rem;
-  border: 1px solid var(--border);
-  border-radius: 5px;
+  padding: var(--sp-1) var(--sp-2) 6px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
   background: none;
-  color: inherit;
+  color: var(--muted);
   cursor: pointer;
   text-align: start;
-  font-size: 0.75rem;
+  font-size: var(--fs-micro);
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    color var(--dur-fast) var(--ease-pen);
 }
-.sl-thumb.active { border-color: var(--accent); background: var(--panel); }
-.sl-thumb-n { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; }
-.sl-thumb-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sl-thumb:hover {
+  color: var(--text);
+  border-color: var(--sketch);
+}
+.sl-thumb:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* The slide you are on. The marker underline is the app's ONE active signal
+   (paper.css section 2), so the rail agrees with the reader's modes, the
+   book's contents list and the activity rail. */
+.sl-thumb.active {
+  color: var(--text-strong);
+  border-color: var(--sketch);
+}
+.sl-thumb.active::after {
+  content: "";
+  position: absolute;
+  left: var(--sp-2);
+  right: var(--sp-2);
+  bottom: 2px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--accent-fill) 0%,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 68%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  pointer-events: none;
+}
+/* A slide number is a figure: mono and tabular, so the rail does not jitter
+   between 9 and 10. */
+.sl-thumb-n {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.sl-thumb-t {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sl-thumb {
+    transition: none;
+  }
+}

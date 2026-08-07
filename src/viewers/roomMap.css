@@ -1,12 +1,33 @@
-/* ------------------------------------------------------------------ *
- * Room Map — full-canvas constellation view.
- *
- * Owned by A5 (RoomMap.tsx imports this). New classes only; the shared
- * `.room-map`, `.room-map-toolbar`, `.room-map-title`, `.room-map-count`
- * and `.room-map-empty` rules live in App.css (owned by A2) and are reused
- * as-is. Everything the full-canvas rework introduces is namespaced here so
- * it never collides with A2's center-pane container `.room-map-canvas`.
- * ------------------------------------------------------------------ */
+/* ---------- room map ----------
+   The room drawn as a diagram in a notebook: files and memories inked onto the
+   dotted sheet, and a pencil line between two of them wherever the room can say
+   how they are related.
+
+   THE ONE RULE THIS FILE IS BUILT ON: the geometry is not decoration. A node
+   sits exactly where the layout put it and a line joins exactly the two nodes
+   it represents. Everything hand-drawn here is STROKE QUALITY and node
+   treatment — the pen, the wobble in the ring round a selection, the round caps
+   on a pencil line. Nothing below moves a coordinate.
+
+   Colour on this map means ONE thing: what a link between two files claims.
+   Nodes are ink and are told apart by shape, so a hue is never asked to say two
+   things at once. And because hue alone is not an accessible channel for a set
+   of six categories, every kind also carries its own dash pattern, its own
+   weight, and its own word in the legend (roomMap/edges.ts).
+
+   Owned by the Room Map. The shared `.room-map`, `.room-map-toolbar`,
+   `.room-map-title`, `.room-map-count` and `.room-map-empty` rules live in
+   misc-moonshot.css and are composed with, not redefined. Everything this file
+   introduces is namespaced `rm-` / `room-map-` so it cannot collide with the
+   center-pane host `.room-map-canvas` in viewer.css.
+
+   No rule here names a colour, so there is deliberately no light-mode block at
+   the end of this file — the whole map flips with the theme through tokens.
+   ========================================================================== */
+
+/* ==========================================================================
+   1. THE SHEET
+   ========================================================================== */
 
 /* The canvas area under the header — fills all remaining space and is the
    positioning context for the SVG, controls and tooltip. */
@@ -17,16 +38,32 @@
   overflow: hidden;
 }
 
-/* Ink surface with a faint violet vignette so stars read with depth.
-   Sized 1:1 with the stage (viewBox === pixel size) so pan/zoom math is in
-   plain client pixels. */
+/* A diagram drawn on notebook paper, not an ink starfield. Sized 1:1 with the
+   stage (viewBox === pixel size) so pan/zoom math is in plain client pixels.
+
+   The dotted rule is painted HERE rather than being inherited from the sheet on
+   <html>, because `.room-map` and `.room-map-canvas` both carry an opaque
+   background and would cover it. Painting `--page` under our own dots keeps
+   this the only dot layer on the surface whatever those two do; two grids at
+   the same pitch but different origins would moiré.
+
+   The dots are mixed down to ~60% of their normal strength. Everywhere else in
+   the app the grid sits behind text; here it sits behind a field of thin lines
+   it would otherwise compete with, and the graph has to be the loudest thing on
+   its own canvas. color-mix in a gradient stop is proven in this tree (the
+   grain layers in paper.css) — the WebKit gap this project was bitten by is
+   calc() INSIDE a color-mix percentage, and there is none here. */
 .room-map-svg {
   position: absolute;
   inset: 0;
   display: block;
-  background:
-    radial-gradient(130% 100% at 50% 42%, rgba(139, 124, 246, 0.09), transparent 68%),
-    #0e1014;
+  background-color: var(--page);
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    color-mix(in srgb, var(--grid-dot) 60%, transparent) 1.1px,
+    transparent 1.2px
+  );
+  background-size: var(--grid-gap) var(--grid-gap);
   cursor: grab;
   touch-action: none;
   user-select: none;
@@ -34,127 +71,361 @@
 .room-map-svg:active {
   cursor: grabbing;
 }
-/* Light mode: the ink canvas and its labels are the only surfaces in the app
-   that hard-code a dark palette — without these the map stays a black slab in
-   the middle of a white window. */
-:root[data-theme="light"] .room-map-svg {
-  background:
-    radial-gradient(130% 100% at 50% 42%, rgba(101, 68, 154, 0.1), transparent 68%),
-    #f3f1f6;
+
+/* ==========================================================================
+   2. LINKS
+   One identity per relationship kind. Four markers plus a graphite, which is
+   the same recipe tokens.css uses for the seven search engines: the palette has
+   five marker hues and this needs six slots, so the two quietest kinds share a
+   neutral and are separated by their dash and their weight instead.
+
+   Red is deliberately absent. It means recording / failed / error across the
+   whole product, and a "both came from the same website" line drawn in it would
+   read as something being wrong.
+   ========================================================================== */
+
+.room-map {
+  --rm-edge-derived: var(--mk-green-ink); /* the room watched this happen */
+  --rm-edge-page: var(--mk-blue-ink);
+  --rm-edge-mentions: var(--mk-pink-ink);
+  --rm-edge-cited: var(--mk-yellow-ink);
+  /* The two neutral kinds. Same graphite, told apart by a 5-3 dash against a
+     1-3.5 dot, by weight, and by the words on their chips. */
+  --rm-edge-site: var(--muted);
+  --rm-edge-similar: var(--muted);
 }
 
-/* Keyboard focus on a star (stars are role="button", tabbable). */
+/* Stroke, width, dash and opacity are all set per-edge in Edge.tsx, because
+   each of them has to be divided by the live zoom or keyed to the link's
+   strength. Nothing paint-related may be added here: this class is on the
+   element itself, so a declaration here would outrank the component's own
+   presentation attributes — which is exactly how every typed hue on this map
+   once collapsed into one violet hairline. */
+.room-map-edge {
+  fill: none;
+}
+
+/* ==========================================================================
+   3. NODES
+   Inked circles. A file is a filled disc, a memory is an open ring around a
+   dot, and the selected one is circled by hand. No halos, no glow, no fill
+   swap on hover — the map used to draw a translucent accent disc at 2.7x the
+   node radius behind every file, which is where its neon came from.
+   ========================================================================== */
+
+/* Keyboard focus on a node (nodes are role="button" and tabbable). The drawn
+   ring in .rm-node-circled appears in the same state — focusing a node selects
+   it — so there is a visible indicator even where an outline on an SVG element
+   is unreliable. */
 .room-map-node:focus-visible {
-  outline: 2px solid var(--accent, #8b7cf6);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
-/* ---- persistent on-canvas labels (screen space, constant size) ---- */
-.rm-label-bg {
-  fill: rgba(10, 12, 16, 0.82);
-  stroke: rgba(139, 124, 246, 0.18);
-  stroke-width: 1;
-}
-/* The selected node's label gets a slightly stronger violet edge. */
-.rm-label-bg.is-focus {
-  fill: rgba(14, 12, 24, 0.9);
-  stroke: rgba(139, 124, 246, 0.55);
-}
-.rm-label-text {
-  font-size: 11px;
-  font-weight: 500;
-  fill: #e9e9f2;
-  paint-order: stroke;
-  /* thin ink halo so glyphs stay legible even if a pill edge clips a star */
-  stroke: rgba(10, 12, 16, 0.55);
-  stroke-width: 0.6px;
-  dominant-baseline: alphabetic;
-}
-.rm-label-text.is-memory {
-  fill: #bfe4d3;
-}
-:root[data-theme="light"] .rm-label-bg {
-  fill: rgba(255, 255, 255, 0.9);
-  stroke: rgba(101, 68, 154, 0.24);
-}
-:root[data-theme="light"] .rm-label-bg.is-focus {
-  fill: #ffffff;
-  stroke: rgba(101, 68, 154, 0.6);
-}
-:root[data-theme="light"] .rm-label-text {
-  fill: #353139;
-  stroke: rgba(255, 255, 255, 0.75);
-}
-:root[data-theme="light"] .rm-label-text.is-memory {
-  fill: #2f7c58;
+/* The invisible hit target. `transparent` still counts as painted, so it stays
+   hit-testable; `stroke: none` is load-bearing, because `.room-map-node` in
+   misc-moonshot.css puts a stroke on the wrapping <g> and stroke inherits —
+   without this the target would draw as a wide pink ring round every node. */
+.rm-node-hit {
+  fill: transparent;
+  stroke: none;
 }
 
-/* ---- pan/zoom controls, top-right of the canvas ---- */
+/* A file: the pen round a wash of ink. The wash is a percentage of --ink, which
+   is the one recipe that reads correctly in both themes without an override —
+   a little warm ivory lightens the charcoal sheet, a little charcoal greys the
+   ivory sheet. The ring is what carries the 3:1 a meaningful non-text mark
+   owes; at these opacities it measures ~9:1 on the paper in both themes. */
+.rm-node-disc {
+  fill: var(--ink);
+  fill-opacity: 0.16;
+  stroke: var(--sketch);
+  stroke-opacity: 0.85;
+}
+
+/* A memory: an open ring with a dot in it. The difference from a file is a
+   SHAPE, not a colour, and the same ring is repeated in front of a memory's
+   label so the distinction survives on the card too. */
+.rm-node-ring {
+  fill: none;
+  stroke: var(--sketch);
+  stroke-opacity: 0.85;
+}
+.rm-node-core {
+  fill: var(--sketch);
+  fill-opacity: 0.85;
+  stroke: none;
+}
+
+/* Selected / hovered / focused: the pen presses harder, and the ring below is
+   drawn round it. Deliberately NOT a hue change — the accent appears on this
+   map only as that ring, so a selected node reads as circled rather than as
+   recoloured, and a reader who cannot separate the pen from the paper by hue
+   still sees a shape appear. Nor is the wash taken to full: a solid disc of
+   --ink is a bright blob on the dark sheet, which is the neon this rework
+   exists to remove. */
+.room-map-node.is-active .rm-node-disc {
+  fill-opacity: 0.34;
+  stroke-opacity: 1;
+}
+.room-map-node.is-active .rm-node-ring {
+  stroke-opacity: 1;
+}
+.room-map-node.is-active .rm-node-core {
+  fill-opacity: 1;
+}
+/* A neighbour of the selection is lifted, never dimmed: this map answers "what
+   is this file attached to" by drawing the answer darker, not by fading the
+   rest of the room out of existence. */
+.room-map-node.is-neighbour .rm-node-disc,
+.room-map-node.is-neighbour .rm-node-ring {
+  stroke-opacity: 1;
+}
+
+/* The ring the analyst draws round the thing being discussed — out of true, and
+   carried a little past where the pen started (the path is generated in
+   roomMap/layout.ts, from fixed numbers, so it is identical on every frame).
+
+   It reaches a quarter of a node radius past the node's hit circle, so without
+   pointer-events:none a stroked path is hit-testable and the ring would enlarge
+   the target it is only describing. Decoration on this map is inert. */
+.rm-node-circled {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   4. LABELS
+   Small index cards, in screen space so they stay a constant readable size at
+   any zoom. These are the ONE opaque thing the canvas draws, and they have to
+   be: a real file name printed over a field of crossing lines is unreadable,
+   and this app's promise is that it shows the user's files truthfully.
+   ========================================================================== */
+
+.rm-label-bg {
+  fill: var(--raised);
+  fill-opacity: 0.96;
+  stroke: color-mix(in srgb, var(--sketch) 52%, transparent);
+  stroke-width: 1;
+}
+/* The selection's own card is the one the reader is looking for: the pen goes
+   round it, matching the ring on its node. */
+.rm-label-bg.is-focus {
+  fill: var(--raised);
+  fill-opacity: 1;
+  stroke: var(--accent);
+  stroke-width: 1.4;
+}
+
+/* --fs-micro, which is the smallest size the notebook allows anywhere; this was
+   11px, under that floor, and it is the size at which a room of similar file
+   names stops being readable at a glance.
+
+   No paint-order halo. The card underneath is opaque, so a stroke round the
+   glyphs would only thicken them — and these are real file names, which may be
+   Hebrew, CJK or Turkish, where a synthetic outline is exactly the kind of
+   styling that can misrepresent a shape. Sans, never the hand: a file name is
+   something the user typed. */
+.rm-label-text {
+  font-family: var(--sans);
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  fill: var(--text-strong);
+  dominant-baseline: alphabetic;
+}
+/* A memory's card is marked by the same open ring its node is drawn as, so the
+   kind is carried by a shape and not only by where the card happens to sit. */
+.rm-label-mark {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.3;
+}
+/* One tier of ink quieter than a file's card. A file name is the thing the
+   reader can open; a memory's name is a note about the room. */
+.rm-label-text.is-memory {
+  fill: var(--text);
+}
+
+/* ==========================================================================
+   5. THE LINK KEY
+   Six kinds of line are only readable with a key on screen, and the key IS the
+   control: each chip is the filter for its kind, carrying a sample of the exact
+   line the map draws, the kind's name in the hand, and how many the room has.
+   ========================================================================== */
+
+/* Ruled off from the canvas with the tapered pencil stroke rather than a
+   border, so the strip reads as a line drawn across the sheet instead of a bar
+   laid on top of it. */
+.rm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+
+/* Composes .nb-chip / .nb-chip-btn, so the outline, the 24px target, the press
+   and the focus ring all come from the system. Scoped under .room-map purely to
+   outrank paper.css on the two properties that differ — import order between a
+   component stylesheet and the App.css chain is not something to bet a control
+   on. Kalam because these are short labels naming a kind of line, which is on
+   the hand's reserve list; --fs-hand, not --fs-micro, because Kalam runs small
+   and a 12px hand is not a 12px floor. */
+.room-map .rm-legend-chip {
+  gap: var(--sp-2);
+  padding: 3px 10px;
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: 1.2;
+}
+.rm-legend-swatch {
+  flex: none;
+}
+/* Switched off reads as switched off — struck through, sample faded, no ring.
+   A shape, so it survives greyscale, and the word keeps its full colour rather
+   than being dimmed into illegibility the way the old blanket 0.4 opacity did.
+   Colour is deliberately not touched here, so .nb-chip-btn:hover still lifts an
+   off chip on the way back to switching it on. */
+.room-map .rm-legend-chip[aria-pressed="false"] {
+  text-decoration: line-through;
+}
+.rm-legend-chip[aria-pressed="false"] .rm-legend-swatch {
+  opacity: 0.4;
+}
+/* A kind the room has none of. Disabled controls are exempt from the contrast
+   floor, but only just — this stays readable enough to explain itself, and the
+   chip's title says why it cannot be pressed.
+
+   It also loses the circled treatment. The chip is technically "on" (a kind
+   with nothing in it was never switched off), but drawing it as a live
+   selection would claim the map is showing links that do not exist; a plain
+   outlined chip with a 0 beside it says exactly what is true. */
+.room-map .rm-legend-chip:disabled {
+  opacity: 0.55;
+  cursor: default;
+  text-decoration: none;
+  color: var(--muted);
+  border-color: var(--rule-strong);
+  background: transparent;
+}
+.room-map .rm-legend-chip:disabled::after {
+  content: none;
+}
+.rm-legend-count {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The strength bar sits at the far end of the strip: the chips choose WHICH
+   kinds, this chooses HOW WEAK a link may be and still be drawn. */
+.rm-legend-strength {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-left: auto;
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  color: var(--muted);
+}
+/* The control's own name is a structural label, so it stays in the interface
+   sans while the count beside it may be in the hand. */
+.rm-legend-strength-label {
+  font-family: var(--sans);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+/* accent-color is nearly the whole styling: a native range keeps its own
+   keyboard behaviour, its own hit area and its own platform focus ring, all of
+   which are better than anything a re-skin would give back. The padding only
+   restores the target height that base.css's shared input frame costs it —
+   24px is the floor for anything clickable. */
+.rm-legend-strength input {
+  width: 96px;
+  padding: 4px 6px;
+  accent-color: var(--accent);
+}
+
+/* ==========================================================================
+   6. CANVAS CONTROLS
+   ========================================================================== */
+
 .rm-controls {
   position: absolute;
-  top: 12px;
-  right: 12px;
+  top: var(--sp-3);
+  right: var(--sp-3);
   display: flex;
   flex-direction: column;
   gap: 6px;
   z-index: 2;
 }
-.rm-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+/* Composes .nb-btn / .nb-btn-icon. These genuinely float over the canvas, so
+   unlike the rest of the map they take an opaque fill — the section-9 rule.
+   Scoped under .room-map so the fill beats .nb-btn's transparent background
+   whichever way the two stylesheets end up ordered. */
+.room-map .rm-btn {
   width: 30px;
   height: 30px;
+  min-width: 30px;
+  min-height: 30px;
   padding: 0;
-  color: var(--text-dim, #b8b8c4);
-  background: color-mix(in srgb, var(--panel, #1a1c22) 86%, transparent);
-  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
-  border-radius: 8px;
-  cursor: pointer;
-  backdrop-filter: blur(6px);
-  transition:
-    color 0.15s ease,
-    border-color 0.15s ease,
-    background 0.15s ease;
+  color: var(--muted);
+  background-color: var(--raised);
 }
-.rm-btn:hover {
-  color: var(--accent, #8b7cf6);
-  border-color: color-mix(in srgb, var(--accent, #8b7cf6) 55%, transparent);
-  background: color-mix(in srgb, var(--panel, #1a1c22) 96%, transparent);
+.room-map .rm-btn:hover:not(:disabled) {
+  color: var(--text-strong);
 }
-.rm-btn:focus-visible {
-  outline: 2px solid var(--accent, #8b7cf6);
-  outline-offset: 2px;
-}
+/* A hair of air before "reset", which is a different move from zooming. */
 .rm-btn-reset {
   margin-top: 2px;
 }
 
-/* ---- hover tooltip: node name / "why linked" edge reasons ---- */
+/* ==========================================================================
+   7. TOOLTIP
+   ========================================================================== */
+
+/* Composes .nb-tip for its surface; only the placement is this map's own. It
+   follows the cursor, so it is positioned in stage coordinates by the
+   component and must never be hit-testable — a tooltip that eats a pointer
+   event would make the link under it unclickable. */
 .rm-tip {
   position: absolute;
   z-index: 3;
   max-width: 260px;
-  padding: 7px 10px;
-  font-size: 12px;
-  line-height: 1.45;
-  color: var(--text, #ececf2);
-  background: var(--surface-3, #23252e);
-  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
-  border-radius: 9px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  line-height: var(--lh-body);
   pointer-events: none;
 }
 .rm-tip-title {
   font-weight: 600;
+  color: var(--text-strong);
 }
+/* What the link claims, then the evidence. Sans, not the hand: these lines
+   quote the room's own record — file names, page titles, shared terms. */
 .rm-tip-line {
   margin-top: 2px;
-  color: var(--text-dim, #b8b8c4);
-  font-size: 11px;
+  color: var(--muted);
 }
 
-/* ---- failure panel: plain words + a retry, never a bare exception ---- */
+/* ==========================================================================
+   8. FAILURE, EMPTY, AND THE LIST
+   ========================================================================== */
+
+/* Plain words and a retry, never a bare exception. */
 .room-map-error {
   position: absolute;
   inset: 0;
@@ -162,19 +433,40 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  padding: 24px;
+  gap: var(--sp-2);
+  padding: var(--sp-6);
   text-align: center;
-  color: var(--text-dim, #b8b8c4);
+  color: var(--muted);
 }
+/* The raw reason. Mono because it is a technical string the reader may need to
+   copy or quote, and it is not prose. */
 .room-map-error-detail {
   max-width: 460px;
-  font-size: 11px;
-  color: var(--faint, #928d9a);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--faint);
   word-break: break-word;
 }
+.rm-retry {
+  margin-top: var(--sp-2);
+}
 
-/* ---- plain-list alternative to the canvas (keyboard / screen reader) ---- */
+/* The empty state is a direction to the reader — one of the few places the
+   hand is allowed. Scoped so it beats .room-map-empty's own size and colour in
+   misc-moonshot.css regardless of stylesheet order. */
+.room-map .rm-empty {
+  font-family: var(--hand);
+  font-size: var(--fs-hand-lg);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+  max-width: 20ch;
+}
+
+/* ----- the plain-list alternative to the canvas -----
+   The keyboard and screen-reader route to exactly what the map draws, and the
+   reason the faintest end of the ink ramp is allowed to be faint: every link on
+   the canvas is also written out here, by kind and by name. */
+
 /* First of the trailing toolbar buttons — it carries the auto margin that
    pushes the whole group right. A SECOND `margin-left: auto` would split the
    free space and leave a gap between the two buttons. */
@@ -184,131 +476,91 @@
 .rm-toolbtn {
   margin-left: 6px;
 }
+/* The two header toggles. Kalam, like the legend chips: "Links", "List" and
+   "Map" are short labels, and the toolbar reads as one row of chips. */
+.room-map .rm-toolchip {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: 1.2;
+  padding: 3px 10px;
+}
+
 .room-map-list {
   position: absolute;
   inset: 0;
   overflow: auto;
-  padding: 10px 14px;
+  padding: var(--sp-3) var(--sp-4);
 }
-.room-map-list ul {
+.rm-list {
   margin: 0;
   padding: 0;
   list-style: none;
 }
-.room-map-list li {
-  padding: 8px 0;
-  border-bottom: 1px solid var(--line-soft, rgba(255, 255, 255, 0.06));
+/* Rows are separated by .nb-list's pencil rule, which fades at both ends and is
+   applied on this same <ul> in the component — so no border is set here. */
+.rm-list > li {
+  padding: var(--sp-2) 0;
 }
+/* The file's own name, and the way into it. A button, so it keeps its focus
+   ring and its Enter key; underlined on hover rather than only recoloured. */
 .rm-list-name {
   padding: 0;
-  font-size: 13px;
+  font-family: var(--sans);
+  font-size: var(--fs-body);
   font-weight: 600;
-  color: var(--text, #ececf2);
+  color: var(--text-strong);
   background: none;
   border: 0;
   cursor: pointer;
 }
 .rm-list-name:hover:not(:disabled) {
-  color: var(--accent, #8b7cf6);
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
+/* Nothing to open (the host passed no handler). The name keeps its full ink —
+   it is the file's real name, which is content, not an affordance — and only
+   the pointer says the row will not do anything. */
 .rm-list-name:disabled {
+  color: var(--text);
   cursor: default;
 }
+/* A path, in the mono face like every other path in the app. */
 .rm-list-folder {
-  margin-left: 8px;
-  font-size: 11px;
-  color: var(--faint, #928d9a);
+  margin-left: var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--faint);
 }
 .rm-list-links {
   margin-top: 2px;
-  font-size: 12px;
-  color: var(--text-dim, #b8b8c4);
+  font-size: var(--fs-meta);
+  color: var(--muted);
 }
 .rm-list-kinds {
   margin: 2px 0 0;
   padding: 0;
   list-style: none;
 }
+/* The kind's name, matching the word on its legend chip so the list and the
+   canvas can be read against each other. */
 .rm-list-kind {
-  color: var(--faint, #928d9a);
+  color: var(--faint);
+  font-weight: 600;
 }
 
-/* ---- typed links: one hue per relationship ----
-   Custom properties, not hex literals in the TS, because the canvas is ink-dark
-   by default and near-white under the light theme (.room-map-svg above) — a
-   fixed amber at 0.2 stroke-opacity is invisible on the white one. Each pair is
-   the same hue, darkened and saturated for the light canvas. */
-.room-map {
-  --rm-edge-derived: #e0a33a;
-  --rm-edge-page: #3aa8a0;
-  --rm-edge-mentions: #8b7cf6;
-  --rm-edge-cited: #8b95a6;
-  --rm-edge-site: #3aa8a0;
-  --rm-edge-similar: #8b7cf6;
-}
-:root[data-theme="light"] .room-map {
-  --rm-edge-derived: #a35f00;
-  --rm-edge-page: #00706a;
-  --rm-edge-mentions: #5b3fd6;
-  --rm-edge-cited: #4c5566;
-  --rm-edge-site: #00706a;
-  --rm-edge-similar: #5b3fd6;
-}
-
-/* ---- density control: which kinds of link to draw ----
-   A NEW class: `.room-map-legend` (misc-moonshot.css) is a decorative, non-
-   interactive panel with `pointer-events: none`, which would make every toggle
-   here unclickable. */
-.rm-legend {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 10px;
-  padding: 6px 12px 8px;
-  border-bottom: 1px solid var(--line-soft, rgba(255, 255, 255, 0.06));
-}
-.rm-legend-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 7px;
-  font-size: 11px;
-  color: var(--text-dim, #b8b8c4);
-  background: none;
-  border: 1px solid transparent;
-  border-radius: 7px;
-  cursor: pointer;
-}
-.rm-legend-item:hover:not(:disabled) {
-  border-color: var(--border-subtle, rgba(255, 255, 255, 0.12));
-}
-/* Switched off reads as switched off, not as merely unemphasised. */
-.rm-legend-item[aria-pressed="false"] {
-  opacity: 0.4;
-  text-decoration: line-through;
-}
-.rm-legend-item:disabled {
-  opacity: 0.3;
-  cursor: default;
-}
-.rm-legend-count {
-  color: var(--faint, #928d9a);
-  font-variant-numeric: tabular-nums;
-}
-.rm-legend-strength {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--text-dim, #b8b8c4);
-}
-.rm-legend-strength input {
-  width: 90px;
-}
+/* ==========================================================================
+   9. MOTION
+   The map declares none of its own. The settle animation is the layout finding
+   its shape — not decoration — and every hover and press on this surface is
+   inherited from .nb-btn / .nb-chip-btn, whose reduced-motion escapes already
+   live in paper.css.
+   ========================================================================== */
 
 @media (prefers-reduced-motion: reduce) {
-  .rm-btn {
+  /* The one exception: misc-moonshot.css puts a colour transition on every node
+     group and carries no escape of its own. */
+  .room-map .room-map-node {
     transition: none;
   }
 }

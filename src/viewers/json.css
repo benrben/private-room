@@ -1,45 +1,113 @@
 /* JSON as a tree. Rows are one line each and indent by depth, so the SHAPE of
-   the data is the first thing visible — which a wall of source hides. */
-.json-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+   the data is the first thing visible — which a wall of source hides.
+
+   This is technical content end to end, so it is the one reader that is mono
+   throughout rather than in the interface face: alignment down the column IS
+   the structure here. */
+.json-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+/* Composed to match `.rdr-bar` (styles/viewer.css): transparent, with a
+   pencil rule under it that thins toward both ends. */
 .json-bar {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--sp-2);
   align-items: center;
-  padding: 0.4rem 0.75rem;
-  border-bottom: 1px solid var(--border);
+  padding: var(--sp-2) var(--sp-3);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }
-.json-tree { flex: 1; overflow: auto; padding: 0.5rem 0.75rem 2rem; font-size: 0.85rem; }
-.json-raw { flex: 1; overflow: auto; margin: 0; padding: 0.75rem; white-space: pre-wrap; }
+.json-tree {
+  flex: 1;
+  overflow: auto;
+  padding: var(--sp-2) var(--sp-3) var(--sp-8);
+  font-size: var(--fs-meta);
+}
+.json-raw {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: var(--sp-3);
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+}
 .json-row {
   display: flex;
-  gap: 0.4rem;
+  gap: var(--sp-1);
   align-items: baseline;
   padding: 1px 0;
-  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
   line-height: 1.5;
 }
 .json-toggle {
   width: 100%;
+  min-height: 24px;
   background: none;
   border: 0;
   text-align: start;
   cursor: pointer;
   color: inherit;
 }
-.json-toggle:hover { background: var(--panel); }
-.json-caret { width: 0.8em; flex: none; color: var(--muted); }
-.json-key { color: var(--accent); }
-.json-key::after { content: ":"; color: var(--muted); }
-.json-summary { color: var(--muted); }
-.json-string { color: var(--ok, #4cc38a); }
-.json-number { color: var(--warn, #e3b341); }
-.json-boolean, .json-null { color: var(--muted); font-style: italic; }
+.json-toggle:hover {
+  background: var(--hover);
+}
+.json-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.json-caret {
+  width: 0.8em;
+  flex: none;
+  color: var(--muted);
+}
+/* THE VALUE COLOURS ARE IDENTITY, NOT STATUS — a string is not "done" and a
+   number is not "pending". They come from the marker library's HUE track
+   (--mk-*-ink, contrast-checked to >=4.5:1 in both themes) rather than from
+   the semantic aliases this used to name, which are reserved product-wide for
+   what a colour MEANS. The rendered values are identical; what changes is that
+   "green means complete" stays true everywhere else in the app.
+
+   The type is never carried by colour alone either: a string keeps its quotes,
+   a number has no quotes, and null/boolean are also italicised. */
+.json-key {
+  color: var(--mk-pink-ink);
+}
+.json-key::after {
+  content: ":";
+  color: var(--muted);
+}
+.json-summary {
+  color: var(--muted);
+}
+.json-string {
+  color: var(--mk-green-ink);
+}
+.json-number {
+  color: var(--mk-yellow-ink);
+}
+.json-boolean,
+.json-null {
+  color: var(--muted);
+  font-style: italic;
+}
+/* "…and 240 more". The control's LOOK belongs to `.nb-btn`, which JsonView
+   composes onto it — deliberately nothing here declares a border, a fill or a
+   colour, so the two rules can never fight over which stylesheet the bundler
+   emitted first. All this owns is where it sits in the tree. */
 .json-more {
-  display: block;
-  margin: 0.25rem 0;
-  background: none;
-  border: 0;
-  color: var(--accent);
-  cursor: pointer;
-  font-size: 0.8rem;
+  margin: var(--sp-1) 0;
+  font-size: var(--fs-micro);
 }

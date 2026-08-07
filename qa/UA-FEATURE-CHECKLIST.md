@@ -930,6 +930,81 @@ Test each by asking the agent in plain language and observing the stated outcome
 
 ---
 
+## 31. Multi-file operations (Library selection)
+
+Selection is a DIFFERENT idea from the AI-sources checkboxes. Both are "picked
+files", and confusing them is the failure this section exists to catch.
+
+- [ ] ⌘-click adds one file to the selection; the picked rows are visibly framed
+- [ ] Shift-click selects the whole visible range, in the order shown on screen
+- [ ] Shift-range across a **collapsed** folder does NOT sweep in its hidden files
+- [ ] ⌘A selects every visible file; Esc clears the selection
+- [ ] The selection bar shows a live count and Move / Attach / Export / Trash / Clear
+- [ ] Selecting files leaves the AI-sources checkboxes untouched, and vice versa
+- [ ] Right-click INSIDE a selection → plural labels ("Move 3 files…")
+- [ ] Right-click OUTSIDE a selection → acts on the single row under the cursor
+- [ ] Dragging any selected row drags the whole selection into a folder
+- [ ] Move to folder: the destination the files are already in is disabled
+- [ ] Trashing a selection produces ONE receipt, not one toast per file
+- [ ] A batch where one file fails: the receipt NAMES the failure and the rest still complete
+- [ ] A batch over the 200-file cap says so — a truncated batch never reads as complete
+- [ ] Deleting a file that is open in the viewer closes/detaches it cleanly
+
+## 31b. Trash, in bulk
+
+- [ ] Per-row checkboxes in the Trash tab; the bar shows a count
+- [ ] Restore several at once — each returns to its original folder
+- [ ] Permanent delete is ARMED (two-step), never a single click
+- [ ] A row trashed by the agent reads "by the AI · trash_files"
+- [ ] A row trashed by hand reads "by you"
+- [ ] A row from before attribution existed says so rather than guessing
+
+## 31c. The file agent organizes (chat-invocable)
+
+Extends §28. These three tools are boxed on the File agent and served to
+LocalEngine, CloudEngine and ExternalAgent — test on a LOCAL model too, since a
+pass on a cloud engine does not prove the local tier serves the box.
+
+- [ ] `organize_files` with `dry_run` returns a plan and changes NOTHING (re-list to prove it)
+- [ ] …including creating no folders the plan merely mentioned
+- [ ] A file listed as `Folder/name.ext` can be renamed using that EXACT string
+- [ ] …and moved using it too
+- [ ] A real organize reports counts and names anything that failed
+- [ ] `trash_files` moves to the trash and is attributed to the agent
+- [ ] The agent CANNOT permanently delete, and CANNOT empty the trash
+- [ ] `merge_files` combines two files without calling a model (works on a 4B)
+- [ ] Asking to organize files that do not exist is refused, not faked
+- [ ] Moving into a missing folder without permission to create one is reported honestly
+
+## 31d. Podcast voices (Studio → Voices)
+
+- [ ] A generated podcast script opens a Voices panel (older script pages say why they can't)
+- [ ] Every host has its own voice, speed and pitch control
+- [ ] A FRESH cast gives the two hosts DIFFERENT voices
+- [ ] Preview speaks that host's OWN line from the script, not a generic sample
+- [ ] Suggest voices never repeats a voice and alternates gender where known
+- [ ] If the voice catalog fails to load, the panel SAYS so (a greyed button with no reason is a fail)
+- [ ] Editing the cast enables Save; Record is disabled until the cast is saved
+- [ ] "Recording uses a cloud voice" appears ABOVE the Record button
+- [ ] With the privacy door on, the redaction warning also appears ABOVE the button
+- [ ] Offline: Record is disabled up front, and does not fail after being pressed
+
+## 31e. Recording an episode
+
+- [ ] Record runs as a background job with Stop / Resume, visible in Activity
+- [ ] **Listen**: two distinct voices, alternating, with gaps between turns
+- [ ] No host reads their own name aloud ("Alex: welcome in" spoken as words is a fail)
+- [ ] Loudness is even across the whole episode — no line jumping in volume
+- [ ] The episode saves as .m4a and plays in the normal audio viewer
+- [ ] The transcript reads `[m:ss] Speaker: line`, and each speaker appears ONCE per line
+- [ ] Clicking a transcript line seeks to that moment
+- [ ] With the privacy door on, the transcript shows the placeholders that were actually spoken
+- [ ] Re-casting and recording again KEEPS the old episode, and the new one has a different name (`… episode 2.m4a`)
+- [ ] Reopening the script later still shows the chosen voices
+- [ ] Stopping mid-record lands no half file in the room
+
+---
+
 ## Meta: coverage rules for the UA agent
 
 1. **Every checkbox is one verdict**: pass / fail (with repro + observed vs expected) / blocked-precondition (say which). Never silently skip.

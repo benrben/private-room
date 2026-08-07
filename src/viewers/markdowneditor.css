@@ -1,4 +1,13 @@
-/* The Markdown note editor: toolbar over source-and-preview. */
+/* THE NOTE EDITOR: a formatting row over source-and-page.
+
+   The chrome is a strip of pencil marks on the sheet, not a filled toolbar —
+   the same treatment `.rdr-bar` gives every other reader — because the moment
+   the editor grows a grey bar the writing surface stops reading as paper.
+
+   Three faces, three jobs, and this file is where they meet: the SOURCE is
+   Markdown (technical, mono, Monaco's own), the PAGE is the reader's own
+   `.md-body` (interface face, prose measure), and the formatting marks are
+   drawn in the hand. */
 
 .mde {
   display: flex;
@@ -10,66 +19,175 @@
 .mde-bar {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: var(--sp-3);
   flex-wrap: wrap;
-  padding: 0.35rem 0.5rem;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel);
+  padding: var(--sp-2) var(--sp-3);
+  background: transparent;
+  /* The hand-drawn divider: a pencil rule that thins toward both ends rather
+     than a flat 1px border. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }
 
 .mde-tools {
   display: flex;
   align-items: center;
-  gap: 0.15rem;
+  gap: 2px;
   flex-wrap: wrap;
 }
 
+/* THE FORMATTING MARKS ARE DRAWN BY HAND.
+   Kalam here is not a caption in disguise: every one of these labels is a
+   MARK — B, I, H1, a bullet, a rule, a quote glyph — the shorthand a person
+   scribbles in a margin, which is precisely the register the hand is reserved
+   for. It is never applied to the words of a control (Source / Split / Preview
+   / Focus below stay in the interface face), and it changes nothing an
+   assistive technology hears: each button carries its real aria-label ("Bold",
+   "Bulleted list"), so the glyph is decoration over a named control.
+
+   28px square rather than the old 1.75rem, so every one of them clears the
+   24px minimum target with its border included. */
 .mde-tool {
-  min-width: 1.9rem;
-  height: 1.75rem;
-  padding: 0 0.4rem;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 var(--sp-2);
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: none;
   color: var(--muted);
-  font-size: 0.82rem;
+  /* The interface sans, not the hand. These are toolbar CONTROLS — B, I, H1,
+     the list and link marks — not annotations, and half of their labels
+     (the checkbox, the quotation marks, the table glyph, the link) fall
+     outside Kalam's bundled latin + latin-ext subsets. The row was rendering
+     half in Kalam and half in the system fallback, at visibly different
+     sizes, in a single strip of buttons. */
+  font-size: var(--fs-body);
+  font-weight: 600;
   line-height: 1;
   cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
 }
 .mde-tool:hover {
-  border-color: var(--border);
-  background: var(--bg);
+  border-color: var(--rule-strong);
   color: var(--text);
+}
+.mde-tool:active {
+  /* Pressed against the paper. */
+  transform: translateY(1px);
+}
+.mde-tool:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 /* Bold and italic read as what they do. */
 .mde-tool:nth-child(1) {
-  font-weight: 800;
+  font-weight: 700;
 }
 .mde-tool:nth-child(2) {
   font-style: italic;
-  font-family: Georgia, serif;
 }
 
+/* Source / Split / Preview. A segmented control drawn on the sheet; the
+   active one carries the marker underline — the app's ONE active signal —
+   instead of a filled accent block, which read as "selected" and so collided
+   with the meaning selection has everywhere else. */
 .mde-layout {
   display: flex;
-  gap: 0.1rem;
+  gap: var(--sp-2);
   margin-left: auto;
-  padding: 0.1rem;
-  border: 1px solid var(--border);
-  border-radius: 7px;
+  align-items: center;
 }
 .mde-layout-btn {
-  padding: 0.2rem 0.55rem;
+  position: relative;
+  min-height: 24px;
+  padding: 3px 2px;
   border: none;
-  border-radius: 5px;
   background: none;
   color: var(--muted);
-  font-size: 0.76rem;
+  font-size: var(--fs-meta);
   cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-pen);
+}
+.mde-layout-btn:hover {
+  color: var(--text);
+}
+.mde-layout-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 .mde-layout-btn.active {
-  background: var(--accent);
-  color: #fff;
+  color: var(--text-strong);
+}
+.mde-layout-btn.active::after {
+  content: "";
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  bottom: -1px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--accent-fill) 0%,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 68%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  animation: nb-draw var(--dur) var(--ease-pen);
+  pointer-events: none;
+}
+
+/* Focused writing. Its own control rather than a fourth layout: Source /
+   Split / Preview says what you are looking at, this says how much is in the
+   way of it. Drawn as a chip so it never reads as a member of that group. */
+.mde-focus {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 10px;
+  font-size: var(--fs-micro);
+  color: var(--ink-2);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-pen);
+}
+.mde-focus:hover {
+  color: var(--ink);
+  border-color: var(--sketch);
+}
+.mde-focus:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Circled, the way a pen rings the thing it turned on: the ring goes to the
+   pen colour and a second stroke sits just outside it. The WORD is what says
+   the mode is on — aria-pressed says so too — so the ink is never the only
+   signal. */
+.mde-focus.active {
+  position: relative;
+  color: var(--ink);
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+}
+.mde-focus.active::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
 }
 
 .mde-panes {
@@ -90,23 +208,60 @@
   min-height: 0;
 }
 
+/* The page beside the source. Its own scroll region, so the reading-progress
+   stroke and the sheet below both belong to it rather than to the pane. */
 .mde-preview {
   flex: 1;
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: 1.25rem 1.5rem 3rem;
-  border-left: 1px solid var(--border);
-  background: var(--bg);
+  padding: var(--sp-6) var(--sp-6) var(--sp-8);
+  /* A pencil rule dividing the two columns, thinning at both ends. */
+  background-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--line-soft) 8%,
+    var(--line-soft) 90%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 1px 100%;
+  background-position: left top;
 }
-/* In preview-only mode there is no source pane to divide from, and the column
-   should read like the page rather than like half of one. */
-.mde[data-layout="preview"] .mde-preview {
-  border-left: none;
-}
-.mde[data-layout="preview"] .mde-preview > * {
-  max-width: 46rem;
+
+/* The page itself: the same warm-paper sheet every document in this app gets,
+   so what you are writing looks like what you will read. */
+.mde-preview > .md-body {
+  max-width: var(--doc-measure, 86ch);
   margin-inline: auto;
+  padding: var(--doc-pad-b, 32px) var(--doc-pad-i, 32px)
+    calc(var(--doc-pad-b, 32px) * 2);
+  background: var(--doc-paper);
+  border: var(--stroke-w) solid var(--doc-edge);
+  border-radius: var(--radius-lg);
+  font-size: var(--fs-lead);
+  line-height: var(--lh-body);
+}
+
+/* In preview-only mode there is no source pane to divide from. */
+.mde[data-layout="preview"] .mde-preview {
+  background-image: none;
+}
+
+/* ----- focused writing -----
+   The formatting row is gone (unmounted in the component, not hidden here),
+   so the bar shrinks to the two mode controls and the page takes the width
+   back. Nothing moves and nothing animates; it is a layout, not an effect. */
+.mde[data-focus="on"] .mde-bar {
+  padding-block: var(--sp-1);
+  background-image: none;
+}
+.mde[data-focus="on"] .mde-preview {
+  padding-block: var(--sp-8);
+}
+.mde[data-focus="on"] .mde-preview > .md-body {
+  border-color: transparent;
+  background: transparent;
 }
 
 @media (max-width: 900px) {
@@ -115,7 +270,28 @@
     flex-direction: column;
   }
   .mde[data-layout="split"] .mde-preview {
-    border-left: none;
-    border-top: 1px solid var(--border);
+    background-position: left top;
+    background-size: 100% 1px;
+    background-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--line-soft) 3%,
+      var(--line-soft) 95%,
+      transparent 100%
+    );
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mde-tool,
+  .mde-layout-btn,
+  .mde-focus {
+    transition: none;
+  }
+  .mde-tool:active {
+    transform: none;
+  }
+  .mde-layout-btn.active::after {
+    animation: none;
   }
 }

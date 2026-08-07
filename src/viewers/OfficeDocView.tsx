@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import TextView from "../workspace/TextView";
-import { frameIsDark } from "./frameTheme";
 import QuickLookView from "./QuickLookView";
 import "./officedoc.css";
 
@@ -49,7 +48,7 @@ export default function OfficeDocView({
           setState("none");
           return;
         }
-        const token = await api.stagePreviewHtml(wrap(html, frameIsDark()));
+        const token = await api.stagePreviewHtml(wrap(html));
         if (!alive) return;
         setUrl(`roomdoc://localhost/${token}`);
         setState("ready");
@@ -98,39 +97,58 @@ export default function OfficeDocView({
   );
 }
 
-/** Give the imported HTML a readable page: a measured column, the APP's
- * light/dark setting, and images that can't overflow. The document's OWN
- * stylesheet comes after, so it wins wherever it has an opinion.
+/* The document's page, written into the frame's own markup.
  *
- * `dark` is passed in rather than sniffed with `prefers-color-scheme`: the
- * frame is a separate origin and would otherwise follow the MAC's setting, so
- * an app on light over a Mac on dark rendered a dark page in a light window.
+ * These are literal hex values rather than the app's tokens on purpose: a
+ * `roomdoc://` frame is an opaque origin and cannot read a single custom
+ * property off the parent. They are the light theme's warm paper and ink, and
+ * they are FIXED — see the note on `wrap` for why the theme does not reach in
+ * here. A link is drawn in the app's own pink pen so it still reads as part of
+ * this product rather than as a browser default. */
+const DOC_PAPER = "#f7f4ec";
+const DOC_INK = "#1b1c19";
+const DOC_LINK = "#a92f49";
+
+/** Give the imported HTML a readable page: warm paper, a measured column, and
+ * images that can't overflow. The document's OWN stylesheet comes after, so it
+ * wins wherever it has an opinion.
+ *
+ * THE PAGE IS ALWAYS PAPER, IN BOTH THEMES. This used to take the app's
+ * light/dark setting and paint the document charcoal in dark mode, which is
+ * the trap every "dark reader" falls into: `textutil` emits Word's own
+ * character formatting, and Word writes explicit colours — `color:#000000` on
+ * a run is ordinary — while writing no background at all. A document that
+ * named its ink and trusted the paper therefore came out black-on-charcoal,
+ * unreadable, with no way for the reader to tell that the app had done it.
+ * Only the app can be sure what its own frame is; it cannot be sure what a
+ * 2003 Word file assumed. So the frame keeps the author's assumption (paper
+ * under ink) and the notebook stays outside it, exactly as a rasterised PDF
+ * page and a rendered slide already do in this app.
+ *
  * `html` carries the background too, so it covers the whole frame rather than
  * stopping where the text does. */
-function wrap(html: string, dark: boolean): string {
-  const bg = dark ? "#17171b" : "#ffffff";
-  const fg = dark ? "#e4e1db" : "#111111";
+function wrap(html: string): string {
   const style = `<style>
-  :root { color-scheme: ${dark ? "dark" : "light"}; }
+  :root { color-scheme: light; }
   html {
     -webkit-text-size-adjust: 100%;
     min-height: 100%;
-    background: ${bg};
+    background: ${DOC_PAPER};
   }
   body {
     margin: 0 auto;
     min-height: 100vh;
-    padding: 2.5rem 1.5rem 4rem;
-    max-width: 48rem;
-    background: ${bg};
-    color: ${fg};
-    line-height: 1.55;
+    padding: 3rem 2rem 5rem;
+    max-width: 46rem;
+    background: ${DOC_PAPER};
+    color: ${DOC_INK};
+    line-height: 1.6;
     overflow-wrap: break-word;
   }
-  a { color: ${dark ? "#9d8df1" : "#5b4bd6"}; }
+  a { color: ${DOC_LINK}; }
   img { max-width: 100%; height: auto; }
   table { border-collapse: collapse; max-width: 100%; }
-  td, th { border: 1px solid rgba(128,128,128,.35); padding: 4px 7px; }
+  td, th { border: 1px solid rgba(27,28,25,.28); padding: 4px 7px; }
 </style>`;
   // textutil emits a complete document; slip the page style in before its own
   // <style> block so the document's rules take precedence.

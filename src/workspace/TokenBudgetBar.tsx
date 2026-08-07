@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { RefreshIcon, SparklesIcon } from "../icons";
 import MarkdownView from "../viewers/MarkdownView";
 import { WSState } from "./state";
@@ -19,13 +19,23 @@ function formatTokenCount(n: number): string {
   return Math.round(n).toLocaleString();
 }
 
-/** near/at/over-budget signal on the bar's outer ring — a color-only glow,
- * never a width change (the fill width is always the real ratio). */
+/** near/at/over-budget signal on the bar's outer ring — never a width change
+ * (the fill width is always the real ratio). */
 function thresholdClass(pct: number): "ok" | "warn" | "danger" {
   if (pct >= 92) return "danger";
   if (pct >= 75) return "warn";
   return "ok";
 }
+
+/** …and the word that rides with it. The ring alone would be colour-only
+ * status, and the five segment colours are already spoken for as CATEGORY
+ * identity — so the budget signal is red, which no category uses, and it
+ * always carries one of these. */
+const THRESHOLD_WORD: Record<"ok" | "warn" | "danger", string> = {
+  ok: "",
+  warn: "Near limit",
+  danger: "At limit",
+};
 
 /** The chat's live token-budget bar: a segmented fill (colored by category)
  * showing how much of the model's context window this turn used, plus a
@@ -63,6 +73,16 @@ export default function TokenBudgetBar({ s, a }: { s: WSState; a: WSActions }) {
           onClick={() => setOpen((o) => !o)}
           title={`${formatTokenCount(total)} / ${formatTokenCount(max)} tokens used this turn — click for a breakdown`}
         >
+          {/* The one-number view of the same ratio, as a partially filled
+              circle: the conic sweep is exactly `fillPct` of the disc, no
+              easing and no minimum visible sliver, so it cannot overstate a
+              small value. Decorative in the strict sense — the exact figures
+              are written out beside it — hence aria-hidden. */}
+          <span
+            className="nb-dial token-bar-dial"
+            style={{ "--nb-val": `${fillPct}%` } as CSSProperties}
+            aria-hidden
+          />
           <span className="token-bar-track">
             <span className="token-bar-fill" style={{ width: `${fillPct}%` }}>
               {CATEGORY_ORDER.map(({ key, label }) => {
@@ -92,6 +112,11 @@ export default function TokenBudgetBar({ s, a }: { s: WSState; a: WSActions }) {
               </span>
             )}
           </span>
+          {cls !== "ok" && (
+            <span className="nb-tape nb-sem-urgent token-bar-flag">
+              {THRESHOLD_WORD[cls]}
+            </span>
+          )}
         </button>
         {open && (
           <>

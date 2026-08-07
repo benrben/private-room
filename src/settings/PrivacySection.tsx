@@ -147,11 +147,17 @@ export default function PrivacySection({
                 onChange={(e) => setPwRepeat(e.target.value)}
               />
             </div>
-            <p className="settings-hint">
-              {/* One consistent story with the Recovery key section — a flat
-                  "no recovery" here contradicted it and read as a threat. */}
-              There is no password reset. A recovery key (Settings → Recovery
-              key) is the only way back in if you forget it.
+            {/* One consistent story with the Recovery key section — a flat
+                "no recovery" here contradicted it and read as a threat.
+                The tape carries the sentence's own opening clause, verbatim;
+                the yellow edge says this is the consequence to read before
+                typing a new password, not a footnote after it. */}
+            <p className="set-note set-note--flag nb-sem-pending">
+              <span className="nb-tape set-note-tag">
+                There is no password reset
+              </span>
+              . A recovery key (Settings → Recovery key) is the only way back
+              in if you forget it.
             </p>
             {pwError && <div className="gate-error">{pwError}</div>}
             <div className="settings-actions">
@@ -219,7 +225,9 @@ export default function PrivacySection({
                   : "Unlock this room with a fingerprint."}
               </span>
             </div>
-            <p className="settings-hint">
+            {/* Where a secret is kept is a privacy fact, so it hangs off the
+                switch that decides it rather than floating as another hint. */}
+            <p className="set-note">
               Your password is stored in the macOS Keychain, guarded by
               biometrics — never in the room file. Changing your password
               updates it automatically.

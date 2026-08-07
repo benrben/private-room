@@ -34,6 +34,35 @@ pub fn get_rec_meta(conn: &Connection, file_id: &str) -> Option<String> {
     .ok()
 }
 
+/// Recordings the room has never read (see `jobs::rec_read`) — the set the
+/// background sweep works through so recordings made before this feature
+/// existed fill in by themselves.
+///
+/// "Never read" is `readOf` being absent, which is exactly what
+/// `RecMeta.read_of` serializes to when unset — read through `json_extract`
+/// rather than a LIKE on the blob, so a note whose text happens to contain the
+/// word cannot make a recording look read. A recording with no transcript yet
+/// is skipped: there is nothing to read, and asking a model about silence
+/// wastes the machine.
+///
+/// Trashed files are excluded by the same join `get_rec_meta` uses.
+pub fn recordings_missing_read(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    query_rows(
+        conn,
+        "SELECT r.file_id FROM recordings r JOIN files f ON f.id = r.file_id
+         WHERE f.trashed_at IS NULL
+           AND json_extract(r.meta, '$.readOf') IS NULL
+           AND json_array_length(r.meta, '$.segments') > 0
+         ORDER BY f.created_at DESC
+         LIMIT ?1",
+        [limit as i64],
+        |r| r.get(0),
+    )
+}
+
 // ---- live-recording audio checkpoints -----------------------------------
 //
 // A live session's periodic saves used to rewrite the file's ENTIRE growing

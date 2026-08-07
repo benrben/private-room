@@ -18,6 +18,14 @@ mod recent;
 mod safety;
 mod room_checkpoints;
 mod files;
+/// Batch file operations (move / trash / restore / destroy a SET of files).
+/// Shared by the Library's multi-selection and the File agent's organize tools
+/// so the two can never behave differently — see the module header.
+mod bulk;
+/// The File agent's organize verbs (`organize_files`, `trash_files`,
+/// `merge_files`) — built on `bulk` above, so an AI move and a human move are
+/// the same operation with a different actor recorded.
+mod organize;
 mod spreadsheet;
 mod stt_cmds;
 mod library;
@@ -72,6 +80,7 @@ pub use recent::*;
 pub use safety::*;
 pub use room_checkpoints::*;
 pub use files::*;
+pub use bulk::*;
 pub use spreadsheet::*;
 pub use stt_cmds::*;
 pub use library::*;

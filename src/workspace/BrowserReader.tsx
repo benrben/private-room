@@ -3,6 +3,9 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api } from "../api";
 import type { BrowserInfo, BrowserPageText } from "../apiTypes";
+// The reading-progress hook lives beside the plain-text reader because it was
+// written for it; it belongs in a module of its own and should move there.
+import { useReadingProgress } from "../viewers/ProseView";
 import { hostOf } from "./browserAnnounce";
 
 /* Item #18: the page, as text you can actually read.
@@ -56,6 +59,10 @@ export function BrowserReader({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  // How far down the copy you have read. The panel is its own scroll region,
+  // so this is the real scroll position and not an estimate.
+  const read = useReadingProgress(bodyRef);
 
   const load = useCallback(async (which: Mode) => {
     setBusy(true);
@@ -142,6 +149,19 @@ export function BrowserReader({
         onClose();
       }}
     >
+      {/* Reading progress as a marker stroke across the top of the copy.
+          aria-hidden and inert: the scroll position is already available to a
+          keyboard or screen-reader user, and a live region announcing a
+          percentage on every frame would make the panel unreadable. */}
+      {read !== null && (
+        <div
+          className="rdr-progress"
+          aria-hidden
+          style={{ "--nb-val": `${read}%` } as React.CSSProperties}
+        >
+          <i />
+        </div>
+      )}
       <header className="browser-reader-head">
         {/* tabIndex -1 so the focus move on open lands somewhere meaningful
             without adding a tab stop nobody asked for. */}
@@ -152,7 +172,14 @@ export function BrowserReader({
         <p className="browser-reader-where">
           <span>{host ?? page?.url ?? info.url ?? "no address"}</span>
           <span className="sep">·</span>
-          <span>
+          {/* Whether the connection is encrypted is a STATE, so it is drawn as
+              a strip of tape: red for urgent, green for verified, per the
+              product-wide marker meanings. The sentence is what carries it —
+              the marker only reinforces a word that already says everything,
+              so the badge still works for a reader who sees no colour. */}
+          <span
+            className={`nb-tape ${insecure ? "nb-sem-urgent" : "nb-sem-done"}`}
+          >
             {insecure
               ? "Not encrypted — anything typed into this page travels in the clear"
               : "Encrypted connection"}
@@ -195,7 +222,7 @@ export function BrowserReader({
 
       {/* Every state below says which one it is. "Nothing here" must never be
           the same rendering as "we could not ask". */}
-      <div className="browser-reader-body">
+      <div className="browser-reader-body" ref={bodyRef}>
         {error && (
           <p className="browser-reader-error" role="alert">
             {error}

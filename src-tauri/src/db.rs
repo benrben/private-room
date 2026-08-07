@@ -22,6 +22,8 @@ mod jobs;
 mod memories;
 mod messages;
 mod meta;
+/// Generated podcast scripts as data: hosts, turns, cast, rendered episode.
+mod podcasts;
 mod privacy;
 mod recordings;
 mod schema;
@@ -29,6 +31,7 @@ mod settings;
 mod skills;
 mod util;
 mod versions;
+mod voices;
 mod web_cache;
 mod workflows;
 
@@ -42,6 +45,7 @@ pub use jobs::*;
 pub use memories::*;
 pub use messages::*;
 pub use meta::*;
+pub use podcasts::*;
 pub use privacy::*;
 pub use recordings::*;
 pub use schema::*;
@@ -49,6 +53,7 @@ pub use settings::*;
 pub use skills::*;
 pub(crate) use util::*;
 pub use versions::*;
+pub use voices::*;
 pub use web_cache::*;
 pub use workflows::*;
 

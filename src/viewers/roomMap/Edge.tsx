@@ -1,5 +1,5 @@
 import type { SimNode, SimEdge, View, Tip } from "./types";
-import { styleFor, edgeLines } from "./edges";
+import { styleFor, edgeLines, edgeInk } from "./edges";
 import { nodeRadius } from "./layout";
 
 interface EdgeProps {
@@ -21,7 +21,13 @@ interface EdgeProps {
  *  `.room-map-edge { stroke: … }` rule in misc-moonshot.css used to beat the
  *  attributes (any author selector outranks a presentation attribute), so
  *  every edge rendered as the same violet hairline no matter what the code
- *  asked for. An inline declaration wins whatever the stylesheet says. */
+ *  asked for. An inline declaration wins whatever the stylesheet says.
+ *
+ *  A pencil line, not a wire: round caps and joins, so a stroke ends the way a
+ *  pencil lifts rather than being cut square, and the dotted kinds land as a
+ *  trail of round dots instead of a row of ticks. Both ends of the geometry are
+ *  the nodes' exact positions — the drawing is hand-made, the coordinates are
+ *  not, and nothing here nudges a line off the two points it connects. */
 export default function Edge({
   se,
   a,
@@ -36,7 +42,6 @@ export default function Edge({
   const lit =
     hovered === a.id || hovered === b.id || focusId === a.id || focusId === b.id;
   const style = styleFor(se.edge.kind);
-  const base = 0.14 + se.edge.weight * 0.4;
   const title = `${a.name} ${se.edge.directed ? "→" : "↔"} ${b.name}`;
   const lines = edgeLines(se.edge);
 
@@ -79,7 +84,11 @@ export default function Edge({
         y2={y2}
         style={{
           stroke: style.color,
-          strokeWidth: ((0.5 + se.edge.weight * 1.2) * style.widthMul) / view.k,
+          // Weight is the second strength channel beside opacity. The floor is
+          // 0.7 rather than 0.5 because the thinnest kind multiplies it by 0.9
+          // and a sub-half-pixel dotted line does not survive being broken into
+          // round dots — it just disappears.
+          strokeWidth: ((0.7 + se.edge.weight * 1.1) * style.widthMul) / view.k,
         }}
         // Dashes are in world units, so they have to be unscaled like the width
         // or they vanish into a solid line as you zoom out.
@@ -91,7 +100,9 @@ export default function Edge({
                 .join(" ")
             : undefined
         }
-        strokeOpacity={lit ? Math.min(0.95, base + 0.4) : base}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeOpacity={edgeInk(se.edge, lit)}
         markerEnd={se.edge.directed ? `url(#rm-arrow-${se.edge.kind})` : undefined}
         pointerEvents="none"
       />

@@ -1,6 +1,5 @@
 import type { SimNode, View, Tip } from "./types";
-import { nodeRadius, starPoints } from "./layout";
-import { VIOLET, VIOLET_SOFT, MEMORY } from "./constants";
+import { nodeRadius, handCircle } from "./layout";
 
 interface NodeStarProps {
   n: SimNode;
@@ -16,8 +15,26 @@ interface NodeStarProps {
   setTip: (t: Tip | null) => void;
 }
 
-/** One node — a violet file star or a green memory ring — with its halo,
- *  hit target, and hover/click wiring (all handlers threaded from the shell). */
+/** One node — an inked disc for a file, a ringed dot for a memory — with its
+ *  hit target and hover/click wiring (all handlers threaded from the shell).
+ *
+ *  NODES ARE INK, NOT COLOUR. Both kinds are drawn in the pen, and which one a
+ *  node is comes from its SHAPE: a filled disc is a file, an open ring around a
+ *  dot is a memory, and the same ring is repeated in front of a memory's label.
+ *  That leaves every hue on this map free to mean one thing — what a LINE
+ *  between two nodes claims — instead of hue being asked to say two unrelated
+ *  things at once. It also retires the last two colour literals the map
+ *  carried (a violet wash and a neon green), which is where its glow came from.
+ *
+ *  Paint lives in roomMap.css, keyed off the classes below. Only stroke WIDTHS
+ *  are set here, because they have to be divided by the zoom to stay a constant
+ *  weight on screen, and only the browser knows the current scale at draw time.
+ *
+ *  Note that the class values are what protect these shapes from
+ *  `.room-map-node { fill: … }` in misc-moonshot.css: that rule paints the
+ *  wrapping <g>, and fill INHERITS, so a shape that declared nothing would pick
+ *  the accent up. A rule matching the shape itself always beats a value
+ *  inherited from its parent. */
 export default function NodeStar({
   n,
   degree,
@@ -57,7 +74,9 @@ export default function NodeStar({
   };
   return (
     <g
-      className={`room-map-node ${isFile ? "is-file" : "is-memory"}`}
+      className={`room-map-node ${isFile ? "is-file" : "is-memory"}${
+        active ? " is-active" : neighbour ? " is-neighbour" : ""
+      }`}
       transform={`translate(${n.x} ${n.y})`}
       style={{ cursor: openable ? "pointer" : "default" }}
       role="button"
@@ -89,31 +108,25 @@ export default function NodeStar({
       }}
       onClick={activate}
     >
-      <circle r={hit} fill="transparent" />
+      <circle className="rm-node-hit" r={hit} />
+      {/* The selected node is CIRCLED, the way you would circle it on paper.
+          A drawn shape, not a colour swap and not a glow — so the selection
+          survives greyscale, and it is also the keyboard indicator, since
+          focusing a node selects it (onFocus above). */}
+      {active && (
+        <path
+          className="rm-node-circled"
+          d={handCircle(r * 1.85)}
+          strokeWidth={1.7 / view.k}
+          aria-hidden="true"
+        />
+      )}
       {isFile ? (
-        <>
-          {/* soft halo → the star "glows" without an SVG filter */}
-          <circle
-            r={r * (active ? 2.7 : neighbour ? 2.3 : 2.0)}
-            fill={VIOLET_SOFT}
-          />
-          <polygon
-            points={starPoints(r * (active ? 1.28 : 1))}
-            fill={VIOLET}
-            stroke={active ? "#fff" : "none"}
-            strokeWidth={active ? 0.8 / view.k : 0}
-          />
-        </>
+        <circle className="rm-node-disc" r={r} strokeWidth={1.4 / view.k} />
       ) : (
         <>
-          <circle r={r * 1.9} fill="rgba(76, 195, 138, 0.14)" />
-          <circle
-            r={r * 0.9}
-            fill="none"
-            stroke={MEMORY}
-            strokeWidth={1.4 / view.k}
-          />
-          <circle r={r * 0.34} fill={MEMORY} />
+          <circle className="rm-node-ring" r={r * 0.95} strokeWidth={1.4 / view.k} />
+          <circle className="rm-node-core" r={r * 0.36} />
         </>
       )}
     </g>

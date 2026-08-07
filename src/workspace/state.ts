@@ -22,6 +22,7 @@ import {
   McpServerStatus,
   Memory,
   Message,
+  Podcast,
   RoomInfo,
   SearchResults,
   ScriptInfo,
@@ -275,12 +276,52 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [showSyncWarn, setShowSyncWarn] = useState(false);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
+  // The Library's MULTI-SELECTION — the set of file rows the user has picked
+  // out for one action (move, trash, export).
+  //
+  // Deliberately NOT `attachments`, and the two must never be merged. The "AI
+  // sources" tab's checkboxes already mean something else entirely: which files
+  // ground the next answer. One set is "what am I about to do something to",
+  // the other is "what may the model read". Collapsing them would make
+  // selecting three files to move them silently rewrite the evidence set of the
+  // next question.
+  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
+  // The Trash tab's own selection. A separate set on purpose: the two tabs list
+  // disjoint rows, and one shared set would carry a library selection into a
+  // "delete for good" button — the one place in the app where acting on the
+  // wrong set cannot be undone.
+  const [selectedTrashIds, setSelectedTrashIds] = useState<Set<string>>(new Set());
+  // The podcast script attached to the OPEN file, when it has one. Null covers
+  // both "not a podcast" and "a podcast page from before scripts were stored as
+  // data" — the panel tells those two apart and says which.
+  const [openPodcast, setOpenPodcast] = useState<Podcast | null>(null);
+  // Where a shift-range starts. Held separately from the selection because the
+  // anchor survives the range being re-drawn: shift-clicking twice from the
+  // same anchor must replace the range, not extend from wherever it last ended.
+  const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
+  // The ids currently on screen, in the exact order they are painted (loose
+  // files first, then each folder's contents). Owned here rather than
+  // recomputed by every consumer because a shift-range and ⌘A both have to
+  // agree with what the reader can actually see — a range computed against the
+  // unsorted or unfiltered list selects rows that are not on the screen.
+  const [visibleFileOrder, setVisibleFileOrder] = useState<string[]>([]);
   const [moveMenuFor, setMoveMenuFor] = useState<{
-    id: string;
+    /** The files this move applies to — one for a single row, many when the
+     * multi-selection is what opened it. */
+    ids: string[];
     x: number;
     y: number;
   } | null>(null);
-  const [ctxMenu, setCtxMenu] = useState<{ file: FileMeta; x: number; y: number } | null>(null);
+  // `files` is the set the menu acts on: one row normally, the whole selection
+  // when the right-clicked row is part of it. `file` (the first) stays the
+  // subject of the single-file items (Open, Rename) so those never have to
+  // guess which of several they meant.
+  const [ctxMenu, setCtxMenu] = useState<{
+    file: FileMeta;
+    files: FileMeta[];
+    x: number;
+    y: number;
+  } | null>(null);
   const ctxMenuRef = useRef(false);
   const ctxMenuElRef = useRef<HTMLDivElement>(null);
   const moveMenuElRef = useRef<HTMLDivElement>(null);
@@ -450,7 +491,13 @@ export function useWorkspaceState(_info: RoomInfo) {
   // step that says "your cloud AI is writing (content leaves this Mac)" — a
   // privacy statement, not a nicety — was never shown at all. "" = no step
   // reported since the last job ended.
-  const [studioStep, setStudioStep] = useState("");
+  /** The Studio's current stage, and whether it keeps content on this Mac.
+   * The flag rides with the words because the pane draws a privacy
+   * consequence differently from a progress aside — see apiTypes' StudioStep. */
+  const [studioStep, setStudioStep] = useState<{ text: string; local: boolean }>({
+    text: "",
+    local: true,
+  });
   // AUDIT 262: file names whose scanned pages are being read right now. The
   // `ocr-progress` event existed from the first build with nothing listening,
   // so a vision pass that takes minutes on a local model looked like nothing at
@@ -601,6 +648,9 @@ export function useWorkspaceState(_info: RoomInfo) {
     revealMsgId, setRevealMsgId,
     showSyncWarn, setShowSyncWarn, folders, setFolders,
     collapsedFolders, setCollapsedFolders, moveMenuFor, setMoveMenuFor,
+    selectedFileIds, setSelectedFileIds, selectionAnchor, setSelectionAnchor,
+    selectedTrashIds, setSelectedTrashIds, openPodcast, setOpenPodcast,
+    visibleFileOrder, setVisibleFileOrder,
     ctxMenu, setCtxMenu, ctxMenuRef, ctxMenuElRef, moveMenuElRef,
     renamingFile, setRenamingFile, fileFilter, setFileFilter,
     fileSort, setFileSort,

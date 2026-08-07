@@ -2,7 +2,14 @@ import { useEffect, useState } from "react";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
-import { AlertIcon, CircleCheckIcon, DownloadIcon, FolderIcon } from "../icons";
+import {
+  AlertIcon,
+  CircleCheckIcon,
+  DownloadIcon,
+  FolderIcon,
+  Logomark,
+  Wordmark,
+} from "../icons";
 import { api } from "../api";
 import { autoUpdateCheckEnabled, setAutoUpdateCheck } from "../updater";
 
@@ -99,6 +106,29 @@ export default function AboutSection() {
 
   return (
     <section id="set-about">
+      {/* The brand lockup: the mark large enough for the folds to read, and
+          the handwritten wordmark beside it. This is the only screen in the
+          product that shows the brand at rest rather than as a 26px chip in a
+          toolbar, so it is worth the room. The version deliberately is NOT
+          repeated here — it already has a functional row of its own directly
+          below, next to the button that acts on it.
+
+          Inline styles rather than a class because this file already styles
+          its one-off rows that way and the settings stylesheet is not this
+          component's to grow. */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 16,
+          marginBottom: 22,
+          lineHeight: 0,
+        }}
+      >
+        <Logomark size={64} />
+        <Wordmark size={38} />
+      </div>
+
       <h3>Updates &amp; version</h3>
       <p className="settings-hint">
         Arcelle updates itself from its signed GitHub releases.{" "}

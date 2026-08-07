@@ -1,17 +1,66 @@
 /* What is inside a zip, without unpacking it. */
-.zip-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-.zip-tree { flex: 1; overflow: auto; padding: 0.35rem 0.75rem 2rem; font-size: 0.85rem; }
+.zip-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.zip-tree {
+  flex: 1;
+  overflow: auto;
+  padding: var(--sp-2) var(--sp-3) var(--sp-8);
+  font-size: var(--fs-meta);
+}
 .zip-row {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--sp-2);
   align-items: baseline;
   width: 100%;
+  min-height: 24px;
   padding: 2px 0;
   line-height: 1.5;
 }
-.zip-folder { background: none; border: 0; text-align: start; cursor: pointer; color: inherit; }
-.zip-folder:hover { background: var(--panel); }
-.zip-caret { width: 0.8em; flex: none; color: var(--muted); }
-.zip-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.zip-folder .zip-name { color: var(--accent); }
-.zip-size { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 0.8rem; }
+.zip-folder {
+  background: none;
+  border: 0;
+  text-align: start;
+  cursor: pointer;
+  color: inherit;
+}
+.zip-folder:hover {
+  background: var(--hover);
+}
+.zip-folder:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.zip-caret {
+  width: 0.8em;
+  flex: none;
+  color: var(--muted);
+}
+/* A path is technical content, and it may be arbitrarily long — mono, with
+   the row's own ellipsis doing the truncating. */
+.zip-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+/* A folder is heavier ink, not the pen: --accent means "active/selected"
+   across this product, and a directory is neither. The caret beside it is the
+   shape that says "this opens", so weight alone is enough here. */
+.zip-folder .zip-name {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+/* Sizes are figures: tabular, so a column of them lines up. */
+.zip-size {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-micro);
+}

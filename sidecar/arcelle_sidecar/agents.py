@@ -57,6 +57,7 @@ from .routing import (
     DOWNLOAD_TOOL_NAMES,
     JOB_TOOL_NAMES,
     MCP_MANAGEMENT_TOOL_NAMES,
+    ORGANIZE_TOOL_NAMES,
     SKILL_TOOL_NAMES,
     UI_TOOL_NAMES,
     WRITE_TOOL_NAMES,
@@ -186,6 +187,23 @@ class AgentSpec:
     #: video is already ``media.video``'s job under ``ask_file_agent``, so
     #: nothing is lost by dropping the domain on those tiers.
     requires: tuple[str, ...] = ()
+    #: This worker's real job is CORE; its :attr:`tools` box is an ADDITION it
+    #: is useful without. ``worker_reachable`` then tests CORE rather than the
+    #: box, exactly as it does for a worker with no box at all.
+    #:
+    #: THE BUG THIS EXISTS FOR (2026-08-07): the File agent had ``tools=()`` and
+    #: rode the CORE branch of ``worker_reachable``. Giving it the ORGANIZE box
+    #: moved it onto the box branch — so on any tier that does not serve the
+    #: organize tools (a consulted advisor, ``include_organize_tools``) the File
+    #: agent, the room's DEFAULT worker, silently became UNREACHABLE. Reading,
+    #: searching and editing files is its job whether or not it can also tidy
+    #: them; "cannot file things" is not "has nothing to do".
+    #:
+    #: Only true where it is really true. For ``chat.web`` or ``jobs.run`` the
+    #: box IS the job, and a tier that serves none of it must drop the domain
+    #: rather than route to an empty one — the confident-non-answer this whole
+    #: function exists to kill.
+    core_capable: bool = False
     #: The name a user types after ``*`` to send a turn HERE ("browse"). ``a-z``
     #: only, because that is all `tagged_specialist` and the host's
     #: ``composer.ts`` can lex, and unique across the registry — both pinned by
@@ -453,9 +471,27 @@ REGISTRY: tuple[AgentSpec, ...] = (
         area="this room's own files and notes",
         summary=(
             "Lists, searches, reads, opens, summarizes, creates and edits the "
-            "files, notes and memories in this room."
+            "files, notes and memories in this room — and organizes them: "
+            "filing into folders, renaming, merging, and deleting to the trash."
         ),
-        tools=(),  # CORE alone (read + write verbs)
+        # CORE (read + write verbs) plus the ORGANIZE box. Three tools against a
+        # cap of seven, so this agent keeps room to grow.
+        #
+        # These are boxed on THIS agent rather than added to CORE deliberately.
+        # CORE is offered to every worker, and "may reorganize and delete the
+        # user's files" is not a power the web agent, the browser agent or the
+        # transcriber has any use for — a tool nobody in that seat should call
+        # is a tool that will eventually be called from it.
+        #
+        # A room whose engine tier is not served these (a consulted advisor)
+        # simply gets a File agent without them: `toolbox_for` intersects the
+        # box with what the host serves, so the box degrades rather than
+        # advertising a verb the bridge would then refuse.
+        tools=ORGANIZE_TOOL_NAMES,
+        # Reading and editing this room's files is the job; organizing them is
+        # an addition. Without this the File agent — the room's DEFAULT worker —
+        # would go unreachable on any tier that withholds the organize box.
+        core_capable=True,
         prompt=FILES_PROMPT,
     ),
     AgentSpec(
@@ -881,7 +917,7 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # and NOT rec_retranscribe (it drives a live recording session) — an
         # agent can supply neither. Re-transcribing a room FILE is the
         # operation it can actually perform.
-        tools=("stt_status", "retranscribe_file"),
+        tools=("stt_status", "retranscribe_file", "read_recording"),
         prompt=TRANSCRIBE_PROMPT,
         # VERBS, plus the noun only when the sentence asks for a transcript to
         # be MADE (or made again). The bare noun "transcript" used to be a hint,
@@ -907,6 +943,18 @@ REGISTRY: tuple[AgentSpec, ...] = (
             # the last tie-break rung prefers the LONGEST matched hint, the
             # 15-character pair beats creator.studio's "flashcard" outright.
             "a transcript of", "me a transcript", "new transcript",
+            # Reading a recording (chapters / highlights / notes). ALL-OF pairs
+            # against a recording noun, not bare verbs: "make chapters" alone is
+            # also what someone says about a document, and "action items" is a
+            # phrase the File agent answers about notes.md every day. Anchoring
+            # each on meeting/recording/standup/call keeps this agent to the
+            # asks it can actually act on with `read_recording`.
+            "chapters+meeting", "chapters+recording", "chapters+standup",
+            "chapters+call", "highlights+meeting", "highlights+recording",
+            "action items+meeting", "action items+recording",
+            "action items+standup", "action items+call",
+            "decided+meeting", "decided+recording", "decided+standup",
+            "read+recording", "read+meeting",
         ),
     ),
     AgentSpec(
@@ -1264,8 +1312,12 @@ def worker_reachable(spec: AgentSpec, *, web_enabled: bool, served_names: set[st
     # because to it one tool is as good as another. See `AgentSpec.requires`.
     if not set(spec.requires) <= served_names:
         return False
-    if not spec.tools:
-        # CORE-only workers (the File agent) ride the always-served base.
+    if not spec.tools or spec.core_capable:
+        # Workers whose job IS the always-served base: those with no box at
+        # all, and those (the File agent) whose box only ADDS to it. See
+        # `AgentSpec.core_capable` for the regression that split these two
+        # cases apart — the room's default worker went unreachable on every
+        # tier that withholds its box.
         return bool(set(CORE_TOOLS) & served_names)
     return bool(set(spec.tools) & served_names)
 

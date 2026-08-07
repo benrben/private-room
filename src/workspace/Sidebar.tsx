@@ -1,13 +1,16 @@
-import { useEffect } from "react";
+import { useEffect, type ReactNode } from "react";
 import {
+  ChatBubbleIcon,
   CloseIcon,
   CollapseLeftIcon,
   DownloadIcon,
+  FilesIcon,
   FocusIcon,
   FolderIcon,
   LinkIcon,
   MemoryIcon,
   MicIcon,
+  PaperclipIcon,
   PencilIcon,
   PlusIcon,
   ScriptIcon,
@@ -43,6 +46,7 @@ const AREA_HEADINGS: Record<WorkArea, string> = {
   skills: "Skills",
   memory: "Memory",
   connectors: "Connectors",
+  find: "Find",
   browser: "Private browser",
 };
 
@@ -229,13 +233,16 @@ export default function LibraryPane({
       )}
 
       {fileArea && s.libraryTab === "browse" && (
-        <BrowsePanel
-          s={s}
-          a={a}
-          shownFiles={shownFiles}
-          looseFiles={looseFiles}
-          filterQ={filterQ}
-        />
+        <>
+          <SelectionBar s={s} a={a} />
+          <BrowsePanel
+            s={s}
+            a={a}
+            shownFiles={shownFiles}
+            looseFiles={looseFiles}
+            filterQ={filterQ}
+          />
+        </>
       )}
       {fileArea && s.libraryTab === "sources" && (
         <SourcesPanel s={s} a={a} shownFiles={shownFiles} attachedIds={attachedIds} />
@@ -249,6 +256,7 @@ export default function LibraryPane({
       {area === "skills" && <SkillsNav s={s} a={a} />}
       {area === "memory" && <MemoryNav s={s} a={a} />}
       {area === "connectors" && <ConnectorsNav s={s} />}
+      {area === "find" && <FindNav s={s} />}
       {area === "browser" && <BrowserNav />}
 
       {(fileArea || area === "recordings") && (
@@ -405,7 +413,122 @@ export default function LibraryPane({
   );
 }
 
+/* ---------- The multi-selection's own strip ---------- */
+
+/** What is picked, and the things you can do to all of it at once.
+ *
+ * Only drawn when something IS selected. A permanently-visible bar of disabled
+ * verbs teaches nothing and costs a row of the list forever; appearing at the
+ * moment it becomes true is also what tells a reader the selection exists.
+ *
+ * The count is the heading, not a suffix, because it is the one fact that makes
+ * every button below it safe to press — "Remove" beside "7 selected" asks a
+ * different question than "Remove" on its own. Deletion keeps the SAME armed
+ * confirm the single-file path uses (`DeleteControl`), so a multi-file removal
+ * is never easier to trigger than a single one. */
+function SelectionBar({ s, a }: { s: WSState; a: WSActions }) {
+  const picked = a.selectedFiles();
+  const n = picked.length;
+
+  // Escape clears, ⌘A selects everything on screen. Both are capture-phase and
+  // both bail when a text field has focus — ⌘A inside the filter box has to
+  // keep meaning "select all this text".
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const el = e.target as HTMLElement | null;
+      const typing =
+        el?.tagName === "INPUT" ||
+        el?.tagName === "TEXTAREA" ||
+        el?.isContentEditable;
+      if (typing) return;
+      if (e.key === "Escape" && n > 0) {
+        e.stopPropagation();
+        a.clearSelection();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        a.selectAllVisible();
+      }
+    }
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [a, n]);
+
+  if (n === 0) return null;
+  const ids = picked.map((f) => f.id);
+  return (
+    <div className="selection-bar" role="toolbar" aria-label={`${n} files selected`}>
+      <span className="selection-count" role="status">
+        {n} selected
+      </span>
+      <div className="selection-actions">
+        <button
+          className="chip-btn"
+          title="Move all of these into a folder"
+          onClick={(e) => {
+            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            s.setCtxMenu(null);
+            s.setMoveMenuFor({ ids, x: r.left, y: r.bottom + 4 });
+          }}
+        >
+          <FolderIcon size={13} /> Move
+        </button>
+        <button
+          className="chip-btn"
+          title="Pin all of these into your next question"
+          onClick={() => a.attachFiles(picked)}
+        >
+          <PaperclipIcon size={13} /> Attach
+        </button>
+        <button
+          className="chip-btn"
+          title="Export copies of all of these out of the room"
+          onClick={() => void a.exportFiles(picked)}
+        >
+          <DownloadIcon size={13} /> Export
+        </button>
+        {/* Same armed confirm as one file's Remove — a set of files must never
+            be easier to delete than one of them. The question names the count,
+            because "Move to the trash?" over seven files is a different act. */}
+        <DeleteControl
+          k="selection-remove"
+          trigger={<TrashIcon size={13} />}
+          question={`Move ${n} file${n === 1 ? "" : "s"} to the trash?`}
+          title={`Move ${n} file${n === 1 ? "" : "s"} to the trash`}
+          onConfirm={() => void a.removeFiles(ids)}
+          confirmDelete={s.confirmDelete}
+          askConfirm={a.askConfirm}
+          cancelConfirm={a.cancelConfirm}
+        />
+        <button
+          className="chip-btn"
+          title="Clear the selection"
+          aria-label="Clear the selection"
+          onClick={a.clearSelection}
+        >
+          <CloseIcon size={12} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ---------- Browse: the real folder tree ---------- */
+
+/** The ids a library drag is carrying.
+ *
+ * `FileRow` writes one id per line, because dragging a row that is part of the
+ * multi-selection drags the whole selection. Splitting here (rather than at
+ * each drop site) keeps the two ends of the drag describing the same thing —
+ * a single-id drag is just the one-line case, so nothing needed a special path. */
+function dragIds(e: React.DragEvent): string[] {
+  return e.dataTransfer
+    .getData("text/plain")
+    .split("\n")
+    .map((id) => id.trim())
+    .filter(Boolean);
+}
 
 function BrowsePanel({
   s,
@@ -420,6 +543,45 @@ function BrowsePanel({
   looseFiles: import("../api").FileMeta[];
   filterQ: string;
 }) {
+  // THE ORDER THE ROWS ARE PAINTED IN — loose files, then each folder's
+  // contents in the order the folders are drawn. Published to state because a
+  // shift-range and ⌘A must agree with what is on the screen: computed against
+  // `s.files` instead, a range would silently include rows the filter has
+  // hidden or the sort has moved elsewhere.
+  //
+  // Collapsed folders are deliberately EXCLUDED: a range must never sweep in
+  // files nobody can see, and "select all" over a collapsed folder would arm a
+  // destructive action against rows with no way to review them first.
+  const paintedOrder = [
+    ...looseFiles.map((f) => f.id),
+    ...s.folders.flatMap((folder) =>
+      s.collapsedFolders.has(folder.id)
+        ? []
+        : shownFiles.filter((f) => f.folderId === folder.id).map((f) => f.id),
+    ),
+  ];
+  const orderKey = paintedOrder.join(" ");
+  useEffect(() => {
+    s.setVisibleFileOrder(paintedOrder);
+    // Keyed on the joined order, not the array: a fresh array with identical
+    // contents is produced on every render, and setting state from that would
+    // loop forever.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderKey]);
+
+  // A selection that outlives the rows it names is a trap — the counts stay
+  // right while the actions quietly hit nothing. Prune to what is on screen
+  // whenever the visible set changes (a filter typed, a file trashed, a folder
+  // collapsed).
+  useEffect(() => {
+    const visible = new Set(paintedOrder);
+    s.setSelectedFileIds((cur) => {
+      const kept = [...cur].filter((id) => visible.has(id));
+      return kept.length === cur.size ? cur : new Set(kept);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderKey]);
+
   return (
     <div
       className={`library-scroll file-list${s.dragOverFolder === "__root__" ? " drag-over" : ""}`}
@@ -431,9 +593,9 @@ function BrowsePanel({
       onDragLeave={() => s.setDragOverFolder(null)}
       onDrop={(e) => {
         e.preventDefault();
-        const id = e.dataTransfer.getData("text/plain");
+        const ids = dragIds(e);
         s.setDragOverFolder(null);
-        if (id) a.moveFile(id, null);
+        if (ids.length) void a.moveFiles(ids, null);
       }}
     >
       {s.creatingFolder !== null && (
@@ -479,9 +641,9 @@ function BrowsePanel({
               onDragLeave={() => s.setDragOverFolder(null)}
               onDrop={(e) => {
                 e.preventDefault();
-                const id = e.dataTransfer.getData("text/plain");
+                const ids = dragIds(e);
                 s.setDragOverFolder(null);
-                if (id) a.moveFile(id, folder.id);
+                if (ids.length) void a.moveFiles(ids, folder.id);
               }}
             >
               <button
@@ -838,6 +1000,61 @@ function SkillsNav({ s, a }: { s: WSState; a: WSActions }) {
           <span className="area-nav-state">{skill.createdBy === "agent" ? "AI" : skill.createdBy}</span>
         </button>
       ))}
+    </div>
+  );
+}
+
+/* ---------- Find lens ---------- */
+
+/** The Find area has no list of its own: the search page in the centre owns
+ * the results, the filters and the saved searches. What this pane can honestly
+ * add is the SCOPE — the three things a room-wide search reads and how much is
+ * in each — so "search this room" is a number rather than a promise.
+ *
+ * The rows are deliberately static (`is-static`, like the Memory lens's
+ * counts): clicking a scope here would be a second, competing filter beside
+ * the one on the page, and two controls for one setting is how they end up
+ * disagreeing. */
+function FindNav({ s }: { s: WSState }) {
+  const scopes: { key: string; label: string; count: number; icon: ReactNode }[] = [
+    { key: "files", label: "Files", count: s.files.length, icon: <FilesIcon size={15} /> },
+    {
+      key: "chats",
+      label: "Conversations",
+      count: s.chats.length,
+      icon: <ChatBubbleIcon size={15} />,
+    },
+    {
+      key: "memories",
+      label: "Memories",
+      count: s.memories.length,
+      icon: <MemoryIcon size={15} />,
+    },
+  ];
+  return (
+    <div className="library-scroll">
+      <p className="area-nav-intro">
+        One search reads all three of these at once. Everything is indexed on
+        this Mac — searching never reaches the internet, whichever model the
+        room is using.
+      </p>
+      <div className="group-heading">What is searched</div>
+      {scopes.map((sc) => (
+        <div key={sc.key} className="area-nav-row is-static">
+          <span className="browse-icon">{sc.icon}</span>
+          <span className="area-nav-main">
+            <span className="area-nav-title">{sc.label}</span>
+          </span>
+          <span className="area-nav-state">{sc.count}</span>
+        </div>
+      ))}
+      <div className="group-heading">Elsewhere</div>
+      <p className="area-nav-intro">
+        ⌘K searches the same index and adds the room's commands, for when you
+        already know where you are going. The Library's filter box is a
+        different thing again — it narrows the list of files you can see, and
+        never looks inside one.
+      </p>
     </div>
   );
 }

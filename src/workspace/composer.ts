@@ -139,6 +139,76 @@ export function hoistTag(text: string, key: string): string {
   return without ? `*${key} ${without}` : `*${key}`;
 }
 
+/** Which sigil token the message currently OPENS with, or null.
+ *
+ * Purely for the composer's tool row: the Action / Skill / Specialist chip that
+ * matches the token being composed is drawn as chosen, so "this turn is going to
+ * one specialist" is visible on the control as well as in the text. It is a
+ * DISPLAY derivation and nothing routes off it — `parseComposer` below is still
+ * the only thing that decides what is actually sent.
+ *
+ * The three patterns are deliberately the same ones `parseComposer` uses,
+ * including the `(?=\s|$)` lookahead on the tag: a message that opens with
+ * markdown emphasis ("*important* note") is NOT a specialist tag, and a chip
+ * that lit up for it would be telling the user something the sender disagrees
+ * with. The bare sigil alone matches as well ("*", the instant the menu opens),
+ * but a sigil followed by a SPACE does not: "* bullet" and "# heading" are
+ * markdown, and neither parser reads them as a token either. */
+export function openingSigil(text: string): "#" | "/" | "*" | null {
+  if (/^\*([a-z]+(?=\s|$)|$)/.test(text)) return "*";
+  if (/^\/([a-z0-9-]+(?=\s|$)|$)/.test(text)) return "/";
+  if (/^#([a-z-]+(?=\s|$)|$)/.test(text)) return "#";
+  return null;
+}
+
+// ---- how a message is SET: the hand, or the interface sans ----------------
+//
+// The AI pane is meant to read as two people passing notes in the same
+// notebook, and the rule for which face a message takes is about LENGTH and
+// KIND, never about who wrote it:
+//
+//   short message, ordinary prose ....... the hand (Kalam)
+//   long message ........................ the interface sans
+//   code, tables, citations, paths ...... the interface sans (mono inside it)
+//
+// So a one-line question from the user and a one-line "Nothing in this room
+// mentions that" from the AI are both handwritten, and a 900-word answer from
+// either is not.
+
+/** Where the handwriting stops.
+ *
+ * The conversation column is 720px wide (`.messages` in chat.css). Kalam at
+ * --fs-hand (15px) averages a little over 7px per glyph, so a line of it holds
+ * roughly 95 characters — 280 is three lines, which is exactly the length
+ * paper.css reserves the hand for ("annotations, dates, counts, short notes").
+ *
+ * Checked against what messages in this app are actually like. The four canned
+ * prompts in the empty chat run 25-40 characters; the room's generated starter
+ * questions are one sentence by construction (front_page.rs asks for "short"
+ * ones); a reply that is only an acknowledgement — "Nothing in this room
+ * mentions that", "Done — both are filed under Leases" — is well under 100.
+ * Every one of those stays in the hand. A `#command` answer, a file summary or
+ * any explanation with a structure to it clears 280 on its first paragraph and
+ * lands in the sans, which is what the reader needs for a long run anyway.
+ *
+ * Length is only half of it: "Saved it as Notes.md" is nine words and still
+ * comes back false, because the sniff below sees a filename. That is deliberate
+ * — the one detail in that sentence is the thing the reader has to be able to
+ * go and find. */
+/* The "is this message handwritten?" decision deliberately does NOT live here.
+ *
+ * It used to, as `readsAsHandwriting` — a second implementation with a
+ * different threshold that nothing ever imported, while ChatPane used
+ * markup.ts's `isHandwritten`. The two disagreed, and the copy with the
+ * important guard (anything outside Kalam's bundled latin + latin-ext subsets)
+ * was the dead one, so Hebrew and CJK messages were being set in a face with
+ * no glyphs for them. Its stoppers have been merged into markup.ts, which is
+ * the one the pane actually calls.
+ *
+ * Nothing in THIS file should classify a message anyway: the composer's job is
+ * the field, and what the user is typing is always the sans — they have to see
+ * exactly what they are about to send. */
+
 /** One row of the composer's autocomplete popover. */
 export interface AutocompleteItem {
   key: string;

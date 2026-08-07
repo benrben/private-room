@@ -14,12 +14,17 @@ import type {
   RecFile,
   RecLive,
   RecMeta,
+  NoteKind,
   RecSegment,
   RecStart,
+  SavedVoice,
   RoomInfo,
   ImportReport,
   FileMeta,
   TrashedFile,
+  BulkReport,
+  Podcast,
+  PodcastHost,
   FileContent,
   DecodedFileText,
   AudioPeaks,
@@ -96,6 +101,7 @@ import type {
   PrivacyEntity,
   PrivacyPreview,
   PrivacyScanProgress,
+  StudioStep,
   PrivacyStatus,
   BrowserTab,
 } from "./apiTypes";
@@ -225,6 +231,18 @@ export const api = {
     invoke<void>("delete_file_permanently", { id }),
   /** Returns how many files were actually destroyed. */
   emptyTrash: () => invoke<number>("empty_trash"),
+  // ---- Batch twins of the four above (the Library's multi-selection) ----
+  // Each returns a BulkReport instead of throwing on the first bad id: the
+  // files that CAN be acted on are, and the ones that can't come back named.
+  // One backend call means one room event, so a 40-file move re-renders the
+  // library once rather than forty times.
+  trashFiles: (ids: string[]) => invoke<BulkReport>("trash_files", { ids }),
+  moveFilesToFolder: (fileIds: string[], folderId: string | null) =>
+    invoke<BulkReport>("move_files_to_folder", { fileIds, folderId }),
+  restoreFiles: (ids: string[]) => invoke<BulkReport>("restore_files", { ids }),
+  /** Irreversible, and each id must ALREADY be in the trash. */
+  deleteFilesPermanently: (ids: string[]) =>
+    invoke<BulkReport>("delete_files_permanently", { ids }),
   // ---- Wave 2: data safety ----
   listFileVersions: (id: string) =>
     invoke<FileVersion[]>("list_file_versions", { id }),
@@ -547,6 +565,30 @@ export const api = {
     instructions?: string,
     refs?: string[],
   ) => invoke<string>("start_studio_job", { kind, scope, instructions, refs }),
+  // ---- Podcast voices ----
+  /** The script attached to a file, or null when it has none — which is the
+   * ordinary answer for any file that is not a podcast, and also for a script
+   * page generated before scripts were stored as data. */
+  getPodcast: (fileId: string) =>
+    invoke<Podcast | null>("get_podcast", { fileId }),
+  /** Re-cast: voices, names and prosody. Renaming a host rewrites its turns, so
+   * the lines follow the name. Returns the script as it now stands. */
+  setPodcastCast: (fileId: string, cast: PodcastHost[]) =>
+    invoke<Podcast>("set_podcast_cast", { fileId, cast }),
+  /** Speak one line in one host's voice — base64 WAV, same shape and the same
+   * privacy door as `speakTextNeural`. */
+  previewPodcastVoice: (
+    text: string,
+    voice: string,
+    rate: string,
+    pitch: string,
+  ) =>
+    invoke<string>("preview_podcast_voice", { text, voice, rate, pitch }),
+  /** Record the whole episode as a background job; returns the job id. Progress
+   * and the finished file arrive on the sidebar job card like every other long
+   * build. */
+  startPodcastAudioJob: (scriptFileId: string) =>
+    invoke<string>("start_podcast_audio_job", { scriptFileId }),
   /** Pause a running job — it checkpoints and parks as 'paused'. */
   cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
   /** Continue a paused/errored job from its checkpoint. */
@@ -944,8 +986,13 @@ export const api = {
   onPrivacyScan: (cb: (p: PrivacyScanProgress) => void): Promise<UnlistenFn> =>
     listen<PrivacyScanProgress>("privacy-scan", (e) => cb(e.payload)),
   // ADD-31: named stage while a Studio (flashcards/mindmap/podcast) runs.
-  onStudioStep: (cb: (text: string) => void): Promise<UnlistenFn> =>
-    listen<string>("studio-step", (e) => cb(e.payload)),
+  // `local` says whether this stage keeps the room's content on the Mac. It
+  // travels WITH the words so the pane can style a privacy consequence
+  // differently from a progress aside without matching English against the
+  // sentence — see studios.rs, where the flag comes from the model's declared
+  // capabilities rather than from its name.
+  onStudioStep: (cb: (p: StudioStep) => void): Promise<UnlistenFn> =>
+    listen<StudioStep>("studio-step", (e) => cb(e.payload)),
   // ADD-30: live progress of a background job, plus its terminal flags.
   onJobProgress: (cb: (p: JobProgress) => void): Promise<UnlistenFn> =>
     listen<JobProgress>("job-progress", (e) => cb(e.payload)),
@@ -1046,9 +1093,46 @@ export const api = {
   recCorrectRange: (id: string, t0: number, t1: number, text: string) =>
     invoke<RecMeta>("rec_correct_range", { id, t0, t1, text }),
   /** GH #5: name a speaker after transcribing ("Speaker 2" → "Dana"). Renames
-   * every line they said at once; an empty name restores the machine label. */
+   * every line they said at once; an empty name restores the machine label.
+   *
+   * Also teaches the ROOM this voice, so the next recording recognises them
+   * without being asked again — and, when it is correcting a guess, teaches it
+   * that the name it guessed belongs to somebody else. */
   recSetSpeakerName: (id: string, speaker: string, name: string) =>
     invoke<RecMeta>("rec_set_speaker_name", { id, speaker, name }),
+  /** "Read this recording" / "Read again": have the room read a recording and
+   * write its chapters, highlights and notes. The same job the room starts by
+   * itself when a recording stops — this is the button for when it did not (no
+   * model then, the room was busy, an old recording, or a transcript you have
+   * since corrected). Resolves to the job id; watch it via the job events. */
+  recReadStart: (id: string) => invoke<string>("rec_read_start", { id }),
+  /** The reading finished — reload the recording so the tabs fill in. */
+  onRecReadDone: (cb: (p: { fileId: string }) => void): Promise<UnlistenFn> =>
+    listen("rec-read-done", (e) => cb(e.payload as never)),
+  /** Your own note at a moment. Works while a recording is running. */
+  recNoteAdd: (id: string, t0: number, kind: NoteKind, text: string, who?: string) =>
+    invoke<RecMeta>("rec_note_add", { id, t0, kind, text, who }),
+  /** Retype a note. Correcting one the ROOM wrote makes it yours, and the next
+   * reading leaves it alone. */
+  recNoteSet: (id: string, noteId: string, text: string) =>
+    invoke<RecMeta>("rec_note_set", { id, noteId, text }),
+  /** Name a section starting at `t0`. */
+  recChapterAdd: (id: string, t0: number, title: string) =>
+    invoke<RecMeta>("rec_chapter_add", { id, t0, title }),
+  /** Rename a chapter — and make it yours. */
+  recChapterSet: (id: string, chapterId: string, title: string) =>
+    invoke<RecMeta>("rec_chapter_set", { id, chapterId, title }),
+  /** Mark a span worth coming back to. Works while recording. */
+  recHighlightAdd: (id: string, t0: number, t1: number) =>
+    invoke<RecMeta>("rec_highlight_add", { id, t0, t1 }),
+  /** Remove one item ("note" | "chapter" | "highlight"). */
+  recItemDelete: (id: string, kind: "note" | "chapter" | "highlight", itemId: string) =>
+    invoke<RecMeta>("rec_item_delete", { id, kind, itemId }),
+  /** The voices this room can recognise. */
+  voicesList: () => invoke<SavedVoice[]>("voices_list"),
+  /** Forget a saved voice — transcripts already written keep the names they
+   * show. Returns the remaining voices. */
+  voiceForget: (name: string) => invoke<SavedVoice[]>("voice_forget", { name }),
   /** Render the cuts into a new "<name> (edited).wav" file. */
   recExportClean: (id: string) => invoke<FileMeta>("rec_export_clean", { id }),
   /** Translate the whole transcript on the local model into any language. */
@@ -1071,8 +1155,16 @@ export const api = {
   ): Promise<UnlistenFn> => listen("rec-segment-drop", (e) => cb(e.payload as never)),
   /** The meeting's speakers were re-derived from every voice heard so far —
    *  labels already on screen may change (that's the point). */
+  /** Speakers sorting themselves out mid-meeting. Carries the name overlay as
+   * well as the labels: a pass can change what a voice is CALLED without
+   * moving a single label (a saved voice recognised as the meeting grows). */
   onRecRelabel: (
-    cb: (p: { fileId: string; labels: { id: string; speaker: string }[] }) => void,
+    cb: (p: {
+      fileId: string;
+      labels: { id: string; speaker: string }[];
+      speakerNames?: Record<string, string>;
+      recognized?: string[];
+    }) => void,
   ): Promise<UnlistenFn> => listen("rec-relabel", (e) => cb(e.payload as never)),
   onRecLevel: (
     cb: (p: { fileId: string; mic: number; sys: number; durationCs: number }) => void,

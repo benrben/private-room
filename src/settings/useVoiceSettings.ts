@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, NeuralVoiceInfo } from "../api";
 import * as voice from "../workspace/voice";
+import { loadVoiceCatalog } from "./voiceCatalog";
 import {
   ARCHETYPE_DEFAULTS,
   VoiceArchetype,
@@ -46,8 +47,9 @@ export function useVoiceSettings(visible: boolean) {
   useEffect(() => {
     if (!visible || catalogAsked.current) return;
     catalogAsked.current = true;
-    api
-      .listNeuralVoices()
+    // Shared with the podcast panel: one fetch per session, so opening either
+    // picker populates the other and a remount never restarts the request.
+    loadVoiceCatalog()
       .then(setVoices)
       .catch(() => setVoicesError(true));
   }, [visible]);

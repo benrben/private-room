@@ -62,11 +62,15 @@ export function CreateScreen({
         <div className="tpl-label">Start from a template</div>
         <div className="tpl-chips">
           {ROOM_TEMPLATES.map((tpl) => (
+            /* The chip and its circled "selected" treatment are the shared
+               .nb-chip primitives; `is-on` is the class that primitive reads.
+               aria-pressed is what actually carries the state — the ring is
+               the visible half of the same fact. */
             <button
               key={tpl.key}
               type="button"
-              className={`tpl-chip${
-                templateKey === tpl.key ? " active" : ""
+              className={`nb-chip nb-chip-btn tpl-chip${
+                templateKey === tpl.key ? " is-on" : ""
               }`}
               aria-pressed={templateKey === tpl.key}
               onClick={() => setTemplateKey(tpl.key)}
@@ -173,7 +177,7 @@ export function CreateScreen({
         * password-strength advice. There is no reset: saying so HERE, not one
         * screen later beside a "Skip for now" button, is the only place the
         * warning can still change what the user types. */}
-      <p className="gate-note">
+      <p className="gate-note gate-note-warn">
         Longer is stronger. There is no password reset — if you forget this
         password, only the one-time recovery code on the next screen can reopen
         the room, and nobody (including us) can recover either one for you.

@@ -278,6 +278,7 @@ const SHORTCUTS: { group: string; rows: [string, string][] }[] = [
     group: "Tabs",
     rows: [
       ["⌘W", "Close the current tab"],
+      ["⇧⌘T", "Reopen the last file tab you closed"],
       ["⌘⇧]  /  ⌘⇧[", "Next / previous tab"],
       ["⌥⌘1 – ⌥⌘9", "Jump to a tab by position (⌥⌘9 = last)"],
     ],
@@ -458,6 +459,15 @@ export default function Overlays({
           onDecline={() => a.resolveScriptApproval(pendingScript, "deny")}
         >
           <>
+            {/* The marker category label: what CLASS of decision this is,
+                before the sentence that asks it. Yellow is "needs review"
+                product-wide, and these three cards are all the same kind of
+                ask — a program wants to run. The deletion card below uses the
+                red "urgent" marker instead, because it is the one that
+                destroys something. */}
+            <div className="approve-kind">
+              <span className="nb-cat nb-sem-pending">Permission</span>
+            </div>
             <div className="approve-title">
               <ScriptIcon size={17} /> Run a script from this room?
             </div>
@@ -522,6 +532,9 @@ export default function Overlays({
           onDecline={() => a.resolveMcpApproval(pendingApproval, "deny")}
         >
           <>
+            <div className="approve-kind">
+              <span className="nb-cat nb-sem-urgent">Deletion</span>
+            </div>
             <div className="approve-title">
               <ShieldIcon size={17} /> Delete the {pendingApproval.tool}{" "}
               &ldquo;{pendingApproval.server}&rdquo;?
@@ -556,6 +569,9 @@ export default function Overlays({
           onDecline={() => a.resolveMcpApproval(pendingApproval, "deny")}
         >
           <>
+            <div className="approve-kind">
+              <span className="nb-cat nb-sem-pending">Permission</span>
+            </div>
             <div className="approve-title">
               <GlobeIcon size={17} /> Allow a connected tool to run?
             </div>
@@ -607,6 +623,12 @@ export default function Overlays({
           onDecline={() => a.resolveBrowseConsent(pendingBrowse, false)}
         >
           <>
+            {/* Red, not yellow: nothing is being deleted, but this is the one
+                card where saying yes puts room content OUTSIDE the room, and
+                that is irreversible in exactly the way a deletion is. */}
+            <div className="approve-kind">
+              <span className="nb-cat nb-sem-urgent">Leaves this room</span>
+            </div>
             <div className="approve-title">
               <ShieldIcon size={17} /> Type this into the page?
             </div>
@@ -656,6 +678,9 @@ export default function Overlays({
           onDecline={() => a.resolveEditApproval(pendingEdit, "deny")}
         >
           <>
+            <div className="approve-kind">
+              <span className="nb-cat nb-sem-pending">File change</span>
+            </div>
             <div className="approve-title">
               Apply {pendingEdit.files.length > 1 ? "these changes" : "this change"} to{" "}
               {pendingEdit.files.length === 1 ? (
@@ -718,15 +743,53 @@ export default function Overlays({
             onKeyDown={ctxKeys.onKeyDown}
             style={{ top: s.ctxMenu.y, left: s.ctxMenu.x }}
           >
-            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.viewFile(s.ctxMenu!.file.id); s.setCtxMenu(null); }}>Open</button>
-            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.toggleAttach(s.ctxMenu!.file); s.setCtxMenu(null); }}>{s.attachments.some((x) => x.id === s.ctxMenu!.file.id) ? "Detach from chat" : "Attach to chat"}</button>
-            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { s.setRenamingFile({ id: s.ctxMenu!.file.id, name: s.ctxMenu!.file.name, where: "library" }); s.setCtxMenu(null); }}>Rename…</button>
-            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { s.setMoveMenuFor({ id: s.ctxMenu!.file.id, x: s.ctxMenu!.x, y: s.ctxMenu!.y }); s.setCtxMenu(null); }}>Move to…</button>
-            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.exportOne(s.ctxMenu!.file.id, s.ctxMenu!.file.name); s.setCtxMenu(null); }}>Export a copy…</button>
+            {/* MANY vs ONE. When the right-clicked row is part of the
+                selection, `files` is the whole selection and every label says
+                so — a menu that reads "Move to…" while it is about to move
+                seven files is the bug this count prevents. The single-subject
+                items (Open, Rename) stay on `file`, which is the row actually
+                clicked, so they never have to guess. */}
+            {s.ctxMenu.files.length > 1 && (
+              <div className="ctx-heading">
+                <span className="nb-cat nb-sem-linked">
+                  {s.ctxMenu.files.length} files selected
+                </span>
+              </div>
+            )}
+            {s.ctxMenu.files.length === 1 && (
+              <>
+                <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.viewFile(s.ctxMenu!.file.id); s.setCtxMenu(null); }}>Open</button>
+                <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.toggleAttach(s.ctxMenu!.file); s.setCtxMenu(null); }}>{s.attachments.some((x) => x.id === s.ctxMenu!.file.id) ? "Detach from chat" : "Attach to chat"}</button>
+                <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { s.setRenamingFile({ id: s.ctxMenu!.file.id, name: s.ctxMenu!.file.name, where: "library" }); s.setCtxMenu(null); }}>Rename…</button>
+              </>
+            )}
+            {s.ctxMenu.files.length > 1 && (
+              <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.attachFiles(s.ctxMenu!.files); s.setCtxMenu(null); }}>Attach {s.ctxMenu.files.length} to chat</button>
+            )}
+            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { s.setMoveMenuFor({ ids: s.ctxMenu!.files.map((f) => f.id), x: s.ctxMenu!.x, y: s.ctxMenu!.y }); s.setCtxMenu(null); }}>
+              {s.ctxMenu.files.length > 1 ? `Move ${s.ctxMenu.files.length} files to…` : "Move to…"}
+            </button>
+            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { const fs = s.ctxMenu!.files; s.setCtxMenu(null); if (fs.length > 1) void a.exportFiles(fs); else a.exportOne(fs[0].id, fs[0].name); }}>
+              {s.ctxMenu.files.length > 1 ? `Export ${s.ctxMenu.files.length} copies…` : "Export a copy…"}
+            </button>
             {(s.aiActionDefs ?? []).some((x) => x.scope === "file") && (
               <>
-                <div className="ctx-sep" />
-                <div className="ctx-heading">AI actions · this file</div>
+                {/* .nb-rule is the tapered pencil stroke from paper.css — it
+                    thins toward both ends instead of butting into the menu's
+                    edges, which is the difference between a drawn separator
+                    and a hairline border. */}
+                <div className="ctx-sep nb-rule" />
+                <div className="ctx-heading">
+                  <span className="nb-cat nb-sem-saved">
+                    {/* An action over seven files must not be introduced as
+                        "this file" — the heading is what tells the reader how
+                        much material the run is about to read. */}
+                    AI actions ·{" "}
+                    {s.ctxMenu.files.length > 1
+                      ? `these ${s.ctxMenu.files.length} files`
+                      : "this file"}
+                  </span>
+                </div>
                 {(s.aiActionDefs ?? [])
                   .filter((x) => x.scope === "file")
                   .map((x) => (
@@ -737,9 +800,11 @@ export default function Overlays({
                       className="ctx-item"
                       title={x.description}
                       onClick={() => {
-                        const f = s.ctxMenu!.file;
+                        // `refs` already takes a LIST, so a multi-file AI action
+                        // needed no new plumbing — only the ids the user picked.
+                        const ids = s.ctxMenu!.files.map((f) => f.id);
                         s.setCtxMenu(null);
-                        a.openAiAction(x, null, [f.id]);
+                        a.openAiAction(x, null, ids);
                       }}
                     >
                       {x.title}
@@ -747,7 +812,7 @@ export default function Overlays({
                   ))}
               </>
             )}
-            <div className="ctx-sep" />
+            <div className="ctx-sep nb-rule" />
             {s.confirmDelete === `ctx-remove-${s.ctxMenu.file.id}` ? (
               // ADD-25: the agent driver must not be able to click ✓ on a
               // removal it didn't earn.
@@ -760,17 +825,22 @@ export default function Overlays({
                     history?") described the pre-trash behaviour and would now
                     be a false warning. */}
                 <span className="ctx-confirm-q">
-                  Move to the trash?
+                  {s.ctxMenu.files.length > 1
+                    ? `Move ${s.ctxMenu.files.length} files to the trash?`
+                    : "Move to the trash?"}
                 </span>
                 <button
                   role="menuitem"
                   tabIndex={-1}
                   className="ctx-item danger btn-ic"
                   onClick={() => {
-                    const id = s.ctxMenu!.file.id;
+                    const ids = s.ctxMenu!.files.map((f) => f.id);
                     a.cancelConfirm();
                     s.setCtxMenu(null);
-                    a.removeFile(id);
+                    // One command for many, the single-file one for one — so a
+                    // lone removal keeps its existing toast wording exactly.
+                    if (ids.length > 1) void a.removeFiles(ids);
+                    else void a.removeFile(ids[0]);
                   }}
                 >
                   <CheckIcon size={13} /> Move to trash
@@ -791,7 +861,9 @@ export default function Overlays({
                 className="ctx-item danger"
                 onClick={() => a.askConfirm(`ctx-remove-${s.ctxMenu!.file.id}`)}
               >
-                Remove from room
+                {s.ctxMenu.files.length > 1
+                  ? `Remove ${s.ctxMenu.files.length} files from room`
+                  : "Remove from room"}
               </button>
             )}
           </div>
@@ -812,17 +884,30 @@ export default function Overlays({
             onKeyDown={moveKeys.onKeyDown}
             style={{ top: s.moveMenuFor.y, left: s.moveMenuFor.x }}
           >
-            <div className="ctx-heading">Move to…</div>
+            <div className="ctx-heading">
+              <span className="nb-cat nb-sem-linked">
+                {s.moveMenuFor.ids.length > 1
+                  ? `Move ${s.moveMenuFor.ids.length} files to…`
+                  : "Move to…"}
+              </span>
+            </div>
             {(() => {
-              const mf = s.files.find((f) => f.id === s.moveMenuFor!.id);
+              const ids = s.moveMenuFor!.ids;
+              const moving = s.files.filter((f) => ids.includes(f.id));
+              // A destination is only "where they already are" when EVERY file
+              // is there. Disabling on the first file's folder would grey out a
+              // real move for the other six.
+              const allIn = (folderId: string | null) =>
+                moving.length > 0 &&
+                moving.every((f) => (f.folderId ?? null) === folderId);
               return (
                 <>
                   <button
                     role="menuitem"
                     tabIndex={-1}
                     className="ctx-item"
-                    disabled={!mf || mf.folderId === null}
-                    onClick={() => { a.moveFile(s.moveMenuFor!.id, null); s.setMoveMenuFor(null); }}
+                    disabled={allIn(null)}
+                    onClick={() => { void a.moveFiles(ids, null); }}
                   >
                     No folder
                   </button>
@@ -832,14 +917,22 @@ export default function Overlays({
                       role="menuitem"
                       tabIndex={-1}
                       className="ctx-item"
-                      disabled={mf?.folderId === fo.id}
-                      onClick={() => { a.moveFile(s.moveMenuFor!.id, fo.id); s.setMoveMenuFor(null); }}
+                      disabled={allIn(fo.id)}
+                      onClick={() => { void a.moveFiles(ids, fo.id); }}
                     >
                       {fo.name}
                     </button>
                   ))}
                   {s.folders.length === 0 && (
-                    <div className="ctx-empty">No folders yet</div>
+                    // An empty state names what would fill it and where the
+                    // action lives. "No folders yet" on its own left a dead
+                    // menu with no route out of it — the only place a folder
+                    // can be made is the Library's "Add page or source" menu,
+                    // and this is the moment somebody wants to know that.
+                    <div className="ctx-empty">
+                      No folders yet — make one from &ldquo;Add page or
+                      source&rdquo; in the Library.
+                    </div>
                   )}
                 </>
               );

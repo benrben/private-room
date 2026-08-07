@@ -102,7 +102,7 @@ function RecordingIcon({ size = 16, className }: IconProps) {
   );
 }
 
-/** AI-generated files get the violet spark, always accent-colored. */
+/** AI-generated files get the spark, always in the accent (the pink pen). */
 export function SparkIcon({ size = 16, className }: IconProps) {
   return (
     <svg

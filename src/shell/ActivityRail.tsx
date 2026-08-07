@@ -23,8 +23,8 @@ import type { WorkArea } from "../workspace/types";
 
 export type { WorkArea };
 
-/** The rail's own label for an area, reused by the tab strip so a tab and its
- * rail button can never disagree about what a place is called. */
+/** The rail's own label for an area, reused by anything that has to name a
+ * place, so two surfaces can never disagree about what somewhere is called. */
 export function areaLabel(key: WorkArea): string {
   return AREAS.find((a) => a.key === key)?.label ?? "Files";
 }
@@ -32,11 +32,14 @@ export function areaLabel(key: WorkArea): string {
 const AREAS: {
   key: Exclude<WorkArea, "files">;
   label: string;
-  /** Short label shown under the icon in the rail (≤9 chars). */
+  /** Short label shown under the icon in the COLLAPSED rail (≤9 chars). */
   short: string;
   icon: (size: number) => ReactElement;
 }[] = [
   { key: "home", label: "Room home", short: "Home", icon: (s) => <HomeIcon size={s} /> },
+  // Find sits second because it is how you get anywhere in a room you have
+  // stopped remembering the shape of.
+  { key: "find", label: "Find", short: "Find", icon: (s) => <SearchIcon size={s} /> },
   { key: "map", label: "Room Map", short: "Map", icon: (s) => <GraphIcon size={s} /> },
   { key: "recordings", label: "Recordings", short: "Record", icon: (s) => <MicIcon size={s} /> },
   {
@@ -62,34 +65,47 @@ const AREAS: {
   },
 ];
 
-/** The activity rail. Two deliberately different groups: pane visibility
- * (neutral pressed state) and product-area navigation (accent current
- * state), plus Focus editor and Settings at the bottom. Every button carries
- * a persistent visible label (`.rail-label`) rather than relying on a hover
- * tooltip — the rail is a scroll container (`overflow-x: hidden`, needed for
- * its vertical auto-scroll), so a popover tooltip anchored to a narrow button
- * gets silently clipped to a couple of characters. The aria-label carries the
- * keyboard shortcut for screen readers instead.
+/** The activity rail: the app's ONE primary navigation.
  *
- * GH #2: the rail expands. Collapsed it is a 74px icon strip whose labels have
- * to be abbreviated ("Connect", "Record"); expanded it is a 184px column with
- * the icon and the FULL label side by side. The choice persists per room. */
+ * It used to share that job with the tab strip — every rail click also opened
+ * an "area" tab, so Home / Map / Recordings / Workflows / Scripts / Skills /
+ * Memory / Connectors / Browser were listed twice, in two different visual
+ * languages, and the strip filled up with places rather than with the
+ * documents the user was actually working on. The rail wins that argument for
+ * three reasons: it is always visible, it can carry a readable label for every
+ * destination, and its order is stable — a tab strip's is not, because it
+ * reorders itself as you work. So: the rail navigates to PLACES, the strip
+ * holds the DOCUMENTS you have open, and neither draws the other's job. (The
+ * strip's side of that split lives in shell/TabStrip.tsx and Workspace.tsx.)
+ *
+ * Labels are shown by default and in full. Collapsing to the 84px icon strip
+ * is still one click away and still persists per room, but a first-time reader
+ * should never have to hover a column of glyphs to find out where they lead;
+ * that is also why the collapsed labels stay under the icons rather than being
+ * replaced by a tooltip, which the rail's own overflow would clip.
+ *
+ * The ⌘K command launcher deliberately has NO entry here any more: it is a
+ * command, not a place, it already owns the widest control in the top bar, and
+ * a second magnifier in the rail next to Find would be exactly the duplication
+ * this pass removes. ⌘K itself is untouched. */
 export default function ActivityRail({
   layout,
   area,
   onArea,
-  onSearch,
   onSettings,
-  aiAttention,
+  approvals = 0,
+  running = 0,
 }: {
   layout: LayoutApi;
   area: WorkArea;
   onArea: (area: Exclude<WorkArea, "files">) => void;
-  onSearch: () => void;
   onSettings: () => void;
-  /** True when background work or an approval wants the AI pane's Activity
-   * tab — shows a small amber dot on the pane toggle. */
-  aiAttention: boolean;
+  /** How many things are WAITING ON THE READER — approvals that cannot
+   * proceed until someone answers. Drawn as a hand-circled number. */
+  approvals?: number;
+  /** How many jobs are running BY THEMSELVES. Drawn as a quiet dot: it is
+   * news, not a request. */
+  running?: number;
 }) {
   const paneVisible = (k: "library" | "center" | "ai") =>
     layout.visible.includes(k);
@@ -111,6 +127,15 @@ export default function ActivityRail({
         <span className="rail-label">{wide ? "Collapse" : "Expand"}</span>
       </button>
 
+      {/* The two groups do different jobs — one shows and hides columns, the
+          other goes somewhere — and the headings say so out loud in the
+          expanded rail. aria-hidden because the <nav>'s own name already tells
+          a screen reader this is "Workspace panes and areas" and every button
+          below carries its full purpose in its label; a repeated heading would
+          only add noise to the tab order's read-out. */}
+      <div className="rail-group-label" aria-hidden>
+        Panes
+      </div>
       <div className="rail-divider" aria-hidden />
 
       <button
@@ -145,29 +170,43 @@ export default function ActivityRail({
       >
         <PanelRightIcon size={17} />
         <span className="rail-label">AI</span>
-        {aiAttention && <span className="rail-badge" aria-hidden />}
+        {/* Two different facts, so two different marks — and they can appear
+            together. An approval is WAITING ON YOU, so it gets the count,
+            circled by hand, in the pending yellow the token map reserves for
+            "needs review". A running job is the software working on its own,
+            which is news rather than a request, so it gets the quiet dot in
+            the linked blue that Room Home's stamp already uses for the same
+            fact. Summing them into one yellow number said "N things need you"
+            when N-1 of them did not, and it made the dot branch unreachable:
+            the count was the sum, so it was non-zero whenever the dot would
+            have been.
+
+            Both stay aria-hidden. The AI pane's Activity tab is where the
+            real, readable list lives, and a toggle whose accessible name
+            changed under the reader every time a job finished would be worse,
+            not better. */}
+        {approvals > 0 && (
+          <span className="rail-count nb-circled nb-sem-pending" aria-hidden>
+            {approvals > 99 ? "99+" : approvals}
+          </span>
+        )}
+        {running > 0 && (
+          <span className="rail-badge nb-sem-linked" aria-hidden />
+        )}
       </button>
 
+      <div className="rail-group-label" aria-hidden>
+        Areas
+      </div>
       <div className="rail-divider" aria-hidden />
 
-      {AREAS.slice(0, 1).map((a) => (
-        <RailAreaButton key={a.key} def={a} area={area} onArea={onArea} wide={wide} />
-      ))}
-      <button
-        className="rail-button"
-        type="button"
-        aria-label="Search this room or run a command (⌘K)"
-        onClick={onSearch}
-      >
-        <SearchIcon size={17} />
-        <span className="rail-label">Search</span>
-      </button>
-      {AREAS.slice(1).map((a) => (
+      {AREAS.map((a) => (
         <RailAreaButton key={a.key} def={a} area={area} onArea={onArea} wide={wide} />
       ))}
 
       <div className="rail-spacer" />
 
+      <div className="rail-divider" aria-hidden />
       <button
         className={`rail-button zen`}
         type="button"

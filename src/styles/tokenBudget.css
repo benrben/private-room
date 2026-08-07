@@ -1,8 +1,28 @@
-/* Token-budget bar: a segmented composition meter (colored by category) plus
-   a click-to-expand exact breakdown. Extends the .pw-meter track/fill idiom
-   (gate.css) to N colored sub-segments; the overall near/at/over-budget
-   signal is a color-only ring (never a width change — the fill width is
-   always the real ratio). Categorical colors: --tok-* (tokens.css). */
+/* ---------- token budget ----------
+   How much of the model's context window this turn spent, broken into the five
+   fixed categories, plus the hand-off control that buys the window back.
+
+   THIS IS DATA, SO THE GEOMETRY IS NOT DRAWN BY HAND. Every segment's width is
+   exactly its share of the turn and the fill's width is exactly the used
+   ratio — the hand is in the STROKE (an uneven marker wash inside a pen
+   outline, the .nb-bar recipe from paper.css) and never in the measurement.
+
+   TWO SIGNALS THAT MUST NOT COLLIDE.
+
+     CATEGORY is identity: --tok-system / history / tools / skills / files, in
+     that fixed order, never reordered and never cycled. A marker fill measures
+     under 2:1 on ivory paper, so each segment also carries a hairline of its
+     own contrast-safe INK — that stroke is what makes a segment meaningful
+     non-text at 3:1, and it is drawn INSIDE the segment so it costs no width.
+
+     BUDGET is status, and it is red — the one hue no category uses — carried
+     as an outline on the whole control PLUS a word ("Near limit" / "At
+     limit"). Never a width change: the fill is always the true ratio.
+
+   The bar used to put a 2px flex gap between segments. Fixed gaps inside a
+   percentage-summed flex line overflow the track, and the track clips, so the
+   last category — files — was quietly drawn short. The segments now abut and
+   the ink hairlines are the boundary. */
 
 .token-bar-row {
   display: flex;
@@ -15,61 +35,98 @@
   flex: 1;
   min-width: 0;
 }
+/* A control, so it clears the 24px target floor — it was a ~12px strip. */
 .token-bar {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   width: 100%;
-  padding: 3px 4px;
+  min-height: 26px;
+  padding: 3px 6px;
   background: none;
   border: 1px solid transparent;
   border-radius: var(--radius);
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    background-color var(--dur-fast) var(--ease-pen);
 }
 .token-bar:hover {
   background: var(--hover);
 }
+
+/* The gauge: one partially filled circle for the overall ratio, drawn in the
+   pen rather than in a marker so it never competes with the five categories
+   beside it. --mk/--mk-ink are .nb-dial's own inputs (paper.css); --ink is the
+   one wash that is correct in both themes without an override, because 22% of
+   warm ivory lightens the charcoal sheet exactly as 22% of charcoal greys the
+   ivory one. */
+.token-bar-dial {
+  --nb-dial-size: 15px;
+  --mk: var(--ink);
+  --mk-ink: var(--rule-strong);
+  flex: 0 0 auto;
+}
+
 .token-bar-track {
   flex: 1;
-  height: 6px;
-  border-radius: 3px;
-  background: var(--panel-2);
+  min-width: 0;
+  height: 9px;
+  border-radius: 999px 999px 999px 999px / 8px 6px 8px 6px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
   overflow: hidden;
 }
 .token-bar-fill {
   display: flex;
   height: 100%;
-  gap: 2px;
-  transition: width 0.3s ease;
+  transition: width var(--dur-slow) var(--ease-pen);
 }
+/* A marker stroke inside a pen outline. The ramp is the highlighter's own —
+   heavier where the pen landed, lighter where it lifted — so a stack of five
+   reads as ink absorbed into paper rather than as five flat UI fills. */
 .token-bar-seg {
   flex: 0 0 auto;
   height: 100%;
   position: relative;
+  background-image: linear-gradient(
+    100deg,
+    color-mix(in srgb, var(--mk) 64%, transparent) 0%,
+    color-mix(in srgb, var(--mk) 48%, transparent) 55%,
+    color-mix(in srgb, var(--mk) 62%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px var(--mk-ink);
 }
-.token-bar-seg:first-child {
-  border-radius: 3px 0 0 3px;
-}
-.token-bar-seg:last-child {
-  border-radius: 0 3px 3px 0;
-}
+
+/* The five categories, as marker setters rather than flat backgrounds. Four of
+   them have a contrast-safe ink in tokens.css; --tok-files is a deliberate
+   graphite neutral with no ink twin, so its stroke is derived by pulling the
+   fill toward the page's own ink — which darkens it on ivory and lightens it
+   on charcoal, landing at 3.8:1 and 5.4:1 respectively. */
 .tok-system {
-  background: var(--tok-system);
+  --mk: var(--tok-system);
+  --mk-ink: var(--mk-blue-ink);
 }
 .tok-history {
-  background: var(--tok-history);
+  --mk: var(--tok-history);
+  --mk-ink: var(--mk-green-ink);
 }
 .tok-tools {
-  background: var(--tok-tools);
+  --mk: var(--tok-tools);
+  --mk-ink: var(--mk-pink-ink);
 }
 .tok-skills {
-  background: var(--tok-skills);
+  --mk: var(--tok-skills);
+  --mk-ink: var(--mk-yellow-ink);
 }
 .tok-files {
-  background: var(--tok-files);
+  --mk: var(--tok-files);
+  --mk-ink: color-mix(in srgb, var(--tok-files) 68%, var(--ink));
 }
+
 .token-bar-label {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
@@ -78,28 +135,27 @@
   color: var(--faint);
   cursor: help;
 }
-/* Threshold ring — a glow, never a width jump. Reuses the app's own
-   --ok/--warn/--danger (green/amber/red), same triad as .pw-meter. */
-.token-bar.ok {
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 22%, transparent);
+.token-bar-flag {
+  flex: 0 0 auto;
 }
+
+/* ----- the budget signal -----
+   An outline that appears, then goes round a second time. Red at 78% of the
+   ink measures 3.45:1 light / 3.28:1 dark against the pane, which is what a
+   meaningful boundary owes; at rest there is no outline at all, because "you
+   have room" is not news.
+
+   There is no pulse any more. A control that throbs forever above the composer
+   is exactly the constant movement this system refuses, and it was carrying
+   information the word beside it now states outright. */
 .token-bar.warn {
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 30%, transparent);
+  border-color: color-mix(in srgb, var(--sem-urgent) 78%, transparent);
 }
 .token-bar.danger {
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--danger) 36%, transparent);
-  animation: token-bar-pulse 1.6s ease-in-out infinite;
+  border-color: var(--sem-urgent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--sem-urgent) 38%, transparent);
 }
-@keyframes token-bar-pulse {
-  50% {
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 20%, transparent);
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .token-bar.danger {
-    animation: none;
-  }
-}
+
 /* Per-segment hover tooltip — the shared [data-tip] mechanism (shell.css),
    anchored above the thin mark instead of the icon-btn's corner offset. */
 .token-bar-seg[data-tip]::after {
@@ -124,44 +180,66 @@
   align-items: center;
   gap: var(--sp-2);
   padding: 5px 6px;
-  font-size: 12px;
+  font-size: var(--fs-meta);
 }
+/* The legend's swatch is the same drawn mark as the bar's segment, at the same
+   proportions, so the two are recognisably one system rather than a chart and
+   a key that happen to share a palette. */
 .token-breakdown-swatch {
-  width: 8px;
-  height: 8px;
-  border-radius: 2px;
+  width: 14px;
+  height: 9px;
   flex: 0 0 auto;
+  border-radius: 3px 4px 2px 3px / 3px 2px 4px 3px;
+  background-image: linear-gradient(
+    100deg,
+    color-mix(in srgb, var(--mk) 64%, transparent) 0%,
+    color-mix(in srgb, var(--mk) 48%, transparent) 55%,
+    color-mix(in srgb, var(--mk) 62%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px var(--mk-ink);
 }
 .token-breakdown-name {
   flex: 1;
   min-width: 0;
   color: var(--text);
 }
-.token-breakdown-count {
-  color: var(--faint);
+.token-breakdown-count,
+.token-breakdown-pct {
+  font-family: var(--mono);
   font-variant-numeric: tabular-nums;
 }
+.token-breakdown-count {
+  color: var(--faint);
+}
 .token-breakdown-pct {
-  width: 3.2em;
+  width: 3.6em;
   text-align: right;
   color: var(--muted);
-  font-variant-numeric: tabular-nums;
 }
 .token-breakdown-total {
   display: flex;
   justify-content: space-between;
-  margin: 6px 0 2px;
-  padding: 6px 6px 0;
+  gap: var(--sp-3);
+  margin: var(--sp-1) 0 2px;
+  padding: var(--sp-2) 6px 0;
   border-top: 1px solid var(--line-soft);
-  font-size: 12px;
+  font-size: var(--fs-meta);
   color: var(--text);
 }
+.token-breakdown-total > span:last-child {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+/* A margin note about the numbers above it, so it takes the hand — the one
+   run of handwriting on this surface, and it is an aside about how the figures
+   were arrived at, never a figure itself. */
 .token-breakdown-note {
-  margin-top: 6px;
+  margin-top: var(--sp-2);
   padding: 0 6px;
-  font-size: 10.5px;
-  color: var(--faint);
-  line-height: 1.4;
+  color: var(--ink-2);
+  font-family: var(--hand);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-hand);
 }
 
 /* Hand-off (context compaction) button — sits beside the bar in the same
@@ -182,57 +260,97 @@
     transform: rotate(360deg);
   }
 }
-@media (prefers-reduced-motion: reduce) {
-  .token-handoff-spin {
-    animation: none;
-  }
-}
 
-/* Handoff marker — a divider in the message list, not a .msg bubble. */
+/* Handoff marker — a divider in the message list, not a .msg bubble. The line
+   is a pencil rule that thins toward both ends, and the words on it are the
+   notebook's own aside about what just happened to the conversation. */
 .handoff-marker {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
-  margin: var(--sp-1) 0;
+  gap: var(--sp-1);
+  margin: var(--sp-2) 0;
 }
 .handoff-marker-line {
   display: flex;
   align-items: center;
   gap: var(--sp-3);
   width: 100%;
-  color: var(--faint);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  color: var(--ink-2);
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  text-transform: none;
+  letter-spacing: 0;
 }
 .handoff-marker-line::before,
 .handoff-marker-line::after {
   content: "";
   flex: 1;
   height: 1px;
-  background: var(--line-soft);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 12%,
+    var(--line-soft) 88%,
+    transparent 100%
+  );
 }
 .handoff-marker-details {
   max-width: 560px;
   width: 100%;
 }
+/* A summary is a control: it gets the 24px target and a visible focus ring,
+   neither of which a bare <summary> has. */
 .handoff-marker-details > summary {
+  min-height: 24px;
+  padding: 4px 8px;
   cursor: pointer;
   text-align: center;
-  font-size: 11.5px;
+  font-size: var(--fs-micro);
   color: var(--faint);
+  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
   user-select: none;
 }
 .handoff-marker-details > summary:hover {
   color: var(--text);
 }
+.handoff-marker-details > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* The recap sits IN the transcript, so it is a frame on the sheet rather than
+   a filled panel. */
 .handoff-marker-body {
-  margin-top: 6px;
+  margin-top: var(--sp-2);
   padding: var(--sp-3);
-  border: 1px solid var(--line-soft);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: var(--panel-2);
-  font-size: 12.5px;
+  background: transparent;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--muted);
+}
+
+/* ----- the narrow column -----
+   The AI pane clamps to a fifth of the grid, where the bar, its numbers, the
+   status word and the hand-off button cannot share one line. The row wraps and
+   the gauge — the one mark here that is purely a second reading of a number
+   already written out — is the first thing to go. */
+@container (max-width: 300px) {
+  .token-bar-row {
+    flex-wrap: wrap;
+  }
+  .token-bar-dial {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .token-handoff-spin {
+    animation: none;
+  }
+  .token-bar,
+  .token-bar-fill {
+    transition: none;
+  }
 }

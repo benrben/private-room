@@ -1628,6 +1628,13 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "set_cells",
     "rename_file",
     "move_file",
+    // The File agent's organize box (commands::organize). Reserved here like
+    // every other built-in so a connected MCP server cannot shadow an arm —
+    // which for `trash_files` would mean a third-party route inheriting the
+    // word "trash" over the room's own files.
+    "organize_files",
+    "trash_files",
+    "merge_files",
     "add_memory",
     "list_memories",
     "update_memory",
@@ -1675,6 +1682,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "generate_podcast_script",
     "retranscribe_file",
     "stt_status",
+    "read_recording",
     // Wave 4a (Idea 2): the workflow authoring tools (LocalEngine/ExternalAgent
     // scopes only, never tools_catalog). Reserved so an MCP route can't shadow
     // their exec_tool arms.
@@ -1744,6 +1752,50 @@ pub(crate) fn studio_tools_specs() -> Vec<serde_json::Value> {
     .as_array().cloned().unwrap_or_default()
 }
 
+/// The File agent's ORGANIZE box — tidy the room, delete into the trash, merge
+/// documents. See `commands::organize` for why these are three tools and not
+/// one, and for what the agent deliberately still cannot do.
+///
+/// Kept out of `tools_catalog` on purpose. That catalog is served to EVERY
+/// scope including a merely consulted cloud advisor, and an advisor asked for a
+/// second opinion has no business reorganizing or deleting the user's files.
+/// `room_mcp::include_organize_tools` draws the same line `include_browse_tools`
+/// does: the engine running this room, never an advisor.
+pub(crate) fn organize_tools_specs() -> Vec<serde_json::Value> {
+    serde_json::json!([
+        {"type": "function", "function": {"name": "organize_files",
+            "description": "Tidy the room: move files into folders, rename them, add/remove folders — ALL IN ONE CALL. Use this, not repeated move_file/rename_file, whenever more than one file is involved. Folders are created on the way in. dry_run: true shows the user the plan first. To delete, use trash_files. Example: {\"files\": [{\"name\": \"q3.pdf\", \"folder\": \"Invoices\", \"new_name\": \"Q3 invoice\"}], \"remove_folders\": [\"Untitled\"]}",
+            "parameters": {"type": "object", "properties": {
+                "files": {"type": "array", "description": "Per file: folder to move it, new_name to rename it, or both.",
+                    "items": {"type": "object", "properties": {
+                        "name": {"type": "string", "description": "File name or part of it; \"Folder/file.md\" works as listed"},
+                        "folder": {"type": "string", "description": "Destination folder, created if missing; empty string = top level"},
+                        "new_name": {"type": "string", "description": "New name; extension kept if omitted"}},
+                        "required": ["name"]}},
+                "make_folders": {"type": "array", "items": {"type": "string"},
+                    "description": "Folders to create even if empty"},
+                "remove_folders": {"type": "array", "items": {"type": "string"},
+                    "description": "Folders to delete; their files survive at the top level"},
+                "dry_run": {"type": "boolean", "description": "Report the plan, change nothing (default false)"}}}}},
+        {"type": "function", "function": {"name": "trash_files",
+            "description": "Move files to the room's trash. They leave the library and everything you can search, but the user can restore them from Library → Trash — you cannot destroy anything. Only when the user asked. Example: {\"names\": [\"old draft.md\"]}",
+            "parameters": {"type": "object", "properties": {
+                "names": {"type": "array", "items": {"type": "string"},
+                    "description": "File names or parts of them"}},
+                "required": ["names"]}}},
+        {"type": "function", "function": {"name": "merge_files",
+            "description": "Join text files into ONE new file, in order. A mechanical join of their FULL contents — nothing summarized, no length limit — for combining notes/chapters/transcripts. To have the material rewritten or summarized instead, use start_file_pass. Example: {\"names\": [\"ch1.md\", \"ch2.md\"], \"into\": \"Book draft.md\"}",
+            "parameters": {"type": "object", "properties": {
+                "names": {"type": "array", "items": {"type": "string"},
+                    "description": "At least two files, in the order they should appear"},
+                "into": {"type": "string", "description": "Name for the new file (.md added if omitted)"},
+                "headings": {"type": "boolean", "description": "Head each part with its source file name (default true)"},
+                "trash_sources": {"type": "boolean", "description": "Trash the originals afterwards (default false)"}},
+                "required": ["names", "into"]}}}
+    ])
+    .as_array().cloned().unwrap_or_default()
+}
+
 /// On-device transcription, for a room file that already exists.
 pub(crate) fn transcribe_tools_specs() -> Vec<serde_json::Value> {
     serde_json::json!([
@@ -1754,6 +1806,11 @@ pub(crate) fn transcribe_tools_specs() -> Vec<serde_json::Value> {
             "description": "Transcribe a room audio/video file again on this computer — use when a transcript is missing, in the wrong language, or poor. Nothing is uploaded.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "The file's name in this room"}},
+                "required": ["name"]}}},
+        {"type": "function", "function": {"name": "read_recording",
+            "description": "Read a recording and write its chapters, highlights and notes (decisions, action items, open questions) onto it. Needs an existing transcript; runs in the background.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "The recording's name in this room"}},
                 "required": ["name"]}}}
     ])
     .as_array().cloned().unwrap_or_default()
@@ -3746,7 +3803,11 @@ pub(crate) async fn exec_tool(
             }
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = db::find_file_like(&room.conn, name)?;
+            // `_qualified`: `list_room_files` prints a filed document as
+            // "Invoices/q3.pdf", so that string has to work here — see
+            // `db::find_file_like_qualified`. The plain matcher searches the
+            // name column alone and rejected the exact text it had just shown.
+            let (id, real_name) = db::find_file_like_qualified(&room.conn, name)?;
             // Keep the original extension if the model dropped it.
             let final_name = if extraction::extension_of(new_name).is_empty() {
                 let ext = extraction::extension_of(&real_name);
@@ -3769,7 +3830,8 @@ pub(crate) async fn exec_tool(
             let folder = args["folder"].as_str().unwrap_or_default().trim();
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            let (id, real_name) = db::find_file_like(&room.conn, name)?;
+            // Same round-trip fix as `rename_file` above.
+            let (id, real_name) = db::find_file_like_qualified(&room.conn, name)?;
             let to_top = folder.is_empty()
                 || ["none", "top", "top level", "root", "/"]
                     .iter()
@@ -3788,6 +3850,82 @@ pub(crate) async fn exec_tool(
             let _ = window.emit("room-files-changed", ());
             effects.wrote = true;
             Ok(format!("Moved \"{real_name}\" to {where_to}."))
+        }
+        // ---- the organize box (commands::organize) ----
+        "organize_files" => {
+            let entries: Vec<super::organize::OrganizeEntry> =
+                serde_json::from_value(args["files"].clone()).unwrap_or_default();
+            let make: Vec<String> =
+                serde_json::from_value(args["make_folders"].clone()).unwrap_or_default();
+            let remove: Vec<String> =
+                serde_json::from_value(args["remove_folders"].clone()).unwrap_or_default();
+            let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+            if entries.is_empty() && make.is_empty() && remove.is_empty() {
+                // Refuse rather than reporting a cheerful nothing: an empty
+                // plan is a model that misread the schema, and "done!" over it
+                // is precisely the false completion `react_verify` exists for.
+                return Err(
+                    "organize_files needs at least one entry in files, make_folders or \
+                     remove_folders."
+                        .into(),
+                );
+            }
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let report =
+                super::organize::organize(&room.conn, &entries, &make, &remove, dry_run)?;
+            if !dry_run {
+                let _ = window.emit("room-files-changed", ());
+                // Only a run that CHANGED something counts as a write — a
+                // preview must not arm the undo affordance for edits it never
+                // made, and a plan that matched nothing must not either.
+                effects.wrote = !report.moved.is_empty()
+                    || !report.renamed.is_empty()
+                    || !report.folders_made.is_empty()
+                    || !report.folders_removed.is_empty();
+            }
+            Ok(report.sentence(dry_run))
+        }
+        "trash_files" => {
+            let names: Vec<String> =
+                serde_json::from_value(args["names"].clone()).unwrap_or_default();
+            if names.is_empty() {
+                return Err("trash_files needs at least one file name.".into());
+            }
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let (report, misses) = super::organize::trash_named(&room.conn, &names);
+            let _ = window.emit("room-files-changed", ());
+            effects.wrote = report.changed_anything();
+            let mut out = report.sentence("moved to the trash");
+            if !misses.is_empty() {
+                out.push_str(&format!(
+                    " Not found: {}.",
+                    misses
+                        .iter()
+                        .map(|m| format!("\"{}\"", m.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            // Name the way back, every time. The user did not press this
+            // button, so the sentence they read has to carry the undo.
+            out.push_str(" They are recoverable from Library → Trash.");
+            Ok(out)
+        }
+        "merge_files" => {
+            let names: Vec<String> =
+                serde_json::from_value(args["names"].clone()).unwrap_or_default();
+            let into = args["into"].as_str().unwrap_or_default();
+            let headings = args["headings"].as_bool().unwrap_or(true);
+            let trash_sources = args["trash_sources"].as_bool().unwrap_or(false);
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let (_, receipt, _) =
+                super::organize::merge(&room.conn, &names, into, headings, trash_sources)?;
+            let _ = window.emit("room-files-changed", ());
+            effects.wrote = true;
+            Ok(receipt)
         }
         "add_memory" => {
             let raw = args["content"].as_str().unwrap_or_default();
@@ -3981,6 +4119,27 @@ pub(crate) async fn exec_tool(
                     s.size_mb
                 )
             })
+        }
+        "read_recording" => {
+            let wanted = args["name"].as_str().unwrap_or_default().trim().to_string();
+            if wanted.is_empty() {
+                return Err("Say which recording to read, by name.".into());
+            }
+            let (file_id, name) = {
+                let guard = state.room.lock().unwrap();
+                let room = guard.as_ref().ok_or("No room is open.")?;
+                db::find_file_like(&room.conn, &wanted)?
+            };
+            let room_path = state.with_room(|room| Ok(room.path.clone()))?;
+            super::start_rec_read(window, state, &room_path, &file_id).await?;
+            // Same honesty as retranscribe_file: this is QUEUED, not done. A
+            // model that reports a started job as a finished one is the exact
+            // failure the self-test wave found in the transcription tool.
+            Ok(format!(
+                "Started reading \"{name}\". It runs in the background — the chapters, \
+                 highlights and notes appear on the recording when it finishes. It is NOT \
+                 finished yet; call job_status to see how far it has got."
+            ))
         }
         "retranscribe_file" => {
             use tauri::Manager;

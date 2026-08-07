@@ -14,14 +14,30 @@ export type PaneKey = "library" | "center" | "ai";
 
 export const PANE_ORDER: PaneKey[] = ["library", "center", "ai"];
 
-/** Default proportions (18 / 58 / 24): ONE dominant workspace, with the library
+/** Default proportions (16 / 61 / 23): ONE dominant workspace, with the library
  * a navigable strip and the AI pane a slim contextual column you widen or
  * collapse to a drawer as needed. Ratios, not widths. New rooms (and Reset
- * layout) get this; rooms with a saved custom layout keep theirs. */
+ * layout) get this; rooms with a saved custom layout keep theirs.
+ *
+ * The target is 65-75% of the WINDOW for the thing being worked on, and the
+ * arithmetic only reaches it once a side column is out of the way — which is
+ * the point of the AI pane being contextual. A hidden pane's track collapses
+ * to 0px and its share is redistributed by the `fr` units, so on a 1440px
+ * window with the rail expanded (192px) the grid is 1248px and:
+ *
+ *   all three open   0.61            × 1248 = 761px   53% of the window
+ *   AI closed        0.61/0.77 = .79 × 1248 = 989px   69% of the window  ← target
+ *   focus mode       1.0             × 1248          87% of the window
+ *
+ * There is no split that hits 65% with three panes open and still leaves the
+ * library navigable and the composer usable: their floors alone (0.13 + 0.20)
+ * spend a third of the grid. So the width is earned by CLOSING the column the
+ * page does not need, per `setFocusedPage` below, rather than by squeezing two
+ * panes down to a size neither works at. */
 const DEFAULT_RATIOS: Record<PaneKey, number> = {
-  library: 0.18,
-  center: 0.58,
-  ai: 0.24,
+  library: 0.16,
+  center: 0.61,
+  ai: 0.23,
 };
 
 /** Drag/keyboard clamps: the library stays a navigable strip at the low end and
@@ -46,7 +62,21 @@ type Persisted = {
   hidden?: Partial<Record<PaneKey, boolean>>;
   /** GH #2: the activity rail widened to icon + full label. */
   railExpanded?: boolean;
+  /** Schema version of this record. See `LAYOUT_VERSION`. */
+  v?: number;
 };
+
+/** Bumped when a DEFAULT changes in a way a stored value would hide.
+ *
+ * v2 made the rail's readable labels the default. Every room saved before it
+ * carries `railExpanded: false` — not because anyone chose the icon strip, but
+ * because that was the old default and the flag is written on every layout
+ * change. Reading those back would mean the labels never appeared for anyone
+ * who had ever resized a pane. So a record older than this version keeps its
+ * ratios and its collapsed panes (both are real choices) and takes the new
+ * rail default once; the next write stamps v2 and the choice is the user's
+ * again from then on. */
+const LAYOUT_VERSION = 2;
 
 const LAYOUT_PREFIX = "prLayout:";
 
@@ -145,10 +175,12 @@ export function useLayout(roomPath: string) {
   }));
   const [focusPane, setFocusPane] = useState<PaneKey | null>(null);
   const [dragging, setDragging] = useState<"a" | "b" | null>(null);
-  /** GH #2: the rail widened to icon + full label. Persisted like the ratios —
-   * it's a standing preference, not a transient mode. */
-  const [railExpanded, setRailExpanded] = useState(
-    () => persisted.railExpanded === true,
+  /** The rail showing icon + full label. Persisted like the ratios — it's a
+   * standing preference, not a transient mode — and ON by default: navigation
+   * a first-time reader has to hover to identify is not navigation. See
+   * LAYOUT_VERSION for why a pre-v2 record's stored value is ignored. */
+  const [railExpanded, setRailExpanded] = useState(() =>
+    persisted.v === LAYOUT_VERSION ? persisted.railExpanded !== false : true,
   );
   const [isNarrow, setIsNarrow] = useState(
     () => window.matchMedia(NARROW_QUERY).matches,
@@ -162,17 +194,35 @@ export function useLayout(roomPath: string) {
     return () => mq.removeEventListener("change", onChange);
   }, []);
 
+  /** The one-time "step aside for a document" collapse of the AI column.
+   *
+   * Kept OUT of `hidden`, and therefore out of localStorage, on purpose. When
+   * this lived in `hidden` it was serialised by the effect below, so opening a
+   * single PDF hid the AI pane FOREVER: the flag came back from storage on the
+   * next launch while `aiChoiceRef` reset to false with the mount, and the user
+   * arrived at Home with a column missing and nothing on screen explaining why.
+   * A suggestion the software makes on the user's behalf must not outlive the
+   * session; only a choice the user actually made gets written down. */
+  const [aiSteppedAside, setAiSteppedAside] = useState(false);
+
   // Persist ratios + hidden + rail width per room (focus is a transient mode).
   useEffect(() => {
     try {
       localStorage.setItem(
         storageKey,
-        JSON.stringify({ ratios, hidden, railExpanded }),
+        JSON.stringify({ ratios, hidden, railExpanded, v: LAYOUT_VERSION }),
       );
     } catch {
       /* private-mode etc. — layout just won't persist */
     }
-  }, [storageKey, ratios, hidden, railExpanded]);
+  }, [storageKey, ratios, railExpanded, hidden]);
+
+  /** What is actually collapsed right now: the persisted choice, plus the
+   * transient step-aside. Everything downstream reads this, never `hidden`. */
+  const effHidden = useMemo<Record<PaneKey, boolean>>(
+    () => ({ ...hidden, ai: hidden.ai || aiSteppedAside }),
+    [hidden, aiSteppedAside],
+  );
 
   /** Panes that currently own width. Narrow mode: exactly one (the focused
    * pane, else the first non-hidden in priority center > ai > library). */
@@ -180,15 +230,15 @@ export function useLayout(roomPath: string) {
     if (isNarrow) {
       if (focusPane) return [focusPane];
       const pick = (["center", "ai", "library"] as PaneKey[]).find(
-        (k) => !hidden[k],
+        (k) => !effHidden[k],
       );
       return [pick ?? "center"];
     }
     const list = PANE_ORDER.filter(
-      (k) => !hidden[k] && (!focusPane || focusPane === k),
+      (k) => !effHidden[k] && (!focusPane || focusPane === k),
     );
     return list.length > 0 ? list : ["center"];
-  }, [isNarrow, focusPane, hidden]);
+  }, [isNarrow, focusPane, effHidden]);
 
   const showSplitA =
     visible.includes("library") &&
@@ -211,10 +261,48 @@ export function useLayout(roomPath: string) {
     } as CSSProperties;
   }, [visible, ratios, showSplitA, showSplitB]);
 
+  /** Has the reader said anything about the AI column this session? Set by
+   * every path a PERSON can take to it — the rail button, ⌘3, a collapse
+   * arrow, a jump to Activity. Once it is true the automatic collapse below
+   * never fires again: a pane the user has opened stays open, and software
+   * that quietly undoes a click is worse than software that never helped. */
+  const aiChoiceRef = useRef(false);
+  /** Whether the workspace is currently on a focused page (see below). */
+  const focusedRef = useRef(false);
+
+  /** Tell the layout that the workspace pane is (or is no longer) showing a
+   * page whose whole job is reading or recording — a book, a PDF, a Word
+   * document, a deck, a recording, the Recordings area.
+   *
+   * On the way IN, the AI column steps aside once, which is what gets the
+   * document to ~70% of the window (see DEFAULT_RATIOS). It is a suggestion,
+   * not a mode: reopening the pane is one click, and doing so settles the
+   * question for the rest of the session. Nothing happens on the way out —
+   * re-opening a column the user did not ask for would be the same
+   * interruption in the other direction.
+   *
+   * It writes to `aiSteppedAside`, never to `hidden`, so it dies with the
+   * session rather than being persisted as though the user had chosen it. */
+  const setFocusedPage = useCallback((focused: boolean) => {
+    if (focusedRef.current === focused) return;
+    focusedRef.current = focused;
+    if (!focused || aiChoiceRef.current) return;
+    setAiSteppedAside(true);
+  }, []);
+
+  /** Every path a PERSON can take to the AI column settles the question: the
+   * automatic collapse never fires again, and any step-aside already in effect
+   * is released so their click is not immediately fighting it. */
+  const noteAiChoice = useCallback(() => {
+    aiChoiceRef.current = true;
+    setAiSteppedAside(false);
+  }, []);
+
   /** Rail pane button: toggle visibility (or, in focus/narrow mode, move the
    * single visible slot to that pane). Never leaves zero panes. */
   const togglePane = useCallback(
     (key: PaneKey) => {
+      if (key === "ai") noteAiChoice();
       if (isNarrow) {
         setFocusPane((f) => (f === key ? f : key));
         setHidden((h) => ({ ...h, [key]: false }));
@@ -231,40 +319,55 @@ export function useLayout(roomPath: string) {
         return next;
       });
     },
-    [isNarrow, focusPane],
+    [isNarrow, focusPane, noteAiChoice],
   );
 
-  /** Focus/maximize a pane; activating again restores the prior layout. */
-  const toggleFocus = useCallback((key: PaneKey) => {
-    setHidden((h) => ({ ...h, [key]: false }));
-    setFocusPane((f) => (f === key ? null : key));
-  }, []);
+  /** Focus/maximize a pane; activating again restores the prior layout.
+   * Maximising the AI column is as deliberate a choice as opening it, so it
+   * settles the step-aside question too — otherwise focusing it and then
+   * opening a PDF would collapse the pane the user had just maximised. */
+  const toggleFocus = useCallback(
+    (key: PaneKey) => {
+      if (key === "ai") noteAiChoice();
+      setHidden((h) => ({ ...h, [key]: false }));
+      setFocusPane((f) => (f === key ? null : key));
+    },
+    [noteAiChoice],
+  );
 
   /** Make sure a pane is on screen (used by citations, activity jumps…).
    * Unhides it; in narrow/focus modes it becomes the focused pane. */
   const showPane = useCallback(
     (key: PaneKey) => {
+      if (key === "ai") noteAiChoice();
       setHidden((h) => ({ ...h, [key]: false }));
       if (isNarrow) setFocusPane(key);
       else setFocusPane((f) => (f !== null && f !== key ? null : f));
     },
-    [isNarrow],
+    [isNarrow, noteAiChoice],
   );
 
   const collapsePane = useCallback((key: PaneKey) => {
+    if (key === "ai") noteAiChoice();
     setFocusPane(null);
     setHidden((h) => {
       const next = { ...h, [key]: true };
       if (next.library && next.center && next.ai) next.center = false;
       return next;
     });
-  }, []);
+  }, [noteAiChoice]);
 
   const resetLayout = useCallback(() => {
     setRatios({ ...DEFAULT_RATIOS });
     setHidden({ library: false, center: false, ai: false });
     setFocusPane(null);
-    setRailExpanded(false);
+    setRailExpanded(true);
+    // Reset means "start again from the defaults", and the focused-page
+    // suggestion is one of them — so it is re-armed rather than left disabled
+    // by whatever the user happened to click before pressing Reset.
+    aiChoiceRef.current = false;
+    focusedRef.current = false;
+    setAiSteppedAside(false);
   }, []);
 
   const toggleRail = useCallback(() => setRailExpanded((v) => !v), []);
@@ -410,7 +513,10 @@ export function useLayout(roomPath: string) {
 
   return {
     ratios,
-    hidden,
+    // The EFFECTIVE map, so a consumer asking "is the AI pane hidden?" gets
+    // the same answer the layout is rendering. `hidden` alone is only the
+    // persisted half and would lie while the step-aside is in effect.
+    hidden: effHidden,
     focusPane,
     visible,
     isNarrow,
@@ -426,6 +532,7 @@ export function useLayout(roomPath: string) {
     toggleFocus,
     showPane,
     collapsePane,
+    setFocusedPage,
     resetLayout,
     startDrag,
     keyResize,

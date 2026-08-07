@@ -122,10 +122,16 @@ export default function AiProvidersSection({
           </div>
         )}
       </div>
-      <p className="settings-hint">
-        Connecting validates the key and loads the models allowed by your OpenRouter
-        preferences, privacy settings, and guardrails.
-      </p>
+      {/* What "Connect" actually does, in provider terms. Detail, not a
+          consequence — the sentence about where keys are stored is the
+          consequence and it stays open above. */}
+      <details className="set-more">
+        <summary>What connecting does</summary>
+        <p className="settings-hint">
+          Connecting validates the key and loads the models allowed by your OpenRouter
+          preferences, privacy settings, and guardrails.
+        </p>
+      </details>
     </section>
   );
 }

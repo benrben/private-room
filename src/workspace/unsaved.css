@@ -1,5 +1,21 @@
-/* The unsaved-edits door. Deliberately small and centred: it is a question
-   with three answers, not a panel. */
+/* ---------- the unsaved-edits door ----------
+
+   Deliberately small and centred: it is a question with three answers, not a
+   panel. It is also the only dialog in the product where one of the answers
+   destroys work the user just typed, so the rules that shape it are:
+
+     DISCARD IS NEVER PRIMARY AND NEVER FILLED. It reads as danger through a
+     red OUTLINE and through the verb in its own label — "Discard changes",
+     not "Discard" — so it survives being read without colour. Filled
+     saturated red is not used anywhere in this product.
+
+     SAVE IS THE DEFAULT, and it takes focus on open. The edit is the thing the
+     user made; the navigation is the thing they can repeat.
+
+     CANCEL SITS APART from the two answers that leave, so the destructive one
+     is never the neighbour of the safe one.
+
+   Nothing below names a colour, so both themes come from tokens. */
 
 .unsaved-backdrop {
   position: fixed;
@@ -7,63 +23,120 @@
   z-index: 120;
   display: grid;
   place-items: center;
-  background: rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(2px);
+  padding: var(--sp-6);
+  /* The veil is the PAPER at 78%, not black — the same recipe the ⌘K launcher
+     and the consent cards use. In dark it dims the sheet, in light it washes
+     it out, and in both it reads as the room going quiet behind a question. */
+  background: color-mix(in srgb, var(--page) 78%, transparent);
 }
 
+/* The one opaque surface here, because it genuinely floats and has to occlude
+   the editor underneath it. Drawn in the pen at full stroke width, with the
+   system's asymmetric corner and the restrained two-layer lift. Never a glow. */
 .unsaved-modal {
+  position: relative;
   width: min(30rem, calc(100vw - 3rem));
-  padding: 1.25rem 1.35rem 1.1rem;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--panel);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.4);
+  padding: var(--sp-6) var(--sp-6) 20px;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
+  background: var(--raised);
+  box-shadow:
+    0 18px 44px var(--shadow),
+    0 3px 10px var(--shadow-lift);
+  animation: nb-float-in var(--dur) var(--ease-pen);
 }
 
+/* The question, with the marker swipe under it — the only decorative mark on
+   the card, and it lands on the thing being asked. */
 .unsaved-title {
-  margin: 0 0 0.5rem;
-  font-size: 1.02rem;
-  font-weight: 650;
-  color: var(--text);
+  display: inline-block;
+  position: relative;
+  margin: 0 0 var(--sp-3);
+  padding-bottom: 3px;
+  font-size: var(--fs-card);
+  font-weight: 700;
+  color: var(--text-strong);
+}
+.unsaved-title::after {
+  content: "";
+  position: absolute;
+  left: -3px;
+  right: -6px;
+  bottom: 0;
+  height: 2.5px;
+  border-radius: 2px 4px 2px 3px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    91deg,
+    var(--mk-yellow) 2%,
+    color-mix(in srgb, var(--mk-yellow) 62%, transparent) 74%,
+    transparent 100%
+  );
+  pointer-events: none;
 }
 
 .unsaved-body {
   margin: 0;
-  font-size: 0.88rem;
-  line-height: 1.5;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--muted);
 }
 .unsaved-body strong {
-  color: var(--text);
+  color: var(--text-strong);
   /* A long file name must not push the buttons off the card. */
   overflow-wrap: anywhere;
 }
 
+/* The save FAILED. An error state, drawn as one: red ink inside a red outline,
+   with the sentence carrying the meaning. This is a `role="alert"` in the
+   markup, so it is announced as well as drawn. */
 .unsaved-failed {
-  margin: 0.7rem 0 0;
-  padding: 0.5rem 0.6rem;
-  border-radius: 7px;
-  font-size: 0.83rem;
-  line-height: 1.45;
-  color: var(--danger, #d9534f);
-  background: color-mix(in srgb, var(--danger, #d9534f) 12%, transparent);
+  margin: var(--sp-3) 0 0;
+  padding: var(--sp-2) 10px;
+  border: 1px solid var(--sem-urgent);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+  color: var(--sem-urgent);
+  background: color-mix(in srgb, var(--sem-urgent-fill) 9%, transparent);
 }
 
 .unsaved-actions {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  margin-top: 1.1rem;
+  gap: var(--sp-2);
+  margin-top: 20px;
 }
 .unsaved-spacer {
   flex: 1;
 }
-
-/* Discarding is the one answer that destroys work; it reads as danger without
-   being styled as the primary action. */
-.unsaved-discard {
-  color: var(--danger, #d9534f);
+.unsaved-actions button {
+  min-height: 30px;
 }
-.unsaved-discard:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--danger, #d9534f) 14%, transparent);
+
+/* Discarding is the one answer that destroys work. Red INK and a red OUTLINE,
+   never a fill, and never the primary treatment — this must not look like the
+   button the user is being nudged toward. The border is the full --sem-urgent
+   ink rather than a wash of it: a 62% red measures about 2.4:1 on the dark
+   sheet, under the 3:1 a control edge owes.
+
+   Written as `.unsaved-actions button.unsaved-discard` on purpose. The element
+   also carries `.subtle`, and base.css's `button.subtle` rule sets
+   `border: none` at (0,1,1) — a bare `.unsaved-discard` selector is (0,1,0)
+   and would lose to it no matter which stylesheet loaded last, so the outline
+   that carries the whole warning would simply never draw. */
+.unsaved-actions button.unsaved-discard {
+  color: var(--sem-urgent);
+  border: 1px solid var(--sem-urgent);
+  padding: 6px 12px;
+}
+.unsaved-actions button.unsaved-discard:hover:not(:disabled) {
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+  background-color: color-mix(in srgb, var(--sem-urgent-fill) 18%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .unsaved-modal {
+    animation: none;
+  }
 }

@@ -42,9 +42,13 @@ export function applyTheme(theme: Theme) {
   document.documentElement.dataset.theme = theme;
   // Keep the anti-flash <html>/<body> inline backgrounds in step, so a
   // reload in light mode doesn't open on a dark frame (and vice versa).
-  const bg = theme === "light" ? "#efedf1" : "#121116";
-  document.documentElement.style.background = bg;
-  document.body.style.background = bg;
+  // These are the notebook's paper colours and must stay identical to
+  // --page in tokens.css and to the inline script in index.html.
+  const bg = theme === "light" ? "#f4f1e8" : "#151716";
+  // <html> only, and backgroundCOLOR only. paper.css paints the dotted sheet
+  // on <html> as a background-image: the `background` shorthand here would
+  // reset it away, and setting <body> opaque would cover it up.
+  document.documentElement.style.backgroundColor = bg;
 }
 
 export function initTheme() {

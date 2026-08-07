@@ -1,16 +1,56 @@
-/* CHG-1/ADD-10 — onboarding banners: button rows + in-banner download bar. */
+/* ---------- first run, and the composer's own popovers ----------
+
+   THE OPENING PAGES. The onboarding banner is the first thing a new room ever
+   shows, and for most people it is the first drawn surface they see in the
+   product. It is deliberately NOT a filled notification band: it is a frame
+   drawn onto the dotted sheet, with a handwritten aside and a small row of
+   model cards, the way the first page of a working notebook is set out before
+   anything has been filled in.
+
+   The rest of this file is the composer's chrome: the attachment chips, the
+   "#"/"@" autocomplete, and the "#help" sheet. The autocomplete FLOATS, so it
+   is the one opaque surface here.
+
+   Nothing below names a colour, so both themes come from tokens and there is
+   deliberately no light-mode block at the end. */
+
+/* ==========================================================================
+   1. THE ONBOARDING BANNER
+   ========================================================================== */
+
+/* Drawn rather than filled. `.banner` (chat.css) gives it the accent wash and
+   the bottom rule; this turns that band into a framed note with room to
+   breathe, because it is the only thing on the screen at first run and it is
+   asking for a decision. */
 .banner.onboard {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--sp-2);
+  margin: var(--sp-3) var(--sp-3) 0;
+  padding: var(--sp-4);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  background: transparent;
+  /* The shorthand replaces `.banner`'s bottom-only rule on all four sides —
+     this is a framed note now, not a band with a line under it. */
+  border: var(--stroke-w) solid
+    color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+}
+.banner.onboard strong {
+  color: var(--text-strong);
 }
 .onboard-actions {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-1);
   margin-left: auto;
 }
+
+/* The download strip. The bar itself is `.pull-bar` (settings.css); this row
+   only lays it out and states the percentage in words beside it — progress is
+   never a length and a colour alone. */
 .banner-pull {
   display: flex;
   align-items: center;
@@ -22,105 +62,188 @@
   margin-bottom: 0;
 }
 .banner-pull-status {
-  font-size: 12px;
-  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+/* A failed pull is an ERROR state, so it is drawn as one: red ink on a red
+   outline, with the message itself carrying the meaning. Never a red fill. */
 .banner-error {
   width: 100%;
-  margin-top: 6px;
-  color: var(--danger);
-  font-size: 12px;
+  margin-top: var(--sp-2);
+  padding: 7px 10px;
+  color: var(--sem-urgent);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+  border: 1px solid var(--sem-urgent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--sem-urgent-fill) 8%, transparent);
 }
 
-/* First-run model chooser inside the onboarding banner. */
+/* ----- the first-run model chooser ----- */
+
 .model-pick {
   width: 100%;
 }
 .model-pick-head {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  margin-bottom: 9px;
+  gap: 3px;
+  margin-bottom: var(--sp-3);
 }
+.model-pick-head strong {
+  font-size: var(--fs-card);
+  color: var(--text-strong);
+}
+/* The one handwritten line on the page: an aside about what is about to
+   happen, which is exactly what Kalam is reserved for. */
 .model-pick-sub {
-  font-size: 12px;
-  color: var(--text-dim);
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
 }
 .model-pick-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
 }
+/* Cards drawn on the sheet, not boxes laid on it: transparent, so the dots
+   run through them, with the pen at 72% at rest going to full strength under
+   the pointer — the pen pressing harder rather than a colour change. Even at
+   72% the edge measures about 6.9:1 dark and 5.2:1 light, well clear of the
+   3:1 a component boundary owes. */
 .model-pick-card {
   display: flex;
   flex-direction: column;
   gap: 3px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 10px 11px;
+  background: transparent;
+  border: var(--stroke-w) solid
+    color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+  padding: var(--sp-3);
+  transition: border-color var(--dur-fast) var(--ease-pen);
 }
+.model-pick-card:hover {
+  border-color: var(--sketch);
+}
+/* Four fixed corner signatures rotated by position, so a row of sibling cards
+   does not look stamped. Deterministic — the same card draws identically on
+   every render. */
+.model-pick-grid > *:nth-child(4n + 2) {
+  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+}
+.model-pick-grid > *:nth-child(4n + 3) {
+  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+}
+.model-pick-grid > *:nth-child(4n + 4) {
+  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+}
+/* "Recommended" — a marker category label, not a filled pill. The word is
+   written in --ink over the wash rather than in the marker's own ink: a hue's
+   ink on a wash of the same hue is the one combination in this palette that
+   fails, and the meaning was always coming from the word anyway. */
 .model-pick-tag {
   align-self: flex-start;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  color: var(--accent);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent);
-  border-radius: 999px;
   padding: 1px 7px;
-  margin-bottom: 2px;
+  margin-bottom: 3px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink);
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--sem-saved-fill) 30%, transparent) 0%,
+    color-mix(in srgb, var(--sem-saved-fill) 22%, transparent) 58%,
+    color-mix(in srgb, var(--sem-saved-fill) 28%, transparent) 100%
+  );
+  border-radius: 4px 6px 3px 5px / 5px 3px 6px 4px;
 }
 .model-pick-name {
-  font-weight: 650;
-  font-size: 13px;
+  font-weight: 600;
+  font-size: var(--fs-meta);
+  color: var(--text-strong);
 }
+/* Size and family are technical data, so they take the mono face. */
 .model-pick-meta {
-  font-size: 12px;
-  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
 }
 .model-pick-blurb {
-  font-size: 12px;
-  color: var(--text-dim);
-  line-height: 1.4;
-  margin: 2px 0 9px;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  line-height: var(--lh-body);
+  margin: var(--sp-1) 0 10px;
 }
 .model-pick-get {
   margin-top: auto;
   align-self: flex-start;
+  min-height: 26px;
 }
+
+/* ==========================================================================
+   2. COMPOSER CHROME
+   ========================================================================== */
 
 .attach-row {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin-bottom: 8px;
+  margin-bottom: var(--sp-2);
 }
 
+/* An attachment reads as CIRCLED: the pen on the ring, a wash inside, and a
+   second offset stroke so it looks gone-round-twice rather than merely
+   tinted. The file name is always in the sheet's own ink, never in the pen —
+   it is content, not state. */
 .attach-chip {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  background: var(--accent-soft);
+  min-height: 24px;
+  color: var(--text);
+  background: var(--accent-ghost);
   border: 1px solid var(--accent);
-  border-radius: 20px;
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
   padding: 3px 10px;
-  font-size: 12px;
+  font-size: var(--fs-micro);
 }
-
+.attach-chip::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
+}
 .attach-chip svg {
   flex-shrink: 0;
   color: var(--accent);
 }
-
+/* Detach. 24px minimum in both directions — it used to be a 2px-padded glyph
+   inside a chip, which is not a target. */
 .attach-chip button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  min-height: 24px;
+  margin: -3px -6px -3px 0;
   background: none;
   border: none;
   padding: 0 2px;
-  color: var(--text-dim);
+  color: var(--muted);
+  line-height: 0;
+}
+.attach-chip button:hover {
+  color: var(--text-strong);
+  border-color: transparent;
+  background: none;
 }
 
 .composer-row {
@@ -136,7 +259,12 @@
   max-height: 140px;
 }
 
-/* ---------- "#"/"@" autocomplete popover ---------- */
+/* ==========================================================================
+   3. THE "#"/"@" AUTOCOMPLETE
+   It floats over the transcript, so it is opaque and drawn in the pen —
+   section 9 of paper.css, the one place a fill is correct.
+   ========================================================================== */
+
 .ac-popover {
   position: absolute;
   bottom: calc(100% + 6px);
@@ -147,12 +275,15 @@
   max-width: min(520px, 94vw);
   max-height: 320px;
   overflow-y: auto;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
-  padding: 4px;
+  background: var(--raised);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+  padding: var(--sp-1);
   z-index: 20;
+  animation: nb-float-in var(--dur-fast) var(--ease-pen);
 }
 
 /* A list that scrolls must LOOK like it scrolls — always-visible thumb. */
@@ -160,19 +291,22 @@
   width: 8px;
 }
 .ac-popover::-webkit-scrollbar-thumb {
-  background: var(--border);
+  background: var(--rule);
   border-radius: 999px;
 }
 
 .ac-hint {
-  font-size: 11px;
-  color: var(--text-dim);
-  padding: 4px 8px 6px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--muted);
+  padding: 5px 8px 6px;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.075em;
 }
 
-/* Count on the left, keyboard cheatsheet on the right — the overflow cue. */
+/* Count on the left, keyboard cheatsheet on the right — the overflow cue. The
+   sticky header has to be OPAQUE or the rows scroll through it, which is why
+   it repeats the popover's own fill. */
 .ac-hint-row {
   display: flex;
   align-items: baseline;
@@ -180,24 +314,31 @@
   gap: 10px;
   position: sticky;
   top: -4px;
-  background: var(--panel-2);
+  background: var(--raised);
   z-index: 1;
 }
 
+/* The keyboard cheatsheet is technical data, so it takes the mono face. */
 .ac-keys {
+  font-family: var(--mono);
+  font-weight: 400;
   text-transform: none;
   letter-spacing: 0;
-  color: var(--text-faint, var(--text-dim));
+  color: var(--faint);
   flex: 0 0 auto;
 }
 
-/* The "*" menu's honest empty state — a sentence, not an option. Sentence case
-   and full width, so it never reads as a row someone could arrow onto. */
+/* The "*" menu's honest empty state — a sentence, not an option. In the hand
+   and at full width, so it never reads as a row someone could arrow onto. */
 .ac-empty {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  font-weight: 400;
   text-transform: none;
   letter-spacing: 0;
-  padding: 8px 9px 10px;
-  line-height: 1.4;
+  color: var(--ink-2);
+  padding: var(--sp-2) 9px 10px;
+  line-height: var(--lh-hand);
 }
 
 .ac-item {
@@ -207,18 +348,31 @@
   align-items: flex-start;
   gap: 3px;
   width: 100%;
+  min-height: 24px;
   text-align: left;
-  background: transparent;
+  background-color: transparent;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   padding: 7px 9px;
   color: var(--text);
   cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-pen);
 }
 
-.ac-item:hover,
+/* Hover is a warm paper wash; the KEYBOARD selection is a different thing and
+   says so with a shape — the marker spine down the left edge — so the two are
+   never confused and the highlighted row survives being read without colour.
+   `.active` is the arrow-key cursor, and it is what Enter will run. */
+.ac-item:hover {
+  background-color: var(--hover);
+  border-color: transparent;
+}
 .ac-item.active {
-  background: var(--accent-soft);
+  background-color: var(--selected);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.ac-item.active .ac-label {
+  color: var(--text-strong);
 }
 
 .ac-label {
@@ -230,21 +384,21 @@
 /* The "#cmd …" usage line, shown above the description as a monospace chip. */
 .ac-usage {
   align-self: flex-start;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
   color: var(--text);
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: 5px;
+  background: color-mix(in srgb, var(--page) 70%, transparent);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
   padding: 1px 6px;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
 .ac-desc {
-  font-size: 12px;
-  color: var(--text-dim);
-  line-height: 1.4;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  line-height: var(--lh-body);
   /* No ellipsis — full descriptions wrap onto as many lines as needed. */
   white-space: normal;
   overflow: visible;
@@ -262,3 +416,15 @@
   flex-shrink: 0;
 }
 
+/* ==========================================================================
+   4. MOTION
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .ac-popover {
+    animation: none;
+  }
+  .ac-item,
+  .model-pick-card {
+    transition: none;
+  }
+}

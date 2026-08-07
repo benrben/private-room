@@ -1,185 +1,104 @@
-/* =====================================================================
-   Moonshot (Wave 3) — CSS agent additions
-   Calm, on-brand styles for new UI the other frontend agents mount.
-   Palette is the existing tokens (accent violet #8b7cf6, ink #0e1014,
-   panels --surface-* and --panel, border --border, ok green #4cc38a).
+/* ---------- the Room Map shell, and Home's suggestion tray ----------
 
-   CLASS / KEYFRAME CONTRACT — markup agents must match these names:
+   What is left in this file after the seal moved out (see below): the frame
+   the Room Map is drawn inside, and the collapsed tray of suggested questions
+   at the foot of Room Home.
 
-   THE SEAL (frontend-only ritual)
-     .seal-unlocking            full-screen unlock overlay (keyhole bloom)
-       @keyframes seal-bloom      overlay lifts (scale up + fade) ~700ms
-       @keyframes seal-glow         helper: the violet keyhole point
-     .seal-locking              collapse the workspace on lock ~500ms
-       @keyframes seal-fold         shrink toward center + fade + blur
-       @keyframes seal-fade         reduced-motion fallback (opacity only)
-     -> heavy transforms/blur disabled under prefers-reduced-motion.
+   THE SEAL IS NOT HERE ANY MORE. src/seal.css owns the whole unlock/lock
+   ritual — `.seal-unlocking`, `.seal-locking-overlay`, their keyframes and
+   their reduced-motion escape — and it is imported directly by App.tsx AFTER
+   App.css, so it loads last and wins. The copy that used to live here declared
+   a second `animation` on the same class from a stylesheet that loads earlier:
+   dead in practice, and the kind of dead that comes back to life the moment
+   somebody reorders an import. One definition, in the file that owns it.
 
-   ROOM MAP (VIEWERS RoomMap.tsx)
-     .room-map  .room-map-canvas  .room-map-legend  .room-map-legend-dot
-     .room-map-tooltip  .room-map-node  .room-map-edge  .room-map-empty
+   CLASS CONTRACT — markup agents must match these names:
 
-   FRONT PAGE (Workspace, shown on unlock)
-     .front-page  .front-page-grid  .fp-card  .fp-card-title  .fp-card-list
-     .fp-card-empty  .fp-suggestions  .fp-suggestion (clickable chip)
+   ROOM MAP (viewers/RoomMap.tsx) — only the shared shell lives here:
+     .room-map  .room-map-toolbar  .room-map-title  .room-map-count
+     .room-map-edge  .room-map-empty
+     Nodes, legend, tooltip, labels and controls are viewers/roomMap.css.
 
-   STUDIO SHELF
-     .studio-shelf  .studio-shelf-title  .studio-btn  .studio-btn-label
-     .studio-btn-sub
+   HOME'S SUGGESTION TRAY (workspace/FrontPage.tsx):
+     .fp-suggestions  .fp-suggestions-toggle  .fp-suggestion
 
-   RECEIPTS
-     .receipt-badge (green "verified" pill)
-     .annot-chip.receipt-verified (verified state on annotation chips)
+   Nothing below names a colour, so both themes come from tokens and there is
+   deliberately no light-mode block at the end. */
 
-   MEMORY SUGGESTION CARD
-     .memory-suggestion  .memory-suggestion-head  .memory-suggestion-fact
-     .memory-suggestion-actions
+/* ==========================================================================
+   1. ROOM MAP
+   ========================================================================== */
 
-   SMART-IMPORT CHIP
-     .import-suggestion  .import-suggestion-text  .import-suggestion-actions
-
-   RECOVERY SHEET
-     .recovery-sheet  .recovery-sheet-title  .recovery-code
-     .recovery-sheet-note  .recovery-sheet-actions
-     -> @media print hides app chrome and prints the code big + mono.
-
-   TIME MACHINE
-     .time-machine  .tm-version  .tm-version-dot  .tm-cause  .tm-time
-     .tm-version.current  .tm-prov  .tm-now  .tm-now-label
-   ===================================================================== */
-
-/* ---- THE SEAL: unlock (keyhole bloom + door-open) ---- */
-
-/* Sits over everything on a successful unlock, then lifts to reveal the room.
-   Matches the create-flow bloom vibe (gate-out / logo-bloom). */
-.seal-unlocking {
-  position: fixed;
-  inset: 0;
-  z-index: 90;
-  pointer-events: none;
-  background: var(--bg);
-  animation: seal-bloom 0.7s ease forwards;
-}
-
-@keyframes seal-bloom {
-  0% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  55% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0;
-    transform: scale(1.06);
-  }
-}
-
-@keyframes seal-glow {
-  0% {
-    opacity: 0;
-    transform: translate(-50%, -50%) scale(0.3);
-    filter: blur(2px);
-  }
-  35% {
-    opacity: 1;
-    transform: translate(-50%, -50%) scale(1);
-    filter: blur(0);
-  }
-  100% {
-    opacity: 0;
-    transform: translate(-50%, -50%) scale(2.4);
-    filter: blur(8px);
-  }
-}
-
-@keyframes seal-fold {
-  0% {
-    opacity: 1;
-    transform: scale(1);
-    filter: blur(0);
-  }
-  100% {
-    opacity: 0;
-    transform: scale(0.82);
-    filter: blur(3px);
-  }
-}
-
-/* Reduced-motion fallback for the reveal/collapse. */
-@keyframes seal-fade {
-  to {
-    opacity: 0;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  /* Drop the scale/blur/keyhole; keep a gentle fade so the transition still
-     reads without vestibular motion. */
-  .seal-unlocking {
-    animation: seal-fade 0.35s ease forwards;
-  }
-  .seal-unlocking::before {
-    animation: none;
-    opacity: 0;
-  }
-  .seal-locking {
-    animation: seal-fade 0.3s ease forwards;
-  }
-}
-
-/* ---- ROOM MAP (constellation of related files) ---- */
-
+/* Transparent, like every other pane in the system: identity comes from what
+   is drawn inside it, not from a fill. Nothing changes visually — the center-
+   pane host `.room-map-canvas` (viewer.css) is opaque underneath it and the
+   canvas paints its own paper and dots (`.room-map-svg`, viewers/roomMap.css)
+   — but this stops the map from being the one region that answers "what is my
+   background" twice. */
 .room-map {
   position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
   height: 100%;
-  background: var(--bg);
+  background: transparent;
 }
 
-/* Header row: icon · "Room map" · "N files · M links" — the gap keeps the
-   title and the count from running together ("Room map9 files"). */
+/* Header row: icon · "Room map" · "N files · M links". Ruled off with the
+   pencil stroke that fades at both ends rather than a flat border — the
+   notebook draws a line across the page, it does not put a box around it. */
 .room-map-toolbar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
+  gap: var(--sp-2);
+  padding: 10px var(--sp-3);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }
 .room-map-title {
   font-weight: 600;
-  font-size: 13px;
-  color: var(--text);
+  font-size: var(--fs-meta);
+  color: var(--text-strong);
 }
+/* A count pencilled beside a heading is exactly what Kalam is reserved for —
+   the same treatment the ⌘K launcher gives its per-group tallies. */
 .room-map-count {
-  font-size: 12px;
-  color: var(--slate);
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: 1;
+  color: var(--ink-2);
 }
 
-/* NOTE: the center-pane host `.room-map-canvas` is defined once, near the top
-   of this file. RoomMap paints its own drawable surface (.room-map-svg, in
-   viewers/roomMap.css), so the old stale `.room-map-canvas` drawable rule that
-   used to live here was removed (it clobbered the flex host and leaked a grab
-   cursor onto the toolbar). */
+/* NOTE: the center-pane host `.room-map-canvas` is defined once, in
+   styles/viewer.css. RoomMap paints its own drawable surface (.room-map-svg,
+   in viewers/roomMap.css), so the old stale `.room-map-canvas` drawable rule
+   that used to live here was removed (it clobbered the flex host and leaked a
+   grab cursor onto the toolbar). */
 
-/* Violet nodes / subtle edges when the map is drawn with SVG rather than a
-   raster <canvas>. */
-.room-map-node {
-  fill: var(--accent);
-  stroke: rgba(139, 124, 246, 0.35);
-  stroke-width: 1;
-  cursor: pointer;
-  transition: fill 0.15s ease;
-}
-.room-map-node:hover,
-.room-map-node.active {
-  fill: var(--accent-2);
-}
-.room-map-node.memory {
-  fill: var(--text-dim);
-}
+/* The node paint that used to live here is GONE, and must not come back.
+   It set `fill`/`stroke` on the wrapping <g>, and both of those INHERIT into
+   every child shape — so it could only ever be neutralised by giving each
+   shape its own paint, which is why `.rm-node-hit` still carries a
+   `stroke: none` that reads like it does nothing. The map now says what a node
+   IS with its shape (an inked disc is a file, a ring round a dot is a memory)
+   and reserves hue for what a LINE claims, so a rule here that paints a node
+   accent-pink on hover is not a style this surface has any use for.
+   Node treatment belongs in viewers/roomMap.css, keyed to the shape classes.
+
+   The `.room-map-legend`, `.room-map-legend-dot` and `.room-map-tooltip` rules
+   went with it: the legend is an interactive group of toggles now
+   (`.rm-legend`) and the tooltip is `.rm-tip`. The old legend rule carried
+   `pointer-events: none`, so reusing that name would silently make every
+   toggle unclickable — the reason RoomMap.tsx chose a new one. */
+
 /* Stroke and width are deliberately NOT set here. The Room Map colors each
    link by what the link MEANS (roomMap/edges.ts), and a rule on this class
    outranks the presentation attributes the component was setting — so every
@@ -191,106 +110,99 @@
   fill: none;
 }
 
-/* Floating legend, bottom-left over the canvas. */
-.room-map-legend {
-  position: absolute;
-  left: 12px;
-  bottom: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  padding: 9px 11px;
-  font-size: 11px;
-  color: var(--text-dim);
-  background: color-mix(in srgb, var(--panel) 88%, transparent);
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  backdrop-filter: blur(6px);
-  pointer-events: none;
-}
-.room-map-legend-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  margin-right: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  vertical-align: 1px;
-}
-.room-map-legend-dot.memory {
-  background: var(--text-dim);
-}
-
-/* Hover tooltip (node name / shared reasons on an edge). */
-.room-map-tooltip {
-  position: absolute;
-  z-index: 3;
-  max-width: 240px;
-  padding: 7px 10px;
-  font-size: 12px;
-  line-height: 1.4;
-  color: var(--text);
-  background: var(--surface-3);
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
-  pointer-events: none;
-  transform: translate(-50%, calc(-100% - 10px));
-}
-.room-map-tooltip .shared {
-  display: block;
-  margin-top: 3px;
-  color: var(--text-dim);
-  font-size: 11px;
-}
-
+/* The base empty state. viewers/roomMap.css scopes `.room-map .rm-empty` on
+   top of this to set it in the hand at emphasis size — that file owns the
+   voice of the surface, this only owns the box it sits in. */
 .room-map-empty {
   margin: auto;
-  max-width: 300px;
+  max-width: 32ch;
   text-align: center;
-  color: var(--text-dim);
-  font-size: 13px;
-  line-height: 1.6;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
 }
 
-/* Suggested-question chips (span the grid, wrap). */
+/* ==========================================================================
+   2. HOME'S SUGGESTION TRAY
+   Optional ideas at the foot of the briefing page. They must never compete
+   with the work above them, so the handle is quiet at rest and the chips
+   inside only warm up under the pointer.
+   ========================================================================== */
+
 .fp-suggestions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--sp-2);
 }
 
+/* A secondary button: transparent, sketched border, and a marker swash that
+   wipes in from the left on hover. The swash is the element's OWN
+   background-image growing from 0% to 100% width — no pseudo-element, so the
+   label can never end up underneath it. Border is --rule-strong, which is the
+   3:1 floor WCAG 1.4.11 sets for a control boundary. */
 .fp-suggestion {
+  min-height: 28px;
   text-align: left;
-  padding: 9px 13px;
-  font-size: 12.5px;
+  padding: 8px 13px;
+  font-size: var(--fs-meta);
   color: var(--text);
-  background: var(--accent-ghost);
-  border: 1px solid rgba(139, 124, 246, 0.2);
-  border-radius: 20px;
+  background-color: transparent;
+  background-image: linear-gradient(
+    98deg,
+    color-mix(in srgb, var(--accent-fill) 32%, transparent) 0%,
+    color-mix(in srgb, var(--accent-fill) 20%, transparent) 62%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  background-repeat: no-repeat;
+  background-position: left center;
+  background-size: 0% 100%;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 18px 15px 18px 15px;
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition:
+    background-size var(--dur) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
 }
 .fp-suggestion:hover {
-  background: var(--accent-soft);
-  border-color: rgba(139, 124, 246, 0.4);
+  background-size: 100% 100%;
+  border-color: var(--sketch);
+}
+/* Pressed against the paper. */
+.fp-suggestion:active {
+  transform: translateY(1px);
 }
 
-/* The tray handle: deliberately quieter than the chips it reveals — no
-   violet at rest, so the dashboard's one accent stays on real actions. */
+/* The tray handle: deliberately quieter than the chips it reveals — pencil
+   weight and muted ink at rest, so the page's one accent stays on real work. */
 .fp-suggestions-toggle {
+  min-height: 28px;
   text-align: left;
-  padding: 9px 13px;
-  font-size: 12.5px;
-  color: var(--text-dim);
+  padding: 8px 13px;
+  font-size: var(--fs-meta);
+  color: var(--muted);
   background: transparent;
-  border: 1px solid var(--surface-3);
-  border-radius: 20px;
+  border: 1px solid var(--line);
+  border-radius: 999px 999px 999px 999px / 18px 15px 18px 15px;
   cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease;
+  transition:
+    color var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
 }
 .fp-suggestions-toggle:hover {
-  color: var(--text);
-  border-color: var(--text-faint);
+  color: var(--text-strong);
+  border-color: var(--rule-strong);
 }
 
+/* ==========================================================================
+   3. MOTION
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .fp-suggestion,
+  .fp-suggestions-toggle {
+    transition: none;
+  }
+  .fp-suggestion:active {
+    transform: none;
+  }
+}

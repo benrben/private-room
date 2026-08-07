@@ -30,6 +30,13 @@ const DEFAULT_COL_W = 96;
  * like it ended at row 1,000.
  */
 const MAX_COLS = 512;
+/**
+ * How many stored cells the notes panel is willing to walk before it declines.
+ * The scan is O(stored cells) and runs once per sheet; a workbook past this
+ * size gets a note saying it was not counted rather than a number nobody
+ * waited for. 250,000 is roughly 15ms on the machines this ships to.
+ */
+const SCAN_LIMIT = 250_000;
 
 export interface SheetTarget {
   sheet?: string;
@@ -174,6 +181,15 @@ export default function SheetView({
     value: string;
     seed: string;
   } | null>(null);
+  /**
+   * The cell the formula bar is reading.
+   *
+   * A readout, and nothing more: setting it selects nothing, moves nothing and
+   * writes nothing. It exists because a spreadsheet cell shows its RESULT, so
+   * without a bar the only way to see a formula was to hover the cell and wait
+   * for a tooltip — which a keyboard has no way to do at all.
+   */
+  const [active, setActive] = useState<{ r: number; c: number } | null>(null);
   /** Why the last commit was declined, shown under the grid. */
   const [notice, setNotice] = useState("");
   const gridRef = useRef<HTMLDivElement>(null);
@@ -265,6 +281,48 @@ export default function SheetView({
   }, [workbook, name]);
 
   const numCols = Math.min(MAX_COLS, sheet.totalCols);
+
+  // The formula bar reads a cell of THIS sheet, so switching sheets has to
+  // clear it — otherwise C14 of the old sheet would be reported as C14 of the
+  // new one, which is exactly the kind of quiet lie this viewer must not tell.
+  useEffect(() => setActive(null), [name]);
+
+  /** The active cell, read straight off the worksheet rather than out of the
+   * rendered window: the window only holds the rows on screen, and the bar has
+   * to keep reporting the cell you left when you scroll away from it. */
+  const activeCell = useMemo(() => {
+    if (!active || !sheet.ws) return null;
+    return toGridCell(
+      sheet.ws[XLSX.utils.encode_cell({ r: active.r, c: active.c })] as XLSX.CellObject,
+    );
+  }, [active, sheet.ws]);
+
+  /**
+   * What the notes panel can say about this sheet without guessing.
+   *
+   * Every figure is counted off the parsed worksheet, so the panel is a
+   * READING of the file, never a summary of it. The scan walks each stored
+   * cell once per sheet; past `SCAN_LIMIT` stored cells it declines and says
+   * so, because a 2-million-cell export must not spend a second counting
+   * before it will draw, and "we did not count" is the honest answer.
+   */
+  const scan = useMemo(() => {
+    const ws = sheet.ws;
+    if (!ws) return { scanned: false, cells: 0, formulas: 0 };
+    const keys = Object.keys(ws);
+    if (keys.length > SCAN_LIMIT) return { scanned: false, cells: 0, formulas: 0 };
+    let cells = 0;
+    let formulas = 0;
+    for (const k of keys) {
+      // "!ref", "!cols", "!merges", "!margins" … are the sheet's metadata.
+      if (k.charCodeAt(0) === 33) continue;
+      const cell = ws[k] as XLSX.CellObject | undefined;
+      if (!cell) continue;
+      cells += 1;
+      if (cell.f) formulas += 1;
+    }
+    return { scanned: true, cells, formulas };
+  }, [sheet.ws]);
 
   /** Build only the rows currently on screen. */
   const rows = useMemo(() => {
@@ -430,6 +488,35 @@ export default function SheetView({
   const padTop = view.first * ROW_H;
   const padBottom = Math.max(0, (totalRows - lastRendered) * ROW_H);
 
+  // ---- the formula bar's three fields -------------------------------------
+  const activeRef = active ? `${colLetters(active.c)}${active.r + 1}` : null;
+  // A cell this session changed reports what is in the FILE now, not what the
+  // workbook held when it was parsed.
+  const activeEdit = activeRef ? editedAt(name, activeRef) : undefined;
+  // A committed edit is always a VALUE — a typed formula is declined — so a
+  // changed cell stops being reported as computed.
+  const barIsFormula = !!activeCell?.formula && !activeEdit;
+  const usedRange =
+    totalRows > 0 && totalCols > 0
+      ? `A1:${colLetters(totalCols - 1)}${totalRows}`
+      : "—";
+  const barValue = active
+    ? (activeEdit ? activeEdit.after : activeCell?.edit ?? "") || "(empty)"
+    : `${name} — ${totalRows.toLocaleString()} rows × ${totalCols.toLocaleString()} columns`;
+
+  // ---- what the notes panel can say without guessing ----------------------
+  const changedHere = edits.filter((e) => e.sheet === name);
+  const hiddenCols = widths.filter((w) => w === 0).length;
+  const mergedCols = sheet.merges.size;
+  const glance = [
+    `${totalRows.toLocaleString()} rows`,
+    `${totalCols.toLocaleString()} columns`,
+    scan.scanned ? `${scan.formulas.toLocaleString()} formulas` : null,
+    changedHere.length > 0 ? `${changedHere.length} changed` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
   return (
     <div className="sheet-view">
       {workbook.SheetNames.length > 1 && (
@@ -437,10 +524,17 @@ export default function SheetView({
           {workbook.SheetNames.map((n, i) => (
             <button
               key={n}
+              type="button"
+              // `active` is kept for the base rules in viewer-formats.css;
+              // aria-current is what a screen reader reads and what the
+              // notebook divider styles itself from, so "which sheet am I on"
+              // never rests on a background colour alone.
               className={i === sheetIdx ? "active" : ""}
+              aria-current={i === sheetIdx ? "true" : undefined}
               onClick={() => {
                 setSheetIdx(i);
                 setEditing(null);
+                setActive(null);
                 setNotice("");
                 if (gridRef.current) gridRef.current.scrollTop = 0;
               }}
@@ -469,7 +563,7 @@ export default function SheetView({
               <strong>
                 {edits.length} cell{edits.length === 1 ? "" : "s"} changed
               </strong>
-              <button className="subtle" onClick={undoLastEdit}>
+              <button className="nb-btn" onClick={undoLastEdit}>
                 Undo {edits[edits.length - 1].ref} ⌘Z
               </button>
             </span>
@@ -481,6 +575,22 @@ export default function SheetView({
           {notice}
         </div>
       )}
+      {/* The formula bar. A cell shows its RESULT, so this is the only place
+          its SOURCE is readable — and it scrolls rather than truncating,
+          because a formula cut off at the pane's edge is a formula
+          misreported. With no cell picked it states the sheet's own identity
+          and true extent instead of sitting empty.
+
+          Deliberately not a live region: it changes on every arrow-key step,
+          and a screen reader announcing the whole bar on each one would bury
+          the cell content it is already reading. */}
+      <div className="sheet-bar">
+        <span className="sheet-ref">{active ? activeRef : usedRange}</span>
+        <span className={`sheet-field-key${barIsFormula ? " is-formula" : ""}`}>
+          {active ? (barIsFormula ? "Formula" : "Value") : "Sheet"}
+        </span>
+        <span className="sheet-src">{barValue}</span>
+      </div>
       <div className="sheet-scroll" ref={gridRef} onScroll={measure}>
         <table role="grid" aria-readonly={!editable} aria-rowcount={totalRows}>
           <colgroup>
@@ -568,13 +678,15 @@ export default function SheetView({
                     // `typed` is the character that opened the editor (Excel's
                     // type-to-replace); `seed` stays the cell's own content so
                     // that counts as a change and a bare click does not.
-                    const startEdit = (typed?: string) =>
+                    const startEdit = (typed?: string) => {
+                      setActive({ r: i, c: j });
                       setEditing({
                         r: i,
                         c: j,
                         value: typed ?? changed?.after ?? cell.edit,
                         seed: changed?.after ?? cell.edit,
                       });
+                    };
                     return (
                       <td
                         key={j}
@@ -592,7 +704,24 @@ export default function SheetView({
                             ? `Formula: ${cell.edit} — saving a value here replaces the formula with that value.`
                             : undefined
                         }
-                        onClick={editable && !isEditing ? () => startEdit() : undefined}
+                        // Point the formula bar at whatever the keyboard lands
+                        // on. Read-only sheets have no focusable cells, so
+                        // there the click below is what feeds the bar.
+                        onFocus={
+                          editable && !isEditing
+                            ? () => setActive({ r: i, c: j })
+                            : undefined
+                        }
+                        // A read-only cell can still be INSPECTED. Nothing is
+                        // selected, moved or written; the click only tells the
+                        // bar which cell to read, which is the difference
+                        // between a formula you can see and one hidden behind
+                        // a hover tooltip.
+                        onClick={
+                          editable && !isEditing
+                            ? () => startEdit()
+                            : () => setActive({ r: i, c: j })
+                        }
                         onKeyDown={
                           editable && !isEditing
                             ? (e) => {
@@ -640,6 +769,105 @@ export default function SheetView({
           </tbody>
         </table>
       </div>
+      {/* The notes panel: what this viewer can say about the sheet WITHOUT
+          guessing. Every line is counted off the parsed workbook, so it is a
+          reading of the file and never a summary of it — and where it cannot
+          count (a workbook past SCAN_LIMIT) it says so rather than rounding.
+
+          Closed by default, because vertical space in a grid belongs to the
+          grid; the one-line glance in the summary carries the headline figures
+          so the panel is worth something without being opened. */}
+      <details className="sheet-notes">
+        <summary>
+          <span className="sheet-notes-caret" aria-hidden>
+            ▸
+          </span>
+          <span className="sheet-notes-label">Notes</span>
+          <span className="sheet-notes-glance">{glance}</span>
+        </summary>
+        <dl className="sheet-notes-fields">
+          <div className="sheet-note">
+            <dt>Grid</dt>
+            <dd>
+              <code>{totalRows.toLocaleString()}</code> rows by{" "}
+              <code>{totalCols.toLocaleString()}</code> columns —{" "}
+              <code>{usedRange}</code>. Rows and columns are numbered exactly as
+              the file numbers them, so a sheet whose data starts at B3 still
+              shows an empty column A and rows 1 and 2.
+            </dd>
+          </div>
+          <div className="sheet-note">
+            <dt>Formulas</dt>
+            <dd>
+              {!scan.scanned ? (
+                <>
+                  This sheet holds too many cells to count one by one, so no
+                  total is given here rather than a guess. Individual formula
+                  cells are still marked in their top-right corner.
+                </>
+              ) : scan.formulas === 0 ? (
+                <>
+                  None. All <code>{scan.cells.toLocaleString()}</code> filled
+                  cells hold values that were typed or pasted in.
+                </>
+              ) : (
+                <>
+                  <code>{scan.formulas.toLocaleString()}</code> of{" "}
+                  <code>{scan.cells.toLocaleString()}</code> filled cells are
+                  computed. Each is marked in its top-right corner, and
+                  selecting one shows its source in the bar above the grid — the
+                  grid itself can only ever show the result.
+                </>
+              )}
+            </dd>
+          </div>
+          {mergedCols > 0 && (
+            <div className="sheet-note">
+              <dt>Merged</dt>
+              <dd>
+                <code>{mergedCols.toLocaleString()}</code> merges run across
+                columns and are drawn as one wide cell. A merge that runs down
+                ROWS is drawn as its top cell instead — nothing is hidden, since
+                the cells it covers are empty in the file.
+              </dd>
+            </div>
+          )}
+          {hiddenCols > 0 && (
+            <div className="sheet-note">
+              <dt>Hidden</dt>
+              <dd>
+                <code>{hiddenCols.toLocaleString()}</code> of the columns shown
+                here are hidden in the file, and are drawn at zero width. They
+                keep their place, so every column letter after them is still the
+                file's own.
+              </dd>
+            </div>
+          )}
+          {hlActive && target?.range && (
+            <div className="sheet-note">
+              <dt>Pointed at</dt>
+              <dd>
+                The assistant pointed at <code>{target.range}</code> on this
+                sheet. Those cells are outlined and washed in yellow in the grid
+                above.
+              </dd>
+            </div>
+          )}
+          {changedHere.length > 0 && (
+            <div className="sheet-note">
+              <dt>Changed here</dt>
+              <dd>
+                <code>{changedHere.map((e) => e.ref).join(", ")}</code> —
+                changed in this session and already saved into the file. Each
+                one carries a pink edge in the grid; ⌘Z puts the last one back.
+              </dd>
+            </div>
+          )}
+          {/* `readOnlyReason` is deliberately NOT repeated here: it already
+              has its own strip above the grid, and a sentence printed twice on
+              one screen reads as two different facts. */}
+        </dl>
+      </details>
       {/* Trimming must always be visible — a wide report silently stopping at
           column BH reads as "those columns aren't in the file". Rows no longer
           trim at all. */}

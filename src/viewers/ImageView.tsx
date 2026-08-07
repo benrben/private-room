@@ -305,8 +305,8 @@ export default function ImageView({ fileId, name, mime, mediaToken, dataB64, tex
             padding: "8px 12px",
             margin: "2px 0",
             borderRadius: 8,
-            background: "rgba(139, 124, 246, 0.08)",
-            border: "1px solid rgba(139, 124, 246, 0.16)",
+            background: "color-mix(in srgb, var(--mk-pink) 12%, transparent)",
+            border: "1px solid color-mix(in srgb, var(--mk-pink) 26%, transparent)",
           }}
         >
           <span style={{ color: "var(--text-dim)" }}>

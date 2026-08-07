@@ -2,6 +2,7 @@ import { WSState } from "../state";
 import { WSActions } from "../actions";
 import { ScriptIcon, CloseIcon, PlusIcon } from "../../icons";
 import { ScriptRow } from "./ScriptRow";
+import { SCRIPT_POWERS, SCRIPT_WORKSPACE_NOTE } from "../scriptTrust";
 
 type Props = { s: WSState; a: WSActions };
 
@@ -15,7 +16,7 @@ export function ScriptsPage({ s, a }: Props) {
           <ScriptIcon size={15} /> Scripts
         </span>
         <span className="viewer-actions">
-          <button className="subtle btn-ic" onClick={() => void a.createNewScript()}>
+          <button className="btn-ic script-go" onClick={() => void a.createNewScript()}>
             <PlusIcon size={13} /> New script
           </button>
           <button className="subtle btn-ic" onClick={() => a.closeScripts()}>
@@ -24,6 +25,22 @@ export function ScriptsPage({ s, a }: Props) {
         </span>
       </div>
       <div className="scripts-body">
+        {/* The permissions every run on this page gets, stated once, in the
+            interface sans at reading size — a security statement is never an
+            aside and never handwriting. The sentences come from scriptTrust.ts
+            rather than being retyped here, because that module is deliberately
+            the ONE place the app's trust wording lives: the run-consent card
+            and this page must never be able to drift apart.
+
+            Only when there is something to run: a standing caution over "No
+            scripts yet" warns about a thing that cannot happen. */}
+        {s.scripts.length > 0 && (
+          <p className="script-caution script-caution-page">
+            <strong>Every run:</strong> a script here is a real program:{" "}
+            {SCRIPT_POWERS} {SCRIPT_WORKSPACE_NOTE} Each version is approved
+            once, on this Mac, before it can run at all.
+          </p>
+        )}
         {s.scripts.length === 0 ? (
           <div className="scripts-empty">
             <h3>No scripts yet</h3>

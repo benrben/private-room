@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import monaco, { monacoTheme, watchMonacoTheme } from "./monacoSetup";
+import monaco, {
+  EDITOR_FONT,
+  monacoTheme,
+  remeasureWhenFontReady,
+  watchMonacoTheme,
+} from "./monacoSetup";
 import { SaveIcon } from "../icons";
 
 /** Build the toolbar operations for a live editor.
@@ -176,6 +181,7 @@ export default function CodeEditor({
       readOnly: !!readOnly,
       automaticLayout: true,
       minimap: { enabled: false },
+      fontFamily: EDITOR_FONT,
       fontSize: 13,
       wordWrap: "on",
       scrollBeyondLastLine: false,
@@ -212,6 +218,53 @@ export default function CodeEditor({
   // Follow the app's light/dark switch instead of staying black in light mode.
   useEffect(watchMonacoTheme, []);
 
+  /** The first line of the file has to be on screen when the file opens.
+   *
+   * Two things can leave it above the fold. The bundled monospace face can
+   * land after monaco has measured its glyph box, which relays every line out
+   * under a scroll offset computed for the old one; and the editor can be
+   * built while the centre pane is still settling, so its first layout is
+   * against a height it is about to lose. Live QA caught the result on a .js
+   * file — the gutter began at line 2, with the opening comment clipped at the
+   * top edge.
+   *
+   * So: remeasure once the face is really there, then put the viewport back at
+   * the top — unless something has deliberately gone elsewhere. A citation
+   * reveal and any reader input both count, which is why this WATCHES rather
+   * than assumes. Correcting a scroll position out from under someone who
+   * navigated on purpose would be a worse bug than the one it fixes. */
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    // `find` is read once on purpose: it is the citation this editor was
+    // MOUNTED with. A later one arrives through the effect above, which moves
+    // the selection — and that trips the same flag.
+    let moved = !!find;
+    const mark = () => {
+      moved = true;
+    };
+    const subs = [
+      editor.onKeyDown(mark),
+      editor.onMouseDown(mark),
+      editor.onDidChangeCursorPosition(mark),
+    ];
+    let alive = true;
+    const settle = () => {
+      if (!alive || moved) return;
+      if (editor.getScrollTop() !== 0) editor.setScrollTop(0);
+    };
+    const raf = requestAnimationFrame(settle);
+    void remeasureWhenFontReady().then(settle);
+    return () => {
+      alive = false;
+      cancelAnimationFrame(raf);
+      subs.forEach((d) => d.dispose());
+    };
+    // Mount only: the parent keys this component by file id, so a different
+    // file is a different editor with its own first line to show.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   /** Jump to the word the AI (or a search result) pointed at. Runs on every
    * change of `find`, not once at mount — a second request in an already-open
    * file used to be ignored entirely. The find widget is opened seeded with
@@ -234,10 +287,31 @@ export default function CodeEditor({
       {banner && !readOnly && <div className="editor-banner">{banner}</div>}
       {onSave && !readOnly && (
         <div className="editor-bar">
-          <span className={`editor-dirty ${dirty ? "on" : ""}`}>
+          {/* What this buffer IS, at the head of its own bar. The bar used to
+              open with a dirty flag and nothing else, so a code file's header
+              said only whether it had been typed in. Blue is the product's
+              informational marker and the word carries the fact — this is a
+              label, not a status.
+
+              The auto margin is inline because .editor-bar (viewer-formats.css,
+              another owner's file) justifies its children to the end, and there
+              is no margin utility in the shared primitives to say this with. */}
+          <span className="nb-cat nb-mark-blue" style={{ marginRight: "auto" }}>
+            {language}
+          </span>
+          {/* Unsaved work is a state to notice, which is what the yellow marker
+              means product-wide — and it arrives as a strip of tape, so the
+              change is a SHAPE as well as a hue. The saved state deliberately
+              gets no mark at all: a permanent green badge saying nothing is
+              wrong is noise, and the resting state of a buffer should be calm.
+              The wording is unchanged; `editor-dirty` is dropped in the dirty
+              case only because its `.on` colour would fight the tape's ink. */}
+          <span className={dirty ? "nb-tape nb-sem-pending" : "editor-dirty"}>
             {dirty ? "● unsaved changes" : "all changes saved"}
           </span>
-          <button className="subtle btn-ic" onClick={() => void saveNow()}>
+          {/* Saving is the one action in this bar, so it is drawn as a real
+              outlined control rather than as a third flat link. */}
+          <button className="nb-btn btn-ic" onClick={() => void saveNow()}>
             <SaveIcon size={13} /> {saveLabel ?? "Save"} ⌘S
           </button>
         </div>

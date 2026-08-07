@@ -1,49 +1,171 @@
 /* An e-book, as a book. The chapter itself renders inside the roomdoc://
    sandbox (an opaque, script-free, network-free origin), so everything here
-   is the reader's chrome around that frame. */
-.book-view { display: flex; flex-direction: column; height: 100%; min-height: 0; outline: none; }
+   is the reader's chrome around that frame.
+
+   The chapter's own theme is NOT forced to paper the way a legacy Word
+   document's is (see officedoc.css). The two cases are genuinely different: a
+   .doc is a fixed document whose author named ink colours and trusted the
+   page, while an EPUB is reflowable text whose publisher's stylesheet almost
+   never sets colours at all — and a novel read at night is the one place a
+   dark page is what the reader wants. So BookView keeps handing the chapter
+   frameIsDark(), and this frame agrees with it through --raised. */
+.book-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  outline: none;
+}
+
+/* Composed with `.rdr-bar` (styles/viewer.css): transparent, with the hand-
+   drawn pencil rule under it instead of a filled toolbar. */
 .book-bar {
   display: flex;
-  gap: 0.75rem;
+  gap: var(--sp-3);
   align-items: center;
-  padding: 0.4rem 0.75rem;
-  border-bottom: 1px solid var(--border);
 }
-.book-where { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.book-of { color: var(--muted); }
-.book-actions { display: flex; gap: 0.3rem; }
-.book-stage { flex: 1; display: flex; min-height: 0; }
-.book-frame { flex: 1; border: 0; background: #fdfcfa; }
+.book-where {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-body);
+  color: var(--text-strong);
+}
+/* "4 of 21" is a count pencilled beside the title — exactly what the hand is
+   reserved for. */
+.book-of {
+  font-family: var(--hand);
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.book-actions {
+  display: flex;
+  gap: var(--sp-1);
+}
+
+/* The progress stroke sits flush under the bar rather than floating in a
+   page's top margin, which is where `.rdr-progress` puts it inside a
+   document. Written at two-class specificity because `.rdr-progress` in
+   styles/viewer.css sets the same properties, and which of the two stylesheets
+   the bundler emits first is not something this file should have to know. */
+.book-view .book-progress {
+  position: static;
+  flex: 0 0 auto;
+  margin-bottom: 0;
+  border-radius: 0;
+}
+
+.book-stage {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+/* An e-book page is paper. BookView hands the chapter the app's theme via
+   frameIsDark(), so the frame behind it must agree. */
+.book-frame {
+  flex: 1;
+  border: 0;
+  background: var(--raised);
+}
+
 .book-toc {
   flex: none;
-  width: 16rem;
+  width: 17rem;
   overflow: auto;
-  padding: 0.75rem;
-  border-inline-end: 1px solid var(--border);
+  padding: var(--sp-3);
+  border-inline-end: 1px solid var(--line);
 }
-.book-cover { display: block; width: 100%; border-radius: 4px; margin-bottom: 0.6rem; }
-.book-meta { display: flex; flex-direction: column; gap: 0.15rem; margin-bottom: 0.6rem; font-size: 0.8rem; }
-.book-meta span { color: var(--muted); }
-.book-toc ol { margin: 0; padding: 0; list-style: none; }
-.book-toc li button {
+.book-cover {
   display: block;
   width: 100%;
-  padding: 0.25rem 0.4rem;
+  border-radius: var(--radius-sm);
+  margin-bottom: var(--sp-2);
+}
+.book-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-meta);
+  color: var(--text-strong);
+}
+.book-meta span {
+  color: var(--muted);
+}
+.book-toc ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.book-toc li button {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-height: 24px;
+  padding: 4px var(--sp-2) 6px;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: none;
-  color: inherit;
+  color: var(--muted);
   cursor: pointer;
   text-align: start;
-  font-size: 0.8rem;
+  font-size: var(--fs-meta);
   line-height: 1.45;
+  transition: color var(--dur-fast) var(--ease-pen);
 }
-.book-toc li button:hover { background: var(--panel); }
-.book-toc li button.active { background: var(--panel); color: var(--accent); }
+.book-toc li button:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.book-toc li button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* The chapter you are in. The marker underline is the app's ONE active signal
+   (paper.css section 2) — the same mark the reader's modes and the activity
+   rail use — rather than a third way of saying "selected". */
+.book-toc li button.active {
+  color: var(--text-strong);
+}
+.book-toc li button.active::after {
+  content: "";
+  position: absolute;
+  left: var(--sp-2);
+  right: var(--sp-2);
+  bottom: 2px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--accent-fill) 0%,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 68%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  pointer-events: none;
+}
+
 .book-nav {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--sp-2);
   justify-content: center;
-  padding: 0.45rem;
-  border-top: 1px solid var(--border);
+  padding: var(--sp-2);
+  /* The pencil rule, fading at both ends, rather than a flat 1px border. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .book-toc li button {
+    transition: none;
+  }
 }

@@ -207,7 +207,7 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
 
       {node.kind === "generate" && (
         <label>
-          Prompt <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}} {{files}} {{date}}"})</span>
+          Prompt <span className="wf-field-hint">({"{{input}} {{files}} {{date}}"})</span>
           <textarea value={String(node.prompt ?? "")} onChange={(e) => set("prompt", e.target.value)} />
         </label>
       )}
@@ -254,7 +254,7 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
 
       {node.kind === "for_each_file" && (
         <label>
-          Instruction <span style={{ opacity: 0.6, fontWeight: 400 }}>(run on EACH file)</span>
+          Instruction <span className="wf-field-hint">(run on EACH file)</span>
           <textarea value={String(node.instruction ?? "")} onChange={(e) => set("instruction", e.target.value)} />
         </label>
       )}
@@ -268,7 +268,7 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
 
       {node.kind === "extract" && (
         <label>
-          Fields to pull out <span style={{ opacity: 0.6, fontWeight: 400 }}>(comma-separated)</span>
+          Fields to pull out <span className="wf-field-hint">(comma-separated)</span>
           <CsvField
             key={`${node.id}:fields`}
             value={node.fields}
@@ -281,11 +281,11 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
       {node.kind === "route" && (
         <>
           <label>
-            Question <span style={{ opacity: 0.6, fontWeight: 400 }}>(how to classify {"{{input}}"})</span>
+            Question <span className="wf-field-hint">(how to classify {"{{input}}"})</span>
             <textarea value={String(node.prompt ?? "")} onChange={(e) => set("prompt", e.target.value)} />
           </label>
           <label>
-            Labels <span style={{ opacity: 0.6, fontWeight: 400 }}>(comma-separated — each becomes a branch)</span>
+            Labels <span className="wf-field-hint">(comma-separated — each becomes a branch)</span>
             <CsvField
               key={`${node.id}:labels`}
               value={node.labels}
@@ -299,7 +299,7 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
       {node.kind === "vote" && (
         <>
           <label>
-            Prompt <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}}"})</span>
+            Prompt <span className="wf-field-hint">({"{{input}}"})</span>
             <textarea value={String(node.prompt ?? "")} onChange={(e) => set("prompt", e.target.value)} />
           </label>
           <label>
@@ -331,11 +331,11 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
       {node.kind === "refine" && (
         <>
           <label>
-            Prompt <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}} {{files}}"})</span>
+            Prompt <span className="wf-field-hint">({"{{input}} {{files}}"})</span>
             <textarea value={String(node.prompt ?? "")} onChange={(e) => set("prompt", e.target.value)} />
           </label>
           <label>
-            Quality bar <span style={{ opacity: 0.6, fontWeight: 400 }}>(what a good result must be)</span>
+            Quality bar <span className="wf-field-hint">(what a good result must be)</span>
             <textarea value={String(node.rubric ?? "")} onChange={(e) => set("rubric", e.target.value)} />
           </label>
           <label>
@@ -354,7 +354,7 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
       {node.kind === "plan_and_map" && (
         <>
           <label>
-            Objective <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}} {{files}}"})</span>
+            Objective <span className="wf-field-hint">({"{{input}} {{files}}"})</span>
             <textarea value={String(node.objective ?? "")} onChange={(e) => set("objective", e.target.value)} />
           </label>
           <label>
@@ -410,7 +410,7 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
 
       {node.kind === "http_fetch" && (
         <label>
-          URL <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{input}} {{date}}"})</span>
+          URL <span className="wf-field-hint">({"{{input}} {{date}}"})</span>
           <input type="text" placeholder="https://…" value={String(node.url ?? "")} onChange={(e) => set("url", e.target.value)} />
         </label>
       )}
@@ -471,7 +471,7 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
       {node.kind === "save_file" && (
         <>
           <label>
-            File name <span style={{ opacity: 0.6, fontWeight: 400 }}>({"{{date}}"})</span>
+            File name <span className="wf-field-hint">({"{{date}}"})</span>
             <input type="text" value={String(node.name_template ?? "")} onChange={(e) => set("name_template", e.target.value)} />
           </label>
           <label>
@@ -592,7 +592,9 @@ export function NodeParamSheet({ node, onChange, onDelete, edges, allNodes, onEd
         </div>
       )}
 
-      <button className="subtle" data-agent-blocked onClick={onDelete} style={{ alignSelf: "flex-start" }}>
+      {/* Destructive, so it is drawn as an outline in the urgent ink and
+          carries the word — never a filled red, never colour alone. */}
+      <button className="nb-btn nb-btn-danger wf-delete-step" data-agent-blocked onClick={onDelete}>
         Delete step
       </button>
     </div>

@@ -1,32 +1,77 @@
 /* A Jupyter notebook, laid out the way JupyterLab lays one out: a numbered
-   execution gutter beside each code cell, prose cells full-width between them. */
-.nb-view { padding: 0.75rem 1rem 3rem; }
-.nb-cell { margin-bottom: 1rem; }
-.nb-code { display: flex; gap: 0.6rem; align-items: flex-start; }
+   execution gutter beside each code cell, prose cells full-width between them.
+
+   NAMESPACE WARNING (the other half of the note in styles/paper.css): every
+   `.nb-*` class in this file belongs to the notebook VIEWER and predates the
+   shared notebook-primitive library. They are not the same vocabulary, and
+   paper.css must never define one of them. The page these cells sit on comes
+   from `.viewer-host > .nb-view` in styles/viewer.css. */
+.nb-view {
+  padding: 0.75rem 1rem 3rem;
+}
+.nb-cell {
+  margin-bottom: var(--sp-4);
+}
+.nb-code {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: flex-start;
+}
+/* An execution count is figures: mono and tabular, so [9] and [142] line up
+   down the margin instead of drifting. */
 .nb-gutter {
   flex: none;
   width: 3.5rem;
   padding-top: 0.9rem;
   text-align: right;
+  font-family: var(--mono);
   font-variant-numeric: tabular-nums;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   color: var(--muted);
 }
-.nb-body { flex: 1; min-width: 0; }
-.nb-md { padding-inline-start: 4.1rem; }
+.nb-body {
+  flex: 1;
+  min-width: 0;
+}
+.nb-md {
+  padding-inline-start: 4.1rem;
+}
+/* A raw cell is the notebook's own source, not prose — mono, and quieter. */
 .nb-raw {
   padding-inline-start: 4.1rem;
   white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
   color: var(--muted);
 }
+/* What the cell printed. Output is technical text, so it keeps the mono face;
+   the stroke down its leading edge is what says it belongs to the cell above
+   rather than being a new one. */
 .nb-out {
-  margin: 0.35rem 0 0;
-  padding: 0.5rem 0.7rem;
-  border-inline-start: 2px solid var(--border);
+  margin: var(--sp-1) 0 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-inline-start: 2px solid color-mix(in srgb, var(--sketch) 45%, transparent);
   white-space: pre-wrap;
   overflow-x: auto;
-  font-size: 0.85rem;
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  line-height: 1.55;
 }
-.nb-error { color: var(--danger, #e5646c); }
-.nb-muted { color: var(--muted); font-style: italic; }
-.nb-img { display: block; max-width: 100%; height: auto; margin-top: 0.35rem; }
+/* A traceback is a failure, and red carries that across the whole product —
+   but the exception text is what actually says so, so the colour and the
+   heavier stroke only reinforce the words. */
+.nb-error {
+  color: var(--danger);
+  border-inline-start-color: var(--sem-urgent-fill);
+}
+.nb-muted {
+  color: var(--muted);
+  font-style: italic;
+}
+.nb-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin-top: var(--sp-1);
+  border-radius: var(--radius-sm);
+}

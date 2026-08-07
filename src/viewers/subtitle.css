@@ -1,33 +1,101 @@
-/* Subtitles as a timed transcript: the stamp is a column you read past,
-   not a line between every sentence. */
-.srt-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+/* ------------------------------------------------------------------ *
+ * Subtitles as a timed transcript.
+ *
+ * Before this a `.srt` had no viewer: it opened on the plain-text card with
+ * a cue number and a raw timecode between every line of speech. Here the
+ * timing is a MONO gutter you read past — the same treatment the recording
+ * transcript gives its turn stamps, and for the same reason: a timecode is
+ * technical data, never an annotation, so it is never the hand.
+ *
+ * Nothing below names a colour; light mode falls out of the same rules.
+ * ------------------------------------------------------------------ */
+
+.srt-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
 .srt-bar {
   display: flex;
-  gap: 0.75rem;
+  gap: var(--sp-3);
   align-items: center;
   justify-content: space-between;
-  padding: 0.4rem 0.75rem;
-  border-bottom: 1px solid var(--border);
-}
-.srt-list { flex: 1; overflow: auto; margin: 0; padding: 0.5rem 0.75rem 3rem; list-style: none; }
-.srt-cue { display: flex; gap: 0.65rem; align-items: flex-start; padding: 0.2rem 0; }
-.srt-time {
   flex: none;
-  width: 4rem;
-  padding-top: 0.15rem;
-  font-variant-numeric: tabular-nums;
-  font-size: 11px;
-  color: var(--accent);
+  padding: var(--sp-2) var(--sp-4);
+  /* A drawn rule rather than a flat border: a pencil stroke thins at both
+     ends. Carried as a background so it costs no element. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 2%,
+    var(--line) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }
-.srt-text { flex: 1; min-width: 0; line-height: 1.5; white-space: pre-wrap; }
+
+.srt-list {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4) var(--sp-8);
+  list-style: none;
+}
+
+/* One cue per row: the stamp in a fixed gutter, the words in the column. */
+.srt-cue {
+  display: grid;
+  grid-template-columns: 4.25rem minmax(0, 1fr);
+  gap: var(--sp-3);
+  align-items: start;
+  padding: 3px 0;
+}
+
+/* Mono and tabular so a column of timecodes lines up, and --muted rather
+   than the pen: the accent means selected or active everywhere in this
+   product, and every cue is neither. Sized up off the old 11px, which was
+   under the type scale's 12px floor. */
+.srt-time {
+  padding-top: 3px;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.srt-text {
+  min-width: 0;
+  font-size: var(--fs-body);
+  /* Subtitles are read in long runs; this is the cheapest thing that makes
+     one readable. */
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+/* In edit mode a cue is a field, and it has to look editable without the
+   list turning into a form. No boundary at rest, the pencil rule on hover,
+   the pen plus a focus ring when the caret is in it. */
 textarea.srt-text {
   resize: vertical;
   background: transparent;
   color: inherit;
   border: 1px solid transparent;
-  border-radius: 4px;
-  padding: 0.15rem 0.3rem;
+  border-radius: var(--radius-sm);
+  padding: 2px 5px;
+  margin: -2px -5px;
   font: inherit;
+  line-height: 1.7;
 }
-textarea.srt-text:hover { border-color: var(--border); }
-textarea.srt-text:focus { border-color: var(--accent); outline: none; }
+textarea.srt-text:hover {
+  border-color: var(--rule-strong);
+}
+textarea.srt-text:focus {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

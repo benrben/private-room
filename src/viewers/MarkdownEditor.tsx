@@ -17,6 +17,10 @@ import "./markdowneditor.css";
  * So: source and result side by side, and a toolbar for the marks people
  * actually use. The preview is the SAME `MarkdownView` the reader uses, not a
  * second renderer that could disagree with it.
+ *
+ * FOCUS puts the formatting row away and lets the page have the width. It is
+ * a third axis, not a fourth layout: Source / Split / Preview still decide
+ * WHAT you are looking at, and Focus decides how much chrome is in the way.
  */
 
 type Layout = "split" | "source" | "preview";
@@ -65,6 +69,12 @@ export default function MarkdownEditor({
   banner,
 }: Props) {
   const [layout, setLayout] = useState<Layout>("split");
+  /** Focused writing: the formatting row goes away and the page takes the
+   * width the chrome was using. The tools are UNMOUNTED rather than faded —
+   * a control at a third opacity is both a contrast failure and, worse, a
+   * phantom tab stop that a keyboard user lands on and cannot see. Turning
+   * focus back off brings every one of them back, in the same order. */
+  const [focus, setFocus] = useState(false);
   // The preview follows the buffer, not the saved file — that is the point.
   const [live, setLive] = useState(value);
   const formatRef = useRef<EditorFormatApi | null>(null);
@@ -74,24 +84,26 @@ export default function MarkdownEditor({
   }, []);
 
   return (
-    <div className="mde" data-layout={layout}>
+    <div className="mde" data-layout={layout} data-focus={focus ? "on" : "off"}>
       <div className="mde-bar">
-        <div className="mde-tools" role="toolbar" aria-label="Formatting">
-          {TOOLS.map((t) => (
-            <button
-              key={t.tip}
-              className="mde-tool"
-              title={t.tip}
-              aria-label={t.tip}
-              // The editor keeps the caret: a toolbar button that stole focus
-              // would apply its mark to a selection that no longer exists.
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => formatRef.current && t.run(formatRef.current)}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
+        {!focus && (
+          <div className="mde-tools" role="toolbar" aria-label="Formatting">
+            {TOOLS.map((t) => (
+              <button
+                key={t.tip}
+                className="mde-tool"
+                title={t.tip}
+                aria-label={t.tip}
+                // The editor keeps the caret: a toolbar button that stole focus
+                // would apply its mark to a selection that no longer exists.
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => formatRef.current && t.run(formatRef.current)}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="mde-layout" role="group" aria-label="Editor layout">
           {(["source", "split", "preview"] as Layout[]).map((l) => (
             <button
@@ -111,6 +123,14 @@ export default function MarkdownEditor({
             </button>
           ))}
         </div>
+        <button
+          className={`mde-focus${focus ? " active" : ""}`}
+          aria-pressed={focus}
+          title="Put the formatting tools away and give the page the room"
+          onClick={() => setFocus((f) => !f)}
+        >
+          Focus
+        </button>
       </div>
       <div className="mde-panes">
         {layout !== "preview" && (

@@ -1,10 +1,25 @@
 import { GraphIcon, PodcastIcon, StudioIcon } from "../icons";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+/* The AI column's own stylesheet — the Studio shelf and the Activity journal —
+ * is `styles/aiPane.css`, loaded from the App.css barrel beside every other
+ * section sheet. It is deliberately NOT a side-effect import in this file or in
+ * AiPane.tsx: e2e/page-script/activityPane.test.mjs transpiles AiPane.tsx in
+ * memory and rewrites only its `… from "…"` specifiers, so a bare `import
+ * "…css"` would survive into a data: URL module and fail to resolve. */
 
 /** The Studio Shelf (D5/D12). `scope` is a file id (this file) or undefined
  * (whole room). Rendered inside the right pane's Studio tab and reused by
- * area views. Flat rows, not cards — outputs are saved back into the room. */
+ * area views.
+ *
+ * A shelf of things you can make, so each artefact is an INDEX CARD with a
+ * hand-drawn category mark — flashcards blue, mind map green, podcast script
+ * yellow. Those hues are identity, not status: they say WHICH artefact, never
+ * how a run is going, which is why they come from the hue setters
+ * (.nb-mark-*) and not from the semantic ones. `ap-sig-*` picks one of the
+ * four fixed frame signatures so a run of cards does not look stamped, and it
+ * is assigned per card rather than by position so nothing re-shapes when the
+ * shelf grows a row. */
 export default function StudioShelf({
   scope,
   s,
@@ -20,7 +35,7 @@ export default function StudioShelf({
         {scope ? "From the open file" : "From this room's sources"}
       </div>
       <button
-        className="studio-row"
+        className="studio-row nb-mark-blue"
         onClick={() => a.openStudioPrompt("flashcards", scope)}
       >
         <span className="studio-row-icon">
@@ -33,7 +48,7 @@ export default function StudioShelf({
         <span className="studio-row-state">Create</span>
       </button>
       <button
-        className="studio-row"
+        className="studio-row ap-sig-b nb-mark-green"
         onClick={() => a.openStudioPrompt("mindmap", scope)}
       >
         <span className="studio-row-icon">
@@ -46,7 +61,7 @@ export default function StudioShelf({
         <span className="studio-row-state">Create</span>
       </button>
       <button
-        className="studio-row"
+        className="studio-row ap-sig-c nb-mark-yellow"
         onClick={() => a.openStudioPrompt("podcast", scope)}
       >
         <span className="studio-row-icon">

@@ -457,6 +457,24 @@ pub fn get_file_name(conn: &Connection, id: &str) -> Result<String, String> {
     )
 }
 
+/// A file's name whether or not it is in the trash — for RECEIPTS only.
+///
+/// Deliberately separate from [`get_file_name`], which hides trashed rows for
+/// the reason spelled out on [`get_file_meta`]: a by-id read that keeps working
+/// after a delete resurrects the file everywhere an id is still held. Naming
+/// one is the single exception, because a batch restore or a batch destroy has
+/// to say WHICH files it acted on, and by then the only rows it can name are
+/// trashed ones. It returns a name and nothing else — no bytes, no text, no
+/// metadata — so it cannot be the accidental route back into a deleted file.
+///
+/// `Option`, not `Result`: an id that names nothing is an ordinary outcome for
+/// a batch (someone else's window may have destroyed it a second ago), and the
+/// caller reports that per-file rather than failing the whole run.
+pub fn any_file_name(conn: &Connection, id: &str) -> Option<String> {
+    conn.query_row("SELECT name FROM files WHERE id = ?1", [id], |r| r.get(0))
+        .ok()
+}
+
 /// Where this file came from, when it came over the network — `None` for
 /// anything typed, imported from disk or generated in the room.
 ///
@@ -877,6 +895,39 @@ pub fn find_file_like(conn: &Connection, fragment: &str) -> Result<(String, Stri
         Ok((r.get(0)?, r.get(1)?))
     })
     .map_err(|_| format!("No file matching \"{fragment}\" in this room.{}", file_names_hint(conn)))
+}
+
+/// [`find_file_like`], but it also accepts the FOLDER-QUALIFIED name the room
+/// hands out.
+///
+/// THE ROUND-TRIP THIS CLOSES. `list_files_brief` — which is what the agent's
+/// `list_room_files` prints — renders a filed document as `Invoices/q3.pdf`.
+/// Every matcher underneath searches the `name` COLUMN, which holds `q3.pdf`
+/// alone. So the one string the model was just shown was the one string it
+/// could not use: "move Invoices/q3.pdf to Archive" came back "No file
+/// matching…", for a file plainly in the list. The model's only recovery was to
+/// guess that the prefix should be dropped — and a 4B mostly guessed wrong,
+/// which is a large part of why organizing by name never worked.
+///
+/// Order matters. The FULL string is tried first so a real file called
+/// `notes/draft.md` (a slash is legal in a name) still wins over a same-named
+/// file inside a `notes` folder; only when nothing matches is the last path
+/// segment tried. Falling back first would silently prefer the wrong file.
+pub fn find_file_like_qualified(
+    conn: &Connection,
+    fragment: &str,
+) -> Result<(String, String), String> {
+    match find_file_like(conn, fragment) {
+        Ok(hit) => Ok(hit),
+        Err(first) => match fragment.rsplit_once('/') {
+            // Empty tail ("Invoices/") names a folder, not a file — retrying on
+            // "" would match the newest file in the room, which is a confident
+            // wrong answer where an error is the honest one.
+            Some((_, tail)) if !tail.trim().is_empty() => find_file_like(conn, tail.trim())
+                .map_err(|_| first),
+            _ => Err(first),
+        },
+    }
 }
 
 /// Like `find_file_like`, but excludes the app's own generated "Full pass — …"

@@ -23,11 +23,16 @@ import { AgentGraph, type AgentTiming } from "./AgentGraph";
 import { uniqueFileName } from "./composer";
 import {
   annotationTarget,
+  handTokens,
   isCloudRoute,
+  isHandwritten,
+  isLatinScript,
   isModelReady,
   lostReplyAdvice,
   lostReplyNotice,
+  messageClock,
   patchStreamFences,
+  speakerName,
   splitMarkupBlocks,
 } from "./markup";
 import {
@@ -54,6 +59,35 @@ interface PastGraph {
   steps: { label: string; ok: boolean }[];
   lane: string;
   timings: { current: Record<string, AgentTiming> };
+}
+
+/** A short message set in the hand, with its technical tokens PRINTED.
+ *
+ * A person writing a note still prints the things that have to be read
+ * exactly — a filename, a host, an @mention — so `handTokens` marks those runs
+ * and they come out in the mono face inside the handwriting. The runs
+ * concatenate back to the message character for character (see `handTokens`),
+ * and this renders TEXT NODES only: the string never becomes markup, which is
+ * the same guarantee the sanitised Markdown path gives the other speaker.
+ *
+ * Used for the user's own notes alone. A short answer from the model goes
+ * through MarkdownView, which cannot be token-split — it does not need to be,
+ * because a model answer carrying code, a table or a URL fails the hand test
+ * outright and is set in the sans. */
+function HandNote({ text }: { text: string }) {
+  return (
+    <>
+      {handTokens(text).map((t, i) =>
+        t.mono ? (
+          <span key={i} className="msg-mono">
+            {t.text}
+          </span>
+        ) : (
+          t.text
+        ),
+      )}
+    </>
+  );
 }
 
 /** Pane 3: the chat header, onboarding banners, the message transcript (with
@@ -314,8 +348,15 @@ export default function ChatPane({
         )}
       </div>
 
+      {/* The kicker is the one handwritten word on a notice, and the rule
+          behind that split is worth stating once: the LABEL is an aside, so it
+          takes the hand; the CONSEQUENCE is an instruction about what leaves
+          this Mac, so it stays in the interface sans at reading size. A
+          privacy warning set in a handwriting face would be decoration
+          wearing the clothes of the product's core promise. */}
       {s.showSyncWarn && (
-        <div className="banner">
+        <div className="banner notice">
+          <span className="banner-kicker">Note</span>
           This room lives in a synced folder. Never open it on two computers
           at the same time — the file can be damaged. Lock it before
           switching machines.{" "}
@@ -328,6 +369,7 @@ export default function ChatPane({
           door open says so persistently, not in a setting nobody reopens. */}
       {isCloudRoute(model, s.ai) && s.privacyOn === false && (
         <div className="banner privacy-off-banner" role="alert">
+          <span className="banner-kicker">Heads up</span>
           Privacy is off — cloud models can see everything in this room,
           names and all. Turn it back on in Settings → Cloud privacy.
         </div>
@@ -511,13 +553,42 @@ export default function ChatPane({
           // reply? Only then does the recovery strip below appear.
           const lostReply =
             m.role === "assistant" ? lostReplyNotice(m.content) : null;
+          // The hand is a function of LENGTH and KIND, never of who is
+          // speaking (see `isHandwritten`) — with one carve-out: Arcelle's own
+          // "the reply was lost" notice is a consequence the reader has to act
+          // on, and the system reserves the sans for those. It is short enough
+          // to pass the hand test, so it is excluded by name rather than by
+          // length.
+          const hand = lostReply === null && isHandwritten(text);
+          // A LONG answer goes to the sans but keeps handwritten headings, per
+          // the brief. That only works while the hand has the glyphs — Kalam
+          // bundles latin + latin-ext only — so a Hebrew or CJK answer must
+          // keep its headings in the sans too. `is-hand` cannot carry this:
+          // these are exactly the messages that are NOT handwritten.
+          const latin = isLatinScript(text);
+          const clock = messageClock(m.createdAt);
           return (
-          <div key={m.id} id={`msg-${m.id}`} className={`msg ${m.role}`}>
+          <div
+            key={m.id}
+            id={`msg-${m.id}`}
+            className={`msg ${m.role}${hand ? " is-hand" : ""}${
+              latin ? " is-latin" : ""
+            }${m.id === lastAssistantId ? " is-latest" : ""}`}
+          >
             <div className="msg-label">
               <span className="msg-avatar" aria-hidden>
                 {m.role === "assistant" ? <SparkIcon size={12} /> : "•"}
               </span>
-              {m.role === "assistant" ? "Room AI" : "You"}
+              <span className="msg-who">{speakerName(m.role)}</span>
+              {/* The margin time of a notebook log line. Real stored data, in
+                  the mono face with the rest of the technical metadata — the
+                  page never derives a SHAPE from the clock, so a given
+                  conversation still draws identically on every render. */}
+              {clock && (
+                <time className="msg-when" dateTime={m.createdAt}>
+                  {clock}
+                </time>
+              )}
             </div>
             {/* The turn's own diagram when this session drew one (helpers,
                 their steps and their clocks stay readable afterwards); the
@@ -566,15 +637,24 @@ export default function ChatPane({
                     />
                   )}
                   {annotation && (
-                    <div
-                      className="annot-chip-wrap"
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "6px",
-                        flexWrap: "wrap",
-                      }}
-                    >
+                    // The one honest margin annotation on an answer: the model
+                    // located a passage and said so, so the note beside the
+                    // answer is the model's OWN output, tied back to the
+                    // paragraph it came from with a drawn arrow. Nothing here
+                    // is written by the interface — an annotation Arcelle
+                    // invented ("good point", "check this") would be the UI
+                    // manufacturing an opinion and attributing it to nobody,
+                    // which is why the decorative reading of the brief is not
+                    // implemented anywhere in this pane.
+                    // The arrow is an aria-hidden, pointer-events:none masked
+                    // span from paper.css, and it is a FLEX ITEM rather than an
+                    // absolutely positioned mark, so it lands on the correct
+                    // side of an RTL answer without a single hard `left`.
+                    <div className="annot-chip-wrap msg-annot">
+                      <span
+                        className="nb-arrow-curve nb-arrow-curve--nw msg-tie"
+                        aria-hidden
+                      />
                       <button
                         className={`annot-chip${annotVerified ? " receipt-verified" : ""}`}
                         title="Show the highlight in the viewer"
@@ -655,6 +735,8 @@ export default function ChatPane({
                     </button>
                   </span>
                 </div>
+              ) : hand ? (
+                <HandNote text={text} />
               ) : (
                 text
               )}
@@ -712,7 +794,18 @@ export default function ChatPane({
             {m.role === "assistant" && (
               <div className="msg-footer">
                 {m.sources.length > 0 && (
+                  // Citations are load-bearing, so they lead the action group
+                  // on their own line instead of sitting among the buttons —
+                  // and they are the one thing in this footer that never
+                  // fades: an answer's evidence is content, not an action.
+                  // The kicker labels a group that had no label at all, and
+                  // the drawn arrow ties it back to the answer above it.
                   <span className="msg-sources">
+                    <span
+                      className="nb-arrow-curve nb-arrow-curve--nw msg-tie"
+                      aria-hidden
+                    />
+                    <span className="msg-sources-kicker">Sources</span>
                     {m.sources.map((src) => (
                       <button
                         key={src}
@@ -811,12 +904,19 @@ export default function ChatPane({
           );
         })}
         {s.asking && (
-          <div className={`msg assistant ${s.streamText ? "" : "thinking"}`}>
+          // The live turn is ALWAYS set in the sans, whatever it ends up
+          // saying. The voice is a property of a finished message, and
+          // re-deciding it as tokens arrive would swap the face — and relayout
+          // the whole block — several times per answer. It settles into the
+          // hand, if it earns it, when the stored message replaces this row.
+          <div
+            className={`msg assistant is-streaming ${s.streamText ? "" : "thinking"}`}
+          >
             <div className="msg-label">
               <span className="msg-avatar" aria-hidden>
                 <SparkIcon size={12} />
               </span>
-              Room AI
+              <span className="msg-who">{speakerName("assistant")}</span>
             </div>
             {/* The live roster as a hub-and-spoke graph. A turn where nothing
                 was delegated has no graph to draw, and AgentGraph falls back to
@@ -857,12 +957,23 @@ export default function ChatPane({
               {s.streamText ? (
                 <>
                   <MarkdownView text={patchStreamFences(s.streamText)} />
-                  <span className="stream-cursor">▍</span>
+                  {/* The nib. Decorative and repeating, so it is kept out of
+                      assistive technology entirely — a screen reader following
+                      a streaming answer must not be handed a block glyph after
+                      every delta. */}
+                  <span className="stream-cursor" aria-hidden>
+                    ▍
+                  </span>
                 </>
               ) : isCloudRoute(model, s.ai) ? (
-                "Asking your cloud AI — content leaves this Mac…"
+                // Where this question is going is a privacy consequence, so it
+                // is a taped note in the sans at reading size — never the hand,
+                // and never quieter than the local line beside it.
+                <span className="chat-route chat-route-cloud">
+                  Asking your cloud AI — content leaves this Mac…
+                </span>
               ) : (
-                "Thinking locally…"
+                <span className="chat-route">Thinking locally…</span>
               )}
             </div>
           </div>

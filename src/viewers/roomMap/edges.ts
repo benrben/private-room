@@ -14,6 +14,18 @@ import { MAX_EDGES } from "./constants";
  * Colors are CSS custom properties, not hex literals: the canvas is near-black
  * in dark mode and near-white in light mode (roomMap.css), and a fixed amber at
  * low opacity is invisible on one of them.
+ *
+ * THREE CHANNELS, NEVER ONE. A relationship kind is a nominal set, and hue
+ * alone is not an accessible channel for a nominal set — so every kind carries
+ * a hue AND a line treatment (dash pattern + weight) AND its own word in the
+ * legend. The two neutral kinds at the bottom share a graphite and are told
+ * apart by their dash and their weight, which is more honest than inventing a
+ * sixth hue the palette does not have: tokens.css does the same thing for the
+ * seven search engines (markers plus neutrals).
+ *
+ * The dash patterns also carry the trust axis on their own: a recorded fact is
+ * drawn as an unbroken stroke, the further down the list the more broken it
+ * gets, and the single inferred kind is a dotted pencil trail.
  * ------------------------------------------------------------------ */
 
 export interface EdgeStyle {
@@ -45,7 +57,7 @@ export const EDGE_STYLE: Record<EdgeKind, EdgeStyle> = {
     lead: "Made from this file",
     color: "var(--rm-edge-derived)",
     dash: null,
-    widthMul: 2.2,
+    widthMul: 2.4,
     springMul: 1.6,
     directed: true,
     fact: true,
@@ -55,7 +67,7 @@ export const EDGE_STYLE: Record<EdgeKind, EdgeStyle> = {
     lead: "Both saved from the same page",
     color: "var(--rm-edge-page)",
     dash: null,
-    widthMul: 1.8,
+    widthMul: 1.9,
     springMul: 1.4,
     directed: false,
     fact: true,
@@ -65,7 +77,7 @@ export const EDGE_STYLE: Record<EdgeKind, EdgeStyle> = {
     lead: "This one names the other by name",
     color: "var(--rm-edge-mentions)",
     dash: null,
-    widthMul: 1.5,
+    widthMul: 1.6,
     springMul: 1.2,
     directed: true,
     fact: true,
@@ -75,7 +87,7 @@ export const EDGE_STYLE: Record<EdgeKind, EdgeStyle> = {
     lead: "One answer used both",
     color: "var(--rm-edge-cited)",
     dash: "3 3",
-    widthMul: 1.2,
+    widthMul: 1.3,
     springMul: 0.8,
     directed: false,
     fact: true,
@@ -84,18 +96,21 @@ export const EDGE_STYLE: Record<EdgeKind, EdgeStyle> = {
     label: "Same site",
     lead: "Both came from the same website",
     color: "var(--rm-edge-site)",
-    dash: "4 3",
-    widthMul: 1,
+    dash: "5 3",
+    widthMul: 1.1,
     springMul: 0.7,
     directed: false,
     fact: true,
   },
   similar: {
+    // The pencil trail: shortest dash, thinnest stroke, faintest ramp. It is
+    // the only line on the map that is not a record of something the room
+    // watched happen, and it is drawn like a note to self.
     label: "Reads alike",
     lead: "These read alike — a guess, not a record",
     color: "var(--rm-edge-similar)",
-    dash: "1 3",
-    widthMul: 1,
+    dash: "1 3.5",
+    widthMul: 0.9,
     springMul: 0.5,
     directed: false,
     fact: false,
@@ -170,4 +185,42 @@ export function countByKind(edges: GraphEdge[]): Record<string, number> {
  *  weight is a position in this room's own range, not a "% similar". */
 export function edgeLines(edge: GraphEdge): string[] {
   return [styleFor(edge.kind).lead, ...edge.shared.slice(0, 3)];
+}
+
+/* ----- how much ink a link gets -----
+ *
+ * A weak link is drawn faint and a strong one is drawn dark, on separate ramps
+ * for records and for the one inferred kind. This is the whole answer to "the
+ * map is a hairball": nothing is hidden, the weak relations simply recede, and
+ * the reader can still bring any of them forward with the strength bar or the
+ * legend — both of which are visible, reversible controls.
+ *
+ * The ramps are set so that a full-strength link of every kind clears 3:1
+ * against the paper in BOTH themes (the floor WCAG 1.4.11 asks of meaningful
+ * non-text), while a near-zero-strength one is deliberately a whisper. That
+ * lower end is under 3:1 on purpose, and it is allowed to be: the map is a
+ * supplementary picture of data that is also stated in words — every link it
+ * draws is spelled out, by kind and by name, in the List view beside it, which
+ * is the keyboard and screen-reader route to the same information. */
+const FACT_INK_FLOOR = 0.55;
+const FACT_INK_GAIN = 0.38;
+const GUESS_INK_FLOOR = 0.3;
+const GUESS_INK_GAIN = 0.45;
+/** How much darker a link goes while its node is hovered or selected. */
+const LIT_INK_BOOST = 0.3;
+const LIT_INK_MAX = 0.96;
+
+/** Stroke opacity for one link. `lit` is true while either end is the hovered
+ *  or selected node, which is the map's way of answering "what is this file
+ *  attached to" without hiding anything else. */
+export function edgeInk(edge: GraphEdge, lit: boolean): number {
+  const s = styleFor(edge.kind);
+  // The backend's weight is a position in this room's own range and should
+  // already be 0..1; clamp anyway, because an out-of-range weight would push
+  // the opacity past 1 and quietly flatten the whole strength channel.
+  const w = Math.max(0, Math.min(1, edge.weight));
+  const base = s.fact
+    ? FACT_INK_FLOOR + w * FACT_INK_GAIN
+    : GUESS_INK_FLOOR + w * GUESS_INK_GAIN;
+  return lit ? Math.min(LIT_INK_MAX, base + LIT_INK_BOOST) : base;
 }

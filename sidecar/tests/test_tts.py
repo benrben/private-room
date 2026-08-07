@@ -262,3 +262,161 @@ async def test_catalog_trims_sorts_and_serves_last_good_on_failure(
     monkeypatch.setattr(tts, "_voices_cache", None)
     with pytest.raises(tts.TtsError):
         await tts.list_neural_voices()
+
+
+# --- podcast: many voices, one episode --------------------------------------
+#
+# Nothing here touches the network. `synthesize_podcast` reaches the service
+# through `synthesize_mp3` and macOS through `mp3_to_wav`, and both are
+# monkeypatched — which is exactly why tts.py defers its `edge_tts` import.
+
+
+@pytest.fixture
+def fake_voices(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Record every synthesis call and answer it with a fixed-length clip.
+
+    The clip's LENGTH is what the offset assertions read, so it is the same for
+    every call: any drift in the computed offsets is then the joining code's,
+    not the fixture's.
+    """
+    calls: list[dict[str, str]] = []
+
+    async def fake_mp3(text: str, voice: str, rate: str, pitch: str) -> bytes:
+        calls.append({"text": text, "voice": voice, "rate": rate, "pitch": pitch})
+        return b"MP3:" + text.encode()
+
+    def fake_decode(mp3: bytes, sample_rate: int | None = None) -> bytes:
+        # 0.5 s of silence at whatever rate the caller forced.
+        return sine_wav(seconds=0.5, amp=0.05, fs=sample_rate or 24_000)
+
+    monkeypatch.setattr(tts, "synthesize_mp3", fake_mp3)
+    monkeypatch.setattr(tts, "mp3_to_wav", fake_decode)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_each_turn_is_spoken_in_its_own_voice(fake_voices: list) -> None:
+    # The whole point of the endpoint: a two-host script must not come back in
+    # one voice, which is what looping the single-sentence /tts would give.
+    wav, offsets, duration = await tts.synthesize_podcast(
+        [
+            {"text": "Welcome in.", "voice": "voice-a", "rate": "+10%", "pitch": "-1Hz"},
+            {"text": "Glad to be here.", "voice": "voice-b"},
+        ],
+        gap_ms=200,
+    )
+    assert [c["voice"] for c in fake_voices] == ["voice-a", "voice-b"]
+    # Per-host prosody reaches the service; an unset one falls to the default.
+    assert fake_voices[0]["rate"] == "+10%"
+    assert fake_voices[1]["rate"] == tts.DEFAULT_RATE
+    assert len(offsets) == 2
+    assert duration > 0
+    samples, fs = wav_samples(wav)
+    assert fs == tts.PODCAST_SAMPLE_RATE
+
+
+@pytest.mark.asyncio
+async def test_offsets_are_measured_from_the_audio_not_estimated(
+    fake_voices: list,
+) -> None:
+    # These offsets become the "[m:ss] Speaker: line" transcript on the room
+    # file, which is what makes the episode seekable. Estimated instead of
+    # measured, every stamp after the first would drift.
+    _, offsets, duration = await tts.synthesize_podcast(
+        [{"text": "One."}, {"text": "Two."}, {"text": "Three."}],
+        gap_ms=200,
+    )
+    # Each clip is 500 ms, each gap 200 ms.
+    assert offsets[0] == 0
+    assert abs(offsets[1] - 700) <= 1
+    assert abs(offsets[2] - 1400) <= 1
+    assert abs(duration - 1900) <= 1
+
+
+@pytest.mark.asyncio
+async def test_an_empty_turn_keeps_its_index(fake_voices: list) -> None:
+    # The caller zips offsets against ITS turn list. A silently shorter list
+    # would mis-stamp every following line rather than fail.
+    _, offsets, _ = await tts.synthesize_podcast(
+        [{"text": "One."}, {"text": "   "}, {"text": "Three."}], gap_ms=0
+    )
+    assert len(offsets) == 3
+    assert len(fake_voices) == 2, "the blank line is not sent to the service"
+
+
+@pytest.mark.asyncio
+async def test_the_mix_is_normalized_once_over_the_whole_episode(
+    fake_voices: list,
+) -> None:
+    # Per-clip normalization makes every speaker change a jump in level. The
+    # finished mix is what gets measured, so the two voices keep their relative
+    # dynamics.
+    wav, _, _ = await tts.synthesize_podcast(
+        [{"text": "One.", "voice": "a"}, {"text": "Two.", "voice": "b"}], gap_ms=0
+    )
+    samples, fs = wav_samples(wav)
+    assert abs(tts.measure_lufs(samples, fs) - tts.TARGET_LUFS) < 1.0
+    assert max(abs(v) for v in samples) < 1.0, "nothing clips"
+
+
+@pytest.mark.asyncio
+async def test_a_long_turn_is_split_rather_than_failing_the_episode(
+    fake_voices: list,
+) -> None:
+    # One over-long turn used to be the difference between an episode and an
+    # error, because MAX_TTS_CHARS is a hard service limit.
+    long_turn = " ".join(["This is a sentence."] * 200)
+    assert len(long_turn) > tts.MAX_TTS_CHARS
+    await tts.synthesize_podcast([{"text": long_turn}])
+    assert len(fake_voices) > 1, "the turn was split"
+    assert all(len(c["text"]) <= tts.MAX_TTS_CHARS for c in fake_voices)
+
+
+@pytest.mark.asyncio
+async def test_an_all_empty_script_is_an_error_not_a_silent_file(
+    fake_voices: list,
+) -> None:
+    # A zero-length "episode" saved into the room would look like a successful
+    # recording of nothing.
+    with pytest.raises(tts.TtsError):
+        await tts.synthesize_podcast([{"text": "  "}, {"text": ""}])
+    with pytest.raises(tts.TtsError):
+        await tts.synthesize_podcast([])
+
+
+def test_splitting_cuts_between_sentences_and_keeps_the_terminator() -> None:
+    text = "First one. Second one! Third one?"
+    assert tts.split_for_tts(text, limit=20) == [
+        "First one.",
+        "Second one!",
+        "Third one?",
+    ]
+    # Short enough to stay whole.
+    assert tts.split_for_tts("Hello.", limit=100) == ["Hello."]
+    # A single sentence past the limit still comes back, cut on whitespace —
+    # dropping it would lose the line with nothing said about it.
+    long_one = "word " * 100
+    pieces = tts.split_for_tts(long_one, limit=50)
+    assert pieces and all(len(p) <= 50 for p in pieces)
+    assert "".join(p.replace(" ", "") for p in pieces) == long_one.replace(" ", "")
+
+
+@pytest.mark.asyncio
+async def test_the_route_refuses_an_empty_script(fake_voices: list) -> None:
+    async with client_for(app()) as c:
+        r = await c.post("/tts/podcast", json={"turns": []})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_the_route_returns_audio_with_its_timings(fake_voices: list) -> None:
+    async with client_for(app()) as c:
+        r = await c.post(
+            "/tts/podcast",
+            json={"turns": [{"text": "One.", "voice": "a"}, {"text": "Two."}], "gap_ms": 0},
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert base64.b64decode(body["audio_b64"])[:4] == b"RIFF"
+    assert body["offsets_ms"] == [0, 500]
+    assert body["duration_ms"] == 1000

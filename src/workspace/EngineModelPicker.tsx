@@ -274,11 +274,17 @@ export default function EngineModelPicker({
                 </button>
                 {expanded === engine && (
                   <div className="engine-submodel-list">
+                    {/* Loading and error are designed, announced states, not
+                        silent text: this list can take seconds to arrive over
+                        a network, and until now nothing told a screen-reader
+                        user that anything was happening at all. */}
                     {loadingEngine === engine && (
-                      <div className="settings-hint engine-submodel-loading">Checking…</div>
+                      <div className="settings-hint engine-submodel-loading" role="status">
+                        Checking…
+                      </div>
                     )}
                     {loadError === engine && (
-                      <div className="settings-hint engine-submodel-loading">
+                      <div className="settings-hint engine-submodel-loading" role="status">
                         {engine === "openrouter"
                           ? "Couldn't refresh the model catalog. Check the connection in Settings."
                           : `Couldn't list models — using ${ENGINE_LABELS[engine] ?? engine}'s default.`}
@@ -293,37 +299,47 @@ export default function EngineModelPicker({
                           placeholder={`Search ${models.length.toLocaleString()} models…`}
                           aria-label={`Search ${ENGINE_LABELS[engine] ?? engine} models`}
                         />
+                        {/* An engaged filter carries a TICK as well as the
+                            wash behind it. The wash alone was the only signal
+                            that a capability was being required, and a filter
+                            silently narrowing a 300-model catalogue is exactly
+                            the kind of state that must not depend on being
+                            able to tell the pen from the paper. */}
                         <div className="model-filter-chips" role="group" aria-label="Model capabilities">
                           <button
                             type="button"
-                            className={needsTools ? "active" : ""}
+                            className={needsTools ? "active pick-on" : ""}
                             aria-pressed={needsTools}
                             onClick={() => setNeedsTools((value) => !value)}
                           >
+                            {needsTools && <CheckIcon size={11} />}
                             Tools
                           </button>
                           <button
                             type="button"
-                            className={needsVision ? "active" : ""}
+                            className={needsVision ? "active pick-on" : ""}
                             aria-pressed={needsVision}
                             onClick={() => setNeedsVision((value) => !value)}
                           >
+                            {needsVision && <CheckIcon size={11} />}
                             Vision
                           </button>
                           <button
                             type="button"
-                            className={needsReasoning ? "active" : ""}
+                            className={needsReasoning ? "active pick-on" : ""}
                             aria-pressed={needsReasoning}
                             onClick={() => setNeedsReasoning((value) => !value)}
                           >
+                            {needsReasoning && <CheckIcon size={11} />}
                             Reasoning
                           </button>
                           <button
                             type="button"
-                            className={needsStructured ? "active" : ""}
+                            className={needsStructured ? "active pick-on" : ""}
                             aria-pressed={needsStructured}
                             onClick={() => setNeedsStructured((value) => !value)}
                           >
+                            {needsStructured && <CheckIcon size={11} />}
                             JSON
                           </button>
                           <span>{visibleModels.length.toLocaleString()} shown</span>
@@ -379,10 +395,17 @@ export default function EngineModelPicker({
                              * one, so the picker stays compact. "Default" clears
                              * the effort back to the CLI's own default. */}
                             {picked && mi.efforts.length > 0 && (
+                              // Exactly one of these is always the chosen one,
+                              // and it used to say so with a wash and a border
+                              // colour — nothing a greyscale or colour-blind
+                              // reader could resolve. The tick is the shape
+                              // that carries it; aria-pressed is the same fact
+                              // for anyone listening.
                               <div className="effort-chips" role="group" aria-label="Reasoning effort">
                                 <button
                                   type="button"
-                                  className={`effort-chip${model === base ? " sel" : ""}`}
+                                  className={`effort-chip${model === base ? " sel pick-on" : ""}`}
+                                  aria-pressed={model === base}
                                   title={
                                     mi.defaultEffort
                                       ? `Model default (${mi.defaultEffort})`
@@ -390,6 +413,7 @@ export default function EngineModelPicker({
                                   }
                                   onClick={() => onSelect(base)}
                                 >
+                                  {model === base && <CheckIcon size={11} />}
                                   Default
                                 </button>
                                 {mi.efforts.map((eff) => {
@@ -398,9 +422,11 @@ export default function EngineModelPicker({
                                     <button
                                       type="button"
                                       key={eff}
-                                      className={`effort-chip${model === withEffort ? " sel" : ""}`}
+                                      className={`effort-chip${model === withEffort ? " sel pick-on" : ""}`}
+                                      aria-pressed={model === withEffort}
                                       onClick={() => onSelect(withEffort)}
                                     >
+                                      {model === withEffort && <CheckIcon size={11} />}
                                       {eff}
                                     </button>
                                   );
@@ -411,12 +437,15 @@ export default function EngineModelPicker({
                         );
                       })}
                     {!loadingEngine && hasRichCatalog && visibleModels.length === 0 && (
-                      <div className="settings-hint engine-submodel-loading">
-                        No models match these filters.
+                      // An empty state says what would fill it: here the list
+                      // is empty because of something the user did, and the
+                      // way out is one click above this line.
+                      <div className="settings-hint engine-submodel-loading" role="status">
+                        No models match these filters — clear one to see more.
                       </div>
                     )}
                     {!loadingEngine && !loadError && engine === "openrouter" && models.length === 0 && (
-                      <div className="settings-hint engine-submodel-loading">
+                      <div className="settings-hint engine-submodel-loading" role="status">
                         No models are available for this OpenRouter account.
                       </div>
                     )}

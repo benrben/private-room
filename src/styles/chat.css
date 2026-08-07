@@ -1,4 +1,51 @@
-/* ---------- chat (right pane, Chat tab) ---------- */
+/* ---------- chat: two people writing in the same notebook ----------
+   workspace/ChatPane.tsx. The composer below it is composer.css; the live
+   agent diagram is agentGraph.css; the rendered Markdown of an answer is
+   viewer-formats.css + viewers/markdown.css. This file owns the page the
+   conversation is written on.
+
+   THE GOVERNING RULE — and it is a rule about the MESSAGE, not the speaker:
+
+     short and conversational  →  the hand (Kalam)
+     long, or technical        →  the interface sans
+
+   `markup.isHandwritten` is where that decision actually lives — a length
+   threshold calibrated against the prompts this app really gets, plus a sniff
+   for the things a handwriting face renders badly (a code fence, a table, a
+   list, a heading, a quotation, a URL, a path). ChatPane puts `.is-hand` on
+   the row when a message earns it. Nothing here keys off `.user`, so a
+   three-word answer is a note and a pasted brief is a document, whoever typed
+   it. The clean-font fallback is the default, not the exception.
+
+   WHAT IS NEVER HANDWRITTEN, whatever its length: a privacy consequence, a
+   warning, an error, or any instruction the reader has to act on. Those keep
+   the sans at reading size, and the hand is spent on the LABEL beside them
+   ("Note", "Heads up"). A sentence about what leaves this Mac is the core
+   promise of this product and it is not a decorative surface.
+
+   WHAT THE INTERFACE NEVER WRITES: there are no invented reactions and no
+   invented margin notes anywhere in this pane. Every handwritten mark on an
+   answer comes from something real — a heading the model wrote, an annotation
+   it emitted, a citation it cited, or a word the app itself is responsible for
+   (the speaker's name, a notice's label). "Good point" printed beside an
+   answer would be Arcelle manufacturing an opinion and attributing it to
+   nobody, so the decorative reading of that idea is deliberately not built.
+
+   LOAD ORDER, because four later sheets touch elements that live inside a
+   message: composer.css (.agent-chip, .step-chip, .source-chip, .chat-rename),
+   settings-annotations.css and misc-moonshot-cards.css (.annot-chip), and
+   viewer-formats.css (.md-body). All of them load after this file, so every
+   rule here that has to beat one is scoped under `.msg` or `.chat-head` and
+   wins on specificity rather than on order. `.chat-select` in particular is
+   ALSO worn by a <select> in Settings → Spoken voice, which is why the header's
+   handwritten title is scoped and not global.
+
+   Both themes come from tokens by construction — nothing below names a colour,
+   so there is deliberately no light-mode block at the end of this file. */
+
+/* ==========================================================================
+   1. THE PANE AND ITS HEADER
+   ========================================================================== */
 
 .chat {
   flex: 1;
@@ -10,64 +57,176 @@
   position: relative;
 }
 
-/* Compact conversation row: chat picker + rename/new/voice/delete. */
+/* The conversation's own line: its title, then the controls that act on it.
+   Ruled off with the tapered pencil stroke as a background rather than a flat
+   border, so the header reads as a line drawn across the sheet instead of the
+   edge of a box. */
 .chat-head {
   display: flex;
   align-items: center;
-  gap: 3px;
-  padding: 5px 8px;
-  border-bottom: 1px solid var(--line-soft);
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
   flex: 0 0 auto;
   min-width: 0;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 4%,
+    var(--line-soft) 94%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
 }
 
-.chat-select {
+/* The conversation's NAME, in the hand: a chat title is something someone
+   wrote at the top of a page, not interface copy. Scoped to `.chat-head`
+   because Settings → Spoken voice wears `.chat-select` too, and a settings
+   control stays in the interface face. */
+/* The sans: a conversation's name is frequently one the READER typed, and a
+   renamed chat can be in any script — Kalam ships latin + latin-ext only. The
+   handwritten treatment stays on the static title beside it, which is the
+   app's own word. */
+.chat-head .chat-select {
   flex: 1;
   min-width: 0;
-  font-size: 12px;
-  padding: 4px 6px;
-  color: var(--text);
+  padding: 3px 6px;
+  font-family: var(--sans);
+  font-size: var(--fs-card);
+  line-height: var(--lh-body);
+  color: var(--text-strong);
   background: none;
   border: 1px solid transparent;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
 }
-.chat-select:hover {
+.chat-head .chat-select:hover {
   background: var(--hover);
   border-color: var(--line);
 }
+/* Renaming is TYPING. The system reserves the hand for what is already
+   written, so the field you are typing the new title into is the sans — the
+   title only becomes handwriting once it has been committed. */
+.chat-head .chat-rename {
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  color: var(--text);
+}
+
+/* ==========================================================================
+   2. NOTICES — taped notes, not tinted bars
+   A banner is a slip of paper taped onto the page: transparent, drawn, with
+   the marker meaning on its edge and a one-word handwritten label. The
+   consequence text stays sans at reading size (see the header note), so the
+   colour and the hand are both reinforcement and never the carrier.
+   ========================================================================== */
 
 .banner {
-  padding: 8px 12px;
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  border-bottom: 1px solid var(--line-soft);
-  font-size: 12px;
+  position: relative;
+  margin: var(--sp-3) var(--sp-4) 0;
+  padding: 10px 13px;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--text);
-  line-height: 1.5;
+  background: transparent;
+  /* 3.6:1 light, 4.8:1 dark — the outline of a notice is meaningful non-text
+     and owes the 3:1 of WCAG 1.4.11. The 3px marker EDGE beside it is a fill
+     and cannot clear that in light mode; per the system's own rule for
+     .nb-edge, a fill that thin is never the only signal, and here it always
+     rides with the kicker word and the sentence. */
+  border: 1px solid color-mix(in srgb, var(--sketch) 58%, transparent);
+  border-radius: var(--radius);
+  box-shadow: inset 3px 0 0 var(--mk, var(--sem-linked-fill));
+}
+/* The tape. Same recipe as paper.css's .nb-taped — a wash of --ink, which is
+   the one strip that reads correctly in both themes without an override,
+   because real tape lightens charcoal and greys ivory exactly like this. It is
+   absolutely positioned, so it is not a flex item inside `.banner.onboard`
+   (onboarding.css) and cannot disturb that layout. */
+.banner::before {
+  content: "";
+  position: absolute;
+  top: -7px;
+  inset-inline-start: 18px;
+  width: 58px;
+  height: 15px;
+  background: color-mix(in srgb, var(--ink) 11%, transparent);
+  box-shadow:
+    inset 1px 0 0 color-mix(in srgb, var(--ink) 7%, transparent),
+    inset -1px 0 0 color-mix(in srgb, var(--ink) 7%, transparent);
+  border-radius: 1px 2px 1px 2px;
+  transform: rotate(-3deg);
+  pointer-events: none;
+}
+
+/* The handwritten label — the ONLY handwriting on a notice. Set at the note
+   size rather than shrunk, and in the meaning's own ink so the word and the
+   colour say the same thing. */
+.banner-kicker {
+  display: inline-block;
+  margin-inline-end: var(--sp-2);
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--mk-ink, var(--sem-linked));
 }
 
 .banner.notice {
-  background: color-mix(in srgb, var(--amber) 10%, transparent);
+  --mk: var(--sem-pending-fill);
+  --mk-ink: var(--sem-pending);
 }
 
-/* "Show earlier messages (N older)" — the transcript paints a tail page, so
-   this sits above the oldest row that IS drawn. Centered and quiet: it is a
-   render control, not a turn in the conversation. */
-.chat-load-older {
-  align-self: center;
-  flex: 0 0 auto;
+/* PRIV-1: privacy OFF is the loudest thing this pane can say. Urgent red on
+   the edge and on the label; the sentence itself stays in the reading ink,
+   because a consequence printed in a warning colour is harder to read and no
+   more true. */
+.privacy-off-banner {
+  --mk: var(--sem-urgent-fill);
+  --mk-ink: var(--sem-urgent);
+  /* The full urgent ink, not a wash of it: at 55% the outline measures 2.5:1
+     and a boundary under 3:1 is not a boundary. Same reasoning paper.css gives
+     for .nb-btn-danger. */
+  border-color: var(--sem-urgent);
 }
+
+/* ==========================================================================
+   3. THE TRANSCRIPT
+   ========================================================================== */
 
 .messages {
   flex: 1;
   overflow-y: auto;
   /* A readable conversation column even when the AI pane is focused to the
      full window: content centers once the pane passes ~62rem. */
-  padding: 16px max(14px, calc((100% - 720px) / 2)) 24px;
+  padding: var(--sp-4) max(var(--sp-3), calc((100% - 720px) / 2)) var(--sp-6);
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: var(--sp-6);
   min-height: 0;
 }
+
+/* "Show earlier messages (N older)" — the transcript paints a tail page, so
+   this sits above the oldest row that IS drawn. Centered, quiet, and drawn
+   with the dashed pencil stroke the system uses for a provisional boundary:
+   it is the fold in a truncated list, not a turn in the conversation. */
+.chat-load-older {
+  align-self: center;
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 4px 12px;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  border: 1px dashed var(--rule-strong);
+  border-radius: var(--radius-sm);
+}
+.chat-load-older:hover {
+  color: var(--text);
+  border-color: var(--sketch);
+}
+
+/* ==========================================================================
+   4. THE EMPTY PAGE
+   ========================================================================== */
 
 .chat-hero {
   margin: auto;
@@ -79,123 +238,183 @@
   align-items: center;
 }
 
+/* No glow behind the mark. The pane used to paint a radial accent bloom here,
+   which is the one effect the direction rules out by name — and it was drawn
+   by a negative-z-index pseudo-element, the exact trick that paints behind its
+   parent's own background in WebKit. */
 .chat-hero-icon {
   line-height: 0;
   display: flex;
   justify-content: center;
-  position: relative;
-}
-.chat-hero-icon::after {
-  content: "";
-  position: absolute;
-  inset: -25%;
-  background: radial-gradient(
-    closest-side,
-    color-mix(in srgb, var(--accent) 14%, transparent),
-    transparent 70%
-  );
-  z-index: -1;
 }
 
 .chat-hero h2 {
+  margin: var(--sp-4) 0 var(--sp-2);
+  font-family: var(--hand);
+  font-size: var(--fs-hand-lg);
+  font-weight: 400;
+  line-height: 1.3;
   color: var(--text-strong);
-  font-size: 16px;
-  font-weight: 500;
-  margin: 14px 0 7px;
 }
 
+/* What the room can do is an explanation, so it is the sans. */
 .chat-hero p {
-  font-size: 12.5px;
-  line-height: 1.6;
-  max-width: 300px;
-  margin: 0 0 16px;
+  margin: 0 0 var(--sp-4);
+  max-width: 34ch;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
 }
 
-/* Example prompt chips in the empty chat. */
+/* ----- suggested questions -----
+   Handwritten note cards: these are short conversational prompts, which is
+   exactly what the hand is for. The two radius signatures alternate BY
+   POSITION, so a stack of four does not look stamped and still draws
+   identically on every render — no randomness anywhere in this file. */
 .prompt-chips {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--sp-2);
   width: 100%;
 }
 .prompt-chip {
-  text-align: left;
-  padding: 8px 11px;
-  font-size: 12px;
+  text-align: start;
+  padding: 8px 12px;
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
   color: var(--text);
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  transition:
+    transform var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
+}
+.prompt-chip:nth-child(even) {
+  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
 }
 .prompt-chip:hover {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
-  background: var(--hover);
+  transform: translateY(-2px);
+  border-color: var(--sketch);
+  background: transparent;
+  box-shadow: 0 6px 18px var(--shadow-lift);
+}
+.prompt-chip:active {
+  transform: translateY(1px);
 }
 
-/* Flat, label-led messages (the reference language): a small uppercase
-   speaker line, then the text — no bubbles competing with the document. */
-.msg {
-  max-width: 100%;
-  min-width: 0;
-  border-radius: 0;
-  padding: 0;
-  line-height: 1.6;
-  font-size: 13px;
-}
+/* ==========================================================================
+   5. THE SPEAKER LINE
+   Who wrote it, and when. The name is handwritten — it is the one word on the
+   row that a person would have written in the margin — and the clock is mono,
+   with the rest of the technical metadata.
+   ========================================================================== */
 
 .msg-label {
   display: flex;
   align-items: center;
   gap: 7px;
-  margin-bottom: 6px;
-  color: var(--faint);
-  font-size: 10px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
+  margin-bottom: var(--sp-2);
 }
+
+.msg-who {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+}
+/* Pink is AI attribution across the whole product, so the answer's name is
+   written in the pen. Solved against the two grounds a message can sit on —
+   the AI pane's paper wash (4.98:1 light, 5.36:1 dark) and the bare sheet
+   (4.81:1 light, 5.74:1 dark). */
+.msg.assistant .msg-who {
+  color: var(--sem-saved);
+}
+
+.msg-when {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+
 .msg-label .msg-avatar {
-  width: 19px;
-  height: 19px;
-  border-radius: 6px;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
   display: grid;
   place-items: center;
-  background: var(--selected);
-  color: var(--accent-2);
+  font-size: var(--fs-micro);
+  /* A wash of the meaning behind a mark drawn in its ink: 3.9:1 dark and
+     4.4:1 light, which clears the 3:1 a meaningful non-text mark owes. */
+  background: color-mix(in srgb, var(--sem-saved-fill) 22%, transparent);
+  color: var(--sem-saved);
 }
 .msg.user .msg-label .msg-avatar {
   background: var(--hover);
   color: var(--muted);
 }
 
+/* ==========================================================================
+   6. THE TWO MESSAGE BODIES
+   A question is a note written on the page; an answer is a section OF the
+   page. That difference is drawn, not filled — neither one is opaque, so the
+   dotted sheet runs straight through the whole conversation.
+   ========================================================================== */
+
+.msg {
+  max-width: 100%;
+  min-width: 0;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text);
+}
+
+/* ----- the question: a lightly outlined note -----
+   The imperfection is the system's own: an asymmetric radius makes the
+   rectangle read as drawn rather than computed, and the signature alternates
+   by position down the transcript. At 58% of the pen the edge still measures
+   4.8:1 in dark and 3.6:1 in light, so the frame that distinguishes a question
+   from an answer clears the 3:1 a meaningful boundary owes — and it never
+   carries the meaning alone, because the speaker's name is written above it. */
 .msg.user {
-  color: var(--text);
-}
+  padding: var(--sp-3) var(--sp-4);
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 58%, transparent);
+  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  /* Copy and "Edit & resend" ride in the note's OWN header line, beside the
+     name and the time, rather than in a band under the question.
 
-.msg.assistant {
-  color: var(--text);
-}
+     Those buttons are quiet until the row is hovered (see .msg-footer below)
+     and they keep their space on purpose, so nothing shifts under the pointer
+     — but reserving a 33px band INSIDE a drawn note left every one-line
+     question sitting in a framed box whose bottom half was empty. The header
+     line was already half empty, so the actions cost nothing there.
 
-.msg.thinking {
-  color: var(--muted);
-  font-style: italic;
+     Everything spans both columns by default, so an unassigned child (the
+     edit-in-place form) still gets the full width. */
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: var(--sp-3);
 }
-
-.stream-cursor {
-  display: inline-block;
-  color: var(--accent);
-  animation: blink 1s steps(2) infinite;
+.msg.user > * {
+  grid-column: 1 / -1;
+  min-width: 0;
 }
-
-@keyframes blink {
-  50% {
-    opacity: 0;
-  }
+.msg.user > .msg-label {
+  grid-column: 1;
+  grid-row: 1;
 }
-@media (prefers-reduced-motion: reduce) {
-  .stream-cursor {
-    animation: none;
-  }
+.msg.user > .msg-footer {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: end;
+  margin-top: 0;
+  padding-top: 0;
+}
+.msg.user:nth-child(even) {
+  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
 }
 
 .msg-content {
@@ -211,151 +430,543 @@
 .msg.thinking .msg-content {
   white-space: pre-wrap;
 }
-.msg-content p {
-  margin: 0 0 8px;
+
+/* An answer is set to the conversation's own measure. `.md-body` carries a
+   72ch cap from shell.css for rendered DOCUMENTS, which inside this column
+   would make every answer noticeably narrower than the question above it —
+   the `.messages` padding is already the measure here. */
+.msg .msg-content .md-body {
+  max-width: none;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
 }
-.msg-content p:last-child {
-  margin-bottom: 0;
+
+/* ----- the hand -----
+   One switch, both speakers. It has to reach `.md-body` explicitly because
+   viewer-formats.css sets the answer's size there; this rule follows the
+   sizing rule above so it wins the tie. */
+.msg.is-hand .msg-content,
+.msg.is-hand .msg-content .md-body {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
 }
-.msg-content :is(ul, ol) {
-  margin: 6px 0 8px;
-  padding-left: 18px;
+
+/* The hand stops at the edge of the prose. base.css gives every button
+   `font: inherit`, so without this the buttons inside a handwritten row — the
+   edit card's "Send again", an annotation chip on a short answer — would come
+   out in Kalam, and a control label is interface copy. input/textarea/select
+   already name the sans in base.css and need no help. */
+.msg.is-hand .msg-content button {
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
 }
-.msg-content li {
-  margin: 3px 0;
-}
-.msg-content pre {
-  margin: 8px 0;
-  padding: 9px 11px;
-  overflow-x: auto;
-  background: var(--panel-2);
-  border: 1px solid var(--line-soft);
-  border-radius: 6px;
-  font-size: 11.5px;
-}
-.msg-content h1,
-.msg-content h2,
-.msg-content h3 {
-  margin: 12px 0 6px;
-  font-size: 13.5px;
-  font-weight: 600;
+
+/* The printed runs inside a handwritten note — a filename, a host, an
+   @mention. Kalam runs large for its point size, so the mono is stepped down
+   to keep the two faces at the same apparent height on the same line. */
+.msg-mono {
+  font-family: var(--mono);
+  font-size: 0.86em;
   color: var(--text-strong);
 }
 
-.msg-footer {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 5px;
-  margin-top: 8px;
-  font-size: 11px;
+/* ==========================================================================
+   7. INSIDE AN ANSWER
+   Everything here renders something the MODEL wrote. Nothing is injected.
+   ========================================================================== */
+
+/* ----- section kickers -----
+   A heading the model wrote IS the answer's kicker — "Key idea", "Next step",
+   "Watch out" — so it is set in the hand rather than having one invented for
+   it. Sized from the type scale (never below the lead size, because a
+   handwritten heading that has to be leaned into is a failed heading) and
+   marked with a short marker tick instead of being scaled up: a chat answer
+   has no room for a 26px section title, and the tick gives the hierarchy the
+   size cannot. */
+/* A model-written heading takes the hand — that is the brief's rule for a long
+   answer: clean body text, handwritten headings. Gated on `.is-latin` because
+   Kalam bundles latin + latin-ext only, so the headings of a Hebrew or CJK
+   answer stay in the sans rather than being drawn in a face that has none of
+   their glyphs. The marker tick below still applies either way. */
+.msg.is-latin .msg-content :is(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--hand);
+  font-weight: 400;
 }
-.msg-footer > button.subtle {
-  padding: 2px 7px;
-  font-size: 11px;
-  color: var(--faint);
-  background: transparent;
-  border-color: transparent;
+.msg .msg-content :is(h1, h2, h3, h4, h5, h6) {
+  margin: var(--sp-4) 0 var(--sp-2);
+  font-weight: 400;
+  font-size: var(--fs-lead);
+  line-height: 1.35;
+  color: var(--text-strong);
 }
-.msg-footer > button.subtle:hover {
-  color: var(--text);
-  background: var(--hover);
-  border-color: var(--line);
+.msg .msg-content h1 {
+  font-size: var(--fs-hand-lg);
+}
+.msg .msg-content :is(h1, h2, h3, h4, h5, h6)::before {
+  content: "";
+  display: inline-block;
+  width: 13px;
+  height: 3px;
+  margin-inline-end: 8px;
+  vertical-align: 0.22em;
+  /* The INK track, not the fill: a 3px mark in the light-mode marker fill
+     measures 1.45:1 on ivory and would simply not be there. */
+  background: var(--sem-pending);
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  pointer-events: none;
 }
 
-/* The recovery strip under a turn that produced no answer. Deliberately not a
-   .msg-footer variant: the footer's buttons are transparent until hover, and
-   the one action available after a lost reply must be visible without one. */
-.msg-recover {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
-  padding: 7px 9px;
-  font-size: 11.5px;
-  color: var(--faint);
-  background: var(--hover);
-  border: 1px solid var(--line);
-  border-radius: 7px;
+/* ----- emphasis -----
+   The marker goes behind the phrases the MODEL emphasised, and nowhere else.
+   A low stroke across the bottom of the line rather than a full highlight,
+   because an answer with six bold phrases in it would otherwise be a page of
+   highlighter. --ink-strong on the densest part measures 8.1:1 dark and
+   14.8:1 light. */
+.msg .msg-content strong {
+  font-weight: 600;
+  color: var(--ink-strong);
+  background-image: linear-gradient(
+    101deg,
+    transparent 0.5%,
+    color-mix(in srgb, var(--sem-pending-fill) 40%, transparent) 2%,
+    color-mix(in srgb, var(--sem-pending-fill) 30%, transparent) 52%,
+    color-mix(in srgb, var(--sem-pending-fill) 38%, transparent) 84%,
+    color-mix(in srgb, var(--sem-pending-fill) 18%, transparent) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-position: 0 92%;
+  background-size: 100% 38%;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
 }
-.msg-recover > button.subtle {
-  padding: 3px 10px;
-  font-size: 11.5px;
-  margin-left: auto;
+/* A heading is already a kicker and a <mark> already carries the full marker
+   (viewer-formats.css) — neither takes a second stroke. */
+.msg .msg-content :is(h1, h2, h3, h4, h5, h6) strong,
+.msg .msg-content mark strong {
+  background-image: none;
 }
+
+/* Logical, so an RTL answer indents its lists on the correct side. This was a
+   `padding-left`, which put the indent on the outside of every Hebrew list. */
+.msg .msg-content :is(ul, ol) {
+  padding-inline-start: 22px;
+}
+
+/* Code, tables and quotations are left entirely to viewer-formats.css, which
+   already draws them as boxes on the sheet in the mono face. A second opinion
+   here (this file used to fill `pre` with an opaque panel) only fought it. */
+
+/* ==========================================================================
+   8. CITATIONS, ANNOTATIONS, ATTACHED FILES
+   The evidence under an answer. All of it stays keyboard-reachable with the
+   focus ring base.css draws, and none of it is allowed to fade with the
+   action buttons — evidence is content.
+   ========================================================================== */
 
 .msg-sources {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
-  gap: 5px;
+  gap: var(--sp-2);
+  /* Its own line at the head of the action group. */
+  flex-basis: 100%;
 }
 
-/* Citations: quiet accent chips that reopen the supporting source. */
-.source-chip {
+/* The drawn tie between a group and what it refers to. An aria-hidden masked
+   span from paper.css (pointer-events: none, never focusable), sized down
+   here; as a FLEX ITEM it lands on the correct side of an RTL row without a
+   single physical offset. */
+.msg-tie {
+  flex: none;
+  width: 28px;
+  height: 22px;
+  align-self: center;
+}
+
+.msg-sources-kicker {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+}
+
+/* A citation reads as a marker-highlighted chip, but the file NAME stays in
+   the interface face: a marker fill is not legible as text, and a filename is
+   something you may have to read character by character. The word therefore
+   sits in the reading ink over a blue wash (9.7:1 dark, 12.5:1 light), the
+   boundary is --rule-strong, and the underline survives so the chip is still
+   identifiable as "opens something" with colour ignored entirely. */
+.msg-sources .source-chip {
+  /* Moved here from composer.css, which used to own a second `.source-chip`
+     block for a chip only this pane renders. These four are what made the chip
+     read as "opens something"; the rules below then colour it. */
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  transition:
+    color var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    text-decoration-color var(--dur-fast) var(--ease-pen);
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--accent-2);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
-  border-radius: 5px;
-  padding: 2px 7px;
-  font-size: 10.5px;
+  /* 3px + an 18px line box + 3px + the border is 26px, so the target clears
+     the 24px floor without a min-height — which on an inline-block would push
+     the box taller than its text and leave the label sitting off-centre.
+     `text-overflow` is why this stays inline-block rather than inline-flex: a
+     flex container cannot ellipsise its own anonymous text run, and a
+     truncated filename is exactly what a long citation needs. */
+  padding: 3px 10px;
+  font-family: var(--sans);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  color: var(--text);
+  background-color: transparent;
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--sem-linked-fill) 30%, transparent) 0%,
+    color-mix(in srgb, var(--sem-linked-fill) 22%, transparent) 58%,
+    color-mix(in srgb, var(--sem-linked-fill) 28%, transparent) 100%
+  );
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  text-decoration-color: color-mix(in srgb, var(--sem-linked) 70%, transparent);
 }
-.source-chip:hover {
-  background: var(--selected);
-  border-color: var(--accent);
+.msg-sources .source-chip:hover {
+  color: var(--text-strong);
+  background-color: transparent;
+  border-color: var(--sem-linked);
+  text-decoration-color: var(--sem-linked);
+}
+
+/* ----- the model's own margin note -----
+   The answer said where it found something; this is that, tied back to the
+   passage with a drawn arrow. `.annot-chip` comes from settings-annotations
+   .css with `white-space: nowrap` for a viewer sidebar — in a conversation the
+   quote has to be readable, so it wraps here and the chip becomes a note. */
+.msg-annot {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+.msg .annot-chip {
+  align-items: flex-start;
+  max-width: 100%;
+  padding: 6px 12px;
+  margin-top: 0;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  text-align: start;
+  white-space: normal;
+  overflow: visible;
+  color: var(--text);
+  background: color-mix(in srgb, var(--sem-pending-fill) 20%, transparent);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+}
+.msg .annot-chip:hover {
+  background: color-mix(in srgb, var(--sem-pending-fill) 32%, transparent);
+  border-color: var(--sketch);
+}
+/* Verified: the quote was found verbatim, so the note turns from "noted" to
+   "done". Three classes deep because misc-moonshot-cards.css carries a
+   two-class rule for the same state and loads later. */
+.msg .annot-chip.receipt-verified {
+  background: color-mix(in srgb, var(--sem-done-fill) 20%, transparent);
+  border-color: var(--rule-strong);
+}
+.msg .annot-chip.receipt-verified:hover {
+  background: color-mix(in srgb, var(--sem-done-fill) 32%, transparent);
+  border-color: var(--sketch);
+}
+/* "≈ closest match" — the honesty in that chip, saying the quote was NOT found
+   verbatim — is already set in the hand by misc.css, and that is the right
+   call: it is a margin note about a quotation. Deliberately not restyled here.
+   */
+
+/* ==========================================================================
+   9. THE ACTION GROUP
+   One group at the END of a turn, and quiet until the turn is the one being
+   read. Every message used to carry a permanently lit row of buttons, so a
+   long conversation was a column of chrome with answers in between.
+   ========================================================================== */
+
+.msg-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-2);
+  font-size: var(--fs-micro);
+}
+/* An answer's actions are ruled off from the answer with the tapered pencil
+   stroke, so the group reads as the end of the section rather than as more of
+   it. */
+.msg.assistant .msg-footer {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 62%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+
+/* Quiet until the turn is hovered or holds focus. Deliberately opacity and
+   NOT display/visibility: the buttons stay in the DOM, in the tab order and in
+   the accessibility tree, so a keyboard user reaches them exactly as before,
+   `:focus-within` lights the group the moment they do, and the group keeps its
+   space — a row that appeared on hover would shove the conversation around
+   under the pointer. The newest answer — the one anyone is actually about to
+   act on — never fades at all. */
+/* No border declarations here on purpose: every button in this footer is
+   `.subtle`, which base.css draws with `border: none`, so a border-color would
+   be a rule that can never paint. */
+.msg-footer > button {
+  padding: 3px 8px;
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  opacity: 0;
+  transition:
+    opacity var(--dur-fast) var(--ease-pen),
+    color var(--dur-fast) var(--ease-pen);
+}
+.msg:hover .msg-footer > button,
+.msg:focus-within .msg-footer > button,
+.msg.is-latest .msg-footer > button,
+/* An Undo is not an action prompt, it is a REPORT that this answer changed a
+   file. It stays lit whether or not anyone is looking at the row. */
+.msg-footer > button.undo-edit {
+  opacity: 1;
+}
+.msg-footer > button:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+/* The recovery strip under a turn that produced no answer. Deliberately not a
+   .msg-footer variant: the footer's buttons are quiet until the row is
+   touched, and the one action available after a lost reply must be visible
+   without that. A caution note — the advice is a consequence, so it is the
+   sans, and the marker edge carries the tone alongside the words. */
+.msg-recover {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  padding: 8px 11px;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--text);
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--sketch) 58%, transparent);
+  border-radius: var(--radius);
+  box-shadow: inset 3px 0 0 var(--sem-pending-fill);
+}
+.msg-recover > button.subtle {
+  padding: 3px 10px;
+  font-size: var(--fs-meta);
+  margin-inline-start: auto;
+  color: var(--text);
+  border: 1px solid var(--rule-strong);
 }
 
 .save-form {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--sp-1);
 }
-
 .save-form input {
-  font-size: 12px;
-  padding: 4px 8px;
   width: 160px;
+  padding: 4px 8px;
+  font-size: var(--fs-micro);
 }
 
-/* ---------- PRIV-1: privacy receipt + valve + OFF banner ---------- */
-.privacy-off-banner {
-  border-color: var(--red);
-  color: var(--red);
+/* ==========================================================================
+   10. THE ACTIVITY LOG
+   Which agents ran and which tools they used, as the log line of a notebook
+   page: a handwritten caption, then the technical names in mono. The step
+   CLOCKS live in the agent diagram (agentGraph.css) — nothing here invents a
+   time for a step that never recorded one.
+   ========================================================================== */
+
+.msg .agent-strip-caption {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-2);
+  opacity: 1;
 }
+/* The names themselves are technical metadata, so they are printed. The chips
+   lose their opaque `--panel` fill (nothing inside the transcript is allowed to
+   be opaque) but NOT their state colours: `.agent-chip.active/.done/.failed`
+   and `.step-chip.failed` are two-class rules in composer.css and misc.css that
+   load later, so "this step didn't succeed" still reads red. */
+.msg .agent-chip,
+.msg .step-chip {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: 400;
+  background: transparent;
+  border-width: 1px;
+  border-color: var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+}
+/* The lane already carries its blue "informational" wash from misc.css — all
+   it needs from the log line is the mono face. */
+.msg .lane-chip {
+  font-family: var(--mono);
+}
+
+/* ==========================================================================
+   11. THE LIVE TURN
+   ========================================================================== */
+
+.msg.thinking .msg-content {
+  color: var(--muted);
+}
+
+/* "Thinking locally…" is a short aside about nothing consequential — the hand
+   is exactly right for it. */
+.chat-route {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+}
+/* …and the cloud line is the opposite: it says room content is leaving this
+   Mac. Sans, at reading size, in the reading ink, drawn as a note with the
+   caution marker on its edge — the same meaning the composer's cloud strip and
+   the status bar's "Protected cloud" badge use for the same fact. */
+.chat-route-cloud {
+  display: inline-block;
+  padding: 6px 11px;
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--text);
+  border: 1px solid var(--sem-pending);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 3px 0 0 var(--sem-pending-fill);
+}
+
+/* The nib at the end of the stream. This is the one thing in the pane that
+   moves on its own, and it earns it by being the answer to "is it still
+   writing?" — a status indicator rather than decoration. Slow and shallow
+   (1.8s round trip, never to zero) so it reads as wet ink rather than as a
+   blinking terminal caret, and aria-hidden in the markup so a screen reader
+   following the answer never hears it. */
+.stream-cursor {
+  display: inline-block;
+  color: var(--accent);
+  animation: chat-nib 900ms var(--ease-pen) infinite alternate;
+}
+@keyframes chat-nib {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0.22;
+  }
+}
+
+/* Ink appearing on paper: an emphasised phrase draws its marker in as it
+   arrives. It animates the EMPHASIS, not the text flow — no per-character
+   work, no relayout, and nothing repeats, because only elements that are new
+   in the DOM start the animation. It is scoped to the streaming row, so a
+   finished answer never re-draws itself on a re-render. Only `from` is
+   declared, so switching the animation off lands on the finished mark. */
+@keyframes chat-ink-in {
+  from {
+    background-size: 0% 38%;
+  }
+}
+.msg.is-streaming .msg-content strong {
+  animation: chat-ink-in var(--dur) var(--ease-pen);
+}
+
+/* ==========================================================================
+   12. PRIVACY RECEIPT AND THE "REAL DETAILS" VALVE
+   What actually left this Mac, after the fact. Sans throughout — every line
+   here is a privacy consequence.
+   ========================================================================== */
+
 .privacy-receipt {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--sp-2);
   padding: 2px 4px 6px;
-  font-size: 12px;
+  font-size: var(--fs-meta);
 }
+/* A strip of tape carrying the word: the wash is the meaning and the reading
+   ink carries the sentence (8.3:1 dark, 12.3:1 light), which is what lets the
+   receipt be read correctly in greyscale — the hue is never the claim. */
 .privacy-receipt-chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 2px 9px;
-  border-radius: 99px;
-  border: 1px solid var(--green);
-  color: var(--green);
+  padding: 3px 10px;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--sem-done-fill) 34%, transparent);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sem-done-fill) 46%, transparent);
 }
 .privacy-receipt-chip.bypassed {
-  border-color: var(--amber);
-  color: var(--amber);
+  background: color-mix(in srgb, var(--sem-pending-fill) 34%, transparent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sem-pending-fill) 46%, transparent);
 }
 .privacy-valve {
-  font-size: 12px;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.privacy-valve:hover {
+  color: var(--text);
 }
 .privacy-valve-confirm {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  color: var(--amber);
-  font-size: 12px;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  font-size: var(--fs-meta);
+  color: var(--text);
 }
-button.subtle.danger { color: var(--red); }
+
+/* ==========================================================================
+   13. MOTION
+   Every animation and transition above has its escape here.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .stream-cursor,
+  .msg.is-streaming .msg-content strong {
+    animation: none;
+  }
+  .prompt-chip,
+  .msg-footer > button {
+    transition: none;
+  }
+  .prompt-chip:hover {
+    transform: none;
+  }
+  .prompt-chip:active {
+    transform: none;
+  }
+}

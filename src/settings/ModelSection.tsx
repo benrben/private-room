@@ -153,8 +153,11 @@ export default function ModelSection({
                   const sel = caps.find((c) => c.name === model);
                   if (!sel || sel.tools) return null;
                   return (
-                    <p className="settings-hint model-warn">
-                      <AlertIcon size={13} className="warn-ic" /> This model can chat
+                    /* A capability the chosen model lacks: caution, not
+                       alarm — nothing is leaving the Mac, something merely
+                       will not work. */
+                    <p className="model-warn set-note set-note--flag nb-sem-pending">
+                      <AlertIcon size={16} className="warn-ic" /> This model can chat
                       but can't control the app (open, edit, or highlight files).
                       Pick a model badged{" "}
                       <strong>
@@ -165,8 +168,10 @@ export default function ModelSection({
                   );
                 })()}
                 {ai.external.length > 0 && (
-                  <p className="settings-hint">
-                    <AlertIcon size={13} className="warn-ic" /> Cloud engines send your questions and room context to your
+                  /* Content leaving this Mac is the urgent meaning, and the
+                     sentence is a core promise, so it runs at lead size. */
+                  <p className="set-note set-note--flag set-note--lead nb-sem-urgent">
+                    <AlertIcon size={16} className="warn-ic" /> Cloud engines send your questions and room context to your
                     connected AI provider or account — content leaves this Mac. Images stay
                     local (vision and image marking always use the local model).
                   </p>
@@ -206,10 +211,15 @@ export default function ModelSection({
                 </span>
               </div>
             )}
-            <p className="settings-hint">
-              Tip: on a 16 GB Mac keep one model around 4B parameters — larger
-              models are smarter but slower and heavier.
-            </p>
+            {/* Sizing guidance is the kind of detail a returning user does not
+                need on screen every time. Folded, not cut. */}
+            <details className="set-more">
+              <summary>Which size should I download?</summary>
+              <p className="settings-hint">
+                Tip: on a 16 GB Mac keep one model around 4B parameters — larger
+                models are smarter but slower and heavier.
+              </p>
+            </details>
 
             <label className="settings-label">Dictation &amp; transcription</label>
             <p className="settings-hint">
@@ -219,7 +229,7 @@ export default function ModelSection({
               {stt ? ` (~${stt.sizeMb} MB)` : ""}.
             </p>
             {stt?.installed ? (
-              <div className="model-row active">
+              <div className="model-row active is-ok">
                 <span className="btn-ic"><CircleCheckIcon size={13} /> Voice model installed</span>
                 <button
                   className="subtle btn-ic"
@@ -276,7 +286,10 @@ export default function ModelSection({
                     <option value="prompt">Optimized AI prompt</option>
                   </select>
                 </label>
-                <p className="settings-hint">
+                {/* Where dictated words go is a privacy fact, so it is an
+                    attached note rather than a trailing hint. Quiet, because
+                    the state it describes is the safe one. */}
+                <p className="set-note">
                   Shaping and translation run on this room's local AI — dictated
                   words never reach a cloud engine. If the local AI is off, the
                   exact transcript is used instead.

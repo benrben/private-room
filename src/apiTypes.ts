@@ -116,6 +116,59 @@ export interface Folder {
   name: string;
 }
 
+/** One speaker in a podcast script, and the voice that reads them. */
+export interface PodcastHost {
+  /** The JOIN KEY between a line and a voice — the speaker name exactly as it
+   * appears in every turn. Renaming a host rewrites its turns to match. */
+  name: string;
+  /** A neural voice id from the live catalog. "" = the product default. */
+  voice: string;
+  /** Edge prosody, e.g. "+22%" / "-2Hz". "" = the service default. */
+  rate: string;
+  pitch: string;
+}
+
+/** One line of an episode. */
+export interface PodcastTurn {
+  speaker: string;
+  line: string;
+}
+
+/** A generated podcast script as DATA, so its hosts can be cast and the
+ * episode rendered without asking the model to write it again. */
+export interface Podcast {
+  /** The script page's file id — the row's identity. */
+  fileId: string;
+  title: string;
+  turns: PodcastTurn[];
+  cast: PodcastHost[];
+  /** The rendered episode, when one exists — an ordinary room file. */
+  audioFileId: string | null;
+  createdAt: string;
+}
+
+/** One file a batch operation could not act on, and why. */
+export interface BulkFailure {
+  /** The file's name, or its id when even that could no longer be read. */
+  name: string;
+  error: string;
+}
+
+/** What a batch file operation actually did (`commands::bulk`).
+ *
+ * Every field is read back from the room, never assumed from the input list —
+ * which is the whole reason these commands return a value instead of `void`.
+ * A multi-file move is best-effort by design (unlike `edit_files`, which is
+ * atomic): independent files must not lose 39 good moves to a 40th bad id, so
+ * the ones that failed come back NAMED rather than silently dropped. */
+export interface BulkReport {
+  /** Names of the files that really changed, in the order given. */
+  ok: string[];
+  failed: BulkFailure[];
+  /** Ids past the backend's per-batch ceiling that were never attempted. */
+  capped: number;
+}
+
 /** A prebuilt "#name" chat workflow, for autocomplete/help. */
 export interface ChatCommand {
   name: string;
@@ -353,6 +406,20 @@ export interface PrivacyScanProgress {
   label?: string;
   /** Terminal events only: why the scan stopped without finishing. */
   error?: string | null;
+}
+
+/** ADD-31: a named stage while a Studio artefact is being written.
+ *
+ * `local` is the whole reason this is a struct and not a string. When it is
+ * false the step says room content is leaving the Mac, which is a privacy
+ * consequence rather than a progress aside, and the AI pane draws the two
+ * differently. Recovering that by matching "leaves this Mac" against `step`
+ * would break on the first reworded sentence — silently, and in the direction
+ * that under-warns. It comes from the model's DECLARED capabilities in
+ * studios.rs, not from its name. */
+export interface StudioStep {
+  step: string;
+  local: boolean;
 }
 
 /** ADD-23: the `effects` column payload — what a turn's tools drew. */
@@ -614,6 +681,78 @@ export interface RecMeta {
    * An overlay on top of `segments`, so re-clustering and re-transcribe (which
    * both rewrite the labels) can't destroy it. Absent until someone renames. */
   speakerNames?: Record<string, string>;
+  /** Which of `speakerNames` the app GUESSED, from a voice this room has been
+   * told the name of before — as opposed to a name the user typed.
+   *
+   * NAMES, not labels: re-clustering moves labels constantly, so a guess keyed
+   * to one would be about a different person by the next pass. The screen has
+   * to keep the two apart — a name the app inferred and a name the user
+   * asserted are not the same claim, and only the first may be withdrawn. */
+  recognized?: string[];
+  /** What the room found when it read this recording, plus anything you wrote
+   * yourself. All three are kept in time order and anchored on the ORIGINAL
+   * timeline (the same one `cuts` are stated on), so a re-transcribe — which
+   * remakes every segment — leaves them exactly where they were. */
+  chapters?: RecChapter[];
+  highlights?: RecHighlight[];
+  notes?: RecNote[];
+  /** The transcript the last reading was made from. Absent = never read, which
+   * is what the background sweep looks for. When it no longer matches the
+   * transcript, the tabs say the reading is out of date rather than presenting
+   * old findings as current. */
+  readOf?: { turns: number; chars: number };
+}
+
+/** Who put an item on the recording. `room` is the reading pass; `you` is the
+ * person. Editing one of the room's items makes it yours, and the room never
+ * touches it again — which is also the "Read again" rule.
+ *
+ * The distinction is the safety property of the whole feature: the room reads
+ * every recording by itself and is sometimes wrong, and a made-up action item
+ * with a colleague's name on it must never look like something you wrote. */
+export type By = "room" | "you";
+
+export type NoteKind = "decision" | "action" | "question" | "point";
+
+export interface RecChapter {
+  id: string;
+  t0: number;
+  title: string;
+  by?: By;
+}
+
+export interface RecHighlight {
+  id: string;
+  t0: number;
+  t1: number;
+  by?: By;
+}
+
+export interface RecNote {
+  id: string;
+  t0: number;
+  kind: NoteKind;
+  text: string;
+  /** Who an action is on — only ever somebody who actually speaks in this
+   * recording; the backend drops a name it cannot find. */
+  who?: string;
+  by?: By;
+}
+
+/** A voice this room can recognise: someone named in a recording, whose
+ * voiceprint is saved so later recordings put their name back automatically.
+ * Stored in the encrypted room, never sent anywhere; the print itself never
+ * crosses this boundary. */
+export interface SavedVoice {
+  name: string;
+  /** Seconds of speech behind the saved voice — the evidence, in a unit a
+   * person can weigh. */
+  seconds: number;
+  /** How many separate namings have been folded into it. */
+  takes: number;
+  /** How many times the user has said "that isn't them". */
+  corrections: number;
+  updatedAt: string;
 }
 
 export interface RecStart {

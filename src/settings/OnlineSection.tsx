@@ -49,8 +49,10 @@ export default function OnlineSection({
               bar refuses to load anything. Turn it on and you can then choose,
               below, which of the two online abilities the AI actually gets.
             </p>
-            <p className="settings-hint">
-              <AlertIcon size={13} className="warn-ic" /> When on, search queries and fetched pages leave this Mac.
+            {/* The consequence of the master switch, drawn as a marked note
+                above the switch itself. */}
+            <p className="set-note set-note--flag set-note--lead nb-sem-urgent">
+              <AlertIcon size={16} className="warn-ic" /> When on, search queries and fetched pages leave this Mac.
               Your files never do.
             </p>
             <label className="settings-label">
@@ -61,13 +63,27 @@ export default function OnlineSection({
               />{" "}
               Let this room reach the internet
             </label>
+            {/* How many parties see a search is a CONSEQUENCE, not mechanics,
+                so it stays out in the open next to the switch that causes it.
+                It was briefly folded into the disclosure below on the grounds
+                that it described how search is built; but "one query goes out
+                to several independent engines at once" is the answer to "who
+                sees what I type", which is the question this whole screen
+                exists to answer honestly. Only the resilience mechanics —
+                which are genuinely mechanics — are folded. */}
             <p className="settings-hint">
-              There is nothing to sign up for and no key to paste. Search is
-              built in: one query goes out to several independent engines at
-              once and the results are merged into a single ranking, so a
-              blocked or rate-limited engine quietly drops out instead of
-              breaking your search.
+              One query goes out to several independent engines at once, so
+              more than one provider sees what you searched for.
             </p>
+            <details className="set-more">
+              <summary>How search works</summary>
+              <p className="settings-hint">
+                There is nothing to sign up for and no key to paste. Search is
+                built in, and the engines' results are merged into a single
+                ranking, so a blocked or rate-limited engine quietly drops out
+                instead of breaking your search.
+              </p>
+            </details>
             {webOn && (
               <>
                 <label className="settings-label">What the AI may do online</label>
@@ -100,8 +116,8 @@ export default function OnlineSection({
                   rather than searching for it.
                 </p>
                 {!searchAgent && !browseAgent && (
-                  <p className="settings-hint">
-                    <AlertIcon size={13} className="warn-ic" /> Both are off, so
+                  <p className="set-note set-note--flag nb-sem-pending">
+                    <AlertIcon size={16} className="warn-ic" /> Both are off, so
                     the AI has no internet abilities in this room — the same as
                     turning the switch above off. You can still use the Browser
                     area yourself.
@@ -154,15 +170,24 @@ export default function OnlineSection({
                 discard the change in silence — the user believed the room was
                 offline and it was not. Say it out loud instead. */}
             {webDirty && !webSaved && (
-              <p className="settings-hint" role="status">
-                <AlertIcon size={13} className="warn-ic" /> Not saved yet —
+              <p
+                className="set-note set-note--flag nb-sem-pending"
+                role="status"
+              >
+                {/* The tape is the sentence's own opening clause — the same
+                    "Unsaved" yellow the left-hand index is flying for this
+                    page, so the two readings of the same fact agree. */}
+                <span className="nb-tape set-note-tag">Not saved yet</span> —
                 press Save, or these changes are discarded when you close
                 Settings.
               </p>
             )}
             {webError && (
-              <p className="settings-hint" role="alert">
-                <AlertIcon size={13} className="warn-ic" /> {webError}
+              <p
+                className="set-note set-note--flag nb-sem-urgent"
+                role="alert"
+              >
+                <AlertIcon size={16} className="warn-ic" /> {webError}
               </p>
             )}
             {webTestResult && (
