@@ -86,6 +86,10 @@
   flex: 1;
   overflow: auto;
   padding: var(--sp-6) var(--sp-6) var(--sp-8);
+  /* The document itself (P0-3) — explicit so a file's content stays
+     selectable even though `.viewer-head`/`.editor-breadcrumb-bar` above it
+     (shell.css) are not. */
+  user-select: text;
 }
 
 .viewer-body img {

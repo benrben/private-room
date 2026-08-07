@@ -57,6 +57,10 @@
   border-bottom: 1px solid var(--line);
   position: relative;
   z-index: 20;
+  /* Toolbar, not a document (P0-3): the room name still opens for editing
+     via `.room-name-input`, an <input> — base.css opts inputs back into
+     `text` regardless of this. */
+  user-select: none;
 }
 
 .pr-brandmark {
@@ -399,6 +403,10 @@
   background: transparent;
   border-right: 1px solid var(--line);
   position: relative;
+  /* Furniture, not content: ⌘A used to run the browser default and paint
+     the whole rail's icon labels blue along with every other pane's chrome
+     (P0-3). The rail never holds anything a person typed or would copy. */
+  user-select: none;
   z-index: 15;
   overflow: hidden auto;
 }
@@ -526,10 +534,22 @@
   color: var(--text);
 }
 /* Pane-visibility toggles: restrained neutral pressed state. A pane toggle is
-   not a destination, so it never takes the pen — its spine is pencil. */
+   not a destination, so it never takes the pen — its spine is pencil, not the
+   AREA rows' accent gradient below. The wash is 12%, matching the order of
+   magnitude .icon-btn[aria-pressed="true"] already uses elsewhere in this
+   file (11%) — the previous 5% read as almost nothing next to a hover state
+   that is itself var(--hover), a full opaque tint. */
 .rail-button[data-pane-toggle][aria-pressed="true"] {
   color: var(--text);
-  background: color-mix(in srgb, var(--text) 5%, transparent);
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+}
+/* The panel glyph itself flips from outline to filled — on beats off without
+   requiring the reader to notice a colour shift or find the spine in the
+   gutter. Scoped to the pane toggles' own <rect>, so no other rail icon is
+   touched. */
+.rail-button[data-pane-toggle][aria-pressed="true"] svg rect {
+  fill: var(--rule-strong);
+  fill-opacity: 0.28;
 }
 .rail-button[data-pane-toggle][aria-pressed="true"]::before {
   content: "";
@@ -793,6 +813,9 @@ body.resizing-col * {
   align-items: center;
   gap: 7px;
   min-width: 0;
+  /* Every pane's title bar (Library / Workspace / AI chat) is app-generated
+     label text and icon buttons — furniture, not content (P0-3). */
+  user-select: none;
 }
 .pane-heading {
   min-width: 0;
@@ -839,6 +862,9 @@ body.resizing-col * {
   align-items: flex-end;
   gap: 13px;
   border-bottom: 1px solid var(--line-soft);
+  /* A tab strip (P0-3) — the same furniture class as .tab-strip and
+     .assistant-header below. */
+  user-select: none;
 }
 .pane-tab {
   height: 34px;
@@ -894,6 +920,8 @@ body.resizing-col * {
   gap: 2px;
   border-bottom: 1px solid var(--line-soft);
   min-width: 0;
+  /* A tab strip (P0-3). */
+  user-select: none;
 }
 .assistant-tab {
   height: 30px;
@@ -953,6 +981,8 @@ body.resizing-col * {
   border-bottom: 1px solid var(--line-soft);
   font-size: 11px;
   min-width: 0;
+  /* A status readout, not content the user wrote (P0-3). */
+  user-select: none;
 }
 .context-strip .context-label {
   min-width: 0;
@@ -1002,6 +1032,9 @@ body.resizing-col * {
   color: var(--faint);
   font-size: var(--fs-micro);
   min-width: 0;
+  /* Readouts, not content (P0-3): nothing in the status strip is text a
+     person typed or would copy. */
+  user-select: none;
 }
 .status-seal {
   height: 24px;
@@ -1409,6 +1442,8 @@ button.status-trust.danger:hover {
   color: var(--muted);
   font-size: var(--fs-meta);
   flex-wrap: wrap;
+  /* The room/folder trail, not the document (P0-3). */
+  user-select: none;
 }
 .editor-breadcrumb {
   min-width: 0;
@@ -1701,6 +1736,9 @@ button.status-trust.danger:hover {
   border-bottom: 1px solid var(--line-soft);
   background: transparent;
   flex-wrap: wrap;
+  /* Toolbar, not the document (P0-3). The rename field inside it is still an
+     <input>, which base.css opts back into `text`. */
+  user-select: none;
 }
 .viewer-title {
   font-weight: 500;

@@ -320,6 +320,14 @@
   border: none;
   padding: 7px 4px;
   min-width: 0;
+  /* The library pane can end up as the ENTIRE window (both other panes
+     hidden, or the rail collapsed to icons): with no cap here, .file-name and
+     .file-size are the two ends of one `flex: 1` row, so the gap between the
+     name and its size stretches to match the window instead of staying a
+     fixed reading distance apart. Capped, not centred — this is a left-to-right
+     list (icon, name, size), so it stays flush left like every other library
+     row rather than floating a block in the middle of the pane. */
+  max-width: 720px;
   text-align: left;
 }
 

@@ -376,7 +376,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               e.currentTarget.selectionStart,
             )
           }
-          onBlur={() => s.setAc(null)}
+          onBlur={a.dismissAutocomplete}
           onPaste={a.onComposerPaste}
           onKeyDown={a.onComposerKeyDown}
         />
@@ -406,7 +406,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               title={
                 s.skills.some((skill) => skill.enabled)
                   ? "Use a specific enabled skill for this answer"
-                  : "Enable a skill in Skills before invoking it"
+                  : "Enable a skill in Skills to use this"
               }
               disabled={!s.skills.some((skill) => skill.enabled)}
               onClick={() => a.insertComposerToken("/")}

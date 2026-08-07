@@ -160,6 +160,17 @@
    the app's panes scroll over the canvas. */
 .settings.settings-sheet {
   width: min(1040px, 94vw);
+  /* A CONSTANT size, not a cap: the base `.settings` rule below only sets
+     max-height, which lets the box shrink to whatever the active page's
+     content measures. All six pages share one flex column (.settings-main →
+     .settings-body, both min-height:0 / flex:1, see misc.css and section 2's
+     `.settings-sheet .settings-body`), so a fixed `height` here is what makes
+     the frame occupy the same rect on every tab instead of resizing and
+     re-centering under the backdrop each time. Scrolling still happens only
+     inside `.settings-body`. Repeating `max-height` at the same value beats
+     the base rule's 86vh cap, which would otherwise still clip a viewport
+     shorter than 900px. */
+  height: min(900px, 90vh);
   max-height: min(900px, 90vh);
   background-color: var(--raised);
   background-image: radial-gradient(

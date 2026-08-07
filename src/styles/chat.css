@@ -78,6 +78,9 @@
   background-repeat: no-repeat;
   background-size: 100% 1px;
   background-position: left bottom;
+  /* Toolbar (P0-3): the chat picker and its buttons, not a message. The
+     rename field it can show is still an <input> — see base.css. */
+  user-select: none;
 }
 
 /* The conversation's NAME, in the hand: a chat title is something someone
@@ -316,6 +319,8 @@
   align-items: center;
   gap: 7px;
   margin-bottom: var(--sp-2);
+  /* The speaker/avatar/timestamp row, not the message (P0-3). */
+  user-select: none;
 }
 
 .msg-who {
@@ -423,6 +428,12 @@
   /* UX-1 — each line/paragraph picks its own direction so mixed
      Hebrew/English content reads correctly. */
   unicode-bidi: plaintext;
+  /* The one thing in a message that IS content (P0-3): explicit, not just
+     inherited, since nothing here actually sits under a `none` ancestor —
+     `.msg-label`/`.msg-footer` are siblings, not parents. Stated anyway so
+     the message body's selectability can't be lost to a future ancestor
+     rule without this line contradicting it first. */
+  user-select: text;
 }
 /* User text and streaming placeholders are plain strings — keep their line
    breaks. Assistant markdown brings its own block layout. */
@@ -705,6 +716,9 @@
   margin-top: var(--sp-3);
   padding-top: var(--sp-2);
   font-size: var(--fs-micro);
+  /* The action-button row (Copy, Edit, Regenerate…), not the message
+     (P0-3). */
+  user-select: none;
 }
 /* An answer's actions are ruled off from the answer with the tapered pencil
    stroke, so the group reads as the end of the section rather than as more of

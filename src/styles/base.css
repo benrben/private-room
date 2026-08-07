@@ -156,6 +156,11 @@ select {
   transition:
     border-color var(--dur-fast) var(--ease-pen),
     box-shadow var(--dur-fast) var(--ease-pen);
+  /* P0-3: every editable field opts back into selection/editing no matter
+     which chrome region it sits inside (a rename field in `.viewer-head` or
+     `.chat-head`, the `.composer-input`, a search box) — one rule here
+     instead of re-stating it beside each `user-select: none` above it. */
+  user-select: text;
 }
 
 /* Focus draws a second stroke just inside the border, like going over the
