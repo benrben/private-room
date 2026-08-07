@@ -3,6 +3,54 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.18.0 — 2026-08-07
+
+### Do things to many files at once
+
+The Library used to work one file at a time. Now you can pick several — hold
+⌘ to add one, Shift to take a run, ⌘A for everything on screen — and move,
+export, attach, or trash the whole lot in a single go. Dragging any picked
+file drags all of them. The Trash tab works the same way, so you can put a
+dozen files back where they came from without clicking a dozen times.
+
+When part of a batch fails, Arcelle now tells you *which* files failed and
+why, and finishes the rest. It no longer reports a whole batch as done when
+some of it wasn't.
+
+### The AI can tidy your room
+
+Ask the file assistant to sort your files into folders, rename them, file
+them by topic, merge two documents into one, or move clutter to the trash —
+and it does it in one pass rather than one file at a time. For anything big,
+ask it to show you the plan first: it can preview the whole reorganisation
+without touching anything.
+
+It can move files to the trash, and that's as far as it goes — it cannot
+permanently delete anything or empty your trash. Those stay yours alone. When
+it does trash something, the Trash tab says so, and names the tool it used.
+
+Renaming and moving by name also just works now. Arcelle lists files as
+`Folder/name.pdf`, but the assistant couldn't accept that back — you had to
+strip the folder off first, and often it simply failed. It now takes exactly
+what it showed you.
+
+### Podcasts you can actually listen to
+
+A podcast script is no longer only a page to read. Open one and you'll find
+**Voices**: each host gets their own voice, speed and pitch, with a preview
+that reads one of their real lines so you can hear whether it suits them.
+Press Record and Arcelle produces a finished episode as an audio file in your
+room — each host in their own voice, with natural gaps between turns.
+
+The episode arrives with a timed transcript, so you can read along, click any
+line to jump to that moment, and see who said what. Re-cast a host and record
+again and your earlier episode is kept, under its own name.
+
+Recording sends the script to an online voice service, and the panel says so
+plainly before the button — including a warning that if your privacy door is
+on, names will be spoken as their placeholders, so you learn that before you
+listen rather than after.
+
 ## 0.17.0 — 2026-08-05
 
 ### Hands-free now sends on its own
