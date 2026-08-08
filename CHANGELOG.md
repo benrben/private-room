@@ -3,6 +3,53 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.20.0 — 2026-08-09
+
+### A story films as one take
+
+Filming a shot list no longer produces a pile of unrelated clips. Each clip
+now opens on the **exact final frame of the clip before it** — captured from
+the finished video itself, not re-imagined from a description — so scene two
+starts precisely where scene one ended. The captured frames are filed into
+the room ("… — end frame.png"), so you can open any seam and check it. A
+clip whose predecessor hasn't finished parks itself with "Waiting for the
+shot before it" and starts on its own the moment that clip lands; stopping,
+locking the room, or quitting mid-run can't reorder the chain or bill a
+join that was lost.
+
+### Read the plan before it costs money
+
+**Film them…** now opens a review sheet first: every part with its prompt,
+its opening frame, its length, its model, and who's in it — plus plain
+warnings when something won't do what you expect (a part with no picture of
+its character, a model that can't accept an opening frame). Nothing is sent
+until you press Send, and pressing it twice can't queue the list twice. When
+a run is doomed — out of credits, a model with no endpoint — the parts
+waiting behind it stop too, with the reason on each card, instead of failing
+one by one at full price.
+
+### Scripts and characters come from your files
+
+The Story tab can now read what you already have instead of asking you to
+retype it. Pick a script file from the room and its text becomes the shot
+list source; pick a character sheet and the room's own model reads the cast
+out of it, showing you exactly who it found — every name editable, anything
+that isn't a person one click away from being dropped — before a word of it
+is used.
+
+### Pictures and clips, sized how you want them
+
+The Create page now offers resolution and aspect-ratio choices for models
+that publish them, and only shows models that can actually be reached — no
+more picking a router that has no image endpoint behind it.
+
+### A new face
+
+Arcelle has a new icon: a cream paper ribbon folded into an A, peeling open
+at the foot, with a small gold spark in the counter — on the same dark
+dotted sheet the app itself is drawn on. The Dock, the document icon, the
+favicon, the launch screen, and the little mark in the top bar all wear it.
+
 ## 0.19.1 — 2026-08-08
 
 ### In-app updates actually install now
