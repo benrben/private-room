@@ -11,9 +11,16 @@
 //
 //      The notebook pass INVERTED the default: the rail is the app's one
 //      primary navigation, and navigation you have to hover to identify is not
-//      navigation, so full labels are what a new room opens with. The toggle,
-//      the persistence and the abbreviation are all still the thing under test
-//      — they are just exercised starting from the other end.
+//      navigation, so full labels are what a new room opens with. The toggle
+//      and the persistence are still the thing under test — they are just
+//      exercised starting from the other end.
+//
+//      A later design-review pass (2026-08-08) replaced the abbreviated-text
+//      collapsed state with icon-only rows plus a native `title` tooltip
+//      carrying the FULL, un-abbreviated label — a shrunken "Connect" was
+//      judged less legible than no visible text at all. The abbreviation
+//      itself is gone; what's under test now is that collapsing clears the
+//      visible label and moves the full name to `title`, not that it shrinks.
 //
 //   2. The Library pane always resized, but you could not tell: the handle was
 //      a 5px line whose grip only appeared on hover, and it refused to go past
@@ -64,8 +71,12 @@ describe("GH #2a — the activity rail expands", () => {
       timeout: 5_000,
       timeoutMsg: "the rail never narrowed",
     });
-    // Abbreviated while narrow — the ≤9-character short form, still present.
-    await expect(await $(RAIL).$('[data-area="connectors"]').getText()).toContain("Connect");
+    // Icon-only while narrow — no shrunken abbreviation, the full name only
+    // survives as a `title` tooltip.
+    await expect(await $(RAIL).$('[data-area="connectors"]').getText()).toBe("");
+    await expect(
+      await $(RAIL).$('[data-area="connectors"]').getAttribute("title"),
+    ).toBe("Connectors");
 
     await (await $(EXPANDER)).click();
     await browser.waitUntil(async () => (await widthOf(RAIL)) > 150, {
