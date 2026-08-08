@@ -8,7 +8,7 @@
 }
 
 .room-name {
-  font-size: 13px;
+  font-size: var(--fs-meta);
   font-weight: 600;
   color: var(--text);
 }
@@ -71,7 +71,7 @@
   border: none;
   border-radius: 7px 5px 8px 6px / 6px 8px 5px 7px;
   padding: 8px 10px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   color: var(--text);
   white-space: nowrap;
 }
@@ -132,12 +132,12 @@
 .engine-picker {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--sp-1);
   min-width: 0;
 }
 .engine-tier-tabs {
   display: flex;
-  gap: 4px;
+  gap: var(--sp-1);
   padding: 3px;
   background: var(--surface-2);
   border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
@@ -148,7 +148,7 @@
   border: none;
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
   padding: 6px 8px;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   color: var(--text-dim);
 }
 .engine-tier-tab.active {
@@ -166,7 +166,7 @@
 .model-menu-row {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-1);
 }
 .model-menu-row .model-menu-item {
   flex: 1;
@@ -186,7 +186,7 @@
   display: flex;
   flex-direction: column;
   gap: 1px;
-  padding-left: 16px;
+  padding-left: var(--sp-4);
   border-left: 1px solid var(--border);
   margin: 2px 0 2px 14px;
 }
@@ -204,13 +204,13 @@
 .model-catalog-controls input {
   width: 100%;
   min-width: 0;
-  font-size: 12px;
+  font-size: var(--fs-micro);
 }
 .model-filter-chips {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--sp-1);
 }
 .model-filter-chips button {
   padding: 3px 7px;
@@ -262,7 +262,7 @@
 .effort-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--sp-1);
   padding: 4px 10px 6px 27px;
 }
 .effort-chip {
@@ -677,7 +677,7 @@
   /* .nb-chip-btn's 24px floor is the minimum; these get 28px because they are
      the only way to reach five areas from this page. */
   min-height: 28px;
-  padding: 4px 12px;
+  padding: var(--sp-1) var(--sp-3);
 }
 .rh-chip-ico {
   display: inline-flex;

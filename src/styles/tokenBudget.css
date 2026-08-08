@@ -303,7 +303,7 @@
    neither of which a bare <summary> has. */
 .handoff-marker-details > summary {
   min-height: 24px;
-  padding: 4px 8px;
+  padding: var(--sp-1) var(--sp-2);
   cursor: pointer;
   text-align: center;
   font-size: var(--fs-micro);

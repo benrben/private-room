@@ -411,7 +411,7 @@
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 2px 8px;
+  padding: 2px var(--sp-2);
   font-size: var(--fs-micro);
   line-height: 1.5;
   color: var(--ink);
@@ -573,7 +573,7 @@
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  padding: 4px 8px;
+  padding: var(--sp-1) var(--sp-2);
 }
 .wf-page .wf-title-input:hover {
   border-color: var(--line);
@@ -1175,7 +1175,7 @@
    is under the 24px floor for anything clickable. */
 .run-step-head .run-step-copy {
   min-height: 24px;
-  padding: 2px 8px;
+  padding: 2px var(--sp-2);
   font-size: var(--fs-micro);
 }
 .run-step-body {

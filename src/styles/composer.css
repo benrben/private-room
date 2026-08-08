@@ -60,7 +60,7 @@
   justify-content: space-between;
   gap: var(--sp-2);
   margin-bottom: var(--sp-2);
-  padding: 4px 10px;
+  padding: var(--sp-1) 10px;
   font-size: var(--fs-micro);
   color: var(--ink);
   background: color-mix(in srgb, var(--sem-pending-fill) 22%, transparent);
@@ -141,7 +141,7 @@
    one about 20px tall — under the floor for something clickable. */
 .composer .attach-nudge .subtle {
   min-height: 24px;
-  padding: 2px 8px;
+  padding: 2px var(--sp-2);
   border-radius: var(--radius-sm);
 }
 
@@ -570,7 +570,7 @@
 .audio-view {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--sp-3);
   height: 100%;
   min-height: 0;
 }
@@ -604,7 +604,7 @@ video.audio-view-media {
   flex-shrink: 0;
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 14px;
+  gap: var(--sp-1) 14px;
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   color: var(--text);
@@ -632,7 +632,7 @@ video.audio-view-media {
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
-  padding: 4px 10px;
+  padding: var(--sp-1) 10px;
 }
 .video-tools .btn-ic:hover:not(:disabled) {
   border-color: var(--accent);
@@ -657,7 +657,7 @@ video.audio-view-media {
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
-  padding: 4px 10px;
+  padding: var(--sp-1) 10px;
 }
 .audio-retranscribe:hover:not(:disabled) {
   border-color: var(--accent);
@@ -687,7 +687,7 @@ video.audio-view-media {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding-right: 4px;
+  padding-right: var(--sp-1);
 }
 .audio-line {
   display: flex;
@@ -696,10 +696,10 @@ video.audio-view-media {
   text-align: left;
   border: 1px solid transparent;
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
-  padding: 4px 8px;
+  padding: var(--sp-1) var(--sp-2);
   background: none;
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   line-height: 1.5;
   cursor: pointer;
 }
@@ -755,12 +755,12 @@ video.audio-view-media {
 }
 .html-view-note {
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: var(--fs-micro);
 }
 .html-view-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   flex-shrink: 0;
 }
 .html-view-frame {

@@ -38,7 +38,7 @@ button {
   background: transparent;
   border: 1px solid var(--rule-strong);
   border-radius: 9px 7px 10px 8px / 8px 10px 7px 9px;
-  padding: 6px 12px;
+  padding: 6px var(--sp-3);
   cursor: pointer;
   position: relative;
   transition:
@@ -188,7 +188,7 @@ code {
   border-radius: 4px 3px 5px 3px / 3px 5px 3px 4px;
   padding: 1px 6px;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--fs-micro);
 }
 
 /* buttons that pair an icon with a label */

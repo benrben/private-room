@@ -142,7 +142,7 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 4px;
+  padding: var(--sp-1);
   border: 1px solid var(--sem-urgent);
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--sem-urgent-fill) 9%, transparent);
@@ -196,7 +196,7 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 14px 8px;
+  padding: 14px var(--sp-2);
   overflow-y: auto;
   background-image: linear-gradient(
     180deg,
@@ -471,7 +471,7 @@
   justify-content: center;
   min-width: 24px;
   min-height: 24px;
-  padding: 4px;
+  padding: var(--sp-1);
   background: none;
   border: none;
   border-radius: var(--radius-sm);
@@ -500,7 +500,7 @@
 .model-badge {
   font-size: var(--fs-micro);
   line-height: 1.5;
-  padding: 1px 8px;
+  padding: 1px var(--sp-2);
   border-radius: 999px 999px 999px 999px / 12px 10px 12px 10px;
   border: 1px solid var(--line);
   color: var(--muted);

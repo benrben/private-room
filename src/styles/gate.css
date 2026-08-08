@@ -306,7 +306,7 @@
   align-self: flex-start;
   min-height: 24px;
   margin-top: calc(var(--sp-1) * -1);
-  padding: 4px 8px;
+  padding: var(--sp-1) var(--sp-2);
   font-size: var(--fs-meta);
 }
 
@@ -486,7 +486,7 @@
 .recent-clear {
   margin-top: var(--sp-3);
   min-height: 24px;
-  padding: 4px 8px;
+  padding: var(--sp-1) var(--sp-2);
   font-size: var(--fs-meta);
   color: var(--ink-2);
   background: none;
@@ -557,7 +557,7 @@
   justify-content: center;
   gap: 6px;
   min-height: 24px;
-  padding: 4px 8px;
+  padding: var(--sp-1) var(--sp-2);
   font-size: var(--fs-meta);
 }
 

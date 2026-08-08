@@ -129,7 +129,7 @@
 
 .command-wrap {
   min-width: 0;
-  padding: 0 12px;
+  padding: 0 var(--sp-3);
   display: flex;
 }
 /* The one control in the bar that grew: ⌘K is the way into everything, and
@@ -143,7 +143,7 @@
   padding: 0 10px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   color: var(--muted);
   background: transparent;
   border: 1px solid var(--rule-strong);
@@ -181,11 +181,11 @@
 
 .top-actions {
   min-width: 0;
-  padding: 0 8px;
+  padding: 0 var(--sp-2);
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 4px;
+  gap: var(--sp-1);
 }
 
 /* Truthful data-route badge — the same three trust tones as the status-bar
@@ -244,7 +244,7 @@
   min-width: 0;
   max-width: 210px;
   height: 26px;
-  padding: 0 8px;
+  padding: 0 var(--sp-2);
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -411,7 +411,7 @@
      `.activity-rail.is-expanded` replaces this whole `padding` shorthand
      with its own, so the extra room here is collapsed-only by construction,
      not by a second rule. */
-  padding: 8px 6px 20px;
+  padding: var(--sp-2) 6px 20px;
   background: transparent;
   border-right: 1px solid var(--line);
   position: relative;
@@ -455,7 +455,7 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: var(--sp-1);
   color: var(--muted);
   background: transparent;
   border: 0;
@@ -823,7 +823,7 @@ body.resizing-col * {
 .pane-header {
   height: 39px;
   flex: 0 0 auto;
-  padding: 0 6px 0 12px;
+  padding: 0 6px 0 var(--sp-3);
   border-bottom: 1px solid var(--line-soft);
   display: flex;
   align-items: center;
@@ -839,7 +839,7 @@ body.resizing-col * {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-strong);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   font-weight: 500;
   letter-spacing: 0.01em;
 }
@@ -873,7 +873,7 @@ body.resizing-col * {
 .pane-tabs {
   height: 34px;
   flex: 0 0 auto;
-  padding: 0 12px;
+  padding: 0 var(--sp-3);
   display: flex;
   align-items: flex-end;
   gap: 13px;
@@ -890,7 +890,7 @@ body.resizing-col * {
   border: 0;
   border-bottom: 2px solid transparent;
   border-radius: 0;
-  font-size: 12px;
+  font-size: var(--fs-micro);
 }
 .pane-tab:hover {
   color: var(--text);
@@ -949,7 +949,7 @@ body.resizing-col * {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   position: relative;
 }
 .assistant-tab:hover {
@@ -1163,7 +1163,7 @@ button.status-trust.danger:hover {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 0 8px;
+  padding: 0 var(--sp-2);
   color: var(--muted);
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -1180,7 +1180,7 @@ button.status-trust.danger:hover {
   background: transparent;
   border: 0;
   outline: 0;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   padding: 0;
 }
 .search-field input::placeholder {
@@ -1261,7 +1261,7 @@ button.status-trust.danger:hover {
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   padding: 0;
 }
 .add-source-button:hover {
@@ -1372,7 +1372,7 @@ button.status-trust.danger:hover {
   display: inline-block;
   font-size: 11px;
   font-weight: 600;
-  padding: 2px 8px;
+  padding: 2px var(--sp-2);
   border-radius: 999px;
 }
 .scope-tag.auto {
@@ -1449,7 +1449,7 @@ button.status-trust.danger:hover {
 .editor-breadcrumb-bar {
   min-height: 32px;
   flex: 0 0 auto;
-  padding: 2px 8px 2px 14px;
+  padding: 2px var(--sp-2) 2px 14px;
   display: flex;
   align-items: center;
   min-width: 0;
@@ -1485,9 +1485,9 @@ button.status-trust.danger:hover {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-1);
   min-height: 22px;
-  margin-left: 4px;
+  margin-left: var(--sp-1);
   padding: 2px 9px 2px 6px;
   border: 1px solid var(--line);
   /* The same uneven pen-drawn radius the other small paper controls use. */
@@ -1517,7 +1517,7 @@ button.status-trust.danger:hover {
     display: none;
   }
   .pane-heading {
-    font-size: 12px;
+    font-size: var(--fs-micro);
   }
 }
 @container (max-width: 390px) {
@@ -1552,7 +1552,7 @@ button.status-trust.danger:hover {
   }
   .command-wrap {
     grid-column: 2;
-    padding-inline: 8px;
+    padding-inline: var(--sp-2);
   }
   .top-actions {
     grid-column: 3;
@@ -1579,7 +1579,7 @@ button.status-trust.danger:hover {
   background: transparent;
   border: 1px solid transparent;
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   line-height: 1;
 }
 .qa-pill:hover {
@@ -1637,7 +1637,7 @@ button.status-trust.danger:hover {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin: 8px 10px 0;
+  margin: var(--sp-2) 10px 0;
   padding: 7px 9px;
   border: 1px solid var(--line);
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
@@ -1665,9 +1665,9 @@ button.status-trust.danger:hover {
   padding: 13px 12px 40px;
 }
 .studio-intro {
-  margin: 0 2px 12px;
+  margin: 0 2px var(--sp-3);
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--fs-micro);
   line-height: 1.5;
 }
 .studio-section-title {
@@ -1680,7 +1680,7 @@ button.status-trust.danger:hover {
 .studio-row {
   width: 100%;
   min-height: 48px;
-  padding: 8px;
+  padding: var(--sp-2);
   display: grid;
   grid-template-columns: 29px minmax(0, 1fr) auto;
   align-items: center;
@@ -1714,7 +1714,7 @@ button.status-trust.danger:hover {
 .studio-row-title {
   display: block;
   color: var(--text-strong);
-  font-size: 12px;
+  font-size: var(--fs-micro);
 }
 .studio-row-copy {
   display: block;
@@ -1747,7 +1747,7 @@ button.status-trust.danger:hover {
 .viewer-head {
   min-height: 42px;
   flex: 0 0 auto;
-  padding: 4px 10px 4px 14px;
+  padding: var(--sp-1) 10px var(--sp-1) 14px;
   gap: 6px;
   border-bottom: 1px solid var(--line-soft);
   background: transparent;
@@ -1758,7 +1758,7 @@ button.status-trust.danger:hover {
 }
 .viewer-title {
   font-weight: 500;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   color: var(--text-strong);
 }
 .viewer-actions {
@@ -1854,7 +1854,7 @@ button.status-trust.danger:hover {
 }
 .search-input {
   padding: 13px 15px;
-  font-size: 14px;
+  font-size: var(--fs-body);
 }
 .search-result {
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
@@ -1888,7 +1888,7 @@ button.status-trust.danger:hover {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 12px 10px 40px;
+  padding: var(--sp-3) 10px 40px;
 }
 .activity-summary {
   margin: 0 2px 11px;
@@ -1915,7 +1915,7 @@ button.status-trust.danger:hover {
   min-width: 0;
   flex: 1;
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-micro);
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -1926,7 +1926,7 @@ button.status-trust.danger:hover {
   white-space: nowrap;
 }
 .activity-copy {
-  margin: 4px 0 0;
+  margin: var(--sp-1) 0 0;
   color: var(--muted);
   font-size: 10.5px;
   line-height: 1.5;
@@ -1970,7 +1970,7 @@ button.status-trust.danger:hover {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--sp-2);
   margin-top: 5px;
 }
 .activity-row-foot .activity-copy {
@@ -1986,7 +1986,7 @@ button.status-trust.danger:hover {
    boundary, not on which card happens to have a button. */
 .activity-history {
   margin-top: 26px;
-  padding-top: 4px;
+  padding-top: var(--sp-1);
   border-top: 1px solid var(--line);
 }
 .activity-history .activity-group-title {
@@ -2035,7 +2035,7 @@ button.status-trust.danger:hover {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 12px;
+  padding: 10px var(--sp-3);
   border: 1px solid var(--line-soft);
   border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
   background: var(--panel-2);
@@ -2061,7 +2061,7 @@ button.status-trust.danger:hover {
   padding: 40px 0 80px;
 }
 .memory-view-head h1 {
-  margin: 0 0 8px;
+  margin: 0 0 var(--sp-2);
   color: var(--text-strong);
   font-size: 24px;
   font-weight: 500;
@@ -2070,7 +2070,7 @@ button.status-trust.danger:hover {
 .memory-view-sub {
   margin: 0 0 22px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   line-height: 1.6;
 }
 .memory-view .memory-add {
@@ -2091,7 +2091,7 @@ button.status-trust.danger:hover {
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
-  padding: 8px 4px;
+  padding: var(--sp-2) var(--sp-1);
   border-bottom: 1px solid var(--line-soft);
   font-size: 12.5px;
   color: var(--text);
@@ -2131,9 +2131,9 @@ button.status-trust.danger:hover {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   color: var(--faint);
-  font-size: 12px;
+  font-size: var(--fs-micro);
   text-align: center;
 }
 .memory-scratch-note {
@@ -2141,9 +2141,9 @@ button.status-trust.danger:hover {
   padding-top: 6px;
 }
 .memory-scratch-note p {
-  margin: 4px 0 10px;
+  margin: var(--sp-1) 0 10px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--fs-micro);
   line-height: 1.55;
 }
 
@@ -2363,7 +2363,7 @@ button.status-trust.danger:hover {
   align-self: center;
   min-width: 24px;
   min-height: 24px;
-  margin-left: 4px;
+  margin-left: var(--sp-1);
   padding: 3px 7px;
   border: none;
   border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
@@ -2387,13 +2387,13 @@ button.status-trust.danger:hover {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 32px;
+  padding: var(--sp-8);
   background: var(--bg);
   color: var(--text);
 }
 .crash-card {
   max-width: 520px;
-  padding: 24px;
+  padding: var(--sp-6);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: var(--panel);
@@ -2405,22 +2405,22 @@ button.status-trust.danger:hover {
 }
 .crash-card p {
   margin: 0 0 14px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   line-height: 1.5;
   color: var(--muted);
 }
 .crash-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--sp-2);
   margin-top: 14px;
 }
 .crash-pane {
-  margin: 16px;
+  margin: var(--sp-4);
   padding: 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   color: var(--muted);
   overflow: auto;
 }
@@ -2430,7 +2430,7 @@ button.status-trust.danger:hover {
 .crash-detail {
   max-height: 160px;
   margin: 0;
-  padding: 8px 10px;
+  padding: var(--sp-2) 10px;
   border-radius: var(--radius-sm);
   background: var(--panel-2);
   color: var(--faint);
@@ -2453,7 +2453,7 @@ button.status-trust.danger:hover {
   flex-direction: column;
   gap: 7px;
   width: 260px;
-  padding: 12px 14px;
+  padding: var(--sp-3) 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel);

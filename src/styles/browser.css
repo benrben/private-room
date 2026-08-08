@@ -134,8 +134,8 @@
      stage a few pixels of height — which the ResizeObserver in BrowserView
      pushes to Rust — whereas an overflowing row silently hides a control. */
   flex-wrap: wrap;
-  gap: 8px;
-  padding: 8px 10px;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 10px;
   border-bottom: 1px solid var(--line);
   background: transparent;
   flex: 0 0 auto;
@@ -283,7 +283,7 @@
   position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   /* A 240px basis, so the strip wraps the BUTTONS onto a second row rather
      than crushing the address into an unreadable slot. */
   flex: 1 1 240px;
@@ -461,7 +461,7 @@
   position: relative;
   flex: none;
   height: 28px;
-  padding: 0 12px;
+  padding: 0 var(--sp-3);
   color: var(--text);
   background: transparent;
   border: 1px solid var(--rule-strong);
@@ -531,7 +531,7 @@
   width: auto;
   height: auto;
   clip-path: none;
-  padding: 6px 12px;
+  padding: 6px var(--sp-3);
   color: var(--text);
   background: var(--raised);
   border: 1px solid var(--accent);
@@ -755,7 +755,7 @@
 .browser-journal {
   flex: 0 1 320px;
   min-width: 232px;
-  padding: 12px 14px 28px;
+  padding: var(--sp-3) 14px 28px;
   border-left: 1px solid var(--line);
   background: transparent;
   overflow-y: auto;
@@ -765,7 +765,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--sp-2);
   padding-bottom: var(--sp-2);
   /* The same drawn section rule Room Home uses, as a background so it costs
      no element. */
@@ -871,7 +871,7 @@
   justify-self: start;
   display: inline-flex;
   align-items: center;
-  padding: 1px 8px;
+  padding: 1px var(--sp-2);
   color: var(--ink);
   background: color-mix(in srgb, var(--mk) 34%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mk) 46%, transparent);
@@ -1118,7 +1118,7 @@
    reflowed: it scrolls in its own box so the source stays exactly as it is. */
 .browser-reader-body pre {
   overflow-x: auto;
-  padding: 10px 12px;
+  padding: 10px var(--sp-3);
   border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
   background: color-mix(in srgb, var(--raised) 70%, transparent);
   border: 1px solid var(--line-soft);
@@ -1150,7 +1150,7 @@
 }
 
 .browser-reader-error {
-  padding: 10px 12px;
+  padding: 10px var(--sp-3);
   color: var(--sem-urgent);
   border: 1px solid var(--sem-urgent);
   border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
@@ -1205,7 +1205,7 @@
   display: grid;
   gap: 9px;
   padding: 12px 13px;
-  margin: 8px 0;
+  margin: var(--sp-2) 0;
   border: 1px solid var(--mk-ink);
   border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
   background-image: linear-gradient(
@@ -1249,7 +1249,7 @@
 
 .browse-consent .bc-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--sp-2);
 }
 
 /* ==========================================================================
@@ -1270,7 +1270,7 @@
   position: absolute;
   inset: 0;
   overflow-y: auto;
-  padding: 22px 26px 32px;
+  padding: 22px 26px var(--sp-8);
   display: flex;
   flex-direction: column;
   gap: 13px;
@@ -1281,7 +1281,7 @@
 
 /* ---- header ---- */
 .bsearch-head h1 {
-  margin: 0 0 8px;
+  margin: 0 0 var(--sp-2);
   color: var(--text-strong);
   font-size: var(--fs-section);
   font-weight: 600;
@@ -1297,7 +1297,7 @@
   gap: 3px;
   height: 4px;
   max-width: 330px;
-  margin-bottom: 8px;
+  margin-bottom: var(--sp-2);
 }
 
 .bsearch-fuse i {
@@ -1427,7 +1427,7 @@
   justify-content: center;
   min-width: 17px;
   height: 17px;
-  padding: 0 4px;
+  padding: 0 var(--sp-1);
   margin: 0 2px;
   vertical-align: baseline;
   color: var(--accent-2);
@@ -1449,7 +1449,7 @@
    harder, not a colour change — which is .nb-card's recipe and still measures
    ~6.9:1 dark / ~5.2:1 light, well over the 3:1 a clickable boundary owes. */
 .bsearch-duo { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.bsearch-rows { display: flex; flex-direction: column; gap: 8px; }
+.bsearch-rows { display: flex; flex-direction: column; gap: var(--sp-2); }
 
 .bsearch-card {
   position: relative;
@@ -1502,7 +1502,7 @@
   text-underline-offset: 3px;
 }
 
-.bsearch-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.bsearch-body { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
 
 /* tier 1 — the feature card */
 .bsearch-card.feature { display: grid; grid-template-columns: minmax(0, 1fr) 244px; }
@@ -1696,14 +1696,14 @@
 .bsearch-inroom {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-1);
   color: var(--sem-done);
   font-size: var(--fs-micro);
   font-weight: 600;
   white-space: nowrap;
 }
 
-.bsearch-acts { margin-left: auto; display: flex; gap: 4px; opacity: 0; transition: opacity var(--dur-fast) var(--ease-pen); }
+.bsearch-acts { margin-left: auto; display: flex; gap: var(--sp-1); opacity: 0; transition: opacity var(--dur-fast) var(--ease-pen); }
 .bsearch-card:hover .bsearch-acts,
 .bsearch-card.sel .bsearch-acts,
 .bsearch-card.peeked .bsearch-acts { opacity: 1; }
@@ -1733,7 +1733,7 @@
 /* ---- peek ---- */
 .bsearch-peek {
   margin-top: 9px;
-  padding: 10px 12px;
+  padding: 10px var(--sp-3);
   background: transparent;
   border: 1px dashed var(--line);
   border-radius: var(--radius);
@@ -1764,7 +1764,7 @@
 }
 
 .bsearch-empty svg { color: var(--faint); }
-.bsearch-empty h2 { margin: 10px 0 4px; font-size: var(--fs-card); color: var(--text-strong); }
+.bsearch-empty h2 { margin: 10px 0 var(--sp-1); font-size: var(--fs-card); color: var(--text-strong); }
 .bsearch-empty p { margin: 0 auto; max-width: 52ch; font-size: var(--fs-body); line-height: var(--lh-body); }
 
 .bsearch-error {
@@ -1787,7 +1787,7 @@
 .bsearch-foot {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 14px;
+  gap: var(--sp-1) 14px;
   padding-top: 10px;
   color: var(--faint);
   font-size: var(--fs-micro);
@@ -1840,7 +1840,7 @@
    ========================================================================== */
 
 @media (max-width: 720px) {
-  .bsearch { padding: 16px; }
+  .bsearch { padding: var(--sp-4); }
   .bsearch-card.feature { grid-template-columns: 1fr; }
   .bsearch-card.feature .bsearch-img { min-height: 128px; order: -1; }
   .bsearch-duo { grid-template-columns: 1fr; }

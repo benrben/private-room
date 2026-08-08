@@ -656,13 +656,13 @@
 .pane-ai .pod-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 0 2px 16px;
+  gap: var(--sp-3);
+  padding: 0 2px var(--sp-4);
 }
 .pane-ai .pod-head {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-2);
   flex-wrap: wrap;
 }
 .pane-ai .pod-head h3 {
@@ -728,7 +728,7 @@
 .pane-ai .pod-record {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   flex-wrap: wrap;
 }
 /* The record row sits above its own rule: it is the one irreversible-ish act

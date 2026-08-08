@@ -216,7 +216,7 @@
   align-self: center;
   flex: 0 0 auto;
   min-height: 24px;
-  padding: 4px 12px;
+  padding: var(--sp-1) var(--sp-3);
   font-size: var(--fs-micro);
   color: var(--muted);
   border: 1px dashed var(--rule-strong);
@@ -281,7 +281,7 @@
 }
 .prompt-chip {
   text-align: start;
-  padding: 8px 12px;
+  padding: var(--sp-2) var(--sp-3);
   font-family: var(--hand);
   font-size: var(--fs-hand);
   line-height: var(--lh-hand);
@@ -519,7 +519,7 @@
   display: inline-block;
   width: 13px;
   height: 3px;
-  margin-inline-end: 8px;
+  margin-inline-end: var(--sp-2);
   vertical-align: 0.22em;
   /* The INK track, not the fill: a 3px mark in the light-mode marker fill
      measures 1.45:1 on ivory and would simply not be there. */
@@ -669,7 +669,7 @@
 .msg .annot-chip {
   align-items: flex-start;
   max-width: 100%;
-  padding: 6px 12px;
+  padding: 6px var(--sp-3);
   margin-top: 0;
   font-size: var(--fs-meta);
   line-height: var(--lh-body);
@@ -808,7 +808,7 @@
 }
 .save-form input {
   width: 160px;
-  padding: 4px 8px;
+  padding: var(--sp-1) var(--sp-2);
   font-size: var(--fs-micro);
 }
 
@@ -928,7 +928,7 @@
   align-items: center;
   flex-wrap: wrap;
   gap: var(--sp-2);
-  padding: 2px 4px 6px;
+  padding: 2px var(--sp-1) 6px;
   font-size: var(--fs-meta);
 }
 /* A strip of tape carrying the word: the wash is the meaning and the reading
